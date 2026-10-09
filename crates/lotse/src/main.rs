@@ -27,7 +27,6 @@ use crate::cli::{Cli, Command, ServeArgs, WorkerArgs};
 
 mod cli;
 mod config;
-mod console;
 mod ctl;
 mod logging;
 
@@ -113,8 +112,7 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
 /// The worker process: logging from its flags, the panic hook, the worker
 /// sandbox, then the runtime on the channel it inherited as stdin.
 fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
-    // Workers carry no console: they would all bind its port.
-    let _no_console = logging::init(args.log_format, &args.log_level, false).context("logging")?;
+    logging::init(args.log_format, &args.log_level).context("logging")?;
     let _process =
         tracing::info_span!("process", kind = "worker", pid = std::process::id()).entered();
     logging::install_panic_hook();
@@ -166,8 +164,7 @@ fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
 /// logging, panic hook, the control socket, sandbox, runtime.
 fn serve(args: &ServeArgs, matches: &ArgMatches) -> anyhow::Result<()> {
     let (settings, provenance) = config::load(args, matches).context("configuration")?;
-    let console =
-        logging::init(settings.log.format, &settings.log.level, true).context("logging")?;
+    logging::init(settings.log.format, &settings.log.level).context("logging")?;
     let _process =
         tracing::info_span!("process", kind = "supervisor", pid = std::process::id()).entered();
     logging::install_panic_hook();
@@ -180,8 +177,6 @@ fn serve(args: &ServeArgs, matches: &ArgMatches) -> anyhow::Result<()> {
         binary: binary.clone(),
     };
     let report = lotse_sandbox::apply(&profile, &settings.sandbox).context("sandbox")?;
-    // After the sandbox, so the console's thread is under it.
-    console::start(console);
 
     let limits = &settings.supervisor.limits;
     let environment = Environment {

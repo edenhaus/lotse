@@ -150,9 +150,6 @@ The clients, the Python `lotse-client` among them, live in their own repository,
   panic ends the process. Cargo ignores the setting for the test profile,
   so a test that needs abort semantics must run a release-profile binary
   in a subprocess.
-- `tokio::task::Builder` (named tasks) exists only behind
-  `--cfg tokio_unstable`; the `spawn_named` wrapper uses it under the
-  `console` feature only.
 - A release is publishing the draft that Release Drafter keeps on GitHub
   (CI's Release notes job, `.github/release-drafter.yml`): the merged PRs'
   Conventional Commit titles sort its notes and pick the version, and

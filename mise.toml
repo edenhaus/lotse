@@ -139,23 +139,6 @@ arg "[play]" help="how long each play lasts after the first frame (20s)" default
 '''
 run = 'scripts/compare.sh "$usage_engine" "$usage_runs" "$usage_play"'
 
-[tasks.console]
-description = "The daemon with tokio-console in the supervisor (--cfg tokio_unstable, fake source, no sandbox); then run `tokio-console`"
-usage = 'arg "[dir]" help="a 0700 directory for the control socket" default="/tmp/lotse-console"'
-env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/console" }
-run = """
-mkdir -m 0700 -p "$usage_dir"
-cargo run --locked --bin lotse --features console,source-fake -- serve --socket "$usage_dir/lotse.sock" --sandbox off
-"""
-
-[tasks.console-check]
-description = "Lints and tests the console build, which only --cfg tokio_unstable compiles (CI's Console build job)"
-env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/console" }
-run = [
-  "cargo clippy --locked -p lotse -p lotse-core --features lotse/console,lotse/source-fake --all-targets -- -D warnings",
-  "cargo nextest run --locked -p lotse -p lotse-core --features lotse/console,lotse/source-fake --no-tests=warn console logging task::",
-]
-
 [tasks.fuzz]
 description = "Run one cargo-fuzz target for N seconds on the pinned nightly (installed if missing); needs cargo-fuzz (`cargo install cargo-fuzz --locked`), the one nightly use"
 usage = '''

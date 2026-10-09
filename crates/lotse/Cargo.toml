@@ -21,12 +21,10 @@ default = ["source-rtsp", "output-webrtc"]
 source-rtsp = ["dep:lotse-rtsp"] # the RTSP source factory
 output-webrtc = ["dep:lotse-webrtc"] # the WebRTC session output factory
 source-fake = ["lotse-core/test-util"] # the `fake://` source of lotse-core's fakes, for tests and development only
-console = ["lotse-core/console", "dep:console-subscriber"] # tokio-console in the supervisor; needs `--cfg tokio_unstable`
 
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-console-subscriber = { workspace = true, optional = true }
 futures-util = { workspace = true } # the WebSocket halves of `lotse ctl`
 rustix = { workspace = true, features = ["process"] } # the starting uid, the default of `allow_uid`
 serde = { workspace = true }

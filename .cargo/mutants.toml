@@ -41,10 +41,6 @@ exclude_re = [
     "replace \\| with \\^ in ntp_timestamp",
     # The CVO flip bit and the rotation bits are disjoint, so `|` and `^` produce the same byte.
     "cvo.rs:.*replace \\| with \\^ in byte$",
-    # Compiled only under `--cfg tokio_unstable`, which no mutants run sets: a mutation there
-    # changes nothing that is built. `mise run console-check` lints and tests that code.
-    "enabled::(layer|start)",
-    "replace console::spawn(_blocking)? -> JoinHandle",
     # H.265 headers (RFC 7798 §1.1.4, §4.4.2, §4.4.3) and the SPS bit reader: the fields
     # OR-ed together occupy disjoint bits, so `|` and `^` produce the same value.
     "h265/nal.rs:.*replace \\| with \\^ in (layer_id|parse|aggregate|fu_indicator|fu)$",

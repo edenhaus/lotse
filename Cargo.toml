@@ -64,9 +64,6 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
 # JSON (or text) log lines on stderr with `RUST_LOG` filtering.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
-# The tokio-console layer and its gRPC server, in development builds of the binary only: behind
-# the `console` feature, which also needs `--cfg tokio_unstable`.
-console-subscriber = { version = "0.5", default-features = false }
 # Ergonomic error context at the top level only: `anyhow` never leaves `main` (AGENTS.md).
 anyhow = { version = "1", default-features = false, features = ["std"] }
 # JSON Schema 2020-12 for every control API message, generated from the DTOs and committed.
@@ -177,11 +174,10 @@ unused_qualifications = "warn"
 unused_lifetimes = "warn"
 trivial_casts = "warn"
 trivial_numeric_casts = "warn"
-# `tokio::task::Builder` (named tasks) only exists behind `tokio_unstable`. `aes_armv8` and
-# `polyval_armv8` select the ARMv8 crypto backends of `aes` and `polyval` (.cargo/config.toml),
+# `aes_armv8` and `polyval_armv8` select the ARMv8 crypto backends of `aes` and `polyval` (.cargo/config.toml),
 # which a test checks on aarch64. `coverage` is set by cargo-llvm-cov (the coverage gate) and
 # opens to sandboxed processes what the profiler runtime does when it writes its profile.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)", "cfg(aes_armv8)", "cfg(polyval_armv8)", "cfg(coverage)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(aes_armv8)", "cfg(polyval_armv8)", "cfg(coverage)"] }
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"

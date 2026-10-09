@@ -15,10 +15,6 @@ categories.workspace = true
 # Fakes for core's own types (`FakeClock`, later the scripted track driver). They cannot live in
 # `lotse-testing`, which depends on this crate.
 test-util = []
-# Names every task for tokio-console: `spawn_named` goes through `tokio::task::Builder`, which
-# exists only with `--cfg tokio_unstable` and tokio's `tracing` feature; without the cfg it changes
-# nothing.
-console = ["tokio/tracing"]
 
 [dependencies]
 arc-swap = { workspace = true }
