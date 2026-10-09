@@ -22,7 +22,7 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: "23 1 * * *" # nightly: the browser test, the go2rtc comparison, load and soak
+    - cron: "14 0 * * *" # nightly: the browser test, the go2rtc comparison, load and soak
   workflow_dispatch:
     inputs:
       nightly:
