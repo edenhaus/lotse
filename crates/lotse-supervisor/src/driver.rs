@@ -936,7 +936,7 @@ mod tests {
     use crate::net::demux::Registrations;
     use crate::registry::State;
     use crate::session::SessionEntry;
-    use crate::test_support::{environment, private_dir};
+    use crate::test_support::{environment, let_expect, private_dir};
     use crate::worker::WorkerManager;
 
     fn shared(binary: &str) -> Arc<Shared> {
@@ -1005,15 +1005,12 @@ mod tests {
         let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
         assert!(sink.ice_tcp(fd(), peer, vec![1, 2]));
         assert!(!sink.ice_tcp(fd(), peer, vec![3]), "a full queue refuses");
-        let Some(DriverCommand::IceTcp {
+        let_expect!(rx.recv().await => Some(DriverCommand::IceTcp {
             peer: got,
             local_ufrag,
             first_frame,
             ..
-        }) = rx.recv().await
-        else {
-            panic!("an ice-tcp hand-off");
-        };
+        }), "an ice-tcp hand-off");
         assert_eq!((got, first_frame), (peer, vec![1, 2]));
         assert_eq!(local_ufrag, "abcd", "the session the sink belongs to");
     }
@@ -1608,11 +1605,11 @@ mod tests {
     /// come first or not at all: the relay task races the reaper (the exit
     /// came first on Linux 7.0, the channel's end on macOS, 2026-10-09).
     async fn step_to_exit(driver: &mut Driver) -> String {
-        let mut next = bounded_step(driver).await;
-        while next == "ChannelClosed" {
-            next = bounded_step(driver).await;
+        let mut step = String::from("ChannelClosed");
+        while step == "ChannelClosed" {
+            step = bounded_step(driver).await;
         }
-        next
+        step
     }
 
     /// A worker script at `dir/worker.sh` running `body`.
@@ -1709,6 +1706,226 @@ mod tests {
         step(&mut driver).await;
         assert_eq!(driver.machine.state(), ConnectionState::Idle);
         assert!(driver.silence.is_none());
+        drop((driver, demand_tx));
+        wind_down(&shared, &clock, dir).await;
+    }
+
+    /// A worker that has exited, as the driver still holds it.
+    async fn dead_worker(shared: &Shared) -> Worker {
+        let mut worker = shared.manager.spawn(&[], false).unwrap();
+        while !matches!(worker.next_event().await, WorkerEvent::Exited(_)) {}
+        worker
+    }
+
+    fn spec_of(url: &str) -> DriverSpec {
+        DriverSpec {
+            connection_id: "c1".into(),
+            url: url.into(),
+            options: "{}".into(),
+            host: "127.0.0.1".into(),
+            port: Some(1),
+            loopback_relay: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_is_a_backoff_and_retried_on_the_clock() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        assert!(matches!(driver.pending, Pending::Resolving(_)));
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver
+            .handle(Wake::Resolved(Err("no such host".into())))
+            .await;
+        assert_eq!(driver.machine.state(), ConnectionState::Backoff);
+        assert_eq!(
+            driver.machine.last_error().map(ConnectionError::code),
+            Some("source_unreachable")
+        );
+        let logged = captured.lines("host resolution failed; retrying");
+        assert!(
+            logged[0].contains("error=no such host") && logged[0].contains("retry_ms="),
+            "{logged:?}"
+        );
+        assert!(ready_wake(&mut driver).await.is_none(), "the retry waits");
+        clock.advance(Duration::from_secs(120));
+        let wake = next_wake(&mut driver).await;
+        assert!(matches!(wake, Wake::RetryResolve));
+        driver.handle(wake).await;
+        assert_eq!(driver.machine.state(), ConnectionState::Connecting);
+        assert!(
+            matches!(driver.pending, Pending::Resolving(_)),
+            "looked up again"
+        );
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn a_switch_whose_lookup_fails_waits_on_the_clock_and_a_dead_worker_is_not_told() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (_demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver
+            .handle(Wake::SwitchResolved(Err("no such host".into())))
+            .await;
+        let logged = captured.lines("source to switch to could not be resolved");
+        assert!(logged[0].contains("retry_ms="), "{logged:?}");
+        assert!(ready_wake(&mut driver).await.is_none(), "the retry waits");
+        clock.advance(Duration::from_secs(120));
+        let wake = next_wake(&mut driver).await;
+        assert!(matches!(wake, Wake::RetrySwitchResolve));
+        driver.handle(wake).await;
+        assert!(
+            matches!(driver.pending, Pending::Nothing),
+            "no worker, no lookup"
+        );
+        // A worker that is gone cannot be told: the exit follows.
+        driver.worker = Some(dead_worker(&shared).await);
+        driver
+            .handle(Wake::SwitchResolved(Ok(vec![
+                "127.0.0.1:1".parse().unwrap(),
+            ])))
+            .await;
+        assert_eq!(
+            captured
+                .lines("source switch could not be sent to the worker")
+                .len(),
+            1
+        );
+        driver.handle(Wake::SwitchConnect(SlotWake::Grant)).await;
+        assert_eq!(
+            captured
+                .lines("standby connect grant could not be sent to the worker")
+                .len(),
+            1
+        );
+        // Nothing else is a switch's to handle.
+        driver.handle_switch(Wake::LingerExpired).await;
+        assert!(driver.worker.is_some());
+        // A switch message never goes to the worker itself.
+        let (commands, _rx) = mpsc::channel(1);
+        let worker = driver.worker.as_mut().unwrap();
+        let switch = DriverCommand::SwitchSource(spec_of("fake://127.0.0.1:1/b"));
+        Driver::send(worker, &shared, &commands, switch).await;
+        drop(driver);
+        assert!(
+            captured
+                .lines("session message could not be sent")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_worker_s_reports_reach_the_snapshot_and_the_log() {
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        // Ready before the snapshot has a worker, and after.
+        driver.on_worker_event(WorkerEvent::Ready {
+            pid: 7,
+            memory: None,
+        });
+        driver.snapshot.worker = Some(WorkerProcess {
+            pid: 7,
+            started: shared.clock.now(),
+            memory: None,
+        });
+        driver.on_worker_event(WorkerEvent::Ready {
+            pid: 7,
+            memory: None,
+        });
+        assert_eq!(captured.lines("worker ready").len(), 2);
+        let track = lotse_ipc::TrackInfo {
+            id: "v0".into(),
+            kind: "video".into(),
+            codec: "h264".into(),
+            clock_rate: 90_000,
+            sync: "arrival".into(),
+            derived_from: None,
+            audio_delay_ms: None,
+        };
+        driver.on_worker_event(WorkerEvent::Tracks(vec![track.clone()]));
+        assert_eq!(driver.snapshot.tracks, [track]);
+        assert_eq!(captured.lines("tracks declared").len(), 1);
+        // A session event for a session that is gone changes nothing.
+        driver.on_worker_event(WorkerEvent::Session {
+            session_id: "gone".into(),
+            event: lotse_ipc::SessionEvent::Answer { sdp: "v=0".into() },
+        });
+        assert!(shared.lock().sessions.is_empty());
+        driver.on_worker_event(WorkerEvent::SwitchReport(WorkerReport::Backoff {
+            error: SourceError::AuthFailed("401".into()),
+            retry_in: Duration::from_millis(1_500),
+        }));
+        let logged = captured.lines("the source to switch to failed");
+        assert!(
+            logged[0].contains("error.code=\"source_auth_failed\"")
+                && logged[0].contains("retry_ms=1500"),
+            "{logged:?}"
+        );
+        // A stop without a worker is the exit at once.
+        assert!(matches!(
+            driver.perform(Action::StopWorker),
+            Some(Input::WorkerExited)
+        ));
+        drop(driver);
+        assert!(shared.tracker.is_empty(), "nothing to stop");
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_cannot_start_counts_as_a_crash() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/nonexistent/lotse", clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut owned = driver_on(&shared, demand);
+        let driver = &mut owned;
+        demand_tx.send_replace(1);
+        step(driver).await;
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver
+            .handle(Wake::Resolved(Ok(vec!["127.0.0.1:1".parse().unwrap()])))
+            .await;
+        assert!(driver.worker.is_none());
+        assert_eq!(captured.lines("worker could not be started").len(), 1);
+        assert_eq!(driver.machine.crashes(), 1);
+        assert_eq!(driver.machine.state(), ConnectionState::Restarting);
+        drop((owned, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn a_source_too_large_for_the_channel_still_leaves_the_worker_timed() {
+        let dir = private_dir("driver-too-large");
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with(&worker_script(&dir, "exec sleep 30"), clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        // Over the channel's message limit: the send fails before a write.
+        driver.spec.url = format!("fake://127.0.0.1/{}", "x".repeat(300 * 1024));
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver
+            .handle(Wake::Resolved(Ok(vec!["127.0.0.1:1".parse().unwrap()])))
+            .await;
+        assert_eq!(
+            captured
+                .lines("source could not be sent to the worker")
+                .len(),
+            1
+        );
+        assert!(driver.worker.is_some() && driver.silence.is_some());
         drop((driver, demand_tx));
         wind_down(&shared, &clock, dir).await;
     }

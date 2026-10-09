@@ -1106,6 +1106,7 @@ mod tests {
     use lotse_ipc::TrackStats;
 
     use super::*;
+    use crate::test_support::{Captured, let_expect};
 
     fn ipc_track(id: &str, derived_from: Option<&str>, delay: Option<u32>) -> IpcTrackInfo {
         IpcTrackInfo {
@@ -1279,6 +1280,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_switch_reaches_the_driver_unless_its_connection_is_gone_or_its_queue_is_full() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let (mut state, mut rx) = relay_state(0);
+        let key = |url: &str| ConnectionKey {
+            url: SourceUrl::parse(url).unwrap(),
+            options: serde_json::Value::Null,
+        };
+        let spec = |url: &str| DriverSpec {
+            connection_id: "c1".into(),
+            url: url.into(),
+            options: "{}".into(),
+            host: "127.0.0.1".into(),
+            port: None,
+            loopback_relay: false,
+        };
+        state.switch_connection(
+            "gone",
+            key("fake://127.0.0.1/a"),
+            spec("fake://127.0.0.1/a"),
+        );
+        assert!(rx.try_recv().is_err(), "no connection, no switch");
+        state.switch_connection("c1", key("fake://127.0.0.1/b"), spec("fake://127.0.0.1/b"));
+        // The queue holds one: the next switch keeps its key, not its source.
+        state.switch_connection("c1", key("fake://127.0.0.1/c"), spec("fake://127.0.0.1/c"));
+        assert_eq!(
+            state.connections["c1"].key,
+            key("fake://127.0.0.1/c"),
+            "the key follows the put"
+        );
+        let_expect!(rx.try_recv() => Ok(DriverCommand::SwitchSource(sent)));
+        assert_eq!(sent.url, "fake://127.0.0.1/b");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(captured.lines("driver queue full").len(), 1);
+    }
+
+    #[test]
+    fn a_full_subscription_drops_the_event_and_a_closed_one_is_forgotten() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let mut state = State::default();
+        state.streams.insert("front".into(), stream_on_c1(false));
+        let mut kept = state.subscribe(ConnectionId(1), Some("front".into()));
+        drop(state.subscribe(ConnectionId(1), Some("front".into())));
+        // A stream that is not there tells nobody anything.
+        state.notify_stream("nowhere");
+        assert_eq!(state.subscribers.len(), 2);
+        for _ in 0..=SUBSCRIPTION_QUEUE {
+            state.notify_stream("front");
+        }
+        assert_eq!(state.subscribers.len(), 1, "the closed one is forgotten");
+        let mut queued = 0;
+        while kept.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(
+            queued,
+            1 + SUBSCRIPTION_QUEUE,
+            "the snapshot and a full queue"
+        );
+        assert_eq!(captured.lines("subscription queue full").len(), 1);
+    }
+
+    #[test]
+    fn every_core_state_has_its_api_name() {
+        for (state, name) in [
+            (ConnectionState::Idle, "idle"),
+            (ConnectionState::Connecting, "connecting"),
+            (ConnectionState::Live, "live"),
+            (ConnectionState::Reconnecting, "reconnecting"),
+            (ConnectionState::Backoff, "backoff"),
+            (ConnectionState::Draining, "draining"),
+            (ConnectionState::Restarting, "restarting"),
+        ] {
+            assert_eq!(api_state(state).as_str(), name);
+        }
+    }
+
     #[tokio::test]
     async fn a_relay_lease_goes_to_the_worker_unless_too_late_or_its_queue_is_full() {
         let (mut state, mut rx) = relay_state(4);
@@ -1287,17 +1367,14 @@ mod tests {
         state.session_relayed("s1", 2, Some(relayed(1)));
         assert!(rx.try_recv().is_err());
         state.session_relayed("s1", 1, Some(relayed(1)));
-        let Ok(DriverCommand::RelayCandidate {
+        let_expect!(rx.try_recv() => Ok(DriverCommand::RelayCandidate {
             session_id,
             relayed: address,
             server,
             local,
             tcp,
             grant: _,
-        }) = rx.try_recv()
-        else {
-            panic!("a relay candidate for the worker");
-        };
+        }), "a relay candidate for the worker");
         assert_eq!(
             (session_id.as_str(), address, server, local, tcp),
             (
@@ -1454,5 +1531,14 @@ mod tests {
             (native.derived_from, native.audio_delay_ms, native.frames),
             (None, None, 0)
         );
+        // A stream's DTO lists its connection's tracks with their counters.
+        let (mut registry, _rx) = relay_state(0);
+        let connection = registry.connections.get_mut("c1").unwrap();
+        connection.snapshot.tracks = vec![ipc_track("a1", None, None)];
+        connection.snapshot.stats = Some(stats);
+        let entry = stream_on_c1(false);
+        let dto = registry.stream_dto("front", &entry).stream;
+        assert_eq!(dto.tracks.len(), 1);
+        assert_eq!((dto.tracks[0].id.as_str(), dto.tracks[0].frames), ("a1", 5));
     }
 }

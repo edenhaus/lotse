@@ -1209,7 +1209,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::test_support::{environment, private_dir, settings};
+    use crate::test_support::{Captured, environment, let_expect, private_dir, settings};
 
     #[test]
     fn the_schema_advertises_the_identifier_rule_the_core_checks() {
@@ -1228,32 +1228,26 @@ mod tests {
     }
 
     async fn call(supervisor: &Supervisor, command: &str) -> Outcome {
-        let command = parse_command(command).unwrap_or_else(|err| panic!("{command}: {err}"));
+        let command = parse_command(command).expect(command);
         supervisor.handle(ConnectionId(1), command).await
     }
 
     fn result(outcome: Outcome) -> Value {
-        match outcome {
-            Outcome::Result(value) => value,
-            Outcome::Error(err) => panic!("error {err}"),
-            Outcome::Subscribed(_) => panic!("subscription"),
-        }
+        let seen = format!("{outcome:?}");
+        let_expect!(outcome => Outcome::Result(value), "a result, not {seen}");
+        value
     }
 
     fn error(outcome: Outcome) -> ApiError {
-        match outcome {
-            Outcome::Error(err) => err,
-            Outcome::Result(value) => panic!("result {value}"),
-            Outcome::Subscribed(_) => panic!("subscription"),
-        }
+        let seen = format!("{outcome:?}");
+        let_expect!(outcome => Outcome::Error(err), "an error, not {seen}");
+        err
     }
 
     fn subscription(outcome: Outcome) -> mpsc::Receiver<Event> {
-        match outcome {
-            Outcome::Subscribed(rx) => rx,
-            Outcome::Result(value) => panic!("result {value}"),
-            Outcome::Error(err) => panic!("error {err}"),
-        }
+        let seen = format!("{outcome:?}");
+        let_expect!(outcome => Outcome::Subscribed(rx), "a subscription, not {seen}");
+        rx
     }
 
     /// The next event, failing the test after 10 s instead of hanging it
@@ -1361,8 +1355,54 @@ mod tests {
         assert_eq!(metrics["worker_restarts"], 0);
         assert_eq!(metrics["supervisor"]["pid"], std::process::id());
         assert_eq!(metrics["streams"], json!({}));
+        let captured = Captured::default();
+        let _logs = captured.install();
         let err = error(call(&s, r#"{"id":3,"type":"ping"}"#).await);
         assert_eq!(err.code, ErrorCode::InternalError);
+        let logged = captured.lines("the server answers this command itself");
+        assert!(logged[0].contains("command=\"ping\""), "{logged:?}");
+    }
+
+    #[tokio::test]
+    async fn an_offer_for_a_stream_whose_connection_is_gone_is_an_internal_error() {
+        let s = with_webrtc("/bin/sh", Arc::new(SystemClock));
+        result(call(&s, &put("front", "fake://127.0.0.1/", false)).await);
+        // The registry's invariant broken by hand: the stream outlives its
+        // connection.
+        s.shared.lock().connections.clear();
+        let err = error(call_on(&s, 1, &offer(2, "front", Some("f1"))).await);
+        assert_eq!(err.code, ErrorCode::InternalError);
+        assert!(err.message.contains("no source connection"), "{err}");
+        s.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_whose_connections_miss_the_budget_is_logged_and_ends() {
+        let clock = Arc::new(FakeClock::default());
+        let s = supervisor("/bin/sh", clock.clone());
+        // A connection's driver that never stops.
+        let _stuck = spawn_named(
+            "test.driver",
+            s.shared.tracker.track_future(std::future::pending::<()>()),
+        );
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let mut shutdown = Box::pin(s.shutdown());
+        // One poll starts the budget on the fake clock.
+        let early = tokio::select! {
+            biased;
+            () = &mut shutdown => true,
+            () = std::future::ready(()) => false,
+        };
+        assert!(!early, "the driver holds it up");
+        clock.advance(Duration::from_millis(200) + SHUTDOWN_GRACE);
+        shutdown.await;
+        assert_eq!(
+            captured
+                .lines("connections missed the shutdown budget")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1652,15 +1692,16 @@ mod tests {
     /// The pid of `front`'s worker. `connecting` is published before the
     /// lookup completes; the worker follows a few polls later.
     async fn worker_pid(s: &Supervisor) -> u64 {
-        for _ in 0..10_000 {
+        let mut pid = None;
+        let mut polls = 0;
+        while pid.is_none() && polls < 10_000 {
+            tokio::task::yield_now().await;
+            polls += 1;
             let front =
                 result(call(s, r#"{"id":1,"type":"stream/get","stream_id":"front"}"#).await);
-            if let Some(pid) = front["sources"][0]["connection"]["worker"]["pid"].as_u64() {
-                return pid;
-            }
-            tokio::task::yield_now().await;
+            pid = front["sources"][0]["connection"]["worker"]["pid"].as_u64();
         }
-        panic!("no worker pid");
+        pid.expect("no worker pid")
     }
 
     #[tokio::test]
@@ -2337,7 +2378,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_worker_s_message_is_logged_escaped_under_detail_never_as_a_line_of_its_own() {
-        let captured = crate::test_support::Captured::default();
+        let captured = Captured::default();
         let _logs = captured.install();
         let dir = private_dir("escaped");
         let s = with_webrtc(&blocking_worker(&dir), Arc::new(SystemClock));
@@ -2377,7 +2418,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_worker_flapping_a_session_s_state_logs_each_state_once_per_interval() {
-        let captured = crate::test_support::Captured::default();
+        let captured = Captured::default();
         let _logs = captured.install();
         let dir = private_dir("flapping");
         let clock = Arc::new(FakeClock::from_system());
@@ -2714,9 +2755,7 @@ mod tests {
         let _f = subscription(call_on(&s, 1, &offer(2, "front", Some("f1"))).await);
         let _b = subscription(call_on(&s, 1, &offer(3, "back", Some("b1"))).await);
         for (session, audio, orientation) in [("f1", true, 6), ("b1", false, 1)] {
-            let Some(DriverCommand::OpenSession(spec)) = rx.recv().await else {
-                panic!("an offer");
-            };
+            let_expect!(rx.recv().await => Some(DriverCommand::OpenSession(spec)), "an offer");
             assert_eq!(
                 (spec.session_id.as_str(), spec.audio, spec.orientation),
                 (session, audio, orientation)
@@ -2745,9 +2784,7 @@ mod tests {
             Some(DriverCommand::Orientation { .. })
         ));
         let _b2 = subscription(call_on(&s, 1, &offer(5, "back", Some("b2"))).await);
-        let Some(DriverCommand::OpenSession(spec)) = rx.recv().await else {
-            panic!("an offer");
-        };
+        let_expect!(rx.recv().await => Some(DriverCommand::OpenSession(spec)), "an offer");
         assert_eq!((spec.session_id.as_str(), spec.orientation), ("b2", 8));
         // The supervisor's close reaches the worker; a gone worker's does not.
         result(
@@ -2758,12 +2795,11 @@ mod tests {
             )
             .await,
         );
-        let Some(DriverCommand::CloseSession {
-            session_id, code, ..
-        }) = rx.recv().await
-        else {
-            panic!("a close");
-        };
+        let_expect!(rx.recv().await => Some(DriverCommand::CloseSession {
+            session_id,
+            code,
+            ..
+        }), "a close");
         assert_eq!((session_id.as_str(), code), ("f1", "session_closed"));
         s.shared.lock().close_sessions_where(
             |_| true,
@@ -2809,13 +2845,10 @@ mod tests {
         // The open session of the turned stream turns; the other stream's
         // hears nothing.
         result(call(&s, &put("back", "off", "rotate_right")).await);
-        let Some(DriverCommand::Orientation {
+        let_expect!(rx.recv().await => Some(DriverCommand::Orientation {
             session_id,
             orientation,
-        }) = rx.recv().await
-        else {
-            panic!("an orientation");
-        };
+        }), "an orientation");
         assert_eq!((session_id.as_str(), orientation), ("b1", 8));
         assert!(rx.try_recv().is_err(), "one session turns");
         // A put that keeps the orientation tells no session about it.
@@ -3049,17 +3082,14 @@ mod tests {
         let mut events =
             subscription(call_on(&s, 1, &turn_offer(2, server.udp_addr(), "pw")).await);
         next(&mut events).await;
-        let DriverCommand::RelayCandidate {
+        let_expect!(next_command(&mut rx).await => DriverCommand::RelayCandidate {
             session_id,
             relayed,
             server: via,
             local,
             tcp,
             grant: _,
-        } = next_command(&mut rx).await
-        else {
-            panic!("a relay candidate");
-        };
+        }, "a relay candidate");
         let allocation = turn.allocations().remove(0);
         assert_eq!(
             (session_id.as_str(), relayed, via, local, tcp),
@@ -3098,15 +3128,12 @@ mod tests {
         for _ in 0..2 {
             report(&s, "s1", Report::ChannelWanted { relayed, peer });
         }
-        let DriverCommand::RelayChannel {
+        let_expect!(next_command(&mut rx).await => DriverCommand::RelayChannel {
             session_id,
             relayed: on,
             peer: to,
             channel,
-        } = next_command(&mut rx).await
-        else {
-            panic!("a relay channel");
-        };
+        }, "a relay channel");
         assert_eq!(
             (session_id.as_str(), on, to, channel),
             ("s1", relayed, peer, 0x4000)

@@ -14,10 +14,15 @@ pub(crate) async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, St
     if let Some(ip) = literal(host) {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+    let addrs = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|err| format!("{host}: {err}"))?
-        .collect();
+        .map_err(|err| format!("{host}: {err}"))?;
+    addresses(host, addrs.collect())
+}
+
+/// The addresses a lookup of `host` found; none is an error, so no
+/// worker starts without an address to connect to.
+fn addresses(host: &str, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, String> {
     if addrs.is_empty() {
         return Err(format!("{host}: no addresses"));
     }
@@ -63,5 +68,12 @@ mod tests {
         );
         let err = resolve("", 1).await.unwrap_err();
         assert!(err.starts_with(':'), "{err}");
+    }
+
+    #[test]
+    fn a_lookup_without_addresses_is_an_error() {
+        assert_eq!(addresses("cam", vec![]).unwrap_err(), "cam: no addresses");
+        let one: SocketAddr = "192.0.2.1:554".parse().unwrap();
+        assert_eq!(addresses("cam", vec![one]).unwrap(), [one]);
     }
 }
