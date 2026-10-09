@@ -171,9 +171,8 @@ impl LatenessMeter {
             .unwrap_or(arrival)
             .min(arrival)
             .saturating_duration_since(previous_at);
-        let Some(transfer_ns) = i128::try_from(transfer.as_nanos()).ok() else {
-            return 0;
-        };
+        // A `Duration`'s nanoseconds (below 2^94) always fit an `i128`.
+        let transfer_ns = i128::try_from(transfer.as_nanos()).unwrap_or(i128::MAX);
         let Some(between) = self.nanos(ts.saturating_sub(previous_ts)) else {
             return 0;
         };
@@ -389,12 +388,19 @@ mod tests {
 
     #[test]
     fn a_timestamp_jump_rebases_instead_of_skipping_forever() {
+        let (logs, _guard) = crate::test_logs::Logs::capture();
         let mut meter = LatenessMeter::new(90_000);
         let t0 = SystemClock.now();
         let _ = feed(&mut meter, t0, 0..30, Duration::ZERO);
         // The camera's clock jumps back an hour without a new epoch.
         let back = 90_000_u32.wrapping_sub(90_000 * 3_600);
         assert_eq!(meter.packet(t0 + ms(1_000), back, true), Duration::ZERO);
+        let jumped = logs.lines(
+            tracing::Level::DEBUG,
+            "lateness beyond the rebase bound; the timestamps jumped",
+        );
+        assert_eq!(jumped.len(), 1);
+        assert_eq!(jumped[0].fields, " late_ms=3600000");
         assert_eq!(
             meter.packet(t0 + ms(1_033), back + 33 * 90, true),
             Duration::ZERO

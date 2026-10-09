@@ -573,6 +573,7 @@ mod tests {
 
     #[test]
     fn a_crash_restarts_with_backoff_while_demand_remains() {
+        let (logs, _guard) = crate::test_logs::Logs::capture();
         let now = SystemClock.now();
         let mut m = machine();
         m.handle(Input::Demand(1), now);
@@ -584,6 +585,19 @@ mod tests {
         assert_eq!(m.state(), S::Restarting);
         assert_eq!(m.last_error(), Some(&ConnectionError::WorkerCrashed));
         assert_eq!(m.crashes(), 1);
+        let crashed = logs.lines(
+            tracing::Level::WARN,
+            "worker crashed; restarting after backoff",
+        );
+        assert_eq!(crashed.len(), 1);
+        assert_eq!(crashed[0].fields, " crashes=1 retry_ms=500");
+        let changed = logs.lines(tracing::Level::INFO, "connection state changed");
+        assert_eq!(
+            changed.last().map(|line| line.fields.as_str()),
+            Some(
+                " from=\"live\" to=\"restarting\" reason=\"worker exited\" demand=1 error=\"worker_crashed\""
+            )
+        );
         // Reports from the dead worker are ignored.
         m.handle(Input::Report(WorkerReport::Live), now);
         assert_eq!(m.state(), S::Restarting);

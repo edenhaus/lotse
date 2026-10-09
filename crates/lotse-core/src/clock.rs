@@ -240,12 +240,9 @@ mod tests {
         let clock = Arc::new(FakeClock::default());
         let mut sleep = clock.sleep(Duration::from_secs(5));
         clock.sleep(Duration::ZERO).await;
-        assert!(
-            futures_ready(&mut sleep).is_none(),
-            "not before the deadline"
-        );
+        assert!(!futures_ready(&mut sleep), "not before the deadline");
         clock.advance(Duration::from_secs(4));
-        assert!(futures_ready(&mut sleep).is_none());
+        assert!(!futures_ready(&mut sleep));
         clock.advance(Duration::from_secs(1));
         sleep.await;
 
@@ -254,15 +251,12 @@ mod tests {
         late.await;
     }
 
-    /// Polls `future` once without a runtime hook; `Some` when it is ready.
-    fn futures_ready(future: &mut BoxFuture<'static, ()>) -> Option<()> {
-        use std::task::{Context, Poll, Waker};
-        match future
+    /// Polls `future` once without a runtime hook; whether it is ready.
+    fn futures_ready(future: &mut BoxFuture<'static, ()>) -> bool {
+        use std::task::{Context, Waker};
+        future
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
-        {
-            Poll::Ready(()) => Some(()),
-            Poll::Pending => None,
-        }
+            .is_ready()
     }
 }

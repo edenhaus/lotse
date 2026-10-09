@@ -629,6 +629,7 @@ mod tests {
     use crate::clock::SystemClock;
     use crate::codec::CodecFamily;
     use crate::media::{MediaFrame, MediaTime, RtpHeaderFields};
+    use crate::test_logs::Logs;
     use crate::track::{TrackEvent, Unit};
 
     fn h264() -> Codec {
@@ -679,14 +680,26 @@ mod tests {
     }
 
     async fn next_packet(sub: &mut crate::track::TrackSubscription) -> (u16, u32) {
-        match sub.next().await {
-            Some(TrackEvent::Packet(packet)) => (packet.rtp.seq, packet.epoch),
-            other => panic!("expected a packet, got {other:?}"),
+        crate::let_assert!(Some(TrackEvent::Packet(packet)) = sub.next().await);
+        (packet.rtp.seq, packet.epoch)
+    }
+
+    /// The standby with tag 1 and its two tracks was armed and switched
+    /// to, each logged once.
+    fn assert_armed_and_switched_once(logs: &Logs) {
+        for message in [
+            "standby source armed; switching at its next keyframe",
+            "source switched: the standby feeds the tracks",
+        ] {
+            let lines = logs.lines(tracing::Level::INFO, message);
+            assert_eq!(lines.len(), 1, "{message}");
+            assert_eq!(lines[0].fields, " tag=1 tracks=2", "{message}");
         }
     }
 
     #[tokio::test]
     async fn a_standby_source_switches_in_at_its_first_keyframe_and_the_old_one_is_dropped() {
+        let (logs, _guard) = Logs::capture();
         let live = TrackSet::new(TrackLimits::default(), SystemClock.now());
         let mut old = live.publisher();
         let v0 = old.declare(Kind::Video, h264(), 90_000);
@@ -725,6 +738,7 @@ mod tests {
         // standby's codecs on them, then the keyframe itself.
         sv0.publish_packet(packet(3, true));
         assert_eq!(*switched.borrow_and_update(), 1);
+        assert_armed_and_switched_once(&logs);
         assert!(staging.is_active() && !live.is_active());
         assert_eq!(live.feeds().active(), 1);
         assert_eq!(
@@ -872,6 +886,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracks_keep_their_identity_across_reconnects() {
+        let (logs, _guard) = Logs::capture();
         let set = TrackSet::new(TrackLimits::default(), SystemClock.now());
         let mut ready = set.ready();
         assert!(!*ready.borrow_and_update());
@@ -905,8 +920,29 @@ mod tests {
         let audio_again = second.declare(Kind::Audio, Codec::Pcmu, 16_000);
         assert!(Arc::ptr_eq(&a0, &audio_again));
         assert_eq!(audio_again.clock_rate(), 8_000, "clock rate is kept");
+        let changed = logs.lines(
+            tracing::Level::WARN,
+            "track clock rate changed on reconnect; keeping the original",
+        );
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].fields, " track=a0 was=8000 now=16000");
         assert_eq!(set.tracks().len(), 3);
         assert!(Arc::ptr_eq(second.tracks(), &set));
+    }
+
+    #[test]
+    fn a_standby_whose_live_set_is_gone_still_switches_its_tag() {
+        let live = TrackSet::new(TrackLimits::default(), SystemClock.now());
+        let feeds = Arc::clone(live.feeds());
+        let staging = TrackSet::staging(&live);
+        let sv0 = staging.publisher().declare(Kind::Video, h265(), 90_000);
+        staging.arm_switch();
+        // The connection is torn down while the standby's source still
+        // holds its track: the switch has no live set to declare into.
+        drop((staging, live));
+        sv0.publish_packet(packet(1, true));
+        assert_eq!(feeds.active(), 1);
+        assert_eq!(sv0.stats().packets, 1, "no live track to forward to");
     }
 
     #[tokio::test]
@@ -1029,7 +1065,7 @@ mod tests {
             format!("{:?}", KeyframeRequest::Unsupported),
             "KeyframeRequest::Unsupported"
         );
-        let sent = KeyframeRequest::Sent(Box::pin(async { Ok(()) }));
+        let sent = KeyframeRequest::Sent(Box::pin(std::future::ready(Ok(()))));
         assert_eq!(format!("{sent:?}"), "KeyframeRequest::Sent(..)");
     }
 }

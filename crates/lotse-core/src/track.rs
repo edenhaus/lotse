@@ -394,19 +394,20 @@ impl TrackSubscription {
         loop {
             tokio::select! {
                 biased;
+                // Neither channel reports `Closed` while this subscription
+                // holds the track, which holds both senders; it would end
+                // the subscription like `TrackControlEvent::Closed`.
                 control = self.control.recv() => match control {
-                    Ok(event) => return TrackEvent::from_control(event),
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         if let Some(count) = self.lags.hit(self.track.activity_clock()) {
                             tracing::warn!(track = %self.track.id, skipped, count, "subscriber missed control events");
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => return None,
+                    event => return event.ok().and_then(TrackEvent::from_control),
                 },
                 media = self.media.recv() => match media {
-                    Ok(event) => return Some(event),
                     Err(SubscriptionError::Lagged(skipped)) => return Some(TrackEvent::Gap { skipped }),
-                    Err(SubscriptionError::Closed) => return None,
+                    event => return event.ok(),
                 },
             }
         }
@@ -1504,6 +1505,39 @@ mod tests {
     }
 
     #[test]
+    fn gop_truncations_are_logged_once_per_interval() {
+        let (logs, _guard) = Logs::capture();
+        let track = video_track(TrackLimits {
+            gop_cache_frames: 1,
+            ..TrackLimits::default()
+        });
+        // Every frame at the same instant: the second truncation falls
+        // inside the first one's summary interval.
+        let at = SystemClock.now();
+        let frame_at = |keyframe| MediaFrame {
+            wallclock: at,
+            arrival: at,
+            ..frame(keyframe, 10)
+        };
+        for _ in 0..2 {
+            assert!(track.publish_frame(frame_at(true)));
+            assert!(track.publish_frame(frame_at(false)));
+            assert!(track.gop().unwrap().truncated());
+        }
+        let lines = logs.lines(
+            tracing::Level::DEBUG,
+            "gop cache: GOP exceeds the cache, keeping only the keyframe",
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            lines[0].fields,
+            format!(
+                " track=v0 limit=\"gop_cache_frames\" gop_bytes=20 gop_frames=2 bytes_limit={DEFAULT_GOP_CACHE_BYTES} frames_limit=1 truncations=1"
+            )
+        );
+    }
+
+    #[test]
     fn a_frame_count_cap_of_zero_still_keeps_the_keyframe() {
         let limits = TrackLimits {
             gop_cache_frames: 0,
@@ -1799,9 +1833,7 @@ mod tests {
         let polled = next
             .as_mut()
             .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
-        let std::task::Poll::Ready(event) = polled else {
-            panic!("no event queued");
-        };
+        crate::let_assert!(std::task::Poll::Ready(event) = polled);
         event
     }
 
@@ -1825,26 +1857,18 @@ mod tests {
             queued(&mut packets),
             Some(TrackEvent::EpochStart { epoch: 1 })
         );
-        let Some(TrackEvent::Packet(first)) = queued(&mut packets) else {
-            panic!("packet expected");
-        };
+        crate::let_assert!(Some(TrackEvent::Packet(first)) = queued(&mut packets));
         assert_eq!((first.rtp.seq, first.epoch), (1, 0));
-        let Some(TrackEvent::Packet(second)) = queued(&mut packets) else {
-            panic!("packet expected");
-        };
+        crate::let_assert!(Some(TrackEvent::Packet(second)) = queued(&mut packets));
         assert_eq!((second.rtp.seq, second.epoch), (2, 1));
 
         assert_eq!(
             queued(&mut frames),
             Some(TrackEvent::EpochStart { epoch: 1 })
         );
-        let Some(TrackEvent::Frame(keyframe)) = queued(&mut frames) else {
-            panic!("frame expected");
-        };
+        crate::let_assert!(Some(TrackEvent::Frame(keyframe)) = queued(&mut frames));
         assert!(keyframe.discontinuity && keyframe.epoch == 1);
-        let Some(TrackEvent::Frame(next)) = queued(&mut frames) else {
-            panic!("frame expected");
-        };
+        crate::let_assert!(Some(TrackEvent::Frame(next)) = queued(&mut frames));
         assert!(!next.discontinuity, "only the first frame of an epoch");
     }
 

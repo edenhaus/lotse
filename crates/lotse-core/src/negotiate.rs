@@ -291,20 +291,14 @@ mod tests {
             request(Kind::Audio, &[CodecFamily::Opus], false),
         ];
         let plans = negotiate(&requests, &tracks, &[]);
-        let [video, audio] = plans.as_slice() else {
-            panic!("two plans");
-        };
-        let TrackPlan::Unavailable(video) = video else {
-            panic!("video unavailable");
-        };
+        crate::let_assert!([video, audio] = plans.as_slice());
+        crate::let_assert!(TrackPlan::Unavailable(video) = video);
         assert_eq!(video.code(), "video_codec_unsupported");
         assert_eq!(
             video.to_string(),
             "sink accepts [H264]; stream video is h265"
         );
-        let TrackPlan::Unavailable(audio) = audio else {
-            panic!("audio unavailable");
-        };
+        crate::let_assert!(TrackPlan::Unavailable(audio) = audio);
         assert_eq!(audio.code(), "audio_codec_unsupported");
 
         let plans = negotiate(&requests, &[], &[]);
@@ -315,14 +309,10 @@ mod tests {
                 TrackPlan::Unavailable(NegotiationError::NoTrack { kind: Kind::Audio }),
             ]
         );
-        let TrackPlan::Unavailable(video) = &plans[0] else {
-            panic!()
-        };
+        crate::let_assert!(TrackPlan::Unavailable(video) = &plans[0]);
         assert_eq!(video.code(), "no_video_track");
         assert_eq!(video.to_string(), "stream has no video track");
-        let TrackPlan::Unavailable(audio) = &plans[1] else {
-            panic!()
-        };
+        crate::let_assert!(TrackPlan::Unavailable(audio) = &plans[1]);
         assert_eq!(audio.code(), "audio_codec_unsupported");
     }
 
