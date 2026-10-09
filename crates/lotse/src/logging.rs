@@ -86,6 +86,24 @@ pub(crate) fn install_panic_hook() {
     }));
 }
 
+/// Runs `f` under a text subscriber of its own and returns the lines it
+/// logged. They go through a pipe, whose read end sees the end once the
+/// subscriber, holding every write end, is dropped with `f` done; a pipe
+/// holds far more than a test logs.
+#[cfg(test)]
+pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
+    use std::io::Read as _;
+    let (mut reader, writer) = std::io::pipe().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.try_clone().unwrap())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let mut logs = String::new();
+    reader.read_to_string(&mut logs).unwrap();
+    logs
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -111,5 +129,35 @@ mod tests {
         ensure_fallback();
         install_panic_hook();
         tracing::info!("still logs after the hook is installed");
+    }
+
+    #[test]
+    fn the_panic_hook_logs_the_message_and_location_of_every_payload() {
+        // Tests unwind (Cargo ignores `panic = "abort"` for them), so the
+        // hook runs and the panic is caught here.
+        install_panic_hook();
+        let logs = capture_logs(|| {
+            let caught = [
+                std::panic::catch_unwind(|| panic!("a static message")),
+                std::panic::catch_unwind(|| panic!("a formatted message {}", 7)),
+                std::panic::catch_unwind(|| std::panic::panic_any(7_u32)),
+            ];
+            assert!(caught.iter().all(Result::is_err));
+        });
+        drop(std::panic::take_hook());
+        assert_eq!(
+            logs.matches("panic; the process aborts").count(),
+            3,
+            "{logs}"
+        );
+        for message in [
+            "panic.message=a static message",
+            "panic.message=a formatted message 7",
+            "panic.message=non-string panic payload",
+        ] {
+            assert!(logs.contains(message), "{message}: {logs}");
+        }
+        // Each line points at its `panic!` here.
+        assert_eq!(logs.matches(file!()).count(), 3, "{logs}");
     }
 }

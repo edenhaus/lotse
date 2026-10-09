@@ -77,36 +77,44 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
         .transcoders
         .register(Arc::new(AacToOpus::new(Arc::new(SystemClock))));
     #[cfg(feature = "output-webrtc")]
-    {
-        if let Err(err) = registries
+    registered(
+        "webrtc output",
+        registries
             .outputs
-            .register(Arc::new(lotse_webrtc::WebRtcFactory))
-        {
-            tracing::error!(error = %err, "webrtc output not registered");
-        }
-    }
+            .register(Arc::new(lotse_webrtc::WebRtcFactory)),
+    );
     #[cfg(feature = "source-rtsp")]
-    {
-        if let Err(err) = registries
+    registered(
+        "rtsp source",
+        registries
             .sources
-            .register(Arc::new(lotse_rtsp::RtspFactory::new(relay)))
-        {
-            tracing::error!(error = %err, "rtsp source not registered");
-        }
-    }
+            .register(Arc::new(lotse_rtsp::RtspFactory::new(relay))),
+    );
     #[cfg(not(feature = "source-rtsp"))]
     drop(relay);
     #[cfg(feature = "source-fake")]
-    {
-        use lotse_core::test_util::FakeSourceFactory;
-        if let Err(err) = registries
+    registered(
+        "fake source",
+        registries
             .sources
-            .register(Arc::new(FakeSourceFactory::new(&["fake"])))
-        {
-            tracing::error!(error = %err, "fake source not registered");
-        }
-    }
+            .register(Arc::new(lotse_core::test_util::FakeSourceFactory::new(&[
+                "fake",
+            ]))),
+    );
     registries
+}
+
+/// Logs a registration [`registries`] could not make: the daemon runs on
+/// without `what`, which its `info` then does not list.
+#[cfg(any(
+    feature = "output-webrtc",
+    feature = "source-rtsp",
+    feature = "source-fake"
+))]
+fn registered(what: &str, outcome: Result<(), lotse_core::registry::RegistryError>) {
+    if let Err(err) = outcome {
+        tracing::error!(error = %err, "{what} not registered");
+    }
 }
 
 /// The worker process: logging from its flags, the panic hook, the worker
@@ -265,5 +273,23 @@ mod tests {
             "{}",
             env!("LOTSE_RUSTC")
         );
+    }
+
+    #[cfg(any(
+        feature = "output-webrtc",
+        feature = "source-rtsp",
+        feature = "source-fake"
+    ))]
+    #[test]
+    fn a_refused_registration_is_logged_and_an_accepted_one_is_not() {
+        use lotse_core::registry::RegistryError;
+        let logs = logging::capture_logs(|| {
+            registered("fake source", Ok(()));
+            registered("fake source", Err(RegistryError::DuplicateScheme("fake")));
+        });
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("fake source not registered"), "{logs}");
+        assert!(logs.contains("scheme fake is already registered"), "{logs}");
     }
 }
