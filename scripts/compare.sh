@@ -6,7 +6,7 @@
 # report fails nothing: only lotse's runs failing the browser test's own checks fail it. go2rtc and
 # the ffmpeg it runs are the releases pinned in mise.toml, found on PATH.
 #
-# usage: scripts/compare.sh chrome|firefox [runs] [play] [pytest arguments...]
+# usage: scripts/compare.sh chrome|firefox|safari [runs] [play] [pytest arguments...]
 #
 # Runs through scripts/browser.sh (the builds, uv, the browser's options); the report goes to
 # target/compare-<engine>/compare.json and compare.md, each run's logs and report to

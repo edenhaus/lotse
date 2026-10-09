@@ -58,8 +58,7 @@ export LOTSE_COTURN_STATIC=127.0.0.1:34780 LOTSE_COTURN_STATIC_METRICS=127.0.0.1
 export LOTSE_COTURN_REST=127.0.0.1:34790 LOTSE_COTURN_REST_METRICS=127.0.0.1:19642
 export LOTSE_COTURN_REST_USERNAME="$username" LOTSE_COTURN_REST_CREDENTIAL="$credential"
 
-if ! cargo nextest run -p lotse --all-features --locked --test signaling \
-  --run-ignored only --test-threads 1 coturn_; then
+if ! scripts/nextest.sh -E 'binary_id(lotse::signaling)' --run-ignored only --test-threads 1 coturn_; then
   for name in "$STATIC" "$REST"; do
     echo "--- $name" >&2
     docker logs "$name" 2>&1 | tail -n 60 >&2

@@ -5,8 +5,9 @@ Thanks for helping build lotse. The short version:
 1. **Design first.** A new feature starts as a design discussion in an
    issue, not as code.
 2. **Set up with mise.** `mise install` fetches the pinned toolchain and
-   tools and installs the git hooks. `mise run check` runs everything CI
-   runs. The commands are listed in [AGENTS.md](AGENTS.md#commands).
+   tools and installs the git hooks. `mise run check` runs every check;
+   the tests run in CI, on Linux. The commands are listed in
+   [AGENTS.md](AGENTS.md#commands).
 3. **Follow the conventions** in [AGENTS.md](AGENTS.md): no untested
    code, everything documented, every spec clause cited, structured
    logging, strict lints.

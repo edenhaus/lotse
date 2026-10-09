@@ -1,9 +1,9 @@
 # The single definition of every check. prek runs it:
-#   - on `git commit`:  everything below except the tests, on the changed files
+#   - on `git commit`:  everything below, on the changed files
 #   - on `commit-msg`:  the Conventional Commits check
-#   - `mise run check` and CI: all of it, tests included, on all files (`--stage manual`)
-# The tests run on Linux only, in CI; the Linux-only gates (coverage, mutants) are mise tasks that
-# CI runs, see mise.toml. `mise install` installs the git hooks.
+#   - `mise run check` and CI's Check job: all of it, on all files (`--stage manual`)
+# No test is a hook: the tests, the coverage and the mutation gates are CI jobs (ci.yml), on Linux.
+# `mise install` installs the git hooks.
 default_install_hook_types: [pre-commit, commit-msg]
 default_stages: [pre-commit, manual]
 
@@ -58,13 +58,6 @@ repos:
         language: system
         files: ^tests/browser/
         pass_filenames: false
-      - id: browser-test-checks
-        name: browser test checks (unit tests, no browser)
-        entry: sh -c 'cd tests/browser && uv run --locked pytest -q'
-        language: system
-        files: ^tests/browser/
-        pass_filenames: false
-        stages: [manual]
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --all --
@@ -128,7 +121,7 @@ repos:
         pass_filenames: false
       - id: cargo-deny
         name: cargo deny
-        # advisories need the network and change without our code changing: security-audit.yml
+        # advisories need the network and change without our code changing: CI's Security audit job
         entry: cargo deny --all-features check bans licenses sources
         language: system
         files: (Cargo\.toml|Cargo\.lock|\.cargo/deny\.toml)$
@@ -140,17 +133,3 @@ repos:
         language: system
         files: (Cargo\.toml|Cargo\.lock|\.cargo/deny\.toml)$
         pass_filenames: false
-      - id: cargo-nextest
-        name: cargo nextest
-        entry: cargo nextest run --workspace --all-features --locked --no-tests=warn
-        language: system
-        files: (\.rs|Cargo\.toml|Cargo\.lock)$
-        pass_filenames: false
-        stages: [manual]
-      - id: cargo-test-doc
-        name: cargo test --doc (nextest does not run doctests)
-        entry: cargo test --workspace --all-features --locked --doc
-        language: system
-        files: (\.rs|Cargo\.toml|Cargo\.lock)$
-        pass_filenames: false
-        stages: [manual]

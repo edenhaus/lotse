@@ -1,4 +1,4 @@
-# The browser test: one pytest test, run once per browser (`--browser chrome|firefox`), that
+# The browser test: one pytest test, run once per browser (`--browser chrome|firefox|safari`), that
 # drives the browser with Selenium and checks what the test page measured. `mise run browser
 # <engine>` builds the daemon and the `lotse-browser` example and runs it; without `--browser` only
 # the checks' unit tests run. uv installs the Python (.python-version) and the packages pinned in
@@ -7,7 +7,7 @@
 [project]
 name = "lotse-browser-test"
 version = "0.0.0"
-description = "The browser test of lotse and its go2rtc comparison: Selenium drives Chrome or Firefox"
+description = "The browser test of lotse and its go2rtc comparison: Selenium drives Chrome, Firefox or Safari"
 requires-python = ">=3.14"
 dependencies = [
   "go2rtc-client==0.4.0", # go2rtc's Python client, the version its common deployment pins: the comparison registers the camera with go2rtc through it, as deployed

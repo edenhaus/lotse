@@ -92,8 +92,8 @@ def tail(path: Path, lines: int = 40) -> str:
         return f"({path}: {err})"
 
 
-def options(settings: Settings) -> webdriver.ChromeOptions | webdriver.FirefoxOptions:
-    """The browser's options: headless unless headful, sound without a gesture."""
+def options(settings: Settings) -> webdriver.ChromeOptions | webdriver.FirefoxOptions | None:
+    """The browser's options: headless where it has a mode for it, sound without a gesture."""
     options: webdriver.ChromeOptions | webdriver.FirefoxOptions
     match settings.engine:
         case "chrome":
@@ -101,7 +101,7 @@ def options(settings: Settings) -> webdriver.ChromeOptions | webdriver.FirefoxOp
             if settings.headless:
                 options.add_argument("--headless=new")
             options.add_argument("--autoplay-policy=no-user-gesture-required")
-        case _:
+        case "firefox":
             options = webdriver.FirefoxOptions()
             if settings.headless:
                 options.add_argument("-headless")
@@ -113,6 +113,10 @@ def options(settings: Settings) -> webdriver.ChromeOptions | webdriver.FirefoxOp
             options.set_preference("media.gmp-manager.updateEnabled", value=True)
             # The daemon listens on loopback: let ICE gather there.
             options.set_preference("media.peerconnection.ice.loopback", value=True)
+        case _:
+            # Safari takes no options: it has no headless mode, and the click on Start is the
+            # gesture that lets it play.
+            return None
     for argument in settings.browser_args:
         options.add_argument(argument)
     if settings.browser_version:
@@ -128,8 +132,10 @@ def versions(session: WebDriver, settings: Settings) -> dict[str, object]:
     match settings.engine:
         case "chrome":
             driver_version = caps.get("chrome", {}).get("chromedriverVersion")
-        case _:
+        case "firefox":
             driver_version = caps.get("moz:geckodriverVersion")
+        case _:
+            driver_version = None  # safaridriver reports none; it ships with Safari
     service = getattr(session, "service", None)
     return {
         "browser": {

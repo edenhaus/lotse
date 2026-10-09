@@ -1,11 +1,12 @@
-name: release
+name: Release
 
-# The release pipeline.
+# The release pipeline, which ci.yml calls on every push to main, one at a time and never
+# cancelled.
 #
 # Every push to main: release-plz opens or updates the release PR, which bumps the version and
 # writes CHANGELOG.md from the Conventional Commits (.release-plz.toml). When that PR is merged,
 # the same run tags the merge commit, opens a draft release with the changelog as its notes,
-# builds both targets with build.yml, writes the SBOMs and the license notices, pushes the
+# builds both targets with build.yml (without any cache), writes the SBOMs and the license notices, pushes the
 # scratch image to ghcr.io, attests all of it and publishes the release.
 #
 # Everything after the tag happens in this one run, on purpose: a tag or a release made with
@@ -13,15 +14,13 @@ name: release
 # release PR is the one thing made with the lotse bot's token, so that CI runs on it.
 
 on:
-  push:
-    branches: [main]
+  workflow_call:
+    secrets:
+      LOTSE_BOT_PRIVATE_KEY:
+        description: "The lotse bot GitHub App's private key, which opens the release PR"
+        required: false # checked by the release-pr job, with a message
 
 permissions: {}
-
-# A release in progress is never cancelled; the next push waits for it.
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,7 +28,7 @@ env:
 
 jobs:
   release:
-    name: tag and draft the release (release-plz)
+    name: Tag and draft the release (release-plz)
     runs-on: ubuntu-latest
     permissions:
       contents: write # the tag and the draft release
@@ -71,7 +70,7 @@ jobs:
           { echo "tag=$tag"; echo "version=$version"; } >> "$GITHUB_OUTPUT"
 
   release-pr:
-    name: open or update the release PR (release-plz)
+    name: Open or update the release PR (release-plz)
     # After `release`, so a release just tagged is not offered again.
     needs: release
     runs-on: ubuntu-latest
@@ -112,7 +111,7 @@ jobs:
         run: release-plz release-pr --forge github --repo-url "$REPO_URL"
 
   build:
-    name: build
+    name: Build
     needs: release
     if: needs.release.outputs.tag != ''
     permissions:
@@ -148,7 +147,7 @@ jobs:
           if-no-files-found: error
 
   image:
-    name: push and attest the image
+    name: Push and attest the image
     needs: [release, build]
     runs-on: ubuntu-latest
     permissions:
@@ -206,7 +205,7 @@ jobs:
         run: docker logout ghcr.io
 
   publish:
-    name: attest, checksum and publish the release
+    name: Attest, checksum and publish the release
     needs: [release, build, notices, image]
     runs-on: ubuntu-latest
     permissions:

@@ -321,6 +321,23 @@ url = "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-
 url_api = "https://api.github.com/repos/taiki-e/cargo-llvm-cov/releases/assets/547403359"
 provenance = "github-attestations"
 
+[[tools."http:ffmpeg"]]
+version = "9.0.2"
+backend = "http:ffmpeg"
+specifiers = ["9.0.2"]
+
+[tools."http:ffmpeg"."platforms.linux-arm64"]
+checksum = "sha256:c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
+url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip"
+
+[tools."http:ffmpeg"."platforms.linux-x64"]
+checksum = "sha256:c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
+url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip"
+
+[tools."http:ffmpeg"."platforms.macos-arm64"]
+checksum = "sha256:c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
+url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip"
+
 [[tools.prek]]
 version = "0.5.4"
 backend = "aqua:j178/prek"

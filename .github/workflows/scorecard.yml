@@ -1,4 +1,8 @@
-name: scorecard
+name: Scorecard
+
+# Apart from ci.yml on purpose: publishing the results requires a workflow without top-level env or
+# defaults and without workflow-level write permissions, and it also runs on branch protection
+# changes.
 
 on:
   branch_protection_rule:

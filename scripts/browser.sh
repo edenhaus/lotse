@@ -4,7 +4,7 @@
 # same for every browser. The camera is ffmpeg publishing to MediaMTX, both pinned in mise.toml and
 # found on PATH, which the `lotse-browser` example starts and stops (lotse_testing::mediamtx).
 #
-# usage: scripts/browser.sh chrome|firefox [play] [pytest arguments...]
+# usage: scripts/browser.sh chrome|firefox|safari [play] [pytest arguments...]
 #
 # Builds `lotse` and `lotse-browser` in release and runs the test with uv (the Python and the
 # packages pinned in tests/browser/uv.lock); the test starts the daemon, `lotse-browser` and the
@@ -14,8 +14,9 @@
 #
 # The browser is the installed one, its driver the one Selenium Manager resolves for it (on PATH
 # when it matches, else fetched); `--browser-version 142` (Chrome for Testing, Firefox) has
-# Selenium Manager fetch that browser instead. The browser runs headless unless
-# LOTSE_BROWSER_HEADFUL=1. $LOTSE_BROWSER_ARGS adds browser arguments (space-separated).
+# Selenium Manager fetch that browser instead. Chrome and Firefox run headless unless
+# LOTSE_BROWSER_HEADFUL=1; Safari has no headless mode, and its driver must be enabled once
+# (`sudo safaridriver --enable`). $LOTSE_BROWSER_ARGS adds browser arguments (space-separated).
 # scripts/compare.sh runs the go2rtc comparison through it: $LOTSE_BROWSER_TEST names the test file
 # (test_browser.py) and $LOTSE_BROWSER_OUT the report's directory (target/browser-<engine>).
 set -eu
@@ -24,15 +25,20 @@ ENGINE="${1:-chrome}"
 PLAY="${2:-20s}"
 if [ "$#" -ge 2 ]; then shift 2; elif [ "$#" -ge 1 ]; then shift; fi
 case "$ENGINE" in
-  chrome | firefox) ;;
-  *) echo "usage: scripts/browser.sh chrome|firefox [play] [pytest arguments...]" >&2; exit 2 ;;
+  chrome | firefox | safari) ;;
+  *) echo "usage: scripts/browser.sh chrome|firefox|safari [play] [pytest arguments...]" >&2; exit 2 ;;
 esac
-[ "$(uname -s)" = Linux ] || { echo "the browser test runs on Linux only" >&2; exit 2; }
 
-# The daemon is the static musl build that ships (as in scripts/load.sh).
-TARGET="$(uname -m)-unknown-linux-musl"
-cargo build --release --locked --bin lotse --target "$TARGET"
-LOTSE="$PWD/target/$TARGET/release/lotse"
+# On Linux the daemon is the static musl build that ships (as in scripts/load.sh); elsewhere
+# (macOS, for Safari) the host build.
+if [ "$(uname -s)" = Linux ]; then
+  TARGET="$(uname -m)-unknown-linux-musl"
+  cargo build --release --locked --bin lotse --target "$TARGET"
+  LOTSE="$PWD/target/$TARGET/release/lotse"
+else
+  cargo build --release --locked --bin lotse
+  LOTSE="$PWD/target/release/lotse"
+fi
 cargo build --release --locked -p lotse-testing --example lotse-browser
 
 set -- --browser "$ENGINE" --play "$PLAY" --lotse "$LOTSE" \

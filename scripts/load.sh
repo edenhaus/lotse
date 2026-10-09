@@ -9,7 +9,7 @@
 #
 # The sandbox is off unless LOTSE_LOAD_SANDBOX says otherwise: a sandboxed process is not
 # dumpable, which closes its /proc/<pid>/fd to the generator, and the soak counts descriptors.
-# The sandbox changes no media path; the sandbox-isolation job covers it.
+# The sandbox changes no media path; CI's Sandbox isolation job covers it.
 set -eu
 
 SANDBOX="${LOTSE_LOAD_SANDBOX:-off}"

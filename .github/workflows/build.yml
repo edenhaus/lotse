@@ -1,35 +1,30 @@
-name: build
+name: Release build
+
+# The static musl release binaries, natively on each arch, with the size check. ci.yml calls it on
+# every push and PR (cached); release.yml calls it for a release, which restores no cache, so
+# nothing a cache holds can reach a released binary.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-  # release.yml builds the released binaries with this same workflow.
   workflow_call:
     inputs:
       release:
-        description: "A release build: restores no cache, so nothing a cache holds can reach a released binary"
+        description: "A release build: restores no cache"
         type: boolean
         default: false
 
 permissions:
   contents: read
 
-# Called from release.yml, `github.workflow` is `release`; a release build is never cancelled.
-concurrency:
-  group: ${{ github.workflow }}-build-${{ github.ref }}
-  cancel-in-progress: ${{ !inputs.release }}
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   musl:
-    name: static musl build
+    name: Release binary (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
-        # Each arch on its own runner, natively (as test-musl): libopus is built by cmake, which
+        # Each arch on its own runner, natively (as CI's Build): libopus is built by cmake, which
         # archives with the host's ranlib, so no build depends on a ranlib for a foreign arch.
         include:
           - arch: x86_64
@@ -53,7 +48,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ !inputs.release }}
         with:
-          key: ${{ matrix.arch }}
+          shared-key: release-${{ matrix.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run release-build "$ARCH"
         env:
           MISE_AUTO_INSTALL: "false" # the tools above, not the whole mise.toml

@@ -1,24 +1,99 @@
-name: ci
+name: CI
+
+# The main workflow: every job of a push, a PR, the nightly run and a run by hand. Two workflows
+# stay apart: scorecard.yml, whose published results require a workflow of its own (no top-level
+# env, no workflow-level write permission), and pr-title.yml, which runs when a PR's title is
+# edited, an event that must not run all of this.
+#
+# Build once: the Build job compiles the tests of the static musl target once per arch and
+# archives them (cargo nextest archive); Tests, Interop, TURN and Sandbox isolation run that
+# archive and compile nothing. The other compiling jobs build what only they need (clippy's check
+# build, the coverage instrumentation, the release profile) and each keeps its own Rust cache.
+#
+# Caches: every Rust cache is saved by runs on main only and restored by every run, so a PR starts
+# from main's build without evicting it; the tools come from mise's cache, the browser test's
+# Python packages from uv's.
 
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "23 1 * * *" # nightly: the browser test, the go2rtc comparison, load and soak
+  workflow_dispatch:
+    inputs:
+      nightly:
+        description: "Also run the nightly jobs (browser test, comparison, load, soak)"
+        type: boolean
+        default: false
+      play:
+        description: "How long each browser plays after its first frame (20s, 2m)"
+        type: string
+        default: "20s"
+      runs:
+        description: "The comparison's plays through each server"
+        type: string
+        default: "5"
+      duration:
+        description: "How long the soak runs (lotse-load --duration: 30m, 5h); GitHub-hosted jobs stop at 6 h"
+        type: string
+        default: "5h"
 
 permissions:
   contents: read
 
+# A PR's newer push cancels its older run. A run on main, nightly or by hand is never cancelled:
+# it may be releasing or soaking, so each has a group of its own.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  MISE_AUTO_INSTALL: "false" # each job installs the tools it names, not the whole mise.toml
 
 jobs:
-  # Every prek hook on all files, tests included: the same as `mise run check`.
+  # What the push or the PR changed, for the jobs that only some changes concern. A run with
+  # nothing to compare with (nightly, by hand, a new branch) counts everything as changed.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      deps: ${{ steps.diff.outputs.deps }}
+      schema: ${{ steps.diff.outputs.schema }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the base to compare with
+      - name: Compare with the base
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            pull_request) base="$PR_BASE" ;;
+            push) base="$BEFORE" ;;
+            *) base="" ;;
+          esac
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base=""
+          fi
+          changed() {
+            if [ -z "$base" ]; then echo true; return; fi
+            if git diff --quiet "$base" HEAD -- "$@"; then echo false; else echo true; fi
+          }
+          {
+            echo "deps=$(changed Cargo.lock fuzz/Cargo.lock .cargo/deny.toml)"
+            echo "schema=$(changed crates/lotse-api-types/schema/api.json)"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # Every prek hook on all files (`mise run check`), and the browser test's unit tests.
   check:
-    name: every prek hook
+    name: Check
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,16 +102,46 @@ jobs:
       - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
         with:
           version: 2026.9.15
+          # What the hooks run; cmake builds libopus for clippy and rustdoc.
+          install_args: rust cmake prek cargo-deny github:taiki-e/cargo-hack github:boshen/cargo-shear uv shellcheck
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: check
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/browser/uv.lock') }}
+      # The hooks prek fetches itself (actionlint, zizmor, codespell, ruff), by their pins.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/prek
+          key: prek-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.pre-commit-config.yaml') }}
       - run: mise run check
+      - name: Browser test unit tests
+        run: mise run test-browser
 
-  test-musl:
-    name: tests on the musl target
+  # The tests of the static musl target, compiled once per arch (natively, no cross, no QEMU) and
+  # archived for the jobs that run them; without debuginfo, which would make the archive several
+  # GB. The doctests run here, where the libraries are already built.
+  build:
+    name: Build (${{ matrix.arch }})
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm] # x86_64 and aarch64, natively (no cross, no QEMU)
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,18 +149,65 @@ jobs:
       - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
         with:
           version: 2026.9.15
-          # What the musl tests need (zig through cargo-zigbuild compiles and links, cmake builds
-          # libopus, nextest runs them); the rest of mise.toml is for the checks.
+          # zig through cargo-zigbuild compiles and links musl, cmake builds libopus.
           install_args: rust zig cmake github:rust-cross/cargo-zigbuild github:nextest-rs/nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: musl-tests-${{ matrix.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: mise run test-archive
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tests-${{ matrix.arch }}
+          path: target/nextest-archive.tar.zst
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0 # zstd already
+
+  tests:
+    name: Tests (${{ matrix.arch }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    env:
+      LOTSE_NEXTEST_ARCHIVE: nextest-archive.tar.zst
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: github:nextest-rs/nextest
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tests-${{ matrix.arch }}
       - run: mise run test-musl
-        env:
-          MISE_AUTO_INSTALL: "false" # the tools above, not the whole mise.toml
 
-  # Linux-only gates.
-  coverage:
-    name: coverage gate (100% lines)
-    runs-on: ubuntu-latest
+  # The daemon against a third-party RTSP server (MediaMTX) fed by ffmpeg, over TCP and UDP, video
+  # only and with AAC, PCMU and Opus. Both tools are pinned in mise.toml; both arches, so both
+  # ffmpeg pins are exercised.
+  interop:
+    name: Interop with MediaMTX and ffmpeg (${{ matrix.arch }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    env:
+      LOTSE_NEXTEST_ARCHIVE: nextest-archive.tar.zst
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -63,33 +215,20 @@ jobs:
       - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
         with:
           version: 2026.9.15
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: mise run coverage
+          install_args: github:nextest-rs/nextest github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tests-${{ matrix.arch }}
+      - run: mise run interop
 
-  # The console build compiles code that only `--cfg tokio_unstable` turns on, which no other job
-  # sees.
-  console:
-    name: console build (--cfg tokio_unstable)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
-        with:
-          version: 2026.9.15
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: console
-      - run: mise run console-check
-
-  # The daemon under Docker's default seccomp profile, as a deployment's container may run it
-  # (scripts/sandbox-isolation.sh).
-  sandbox-isolation:
-    name: sandbox isolation (Docker, default seccomp profile)
+  # The TURN client against a real coturn (scripts/turn-e2e.sh starts it with Docker on the host
+  # network and removes it).
+  turn:
+    name: TURN client against coturn
+    needs: build
     runs-on: ubuntu-latest
     env:
-      BIN: target/x86_64-unknown-linux-musl/release/lotse
+      LOTSE_NEXTEST_ARCHIVE: nextest-archive.tar.zst
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -97,11 +236,29 @@ jobs:
       - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
         with:
           version: 2026.9.15
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          install_args: github:nextest-rs/nextest
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          key: sandbox-isolation
-      - name: Static build with the fake source
-        run: cargo build --release --locked --bin lotse --features source-fake --target x86_64-unknown-linux-musl
+          name: tests-x86_64
+      - run: mise run turn-e2e
+
+  # The daemon under Docker's default seccomp profile, as a deployment's container may run it
+  # (scripts/sandbox-isolation.sh). The binary is the archive's: static, with the fake source.
+  sandbox:
+    name: Sandbox isolation (Docker, default seccomp profile)
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      BIN: target/x86_64-unknown-linux-musl/debug/lotse
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tests-x86_64
+      - name: Take the binary from the archive
+        run: tar --zstd -xf nextest-archive.tar.zst "$BIN"
       - name: Run the check in a container
         run: |
           docker run --rm \
@@ -109,10 +266,9 @@ jobs:
             --volume "$PWD/scripts/sandbox-isolation.sh:/check.sh:ro" \
             alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 sh /check.sh
 
-  # The TURN client against a real coturn (scripts/turn-e2e.sh starts it with Docker on the host
-  # network and removes it).
-  turn-e2e:
-    name: TURN client against coturn
+  coverage:
+    name: Coverage (100 % of lines)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -121,68 +277,15 @@ jobs:
       - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
         with:
           version: 2026.9.15
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: mise run turn-e2e
-
-  # The daemon against a third-party RTSP server (MediaMTX) fed by ffmpeg, over TCP and UDP, video
-  # only and with AAC, PCMU and Opus. Both tools are pinned in mise.toml; both arches, so both
-  # ffmpeg pins are exercised.
-  interop:
-    name: interop with MediaMTX and ffmpeg
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
-        with:
-          version: 2026.9.15
-          # The host build (cmake builds libopus), nextest, and the camera's two tools; the rest of
-          # mise.toml is for the checks.
-          install_args: rust cmake github:nextest-rs/nextest github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds
+          install_args: rust cmake github:nextest-rs/nextest github:taiki-e/cargo-llvm-cov
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: interop
-      - run: mise run interop
-        env:
-          MISE_AUTO_INSTALL: "false" # the tools above, not the whole mise.toml
-
-  # The fuzz targets, 60 s each on every PR.
-  fuzz-smoke:
-    name: fuzz smoke (60 s per target)
-    runs-on: ubuntu-latest
-    env:
-      NIGHTLY: nightly-2026-10-01 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Nightly toolchain (the one nightly use)
-        run: rustup toolchain install "$NIGHTLY" --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: |
-            . -> target
-            fuzz -> fuzz/target
-          cache-bin: true
-      - run: cargo "+$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
-      # cargo-fuzz has no `--locked`: this fails on a stale fuzz/Cargo.lock, and the builds below
-      # then resolve nothing new.
-      - run: cargo "+$NIGHTLY" fetch --manifest-path fuzz/Cargo.toml --locked
-      # scripts/fuzz.sh adds the contract's limits (a 10 s hang, a 64 MiB allocation, 1 GiB
-      # resident), the same as `mise run fuzz`.
-      - name: Fuzz every target for 60 s
-        run: |
-          for target in $(cargo "+$NIGHTLY" fuzz list); do
-            scripts/fuzz.sh "$target" 60
-          done
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: mise run coverage
 
   mutants:
-    name: mutation gate (changed lines)
+    name: Mutants (changed lines)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     env:
@@ -195,5 +298,333 @@ jobs:
       - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
         with:
           version: 2026.9.15
+          install_args: rust cmake github:nextest-rs/nextest cargo:cargo-mutants
+      # Saved on the PR too: only PRs run it, and the next push to the same PR restores it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mutants
       - run: mise run mutants "origin/$BASE_REF"
+
+  # The console build compiles code that only `--cfg tokio_unstable` turns on, which no other job
+  # sees.
+  console:
+    name: Console build (--cfg tokio_unstable)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: rust cmake github:nextest-rs/nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: console
+          workspaces: ". -> target/console"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: mise run console-check
+
+  # The fuzz targets, 60 s each.
+  fuzz:
+    name: Fuzz smoke (60 s per target)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      NIGHTLY: nightly-2026-10-01 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Nightly toolchain (the one nightly use)
+        run: rustup toolchain install "$NIGHTLY" --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: fuzz
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+          cache-bin: true # cargo-fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo "+$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
+      # cargo-fuzz has no `--locked`: this fails on a stale fuzz/Cargo.lock, and the builds below
+      # then resolve nothing new.
+      - run: cargo "+$NIGHTLY" fetch --manifest-path fuzz/Cargo.toml --locked
+      # scripts/fuzz.sh adds the contract's limits (a 10 s hang, a 64 MiB allocation, 1 GiB
+      # resident), the same as `mise run fuzz`.
+      - name: Fuzz every target for 60 s
+        run: |
+          for target in $(cargo "+$NIGHTLY" fuzz list); do
+            scripts/fuzz.sh "$target" 60
+          done
+
+  # The release binaries' build on every push and PR (both arches, the size check); the release
+  # itself builds them again without any cache (release.yml).
+  release-build:
+    name: Release build
+    if: github.event_name != 'schedule'
+    permissions:
+      contents: read
+    # A job-level `./` call takes the workflow from this run's commit, not from the runner's
+    # disk; `$/`, which zizmor prefers, is rejected by actionlint 1.7.12, the latest.
+    uses: ./.github/workflows/build.yml # zizmor: ignore[self-repository]
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # uploading the analysis results to code scanning
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: /language:${{ matrix.language }}
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: moderate
+
+  # RustSec advisories: nightly and by hand, and on a push or PR that changes the dependencies, so
+  # a new advisory fails no unrelated PR.
+  audit:
+    name: Security audit
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: rust cargo-deny # cargo-deny reads `cargo metadata`
+      - run: mise run audit
+
+  # The browser test (scripts/browser.sh): one pytest test in tests/browser/, run once per browser
+  # and case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash), has
+  # Selenium drive a real browser that plays the synthetic camera (ffmpeg publishing to MediaMTX,
+  # both pinned in mise.toml) through a release daemon and the dev viewer, and checks what it
+  # showed, played and reported in getStats(). Chrome and Firefox on the x86-64 Linux runner,
+  # Safari on the macOS one; the browsers are the runner images' own, current stable releases,
+  # their drivers the ones Selenium Manager resolves, and each report records the versions that
+  # ran.
+  browser:
+    name: Browser test (${{ matrix.engine }})
+    if: github.event_name == 'schedule' || inputs.nightly
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: the release daemon's musl build (as in build.yml) and the camera's tools.
+          - engine: chrome
+            os: ubuntu-latest
+            tools: rust zig cmake github:rust-cross/cargo-zigbuild github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds uv
+            # Ubuntu 24.04's AppArmor keeps Chrome's sandbox from the user namespaces it needs;
+            # the page it loads is the test's own, on loopback.
+            browser_args: --no-sandbox
+          - engine: firefox
+            os: ubuntu-latest
+            tools: rust zig cmake github:rust-cross/cargo-zigbuild github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds uv
+            browser_args: ""
+          # macOS: the host build (cmake builds libopus; no musl, so no zig), ffmpeg from the
+          # macOS arm64 build in mise.toml (GitHub's macos-latest is arm64).
+          - engine: safari
+            os: macos-latest
+            tools: rust cmake github:bluenviron/mediamtx http:ffmpeg uv
+            browser_args: ""
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      PLAY: ${{ inputs.play || '20s' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: ${{ matrix.tools }}
+      # One cache for the browser test, the comparison, load and soak on Linux: the same release
+      # builds of the daemon and the examples.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: nightly-${{ runner.os }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/browser/uv.lock') }}
+      # Safari's WebDriver is off until an administrator turns it on; the hosted runner allows it.
+      - if: matrix.engine == 'safari'
+        run: sudo safaridriver --enable
+      - run: mise run browser "$ENGINE" "$PLAY"
+        env:
+          ENGINE: ${{ matrix.engine }}
+          LOTSE_BROWSER_ARGS: ${{ matrix.browser_args }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: browser-${{ matrix.engine }}
+          path: target/browser-${{ matrix.engine }}/
+          if-no-files-found: warn
+
+  # The same page and camera through lotse and through go2rtc as its common deployment configures
+  # it (scripts/compare.sh, tests/browser/test_comparison.py), alternating, and the side-by-side
+  # report; Chrome on Linux only. go2rtc's figures, its failed checks and its runs that did not play
+  # are reported, never judged: the job fails only when one of lotse's runs fails the browser
+  # test's own checks.
+  compare:
+    name: Comparison with go2rtc (chrome)
+    if: github.event_name == 'schedule' || inputs.nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PLAY: ${{ inputs.play || '20s' }}
+      RUNS: ${{ inputs.runs || '5' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          # The browser job's Linux tools, and go2rtc.
+          install_args: rust zig cmake github:rust-cross/cargo-zigbuild github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds uv github:AlexxIT/go2rtc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: nightly-${{ runner.os }}
+          save-if: false # the browser job saves it
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/browser/uv.lock') }}
+      - run: mise run compare chrome "$RUNS" "$PLAY"
+        env:
+          # As in the browser job: Ubuntu 24.04's AppArmor keeps Chrome's sandbox from its user
+          # namespaces.
+          LOTSE_BROWSER_ARGS: --no-sandbox
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: compare-chrome
+          path: target/compare-chrome/
+          if-no-files-found: warn
+
+  # The load generator and the soak against a release daemon (scripts/load.sh). Never on a PR,
+  # since a soak takes hours. GitHub's hosted jobs stop at 6 h: the 72 h soak and the Pi 4 and
+  # RK3566 runs are made by hand on lab hardware before a release.
+  load:
+    name: Load (4 cameras x 4 viewers, 2 min)
+    if: github.event_name == 'schedule' || inputs.nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: rust zig cmake github:rust-cross/cargo-zigbuild
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: nightly-${{ runner.os }}
+          save-if: false # the browser job saves it
+      - run: mise run load 4 4 2m
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: load-report
+          path: target/load-report.json
+          if-no-files-found: warn
+
+  soak:
+    name: Soak (cameras hang up, viewers come and go)
+    if: github.event_name == 'schedule' || inputs.nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DURATION: ${{ inputs.duration || '5h' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: rust zig cmake github:rust-cross/cargo-zigbuild
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: nightly-${{ runner.os }}
+          save-if: false # the browser job saves it
+      - run: mise run soak "$DURATION"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: soak-report
+          path: target/soak-report.json
+          if-no-files-found: warn
+
+  # Every push to main: release-plz's release PR, and the release when that PR was merged
+  # (release.yml). One release at a time, never cancelled; the next push waits for it.
+  release:
+    name: Release
+    if: github.event_name == 'push'
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write # the tag, the draft release and its assets
+      pull-requests: read # release-plz checks that this commit is a merged release PR
+      packages: write # the image on ghcr.io
+      id-token: write # the Sigstore certificates of the attestations
+      attestations: write # storing the attestations
+    uses: ./.github/workflows/release.yml # zizmor: ignore[self-repository]
+    secrets:
+      LOTSE_BOT_PRIVATE_KEY: ${{ secrets.LOTSE_BOT_PRIVATE_KEY }}
+
+  # A change to the API schema on main asks lotse-clients to sync it: its sync-schema.yml opens or
+  # updates a PR with the schema and the regenerated models, whose CI runs the contract tests
+  # against this commit.
+  clients:
+    name: Ask lotse-clients to sync the schema
+    needs: changes
+    if: github.event_name == 'push' && needs.changes.outputs.schema == 'true'
+    runs-on: ubuntu-latest
+    # The newest schema is the one to sync; lotse-clients' run supersedes an older one anyway.
+    concurrency:
+      group: clients
+      cancel-in-progress: true
+    steps:
+      # GITHUB_TOKEN reaches only this repository.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          client-id: ${{ vars.LOTSE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.LOTSE_BOT_PRIVATE_KEY }}
+          repositories: lotse-clients
+          permission-contents: write # what a repository_dispatch needs
+      - name: Dispatch lotse-schema
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SHA: ${{ github.sha }}
+        run: gh api repos/edenhaus/lotse-clients/dispatches -f event_type=lotse-schema -f "client_payload[sha]=$SHA"

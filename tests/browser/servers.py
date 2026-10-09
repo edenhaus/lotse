@@ -39,6 +39,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.safari.service import Service as SafariService
 
 from checks import Stream
 from harness import Served, options, tail
@@ -178,7 +179,7 @@ def lotse(settings: Settings, out: Path, audio: str = "pcmu") -> Iterator[Runnin
     The camera sends `audio`. Both stopped after, the daemon's exit checked. The page puts the
     stream itself.
     """
-    # A short path: a Unix socket path must fit in sun_path (108 bytes on Linux).
+    # A short path: a Unix socket path must fit in sun_path (104 bytes on macOS).
     directory = Path(tempfile.mkdtemp(prefix="lotse-browser.", dir="/tmp"))
     socket = directory / "lotse.sock"
     daemon_log = out / "lotse.log"
@@ -348,8 +349,10 @@ def browser(settings: Settings, out: Path) -> Iterator[WebDriver]:
     session: WebDriver
     if isinstance(wanted, webdriver.ChromeOptions):
         session = webdriver.Chrome(options=wanted, service=ChromeService(log_output=log))
-    else:
+    elif isinstance(wanted, webdriver.FirefoxOptions):
         session = webdriver.Firefox(options=wanted, service=FirefoxService(log_output=log))
+    else:
+        session = webdriver.Safari(service=SafariService())
     session.set_script_timeout(settings.play_s + PAGE_OVERHEAD_S)
     session.set_page_load_timeout(30)
     try:

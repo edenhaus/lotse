@@ -37,8 +37,10 @@ uv = "0.12.23" # the browser test's Python, Selenium and pytest, and its checks 
 "github:bluenviron/mediamtx" = "1.21.1"
 # FFmpeg 9.0.2, static GPL builds (libx264, libopus; the native aac and pcm_mulaw encoders). Linux:
 # BtbN/FFmpeg-Builds, the build ffmpeg.org links, a month-end autobuild (kept for years, the daily
-# ones only for weeks) from the release/9.0 branch.
+# ones only for weeks) from the release/9.0 branch. macOS arm64 (the Safari browser test): Martin
+# Riedl's static release build; evermeet.cx, the one ffmpeg.org links, is Intel-only.
 "github:BtbN/FFmpeg-Builds" = { version = "autobuild-2026-09-30-13-08", version_prefix = "", os = ["linux"], strip_components = 1, bin_path = "bin", platforms = { linux-x64 = { asset_pattern = "ffmpeg-n9.0.2-17-g2a571b6068-linux64-gpl-9.0.tar.xz", checksum = "sha256:68ee646831adaae2495618346f3bba94ff207ff83bbd34d643e7004730d66269" }, linux-arm64 = { asset_pattern = "ffmpeg-n9.0.2-17-g2a571b6068-linuxarm64-gpl-9.0.tar.xz", checksum = "sha256:91afcd7695d4bbbb9e0057aa10baaf9875ec4e1a97303f9059ec971336a2ab46" } } }
+"http:ffmpeg" = { version = "9.0.2", os = ["macos/arm64"], url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip", checksum = "sha256:c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924" }
 # go2rtc, the server the browser test is compared with (`mise run compare`, report only): the
 # release its common deployment pins, observed 2026-10-07. Its release binaries are UPX-packed;
 # they run as they are.
@@ -49,12 +51,31 @@ uv = "0.12.23" # the browser test's Python, Selenium and pytest, and its checks 
 postinstall = "prek install"
 
 [tasks.check]
-description = "Everything CI runs: all prek hooks, tests included, on all files"
+description = "Every check: all prek hooks on all files (CI's Check job); the tests are CI jobs"
 run = "prek run --all-files --stage manual --show-diff-on-failure"
 
+[tasks.test]
+description = "The tests, as CI runs them (Linux only): nextest on the host target, then the doctests"
+run = [
+  "scripts/nextest.sh --no-tests=warn",
+  "cargo test --workspace --all-features --locked --doc",
+]
+
 [tasks.test-musl]
-description = "Run the tests on the host's static musl target (Linux only)"
-run = 'cargo nextest run --workspace --all-features --locked --no-tests=warn --target "$(uname -m)-unknown-linux-musl"'
+description = "The tests on the host's static musl target (Linux only); from $LOTSE_NEXTEST_ARCHIVE when set (CI)"
+run = 'LOTSE_NEXTEST_TARGET="$(uname -m)-unknown-linux-musl" scripts/nextest.sh --no-tests=warn'
+
+[tasks.test-archive]
+description = "The tests of the host's musl target, built and archived for other machines (CI's Build job), then the doctests"
+run = [
+  'cargo nextest archive --workspace --all-features --locked --target "$(uname -m)-unknown-linux-musl" --archive-file target/nextest-archive.tar.zst',
+  'cargo test --workspace --all-features --locked --doc --target "$(uname -m)-unknown-linux-musl"',
+]
+
+[tasks.test-browser]
+description = "The browser test's unit tests (no browser): its checks and its harness"
+dir = "tests/browser"
+run = "uv run --locked pytest -q"
 
 [tasks.audit]
 description = "Advisories (RustSec database) for the root and the fuzz workspace; needs the network"
@@ -82,7 +103,7 @@ run = "scripts/turn-e2e.sh"
 
 [tasks.interop]
 description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus (the ignored `mediamtx_` tests)"
-run = "cargo nextest run -p lotse --all-features --locked --test interop --run-ignored only --no-tests=fail mediamtx_"
+run = "scripts/nextest.sh -E 'binary_id(lotse::interop)' --run-ignored only --no-tests=fail mediamtx_"
 
 [tasks.load]
 description = "The load generator: N fake cameras x M headless viewers against a release daemon; report in target/load-report.json"
@@ -102,9 +123,9 @@ arg "[cycle]" help="one cycle of viewers and a camera hang-up; over a minute, af
 run = 'scripts/load.sh --cameras 4 --viewers 2 --duration "$usage_duration" --cycle "$usage_cycle" --drop --sample 10s --report target/soak-report.json'
 
 [tasks.browser]
-description = "The browser test: Selenium has Chrome or Firefox play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash); report and logs in target/browser-<engine>/<case>/"
+description = "The browser test: Selenium has Chrome, Firefox or Safari play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash); report and logs in target/browser-<engine>/<case>/"
 usage = '''
-arg "[engine]" help="chrome or firefox" default="chrome"
+arg "[engine]" help="chrome, firefox or safari" default="chrome"
 arg "[play]" help="how long each window plays (20s); a case with a disruption plays one before it and one after" default="20s"
 arg "[case]" help="join, aac, pli, reconnect, crash or all" default="all"
 '''
@@ -113,7 +134,7 @@ run = 'scripts/browser.sh "$usage_engine" "$usage_play" --case "$usage_case"'
 [tasks.compare]
 description = "The go2rtc comparison: the browser test through lotse and through go2rtc as its common deployment configures it, alternating, N runs each, reported side by side (fails only on lotse's own checks); report in target/compare-<engine>/"
 usage = '''
-arg "[engine]" help="chrome or firefox" default="chrome"
+arg "[engine]" help="chrome, firefox or safari" default="chrome"
 arg "[runs]" help="plays through each server" default="5"
 arg "[play]" help="how long each play lasts after the first frame (20s)" default="20s"
 '''
@@ -129,7 +150,7 @@ cargo run --locked --bin lotse --features console,source-fake -- serve --socket 
 """
 
 [tasks.console-check]
-description = "Lints and tests the console build, which only --cfg tokio_unstable compiles (CI's `console` job)"
+description = "Lints and tests the console build, which only --cfg tokio_unstable compiles (CI's Console build job)"
 env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/console" }
 run = [
   "cargo clippy --locked -p lotse -p lotse-core --features lotse/console,lotse/source-fake --all-targets -- -D warnings",

@@ -1,6 +1,6 @@
 """The browser test's options and fixtures: the daemon, the camera and page, and the browser.
 
-`--browser chrome|firefox` picks the browser; without it the browser test and the comparison
+`--browser chrome|firefox|safari` picks the browser; without it the browser test and the comparison
 are skipped and only the unit tests run. `--case` picks the browser test's cases (`harness.CASES`,
 all by default); each writes its report and logs to its own directory in `--out`.
 `scripts/browser.sh` (`mise run browser`) builds the release daemon and the `lotse-browser` example
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
     from selenium.webdriver.remote.webdriver import WebDriver
 
-ENGINES = ("chrome", "firefox")
+ENGINES = ("chrome", "firefox", "safari")
 """The browsers the test runs on."""
 
 
@@ -46,7 +46,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
     group.addoption("--camera", help="an RTSP camera to play instead of the synthetic one")
     group.addoption("--out", help="the directory of the report and the logs")
-    group.addoption("--headful", action="store_true", help="a window instead of headless")
+    group.addoption("--headful", action="store_true", help="a window for Chrome and Firefox")
     group.addoption(
         "--browser-arg", action="append", default=[], help="a browser argument (repeatable)"
     )
@@ -89,7 +89,7 @@ def settings(request: pytest.FixtureRequest) -> Settings:
         lotse_browser=Path(config.getoption("--lotse-browser")).resolve(),
         camera=config.getoption("--camera"),
         out=out,
-        headless=not config.getoption("--headful"),
+        headless=engine != "safari" and not config.getoption("--headful"),
         browser_args=config.getoption("--browser-arg"),
         browser_version=config.getoption("--browser-version"),
         browser_binary=config.getoption("--browser-binary"),
