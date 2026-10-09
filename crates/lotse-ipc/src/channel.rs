@@ -183,11 +183,9 @@ impl Sender {
         if fds.len() > MAX_FDS {
             return Err(IpcError::TooManyFds(fds.len()));
         }
+        // At most `MAX_MESSAGE_BYTES`, checked above, which fits a `u32`.
         let prefix = u32::try_from(payload.len())
-            .map_err(|_| IpcError::TooLarge {
-                len: payload.len(),
-                max: MAX_MESSAGE_BYTES,
-            })?
+            .unwrap_or(u32::MAX)
             .to_le_bytes();
         let mut frame = Vec::with_capacity(PREFIX_LEN.saturating_add(payload.len()));
         frame.extend_from_slice(&prefix);
@@ -780,6 +778,21 @@ mod tests {
         matches!((&*kept).read(&mut [0_u8; 1]), Ok(0))
     }
 
+    #[test]
+    fn one_write_refuses_more_descriptors_than_its_cmsg_3_buffer_holds() {
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        // `cmsg_space!` may round the buffer up past `MAX_FDS`, never 8-fold.
+        let (_kept, passed) = passable(8 * MAX_FDS);
+        let borrowed: Vec<BorrowedFd<'_>> = passed.iter().map(AsFd::as_fd).collect();
+        let err = send_once(ours.as_fd(), b"x", &borrowed).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ancillary buffer too small for the descriptors"
+        );
+        let sent = send_once(ours.as_fd(), b"x", &borrowed[..MAX_FDS]).unwrap();
+        assert_eq!(sent, 1, "the buffer holds exactly MAX_FDS");
+    }
+
     #[tokio::test]
     async fn max_fds_descriptors_in_one_frame_are_accepted_across_writes() {
         let (raw, mut rx) = raw_pair();
@@ -924,7 +937,8 @@ mod tests {
         let (message, fds) = rx.recv_msg::<ToWorker>().await.unwrap().unwrap();
         assert_eq!((message, fds.len()), (shutdown, 1));
         drop(raw);
-        assert!(rx.recv_decoded::<ToWorker>().await.unwrap().is_none());
+        // One instantiation of `recv_msg` sees every outcome, the end too.
+        assert!(rx.recv_msg::<ToWorker>().await.unwrap().is_none());
     }
 
     #[tokio::test]
