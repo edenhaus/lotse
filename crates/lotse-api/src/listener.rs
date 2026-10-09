@@ -120,15 +120,10 @@ pub(crate) fn bind_unix(
     }
 
     let previous = rustix::process::umask(Mode::from_bits_truncate(0o177));
-    let bound = std::os::unix::net::UnixListener::bind(path);
+    let bound = std::os::unix::net::UnixListener::bind(path)
+        .and_then(|listener| listener.set_nonblocking(true).map(|()| listener));
     let _restored = rustix::process::umask(previous);
     let listener = bound.map_err(|source| BindError::Bind { path: text, source })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|source| BindError::Bind {
-            path: path.display().to_string(),
-            source,
-        })?;
     tracing::info!(socket = %path.display(), "control socket bound");
     Ok(listener)
 }
@@ -164,23 +159,21 @@ impl CheckedUnix {
         })
     }
 
-    /// The next allowed peer. A peer whose uid is not allowed, or whose
-    /// credentials cannot be read, is closed here without a response and
-    /// before anything it sent is read.
-    /// A failed `accept` is retried after a pause on the clock, the
+    /// The next allowed peer. A peer whose uid is not allowed is closed
+    /// here without a response and before anything it sent is read.
+    /// A failed `accept`, or one whose peer's credentials cannot be read
+    /// (`SO_PEERCRED`, which `unix(7)` fills at `connect`; the peer is
+    /// closed), is retried after a pause on the clock, the
     /// [`AcceptBackoff`] schedule, reset by the next success.
     pub(crate) async fn accept(&mut self) -> (UnixStream, PeerInfo) {
         loop {
-            match self.inner.accept().await {
-                Ok((stream, _addr)) => {
+            let accepted = self.inner.accept().await.and_then(|(stream, _addr)| {
+                let cred = stream.peer_cred()?;
+                Ok((stream, cred))
+            });
+            match accepted {
+                Ok((stream, cred)) => {
                     self.backoff.reset();
-                    let cred = match stream.peer_cred() {
-                        Ok(cred) => cred,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "peer credentials unreadable; connection refused");
-                            continue;
-                        }
-                    };
                     let peer = PeerInfo {
                         uid: cred.uid(),
                         pid: cred.pid(),
@@ -298,9 +291,9 @@ mod tests {
             closed = client.read(&mut byte) => panic!("refused: {closed:?}"),
         };
         assert_eq!(peer.uid, uid);
-        if let Some(pid) = peer.pid {
-            assert_eq!(u32::try_from(pid).unwrap(), std::process::id());
-        }
+        // Linux reports the pid (`SO_PEERCRED`).
+        let pid = peer.pid.map(|pid| u32::try_from(pid).unwrap());
+        assert_eq!(pid, Some(std::process::id()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -372,6 +365,8 @@ mod tests {
             .with_ansi(false)
             .finish();
         let _logs = tracing::subscriber::set_default(subscriber);
+        // The subscriber never flushes its writer, whose flush does nothing.
+        io::Write::flush(&mut captured.clone()).unwrap();
         let dir = private_dir("emfile", 0o700);
         let path = dir.join("lotse.sock");
         let uid = rustix::process::getuid().as_raw();
@@ -456,6 +451,11 @@ mod tests {
             bind_unix(&file.join("lotse.sock"), uid).unwrap_err(),
             BindError::NotADirectory(_)
         ));
+        // A file in the socket's place is not a stale socket: it stays,
+        // and the bind fails.
+        let err = bind_unix(&file, uid).unwrap_err();
+        assert!(matches!(err, BindError::Bind { .. }), "{err}");
+        assert!(file.is_file());
         std::fs::remove_dir_all(&open).unwrap();
         std::fs::remove_dir_all(&private).unwrap();
     }

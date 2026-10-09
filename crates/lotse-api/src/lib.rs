@@ -218,11 +218,6 @@ impl Server {
         Ok(Self { unix, config })
     }
 
-    /// The settings.
-    pub const fn config(&self) -> &Config {
-        &self.config
-    }
-
     /// Serves until `shutdown` is cancelled: then no new connections, the
     /// ones not yet upgraded are closed, every upgraded one gets `shutdown`
     /// and a `1001` close, and the call returns. `clock` times the upgrade
@@ -337,6 +332,7 @@ mod tests {
         reason = "test code"
     )]
 
+    use lotse_api_types::error::ErrorCode;
     use lotse_api_types::frame::HelloTag;
 
     use super::*;
@@ -375,5 +371,94 @@ mod tests {
         assert!(handler.unsubscribed(ConnectionId(1), 2).is_none());
         handler.connection_closed(ConnectionId(1));
         assert_eq!(handler.hello().api, lotse_api_types::API_VERSION);
+    }
+
+    /// A WebSocket upgrade as the router extracts it, from a request the
+    /// connection cannot actually upgrade.
+    async fn ws_upgrade() -> axum::extract::ws::WebSocketUpgrade {
+        use axum::extract::FromRequestParts as _;
+
+        let mut request = axum::http::Request::builder()
+            .uri(lotse_api_types::WS_PATH)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(())
+            .unwrap();
+        let on_upgrade = hyper::upgrade::on(&mut request);
+        let (mut parts, ()) = request.into_parts();
+        parts.extensions.insert(on_upgrade);
+        axum::extract::ws::WebSocketUpgrade::from_request_parts(&mut parts, &())
+            .await
+            .unwrap()
+    }
+
+    /// What every connection shares, with `max_connections` and the
+    /// shutdown begun or not.
+    fn state(max_connections: u32, shutting_down: bool) -> AppState<Minimal> {
+        let shutdown = CancellationToken::new();
+        if shutting_down {
+            shutdown.cancel();
+        }
+        AppState {
+            handler: Arc::new(Minimal),
+            config: Config {
+                socket: PathBuf::from("/run/lotse/lotse.sock"),
+                owner_uid: 0,
+                allow_uid: 0,
+                max_connections,
+                max_subscriptions: 1,
+            },
+            connections: Arc::new(AtomicU32::new(0)),
+            next_id: Arc::new(AtomicU64::new(1)),
+            shutdown,
+            clock: Arc::new(lotse_core::clock::FakeClock::default()),
+        }
+    }
+
+    /// `upgrade`'s answer for `state`, its status and its error code.
+    async fn answer(state: AppState<Minimal>) -> (u16, serde_json::Value) {
+        let peer = PeerInfo { uid: 0, pid: None };
+        let response = connection::upgrade(
+            axum::extract::State(state),
+            Extension(peer),
+            ws_upgrade().await,
+        )
+        .await;
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let code = serde_json::from_slice::<serde_json::Value>(&body)
+            .map_or(serde_json::Value::Null, |error| error["code"].clone());
+        (status, code)
+    }
+
+    /// The upgrade handler driven directly, every check in one
+    /// instantiation: over a socket, an upgrade read just before the
+    /// shutdown is closed at the cancel as often as it is answered.
+    #[tokio::test]
+    async fn an_upgrade_is_refused_while_shutting_down_or_at_the_limit_and_else_switches() {
+        let shutting_down = state(1, true);
+        let connections = Arc::clone(&shutting_down.connections);
+        assert_eq!(
+            answer(shutting_down).await,
+            (503, ErrorCode::ShuttingDown.as_str().into())
+        );
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "no slot taken"
+        );
+        assert_eq!(
+            answer(state(0, false)).await,
+            (503, ErrorCode::LimitReached.as_str().into())
+        );
+        // RFC 6455 §4.2.2: the handshake is answered 101 Switching Protocols.
+        assert_eq!(
+            answer(state(1, false)).await,
+            (101, serde_json::Value::Null)
+        );
     }
 }
