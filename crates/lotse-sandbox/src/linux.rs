@@ -43,8 +43,8 @@ pub(crate) fn apply(
             .map_err(step("PR_SET_PDEATHSIG"))?;
     }
     rustix::thread::set_no_new_privs(true).map_err(step("PR_SET_NO_NEW_PRIVS"))?;
-    let landlock = apply_landlock(profile, config.mode, &mut notes)?;
-    let seccomp = seccomp::apply(profile, config.mode, &mut notes)?;
+    let landlock = apply_landlock(profile, config.mode, probe_abi(), &mut notes)?;
+    let seccomp = seccomp::apply(profile, config.mode, std::env::consts::ARCH, &mut notes)?;
     Ok(SandboxReport {
         mode: config.mode,
         uid,
@@ -71,8 +71,11 @@ pub(crate) fn drop_privileges(config: &SandboxConfig) -> Result<(u32, u32), Sand
     if !rustix::process::geteuid().is_root() {
         return Ok((crate::current_uid(), crate::current_gid()));
     }
-    let uid = Uid::from_raw(config.uid);
-    let gid = Gid::from_raw(config.gid);
+    // Unchecked: `-1` is setresuid(2)'s and setresgid(2)'s "unchanged", which
+    // leaves root in place, and the check below must see it to refuse it
+    // (rustix's checked constructor asserts on it in debug builds only).
+    let uid = Uid::from_raw_unchecked(config.uid);
+    let gid = Gid::from_raw_unchecked(config.gid);
     let failed = |errno: rustix::io::Errno| SandboxError::PrivilegeDrop {
         uid: config.uid,
         gid: config.gid,
@@ -192,13 +195,14 @@ fn layer_status(status: &RulesetStatus, layer: &str, notes: &mut Vec<String>) ->
     }
 }
 
-/// Filesystem and TCP rulesets for the profile.
+/// Filesystem and TCP rulesets for the profile, on a kernel whose highest
+/// Landlock ABI is `abi` ([`probe_abi`]; zero without Landlock).
 fn apply_landlock(
     profile: &Profile,
     mode: Mode,
+    abi: u32,
     notes: &mut Vec<String>,
 ) -> Result<LandlockReport, SandboxError> {
-    let abi = probe_abi();
     if abi == 0 {
         let reason =
             "landlock: not supported or disabled by this kernel (needs Linux 5.13)".to_owned();
@@ -335,7 +339,341 @@ mod tests {
         reason = "test code"
     )]
 
+    use std::os::fd::AsRawFd as _;
+    use std::process::{Command, Output};
+
     use super::*;
+
+    /// The variable that turns this test binary into a child that changes
+    /// process-wide state (rlimits), which no other test may share.
+    const CHILD: &str = "LOTSE_SANDBOX_LINUX_CHILD";
+
+    /// The line a child prints once its checks passed, so a child that
+    /// returned early does not pass.
+    const CHILD_DONE: &str = "child: checks passed";
+
+    /// Whether this process is a child run by [`in_child`].
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the child reads the variable that marks it"
+    )]
+    fn is_child() -> bool {
+        std::env::var_os(CHILD).is_some()
+    }
+
+    /// Runs this test binary's test `test` as a child and returns its
+    /// output once it exited successfully having passed its checks. The
+    /// child exits normally, so a coverage build writes its profile.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "spawns this test binary as the child"
+    )]
+    fn in_child(test: &str) -> Output {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(CHILD_DONE),
+            "{}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+        output
+    }
+
+    /// The soft and the hard limit of `resource`.
+    fn limits(resource: Resource) -> (Option<u64>, Option<u64>) {
+        let limit = rustix::process::getrlimit(resource);
+        (limit.current, limit.maximum)
+    }
+
+    #[test]
+    fn setrlimit2_a_limit_the_kernel_refuses_names_its_step() {
+        in_child("linux::tests::setrlimit2_refused_limit_child");
+    }
+
+    /// The child: a hard `RLIMIT_AS` below the configured one, which no
+    /// unprivileged process may raise (setrlimit(2), `EPERM`); a root run
+    /// drops to `nobody` first and loses `CAP_SYS_RESOURCE` with it.
+    #[test]
+    fn setrlimit2_refused_limit_child() {
+        if !is_child() {
+            return;
+        }
+        let ceiling = rustix::process::getrlimit(Resource::As)
+            .maximum
+            .unwrap_or(u64::MAX)
+            .min(1 << 36);
+        let lowered = Rlimit {
+            current: Some(ceiling),
+            maximum: Some(ceiling),
+        };
+        rustix::process::setrlimit(Resource::As, lowered).unwrap();
+        let config = SandboxConfig {
+            worker_address_space: ceiling + 1,
+            ..SandboxConfig::default()
+        };
+        let profile = Profile::Worker {
+            connect_ports: vec![554],
+        };
+        let err = apply(&profile, &config).unwrap_err();
+        assert!(
+            matches!(&err, SandboxError::Step { step: "RLIMIT_AS", source }
+                if source.kind() == io::ErrorKind::PermissionDenied),
+            "{err}"
+        );
+        assert!(err.to_string().starts_with("RLIMIT_AS failed: "), "{err}");
+        assert_eq!(limits(Resource::Core), (Some(0), Some(0)), "set before");
+        println!("{CHILD_DONE}");
+    }
+
+    #[test]
+    fn setrlimit2_a_decoder_gets_its_address_space_and_cpu_limits() {
+        in_child("linux::tests::setrlimit2_decoder_limits_child");
+    }
+
+    /// The child: the decoder's limits, set and read back.
+    #[test]
+    fn setrlimit2_decoder_limits_child() {
+        if !is_child() {
+            return;
+        }
+        apply_rlimits(&Profile::Decoder, &SandboxConfig::default()).unwrap();
+        let address_space = Some(DECODER_ADDRESS_SPACE);
+        assert_eq!(limits(Resource::As), (address_space, address_space));
+        let cpu = Some(DECODER_CPU_SECONDS);
+        assert_eq!(limits(Resource::Cpu), (cpu, cpu));
+        assert_eq!(limits(Resource::Core), (Some(0), Some(0)));
+        println!("{CHILD_DONE}");
+    }
+
+    #[test]
+    fn landlock7_a_ruleset_the_kernel_cannot_create_is_a_landlock_step_error() {
+        in_child("linux::tests::landlock7_no_descriptor_left_child");
+    }
+
+    /// The child: no descriptor left for the ruleset that
+    /// `landlock_create_ruleset(2)` returns (`EMFILE`), and the soft limit
+    /// back afterwards. Needs a kernel with Landlock: without it nothing
+    /// is created.
+    #[test]
+    fn landlock7_no_descriptor_left_child() {
+        if !is_child() {
+            return;
+        }
+        assert!(probe_abi() > 0, "needs a kernel with Landlock");
+        let before = rustix::process::getrlimit(Resource::Nofile);
+        let lowest_free = rustix::io::fcntl_dupfd_cloexec(io::stderr(), 0).unwrap();
+        let exhausted = Rlimit {
+            current: Some(u64::try_from(lowest_free.as_raw_fd()).unwrap()),
+            maximum: before.maximum,
+        };
+        drop(lowest_free);
+        rustix::process::setrlimit(Resource::Nofile, exhausted).unwrap();
+        let mut notes = Vec::new();
+        let result = apply_landlock(&Profile::Decoder, Mode::On, 1, &mut notes);
+        rustix::process::setrlimit(Resource::Nofile, before).unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SandboxError::Step {
+                    step: "landlock",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("(os error 24)"), "{err}");
+        println!("{CHILD_DONE}");
+    }
+
+    #[test]
+    fn landlock7_without_landlock_on_reports_it_and_require_refuses() {
+        let mut notes = Vec::new();
+        let report = apply_landlock(&Profile::Decoder, Mode::On, 0, &mut notes).unwrap();
+        assert_eq!(
+            report,
+            LandlockReport {
+                fs: LayerStatus::Unavailable,
+                net: LayerStatus::Unavailable,
+                abi: 0,
+            }
+        );
+        assert_eq!(
+            notes,
+            ["landlock: not supported or disabled by this kernel (needs Linux 5.13)"]
+        );
+        let err = apply_landlock(&Profile::Decoder, Mode::Require, 0, &mut notes).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SandboxError::Required { layer: "landlock.fs", reason }
+                    if reason == "landlock: not supported or disabled by this kernel (needs Linux 5.13)"
+            ),
+            "{err}"
+        );
+        assert_eq!(notes.len(), 1, "require reports through the error");
+    }
+
+    /// Restricts this test's thread (landlock(7): a domain applies to the
+    /// calling thread), which touches no file afterwards.
+    #[test]
+    fn landlock7_tcp_rules_need_abi_4_and_require_refuses_without_them() {
+        let mut notes = Vec::new();
+        let report = apply_landlock(&Profile::Decoder, Mode::On, 3, &mut notes).unwrap();
+        assert_eq!((report.net, report.abi), (LayerStatus::Unavailable, 3));
+        let tcp_note = "landlock.net: TCP rules need ABI 4 (Linux 6.7); this kernel has ABI 3";
+        assert!(notes.iter().any(|note| note == tcp_note), "{notes:?}");
+        let mut notes = Vec::new();
+        let err = apply_landlock(&Profile::Decoder, Mode::Require, 3, &mut notes).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SandboxError::Required { layer: "landlock.fs" | "landlock.net", reason }
+                    if reason.contains(tcp_note)
+            ),
+            "{err}"
+        );
+    }
+
+    /// Restricts this test's thread, which touches no file afterwards.
+    #[test]
+    fn landlock7_a_path_that_cannot_be_opened_is_noted_and_not_granted() {
+        let profile = Profile::Supervisor {
+            binary: "/nonexistent/lotse".into(),
+        };
+        let mut notes = Vec::new();
+        apply_landlock(&profile, Mode::On, 1, &mut notes).unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("landlock: /nonexistent/lotse not granted: ")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn landlock7_partial_or_no_enforcement_is_noted() {
+        let mut notes = Vec::new();
+        let full = layer_status(&RulesetStatus::FullyEnforced, "landlock.fs", &mut notes);
+        assert_eq!(full, LayerStatus::Enforced);
+        assert!(notes.is_empty());
+        let partial = layer_status(&RulesetStatus::PartiallyEnforced, "landlock.fs", &mut notes);
+        assert_eq!(partial, LayerStatus::Enforced);
+        let none = layer_status(&RulesetStatus::NotEnforced, "landlock.net", &mut notes);
+        assert_eq!(none, LayerStatus::Unavailable);
+        assert_eq!(
+            notes,
+            [
+                "landlock.fs: partially enforced; the kernel lacks some of the requested access rights",
+                "landlock.net: not enforced by this kernel",
+            ]
+        );
+    }
+
+    #[test]
+    fn landlock7_each_profile_keeps_only_its_own_paths_and_ports() {
+        let supervisor = Profile::Supervisor {
+            binary: "/lotse".into(),
+        };
+        let worker = Profile::Worker {
+            connect_ports: vec![554, 80],
+        };
+        let paths: Vec<_> = fs_rules(&supervisor)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                Path::new("/etc/resolv.conf"),
+                Path::new("/etc/hosts"),
+                Path::new("/proc"),
+                Path::new("/dev/null"),
+                Path::new("/lotse"),
+            ]
+        );
+        assert!(fs_rules(&worker).is_empty());
+        assert!(fs_rules(&Profile::Decoder).is_empty());
+        assert_eq!(net_rules(&supervisor), [(0, AccessNet::BindTcp.into())]);
+        assert_eq!(
+            net_rules(&worker),
+            [
+                (554, AccessNet::ConnectTcp.into()),
+                (80, AccessNet::ConnectTcp.into())
+            ]
+        );
+        assert!(net_rules(&Profile::Decoder).is_empty());
+        assert_eq!(net_access(&supervisor), AccessNet::BindTcp);
+        let both = AccessNet::BindTcp | AccessNet::ConnectTcp;
+        assert_eq!(net_access(&worker), both);
+        assert_eq!(net_access(&Profile::Decoder), both);
+    }
+
+    /// The thread's effective capabilities without `CAP_SETUID` and
+    /// `CAP_SETGID`: root by uid, but unable to change its ids.
+    fn without_setid_capabilities() {
+        let mut sets = rustix::thread::capabilities(None).unwrap();
+        sets.effective
+            .remove(rustix::thread::CapabilitySet::SETUID | rustix::thread::CapabilitySet::SETGID);
+        rustix::thread::set_capabilities(None, sets).unwrap();
+    }
+
+    /// Root without the capabilities to change ids fails the drop's first
+    /// call (setgroups(2), `EPERM`); unprivileged there is nothing to
+    /// drop. Per thread: it ends with this test's thread.
+    #[test]
+    fn setresuid2_a_failed_drop_call_is_a_privilege_drop_error() {
+        let root = rustix::process::geteuid().is_root();
+        let own = (crate::current_uid(), crate::current_gid());
+        without_setid_capabilities();
+        let config = SandboxConfig {
+            uid: 4242,
+            gid: 4343,
+            ..SandboxConfig::default()
+        };
+        let outcome = drop_privileges(&config).map_err(|err| err.to_string());
+        let refused = "privilege drop to 4242:4343 failed: Operation not permitted (os error 1)";
+        assert_eq!(
+            outcome.as_ref().ok(),
+            (!root).then_some(&own),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            outcome.as_ref().err().map(String::as_str),
+            root.then_some(refused),
+            "{outcome:?}"
+        );
+    }
+
+    /// Two configurations that would leave root: uid `-1`, which
+    /// setresuid(2) reads as "unchanged", and uid 0, which root can return
+    /// to. Unprivileged there is nothing to drop. Per thread: it ends with
+    /// this test's thread.
+    #[test]
+    fn setresuid2_a_drop_that_leaves_root_is_still_privileged() {
+        let root = rustix::process::geteuid().is_root();
+        let own = (crate::current_uid(), crate::current_gid());
+        for id in [u32::MAX, 0] {
+            let config = SandboxConfig {
+                uid: id,
+                gid: id,
+                ..SandboxConfig::default()
+            };
+            let outcome = drop_privileges(&config).map_err(|err| err.to_string());
+            let refused = format!("still privileged after dropping to {id}:{id}");
+            assert_eq!(
+                outcome.as_ref().ok(),
+                (!root).then_some(&own),
+                "{outcome:?}"
+            );
+            assert_eq!(outcome.err(), root.then_some(refused));
+        }
+    }
 
     #[test]
     fn landlock7_abi_4_is_probed_with_the_tcp_rights_an_abi_3_kernel_lacks() {

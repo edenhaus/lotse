@@ -51,13 +51,16 @@ use seccompiler::{
 use crate::report::LayerStatus;
 use crate::{Mode, Profile, SandboxError, WORKER_CONTROL_FD, WORKER_SHARED_UDP_FD};
 
-/// Builds and installs the profile's filters.
+/// Builds and installs the profile's filters for the architecture named
+/// `arch` (`std::env::consts::ARCH`); seccompiler 0.5.0 has backends for
+/// `x86_64`, `aarch64` and `riscv64` only.
 pub(crate) fn apply(
     profile: &Profile,
     mode: Mode,
+    arch: &str,
     notes: &mut Vec<String>,
 ) -> Result<LayerStatus, SandboxError> {
-    let arch = match TargetArch::try_from(std::env::consts::ARCH) {
+    let arch = match TargetArch::try_from(arch) {
         Ok(arch) => arch,
         Err(err) => {
             let reason = format!("seccomp: no allowlist for this architecture: {err}");
@@ -105,13 +108,24 @@ fn errno_filter(arch: TargetArch) -> Result<BpfProgram, BackendError> {
     let mut rules = BTreeMap::new();
     rules.insert(libc::SYS_clone3, Vec::new());
     let enosys = u32::try_from(libc::ENOSYS).unwrap_or(38);
-    SeccompFilter::new(
+    compile(
         rules,
         SeccompAction::Allow,
         SeccompAction::Errno(enosys),
         arch,
-    )?
-    .try_into()
+    )
+}
+
+/// The BPF program that answers the calls in `rules` (each matching one of
+/// its rules) with `matched` and every other call with `mismatched`.
+/// seccompiler refuses identical actions.
+fn compile(
+    rules: BTreeMap<i64, Vec<SeccompRule>>,
+    mismatched: SeccompAction,
+    matched: SeccompAction,
+    arch: TargetArch,
+) -> Result<BpfProgram, BackendError> {
+    SeccompFilter::new(rules, mismatched, matched, arch)?.try_into()
 }
 
 /// Whether this build carries the LLVM profiler runtime, which writes the
@@ -161,13 +175,12 @@ fn allowlist(
             rules.insert(libc::SYS_tgkill, own_thread_group(own_pid)?);
         }
     }
-    SeccompFilter::new(
+    compile(
         rules,
         SeccompAction::KillProcess,
         SeccompAction::Allow,
         arch,
-    )?
-    .try_into()
+    )
 }
 
 /// A syscall argument value; a negative constant becomes a value no
@@ -180,26 +193,20 @@ fn arg(value: libc::c_int) -> u64 {
 fn inet_only() -> Result<Vec<SeccompRule>, BackendError> {
     [libc::AF_INET, libc::AF_INET6]
         .into_iter()
-        .map(|domain| {
-            SeccompRule::new(vec![SeccompCondition::new(
-                0,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::Eq,
-                arg(domain),
-            )?])
-        })
+        .map(|domain| SeccompRule::new(vec![equals(0, SeccompCmpArgLen::Dword, arg(domain))?]))
         .collect()
 }
 
 /// `clone(flags, ..)` with `CLONE_THREAD` set: a thread, never a process.
 fn threads_only() -> Result<Vec<SeccompRule>, BackendError> {
     let thread = arg(libc::CLONE_THREAD);
-    Ok(vec![SeccompRule::new(vec![SeccompCondition::new(
+    let has_thread = SeccompCondition::new(
         0,
         SeccompCmpArgLen::Qword,
         SeccompCmpOp::MaskedEq(thread),
         thread,
-    )?])?])
+    );
+    Ok(vec![SeccompRule::new(vec![has_thread?])?])
 }
 
 /// `tgkill(tgid, ..)` with `tgid` the caller's own pid: a signal to one of
@@ -918,7 +925,7 @@ mod tests {
     fn every_profile_compiles_to_a_filter() {
         let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
         assert!(!errno_filter(arch).unwrap().is_empty());
-        for profile in [
+        let empty = [
             Profile::Supervisor {
                 binary: "/lotse".into(),
             },
@@ -926,13 +933,89 @@ mod tests {
                 connect_ports: vec![554],
             },
             Profile::Decoder,
-        ] {
-            assert!(
-                !allowlist(&profile, arch, OWN, false).unwrap().is_empty(),
-                "{}",
-                profile.name()
-            );
-        }
+        ]
+        .map(|profile| allowlist(&profile, arch, OWN, false).unwrap().is_empty());
+        assert_eq!(empty, [false; 3], "supervisor, worker, decoder");
+    }
+
+    #[test]
+    fn seccomp2_an_architecture_without_an_allowlist_is_reported_or_refused() {
+        let mut notes = Vec::new();
+        let status = apply(&Profile::Decoder, Mode::On, "s390x", &mut notes).unwrap();
+        assert_eq!(status, LayerStatus::Unavailable);
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with("seccomp: no allowlist for this architecture: "),
+            "{notes:?}"
+        );
+        let err = apply(&Profile::Decoder, Mode::Require, "s390x", &mut notes).unwrap_err();
+        assert!(
+            matches!(&err, SandboxError::Required { layer: "seccomp", reason } if *reason == notes[0]),
+            "{err}"
+        );
+        assert_eq!(notes.len(), 1, "require reports through the error");
+    }
+
+    /// As a container's own seccomp profile can, a filter on this test's
+    /// thread answers `seccomp(2)` with `EPERM`, so neither of the
+    /// profile's filters is installed. Filters apply to the calling thread
+    /// only (seccomp(2), without `SECCOMP_FILTER_FLAG_TSYNC`).
+    #[test]
+    fn seccomp2_a_filter_the_kernel_refuses_is_reported_or_refused() {
+        let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
+        let mut rules = BTreeMap::new();
+        rules.insert(libc::SYS_seccomp, Vec::new());
+        let eperm = u32::try_from(libc::EPERM).unwrap();
+        let refuse = compile(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(eperm),
+            arch,
+        );
+        seccompiler::apply_filter(&refuse.unwrap()).unwrap();
+
+        let worker = Profile::Worker {
+            connect_ports: vec![554],
+        };
+        let mut notes = Vec::new();
+        let status = apply(&worker, Mode::On, std::env::consts::ARCH, &mut notes).unwrap();
+        assert_eq!(status, LayerStatus::Unavailable);
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with("seccomp: the kernel or container refused the filter: "),
+            "{notes:?}"
+        );
+        let err = apply(&worker, Mode::Require, std::env::consts::ARCH, &mut notes).unwrap_err();
+        assert!(
+            matches!(&err, SandboxError::Required { layer: "seccomp", reason } if *reason == notes[0]),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_filter_seccompiler_cannot_build_is_a_seccomp_step_error() {
+        let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
+        let built = compile(
+            BTreeMap::new(),
+            SeccompAction::Allow,
+            SeccompAction::Allow,
+            arch,
+        );
+        let err = built.map_err(seccomp_step).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SandboxError::Step {
+                    step: "seccomp",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "seccomp failed: `match_action` and `mismatch_action` are equal."
+        );
     }
 
     #[test]
