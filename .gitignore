@@ -1,0 +1,40 @@
+# Rust build output (Cargo.lock is committed: lotse ships a binary)
+/target/
+**/*.rs.bk
+*.pdb
+
+# cargo-fuzz
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# cargo-llvm-cov
+lcov.info
+*.profraw
+*.profdata
+
+# cargo-mutants
+/mutants.out*/
+
+# Python (scripts/)
+__pycache__/
+*.py[cod]
+
+# The browser test's Python environment and tool caches (uv, mypy, ruff)
+.venv/
+.mypy_cache/
+.ruff_cache/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Local environment
+.env
+.env.*
+
+# Manual test results
+/manual-test-results/

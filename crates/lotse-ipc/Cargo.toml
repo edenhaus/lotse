@@ -1,0 +1,29 @@
+[package]
+name = "lotse-ipc"
+description = "Supervisor-worker messages, length-prefixed framing over a socketpair, fd passing and memfd bulk transfer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+postcard = { workspace = true }
+# socketpair, sendmsg/recvmsg with SCM_RIGHTS. `time` only because rustix 1.1's libc backend does
+# not build with `net` alone on macOS (its sockopt code needs the `timespec` type `time` gates).
+rustix = { workspace = true, features = ["net", "time"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net"] } # `AsyncFd` readiness on the socketpair
+tracing = { workspace = true }
+
+[dev-dependencies]
+rustix = { workspace = true, features = ["process"] } # lowers the descriptor limit to fill the table in a test
+tokio = { workspace = true, features = ["macros", "io-util", "rt-multi-thread"] }
+
+[lints]
+workspace = true

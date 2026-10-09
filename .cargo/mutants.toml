@@ -1,0 +1,61 @@
+# cargo-mutants configuration.
+# `mise run mutants` runs the changed lines; the nightly job runs the whole workspace.
+test_tool = "nextest"
+# Test infrastructure: exercised by the other crates' tests and left out of
+# the coverage gate for the same reason (mise.toml `coverage`).
+exclude_globs = ["crates/lotse-testing/**", "crates/lotse-codec/src/aac/test_data.rs"]
+# Equivalent mutants: mutations that cannot change behavior, each with its reason.
+# Keep this list short and delete entries with the code they refer to.
+exclude_re = [
+    # The default body already returns `None`.
+    "replace Handler::unsubscribed -> Option<Event> with None",
+    # The arms only pick the log level; the fallback arm logs the same event at debug.
+    "delete match arm SessionEvent::(Answer|State|Warning)\\{.*\\} in State::deliver_session",
+    # The shifted-in low byte is zero, so `|` and `^` produce the same value.
+    "replace \\| with \\^ in encode_ulid",
+    # The type preference, local preference and component occupy disjoint bits.
+    "replace \\| with \\^ in srflx_candidate",
+    # 248 itself maps to 'A' as 248 % 62 == 0: one value of bias, no observable behavior.
+    "replace < with <= in random_chars",
+    # An equal profile is taken by the arms before, so `>` and `>=` cannot differ there.
+    "video/h264.rs:.*replace > with >= in choose_pt$",
+    # The profile, constraint and level bytes are shifted into disjoint bits, so `|` and `^`
+    # produce the same value.
+    "video/h264.rs:.*replace \\| with \\^ in stream_profile_level_id$",
+    # The bit shifted in lands in a zero low bit (and ADTS length fields in
+    # disjoint bits), so `|` and `^` produce the same value.
+    "replace \\| with \\^ in BitReader<'a>::read",
+    "replace \\| with \\^ in strip_adts",
+    # Only picks whether the one-per-connection warning is logged.
+    "replace == with != in publish_aac",
+    "replace == with != in violation$",
+    # A stream's RTP channel is even (`ReceiverReports::set_up` takes no other), so `| 1`
+    # and `^ 1` name the same RTCP channel.
+    "rtcp.rs:.*replace \\| with \\^ in Report::interleave$",
+    # Only logs, rate-limited, why a receiver report did not leave.
+    "replace UdpRelay::sent with \\(\\)$",
+    # Only picks whether the rate-limited unroutable warning is logged.
+    "replace \\|\\| with && in Peers::route",
+    "replace == with != in Peers::route",
+    # The seconds shifted up 32 bits and the fraction below 2^32 occupy disjoint bits.
+    "replace \\| with \\^ in ntp_timestamp",
+    # The CVO flip bit and the rotation bits are disjoint, so `|` and `^` produce the same byte.
+    "cvo.rs:.*replace \\| with \\^ in byte$",
+    # Compiled only under `--cfg tokio_unstable`, which no mutants run sets: a mutation there
+    # changes nothing that is built. `mise run console-check` lints and tests that code.
+    "enabled::(layer|start)",
+    "replace console::spawn(_blocking)? -> JoinHandle",
+    # H.265 headers (RFC 7798 §1.1.4, §4.4.2, §4.4.3) and the SPS bit reader: the fields
+    # OR-ed together occupy disjoint bits, so `|` and `^` produce the same value.
+    "h265/nal.rs:.*replace \\| with \\^ in (layer_id|parse|aggregate|fu_indicator|fu)$",
+    "h265/sps.rs:.*replace \\| with \\^ in Bits<'a>::bits$",
+    # The FU-A indicator and header (RFC 6184 §5.8): F and NRI above the type, S and E above
+    # the original type, disjoint bits, so `|` and `^` produce the same value.
+    "h264/nal.rs:.*replace \\| with \\^ in fu_part$",
+    # A unit of exactly the target goes through `fragment`, which returns it whole, and alone
+    # either way: the same payloads in the same order.
+    # (Column 27 is `unit.len() > self.max_payload`; the group check after it stays mutated.)
+    "h265/packet.rs:\\d+:27: replace > with >= in PacketNormalizer::pack_units",
+    # retina's RTP channel is even, so OR-ing in the RTCP bit and XOR-ing it set the same channel.
+    "lotse-rtsp/src/udp.rs:.*replace \\| with \\^ in UdpRelay::datagram$",
+]

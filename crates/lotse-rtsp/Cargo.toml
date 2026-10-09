@@ -1,0 +1,39 @@
+[package]
+name = "lotse-rtsp"
+description = "RTSP source on retina, with the backchannel extension point."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+futures-util = { workspace = true } # the session's packet stream
+retina = { workspace = true, features = ["h265"] } # `h265`: the RFC 7798 §7.1 `sprop-vps`, `sprop-sps` and `sprop-pps` of an H.265 camera's SDP
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustls = { workspace = true } # `rtsps`: the client configuration and the certificate verifier
+sha2 = { workspace = true } # the `tls_fingerprint` pin of the camera's leaf certificate
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "io-util", "sync"] } # `select!` over packets and cancellation; the `rtsps` relay's sockets and copy loop; `sync`: the TCP relay's wake-up when a receiver report is first scheduled
+tokio-rustls = { workspace = true } # the TLS stream to an `rtsps` camera
+tracing = { workspace = true }
+url = { workspace = true } # the URL retina connects to, host replaced by the resolved address
+webpki-roots = { workspace = true } # the embedded roots an `rtsps` camera is verified against without a pin
+lotse-codec = { workspace = true }
+lotse-core = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] } # the end-to-end tests against the fake camera
+lotse-core = { workspace = true, features = ["test-util"] } # the fake clock
+lotse-testing = { workspace = true } # the fake camera and the source harness
+tokio-util = { workspace = true } # cancels the runner in the reconnect row
+tracing-subscriber = { workspace = true } # captures the `insecure_tls` and `frame_over_browser_limit` warnings; runs the UDP tests at `trace`
+
+[lints]
+workspace = true

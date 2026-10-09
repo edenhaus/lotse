@@ -1,0 +1,31 @@
+too-many-arguments-threshold = 6
+# Proper names that are not code; ".." keeps clippy's defaults.
+doc-valid-idents = ["WebDriver", "WebAudio", "MediaMTX", ".."]
+# The deny-level lints in Cargo.toml target production code, not tests.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-print-in-tests = true
+# No in-tests switch exists for `arithmetic_side_effects`; test modules relax it with an inner
+# `#![allow(...)]`, see AGENTS.md.
+
+# Design rules that a lint can enforce. `allow-invalid` keeps an entry inert until
+# the crate it names is a dependency; the `replacement` must exist by then.
+disallowed-methods = [
+  { path = "tokio::spawn", reason = "every task is named and cancellable", replacement = "lotse_core::task::spawn_named", allow-invalid = true },
+  { path = "tokio::task::spawn", reason = "every task is named and cancellable", replacement = "lotse_core::task::spawn_named", allow-invalid = true },
+  { path = "tokio::task::spawn_blocking", reason = "every task is named", replacement = "lotse_core::task::spawn_blocking_named", allow-invalid = true },
+  { path = "std::time::Instant::now", reason = "time comes from the injected clock so tests can drive it; the clock implementation carries the one scoped expect", replacement = "lotse_core::clock::Clock::now" },
+  { path = "std::time::SystemTime::now", reason = "time comes from the injected clock", replacement = "lotse_core::clock::Clock::wall_now" },
+  { path = "tokio::time::Instant::now", reason = "time comes from the injected clock", replacement = "lotse_core::clock::Clock::now", allow-invalid = true },
+  { path = "std::env::var", reason = "configuration is parsed once, in the binary" },
+  { path = "std::env::var_os", reason = "configuration is parsed once, in the binary" },
+  { path = "std::thread::sleep", reason = "blocks a runtime thread, and timers come from the injected clock", replacement = "lotse_core::clock::Clock::sleep" },
+  { path = "tokio::time::sleep", reason = "timers come from the injected clock so tests can drive them", replacement = "lotse_core::clock::Clock::sleep", allow-invalid = true },
+  { path = "tokio::time::sleep_until", reason = "timers come from the injected clock", replacement = "lotse_core::clock::Clock::sleep", allow-invalid = true },
+  { path = "tokio::time::timeout", reason = "timers come from the injected clock", replacement = "lotse_core::clock::Clock::sleep", allow-invalid = true },
+  { path = "tokio::time::interval", reason = "timers come from the injected clock", replacement = "lotse_core::clock::Clock::sleep", allow-invalid = true },
+  { path = "std::process::Command::new", reason = "only the supervisor's worker manager spawns processes, with a scoped expect" },
+  { path = "tokio::process::Command::new", reason = "only the supervisor's worker manager spawns processes, with a scoped expect", allow-invalid = true },
+]

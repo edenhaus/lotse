@@ -1,0 +1,40 @@
+# go2rtc as its common deployment configures it, for the comparison (`mise run compare`,
+# tests/browser/test_comparison.py). It is that deployment's default variant (no debug UI); the
+# comparison renders it with Python's string.Template (`servers.py`).
+#
+# What differs from the deployment's file, and why:
+# - api.listen: on loopback at a free port, not "" (no HTTP listener; the debug UI variant opens
+#   ":11984"): the test page signals to go2rtc's WebSocket API itself, where the deployment's own
+#   front end goes through its server, which talks to go2rtc over the Unix socket.
+# - api.local_auth: false, not true: a browser WebSocket cannot send Basic credentials, so
+#   loopback (and the Unix socket) skip them; the harness still sends them, as the deployment does.
+# - api.origin: "*", not unset: the page comes from the dev viewer, another port, and go2rtc
+#   takes a WebSocket only from its own origin unless told otherwise.
+# - rtsp.listen and webrtc.listen: free ports, not 18554 and 18555, so another go2rtc running on
+#   the machine does not collide; the address part is the deployment's.
+# Everything else is the deployment's, the WebRTC ICE servers (none) included.
+
+app:
+  modules: ["api", "exec", "ffmpeg", "http", "mjpeg", "onvif", "rtmp", "rtsp", "srtp", "webrtc", "ws"]
+
+api:
+  listen: "127.0.0.1:${api_port}"
+  unix_listen: "${unix_socket}"
+  allow_paths: ["/", "/api", "/api/frame.jpeg", "/api/preload", "/api/schemes", "/api/streams", "/api/webrtc", "/api/ws"]
+  local_auth: false
+  origin: "*"
+  username: ${username}
+  password: ${password}
+
+# ffmpeg needs the exec module
+# Restrict execution to only ffmpeg binary
+exec:
+  allow_paths:
+    - ffmpeg
+
+rtsp:
+  listen: "127.0.0.1:${rtsp_port}"
+
+webrtc:
+  listen: ":${webrtc_port}/tcp"
+  ice_servers: []

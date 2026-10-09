@@ -1,0 +1,33 @@
+# Per-target code generation.
+#
+# The musl targets compile C code and link through zig (scripts/zig-*), so `cargo build`,
+# `cargo nextest run --target …-musl` and `mise run release-build` share one toolchain and
+# produce the same kind of binary. Paths are relative to the repository root.
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v2", "-C", "target-feature=+crt-static"]
+linker = "scripts/zig-cc-x86_64-linux-musl"
+
+# On aarch64, `aes` 0.8 and `polyval` 0.6 (SRTP's AES-GCM) use the ARMv8 crypto extensions
+# only under these cfgs, detected at runtime, falling back to software where they are missing
+# (the Pi 4); without them every aarch64 build encrypts in software.
+[target.aarch64-unknown-linux-musl]
+rustflags = [
+  "-C", "target-feature=+crt-static", # ARMv8.0 baseline; outline-atomics is on by default
+  "--cfg", "aes_armv8",
+  "--cfg", "polyval_armv8",
+]
+linker = "scripts/zig-cc-aarch64-linux-musl"
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+[env]
+# cc-rs (build scripts of libopus, mimalloc, OpenH264) reads the per-target CC/AR.
+CC_x86_64_unknown_linux_musl = { value = "scripts/zig-cc-x86_64-linux-musl", relative = true }
+AR_x86_64_unknown_linux_musl = { value = "scripts/zig-ar", relative = true }
+CC_aarch64_unknown_linux_musl = { value = "scripts/zig-cc-aarch64-linux-musl", relative = true }
+AR_aarch64_unknown_linux_musl = { value = "scripts/zig-ar", relative = true }

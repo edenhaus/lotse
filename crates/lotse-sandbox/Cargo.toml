@@ -1,0 +1,30 @@
+[package]
+name = "lotse-sandbox"
+description = "Privilege drop, no_new_privs, rlimits, and Landlock and seccomp profiles per process kind."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rustix = { workspace = true, features = ["process", "thread"] } # privilege drop, prctl, rlimits
+serde = { workspace = true } # the `info.sandbox` report crosses IPC and the API
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { workspace = true }
+libc = { workspace = true }
+seccompiler = { workspace = true }
+
+[dev-dependencies]
+rustix = { workspace = true, features = ["net"] } # the probe child's calls on the shared socket
+serde_json = { workspace = true } # the report's JSON shape, and the probe child's output
+
+[lints]
+workspace = true

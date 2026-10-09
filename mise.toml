@@ -1,0 +1,185 @@
+# Contributor tooling and tasks. `mise install`, then `mise tasks` for the list.
+# Checks live in .pre-commit-config.yaml; `mise run check` runs all of them.
+#
+# mise.lock records every downloaded tool's URL and SHA-256 for linux-x64, linux-arm64 and
+# macos-arm64, and `mise install` checks each download against it (CI installs `--locked`). After
+# changing a tool, run `mise lock` and commit both files; Renovate does the same for its updates.
+
+# The release that wrote mise.lock (lockfile revision 2) and that CI pins (jdx/mise-action `version`).
+min_version = "2026.9.15"
+
+[settings]
+# Rust comes from rust-toolchain.toml, so the version is pinned in one place.
+idiomatic_version_file_enable_tools = ["rust"]
+# `cargo:` tools build from crates.io source with `cargo install --locked` (the registry checks
+# each crate's SHA-256), never a cargo-binstall download, which mise.lock could not check.
+cargo.binstall = false
+
+[tools]
+prek = "0.5.4"
+cargo-deny = "0.20.2"
+"github:nextest-rs/nextest" = { version = "0.9.146", version_prefix = "cargo-nextest-" }
+"github:rust-cross/cargo-zigbuild" = "0.23.4"
+zig = "0.15.2" # C compiler and linker for every musl build, tests included (see .cargo/config.toml)
+cmake = "4.4.3" # builds the bundled libopus (`opusic-sys`, behind the `opus` crate) on every host
+"github:taiki-e/cargo-llvm-cov" = "0.9.1" # line coverage gate
+"cargo:cargo-mutants" = "27.1.0" # mutation testing gate (no aarch64-darwin release asset, so built from source)
+"github:taiki-e/cargo-hack" = "0.6.45" # checks every feature combination builds
+"github:boshen/cargo-shear" = "1.14.0" # fails on unused dependencies
+"github:EmbarkStudios/cargo-about" = "0.9.2" # THIRD_PARTY_LICENSES.md of a release (`mise run licenses`)
+"github:CycloneDX/cyclonedx-rust-cargo" = { version = "0.5.9", version_prefix = "cargo-cyclonedx-" } # the CycloneDX SBOM of a release (`mise run sbom`)
+"github:release-plz/release-plz" = { version = "0.3.169", version_prefix = "release-plz-v" } # the version and changelog PR, the tag and the release notes (release.yml)
+uv = "0.12.23" # the browser test's Python, Selenium and pytest, and its checks (tests/browser/uv.lock)
+
+# The camera of the browser and interop tests: ffmpeg encodes and publishes, MediaMTX serves RTSP.
+# Third-party tools on purpose, so the stream is not our own reading of the specs.
+"github:bluenviron/mediamtx" = "1.21.1"
+# FFmpeg 9.0.2, static GPL builds (libx264, libopus; the native aac and pcm_mulaw encoders). Linux:
+# BtbN/FFmpeg-Builds, the build ffmpeg.org links, a month-end autobuild (kept for years, the daily
+# ones only for weeks) from the release/9.0 branch. macOS arm64 (development only): Martin Riedl's
+# static release build; evermeet.cx, the one ffmpeg.org links, is Intel-only.
+"github:BtbN/FFmpeg-Builds" = { version = "autobuild-2026-09-30-13-08", version_prefix = "", os = ["linux"], strip_components = 1, bin_path = "bin", platforms = { linux-x64 = { asset_pattern = "ffmpeg-n9.0.2-17-g2a571b6068-linux64-gpl-9.0.tar.xz", checksum = "sha256:68ee646831adaae2495618346f3bba94ff207ff83bbd34d643e7004730d66269" }, linux-arm64 = { asset_pattern = "ffmpeg-n9.0.2-17-g2a571b6068-linuxarm64-gpl-9.0.tar.xz", checksum = "sha256:91afcd7695d4bbbb9e0057aa10baaf9875ec4e1a97303f9059ec971336a2ab46" } } }
+"http:ffmpeg" = { version = "9.0.2", os = ["macos/arm64"], url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip", checksum = "sha256:c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924" }
+# go2rtc, the server the browser test is compared with (`mise run compare`, report only): the
+# release its common deployment pins, observed 2026-10-07. Its release binaries are UPX-packed;
+# they run as they are.
+"github:AlexxIT/go2rtc" = { version = "1.9.14", bin = "go2rtc", platforms = { linux-x64 = { asset_pattern = "go2rtc_linux_amd64", checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6" }, linux-arm64 = { asset_pattern = "go2rtc_linux_arm64", checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50" }, macos-arm64 = { asset_pattern = "go2rtc_mac_arm64.zip", checksum = "sha256:919b78adc759d6b3883d1e1b2ac915ac0985bb903ff1897b4d228527bd64690c" } } }
+
+# Git hooks are installed on every `mise install`, so nobody has to remember.
+[hooks]
+postinstall = "prek install"
+
+[tasks.check]
+description = "Everything CI runs: all prek hooks, tests included, on all files"
+run = "prek run --all-files --stage manual --show-diff-on-failure"
+
+[tasks.test-musl]
+description = "Run the tests on the host's static musl target (Linux only)"
+run = 'cargo nextest run --workspace --all-features --locked --no-tests=warn --target "$(uname -m)-unknown-linux-musl"'
+
+[tasks.audit]
+description = "Advisories (RustSec database) for the root and the fuzz workspace; needs the network"
+run = [
+  "cargo deny --all-features check advisories",
+  "cargo deny --manifest-path fuzz/Cargo.toml --all-features check advisories",
+]
+
+[tasks.coverage]
+description = "Line-coverage gate: 100% over the workspace; Linux is the reference host"
+run = "cargo llvm-cov nextest --workspace --all-features --locked --no-tests=warn --fail-under-lines 100 --ignore-filename-regex 'crates/lotse-testing/'"
+
+[tasks.mutants]
+description = "Mutation-testing gate on the lines changed against a base ref (default origin/main)"
+usage = 'arg "[base]" help="git ref to diff against" default="origin/main"'
+run = """
+diff="$(mktemp)"
+git diff "${usage_base}...HEAD" > "$diff"
+cargo mutants --workspace --all-features --test-tool nextest --in-diff "$diff"
+"""
+
+[tasks.turn-e2e]
+description = "The TURN client against a real coturn in Docker (UDP and TCP, long-term and REST credentials); needs docker and curl"
+run = "scripts/turn-e2e.sh"
+
+[tasks.interop]
+description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus (the ignored `mediamtx_` tests)"
+run = "cargo nextest run -p lotse --all-features --locked --test interop --run-ignored only --no-tests=fail mediamtx_"
+
+[tasks.load]
+description = "The load generator: N fake cameras x M headless viewers against a release daemon; report in target/load-report.json"
+usage = '''
+arg "[cameras]" help="fake cameras, one stream each" default="2"
+arg "[viewers]" help="viewers per stream (at most 16, the daemon's per-stream limit)" default="5"
+arg "[duration]" help="how long the viewers play (60s, 5m)" default="60s"
+'''
+run = 'scripts/load.sh --cameras "$usage_cameras" --viewers "$usage_viewers" --duration "$usage_duration" --report target/load-report.json'
+
+[tasks.soak]
+description = "The soak: cycles of viewers joining and leaving and cameras hanging up, checked for memory, task and descriptor growth; report in target/soak-report.json"
+usage = '''
+arg "[duration]" help="how long it runs (30m, 5h, 72h)" default="1h"
+arg "[cycle]" help="one cycle of viewers and a camera hang-up; over a minute, after which the daemon's reconnect backoff starts over" default="5m"
+'''
+run = 'scripts/load.sh --cameras 4 --viewers 2 --duration "$usage_duration" --cycle "$usage_cycle" --drop --sample 10s --report target/soak-report.json'
+
+[tasks.browser]
+description = "The browser test: Selenium has Chrome, Firefox or Safari play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash); report and logs in target/browser-<engine>/<case>/"
+usage = '''
+arg "[engine]" help="chrome, firefox or safari" default="chrome"
+arg "[play]" help="how long each window plays (20s); a case with a disruption plays one before it and one after" default="20s"
+arg "[case]" help="join, aac, pli, reconnect, crash or all" default="all"
+'''
+run = 'scripts/browser.sh "$usage_engine" "$usage_play" --case "$usage_case"'
+
+[tasks.compare]
+description = "The go2rtc comparison: the browser test through lotse and through go2rtc as its common deployment configures it, alternating, N runs each, reported side by side (fails only on lotse's own checks); report in target/compare-<engine>/"
+usage = '''
+arg "[engine]" help="chrome, firefox or safari" default="chrome"
+arg "[runs]" help="plays through each server" default="5"
+arg "[play]" help="how long each play lasts after the first frame (20s)" default="20s"
+'''
+run = 'scripts/compare.sh "$usage_engine" "$usage_runs" "$usage_play"'
+
+[tasks.console]
+description = "The daemon with tokio-console in the supervisor (--cfg tokio_unstable, fake source, no sandbox); then run `tokio-console`"
+usage = 'arg "[dir]" help="a 0700 directory for the control socket" default="/tmp/lotse-console"'
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/console" }
+run = """
+mkdir -m 0700 -p "$usage_dir"
+cargo run --locked --bin lotse --features console,source-fake -- serve --socket "$usage_dir/lotse.sock" --sandbox off
+"""
+
+[tasks.console-check]
+description = "Lints and tests the console build, which only --cfg tokio_unstable compiles (CI's `console` job)"
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/console" }
+run = [
+  "cargo clippy --locked -p lotse -p lotse-core --features lotse/console,lotse/source-fake --all-targets -- -D warnings",
+  "cargo nextest run --locked -p lotse -p lotse-core --features lotse/console,lotse/source-fake --no-tests=warn console logging task::",
+]
+
+[tasks.fuzz]
+description = "Run one cargo-fuzz target for N seconds on the pinned nightly (installed if missing); needs cargo-fuzz (`cargo install cargo-fuzz --locked`), the one nightly use"
+usage = '''
+arg "<target>" help="a target under fuzz/fuzz_targets"
+arg "[secs]" help="seconds to run" default="60"
+'''
+# The nightly is pinned by date, the same one as CI's fuzz-smoke (Renovate bumps both). cargo-fuzz
+# has no `--locked`: the fetch fails on a stale fuzz/Cargo.lock, and the build then resolves
+# nothing new. scripts/fuzz.sh holds libFuzzer's time and memory limits, for CI too.
+env = { NIGHTLY = "nightly-2026-10-01" }
+run = [
+  'rustup toolchain install "$NIGHTLY" --profile minimal',
+  'cargo "+$NIGHTLY" fetch --manifest-path fuzz/Cargo.toml --locked',
+  'scripts/fuzz.sh "$usage_target" "$usage_secs"',
+]
+
+[tasks.release-build]
+description = "Static musl binary (Linux only; CI builds each arch on its own runner); zig links (.cargo/config.toml)"
+usage = 'arg "[arch]" help="x86_64 or aarch64" default="x86_64"'
+# On macOS cmake archives libopus with the host's ranlib, which drops the ELF objects: the build
+# would succeed and the binary fail to link, so it stops here instead.
+run = """
+[ "$(uname -s)" = Linux ] || { echo "release-build runs on Linux; CI builds both arches (build.yml)" >&2; exit 1; }
+cargo build --release --locked --bin lotse --target ${usage_arch}-unknown-linux-musl
+"""
+
+# The release steps that need no tag, so a release can be checked and reproduced off CI;
+# release.yml runs the same tasks.
+[tasks.sbom]
+description = "CycloneDX SBOMs of the binary, one per release target, in target/dist/ (scripts/sbom.py)"
+run = [
+  "python3 scripts/sbom.py x86_64-unknown-linux-musl target/dist/lotse-x86_64-unknown-linux-musl.cdx.json",
+  "python3 scripts/sbom.py aarch64-unknown-linux-musl target/dist/lotse-aarch64-unknown-linux-musl.cdx.json",
+]
+
+[tasks.licenses]
+description = "THIRD_PARTY_LICENSES.md of the crates the binary links, in target/dist/ (cargo about, .cargo/about.toml)"
+run = """
+mkdir -p target/dist
+cargo about generate --locked --fail --config .cargo/about.toml --manifest-path crates/lotse/Cargo.toml \
+  --output-file target/dist/THIRD_PARTY_LICENSES.md .cargo/about.hbs
+"""
+
+[tasks.image]
+description = "The scratch image from the static binaries: `load [arch]` into the local Docker as lotse:dev, or `push <repository> <version>` (release.yml); see scripts/image.sh"
+run = "scripts/image.sh"

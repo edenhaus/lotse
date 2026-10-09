@@ -1,0 +1,8 @@
+# nextest settings for every run: the prek hook, `mise run check`, coverage
+# (`cargo llvm-cov nextest`), mutants (`--test-tool nextest`) and CI.
+
+[profile.default]
+# A hung test is reported after a minute and killed after three, with its
+# whole process group: the `lotse serve` and workers it started go with it.
+# The slowest test takes about 10 s (2026-10-09), so this only fires on a hang.
+slow-timeout = { period = "60s", terminate-after = 3 }

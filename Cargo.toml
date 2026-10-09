@@ -1,0 +1,267 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["fuzz"] # cargo-fuzz crate is its own workspace (nightly, libfuzzer-sys)
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0" # see README, License
+publish = false
+rust-version = "1.98"
+repository = "https://github.com/edenhaus/lotse"
+readme = "README.md"
+keywords = ["media-server", "webrtc", "rtsp", "camera", "streaming"]
+categories = ["multimedia::video", "network-programming"]
+
+[workspace.dependencies]
+# Every dependency, internal crates included, is declared here once and used by crates with
+# `{ workspace = true }`. External crates set `default-features = false` and carry a comment
+# saying why they exist. Dependency direction is strictly downward and enforced by `[bans] deny`
+# in .cargo/deny.toml.
+# `cargo shear` fails on entries nothing uses, so this table only ever lists real edges.
+
+# Runtime: tasks are spawned only through `lotse_core::task`.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# Typed errors in every library crate; `anyhow` stays in `main` (AGENTS.md).
+thiserror = { version = "2", default-features = false, features = ["std"] }
+# Structured logs and spans; every event carries its stream, session and task.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# RFC 3986 parsing of source URLs, so credentials are split off and redacted at the type level.
+url = { version = "2", default-features = false, features = ["std"] }
+# Percent-decoding of the userinfo in source URLs (RFC 3986 §3.2.1); already in the tree via `url`.
+percent-encoding = { version = "2", default-features = false, features = ["std"] }
+# Reference-counted byte buffers: RTP payloads are slices of the receive buffer, and fan-out
+# costs a refcount per subscriber, never a copy.
+bytes = { version = "1", default-features = false }
+# Lock-free snapshots read on the media path: GOP cache, codec descriptors, later stats.
+arc-swap = { version = "1", default-features = false }
+# `CancellationToken`: the cancellation path every task and source run has.
+tokio-util = { version = "0.7", default-features = false }
+# Untyped JSON for per-scheme source options until a factory validates them into its own type.
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# Typed messages on every boundary: IPC (postcard) and the control API (JSON).
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+# Compact, typed supervisor↔worker messages.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+# Safe syscall wrappers: socketpairs, `sendmsg`/`recvmsg` with `SCM_RIGHTS`, later prctl, pidfd,
+# memfd and rlimits.
+rustix = { version = "1", default-features = false, features = ["std"] }
+# Landlock filesystem and TCP-connect rules per process kind, Linux only.
+landlock = { version = "0.4", default-features = false }
+# seccomp-bpf allowlists per process kind, Linux only.
+seccompiler = { version = "0.5", default-features = false }
+# The supervisor's interface enumeration (`getifaddrs(3)`) for the host candidates, and the DSCP a
+# datagram arrived with in lotse-testing on Linux only: `recvmsg` with the `IP_TOS` and
+# `IPV6_TCLASS` control messages. Neither rustix nor socket2 has either without `unsafe`.
+nix = { version = "0.31", default-features = false }
+# Syscall numbers for the seccomp allowlists, and the worker's DSCP control message (`cmsghdr`,
+# `IP_TOS`, `IPV6_TCLASS`), which rustix cannot send; everything else goes through rustix.
+libc = { version = "0.2", default-features = false }
+# The command line of the one binary: subcommands, flags and `LOTSE_*` environment variables.
+clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+# The standalone TOML configuration file, below flags and environment in precedence.
+toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
+# JSON (or text) log lines on stderr with `RUST_LOG` filtering.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
+# The tokio-console layer and its gRPC server, in development builds of the binary only: behind
+# the `console` feature, which also needs `--cfg tokio_unstable`.
+console-subscriber = { version = "0.5", default-features = false }
+# Ergonomic error context at the top level only: `anyhow` never leaves `main` (AGENTS.md).
+anyhow = { version = "1", default-features = false, features = ["std"] }
+# JSON Schema 2020-12 for every control API message, generated from the DTOs and committed.
+schemars = { version = "1", default-features = false, features = ["std", "derive"] }
+# The control API server: HTTP/1.1 with the WebSocket upgrade on the Unix socket; also the dev
+# viewer's pages and relay in `lotse-testing`.
+axum = { version = "0.8", default-features = false, features = ["ws", "http1", "tokio"] }
+# The control API's HTTP/1.1 connection, configured directly because `axum::serve` exposes no
+# limits: upgrade headers <= 16 KiB and a header count. Already axum's engine; no new code.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+# Tokio IO for hyper and the tower-to-hyper service adapter of the control API's accept loop; the
+# same crate and features axum uses.
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
+# `Stream`/`Sink` adapters for the WebSocket halves; the WebSocket types come from axum.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# The RTSP client with the camera quirk history the design chose; packets are taken as RTP, so the
+# H.265 depacketizer feature is off. Pinned to a commit of main until a release carries its fixes
+# for camera input: no panic on an `m=` line without a format, sdp-types 0.2, the response size
+# limit (`SessionOptions::max_message_size`) and a validated `Session` id.
+retina = { git = "https://github.com/scottlamb/retina", rev = "7698fa14924768f024aa16126a5e3ca324e5bfe6", default-features = false }
+# RTSP message parsing and serialization for the fake camera of the tests.
+rtsp-types = { version = "0.1", default-features = false }
+# H.264 bitstream syntax (SPS profile, level and dimensions, SEI) on the side branch; the packet
+# layer parses only NAL headers itself.
+h264-reader = { version = "0.9", default-features = false }
+# Transaction ids of the STUN client (RFC 8489 §5: 96 bits, unpredictable); the OS entropy source.
+getrandom = { version = "0.3", default-features = false }
+# STUN MESSAGE-INTEGRITY (RFC 8489 §14.5) in the supervisor's demux and in str0m's crypto provider.
+hmac = { version = "0.12", default-features = false }
+sha1 = { version = "0.10", default-features = false }
+# The TURN client's long-term credential key for the MD5 password algorithm (RFC 8489 §9.2.2,
+# §18.5.1.1), which every TURN server still offers; already in the tree via retina's Digest auth.
+md-5 = { version = "0.10", default-features = false }
+# Socket options the standard library lacks: dual-stack, buffer sizes, DSCP, and `sendmsg` with a
+# control message for the audio track's DSCP.
+socket2 = { version = "0.6", default-features = false, features = ["all"] }
+# The supervisor's receive thread: batched `recvmmsg` with GRO, and each datagram's destination
+# address (`IP_PKTINFO`, `IPV6_PKTINFO`) without `unsafe` of ours.
+quinn-udp = { version = "0.6", default-features = false }
+# The WebRTC engine, sans-IO, without a crypto feature: lotse-webrtc's own provider supplies it,
+# because str0m's `rust-crypto` feature turns on dimpl's `rcgen` feature and with it aws-lc-rs.
+str0m = { version = "0.24", default-features = false }
+# DTLS 1.2/1.3 of the crypto provider on its RustCrypto backend only, so neither aws-lc nor OpenSSL
+# is linked; already in the tree via str0m.
+dimpl = { version = "0.7", default-features = false, features = ["rust-crypto"] }
+# SRTP ciphers of the crypto provider: AES-CM (RFC 3711 §4.1.1) and AEAD AES-GCM (RFC 7714);
+# already in the tree via dimpl.
+aes = { version = "0.8", default-features = false }
+ctr = { version = "0.9", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+# TLS for `rtsps://` cameras, with the `ring` provider so the static musl build carries no OpenSSL or
+# aws-lc of its own; TLS 1.2 stays on because cameras often speak nothing newer.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# rustls over tokio streams: the client half for `rtsps://`, the server half for the fake camera.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Mozilla's root certificates, embedded: the worker has no filesystem to read a CA bundle from.
+webpki-roots = { version = "1", default-features = false }
+# SHA-256 of the camera's leaf certificate for the `tls_fingerprint` pin, of the DTLS certificate
+# fingerprint (RFC 8122 §5) in str0m's crypto provider, and the TURN client's SHA-256 password
+# algorithm, USERHASH and MESSAGE-INTEGRITY-SHA256 (RFC 8489 §18.5.1.2, §14.4, §14.6); already in
+# the tree via dimpl.
+sha2 = { version = "0.10", default-features = false }
+# Self-signed certificates with the `ring` backend (already linked for rustls): the DTLS certificate of
+# every WebRTC session and the fake camera's TLS certificate.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+# The allocation-counting tests of the hot paths: a global allocator counting the calling thread's
+# allocations, linked only into the test binaries that use it.
+allocation-counter = { version = "0.8", default-features = false }
+# The WebSocket client of `lotse ctl` over the Unix socket; the same engine axum uses.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+
+# The Opus encoder of the AAC-LC → Opus transcoder, later the talk-back decoder: safe bindings to
+# libopus, bundled and built statically by cmake.
+opus = { version = "0.4", default-features = false }
+# The AAC-LC decoder at the head of the AAC-LC → Opus transcoder: pure Rust, LC only, fed the camera's
+# raw AAC frames in workers.
+symphonia-codec-aac = { version = "0.6", default-features = false }
+symphonia-core = { version = "0.6", default-features = false }
+# The resampler of the transcoder, AAC rates to Opus's 48 kHz: pure Rust windowed-sinc, without the
+# FFT resampler.
+rubato = { version = "5", default-features = false }
+
+# Workspace crates; the allowed edges are in .cargo/layering.toml.
+lotse-api = { path = "crates/lotse-api" }
+lotse-api-types = { path = "crates/lotse-api-types" }
+lotse-codec = { path = "crates/lotse-codec" }
+lotse-core = { path = "crates/lotse-core" }
+lotse-ipc = { path = "crates/lotse-ipc" }
+lotse-rtsp = { path = "crates/lotse-rtsp" }
+lotse-sandbox = { path = "crates/lotse-sandbox" }
+lotse-supervisor = { path = "crates/lotse-supervisor" }
+lotse-testing = { path = "crates/lotse-testing" }
+lotse-webrtc = { path = "crates/lotse-webrtc" }
+lotse-worker = { path = "crates/lotse-worker" }
+
+# Lint policy. Clippy runs with `-D warnings`, so every `warn` below fails the build. Suppress a
+# lint only with `#[expect(lint, reason = "...")]`; blanket relaxations for test modules are an
+# inner `#![allow(...)]` (AGENTS.md).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn" # every type can be logged with `?`; secrets redact in their own impl
+unreachable_pub = "warn"
+unnameable_types = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_must_use = "deny"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+# `tokio::task::Builder` (named tasks) only exists behind `tokio_unstable`. `aes_armv8` and
+# `polyval_armv8` select the ARMv8 crypto backends of `aes` and `polyval` (.cargo/config.toml),
+# which a test checks on aarch64. `coverage` is set by cargo-llvm-cov (the coverage gate) and
+# opens to sandboxed processes what the profiler runtime does when it writes its profile.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)", "cfg(aes_armv8)", "cfg(polyval_armv8)", "cfg(coverage)"] }
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+missing_docs_in_private_items = "warn" # missing_docs only covers the public API; we document everything
+# `nursery` is not enabled as a group: its lints are unstable and `redundant_pub_crate` contradicts
+# `unreachable_pub`. The ones we want are listed one by one.
+branches_sharing_code = "warn"
+cognitive_complexity = "warn"
+collection_is_never_read = "warn"
+debug_assert_with_mut_call = "warn"
+derive_partial_eq_without_eq = "warn"
+equatable_if_let = "warn"
+fallible_impl_from = "warn"
+future_not_send = "warn"
+iter_on_empty_collections = "warn"
+iter_on_single_items = "warn"
+large_stack_frames = "warn"
+mutex_integer = "warn"
+needless_collect = "warn"
+needless_pass_by_ref_mut = "warn"
+non_send_fields_in_send_ty = "warn"
+or_fun_call = "warn"
+path_buf_push_overwrite = "warn"
+read_zero_byte_vec = "warn"
+redundant_clone = "warn"
+set_contains_or_insert = "warn"
+significant_drop_in_scrutinee = "warn"
+significant_drop_tightening = "warn"
+string_lit_as_bytes = "warn"
+suboptimal_flops = "warn"
+trivial_regex = "warn"
+tuple_array_conversions = "warn"
+uninhabited_references = "warn"
+unnecessary_struct_initialization = "warn"
+unused_peekable = "warn"
+use_self = "warn"
+useless_let_if_seq = "warn"
+# hard errors on the things that turn into 3 a.m. pages
+unwrap_used = "deny"
+expect_used = "deny"                 # allowed in tests via clippy.toml
+panic = "deny"
+unreachable = "deny"                 # invariants live in the type system or return `internal_error`
+indexing_slicing = "deny"            # parsers use get()/split_at_checked()
+arithmetic_side_effects = "deny"     # wrapping_/checked_/saturating_ explicit on the media path
+unimplemented = "deny"
+todo = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"                # logs go to stderr; the one exception is `lotse ctl` output, in one module with a scoped expect
+print_stderr = "deny"                # use tracing
+exit = "deny"                        # `process::exit` skips destructors; `main` returns `ExitCode`
+mem_forget = "deny"                  # leaks fds and buffers
+let_underscore_must_use = "deny"     # `let _ = fallible()` would silently bypass `unused_must_use`
+allow_attributes = "deny"            # `#[expect]` fails once the lint no longer fires, so suppressions cannot rot
+allow_attributes_without_reason = "deny"
+large_futures = "warn"
+# lints whose policy lives elsewhere
+multiple_crate_versions = "allow"    # cargo-deny `[bans] multiple-versions` owns this
+# pedantic lints we consciously relax
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+# Profiles. Every process uses panic = "abort".
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+
+[profile.profiling] # perf / flamegraphs
+inherits = "release"
+strip = false
+debug = "line-tables-only"

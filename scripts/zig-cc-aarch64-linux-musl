@@ -1,0 +1,19 @@
+#!/bin/sh
+# C compiler and linker for the aarch64 musl target: zig, through cargo-zigbuild's wrapper, which
+# strips the flags zig does not understand. Referenced from .cargo/config.toml as the target's
+# `linker` and as `CC_aarch64_unknown_linux_musl`.
+#
+# rustc adds `-Wl,-O1` to optimized links; zig 0.15 reports that setting as deprecated and
+# ignored, and rustc turns linker stderr into a `linker_messages` warning. Drop the flag.
+n=$#
+i=0
+while [ "$i" -lt "$n" ]; do
+  arg="$1"
+  shift
+  case "$arg" in
+    -Wl,-O1) ;;
+    *) set -- "$@" "$arg" ;;
+  esac
+  i=$((i + 1))
+done
+exec cargo-zigbuild zig cc -- -target aarch64-linux-musl "$@"

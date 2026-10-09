@@ -1,0 +1,64 @@
+# The browser test: one pytest test, run once per browser (`--browser chrome|firefox|safari`), that
+# drives the browser with Selenium and checks what the test page measured. `mise run browser
+# <engine>` builds the daemon and the `lotse-browser` example and runs it; without `--browser` only
+# the checks' unit tests run. uv installs the Python (.python-version) and the packages pinned in
+# uv.lock.
+
+[project]
+name = "lotse-browser-test"
+version = "0.0.0"
+description = "The browser test of lotse and its go2rtc comparison: Selenium drives Chrome, Firefox or Safari"
+requires-python = ">=3.14"
+dependencies = [
+  "go2rtc-client==0.4.0", # go2rtc's Python client, the version its common deployment pins: the comparison registers the camera with go2rtc through it, as deployed
+  "psutil==7.2.2", # the comparison's per-process CPU and memory of lotse and go2rtc
+  "pytest==9.1.1",
+  "selenium==4.50.0", # the official W3C WebDriver bindings; its Selenium Manager finds or fetches the driver
+]
+
+[dependency-groups]
+dev = [
+  "mypy==2.4.0",
+  "ruff==0.16.10", # the version of the ruff-pre-commit hook; Renovate updates both in one PR
+  "types-psutil==7.2.2.20260906", # psutil's type stubs (typeshed), for mypy --strict
+]
+
+[tool.uv]
+package = false # a test, not a package
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100 # rustfmt's width, as in the Rust code
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812", # conflicts with the formatter (ruff warns when both are on)
+  "CPY001", # no file in the repository carries a copyright header; the license is in LICENSE-*
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# What conflicts with pytest and with the tests' conventions, as the Rust tests relax the
+# production-only lints (AGENTS.md).
+"test_*.py" = [
+  "D1", # test names are the docs
+  "PLR2004", # expected values are written inline
+  "S101", # pytest's assertions are plain `assert`
+]
+"conftest.py" = [
+  "S603", # the fixture starts the binaries the command line names, without a shell
+]
+
+[tool.mypy]
+strict = true
+python_version = "3.14"
+files = ["."]
+exclude = ["^\\.venv/"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+addopts = "--strict-markers -p no:cacheprovider"
+filterwarnings = ["error"]

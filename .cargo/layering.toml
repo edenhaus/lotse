@@ -1,0 +1,54 @@
+# Crate layering, enforced by scripts/check_crate_layering.py (a prek hook) against `cargo metadata`.
+# This is the crate dependency graph written down ahead of the code: every direct dependency
+# edge between workspace crates must be listed under [dependents], a restricted external crate
+# may only be a direct dependency of its owners under [external], and a [dev-only] crate may never
+# be a normal or build dependency. Adding an edge means editing this file.
+
+[dependents]
+# crate = the workspace crates that may depend on it directly
+lotse-core = ["lotse-codec", "lotse-rtsp", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-supervisor", "lotse-worker", "lotse-testing", "lotse"]
+lotse-codec = ["lotse-rtsp", "lotse-webrtc", "lotse-snapshot", "lotse-testing", "lotse"]
+lotse-ipc = ["lotse-supervisor", "lotse-worker", "lotse-snapshot"]
+lotse-sandbox = ["lotse"]
+lotse-api-types = ["lotse-api", "lotse-supervisor", "lotse", "lotse-testing"] # lotse-testing: the load generator reads `metrics/get`
+lotse-api = ["lotse-supervisor"]
+lotse-rtsp = ["lotse"]
+lotse-webrtc = ["lotse", "lotse-testing"] # lotse-testing: dev-only, its reproduction test of an open str0m issue (Safari's ICE)
+lotse-snapshot = ["lotse-supervisor", "lotse"] # M5
+lotse-supervisor = ["lotse"]
+lotse-worker = ["lotse"]
+# Never of lotse-core: it depends on core itself, and a dev-dependency cycle compiles two copies of
+# core whose types do not unify. Core's own fakes live behind its `test-util` feature.
+lotse-testing = ["lotse-codec", "lotse-rtsp", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-api-types", "lotse-supervisor", "lotse-worker", "lotse"]
+
+[dev-only]
+# allocation-counter: its global allocator replaces the daemon's in whatever links it.
+crates = ["lotse-testing", "allocation-counter"]
+
+[external]
+# protocol engines and process-specific crates stay inside the crate that owns them
+retina = ["lotse-rtsp"]
+rtsp-types = ["lotse-rtsp", "lotse-testing"]
+sdp-types = ["lotse-rtsp", "lotse-testing"]
+str0m = ["lotse-webrtc", "lotse-testing"]
+dimpl = ["lotse-webrtc"] # DTLS of str0m's crypto provider
+rustls = ["lotse-rtsp", "lotse-testing"] # rtsps; the fake camera's TLS mode
+tokio-rustls = ["lotse-rtsp", "lotse-testing"]
+webpki-roots = ["lotse-rtsp"]
+rcgen = ["lotse-webrtc", "lotse-testing"] # the DTLS certificate; the fake camera's certificate
+axum = ["lotse-api", "lotse-testing"] # the control API; the dev viewer, a test crate never linked into the binary
+hyper = ["lotse-api"] # the control API's HTTP/1.1 connection, under axum
+hyper-util = ["lotse-api"]
+postcard = ["lotse-ipc"]
+landlock = ["lotse-sandbox"]
+seccompiler = ["lotse-sandbox"]
+opus = ["lotse-codec"]
+symphonia = ["lotse-codec"]
+rubato = ["lotse-codec"]
+openh264 = ["lotse-snapshot"]
+jpeg-encoder = ["lotse-snapshot"]
+clap = ["lotse"]
+anyhow = ["lotse"] # AGENTS.md: `anyhow` only in `main`
+console-subscriber = ["lotse"] # tokio-console, the supervisor's subscriber
+mimalloc = ["lotse"]
+nix = ["lotse-supervisor", "lotse-testing"] # interface enumeration for the host candidates; the DSCP of received datagrams (`lotse_testing::dscp`)

@@ -1,0 +1,51 @@
+# MediaMTX as the camera of the browser and interop tests: ffmpeg publishes the synthetic stream
+# to it over RTSP, the daemon pulls it from it over RTSP, with RTP interleaved on TCP or as UDP
+# datagrams. `lotse_testing::mediamtx` starts it with this file and puts every address on free
+# loopback ports through MTX_* variables; by hand:
+#
+#   mediamtx crates/lotse-testing/mediamtx.yml
+#
+# then publish to rtsp://127.0.0.1:8554/cam (the ffmpeg command line is
+# `lotse_testing::mediamtx::ffmpeg_args`). Keys left out take MediaMTX's defaults, which enable
+# every protocol, so each one is turned off here.
+
+logLevel: info
+logDestinations: [stdout]
+
+# Anyone on loopback may publish, read and use the API.
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: publish
+      - action: read
+      - action: api
+
+# The control API: `GET /v3/paths/get/<path>` says when the publisher's tracks are ready.
+api: true
+apiAddress: 127.0.0.1:9997
+
+# RTSP only: unicast UDP and TCP interleaved, no multicast, no TLS.
+rtsp: true
+rtspTransports: [udp, tcp]
+rtspEncryption: "no"
+rtspAddress: 127.0.0.1:8554
+# The server's RTP and RTCP ports for UDP: an even port and the next one.
+rtpAddress: 127.0.0.1:8000
+rtcpAddress: 127.0.0.1:8001
+rtspAuthMethods: [basic]
+
+metrics: false
+pprof: false
+playback: false
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false
+
+paths:
+  # Any path a publisher names, `cam` by default.
+  all_others:

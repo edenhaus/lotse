@@ -1,0 +1,157 @@
+# The single definition of every check. prek runs it:
+#   - on `git commit`:  everything below except the tests, on the changed files
+#   - on `commit-msg`:  the Conventional Commits check
+#   - on `git push`:    the tests and the doctests
+#   - `mise run check` and CI: all of it, on all files (`--stage manual`)
+# The Linux-only gates (coverage, mutants) are mise tasks that CI runs, see mise.toml.
+# `mise install` installs the git hooks.
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
+default_stages: [pre-commit, manual]
+
+repos:
+  # prek implements these natively: no Python environment to download.
+  - repo: builtin
+    hooks:
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+        exclude: ^LICENSE-
+        stages: [pre-commit, manual] # its manifest also lists pre-push
+      - id: trailing-whitespace
+        exclude: \.md$
+        stages: [pre-commit, manual]
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit # squash-merged PR titles are checked by pr-title.yml
+        stages: [commit-msg]
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.3
+    hooks:
+      - id: codespell
+        args: ["--ignore-words-list=medias,unparseable,numer,stap,ue,fo"] # SDP media sections; accepted spelling; str0m's `MediaTime::numer`; RFC 6184 STAP-A; Exp-Golomb `ue(v)`; RFC 4648 test vector
+        exclude: ^(Cargo\.lock|fuzz/Cargo\.lock|tests/browser/uv\.lock)$
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.30.1
+    hooks:
+      - id: zizmor
+        args: ["--persona=pedantic"]
+  # The browser test's lint and format (tests/browser/); its settings are in its pyproject.toml.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.10 # the ruff in tests/browser/pyproject.toml; Renovate updates both in one PR
+    hooks:
+      - id: ruff-check
+        files: ^tests/browser/
+      - id: ruff-format
+        files: ^tests/browser/
+  - repo: local
+    hooks:
+      # The browser test (tests/browser/). uv installs the Python and the packages pinned in
+      # tests/browser/uv.lock on first use; the test itself needs a browser (`mise run browser`).
+      - id: browser-test-mypy
+        name: mypy --strict (browser test)
+        entry: sh -c 'cd tests/browser && uv run --locked mypy'
+        language: system
+        files: ^tests/browser/
+        pass_filenames: false
+      - id: browser-test-checks
+        name: browser test checks (unit tests, no browser)
+        entry: sh -c 'cd tests/browser && uv run --locked pytest -q'
+        language: system
+        files: ^tests/browser/
+        pass_filenames: false
+        stages: [pre-push, manual]
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        language: system
+        files: (\.rs|Cargo\.toml|Cargo\.lock|clippy\.toml)$
+        pass_filenames: false
+      - id: cargo-doc
+        name: cargo doc
+        entry: env RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --document-private-items --locked
+        language: system
+        files: (\.rs|Cargo\.toml|Cargo\.lock)$
+        pass_filenames: false
+      - id: cargo-hack
+        name: cargo hack (every feature combination builds)
+        # No `--no-dev-deps`: resolver 3 already keeps dev-dependency features out of normal builds,
+        # and the manifest rewrite it does would make `--locked` fail on every dev-dependency.
+        entry: cargo hack check --workspace --each-feature --locked
+        language: system
+        files: (\.rs|Cargo\.toml|Cargo\.lock)$
+        pass_filenames: false
+      - id: cargo-shear
+        name: cargo shear (no unused dependencies)
+        entry: cargo shear
+        language: system
+        files: (\.rs|Cargo\.toml|Cargo\.lock)$
+        pass_filenames: false
+      - id: fuzz-check
+        name: cargo check (fuzz targets build)
+        # The fuzz crate is its own workspace, outside clippy and hack: a change to a crate's API
+        # breaks a target silently until the nightly fuzz run. Type-checking needs no nightly and no
+        # sanitizer. `--locked`: fuzz/Cargo.lock is committed, so a crate change that moves the fuzz
+        # graph fails here until the lockfile is refreshed (the same command without `--locked`).
+        entry: cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
+        language: system
+        files: ^(crates|fuzz)/|^Cargo\.toml$
+        pass_filenames: false
+      - id: api-schema
+        name: api schema (schema/api.json matches the DTOs)
+        # The committed bundle is what the clients (lotse-clients) are generated from; regenerate it with
+        # `cargo run -p lotse-api-types --example schema > crates/lotse-api-types/schema/api.json`.
+        entry: sh -c 'cargo run -q -p lotse-api-types --example schema --locked | diff -u crates/lotse-api-types/schema/api.json -'
+        language: system
+        files: ^crates/lotse-api-types/
+        pass_filenames: false
+      - id: crate-layering
+        name: crate layering (.cargo/layering.toml)
+        entry: python3 scripts/check_crate_layering.py
+        language: system
+        files: (Cargo\.toml|Cargo\.lock|\.cargo/layering\.toml|scripts/check_crate_layering\.py)$
+        pass_filenames: false
+      - id: license-lists
+        name: license lists (.cargo/about.toml accepts what .cargo/deny.toml allows)
+        entry: python3 scripts/check_license_lists.py
+        language: system
+        files: (\.cargo/deny\.toml|\.cargo/about\.toml|scripts/check_license_lists\.py)$
+        pass_filenames: false
+      - id: cargo-deny
+        name: cargo deny
+        # advisories need the network and change without our code changing: security-audit.yml
+        entry: cargo deny --all-features check bans licenses sources
+        language: system
+        files: (Cargo\.toml|Cargo\.lock|\.cargo/deny\.toml)$
+        pass_filenames: false
+      - id: cargo-deny-fuzz
+        name: cargo deny (fuzz workspace)
+        # Its own lockfile, so its own graph (libFuzzer and its build script); the same policy.
+        entry: cargo deny --manifest-path fuzz/Cargo.toml --all-features check bans licenses sources
+        language: system
+        files: (Cargo\.toml|Cargo\.lock|\.cargo/deny\.toml)$
+        pass_filenames: false
+      - id: cargo-nextest
+        name: cargo nextest
+        entry: cargo nextest run --workspace --all-features --locked --no-tests=warn
+        language: system
+        files: (\.rs|Cargo\.toml|Cargo\.lock)$
+        pass_filenames: false
+        stages: [pre-push, manual]
+      - id: cargo-test-doc
+        name: cargo test --doc (nextest does not run doctests)
+        entry: cargo test --workspace --all-features --locked --doc
+        language: system
+        files: (\.rs|Cargo\.toml|Cargo\.lock)$
+        pass_filenames: false
+        stages: [pre-push, manual]

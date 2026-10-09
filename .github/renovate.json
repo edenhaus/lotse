@@ -1,0 +1,46 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":semanticCommits",
+    "group:allNonMajor",
+    "schedule:weekly"
+  ],
+  "labels": ["dependencies"],
+  "lockFileMaintenance": { "enabled": true },
+  "pre-commit": { "enabled": true },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Pinned stable toolchain in rust-toolchain.toml; bump rust-version in Cargo.toml with it",
+      "managerFilePatterns": ["/^rust-toolchain\\.toml$/"],
+      "matchStrings": ["channel = \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
+      "depNameTemplate": "rust",
+      "packageNameTemplate": "rust-lang/rust",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "description": "Container images pinned by tag and digest: BuildKit (scripts/image.sh), coturn (scripts/turn-e2e.sh), Alpine for the sandbox check (ci.yml)",
+      "managerFilePatterns": ["/^scripts/(image|turn-e2e)\\.sh$/", "/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["(?<depName>[a-z0-9][a-z0-9./_-]*):(?<currentValue>[A-Za-z0-9][A-Za-z0-9._-]*)@(?<currentDigest>sha256:[a-f0-9]{64})"],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "The fuzzing nightly, pinned by date in mise.toml (`mise run fuzz`) and ci.yml (fuzz-smoke)",
+      "managerFilePatterns": ["/^mise\\.toml$/", "/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["NIGHTLY *[:=] *\"?(?<currentValue>nightly-\\d{4}-\\d{2}-\\d{2})"],
+      "depNameTemplate": "rust-nightly",
+      "packageNameTemplate": "rust",
+      "datasourceTemplate": "rust-version"
+    },
+    {
+      "customType": "regex",
+      "description": "cargo-fuzz, installed by version in ci.yml (fuzz-smoke)",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["install (?<depName>cargo-fuzz) --version (?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "crate"
+    }
+  ]
+}

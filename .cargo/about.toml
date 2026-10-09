@@ -1,0 +1,26 @@
+# cargo-about: THIRD_PARTY_LICENSES.md of a release (`mise run licenses`, release.yml), rendered
+# with .cargo/about.hbs from the crates the `lotse` binary links.
+
+# The `[licenses] allow` list of .cargo/deny.toml, in the same order (the order is cargo-about's
+# preference for `OR` expressions); the `license-lists` hook keeps the two equal.
+accepted = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MPL-2.0",
+  "Zlib",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+]
+
+# The release targets: crates only other platforms pull in are left out.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+
+# What ships is the binary: build scripts and test-only crates are not in it.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Our own `publish = false` crates are lotse, MIT OR Apache-2.0, not third parties.
+private = { ignore = true }

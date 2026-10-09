@@ -1,0 +1,37 @@
+[package]
+name = "lotse-webrtc"
+description = "WebRTC sessions on str0m, RTP cut-through writer, SDP negotiation and transports."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+aes = { workspace = true } # SRTP AES-CM and the key derivation's AES block (RFC 3711 §4.1.1, §4.3)
+aes-gcm = { workspace = true } # SRTP AEAD AES-GCM (RFC 7714)
+bytes = { workspace = true } # the payloads the join's packetizers return
+ctr = { workspace = true } # the counter mode of SRTP AES-CM
+dimpl = { workspace = true } # DTLS on its RustCrypto backend
+hmac = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5)
+rcgen = { workspace = true } # the self-signed DTLS certificate
+sha1 = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5)
+sha2 = { workspace = true } # the DTLS certificate fingerprint (RFC 8122 §5)
+str0m = { workspace = true }
+tracing = { workspace = true }
+lotse-codec = { workspace = true } # RFC 6184 and RFC 7798 packetization of the join frames; the H.265 SPS's profile for negotiation
+lotse-core = { workspace = true }
+
+[dev-dependencies]
+allocation-counter = { workspace = true } # the write path's allocation count
+lotse-codec = { workspace = true, features = ["test-util"] } # hand-built parameter sets
+lotse-core = { workspace = true, features = ["test-util"] } # the fake clock and hand-built packets
+lotse-testing = { workspace = true } # the browser stand-in
+tracing-subscriber = { workspace = true } # captures the H.265 level deviation's log line
+
+[lints]
+workspace = true

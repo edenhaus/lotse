@@ -1,0 +1,3 @@
+#!/bin/sh
+# Archiver for the musl targets (cc-rs reads it as `AR_<target>`), see .cargo/config.toml.
+exec cargo-zigbuild zig ar -- "$@"

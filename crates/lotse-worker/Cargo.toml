@@ -1,0 +1,33 @@
+[package]
+name = "lotse-worker"
+description = "Worker process: IPC client, source connection runner, session manager and stats push for one camera connection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+libc = { workspace = true } # the layout and names of the DSCP and source-address control messages (`cmsghdr`, `IP_TOS`, `IPV6_TCLASS`, `in_pktinfo`, `in6_pktinfo`)
+rustix = { workspace = true } # moves the shared UDP socket to the descriptor number the seccomp filter names (`F_DUPFD_CLOEXEC`)
+socket2 = { workspace = true } # `sendmsg` with the audio track's DSCP and the candidate's source address as control messages
+serde_json = { workspace = true } # the per-scheme options arrive as JSON text
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "net", "io-util"] } # the worker's runtime, channels, the datagram channel and ICE-TCP framing
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+lotse-core = { workspace = true }
+lotse-ipc = { workspace = true }
+
+[dev-dependencies]
+allocation-counter = { workspace = true } # the relay framer's allocation count (tests/allocations.rs)
+lotse-core = { workspace = true, features = ["test-util"] } # the fake source
+lotse-testing = { workspace = true } # the DSCP datagrams arrive with (Linux)
+rustix = { workspace = true, features = ["fs", "process"] } # reads the shared socket's O_NONBLOCK and fills the descriptor table in tests
+
+[lints]
+workspace = true

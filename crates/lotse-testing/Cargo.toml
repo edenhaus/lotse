@@ -1,0 +1,47 @@
+[package]
+name = "lotse-testing"
+description = "Fake RTSP camera, fake TURN server, conformance suites, headless WebRTC viewer, fixtures and load generator."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+axum = { workspace = true } # the dev viewer's HTTP server: its pages and the browser's WebSocket upgrade
+bytes = { workspace = true }
+hmac = { workspace = true } # MESSAGE-INTEGRITY of the fake TURN server (RFC 8489 §14.5) and of the Safari ICE test's hand-made STUN requests
+md-5 = { workspace = true } # the fake TURN server's long-term key (RFC 8489 §9.2.2)
+futures-util = { workspace = true } # the dev viewer's relay halves
+rcgen = { workspace = true } # the fake camera's self-signed certificate in TLS mode
+rtsp-types = { workspace = true }
+rustls = { workspace = true } # the fake camera's TLS server configuration
+rustix = { workspace = true, features = ["param", "process"] } # the load generator: clock ticks of /proc/<pid>/stat, and whether a worker is gone (kill 0)
+serde = { workspace = true } # the load generator's JSON report
+serde_json = { workspace = true } # the load generator's control-API frames and report
+sha1 = { workspace = true } # MESSAGE-INTEGRITY of the fake TURN server (RFC 8489 §14.5) and of the Safari ICE test's hand-made STUN requests
+sha2 = { workspace = true } # the fake camera's certificate fingerprint, computed independently of lotse-rtsp; the dev viewer's CSP hash-sources
+str0m = { workspace = true } # the headless viewer
+tokio = { workspace = true, features = ["net", "io-util", "sync", "macros", "rt"] } # the fake camera's listener and connections; the dev viewer's runtime
+tokio-rustls = { workspace = true } # the fake camera's TLS mode (`rtsps`)
+tokio-tungstenite = { workspace = true } # the dev viewer's WebSocket to the daemon; the load generator's control connection
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+lotse-api-types = { workspace = true } # the load generator reads `metrics/get` through its type
+lotse-codec = { workspace = true, features = ["test-util"] } # hand-built parameter sets for the fake camera's stream
+lotse-core = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true } # the control buffer's size for `recv_marked` (`cmsg_space!`)
+nix = { workspace = true, features = ["net", "socket", "uio"] } # `recv_marked`: `recvmsg` with the `IP_TOS`/`IPV6_TCLASS` control messages, which safe Rust gets nowhere else
+
+[dev-dependencies]
+lotse-webrtc = { workspace = true } # the session engine the Safari ICE reproduction (`tests/t7_safari_ice.rs`) drives; the crypto provider of the `lotse-load` example's viewers
+tokio = { workspace = true, features = ["rt-multi-thread"] } # the `lotse-load` example's runtime
+
+[lints]
+workspace = true

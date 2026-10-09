@@ -1,0 +1,688 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lotse dev viewer</title>
+<style>
+  :root { --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #5d6677; --line: #d9dde5; --accent: #2f6fde; --bad: #c0392b; --good: #1f8a4c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --panel: #1c2027; --text: #e6e9ef; --muted: #99a2b3; --line: #2d333d; --accent: #6b9bff; --bad: #ff7b6b; --good: #5fd08f; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; overflow-x: hidden; }
+  /* The video takes everything the side panel leaves; below 760 px the
+     panel goes under it and the page scrolls vertically only. */
+  .app { display: grid; grid-template-columns: minmax(0, 1fr) 360px; height: 100vh; height: 100dvh; }
+  .stage { background: #000; min-width: 0; min-height: 0; }
+  video { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  aside { background: var(--panel); border-left: 1px solid var(--line); padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  h1 { font-size: 16px; margin: 0; }
+  h1 small { display: block; color: var(--muted); font-weight: normal; font-size: 12px; }
+  h2 { font-size: 12px; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  form, section { display: grid; gap: 8px; min-width: 0; }
+  label { display: grid; gap: 3px; color: var(--muted); font-size: 12px; min-width: 0; }
+  label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+  input, select { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); min-width: 0; width: 100%; }
+  label.check input { width: auto; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+  .buttons input { flex: 1 1 120px; width: auto; }
+  button { font: inherit; padding: 5px 12px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  #log { margin: 0; min-height: 120px; flex: 1 0 120px; overflow: auto; font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .bad { color: var(--bad); } .good { color: var(--good); }
+  @media (max-width: 760px) {
+    .app { grid-template-columns: minmax(0, 1fr); height: auto; }
+    .stage { height: min(75vh, 100vw); height: min(75dvh, 100vw); }
+    aside { border-left: 0; overflow: visible; }
+    #log { max-height: 50vh; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="stage"><video id="video" autoplay muted playsinline controls></video></div>
+  <aside>
+    <h1>lotse dev viewer <small id="hello">connecting to the daemon…</small></h1>
+    <form id="form">
+      <label>Saved streams <select id="saved"><option value="">(not saved)</option></select></label>
+      <div class="buttons">
+        <input id="label" placeholder="Name (optional)" aria-label="Name for the saved stream" autocomplete="off">
+        <button id="save-entry" type="button" class="secondary">Save</button>
+        <button id="delete-entry" type="button" class="secondary" disabled>Delete</button>
+      </div>
+      <label>Stream id <input id="stream" value="cam" pattern="[A-Za-z0-9._\-]{1,128}" required></label>
+      <label>Camera URL <input id="url" placeholder="rtsp://user:pass@192.168.1.10:554/stream1" autocomplete="off" spellcheck="false" required></label>
+      <label>STUN server (optional) <input id="stun" placeholder="stun:stun.l.google.com:19302"></label>
+      <label title="stream/put's orientation; changing it while playing puts the stream again, and the open session turns from its next frame">Orientation (CVO)
+        <select id="orientation">
+          <option value="no_transform">no_transform</option>
+          <option value="mirror">mirror</option>
+          <option value="rotate_180">rotate_180</option>
+          <option value="flip">flip</option>
+          <option value="rotate_left_and_flip">rotate_left_and_flip</option>
+          <option value="rotate_left">rotate_left</option>
+          <option value="rotate_right_and_flip">rotate_right_and_flip</option>
+          <option value="rotate_right">rotate_right</option>
+        </select>
+      </label>
+      <div class="buttons">
+        <button id="play" type="submit" disabled>Play</button>
+        <button id="stop" type="button" class="secondary" disabled>Stop</button>
+      </div>
+    </form>
+    <section>
+      <h2>Session</h2>
+      <dl id="stats">
+        <dt>Session</dt><dd id="s-state">–</dd>
+        <dt>First frame</dt><dd id="s-ttff">–</dd>
+        <dt>Video</dt><dd id="s-video">–</dd>
+        <dt title="Whether the answer's video m-line carries urn:3gpp:video-orientation">CVO</dt><dd id="s-cvo">–</dd>
+        <dt>Frame rate</dt><dd id="s-fps">–</dd>
+        <dt>Decoded</dt><dd id="s-decoded">–</dd>
+        <dt>Lost</dt><dd id="s-lost">–</dd>
+        <dt>Video buffer</dt><dd id="s-vbuf">–</dd>
+        <dt>Audio</dt><dd id="s-audio">–</dd>
+        <dt>Audio buffer</dt><dd id="s-abuf">–</dd>
+        <dt title="The browser's estimate from the daemon's Sender Reports: shows what it aligns to, not whether the camera's timestamps are right">A/V playout</dt><dd id="s-av">–</dd>
+        <dt>Path</dt><dd id="s-path">–</dd>
+      </dl>
+    </section>
+    <section>
+      <h2>Offer</h2>
+      <label class="check"><input id="audio" type="checkbox" checked> Offer audio (receive-only)</label>
+      <label class="check"><input id="constrained-high" type="checkbox" checked> Offer Constrained High (640c1f)</label>
+      <label class="check"><input id="playout-delay" type="checkbox" checked> Offer playout-delay (daemon sends min 0 / max 0)</label>
+      <div class="buttons"><button id="copy-offer" type="button" class="secondary" disabled>Copy offer SDP</button></div>
+    </section>
+    <pre id="log"></pre>
+  </aside>
+</div>
+<script>
+"use strict";
+// Speaks lotse's control API through the dev
+// viewer's relay: stream/put, then webrtc/offer as a subscription whose
+// events carry the answer and the daemon's candidates.
+const $ = (id) => document.getElementById(id);
+// The camera URL's password is masked while the field is not being
+// edited, so a screenshot never shows it. The real URL is kept in `cameraUrl`:
+// focusing the field shows it for editing and copying, and Play sends it.
+// The saved-streams list shows it masked too.
+// Credentials never reach localStorage, which any page later served on
+// this origin (localhost:8080, say) reads and which stays on disk: it keeps
+// every URL without its userinfo, and the userinfo goes to sessionStorage,
+// which this tab alone sees and closing it clears. So a reload keeps the
+// real URL, and a new tab gets it back without user and password.
+let cameraUrl = "";
+const MASK = "•".repeat(8);
+// The video orientation RTP header extension (3GPP TS 26.114 §6.2.3.3).
+const CVO = "urn:3gpp:video-orientation";
+// The key in localStorage (the settings) and in sessionStorage (the
+// credentials).
+const STORE = "lotse-dev-viewer";
+// A URL's scheme and `//`, after which its authority starts (RFC 3986 §3).
+const SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+// `url` with its password replaced by a fixed-length mask; the userinfo
+// ends at the authority's last `@` (RFC 3986 §3.2.1).
+function masked(url) {
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/[^\/?#@:]*:)[^\/?#]*@/i, `$1${MASK}@`);
+}
+
+// `url` split into `bare`, the URL without its userinfo, and `userinfo`,
+// user and password up to and including the authority's last `@` (RFC
+// 3986 §3.2.1), or "" if it has none.
+function splitUserinfo(url) {
+  const found = /^([a-z][a-z0-9+.-]*:\/\/)([^\/?#]*@)/i.exec(url);
+  return found ? { bare: found[1] + url.slice(found[0].length), userinfo: found[2] } : { bare: url, userinfo: "" };
+}
+
+// `url` with `userinfo` put back, unless it has userinfo of its own; a
+// `userinfo` that is not one (sessionStorage holds what any page on this
+// origin wrote) is ignored.
+function withUserinfo(url, userinfo) {
+  if (typeof userinfo !== "string" || !/^[^\/?#]*@$/.test(userinfo) || splitUserinfo(url).userinfo) return url;
+  return url.replace(SCHEME, (scheme) => scheme + userinfo);
+}
+
+const hasUserinfo = (url) => typeof url === "string" && splitUserinfo(url).userinfo !== "";
+
+function showUrl() {
+  const field = $("url");
+  field.value = document.activeElement === field ? cameraUrl : masked(cameraUrl);
+}
+
+function log(text, cls) {
+  const line = document.createElement("div");
+  line.textContent = `${new Date().toISOString().slice(11, 23)}  ${text}`;
+  if (cls) line.className = cls;
+  $("log").prepend(line);
+}
+
+// `text` parsed as an object, or nothing: storage can hold something this
+// page did not write.
+function parsed(text) {
+  const value = JSON.parse(text ?? "{}");
+  return value && typeof value === "object" ? value : {};
+}
+
+// The settings localStorage held and the credentials sessionStorage held,
+// or nothing: storage can be disabled, full, or hold anything.
+function load() {
+  let settings = {}, credentials = {};
+  try {
+    settings = parsed(localStorage.getItem(STORE));
+  } catch {}
+  try {
+    credentials = parsed(sessionStorage.getItem(STORE));
+  } catch {}
+  return { saved: settings, credentials };
+}
+
+const isOrientation = (value) => [...$("orientation").options].some((o) => o.value === value);
+const { saved, credentials } = load();
+const savedCredentials = new Map(Array.isArray(credentials.saved) ? credentials.saved.filter(Array.isArray) : []);
+// The saved streams, each { id, label, stream, url, orientation } with the
+// URL as typed, the credentials of this tab put back; and which one the
+// fields show, if any.
+let entries = (Array.isArray(saved.saved) ? saved.saved : [])
+  .filter((e) => e && typeof e.id === "string" && typeof e.url === "string" && typeof e.stream === "string")
+  .map((e) => ({ id: e.id, label: typeof e.label === "string" ? e.label : "", stream: e.stream,
+                 url: withUserinfo(e.url, savedCredentials.get(e.id)),
+                 orientation: isOrientation(e.orientation) ? e.orientation : "no_transform" }));
+let selectedId = typeof saved.selected === "string" ? saved.selected : undefined;
+let storageWarned = false;
+
+function storageFailed(err) {
+  if (!storageWarned) log(`settings are not kept: storage unavailable (${err.name})`, "bad");
+  storageWarned = true;
+}
+
+// Keeps the fields and the saved streams: every URL without its userinfo
+// in localStorage, the userinfo in this tab's sessionStorage, which a
+// reload keeps.
+function save() {
+  const current = splitUserinfo(cameraUrl);
+  const split = entries.map((e) => ({ entry: e, ...splitUserinfo(e.url) }));
+  try {
+    localStorage.setItem(STORE, JSON.stringify({
+      stream: $("stream").value.trim(),
+      url: current.bare,
+      stun: $("stun").value.trim(),
+      orientation: $("orientation").value,
+      saved: split.map(({ entry, bare }) => ({ ...entry, url: bare })),
+      selected: selectedId ?? null,
+    }));
+  } catch (err) {
+    storageFailed(err);
+  }
+  try {
+    sessionStorage.setItem(STORE, JSON.stringify({
+      url: current.userinfo,
+      saved: split.filter((s) => s.userinfo).map((s) => [s.entry.id, s.userinfo]),
+    }));
+  } catch (err) {
+    storageFailed(err);
+  }
+}
+
+const selected = () => entries.find((e) => e.id === selectedId);
+// The saved stream the fields show: the selected one while they still
+// match it, else the first that matches, else none. URLs match without
+// their userinfo, so typing the password into a stream saved without it
+// (a new tab) keeps it selected, and Save updates it.
+function matching() {
+  const stream = $("stream").value.trim();
+  const bare = splitUserinfo(cameraUrl).bare;
+  const same = (e) => splitUserinfo(e.url).bare === bare && e.stream === stream;
+  const current = selected();
+  return current && same(current) ? current : entries.find(same);
+}
+
+function renderSaved() {
+  const list = $("saved");
+  list.replaceChildren(new Option("(not saved)", ""));
+  for (const entry of entries) {
+    const shown = masked(entry.url);
+    const option = new Option(entry.label ? `${entry.label}: ${shown}` : shown, entry.id);
+    option.title = `${entry.stream}, ${entry.orientation}, ${shown}`;
+    list.add(option);
+  }
+  list.value = selected() ? selectedId : "";
+  $("delete-entry").disabled = !selected();
+}
+
+function syncSelection() {
+  selectedId = matching()?.id;
+  renderSaved();
+}
+
+for (const id of ["stream", "stun"]) if (typeof saved[id] === "string" && saved[id]) $(id).value = saved[id];
+if (isOrientation(saved.orientation)) $("orientation").value = saved.orientation;
+cameraUrl = typeof saved.url === "string" ? withUserinfo(saved.url, credentials.url) : "";
+showUrl();
+syncSelection();
+if (selected()) $("label").value = selected().label;
+// Pages before 2026-10-08 kept URLs with their credentials: they move to
+// sessionStorage now, and localStorage is rewritten without them.
+if (hasUserinfo(saved.url) || (Array.isArray(saved.saved) && saved.saved.some((e) => hasUserinfo(e?.url)))) {
+  save();
+  log("camera credentials removed from local storage; this tab keeps them until it closes");
+}
+$("url").addEventListener("focus", showUrl);
+$("url").addEventListener("input", () => { cameraUrl = $("url").value.trim(); syncSelection(); });
+$("url").addEventListener("blur", () => { save(); showUrl(); });
+$("stream").addEventListener("input", syncSelection);
+
+let ws, nextId = 1, pc, offerId, sessionId, offerAccepted = false, pendingCandidates = [];
+let statsTimer, playClicked, lastOffer, offeredCvo, attempt = 0;
+// The playing session's stream and camera URL, and its answer.
+let playing, lastAnswer;
+// The last second's cumulative jitter-buffer counters per inbound stream,
+// so the page shows the current buffer rather than the session average.
+let previous = new Map();
+const results = new Map();
+
+function send(command, onResult) {
+  const id = nextId++;
+  if (onResult) results.set(id, onResult);
+  ws.send(JSON.stringify({ id, ...command }));
+  return id;
+}
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => log("relay connected");
+  ws.onclose = () => {
+    $("hello").textContent = "daemon connection closed — reload to retry";
+    $("hello").className = "bad";
+    $("play").disabled = true;
+  };
+  ws.onmessage = (message) => {
+    const frame = JSON.parse(message.data);
+    if (frame.type === "hello") {
+      $("hello").textContent = `lotse ${frame.version}, api ${frame.api}`;
+      $("play").disabled = false;
+      log(`hello: outputs ${frame.outputs.join(", ")}`);
+    } else if (frame.type === "result") {
+      const callback = results.get(frame.id);
+      results.delete(frame.id);
+      if (!frame.success) log(`#${frame.id} failed: ${frame.error.code}: ${frame.error.message}`, "bad");
+      if (callback) callback(frame);
+    } else if (frame.type === "event" && frame.id === offerId) {
+      onSessionEvent(frame.event);
+    } else if (frame.type === "shutdown") {
+      log("the daemon is shutting down", "bad");
+    }
+  };
+}
+
+// The id under which `sdp`'s first `kind` m-section (or its session
+// level) maps the header extension `uri` (RFC 8285 §5), or undefined.
+function extmapId(sdp, kind, uri) {
+  const sections = sdp.split(/\r?\n(?=m=)/);
+  const media = sections.find((s) => s.startsWith(`m=${kind} `));
+  if (media === undefined) return undefined;
+  const session = sections[0].startsWith("m=") ? "" : sections[0];
+  for (const line of `${session}\n${media}`.split(/\r?\n/)) {
+    const map = /^a=extmap:(\d+)(?:\/\w+)? (\S+)/.exec(line);
+    if (map && map[2] === uri) return Number(map[1]);
+  }
+  return undefined;
+}
+
+// What the answer says about CVO: negotiated, or why not.
+function showCvo(answer) {
+  const id = extmapId(answer, "video", CVO);
+  const orientation = $("orientation").value;
+  let text, cls;
+  if (id !== undefined) {
+    const turnedOnly = /flip|mirror/.test(orientation) ? "; turned, not mirrored (the flip bit is not sent)" : "";
+    text = `negotiated, extmap id ${id}, ${orientation}${turnedOnly}`;
+    cls = "good";
+  } else if (offeredCvo !== undefined) {
+    text = `offered (id ${offeredCvo}) but not in the answer`;
+    cls = "bad";
+  } else {
+    text = "not offered by this browser: the picture plays unturned";
+    cls = orientation === "no_transform" ? undefined : "bad";
+  }
+  $("s-cvo").textContent = text;
+  $("s-cvo").className = cls ?? "";
+  log(`CVO: ${text}`, cls);
+}
+
+async function onSessionEvent(event) {
+  switch (event.type) {
+    case "session":
+      log(`session ${event.session_id}`);
+      break;
+    case "answer":
+      lastAnswer = event.sdp;
+      showCvo(event.sdp);
+      await pc.setRemoteDescription({ type: "answer", sdp: event.sdp });
+      log("answer applied");
+      break;
+    case "candidate":
+      try {
+        if (event.candidate === "") {
+          await pc.addIceCandidate();
+          log("daemon: end of candidates");
+        } else {
+          await pc.addIceCandidate({
+            candidate: event.candidate,
+            sdpMid: event.sdp_mid ?? null,
+            sdpMLineIndex: event.sdp_mline_index ?? (event.sdp_mid == null ? 0 : null),
+          });
+          log(`daemon candidate: ${event.candidate}`);
+        }
+      } catch (err) {
+        log(`candidate refused: ${err}`, "bad");
+      }
+      break;
+    case "state":
+      $("s-state").textContent = `ice ${event.ice}, dtls ${event.dtls}`;
+      log(`state: ice ${event.ice}, dtls ${event.dtls}`, event.ice === "connected" ? "good" : undefined);
+      break;
+    case "warning":
+      log(`warning ${event.code}: ${event.message}`, "bad");
+      break;
+    case "closed":
+      log(`closed: ${event.code}: ${event.message}`, event.code === "session_closed" ? undefined : "bad");
+      $("s-state").textContent = `closed (${event.code})`;
+      offerId = undefined; // the subscription ended with this event
+      teardown(true);
+      break;
+  }
+}
+
+function sendCandidate(candidate) {
+  send({
+    type: "webrtc/candidate",
+    session_id: sessionId,
+    candidate: candidate ? candidate.candidate : "",
+    sdp_mid: candidate?.sdpMid ?? undefined,
+    sdp_mline_index: candidate?.sdpMLineIndex ?? undefined,
+  });
+}
+
+async function play() {
+  teardown(true);
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // A newer Play (an orientation change, another saved stream) ends this
+  // one at its next await.
+  const mine = ++attempt;
+  const streamId = $("stream").value.trim();
+  const url = cameraUrl;
+  const stun = $("stun").value.trim();
+  const orientation = $("orientation").value;
+  playing = { streamId, url };
+  lastAnswer = undefined;
+  save();
+  $("play").disabled = true;
+  $("stop").disabled = false;
+  for (const id of ["s-ttff", "s-video", "s-cvo", "s-fps", "s-decoded", "s-lost", "s-vbuf", "s-audio", "s-abuf", "s-av", "s-path"]) $(id).textContent = "–";
+  $("s-cvo").className = "";
+  previous = new Map();
+  // Play is a user gesture, so the browser lets the element start with
+  // sound; without audio it stays muted as before.
+  const withAudio = $("audio").checked;
+  $("video").muted = !withAudio;
+  playClicked = performance.now();
+  offerAccepted = false;
+  pendingCandidates = [];
+  sessionId = `viewer-${Date.now()}`;
+
+  // The offer needs the stream, so it waits for the put's result.
+  const put = new Promise((resolve) => {
+    send({ type: "stream/put", stream_id: streamId, sources: [{ url }], orientation }, resolve);
+  });
+
+  const peer = new RTCPeerConnection({ iceServers: stun ? [{ urls: stun }] : [] });
+  pc = peer;
+  const transceiver = peer.addTransceiver("video", { direction: "recvonly" });
+  if (!$("constrained-high").checked && transceiver.setCodecPreferences && RTCRtpReceiver.getCapabilities) {
+    // A diagnostic: without Constrained High the daemon answers under the
+    // next payload type, as before 2026-09-30.
+    const codecs = RTCRtpReceiver.getCapabilities("video").codecs
+      .filter((c) => !/profile-level-id=640c/i.test(c.sdpFmtpLine ?? ""));
+    transceiver.setCodecPreferences(codecs);
+    log("offer without Constrained High");
+  }
+  if (withAudio) {
+    // The daemon answers it with the camera's audio: G.711, G.722 or Opus
+    // cut through, AAC transcoded to Opus; or inactive without usable audio.
+    peer.addTransceiver("audio", { direction: "recvonly" });
+  }
+  // The daemon puts audio and video in one stream (one msid), so the
+  // browser keeps them in sync; both tracks go to the one element.
+  peer.ontrack = (track) => {
+    const video = $("video");
+    if (track.streams[0]) {
+      if (video.srcObject !== track.streams[0]) video.srcObject = track.streams[0];
+    } else {
+      if (!(video.srcObject instanceof MediaStream)) video.srcObject = new MediaStream();
+      video.srcObject.addTrack(track.track);
+    }
+    log(`track: ${track.track.kind}`);
+    if (track.track.kind === "video") watchFirstFrame(mine);
+    video.play().catch(() => {
+      video.muted = true;
+      video.play().catch(() => {});
+      log("autoplay with sound was blocked; unmute with the player controls", "bad");
+    });
+  };
+  // The session exists once the offer's result arrived; candidates wait.
+  peer.onicecandidate = ({ candidate }) => {
+    if (mine !== attempt) return;
+    if (offerAccepted) sendCandidate(candidate);
+    else pendingCandidates.push(candidate);
+  };
+  peer.onconnectionstatechange = () => log(`browser: ${peer.connectionState}`);
+  const offer = await peer.createOffer();
+  if (mine !== attempt) return;
+  await peer.setLocalDescription(offer);
+  if (mine !== attempt) return;
+  // What this browser offers for H.264, for negotiation fixtures.
+  lastOffer = offer.sdp;
+  $("copy-offer").disabled = false;
+  const h264 = offer.sdp.split("\r\n")
+    .filter((line) => /^a=fmtp:\d+ .*profile-level-id=/.test(line))
+    .map((line) => `${line.match(/^a=fmtp:(\d+)/)[1]}: ${line.match(/profile-level-id=([0-9a-fA-F]{6})/)[1]}${/packetization-mode=1/.test(line) ? "" : " (mode 0)"}`);
+  log(`offer H.264 payload types ${h264.join(", ")}`);
+  // The browser's own offer carries CVO where it supports it (Chrome and
+  // Safari do, Firefox does not); nothing below removes it.
+  offeredCvo = extmapId(offer.sdp, "video", CVO);
+  log(offeredCvo === undefined ? "offer without CVO" : `offer CVO extmap id ${offeredCvo}`);
+  // A diagnostic: without the extension in the offer the daemon cannot
+  // negotiate it, so the browser applies its own playout timing, lip-sync
+  // hold included. Only what is sent changes; the local description keeps it.
+  let sdp = offer.sdp;
+  if (!$("playout-delay").checked) {
+    sdp = sdp.split("\r\n")
+      .filter((line) => !/^a=extmap:\d+(\/\w+)? http:\/\/www\.webrtc\.org\/experiments\/rtp-hdrext\/playout-delay/.test(line))
+      .join("\r\n");
+    log("offer without playout-delay");
+  }
+  const putResult = await put;
+  if (mine !== attempt) return;
+  if (!putResult.success) { teardown(true); return; }
+  log(`stream ${streamId} ${putResult.result.created ? "created" : "updated or unchanged"}, ${orientation}`);
+  offerId = send({
+    type: "webrtc/offer",
+    stream_id: streamId,
+    session_id: sessionId,
+    sdp,
+    ice_servers: stun ? [{ urls: [stun] }] : [],
+  }, (result) => {
+    if (mine !== attempt) return;
+    if (!result.success) { offerId = undefined; teardown(true); return; }
+    offerAccepted = true;
+    for (const candidate of pendingCandidates) sendCandidate(candidate);
+    pendingCandidates = [];
+  });
+  statsTimer = setInterval(stats, 1000);
+}
+
+// One inbound stream's jitter buffer over the last second: what it holds
+// now and what the browser aims for (its target includes the delay it adds
+// to keep audio and video in sync), with the session average for contrast.
+function buffer(s) {
+  if (!s.jitterBufferEmittedCount) return "–";
+  const last = previous.get(s.id) ?? { delay: 0, target: 0, count: 0 };
+  previous.set(s.id, { delay: s.jitterBufferDelay, target: s.jitterBufferTargetDelay ?? 0, count: s.jitterBufferEmittedCount });
+  const average = Math.round((s.jitterBufferDelay / s.jitterBufferEmittedCount) * 1000);
+  const emitted = s.jitterBufferEmittedCount - last.count;
+  if (emitted <= 0) return `nothing played this second (session ${average} ms)`;
+  const now = Math.round(((s.jitterBufferDelay - last.delay) / emitted) * 1000);
+  const target = s.jitterBufferTargetDelay === undefined
+    ? ""
+    : `, target ${Math.round(((s.jitterBufferTargetDelay - last.target) / emitted) * 1000)} ms`;
+  return `${now} ms now${target} (session ${average} ms)`;
+}
+
+// `mine` is the Play it belongs to; a later one's frame is not its.
+function watchFirstFrame(mine) {
+  const video = $("video");
+  const done = () => {
+    if (mine !== attempt) return;
+    const ms = Math.round(performance.now() - playClicked);
+    $("s-ttff").textContent = `${ms} ms after Play`;
+    log(`first frame after ${ms} ms`, "good");
+  };
+  if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(done);
+  else video.addEventListener("playing", done, { once: true });
+}
+
+async function stats() {
+  if (!pc) return;
+  const report = await pc.getStats();
+  let pair;
+  const playout = {};
+  report.forEach((s) => {
+    if (s.type === "inbound-rtp" && s.kind === "video") {
+      // The decoded size; the element's is the turned one under CVO.
+      const video = $("video");
+      const shown = video.videoWidth && (video.videoWidth !== s.frameWidth || video.videoHeight !== s.frameHeight)
+        ? `, shown ${video.videoWidth}×${video.videoHeight}`
+        : "";
+      if (s.frameWidth) $("s-video").textContent = `${s.frameWidth}×${s.frameHeight}${shown}`;
+      if (s.framesPerSecond !== undefined) $("s-fps").textContent = `${s.framesPerSecond} fps`;
+      $("s-decoded").textContent = `${s.framesDecoded ?? 0} frames, ${s.keyFramesDecoded ?? "?"} keyframes`;
+      $("s-lost").textContent = `${s.packetsLost ?? 0} packets, ${s.nackCount ?? 0} NACKs, ${s.pliCount ?? 0} PLIs`;
+      $("s-vbuf").textContent = buffer(s);
+      playout.video = s.estimatedPlayoutTimestamp;
+    }
+    if (s.type === "inbound-rtp" && s.kind === "audio") {
+      const codec = s.codecId ? report.get(s.codecId) : undefined;
+      const name = codec ? `${codec.mimeType.replace("audio/", "")} ${codec.clockRate / 1000} kHz` : "?";
+      $("s-audio").textContent = `${name}, ${s.packetsReceived ?? 0} packets, ${s.packetsLost ?? 0} lost`;
+      $("s-abuf").textContent = buffer(s);
+      playout.audio = s.estimatedPlayoutTimestamp;
+    }
+    if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") pair = s;
+  });
+  if (playout.audio !== undefined && playout.video !== undefined) {
+    // Both are the sender-clock time of what plays now; equal is in sync.
+    const ms = Math.round(playout.audio - playout.video);
+    $("s-av").textContent = ms === 0 ? "in sync" : `audio ${Math.abs(ms)} ms ${ms > 0 ? "ahead of" : "behind"} video`;
+  }
+  if (pair) {
+    const local = report.get(pair.localCandidateId);
+    const remote = report.get(pair.remoteCandidateId);
+    if (local && remote) {
+      $("s-path").textContent = `${remote.address ?? remote.ip ?? "?"}:${remote.port} ${remote.protocol} (${remote.candidateType}), rtt ${Math.round((pair.currentRoundTripTime ?? 0) * 1000)} ms`;
+    }
+  }
+}
+
+function teardown(quiet) {
+  clearInterval(statsTimer);
+  attempt++;
+  if (offerId !== undefined && ws.readyState === WebSocket.OPEN) {
+    send({ type: "unsubscribe", subscription: offerId });
+    if (!quiet) log("session ended");
+  }
+  offerId = undefined;
+  if (pc) pc.close();
+  pc = undefined;
+  playing = undefined;
+  $("play").disabled = !ws || ws.readyState !== WebSocket.OPEN;
+  $("stop").disabled = true;
+}
+
+$("form").addEventListener("submit", (event) => { event.preventDefault(); play(); });
+$("stop").addEventListener("click", () => teardown(false));
+// The orientation reaches the open session too, from its next frame, so
+// a change while playing only puts the stream again: no new session.
+$("orientation").addEventListener("change", () => {
+  const entry = matching();
+  const orientation = $("orientation").value;
+  if (entry) entry.orientation = orientation;
+  save();
+  renderSaved();
+  if (!playing) return;
+  const { streamId, url } = playing;
+  send({ type: "stream/put", stream_id: streamId, sources: [{ url }], orientation }, (result) => {
+    if (!result.success) return;
+    log(`orientation ${orientation}: stream ${streamId} put again; the session turns from its next frame`);
+    if (lastAnswer !== undefined) showCvo(lastAnswer);
+  });
+});
+// Picking a saved stream fills the fields and plays it.
+$("saved").addEventListener("change", () => {
+  selectedId = $("saved").value || undefined;
+  const entry = selected();
+  $("delete-entry").disabled = !entry;
+  if (entry) {
+    $("stream").value = entry.stream;
+    cameraUrl = entry.url;
+    showUrl();
+    $("orientation").value = entry.orientation;
+    $("label").value = entry.label;
+  }
+  save();
+  if (entry && $("form").reportValidity()) play();
+});
+// Saves the fields: the entry with this URL and stream id gets the name
+// and orientation, or a new entry is added.
+$("save-entry").addEventListener("click", () => {
+  const stream = $("stream").value.trim();
+  if (!cameraUrl || !$("form").reportValidity()) return;
+  const fields = { label: $("label").value.trim(), stream, url: cameraUrl, orientation: $("orientation").value };
+  const entry = matching();
+  if (entry) Object.assign(entry, fields);
+  else entries.push({ id: `${Date.now().toString(36)}-${entries.length}`, ...fields });
+  selectedId = (entry ?? entries[entries.length - 1]).id;
+  save();
+  renderSaved();
+  const forTab = hasUserinfo(cameraUrl) ? "; its user and password only until this tab closes" : "";
+  log(`saved ${fields.label || masked(cameraUrl)}${forTab}`);
+});
+$("delete-entry").addEventListener("click", () => {
+  const entry = selected();
+  if (!entry) return;
+  entries = entries.filter((e) => e !== entry);
+  selectedId = undefined;
+  $("label").value = "";
+  save();
+  renderSaved();
+  log(`deleted ${entry.label || masked(entry.url)}`);
+});
+$("copy-offer").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(lastOffer);
+    log("offer SDP copied");
+  } catch (err) {
+    log(`copy failed: ${err}`, "bad");
+  }
+});
+connect();
+</script>
+</body>
+</html>

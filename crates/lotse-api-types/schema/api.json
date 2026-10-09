@@ -1,0 +1,2535 @@
+{
+  "$defs": {
+    "ApiError": {
+      "description": "An error as the API carries it, in results, `closed` events and\n`last_error`.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode",
+          "description": "The stable code."
+        },
+        "details": {
+          "additionalProperties": true,
+          "description": "Structured detail, per code.",
+          "type": "object"
+        },
+        "message": {
+          "description": "For humans; may change.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "AudioMode": {
+      "description": "`stream/put`'s `audio`.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Audio when the source has it.",
+          "type": "string"
+        },
+        {
+          "const": "off",
+          "description": "Video-first: audio m-lines answered `inactive`, no transcoder.",
+          "type": "string"
+        }
+      ]
+    },
+    "BuildInfo": {
+      "description": "How the daemon was built.",
+      "properties": {
+        "git_sha": {
+          "description": "The git commit, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rustc": {
+          "description": "The Rust version.",
+          "type": "string"
+        },
+        "target": {
+          "description": "The target triple.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "rustc"
+      ],
+      "type": "object"
+    },
+    "Codecs": {
+      "description": "The codecs the daemon can carry.",
+      "properties": {
+        "audio": {
+          "description": "Audio codec names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "video": {
+          "description": "Video codec names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "video",
+        "audio"
+      ],
+      "type": "object"
+    },
+    "Command": {
+      "description": "Every command, tagged by `type`. Each variant's schema title names the\nPython client's class for it (`StreamPutCommand`), and its `type` names\nthe client's method: `domain/verb` is `client.domain.verb(...)`, a type\nwithout a slash a method of the client itself.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "`ping`: answered with `pong`, not a `result`.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "ping",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "title": "PingCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`info`: version, build, schemes, outputs, codecs, limits and sandbox.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "info",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "title": "InfoCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`metrics/get`: process, worker and stream counters.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "metrics/get",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "title": "MetricsGetCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`schema`: the JSON Schema bundle of every message.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "schema",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "title": "SchemaCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`stream/put`: the idempotent upsert of a stream's desired state.",
+          "properties": {
+            "audio": {
+              "$ref": "#/$defs/AudioMode",
+              "default": "auto",
+              "description": "Audio handling."
+            },
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "orientation": {
+              "$ref": "#/$defs/Orientation",
+              "default": "no_transform",
+              "description": "How the picture is turned for display. A change reaches the open\nsessions too, from their next frame and without a new answer.\nChanging only this never reconnects."
+            },
+            "preload": {
+              "default": false,
+              "description": "Keep the source connected without viewers: connected at put and\nreconnected after failures while set, so the first viewer gets a\nframe from the warm GOP cache. Changing only this never reconnects;\nturning it off with no viewers starts the linger.",
+              "type": "boolean"
+            },
+            "sources": {
+              "description": "The sources, in order; the first that provides a kind wins.",
+              "items": {
+                "$ref": "#/$defs/SourceSpec"
+              },
+              "maxItems": 8,
+              "minItems": 1,
+              "type": "array"
+            },
+            "stream_id": {
+              "description": "The stream, `^[A-Za-z0-9._-]{1,128}$`.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "stream/put",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "stream_id",
+            "sources"
+          ],
+          "title": "StreamPutCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`stream/get`: one stream's state, sources, tracks and counters.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "description": "The stream.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "stream/get",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "stream_id"
+          ],
+          "title": "StreamGetCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`stream/list`: every stream, by id.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "stream/list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "title": "StreamListCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`stream/delete`: removes a stream and closes its sessions; idempotent.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "description": "The stream.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "stream/delete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "stream_id"
+          ],
+          "title": "StreamDeleteCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`stream/subscribe`: a subscription to one stream's state, or every\nstream's.",
+          "properties": {
+            "id": {
+              "description": "The command id, which becomes the subscription id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "description": "One stream, or all when absent.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "stream/subscribe",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "title": "StreamSubscribeCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`unsubscribe`: ends a subscription of this connection.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "subscription": {
+              "description": "The subscribing command's id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "unsubscribe",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "subscription"
+          ],
+          "title": "UnsubscribeCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`webrtc/offer`: opens a session; the subscription's events carry the\nwhole signaling conversation.",
+          "properties": {
+            "ice_servers": {
+              "description": "Overrides the configured ICE servers for this session.",
+              "items": {
+                "$ref": "#/$defs/IceServer"
+              },
+              "maxItems": 16,
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "id": {
+              "description": "The command id, which becomes the subscription id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sdp": {
+              "description": "The browser's SDP offer.",
+              "maxLength": 65536,
+              "type": "string"
+            },
+            "session_id": {
+              "description": "The client's session id, `^[A-Za-z0-9._-]{1,128}$`; a ULID when absent.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stream_id": {
+              "description": "The stream to view.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "webrtc/offer",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "stream_id",
+            "sdp"
+          ],
+          "title": "WebrtcOfferCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`webrtc/candidate`: a trickled candidate from the browser, taken\nonly from the connection that owns the session.",
+          "properties": {
+            "candidate": {
+              "description": "The `candidate:` attribute value; empty is end-of-candidates.",
+              "maxLength": 1024,
+              "type": "string"
+            },
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sdp_mid": {
+              "description": "The media section, when the browser named it (a client may forward\nonly this string; BUNDLE makes it redundant).",
+              "maxLength": 1024,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sdp_mline_index": {
+              "description": "The media section's index.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session_id": {
+              "description": "The session.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "webrtc/candidate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "session_id",
+            "candidate"
+          ],
+          "title": "WebrtcCandidateCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`session/get`: one session's state.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session_id": {
+              "description": "The session.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "session/get",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "session_id"
+          ],
+          "title": "SessionGetCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`session/list`: every session.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "session/list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "title": "SessionListCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`session/close`; idempotent.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session_id": {
+              "description": "The session.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "session/close",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "session_id"
+          ],
+          "title": "SessionCloseCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`session/adopt`: takes back an orphaned session.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session_id": {
+              "description": "The session.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "session/adopt",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "session_id"
+          ],
+          "title": "SessionAdoptCommand",
+          "type": "object"
+        }
+      ]
+    },
+    "ConnectionInfo": {
+      "description": "The upstream connection behind a source: the stream's own, since a\nsource URL belongs to one stream (`source_in_use`).",
+      "properties": {
+        "id": {
+          "description": "The connection's id.",
+          "type": "string"
+        },
+        "worker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its worker, while one runs."
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "DemuxMetrics": {
+      "description": "The supervisor's demux counters: what the receive thread did with each\ndatagram on the shared UDP socket.",
+      "properties": {
+        "addresses_learned": {
+          "description": "Addresses learned through verified STUN requests.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "forwarded": {
+          "description": "Datagrams handed to a worker.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "idle_wakeups": {
+          "description": "Receive wake-ups without a datagram.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "received": {
+          "description": "Datagrams read.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "relay_discarded": {
+          "description": "Datagrams from a TURN server discarded: not on a held channel, not\nfrom a permitted peer, or neither STUN nor `ChannelData`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "relayed": {
+          "description": "Datagrams a TURN server relayed from a peer, unwrapped and routed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "responses": {
+          "description": "Responses to the supervisor's own STUN and TURN requests.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stun_rejected": {
+          "description": "STUN requests with an unknown ufrag or a wrong password.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unroutable": {
+          "description": "Datagrams from unknown addresses that were not a usable STUN request.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "worker_full": {
+          "description": "Datagrams dropped because the worker's channel was full.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "received",
+        "forwarded",
+        "unroutable",
+        "stun_rejected",
+        "addresses_learned",
+        "worker_full",
+        "responses",
+        "relayed",
+        "relay_discarded",
+        "idle_wakeups"
+      ],
+      "type": "object"
+    },
+    "Empty": {
+      "description": "An empty result (`stream/delete`, `unsubscribe`, the subscriptions,\n`webrtc/candidate`, `session/close`).",
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "Every stable error code. `code` is the contract; `message` may change.",
+      "oneOf": [
+        {
+          "const": "invalid_request",
+          "description": "Malformed JSON, an unknown field, a bad value.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_command",
+          "description": "`type` is not a command.",
+          "type": "string"
+        },
+        {
+          "const": "id_reuse",
+          "description": "`id` is not greater than the previous one on this connection.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_stream_id",
+          "description": "The stream id fails the pattern.",
+          "type": "string"
+        },
+        {
+          "const": "stream_not_found",
+          "description": "No such stream.",
+          "type": "string"
+        },
+        {
+          "const": "session_not_found",
+          "description": "No such session, or its grace expired; for `webrtc/candidate`, also\na session this connection does not own.",
+          "type": "string"
+        },
+        {
+          "const": "session_id_in_use",
+          "description": "The session id is already open.",
+          "type": "string"
+        },
+        {
+          "const": "subscription_not_found",
+          "description": "`unsubscribe` of an unknown subscription.",
+          "type": "string"
+        },
+        {
+          "const": "limit_reached",
+          "description": "Streams, sessions, sessions per stream or connections.",
+          "type": "string"
+        },
+        {
+          "const": "scheme_unsupported",
+          "description": "The source URL scheme is not in `info.schemes`.",
+          "type": "string"
+        },
+        {
+          "const": "source_in_use",
+          "description": "The source URL, credentials aside, is already another stream's;\n`details.stream_id` names it.",
+          "type": "string"
+        },
+        {
+          "const": "shutting_down",
+          "description": "The command arrived during graceful shutdown.",
+          "type": "string"
+        },
+        {
+          "const": "internal_error",
+          "description": "An invariant failed; a bug, always logged with context.",
+          "type": "string"
+        },
+        {
+          "const": "source_unreachable",
+          "description": "Connecting to the source failed.",
+          "type": "string"
+        },
+        {
+          "const": "source_auth_failed",
+          "description": "The source rejected the credentials.",
+          "type": "string"
+        },
+        {
+          "const": "source_timeout",
+          "description": "The read deadline or stall watchdog hit.",
+          "type": "string"
+        },
+        {
+          "const": "source_protocol_error",
+          "description": "The source violated its protocol.",
+          "type": "string"
+        },
+        {
+          "const": "source_ended",
+          "description": "The source or publisher closed the stream.",
+          "type": "string"
+        },
+        {
+          "const": "worker_crashed",
+          "description": "The connection's worker process died.",
+          "type": "string"
+        },
+        {
+          "const": "audio_codec_unsupported",
+          "description": "Audio omitted from a session; video continues.",
+          "type": "string"
+        },
+        {
+          "const": "turn_unsupported",
+          "description": "A `turns:` entry was ignored.",
+          "type": "string"
+        },
+        {
+          "const": "h264_profile_mismatch",
+          "description": "The browser did not offer the stream's H.264 profile.",
+          "type": "string"
+        },
+        {
+          "const": "frame_over_browser_limit",
+          "description": "A video frame needed more RTP packets than some libwebrtc receivers\nassemble; it was sent whole.",
+          "type": "string"
+        },
+        {
+          "const": "backchannel_busy",
+          "description": "Another session holds the backchannel.",
+          "type": "string"
+        },
+        {
+          "const": "av_sync_lost",
+          "description": "Audio withdrawn because sync could not be held.",
+          "type": "string"
+        },
+        {
+          "const": "peer_closed",
+          "description": "The browser closed the peer connection.",
+          "type": "string"
+        },
+        {
+          "const": "session_closed",
+          "description": "`unsubscribe`, `session/close`, or the grace expired.",
+          "type": "string"
+        },
+        {
+          "const": "stream_deleted",
+          "description": "The stream was deleted.",
+          "type": "string"
+        },
+        {
+          "const": "stream_changed",
+          "description": "The codec family changed on reconnect.",
+          "type": "string"
+        },
+        {
+          "const": "ice_failed",
+          "description": "ICE failed or stayed disconnected.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_sdp",
+          "description": "The offer could not be parsed.",
+          "type": "string"
+        },
+        {
+          "const": "no_video_track",
+          "description": "The stream has no video track.",
+          "type": "string"
+        },
+        {
+          "const": "video_codec_unsupported",
+          "description": "No video codec both sides can use.",
+          "type": "string"
+        },
+        {
+          "const": "snapshot_timeout",
+          "description": "No keyframe within the snapshot timeout.",
+          "type": "string"
+        },
+        {
+          "const": "snapshot_busy",
+          "description": "The snapshot decode queue is full.",
+          "type": "string"
+        }
+      ]
+    },
+    "EventFrame_for_SessionEvent": {
+      "description": "An `event` of a subscription; `id` is the subscribing command's.",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/SessionEvent",
+          "description": "The event."
+        },
+        "id": {
+          "description": "The subscription's command id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/EventTag",
+          "description": "`\"event\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "event"
+      ],
+      "type": "object"
+    },
+    "EventFrame_for_StreamEvent": {
+      "description": "An `event` of a subscription; `id` is the subscribing command's.",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/StreamEvent",
+          "description": "The event."
+        },
+        "id": {
+          "description": "The subscription's command id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/EventTag",
+          "description": "`\"event\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "event"
+      ],
+      "type": "object"
+    },
+    "EventTag": {
+      "description": "`\"event\"`.",
+      "oneOf": [
+        {
+          "const": "event",
+          "description": "The only value.",
+          "type": "string"
+        }
+      ]
+    },
+    "Failure": {
+      "description": "A failed `result`.",
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/ApiError",
+          "description": "Why."
+        },
+        "id": {
+          "description": "The command's id; `null` when the frame had no readable one.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "success": {
+          "description": "Always `false` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "success",
+        "error"
+      ],
+      "type": "object"
+    },
+    "Hello": {
+      "description": "The first message on every connection, before any result.",
+      "properties": {
+        "api": {
+          "description": "The API version (Semantic Versioning, [`crate::API_VERSION`]); a client checks it\nwith [`crate::ApiVersion::accepts`].",
+          "type": "string"
+        },
+        "features": {
+          "description": "Capabilities inside outputs, for a client to gate features on.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "outputs": {
+          "description": "The output kinds compiled in.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type": {
+          "$ref": "#/$defs/HelloTag",
+          "description": "`\"hello\"`."
+        },
+        "version": {
+          "description": "The daemon version (semver).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "api",
+        "version",
+        "outputs",
+        "features"
+      ],
+      "type": "object"
+    },
+    "HelloTag": {
+      "description": "`\"hello\"`.",
+      "oneOf": [
+        {
+          "const": "hello",
+          "description": "The only value.",
+          "type": "string"
+        }
+      ]
+    },
+    "IceServer": {
+      "additionalProperties": false,
+      "description": "One entry of `webrtc/offer`'s `ice_servers`, as the client forwards what it\ngave the browser (the W3C `RTCIceServer` dictionary). `Debug` redacts the\ncredential.",
+      "properties": {
+        "credential": {
+          "default": null,
+          "description": "The TURN credential.",
+          "maxLength": 1024,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "urls": {
+          "description": "`stun:`, `turn:` or `turns:` URLs (RFC 7064, RFC 7065).",
+          "items": {
+            "maxLength": 1024,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "username": {
+          "default": null,
+          "description": "The TURN username.",
+          "maxLength": 1024,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "urls"
+      ],
+      "type": "object"
+    },
+    "InfoResult": {
+      "description": "`info`'s result.",
+      "properties": {
+        "build": {
+          "$ref": "#/$defs/BuildInfo",
+          "description": "The build."
+        },
+        "codecs": {
+          "$ref": "#/$defs/Codecs",
+          "description": "The codecs."
+        },
+        "features": {
+          "description": "Capabilities inside outputs.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "limits": {
+          "$ref": "#/$defs/Limits",
+          "description": "The limits."
+        },
+        "outputs": {
+          "description": "The output kinds compiled in.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sandbox": {
+          "$ref": "#/$defs/SandboxInfo",
+          "description": "The sandbox."
+        },
+        "schemes": {
+          "description": "The URL schemes a client may route here.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "version": {
+          "description": "The daemon version.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "build",
+        "schemes",
+        "outputs",
+        "features",
+        "codecs",
+        "limits",
+        "sandbox"
+      ],
+      "type": "object"
+    },
+    "LandlockInfo": {
+      "description": "The Landlock layers.",
+      "properties": {
+        "abi": {
+          "description": "The kernel's Landlock ABI; zero without Landlock.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fs": {
+          "description": "Filesystem rules: `enforced`, `unavailable` or `off`.",
+          "type": "string"
+        },
+        "net": {
+          "description": "TCP rules: `enforced`, `unavailable` or `off`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fs",
+        "net",
+        "abi"
+      ],
+      "type": "object"
+    },
+    "LastError": {
+      "description": "The last error of a stream, or the connection it reads from.",
+      "properties": {
+        "at": {
+          "description": "When it happened, RFC 3339.",
+          "type": "string"
+        },
+        "code": {
+          "$ref": "#/$defs/ErrorCode",
+          "description": "The stable code."
+        },
+        "details": {
+          "additionalProperties": true,
+          "description": "Structured detail, per code.",
+          "type": "object"
+        },
+        "message": {
+          "description": "For humans; may change.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "at"
+      ],
+      "type": "object"
+    },
+    "Limits": {
+      "description": "The limits in force.",
+      "properties": {
+        "max_connections": {
+          "description": "Control connections.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_sessions": {
+          "description": "Sessions in total.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_sessions_per_stream": {
+          "description": "Sessions per stream.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_streams": {
+          "description": "Streams.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_grace_ms": {
+          "description": "How long an orphaned session outlives its connection.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_streams",
+        "max_sessions",
+        "max_sessions_per_stream",
+        "max_connections",
+        "session_grace_ms"
+      ],
+      "type": "object"
+    },
+    "Metrics": {
+      "description": "`metrics/get`'s result.",
+      "properties": {
+        "sessions": {
+          "description": "Open viewer sessions on all connections.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "streams": {
+          "additionalProperties": {
+            "$ref": "#/$defs/StreamStats"
+          },
+          "description": "Per stream.",
+          "type": "object"
+        },
+        "supervisor": {
+          "$ref": "#/$defs/SupervisorMetrics",
+          "description": "The supervisor."
+        },
+        "worker_restarts": {
+          "description": "Worker crash restarts since start.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/WorkerMetrics"
+          },
+          "description": "The running workers, by connection id (`c1`).",
+          "type": "object"
+        }
+      },
+      "required": [
+        "supervisor",
+        "workers",
+        "worker_restarts",
+        "sessions",
+        "streams"
+      ],
+      "type": "object"
+    },
+    "Orientation": {
+      "description": "`stream/put`'s `orientation`: how the picture is turned for display,\none of eight transforms by its lowercase name. Their numbers, 1 to 8,\nfollow the EXIF orientation tag's values, but 6 turns the picture a\nquarter counterclockwise and 8 a quarter clockwise. A session\nwhose browser offered the video orientation extension carries it to\nthe browser, which turns the picture; others get it as the camera\nsends it.",
+      "oneOf": [
+        {
+          "const": "no_transform",
+          "description": "1: as the camera sends it.",
+          "type": "string"
+        },
+        {
+          "const": "mirror",
+          "description": "2: mirrored left to right.",
+          "type": "string"
+        },
+        {
+          "const": "rotate_180",
+          "description": "3: turned half way round.",
+          "type": "string"
+        },
+        {
+          "const": "flip",
+          "description": "4: flipped top to bottom.",
+          "type": "string"
+        },
+        {
+          "const": "rotate_left_and_flip",
+          "description": "5: turned a quarter counterclockwise, then flipped top to bottom.",
+          "type": "string"
+        },
+        {
+          "const": "rotate_left",
+          "description": "6: turned a quarter counterclockwise.",
+          "type": "string"
+        },
+        {
+          "const": "rotate_right_and_flip",
+          "description": "7: turned a quarter clockwise, then flipped top to bottom.",
+          "type": "string"
+        },
+        {
+          "const": "rotate_right",
+          "description": "8: turned a quarter clockwise.",
+          "type": "string"
+        }
+      ]
+    },
+    "Pong": {
+      "description": "The answer to `ping`, sent instead of a `result`.",
+      "properties": {
+        "id": {
+          "description": "The `ping`'s id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/PongTag",
+          "description": "`\"pong\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id"
+      ],
+      "type": "object"
+    },
+    "PongTag": {
+      "description": "`\"pong\"`.",
+      "oneOf": [
+        {
+          "const": "pong",
+          "description": "The only value.",
+          "type": "string"
+        }
+      ]
+    },
+    "ResultTag": {
+      "description": "`\"result\"`.",
+      "oneOf": [
+        {
+          "const": "result",
+          "description": "The only value.",
+          "type": "string"
+        }
+      ]
+    },
+    "SandboxInfo": {
+      "description": "The hardening layers of the supervisor, so a client can warn the user\nwhen one is missing.",
+      "properties": {
+        "gid": {
+          "description": "The real gid.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "landlock": {
+          "$ref": "#/$defs/LandlockInfo",
+          "description": "The Landlock layers."
+        },
+        "mode": {
+          "description": "`on`, `require` or `off`.",
+          "type": "string"
+        },
+        "no_new_privs": {
+          "description": "`PR_SET_NO_NEW_PRIVS` is set.",
+          "type": "boolean"
+        },
+        "notes": {
+          "description": "Why layers are missing, for humans.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "seccomp": {
+          "description": "The seccomp allowlist: `enforced`, `unavailable` or `off`.",
+          "type": "string"
+        },
+        "uid": {
+          "description": "The real uid.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mode",
+        "uid",
+        "gid",
+        "no_new_privs",
+        "seccomp",
+        "landlock"
+      ],
+      "type": "object"
+    },
+    "Session": {
+      "description": "A session as `session/get` and `session/list` return it.",
+      "properties": {
+        "answered": {
+          "description": "The answer was sent.",
+          "type": "boolean"
+        },
+        "dtls": {
+          "description": "The DTLS state, as the browser names it.",
+          "type": "string"
+        },
+        "ice": {
+          "description": "The ICE state, as the browser names it.",
+          "type": "string"
+        },
+        "orphaned": {
+          "description": "No control connection owns it; it closes when the grace expires\nunless a `session/adopt` takes it back.",
+          "type": "boolean"
+        },
+        "session_id": {
+          "description": "The session.",
+          "type": "string"
+        },
+        "since": {
+          "description": "When the offer arrived, RFC 3339 UTC.",
+          "type": "string"
+        },
+        "stream_id": {
+          "description": "The stream it views.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "stream_id",
+        "ice",
+        "dtls",
+        "answered",
+        "orphaned",
+        "since"
+      ],
+      "type": "object"
+    },
+    "SessionEvent": {
+      "description": "An event of `webrtc/offer` and `session/adopt`, in the order 04 lists\nthem; `closed` is always the last.\nEach variant's schema title names the Python client's class for it.",
+      "oneOf": [
+        {
+          "description": "The first event: the session's id, the client's or a generated ULID.",
+          "properties": {
+            "session_id": {
+              "description": "The session.",
+              "type": "string"
+            },
+            "type": {
+              "const": "session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "title": "SessionEventSession",
+          "type": "object"
+        },
+        {
+          "description": "The SDP answer, before any candidate.",
+          "properties": {
+            "sdp": {
+              "description": "The SDP.",
+              "type": "string"
+            },
+            "type": {
+              "const": "answer",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sdp"
+          ],
+          "title": "SessionEventAnswer",
+          "type": "object"
+        },
+        {
+          "description": "A local candidate; an empty `candidate` is end-of-candidates.",
+          "properties": {
+            "candidate": {
+              "description": "The `candidate:` attribute value, or empty.",
+              "type": "string"
+            },
+            "sdp_mid": {
+              "description": "The media section it belongs to.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sdp_mline_index": {
+              "description": "The media section's index.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "candidate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "candidate"
+          ],
+          "title": "SessionEventCandidate",
+          "type": "object"
+        },
+        {
+          "description": "ICE or DTLS changed; also the first event of `session/adopt`.",
+          "properties": {
+            "dtls": {
+              "description": "The DTLS state, as the browser names it.",
+              "type": "string"
+            },
+            "ice": {
+              "description": "The ICE state, as the browser names it.",
+              "type": "string"
+            },
+            "type": {
+              "const": "state",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "ice",
+            "dtls"
+          ],
+          "title": "SessionEventState",
+          "type": "object"
+        },
+        {
+          "description": "Non-fatal (`audio_codec_unsupported`, `turn_unsupported`,\n`h264_profile_mismatch`, ...).",
+          "properties": {
+            "code": {
+              "description": "The stable code.",
+              "type": "string"
+            },
+            "message": {
+              "description": "For humans.",
+              "type": "string"
+            },
+            "type": {
+              "const": "warning",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "code",
+            "message"
+          ],
+          "title": "SessionEventWarning",
+          "type": "object"
+        },
+        {
+          "description": "The last event; the subscription ends with it.",
+          "properties": {
+            "code": {
+              "description": "The stable code (`peer_closed`, `session_closed`, ...).",
+              "type": "string"
+            },
+            "message": {
+              "description": "For humans.",
+              "type": "string"
+            },
+            "type": {
+              "const": "closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "code",
+            "message"
+          ],
+          "title": "SessionEventClosed",
+          "type": "object"
+        }
+      ]
+    },
+    "SessionList": {
+      "description": "`session/list`'s result.",
+      "properties": {
+        "sessions": {
+          "description": "Every session on every connection, by id.",
+          "items": {
+            "$ref": "#/$defs/Session"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions"
+      ],
+      "type": "object"
+    },
+    "Shutdown": {
+      "description": "Sent once when the daemon shuts down gracefully, before the close.",
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/ShutdownTag",
+          "description": "`\"shutdown\"`."
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "ShutdownTag": {
+      "description": "`\"shutdown\"`.",
+      "oneOf": [
+        {
+          "const": "shutdown",
+          "description": "The only value.",
+          "type": "string"
+        }
+      ]
+    },
+    "SourceInfo": {
+      "description": "A source as `stream/get` reports it.",
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/ConnectionInfo",
+          "description": "The shared connection."
+        },
+        "details": {
+          "additionalProperties": true,
+          "description": "Protocol-specific detail, documented by the scheme's options schema.",
+          "type": "object"
+        },
+        "protocol": {
+          "description": "The protocol (`rtsp`).",
+          "type": "string"
+        },
+        "reconnects": {
+          "description": "Reconnects so far.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/StreamState",
+          "description": "The connection's state."
+        },
+        "url": {
+          "description": "The URL, credentials redacted.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "protocol",
+        "state",
+        "reconnects",
+        "connection"
+      ],
+      "type": "object"
+    },
+    "SourceSpec": {
+      "additionalProperties": false,
+      "description": "One entry of `stream/put`'s `sources`.",
+      "properties": {
+        "options": {
+          "additionalProperties": true,
+          "description": "Per-scheme options, typed by the scheme's factory; unknown fields\nthere are rejected too.",
+          "type": "object"
+        },
+        "url": {
+          "description": "The source URL, credentials included; redacted everywhere it is\nreported.",
+          "maxLength": 4096,
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "Stream": {
+      "description": "A stream, as `stream/get` returns it and `stream/list` lists it.",
+      "properties": {
+        "last_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last error, if the stream is not live."
+        },
+        "preload": {
+          "description": "Whether the stream stays connected without viewers.",
+          "type": "boolean"
+        },
+        "sessions": {
+          "description": "Open session ids.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "since": {
+          "description": "When the current state began, RFC 3339.",
+          "type": "string"
+        },
+        "sources": {
+          "description": "The sources, in order.",
+          "items": {
+            "$ref": "#/$defs/SourceInfo"
+          },
+          "type": "array"
+        },
+        "state": {
+          "$ref": "#/$defs/StreamState",
+          "description": "The connection's state."
+        },
+        "stats": {
+          "$ref": "#/$defs/StreamStats",
+          "description": "The counters."
+        },
+        "stream_id": {
+          "description": "The id.",
+          "type": "string"
+        },
+        "tracks": {
+          "description": "The tracks.",
+          "items": {
+            "$ref": "#/$defs/TrackInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "stream_id",
+        "state",
+        "preload",
+        "since",
+        "sources",
+        "tracks",
+        "sessions",
+        "stats"
+      ],
+      "type": "object"
+    },
+    "StreamEvent": {
+      "description": "An event of `stream/subscribe`.\nEach variant's schema title names the Python client's class for it.",
+      "oneOf": [
+        {
+          "description": "The stream's state, first as it is, then on every change.",
+          "properties": {
+            "last_error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LastError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Its last error, if any."
+            },
+            "state": {
+              "$ref": "#/$defs/StreamState",
+              "description": "Its state."
+            },
+            "stream_id": {
+              "description": "The stream.",
+              "type": "string"
+            },
+            "type": {
+              "const": "stream",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "stream_id",
+            "state"
+          ],
+          "title": "StreamEventStream",
+          "type": "object"
+        },
+        {
+          "description": "The stream was deleted.",
+          "properties": {
+            "stream_id": {
+              "description": "The stream.",
+              "type": "string"
+            },
+            "type": {
+              "const": "stream_removed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "stream_id"
+          ],
+          "title": "StreamEventStreamRemoved",
+          "type": "object"
+        }
+      ]
+    },
+    "StreamList": {
+      "description": "`stream/list`'s result.",
+      "properties": {
+        "streams": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Stream"
+          },
+          "description": "Every stream by id.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "streams"
+      ],
+      "type": "object"
+    },
+    "StreamPutResult": {
+      "description": "`stream/put`'s result.",
+      "properties": {
+        "created": {
+          "description": "The stream did not exist before.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "created"
+      ],
+      "type": "object"
+    },
+    "StreamState": {
+      "description": "The connection state a stream shows.",
+      "oneOf": [
+        {
+          "const": "idle",
+          "description": "No demand, no worker.",
+          "type": "string"
+        },
+        {
+          "const": "connecting",
+          "description": "Connecting to the source.",
+          "type": "string"
+        },
+        {
+          "const": "live",
+          "description": "Media flows.",
+          "type": "string"
+        },
+        {
+          "const": "reconnecting",
+          "description": "The source dropped; reconnecting at once.",
+          "type": "string"
+        },
+        {
+          "const": "backoff",
+          "description": "Waiting out the reconnect delay.",
+          "type": "string"
+        },
+        {
+          "const": "draining",
+          "description": "Demand went away; the linger timer runs.",
+          "type": "string"
+        },
+        {
+          "const": "restarting",
+          "description": "The worker crashed; the crash-backoff timer runs.",
+          "type": "string"
+        }
+      ]
+    },
+    "StreamStats": {
+      "description": "A stream's counters.",
+      "properties": {
+        "age_skips": {
+          "default": 0,
+          "description": "Live packets skipped for age.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "av_sync_lost": {
+          "default": 0,
+          "description": "Times the skew watchdog withdrew the stream's audio for sync; at\nmost 1, since it stays withdrawn while the source runs.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "datagrams_rejected": {
+          "default": 0,
+          "description": "Datagrams refused before they were read (RTSP over UDP): from an\naddress other than the camera's media ports, not RTP, or from\nanother synchronization source.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "frames_dropped": {
+          "default": 0,
+          "description": "Frames dropped as oversize.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "frames_over_browser_limit": {
+          "default": 0,
+          "description": "Video frames the live path carried in more RTP packets than some\nlibwebrtc receivers assemble (2047), depending on their version;\nevery session sends them whole, and those viewers may freeze until\na keyframe that fits.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ingest_late_skips": {
+          "default": 0,
+          "description": "Frames skipped as late after an ingest stall.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "keyframe_requests": {
+          "default": 0,
+          "description": "Upstream keyframe requests.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lag_events": {
+          "default": 0,
+          "description": "Fan-out lag events.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "packets_lost": {
+          "default": 0,
+          "description": "RTP packets from the camera that never arrived, by their sequence\nnumbers: loss on the network (RTSP over UDP) or packets the camera\ndropped itself.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "packets_out_of_order": {
+          "default": 0,
+          "description": "RTP packets from the camera dropped because they came again or\nafter a later one (RTSP over UDP): duplicates and reordering.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stalls": {
+          "default": 0,
+          "description": "Stall watchdog hits.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Success_for_AnyValue": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_Empty": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/Empty",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_InfoResult": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/InfoResult",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_Metrics": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/Metrics",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_Session": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/Session",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_SessionList": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/SessionList",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_Stream": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/Stream",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_StreamList": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/StreamList",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_StreamPutResult": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/StreamPutResult",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "SupervisorMetrics": {
+      "description": "The supervisor process.",
+      "properties": {
+        "demux": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DemuxMetrics"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The demux, when the WebRTC UDP socket is open."
+        },
+        "pid": {
+          "description": "The process id.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pss_bytes": {
+          "description": "Proportional set size (`Pss` of `smaps_rollup`): the shared text\npages divided among the processes mapping them, so the figures of\nall processes add up.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rss_bytes": {
+          "description": "Resident set size (`Rss` of `smaps_rollup`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tasks": {
+          "description": "Tokio tasks alive in its runtime; `None` until a worker's first\ncounters arrive.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "uptime_ms": {
+          "description": "Milliseconds since it started.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pid",
+        "uptime_ms"
+      ],
+      "type": "object"
+    },
+    "TrackInfo": {
+      "description": "A track as `stream/get` reports it.",
+      "properties": {
+        "audio_delay_ms": {
+          "description": "The delay a derived track's transcoder adds, in milliseconds; absent\non native tracks.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "bytes": {
+          "description": "Bytes seen.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "codec": {
+          "description": "The codec name (`h264`, `aac_lc`).",
+          "type": "string"
+        },
+        "derived_from": {
+          "description": "The native track a derived track came from.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "frames": {
+          "description": "Frames seen.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "id": {
+          "description": "`v0`, `a0`, `a1`.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`video` or `audio`.",
+          "type": "string"
+        },
+        "sync": {
+          "description": "How the track is timed now: `arrival` until the camera's first\nSender Report for it, `sender_reports` from then on, `arrival` again\non a new timeline until the next report; at most a second old. A\nderived track's is its source's.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "codec",
+        "sync",
+        "frames",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "WorkerInfo": {
+      "description": "The worker running a connection.",
+      "properties": {
+        "last_crash": {
+          "description": "When it last crashed, RFC 3339.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pid": {
+          "description": "Its process id.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pss_bytes": {
+          "description": "Its proportional set size, read by the supervisor.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "restarts": {
+          "description": "Crash restarts so far.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pid",
+        "restarts"
+      ],
+      "type": "object"
+    },
+    "WorkerMetrics": {
+      "description": "One worker process: the one running a source connection.",
+      "properties": {
+        "pid": {
+          "description": "The process id.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pss_bytes": {
+          "description": "Proportional set size (`Pss` of `smaps_rollup`): the shared text\npages divided among the processes mapping them, so the figures of\nall processes add up.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "relay_unbound": {
+          "description": "Datagrams from a relay candidate dropped for want of a channel.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "restarts": {
+          "description": "Crash restarts of the connection's worker so far.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rss_bytes": {
+          "description": "Resident set size (`Rss` of `smaps_rollup`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "send_failures": {
+          "description": "Datagrams its sessions could not send.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sessions": {
+          "description": "Open viewer sessions.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "streams": {
+          "description": "The streams reading from its connection.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tasks": {
+          "description": "Tokio tasks alive in its runtime; `None` until a worker's first\ncounters arrive.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "uptime_ms": {
+          "description": "Milliseconds since it started.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pid",
+        "uptime_ms",
+        "streams",
+        "restarts",
+        "sessions",
+        "send_failures",
+        "relay_unbound"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "api": "0.1.0",
+  "command": {
+    "$ref": "#/$defs/Command"
+  },
+  "events": {
+    "session/adopt": {
+      "$ref": "#/$defs/EventFrame_for_SessionEvent"
+    },
+    "stream/subscribe": {
+      "$ref": "#/$defs/EventFrame_for_StreamEvent"
+    },
+    "webrtc/offer": {
+      "$ref": "#/$defs/EventFrame_for_SessionEvent"
+    }
+  },
+  "failure": {
+    "$ref": "#/$defs/Failure"
+  },
+  "hello": {
+    "$ref": "#/$defs/Hello"
+  },
+  "results": {
+    "info": {
+      "$ref": "#/$defs/Success_for_InfoResult"
+    },
+    "metrics/get": {
+      "$ref": "#/$defs/Success_for_Metrics"
+    },
+    "ping": {
+      "$ref": "#/$defs/Pong"
+    },
+    "schema": {
+      "$ref": "#/$defs/Success_for_AnyValue"
+    },
+    "session/adopt": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "session/close": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "session/get": {
+      "$ref": "#/$defs/Success_for_Session"
+    },
+    "session/list": {
+      "$ref": "#/$defs/Success_for_SessionList"
+    },
+    "stream/delete": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "stream/get": {
+      "$ref": "#/$defs/Success_for_Stream"
+    },
+    "stream/list": {
+      "$ref": "#/$defs/Success_for_StreamList"
+    },
+    "stream/put": {
+      "$ref": "#/$defs/Success_for_StreamPutResult"
+    },
+    "stream/subscribe": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "unsubscribe": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "webrtc/candidate": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "webrtc/offer": {
+      "$ref": "#/$defs/Success_for_Empty"
+    }
+  },
+  "shutdown": {
+    "$ref": "#/$defs/Shutdown"
+  },
+  "title": "lotse control API"
+}

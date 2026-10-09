@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>lotse browser test</title>
+<style>
+  body { margin: 0; background: #000; color: #ccc; font: 12px/1.4 ui-monospace, monospace; }
+  video { display: block; width: 320px; height: 240px; background: #000; }
+  canvas { display: none; }
+  button { margin: 8px; }
+</style>
+</head>
+<body>
+<!-- The browser test page, served by the dev viewer at /test and driven by
+     the Selenium test in tests/browser/. A click on Start is the user
+     gesture that lets WebAudio run; `lotseTest.finished` resolves to the
+     measurements, which the test checks: the page measures, the test decides.
+     `?signal=go2rtc&api=ws://host:port/api/ws` signals to go2rtc instead,
+     for the comparison (tests/browser/test_comparison.py): everything but the
+     signaling is the same for both servers.
+     With `disrupt` in the configuration (pli, reconnect, crash) the page
+     plays a window, disrupts the stream (a keyframe request of its own,
+     or the harness acting at `lotseTest.checkpoint`), waits for the
+     recovery and plays a second window, which the checks take; the
+     first is kept as `before`. -->
+<video id="video" autoplay playsinline></video>
+<button id="start" type="button">Start</button>
+<canvas id="canvas" width="16" height="12"></canvas>
+<pre id="log"></pre>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+// What the harness sets before the click (`lotseTest.configure`).
+let config;
+const out = {
+  timings: {}, video: { flashes: [], presented: 0, capture: [] }, audio: { beeps: [] },
+  ice: { local_candidates_sent: 0, local_end_sent: false, remote_candidates: 0, remote_end: false, states: [] },
+  log: [], errors: [],
+};
+const t0 = performance.now();
+const since = () => Math.round(performance.now() - t0);
+function log(text) { out.log.push(`${since()} ${text}`); $("log").textContent += `${text}\n`; }
+function fail(text) { out.errors.push(text); log(`error: ${text}`); }
+const timeout = (ms, what) => new Promise((_, reject) => setTimeout(() => reject(new Error(`${what}: none in ${ms} ms`)), ms));
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Signaling: lotse's control API through the dev viewer's relay,
+// or go2rtc's WebSocket API as its common deployment drives it. Each has
+// `prepare()` (the stream live before the offer) and `offer(sdp, on)`,
+// which sends the offer and returns `candidate(c)` for the local
+// candidates, and calls `on.answer(sdp)`, `on.candidate(init)` (`null` at
+// the end of candidates), `on.state(text)`, `on.warning(text)` and
+// `on.closed(text)`; `close()` ends the session's signaling.
+let ws, nextId = 1;
+const pending = new Map();
+let onEvent = () => {};
+function relay() {
+  return new Promise((resolve, reject) => {
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.onerror = () => reject(new Error("the relay refused the WebSocket"));
+    ws.onmessage = (message) => {
+      const frame = JSON.parse(message.data);
+      if (frame.type === "hello") resolve(frame);
+      else if (frame.type === "result") {
+        const done = pending.get(frame.id);
+        pending.delete(frame.id);
+        if (done) done(frame);
+      } else if (frame.type === "event") onEvent(frame);
+    };
+  });
+}
+function command(body) {
+  const id = nextId++;
+  ws.send(JSON.stringify({ id, ...body }));
+  return { id, result: new Promise((resolve) => pending.set(id, resolve)) };
+}
+async function must(body) {
+  const frame = await command(body).result;
+  if (!frame.success) throw new Error(`${body.type}: ${frame.error.code}: ${frame.error.message}`);
+  return frame.result;
+}
+
+function lotseSignaling() {
+  let offered;
+  return {
+    async prepare() {
+      const hello = await Promise.race([relay(), timeout(5000, "hello")]);
+      out.daemon = { version: hello.version, api: hello.api };
+      // Preloaded and live before the offer: the first frame comes from the
+      // GOP cache, as for a preloaded camera.
+      await must({ type: "stream/put", stream_id: config.stream_id, sources: [{ url: config.url }], preload: true });
+      for (let i = 0; ; i++) {
+        const stream = await must({ type: "stream/get", stream_id: config.stream_id });
+        if (stream.state === "live") break;
+        if (i > 100) throw new Error(`stream ${stream.state}, not live after 10 s`);
+        await delay(100);
+      }
+    },
+    async offer(sdp, on) {
+      const sessionId = `browser-${Date.now()}`;
+      onEvent = async (frame) => {
+        const event = frame.event;
+        try {
+          if (event.type === "answer") await on.answer(event.sdp);
+          else if (event.type === "candidate") {
+            await on.candidate(event.candidate === "" ? null : {
+              candidate: event.candidate, sdpMid: event.sdp_mid ?? null,
+              sdpMLineIndex: event.sdp_mline_index ?? (event.sdp_mid == null ? 0 : null),
+            });
+          } else if (event.type === "state") on.state(`daemon ice ${event.ice}, dtls ${event.dtls}`);
+          else if (event.type === "warning") on.warning(`${event.code}: ${event.message}`);
+          else if (event.type === "closed") on.closed(`${event.code}: ${event.message}`);
+        } catch (err) { fail(`${event.type}: ${err}`); }
+      };
+      offered = command({ type: "webrtc/offer", stream_id: config.stream_id, session_id: sessionId, sdp, ice_servers: [] });
+      const result = await offered.result;
+      if (!result.success) throw new Error(`webrtc/offer: ${result.error.code}: ${result.error.message}`);
+      return (candidate) => {
+        command({
+          type: "webrtc/candidate", session_id: sessionId, candidate: candidate ? candidate.candidate : "",
+          sdp_mid: candidate?.sdpMid ?? undefined, sdp_mline_index: candidate?.sdpMLineIndex ?? undefined,
+        });
+        return true;
+      };
+    },
+    close() { if (offered) command({ type: "unsubscribe", subscription: offered.id }); },
+  };
+}
+
+// go2rtc's WebSocket API (`/api/ws?src=<stream>`), the messages go2rtc's
+// client library sends and reads (go2rtc-client 0.4.0, go2rtc_client/ws;
+// observed 2026-10-07): the offer as `webrtc` with
+// `{type: "offer", sdp, ice_servers}`, the answer back as `webrtc` with
+// `{type: "answer", sdp}`, candidates both ways as `webrtc/candidate` with
+// the candidate line only. The common deployment's web player sends no
+// end of candidates and adds go2rtc's, which carry no mid, with sdpMid
+// "0"; go2rtc sends no end of candidates either. The harness has
+// registered and preloaded the stream through go2rtc's REST API, as that
+// deployment does when it registers a camera, and waited for it to be live.
+function go2rtcSignaling(api) {
+  let socket;
+  return {
+    async prepare() { out.daemon = { server: "go2rtc" }; },
+    async offer(sdp, on) {
+      socket = new WebSocket(`${api}?src=${encodeURIComponent(config.stream_id)}`);
+      await Promise.race([new Promise((resolve, reject) => {
+        socket.onopen = resolve;
+        socket.onerror = () => reject(new Error("go2rtc refused the WebSocket"));
+      }), timeout(5000, "go2rtc's WebSocket")]);
+      socket.onclose = (event) => on.closed(`WebSocket closed (${event.code})`);
+      socket.onmessage = async (message) => {
+        const frame = JSON.parse(message.data);
+        try {
+          if (frame.type === "webrtc" && frame.value?.type === "answer") await on.answer(frame.value.sdp);
+          else if (frame.type === "webrtc/candidate") await on.candidate({ candidate: frame.value, sdpMid: "0" });
+          else if (frame.type === "error") on.closed(`error: ${frame.value}`);
+          else on.warning(`unexpected ${frame.type}`);
+        } catch (err) { fail(`${frame.type}: ${err}`); }
+      };
+      socket.send(JSON.stringify({ type: "webrtc", value: { type: "offer", sdp, ice_servers: [] } }));
+      return (candidate) => {
+        if (!candidate || !candidate.candidate) return false;
+        socket.send(JSON.stringify({ type: "webrtc/candidate", value: candidate.candidate }));
+        return true;
+      };
+    },
+    close() { if (socket) { socket.onclose = null; socket.close(); } },
+  };
+}
+
+// Beeps: an AudioWorklet that sees every sample, so an onset is placed to
+// the sample; it also sums the energy of what it heard.
+const WORKLET = `
+class Marks extends AudioWorkletProcessor {
+  constructor() { super(); this.quiet = 0; this.sum = 0; this.count = 0; this.peak = 0; this.reported = 0; }
+  process(inputs) {
+    const samples = inputs[0] && inputs[0][0];
+    if (samples) {
+      for (let i = 0; i < samples.length; i++) {
+        const level = Math.abs(samples[i]);
+        this.sum += level * level; this.count++;
+        if (level > this.peak) this.peak = level;
+        if (level > 0.05) {
+          if (this.quiet >= sampleRate * 0.3) this.port.postMessage({ onset: (currentFrame + i) / sampleRate });
+          this.quiet = 0;
+        } else this.quiet++;
+      }
+    }
+    if (currentFrame - this.reported >= sampleRate / 4) {
+      this.port.postMessage({ sum: this.sum, count: this.count, peak: this.peak });
+      this.reported = currentFrame;
+    }
+    return true;
+  }
+}
+registerProcessor("marks", Marks);
+`;
+let audio;
+async function prepareAudio() {
+  const context = new AudioContext();
+  await context.resume();
+  await context.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" })));
+  const node = new AudioWorkletNode(context, "marks");
+  // Pulled through a muted gain to the destination, so it always runs.
+  const mute = context.createGain();
+  mute.gain.value = 0;
+  node.connect(mute).connect(context.destination);
+  node.port.onmessage = ({ data }) => {
+    if (data.onset !== undefined) {
+      // Context time to the performance clock at the output (Web Audio
+      // §1.2.2 getOutputTimestamp), else by the current time.
+      const stamp = context.getOutputTimestamp ? context.getOutputTimestamp() : undefined;
+      const at = stamp && stamp.performanceTime
+        ? stamp.performanceTime + (data.onset - stamp.contextTime) * 1000
+        : performance.now() - (context.currentTime - data.onset) * 1000 + (context.outputLatency || 0) * 1000;
+      out.audio.beeps.push(at - t0);
+    } else {
+      out.audio.rms = data.count ? Math.sqrt(data.sum / data.count) : 0;
+      out.audio.peak = data.peak;
+    }
+  };
+  out.audio.sample_rate = context.sampleRate;
+  out.audio.context_state = context.state;
+  out.audio.output_latency_ms = context.outputLatency !== undefined ? context.outputLatency * 1000 : null;
+  return { context, node };
+}
+
+// The capture time of the frames: the abs-capture-time RTP header extension
+// (http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time), which
+// libwebrtc lists but leaves out of its offers until the page asks for it
+// with setHeaderExtensionsToNegotiate (W3C webrtc-extensions; libwebrtc
+// webrtc_video_engine.cc and webrtc_voice_engine.cc list it stopped,
+// observed 2026-10-07 at f56234a4ec). Where the browser takes the
+// extension, the video receiver's synchronization source carries the
+// capture time of the last frame delivered to the track
+// (`captureTimestamp`, webrtc-extensions), which each presented frame
+// samples with its own times from requestVideoFrameCallback.
+const ABS_CAPTURE_TIME = "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time";
+function askForCaptureTime(transceiver) {
+  if (!transceiver.getHeaderExtensionsToNegotiate || !transceiver.setHeaderExtensionsToNegotiate) return "not supported";
+  const extensions = transceiver.getHeaderExtensionsToNegotiate();
+  const extension = extensions.find((e) => e.uri === ABS_CAPTURE_TIME);
+  if (!extension) return "not listed";
+  extension.direction = "sendrecv";
+  try { transceiver.setHeaderExtensionsToNegotiate(extensions); } catch (err) { return `refused: ${err}`; }
+  return "asked";
+}
+// The header extensions of each m-section of an SDP, by kind.
+function extmaps(sdp) {
+  const found = {};
+  for (const section of sdp.split(/\r\n(?=m=)/).slice(1)) {
+    const kind = section.slice(2, section.indexOf(" "));
+    found[kind] = [...section.matchAll(/^a=extmap:(\d+)(?:\/\w+)? (\S+)/gm)].map((m) => `${m[1]} ${m[2]}`);
+  }
+  return found;
+}
+let videoReceiver;
+let sampling = false;
+
+// Flashes: each presented frame drawn to a 16×12 canvas, its mean
+// luma compared to the middle (the camera sends 16 and 235).
+// Who waits for the next frame presented (`nextFrame`).
+const frameWaiters = [];
+const nextFrame = () => new Promise((resolve) => frameWaiters.push(resolve));
+let watching = false;
+function watchFrames() {
+  if (watching) return;
+  watching = true;
+  const video = $("video");
+  const canvas = $("canvas").getContext("2d", { willReadFrequently: true });
+  let wasWhite;
+  const sample = (now, meta) => {
+    out.video.presented++;
+    canvas.drawImage(video, 0, 0, 16, 12);
+    const data = canvas.getImageData(0, 0, 16, 12).data;
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 4) sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    const luma = sum / (data.length / 4);
+    out.video.luma_min = Math.min(out.video.luma_min ?? 255, luma);
+    out.video.luma_max = Math.max(out.video.luma_max ?? 0, luma);
+    const white = luma > 128;
+    if (out.timings.first_frame === undefined) out.timings.first_frame = Math.round(now - t0);
+    for (const waiter of frameWaiters.splice(0)) waiter(Math.round(now - t0));
+    // A rising edge: the first white frame shown, at the time it is.
+    if (white && wasWhite === false) out.video.flashes.push((meta && meta.expectedDisplayTime ? meta.expectedDisplayTime : now) - t0);
+    wasWhite = white;
+    // Over the play time, each presented frame with the synchronization
+    // source's capture time, all on the wall clock in ms: shown
+    // (expectedDisplayTime), received (the frame's last packet,
+    // receiveTime), the source's last delivery (`timestamp`) and its
+    // capture time as the browser reports it (NTP ms in Chrome), the
+    // sender's offset, and both RTP timestamps, so the test takes the
+    // capture time of the very frame shown.
+    if (sampling && videoReceiver?.getSynchronizationSources) {
+      const source = videoReceiver.getSynchronizationSources()[0];
+      if (source && source.captureTimestamp !== undefined) {
+        const wall = (at) => (at === undefined ? null : performance.timeOrigin + at);
+        out.video.capture.push({
+          shown: wall(meta?.expectedDisplayTime ?? now), received: wall(meta?.receiveTime),
+          frame_rtp: meta?.rtpTimestamp ?? null, delivered: source.timestamp,
+          source_rtp: source.rtpTimestamp, capture: source.captureTimestamp,
+          offset: source.senderCaptureTimeOffset ?? null,
+        });
+      } else out.video.no_capture_time = (out.video.no_capture_time ?? 0) + 1;
+    }
+  };
+  if (video.requestVideoFrameCallback) {
+    out.video.frame_callback = "requestVideoFrameCallback";
+    const next = (now, meta) => { sample(now, meta); video.requestVideoFrameCallback(next); };
+    video.requestVideoFrameCallback(next);
+  } else {
+    // Without it, every animation frame whose video time moved.
+    out.video.frame_callback = "requestAnimationFrame";
+    let last = -1;
+    const next = (now) => {
+      if (video.currentTime !== last && video.readyState >= 2) { last = video.currentTime; sample(now); }
+      requestAnimationFrame(next);
+    };
+    requestAnimationFrame(next);
+  }
+}
+
+// Every stats object of the connection but the certificates, as plain
+// objects (W3C webrtc-stats); the test reads the fields it needs.
+async function snapshot(pc) {
+  const report = await pc.getStats();
+  const stats = [];
+  report.forEach((s) => { if (s.type !== "certificate") stats.push({ ...s }); });
+  return { at: since(), stats };
+}
+
+// The PLI case (`config.disrupt === "pli"`): the video receiver's
+// encoded frames pass through a worker unchanged (W3C
+// webrtc-encoded-transform, RTCRtpScriptTransform), whose transformer can
+// ask the sender for a keyframe (`sendKeyFrameRequest`, §4.4.2), which a
+// receiver sends as RTCP PLI or FIR (RFC 4585 §6.3.1, RFC 5104 §4.3.1).
+// It is in place from the first frame, so both windows pass through it.
+const KEYFRAME_WORKER = `
+let transformer;
+onrtctransform = (event) => {
+  transformer = event.transformer;
+  transformer.readable.pipeTo(transformer.writable);
+};
+onmessage = async () => {
+  try {
+    if (!transformer) throw new Error("no transform yet");
+    await transformer.sendKeyFrameRequest();
+    postMessage({ ok: true });
+  } catch (err) { postMessage({ error: String(err) }); }
+};
+`;
+let keyframeWorker;
+function passThroughWorker(receiver) {
+  if (typeof RTCRtpScriptTransform === "undefined") { fail("no RTCRtpScriptTransform for the keyframe request"); return; }
+  keyframeWorker = new Worker(URL.createObjectURL(new Blob([KEYFRAME_WORKER], { type: "text/javascript" })));
+  receiver.transform = new RTCRtpScriptTransform(keyframeWorker, { kind: "video" });
+}
+function requestKeyFrame() {
+  if (!keyframeWorker) return Promise.reject(new Error("no keyframe worker"));
+  return new Promise((resolve, reject) => {
+    keyframeWorker.onmessage = ({ data }) => (data.ok ? resolve() : reject(new Error(data.error)));
+    keyframeWorker.postMessage("request");
+  });
+}
+
+// One session: a peer connection offered to the server, answered, with
+// its first frame presented. `ended` resolves with the reason the server
+// closed it, if it does.
+async function connect(signaling, marks) {
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  pc.addTransceiver("video", { direction: "recvonly" });
+  pc.addTransceiver("audio", { direction: "recvonly" });
+  out.capture_time = {};
+  for (const transceiver of pc.getTransceivers()) {
+    out.capture_time[transceiver.receiver.track.kind] = askForCaptureTime(transceiver);
+  }
+  pc.oniceconnectionstatechange = () => out.ice.states.push(`${since()} ${pc.iceConnectionState}`);
+  let send;
+  const queued = [];
+  const sendCandidate = (candidate) => {
+    if (!send(candidate)) return;
+    if (candidate && candidate.candidate) out.ice.local_candidates_sent++;
+    else out.ice.local_end_sent = true;
+  };
+  pc.onicecandidate = ({ candidate }) => { if (send) sendCandidate(candidate); else queued.push(candidate); };
+  // The element plays picture and sound, unmuted, as a viewer has it: a
+  // muted element mutes the receiver too (Chrome then reports an
+  // audioLevel of 0), and Chrome hands a remote track to WebAudio only
+  // while an element plays it (observed in Chrome 154, 2026-10-06).
+  pc.ontrack = (event) => {
+    const video = $("video");
+    const stream = event.streams[0] ?? new MediaStream([event.track]);
+    if (event.track.kind === "video") {
+      videoReceiver = event.receiver;
+      if (config.disrupt === "pli") passThroughWorker(event.receiver);
+    }
+    if (video.srcObject !== stream) {
+      video.srcObject = stream;
+      video.play().catch((err) => fail(`play: ${err}`));
+      watchFrames();
+    }
+    if (event.track.kind === "audio" && marks) {
+      marks.context.createMediaStreamSource(new MediaStream([event.track])).connect(marks.node);
+    }
+  };
+  const session = { pc, closed: undefined };
+  let ended, answer, refused;
+  session.ended = new Promise((resolve) => { ended = resolve; });
+  const answered = new Promise((resolve, reject) => { answer = resolve; refused = reject; });
+  const on = {
+    async answer(sdp) {
+      out.timings.answer = since();
+      out.answer_extensions = extmaps(sdp);
+      await pc.setRemoteDescription({ type: "answer", sdp });
+      answer();
+    },
+    async candidate(init) {
+      if (init === null) { out.ice.remote_end = true; await pc.addIceCandidate(); }
+      else { out.ice.remote_candidates++; await pc.addIceCandidate(init); }
+    },
+    state(text) { out.ice.states.push(`${since()} ${text}`); },
+    warning(text) { log(`warning ${text}`); },
+    closed(text) { session.closed = text; refused(new Error(`closed: ${text}`)); ended(text); },
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  session.offer = since();
+  // What the browser offered: the codecs of each m-section.
+  out.offer_codecs = {};
+  for (const section of offer.sdp.split(/\r\n(?=m=)/).slice(1)) {
+    const kind = section.slice(2, section.indexOf(" "));
+    out.offer_codecs[kind] = [...new Set([...section.matchAll(/^a=rtpmap:\d+ ([^/\r]+)/gm)].map((m) => m[1]))];
+  }
+  out.offer_extensions = extmaps(offer.sdp);
+  const frame = nextFrame();
+  send = await signaling.offer(offer.sdp, on);
+  for (const candidate of queued.splice(0)) sendCandidate(candidate);
+  await Promise.race([answered, timeout(10000, "answer")]);
+  session.first_frame = await Promise.race([frame, timeout(15000, "first frame")]);
+  return session;
+}
+
+// One play window: the stats at its start and end (the test takes rates
+// from the difference and totals from the end), and the frames presented
+// over it, each with its capture time where the browser reports one.
+async function measure(session) {
+  out.video.capture = [];
+  out.stats = { start: await snapshot(session.pc) };
+  out.video.presented_at_start = out.video.presented;
+  sampling = true;
+  await delay(config.play_ms);
+  sampling = false;
+  out.stats.end = await snapshot(session.pc);
+  out.video.presented_at_end = out.video.presented;
+}
+
+// The stream as the daemon reports it (`stream/get`), the parts
+// the disruptions and the checks read; `undefined` with go2rtc.
+async function streamState() {
+  if (out.signaling !== "lotse") return undefined;
+  const stream = await must({ type: "stream/get", stream_id: config.stream_id });
+  const source = stream.sources?.[0] ?? {};
+  return {
+    state: stream.state, reconnects: source.reconnects ?? null,
+    worker_pid: source.connection?.worker?.pid ?? null, restarts: source.connection?.worker?.restarts ?? null,
+    tracks: (stream.tracks ?? []).map((t) => ({
+      id: t.id, kind: t.kind, codec: t.codec, sync: t.sync, derived_from: t.derived_from ?? null,
+      audio_delay_ms: t.audio_delay_ms ?? null,
+    })),
+    stats: stream.stats,
+  };
+}
+async function until(what, ms, test) {
+  for (const deadline = performance.now() + ms; ; await delay(100)) {
+    const state = await streamState();
+    if (test(state)) return state;
+    if (performance.now() > deadline) throw new Error(`${what}: not within ${ms} ms (${JSON.stringify(state)})`);
+  }
+}
+
+// The disruption between the two windows (`config.disrupt`), and the
+// recovery the second window starts from: a keyframe request from the
+// page (pli), or the harness restarting the camera's publisher
+// (reconnect) or killing the worker (crash), told to it at the
+// checkpoint. After a crash the server closes the session with
+// `worker_crashed` and the page offers anew once the stream is live
+// again, as a player's front end does.
+let reachCheckpoint, proceed;
+const checkpoint = new Promise((resolve) => { reachCheckpoint = resolve; });
+const proceeded = new Promise((resolve) => { proceed = resolve; });
+async function disrupt(session, signaling, marks) {
+  const before = await streamState();
+  const disruption = { mode: config.disrupt, at: since(), before };
+  out.disruption = disruption;
+  if (config.disrupt === "pli") {
+    await requestKeyFrame();
+    disruption.keyframe_request = "sent";
+  } else {
+    reachCheckpoint({ mode: config.disrupt, worker_pid: before?.worker_pid ?? null });
+    await proceeded;
+    disruption.acted = since();
+    if (config.disrupt === "reconnect") {
+      disruption.after = await until("the stream live after a reconnect", 20000,
+        (s) => s.reconnects > before.reconnects && s.state === "live");
+      disruption.first_frame = await Promise.race([nextFrame(), timeout(15000, "a frame after the reconnect")]);
+    } else if (config.disrupt === "crash") {
+      disruption.closed = await Promise.race([session.ended, timeout(10000, "the session closed after the crash")]);
+      session.pc.close();
+      disruption.after = await until("the stream live after the crash", 30000,
+        (s) => s.restarts > before.restarts && s.state === "live");
+      session = await connect(signaling, marks);
+      disruption.offer = session.offer;
+      disruption.first_frame = session.first_frame;
+      disruption.time_to_first_frame_ms = session.first_frame - session.offer;
+    } else throw new Error(`unknown disruption ${config.disrupt}`);
+  }
+  disruption.recovered = since();
+  return session;
+}
+
+async function run() {
+  const marks = await prepareAudio().catch((err) => { fail(`audio: ${err}`); return undefined; });
+  const params = new URLSearchParams(location.search);
+  out.signaling = params.get("signal") === "go2rtc" ? "go2rtc" : "lotse";
+  const signaling = out.signaling === "go2rtc" ? go2rtcSignaling(params.get("api")) : lotseSignaling();
+  await signaling.prepare();
+  out.timings.live = since();
+  await delay(config.warm_ms);
+
+  // Firefox fetches its H.264 codec (OpenH264) after it starts; until
+  // then its offer lacks H.264, so the offer waits for it, a while.
+  const h264 = () => (RTCRtpReceiver.getCapabilities?.("video")?.codecs ?? [])
+    .some((codec) => codec.mimeType.toLowerCase() === "video/h264");
+  for (let waited = 0; !h264() && waited < 60000; waited += 500) {
+    if (waited === 0) log("no H.264 receiver yet; waiting for it");
+    await delay(500);
+  }
+  out.timings.h264 = since();
+
+  let session = await connect(signaling, marks);
+  out.timings.offer = session.offer;
+  out.time_to_first_frame_ms = session.first_frame - session.offer;
+  // With a disruption, a window before it, kept as `before`; the checks
+  // take the window after the recovery.
+  if (config.disrupt) {
+    await measure(session);
+    out.before = { stats: out.stats, presented_at_start: out.video.presented_at_start, presented_at_end: out.video.presented_at_end };
+    session = await disrupt(session, signaling, marks);
+  }
+  await measure(session);
+  out.stream_end = await streamState().catch((err) => { fail(`stream/get: ${err}`); return undefined; });
+  out.video.width = $("video").videoWidth;
+  out.video.height = $("video").videoHeight;
+  out.timings.end = since();
+  if (session.closed) fail(`the server closed the session: ${session.closed}`);
+  out.connection_state = session.pc.connectionState;
+  signaling.close();
+  session.pc.close();
+  if (marks) await marks.context.close();
+}
+
+window.lotseTest = {
+  configure(options) { config = options; },
+  // Resolves when the harness is to act (reconnect, crash), with what it
+  // needs; `proceed()` tells the page it has.
+  checkpoint,
+  proceed() { proceed(); },
+  finished: new Promise((resolve) => {
+    $("start").addEventListener("click", () => {
+      out.timings.clicked = since();
+      // A play() inside the gesture lets the element play with sound later
+      // (Safari's autoplay policy); it has no source yet, so it settles
+      // either way.
+      $("video").play().catch(() => {});
+      run().catch((err) => fail(String(err && err.message ? err.message : err))).finally(() => resolve(out));
+    }, { once: true });
+  }),
+};
+</script>
+</body>
+</html>

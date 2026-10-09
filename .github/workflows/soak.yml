@@ -1,0 +1,73 @@
+name: soak
+
+# The load generator and the soak against a release daemon (scripts/load.sh). Nightly and by hand;
+# never on a PR, since a soak takes hours. CI uses GitHub's hosted runners only, whose jobs stop at
+# 6 h: the 72 h soak and the Pi 4 and RK3566 runs are made by hand on lab hardware before a release.
+
+on:
+  schedule:
+    - cron: "23 1 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "How long the soak runs (lotse-load --duration: 30m, 5h); GitHub-hosted jobs stop at 6 h"
+        type: string
+        default: "5h"
+
+permissions:
+  contents: read
+
+# A soak in progress is never cancelled by the next one; the next waits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  load:
+    name: load generator (4 cameras x 4 viewers, 2 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: load
+      - run: mise run load 4 4 2m
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: load-report
+          path: target/load-report.json
+          if-no-files-found: warn
+
+  soak:
+    name: soak (cameras hang up, viewers come and go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DURATION: ${{ inputs.duration || '5h' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: load
+      - run: mise run soak "$DURATION"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: soak-report
+          path: target/soak-report.json
+          if-no-files-found: warn

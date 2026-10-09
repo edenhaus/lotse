@@ -1,0 +1,35 @@
+[package]
+name = "lotse-codec"
+description = "Bitstream normalizers, G.711, AAC decode, Opus, resampling and transcoders."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Hand-built parameter sets and a bit writer for other crates' tests (the fake camera).
+[features]
+test-util = []
+
+[dependencies]
+bytes = { workspace = true }
+h264-reader = { workspace = true }
+opus = { workspace = true }
+rubato = { workspace = true }
+symphonia-codec-aac = { workspace = true }
+symphonia-core = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros"] } # `select!` over the input, the stop token and the pacer's next release; the tests' runtime
+tokio-util = { workspace = true } # the `CancellationToken` of a running transcoder's `TrackHandle`
+tracing = { workspace = true }
+lotse-core = { workspace = true }
+
+[dev-dependencies]
+lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`, so the transcoder tests set each frame's arrival
+
+[lints]
+workspace = true

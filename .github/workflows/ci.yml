@@ -1,0 +1,203 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Every prek hook on all files, tests included: the same as `mise run check`.
+  check:
+    name: every prek hook
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: mise run check
+
+  test-musl:
+    name: tests on the musl target
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm] # x86_64 and aarch64, natively (no cross, no QEMU)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          # What the musl tests need (zig through cargo-zigbuild compiles and links, cmake builds
+          # libopus, nextest runs them); the rest of mise.toml is for the checks.
+          install_args: rust zig cmake github:rust-cross/cargo-zigbuild github:nextest-rs/nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: mise run test-musl
+        env:
+          MISE_AUTO_INSTALL: "false" # the tools above, not the whole mise.toml
+
+  # Linux-only gates.
+  coverage:
+    name: coverage gate (100% lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: mise run coverage
+
+  # The console build compiles code that only `--cfg tokio_unstable` turns on, which no other job
+  # sees.
+  console:
+    name: console build (--cfg tokio_unstable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: console
+      - run: mise run console-check
+
+  # The daemon under Docker's default seccomp profile, as a deployment's container may run it
+  # (scripts/sandbox-isolation.sh).
+  sandbox-isolation:
+    name: sandbox isolation (Docker, default seccomp profile)
+    runs-on: ubuntu-latest
+    env:
+      BIN: target/x86_64-unknown-linux-musl/release/lotse
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: sandbox-isolation
+      - name: Static build with the fake source
+        run: cargo build --release --locked --bin lotse --features source-fake --target x86_64-unknown-linux-musl
+      - name: Run the check in a container
+        run: |
+          docker run --rm \
+            --volume "$PWD/$BIN:/lotse:ro" \
+            --volume "$PWD/scripts/sandbox-isolation.sh:/check.sh:ro" \
+            alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 sh /check.sh
+
+  # The TURN client against a real coturn (scripts/turn-e2e.sh starts it with Docker on the host
+  # network and removes it).
+  turn-e2e:
+    name: TURN client against coturn
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: mise run turn-e2e
+
+  # The daemon against a third-party RTSP server (MediaMTX) fed by ffmpeg, over TCP and UDP, video
+  # only and with AAC, PCMU and Opus. Both tools are pinned in mise.toml; both arches, so both
+  # ffmpeg pins are exercised.
+  interop:
+    name: interop with MediaMTX and ffmpeg
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          # The host build (cmake builds libopus), nextest, and the camera's two tools; the rest of
+          # mise.toml is for the checks.
+          install_args: rust cmake github:nextest-rs/nextest github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: interop
+      - run: mise run interop
+        env:
+          MISE_AUTO_INSTALL: "false" # the tools above, not the whole mise.toml
+
+  # The fuzz targets, 60 s each on every PR.
+  fuzz-smoke:
+    name: fuzz smoke (60 s per target)
+    runs-on: ubuntu-latest
+    env:
+      NIGHTLY: nightly-2026-10-01 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Nightly toolchain (the one nightly use)
+        run: rustup toolchain install "$NIGHTLY" --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+          cache-bin: true
+      - run: cargo "+$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
+      # cargo-fuzz has no `--locked`: this fails on a stale fuzz/Cargo.lock, and the builds below
+      # then resolve nothing new.
+      - run: cargo "+$NIGHTLY" fetch --manifest-path fuzz/Cargo.toml --locked
+      # scripts/fuzz.sh adds the contract's limits (a 10 s hang, a 64 MiB allocation, 1 GiB
+      # resident), the same as `mise run fuzz`.
+      - name: Fuzz every target for 60 s
+        run: |
+          for target in $(cargo "+$NIGHTLY" fuzz list); do
+            scripts/fuzz.sh "$target" 60
+          done
+
+  mutants:
+    name: mutation gate (changed lines)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      BASE_REF: ${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # `--in-diff` needs the merge base
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: mise run mutants "origin/$BASE_REF"

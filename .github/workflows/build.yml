@@ -1,0 +1,69 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # release.yml builds the released binaries with this same workflow.
+  workflow_call:
+    inputs:
+      release:
+        description: "A release build: restores no cache, so nothing a cache holds can reach a released binary"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Called from release.yml, `github.workflow` is `release`; a release build is never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-build-${{ github.ref }}
+  cancel-in-progress: ${{ !inputs.release }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  musl:
+    name: static musl build
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each arch on its own runner, natively (as test-musl): libopus is built by cmake, which
+        # archives with the host's ranlib, so no build depends on a ranlib for a foreign arch.
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      BIN: target/${{ matrix.arch }}-unknown-linux-musl/release/lotse
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          # What the build needs; the rest of mise.toml is for the checks.
+          install_args: rust zig cmake github:rust-cross/cargo-zigbuild
+          cache: ${{ !inputs.release }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ !inputs.release }}
+        with:
+          key: ${{ matrix.arch }}
+      - run: mise run release-build "$ARCH"
+        env:
+          MISE_AUTO_INSTALL: "false" # the tools above, not the whole mise.toml
+      - name: Size check (< 15 MB)
+        run: |
+          size=$(stat -c %s "$BIN")
+          echo "lotse: $size bytes"
+          test "$size" -lt 15728640
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lotse-${{ matrix.arch }}
+          path: ${{ env.BIN }}
+          if-no-files-found: error

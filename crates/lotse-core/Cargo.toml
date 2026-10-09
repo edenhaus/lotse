@@ -1,0 +1,39 @@
+[package]
+name = "lotse-core"
+description = "Tracks, packets, frames, source and sink contracts, registries, fan-out, clock mapping and track negotiation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# Fakes for core's own types (`FakeClock`, later the scripted track driver). They cannot live in
+# `lotse-testing`, which depends on this crate.
+test-util = []
+# Names every task for tokio-console: `spawn_named` goes through `tokio::task::Builder`, which
+# exists only with `--cfg tokio_unstable` and tokio's `tracing` feature; without the cfg it changes
+# nothing.
+console = ["tokio/tracing"]
+
+[dependencies]
+arc-swap = { workspace = true }
+bytes = { workspace = true }
+percent-encoding = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "time"] } # channels for the fan-out; `select!`; the runtime timer behind `SystemClock::sleep`
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+allocation-counter = { workspace = true } # the fan-out's allocation count (tests/allocations.rs)
+tokio = { workspace = true, features = ["macros", "test-util"] } # `start_paused` tests of the system clock
+
+[lints]
+workspace = true

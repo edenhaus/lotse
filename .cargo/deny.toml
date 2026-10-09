@@ -1,0 +1,67 @@
+# cargo-deny policy.
+
+[graph]
+targets = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# Anything not listed needs a documented justification here.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MPL-2.0",
+  "Zlib",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0", # webpki-roots data
+]
+exceptions = [
+  # libFuzzer's own license (LLVM's before Apache-2.0 WITH LLVM-exception); only the fuzz workspace
+  # (fuzz/Cargo.lock) links it, never a release build, so cargo-about never meets it.
+  { crate = "libfuzzer-sys", allow = ["NCSA"] },
+]
+# One policy for two workspaces (the root and fuzz/): each run meets only its own exceptions.
+unused-license-exception = "allow"
+
+[licenses.private]
+ignore = true # our own publish = false crates
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true # internal path dependencies
+# Crate layering (which crate may depend on which) is checked by scripts/check_crate_layering.py
+# against .cargo/layering.toml: cargo-deny's `wrappers` cannot describe a graph ahead of the code
+# without warning on every run. This list is for crates that must never appear at all.
+deny = [
+  { crate = "openssl", reason = "TLS is rustls with the ring provider" },
+  { crate = "openssl-sys", reason = "TLS is rustls with the ring provider" },
+  { crate = "native-tls", reason = "TLS is rustls with the ring provider" },
+  { crate = "aws-lc-rs", reason = "crypto is ring (rustls, rcgen) and RustCrypto (str0m's provider, dimpl), never aws-lc" },
+  { crate = "aws-lc-sys", reason = "crypto is ring (rustls, rcgen) and RustCrypto (str0m's provider, dimpl), never aws-lc" },
+  { crate = "aws-lc-fips-sys", reason = "crypto is ring (rustls, rcgen) and RustCrypto (str0m's provider, dimpl), never aws-lc" },
+  { crate = "jemallocator", reason = "mimalloc is the allocator" },
+  { crate = "tikv-jemallocator", reason = "mimalloc is the allocator" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    # retina, pinned to a commit of main until its next release (the root `Cargo.toml`).
+    "https://github.com/scottlamb/retina",
+]
