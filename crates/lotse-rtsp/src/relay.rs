@@ -1002,10 +1002,7 @@ mod tests {
     {
         let (orphan, mut plain) = orphaned_relay().await;
         let (fresh, mut far) = tokio::io::duplex(1024);
-        let forward = spawn_named(
-            "test.teardown",
-            teardown(orphan, move || async move { Ok(fresh) }),
-        );
+        let forward = spawn_named("test.teardown", teardown(orphan, connect_to(Ok(fresh))));
         // A keepalive has nobody to answer it; the TEARDOWN, in two
         // pieces, goes on as retina wrote it.
         let teardown_request =
@@ -1036,8 +1033,17 @@ mod tests {
         bounded(forward).await.unwrap();
     }
 
+    /// The fresh connection [`teardown`] makes: `camera`, at once. One
+    /// closure type for every test of a camera type, so one instance of
+    /// [`teardown`] serves them all.
+    fn connect_to<S>(
+        camera: Result<S, SourceError>,
+    ) -> impl FnOnce() -> std::future::Ready<Result<S, SourceError>> {
+        move || std::future::ready(camera)
+    }
+
     /// A camera the fresh connection cannot reach.
-    async fn no_camera() -> Result<tokio::io::DuplexStream, SourceError> {
+    fn no_camera() -> Result<tokio::io::DuplexStream, SourceError> {
         Err(SourceError::Unreachable("no".into()))
     }
 
@@ -1046,11 +1052,11 @@ mod tests {
         // retina closes without one.
         let (orphan, plain) = orphaned_relay().await;
         drop(plain);
-        let forward = spawn_named("test.teardown", teardown(orphan, no_camera));
+        let forward = spawn_named("test.teardown", teardown(orphan, connect_to(no_camera())));
         bounded(forward).await.unwrap();
         // The camera cannot be reached.
         let (orphan, mut plain) = orphaned_relay().await;
-        let forward = spawn_named("test.teardown", teardown(orphan, no_camera));
+        let forward = spawn_named("test.teardown", teardown(orphan, connect_to(no_camera())));
         plain
             .write_all(b"TEARDOWN rtsp://127.0.0.1/s/ RTSP/1.0\r\nCSeq: 6\r\n\r\n")
             .await
@@ -1065,10 +1071,7 @@ mod tests {
         ] {
             let (orphan, mut plain) = orphaned_relay().await;
             let (fresh, mut far) = tokio::io::duplex(1024);
-            let forward = spawn_named(
-                "test.teardown",
-                teardown(orphan, move || async move { Ok(fresh) }),
-            );
+            let forward = spawn_named("test.teardown", teardown(orphan, connect_to(Ok(fresh))));
             plain
                 .write_all(b"TEARDOWN rtsp://127.0.0.1/s/ RTSP/1.0\r\nCSeq: 6\r\n\r\n")
                 .await
@@ -1084,7 +1087,7 @@ mod tests {
         }
         // retina writes what no parser reads.
         let (orphan, mut plain) = orphaned_relay().await;
-        let forward = spawn_named("test.teardown", teardown(orphan, no_camera));
+        let forward = spawn_named("test.teardown", teardown(orphan, connect_to(no_camera())));
         plain.write_all(b"\x01\x02 junk\r\n\r\n").await.unwrap();
         bounded(forward).await.unwrap();
     }
@@ -1231,15 +1234,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pre_bound_socket_that_is_no_tcp_listener_fails_the_attempt_as_unreachable() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+
+        // Its address is no IP address: the listener has none to give.
+        let not_tcp = StdListener::from(OwnedFd::from(UnixDatagram::unbound().unwrap()));
+        let err = listen(Some(&not_tcp)).await.unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Unreachable(message) if message.starts_with("rtsp relay: ")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reset_from_retina_ends_the_copy_and_the_relay_stays_for_the_session() {
+        let (listener, local) = listen(None).await.unwrap();
+        let (camera, mut far) = tokio::io::duplex(1024);
+        let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
+        let mut plain = TcpStream::connect(local).await.unwrap();
+        let request = b"OPTIONS rtsp://127.0.0.1/ RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        plain.write_all(request).await.unwrap();
+        let mut got = vec![0_u8; request.len()];
+        bounded(far.read_exact(&mut got)).await.unwrap();
+        // retina's connection resets: the read fails, the copy ends and
+        // the camera's side closes with it.
+        plain.set_zero_linger().unwrap();
+        drop(plain);
+        let mut rest = Vec::new();
+        assert_eq!(bounded(far.read_to_end(&mut rest)).await.unwrap(), 0);
+        settle().await;
+        assert!(!relay.is_finished(), "a failure is the session's to report");
+        relay.abort();
+    }
+
+    #[tokio::test]
+    async fn over_udp_a_fresh_teardown_that_fails_on_either_connection_gives_up() {
+        let teardown_request = b"TEARDOWN rtsp://127.0.0.1/s/ RTSP/1.0\r\nCSeq: 6\r\n\r\n";
+        // retina's connection resets before its TEARDOWN.
+        let (orphan, plain) = orphaned_relay().await;
+        plain.set_zero_linger().unwrap();
+        drop(plain);
+        let forward = spawn_named("test.teardown", teardown(orphan, connect_to(no_camera())));
+        bounded(forward).await.unwrap();
+        // The fresh connection takes no request.
+        let (orphan, mut plain) = orphaned_relay().await;
+        let (fresh, far) = tokio::io::duplex(1024);
+        drop(far);
+        let forward = spawn_named("test.teardown", teardown(orphan, connect_to(Ok(fresh))));
+        plain.write_all(teardown_request).await.unwrap();
+        bounded(forward).await.unwrap();
+        // The fresh connection fails once the request went on.
+        let (orphan, mut plain) = orphaned_relay().await;
+        let failing = tokio::io::join(Broken, tokio::io::sink());
+        let forward = spawn_named("test.teardown", teardown(orphan, connect_to(Ok(failing))));
+        plain.write_all(teardown_request).await.unwrap();
+        bounded(forward).await.unwrap();
+        // retina's side takes no answer.
+        let (mut orphan, mut plain) = orphaned_relay().await;
+        orphan.to_retina.shutdown().await.unwrap();
+        let (fresh, mut far) = tokio::io::duplex(1024);
+        let forward = spawn_named("test.teardown", teardown(orphan, connect_to(Ok(fresh))));
+        plain.write_all(teardown_request).await.unwrap();
+        assert!(read_head(&mut far).await.starts_with("TEARDOWN "));
+        far.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 6\r\n\r\n")
+            .await
+            .unwrap();
+        bounded(forward).await.unwrap();
+        let mut rest = Vec::new();
+        assert_eq!(bounded(plain.read_to_end(&mut rest)).await.unwrap(), 0);
+    }
+
+    const DESCRIBED: &[u8] = b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Type: application/sdp\r\nContent-Length: 5\r\n\r\nv=0\r\n";
+    const SETUP: &[u8] = b"SETUP rtsp://127.0.0.1/s/track0 RTSP/1.0\r\nCSeq: 3\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n";
+
+    #[tokio::test]
+    async fn rfc3550_6_4_2_over_udp_a_report_the_camera_cannot_take_ends_the_pump_with_retinas_side_kept()
+     {
+        use lotse_core::clock::FakeClock;
+
+        let clock = Arc::new(FakeClock::from_system());
+        let (reports, time) = reports_on(&clock);
+        let udp = UdpRelay::new(Ipv4Addr::LOCALHOST.into(), Arc::default(), time, reports);
+        let (listener, local) = listen(None).await.unwrap();
+        let (reads, mut camera_says) = tokio::io::duplex(4096);
+        let (writes, mut camera_hears) = tokio::io::duplex(4096);
+        let relay = spawn_named(
+            "test.pump",
+            pump(
+                listener,
+                tokio::io::join(reads, writes),
+                Media::Udp(Box::new(udp)),
+            ),
+        );
+        let mut plain = TcpStream::connect(local).await.unwrap();
+        camera_says.write_all(DESCRIBED).await.unwrap();
+        let mut got = vec![0_u8; DESCRIBED.len()];
+        bounded(plain.read_exact(&mut got)).await.unwrap();
+        plain.write_all(SETUP).await.unwrap();
+        assert!(read_head(&mut camera_hears).await.starts_with("SETUP "));
+        // The camera keeps the stream on its connection (RFC 2326 §10.12):
+        // its reports go there too.
+        camera_says
+            .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: 7\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_head(&mut plain).await.contains("interleaved=0-1"));
+        let mut frames = rtp_frame(1);
+        frames.extend_from_slice(&rtp_frame(2));
+        camera_says.write_all(&frames).await.unwrap();
+        let mut got = vec![0_u8; frames.len()];
+        bounded(plain.read_exact(&mut got)).await.unwrap();
+        // The camera stops reading; the report falls due.
+        drop(camera_hears);
+        clock.advance(std::time::Duration::from_secs(30));
+        let end = bounded(relay).await.unwrap();
+        assert!(
+            matches!(end.error, SourceError::Ended(ref m) if m.starts_with("writing to the camera failed")),
+            "{end:?}"
+        );
+        assert!(end.orphan.is_some());
+    }
+
+    #[test]
+    fn over_udp_a_pair_that_cannot_receive_ends_the_pump_with_retinas_side_kept() {
+        // The pair joins a runtime that is then shut down: every receive on
+        // it fails.
+        let gone = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let mut udp = udp_relay();
+        {
+            let _inside = gone.enter();
+            let mut out = Vec::new();
+            udp.camera_sent(DESCRIBED, &mut out).unwrap();
+            udp.retina_wrote(SETUP, &mut out).unwrap();
+            let request = String::from_utf8(out).unwrap();
+            let at = request.find("client_port=").unwrap() + "client_port=".len();
+            let port: u16 = request[at..].split('-').next().unwrap().parse().unwrap();
+            let answer = format!(
+                "RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: 7\r\nTransport: RTP/AVP;unicast;client_port={port}-{}\r\n\r\n",
+                port + 1
+            );
+            udp.camera_sent(answer.as_bytes(), &mut Vec::new()).unwrap();
+        }
+        drop(gone);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let end = runtime.block_on(async move {
+            let (listener, local) = listen(None).await.unwrap();
+            let (camera, _far) = tokio::io::duplex(64);
+            let relay = spawn_named(
+                "test.pump",
+                pump(listener, camera, Media::Udp(Box::new(udp))),
+            );
+            let _plain = TcpStream::connect(local).await.unwrap();
+            bounded(relay).await.unwrap()
+        });
+        assert!(
+            matches!(end.error, SourceError::Ended(ref m) if m.starts_with("rtsp udp: receiving media failed")),
+            "{end:?}"
+        );
+        assert!(end.orphan.is_some());
+    }
+
+    #[tokio::test]
     async fn a_camera_that_cannot_be_reached_is_unreachable() {
         // A port nothing listens on: bound, then closed.
         let addr = StdListener::bind((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
             .local_addr()
             .unwrap();
-        let Err(SourceError::Unreachable(message)) = tcp(addr).await else {
-            panic!("unreachable");
-        };
-        assert!(message.starts_with("Unable to connect to"), "{message}");
+        let err = tcp(addr).await.unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Unreachable(message) if message.starts_with("Unable to connect to")),
+            "{err:?}"
+        );
     }
 }

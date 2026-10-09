@@ -282,17 +282,24 @@ impl ServerCertVerifier for CameraVerifier {
     }
 }
 
+/// A client configuration rustls refused, as the attempt's protocol
+/// error. One function for every refusal: the protocol versions the
+/// `ring` provider always supports cannot be refused, the verifier's
+/// roots can.
+fn tls_failed(err: impl fmt::Display) -> SourceError {
+    SourceError::Protocol(format!("tls: {err}"))
+}
+
 /// The client configuration: the `ring` provider, TLS 1.3 and 1.2, the
 /// check `trust` asks for (against `roots` in [`Trust::Roots`]), no client
 /// certificate.
 fn client_config(trust: Trust, roots: RootCertStore) -> Result<ClientConfig, SourceError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let failed = |err: &dyn fmt::Display| SourceError::Protocol(format!("tls: {err}"));
     let check = match trust {
         Trust::Roots => Check::Roots(
             WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
                 .build()
-                .map_err(|err| failed(&err))?,
+                .map_err(tls_failed)?,
         ),
         Trust::Pin(pin) => Check::Pin(pin),
         Trust::Insecure => Check::Insecure,
@@ -303,7 +310,7 @@ fn client_config(trust: Trust, roots: RootCertStore) -> Result<ClientConfig, Sou
     };
     Ok(ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .map_err(|err| failed(&err))?
+        .map_err(tls_failed)?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth())
@@ -382,6 +389,15 @@ mod tests {
 
     /// FIPS 180-2 Appendix B.1: SHA-256("abc").
     const ABC: &str = "ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad";
+
+    #[test]
+    fn a_verifier_without_roots_is_refused_as_protocol() {
+        let err = client_config(Trust::Roots, RootCertStore::empty()).unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Protocol(m) if m.starts_with("tls: ")),
+            "{err:?}"
+        );
+    }
 
     #[test]
     fn a_fingerprint_is_the_sha256_of_the_der_fips_180_2_b_1() {

@@ -414,7 +414,7 @@ async fn a_camera_that_hangs_up_ends_the_source() {
     assert!(harness.wait_ready().await);
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Ended(_))),
+        matches!(exit, SourceExit::Ended(SourceError::Ended(ref m)) if m == "the camera closed the session"),
         "{exit:?}"
     );
     cam.stop().await;
@@ -485,6 +485,171 @@ async fn an_rtp_media_line_without_a_format_is_skipped_rfc8866_5_14() {
     harness.cancel();
     harness.finish().await;
     cam.stop().await;
+}
+
+/// A camera whose SDP describes a metadata stream before its video: the
+/// application media is no track, and the video plays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc8866_5_14_an_application_stream_is_skipped_and_the_video_plays() {
+    let cam = camera(CameraConfig {
+        sdp_session_lines:
+            "m=application 0 RTP/AVP 107\r\na=rtpmap:107 vnd.onvif.metadata/90000\r\n".into(),
+        ..CameraConfig::default()
+    })
+    .await;
+    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(harness.wait_ready().await);
+    assert_eq!(harness.tracks.tracks().len(), 1);
+    assert_eq!(
+        lotse_testing::fake_camera::Stats::get(&cam.stats().setups),
+        1
+    );
+    harness.cancel();
+    harness.finish().await;
+    cam.stop().await;
+}
+
+/// A camera whose SDP describes two video streams: the first one is the
+/// video track, the second is not set up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc8866_5_14_of_two_video_streams_the_first_plays() {
+    let cam = camera(CameraConfig {
+        sdp_session_lines: "m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n".into(),
+        ..CameraConfig::default()
+    })
+    .await;
+    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(harness.wait_ready().await);
+    assert_eq!(harness.tracks.tracks().len(), 1);
+    assert_eq!(
+        lotse_testing::fake_camera::Stats::get(&cam.stats().setups),
+        1
+    );
+    harness.cancel();
+    harness.finish().await;
+    cam.stop().await;
+}
+
+/// A URL whose request outgrows the relay's bound (64 KiB, as retina
+/// reads) before it is whole: the relay refuses retina's `DESCRIBE`, a
+/// protocol error before the camera sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_over_64_kib_is_refused_by_the_relay_as_protocol() {
+    let cam = camera(CameraConfig::default()).await;
+    let url = format!("{}/{}", cam.url(), "x".repeat(200_000));
+    let source = make_source(&url, &serde_json::Value::Null);
+    let harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    let exit = harness.finish().await;
+    assert!(
+        matches!(exit, SourceExit::Ended(SourceError::Protocol(ref m)) if m.contains("retina's request is unreadable")),
+        "{exit:?}"
+    );
+    assert_eq!(
+        lotse_testing::fake_camera::Stats::get(&cam.stats().describes),
+        0
+    );
+    cam.stop().await;
+}
+
+/// A scripted camera on one connection: every RTSP request answered with
+/// `200 OK`, the `DESCRIBE` with `sdp`, the `SETUP` with an interleaved
+/// session, and `after_play` sent after the `PLAY` answer; until the
+/// client closes.
+async fn answer_with(listener: tokio::net::TcpListener, sdp: &'static str, after_play: &[u8]) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut pending = Vec::new();
+    let mut buf = [0_u8; 4096];
+    loop {
+        let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") else {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            pending.extend_from_slice(&buf[..n]);
+            continue;
+        };
+        let head = String::from_utf8_lossy(&pending[..end]).into_owned();
+        pending.drain(..end + 4);
+        let cseq = head
+            .lines()
+            .find_map(|line| line.strip_prefix("CSeq: "))
+            .unwrap_or("0");
+        let rest = if head.starts_with("DESCRIBE ") {
+            format!(
+                "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+                sdp.len()
+            )
+        } else if head.starts_with("SETUP ") {
+            "Session: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n".to_owned()
+        } else {
+            "Session: 1\r\n\r\n".to_owned()
+        };
+        let answer = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n{rest}");
+        stream.write_all(answer.as_bytes()).await.unwrap();
+        if head.starts_with("PLAY ") {
+            stream.write_all(after_play).await.unwrap();
+        }
+    }
+}
+
+/// A scripted camera on `127.0.0.1` ([`answer_with`]) and its source.
+async fn scripted(
+    sdp: &'static str,
+    after_play: &'static [u8],
+) -> (
+    Box<dyn lotse_core::source::Source>,
+    ResolvedPeer,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let camera = spawn_named("test.camera", answer_with(listener, sdp, after_play));
+    let source = make_source(&format!("rtsp://{addr}/stream"), &serde_json::Value::Null);
+    let peer = ResolvedPeer {
+        host: "127.0.0.1".into(),
+        addrs: vec![addr],
+    };
+    (source, peer, camera)
+}
+
+/// A camera that sends what no RTSP parser reads while it plays: retina's
+/// error ends the source as protocol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_12_an_unreadable_message_while_playing_ends_the_source_as_protocol() {
+    let (source, peer, camera) = scripted(
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=video\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:track0\r\n",
+        b"\x01\x02 junk\r\n\r\n",
+    )
+    .await;
+    let harness = Harness::start(source.as_ref(), peer, clock());
+    let exit = harness.finish().await;
+    assert!(
+        matches!(exit, SourceExit::Ended(SourceError::Protocol(_))),
+        "{exit:?}"
+    );
+    camera.await.unwrap();
+}
+
+/// A camera whose SDP describes a metadata stream alone: nothing to play,
+/// a protocol error before any `SETUP`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_sdp_without_video_or_audio_is_refused_as_protocol_rfc8866_5_14() {
+    let (source, peer, camera) = scripted(
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=metadata\r\nt=0 0\r\nm=application 0 RTP/AVP 107\r\na=rtpmap:107 vnd.onvif.metadata/90000\r\na=control:track0\r\n",
+        b"",
+    )
+    .await;
+    let harness = Harness::start(source.as_ref(), peer, clock());
+    let exit = harness.finish().await;
+    assert!(
+        matches!(exit, SourceExit::Ended(SourceError::Protocol(ref m)) if m == "the SDP describes no video or audio stream"),
+        "{exit:?}"
+    );
+    camera.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
