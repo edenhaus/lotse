@@ -183,7 +183,7 @@ fn start_limited(
     let _gone = std::fs::remove_dir_all(&dir);
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let socket = dir.join("lotse.sock");
-    let uid = rustix_uid();
+    let uid = owner_uid(&dir);
     let server = Server::bind(Config {
         socket: socket.clone(),
         owner_uid: uid,
@@ -213,13 +213,13 @@ fn start_limited(
     }
 }
 
-fn rustix_uid() -> u32 {
+fn owner_uid(dir: &std::path::Path) -> u32 {
     // The test's own uid, read through the file system to keep rustix out
-    // of the dev-dependencies: the temp dir we just made is ours.
+    // of the dev-dependencies: the directory the test just made is its
+    // own. Not the temp dir itself, which belongs to root on Linux (`/tmp`)
+    // and to the user only on macOS (a per-user `$TMPDIR`).
     use std::os::unix::fs::MetadataExt as _;
-    std::fs::metadata(std::env::temp_dir())
-        .map(|m| m.uid())
-        .unwrap()
+    std::fs::metadata(dir).map(|m| m.uid()).unwrap()
 }
 
 type Client = WebSocketStream<UnixStream>;
