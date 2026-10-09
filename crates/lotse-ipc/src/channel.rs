@@ -277,7 +277,16 @@ impl Receiver {
                     &mut self.fds,
                 )
             }) {
-                Ok(read) => read?,
+                Ok(Ok(read)) => read,
+                // A peer that closed with our messages unread: Linux fails
+                // the read with `ECONNRESET` (`unix_release_sock` in
+                // net/unix/af_unix.c; observed on Linux 7.0, 2026-10-09)
+                // where macOS returns end of file. Between frames both
+                // are a close.
+                Ok(Err(err)) if err.kind() == io::ErrorKind::ConnectionReset && self.have == 0 => {
+                    return Ok(None);
+                }
+                Ok(Err(err)) => return Err(err.into()),
                 Err(_would_block) => continue,
             };
             if self.fds.len() > MAX_FDS {
@@ -674,6 +683,34 @@ mod tests {
             matches!(err, IpcError::Truncated { have: 7, want: 14 }),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_closes_with_our_messages_unread_ends_the_channel_unix_7() {
+        // Linux fails the read with ECONNRESET here, macOS returns end of
+        // file: between frames both are a close.
+        let (a_tx, a_rx, mut b_tx, mut b_rx) = pair();
+        b_tx.send(b"never read", &[]).await.unwrap();
+        drop((a_tx, a_rx));
+        assert!(b_rx.recv().await.unwrap().is_none());
+
+        // Inside a frame it is still an error.
+        let (theirs, ours) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::empty(),
+            None,
+        )
+        .unwrap();
+        let (mut tx, mut rx) = Channel::from_fd(ours).unwrap().split();
+        tx.send(b"never read", &[]).await.unwrap();
+        {
+            use std::io::Write as _;
+            let mut raw = std::os::unix::net::UnixStream::from(theirs);
+            raw.write_all(&10_u32.to_le_bytes()).unwrap();
+            raw.write_all(b"abc").unwrap();
+        }
+        assert!(rx.recv().await.is_err());
     }
 
     #[tokio::test]
