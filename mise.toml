@@ -173,12 +173,14 @@ run = [
 ]
 
 [tasks.set-version]
-description = "Sets the workspace's version and its Cargo.lock entries (a release: CI sets the tag's before building)"
+description = "Sets the workspace's version and its lockfile entries (a release: CI sets the tag's before building; the repository keeps 0.0.0-dev)"
 usage = 'arg "<version>" help="SemVer, without the v"'
 run = """
 sed -i.bak -E '/^\\[workspace\\.package\\]/,/^\\[/ s/^version = ".*"/version = "'"$usage_version"'"/' Cargo.toml
 rm Cargo.toml.bak
 cargo update --workspace
+# The fuzz workspace's lockfile records the library crates' version too; cargo updates only that.
+cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
 """
 
 [tasks.release-build]

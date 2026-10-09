@@ -52,7 +52,7 @@ cache that only `main` saves. A new job goes into
 | `mise run test-archive` | the musl tests built and archived for other machines, then the doctests (CI's Build job) |
 | `mise run audit` | RustSec advisories, the root and the fuzz workspace (network) |
 | `mise run fuzz <target> [secs]` | one `cargo fuzz` target on the date-pinned nightly the task installs, under the contract's time and memory limits (`scripts/fuzz.sh`, as CI; cargo-fuzz installed by hand, the one nightly use) |
-| `mise run set-version <version>` | the workspace version and its `Cargo.lock` entries; only a release build sets it, from the tag |
+| `mise run set-version <version>` | the workspace version and its lockfile entries; only a release build sets it, from the tag (the repository keeps `0.0.0-dev`) |
 | `mise run release-build [x86_64\|aarch64]` | static musl binary (Linux only); zig links every musl build (`.cargo/config.toml`) |
 | `mise run sbom` / `mise run licenses` | a release's CycloneDX SBOMs and `THIRD_PARTY_LICENSES.md`, in `target/dist/` |
 | `mise run image load [arch]` | the scratch release image from the static binary, into the local Docker as `lotse:dev` |
@@ -152,6 +152,7 @@ The clients, the Python `lotse-client` among them, live in their own repository,
   Conventional Commit titles sort its notes and pick the version, and
   publishing it starts `release.yml`, which sets that version from the tag
   and builds, attests and attaches everything. The workspace version in
-  the repository is never bumped; never tag by hand.
+  the repository stays `0.0.0-dev`, so a build from source says it is
+  not a release; never bump it, never tag by hand.
 - AI-generated changes must be explainable by the human submitting them
   (`AI_POLICY.md`).

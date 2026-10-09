@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["fuzz"] # cargo-fuzz crate is its own workspace (nightly, libfuzzer-sys)
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.0-dev"
 edition = "2024"
 license = "MIT OR Apache-2.0" # see README, License
 publish = false
