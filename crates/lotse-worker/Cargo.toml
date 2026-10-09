@@ -27,7 +27,7 @@ lotse-ipc = { workspace = true }
 allocation-counter = { workspace = true } # the relay framer's allocation count (tests/allocations.rs)
 lotse-core = { workspace = true, features = ["test-util"] } # the fake source
 lotse-testing = { workspace = true } # the DSCP datagrams arrive with (Linux)
-rustix = { workspace = true, features = ["fs", "process"] } # reads the shared socket's O_NONBLOCK and fills the descriptor table in tests
+rustix = { workspace = true, features = ["fs", "process", "stdio"] } # reads the shared socket's O_NONBLOCK, fills the descriptor table and puts the control channel on stdin in tests
 
 [lints]
 workspace = true

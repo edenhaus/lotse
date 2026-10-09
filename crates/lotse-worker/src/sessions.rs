@@ -601,7 +601,13 @@ fn to_ipc(event: SessionEvent) -> Option<IpcEvent> {
             code: code.to_owned(),
             message,
         }),
-        SessionEvent::Connected | SessionEvent::KeyframeRequest => None,
+        SessionEvent::Connected => None,
+        SessionEvent::KeyframeRequest => {
+            // An upstream request (ONVIF) is an M6 optimization; until
+            // then the next camera keyframe repairs the picture.
+            tracing::debug!("keyframe wanted upstream");
+            None
+        }
     }
 }
 
@@ -670,10 +676,9 @@ async fn wait_ready(
     tokio::pin!(timeout);
     loop {
         tokio::select! {
-            changed = ready.changed() => {
-                if changed.is_err() {
-                    return Some(("internal_error", "the track set is gone".to_owned()));
-                }
+            // The session holds the track set, so its sender outlives this
+            // wait and `changed` never fails.
+            Ok(()) = ready.changed() => {
                 if *ready.borrow_and_update() {
                     return None;
                 }
@@ -971,11 +976,6 @@ async fn drain(
                 let gop = opened.video.gop();
                 opened.engine.join(ctx.clock.now(), gop.as_deref());
             }
-            SessionOutput::Event(SessionEvent::KeyframeRequest) => {
-                // An upstream request (ONVIF) is an M6 optimization;
-                // until then the next camera keyframe repairs the picture.
-                tracing::debug!("keyframe wanted upstream");
-            }
             SessionOutput::Event(SessionEvent::Closed { code, message }) => {
                 ctx.finish(code, message).await;
                 return None;
@@ -1051,12 +1051,10 @@ async fn run_session(
         // engine a capture time in its future (str0m then sends a Sender
         // Report with RTP time 0) and look younger to the age gate.
         tokio::select! {
-            datagram = inbound.recv() => {
+            // `ctx` holds a sender of the queue, so it never closes.
+            Some(datagram) = inbound.recv() => {
                 let now = ctx.clock.now();
-                match datagram {
-                    Some(datagram) => opened.engine.handle_datagram(now, datagram.transport, datagram.source, datagram.destination, &datagram.payload),
-                    None => opened.engine.close(now, "internal_error", "the router is gone".to_owned()),
-                }
+                opened.engine.handle_datagram(now, datagram.transport, datagram.source, datagram.destination, &datagram.payload);
             }
             // The reactions to track events are core's, shared by every
             // session output.
@@ -1074,9 +1072,12 @@ async fn run_session(
                     // track's lease goes; the m-line stays as negotiated.
                     opened.audio = None;
                     ctx.audio_withdrawn().await;
-                } else if let Some(audio) = opened.audio.as_ref() {
-                    let keep = apply_audio_event(opened.engine.as_mut(), now, audio.family, event, |packet| {
-                        audio.capture_time(&ctx.mapper, packet)
+                } else {
+                    // `next_audio` yields only while there is audio.
+                    let keep = opened.audio.as_ref().is_some_and(|audio| {
+                        apply_audio_event(opened.engine.as_mut(), now, audio.family, event, |packet| {
+                            audio.capture_time(&ctx.mapper, packet)
+                        })
                     });
                     if !keep {
                         opened.audio = None;
@@ -1112,9 +1113,793 @@ async fn run_session(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::missing_docs_in_private_items, reason = "test code")]
+    #![allow(
+        clippy::arithmetic_side_effects,
+        clippy::missing_docs_in_private_items,
+        reason = "test code"
+    )]
+
+    use std::collections::VecDeque;
+    use std::io::Read as _;
+    use std::pin::{Pin, pin};
+    use std::task::Poll;
+
+    use lotse_core::clock::FakeClock;
+    use lotse_core::codec::{Codec, Kind};
+    use lotse_core::media::RtpHeaderFields;
+    use lotse_core::output::{OutputShape, TrackRequest};
+    use lotse_core::session::{SessionOpenError, SessionStats};
+    use lotse_core::source::{TrackPublisher, TrackSet};
+    use lotse_core::track::{GopSnapshot, TrackId, TrackLimits};
+    use tracing::Level;
 
     use super::*;
+    use crate::test_logs::Logs;
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    /// What the scripted engines of a test did, and what they say next.
+    #[derive(Debug, Default)]
+    struct Script {
+        /// Every engine and output call, in order.
+        calls: Mutex<Vec<String>>,
+        /// What the next polls return, before the engine's timeout.
+        outputs: Mutex<VecDeque<SessionOutput>>,
+        /// Opening a session fails with `invalid_sdp`.
+        refuse: bool,
+    }
+
+    impl Script {
+        fn call(&self, call: &str) {
+            self.calls.lock().unwrap().push(call.to_owned());
+        }
+
+        fn called(&self, call: &str) -> bool {
+            self.calls.lock().unwrap().iter().any(|made| made == call)
+        }
+
+        fn then(&self, output: SessionOutput) {
+            self.outputs.lock().unwrap().push_back(output);
+        }
+    }
+
+    /// An engine that records its calls in its script and returns the
+    /// script's outputs, then a timeout an hour after it opened or last
+    /// timed out. It takes every relay candidate and video change, and
+    /// closes when asked.
+    #[derive(Debug)]
+    struct Scripted {
+        script: Arc<Script>,
+        idle: Instant,
+    }
+
+    impl SessionEngine for Scripted {
+        fn handle_datagram(
+            &mut self,
+            _now: Instant,
+            transport: Transport,
+            source: SocketAddr,
+            _destination: SocketAddr,
+            bytes: &[u8],
+        ) {
+            let payload = String::from_utf8_lossy(bytes);
+            self.script
+                .call(&format!("datagram {transport:?} {source} {payload}"));
+        }
+
+        fn handle_timeout(&mut self, now: Instant) {
+            self.script.call("timeout");
+            self.idle = now + HOUR;
+        }
+
+        fn add_remote_candidate(&mut self, _now: Instant, candidate: &str) {
+            self.script.call(&format!("candidate {candidate}"));
+        }
+
+        fn add_relay_candidate(
+            &mut self,
+            _now: Instant,
+            relayed: SocketAddr,
+            _local: SocketAddr,
+        ) -> Option<String> {
+            self.script.call(&format!("relay {relayed}"));
+            Some(format!("candidate:relay {relayed}"))
+        }
+
+        fn join(&mut self, _now: Instant, _gop: Option<&GopSnapshot>) {
+            self.script.call("join");
+        }
+
+        fn write_video(&mut self, _now: Instant, _packet: &MediaPacket, _wallclock: Instant) {
+            self.script.call("video");
+        }
+
+        fn write_audio(&mut self, _now: Instant, _packet: &MediaPacket, _wallclock: Instant) {
+            self.script.call("audio");
+        }
+
+        fn skip_to_keyframe(&mut self, reason: &'static str) {
+            self.script.call(&format!("skip {reason}"));
+        }
+
+        fn set_orientation(&mut self, orientation: Orientation) {
+            self.script
+                .call(&format!("orientation {}", orientation.name()));
+        }
+
+        fn check_video_change(&self, codec: &Codec) -> Result<(), String> {
+            self.script.call(&format!("video change {}", codec.name()));
+            Ok(())
+        }
+
+        fn close(&mut self, _now: Instant, code: &'static str, message: String) {
+            self.script.call(&format!("close {code}"));
+            self.script
+                .then(SessionOutput::Event(SessionEvent::Closed { code, message }));
+        }
+
+        fn poll(&mut self) -> SessionOutput {
+            let next = self.script.outputs.lock().unwrap().pop_front();
+            next.unwrap_or(SessionOutput::Timeout(self.idle))
+        }
+
+        fn stats(&self) -> SessionStats {
+            SessionStats::default()
+        }
+    }
+
+    /// The `webrtc` output of [`Scripted`] engines: H.264 video, and PCMU
+    /// audio when asked.
+    #[derive(Debug, Default)]
+    struct ScriptedOutput(Arc<Script>);
+
+    impl OutputFactory for ScriptedOutput {
+        fn kind(&self) -> &'static str {
+            "webrtc"
+        }
+
+        fn shape(&self) -> OutputShape {
+            OutputShape::Session
+        }
+
+        fn session_tracks(&self, audio: bool) -> Vec<TrackRequest> {
+            let video = TrackRequest {
+                kind: Kind::Video,
+                accept: vec![CodecFamily::H264],
+                unit: Unit::Packets,
+                required: true,
+            };
+            let audio = audio.then(|| TrackRequest {
+                kind: Kind::Audio,
+                accept: vec![CodecFamily::Pcmu],
+                unit: Unit::Packets,
+                required: false,
+            });
+            std::iter::once(video).chain(audio).collect()
+        }
+
+        fn open_session(
+            &self,
+            request: SessionRequest,
+            now: Instant,
+        ) -> Result<(Box<dyn SessionEngine>, String), SessionOpenError> {
+            self.0
+                .call(&format!("open audio={}", request.audio.is_some()));
+            self.0
+                .call(&format!("open orientation={}", request.orientation.name()));
+            if self.0.refuse {
+                return Err(SessionOpenError::InvalidSdp("refused by the script".into()));
+            }
+            let engine = Scripted {
+                script: Arc::clone(&self.0),
+                idle: now + HOUR,
+            };
+            Ok((Box::new(engine), "answer".into()))
+        }
+    }
+
+    fn h264() -> Codec {
+        Codec::H264 {
+            profile_level_id: None,
+            sps: None,
+            pps: None,
+        }
+    }
+
+    /// A connection's tracks: H.264 video, PCMU audio with `audio`, ready
+    /// with `ready`.
+    fn connection(clock: &Arc<FakeClock>, audio: bool, ready: bool) -> TrackPublisher {
+        let set = TrackSet::new(TrackLimits::default(), clock.now());
+        let mut publisher = set.publisher();
+        publisher.declare(Kind::Video, h264(), 90_000);
+        if audio {
+            publisher.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        }
+        if ready {
+            publisher.ready();
+        }
+        publisher
+    }
+
+    /// The spec of session `id`, with audio if `audio`.
+    fn spec(id: &str, audio: bool) -> SessionSpec {
+        SessionSpec {
+            session_id: id.into(),
+            kind: "webrtc".into(),
+            offer: "v=0".into(),
+            ice_ufrag: format!("ufrag-{id}"),
+            ice_pass: "pass".into(),
+            candidates: vec![],
+            tcp_candidates: vec![],
+            audio,
+            orientation: 1,
+        }
+    }
+
+    /// A packet of a track's, arriving at `arrival`.
+    fn packet(arrival: Instant) -> MediaPacket {
+        MediaPacket {
+            arrival,
+            rtp: RtpHeaderFields {
+                pt: 96,
+                seq: 0,
+                ts: 0,
+                marker: true,
+                ssrc: 1,
+            },
+            frame_start: true,
+            keyframe_start: true,
+            epoch: 0,
+            lateness: Duration::ZERO,
+            payload: Arc::from(&[0x65_u8][..]),
+        }
+    }
+
+    /// A loopback TCP connection: the browser's end, and the worker's as
+    /// the descriptor the supervisor passes.
+    fn tcp_pair() -> (std::net::TcpStream, OwnedFd, SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let browser = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (ours, peer) = listener.accept().unwrap();
+        (browser, OwnedFd::from(ours), peer)
+    }
+
+    /// Polls `future` once, whatever woke it: a test steps a session to
+    /// where its inputs so far leave it, with nothing else running.
+    async fn poll_once<F: Future + Send + Unpin>(future: &mut F) -> Poll<F::Output> {
+        std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *future).poll(cx))).await
+    }
+
+    /// Yields until `done` holds, which it must not yet: the worker's other
+    /// tasks run meanwhile.
+    async fn until(done: &(dyn Fn() -> bool + Sync)) {
+        let mut yields = 0;
+        assert!(!done(), "holds already");
+        while !done() {
+            assert!(yields < 10_000, "does not hold after {yields} yields");
+            yields += 1;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// One session's surroundings, driven by hand: its connection's tracks,
+    /// its engine's script, and the queues its manager would hold.
+    struct Rig {
+        clock: Arc<FakeClock>,
+        publisher: TrackPublisher,
+        script: Arc<Script>,
+        events: mpsc::Receiver<(String, IpcEvent)>,
+        control: mpsc::Sender<Control>,
+        inbound: mpsc::Sender<Inbound>,
+    }
+
+    impl Rig {
+        /// The events the session reported since the last call.
+        fn events(&mut self) -> Vec<IpcEvent> {
+            std::iter::from_fn(|| self.events.try_recv().ok().map(|(_, event)| event)).collect()
+        }
+
+        /// The connection's first track of `kind`.
+        fn track(&self, kind: Kind) -> Arc<Track> {
+            self.publisher.tracks().get(TrackId::new(kind, 0)).unwrap()
+        }
+
+        fn control(&self, control: Control) {
+            self.control.try_send(control).unwrap();
+        }
+    }
+
+    /// Session `s` on the connection [`connection`] makes, and its task's
+    /// future, not yet polled.
+    fn session(script: Script, audio: bool, ready: bool) -> (Rig, impl Future<Output = ()> + Send) {
+        let clock = Arc::new(FakeClock::default());
+        let publisher = connection(&clock, audio, ready);
+        let script = Arc::new(script);
+        let (events_tx, events) = mpsc::channel(64);
+        let (control, control_rx) = mpsc::channel(64);
+        let (inbound, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let (uplink, _supervisor) = UnixDatagram::pair().unwrap();
+        let ctx = SessionCtx {
+            spec: spec("s", audio),
+            inbound: inbound.clone(),
+            tracks: DerivedTracks::new(Arc::clone(publisher.tracks()), Vec::new(), clock.clone()),
+            mapper: Arc::new(ClockMapper::new()),
+            factory: Arc::new(ScriptedOutput(Arc::clone(&script))),
+            limits: SessionLimits::default(),
+            udp: Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            uplink: Arc::new(uplink),
+            clock: clock.clone(),
+            events: events_tx,
+            routes: Arc::default(),
+            stats: Arc::default(),
+        };
+        let rig = Rig {
+            clock,
+            publisher,
+            script,
+            events,
+            control,
+            inbound,
+        };
+        (rig, run_session(ctx, inbound_rx, control_rx))
+    }
+
+    fn closed(code: &str, message: &str) -> IpcEvent {
+        IpcEvent::Closed {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// A session drives its engine with every input it has: media, the
+    /// supervisor's messages, datagrams and time; reports what the engine
+    /// says but a keyframe request, which stays in the worker; and closes
+    /// once its control queue goes, as the worker stops.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "one session's whole life")]
+    async fn a_live_session_drives_its_engine_and_closes_when_its_control_goes() {
+        let (logs, _guard) = Logs::capture();
+        let (mut rig, session) = session(Script::default(), true, true);
+        let mut session = pin!(session);
+        assert!(poll_once(&mut session).await.is_pending());
+        assert_eq!(
+            rig.events(),
+            [IpcEvent::Answer {
+                sdp: "answer".into()
+            }]
+        );
+        assert!(rig.script.called("open audio=true"));
+
+        rig.track(Kind::Video)
+            .publish_packet(packet(rig.clock.now()));
+        rig.track(Kind::Audio)
+            .publish_packet(packet(rig.clock.now()));
+        assert!(poll_once(&mut session).await.is_pending());
+        assert!(rig.script.called("video") && rig.script.called("audio"));
+
+        // What the engine says after the next input.
+        rig.script
+            .then(SessionOutput::Event(SessionEvent::Connected));
+        rig.script
+            .then(SessionOutput::Event(SessionEvent::KeyframeRequest));
+        rig.script
+            .then(SessionOutput::Event(SessionEvent::Candidate {
+                candidate: "candidate:1".into(),
+                mid: Some("0".into()),
+            }));
+        rig.script.then(SessionOutput::Event(SessionEvent::State {
+            ice: "connected",
+            dtls: "connected",
+        }));
+        rig.control(Control::Candidate("candidate:browser".into()));
+        assert!(poll_once(&mut session).await.is_pending());
+        assert!(rig.script.called("candidate candidate:browser"));
+        assert!(rig.script.called("join"));
+        assert_eq!(
+            rig.events(),
+            [
+                IpcEvent::Candidate {
+                    candidate: "candidate:1".into(),
+                    mid: Some("0".into())
+                },
+                IpcEvent::State {
+                    ice: "connected".into(),
+                    dtls: "connected".into()
+                }
+            ]
+        );
+        assert_eq!(logs.count(Level::DEBUG, "keyframe wanted upstream"), 1);
+
+        let relayed: SocketAddr = "203.0.113.5:40000".parse().unwrap();
+        rig.control(Control::Orientation(Orientation::Rotate180));
+        rig.control(Control::Relay {
+            relayed,
+            server: "203.0.113.1:3478".parse().unwrap(),
+            local: "127.0.0.1:5000".parse().unwrap(),
+            tcp: false,
+        });
+        assert!(poll_once(&mut session).await.is_pending());
+        assert!(rig.script.called("orientation rotate_180"));
+        assert_eq!(
+            rig.events(),
+            [IpcEvent::Relayed {
+                relayed,
+                candidate: Some(format!("candidate:relay {relayed}"))
+            }]
+        );
+        rig.control(Control::Channel {
+            relayed,
+            peer: "192.0.2.1:5000".parse().unwrap(),
+            channel: 0x4000,
+        });
+        assert!(poll_once(&mut session).await.is_pending());
+
+        // A hand-off whose descriptor the runtime cannot poll.
+        let dev_null = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        rig.control(Control::Tcp {
+            stream: std::net::TcpStream::from(dev_null),
+            peer: "192.0.2.1:5000".parse().unwrap(),
+            first_frame: vec![0, 1],
+        });
+        assert!(poll_once(&mut session).await.is_pending());
+        assert_eq!(logs.count(Level::WARN, "ice-tcp connection not usable"), 1);
+
+        rig.inbound
+            .try_send(Inbound {
+                transport: Transport::Udp,
+                source: "192.0.2.1:5000".parse().unwrap(),
+                destination: "127.0.0.1:5000".parse().unwrap(),
+                payload: b"check".to_vec(),
+            })
+            .unwrap();
+        assert!(poll_once(&mut session).await.is_pending());
+        assert!(rig.script.called("datagram Udp 192.0.2.1:5000 check"));
+
+        // A new epoch, then a codec change within the family.
+        rig.publisher.discontinuity();
+        assert!(poll_once(&mut session).await.is_pending());
+        assert!(rig.script.called("skip epoch"));
+        rig.track(Kind::Video).set_codec(Codec::H264 {
+            profile_level_id: Some([0x42, 0xe0, 0x1f]),
+            sps: None,
+            pps: None,
+        });
+        assert!(poll_once(&mut session).await.is_pending());
+        assert!(rig.script.called("video change h264"));
+
+        // The audio track ends: the session goes on with video.
+        rig.track(Kind::Audio).close();
+        assert!(poll_once(&mut session).await.is_pending());
+        assert_eq!(
+            logs.count(
+                Level::INFO,
+                "audio track closed; the session continues with video"
+            ),
+            1
+        );
+
+        rig.clock.advance(HOUR);
+        assert!(poll_once(&mut session).await.is_pending());
+        assert!(rig.script.called("timeout"));
+
+        rig.control = mpsc::channel(1).0;
+        assert!(poll_once(&mut session).await.is_ready());
+        assert!(rig.script.called("close shutting_down"));
+        assert_eq!(
+            rig.events(),
+            [closed("shutting_down", "the worker is stopping")]
+        );
+    }
+
+    /// While it waits for the tracks, a session keeps what its answer
+    /// needs, closes an ICE-TCP connection no browser can use yet, waits
+    /// on while the tracks are not ready, and closes when asked.
+    #[tokio::test]
+    async fn a_session_waiting_for_the_tracks_closes_an_ice_tcp_connection_and_closes_on_request() {
+        let (mut rig, session) = session(Script::default(), false, false);
+        let mut session = pin!(session);
+        assert!(poll_once(&mut session).await.is_pending());
+        let (mut browser, ours, peer) = tcp_pair();
+        rig.control(Control::Candidate("candidate:early".into()));
+        rig.control(Control::Tcp {
+            stream: std::net::TcpStream::from(ours),
+            peer,
+            first_frame: vec![0, 1],
+        });
+        assert!(poll_once(&mut session).await.is_pending());
+        assert_eq!(browser.read(&mut [0_u8; 1]).unwrap(), 0, "closed");
+        // A connection ends before it went live: still not ready.
+        rig.publisher.tracks().reset_ready();
+        assert!(poll_once(&mut session).await.is_pending());
+        assert!(rig.events().is_empty());
+        rig.control(Control::Close {
+            code: "session_closed",
+            message: "bye".into(),
+        });
+        assert!(poll_once(&mut session).await.is_ready());
+        assert_eq!(rig.events(), [closed("session_closed", "bye")]);
+        assert!(rig.script.calls.lock().unwrap().is_empty(), "never opened");
+    }
+
+    /// What arrives while a session waits for the tracks reaches its
+    /// answer: the orientation it opens with, and the relay candidates,
+    /// whose channels must wait for them.
+    #[tokio::test]
+    async fn a_session_waiting_for_the_tracks_answers_with_what_arrived_meanwhile() {
+        let (mut rig, session) = session(Script::default(), false, false);
+        let mut session = pin!(session);
+        assert!(poll_once(&mut session).await.is_pending());
+        let relayed: SocketAddr = "203.0.113.5:40000".parse().unwrap();
+        rig.control(Control::Orientation(Orientation::Rotate180));
+        rig.control(Control::Relay {
+            relayed,
+            server: "203.0.113.1:3478".parse().unwrap(),
+            local: "127.0.0.1:5000".parse().unwrap(),
+            tcp: false,
+        });
+        rig.control(Control::Channel {
+            relayed,
+            peer: "192.0.2.1:5000".parse().unwrap(),
+            channel: 0x4000,
+        });
+        assert!(poll_once(&mut session).await.is_pending());
+        assert!(
+            rig.script.calls.lock().unwrap().is_empty(),
+            "not opened yet"
+        );
+        rig.publisher.ready();
+        assert!(poll_once(&mut session).await.is_pending());
+        assert!(rig.script.called("open orientation=rotate_180"));
+        assert!(rig.script.called(&format!("relay {relayed}")));
+        assert_eq!(
+            rig.events(),
+            [
+                IpcEvent::Answer {
+                    sdp: "answer".into()
+                },
+                IpcEvent::Relayed {
+                    relayed,
+                    candidate: Some(format!("candidate:relay {relayed}"))
+                }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_waiting_for_the_tracks_ends_with_its_control_queue() {
+        let (mut rig, session) = session(Script::default(), false, false);
+        let mut session = pin!(session);
+        rig.control = mpsc::channel(1).0;
+        assert!(poll_once(&mut session).await.is_ready());
+        assert_eq!(
+            rig.events(),
+            [closed("shutting_down", "the worker is stopping")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_that_declares_no_tracks_within_the_ready_timeout_closes_the_session() {
+        let (mut rig, session) = session(Script::default(), false, false);
+        let mut session = pin!(session);
+        assert!(poll_once(&mut session).await.is_pending());
+        rig.clock
+            .advance(READY_TIMEOUT.checked_sub(Duration::from_millis(1)).unwrap());
+        assert!(poll_once(&mut session).await.is_pending());
+        rig.clock.advance(Duration::from_millis(1));
+        assert!(poll_once(&mut session).await.is_ready());
+        assert_eq!(
+            rig.events(),
+            [closed(
+                "source_not_live",
+                "the source declared no tracks within 10 s"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offer_the_output_refuses_closes_the_session_with_its_code() {
+        let script = Script {
+            refuse: true,
+            ..Script::default()
+        };
+        let (mut rig, session) = session(script, false, true);
+        assert_eq!(session.await, ());
+        assert!(rig.script.called("open audio=false"));
+        assert_eq!(
+            rig.events(),
+            [closed(
+                "invalid_sdp",
+                "invalid offer: refused by the script"
+            )]
+        );
+        // The parts no test session reaches.
+        let output = ScriptedOutput::default();
+        assert_eq!(output.shape(), OutputShape::Session);
+        let engine = Scripted {
+            script: Arc::default(),
+            idle: rig.clock.now(),
+        };
+        assert_eq!(engine.stats(), SessionStats::default());
+    }
+
+    /// A manager on fresh sockets with the scripted output, and what a
+    /// test drives it with.
+    struct Managed {
+        manager: SessionManager,
+        /// The supervisor's end of the datagram channel.
+        demux: StdUnixDatagram,
+        events: mpsc::Receiver<(String, IpcEvent)>,
+        clock: Arc<FakeClock>,
+        registries: Registries,
+        /// A connection that never goes live.
+        tracks: Arc<DerivedTracks>,
+    }
+
+    fn managed() -> Managed {
+        let clock = Arc::new(FakeClock::default());
+        let (datagrams, demux) = StdUnixDatagram::pair().unwrap();
+        let (events_tx, events) = mpsc::channel(64);
+        let manager = SessionManager::new(
+            OwnedFd::from(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            None,
+            OwnedFd::from(datagrams),
+            8,
+            clock.clone(),
+            events_tx,
+        )
+        .unwrap();
+        let mut registries = Registries::default();
+        registries
+            .outputs
+            .register(Arc::new(ScriptedOutput::default()))
+            .unwrap();
+        let publisher = connection(&clock, false, false);
+        let tracks = DerivedTracks::new(Arc::clone(publisher.tracks()), Vec::new(), clock.clone());
+        Managed {
+            manager,
+            demux,
+            events,
+            clock,
+            registries,
+            tracks,
+        }
+    }
+
+    impl Managed {
+        /// Opens session `id`, which waits for the tracks. Its task has not
+        /// run when this returns.
+        async fn open(&mut self, id: &str) {
+            self.manager
+                .open(
+                    spec(id, false),
+                    Arc::clone(&self.tracks),
+                    Arc::new(ClockMapper::new()),
+                    &self.registries,
+                    SessionLimits::default(),
+                )
+                .await;
+        }
+
+        /// Sends a datagram-channel frame for `ufrag` as the supervisor's
+        /// demux does.
+        fn route(&self, ufrag: &str) {
+            let mut frame = Vec::new();
+            datagram::encode(
+                ufrag,
+                "192.0.2.1:5000".parse().unwrap(),
+                "127.0.0.1:5000".parse().unwrap(),
+                b"check",
+                &mut frame,
+            );
+            self.demux.send(&frame).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_id_already_open_is_refused() {
+        let mut m = managed();
+        m.open("a").await;
+        m.open("a").await;
+        assert_eq!(
+            m.events.recv().await.unwrap(),
+            (
+                "a".into(),
+                closed("internal_error", "session id already open in this worker")
+            )
+        );
+    }
+
+    /// The manager never waits on a session: what its full control queue
+    /// cannot take is dropped, an ICE-TCP connection closed.
+    #[tokio::test]
+    async fn a_session_whose_control_queue_is_full_drops_messages_and_closes_hand_offs() {
+        let (logs, _guard) = Logs::capture();
+        let mut m = managed();
+        m.open("a").await;
+        // Its task has not run, so nothing reads the queue.
+        for n in 0..64 {
+            m.manager.candidate("a", format!("candidate:{n}"));
+        }
+        let dropped = "message dropped: session busy or gone";
+        assert_eq!(logs.count(Level::DEBUG, dropped), 0);
+        m.manager.candidate("a", "candidate:64".into());
+        assert_eq!(logs.count(Level::DEBUG, dropped), 1);
+        let (mut browser, ours, peer) = tcp_pair();
+        m.manager.ice_tcp("ufrag-a", ours, peer, vec![0, 1]);
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "session busy or gone; ice-tcp connection closed"
+            ),
+            1
+        );
+        assert_eq!(browser.read(&mut [0_u8; 1]).unwrap(), 0, "closed");
+    }
+
+    #[tokio::test]
+    async fn closing_all_sessions_waits_for_their_tasks_at_most_the_close_budget() {
+        let (logs, _guard) = Logs::capture();
+        let mut m = managed();
+        m.open("a").await;
+        let mut closing = pin!(m.manager.close_all("shutting_down", "bye"));
+        // The session's task has not run, so it cannot have stopped.
+        assert!(poll_once(&mut closing).await.is_pending());
+        m.clock.advance(CLOSE_BUDGET);
+        closing.await;
+        assert_eq!(
+            logs.count(Level::WARN, "session task did not stop in time"),
+            1
+        );
+    }
+
+    /// The router drops what no session can take: a frame for a session
+    /// whose queue is full, one for no session, and one that does not
+    /// decode.
+    #[tokio::test]
+    async fn the_router_counts_malformed_frames_and_frames_for_no_session_or_a_full_queue() {
+        let mut m = managed();
+        m.open("a").await;
+        // The session waits for the tracks, so it reads none of its queue.
+        let queue = m.manager.routes.lock().unwrap().get("ufrag-a").cloned();
+        let queue = queue.unwrap();
+        let datagram = || Inbound {
+            transport: Transport::Udp,
+            source: "192.0.2.1:5000".parse().unwrap(),
+            destination: "127.0.0.1:5000".parse().unwrap(),
+            payload: Vec::new(),
+        };
+        while queue.try_send(datagram()).is_ok() {}
+        m.route("ufrag-a");
+        until(&|| m.manager.stats().dropped.load(Ordering::Relaxed) == 1).await;
+        m.route("ufrag-nobody");
+        until(&|| m.manager.stats().unroutable.load(Ordering::Relaxed) == 1).await;
+        m.demux.send(&[0xff, 0xff]).unwrap();
+        until(&|| m.manager.stats().malformed.load(Ordering::Relaxed) == 1).await;
+    }
+
+    #[tokio::test]
+    async fn a_datagram_channel_that_fails_to_read_stops_the_router() {
+        let (logs, _guard) = Logs::capture();
+        // A listening TCP socket with a connection waiting is readable, and
+        // a read on it fails.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _waiting = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (events, _rx) = mpsc::channel(1);
+        let mut manager = SessionManager::new(
+            OwnedFd::from(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            None,
+            OwnedFd::from(listener),
+            8,
+            Arc::new(FakeClock::default()),
+            events,
+        )
+        .unwrap();
+        (&mut manager.reader).await.unwrap();
+        assert_eq!(
+            logs.count(Level::WARN, "datagram channel read failed; routing stopped"),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn egress_never_blocks_and_reaches_the_peer() {
@@ -1254,6 +2039,24 @@ mod tests {
         assert_eq!(egress_target(Some(v4), v4), v4);
         assert_eq!(egress_target(None, v6), v6);
         assert!(to_ipc(SessionEvent::Connected).is_none());
+        assert!(to_ipc(SessionEvent::KeyframeRequest).is_none());
+        assert_eq!(
+            to_ipc(SessionEvent::Candidate {
+                candidate: "candidate:1".into(),
+                mid: None
+            }),
+            Some(IpcEvent::Candidate {
+                candidate: "candidate:1".into(),
+                mid: None
+            })
+        );
+        assert_eq!(
+            to_ipc(SessionEvent::Closed {
+                code: "session_closed",
+                message: "bye".into()
+            }),
+            Some(closed("session_closed", "bye"))
+        );
         assert!(matches!(
             to_ipc(SessionEvent::State {
                 ice: "new",

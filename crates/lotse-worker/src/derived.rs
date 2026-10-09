@@ -659,9 +659,7 @@ mod tests {
         let derived = connection(fake_aac(), &transcoder);
         let (_, audio) = open(&derived);
         let changes = derived.changes();
-        let Codec::AacLc { config, .. } = fake_aac() else {
-            panic!("aac");
-        };
+        let config = variant!(fake_aac(), Codec::AacLc { config, .. } => config);
         let stereo = Codec::AacLc {
             sample_rate: 16_000,
             channels: 2,
@@ -707,9 +705,7 @@ mod tests {
         let derived = connection(fake_aac(), &transcoder);
         let picks = derived.pick(&requests(true));
         assert!(picks[0].is_ok(), "video plays");
-        let Err(err) = &picks[1] else {
-            panic!("audio unmet");
-        };
+        let err = variant!(&picks[1], Err(err) => err);
         assert_eq!(err.code(), "audio_codec_unsupported");
         assert_eq!(
             err.to_string(),
@@ -749,9 +745,7 @@ mod tests {
         };
         let derived = connection(unsupported, &transcoder);
         let picks = derived.pick(&requests(true));
-        let Err(err) = &picks[1] else {
-            panic!("audio unmet");
-        };
+        let err = variant!(&picks[1], Err(err) => err);
         assert_eq!(err.code(), "audio_codec_unsupported");
         assert_eq!(transcoder.started(), 0);
     }
@@ -791,5 +785,56 @@ mod tests {
             TrackId::new(Kind::Audio, 2),
             "past a derived a1 too"
         );
+        // Every index taken: the last, which a track set never reaches.
+        let full: Vec<Arc<Track>> = (0..=u8::MAX)
+            .map(|index| {
+                let id = TrackId::new(Kind::Audio, index);
+                Arc::new(Track::new(
+                    id,
+                    Codec::Pcmu,
+                    8_000,
+                    TrackLimits::default(),
+                    clock.now(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            next_id(&full, &[], Kind::Audio),
+            TrackId::new(Kind::Audio, u8::MAX)
+        );
+    }
+
+    /// Negotiation names only tracks and transcoders it was given; a plan
+    /// that names others is unmet rather than a panic.
+    #[tokio::test]
+    async fn a_plan_naming_an_unknown_track_or_transcoder_is_unmet() {
+        let transcoder = Arc::new(Forwarding::default());
+        let derived = connection(fake_aac(), &transcoder);
+        let no_audio = |result: Result<PickedTrack, NegotiationError>| {
+            matches!(result, Err(NegotiationError::NoTrack { kind: Kind::Audio }))
+        };
+        assert!(no_audio(derived.native(&mut [], &[], A0)));
+        let request = &requests(true)[1];
+        let opus = Codec::Opus { channels: 1 };
+        let natives = derived.tracks().tracks();
+        let mut entries = Vec::new();
+        assert!(no_audio(derived.start(
+            &mut entries,
+            &[],
+            request,
+            A0,
+            opus.clone(),
+            0
+        )));
+        assert!(no_audio(derived.start(
+            &mut entries,
+            &natives,
+            request,
+            A0,
+            opus,
+            1
+        )));
+        assert!(entries.is_empty());
+        assert_eq!(transcoder.started(), 0);
     }
 }
