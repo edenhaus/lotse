@@ -700,6 +700,13 @@ async fn accept_loop(
             },
             () = cancel.cancelled() => return,
         };
+        // Each packet goes out when written: with Nagle's algorithm, Linux's
+        // delayed ACKs held a frame's later packets for up to 40 ms and
+        // skewed every timing the tests take (observed on Linux 7.0,
+        // 2026-10-09; macOS did not hold them).
+        if let Err(err) = stream.set_nodelay(true) {
+            tracing::warn!(error = %err, "fake camera: TCP_NODELAY failed");
+        }
         Stats::bump(&stats.connections);
         let config = Arc::clone(&config);
         let stats = Arc::clone(&stats);

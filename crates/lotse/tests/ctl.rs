@@ -309,6 +309,12 @@ async fn a_sandboxed_supervisor_spawns_workers_that_go_live() {
                 > 0,
             "{stream}"
         );
+        // A URL is the source of one stream at a time (`source_in_use`),
+        // so the camera is released before the next transport takes it.
+        assert_eq!(
+            ok(&socket, &["stream", "delete", id]),
+            serde_json::json!({})
+        );
     }
     assert_eq!(Stats::get(&cam.stats().udp_setups), 1, "one UDP setup");
 

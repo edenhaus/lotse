@@ -1252,7 +1252,9 @@ mod tests {
             .unwrap();
         assert!(wait_for(|| sink.frames.lock().unwrap().len() == 1));
         let state = UdpSocketState::new((&client).into()).unwrap();
-        let burst: Vec<u8> = (0..340_u32).map(|i| (i / 100) as u8).collect();
+        let burst: Vec<u8> = (0..340_u32)
+            .map(|i| u8::try_from(i / 100).unwrap())
+            .collect();
         state
             .try_send(
                 (&client).into(),
