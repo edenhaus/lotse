@@ -18,6 +18,7 @@ cargo.binstall = false
 [tools]
 prek = "0.5.4"
 cargo-deny = "0.20.2"
+shellcheck = "0.11.0" # actionlint checks workflow scripts with it when it is on PATH, as on the CI runners
 "github:nextest-rs/nextest" = { version = "0.9.146", version_prefix = "cargo-nextest-" }
 "github:rust-cross/cargo-zigbuild" = "0.23.4"
 zig = "0.15.2" # C compiler and linker for every musl build, tests included (see .cargo/config.toml)

@@ -256,6 +256,7 @@ jobs:
         run: |
           gh release upload "$TAG" dist/*
           gh release view "$TAG" --json body --jq .body > notes.md
+          # shellcheck disable=SC2016 # envsubst's variable list, expanded by envsubst, not the shell
           envsubst '$IMAGE $VERSION $DIGEST $GH_REPO' >> notes.md <<'EOF'
 
           ## Container image
