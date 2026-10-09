@@ -151,11 +151,13 @@ impl Drop for Slot {
             .per_ip
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(count) = per_ip.get_mut(&self.ip) {
+        // A slot's address is counted until its last slot drops.
+        let left = per_ip.get_mut(&self.ip).map(|count| {
             *count = count.saturating_sub(1);
-            if *count == 0 {
-                per_ip.remove(&self.ip);
-            }
+            *count
+        });
+        if left == Some(0) {
+            per_ip.remove(&self.ip);
         }
     }
 }
@@ -364,28 +366,17 @@ mod tests {
         start_on(TcpListener::from_std(std_listener).unwrap(), config)
     }
 
-    /// The listener on `[::]` at a port where `127.0.0.1` reaches it.
-    /// macOS picks `[::]:0`'s port among the IPv6 ports only, and the
-    /// listener's `SO_REUSEADDR` lets it share one with another process's
-    /// `127.0.0.1` listener, which then takes every IPv4 connection
-    /// (observed 2026-10-07), so a probe connection must arrive here.
+    /// The listener on `[::]`, which a probe from `127.0.0.1` reaches.
+    /// Linux, where the tests run, never shares the port with another
+    /// listener on `127.0.0.1` (macOS did, observed 2026-10-07).
     async fn dual_stack_listener() -> TcpListener {
-        let mut tries = 0;
-        loop {
-            tries += 1;
-            assert!(tries <= 100, "no dual-stack port that 127.0.0.1 reaches");
-            let std_listener = super::super::udp::bind_tcp("[::]:0".parse().unwrap()).unwrap();
-            let listener = TcpListener::from_std(std_listener).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let probe = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-            let ours = tokio::select! {
-                accepted = listener.accept() => accepted.unwrap().1.port() == probe.local_addr().unwrap().port(),
-                () = SystemClock.sleep(Duration::from_secs(1)) => false,
-            };
-            if ours {
-                return listener;
-            }
-        }
+        let std_listener = super::super::udp::bind_tcp("[::]:0".parse().unwrap()).unwrap();
+        let listener = TcpListener::from_std(std_listener).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let probe = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (_accepted, from) = listener.accept().await.unwrap();
+        assert_eq!(from.port(), probe.local_addr().unwrap().port());
+        listener
     }
 
     fn start_on(listener: TcpListener, config: IceTcpConfig) -> Running {
@@ -420,14 +411,45 @@ mod tests {
         }
     }
 
+    /// Waits up to two seconds for `counter` to reach `expected`, looking
+    /// after each 10 ms.
     async fn settle(stats: &IceTcpStats, counter: impl Fn(&IceTcpStats) -> u64, expected: u64) {
-        for _ in 0..200 {
-            if counter(stats) == expected {
-                return;
-            }
+        let mut seen = None;
+        let mut looks = 0;
+        while seen != Some(expected) && looks < 200 {
             SystemClock.sleep(Duration::from_millis(10)).await;
+            looks += 1;
+            seen = Some(counter(stats));
         }
-        assert_eq!(counter(stats), expected);
+        assert_eq!(seen, Some(expected));
+    }
+
+    #[test]
+    fn a_slot_is_refused_over_the_total_or_the_per_address_limit() {
+        let pending = Arc::new(Pending::default());
+        let config = IceTcpConfig {
+            max_pending: 2,
+            max_per_ip: 1,
+            first_frame_deadline: Duration::from_secs(1),
+        };
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        let first = pending.take(a, &config).unwrap();
+        assert!(
+            pending.take(a, &config).is_none(),
+            "over the per-address limit"
+        );
+        let second = pending.take(b, &config).unwrap();
+        assert!(
+            pending
+                .take("192.0.2.3".parse().unwrap(), &config)
+                .is_none(),
+            "over the total"
+        );
+        assert_eq!(pending.total.load(Ordering::Acquire), 2);
+        drop((first, second));
+        assert_eq!(pending.total.load(Ordering::Acquire), 0);
+        assert!(pending.per_ip.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -64,36 +64,18 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<BoundUdp> {
     // Best effort: a kernel that refuses keeps the socket IPv6-only.
     let dual_stack =
         addr.is_ipv6() && socket.set_only_v6(false).is_ok() && !socket.only_v6().unwrap_or(true);
-    if let Err(err) = socket.set_recv_buffer_size(REQUESTED_BUFFER) {
-        tracing::debug!(error = %err, "udp receive buffer not raised");
-    }
-    if let Err(err) = socket.set_send_buffer_size(REQUESTED_BUFFER) {
-        tracing::debug!(error = %err, "udp send buffer not raised");
-    }
-    // A dual-stack socket sends IPv4 by `IP_TOS`, not by its traffic
-    // class (Linux, measured 2026-10-03: unmarked without it); macOS
-    // refuses `IP_TOS` on an IPv6 socket, so there IPv4 goes unmarked.
-    let marked = if addr.is_ipv6() {
-        socket
-            .set_tclass_v6(DSCP_AF41_TOS)
-            .and_then(|()| socket.set_tos_v4(DSCP_AF41_TOS))
-    } else {
-        socket.set_tos_v4(DSCP_AF41_TOS)
-    };
-    if let Err(err) = marked {
-        tracing::debug!(error = %err, "dscp not set on the udp socket");
-    }
+    tune(&socket, addr.is_ipv6());
     socket.bind(&addr.into())?;
     socket.set_read_timeout(Some(RECV_TIMEOUT))?;
     let local = socket
         .local_addr()?
         .as_socket()
-        .ok_or_else(|| io::Error::other("udp socket has no inet address"))?;
+        .ok_or(io::ErrorKind::AddrNotAvailable)?;
     let recv_buffer = socket.recv_buffer_size().unwrap_or(0);
     let send_buffer = socket.send_buffer_size().unwrap_or(0);
     // An empty list means sessions answer without a host candidate; the
     // `ready` event shows it too.
-    let hosts = hosts::host_addresses(local, dual_stack, hosts::probe, hosts::interfaces);
+    let hosts = hosts::host_addresses(local, dual_stack, &hosts::probe, &hosts::interfaces);
     tracing::info!(
         %local,
         dual_stack,
@@ -111,6 +93,30 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<BoundUdp> {
         dual_stack,
         hosts,
     })
+}
+
+/// Asks for the buffers and the DSCP mark, best effort: what the kernel
+/// refuses is logged, and the socket works without it.
+fn tune(socket: &Socket, ipv6: bool) {
+    if let Err(err) = socket.set_recv_buffer_size(REQUESTED_BUFFER) {
+        tracing::debug!(error = %err, "udp receive buffer not raised");
+    }
+    if let Err(err) = socket.set_send_buffer_size(REQUESTED_BUFFER) {
+        tracing::debug!(error = %err, "udp send buffer not raised");
+    }
+    // A dual-stack socket sends IPv4 by `IP_TOS`, not by its traffic
+    // class (Linux, measured 2026-10-03: unmarked without it); macOS
+    // refuses `IP_TOS` on an IPv6 socket, so there IPv4 goes unmarked.
+    let marked = if ipv6 {
+        socket
+            .set_tclass_v6(DSCP_AF41_TOS)
+            .and_then(|()| socket.set_tos_v4(DSCP_AF41_TOS))
+    } else {
+        socket.set_tos_v4(DSCP_AF41_TOS)
+    };
+    if let Err(err) = marked {
+        tracing::debug!(error = %err, "dscp not set on the udp socket");
+    }
 }
 
 /// Binds the ICE-TCP listener, non-blocking for the runtime.
@@ -239,6 +245,20 @@ mod tests {
             let (payload, _, dscp) = recv_marked(&receiver).unwrap();
             assert_eq!((&payload[..], dscp), (&b"video"[..], Some(34)), "{target}");
         }
+    }
+
+    #[test]
+    fn what_the_kernel_refuses_is_logged_and_the_socket_kept() {
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        for ipv6 in [false, true] {
+            // Not a socket: every option is refused.
+            let file = std::fs::File::open("/dev/null").unwrap();
+            tune(&Socket::from(std::os::fd::OwnedFd::from(file)), ipv6);
+        }
+        assert_eq!(captured.lines("udp receive buffer not raised").len(), 2);
+        assert_eq!(captured.lines("udp send buffer not raised").len(), 2);
+        assert_eq!(captured.lines("dscp not set on the udp socket").len(), 2);
     }
 
     #[test]

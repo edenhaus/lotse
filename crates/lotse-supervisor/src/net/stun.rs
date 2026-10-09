@@ -307,13 +307,12 @@ impl<'a> Message<'a> {
         let Some(at) = self.fingerprint_at else {
             return true;
         };
-        let Some(value) = bytes
-            .get(at.saturating_add(4)..at.saturating_add(8))
-            .and_then(|v| <[u8; 4]>::try_from(v).ok())
-        else {
-            return false;
-        };
-        let Some(covered) = bytes.get(..at) else {
+        // Bytes other than the parsed ones may end before the attribute's
+        // value does.
+        let Some((covered, value)) = bytes.split_at_checked(at).and_then(|(covered, attribute)| {
+            let value = <[u8; 4]>::try_from(attribute.get(4..8)?).ok()?;
+            Some((covered, value))
+        }) else {
             return false;
         };
         fingerprint_of(covered, at.saturating_add(8)) == u32::from_be_bytes(value)
@@ -591,6 +590,11 @@ mod tests {
         let message = parse(&tampered).unwrap();
         assert!(!message.verify_integrity(&tampered, PASSWORD));
         assert!(!message.fingerprint_ok(&tampered));
+        // Bytes that end inside the FINGERPRINT attribute, or before it,
+        // do not match (RFC 8489 §14.7).
+        let message = parse(REQUEST).unwrap();
+        assert!(!message.fingerprint_ok(&REQUEST[..REQUEST.len() - 1]));
+        assert!(!message.fingerprint_ok(&REQUEST[..HEADER_LEN]));
         assert!(message.xor_mapped_address().is_none());
         assert!(message.error_code().is_none());
     }
@@ -606,6 +610,20 @@ mod tests {
         );
         assert!(message.verify_integrity(RESPONSE, PASSWORD));
         assert!(message.fingerprint_ok(RESPONSE));
+    }
+
+    /// A message past the 16-bit length of the header (RFC 8489 §5) has no
+    /// length MESSAGE-INTEGRITY can cover: its value is zeros, which never
+    /// verify.
+    #[test]
+    fn rfc8489_5_a_message_too_long_for_its_length_gets_an_integrity_of_zeros() {
+        let big = vec![7_u8; 40_000];
+        let bytes = Builder::new(Class::Request, METHOD_BINDING, TRANSACTION)
+            .attribute(0x8030, &big)
+            .attribute(0x8030, &big)
+            .integrity(b"pass")
+            .build();
+        assert_eq!(&bytes[bytes.len() - INTEGRITY_LEN..], [0; INTEGRITY_LEN]);
     }
 
     #[test]

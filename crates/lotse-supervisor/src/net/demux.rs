@@ -562,31 +562,45 @@ fn receive_loop(
             DemuxStats::bump(&router.stats.idle_wakeups);
             continue;
         }
-        let read = match state.recv(socket.into(), &mut slots, &mut metas) {
-            Ok(read) => read,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                DemuxStats::bump(&router.stats.idle_wakeups);
-                continue;
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "udp receive failed");
-                continue;
-            }
-        };
-        for (slot, meta) in slots.iter().zip(&metas).take(read) {
-            // `len` never exceeds the slot it was read into.
-            let filled = slot.get(..meta.len).into_iter();
-            for payload in filled.flat_map(|data| segments(data, meta.stride)) {
-                router.route(payload, meta.addr, meta.dst_ip);
-            }
-        }
+        let read = state.recv(socket.into(), &mut slots, &mut metas);
+        route_read(read, &slots, &metas, router);
     }
     tracing::info!("demux receive thread stopped");
+}
+
+/// Routes the datagrams of one read into `slots`, described by `metas`.
+/// A read that found nothing (a copy of the shared socket took the
+/// datagram first) counts as an idle wake-up, and one that failed is
+/// logged; the thread reads on after either.
+fn route_read(
+    read: io::Result<usize>,
+    slots: &[IoSliceMut<'_>],
+    metas: &[RecvMeta],
+    router: &mut Router,
+) {
+    let read = match read {
+        Ok(read) => read,
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            DemuxStats::bump(&router.stats.idle_wakeups);
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "udp receive failed");
+            return;
+        }
+    };
+    for (slot, meta) in slots.iter().zip(metas).take(read) {
+        // `len` never exceeds the slot it was read into.
+        let filled = slot.get(..meta.len).into_iter();
+        for payload in filled.flat_map(|data| segments(data, meta.stride)) {
+            router.route(payload, meta.addr, meta.dst_ip);
+        }
+    }
 }
 
 /// The datagrams of one read: a GRO batch is `stride` bytes per datagram
@@ -1060,22 +1074,19 @@ mod tests {
     use super::test_support::MemorySink;
     use super::*;
     use crate::net::stun::{Builder, Class, METHOD_BINDING};
-    use crate::test_support::Captured;
+    use crate::test_support::{Captured, let_expect};
 
     /// Polls `done` for up to five seconds: generous, because the receive
     /// thread competes with the rest of a full test run.
     fn wait_for(mut done: impl FnMut() -> bool) -> bool {
-        for _ in 0..1_000 {
-            if done() {
-                return true;
-            }
-            std::thread::yield_now();
+        // Each look comes after a 5 ms pause, the first one too.
+        (0..1_000).any(|_| {
             let until = SystemClock.now() + Duration::from_millis(5);
             while SystemClock.now() < until {
                 std::thread::yield_now();
             }
-        }
-        done()
+            done()
+        })
     }
 
     fn demux() -> (Demux, SocketAddr) {
@@ -1732,6 +1743,27 @@ mod tests {
     }
 
     #[test]
+    fn a_published_relay_is_logged_with_the_size_of_its_tables() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let (relays, _updates) = Relays::channel();
+        let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        relays.publish(
+            "198.51.100.1:3478".parse().unwrap(),
+            Some(Relay {
+                relayed: "203.0.113.1:50000".parse().unwrap(),
+                channels: [(turn::Channel::new(0x4000).unwrap(), peer)].into(),
+                permissions: [peer.ip()].into(),
+            }),
+        );
+        let published = captured.lines("turn relay published to the demux");
+        assert!(
+            published[0].contains("channels=1 permissions=1"),
+            "{published:?}"
+        );
+    }
+
+    #[test]
     fn the_worker_sink_reports_a_full_channel() {
         let (ours, theirs) = datagram::datagram_pair().unwrap();
         let ours = UnixDatagram::from(ours);
@@ -1740,16 +1772,69 @@ mod tests {
             datagrams: Arc::new(ours),
         };
         let frame = vec![1_u8; 1200];
-        let mut sent = 0;
-        while sink.forward(&frame) {
-            sent += 1;
-            if sent > 100_000 {
-                break;
-            }
-        }
+        let sent = (0..=100_000).take_while(|_| sink.forward(&frame)).count();
         assert!(sent > 0 && sent <= 100_000, "{sent} frames until full");
         drop(theirs);
         assert!(!sink.forward(&frame), "a closed peer is a drop too");
+        // A worker takes its ICE-TCP connections through its driver, not
+        // through this sink.
+        let tcp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        assert!(!sink.ice_tcp(OwnedFd::from(tcp), peer, vec![1]));
+    }
+
+    #[test]
+    fn a_read_that_found_nothing_or_failed_is_counted_or_logged_and_routes_nothing() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let stats = Arc::new(DemuxStats::default());
+        let mut router = Router::new(
+            Arc::new(Registrations::default()),
+            Arc::new(StunResponses::default()),
+            Relays::channel().1,
+            Arc::clone(&stats),
+            Arc::new(SystemClock),
+            "127.0.0.1:3478".parse().unwrap(),
+            &[],
+        );
+        let mut buf = *b"junk";
+        let slots = [IoSliceMut::new(&mut buf)];
+        let mut meta = RecvMeta::default();
+        meta.addr = "192.0.2.1:5000".parse().unwrap();
+        meta.len = 4;
+        meta.stride = 4;
+        let metas = [meta];
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+            route_read(Err(kind.into()), &slots, &metas, &mut router);
+        }
+        assert_eq!(DemuxStats::get(&stats.idle_wakeups), 2);
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        route_read(Err(refused), &slots, &metas, &mut router);
+        assert_eq!(captured.lines("udp receive failed").len(), 1);
+        assert_eq!(DemuxStats::get(&stats.received), 0);
+        route_read(Ok(1), &slots, &metas, &mut router);
+        assert_eq!(DemuxStats::get(&stats.unroutable), 1, "the read is routed");
+    }
+
+    /// A process at its thread limit cannot start the receive thread; the
+    /// error is the caller's. nextest runs each test in its own process.
+    #[test]
+    fn a_receive_thread_that_cannot_start_is_an_error() {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let bound = super::super::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let limit = getrlimit(Resource::Nproc);
+        setrlimit(
+            Resource::Nproc,
+            Rlimit {
+                current: Some(0),
+                maximum: limit.maximum,
+            },
+        )
+        .unwrap();
+        let started = Demux::start(bound.socket, bound.local, vec![], Arc::new(SystemClock));
+        setrlimit(Resource::Nproc, limit).unwrap();
+        let_expect!(started => Err(err), "no thread at the limit");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
     }
 
     /// A flood of rejected STUN requests is counted request by request
@@ -1789,11 +1874,11 @@ mod tests {
         assert_eq!(lines().len(), 1, "no line before the interval is up");
         clock.advance(Duration::from_millis(1));
         reject(102);
-        assert_eq!(lines().len(), 2);
+        let summary = lines();
+        assert_eq!(summary.len(), 2);
         assert!(
-            lines()[1].ends_with("source=192.0.2.1:102 ufrag=Some(\"r1\") rejected=101"),
-            "{:?}",
-            lines()
+            summary[1].ends_with("source=192.0.2.1:102 ufrag=Some(\"r1\") rejected=101"),
+            "{summary:?}"
         );
         assert_eq!(DemuxStats::get(&stats.stun_rejected), 102);
         assert!(sink.frames.lock().unwrap().is_empty());
