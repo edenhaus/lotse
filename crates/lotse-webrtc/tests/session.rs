@@ -685,6 +685,7 @@ fn cut_through_renumbers_and_the_age_gate_skips_to_a_keyframe() {
 
 #[test]
 fn a_frame_late_after_an_ingest_stall_skips_to_a_timely_keyframe() {
+    let (_logs, captured) = capture_logs(tracing::Level::DEBUG);
     let (mut pair, answer) = Pair::new(h264(Some([0x42, 0xc0, 0x28])));
     pair.connect(&answer);
     let mut normalizer = normalizer();
@@ -720,6 +721,11 @@ fn a_frame_late_after_an_ingest_stall_skips_to_a_timely_keyframe() {
     assert_eq!(stats.dropped_old, 0, "not an age drop");
     assert_eq!(stats.ingest_late_skips, 1);
     assert!(pair.events[events_before..].contains(&SessionEvent::KeyframeRequest));
+    let logged = captured.text();
+    assert!(
+        logged.contains("frame arrived late after an ingest stall lateness_ms=201 limit_ms=200"),
+        "{logged}"
+    );
 
     // A late keyframe does not resume either; the stall still counts once
     // and asks once.
@@ -812,6 +818,7 @@ fn a_fresh_gop_is_burst_before_the_live_edge_and_live_resumes_after_it() {
 
 #[test]
 fn an_old_gop_gives_a_still_and_p_frames_wait_for_the_next_keyframe() {
+    let (_logs, captured) = capture_logs(tracing::Level::INFO);
     let (mut pair, answer) = Pair::new(h264(None));
     pair.viewer
         .accept_answer(&answer, &mut pair.to_daemon)
@@ -828,6 +835,11 @@ fn an_old_gop_gives_a_still_and_p_frames_wait_for_the_next_keyframe() {
     pair.drain();
     assert_eq!(pair.session.stats().join_frames, 1);
     assert!(pair.events.contains(&SessionEvent::KeyframeRequest));
+    let logged = captured.text();
+    assert!(
+        logged.contains("join: keyframe still age_ms=2000 truncated=false"),
+        "{logged}"
+    );
     let still_packets = pair.session.stats().packets;
     pair.run_until(
         |p| p.viewer.packets().len() as u64 >= still_packets,
@@ -867,6 +879,24 @@ fn an_old_gop_gives_a_still_and_p_frames_wait_for_the_next_keyframe() {
         pair.session.write_video(pair.now, packet, pair.now);
     }
     assert!(pair.session.stats().packets > after_burst);
+    // A keyframe of a new epoch first after a burst resumes at once.
+    let track = track_with_gop(pair.now, pair.now - Duration::from_millis(100), 2);
+    let gop = track.gop().expect("a cache");
+    pair.session.join(pair.now, Some(&gop));
+    let after_burst = pair.session.stats().packets;
+    let keyframe: Vec<MediaPacket> =
+        packets(&mut normalizer, &mut seq, 600_000, true, 300, pair.now)
+            .into_iter()
+            .skip_while(|packet| !packet.keyframe_start)
+            .map(|packet| MediaPacket { epoch: 8, ..packet })
+            .collect();
+    for packet in &keyframe {
+        pair.session.write_video(pair.now, packet, pair.now);
+    }
+    assert_eq!(
+        pair.session.stats().packets,
+        after_burst + keyframe.len() as u64
+    );
     pair.drain();
 }
 
@@ -2633,6 +2663,26 @@ impl std::io::Write for Captured {
     }
 }
 
+impl Captured {
+    /// What was written, as text.
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+/// Captures what this thread logs at `level` and above until the guard
+/// drops: the log lines' fields are evaluated as in production.
+fn capture_logs(level: tracing::Level) -> (tracing::subscriber::DefaultGuard, Captured) {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(level)
+        .with_ansi(false)
+        .finish();
+    (tracing::subscriber::set_default(subscriber), captured)
+}
+
 /// The `a=extmap` URI of CVO (3GPP TS 26.114 §6.2.3.3).
 const CVO_URI: &str = "urn:3gpp:video-orientation";
 
@@ -3178,4 +3228,175 @@ fn rfc8285_6_abs_capture_time_is_answered_under_chromes_id_and_not_unless_offere
     assert!(!pair.viewer.packets().is_empty() && !pair.viewer.audio_packets().is_empty());
     assert!(carriers(pair.viewer.packets()).is_empty());
     assert!(carriers(pair.viewer.audio_packets()).is_empty());
+}
+
+/// The viewer's offer with every line `edit` maps, lines it drops left out.
+fn edited_offer(viewer: &Viewer, edit: impl Fn(&str) -> Option<String>) -> String {
+    viewer
+        .offer()
+        .split_inclusive("\r\n")
+        .filter_map(|line| edit(line.trim_end_matches("\r\n")))
+        .map(|line| line + "\r\n")
+        .collect()
+}
+
+#[test]
+fn rfc8842_5_an_offer_without_a_fingerprint_is_invalid_sdp() {
+    lotse_webrtc::install_crypto_provider();
+    let now = SystemClock.now();
+    let viewer = Viewer::new(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let offer = edited_offer(&viewer, |line| {
+        (!line.starts_with("a=fingerprint:")).then(|| line.to_owned())
+    });
+    let Err(SessionOpenError::InvalidSdp(reason)) =
+        Session::answer(&request(&offer, h264(None)), now)
+    else {
+        panic!()
+    };
+    assert!(reason.contains("fingerprint"), "{reason}");
+}
+
+#[test]
+fn rfc3264_6_1_a_video_m_line_the_viewer_only_sends_on_is_invalid_sdp() {
+    lotse_webrtc::install_crypto_provider();
+    let now = SystemClock.now();
+    let viewer = Viewer::new(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let offer = edited_offer(&viewer, |line| {
+        Some(
+            if line == "a=recvonly" {
+                "a=sendonly"
+            } else {
+                line
+            }
+            .to_owned(),
+        )
+    });
+    let Err(SessionOpenError::InvalidSdp(reason)) =
+        Session::answer(&request(&offer, h264(None)), now)
+    else {
+        panic!()
+    };
+    assert_eq!(
+        reason,
+        "the answer declared no send stream for the video m-line"
+    );
+}
+
+#[test]
+fn rfc5246_7_2_a_fatal_dtls_alert_closes_the_session_as_internal_error() {
+    let (mut pair, _) = Pair::new(h264(None));
+    // A fatal `handshake_failure` alert (RFC 5246 §7.2) in a DTLS record
+    // (RFC 6347 §4.1).
+    let alert = [21, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 9, 0, 2, 2, 40];
+    pair.session.handle_datagram(
+        pair.now,
+        Transport::Udp,
+        BROWSER.parse().unwrap(),
+        DAEMON.parse().unwrap(),
+        &alert,
+    );
+    pair.drain();
+    assert_eq!(pair.closed_code(), Some("internal_error"));
+}
+
+#[test]
+fn rfc8122_5_a_certificate_other_than_the_offers_fingerprint_closes_the_session() {
+    lotse_webrtc::install_crypto_provider();
+    let now = SystemClock.now();
+    let viewer = Viewer::new(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let offer = edited_offer(&viewer, |line| {
+        Some(match line.split_once(' ') {
+            Some((name, hash)) if name.starts_with("a=fingerprint:") => {
+                format!(
+                    "{name} {}",
+                    hash.replace(|c: char| c.is_ascii_hexdigit(), "0")
+                )
+            }
+            _ => line.to_owned(),
+        })
+    });
+    let (mut pair, answer) = Pair::with_viewer_offer(h264(None), viewer, &offer, now);
+    pair.viewer
+        .accept_answer(&answer, &mut pair.to_daemon)
+        .expect("the answer applies");
+    pair.run_until(|p| p.closed_code().is_some(), 5_000, "closed");
+    assert_eq!(pair.closed_code(), Some("internal_error"));
+}
+
+#[test]
+fn rfc7675_5_1_consent_regained_reconnects_and_consent_lost_for_the_timeout_is_ice_failed() {
+    let (mut pair, answer) = Pair::new(h264(None));
+    pair.connect(&answer);
+    // Nothing the session sends arrives, nothing comes back.
+    let stall = |pair: &mut Pair, until: &dyn Fn(&Pair) -> bool| {
+        for _ in 0..600 {
+            if until(pair) {
+                return;
+            }
+            pair.now += Duration::from_millis(100);
+            pair.session.handle_timeout(pair.now);
+            pair.drain();
+            pair.to_viewer.clear();
+        }
+        panic!("stalled for a minute; events {:?}", pair.events);
+    };
+    stall(&mut pair, &|p| p.session.state() == State::Disconnected);
+    // The path comes back: consent is regained.
+    pair.run_until(
+        |p| p.session.state() == State::Connected,
+        5_000,
+        "consent regained",
+    );
+    assert_eq!(pair.closed_code(), None);
+    // Lost again, for longer than the disconnect timeout.
+    stall(&mut pair, &|p| p.session.state() == State::Disconnected);
+    let lost_at = pair.now;
+    stall(&mut pair, &|p| p.closed_code().is_some());
+    assert_eq!(pair.closed_code(), Some("ice_failed"));
+    assert!(pair.now >= lost_at + SessionLimits::default().disconnect_timeout);
+}
+
+#[test]
+fn rfc8445_7_3_a_check_before_the_agent_started_its_own_moves_the_session_to_connecting() {
+    let (mut pair, answer) = Pair::new(h264(None));
+    assert_eq!(pair.session.state(), State::Gathering);
+    pair.viewer
+        .accept_answer(&answer, &mut pair.to_daemon)
+        .expect("the answer applies");
+    // The viewer's first datagram, before any timeout of the session.
+    for _ in 0..1_000 {
+        if !pair.to_daemon.is_empty() {
+            break;
+        }
+        pair.now += Duration::from_millis(1);
+        pair.viewer.timeout(pair.now, &mut pair.to_daemon);
+    }
+    let first = pair.to_daemon.remove(0);
+    pair.session.handle_datagram(
+        pair.now,
+        Transport::Udp,
+        first.source,
+        first.destination,
+        &first.payload,
+    );
+    assert_eq!(pair.session.state(), State::Connecting);
+}
+
+#[test]
+fn rfc8445_8_1_2_once_no_other_pair_can_succeed_the_session_reports_ice_completed() {
+    let (mut pair, answer) = Pair::new(h264(None));
+    pair.connect(&answer);
+    let completed = |p: &Pair| {
+        p.events.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::State {
+                    ice: "completed",
+                    ..
+                }
+            )
+        })
+    };
+    pair.run_until(completed, 6_000, "completed");
+    assert_eq!(pair.session.state(), State::Connected);
 }

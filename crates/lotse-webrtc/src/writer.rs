@@ -278,9 +278,9 @@ impl VideoWriter {
         if !gop.truncated() && age <= self.limits.catchup_max_age {
             let frames: Vec<_> = gop.frames().collect();
             let count = frames.len();
-            let Some(last) = frames.last() else {
-                return true;
-            };
+            // The frames start with the keyframe, so there is a last one.
+            let keyframe = gop.keyframe();
+            let last = frames.last().copied().unwrap_or(keyframe);
             let last_ts = rtp_ts(last.ts);
             for (index, frame) in frames.iter().enumerate() {
                 // Re-stamped 1 ms apart into the gap before the live edge,
@@ -659,5 +659,70 @@ mod tests {
         assert!(ts_after(0, u32::MAX));
         assert!(!ts_after(0, 0));
         assert!(!ts_after(0, 1));
+    }
+
+    /// An engine with a send stream on mid `v` (video) and on `a`
+    /// (audio), declared directly, without an offer.
+    fn engine(now: Instant) -> Rtc {
+        use str0m::media::MediaKind;
+        use str0m::rtp::Ssrc;
+
+        crate::install_crypto_provider();
+        let mut rtc = Rtc::builder().set_rtp_mode(true).build(now);
+        let mut api = rtc.direct_api();
+        for (mid, kind, ssrc) in [("v", MediaKind::Video, 1), ("a", MediaKind::Audio, 2)] {
+            api.declare_media(Mid::from(mid), kind);
+            api.declare_stream_tx(Ssrc::from(ssrc), None, Mid::from(mid), None);
+        }
+        rtc
+    }
+
+    /// A packet that starts a keyframe, arrived `now`.
+    fn keyframe_start(now: Instant) -> MediaPacket {
+        use lotse_core::media::RtpHeaderFields;
+
+        MediaPacket {
+            arrival: now,
+            rtp: RtpHeaderFields {
+                pt: 96,
+                seq: 1,
+                ts: 3_000,
+                marker: true,
+                ssrc: 9,
+            },
+            frame_start: true,
+            keyframe_start: true,
+            epoch: 0,
+            lateness: Duration::ZERO,
+            payload: Arc::from(&[0x65_u8, 0x88][..]),
+        }
+    }
+
+    #[test]
+    fn a_packet_for_a_mid_without_a_send_stream_is_dropped() {
+        let now = SystemClock.now();
+        let mut rtc = engine(now);
+        let packet = keyframe_start(now);
+        let limits = SessionLimits::default();
+        for (mid, sent) in [("v", 1), ("x", 0)] {
+            let mut video = VideoWriter::new(
+                Pt::from(96),
+                Mid::from(mid),
+                lotse_codec::h264::packetize,
+                limits,
+                false,
+                None,
+            );
+            assert!(!video.write(&mut rtc, now, &packet, now));
+            assert_eq!(video.stats.packets, sent, "{mid}");
+        }
+        for (mid, sent) in [("a", true), ("x", false)] {
+            let mut audio = AudioWriter::new(Pt::from(0), Mid::from(mid), 8_000, limits);
+            assert_eq!(audio.write(&mut rtc, now, &packet, now), sent, "{mid}");
+        }
+        // Too old is dropped before the stream is looked up.
+        let mut audio = AudioWriter::new(Pt::from(0), Mid::from("a"), 8_000, limits);
+        let later = now + limits.max_packet_age + Duration::from_millis(1);
+        assert!(!audio.write(&mut rtc, later, &packet, later));
     }
 }

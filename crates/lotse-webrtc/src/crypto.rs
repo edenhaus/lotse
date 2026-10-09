@@ -194,6 +194,14 @@ impl SupportedAeadAes256Gcm for Gcm256 {
     }
 }
 
+/// An AES-GCM failure as str0m's error, saying `what` failed: one
+/// closure for sealing, which fails only on an input over `P_MAX`
+/// (2³⁶ − 31 octets, RFC 5116 §5.1), and for opening, which fails on a
+/// forged packet.
+fn gcm_failed(what: &'static str) -> impl FnOnce(aes_gcm::Error) -> CryptoError {
+    move |_| CryptoError::Other(what.to_owned())
+}
+
 /// An AES-GCM session key of either size. Encrypts in place into str0m's
 /// buffer, so a packet costs no allocation.
 struct GcmCipher<C>(C);
@@ -223,7 +231,7 @@ impl<C: AeadInPlace<NonceSize = U12, TagSize = U16>> GcmCipher<C> {
         let tag = self
             .0
             .encrypt_in_place_detached(&(*iv).into(), aad, body)
-            .map_err(|_| CryptoError::Other("AES-GCM input too long".to_owned()))?;
+            .map_err(gcm_failed("AES-GCM input too long"))?;
         rest.copy_from_slice(&tag);
         Ok(())
     }
@@ -249,7 +257,7 @@ impl<C: AeadInPlace<NonceSize = U12, TagSize = U16>> GcmCipher<C> {
         let aad = aads.concat();
         self.0
             .decrypt_in_place_detached(&(*iv).into(), &aad, body, &Tag::from(*tag))
-            .map_err(|_| CryptoError::Other("AES-GCM authentication failed".to_owned()))?;
+            .map_err(gcm_failed("AES-GCM authentication failed"))?;
         Ok(ciphertext.len())
     }
 }
