@@ -260,12 +260,14 @@ jobs:
           name: tests-x86_64
       - name: Take the binary from the archive
         run: tar --zstd -xf nextest-archive.tar.zst "$BIN"
+      # Alpine from Docker's own copy of its official images on ECR Public: Docker Hub's anonymous
+      # pull limit ran out on GitHub's shared runners (2026-10-09). The same digest.
       - name: Run the check in a container
         run: |
           docker run --rm \
             --volume "$PWD/$BIN:/lotse:ro" \
             --volume "$PWD/scripts/sandbox-isolation.sh:/check.sh:ro" \
-            alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 sh /check.sh
+            public.ecr.aws/docker/library/alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 sh /check.sh
 
   coverage:
     name: Coverage (100 % of lines)

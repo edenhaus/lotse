@@ -21,7 +21,7 @@
     },
     {
       "customType": "regex",
-      "description": "Container images pinned by tag and digest: BuildKit (scripts/image.sh), coturn (scripts/turn-e2e.sh), Alpine for the sandbox check (ci.yml)",
+      "description": "Container images pinned by tag and digest, each from a registry without Docker Hub's anonymous pull limit: BuildKit (scripts/image.sh, mirror.gcr.io), coturn (scripts/turn-e2e.sh, ghcr.io), Alpine for the sandbox check (ci.yml, public.ecr.aws)",
       "managerFilePatterns": ["/^scripts/(image|turn-e2e)\\.sh$/", "/^\\.github/workflows/ci\\.yml$/"],
       "matchStrings": ["(?<depName>[a-z0-9][a-z0-9./_-]*):(?<currentValue>[A-Za-z0-9][A-Za-z0-9._-]*)@(?<currentDigest>sha256:[a-f0-9]{64})"],
       "datasourceTemplate": "docker"

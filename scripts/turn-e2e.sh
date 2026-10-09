@@ -14,8 +14,9 @@ set -eu
 
 [ "$(uname -s)" = Linux ] || { echo "the TURN end-to-end test runs on Linux only" >&2; exit 2; }
 
-# coturn 4.18.0 (2026-09-08), the multi-arch index digest.
-IMAGE="coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3"
+# coturn 4.18.0 (2026-09-08), the multi-arch index digest, from the project's own registry on
+# GitHub: Docker Hub's anonymous pull limit ran out on GitHub's shared runners (2026-10-09).
+IMAGE="ghcr.io/coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3"
 STATIC=lotse-turn-e2e-static
 REST=lotse-turn-e2e-rest
 SECRET=lotse-rest-secret
