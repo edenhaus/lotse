@@ -11,7 +11,6 @@ use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 use crate::config::LogFormat;
-use crate::console;
 
 /// Why logging could not start.
 #[derive(Debug, thiserror::Error)]
@@ -30,26 +29,18 @@ pub(crate) enum LoggingError {
     AlreadySet,
 }
 
-/// Installs the global subscriber: log lines filtered by `level`, and the
-/// tokio-console layer beside them when `console` and the build has one
-/// ([`crate::console`]); returns the console's server to start once the
-/// sandbox is applied. The level filters the log lines only, so the
-/// console sees the runtime's tasks whatever it is. Reads no environment:
-/// `RUST_LOG` is already folded into `level` by [`crate::config`].
-pub(crate) fn init(
-    format: LogFormat,
-    level: &str,
-    console: bool,
-) -> Result<Option<console::Server>, LoggingError> {
+/// Installs the global subscriber: log lines filtered by `level`. Reads no
+/// environment: `RUST_LOG` is already folded into `level` by
+/// [`crate::config`].
+pub(crate) fn init(format: LogFormat, level: &str) -> Result<(), LoggingError> {
     let filter = EnvFilter::try_new(level).map_err(|source| LoggingError::Level {
         level: level.to_owned(),
         source,
     })?;
-    let (layer, server) = console::layer(console);
     let lines = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false);
-    let registry = tracing_subscriber::registry().with(layer);
+    let registry = tracing_subscriber::registry();
     let installed = match format {
         LogFormat::Json => registry
             .with(
@@ -63,8 +54,7 @@ pub(crate) fn init(
             .try_init(),
         LogFormat::Text => registry.with(lines.with_filter(filter)).try_init(),
     };
-    installed.map_err(|_already| LoggingError::AlreadySet)?;
-    Ok(server)
+    installed.map_err(|_already| LoggingError::AlreadySet)
 }
 
 /// A plain text subscriber for errors raised before [`init`] ran, or when
@@ -111,11 +101,11 @@ mod tests {
         // Under nextest every test is its own process, so the global
         // subscriber is ours to install exactly once.
         // A bare word is a target filter; a bad level after `=` is the error.
-        let err = init(LogFormat::Json, "lotse=loudest", false).err().unwrap();
+        let err = init(LogFormat::Json, "lotse=loudest").err().unwrap();
         assert!(matches!(err, LoggingError::Level { .. }), "{err}");
         assert!(err.to_string().contains("loudest"));
-        init(LogFormat::Text, "debug", false).unwrap();
-        let err = init(LogFormat::Json, "info", false).err().unwrap();
+        init(LogFormat::Text, "debug").unwrap();
+        let err = init(LogFormat::Json, "info").err().unwrap();
         assert!(matches!(err, LoggingError::AlreadySet), "{err}");
         assert_eq!(err.to_string(), "a log subscriber is already installed");
         ensure_fallback();

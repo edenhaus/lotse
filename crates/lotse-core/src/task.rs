@@ -3,10 +3,7 @@
 //! everything else from spawning anonymously.
 //!
 //! The name becomes a `task` span around the future, so every event a task
-//! logs says which task it came from. With the `console` feature and
-//! `--cfg tokio_unstable`, the task is also spawned under its name through
-//! `tokio::task::Builder`, so `tokio-console` lists it by name; that API
-//! has no semver guarantee and never reaches a release build.
+//! logs says which task it came from.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -22,39 +19,25 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// The caller keeps the [`JoinHandle`] as the task's cancellation path, or
 /// gives the future its own (a `CancellationToken`, a channel closing).
-#[cfg_attr(
-    not(all(feature = "console", tokio_unstable)),
-    expect(
-        clippy::disallowed_methods,
-        reason = "the one wrapper around tokio::spawn"
-    )
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one wrapper around tokio::spawn"
 )]
 pub fn spawn_named<F>(name: &'static str, future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let future = future.instrument(tracing::debug_span!("task", task = name));
-    #[cfg(all(feature = "console", tokio_unstable))]
-    {
-        console::spawn(name, future)
-    }
-    #[cfg(not(all(feature = "console", tokio_unstable)))]
-    {
-        tokio::spawn(future)
-    }
+    tokio::spawn(future.instrument(tracing::debug_span!("task", task = name)))
 }
 
 /// Runs `f` on the blocking thread pool under the name `name`.
 ///
 /// For work that blocks a thread (disk I/O, a long computation) and must
 /// never run on a runtime worker.
-#[cfg_attr(
-    not(all(feature = "console", tokio_unstable)),
-    expect(
-        clippy::disallowed_methods,
-        reason = "the one wrapper around tokio::task::spawn_blocking"
-    )
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one wrapper around tokio::task::spawn_blocking"
 )]
 pub fn spawn_blocking_named<F, R>(name: &'static str, f: F) -> JoinHandle<R>
 where
@@ -62,56 +45,7 @@ where
     R: Send + 'static,
 {
     let span = tracing::debug_span!("task", task = name);
-    let f = move || span.in_scope(f);
-    #[cfg(all(feature = "console", tokio_unstable))]
-    {
-        console::spawn_blocking(name, f)
-    }
-    #[cfg(not(all(feature = "console", tokio_unstable)))]
-    {
-        tokio::task::spawn_blocking(f)
-    }
-}
-
-/// The named spawns of the `console` feature: development builds with
-/// `--cfg tokio_unstable` only.
-#[cfg(all(feature = "console", tokio_unstable))]
-mod console {
-    use std::future::Future;
-
-    use tokio::task::{Builder, JoinHandle};
-
-    /// `future` as a task named `name`.
-    #[expect(
-        clippy::expect_used,
-        reason = "Builder::spawn fails only outside a runtime, where tokio::spawn panics too; console builds are for development"
-    )]
-    pub(super) fn spawn<F>(name: &'static str, future: F) -> JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        Builder::new()
-            .name(name)
-            .spawn(future)
-            .expect("a runtime to spawn on")
-    }
-
-    /// `f` on the blocking pool as a task named `name`.
-    #[expect(
-        clippy::expect_used,
-        reason = "Builder::spawn_blocking fails only outside a runtime, where spawn_blocking panics too; console builds are for development"
-    )]
-    pub(super) fn spawn_blocking<F, R>(name: &'static str, f: F) -> JoinHandle<R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        Builder::new()
-            .name(name)
-            .spawn_blocking(f)
-            .expect("a runtime to spawn on")
-    }
+    tokio::task::spawn_blocking(move || span.in_scope(f))
 }
 
 #[cfg(test)]

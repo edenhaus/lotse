@@ -49,6 +49,5 @@ openh264 = ["lotse-snapshot"]
 jpeg-encoder = ["lotse-snapshot"]
 clap = ["lotse"]
 anyhow = ["lotse"] # AGENTS.md: `anyhow` only in `main`
-console-subscriber = ["lotse"] # tokio-console, the supervisor's subscriber
 mimalloc = ["lotse"]
 nix = ["lotse-supervisor", "lotse-testing"] # interface enumeration for the host candidates; the DSCP of received datagrams (`lotse_testing::dscp`)
