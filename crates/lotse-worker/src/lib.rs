@@ -2707,7 +2707,15 @@ mod tests {
         let _demux = live_echo_session(&mut h).await;
         let mut live = Vec::new();
         for n in 0..300 {
-            let (browser, fd, peer) = tcp_pair();
+            let (browser, fd, _) = tcp_pair();
+            // Each connection its own peer, as the supervisor names it: a
+            // known peer's new connection replaces its old one, and Linux
+            // may give a connection to another listener the source port of
+            // a live one (1 in 300 here, measured on Linux 7.0, 2026-10-09).
+            let peer = std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                20_000 + u16::try_from(n).unwrap(),
+            ));
             h.tx.send_msg(
                 &ToWorker::IceTcp {
                     local_ufrag: "ufrag-echo".into(),
