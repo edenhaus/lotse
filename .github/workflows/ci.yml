@@ -355,10 +355,8 @@ jobs:
         run: rustup toolchain install "$NIGHTLY" --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: fuzz
-          workspaces: |
-            . -> target
-            fuzz -> fuzz/target
+          shared-key: fuzz-build
+          workspaces: fuzz -> target # relative to the workspace: fuzz/target
           cache-bin: true # cargo-fuzz
       - run: cargo "+$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
       # cargo-fuzz has no `--locked`: this fails on a stale fuzz/Cargo.lock, and the build below
