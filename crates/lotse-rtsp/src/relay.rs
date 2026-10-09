@@ -296,6 +296,21 @@ where
     }
 }
 
+/// Accepts retina's one connection, the listener closed behind it, with
+/// Nagle's algorithm off (`TCP_NODELAY`): the relay passes on what the
+/// camera sent as it arrives and must not hold it. With Nagle (RFC 1122
+/// §4.2.3.4) a small write waits while an earlier one is unacknowledged,
+/// and retina, which sends nothing while the media flows, acknowledges
+/// late (delayed ACK, §4.2.3.2). The first frames after `PLAY`, the
+/// first Sender Report among them, waited 39 ms for the ACK of the
+/// answer (Linux 7.0, 2026-10-09), which put the clock map's offset as
+/// far ahead of every later arrival for seconds.
+async fn accept(listener: TcpListener) -> io::Result<TcpStream> {
+    let (plain, _) = listener.accept().await?;
+    plain.set_nodelay(true)?;
+    Ok(plain)
+}
+
 /// [`pump`] until it ends: the bytes copied each way. retina's requests
 /// go on whole, with the receiver reports due between them; the camera's
 /// side goes on as it arrives, read along by the tap.
@@ -305,8 +320,7 @@ async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
     reports: ReceiverReports,
     clock: Arc<dyn Clock>,
 ) -> Result<(u64, u64), Ended> {
-    let (plain, _) = listener.accept().await.map_err(Ended::Io)?;
-    drop(listener);
+    let plain = accept(listener).await.map_err(Ended::Io)?;
     let (mut from_retina, mut to_retina) = plain.into_split();
     let (mut from_camera, mut to_camera) = tokio::io::split(camera);
     // Both directions run in this one task and never hold the lock across
@@ -504,8 +518,7 @@ async fn relay_udp<S: AsyncRead + AsyncWrite + Unpin>(
     camera: S,
     udp: UdpRelay,
 ) -> Result<(u64, u64), Ended> {
-    let (plain, _) = listener.accept().await.map_err(Ended::Io)?;
-    drop(listener);
+    let plain = accept(listener).await.map_err(Ended::Io)?;
     let (from_retina, to_retina) = plain.into_split();
     let (from_camera, to_camera) = tokio::io::split(camera);
     let mut pump = UdpPump {
@@ -598,6 +611,17 @@ mod tests {
         let (_own, own) = listen(None).await.unwrap();
         assert_ne!(own, addr);
         assert!(own.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn rfc1122_4_2_3_4_retinas_connection_has_nagle_off() {
+        // With Nagle on, the first frames after PLAY waited for retina's
+        // delayed ACK (39 ms on Linux 7.0) and the clock map took the late
+        // first Sender Report for the camera's transit.
+        let (listener, local) = listen(None).await.unwrap();
+        let _retina = TcpStream::connect(local).await.unwrap();
+        let accepted = accept(listener).await.unwrap();
+        assert!(accepted.nodelay().unwrap());
     }
 
     fn reports() -> ReceiverReports {
