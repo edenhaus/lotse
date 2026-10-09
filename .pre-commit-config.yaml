@@ -1,10 +1,9 @@
 # The single definition of every check. prek runs it:
 #   - on `git commit`:  everything below, on the changed files
-#   - on `commit-msg`:  the Conventional Commits check
 #   - `mise run check` and CI's Check job: all of it, on all files (`--stage manual`)
 # No test is a hook: the tests, the coverage and the mutation gates are CI jobs (ci.yml), on Linux.
+# Commit messages are not checked: PRs are squash-merged with their title, which pr-title.yml checks.
 # `mise install` installs the git hooks.
-default_install_hook_types: [pre-commit, commit-msg]
 default_stages: [pre-commit, manual]
 
 repos:
@@ -20,11 +19,6 @@ repos:
       - id: trailing-whitespace
         exclude: \.md$
         stages: [pre-commit, manual]
-  - repo: https://github.com/compilerla/conventional-pre-commit
-    rev: v4.4.0
-    hooks:
-      - id: conventional-pre-commit # squash-merged PR titles are checked by pr-title.yml
-        stages: [commit-msg]
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.3
     hooks:

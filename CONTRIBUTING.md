@@ -11,8 +11,8 @@ Thanks for helping build lotse. The short version:
 3. **Follow the conventions** in [AGENTS.md](AGENTS.md): no untested
    code, everything documented, every spec clause cited, structured
    logging, strict lints.
-4. **Conventional Commits.** The hook checks commit messages; pull requests
-   are squash-merged with their title, which CI also checks.
+4. **Conventional Commits.** Pull requests are squash-merged with their
+   title, which CI checks; the commit messages on the branch are not.
 5. **Fill in the pull request checklist.** Reviewers use it.
 6. **Security issues** go through [SECURITY.md](SECURITY.md), not the issue
    tracker. Read [AI_POLICY.md](AI_POLICY.md) if you use AI tools.

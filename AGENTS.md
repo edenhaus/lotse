@@ -19,8 +19,8 @@ changing `[tools]`, run `mise lock` and commit both files.
 
 Every check is a prek hook in `.pre-commit-config.yaml`: fmt, clippy,
 rustdoc, cargo-hack, cargo-shear, the fuzz crate's `cargo check`, the
-crate-layering and license-list checks, cargo-deny, codespell, actionlint, zizmor and file hygiene run on `git commit` (only when matching files changed), the
-Conventional Commits check on `commit-msg`. Add new checks there. No test
+crate-layering and license-list checks, cargo-deny, codespell, actionlint, zizmor and file hygiene run on `git commit` (only when matching files changed).
+Add new checks there. No test
 is a hook: the tests, the doctests, coverage and mutants are mise tasks
 that CI runs.
 
@@ -124,7 +124,8 @@ The clients, the Python `lotse-client` among them, live in their own repository,
   `default-features = false` and a comment saying why it exists. It must
   pass `cargo deny`, and a protocol
   engine's owning crate is recorded in `.cargo/layering.toml`.
-- Conventional Commits, enforced on `commit-msg` and on PR titles.
+- Conventional Commits PR titles, enforced by `pr-title.yml`: PRs are
+  squash-merged with their title, so commit messages are not checked.
 - An API change flows Rust DTOs, then the bundle (`cargo run -p
   lotse-api-types --example schema > crates/lotse-api-types/schema/api.json`),
   in one commit; the `api-schema` hook fails on a stale bundle. Once it
