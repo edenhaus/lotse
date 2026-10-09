@@ -27,8 +27,9 @@ that CI runs.
 CI is `.github/workflows/ci.yml`, the one workflow that runs the jobs of a
 push, a PR, the nightly run and a run by hand; `build.yml` is a
 workflow it calls, and only `release.yml` (it publishes, so nothing in
-it may restore a cache), `scorecard.yml` and `pr-title.yml` stand apart
-(each says why). Its Build job compiles the musl tests once per arch
+it may restore a cache), `scorecard.yml`, `pr-title.yml` and
+`cleanup-caches.yml` (a closed PR's caches deleted) stand apart (each
+says why). Its Build job compiles the musl tests once per arch
 into a nextest archive that the Tests, Interop, TURN and Sandbox
 isolation jobs run without compiling; every compiling job keeps a Rust
 cache, saved by every run and restored from the PR's own (GitHub scopes

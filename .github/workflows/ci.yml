@@ -1,10 +1,11 @@
 name: CI
 
-# The main workflow: every job of a push, a PR, the nightly run and a run by hand. Three workflows
+# The main workflow: every job of a push, a PR, the nightly run and a run by hand. Four workflows
 # stay apart, each for a reason it states: release.yml, which publishes and so must not share a
 # workflow with jobs that restore caches (cache poisoning); scorecard.yml, whose published results
 # require a workflow of its own (no top-level env, no workflow-level write permission); and
-# pr-title.yml, which runs when a PR's title is edited, an event that must not run all of this.
+# pr-title.yml and cleanup-caches.yml, which run when a PR's title is edited or the PR is closed,
+# events that must not run all of this.
 #
 # Build once: the Build job compiles the tests of the static musl target once per arch and
 # archives them (cargo nextest archive); Tests, Interop, TURN and Sandbox isolation run that
