@@ -15,6 +15,7 @@ use landlock::{
     ABI, Access as _, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible as _, NetPort,
     PathBeneath, PathFd, Ruleset, RulesetAttr as _, RulesetCreatedAttr as _, RulesetStatus,
 };
+use rustix::io::Errno;
 use rustix::process::{DumpableBehavior, Gid, Resource, Rlimit, Signal, Uid};
 
 use crate::report::{LandlockReport, LayerStatus};
@@ -57,7 +58,7 @@ pub(crate) fn apply(
 }
 
 /// Wraps a syscall error with the step it belongs to.
-fn step(step: &'static str) -> impl Fn(rustix::io::Errno) -> SandboxError {
+fn step(step: &'static str) -> impl Fn(Errno) -> SandboxError {
     move |errno| SandboxError::Step {
         step,
         source: io::Error::from(errno),
@@ -68,38 +69,88 @@ fn step(step: &'static str) -> impl Fn(rustix::io::Errno) -> SandboxError {
 /// supplementary groups first, and proves the drop stuck. Returns the
 /// real ids afterwards. Every mode runs it, `off` included.
 pub(crate) fn drop_privileges(config: &SandboxConfig) -> Result<(u32, u32), SandboxError> {
-    if !rustix::process::geteuid().is_root() {
-        return Ok((crate::current_uid(), crate::current_gid()));
+    drop_ids(&mut ThreadIds, config)
+}
+
+/// The id calls [`drop_privileges`] makes, so a test can stand in for the
+/// kernel: the drop's own path runs only in a process started as root.
+trait IdCalls {
+    /// The effective uid (geteuid(2)).
+    fn effective_uid(&self) -> u32;
+    /// The real and effective uid and gid, in that order (getuid(2),
+    /// geteuid(2), getgid(2), getegid(2)).
+    fn ids(&self) -> (u32, u32, u32, u32);
+    /// No supplementary group (setgroups(2) with an empty list).
+    fn clear_groups(&mut self) -> Result<(), Errno>;
+    /// The real, effective and saved gid all `gid` (setresgid(2)).
+    fn set_gids(&mut self, gid: u32) -> Result<(), Errno>;
+    /// The real, effective and saved uid all `uid` (setresuid(2)).
+    fn set_uids(&mut self, uid: u32) -> Result<(), Errno>;
+}
+
+/// The calling thread's ids, through rustix: the privilege drop is per
+/// thread at the syscall level, which is why the sandbox is applied before
+/// any other thread exists.
+///
+/// The ids are passed unchecked: `-1` is setresuid(2)'s and setresgid(2)'s
+/// "unchanged", which leaves root in place, and [`drop_ids`] must see it to
+/// refuse it (rustix's checked constructor asserts on it in debug builds
+/// only).
+struct ThreadIds;
+
+impl IdCalls for ThreadIds {
+    fn effective_uid(&self) -> u32 {
+        rustix::process::geteuid().as_raw()
     }
-    // Unchecked: `-1` is setresuid(2)'s and setresgid(2)'s "unchanged", which
-    // leaves root in place, and the check below must see it to refuse it
-    // (rustix's checked constructor asserts on it in debug builds only).
-    let uid = Uid::from_raw_unchecked(config.uid);
-    let gid = Gid::from_raw_unchecked(config.gid);
-    let failed = |errno: rustix::io::Errno| SandboxError::PrivilegeDrop {
-        uid: config.uid,
-        gid: config.gid,
-        source: io::Error::from(errno),
+
+    fn ids(&self) -> (u32, u32, u32, u32) {
+        let effective_gid = rustix::process::getegid().as_raw();
+        let (uid, gid) = (crate::current_uid(), crate::current_gid());
+        (uid, self.effective_uid(), gid, effective_gid)
+    }
+
+    fn clear_groups(&mut self) -> Result<(), Errno> {
+        rustix::thread::set_thread_groups(&[])
+    }
+
+    fn set_gids(&mut self, gid: u32) -> Result<(), Errno> {
+        let gid = Gid::from_raw_unchecked(gid);
+        rustix::thread::set_thread_res_gid(gid, gid, gid)
+    }
+
+    fn set_uids(&mut self, uid: u32) -> Result<(), Errno> {
+        let uid = Uid::from_raw_unchecked(uid);
+        rustix::thread::set_thread_res_uid(uid, uid, uid)
+    }
+}
+
+/// [`drop_privileges`] through `calls`.
+fn drop_ids(calls: &mut impl IdCalls, config: &SandboxConfig) -> Result<(u32, u32), SandboxError> {
+    if calls.effective_uid() != 0 {
+        let (uid, _, gid, _) = calls.ids();
+        return Ok((uid, gid));
+    }
+    let failed = |step: &'static str| {
+        move |errno: Errno| SandboxError::PrivilegeDrop {
+            uid: config.uid,
+            gid: config.gid,
+            step,
+            source: io::Error::from(errno),
+        }
     };
-    rustix::thread::set_thread_groups(&[]).map_err(failed)?;
-    rustix::thread::set_thread_res_gid(gid, gid, gid).map_err(failed)?;
-    rustix::thread::set_thread_res_uid(uid, uid, uid).map_err(failed)?;
+    calls.clear_groups().map_err(failed("setgroups"))?;
+    calls.set_gids(config.gid).map_err(failed("setresgid"))?;
+    calls.set_uids(config.uid).map_err(failed("setresuid"))?;
 
     let still_privileged = SandboxError::StillPrivileged {
         uid: config.uid,
         gid: config.gid,
     };
-    let ids = (
-        rustix::process::getuid(),
-        rustix::process::geteuid(),
-        rustix::process::getgid(),
-        rustix::process::getegid(),
-    );
-    if ids != (uid, uid, gid, gid) {
+    if calls.ids() != (config.uid, config.uid, config.gid, config.gid) {
         return Err(still_privileged);
     }
     // The saved ids are gone too, so root cannot come back.
-    if rustix::thread::set_thread_res_uid(Uid::ROOT, Uid::ROOT, Uid::ROOT).is_ok() {
+    if calls.set_uids(0).is_ok() {
         return Err(still_privileged);
     }
     tracing::info!(uid = config.uid, gid = config.gid, "privileges dropped");
@@ -419,7 +470,8 @@ mod tests {
         let profile = Profile::Worker {
             connect_ports: vec![554],
         };
-        let err = apply(&profile, &config).unwrap_err();
+        // Through the crate's entry point, so this binary runs its `on` arm.
+        let err = crate::apply(&profile, &config).unwrap_err();
         assert!(
             matches!(&err, SandboxError::Step { step: "RLIMIT_AS", source }
                 if source.kind() == io::ErrorKind::PermissionDenied),
@@ -442,6 +494,10 @@ mod tests {
             return;
         }
         apply_rlimits(&Profile::Decoder, &SandboxConfig::default()).unwrap();
+        let supervisor = Profile::Supervisor {
+            binary: "/lotse".into(),
+        };
+        apply_rlimits(&supervisor, &SandboxConfig::default()).unwrap();
         let address_space = Some(DECODER_ADDRESS_SPACE);
         assert_eq!(limits(Resource::As), (address_space, address_space));
         let cpu = Some(DECODER_CPU_SECONDS);
@@ -547,7 +603,8 @@ mod tests {
             binary: "/nonexistent/lotse".into(),
         };
         let mut notes = Vec::new();
-        apply_landlock(&profile, Mode::On, 1, &mut notes).unwrap();
+        let report = apply_landlock(&profile, Mode::On, 4, &mut notes).unwrap();
+        assert_eq!(report.abi, 4);
         assert!(
             notes
                 .iter()
@@ -614,6 +671,195 @@ mod tests {
         assert_eq!(net_access(&Profile::Decoder), both);
     }
 
+    /// A stand-in for one thread's ids in the kernel, with setresuid(2)'s
+    /// and setresgid(2)'s rules: only an effective uid of 0 may set ids
+    /// other than its own, `-1` leaves an id unchanged, and the saved ids
+    /// follow the real ones. It records every call by its syscall's name
+    /// and fails the one named `fail` with `EPERM`.
+    struct FakeIds {
+        /// The real uid, and the saved one.
+        uid: u32,
+        /// The effective uid.
+        euid: u32,
+        /// The real gid, and the saved one.
+        gid: u32,
+        /// The effective gid.
+        egid: u32,
+        /// Every call so far, in order.
+        calls: std::cell::RefCell<Vec<&'static str>>,
+        /// The call that fails, if any.
+        fail: Option<&'static str>,
+    }
+
+    impl FakeIds {
+        /// A thread whose ids are all `id`.
+        fn all(id: u32) -> Self {
+            Self {
+                uid: id,
+                euid: id,
+                gid: id,
+                egid: id,
+                calls: std::cell::RefCell::default(),
+                fail: None,
+            }
+        }
+
+        /// Records `call` and decides it: `EPERM` when it is the failing
+        /// one or would need privileges the thread lacks.
+        fn call(&self, call: &'static str, needs_root: bool) -> Result<(), Errno> {
+            self.calls.borrow_mut().push(call);
+            let refused = self.fail == Some(call) || (needs_root && self.euid != 0);
+            if refused { Err(Errno::PERM) } else { Ok(()) }
+        }
+
+        /// The calls made, in order.
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl IdCalls for FakeIds {
+        fn effective_uid(&self) -> u32 {
+            self.calls.borrow_mut().push("geteuid");
+            self.euid
+        }
+
+        fn ids(&self) -> (u32, u32, u32, u32) {
+            self.calls.borrow_mut().push("getids");
+            (self.uid, self.euid, self.gid, self.egid)
+        }
+
+        fn clear_groups(&mut self) -> Result<(), Errno> {
+            self.call("setgroups", true)
+        }
+
+        fn set_gids(&mut self, gid: u32) -> Result<(), Errno> {
+            let own = [self.gid, self.egid, u32::MAX].contains(&gid);
+            self.call("setresgid", !own)?;
+            if gid != u32::MAX {
+                (self.gid, self.egid) = (gid, gid);
+            }
+            Ok(())
+        }
+
+        fn set_uids(&mut self, uid: u32) -> Result<(), Errno> {
+            let own = [self.uid, self.euid, u32::MAX].contains(&uid);
+            self.call("setresuid", !own)?;
+            if uid != u32::MAX {
+                (self.uid, self.euid) = (uid, uid);
+            }
+            Ok(())
+        }
+    }
+
+    /// The configured ids the drop tests drop to.
+    fn to(uid: u32, gid: u32) -> SandboxConfig {
+        SandboxConfig {
+            uid,
+            gid,
+            ..SandboxConfig::default()
+        }
+    }
+
+    #[test]
+    fn setresuid2_root_clears_groups_then_sets_gids_then_uids_and_cannot_return() {
+        let mut ids = FakeIds::all(0);
+        assert_eq!(drop_ids(&mut ids, &to(4242, 4343)).unwrap(), (4242, 4343));
+        assert_eq!(
+            ids.calls(),
+            [
+                "geteuid",
+                "setgroups",
+                "setresgid",
+                "setresuid",
+                "getids",
+                "setresuid"
+            ],
+            "the last call is the refused return to root"
+        );
+        assert_eq!(
+            (ids.uid, ids.euid, ids.gid, ids.egid),
+            (4242, 4242, 4343, 4343)
+        );
+    }
+
+    #[test]
+    fn setresuid2_an_unprivileged_process_keeps_its_ids_and_calls_nothing_else() {
+        let mut ids = FakeIds::all(1001);
+        assert_eq!(drop_ids(&mut ids, &to(4242, 4343)).unwrap(), (1001, 1001));
+        assert_eq!(ids.calls(), ["geteuid", "getids"]);
+    }
+
+    #[test]
+    fn setresuid2_each_failed_drop_call_is_a_privilege_drop_error_naming_it() {
+        let made = ["geteuid", "setgroups", "setresgid", "setresuid"];
+        for (failing, step) in made.iter().enumerate().skip(1) {
+            let mut ids = FakeIds {
+                fail: Some(*step),
+                ..FakeIds::all(0)
+            };
+            let err = drop_ids(&mut ids, &to(4242, 4343)).unwrap_err();
+            assert!(
+                matches!(&err, SandboxError::PrivilegeDrop { uid: 4242, gid: 4343, step: named, source }
+                    if named == step && source.raw_os_error() == Some(libc::EPERM)),
+                "{err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "privilege drop to 4242:4343 failed at {step}: Operation not permitted (os error 1)"
+                )
+            );
+            assert_eq!(ids.calls(), made[..=failing], "nothing after {step}");
+        }
+    }
+
+    /// uid `-1` is setresuid(2)'s "unchanged", so root stays; uid 0 is
+    /// root itself, so root can come back.
+    #[test]
+    fn setresuid2_unchanged_or_root_ids_are_still_privileged() {
+        let mut ids = FakeIds::all(0);
+        let err = drop_ids(&mut ids, &to(u32::MAX, u32::MAX)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "still privileged after dropping to 4294967295:4294967295"
+        );
+        assert_eq!(
+            ids.calls().last(),
+            Some(&"getids"),
+            "refused by the id check"
+        );
+
+        let mut ids = FakeIds::all(0);
+        let err = drop_ids(&mut ids, &to(0, 0)).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::StillPrivileged { uid: 0, gid: 0 }),
+            "{err}"
+        );
+        assert_eq!(
+            ids.calls().last(),
+            Some(&"setresuid"),
+            "refused by the return to root"
+        );
+    }
+
+    /// Each wrapper makes its call on this test's thread. Unprivileged
+    /// (as CI runs) the calls that change ids to another one are refused
+    /// with `EPERM`; as root they succeed, ending root for this thread.
+    #[test]
+    fn setresuid2_the_thread_wrappers_make_the_real_calls() {
+        let mut thread = ThreadIds;
+        let ids = thread.ids();
+        let (uid, gid) = (crate::current_uid(), crate::current_gid());
+        let effective = rustix::process::geteuid().as_raw();
+        let kernel = (uid, effective, gid, rustix::process::getegid().as_raw());
+        assert_eq!(ids, kernel);
+        let refused = (effective != 0).then_some(Errno::PERM);
+        assert_eq!(thread.clear_groups().err(), refused);
+        assert_eq!(thread.set_gids(gid.wrapping_add(1)).err(), refused);
+        assert_eq!(thread.set_uids(uid.wrapping_add(1)).err(), refused);
+    }
+
     /// The thread's effective capabilities without `CAP_SETUID` and
     /// `CAP_SETGID`: root by uid, but unable to change its ids.
     fn without_setid_capabilities() {
@@ -636,18 +882,12 @@ mod tests {
             gid: 4343,
             ..SandboxConfig::default()
         };
-        let outcome = drop_privileges(&config).map_err(|err| err.to_string());
-        let refused = "privilege drop to 4242:4343 failed: Operation not permitted (os error 1)";
-        assert_eq!(
-            outcome.as_ref().ok(),
-            (!root).then_some(&own),
-            "{outcome:?}"
-        );
-        assert_eq!(
-            outcome.as_ref().err().map(String::as_str),
-            root.then_some(refused),
-            "{outcome:?}"
-        );
+        let result = drop_privileges(&config);
+        let refused = result.as_ref().err().map(ToString::to_string);
+        let expected =
+            "privilege drop to 4242:4343 failed at setgroups: Operation not permitted (os error 1)";
+        assert_eq!(result.ok(), (!root).then_some(own));
+        assert_eq!(refused.as_deref(), root.then_some(expected));
     }
 
     /// Two configurations that would leave root: uid `-1`, which
@@ -664,14 +904,11 @@ mod tests {
                 gid: id,
                 ..SandboxConfig::default()
             };
-            let outcome = drop_privileges(&config).map_err(|err| err.to_string());
-            let refused = format!("still privileged after dropping to {id}:{id}");
-            assert_eq!(
-                outcome.as_ref().ok(),
-                (!root).then_some(&own),
-                "{outcome:?}"
-            );
-            assert_eq!(outcome.err(), root.then_some(refused));
+            let result = drop_privileges(&config);
+            let refused = result.as_ref().err().map(ToString::to_string);
+            let expected = format!("still privileged after dropping to {id}:{id}");
+            assert_eq!(result.ok(), (!root).then_some(own));
+            assert_eq!(refused, root.then_some(expected));
         }
     }
 

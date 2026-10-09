@@ -992,6 +992,25 @@ mod tests {
         );
     }
 
+    /// Installs the supervisor's filters on this test's thread only
+    /// (seccomp(2), without `SECCOMP_FILTER_FLAG_TSYNC`); the supervisor's
+    /// allowlist keeps what the thread does afterwards, finishing the test.
+    #[test]
+    fn seccomp2_the_supervisors_filters_install_on_the_calling_thread() {
+        let supervisor = Profile::Supervisor {
+            binary: "/lotse".into(),
+        };
+        let mut notes = Vec::new();
+        let status = apply(
+            &supervisor,
+            Mode::Require,
+            std::env::consts::ARCH,
+            &mut notes,
+        );
+        assert_eq!(status.unwrap(), LayerStatus::Enforced);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
     #[test]
     fn a_filter_seccompiler_cannot_build_is_a_seccomp_step_error() {
         let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();

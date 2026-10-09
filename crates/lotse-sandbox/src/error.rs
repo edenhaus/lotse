@@ -7,12 +7,14 @@ use std::io;
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
     /// A privilege-drop syscall failed.
-    #[error("privilege drop to {uid}:{gid} failed: {source}")]
+    #[error("privilege drop to {uid}:{gid} failed at {step}: {source}")]
     PrivilegeDrop {
         /// The target uid.
         uid: u32,
         /// The target gid.
         gid: u32,
+        /// The call that failed (`setgroups`, `setresgid`, `setresuid`).
+        step: &'static str,
         /// The syscall's error.
         #[source]
         source: io::Error,
