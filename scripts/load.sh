@@ -14,20 +14,15 @@ set -eu
 
 SANDBOX="${LOTSE_LOAD_SANDBOX:-off}"
 
-# On Linux the daemon is the static musl build that ships, with mimalloc;
-# elsewhere (macOS, development only) the host build.
-if [ "$(uname -s)" = Linux ]; then
-  TARGET="$(uname -m)-unknown-linux-musl"
-  cargo build --release --locked --bin lotse --target "$TARGET"
-  LOTSE="target/$TARGET/release/lotse"
-else
-  cargo build --release --locked --bin lotse
-  LOTSE=target/release/lotse
-fi
+[ "$(uname -s)" = Linux ] || { echo "the load generator and the soak run on Linux only" >&2; exit 2; }
+
+# The daemon is the static musl build that ships, with mimalloc.
+TARGET="$(uname -m)-unknown-linux-musl"
+cargo build --release --locked --bin lotse --target "$TARGET"
+LOTSE="target/$TARGET/release/lotse"
 cargo build --release --locked -p lotse-testing --example lotse-load
 
-# A short path: a Unix socket path must fit in sun_path (104 bytes on macOS), which macOS's
-# per-user TMPDIR alone nearly fills.
+# A short path: a Unix socket path must fit in sun_path (108 bytes on Linux).
 DIR="$(mktemp -d /tmp/lotse-load.XXXXXX)"
 chmod 0700 "$DIR"
 SOCKET="$DIR/lotse.sock"

@@ -8,18 +8,11 @@
 # in one server), then runs the ignored `coturn_` tests in crates/lotse/tests/signaling.rs
 # one at a time, since each counts its server's allocations, and removes the containers.
 #
-# Networking: on Linux the containers share the host's network (`--network host`), listen
-# and relay on 127.0.0.1 and allow loopback peers, so the viewer's host candidate is the
-# peer. Docker Desktop (macOS) runs containers in a VM whose host network the Mac cannot
-# reach, so there the listener, the relay range and the metrics port are published on
-# 127.0.0.1 and coturn reports its relayed addresses as 127.0.0.1 (`--external-ip`). Docker
-# Desktop's port forwarding then acts as a symmetric NAT in front of the viewer: coturn sees
-# it at another address per destination port, so the test trickles the viewer's
-# server-reflexive candidate (from a Binding to coturn), which gives the daemon the
-# permission's IP, and the daemon reaches the viewer at the peer-reflexive address its
-# checks arrive from. Its checks to the server-reflexive candidate itself leave the VM like
-# a browser's towards a NAT mapping that is not there.
+# Networking: the containers share the host's network (`--network host`), listen and relay on
+# 127.0.0.1 and allow loopback peers, so the viewer's host candidate is the peer. Linux only.
 set -eu
+
+[ "$(uname -s)" = Linux ] || { echo "the TURN end-to-end test runs on Linux only" >&2; exit 2; }
 
 # coturn 4.18.0 (2026-09-08), the multi-arch index digest.
 IMAGE="coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3"
@@ -38,14 +31,8 @@ start() {
   name=$1 port=$2 relay=$3 metrics=$4
   shift 4
   last=$((relay + 31))
-  if [ "$(uname -s)" = Linux ]; then
-    set -- --network host "$IMAGE" --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
-      --prometheus-address=127.0.0.1 "$@"
-  else
-    set -- -p "127.0.0.1:$port:$port/udp" -p "127.0.0.1:$port:$port/tcp" \
-      -p "127.0.0.1:$relay-$last:$relay-$last/udp" -p "127.0.0.1:$metrics:$metrics/tcp" \
-      "$IMAGE" --external-ip=127.0.0.1 "$@"
-  fi
+  set -- --network host "$IMAGE" --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
+    --prometheus-address=127.0.0.1 "$@"
   docker run -d --name "$name" --entrypoint turnserver "$@" -n --log-file=stdout --verbose \
     --realm=lotse.test --fingerprint \
     --lt-cred-mech --no-tls --allow-loopback-peers --listening-port="$port" \

@@ -4,10 +4,10 @@ name: browser
 # and case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash), has
 # Selenium drive a real browser that plays the synthetic camera (ffmpeg publishing to MediaMTX,
 # both pinned in mise.toml) through a release daemon and the dev viewer, and checks what it
-# showed, played and reported in getStats(). Chrome and Firefox on GitHub's x86-64 Linux runner,
-# Safari on its macOS runner; CI uses GitHub's hosted runners only. The browsers are the runner
-# images' own, current stable releases, their drivers the ones Selenium Manager resolves, and each
-# report records the versions that ran. Nightly and by hand.
+# showed, played and reported in getStats(). Chrome and Firefox on GitHub's x86-64 Linux runner;
+# CI uses GitHub's hosted runners only. The browsers are the runner images' own, current stable
+# releases, their drivers the ones Selenium Manager resolves, and each report records the versions
+# that ran. Nightly and by hand.
 #
 # The `compare` job plays the same page and camera through lotse and through go2rtc as its common
 # deployment configures it (scripts/compare.sh, tests/browser/test_comparison.py), alternating,
@@ -43,29 +43,18 @@ env:
 
 jobs:
   browser:
-    name: ${{ matrix.engine }} on ${{ matrix.os }}
+    name: ${{ matrix.engine }} on ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux: the release daemon's musl build (as in build.yml) and the camera's tools.
           - engine: chrome
-            os: ubuntu-latest
-            tools: rust zig cmake github:rust-cross/cargo-zigbuild github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds uv
             # Ubuntu 24.04's AppArmor keeps Chrome's sandbox from the user namespaces it needs;
             # the page it loads is the test's own, on loopback.
             browser_args: --no-sandbox
           - engine: firefox
-            os: ubuntu-latest
-            tools: rust zig cmake github:rust-cross/cargo-zigbuild github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds uv
             browser_args: ""
-          # macOS: the host build (cmake builds libopus; no musl, so no zig), ffmpeg from the
-          # macOS arm64 build in mise.toml (GitHub's macos-latest is arm64).
-          - engine: safari
-            os: macos-latest
-            tools: rust cmake github:bluenviron/mediamtx http:ffmpeg uv
-            browser_args: ""
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,15 +63,12 @@ jobs:
       - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
         with:
           version: 2026.9.15
-          # What the build and the camera need, and uv for the test's Python; the rest of
-          # mise.toml is for the checks.
-          install_args: ${{ matrix.tools }}
+          # The release daemon's musl build (as in build.yml), the camera's tools, and uv for the
+          # test's Python; the rest of mise.toml is for the checks.
+          install_args: rust zig cmake github:rust-cross/cargo-zigbuild github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds uv
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: browser
-      # Safari's WebDriver is off until an administrator turns it on; the hosted runner allows it.
-      - if: matrix.engine == 'safari'
-        run: sudo safaridriver --enable
       - run: mise run browser "$ENGINE" "$PLAY"
         env:
           ENGINE: ${{ matrix.engine }}

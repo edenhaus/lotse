@@ -20,10 +20,10 @@ changing `[tools]`, run `mise lock` and commit both files.
 Every check is a prek hook in `.pre-commit-config.yaml`: fmt, clippy,
 rustdoc, cargo-hack, cargo-shear, the fuzz crate's `cargo check`, the
 crate-layering and license-list checks, cargo-deny, codespell, actionlint, zizmor and file hygiene run on `git commit` (only when matching files changed), the
-Conventional Commits check on `commit-msg`, the tests and doctests on
-`git push`. Add new checks there. The two Linux-only gates, coverage and
-mutants, are mise tasks that CI runs; `mise run check` does not include
-them.
+Conventional Commits check on `commit-msg`; the tests and doctests run in
+`mise run check` and CI only. Add new checks there. The two further gates,
+coverage and mutants, are mise tasks that CI runs; `mise run check` does
+not include them.
 
 | Command | What it does |
 |---|---|
@@ -36,7 +36,7 @@ them.
 | `mise run load [cameras] [viewers] [duration]` | the load generator against a release daemon (`target/load-report.json`) |
 | `mise run soak [duration] [cycle]` | the soak: viewer and camera churn, checked for memory, task and descriptor growth (`target/soak-report.json`) |
 | `mise run interop` | the daemon against MediaMTX fed by ffmpeg (pinned in `mise.toml`): RTSP over TCP and UDP, video only and with AAC, PCMU and Opus (ignored `mediamtx_` tests) |
-| `mise run browser [chrome\|firefox\|safari] [play] [case]` | the browser test: one pytest test (`tests/browser/`) has Selenium drive a real browser playing ffmpeg's stream from MediaMTX through a release daemon, per case (`join`, `aac`, `pli`, `reconnect`, `crash`, or `all`, the default) (`target/browser-<engine>/<case>/`); needs the browser, Selenium Manager finds or fetches its driver |
+| `mise run browser [chrome\|firefox] [play] [case]` | the browser test: one pytest test (`tests/browser/`) has Selenium drive a real browser playing ffmpeg's stream from MediaMTX through a release daemon, per case (`join`, `aac`, `pli`, `reconnect`, `crash`, or `all`, the default) (`target/browser-<engine>/<case>/`); needs the browser, Selenium Manager finds or fetches its driver |
 | `mise run compare [engine] [runs] [play]` | the browser test through lotse and through go2rtc, side by side; a report, not a gate (`target/compare-<engine>/compare.json`) |
 | `mise run test-musl` | tests on the static musl target (Linux only) |
 | `mise run audit` | RustSec advisories, the root and the fuzz workspace (network) |
@@ -120,13 +120,11 @@ The clients, the Python `lotse-client` among them, live in their own repository,
 
 ## Gotchas
 
-- Target platforms are Linux musl (x86-64-v2, aarch64 ARMv8.0). macOS is
-  for development only; Linux-only code (sandbox, SEQPACKET) must
-  still let the workspace build and test on macOS.
+- Linux is the only platform: the targets are Linux musl (x86-64-v2,
+  aarch64 ARMv8.0), and the tests and every gate run on Linux, in CI.
+  Test and measure on Linux (CI, or a Linux container), never elsewhere.
 - musl builds run on Linux only (`test-musl`, `release-build`, CI's
-  `build` on one native runner per arch). libopus is built by cmake,
-  which on macOS archives with the host's `ranlib` and silently produces
-  an empty `libopus.a`. The macOS host build is unaffected.
+  `build` on one native runner per arch).
 - `panic = "abort"` in every profile: `catch_unwind` does not work, and a
   panic ends the process. Cargo ignores the setting for the test profile,
   so a test that needs abort semantics must run a release-profile binary

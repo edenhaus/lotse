@@ -1,11 +1,10 @@
 # The single definition of every check. prek runs it:
 #   - on `git commit`:  everything below except the tests, on the changed files
 #   - on `commit-msg`:  the Conventional Commits check
-#   - on `git push`:    the tests and the doctests
-#   - `mise run check` and CI: all of it, on all files (`--stage manual`)
-# The Linux-only gates (coverage, mutants) are mise tasks that CI runs, see mise.toml.
-# `mise install` installs the git hooks.
-default_install_hook_types: [pre-commit, commit-msg, pre-push]
+#   - `mise run check` and CI: all of it, tests included, on all files (`--stage manual`)
+# The tests run on Linux only, in CI; the Linux-only gates (coverage, mutants) are mise tasks that
+# CI runs, see mise.toml. `mise install` installs the git hooks.
+default_install_hook_types: [pre-commit, commit-msg]
 default_stages: [pre-commit, manual]
 
 repos:
@@ -65,7 +64,7 @@ repos:
         language: system
         files: ^tests/browser/
         pass_filenames: false
-        stages: [pre-push, manual]
+        stages: [manual]
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --all --
@@ -147,11 +146,11 @@ repos:
         language: system
         files: (\.rs|Cargo\.toml|Cargo\.lock)$
         pass_filenames: false
-        stages: [pre-push, manual]
+        stages: [manual]
       - id: cargo-test-doc
         name: cargo test --doc (nextest does not run doctests)
         entry: cargo test --workspace --all-features --locked --doc
         language: system
         files: (\.rs|Cargo\.toml|Cargo\.lock)$
         pass_filenames: false
-        stages: [pre-push, manual]
+        stages: [manual]

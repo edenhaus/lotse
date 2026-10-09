@@ -37,14 +37,12 @@ uv = "0.12.23" # the browser test's Python, Selenium and pytest, and its checks 
 "github:bluenviron/mediamtx" = "1.21.1"
 # FFmpeg 9.0.2, static GPL builds (libx264, libopus; the native aac and pcm_mulaw encoders). Linux:
 # BtbN/FFmpeg-Builds, the build ffmpeg.org links, a month-end autobuild (kept for years, the daily
-# ones only for weeks) from the release/9.0 branch. macOS arm64 (development only): Martin Riedl's
-# static release build; evermeet.cx, the one ffmpeg.org links, is Intel-only.
+# ones only for weeks) from the release/9.0 branch.
 "github:BtbN/FFmpeg-Builds" = { version = "autobuild-2026-09-30-13-08", version_prefix = "", os = ["linux"], strip_components = 1, bin_path = "bin", platforms = { linux-x64 = { asset_pattern = "ffmpeg-n9.0.2-17-g2a571b6068-linux64-gpl-9.0.tar.xz", checksum = "sha256:68ee646831adaae2495618346f3bba94ff207ff83bbd34d643e7004730d66269" }, linux-arm64 = { asset_pattern = "ffmpeg-n9.0.2-17-g2a571b6068-linuxarm64-gpl-9.0.tar.xz", checksum = "sha256:91afcd7695d4bbbb9e0057aa10baaf9875ec4e1a97303f9059ec971336a2ab46" } } }
-"http:ffmpeg" = { version = "9.0.2", os = ["macos/arm64"], url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip", checksum = "sha256:c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924" }
 # go2rtc, the server the browser test is compared with (`mise run compare`, report only): the
 # release its common deployment pins, observed 2026-10-07. Its release binaries are UPX-packed;
 # they run as they are.
-"github:AlexxIT/go2rtc" = { version = "1.9.14", bin = "go2rtc", platforms = { linux-x64 = { asset_pattern = "go2rtc_linux_amd64", checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6" }, linux-arm64 = { asset_pattern = "go2rtc_linux_arm64", checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50" }, macos-arm64 = { asset_pattern = "go2rtc_mac_arm64.zip", checksum = "sha256:919b78adc759d6b3883d1e1b2ac915ac0985bb903ff1897b4d228527bd64690c" } } }
+"github:AlexxIT/go2rtc" = { version = "1.9.14", bin = "go2rtc", os = ["linux"], platforms = { linux-x64 = { asset_pattern = "go2rtc_linux_amd64", checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6" }, linux-arm64 = { asset_pattern = "go2rtc_linux_arm64", checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50" } } }
 
 # Git hooks are installed on every `mise install`, so nobody has to remember.
 [hooks]
@@ -104,9 +102,9 @@ arg "[cycle]" help="one cycle of viewers and a camera hang-up; over a minute, af
 run = 'scripts/load.sh --cameras 4 --viewers 2 --duration "$usage_duration" --cycle "$usage_cycle" --drop --sample 10s --report target/soak-report.json'
 
 [tasks.browser]
-description = "The browser test: Selenium has Chrome, Firefox or Safari play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash); report and logs in target/browser-<engine>/<case>/"
+description = "The browser test: Selenium has Chrome or Firefox play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash); report and logs in target/browser-<engine>/<case>/"
 usage = '''
-arg "[engine]" help="chrome, firefox or safari" default="chrome"
+arg "[engine]" help="chrome or firefox" default="chrome"
 arg "[play]" help="how long each window plays (20s); a case with a disruption plays one before it and one after" default="20s"
 arg "[case]" help="join, aac, pli, reconnect, crash or all" default="all"
 '''
@@ -115,7 +113,7 @@ run = 'scripts/browser.sh "$usage_engine" "$usage_play" --case "$usage_case"'
 [tasks.compare]
 description = "The go2rtc comparison: the browser test through lotse and through go2rtc as its common deployment configures it, alternating, N runs each, reported side by side (fails only on lotse's own checks); report in target/compare-<engine>/"
 usage = '''
-arg "[engine]" help="chrome, firefox or safari" default="chrome"
+arg "[engine]" help="chrome or firefox" default="chrome"
 arg "[runs]" help="plays through each server" default="5"
 arg "[play]" help="how long each play lasts after the first frame (20s)" default="20s"
 '''
@@ -157,8 +155,6 @@ run = [
 [tasks.release-build]
 description = "Static musl binary (Linux only; CI builds each arch on its own runner); zig links (.cargo/config.toml)"
 usage = 'arg "[arch]" help="x86_64 or aarch64" default="x86_64"'
-# On macOS cmake archives libopus with the host's ranlib, which drops the ELF objects: the build
-# would succeed and the binary fail to link, so it stops here instead.
 run = """
 [ "$(uname -s)" = Linux ] || { echo "release-build runs on Linux; CI builds both arches (build.yml)" >&2; exit 1; }
 cargo build --release --locked --bin lotse --target ${usage_arch}-unknown-linux-musl
