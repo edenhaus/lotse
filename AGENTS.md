@@ -31,8 +31,9 @@ it may restore a cache), `scorecard.yml` and `pr-title.yml` stand apart
 (each says why). Its Build job compiles the musl tests once per arch
 into a nextest archive that the Tests, Interop, TURN and Sandbox
 isolation jobs run without compiling; every compiling job keeps a Rust
-cache that only `main` saves. A new job goes into
-`ci.yml`; workflow and job names start with a capital letter.
+cache, saved by every run and restored from the PR's own (GitHub scopes
+them to it) or else from `main`'s. A new job goes into `ci.yml`; workflow
+and job names start with a capital letter.
 
 | Command | What it does |
 |---|---|

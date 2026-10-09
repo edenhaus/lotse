@@ -11,9 +11,10 @@ name: CI
 # archive and compile nothing. The other compiling jobs build what only they need (clippy's check
 # build, the coverage instrumentation, the release profile) and each keeps its own Rust cache.
 #
-# Caches: every Rust cache is saved by runs on main only and restored by every run, so a PR starts
-# from main's build without evicting it; the tools come from mise's cache, the browser test's
-# Python packages from uv's.
+# Caches: every run saves its Rust caches and restores the newest that fits. GitHub scopes a
+# PR's caches to that PR, so its next push starts from its own last build, and a new PR starts from
+# main's; the tools come from mise's cache, the browser test's Python packages from uv's, prek's
+# hooks from prek's.
 
 on:
   push:
@@ -111,7 +112,6 @@ jobs:
           workspaces: |
             . -> target
             fuzz -> fuzz/target
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/uv
@@ -155,7 +155,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: musl-tests-${{ matrix.arch }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run test-archive
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -282,7 +281,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: coverage
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run coverage
 
   mutants:
@@ -300,7 +298,6 @@ jobs:
         with:
           version: 2026.9.15
           install_args: rust cmake github:nextest-rs/nextest cargo:cargo-mutants
-      # Saved on the PR too: only PRs run it, and the next push to the same PR restores it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: mutants
@@ -324,7 +321,6 @@ jobs:
         with:
           shared-key: console
           workspaces: ". -> target/console"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run console-check
 
   # The fuzz targets, 60 s each.
@@ -347,7 +343,6 @@ jobs:
             . -> target
             fuzz -> fuzz/target
           cache-bin: true # cargo-fuzz
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo "+$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
       # cargo-fuzz has no `--locked`: this fails on a stale fuzz/Cargo.lock, and the builds below
       # then resolve nothing new.

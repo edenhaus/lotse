@@ -53,7 +53,6 @@ jobs:
         if: ${{ !inputs.release }}
         with:
           shared-key: release-${{ matrix.arch }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - if: inputs.version != ''
         run: mise run set-version "$VERSION"
         env:
