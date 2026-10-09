@@ -3,9 +3,10 @@
 //! bucket (a response to a waiting transaction, forwarded, dropped on a
 //! full worker, a rejected STUN request, discarded from a TURN server,
 //! unroutable), and hands a session's worker only what comes from an
-//! address that session learned or is a STUN Binding Request that proves
-//! the session's password with a correct fingerprint, never more than
-//! [`MAX_ADDRS_PER_SESSION`] addresses per session, and every frame exactly
+//! address that session learned and no other session took since, or is a
+//! STUN Binding Request that proves the session's password with a correct
+//! fingerprint, never more than [`MAX_ADDRS_PER_SESSION`] addresses per
+//! session, and every frame exactly
 //! as it arrived, its source canonical and its destination where the
 //! socket said it arrived, canonical on the bound port, or else the host
 //! address of the source's family (RFC 8445 §7.2.2 and §7.2.5.2.1, RFC
@@ -428,6 +429,11 @@ fuzz_target!(|data: &[u8]| {
                 .find(|&i| proves(&payload, i))
                 .expect("only a proof teaches an address");
             assert!(live[i], "a session that is gone learns nothing");
+            // An address another session learned moves to this one, and
+            // stops counting against that one's cap (RFC 8445 §7.3).
+            for other in &mut learned {
+                other.remove(&from);
+            }
             learned[i].insert(from, sinks[i].1);
         }
         for (i, (sink, generation)) in sinks.iter().enumerate() {
