@@ -267,14 +267,28 @@ jobs:
           name: tests-x86_64
       - name: Take the binary from the archive
         run: tar --zstd -xf nextest-archive.tar.zst "$BIN"
-      # Alpine from Docker's own copy of its official images on ECR Public: Docker Hub's anonymous
-      # pull limit ran out on GitHub's shared runners (2026-10-09). The same digest.
+      # The container is what is under test (Docker's seccomp profile and capability set), not
+      # its image: a scratch image with a static busybox for the check's shell and tools, built
+      # here, so no registry is pulled from (Docker Hub's and ECR Public's anonymous limits both
+      # ran out on GitHub's shared runners, 2026-10-09 and 2026-10-10). Docker mounts the
+      # /etc/hosts and /etc/resolv.conf the supervisor's Landlock rules name, as in a deployment.
+      - name: Build the check's image
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends busybox-static
+          root="$RUNNER_TEMP/sandbox-image"
+          mkdir -p "$root/bin"
+          cp "$(command -v busybox)" "$root/bin/busybox"
+          for applet in $(busybox --list); do
+            [ -e "$root/bin/$applet" ] || ln -s busybox "$root/bin/$applet"
+          done
+          tar -C "$root" -c . | docker import - lotse-sandbox-check
       - name: Run the check in a container
         run: |
           docker run --rm \
             --volume "$PWD/$BIN:/lotse:ro" \
             --volume "$PWD/scripts/sandbox-isolation.sh:/check.sh:ro" \
-            public.ecr.aws/docker/library/alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 sh /check.sh
+            lotse-sandbox-check /bin/sh /check.sh
 
   coverage:
     name: Coverage (100 % of lines)
