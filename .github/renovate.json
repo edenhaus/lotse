@@ -28,7 +28,7 @@
     },
     {
       "customType": "regex",
-      "description": "The fuzzing nightly, pinned by date in mise.toml (`mise run fuzz`) and ci.yml (fuzz-smoke)",
+      "description": "The fuzzing nightly, pinned by date in mise.toml (`mise run fuzz`) and ci.yml (Fuzz build)",
       "managerFilePatterns": ["/^mise\\.toml$/", "/^\\.github/workflows/ci\\.yml$/"],
       "matchStrings": ["NIGHTLY *[:=] *\"?(?<currentValue>nightly-\\d{4}-\\d{2}-\\d{2})"],
       "depNameTemplate": "rust-nightly",
@@ -37,7 +37,7 @@
     },
     {
       "customType": "regex",
-      "description": "cargo-fuzz, installed by version in ci.yml (fuzz-smoke)",
+      "description": "cargo-fuzz, installed by version in ci.yml (Fuzz build)",
       "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
       "matchStrings": ["install (?<depName>cargo-fuzz) --version (?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "crate"

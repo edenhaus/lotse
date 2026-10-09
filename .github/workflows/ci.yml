@@ -9,7 +9,8 @@ name: CI
 #
 # Build once: the Build job compiles the tests of the static musl target once per arch and
 # archives them (cargo nextest archive); Tests, Interop, TURN and Sandbox isolation run that
-# archive and compile nothing. The other compiling jobs build what only they need (clippy's check
+# archive and compile nothing. Fuzz build compiles the fuzz targets once for the Fuzz jobs, which
+# run them up to 4 at a time. The other compiling jobs build what only they need (clippy's check
 # build, the coverage instrumentation, the release profile) and each keeps its own Rust cache.
 #
 # Caches: every run saves its Rust caches and restores the newest that fits. GitHub scopes a
@@ -22,11 +23,11 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: "14 0 * * *" # nightly: the browser test, the go2rtc comparison, load and soak
+    - cron: "14 0 * * *" # nightly: the browser test, the go2rtc comparison, load, soak, every fuzz target for 5 min
   workflow_dispatch:
     inputs:
       nightly:
-        description: "Also run the nightly jobs (browser test, comparison, load, soak)"
+        description: "Also run the nightly jobs (browser test, comparison, load, soak) and fuzz each target for 5 min"
         type: boolean
         default: false
       play:
@@ -64,6 +65,8 @@ jobs:
     outputs:
       deps: ${{ steps.diff.outputs.deps }}
       schema: ${{ steps.diff.outputs.schema }}
+      fuzz: ${{ steps.diff.outputs.fuzz }}
+      base: ${{ steps.diff.outputs.base }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -91,6 +94,10 @@ jobs:
           {
             echo "deps=$(changed Cargo.lock fuzz/Cargo.lock .cargo/deny.toml)"
             echo "schema=$(changed crates/lotse-api-types/schema/api.json)"
+            # What a fuzz target can be built from, and what scripts/fuzz-select.sh runs them all
+            # for.
+            echo "fuzz=$(changed crates fuzz Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml scripts/fuzz.sh scripts/fuzz-parallel.sh scripts/fuzz-select.sh .github/workflows/ci.yml)"
+            echo "base=$base"
           } | tee -a "$GITHUB_OUTPUT"
 
   # Every prek hook on all files (`mise run check`), and the browser test's unit tests.
@@ -326,17 +333,24 @@ jobs:
           workspaces: ". -> target/console"
       - run: mise run console-check
 
-  # The fuzz targets, 60 s each.
-  fuzz:
-    name: Fuzz smoke (60 s per target)
-    if: github.event_name != 'schedule'
+  # The fuzz targets, built once (cargo-fuzz's release build with AddressSanitizer, on the pinned
+  # nightly) when the change reaches what they are built from. On a PR only the targets built from
+  # a file it changed run (scripts/fuzz-select.sh, from each target's dep-info), else all of them.
+  fuzz-build:
+    name: Fuzz build
+    needs: changes
+    if: needs.changes.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
+    outputs:
+      groups: ${{ steps.select.outputs.groups }}
     env:
       NIGHTLY: nightly-2026-10-01 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
+      BIN_DIR: fuzz/target/x86_64-unknown-linux-gnu/release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0 # the base to compare with
       - name: Nightly toolchain (the one nightly use)
         run: rustup toolchain install "$NIGHTLY" --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -347,16 +361,77 @@ jobs:
             fuzz -> fuzz/target
           cache-bin: true # cargo-fuzz
       - run: cargo "+$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
-      # cargo-fuzz has no `--locked`: this fails on a stale fuzz/Cargo.lock, and the builds below
-      # then resolve nothing new.
+      # cargo-fuzz has no `--locked`: this fails on a stale fuzz/Cargo.lock, and the build below
+      # then resolves nothing new.
       - run: cargo "+$NIGHTLY" fetch --manifest-path fuzz/Cargo.toml --locked
-      # scripts/fuzz.sh adds the contract's limits (a 10 s hang, a 64 MiB allocation, 1 GiB
-      # resident), the same as `mise run fuzz`.
-      - name: Fuzz every target for 60 s
+      - run: cargo "+$NIGHTLY" fuzz build
+      # The selected targets in groups of up to 4, one Fuzz job each (scripts/fuzz-parallel.sh).
+      - name: Select the targets
+        id: select
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && needs.changes.outputs.base || '' }}
         run: |
-          for target in $(cargo "+$NIGHTLY" fuzz list); do
-            scripts/fuzz.sh "$target" 60
-          done
+          # shellcheck disable=SC2046 # one argument per target
+          scripts/fuzz-select.sh "$BIN_DIR" "$BASE" $(cargo "+$NIGHTLY" fuzz list) > selected
+          echo "groups=$(jq -Rnc '[inputs] | [range(0; length; 4) as $i | .[$i:$i + 4] | join(" ")]' selected)" | tee -a "$GITHUB_OUTPUT"
+      # The binaries in a tarball, which keeps their mode (an artifact's zip does not).
+      - name: Pack the selected targets
+        if: steps.select.outputs.groups != '[]'
+        run: |
+          # shellcheck disable=SC2046 # one argument per target
+          tar --zstd -cf fuzz-targets.tar.zst -C "$BIN_DIR" $(cat selected)
+      - if: steps.select.outputs.groups != '[]'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-targets
+          path: fuzz-targets.tar.zst
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0 # zstd already
+
+  # Each group of targets at once (scripts/fuzz-parallel.sh), from the Fuzz build job's binaries:
+  # 60 s each, 5 min each nightly. A failing input and the logs are uploaded.
+  fuzz:
+    name: Fuzz (${{ matrix.group }})
+    needs: fuzz-build
+    if: needs.fuzz-build.outputs.groups != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.fuzz-build.outputs.groups) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FUZZ_BIN_DIR: fuzz-targets
+      SECS: ${{ (github.event_name == 'schedule' || inputs.nightly) && 300 || 60 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fuzz-targets
+      - name: Unpack the group's targets
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          mkdir "$FUZZ_BIN_DIR"
+          # shellcheck disable=SC2086 # one argument per target
+          tar --zstd -xf fuzz-targets.tar.zst -C "$FUZZ_BIN_DIR" $GROUP
+      - name: Fuzz the group's targets for ${{ env.SECS }} s each
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          # shellcheck disable=SC2086 # one argument per target
+          scripts/fuzz-parallel.sh "$SECS" $GROUP
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-findings-${{ strategy.job-index }}
+          path: |
+            fuzz/artifacts/
+            target/fuzz-logs/
+          if-no-files-found: warn
 
   # The release binaries' build on every push and PR (both arches, the size check); the release
   # itself builds them again without any cache (release.yml).

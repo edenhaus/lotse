@@ -31,7 +31,10 @@ it may restore a cache), `scorecard.yml`, `pr-title.yml` and
 `cleanup-caches.yml` (a closed PR's caches deleted) stand apart (each
 says why). Its Build job compiles the musl tests once per arch
 into a nextest archive that the Tests, Interop, TURN and Sandbox
-isolation jobs run without compiling; every compiling job keeps a Rust
+isolation jobs run without compiling, and its Fuzz build job compiles the
+fuzz targets once for the Fuzz jobs, which run up to 4 targets each in
+parallel: on a PR only the targets built from a file it changed
+(`scripts/fuzz-select.sh`), else all, 5 min each nightly; every compiling job keeps a Rust
 cache, saved by every run and restored from the PR's own (GitHub scopes
 them to it) or else from `main`'s. A new job goes into `ci.yml`; workflow
 and job names start with a capital letter.

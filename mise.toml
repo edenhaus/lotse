@@ -162,7 +162,7 @@ usage = '''
 arg "<target>" help="a target under fuzz/fuzz_targets"
 arg "[secs]" help="seconds to run" default="60"
 '''
-# The nightly is pinned by date, the same one as CI's fuzz-smoke (Renovate bumps both). cargo-fuzz
+# The nightly is pinned by date, the same one as CI's Fuzz build (Renovate bumps both). cargo-fuzz
 # has no `--locked`: the fetch fails on a stale fuzz/Cargo.lock, and the build then resolves
 # nothing new. scripts/fuzz.sh holds libFuzzer's time and memory limits, for CI too.
 env = { NIGHTLY = "nightly-2026-10-01" }
