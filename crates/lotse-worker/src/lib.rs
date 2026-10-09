@@ -1652,6 +1652,23 @@ mod tests {
         seen
     }
 
+    /// The worker's messages until `done` holds for them, for at most 10 s,
+    /// with the fake clock standing still: what the worker sends without
+    /// any time passing. [`messages_until`] moves it while it waits.
+    async fn messages_until_still(
+        h: &mut Harness,
+        done: impl Fn(&[ToSupervisor]) -> bool,
+    ) -> Vec<ToSupervisor> {
+        let mut seen = Vec::new();
+        while !done(&seen) {
+            tokio::select! {
+                message = h.next() => seen.push(message),
+                () = SystemClock.sleep(Duration::from_secs(10)) => panic!("not within 10 s: {seen:?}"),
+            }
+        }
+        seen
+    }
+
     /// The session events among `messages`.
     fn session_events(messages: &[ToSupervisor]) -> impl Iterator<Item = (&str, &SessionEvent)> {
         messages.iter().filter_map(|message| match message {
@@ -1864,7 +1881,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let seen = messages_until(&mut h, |seen| {
+        // Live with the fake clock standing still: moved while waiting, it
+        // reached the first report's second before the worker's messages
+        // arrived on a slow runner (GitHub's, 2026-10-09).
+        let seen = messages_until_still(&mut h, |seen| {
             seen.contains(&ToSupervisor::SourceState(SourceState::Live))
         })
         .await;
