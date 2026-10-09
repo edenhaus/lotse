@@ -57,6 +57,11 @@ impl std::fmt::Debug for AacDecoder {
     }
 }
 
+/// A Symphonia refusal as [`DecodeError::Decoder`].
+fn decoder_error(err: impl std::fmt::Display) -> DecodeError {
+    DecodeError::Decoder(err.to_string())
+}
+
 impl AacDecoder {
     /// A decoder for the `AudioSpecificConfig` `config`.
     pub fn new(config: &[u8]) -> Result<Self, DecodeError> {
@@ -65,8 +70,8 @@ impl AacDecoder {
         params
             .for_codec(CODEC_ID_AAC)
             .with_extra_data(config.into());
-        let inner = Inner::try_new(&params, &AudioDecoderOptions::default())
-            .map_err(|err| DecodeError::Decoder(err.to_string()))?;
+        let inner =
+            Inner::try_new(&params, &AudioDecoderOptions::default()).map_err(decoder_error)?;
         Ok(Self {
             inner,
             channels: parsed.channels,
@@ -96,10 +101,7 @@ impl AacDecoder {
             Duration::new(u64::from(FRAME_SAMPLES)),
             frame,
         );
-        let decoded = self
-            .inner
-            .decode_ref(&packet)
-            .map_err(|err| DecodeError::Decoder(err.to_string()))?;
+        let decoded = self.inner.decode_ref(&packet).map_err(decoder_error)?;
         // symphonia renders every frame whole, silence where a channel
         // element is missing.
         decoded.copy_to_vec_interleaved(&mut self.pcm);

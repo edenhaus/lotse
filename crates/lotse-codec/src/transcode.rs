@@ -119,9 +119,8 @@ impl AacToOpus {
     /// a clump's later packets leave later by as much as their media is
     /// later, so each waits as long as its first.
     pub fn delay(sample_rate: u32) -> Result<Duration, TranscodeError> {
-        let resampler = Resampler::new(sample_rate, 1, chunk())
-            .map_err(|err| TranscodeError::Failed(err.to_string()))?;
-        let encoder = Encoder::new(1).map_err(|err| TranscodeError::Failed(err.to_string()))?;
+        let resampler = Resampler::new(sample_rate, 1, chunk()).map_err(failed)?;
+        let encoder = Encoder::new(1).map_err(failed)?;
         Ok(chain_delay(
             sample_rate,
             resampler.delay(),
@@ -173,8 +172,8 @@ impl Transcoder for AacToOpus {
                 to.name(),
             )));
         }
-        let chain = Chain::new(config, Arc::clone(&output), Arc::clone(&self.clock))
-            .map_err(|err| TranscodeError::Failed(err.to_string()))?;
+        let chain =
+            Chain::new(config, Arc::clone(&output), Arc::clone(&self.clock)).map_err(failed)?;
         tracing::info!(
             track = %output.id(),
             sample_rate = chain.rate,
@@ -191,6 +190,11 @@ impl Transcoder for AacToOpus {
             stop,
         })
     }
+}
+
+/// A refusal of the resampler or the Opus encoder as [`TranscodeError::Failed`].
+fn failed(err: impl std::fmt::Display) -> TranscodeError {
+    TranscodeError::Failed(err.to_string())
 }
 
 /// The resampler's chunk: one decoded AAC frame per call.
@@ -1075,11 +1079,10 @@ mod tests {
             let packets = transcode(fixture, 3_000).await;
             // Every sample the decoder produced, less the FIFO's remainder.
             let samples = input.len() * 1024 * 48_000 / fixture.rate as usize;
+            let (rate, count) = (fixture.rate, packets.len());
             assert!(
-                packets.len().abs_diff(samples / 960) <= 1,
-                "{}: {} packets",
-                fixture.rate,
-                packets.len()
+                count.abs_diff(samples / 960) <= 1,
+                "{rate}: {count} packets"
             );
             for (i, pair) in packets.windows(2).enumerate() {
                 assert_eq!(pair[1].rtp.ts.wrapping_sub(pair[0].rtp.ts), 960, "{i}");
@@ -1135,14 +1138,10 @@ mod tests {
             let first = anchored(ts0, fixture.rate);
             assert_eq!(packets[0].rtp.ts, rtp_ts(first));
             let expected = to_48k(source_onset, fixture.rate);
-            let error = first + opus_onset - expected;
-            assert!(
-                error.abs() <= 12,
-                "{} Hz: tone at {} on the source timeline, {} in the output: {error} samples",
-                fixture.rate,
-                expected,
-                first + opus_onset
-            );
+            let (rate, output_at) = (fixture.rate, first + opus_onset);
+            let error = output_at - expected;
+            // The tone at `expected` on the source timeline, at `output_at` in the output.
+            assert!(error.abs() <= 12, "{rate} Hz: {expected} vs {output_at}");
         }
     }
 

@@ -42,6 +42,11 @@ pub enum SpsError {
     EmptyPicture,
 }
 
+/// An `h264-reader` refusal as [`SpsError::Syntax`].
+fn syntax(err: impl std::fmt::Debug) -> SpsError {
+    SpsError::Syntax(format!("{err:?}"))
+}
+
 /// Reads an SPS NAL unit (header included).
 pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, SpsError> {
     if nal
@@ -51,11 +56,8 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, SpsError> {
         return Err(SpsError::NotSps);
     }
     let rbsp = decode_nal(nal).map_err(|_| SpsError::EmulationPrevention)?;
-    let sps = SeqParameterSet::from_bits(BitReader::new(rbsp.as_ref()))
-        .map_err(|err| SpsError::Syntax(format!("{err:?}")))?;
-    let (width, height) = sps
-        .pixel_dimensions()
-        .map_err(|err| SpsError::Syntax(format!("{err:?}")))?;
+    let sps = SeqParameterSet::from_bits(BitReader::new(rbsp.as_ref())).map_err(syntax)?;
+    let (width, height) = sps.pixel_dimensions().map_err(syntax)?;
     if width == 0 || height == 0 {
         return Err(SpsError::EmptyPicture);
     }
