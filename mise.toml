@@ -18,6 +18,7 @@ cargo.binstall = false
 [tools]
 prek = "0.5.4"
 cargo-deny = "0.20.2"
+shellcheck = "0.11.0" # actionlint checks workflow scripts with it when it is on PATH, as on the CI runners
 "github:nextest-rs/nextest" = { version = "0.9.146", version_prefix = "cargo-nextest-" }
 "github:rust-cross/cargo-zigbuild" = "0.23.4"
 zig = "0.15.2" # C compiler and linker for every musl build, tests included (see .cargo/config.toml)
@@ -28,7 +29,6 @@ cmake = "4.4.3" # builds the bundled libopus (`opusic-sys`, behind the `opus` cr
 "github:boshen/cargo-shear" = "1.14.0" # fails on unused dependencies
 "github:EmbarkStudios/cargo-about" = "0.9.2" # THIRD_PARTY_LICENSES.md of a release (`mise run licenses`)
 "github:CycloneDX/cyclonedx-rust-cargo" = { version = "0.5.9", version_prefix = "cargo-cyclonedx-" } # the CycloneDX SBOM of a release (`mise run sbom`)
-"github:release-plz/release-plz" = { version = "0.3.169", version_prefix = "release-plz-v" } # the version and changelog PR, the tag and the release notes (release.yml)
 uv = "0.12.23" # the browser test's Python, Selenium and pytest, and its checks (tests/browser/uv.lock)
 
 # The camera of the browser and interop tests: ffmpeg encodes and publishes, MediaMTX serves RTSP.
@@ -36,26 +36,45 @@ uv = "0.12.23" # the browser test's Python, Selenium and pytest, and its checks 
 "github:bluenviron/mediamtx" = "1.21.1"
 # FFmpeg 9.0.2, static GPL builds (libx264, libopus; the native aac and pcm_mulaw encoders). Linux:
 # BtbN/FFmpeg-Builds, the build ffmpeg.org links, a month-end autobuild (kept for years, the daily
-# ones only for weeks) from the release/9.0 branch. macOS arm64 (development only): Martin Riedl's
-# static release build; evermeet.cx, the one ffmpeg.org links, is Intel-only.
+# ones only for weeks) from the release/9.0 branch. macOS arm64 (the Safari browser test): Martin
+# Riedl's static release build; evermeet.cx, the one ffmpeg.org links, is Intel-only.
 "github:BtbN/FFmpeg-Builds" = { version = "autobuild-2026-09-30-13-08", version_prefix = "", os = ["linux"], strip_components = 1, bin_path = "bin", platforms = { linux-x64 = { asset_pattern = "ffmpeg-n9.0.2-17-g2a571b6068-linux64-gpl-9.0.tar.xz", checksum = "sha256:68ee646831adaae2495618346f3bba94ff207ff83bbd34d643e7004730d66269" }, linux-arm64 = { asset_pattern = "ffmpeg-n9.0.2-17-g2a571b6068-linuxarm64-gpl-9.0.tar.xz", checksum = "sha256:91afcd7695d4bbbb9e0057aa10baaf9875ec4e1a97303f9059ec971336a2ab46" } } }
 "http:ffmpeg" = { version = "9.0.2", os = ["macos/arm64"], url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip", checksum = "sha256:c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924" }
 # go2rtc, the server the browser test is compared with (`mise run compare`, report only): the
 # release its common deployment pins, observed 2026-10-07. Its release binaries are UPX-packed;
 # they run as they are.
-"github:AlexxIT/go2rtc" = { version = "1.9.14", bin = "go2rtc", platforms = { linux-x64 = { asset_pattern = "go2rtc_linux_amd64", checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6" }, linux-arm64 = { asset_pattern = "go2rtc_linux_arm64", checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50" }, macos-arm64 = { asset_pattern = "go2rtc_mac_arm64.zip", checksum = "sha256:919b78adc759d6b3883d1e1b2ac915ac0985bb903ff1897b4d228527bd64690c" } } }
+"github:AlexxIT/go2rtc" = { version = "1.9.14", bin = "go2rtc", os = ["linux"], platforms = { linux-x64 = { asset_pattern = "go2rtc_linux_amd64", checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6" }, linux-arm64 = { asset_pattern = "go2rtc_linux_arm64", checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50" } } }
 
 # Git hooks are installed on every `mise install`, so nobody has to remember.
 [hooks]
 postinstall = "prek install"
 
 [tasks.check]
-description = "Everything CI runs: all prek hooks, tests included, on all files"
+description = "Every check: all prek hooks on all files (CI's Check job); the tests are CI jobs"
 run = "prek run --all-files --stage manual --show-diff-on-failure"
 
+[tasks.test]
+description = "The tests, as CI runs them (Linux only): nextest on the host target, then the doctests"
+run = [
+  "scripts/nextest.sh --no-tests=warn",
+  "cargo test --workspace --all-features --locked --doc",
+]
+
 [tasks.test-musl]
-description = "Run the tests on the host's static musl target (Linux only)"
-run = 'cargo nextest run --workspace --all-features --locked --no-tests=warn --target "$(uname -m)-unknown-linux-musl"'
+description = "The tests on the host's static musl target (Linux only); from $LOTSE_NEXTEST_ARCHIVE when set (CI)"
+run = 'LOTSE_NEXTEST_TARGET="$(uname -m)-unknown-linux-musl" scripts/nextest.sh --no-tests=warn'
+
+[tasks.test-archive]
+description = "The tests of the host's musl target, built and archived for other machines (CI's Build job), then the doctests"
+run = [
+  'cargo nextest archive --workspace --all-features --locked --target "$(uname -m)-unknown-linux-musl" --archive-file target/nextest-archive.tar.zst',
+  'cargo test --workspace --all-features --locked --doc --target "$(uname -m)-unknown-linux-musl"',
+]
+
+[tasks.test-browser]
+description = "The browser test's unit tests (no browser): its checks and its harness"
+dir = "tests/browser"
+run = "uv run --locked pytest -q"
 
 [tasks.audit]
 description = "Advisories (RustSec database) for the root and the fuzz workspace; needs the network"
@@ -83,7 +102,7 @@ run = "scripts/turn-e2e.sh"
 
 [tasks.interop]
 description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus (the ignored `mediamtx_` tests)"
-run = "cargo nextest run -p lotse --all-features --locked --test interop --run-ignored only --no-tests=fail mediamtx_"
+run = "scripts/nextest.sh -E 'binary_id(lotse::interop)' --run-ignored only --no-tests=fail mediamtx_"
 
 [tasks.load]
 description = "The load generator: N fake cameras x M headless viewers against a release daemon; report in target/load-report.json"
@@ -130,7 +149,7 @@ cargo run --locked --bin lotse --features console,source-fake -- serve --socket 
 """
 
 [tasks.console-check]
-description = "Lints and tests the console build, which only --cfg tokio_unstable compiles (CI's `console` job)"
+description = "Lints and tests the console build, which only --cfg tokio_unstable compiles (CI's Console build job)"
 env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/console" }
 run = [
   "cargo clippy --locked -p lotse -p lotse-core --features lotse/console,lotse/source-fake --all-targets -- -D warnings",
@@ -143,7 +162,7 @@ usage = '''
 arg "<target>" help="a target under fuzz/fuzz_targets"
 arg "[secs]" help="seconds to run" default="60"
 '''
-# The nightly is pinned by date, the same one as CI's fuzz-smoke (Renovate bumps both). cargo-fuzz
+# The nightly is pinned by date, the same one as CI's Fuzz build (Renovate bumps both). cargo-fuzz
 # has no `--locked`: the fetch fails on a stale fuzz/Cargo.lock, and the build then resolves
 # nothing new. scripts/fuzz.sh holds libFuzzer's time and memory limits, for CI too.
 env = { NIGHTLY = "nightly-2026-10-01" }
@@ -153,11 +172,20 @@ run = [
   'scripts/fuzz.sh "$usage_target" "$usage_secs"',
 ]
 
+[tasks.set-version]
+description = "Sets the workspace's version and its lockfile entries (a release: CI sets the tag's before building; the repository keeps 0.0.0-dev)"
+usage = 'arg "<version>" help="SemVer, without the v"'
+run = """
+sed -i.bak -E '/^\\[workspace\\.package\\]/,/^\\[/ s/^version = ".*"/version = "'"$usage_version"'"/' Cargo.toml
+rm Cargo.toml.bak
+cargo update --workspace
+# The fuzz workspace's lockfile records the library crates' version too; cargo updates only that.
+cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
+"""
+
 [tasks.release-build]
 description = "Static musl binary (Linux only; CI builds each arch on its own runner); zig links (.cargo/config.toml)"
 usage = 'arg "[arch]" help="x86_64 or aarch64" default="x86_64"'
-# On macOS cmake archives libopus with the host's ranlib, which drops the ELF objects: the build
-# would succeed and the binary fail to link, so it stops here instead.
 run = """
 [ "$(uname -s)" = Linux ] || { echo "release-build runs on Linux; CI builds both arches (build.yml)" >&2; exit 1; }
 cargo build --release --locked --bin lotse --target ${usage_arch}-unknown-linux-musl

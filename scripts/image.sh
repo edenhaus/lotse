@@ -14,8 +14,10 @@
 set -eu
 
 # The builder for a multi-platform push when the engine's image store cannot hold one (the
-# classic store; the containerd store can). Pinned by digest; Renovate updates it.
-BUILDKIT="moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea"
+# classic store; the containerd store can). Pinned by digest; Renovate updates it. From Google's
+# mirror of Docker Hub, which has no anonymous pull limit (Docker Hub's ran out on GitHub's shared
+# runners, 2026-10-09); the digest makes it the same image, and moby publishes it nowhere else.
+BUILDKIT="mirror.gcr.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea"
 
 cd "$(dirname "$0")/.."
 CONTEXT=target/image

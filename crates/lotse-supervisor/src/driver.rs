@@ -1604,6 +1604,17 @@ mod tests {
         name
     }
 
+    /// Steps a killed worker to its exit, by name. Its channel's end may
+    /// come first or not at all: the relay task races the reaper (the exit
+    /// came first on Linux 7.0, the channel's end on macOS, 2026-10-09).
+    async fn step_to_exit(driver: &mut Driver) -> String {
+        let mut next = bounded_step(driver).await;
+        while next == "ChannelClosed" {
+            next = bounded_step(driver).await;
+        }
+        next
+    }
+
     /// A worker script at `dir/worker.sh` running `body`.
     fn worker_script(dir: &std::path::Path, body: &str) -> String {
         let script = dir.join("worker.sh");
@@ -1655,8 +1666,7 @@ mod tests {
         assert_eq!(bounded_step(driver).await, "resolved:true");
         driver.on_worker_event(WorkerEvent::ChannelError("malformed".into()));
         assert!(driver.silence.is_none());
-        assert_eq!(bounded_step(driver).await, "ChannelClosed");
-        assert_eq!(bounded_step(driver).await, "exited:Some(9)");
+        assert_eq!(step_to_exit(driver).await, "exited:Some(9)");
         assert_eq!(driver.machine.crashes(), 2);
         assert_eq!(captured.lines("channel failed; killing it").len(), 1);
         drop((owned, demand_tx));
@@ -1687,8 +1697,7 @@ mod tests {
         let _logs = captured.install();
         assert_eq!(bounded_step(&mut driver).await, "silent");
         // Its channel ends with it; it is killed once.
-        assert_eq!(bounded_step(&mut driver).await, "ChannelClosed");
-        assert_eq!(bounded_step(&mut driver).await, "exited:Some(9)");
+        assert_eq!(step_to_exit(&mut driver).await, "exited:Some(9)");
         assert_eq!(captured.lines("worker killed").len(), 1);
         assert_eq!(driver.machine.crashes(), 1);
         assert_eq!(driver.machine.state(), ConnectionState::Restarting);

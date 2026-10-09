@@ -1255,9 +1255,8 @@ fn coturn_addr(name: &str) -> SocketAddr {
 }
 
 /// The server-reflexive address of `socket` as the STUN server at
-/// `server` sees it (RFC 8489 §6.1), which a browser would trickle: on
-/// Linux the viewer's own address, behind Docker Desktop's port
-/// forwarding on macOS a NAT's.
+/// `server` sees it (RFC 8489 §6.1), which a browser would trickle: with
+/// coturn on the host's network, the viewer's own address.
 async fn reflexive(socket: &UdpSocket, server: SocketAddr) -> SocketAddr {
     let transaction_id = *b"lotse-e2e-01";
     let mut buf = vec![0_u8; 1_500];

@@ -1,0 +1,50 @@
+# Release Drafter: the draft of the next release, which CI's Release notes job updates on every
+# push to main from the PRs merged since the last release. Their titles are Conventional Commits
+# (pr-title.yml), which sort them below and pick the next version. Publishing the draft on GitHub
+# is the release: CI's Release job builds, attests and attaches everything to it (release.yml).
+#
+# Only the `lotse` binary is released; the library crates share its version and are never released
+# on their own. While the version is 0.x, a breaking change raises the minor version (Cargo's
+# reading of SemVer); from 1.0 it should raise the major one.
+
+name-template: "lotse $RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+tag-prefix: "v"
+change-template: "- $TITLE (#$NUMBER) $AUTHORS"
+change-title-escapes: '\<*_&' # Markdown in a title stays text; Release Drafter keeps @ and # from mentioning
+sort-direction: ascending
+
+categories:
+  - title: "Breaking changes"
+    semver-increment: minor # 0.x; major from 1.0
+    exclusive: true
+    when:
+      conventional:
+        breaking: true
+  - title: "Features"
+    semver-increment: minor
+    exclusive: true
+    when:
+      conventional:
+        type: feat
+  - title: "Fixes"
+    exclusive: true
+    when:
+      conventional:
+        type: fix
+  - title: "Performance"
+    exclusive: true
+    when:
+      conventional:
+        type: perf
+  - title: "Dependencies"
+    collapse-after: 0
+    exclusive: true
+    when:
+      label: dependencies # Renovate's PRs
+  # Tests, docs, CI and chores: in the notes, collapsed.
+  - title: "Maintenance"
+    collapse-after: 0
+
+template: |
+  $CHANGES

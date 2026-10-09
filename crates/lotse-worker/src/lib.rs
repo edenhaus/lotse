@@ -1652,6 +1652,23 @@ mod tests {
         seen
     }
 
+    /// The worker's messages until `done` holds for them, for at most 10 s,
+    /// with the fake clock standing still: what the worker sends without
+    /// any time passing. [`messages_until`] moves it while it waits.
+    async fn messages_until_still(
+        h: &mut Harness,
+        done: impl Fn(&[ToSupervisor]) -> bool,
+    ) -> Vec<ToSupervisor> {
+        let mut seen = Vec::new();
+        while !done(&seen) {
+            tokio::select! {
+                message = h.next() => seen.push(message),
+                () = SystemClock.sleep(Duration::from_secs(10)) => panic!("not within 10 s: {seen:?}"),
+            }
+        }
+        seen
+    }
+
     /// The session events among `messages`.
     fn session_events(messages: &[ToSupervisor]) -> impl Iterator<Item = (&str, &SessionEvent)> {
         messages.iter().filter_map(|message| match message {
@@ -1864,7 +1881,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let seen = messages_until(&mut h, |seen| {
+        // Live with the fake clock standing still: moved while waiting, it
+        // reached the first report's second before the worker's messages
+        // arrived on a slow runner (GitHub's, 2026-10-09).
+        let seen = messages_until_still(&mut h, |seen| {
             seen.contains(&ToSupervisor::SourceState(SourceState::Live))
         })
         .await;
@@ -2687,7 +2707,15 @@ mod tests {
         let _demux = live_echo_session(&mut h).await;
         let mut live = Vec::new();
         for n in 0..300 {
-            let (browser, fd, peer) = tcp_pair();
+            let (browser, fd, _) = tcp_pair();
+            // Each connection its own peer, as the supervisor names it: a
+            // known peer's new connection replaces its old one, and Linux
+            // may give a connection to another listener the source port of
+            // a live one (1 in 300 here, measured on Linux 7.0, 2026-10-09).
+            let peer = std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                20_000 + u16::try_from(n).unwrap(),
+            ));
             h.tx.send_msg(
                 &ToWorker::IceTcp {
                     local_ufrag: "ufrag-echo".into(),

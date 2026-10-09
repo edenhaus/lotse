@@ -30,7 +30,7 @@ case "$ENGINE" in
 esac
 
 # On Linux the daemon is the static musl build that ships (as in scripts/load.sh); elsewhere
-# (macOS, development only) the host build.
+# (macOS, for Safari) the host build.
 if [ "$(uname -s)" = Linux ]; then
   TARGET="$(uname -m)-unknown-linux-musl"
   cargo build --release --locked --bin lotse --target "$TARGET"

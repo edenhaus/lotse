@@ -1,5 +1,6 @@
-# nextest settings for every run: the prek hook, `mise run check`, coverage
-# (`cargo llvm-cov nextest`), mutants (`--test-tool nextest`) and CI.
+# nextest settings for every run: `mise run test`, the archives CI's Build job makes and its test
+# jobs run (scripts/nextest.sh), coverage (`cargo llvm-cov nextest`) and mutants
+# (`--test-tool nextest`).
 
 [profile.default]
 # A hung test is reported after a minute and killed after three, with its

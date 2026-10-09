@@ -86,7 +86,11 @@ fn front_door_with(sandbox: &str, ports: &[u16]) -> FrontDoor {
             log_format: "json".into(),
             log_level: "debug".into(),
             sandbox: sandbox.into(),
-            worker_threads: 1,
+            // The daemon's default (`limits.worker_threads`): with one thread
+            // the camera's ingest and the session's egress share it, and on
+            // GitHub's runners the session fell behind a 2.5 MB keyframe
+            // by more than `max_packet_age` and skipped it (2026-10-09).
+            worker_threads: 2,
             worker_address_space: 1 << 30,
             max_sessions: 256,
         },

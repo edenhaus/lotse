@@ -1303,7 +1303,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lotse-api"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "axum",
  "futures-util",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "lotse-api-types"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "schemars",
  "serde",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "lotse-codec"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "bytes",
  "h264-reader 0.9.0",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "lotse-core"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "lotse-ipc"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "postcard",
  "rustix",
@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "lotse-rtsp"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "lotse-supervisor"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "getrandom 0.3.4",
  "hmac",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "lotse-testing"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "axum",
  "bytes",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "lotse-webrtc"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "lotse-worker"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "libc",
  "lotse-core",

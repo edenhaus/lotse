@@ -53,7 +53,6 @@ is designed with.
 |---|---|---|
 | `x86_64-unknown-linux-musl` | Production | Static binary, x86-64-v2 baseline + runtime dispatch |
 | `aarch64-unknown-linux-musl` | Production | Static binary, ARMv8.0 baseline + runtime dispatch |
-| `aarch64-apple-darwin` | Development only | Not shipped |
 
 ## Trying it with a camera
 

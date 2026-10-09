@@ -1,10 +1,17 @@
 #!/bin/sh
 # One cargo-fuzz target for a while, under the limits that make the fuzz contract's "never hang,
-# never allocate unbounded" a finding instead of a slow run. `mise run fuzz` and CI's fuzz-smoke
-# both run this, so the limits live here only.
+# never allocate unbounded" a finding instead of a slow run. `mise run fuzz` and CI's Fuzz jobs
+# (through scripts/fuzz-parallel.sh) both run this, so the limits live here only.
 #
-# Usage: scripts/fuzz.sh <target> [secs], with NIGHTLY naming the pinned nightly (mise.toml's fuzz
-# task and ci.yml's fuzz-smoke set it) and fuzz/Cargo.lock already fetched `--locked`.
+# Usage: scripts/fuzz.sh <target> [secs]. With FUZZ_BIN_DIR naming a directory of built targets
+# (CI's Fuzz build job builds them all with `cargo fuzz build`), it runs that build of the target;
+# without, it builds the target the same way first, with NIGHTLY naming the pinned nightly
+# (mise.toml's fuzz task sets it) and fuzz/Cargo.lock already fetched `--locked`.
+#
+# The target runs as `cargo fuzz run` would run it (cargo-fuzz 0.13.2, src/project.rs): its corpus
+# in fuzz/corpus/<target>/, a failing input written to fuzz/artifacts/<target>/, and
+# `detect_odr_violation=0` added to ASAN_OPTIONS. `cargo fuzz run <target> <input>` reproduces a
+# failing input.
 #
 # libFuzzer's options (https://llvm.org/docs/LibFuzzer.html#options), each limit a finding when
 # crossed (a `timeout-*` or `oom-*` artifact):
@@ -25,13 +32,21 @@ set -eu
 
 target=${1:?usage: scripts/fuzz.sh <target> [secs]}
 secs=${2:-60}
-: "${NIGHTLY:?NIGHTLY names the pinned nightly toolchain (mise.toml, ci.yml)}"
 
-ASAN_OPTIONS="quarantine_size_mb=64${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
+if [ -z "${FUZZ_BIN_DIR:-}" ]; then
+  : "${NIGHTLY:?NIGHTLY names the pinned nightly toolchain (mise.toml, ci.yml)}"
+  cargo "+$NIGHTLY" fuzz build "$target"
+  FUZZ_BIN_DIR=fuzz/target/$(rustc "+$NIGHTLY" -vV | sed -n 's/^host: //p')/release
+fi
+
+ASAN_OPTIONS="quarantine_size_mb=64${ASAN_OPTIONS:+:$ASAN_OPTIONS}:detect_odr_violation=0"
 export ASAN_OPTIONS
 
-exec cargo "+$NIGHTLY" fuzz run "$target" -- \
+mkdir -p "fuzz/corpus/$target" "fuzz/artifacts/$target"
+exec "$FUZZ_BIN_DIR/$target" \
+  -artifact_prefix="fuzz/artifacts/$target/" \
   -max_total_time="$secs" \
   -timeout=10 \
   -malloc_limit_mb=64 \
-  -rss_limit_mb=1024
+  -rss_limit_mb=1024 \
+  "fuzz/corpus/$target"

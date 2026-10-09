@@ -261,6 +261,11 @@ async fn interop(transport: Transport, audio: Audio) {
             "off",
             "--socket",
             socket.to_str().unwrap(),
+            // The test binary is dynamic, and Landlock checks `execute` on
+            // its loader too; the sandbox is covered on the static build
+            // (`ctl.rs`, `mise run test-musl`).
+            "--sandbox",
+            "off",
             "--log-format",
             "json",
         ],
@@ -373,6 +378,11 @@ async fn mediamtx_rfc2326_10_7_a_failed_udp_attempt_is_torn_down() {
             "off",
             "--socket",
             socket.to_str().unwrap(),
+            // The test binary is dynamic, and Landlock checks `execute` on
+            // its loader too; the sandbox is covered on the static build
+            // (`ctl.rs`, `mise run test-musl`).
+            "--sandbox",
+            "off",
             "--log-format",
             "json",
         ],

@@ -1,0 +1,34 @@
+name: Cache cleanup
+
+# Deletes a PR's caches when it is closed. CI saves its caches on PRs too, under the PR's merge
+# ref, which nothing restores once the PR is closed; left alone they count against the
+# repository's 10 GB until they expire, and eviction, least recently used first, would take main's
+# caches before them. Apart from ci.yml on purpose: a closed PR must not run CI.
+#
+# A PR from a fork gets a read-only token, so its caches cannot be deleted here and expire on their
+# own (`pull_request_target` would grant the write, but runs with the base repository's rights).
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}
+
+# One cleanup per PR; closing it again after a reopen supersedes the earlier one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cleanup:
+    name: Delete the PR's caches
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # deleting caches
+    steps:
+      - name: Delete the caches of the PR's merge ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF: refs/pull/${{ github.event.pull_request.number }}/merge
+        run: gh cache delete --all --ref "$REF" --succeed-on-no-caches
