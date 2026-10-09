@@ -1,7 +1,8 @@
 name: PR title
 
-# PRs are squash-merged, so the PR title becomes the commit that release-plz reads. Apart from
-# ci.yml on purpose: it runs when a title is edited, which must not run all of CI.
+# PRs are squash-merged, so the PR title becomes the commit, and Release Drafter sorts the release
+# notes and picks the next version by it (.github/release-drafter.yml). Apart from ci.yml on
+# purpose: it runs when a title is edited, which must not run all of CI.
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]

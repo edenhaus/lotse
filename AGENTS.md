@@ -25,12 +25,13 @@ is a hook: the tests, the doctests, coverage and mutants are mise tasks
 that CI runs.
 
 CI is `.github/workflows/ci.yml`, the one workflow that runs the jobs of a
-push, a PR, the nightly run and a run by hand; `release.yml` and
-`build.yml` are workflows it calls, and only `scorecard.yml` and
-`pr-title.yml` stand apart (each says why). Its Build job compiles the
-musl tests once per arch into a nextest archive that the Tests, Interop,
-TURN and Sandbox isolation jobs run without compiling; every compiling
-job keeps a Rust cache that only `main` saves. A new job goes into
+push, a PR, the nightly run and a run by hand; `build.yml` is a
+workflow it calls, and only `release.yml` (it publishes, so nothing in
+it may restore a cache), `scorecard.yml` and `pr-title.yml` stand apart
+(each says why). Its Build job compiles the musl tests once per arch
+into a nextest archive that the Tests, Interop, TURN and Sandbox
+isolation jobs run without compiling; every compiling job keeps a Rust
+cache that only `main` saves. A new job goes into
 `ci.yml`; workflow and job names start with a capital letter.
 
 | Command | What it does |
@@ -51,6 +52,7 @@ job keeps a Rust cache that only `main` saves. A new job goes into
 | `mise run test-archive` | the musl tests built and archived for other machines, then the doctests (CI's Build job) |
 | `mise run audit` | RustSec advisories, the root and the fuzz workspace (network) |
 | `mise run fuzz <target> [secs]` | one `cargo fuzz` target on the date-pinned nightly the task installs, under the contract's time and memory limits (`scripts/fuzz.sh`, as CI; cargo-fuzz installed by hand, the one nightly use) |
+| `mise run set-version <version>` | the workspace version and its `Cargo.lock` entries; only a release build sets it, from the tag |
 | `mise run release-build [x86_64\|aarch64]` | static musl binary (Linux only); zig links every musl build (`.cargo/config.toml`) |
 | `mise run sbom` / `mise run licenses` | a release's CycloneDX SBOMs and `THIRD_PARTY_LICENSES.md`, in `target/dist/` |
 | `mise run image load [arch]` | the scratch release image from the static binary, into the local Docker as `lotse:dev` |
@@ -145,7 +147,11 @@ The clients, the Python `lotse-client` among them, live in their own repository,
 - `tokio::task::Builder` (named tasks) exists only behind
   `--cfg tokio_unstable`; the `spawn_named` wrapper uses it under the
   `console` feature only.
-- A release is the merge of release-plz's `chore(release): lotse <version>`
-  PR; never tag by hand, a hand-made tag releases nothing.
+- A release is publishing the draft that Release Drafter keeps on GitHub
+  (CI's Release notes job, `.github/release-drafter.yml`): the merged PRs'
+  Conventional Commit titles sort its notes and pick the version, and
+  publishing it starts `release.yml`, which sets that version from the tag
+  and builds, attests and attaches everything. The workspace version in
+  the repository is never bumped; never tag by hand.
 - AI-generated changes must be explainable by the human submitting them
   (`AI_POLICY.md`).

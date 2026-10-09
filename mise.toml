@@ -29,7 +29,6 @@ cmake = "4.4.3" # builds the bundled libopus (`opusic-sys`, behind the `opus` cr
 "github:boshen/cargo-shear" = "1.14.0" # fails on unused dependencies
 "github:EmbarkStudios/cargo-about" = "0.9.2" # THIRD_PARTY_LICENSES.md of a release (`mise run licenses`)
 "github:CycloneDX/cyclonedx-rust-cargo" = { version = "0.5.9", version_prefix = "cargo-cyclonedx-" } # the CycloneDX SBOM of a release (`mise run sbom`)
-"github:release-plz/release-plz" = { version = "0.3.169", version_prefix = "release-plz-v" } # the version and changelog PR, the tag and the release notes (release.yml)
 uv = "0.12.23" # the browser test's Python, Selenium and pytest, and its checks (tests/browser/uv.lock)
 
 # The camera of the browser and interop tests: ffmpeg encodes and publishes, MediaMTX serves RTSP.
@@ -172,6 +171,15 @@ run = [
   'cargo "+$NIGHTLY" fetch --manifest-path fuzz/Cargo.toml --locked',
   'scripts/fuzz.sh "$usage_target" "$usage_secs"',
 ]
+
+[tasks.set-version]
+description = "Sets the workspace's version and its Cargo.lock entries (a release: CI sets the tag's before building)"
+usage = 'arg "<version>" help="SemVer, without the v"'
+run = """
+sed -i.bak -E '/^\\[workspace\\.package\\]/,/^\\[/ s/^version = ".*"/version = "'"$usage_version"'"/' Cargo.toml
+rm Cargo.toml.bak
+cargo update --workspace
+"""
 
 [tasks.release-build]
 description = "Static musl binary (Linux only; CI builds each arch on its own runner); zig links (.cargo/config.toml)"

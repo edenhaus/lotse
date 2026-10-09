@@ -1,9 +1,10 @@
 name: CI
 
-# The main workflow: every job of a push, a PR, the nightly run and a run by hand. Two workflows
-# stay apart: scorecard.yml, whose published results require a workflow of its own (no top-level
-# env, no workflow-level write permission), and pr-title.yml, which runs when a PR's title is
-# edited, an event that must not run all of this.
+# The main workflow: every job of a push, a PR, the nightly run and a run by hand. Three workflows
+# stay apart, each for a reason it states: release.yml, which publishes and so must not share a
+# workflow with jobs that restore caches (cache poisoning); scorecard.yml, whose published results
+# require a workflow of its own (no top-level env, no workflow-level write permission); and
+# pr-title.yml, which runs when a PR's title is edited, an event that must not run all of this.
 #
 # Build once: the Build job compiles the tests of the static musl target once per arch and
 # archives them (cargo nextest archive); Tests, Interop, TURN and Sandbox isolation run that
@@ -584,23 +585,19 @@ jobs:
           path: target/soak-report.json
           if-no-files-found: warn
 
-  # Every push to main: release-plz's release PR, and the release when that PR was merged
-  # (release.yml). One release at a time, never cancelled; the next push waits for it.
-  release:
-    name: Release
+  # The draft of the next release, from the PRs merged since the last one (.github/release-drafter.yml).
+  release-notes:
+    name: Release notes
     if: github.event_name == 'push'
+    runs-on: ubuntu-latest
     concurrency:
-      group: release
-      cancel-in-progress: false
+      group: release-notes
+      cancel-in-progress: true # the newest push drafts from everything merged
     permissions:
-      contents: write # the tag, the draft release and its assets
-      pull-requests: read # release-plz checks that this commit is a merged release PR
-      packages: write # the image on ghcr.io
-      id-token: write # the Sigstore certificates of the attestations
-      attestations: write # storing the attestations
-    uses: ./.github/workflows/release.yml # zizmor: ignore[self-repository]
-    secrets:
-      LOTSE_BOT_PRIVATE_KEY: ${{ secrets.LOTSE_BOT_PRIVATE_KEY }}
+      contents: write # the draft release
+      pull-requests: read # the merged PRs' titles
+    steps:
+      - uses: release-drafter/release-drafter@978bb0b30c5ee8cdd332ced253758157150d43f0 # v7.10.0
 
   # A change to the API schema on main asks lotse-clients to sync it: its sync-schema.yml opens or
   # updates a PR with the schema and the regenerated models, whose CI runs the contract tests

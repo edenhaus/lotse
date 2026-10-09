@@ -1,8 +1,8 @@
 name: Release build
 
 # The static musl release binaries, natively on each arch, with the size check. ci.yml calls it on
-# every push and PR (cached); release.yml calls it for a release, which restores no cache, so
-# nothing a cache holds can reach a released binary.
+# every push and PR (cached); release.yml calls it for a release, with the tag's version and no
+# cache, so nothing a cache holds can reach a released binary.
 
 on:
   workflow_call:
@@ -11,6 +11,10 @@ on:
         description: "A release build: restores no cache"
         type: boolean
         default: false
+      version:
+        description: "The version to build, set in the workspace first (a release's, from its tag)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -50,6 +54,11 @@ jobs:
         with:
           shared-key: release-${{ matrix.arch }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: inputs.version != ''
+        run: mise run set-version "$VERSION"
+        env:
+          VERSION: ${{ inputs.version }}
+          MISE_AUTO_INSTALL: "false"
       - run: mise run release-build "$ARCH"
         env:
           MISE_AUTO_INSTALL: "false" # the tools above, not the whole mise.toml
