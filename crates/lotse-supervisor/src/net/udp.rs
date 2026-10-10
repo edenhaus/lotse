@@ -61,9 +61,7 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<BoundUdp> {
         Domain::IPV4
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    // Best effort: a kernel that refuses keeps the socket IPv6-only.
-    let dual_stack =
-        addr.is_ipv6() && socket.set_only_v6(false).is_ok() && !socket.only_v6().unwrap_or(true);
+    let dual_stack = open_to_ipv4(&socket);
     tune(&socket, addr.is_ipv6());
     socket.bind(&addr.into())?;
     socket.set_read_timeout(Some(RECV_TIMEOUT))?;
@@ -93,6 +91,15 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<BoundUdp> {
         dual_stack,
         hosts,
     })
+}
+
+/// Clears `IPV6_V6ONLY`, best effort, and says whether the socket now
+/// takes IPv4 too. The read-back decides: a kernel that refuses keeps the
+/// socket IPv6-only, and an IPv4 socket has no such option at all, so both
+/// read as not dual-stack.
+fn open_to_ipv4(socket: &Socket) -> bool {
+    socket.set_only_v6(false).ok();
+    socket.only_v6().is_ok_and(|only| !only)
 }
 
 /// Asks for the buffers and the DSCP mark, best effort: what the kernel
@@ -197,6 +204,18 @@ mod tests {
             bound.local.port(),
         ));
         assert_eq!(v4.unwrap_err().kind(), io::ErrorKind::AddrInUse);
+    }
+
+    /// The flag is cleared, not inherited from the host's
+    /// `net.ipv6.bindv6only`: a socket made IPv6-only first still opens.
+    #[test]
+    fn an_ipv6_only_socket_opens_to_ipv4_and_an_ipv4_socket_stays_single_stack() {
+        let v6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        v6.set_only_v6(true).unwrap();
+        assert!(open_to_ipv4(&v6));
+        assert!(!v6.only_v6().unwrap());
+        let v4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        assert!(!open_to_ipv4(&v4));
     }
 
     #[test]
