@@ -93,7 +93,7 @@ usage = '''
 arg "[base]" help="git ref to diff against" default="origin/main"
 flag "--shard <shard>" help="only this slice of the mutants, k/n with k from 0 (CI's Mutants jobs)"
 flag "--in-place" help="mutate the checked-out tree, not a copy, so its target/ builds (CI's throwaway checkout; an interrupted run can leave a mutation behind)"
-flag "--skip-baseline" help="no test run of the unmutated tree first; the tests' 240 s timeout is set instead of 5x the baseline's (CI, whose Tests job runs them)"
+flag "--skip-baseline" help="no test run of the unmutated tree first; the tests' 240 s timeout is set instead of 5x the baseline's (CI, whose Mutants jobs start after its Tests jobs passed)"
 '''
 run = """
 diff="$(mktemp)"

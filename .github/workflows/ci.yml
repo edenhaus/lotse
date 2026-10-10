@@ -356,13 +356,14 @@ jobs:
   # The changed lines' mutants, one after another, split into consecutive slices over the plan's
   # shards (cargo-mutants' default `slice` sharding). Each shard mutates its checkout in place, so
   # main's cached target/ builds; a copy of the tree would build from cold. No baseline: its build
-  # selects all of the shard's packages at once, the one build the cache does not hold, and the
-  # Tests job runs the unmutated tests. No debug info: every mutant relinks the test binaries, and
-  # debug info is most of what the linker writes.
+  # selects all of the shard's packages at once, the one build the cache does not hold. The Tests
+  # jobs take its place: the shards start only after the unmutated tests passed there, since a
+  # failing test would make every mutant look caught. No debug info: every mutant relinks the test
+  # binaries, and debug info is most of what the linker writes.
   mutants:
     name: Mutants (changed lines, shard ${{ matrix.shard }})
-    needs: mutants-plan
-    if: needs.mutants-plan.outputs.shards != '[]'
+    needs: [mutants-plan, tests]
+    if: needs.mutants-plan.outputs.shards != '[]' # and, implied, every needed job passed
     strategy:
       fail-fast: false
       matrix:
