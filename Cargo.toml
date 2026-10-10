@@ -145,6 +145,9 @@ opus = { version = "0.4", default-features = false }
 # raw AAC frames in workers.
 symphonia-codec-aac = { version = "0.6", default-features = false }
 symphonia-core = { version = "0.6", default-features = false }
+# The ADTS header reader (ISO/IEC 13818-7 §6.2) of the HTTP source's AAC, which MPEG-TS carries as
+# ADTS; its one dependency, mpeg4-audio-const, is in the tree already via h264-reader. No features.
+adts-reader = { version = "0.4", default-features = false }
 # The resampler of the transcoder, AAC rates to Opus's 48 kHz: pure Rust windowed-sinc, without the
 # FFT resampler.
 rubato = { version = "5", default-features = false }

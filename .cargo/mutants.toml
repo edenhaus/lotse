@@ -26,6 +26,8 @@ exclude_re = [
     # disjoint bits), so `|` and `^` produce the same value.
     "replace \\| with \\^ in BitReader<'a>::read",
     "replace \\| with \\^ in strip_adts",
+    # The AudioSpecificConfig fields of an ADTS header are shifted into disjoint bits.
+    "aac/adts.rs:.*replace \\| with \\^ in AdtsConfig::new$",
     # Only picks whether the one-per-connection warning is logged.
     "replace == with != in publish_aac",
     "replace == with != in violation$",

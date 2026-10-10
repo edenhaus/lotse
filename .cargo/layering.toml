@@ -47,6 +47,7 @@ seccompiler = ["lotse-sandbox"]
 opus = ["lotse-codec"]
 symphonia = ["lotse-codec"]
 rubato = ["lotse-codec"]
+adts-reader = ["lotse-codec"] # ADTS of the HTTP source's MPEG-TS, split into raw AAC frames
 openh264 = ["lotse-snapshot"]
 jpeg-encoder = ["lotse-snapshot"]
 clap = ["lotse"]

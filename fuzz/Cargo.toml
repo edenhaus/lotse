@@ -188,3 +188,10 @@ path = "fuzz_targets/hls_playlist.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "aac_adts"
+path = "fuzz_targets/aac_adts.rs"
+test = false
+doc = false
+bench = false
