@@ -36,7 +36,8 @@ fuzz targets once for the Fuzz jobs, which run up to 4 targets each in
 parallel: on a PR only the targets built from a file it changed
 (`scripts/fuzz-select.sh`), else all, 5 min each nightly; every compiling job keeps a Rust
 cache, saved by every run and restored from the PR's own (GitHub scopes
-them to it) or else from `main`'s. A new job goes into `ci.yml`; workflow
+them to it) or else from `main`'s; only the Mutants jobs save none and
+restore the one the Mutants cache job builds on `main`. A new job goes into `ci.yml`; workflow
 and job names start with a capital letter.
 
 | Command | What it does |
@@ -46,7 +47,8 @@ and job names start with a capital letter.
 | `mise run test` | the tests (`scripts/nextest.sh`, nextest filters as usual) and the doctests, on Linux |
 | `mise run test-browser` | the browser test's unit tests, no browser (CI's Check job) |
 | `mise run coverage` | the 100 % line-coverage gate (`cargo llvm-cov nextest`) |
-| `mise run mutants [base]` | `cargo mutants --in-diff` against a base ref (default `origin/main`); CI splits it over up to 8 jobs (`scripts/mutants-shards.sh`, `--shard k/n --in-place`) |
+| `mise run mutants [base]` | `cargo mutants --in-diff` against a base ref (default `origin/main`); CI splits it over up to 8 jobs (`scripts/mutants-shards.sh`, `--shard k/n --in-place --skip-baseline`) |
+| `mise run mutants-cache` | each package's tests built alone, as cargo-mutants builds a mutant (CI's Mutants cache job on `main`) |
 | `mise run turn-e2e` | the TURN client against a real coturn in Docker (ignored `coturn_` tests) |
 | `mise run load [cameras] [viewers] [duration]` | the load generator against a release daemon (`target/load-report.json`) |
 | `mise run soak [duration] [cycle]` | the soak: viewer and camera churn, checked for memory, task and descriptor growth (`target/soak-report.json`) |
