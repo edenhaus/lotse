@@ -104,7 +104,7 @@ async fn bind(pre_bound: Option<&StdListener>) -> io::Result<TcpListener> {
 // rtsps_plays_with_a_pinned_certificate_rfc7826_19_2,
 // an_sdp_retina_cannot_parse_is_refused_as_protocol_rfc8866_5
 pub(crate) fn relay_url(url: &SourceUrl, local: SocketAddr) -> url::Url {
-    let mut target = url.url().clone();
+    let mut target = url.expose_url().clone();
     // Neither can fail: `rtsps` and `rtsp` are both non-special schemes, and
     // a source URL always has a host.
     let _same_kind = target.set_scheme("rtsp");

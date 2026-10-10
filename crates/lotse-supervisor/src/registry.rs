@@ -277,7 +277,7 @@ impl State {
                     && entry
                         .sources
                         .iter()
-                        .any(|source| source.url.url() == url.url())
+                        .any(|source| source.url.expose_url() == url.expose_url())
             })
             .map(|(id, _)| id.clone())
     }
@@ -1452,7 +1452,8 @@ mod tests {
         assert!(!text.contains("sesame-open"), "{text}");
         assert!(!text.contains("5000"), "{text}");
         assert!(text.contains("[\"timeout_ms\", \"token\"]"), "{text}");
-        assert!(text.contains("cam/main"), "{text}");
+        assert!(text.contains("rtsp://****@cam/****"), "{text}");
+        assert!(!text.contains("main"), "{text}");
         assert_eq!(
             format!("{:?}", key("fake://cam/", serde_json::Value::Null)),
             format!(

@@ -72,11 +72,18 @@ schemars = { version = "1", default-features = false, features = ["std", "derive
 # viewer's pages and relay in `lotse-testing`.
 axum = { version = "0.8", default-features = false, features = ["ws", "http1", "tokio"] }
 # The control API's HTTP/1.1 connection, configured directly because `axum::serve` exposes no
-# limits: upgrade headers <= 16 KiB and a header count. Already axum's engine; no new code.
+# limits: upgrade headers <= 16 KiB and a header count. Already axum's engine; no new code. The
+# HTTP source adds the `client` feature for its HTTP/1.1 connections (`client::conn::http1`).
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 # Tokio IO for hyper and the tower-to-hyper service adapter of the control API's accept loop; the
 # same crate and features axum uses.
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
+# The HTTP source's request and response bodies: an empty GET body, frame-by-frame reads and the
+# `Limited` cap on a whole playlist or segment; already in the tree via axum.
+http-body-util = { version = "0.1", default-features = false }
+# Basic (RFC 7617) and Digest (RFC 7616) answers to the HTTP source's `WWW-Authenticate`
+# challenges; already in the tree via retina, which uses it for RTSP.
+http-auth = { version = "0.1", default-features = false, features = ["basic-scheme", "digest-scheme"] }
 # `Stream`/`Sink` adapters for the WebSocket halves; the WebSocket types come from axum.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # The RTSP client with the camera quirk history the design chose; packets are taken as RTP, so the
@@ -84,6 +91,19 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # for camera input: no panic on an `m=` line without a format, sdp-types 0.2, the response size
 # limit (`SessionOptions::max_message_size`) and a validated `Session` id.
 retina = { git = "https://github.com/scottlamb/retina", rev = "7698fa14924768f024aa16126a5e3ca324e5bfe6", default-features = false }
+# The HLS playlist parser of the HTTP source (RFC 8216 §4); only the parser feature, whose nom 7
+# is already in the tree via rtsp-types; chrono comes with it, for `EXT-X-PROGRAM-DATE-TIME`.
+m3u8-rs = { version = "6", default-features = false, features = ["parser"] }
+# The MPEG-TS demultiplexer of the HTTP source (ISO/IEC 13818-1): PAT/PMT with CRC and version
+# handling, the per-PID continuity check and PES headers; push-based and without `unsafe`. It has
+# no features: encoding_rs (for descriptor text), fixedbitset and the SMPTE-RA format identifiers
+# come with it; its `log` warnings go nowhere, as no `log` logger is installed.
+mpeg2ts-reader = { version = "0.18", default-features = false }
+# The ISO base media file format boxes of the HTTP source's fragmented MP4 (ISO/IEC 14496-12): the
+# init segment's moov (stsd with avcC, hvcC and esds) and each media segment's moof (tfhd, tfdt,
+# trun); bounded `Vec`s for untrusted counts, no `unsafe` in the decoding. Its optional features
+# (bytes, serde, tokio) are off; num, derive_more, pastey and thiserror 1 come with it.
+mp4-atom = { version = "0.16", default-features = false }
 # RTSP message parsing and serialization for the fake camera of the tests.
 rtsp-types = { version = "0.1", default-features = false }
 # H.264 bitstream syntax (SPS profile, level and dimensions, SEI) on the side branch; the packet
@@ -114,10 +134,11 @@ dimpl = { version = "0.7", default-features = false, features = ["rust-crypto"] 
 aes = { version = "0.8", default-features = false }
 ctr = { version = "0.9", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
-# TLS for `rtsps://` cameras, with the `ring` provider so the static musl build carries no OpenSSL or
-# aws-lc of its own; TLS 1.2 stays on because cameras often speak nothing newer.
+# TLS of the sources (lotse-tls), `rtsps://` cameras first, with the `ring` provider so the static
+# musl build carries no OpenSSL or aws-lc of its own; TLS 1.2 stays on because cameras often speak
+# nothing newer.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-# rustls over tokio streams: the client half for `rtsps://`, the server half for the fake camera.
+# rustls over tokio streams: the client half of lotse-tls, the server half for the fake camera.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Mozilla's root certificates, embedded: the worker has no filesystem to read a CA bundle from.
 webpki-roots = { version = "1", default-features = false }
@@ -142,6 +163,9 @@ opus = { version = "0.4", default-features = false }
 # raw AAC frames in workers.
 symphonia-codec-aac = { version = "0.6", default-features = false }
 symphonia-core = { version = "0.6", default-features = false }
+# The ADTS header reader (ISO/IEC 13818-7 §6.2) of the HTTP source's AAC, which MPEG-TS carries as
+# ADTS; its one dependency, mpeg4-audio-const, is in the tree already via h264-reader. No features.
+adts-reader = { version = "0.4", default-features = false }
 # The resampler of the transcoder, AAC rates to Opus's 48 kHz: pure Rust windowed-sinc, without the
 # FFT resampler.
 rubato = { version = "5", default-features = false }
@@ -151,11 +175,13 @@ lotse-api = { path = "crates/lotse-api" }
 lotse-api-types = { path = "crates/lotse-api-types" }
 lotse-codec = { path = "crates/lotse-codec" }
 lotse-core = { path = "crates/lotse-core" }
+lotse-http = { path = "crates/lotse-http" }
 lotse-ipc = { path = "crates/lotse-ipc" }
 lotse-rtsp = { path = "crates/lotse-rtsp" }
 lotse-sandbox = { path = "crates/lotse-sandbox" }
 lotse-supervisor = { path = "crates/lotse-supervisor" }
 lotse-testing = { path = "crates/lotse-testing" }
+lotse-tls = { path = "crates/lotse-tls" }
 lotse-webrtc = { path = "crates/lotse-webrtc" }
 lotse-worker = { path = "crates/lotse-worker" }
 

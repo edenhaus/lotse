@@ -23,33 +23,35 @@ pub struct SourceSpec {
     pub options: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Prints the URL without its userinfo and the options' names without
-/// their values, which a future scheme may make secret. `Serialize` is the
-/// wire form a client sends, so it keeps both; a serialized command is
-/// never logged.
+/// Prints the URL's scheme only and the options' names without their
+/// values, which a future scheme may make secret. The URL is not parsed
+/// yet, so where its userinfo, path and query end is not known, and any of
+/// them can carry a secret. `Serialize` is the wire form a client sends,
+/// so it keeps both; a serialized command is never logged.
 impl fmt::Debug for SourceSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SourceSpec")
-            .field("url", &redact_userinfo(&self.url))
+            .field("url", &redact_unparsed(&self.url))
             .field("options", &self.options.keys().collect::<Vec<_>>())
             .finish()
     }
 }
 
-/// `url` with everything between the scheme's `://` (or the start, without
-/// one) and the last `@` replaced by `****`, as `lotse_core::SourceUrl`
-/// prints a parsed URL (`rtsp://****@host:554/path`). The URL is not
-/// parsed yet, so a password with an unencoded `/`, `?`, `#` or `@` must
-/// not end the userinfo early: the last `@` anywhere is taken, which
-/// over-redacts a path that has one. No `@`, no userinfo
-/// (RFC 3986 §3.2.1).
-fn redact_userinfo(url: &str) -> String {
-    let start = url.find("://").map_or(0, |at| at.saturating_add(3));
-    match (url.get(..start), url.rfind('@')) {
-        (Some(scheme), Some(at)) if at >= start => {
-            format!("{scheme}****{}", url.get(at..).unwrap_or_default())
+/// `url` as `scheme://****` when it starts with a scheme (RFC 3986 §3.1:
+/// a letter, then letters, digits, `+`, `-` and `.`) and `://`, else
+/// `****`: the redacted form of a URL not parsed yet. A parsed source URL
+/// prints its origin too (`lotse_core::secret::RedactedUrl`).
+fn redact_unparsed(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, _))
+            if scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        {
+            format!("{scheme}://****")
         }
-        _ => url.to_owned(),
+        _ => "****".to_owned(),
     }
 }
 
@@ -182,7 +184,10 @@ pub struct ConnectionInfo {
 /// A source as `stream/get` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SourceInfo {
-    /// The URL, credentials redacted.
+    /// The URL redacted to its origin, `scheme://[****@]host[:port]`, then
+    /// `/****` when the path is anything but empty or `/` and `?****` when
+    /// a query is present: the path and query can carry secrets (a camera
+    /// key, a session token) as the userinfo can.
     pub url: String,
     /// The protocol (`rtsp`).
     pub protocol: String,
@@ -344,7 +349,7 @@ mod tests {
     use crate::error::ErrorCode;
 
     #[test]
-    fn rfc3986_s3_2_1_debug_never_prints_a_source_userinfo_or_option_values() {
+    fn rfc3986_s3_1_debug_prints_a_source_urls_scheme_only_and_no_option_values() {
         let spec: SourceSpec = serde_json::from_value(json!({
             "url": "rtsp://admin:hunter2@cam.local:554/h264?x=1",
             "options": { "transport": "tcp" }
@@ -352,7 +357,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             format!("{spec:?}"),
-            r#"SourceSpec { url: "rtsp://****@cam.local:554/h264?x=1", options: ["transport"] }"#
+            r#"SourceSpec { url: "rtsp://****", options: ["transport"] }"#
         );
         // The command that carries it prints it the same way.
         let put = crate::parse_command(
@@ -361,7 +366,7 @@ mod tests {
         .unwrap();
         let debug = format!("{put:?}");
         assert!(
-            debug.contains(r#""rtsp://****@c/""#) && !debug.contains("hunter2"),
+            debug.contains(r#""rtsp://****""#) && !debug.contains("hunter2"),
             "{debug}"
         );
         // The wire form keeps the credentials a client sends.
@@ -370,17 +375,18 @@ mod tests {
             "rtsp://admin:hunter2@cam.local:554/h264?x=1"
         );
         for (url, shown) in [
-            ("rtsp://cam.local/h264", "rtsp://cam.local/h264"),
-            ("rtsp://u:pa/ss?w#rd@cam/", "rtsp://****@cam/"),
-            ("rtsp://u:p@ss@cam/", "rtsp://****@cam/"),
-            ("u:p@cam/", "****@cam/"),
-            ("@cam", "****@cam"),
-            ("rtsp://", "rtsp://"),
-            ("rtsp://@", "rtsp://****@"),
-            ("x@y://cam/", "x@y://cam/"),
-            ("", ""),
+            ("rtsp://cam.local/key?token=t", "rtsp://****"),
+            ("https://u:pa/ss?w#rd@cam/", "https://****"),
+            ("svc+x-1.2://cam", "svc+x-1.2://****"),
+            ("rtsp://", "rtsp://****"),
+            ("u:p@cam/key", "****"),
+            ("://cam/key", "****"),
+            ("1rtsp://cam/key", "****"),
+            ("x@y://cam/key", "****"),
+            ("rt sp://cam/key", "****"),
+            ("", "****"),
         ] {
-            assert_eq!(redact_userinfo(url), shown, "{url}");
+            assert_eq!(redact_unparsed(url), shown, "{url}");
         }
     }
 
@@ -422,7 +428,7 @@ mod tests {
             since: "2026-09-28T11:02:03.000Z".into(),
             last_error: None,
             sources: vec![SourceInfo {
-                url: "rtsp://****@192.168.1.10:554/h264".into(),
+                url: "rtsp://****@192.168.1.10:554/****".into(),
                 protocol: "rtsp".into(),
                 state: StreamState::Live,
                 reconnects: 2,

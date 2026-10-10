@@ -30,9 +30,9 @@ use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_core::track::TrackLimits;
 use lotse_rtsp::RtspFactory;
-use lotse_rtsp::tls::Fingerprint;
 use lotse_testing::fake_camera::{CameraTls, Stats};
 use lotse_testing::{CameraConfig, FakeCamera, Harness};
+use lotse_tls::Fingerprint;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -224,7 +224,7 @@ async fn insecure_tls_plays_and_warns() {
     );
     assert!(
         logs.lines()
-            .any(|l| l.contains("TLS established") && l.contains("Insecure")),
+            .any(|l| l.contains("tls: established") && l.contains("Insecure")),
         "{logs}"
     );
 }

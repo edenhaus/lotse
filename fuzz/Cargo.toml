@@ -20,7 +20,8 @@ libfuzzer-sys = { version = "0.4", default-features = false, features = ["link_l
 lotse-api = { path = "../crates/lotse-api" }
 lotse-api-types = { path = "../crates/lotse-api-types" }
 lotse-codec = { path = "../crates/lotse-codec", features = ["test-util"] }
-lotse-core = { path = "../crates/lotse-core" }
+lotse-core = { path = "../crates/lotse-core", features = ["test-util"] }
+lotse-http = { path = "../crates/lotse-http" }
 lotse-ipc = { path = "../crates/lotse-ipc" }
 lotse-rtsp = { path = "../crates/lotse-rtsp" }
 lotse-supervisor = { path = "../crates/lotse-supervisor" }
@@ -32,6 +33,7 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 str0m = { version = "0.24", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "io-util", "macros"] }
 tokio-util = { version = "0.7", default-features = false }
+url = { version = "2", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "ipc_message"
@@ -64,6 +66,13 @@ bench = false
 [[bin]]
 name = "h265_ptl"
 path = "fuzz_targets/h265_ptl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "annexb_normalize"
+path = "fuzz_targets/annexb_normalize.rs"
 test = false
 doc = false
 bench = false
@@ -169,6 +178,41 @@ bench = false
 [[bin]]
 name = "ws_message"
 path = "fuzz_targets/ws_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hls_playlist"
+path = "fuzz_targets/hls_playlist.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aac_adts"
+path = "fuzz_targets/aac_adts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ts_demux"
+path = "fuzz_targets/ts_demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fmp4_segment"
+path = "fuzz_targets/fmp4_segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hls_session"
+path = "fuzz_targets/hls_session.rs"
 test = false
 doc = false
 bench = false

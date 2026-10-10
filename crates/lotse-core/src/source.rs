@@ -75,8 +75,8 @@ pub enum SourceConfigError {
 
 /// One source protocol, registered at startup behind its Cargo feature.
 pub trait SourceFactory: fmt::Debug + Send + Sync {
-    /// The URL schemes this protocol serves (`rtsp`, `rtsps`; later `rtmp`,
-    /// `onvif`, ...), lowercase. `info.schemes` is the union over the registry.
+    /// The URL schemes this protocol serves (`rtsp`, `rtsps`; `http`,
+    /// `https`; later `rtmp`, `onvif`, ...), lowercase. `info.schemes` is the union over the registry.
     fn schemes(&self) -> &'static [&'static str];
 
     /// What the protocol can do.
@@ -213,6 +213,22 @@ impl SourceError {
             Self::Timeout(_) => "source_timeout",
             Self::Protocol(_) => "source_protocol_error",
             Self::Ended(_) => "source_ended",
+        }
+    }
+
+    /// The same error with its message scrubbed of `url`'s secrets
+    /// ([`RedactedUrl::scrub`](crate::secret::RedactedUrl::scrub)): for a
+    /// message that carries a third-party library's text, which may echo
+    /// a URL built from the source URL.
+    #[must_use]
+    pub fn scrubbed(self, url: &SourceUrl) -> Self {
+        let shown = url.redacted();
+        match self {
+            Self::Unreachable(message) => Self::Unreachable(shown.scrub(&message)),
+            Self::AuthFailed(message) => Self::AuthFailed(shown.scrub(&message)),
+            Self::Timeout(message) => Self::Timeout(shown.scrub(&message)),
+            Self::Protocol(message) => Self::Protocol(shown.scrub(&message)),
+            Self::Ended(message) => Self::Ended(shown.scrub(&message)),
         }
     }
 }
@@ -446,6 +462,13 @@ impl TrackSet {
                 }
             }
         }
+    }
+
+    /// The bounds every track of the set enforces, for a source that sizes
+    /// its own buffers by them before it declares a track (a
+    /// demultiplexer's largest frame).
+    pub const fn limits(&self) -> TrackLimits {
+        self.limits
     }
 
     /// What the connection lost or refused before its tracks, over every
@@ -965,6 +988,22 @@ mod tests {
     }
 
     #[test]
+    fn the_set_hands_out_the_limits_its_tracks_enforce() {
+        let limits = TrackLimits {
+            max_frame_bytes: 7,
+            ..TrackLimits::default()
+        };
+        let set = TrackSet::new(limits, SystemClock.now());
+        assert_eq!(set.limits(), limits);
+        assert_eq!(
+            set.publisher()
+                .declare(Kind::Video, h264(), 90_000)
+                .limits(),
+            set.limits()
+        );
+    }
+
+    #[test]
     fn every_attempt_counts_into_the_connections_ingest_stats() {
         let set = TrackSet::new(TrackLimits::default(), SystemClock.now());
         set.publisher().ingest().count_lost(2);
@@ -1026,6 +1065,34 @@ mod tests {
         assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
         slot.withdraw();
         assert!(slot.current().is_none());
+    }
+
+    #[test]
+    fn a_scrubbed_source_error_keeps_its_kind_and_loses_the_urls_secrets() {
+        let url = SourceUrl::parse("rtsp://u:p@cam/KEY/live?token=TOK").unwrap();
+        let text = || "join rtsp://127.0.0.1:9/KEY/live?token=TOK to /KEY/live".to_owned();
+        let shown = "join rtsp://127.0.0.1:9/****?**** to /****";
+        for (err, scrubbed) in [
+            (
+                SourceError::Unreachable(text()),
+                SourceError::Unreachable(shown.into()),
+            ),
+            (
+                SourceError::AuthFailed(text()),
+                SourceError::AuthFailed(shown.into()),
+            ),
+            (
+                SourceError::Timeout(text()),
+                SourceError::Timeout(shown.into()),
+            ),
+            (
+                SourceError::Protocol(text()),
+                SourceError::Protocol(shown.into()),
+            ),
+            (SourceError::Ended(text()), SourceError::Ended(shown.into())),
+        ] {
+            assert_eq!(err.scrubbed(&url), scrubbed);
+        }
     }
 
     #[test]

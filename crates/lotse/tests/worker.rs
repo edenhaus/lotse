@@ -2,8 +2,10 @@
 //! spawn, run the fake source, see its reports, stop it within the budget;
 //! and the M0 exit criterion, a worker crash that the supervisor observes
 //! and survives; an `rtsps` camera played by a worker under its sandbox
-//! through the loopback relay it bound before the sandbox; and an `rtsp`
-//! camera whose media takes UDP, received under the same sandbox. Needs the
+//! through the loopback relay it bound before the sandbox; an `rtsp`
+//! camera whose media takes UDP, received under the same sandbox; and an
+//! HLS stream over `http` and over `https` with a pinned certificate,
+//! fetched by a sandboxed worker from the server's port alone. Needs the
 //! `source-fake` feature (on with `--all-features`).
 
 #![cfg(feature = "source-fake")]
@@ -267,4 +269,116 @@ async fn a_sandboxed_worker_receives_rtsp_media_over_udp() {
     let exit = worker.stop(Duration::from_secs(5), &clock).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     cam.stop().await;
+}
+
+/// Serves three one-second HLS MPEG-TS segments of H.264 and AAC (the HTTP
+/// source's recorded fixtures) as the live playlist `/live/index.m3u8`.
+#[cfg(feature = "source-http")]
+fn serve_live(server: &lotse_testing::fake_http::FakeHttp) {
+    let playlist = "/live/index.m3u8";
+    server.live(playlist, 3);
+    for (uri, body) in [
+        (
+            "/live/0.m2t",
+            &include_bytes!("../../lotse-http/testdata/live_0.m2t")[..],
+        ),
+        (
+            "/live/1.m2t",
+            &include_bytes!("../../lotse-http/testdata/live_1.m2t")[..],
+        ),
+        (
+            "/live/2.m2t",
+            &include_bytes!("../../lotse-http/testdata/live_2.m2t")[..],
+        ),
+    ] {
+        server.push_segment(playlist, uri, 1.0, body);
+    }
+}
+
+/// Plays `url` with `options` in a worker under the sandbox, allowed to
+/// connect to the server's port only and without a loopback relay, until
+/// it is live with the fixtures' H.264 and AAC tracks.
+#[cfg(feature = "source-http")]
+async fn play_http_in_sandbox(
+    server: &lotse_testing::fake_http::FakeHttp,
+    url: String,
+    options: String,
+) {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let mut worker = manager_with_sandbox("on")
+        .spawn(&[server.addr().port()], false)
+        .expect("spawns");
+    assert!(matches!(
+        worker.next_event().await,
+        WorkerEvent::Ready { .. }
+    ));
+    let spec = SourceSpec {
+        connection_id: "c1".into(),
+        url,
+        options,
+        peer_host: "camera.test".into(),
+        peer_addrs: vec![server.addr()],
+    };
+    worker.run_source(&spec).await.expect("run source");
+    assert_eq!(
+        worker.next_event().await,
+        WorkerEvent::Report(WorkerReport::Connecting)
+    );
+    worker.grant_connect().await.expect("grant");
+    let WorkerEvent::Tracks(tracks) = worker.next_event().await else {
+        panic!("tracks expected");
+    };
+    let codecs: Vec<&str> = tracks.iter().map(|track| track.codec.as_str()).collect();
+    assert_eq!(codecs, ["h264", "aac_lc"]);
+    assert_eq!(
+        worker.next_event().await,
+        WorkerEvent::Report(WorkerReport::Live)
+    );
+    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    assert!(exit.success(), "clean exit, got {exit:?}");
+}
+
+/// On Linux the worker's Landlock rules allow TCP to the server's port
+/// alone (the port of the URL; the playlist's segments share its origin);
+/// on macOS the sandbox is a no-op and this checks the HTTP path of a real
+/// worker.
+#[cfg(feature = "source-http")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sandboxed_worker_plays_hls_over_http() {
+    let server = lotse_testing::fake_http::FakeHttp::start()
+        .await
+        .expect("server binds");
+    serve_live(&server);
+    let port = server.addr().port();
+    play_http_in_sandbox(
+        &server,
+        format!("http://camera.test:{port}/live/index.m3u8"),
+        "null".into(),
+    )
+    .await;
+    assert!(!server.requests().is_empty());
+    server.stop().await;
+}
+
+/// `https` under the sandbox: seccomp has to allow what TLS needs, as for
+/// `rtsps`; the certificate is pinned, so it may name another host.
+#[cfg(feature = "source-http")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sandboxed_worker_plays_hls_over_https_with_a_pinned_certificate() {
+    use lotse_testing::fake_camera::CameraTls;
+
+    let tls = CameraTls::self_signed(&["server.test"]).expect("certificate");
+    let pin = tls.fingerprint();
+    let server = lotse_testing::fake_http::FakeHttp::start_tls(&tls)
+        .await
+        .expect("server binds");
+    serve_live(&server);
+    let port = server.addr().port();
+    play_http_in_sandbox(
+        &server,
+        format!("https://camera.test:{port}/live/index.m3u8"),
+        format!("{{\"tls_fingerprint\": \"{pin}\"}}"),
+    )
+    .await;
+    server.stop().await;
 }

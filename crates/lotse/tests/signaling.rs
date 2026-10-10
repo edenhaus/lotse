@@ -32,6 +32,7 @@ use lotse_api_types::command::parse_command;
 use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::registry::Registries;
+use lotse_core::source_url::SourceUrl;
 use lotse_supervisor::api::{ConnectionId, Event, Handler as _, Outcome};
 use lotse_supervisor::net::allocation::AllocationConfig;
 use lotse_supervisor::net::demux::{Demux, DemuxStats};
@@ -389,7 +390,12 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
         )
         .await,
     );
-    assert_eq!(front["sources"][0]["url"], other);
+    // `stream/get` shows the URL's origin only, its path redacted; the
+    // second DESCRIBE above is what tells the new path was connected.
+    assert_eq!(
+        front["sources"][0]["url"],
+        SourceUrl::parse(&other).unwrap().to_string()
+    );
     assert_eq!(front["state"], "live");
     assert_eq!(front["sessions"], json!(["ha-1"]));
     assert_eq!(front["last_error"], Value::Null);

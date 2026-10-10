@@ -6,8 +6,8 @@ rule for humans: whoever submits a change can explain every line of it.
 
 ## What this is
 
-lotse is a media daemon built for Home Assistant: RTSP cameras in, WebRTC
-to browsers out, driven by its client over a Unix-socket control API. It is in the
+lotse is a media daemon built for Home Assistant: RTSP and HLS/MPEG-TS
+cameras in, WebRTC to browsers out, driven by its client over a Unix-socket control API. It is in the
 design phase.
 
 ## Commands
@@ -58,7 +58,7 @@ and job names start with a capital letter.
 | `mise run turn-e2e` | the TURN client against a real coturn in Docker (ignored `coturn_` tests) |
 | `mise run load [cameras] [viewers] [duration]` | the load generator against a release daemon (`target/load-report.json`) |
 | `mise run soak [duration] [cycle]` | the soak: viewer and camera churn, checked for memory, task and descriptor growth (`target/soak-report.json`) |
-| `mise run interop` | the daemon against MediaMTX fed by ffmpeg (pinned in `mise.toml`): RTSP over TCP and UDP, video only and with AAC, PCMU and Opus (ignored `mediamtx_` tests) |
+| `mise run interop` | the daemon against MediaMTX fed by ffmpeg (pinned in `mise.toml`): RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS; and ffmpeg's raw MPEG-TS over HTTP (ignored `mediamtx_` and `ffmpeg_` tests) |
 | `mise run browser [chrome\|firefox\|safari] [play] [case]` | the browser test: one pytest test (`tests/browser/`) has Selenium drive a real browser playing ffmpeg's stream from MediaMTX through a release daemon, per case (`join`, `aac`, `pli`, `reconnect`, `crash`, or `all`, the default) (`target/browser-<engine>/<case>/`); needs the browser, Selenium Manager finds or fetches its driver |
 | `mise run compare [engine] [runs] [play]` | the browser test through lotse and through go2rtc, side by side; a report, not a gate (`target/compare-<engine>/compare.json`) |
 | `mise run test-musl` | the tests on the static musl target (Linux only); CI runs them from `coverage-archive`'s archive instead (`coverage-musl`) |

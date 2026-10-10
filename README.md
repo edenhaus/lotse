@@ -1,8 +1,9 @@
 # lotse
 
 A small, fast, memory-safe media daemon built for Home Assistant. It takes
-camera streams (RTSP first) and serves them to browsers over WebRTC, with
-two-way audio designed in from the start, and does nothing else.
+camera streams (RTSP, and HLS or MPEG-TS over HTTP) and serves them to
+browsers over WebRTC, with two-way audio designed in from the start, and
+does nothing else.
 
 > [!WARNING]
 > **Design phase, not for production use.** lotse is at an early stage. It

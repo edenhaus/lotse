@@ -4,9 +4,12 @@
 //! does a `tls_fingerprint` that is not a SHA-256 in hex or a `user_agent`
 //! that is not a header field value (RFC 7230 §3.2, RFC 2326 §12.41).
 
+use std::fmt;
+
+use lotse_core::secret::{REDACTED, RedactedUrl};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::tls::Fingerprint;
+use lotse_tls::Fingerprint;
 
 /// The read deadline default, in milliseconds.
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -74,14 +77,34 @@ pub enum OnvifKeyframe {
     Off,
 }
 
-/// The ONVIF endpoint a client can pass, so no probing is needed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The ONVIF endpoint a client can pass, so no probing is needed. Its URL
+/// can carry credentials and tokens as a source URL can, so `Debug` and
+/// [`RtspOptions::redacted`] print it as [`RedactedUrl`] does, or `****`
+/// when it does not parse.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OnvifEndpoint {
     /// The device or media service URL.
     pub url: String,
     /// The media profile the stream belongs to.
     pub profile_token: String,
+}
+
+impl fmt::Debug for OnvifEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnvifEndpoint")
+            .field("url", &redact_url(&self.url))
+            .field("profile_token", &self.profile_token)
+            .finish()
+    }
+}
+
+/// `url` as [`RedactedUrl`] prints it, or `****` when it does not parse.
+fn redact_url(url: &str) -> String {
+    url::Url::parse(url).map_or_else(
+        |_| REDACTED.to_owned(),
+        |url| RedactedUrl::new(&url).to_string(),
+    )
 }
 
 /// The typed options.
@@ -138,10 +161,15 @@ impl RtspOptions {
         }
     }
 
-    /// The options as `stream/get` reports them: nothing here is secret
-    /// (a certificate fingerprint is public).
+    /// The options as `stream/get` reports them: the ONVIF URL redacted
+    /// as a source URL is; nothing else here is secret (a certificate
+    /// fingerprint is public).
     pub fn redacted(&self) -> serde_json::Value {
-        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+        let mut shown = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        if let (Some(onvif), Some(url)) = (self.onvif.as_ref(), shown.pointer_mut("/onvif/url")) {
+            *url = serde_json::Value::String(redact_url(&onvif.url));
+        }
+        shown
     }
 
     /// The options half of the connection key:
@@ -203,7 +231,33 @@ mod tests {
         assert!(RtspOptions::parse(&json!({ "transports": "tcp" })).is_err());
         assert!(RtspOptions::parse(&json!({ "transport": "sctp" })).is_err());
         assert!(RtspOptions::parse(&json!({ "onvif": { "url": "x" } })).is_err());
+        assert!(defaults.redacted()["onvif"].is_null());
         assert!(RtspOptions::parse(&json!([])).is_err());
+    }
+
+    #[test]
+    fn the_onvif_url_is_redacted_in_debug_and_the_report() {
+        for (url, shown) in [
+            (
+                "http://admin:hunter2@cam/onvif/KEY?token=TOK",
+                "http://****@cam/****?****",
+            ),
+            ("not a url KEY", "****"),
+        ] {
+            let options = RtspOptions::parse(&json!({
+                "onvif": { "url": url, "profile_token": "p0" }
+            }))
+            .unwrap();
+            let report = options.redacted();
+            assert_eq!(report["onvif"]["url"], shown, "{url}");
+            assert_eq!(report["onvif"]["profile_token"], "p0");
+            assert_eq!(options.onvif.as_ref().unwrap().url, url);
+            let debug = format!("{options:?}");
+            assert!(debug.contains(&format!("url: {shown:?}")), "{debug}");
+            for secret in ["hunter2", "KEY", "TOK"] {
+                assert!(!debug.contains(secret) && !report.to_string().contains(secret));
+            }
+        }
     }
 
     #[test]

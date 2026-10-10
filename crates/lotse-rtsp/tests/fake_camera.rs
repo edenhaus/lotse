@@ -7,8 +7,10 @@
 //! cut through, AAC audio framed on the side branch, an H.265 camera
 //! through the RFC 7798 normalizers, an H.265 camera whose payloads carry
 //! decoding order numbers declared unsupported, an SDP retina cannot parse
-//! refused and an `m=` line without a format skipped, and a keyframe over
-//! the libwebrtc packet limit counted and warned about.
+//! refused and an `m=` line without a format skipped, a keyframe over
+//! the libwebrtc packet limit counted and warned about, and a URL whose
+//! path, query and password never reach a log line, an error or the
+//! description.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -1028,4 +1030,56 @@ async fn libwebrtc_max_frame_packets_a_larger_keyframe_is_counted_and_warned_abo
             && warning.contains("substream"),
         "{warning}"
     );
+}
+
+/// A camera key in the path, a token in the query and a password: none
+/// of them in any log line (down to `trace`), in the exit of a failed or a
+/// cancelled session, or in the description.
+#[tokio::test(flavor = "current_thread")]
+async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
+    const SECRETS: [&str; 3] = ["camkey7f3a", "tok9d2e", "pw5b1c"];
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    let _logs = tracing::subscriber::set_default(subscriber);
+    let cam = camera(CameraConfig {
+        auth: Some(("admin".into(), "pw5b1c".into())),
+        ..CameraConfig::default()
+    })
+    .await;
+    let mut printed = Vec::new();
+    for (password, plays) in [("wrong", false), ("pw5b1c", true)] {
+        let url = format!(
+            "rtsp://admin:{password}@{}/camkey7f3a/live?token=tok9d2e",
+            cam.addr()
+        );
+        let source = make_source(&url, &serde_json::Value::Null);
+        let described = source.describe();
+        assert_eq!(
+            described.url.to_string(),
+            format!("rtsp://****@{}/****?****", cam.addr())
+        );
+        printed.push(format!("{described:?} {} {source:?}", described.url));
+        let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+        assert_eq!(harness.wait_ready().await, plays, "{password}");
+        harness.cancel();
+        let exit = harness.finish().await;
+        printed.push(format!("{exit:?}"));
+        if let SourceExit::Ended(error) = exit {
+            printed.push(error.to_string());
+        }
+    }
+    cam.stop().await;
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("rtsp: describing"), "{logs}");
+    let printed = printed.join("\n");
+    assert!(printed.contains("AuthFailed"), "{printed}");
+    for secret in SECRETS {
+        assert!(!logs.contains(secret), "{secret} logged:\n{logs}");
+        assert!(!printed.contains(secret), "{secret} printed:\n{printed}");
+    }
 }

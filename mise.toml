@@ -31,7 +31,8 @@ cmake = "4.4.3" # builds the bundled libopus (`opusic-sys`, behind the `opus` cr
 "github:CycloneDX/cyclonedx-rust-cargo" = { version = "0.5.9", version_prefix = "cargo-cyclonedx-" } # the CycloneDX SBOM of a release (`mise run sbom`)
 uv = "0.12.23" # the browser test's Python, Selenium and pytest, and its checks (tests/browser/uv.lock)
 
-# The camera of the browser and interop tests: ffmpeg encodes and publishes, MediaMTX serves RTSP.
+# The camera of the browser and interop tests: ffmpeg encodes and publishes, MediaMTX serves RTSP
+# and HLS; ffmpeg alone serves raw MPEG-TS over HTTP.
 # Third-party tools on purpose, so the stream is not our own reading of the specs.
 "github:bluenviron/mediamtx" = "1.21.1"
 # FFmpeg 9.0.2, static GPL builds (libx264, libopus; the native aac and pcm_mulaw encoders). Linux:
@@ -148,8 +149,8 @@ description = "The TURN client against a real coturn in Docker (UDP and TCP, lon
 run = "scripts/turn-e2e.sh"
 
 [tasks.interop]
-description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus (the ignored `mediamtx_` tests)"
-run = "scripts/nextest.sh -E 'binary_id(lotse::interop)' --run-ignored only --no-tests=fail mediamtx_"
+description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS with a pinned certificate; and ffmpeg's raw MPEG-TS over HTTP (the ignored `mediamtx_` and `ffmpeg_` tests)"
+run = "scripts/nextest.sh -E 'binary_id(lotse::interop)' --run-ignored only --no-tests=fail mediamtx_ ffmpeg_"
 
 [tasks.load]
 description = "The load generator: N fake cameras x M headless viewers against a release daemon; report in target/load-report.json"

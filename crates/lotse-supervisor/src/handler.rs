@@ -1461,6 +1461,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_get_reports_a_source_url_redacted_to_its_origin() {
+        let s = supervisor("/bin/sh", Arc::new(SystemClock));
+        let url = "fake://admin:pw5b1c@cam:8/camkey7f3a/live?token=tok9d2e";
+        result(call(&s, &put("front", url, false)).await);
+        let front = result(call(&s, r#"{"id":1,"type":"stream/get","stream_id":"front"}"#).await);
+        assert_eq!(front["sources"][0]["url"], "fake://****@cam:8/****?****");
+        let list = result(call(&s, r#"{"id":1,"type":"stream/list"}"#).await);
+        let listed = list.to_string();
+        for secret in ["pw5b1c", "camkey7f3a", "tok9d2e"] {
+            assert!(!listed.contains(secret), "{listed}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_source_url_belongs_to_one_stream_and_streams_are_listed_fetched_and_deleted() {
         let s = supervisor("/bin/sh", Arc::new(SystemClock));
         assert_eq!(

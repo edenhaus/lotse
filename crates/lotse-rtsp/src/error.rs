@@ -1,5 +1,7 @@
 //! How a retina error becomes a [`SourceError`]: the RTSP status and
-//! method stay in the message, the kind follows what went wrong.
+//! method stay in the message, the kind follows what went wrong. The
+//! attempt scrubs its error of the source URL's path and query
+//! ([`SourceError::scrubbed`]), which retina may echo.
 //!
 //! The camera's own text, which retina's messages quote (a header, an
 //! SDP line), reaches the log and the API's error only through
@@ -66,7 +68,35 @@ mod tests {
         reason = "test code"
     )]
 
+    use lotse_core::source_url::SourceUrl;
+
     use super::*;
+
+    /// retina names the URL it was given in an `InvalidArgument`; the
+    /// relay URL it is given carries the source URL's path and query,
+    /// which the attempt's scrub removes.
+    #[tokio::test]
+    async fn a_url_retina_echoes_loses_its_path_and_query() {
+        let url =
+            SourceUrl::parse("rtsp://admin:pw5b1c@cam/camkey7f3a/live?token=tok9d2e").unwrap();
+        let mut target = url.expose_url().clone();
+        target.set_scheme("rtspx").unwrap();
+        let err =
+            retina::client::Session::describe(target, retina::client::SessionOptions::default())
+                .await
+                .err()
+                .expect("retina refuses a scheme other than rtsp");
+        assert!(
+            err.to_string().contains("camkey7f3a"),
+            "retina echoes: {err}"
+        );
+        assert_eq!(
+            classify(&err).scrubbed(&url),
+            SourceError::Protocol(
+                "Invalid argument: Bad URL rtspx://cam/****?**** only scheme rtsp supported".into()
+            )
+        );
+    }
 
     #[test]
     fn camera_text_is_one_line_of_at_most_200_bytes() {
