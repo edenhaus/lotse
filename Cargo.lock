@@ -1447,6 +1447,7 @@ dependencies = [
  "lotse-api-types",
  "lotse-codec",
  "lotse-core",
+ "lotse-http",
  "lotse-rtsp",
  "lotse-sandbox",
  "lotse-supervisor",

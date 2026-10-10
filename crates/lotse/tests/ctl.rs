@@ -80,6 +80,16 @@ fn check_info(socket: &Path) {
             .unwrap()
             .contains(&Value::from("fake"))
     );
+    // The schemes follow the registered factories, `source-http` one of
+    // them by default.
+    let schemes = info["schemes"].as_array().unwrap();
+    for scheme in ["http", "https"] {
+        assert_eq!(
+            schemes.contains(&Value::from(scheme)),
+            cfg!(feature = "source-http"),
+            "{scheme} in {schemes:?}"
+        );
+    }
     assert_eq!(info["sandbox"]["mode"], "off");
     assert!(!info["build"]["target"].as_str().unwrap().is_empty());
     let compact = ctl(socket, &["--compact", "info"]);
@@ -143,11 +153,29 @@ fn check_errors(socket: &Path) {
     assert_eq!(missing.status.code(), Some(1));
     let error = json(&String::from_utf8_lossy(&missing.stdout));
     assert_eq!(error["error"]["code"], "stream_not_found");
-    let bad_scheme = ctl(socket, &["stream", "put", "x", "--url", "rtmp://cam/"]);
-    assert_eq!(bad_scheme.status.code(), Some(1));
-    assert_eq!(
-        json(&String::from_utf8_lossy(&bad_scheme.stdout))["error"]["code"],
-        "scheme_unsupported"
+    for url in ["rtmp://cam/", "ftp://cam/live.ts"] {
+        let bad_scheme = ctl(socket, &["stream", "put", "x", "--url", url]);
+        assert_eq!(bad_scheme.status.code(), Some(1), "{url}");
+        assert_eq!(
+            json(&String::from_utf8_lossy(&bad_scheme.stdout))["error"]["code"],
+            "scheme_unsupported",
+            "{url}"
+        );
+    }
+    // A fragment is refused before any factory sees the url, `http` too.
+    let fragment = ctl(
+        socket,
+        &["stream", "put", "x", "--url", "http://cam/index.m3u8#y"],
+    );
+    assert_eq!(fragment.status.code(), Some(1));
+    let error = json(&String::from_utf8_lossy(&fragment.stdout));
+    assert_eq!(error["error"]["code"], "invalid_request", "{error}");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("url has a fragment"),
+        "{error}"
     );
     let raw = ctl(socket, &["raw", "not json"]);
     assert_eq!(raw.status.code(), Some(1));

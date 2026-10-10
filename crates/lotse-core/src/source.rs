@@ -75,8 +75,8 @@ pub enum SourceConfigError {
 
 /// One source protocol, registered at startup behind its Cargo feature.
 pub trait SourceFactory: fmt::Debug + Send + Sync {
-    /// The URL schemes this protocol serves (`rtsp`, `rtsps`; later `rtmp`,
-    /// `onvif`, ...), lowercase. `info.schemes` is the union over the registry.
+    /// The URL schemes this protocol serves (`rtsp`, `rtsps`; `http`,
+    /// `https`; later `rtmp`, `onvif`, ...), lowercase. `info.schemes` is the union over the registry.
     fn schemes(&self) -> &'static [&'static str];
 
     /// What the protocol can do.

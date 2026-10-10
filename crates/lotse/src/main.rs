@@ -92,6 +92,13 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
     );
     #[cfg(not(feature = "source-rtsp"))]
     drop(relay);
+    #[cfg(feature = "source-http")]
+    registered(
+        "http source",
+        registries
+            .sources
+            .register(Arc::new(lotse_http::HttpFactory)),
+    );
     #[cfg(feature = "source-fake")]
     registered(
         "fake source",
@@ -109,6 +116,7 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
 #[cfg(any(
     feature = "output-webrtc",
     feature = "source-rtsp",
+    feature = "source-http",
     feature = "source-fake"
 ))]
 fn registered(what: &str, outcome: Result<(), lotse_core::registry::RegistryError>) {

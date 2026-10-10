@@ -175,6 +175,7 @@ lotse-api = { path = "crates/lotse-api" }
 lotse-api-types = { path = "crates/lotse-api-types" }
 lotse-codec = { path = "crates/lotse-codec" }
 lotse-core = { path = "crates/lotse-core" }
+lotse-http = { path = "crates/lotse-http" }
 lotse-ipc = { path = "crates/lotse-ipc" }
 lotse-rtsp = { path = "crates/lotse-rtsp" }
 lotse-sandbox = { path = "crates/lotse-sandbox" }
