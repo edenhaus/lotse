@@ -46,7 +46,7 @@ and job names start with a capital letter.
 | `mise run test` | the tests (`scripts/nextest.sh`, nextest filters as usual) and the doctests, on Linux |
 | `mise run test-browser` | the browser test's unit tests, no browser (CI's Check job) |
 | `mise run coverage` | the 100 % line-coverage gate (`cargo llvm-cov nextest`) |
-| `mise run mutants [base]` | `cargo mutants --in-diff` against a base ref (default `origin/main`); CI splits it over 4 jobs (`--shard k/4 --in-place`) |
+| `mise run mutants [base]` | `cargo mutants --in-diff` against a base ref (default `origin/main`); CI splits it over up to 8 jobs (`scripts/mutants-shards.sh`, `--shard k/n --in-place`) |
 | `mise run turn-e2e` | the TURN client against a real coturn in Docker (ignored `coturn_` tests) |
 | `mise run load [cameras] [viewers] [duration]` | the load generator against a release daemon (`target/load-report.json`) |
 | `mise run soak [duration] [cycle]` | the soak: viewer and camera churn, checked for memory, task and descriptor growth (`target/soak-report.json`) |

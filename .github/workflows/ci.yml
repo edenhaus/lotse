@@ -307,20 +307,48 @@ jobs:
           shared-key: coverage
       - run: mise run coverage
 
-  # The changed lines' mutants, one after another, split into consecutive slices over the shards
-  # (cargo-mutants' default `slice` sharding). Each shard mutates its checkout in place, so the
-  # cached target/ builds; a copy of the tree would build from cold.
+  # How many Mutants jobs the PR needs, from its changed lines' mutants (scripts/mutants-shards.sh):
+  # up to 10 a job, at most 8 jobs, none when it has no mutants. Listing them builds nothing.
+  mutants-plan:
+    name: Mutants plan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      shards: ${{ steps.plan.outputs.shards }}
+    env:
+      BASE_REF: ${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # `--in-diff` needs the merge base
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: rust cargo:cargo-mutants
+      - id: plan
+        run: scripts/mutants-shards.sh "origin/$BASE_REF" >>"$GITHUB_OUTPUT"
+
+  # The changed lines' mutants, one after another, split into consecutive slices over the plan's
+  # shards (cargo-mutants' default `slice` sharding). Each shard mutates its checkout in place, so
+  # the cached target/ builds; a copy of the tree would build from cold. No debug info: every
+  # mutant relinks the test binaries, and debug info is most of what the linker writes.
   mutants:
     name: Mutants (changed lines, shard ${{ matrix.shard }})
-    if: github.event_name == 'pull_request'
+    needs: mutants-plan
+    if: needs.mutants-plan.outputs.shards != '[]'
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3] # `--shard k/4` below
+        shard: ${{ fromJSON(needs.mutants-plan.outputs.shards) }}
     runs-on: ubuntu-latest
     env:
       BASE_REF: ${{ github.base_ref }}
       SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ needs.mutants-plan.outputs.count }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -334,7 +362,7 @@ jobs:
         with:
           shared-key: mutants
           save-if: ${{ matrix.shard == 0 }} # the shards build the same; one saves it
-      - run: mise run mutants --shard "$SHARD/4" --in-place "origin/$BASE_REF"
+      - run: mise run mutants --shard "$SHARD/$SHARDS" --in-place "origin/$BASE_REF"
 
   # The fuzz targets, built once (cargo-fuzz's release build with AddressSanitizer, on the pinned
   # nightly) when the change reaches what they are built from. On a PR only the targets built from
