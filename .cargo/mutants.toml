@@ -2,7 +2,7 @@
 # `mise run mutants` runs the changed lines; the nightly job runs the whole workspace.
 test_tool = "nextest"
 # Test infrastructure: exercised by the other crates' tests and left out of
-# the coverage gate for the same reason (mise.toml `coverage`).
+# the coverage gate for the same reason (mise.toml `coverage-musl`).
 exclude_globs = ["crates/lotse-testing/**", "crates/lotse-codec/src/aac/test_data.rs"]
 # Equivalent mutants: mutations that cannot change behavior, each with its reason.
 # Keep this list short and delete entries with the code they refer to.

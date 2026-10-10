@@ -1,0 +1,37 @@
+# Codecov: CI's Tests jobs upload each arch's line coverage (`mise run coverage-musl`, lcov), one
+# flag per arch. Each flag is gated on its own, so a line one arch never runs is not hidden by the
+# other's report: 100 % of all lines (project) and of the lines a PR changes (patch), as the jobs'
+# own gate (`--fail-under-lines 100`) checks before the upload.
+codecov:
+  # The statuses follow the two uploads, not the whole run (its Mutants jobs take far longer).
+  require_ci_to_pass: false
+  notify:
+    after_n_builds: 2
+
+coverage:
+  status:
+    project:
+      # No `default`: it would gate the union of both arches.
+      x86_64:
+        target: 100%
+        flags: [x86_64]
+      aarch64:
+        target: 100%
+        flags: [aarch64]
+    patch:
+      x86_64:
+        target: 100%
+        flags: [x86_64]
+      aarch64:
+        target: 100%
+        flags: [aarch64]
+
+comment:
+  after_n_builds: 2
+  layout: "condensed_header, diff, flags, files"
+
+flags:
+  x86_64:
+    carryforward: false
+  aarch64:
+    carryforward: false

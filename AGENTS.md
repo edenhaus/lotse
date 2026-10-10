@@ -30,8 +30,12 @@ workflow it calls, and only `release.yml` (it publishes, so nothing in
 it may restore a cache), `scorecard.yml`, `pr-title.yml` and
 `cleanup-caches.yml` (a closed PR's caches deleted) stand apart (each
 says why). Its Build job compiles the musl tests once per arch
-into a nextest archive that the Tests, Interop, TURN and Sandbox
-isolation jobs run without compiling, and its Fuzz build job compiles the
+into a nextest archive that the Interop, TURN and Sandbox
+isolation jobs run without compiling; its Coverage build job does the same
+with coverage instrumentation for the Tests jobs, which gate on 100 % line
+coverage on each arch and upload the report to Codecov, which gates
+each arch at 100 % again on the PR (`.github/codecov.yml`, one flag per
+arch, OIDC, no secret; an upload that fails fails the job). Its Fuzz build job compiles the
 fuzz targets once for the Fuzz jobs, which run up to 4 targets each in
 parallel: on a PR only the targets built from a file it changed
 (`scripts/fuzz-select.sh`), else all, 5 min each nightly; every compiling job keeps a Rust
@@ -46,7 +50,9 @@ and job names start with a capital letter.
 | `prek run <hook-id>` | one hook, e.g. `prek run cargo-clippy` |
 | `mise run test` | the tests (`scripts/nextest.sh`, nextest filters as usual) and the doctests, on Linux |
 | `mise run test-browser` | the browser test's unit tests, no browser (CI's Check job) |
-| `mise run coverage` | the 100 % line-coverage gate (`cargo llvm-cov nextest`) |
+| `mise run coverage` | the 100 % line-coverage gate as CI runs it: `coverage-archive`, then `coverage-musl` |
+| `mise run coverage-archive` | the musl tests built with coverage instrumentation and archived for other machines (CI's Coverage build job) |
+| `mise run coverage-musl` | the 100 % line-coverage gate on the musl target, from `coverage-archive`'s archive; writes `target/cov/lcov.info` (CI's Tests jobs) |
 | `mise run mutants [base]` | `cargo mutants --in-diff` against a base ref (default `origin/main`); CI splits it over up to 8 jobs (`scripts/mutants-shards.sh`, `--shard k/n --in-place --skip-baseline`) |
 | `mise run mutants-cache` | each package's tests built alone, as cargo-mutants builds a mutant (CI's Mutants cache job on `main`) |
 | `mise run turn-e2e` | the TURN client against a real coturn in Docker (ignored `coturn_` tests) |
@@ -55,7 +61,7 @@ and job names start with a capital letter.
 | `mise run interop` | the daemon against MediaMTX fed by ffmpeg (pinned in `mise.toml`): RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS; and ffmpeg's raw MPEG-TS over HTTP (ignored `mediamtx_` and `ffmpeg_` tests) |
 | `mise run browser [chrome\|firefox\|safari] [play] [case]` | the browser test: one pytest test (`tests/browser/`) has Selenium drive a real browser playing ffmpeg's stream from MediaMTX through a release daemon, per case (`join`, `aac`, `pli`, `reconnect`, `crash`, or `all`, the default) (`target/browser-<engine>/<case>/`); needs the browser, Selenium Manager finds or fetches its driver |
 | `mise run compare [engine] [runs] [play]` | the browser test through lotse and through go2rtc, side by side; a report, not a gate (`target/compare-<engine>/compare.json`) |
-| `mise run test-musl` | the tests on the static musl target (Linux only); CI's Tests job runs them from the Build job's archive |
+| `mise run test-musl` | the tests on the static musl target (Linux only); CI runs them from `coverage-archive`'s archive instead (`coverage-musl`) |
 | `mise run test-archive` | the musl tests built and archived for other machines, then the doctests (CI's Build job) |
 | `mise run audit` | RustSec advisories, the root and the fuzz workspace (network) |
 | `mise run fuzz <target> [secs]` | one `cargo fuzz` target on the date-pinned nightly the task installs, under the contract's time and memory limits (`scripts/fuzz.sh`, as CI; cargo-fuzz installed by hand, the one nightly use) |
@@ -119,7 +125,7 @@ The clients, the Python `lotse-client` among them, live in their own repository,
   and a date, never as "the spec".
 - No untested code. Every behavior, error paths included, has a test in the
   same PR that asserts it; bug fixes start with a failing regression test.
-  CI gates on 100 % line coverage (`mise run coverage`) and on
+  CI gates on 100 % line coverage on each arch (`mise run coverage`) and on
   `cargo mutants --in-diff` (`mise run mutants`); an equivalent mutant is
   excluded in `.cargo/mutants.toml` with its reason. Code a test cannot
   reach is dead or needs a seam (fake, injected clock/fault). Fakes for a
@@ -146,8 +152,8 @@ The clients, the Python `lotse-client` among them, live in their own repository,
   The one exception is the nightly Safari browser test, which needs
   GitHub's macOS runner and the host build there.
 - musl builds run on Linux only (`test-musl`, `test-archive`,
-  `release-build`, CI's Build and Release build on one native runner per
-  arch).
+  `coverage-archive`, `release-build`, CI's Build, Coverage build and
+  Release build on one native runner per arch).
 - `panic = "abort"` in every profile: `catch_unwind` does not work, and a
   panic ends the process. Cargo ignores the setting for the test profile,
   so a test that needs abort semantics must run a release-profile binary
