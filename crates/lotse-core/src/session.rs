@@ -97,6 +97,12 @@ pub struct SessionRequest {
     pub video: Arc<Codec>,
     /// The audio track's codec, when the stream has one and audio is on.
     pub audio: Option<Arc<Codec>>,
+    /// The codec the connection's backchannel takes, when its source
+    /// protocol can carry audio back (`SourceCapabilities::backchannel`,
+    /// the feature's gate) and the source offers one now. `None` answers
+    /// talk-back `inactive`. Never whether another session talks: the
+    /// answer stays a function of the offer and this.
+    pub backchannel: Option<Codec>,
     /// How the stream's picture is turned for display: the stream's
     /// `orientation`, which an output marks when the viewer can apply it.
     pub orientation: Orientation,

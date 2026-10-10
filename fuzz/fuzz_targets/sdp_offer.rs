@@ -121,6 +121,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }),
         audio,
+        backchannel: None,
         orientation: Orientation::ALL[usize::from(pick >> 5)],
         limits: SessionLimits::default(),
         wall: SystemTime::UNIX_EPOCH,

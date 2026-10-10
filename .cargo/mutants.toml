@@ -37,6 +37,9 @@ exclude_re = [
     # Only picks whether the rate-limited unroutable warning is logged.
     "replace \\|\\| with && in Peers::route",
     "replace == with != in Peers::route",
+    # Only logs the talk-back decision; the answer it describes is asserted by the
+    # talk-back fixtures.
+    "replace log_talkback with \\(\\)",
     # G.711's sign (0x80), segment (0x70) and step (0x0f) bits are disjoint, so `|` and `^`
     # produce the same code.
     "g711.rs:.*replace \\| with \\^ in (mu|a)_encode$",

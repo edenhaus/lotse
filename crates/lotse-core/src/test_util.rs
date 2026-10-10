@@ -18,8 +18,8 @@ use crate::session::{
     Transport,
 };
 use crate::source::{
-    Direction, Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor,
-    SourceError, SourceExit, SourceFactory,
+    BackchannelHandle, Direction, Source, SourceCapabilities, SourceConfigError, SourceCtx,
+    SourceDescriptor, SourceError, SourceExit, SourceFactory,
 };
 use crate::source_url::SourceUrl;
 use crate::task::BoxFuture;
@@ -59,7 +59,9 @@ macro_rules! let_assert {
 /// asks), `{"audio": true}` to carry a PCMU track too,
 /// `{"audio": "aac"}` to carry an AAC-LC track (side branch only), or
 /// `{"audio": "aac_drifting"}` for that and Sender Reports whose audio
-/// clock runs 2 % fast, so the skew watchdog withdraws its audio;
+/// clock runs 2 % fast, so the skew watchdog withdraws its audio, or
+/// `{"backchannel": "pcmu" | "pcma" | "opus"}` to offer a backchannel
+/// taking that codec while it runs (whose packets go nowhere);
 /// anything else is rejected, so tests can see the validation error path.
 #[derive(Debug)]
 pub struct FakeSourceFactory {
@@ -67,17 +69,29 @@ pub struct FakeSourceFactory {
     schemes: &'static [&'static str],
     /// What a crashing source calls once ready: aborts the process.
     abort: fn() -> !,
+    /// The protocol can carry audio back (`SourceCapabilities::backchannel`).
+    backchannel: bool,
 }
 
 impl FakeSourceFactory {
-    /// A factory claiming `schemes` whose crashing sources abort the
-    /// process: `abort`, not `panic`, because the test profile ignores
-    /// `panic = "abort"`, and the point is the process dying, not the
-    /// unwinding.
+    /// A factory claiming `schemes`, whose protocol has no backchannel and
+    /// whose crashing sources abort the process: `abort`, not `panic`,
+    /// because the test profile ignores `panic = "abort"`, and the point is
+    /// the process dying, not the unwinding.
     pub const fn new(schemes: &'static [&'static str]) -> Self {
         Self {
             schemes,
             abort: std::process::abort,
+            backchannel: false,
+        }
+    }
+
+    /// A factory claiming `schemes` whose protocol declares a backchannel,
+    /// as the RTSP source will once it can send.
+    pub const fn with_backchannel(schemes: &'static [&'static str]) -> Self {
+        Self {
+            backchannel: true,
+            ..Self::new(schemes)
         }
     }
 
@@ -90,6 +104,16 @@ impl FakeSourceFactory {
     }
 }
 
+/// The backchannel codec a fake source's `backchannel` option names.
+fn fake_backchannel(name: &str) -> Option<Codec> {
+    match name {
+        "pcmu" => Some(Codec::Pcmu),
+        "pcma" => Some(Codec::Pcma),
+        "opus" => Some(Codec::Opus { channels: 2 }),
+        _ => None,
+    }
+}
+
 impl SourceFactory for FakeSourceFactory {
     fn schemes(&self) -> &'static [&'static str] {
         self.schemes
@@ -98,7 +122,7 @@ impl SourceFactory for FakeSourceFactory {
     fn capabilities(&self) -> SourceCapabilities {
         SourceCapabilities {
             direction: Direction::Pull,
-            backchannel: false,
+            backchannel: self.backchannel,
             keyframe_request: false,
             snapshot_uri: false,
         }
@@ -118,6 +142,9 @@ impl SourceFactory for FakeSourceFactory {
         let keyframes_every = one("keyframes_every_ms")
             .and_then(serde_json::Value::as_u64)
             .map(Duration::from_millis);
+        let backchannel = one("backchannel")
+            .and_then(serde_json::Value::as_str)
+            .and_then(fake_backchannel);
         let (crash, ready_after, audio) = match options {
             serde_json::Value::Null => (false, Duration::ZERO, FakeAudio::None),
             serde_json::Value::Object(map) if map.is_empty() => {
@@ -137,11 +164,12 @@ impl SourceFactory for FakeSourceFactory {
             _ if audio_name == Some("aac_drifting") => {
                 (false, Duration::ZERO, FakeAudio::AacDrifting)
             }
+            _ if backchannel.is_some() => (false, Duration::ZERO, FakeAudio::None),
             other => {
                 return Err(SourceConfigError::InvalidOptions {
                     scheme,
                     message: format!(
-                        "fake source takes no options but {{\"crash\": true}}, {{\"ready_after_ms\": n}}, {{\"keyframes_every_ms\": n}} or {{\"audio\": true | \"aac\" | \"aac_drifting\"}}, got {other}"
+                        "fake source takes no options but {{\"crash\": true}}, {{\"ready_after_ms\": n}}, {{\"keyframes_every_ms\": n}}, {{\"audio\": true | \"aac\" | \"aac_drifting\"}} or {{\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"}}, got {other}"
                     ),
                 });
             }
@@ -154,6 +182,7 @@ impl SourceFactory for FakeSourceFactory {
             ready_after,
             audio,
             keyframes_every,
+            backchannel,
         }))
     }
 }
@@ -257,7 +286,8 @@ pub fn fake_aac() -> Codec {
 /// publishes a frame of it every 64 ms, stamped with its capture time on
 /// the 64 ms grid from the moment it went live; drifting, it also sends
 /// Sender Reports every second from a second after it went live, whose
-/// audio clock runs 2 % fast.
+/// audio clock runs 2 % fast. With a backchannel it offers one in the slot
+/// before it goes live, and withdraws it when its run ends.
 #[derive(Debug)]
 pub struct FakeSource {
     /// The protocol name it reports.
@@ -274,6 +304,8 @@ pub struct FakeSource {
     audio: FakeAudio,
     /// Publish a video keyframe packet this often, without audio.
     keyframes_every: Option<Duration>,
+    /// The codec of the backchannel it offers, if any.
+    backchannel: Option<Codec>,
 }
 
 impl Source for FakeSource {
@@ -291,6 +323,7 @@ impl Source for FakeSource {
             "ready_after_ms": u64::try_from(self.ready_after.as_millis()).unwrap_or(u64::MAX),
             "audio": self.audio.name(),
             "keyframes_every_ms": self.keyframes_every.map(|every| u64::try_from(every.as_millis()).unwrap_or(u64::MAX)),
+            "backchannel": self.backchannel.as_ref().map(Codec::name),
         })
     }
 
@@ -299,8 +332,10 @@ impl Source for FakeSource {
         let abort = self.abort;
         let audio = self.audio;
         let keyframes_every = self.keyframes_every;
+        let backchannel = self.backchannel.clone();
+        let slot = ctx.backchannel.clone();
         let ready_after = ctx.time.sleep(self.ready_after);
-        Box::pin(async move {
+        let live = async move {
             // The ingest contract holds while waiting to go live too: a
             // cancel ends the run at once, whether or not the clock moves.
             tokio::select! {
@@ -318,6 +353,13 @@ impl Source for FakeSource {
                 },
                 90_000,
             );
+            // The receiver lives as long as the run: the packets sent in
+            // go nowhere, but the handle stays open.
+            let _uplink = backchannel.map(|codec| {
+                let (sender, uplink) = tokio::sync::mpsc::channel(8);
+                ctx.backchannel.offer(BackchannelHandle { codec, sender });
+                uplink
+            });
             let (codec, clock_rate, step) = match audio {
                 FakeAudio::None => {
                     ctx.tracks.ready();
@@ -391,6 +433,13 @@ impl Source for FakeSource {
                     }
                 }
             }
+        };
+        Box::pin(async move {
+            let exit = live.await;
+            // Gone with the run, as a source's backchannel is for the
+            // reconnect.
+            slot.withdraw();
+            exit
         })
     }
 }
@@ -451,8 +500,9 @@ impl OutputFactory for FakeOutputFactory {
 /// worker can run whole sessions without a WebRTC engine. It wants the
 /// H.264 video track and Opus or PCMU audio, in that order, as the WebRTC
 /// output does; an offer of `"refuse"` is refused as invalid SDP. The
-/// answer is [`ECHO_ANSWER`], followed by ` audio=<codec>` with audio and
-/// ` orientation=<name>` for a turned stream.
+/// answer is [`ECHO_ANSWER`], followed by ` audio=<codec>` with audio,
+/// ` backchannel=<codec>` with a backchannel and ` orientation=<name>` for
+/// a turned stream.
 #[derive(Debug)]
 pub struct EchoSessionFactory;
 
@@ -498,10 +548,15 @@ impl OutputFactory for EchoSessionFactory {
             .audio
             .as_ref()
             .map(|audio| format!("audio={}", audio.name()));
+        let backchannel = request
+            .backchannel
+            .as_ref()
+            .map(|backchannel| format!("backchannel={}", backchannel.name()));
         let orientation = (request.orientation != Orientation::NoTransform)
             .then(|| format!("orientation={}", request.orientation.name()));
         let answer = std::iter::once(ECHO_ANSWER.to_owned())
             .chain(audio)
+            .chain(backchannel)
             .chain(orientation)
             .collect::<Vec<_>>()
             .join(" ");
@@ -894,6 +949,65 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn a_fake_source_with_a_backchannel_offers_it_while_it_runs() {
+        assert!(!FakeSourceFactory::new(&["fake"]).capabilities().backchannel);
+        let factory = FakeSourceFactory::with_backchannel(&["fake"]);
+        assert!(factory.capabilities().backchannel);
+        let url = SourceUrl::parse("fake://cam/").unwrap();
+        for refused in [
+            serde_json::json!({"backchannel": "g722"}),
+            serde_json::json!({"backchannel": true}),
+        ] {
+            assert!(factory.validate(&url, &refused).is_err(), "{refused}");
+        }
+        for (name, codec) in [
+            ("pcmu", Codec::Pcmu),
+            ("pcma", Codec::Pcma),
+            ("opus", Codec::Opus { channels: 2 }),
+        ] {
+            let source = factory
+                .validate(&url, &serde_json::json!({ "backchannel": name }))
+                .unwrap();
+            let set = TrackSet::new(TrackLimits::default(), SystemClock.now());
+            let (clock, _reports) =
+                ClockInput::channel(Arc::new(crate::clock_map::ClockMapper::new()));
+            let cancel = CancellationToken::new();
+            let slot = BackchannelSlot::default();
+            let run = source.run(SourceCtx {
+                peer: ResolvedPeer {
+                    host: "cam".into(),
+                    addrs: vec![],
+                },
+                tracks: set.publisher(),
+                clock,
+                time: Arc::new(SystemClock),
+                backchannel: slot.clone(),
+                cancel: cancel.clone(),
+            });
+            let mut ready = set.ready();
+            let run = crate::task::spawn_named("test.fake_source", run);
+            assert!(ready.changed().await.is_ok());
+            // Offered before it went live, video only, and open.
+            let handle = slot.current().expect("offered");
+            assert_eq!(handle.codec, codec);
+            assert_eq!(set.tracks().len(), 1);
+            assert!(
+                handle
+                    .sender
+                    .try_send(pcmu_packet(SystemClock.now(), 0))
+                    .is_ok()
+            );
+            cancel.cancel();
+            assert!(matches!(
+                run.await.unwrap(),
+                SourceExit::Ended(SourceError::Ended(_))
+            ));
+            assert!(slot.current().is_none(), "withdrawn with the run");
+            assert!(handle.sender.is_closed());
+        }
+    }
+
     /// The ingest contract: a source honors `cancel` within 100 ms in every
     /// state, the wait to go live
     /// included. The clock never moves here, so only the cancel can end it.
@@ -1128,7 +1242,7 @@ mod tests {
             err,
             SourceConfigError::InvalidOptions {
                 scheme: "fake",
-                message: "fake source takes no options but {\"crash\": true}, {\"ready_after_ms\": n}, {\"keyframes_every_ms\": n} or {\"audio\": true | \"aac\" | \"aac_drifting\"}, got {\"transport\":\"udp\"}"
+                message: "fake source takes no options but {\"crash\": true}, {\"ready_after_ms\": n}, {\"keyframes_every_ms\": n}, {\"audio\": true | \"aac\" | \"aac_drifting\"} or {\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"}, got {\"transport\":\"udp\"}"
                     .into()
             }
         );
@@ -1293,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn the_echo_names_audio_and_a_turn_in_its_answer_and_reports_turns() {
+    fn the_echo_names_audio_the_backchannel_and_a_turn_in_its_answer_and_reports_turns() {
         let now = SystemClock.now();
         let turned = SessionRequest {
             offer: "v=0".into(),
@@ -1305,6 +1419,7 @@ mod tests {
             tcp_candidates: vec![],
             video: Arc::new(Codec::Pcmu),
             audio: Some(Arc::new(Codec::Pcmu)),
+            backchannel: Some(Codec::Pcma),
             orientation: Orientation::Rotate180,
             limits: crate::session::SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
@@ -1312,7 +1427,7 @@ mod tests {
         let (mut engine, answer) = EchoSessionFactory.open_session(turned, now).unwrap();
         assert_eq!(
             answer,
-            format!("{ECHO_ANSWER} audio=pcmu orientation=rotate_180")
+            format!("{ECHO_ANSWER} audio=pcmu backchannel=pcma orientation=rotate_180")
         );
         engine.set_orientation(Orientation::RotateLeft);
         assert_eq!(
@@ -1338,6 +1453,7 @@ mod tests {
             tcp_candidates: vec![],
             video: Arc::new(Codec::Pcmu),
             audio: None,
+            backchannel: None,
             orientation: Orientation::default(),
             limits: crate::session::SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,

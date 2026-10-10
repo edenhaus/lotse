@@ -302,6 +302,7 @@ impl Safari {
                 pps: None,
             }),
             audio: None,
+            backchannel: None,
             orientation: lotse_core::Orientation::default(),
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,

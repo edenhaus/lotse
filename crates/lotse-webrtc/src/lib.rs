@@ -19,6 +19,7 @@
 //! webrtc.org `abs-capture-time` extension (observed behavior, not a
 //! standard; `capture_time`).
 
+mod audio;
 mod capture_time;
 mod crypto;
 mod cvo;

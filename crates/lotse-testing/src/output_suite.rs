@@ -290,6 +290,7 @@ impl SessionUnderTest {
             tcp_candidates: vec![],
             video: track.codec(),
             audio: None,
+            backchannel: None,
             orientation: lotse_core::Orientation::default(),
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,

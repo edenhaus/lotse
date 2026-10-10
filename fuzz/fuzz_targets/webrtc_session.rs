@@ -216,6 +216,7 @@ fuzz_target!(|data: &[u8]| {
             pps: None,
         }),
         audio: audio.then(|| Arc::new(Codec::Pcmu)),
+        backchannel: None,
         orientation: Orientation::ALL[usize::from((setup >> 1) & 7)],
         limits: SessionLimits::default(),
         wall: SystemTime::UNIX_EPOCH,

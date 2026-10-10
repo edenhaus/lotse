@@ -49,6 +49,7 @@ use lotse_core::session::{
     Transport, apply_audio_event, apply_track_event,
 };
 use lotse_core::skew::AV_SYNC_LOST;
+use lotse_core::source::BackchannelSlot;
 use lotse_core::task::spawn_named;
 use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
 use lotse_ipc::{SessionEvent as IpcEvent, SessionSpec, datagram};
@@ -261,8 +262,7 @@ impl SessionManager {
     pub(crate) async fn open(
         &mut self,
         spec: SessionSpec,
-        tracks: Arc<DerivedTracks>,
-        mapper: Arc<ClockMapper>,
+        connection: ConnectionMedia,
         registries: &Registries,
         limits: SessionLimits,
     ) {
@@ -305,11 +305,17 @@ impl SessionManager {
             .insert(spec.ice_ufrag.clone(), inbound_tx.clone());
         let session_id = spec.session_id.clone();
         let ufrag = spec.ice_ufrag.clone();
+        let ConnectionMedia {
+            tracks,
+            mapper,
+            backchannel,
+        } = connection;
         let ctx = SessionCtx {
             spec,
             inbound: inbound_tx,
             tracks,
             mapper,
+            backchannel,
             factory: Arc::clone(factory),
             limits,
             udp: Arc::clone(&self.udp),
@@ -518,6 +524,8 @@ struct SessionCtx {
     tracks: Arc<DerivedTracks>,
     /// The connection's clock mapper.
     mapper: Arc<ClockMapper>,
+    /// The connection's backchannel slot, when its protocol has one.
+    backchannel: Option<BackchannelSlot>,
     /// The output that opens the session.
     factory: Arc<dyn OutputFactory>,
     /// The tunables.
@@ -764,6 +772,17 @@ struct Opened {
     uplink: Vec<u8>,
 }
 
+/// What a session takes from the connection it opens on.
+pub(crate) struct ConnectionMedia {
+    /// The connection's tracks, native and derived.
+    pub(crate) tracks: Arc<DerivedTracks>,
+    /// The connection's clock mapper.
+    pub(crate) mapper: Arc<ClockMapper>,
+    /// The connection's backchannel slot, when its source protocol can
+    /// carry audio back; talk-back is answered from what it holds.
+    pub(crate) backchannel: Option<BackchannelSlot>,
+}
+
 /// A relay candidate handed over before the engine exists.
 #[derive(Debug, Clone, Copy)]
 struct PendingRelay {
@@ -872,6 +891,13 @@ async fn open_session(
         tcp_candidates: ctx.spec.tcp_candidates.clone(),
         video: video.codec(),
         audio: audio.as_ref().map(|audio| audio.track.codec()),
+        // What the source offers now, behind its protocol's gate; never
+        // who talks.
+        backchannel: ctx
+            .backchannel
+            .as_ref()
+            .and_then(BackchannelSlot::current)
+            .map(|handle| handle.codec),
         orientation: Orientation::from_code(ctx.spec.orientation).unwrap_or_default(),
         limits: ctx.limits,
         wall: ctx.clock.wall_now(),
@@ -1424,6 +1450,7 @@ mod tests {
             inbound: inbound.clone(),
             tracks: DerivedTracks::new(Arc::clone(publisher.tracks()), Vec::new(), clock.clone()),
             mapper: Arc::new(ClockMapper::new()),
+            backchannel: None,
             factory: Arc::new(ScriptedOutput(Arc::clone(&script))),
             limits: SessionLimits::default(),
             udp: Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
@@ -1772,8 +1799,11 @@ mod tests {
             self.manager
                 .open(
                     spec(id, false),
-                    Arc::clone(&self.tracks),
-                    Arc::new(ClockMapper::new()),
+                    ConnectionMedia {
+                        tracks: Arc::clone(&self.tracks),
+                        mapper: Arc::new(ClockMapper::new()),
+                        backchannel: None,
+                    },
                     &self.registries,
                     SessionLimits::default(),
                 )

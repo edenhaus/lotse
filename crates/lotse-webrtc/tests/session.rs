@@ -71,6 +71,7 @@ fn request(offer: &str, video: Arc<Codec>) -> SessionRequest {
         tcp_candidates: vec![DAEMON_TCP.parse().unwrap()],
         video,
         audio: None,
+        backchannel: None,
         orientation: Orientation::default(),
         limits: SessionLimits::default(),
         wall: SystemClock.wall_now(),
@@ -2101,6 +2102,152 @@ fn rfc8829_5_3_1_the_viewer_plays_video_beside_an_inactive_audio_m_line() {
     }
     assert!(pair.viewer.audio_packets().is_empty());
     assert_eq!(pair.session.stats().audio_dropped, 1);
+}
+
+/// The audio m-sections of `sdp`, in order, each with its `m=` line
+/// first.
+fn audio_sections(sdp: &str) -> Vec<Vec<&str>> {
+    let mut sections: Vec<Vec<&str>> = Vec::new();
+    let mut inside = false;
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            inside = line.starts_with("m=audio ");
+            if inside {
+                sections.push(Vec::new());
+            }
+        }
+        if inside {
+            sections.last_mut().unwrap().push(line);
+        }
+    }
+    sections
+}
+
+/// The encoding an m-section names first in its format list: the codec
+/// the offerer sends with on it (RFC 3264 §6.1).
+fn first_encoding<'a>(section: &[&'a str]) -> &'a str {
+    let pt = &payload_types(section)[0];
+    section
+        .iter()
+        .find_map(|line| line.strip_prefix(&format!("a=rtpmap:{pt} ")))
+        .unwrap()
+}
+
+/// The fixture matrix, {dedicated talk-back m-line,
+/// `sendrecv` downlink m-line} × {backchannel present, absent}, with a
+/// PCMU stream and a PCMA backchannel: talk-back is received only with a
+/// backchannel, in its codec first; the downlink plays either way. The
+/// request carries no talker, so whether another session talks cannot
+/// change the answer.
+#[test]
+fn rfc8829_5_3_1_talk_back_is_answered_by_offer_shape_and_backchannel() {
+    use lotse_testing::viewer::TalkbackOffer;
+
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    for (shape, backchannel, downlink, talkback, viewer_downlink, viewer_talkback) in [
+        (
+            TalkbackOffer::Dedicated,
+            Some(Codec::Pcma),
+            "a=sendonly",
+            "a=recvonly",
+            Direction::RecvOnly,
+            Direction::SendOnly,
+        ),
+        (
+            TalkbackOffer::Dedicated,
+            None,
+            "a=sendonly",
+            "a=inactive",
+            Direction::RecvOnly,
+            Direction::Inactive,
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            Some(Codec::Pcma),
+            "a=sendrecv",
+            "a=sendrecv",
+            Direction::SendRecv,
+            Direction::SendRecv,
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            None,
+            "a=sendonly",
+            "a=sendonly",
+            Direction::RecvOnly,
+            Direction::RecvOnly,
+        ),
+    ] {
+        let what = format!("{shape:?} with {backchannel:?}");
+        let viewer =
+            Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, shape).expect("a viewer");
+        let mut request = request(viewer.offer(), h264(None));
+        request.audio = Some(Arc::new(Codec::Pcmu));
+        request.backchannel = backchannel.clone();
+        let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+        let sections = audio_sections(&answer);
+        let dedicated = shape == TalkbackOffer::Dedicated;
+        assert_eq!(
+            sections.len(),
+            if dedicated { 2 } else { 1 },
+            "{what}: {answer}"
+        );
+        let (down, up) = (&sections[0], sections.last().unwrap());
+        assert!(down.contains(&downlink), "{what}: {answer}");
+        assert!(up.contains(&talkback), "{what}: {answer}");
+        // The session sends PCMU on the downlink m-line in every case.
+        assert!(down.contains(&"a=rtpmap:0 PCMU/8000"), "{what}: {answer}");
+        if backchannel.is_some() {
+            assert_eq!(first_encoding(up), "PCMA/8000", "{what}: {answer}");
+        }
+        if dedicated && backchannel.is_none() {
+            assert_inactive_audio(
+                &request.offer.replacen("m=audio", "m=audiox", 1),
+                &answer.replacen("m=audio", "m=audiox", 1),
+            );
+        }
+        // No SSRC on the talk-back m-line: the daemon sends nothing there.
+        if dedicated {
+            assert!(
+                !up.iter().any(|line| line.starts_with("a=ssrc:")),
+                "{what}: {answer}"
+            );
+        }
+
+        pair.connect(&answer);
+        assert!(
+            !pair
+                .events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Warning { .. })),
+            "{what}: {:?}",
+            pair.events
+        );
+        assert_eq!(
+            pair.viewer.audio_direction(),
+            Some(viewer_downlink),
+            "{what}"
+        );
+        assert_eq!(
+            pair.viewer.talkback_direction(),
+            Some(viewer_talkback),
+            "{what}"
+        );
+        for seq in 0..5_u16 {
+            let packet = audio_packet(seq, u32::from(seq) * 160, 0, pair.now);
+            pair.session.write_audio(pair.now, &packet, pair.now);
+        }
+        pair.drain();
+        pair.run_until(|p| p.viewer.audio_packets().len() >= 5, 500, &what);
+        assert!(
+            pair.viewer
+                .audio_packets()
+                .iter()
+                .all(|packet| *packet.header.payload_type == 0),
+            "{what}"
+        );
+    }
 }
 
 #[test]

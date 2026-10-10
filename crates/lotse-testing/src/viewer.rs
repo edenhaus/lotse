@@ -20,6 +20,29 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 /// The direction [`Viewer::audio_direction`] reports.
 pub use str0m::media::Direction;
 
+/// How a viewer offers talk-back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TalkbackOffer {
+    /// A third audio m-line after the video one, `sendonly` and without a
+    /// track, as a talk-back capable frontend adds it: the recommended
+    /// shape.
+    Dedicated,
+    /// The downlink audio m-line `sendrecv`, as a player that sends
+    /// talk-back on its downlink m-line offers it (observed 2026-10-07).
+    SendRecv,
+}
+
+/// The audio m-lines a viewer offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioOffer {
+    /// None.
+    Off,
+    /// A `recvonly` one before the video.
+    Receive,
+    /// Talk-back as well.
+    Talkback(TalkbackOffer),
+}
+
 /// A datagram the viewer wants sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outgoing {
@@ -52,6 +75,8 @@ pub struct Viewer {
     packets: Vec<RtpPacket>,
     /// The audio mid, without an audio m-line `None`.
     audio_mid: Option<Mid>,
+    /// The mid talk-back is offered on, without it `None`.
+    talkback_mid: Option<Mid>,
     /// The payload types of the offer's audio m-line, empty without one.
     audio_pts: Vec<u8>,
     /// Audio RTP received, in arrival order.
@@ -109,7 +134,7 @@ impl Viewer {
     /// A viewer at `addr` whose offer is ready; `Err` names what the
     /// engine refused (an unroutable address).
     pub fn new(addr: SocketAddr, now: Instant) -> Result<Self, String> {
-        Self::with_transport(addr, false, false, &[], now)
+        Self::with_transport(addr, false, AudioOffer::Off, &[], now)
     }
 
     /// A viewer whose only video codecs are H.265 entries, one per
@@ -122,20 +147,31 @@ impl Viewer {
         now: Instant,
         entries: &[(u8, u8, u8)],
     ) -> Result<Self, String> {
-        Self::with_transport(addr, false, false, entries, now)
+        Self::with_transport(addr, false, AudioOffer::Off, entries, now)
     }
 
     /// A viewer that also receives audio: a `recvonly` audio m-line before
     /// the video one, as a web player offers them.
     pub fn new_with_audio(addr: SocketAddr, now: Instant) -> Result<Self, String> {
-        Self::with_transport(addr, false, true, &[], now)
+        Self::with_transport(addr, false, AudioOffer::Receive, &[], now)
+    }
+
+    /// A viewer that receives audio and offers talk-back the way `offer`
+    /// says, with no track to send yet: the browser has not asked for the
+    /// microphone.
+    pub fn new_with_talkback(
+        addr: SocketAddr,
+        now: Instant,
+        offer: TalkbackOffer,
+    ) -> Result<Self, String> {
+        Self::with_transport(addr, false, AudioOffer::Talkback(offer), &[], now)
     }
 
     /// A viewer whose one candidate is an active ICE-TCP one at `addr`, as
     /// a browser on a network that blocks UDP offers it. The caller opens
     /// the connection a TCP [`Outgoing`] asks for and frames it.
     pub fn new_tcp(addr: SocketAddr, now: Instant) -> Result<Self, String> {
-        Self::with_transport(addr, true, false, &[], now)
+        Self::with_transport(addr, true, AudioOffer::Off, &[], now)
     }
 
     /// A viewer with a UDP or an active ICE-TCP candidate, with or without
@@ -147,7 +183,7 @@ impl Viewer {
     fn with_transport(
         addr: SocketAddr,
         tcp: bool,
-        audio: bool,
+        audio: AudioOffer,
         h265: &[(u8, u8, u8)],
         now: Instant,
     ) -> Result<Self, String> {
@@ -165,7 +201,7 @@ impl Viewer {
         let mut config = Rtc::builder()
             .set_rtp_mode(true)
             .set_extension_map(extensions);
-        if audio {
+        if audio != AudioOffer::Off {
             // What browsers offer for audio: Opus, G.722, PCMU and PCMA.
             config = config
                 .enable_g722(true, false)
@@ -195,9 +231,23 @@ impl Viewer {
         .map_err(|err| err.to_string())?;
         rtc.add_local_candidate(host);
         let mut api = rtc.sdp_api();
+        let downlink = match audio {
+            AudioOffer::Off => None,
+            AudioOffer::Receive | AudioOffer::Talkback(TalkbackOffer::Dedicated) => {
+                Some(Direction::RecvOnly)
+            }
+            AudioOffer::Talkback(TalkbackOffer::SendRecv) => Some(Direction::SendRecv),
+        };
         let audio_mid =
-            audio.then(|| api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None));
+            downlink.map(|direction| api.add_media(MediaKind::Audio, direction, None, None, None));
         let mid = api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        let talkback_mid = match audio {
+            AudioOffer::Talkback(TalkbackOffer::Dedicated) => {
+                Some(api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None))
+            }
+            AudioOffer::Talkback(TalkbackOffer::SendRecv) => audio_mid,
+            AudioOffer::Off | AudioOffer::Receive => None,
+        };
         let (offer, pending) = api
             .apply()
             .ok_or_else(|| "the offer has no changes".to_owned())?;
@@ -221,6 +271,7 @@ impl Viewer {
             mid,
             packets: Vec::new(),
             audio_mid,
+            talkback_mid,
             audio_pts,
             audio_packets: Vec::new(),
             ice_states: Vec::new(),
@@ -254,6 +305,21 @@ impl Viewer {
             return None;
         }
         self.audio_mid
+            .and_then(|mid| self.rtc.media(mid))
+            .filter(|media| !media.disabled())
+            .map(str0m::media::Media::direction)
+    }
+
+    /// The direction the applied answer gives the m-line talk-back is
+    /// offered on, from the viewer's side (`sendonly` or `sendrecv` while
+    /// the daemon takes talk-back, else `recvonly` or `inactive`); `None`
+    /// without talk-back offered, before the answer, or when the answer
+    /// rejected it.
+    pub fn talkback_direction(&self) -> Option<Direction> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.talkback_mid
             .and_then(|mid| self.rtc.media(mid))
             .filter(|media| !media.disabled())
             .map(str0m::media::Media::direction)

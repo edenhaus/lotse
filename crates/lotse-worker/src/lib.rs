@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::derived::DerivedTracks;
-use crate::sessions::SessionManager;
+use crate::sessions::{ConnectionMedia, SessionManager};
 
 /// How often the worker pushes its counters.
 pub const STATS_INTERVAL: Duration = Duration::from_secs(1);
@@ -168,6 +168,11 @@ struct Running {
     /// The tracks as last reported to the supervisor; empty until the
     /// source first went live.
     reported: Vec<TrackInfo>,
+    /// The connection's backchannel slot, when its source protocol can
+    /// carry audio back (`SourceCapabilities::backchannel`, the gate of
+    /// two-way audio): sessions answer talk-back from what it holds. `None`
+    /// for a protocol without one, whose slot no session reads.
+    backchannel: Option<BackchannelSlot>,
 }
 
 /// One source runner's handles.
@@ -180,6 +185,8 @@ struct Runner {
     task: JoinHandle<()>,
     /// Where its attempts wait for the supervisor's grants.
     gate: ConnectGate,
+    /// Its backchannel slot, when its source protocol has one.
+    backchannel: Option<BackchannelSlot>,
 }
 
 /// The standby source a `SwitchSource` started: it declares into a staging
@@ -538,6 +545,9 @@ impl Serving<'_> {
             mapper: std::mem::replace(&mut running.mapper, standby.runner.mapper),
             task: std::mem::replace(&mut running.task, standby.runner.task),
             gate: std::mem::replace(&mut running.gate, standby.runner.gate),
+            // Sessions opened from now on answer talk-back from the new
+            // source's slot; the old one is withdrawn as its source stops.
+            backchannel: std::mem::replace(&mut running.backchannel, standby.runner.backchannel),
         };
         stop_runner(old, &self.clock).await;
         // The old runner's last reports, `Stopped` included, are not the
@@ -585,8 +595,11 @@ impl Serving<'_> {
                 manager
                     .open(
                         spec,
-                        Arc::clone(&source.tracks),
-                        Arc::clone(&source.mapper),
+                        ConnectionMedia {
+                            tracks: Arc::clone(&source.tracks),
+                            mapper: Arc::clone(&source.mapper),
+                            backchannel: source.backchannel.clone(),
+                        },
                         &self.registries,
                         self.settings.session,
                     )
@@ -706,6 +719,7 @@ fn start_source(
         task: runner.task,
         gate: runner.gate,
         reported: Vec::new(),
+        backchannel: runner.backchannel,
     })
 }
 
@@ -746,12 +760,20 @@ fn start_runner(
             code: "invalid_request",
             message: err.to_string(),
         })?;
+    // Two-way audio stays off for a protocol that cannot carry audio
+    // back, whatever its source puts in the slot.
+    let backchannel = factory
+        .capabilities()
+        .backchannel
+        .then(BackchannelSlot::default);
+    let capable = backchannel.is_some();
     tracing::info!(
         connection = %spec.connection_id,
         url = %url,
         peer = %spec.peer_host,
         addrs = ?spec.peer_addrs,
         role,
+        backchannel = capable,
         "running source"
     );
 
@@ -766,7 +788,7 @@ fn start_runner(
         },
         native,
         Arc::clone(&mapper),
-        BackchannelSlot::default(),
+        backchannel.clone().unwrap_or_default(),
         Arc::clone(clock),
         settings.runner,
         ReconnectBackoff::new(jitter_seed(clock.as_ref())),
@@ -780,6 +802,7 @@ fn start_runner(
         mapper,
         task,
         gate,
+        backchannel,
     })
 }
 
@@ -1417,6 +1440,61 @@ mod tests {
             };
         }
         found.unwrap()
+    }
+
+    /// Talk-back is answered from the backchannel the source offers, and
+    /// only when its protocol declares one: the gate that keeps two-way
+    /// audio off until a source can send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_learns_the_backchannel_only_behind_the_protocols_gate() {
+        for (factory, options, expected) in [
+            (
+                FakeSourceFactory::with_backchannel(&["fake"]),
+                r#"{"backchannel": "pcma"}"#,
+                format!("{ECHO_ANSWER} backchannel=pcma"),
+            ),
+            (
+                FakeSourceFactory::with_backchannel(&["fake"]),
+                "{}",
+                ECHO_ANSWER.to_owned(),
+            ),
+            (
+                FakeSourceFactory::new(&["fake"]),
+                r#"{"backchannel": "pcma"}"#,
+                ECHO_ANSWER.to_owned(),
+            ),
+        ] {
+            let mut registries = Registries::default();
+            registries.sources.register(Arc::new(factory)).unwrap();
+            registries
+                .outputs
+                .register(Arc::new(EchoSessionFactory))
+                .unwrap();
+            let mut h = start_with_settings(Arc::new(registries), quiet_settings());
+            h.next().await;
+            let shared = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let (_datagrams, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
+            h.tx.send_msg(
+                &ToWorker::Sockets,
+                &[OwnedFd::from(shared).as_fd(), theirs.as_fd()],
+            )
+            .await
+            .unwrap();
+            h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", options)), &[])
+                .await
+                .unwrap();
+            until_live(&mut h).await;
+            h.tx.send_msg(&ToWorker::OpenSession(session_spec("talk")), &[])
+                .await
+                .unwrap();
+            let answer =
+                session_event_where(&mut h, |e| matches!(e, SessionEvent::Answer { .. })).await;
+            assert_eq!(answer, SessionEvent::Answer { sdp: expected }, "{options}");
+            h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+                .await
+                .unwrap();
+            assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+        }
     }
 
     // Multi-threaded, so a session task that never yields cannot keep the
