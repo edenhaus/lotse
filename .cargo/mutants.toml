@@ -56,4 +56,7 @@ exclude_re = [
     "h265/packet.rs:\\d+:27: replace > with >= in PacketNormalizer::pack_units",
     # retina's RTP channel is even, so OR-ing in the RTCP bit and XOR-ing it set the same channel.
     "lotse-rtsp/src/udp.rs:.*replace \\| with \\^ in UdpRelay::datagram$",
+    # Reading one more piece of the body before the sniff decides the same: it looks at the
+    # first bytes only, and every byte read is handed on either way.
+    "lotse-http/src/source/mod.rs:.*replace < with <= in sniff$",
 ]

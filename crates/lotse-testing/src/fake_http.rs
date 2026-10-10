@@ -15,7 +15,9 @@
 //!
 //! Runs on axum, whose hyper server is the third-party HTTP/1.1 peer; it
 //! records every request it saw and counts connections, so tests can
-//! assert on persistence, `Host`, `User-Agent` and `Authorization`.
+//! assert on persistence, `Host`, `User-Agent` and `Authorization`. In TLS
+//! mode ([`FakeHttp::start_tls`]) it serves the same script as `https`
+//! (RFC 9110 §4.2.2) with a [`CameraTls`] certificate, through rustls.
 
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
@@ -32,19 +34,22 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use axum::serve::ListenerExt as _;
+use axum::serve::{Listener, ListenerExt as _};
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 use futures_util::stream;
 use lotse_core::task::spawn_named;
 use md5::Md5;
 use sha2::{Digest as _, Sha256};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::base64;
+use crate::fake_camera::CameraTls;
 
 /// The realm of the server's challenges.
 pub const REALM: &str = "fake http";
@@ -188,8 +193,38 @@ impl Shared {
     }
 }
 
+/// The listener of the TLS mode: each accepted connection's handshake
+/// completes before it is served; a failed one is dropped and logged.
+struct TlsListener {
+    /// The TCP side.
+    tcp: TcpListener,
+    /// The handshakes.
+    acceptor: TlsAcceptor,
+}
+
+impl Listener for TlsListener {
+    type Io = TlsStream<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = Listener::accept(&mut self.tcp).await;
+            match self.acceptor.accept(stream).await {
+                Ok(tls) => return (tls, addr),
+                Err(err) => tracing::debug!(error = %err, "fake http: TLS handshake failed"),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.tcp.local_addr()
+    }
+}
+
 /// A running fake HTTP server.
 pub struct FakeHttp {
+    /// `http` or, in TLS mode, `https`.
+    scheme: &'static str,
     /// Where it listens.
     addr: SocketAddr,
     /// The script and the record.
@@ -213,7 +248,21 @@ impl FakeHttp {
     /// 404) until stopped.
     pub async fn start() -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-        let addr = listener.local_addr()?;
+        Ok(Self::serve("http", listener))
+    }
+
+    /// As [`FakeHttp::start`], over TLS with `tls`'s certificate: `https`.
+    pub async fn start_tls(tls: &CameraTls) -> io::Result<Self> {
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let acceptor = TlsAcceptor::from(Arc::clone(&tls.config));
+        Ok(Self::serve("https", TlsListener { tcp, acceptor }))
+    }
+
+    /// Serves the script on `listener`.
+    fn serve<L: Listener<Addr = SocketAddr>>(scheme: &'static str, listener: L) -> Self {
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
         let shared = Arc::new(Shared {
             script: Mutex::default(),
             cancel: CancellationToken::new(),
@@ -235,12 +284,13 @@ impl FakeHttp {
                 tracing::warn!(error = %err, "fake http: serving failed");
             }
         });
-        Ok(Self {
+        Self {
+            scheme,
             addr,
             shared,
             connections,
             serve,
-        })
+        }
     }
 
     /// The address.
@@ -248,9 +298,9 @@ impl FakeHttp {
         self.addr
     }
 
-    /// `http://127.0.0.1:<port><target>`.
+    /// `http://127.0.0.1:<port><target>`, `https://` in TLS mode.
     pub fn url(&self, target: &str) -> String {
-        format!("http://{}{target}", self.addr)
+        format!("{}://{}{target}", self.scheme, self.addr)
     }
 
     /// Answers `target` (path and query) with `reply` from now on.

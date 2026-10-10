@@ -448,6 +448,13 @@ impl TrackSet {
         }
     }
 
+    /// The bounds every track of the set enforces, for a source that sizes
+    /// its own buffers by them before it declares a track (a
+    /// demultiplexer's largest frame).
+    pub const fn limits(&self) -> TrackLimits {
+        self.limits
+    }
+
     /// What the connection lost or refused before its tracks, over every
     /// attempt so far.
     pub fn ingest(&self) -> IngestStats {
@@ -962,6 +969,22 @@ mod tests {
         }
         assert_eq!(v0.epoch(), 1);
         assert_eq!(a0.epoch(), 1);
+    }
+
+    #[test]
+    fn the_set_hands_out_the_limits_its_tracks_enforce() {
+        let limits = TrackLimits {
+            max_frame_bytes: 7,
+            ..TrackLimits::default()
+        };
+        let set = TrackSet::new(limits, SystemClock.now());
+        assert_eq!(set.limits(), limits);
+        assert_eq!(
+            set.publisher()
+                .declare(Kind::Video, h264(), 90_000)
+                .limits(),
+            set.limits()
+        );
     }
 
     #[test]

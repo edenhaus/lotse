@@ -271,8 +271,9 @@ impl CameraAudio {
 /// the repository.
 #[derive(Clone)]
 pub struct CameraTls {
-    /// The server configuration.
-    config: Arc<rustls::ServerConfig>,
+    /// The server configuration; the fake HTTP server's TLS mode
+    /// serves it too.
+    pub(crate) config: Arc<rustls::ServerConfig>,
     /// The certificate, DER.
     certificate: CertificateDer<'static>,
 }

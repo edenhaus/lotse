@@ -19,9 +19,12 @@ hyper = { workspace = true, features = ["client"] } # the HTTP/1.1 connections t
 hyper-util = { workspace = true } # `TokioIo` between the connection's tokio stream and hyper
 lotse-codec = { workspace = true } # ADTS splitting of AAC from MPEG-TS
 lotse-core = { workspace = true } # the codecs and kinds of a demultiplexed program's tracks, and the tracks it is published on
+lotse-tls = { workspace = true } # `https`: the certificate check and the TLS stream to the server; the `tls_fingerprint` option
 m3u8-rs = { workspace = true }
 mp4-atom = { workspace = true }
 mpeg2ts-reader = { workspace = true }
+serde = { workspace = true } # the typed source options
+serde_json = { workspace = true } # the untyped options `stream/put` carries, and their redacted form
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "macros"] } # the TCP connections to the source; deadlines raced against requests and reads
 tokio-util = { workspace = true } # the cancellation token that ends a connection's task
