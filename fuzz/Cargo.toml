@@ -202,3 +202,10 @@ path = "fuzz_targets/ts_demux.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fmp4_segment"
+path = "fuzz_targets/fmp4_segment.rs"
+test = false
+doc = false
+bench = false

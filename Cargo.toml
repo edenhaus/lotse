@@ -92,6 +92,11 @@ m3u8-rs = { version = "6", default-features = false, features = ["parser"] }
 # no features: encoding_rs (for descriptor text), fixedbitset and the SMPTE-RA format identifiers
 # come with it; its `log` warnings go nowhere, as no `log` logger is installed.
 mpeg2ts-reader = { version = "0.18", default-features = false }
+# The ISO base media file format boxes of the HTTP source's fragmented MP4 (ISO/IEC 14496-12): the
+# init segment's moov (stsd with avcC, hvcC and esds) and each media segment's moof (tfhd, tfdt,
+# trun); bounded `Vec`s for untrusted counts, no `unsafe` in the decoding. Its optional features
+# (bytes, serde, tokio) are off; num, derive_more, pastey and thiserror 1 come with it.
+mp4-atom = { version = "0.16", default-features = false }
 # RTSP message parsing and serialization for the fake camera of the tests.
 rtsp-types = { version = "0.1", default-features = false }
 # H.264 bitstream syntax (SPS profile, level and dimensions, SEI) on the side branch; the packet

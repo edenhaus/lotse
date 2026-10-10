@@ -13,7 +13,10 @@ pub mod sps;
 
 pub use frame::{AccessUnit, Depacketizer, FrameStats};
 pub use framed::FramedNormalizer;
-pub use nal::{ParameterSets, PayloadError, annex_b_units, packetize};
+pub use nal::{
+    LengthPrefixError, ParameterSets, PayloadError, annex_b_units, length_prefixed_to_annex_b,
+    packetize,
+};
 pub use packet::{
     DEFAULT_MAX_PAYLOAD, FrameOverLimit, LIBWEBRTC_MAX_FRAME_PACKETS, NormalizedPacket,
     PacketNormalizer, PacketStats,

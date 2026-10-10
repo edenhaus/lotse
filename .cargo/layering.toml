@@ -33,6 +33,7 @@ rtsp-types = ["lotse-rtsp", "lotse-testing"]
 sdp-types = ["lotse-rtsp", "lotse-testing"]
 m3u8-rs = ["lotse-http"]
 mpeg2ts-reader = ["lotse-http"]
+mp4-atom = ["lotse-http"]
 str0m = ["lotse-webrtc", "lotse-testing"]
 dimpl = ["lotse-webrtc"] # DTLS of str0m's crypto provider
 rustls = ["lotse-rtsp", "lotse-testing"] # rtsps; the fake camera's TLS mode

@@ -17,11 +17,12 @@ use lotse_core::{Codec, Kind};
 /// video track's timestamps: 90 kHz (ISO/IEC 13818-1 §2.4.3.7, `PTS`).
 pub const TS_CLOCK_RATE: u32 = 90_000;
 
-/// The tracks of the program, in the order the program map lists them.
+/// The tracks of the program, in the order the program map (MPEG-TS) or
+/// the movie box (fragmented MP4) lists them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     /// The program they belong to (ISO/IEC 13818-1 §2.4.4.3,
-    /// `program_number`).
+    /// `program_number`); 0 for fragmented MP4, which has no programs.
     pub program_number: u16,
     /// The tracks; [`Unit::track`] indexes them.
     pub tracks: Vec<LayoutTrack>,
@@ -31,15 +32,19 @@ pub struct Layout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutTrack {
     /// The packet identifier carrying it (ISO/IEC 13818-1 §2.4.4.8,
-    /// `elementary_PID`).
-    pub pid: u16,
-    /// Its `stream_type` (ISO/IEC 13818-1 Table 2-34).
+    /// `elementary_PID`), or its `track_ID` in fragmented MP4 (ISO/IEC
+    /// 14496-12 §8.3.2).
+    pub id: u32,
+    /// Its `stream_type` (ISO/IEC 13818-1 Table 2-34); 0 for fragmented
+    /// MP4, whose sample entry names the codec instead.
     pub stream_type: u8,
     /// Video or audio.
     pub kind: Kind,
-    /// The codec. Video starts without parameter sets, which the
-    /// normalizer finds in band; [`Codec::Unsupported`] for a stream that
-    /// is not demultiplexed, whose units never come.
+    /// The codec. Video from MPEG-TS starts without parameter sets, which
+    /// the normalizer finds in band; fragmented MP4 video carries those
+    /// of its `avcC` or `hvcC` (ISO/IEC 14496-15 §5.3.3, §8.3.3), which
+    /// seed the normalizers as an SDP's sets do. [`Codec::Unsupported`]
+    /// for a stream that is not read, whose units never come.
     pub codec: Codec,
     /// The clock of its [`Unit::ts`]: [`TS_CLOCK_RATE`] for video and for
     /// an unsupported track, the sampling rate for AAC.

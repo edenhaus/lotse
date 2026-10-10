@@ -381,7 +381,7 @@ impl Audio {
 }
 
 /// `value` within the range of `i64`.
-fn clamp(value: i128) -> i64 {
+pub(crate) fn clamp(value: i128) -> i64 {
     i64::try_from(value.clamp(i128::from(i64::MIN), i128::from(i64::MAX))).unwrap_or_default()
 }
 
@@ -478,7 +478,7 @@ impl Track {
             Content::Unsupported(kind, name) => unsupported(*kind, name),
         };
         LayoutTrack {
-            pid: self.pid,
+            id: u32::from(self.pid),
             stream_type: self.stream_type,
             kind,
             codec,

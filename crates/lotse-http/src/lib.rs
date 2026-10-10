@@ -1,8 +1,8 @@
 //! HTTP source (M6): HLS with MPEG-TS and fragmented MP4 segments, and raw
 //! MPEG-TS over HTTP. So far the HLS playlist parser and the choice of
 //! variant, audio rendition and segments from the parsed playlists, the
-//! MPEG-TS demultiplexer, and the pacing and publishing of its units on
-//! the tracks.
+//! MPEG-TS demultiplexer and the fragmented MP4 reader, and the pacing
+//! and publishing of their units on the tracks.
 //!
 //! Runs in a worker, on bytes from the network: every parser here is fuzzed.
 //! May depend on `lotse-core` and `lotse-codec` only, never on another source
@@ -11,8 +11,10 @@
 //! Standards: RFC 8216 (HTTP Live Streaming), RFC 6381 §3 (the codec names
 //! of a variant's `CODECS`), RFC 3986 §5.2 (reference resolution of
 //! playlist URIs), RFC 6454 §4 and §5 (the origin a URI must share with its
-//! playlist).
+//! playlist), ISO/IEC 13818-1 (MPEG-TS), ISO/IEC 14496-12 and 14496-15
+//! (fragmented MP4 with AVC and HEVC).
 
+pub mod fmp4;
 pub mod hls;
 pub mod media;
 pub mod pace;

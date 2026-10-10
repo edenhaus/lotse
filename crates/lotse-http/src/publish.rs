@@ -164,20 +164,29 @@ struct Frame {
 }
 
 impl Video {
-    /// Fresh layers for `codec` with units up to `max_frame_bytes`, no
-    /// parameter sets known: MPEG-TS carries them in band. `None` for
-    /// codecs without a normalizer.
+    /// Fresh layers for `codec` with units up to `max_frame_bytes`,
+    /// seeded with the parameter sets the codec carries: none from
+    /// MPEG-TS, which carries them in band; those of the `avcC` or
+    /// `hvcC` from fragmented MP4 (ISO/IEC 14496-15 §5.3.3, §8.3.3).
+    /// `None` for codecs without a normalizer.
     fn new(codec: &Codec, max_frame_bytes: usize) -> Option<Self> {
         match codec {
-            Codec::H264 { .. } => Some(Self::H264(h264::FramedNormalizer::new(
+            Codec::H264 { sps, pps, .. } => Some(Self::H264(h264::FramedNormalizer::new(
                 DEFAULT_MAX_PAYLOAD,
                 max_frame_bytes,
-                h264::ParameterSets::default(),
+                h264::ParameterSets {
+                    sps: sps.clone(),
+                    pps: pps.clone(),
+                },
             ))),
-            Codec::H265 { .. } => Some(Self::H265(h265::FramedNormalizer::new(
+            Codec::H265 { vps, sps, pps } => Some(Self::H265(h265::FramedNormalizer::new(
                 DEFAULT_MAX_PAYLOAD,
                 max_frame_bytes,
-                h265::ParameterSets::default(),
+                h265::ParameterSets {
+                    vps: vps.clone(),
+                    sps: sps.clone(),
+                    pps: pps.clone(),
+                },
             ))),
             _ => None,
         }
@@ -390,7 +399,7 @@ impl Publisher {
             let this = Declared::of(track);
             tracing::info!(
                 program = layout.program_number,
-                pid = track.pid,
+                id = track.id,
                 stream_type = track.stream_type,
                 kind = %this.kind,
                 codec = this.codec.name(),
@@ -570,9 +579,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::fmp4::Reader;
+    use crate::fmp4::test_data::{H264_AAC_0, H264_AAC_1, H264_AAC_INIT, H265_0, H265_INIT};
     use crate::media::Event;
     use crate::ts::Demuxer;
     use crate::ts::test_data::{AUDIO_PID, H264_AAC, H264_AAC16K, H265_V1, VIDEO_PID};
+    use lotse_codec::h264::annex_b_units;
 
     const LEAD: Duration = Duration::from_secs(30);
 
@@ -682,9 +694,9 @@ mod tests {
         Duration::from_nanos(u64::try_from(ticks.max(0) * 1_000_000_000 / 90_000).unwrap())
     }
 
-    fn track(kind: Kind, codec: Codec, clock_rate: u32, pid: u16) -> LayoutTrack {
+    fn track(kind: Kind, codec: Codec, clock_rate: u32, id: u32) -> LayoutTrack {
         LayoutTrack {
-            pid,
+            id,
             stream_type: 0,
             kind,
             codec,
@@ -814,7 +826,7 @@ mod tests {
         let declared = logs.lines("http: declaring a track of the program");
         assert_eq!(declared.len(), 2);
         assert!(
-            declared[0].contains("pid=256") && declared[0].contains("codec=\"h264\""),
+            declared[0].contains("id=256") && declared[0].contains("codec=\"h264\""),
             "{declared:?}"
         );
         let tracks = f.set.tracks();
@@ -860,6 +872,90 @@ mod tests {
         let out = frames(&mut sub);
         assert_eq!(out.len(), 10);
         assert!(out[0].keyframe);
+    }
+
+    fn read_fmp4(init: &[u8], segment: &[u8]) -> (Layout, Vec<Unit>) {
+        let mut reader = Reader::new(init, TrackLimits::default().max_frame_bytes).unwrap();
+        let mut units = Vec::new();
+        reader.read_segment(segment, &mut units).unwrap();
+        (reader.layout().clone(), units)
+    }
+
+    #[test]
+    fn iso14496_15_5_3_3_the_avcc_parameter_sets_seed_the_normalizers() {
+        let (layout, units) = read_fmp4(H264_AAC_INIT, H264_AAC_0);
+        let mut f = start(&layout, LEAD);
+        assert_declared_h264_and_aac(&f.set);
+        let tracks = f.set.tracks();
+        // Declared with the avcC's sets, as an SDP's.
+        let declared = Codec::clone(&tracks[0].codec());
+        assert_h264_codec(&declared);
+        let mut video_frames = tracks[0].subscribe_frames();
+        let mut video_packets = tracks[0].subscribe_packets();
+        let mut audio_frames = tracks[1].subscribe_frames();
+        play(&mut f.publisher, units, f.t0);
+        // The samples carry no SPS or PPS: both layers put the seeded
+        // ones before the IDR.
+        let out = frames(&mut video_frames);
+        assert_eq!(out.len(), 10);
+        assert!(out[0].keyframe);
+        let types: Vec<u8> = annex_b_units(&out[0].payload)
+            .iter()
+            .map(|nal| nal[0] & 0x1f)
+            .collect();
+        assert_eq!(types, [6, 7, 8, 5]);
+        let live = packets(&mut video_packets);
+        let head: Vec<(bool, bool, u8)> = live
+            .iter()
+            .take(3)
+            .map(|p| (p.frame_start, p.keyframe_start, p.payload[0] & 0x1f))
+            .collect();
+        // The SEI, the sets in a STAP-A at the joining point (RFC 6184
+        // §5.7.1), the IDR in FU-A fragments (§5.8).
+        assert_eq!(
+            head,
+            [(true, false, 6), (false, true, 24), (false, false, 28)]
+        );
+        assert_eq!(*tracks[0].codec(), declared, "no update without news");
+        assert_audio_frames(&frames(&mut audio_frames));
+        // A new epoch seeds the fresh normalizers again.
+        f.publisher.new_epoch("test");
+        let (_, units) = read_fmp4(H264_AAC_INIT, H264_AAC_1);
+        play(&mut f.publisher, units, f.t0 + Duration::from_secs(1));
+        let out = frames(&mut video_frames);
+        assert_eq!(out.len(), 10);
+        let types: Vec<u8> = annex_b_units(&out[0].payload)
+            .iter()
+            .map(|nal| nal[0] & 0x1f)
+            .collect();
+        assert_eq!(types, [7, 8, 5]);
+    }
+
+    #[test]
+    fn iso14496_15_8_3_3_the_hvcc_parameter_sets_seed_the_normalizers() {
+        let (layout, units) = read_fmp4(H265_INIT, H265_0);
+        let mut f = start(&layout, LEAD);
+        let video = &f.set.tracks()[0];
+        let declared = Codec::clone(&video.codec());
+        assert!(matches!(
+            declared,
+            Codec::H265 {
+                vps: Some(_),
+                sps: Some(_),
+                pps: Some(_)
+            }
+        ));
+        let mut sub = video.subscribe_frames();
+        play(&mut f.publisher, units, f.t0);
+        let out = frames(&mut sub);
+        assert_eq!(out.len(), 10);
+        assert!(out[0].keyframe);
+        let types: Vec<u8> = annex_b_units(&out[0].payload)
+            .iter()
+            .map(|nal| nal[0] >> 1)
+            .collect();
+        assert_eq!(&types[..3], [32, 33, 34]);
+        assert_eq!(*video.codec(), declared);
     }
 
     #[test]
@@ -1085,8 +1181,8 @@ mod tests {
         );
         let err = f.publisher.relayout(&layout(vec![])).unwrap_err();
         assert!(err.to_string().ends_with("to nothing"), "{err}");
-        assert_eq!(first.tracks[0].pid, VIDEO_PID);
-        assert_eq!(first.tracks[1].pid, AUDIO_PID);
+        assert_eq!(first.tracks[0].id, u32::from(VIDEO_PID));
+        assert_eq!(first.tracks[1].id, u32::from(AUDIO_PID));
     }
 
     #[test]

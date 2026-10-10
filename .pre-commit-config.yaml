@@ -23,7 +23,7 @@ repos:
     rev: v2.4.3
     hooks:
       - id: codespell
-        args: ["--ignore-words-list=medias,unparseable,numer,stap,ue,fo"] # SDP media sections; accepted spelling; str0m's `MediaTime::numer`; RFC 6184 STAP-A; Exp-Golomb `ue(v)`; RFC 4648 test vector
+        args: ["--ignore-words-list=medias,unparseable,numer,stap,ue,fo,trun"] # SDP media sections; accepted spelling; str0m's `MediaTime::numer`; RFC 6184 STAP-A; Exp-Golomb `ue(v)`; RFC 4648 test vector; ISO/IEC 14496-12 `trun` box
         exclude: ^(Cargo\.lock|fuzz/Cargo\.lock|tests/browser/uv\.lock)$
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.12

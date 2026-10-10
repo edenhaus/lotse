@@ -102,7 +102,7 @@ fn aac(sample_rate: u32, config: [u8; 2]) -> Codec {
 
 fn track(pid: u16, stream_type: u8, kind: Kind, codec: Codec, clock_rate: u32) -> LayoutTrack {
     LayoutTrack {
-        pid,
+        id: u32::from(pid),
         stream_type,
         kind,
         codec,
