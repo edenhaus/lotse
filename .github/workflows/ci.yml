@@ -307,12 +307,20 @@ jobs:
           shared-key: coverage
       - run: mise run coverage
 
+  # The changed lines' mutants, one after another, split into consecutive slices over the shards
+  # (cargo-mutants' default `slice` sharding). Each shard mutates its checkout in place, so the
+  # cached target/ builds; a copy of the tree would build from cold.
   mutants:
-    name: Mutants (changed lines)
+    name: Mutants (changed lines, shard ${{ matrix.shard }})
     if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3] # `--shard k/4` below
     runs-on: ubuntu-latest
     env:
       BASE_REF: ${{ github.base_ref }}
+      SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -325,7 +333,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: mutants
-      - run: mise run mutants "origin/$BASE_REF"
+          save-if: ${{ matrix.shard == 0 }} # the shards build the same; one saves it
+      - run: mise run mutants --shard "$SHARD/4" --in-place "origin/$BASE_REF"
 
   # The fuzz targets, built once (cargo-fuzz's release build with AddressSanitizer, on the pinned
   # nightly) when the change reaches what they are built from. On a PR only the targets built from

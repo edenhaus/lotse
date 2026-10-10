@@ -89,11 +89,18 @@ run = "cargo llvm-cov nextest --workspace --all-features --locked --no-tests=war
 
 [tasks.mutants]
 description = "Mutation-testing gate on the lines changed against a base ref (default origin/main)"
-usage = 'arg "[base]" help="git ref to diff against" default="origin/main"'
+usage = '''
+arg "[base]" help="git ref to diff against" default="origin/main"
+flag "--shard <shard>" help="only this slice of the mutants, k/n with k from 0 (CI's Mutants jobs)"
+flag "--in-place" help="mutate the checked-out tree, not a copy, so its target/ builds (CI's throwaway checkout; an interrupted run can leave a mutation behind)"
+'''
 run = """
 diff="$(mktemp)"
 git diff "${usage_base}...HEAD" > "$diff"
-cargo mutants --workspace --all-features --test-tool nextest --in-diff "$diff"
+set --
+[ -z "${usage_shard:-}" ] || set -- "$@" --shard "$usage_shard"
+[ "${usage_in_place:-false}" != true ] || set -- "$@" --in-place
+cargo mutants --workspace --all-features --test-tool nextest --in-diff "$diff" "$@"
 """
 
 [tasks.turn-e2e]
