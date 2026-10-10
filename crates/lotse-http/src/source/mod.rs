@@ -12,7 +12,7 @@
 //!   as long as the server sends it.
 //! - `Content-Type: multipart/x-mixed-replace` (RFC 2046 §5.1, the MJPEG
 //!   stream of many cameras): refused, as is anything else, naming its
-//!   `Content-Type` only, never the URL.
+//!   `Content-Type` only (on one line, at most 200 bytes), never the URL.
 //!
 //! HLS follows RFC 8216 §6.3: a multivariant playlist picks a variant
 //! and its audio rendition ([`crate::hls::choose_variant`], §6.3.1); each
@@ -85,6 +85,11 @@ const SNIFF_BYTES: usize = 2 * TS_PACKET + 1;
 
 /// The media type of the MJPEG stream many cameras serve (RFC 2046 §5.1).
 const MJPEG: &str = "multipart/x-mixed-replace";
+
+/// The most bytes of a server's `Content-Type` a refusal names, as the
+/// RTSP source caps a camera's text: a media type is a few words, and a
+/// header value may be kilobytes of anything.
+const SERVER_TEXT_BYTES: usize = 200;
 
 /// How far ahead a unit may be due before the pacer takes it for a jump of
 /// the timestamps ([`crate::pace::Pacer::new`]). A unit is read only once
@@ -256,7 +261,12 @@ async fn sniff(response: Response) -> Result<Sniffed, SourceError> {
     }
     let labelled = content_type.map_or_else(
         || "no Content-Type".to_owned(),
-        |value| format!("Content-Type {value}"),
+        |value| {
+            format!(
+                "Content-Type {}",
+                lotse_core::text::plain(&value, SERVER_TEXT_BYTES)
+            )
+        },
     );
     Err(SourceError::Protocol(format!(
         "the source is neither an HLS playlist (RFC 8216 §4.3.1.1) nor MPEG-TS (ISO/IEC 13818-1 §2.4.3.2): {labelled}"

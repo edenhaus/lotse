@@ -1010,6 +1010,20 @@ async fn rfc9110_8_3_anything_else_is_refused_naming_its_content_type_only() {
     rig.stop().await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_content_type_is_named_on_one_line_of_at_most_200_bytes() {
+    let rig = Rig::new().await;
+    let long = format!("text/html; q={}", "x".repeat(4096));
+    rig.body("/long", &long, &b"<html></html>"[..]);
+    let err = rig.exit(rig.start("/long")).await;
+    let shown = lotse_core::text::plain(&long, 200);
+    assert_eq!(shown.len(), 200);
+    assert!(shown.starts_with("text/html; q=xxx"), "{shown}");
+    assert_protocol(&err, &format!("Content-Type {shown}"));
+    assert!(!err.to_string().contains(&"x".repeat(200)), "{err}");
+    rig.stop().await;
+}
+
 /// `bytes` without the `nth` transport packet of `pid` that does not start
 /// a PES packet.
 fn drop_packet(bytes: &[u8], pid: u16, nth: usize) -> Vec<u8> {
