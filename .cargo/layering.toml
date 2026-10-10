@@ -20,7 +20,7 @@ lotse-supervisor = ["lotse"]
 lotse-worker = ["lotse"]
 # Never of lotse-core: it depends on core itself, and a dev-dependency cycle compiles two copies of
 # core whose types do not unify. Core's own fakes live behind its `test-util` feature.
-lotse-testing = ["lotse-codec", "lotse-rtsp", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-api-types", "lotse-supervisor", "lotse-worker", "lotse"]
+lotse-testing = ["lotse-codec", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-api-types", "lotse-supervisor", "lotse-worker", "lotse"]
 
 [dev-only]
 # allocation-counter: its global allocator replaces the daemon's in whatever links it.
@@ -41,8 +41,9 @@ tokio-rustls = ["lotse-rtsp", "lotse-testing"]
 webpki-roots = ["lotse-rtsp"]
 rcgen = ["lotse-webrtc", "lotse-testing"] # the DTLS certificate; the fake camera's certificate
 axum = ["lotse-api", "lotse-testing"] # the control API; the dev viewer, a test crate never linked into the binary
-hyper = ["lotse-api"] # the control API's HTTP/1.1 connection, under axum
-hyper-util = ["lotse-api"]
+hyper = ["lotse-api", "lotse-http"] # the control API's HTTP/1.1 connection, under axum; the HTTP source's client
+hyper-util = ["lotse-api", "lotse-http"]
+http-auth = ["lotse-http"] # the HTTP source's Basic and Digest answers (retina uses it on its own for RTSP)
 postcard = ["lotse-ipc"]
 landlock = ["lotse-sandbox"]
 seccompiler = ["lotse-sandbox"]
