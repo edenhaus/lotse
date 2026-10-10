@@ -445,25 +445,6 @@ pub(crate) mod test_support {
     use super::*;
     use crate::worker::WorkerConfig;
 
-    /// `let $pattern = $value else { panic!(...) };` as one statement
-    /// whose first line holds `$value`: the `else` of a test's
-    /// destructuring is on a line that runs, so a passing test leaves no
-    /// line of it unrun (rustfmt keeps the layout, as it does not format
-    /// the `=>`). Without a message the panic names the pattern.
-    macro_rules! let_expect {
-        ($value:expr => $pattern:pat) => {
-            let $pattern = $value else {
-                panic!(concat!("expected ", stringify!($pattern)))
-            };
-        };
-        ($value:expr => $pattern:pat, $($message:tt)+) => {
-            let $pattern = $value else {
-                panic!($($message)+)
-            };
-        };
-    }
-    pub(crate) use let_expect;
-
     /// A private 0700 directory for one test's socket.
     pub(crate) fn private_dir(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lotse-sup-{test}-{}", std::process::id()));

@@ -1103,10 +1103,11 @@ mod tests {
         reason = "test code"
     )]
 
+    use lotse_core::let_assert;
     use lotse_ipc::TrackStats;
 
     use super::*;
-    use crate::test_support::{Captured, let_expect};
+    use crate::test_support::Captured;
 
     fn ipc_track(id: &str, derived_from: Option<&str>, delay: Option<u32>) -> IpcTrackInfo {
         IpcTrackInfo {
@@ -1311,7 +1312,7 @@ mod tests {
             key("fake://127.0.0.1/c"),
             "the key follows the put"
         );
-        let_expect!(rx.try_recv() => Ok(DriverCommand::SwitchSource(sent)));
+        let_assert!(Ok(DriverCommand::SwitchSource(sent)) = rx.try_recv());
         assert_eq!(sent.url, "fake://127.0.0.1/b");
         assert!(rx.try_recv().is_err());
         assert_eq!(captured.lines("driver queue full").len(), 1);
@@ -1367,14 +1368,17 @@ mod tests {
         state.session_relayed("s1", 2, Some(relayed(1)));
         assert!(rx.try_recv().is_err());
         state.session_relayed("s1", 1, Some(relayed(1)));
-        let_expect!(rx.try_recv() => Ok(DriverCommand::RelayCandidate {
-            session_id,
-            relayed: address,
-            server,
-            local,
-            tcp,
-            grant: _,
-        }), "a relay candidate for the worker");
+        let_assert!(
+            Ok(DriverCommand::RelayCandidate {
+                session_id,
+                relayed: address,
+                server,
+                local,
+                tcp,
+                grant: _,
+            }) = rx.try_recv(),
+            "a relay candidate for the worker"
+        );
         assert_eq!(
             (session_id.as_str(), address, server, local, tcp),
             (

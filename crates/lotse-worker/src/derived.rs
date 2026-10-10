@@ -516,6 +516,7 @@ mod tests {
 
     use lotse_core::clock::FakeClock;
     use lotse_core::codec::CodecFamily;
+    use lotse_core::let_assert;
     use lotse_core::test_util::fake_aac;
     use lotse_core::track::{TrackLimits, Unit};
 
@@ -659,7 +660,7 @@ mod tests {
         let derived = connection(fake_aac(), &transcoder);
         let (_, audio) = open(&derived);
         let changes = derived.changes();
-        let config = variant!(fake_aac(), Codec::AacLc { config, .. } => config);
+        let_assert!(Codec::AacLc { config, .. } = fake_aac());
         let stereo = Codec::AacLc {
             sample_rate: 16_000,
             channels: 2,
@@ -705,7 +706,7 @@ mod tests {
         let derived = connection(fake_aac(), &transcoder);
         let picks = derived.pick(&requests(true));
         assert!(picks[0].is_ok(), "video plays");
-        let err = variant!(&picks[1], Err(err) => err);
+        let_assert!(Err(err) = &picks[1]);
         assert_eq!(err.code(), "audio_codec_unsupported");
         assert_eq!(
             err.to_string(),
@@ -745,7 +746,7 @@ mod tests {
         };
         let derived = connection(unsupported, &transcoder);
         let picks = derived.pick(&requests(true));
-        let err = variant!(&picks[1], Err(err) => err);
+        let_assert!(Err(err) = &picks[1]);
         assert_eq!(err.code(), "audio_codec_unsupported");
         assert_eq!(transcoder.started(), 0);
     }

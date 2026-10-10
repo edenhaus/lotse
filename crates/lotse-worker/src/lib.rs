@@ -13,19 +13,6 @@
 //! §6.1 and Linux `ip(7)` (the candidate's source address, `sendmsg`),
 //! RFC 8656 §12.4 (the `ChannelData` it frames, [`relay`]).
 
-/// What `$pattern` binds in `$value`, which must match it: a test failure
-/// naming the value otherwise. One expression, so a test that passes runs
-/// every line of it.
-#[cfg(test)]
-macro_rules! variant {
-    ($value:expr, $pattern:pat => $bound:expr) => {
-        match $value {
-            $pattern => $bound,
-            other => panic!("unexpected {other:?}"),
-        }
-    };
-}
-
 mod derived;
 mod ice_tcp;
 pub mod relay;
@@ -1003,6 +990,7 @@ mod tests {
 
     use lotse_core::clock::FakeClock;
     use lotse_core::codec::{Codec, Kind};
+    use lotse_core::let_assert;
     use lotse_core::output::OutputShape;
     use lotse_core::source::{
         Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor, SourceError,
@@ -1172,7 +1160,13 @@ mod tests {
                 )
             };
             let message = next_where(self, &closed).await;
-            variant!(message, ToSupervisor::Session { session_id, event: SessionEvent::Closed { code, .. } } => (session_id, code))
+            let_assert!(
+                ToSupervisor::Session {
+                    session_id,
+                    event: SessionEvent::Closed { code, .. }
+                } = message
+            );
+            (session_id, code)
         }
     }
 
@@ -1241,12 +1235,12 @@ mod tests {
         // is not the source's.
         h.clock.advance(Duration::from_millis(10));
         assert_eq!(h.next().await, ToSupervisor::Switched);
-        let tracks = variant!(h.next().await, ToSupervisor::Tracks(tracks) => tracks);
+        let_assert!(ToSupervisor::Tracks(tracks) = h.next().await);
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].codec, "h264");
         // A second later: counters, and no `Stopped` from the old source.
         h.clock.advance(STATS_INTERVAL);
-        let stats = variant!(h.next().await, ToSupervisor::Stats(stats) => stats);
+        let_assert!(ToSupervisor::Stats(stats) = h.next().await);
         let video = stats.tracks.iter().find(|(id, _)| id == "v0").unwrap();
         assert!(video.1.packets >= 1, "{stats:?}");
         // A standby pending at shutdown stops with the rest.
@@ -1360,7 +1354,8 @@ mod tests {
     /// The next session event, skipping stats.
     async fn next_session(h: &mut Harness) -> (String, SessionEvent) {
         let message = next_where(h, &|m| matches!(m, ToSupervisor::Session { .. })).await;
-        variant!(message, ToSupervisor::Session { session_id, event } => (session_id, event))
+        let_assert!(ToSupervisor::Session { session_id, event } = message);
+        (session_id, event)
     }
 
     /// Waits for a session's answer, which must be its first event, moving
@@ -1372,7 +1367,7 @@ mod tests {
             steps += 1;
             assert!(steps < 2_000, "no answer within 100 s of fake time");
             answer = tokio::select! {
-                (_, event) = next_session(h) => Some(variant!(event, SessionEvent::Answer { sdp } => sdp)),
+                (_, event) = next_session(h) => { let_assert!(SessionEvent::Answer { sdp } = event); Some(sdp) }
                 () = SystemClock.sleep(Duration::from_millis(5)) => { h.clock.advance(Duration::from_millis(50)); None }
             };
         }
@@ -1598,7 +1593,10 @@ mod tests {
             h.clock.advance(STATS_INTERVAL);
             found = Some(h.next().await)
                 .filter(|m| matches!(m, ToSupervisor::Stats(stats) if want(stats)))
-                .map(|m| variant!(m, ToSupervisor::Stats(stats) => stats));
+                .map(|m| {
+                    let_assert!(ToSupervisor::Stats(stats) = m);
+                    stats
+                });
         }
         found.unwrap()
     }
@@ -1658,7 +1656,8 @@ mod tests {
     /// message.
     fn has_track(message: &ToSupervisor, id: &str) -> Option<bool> {
         matches!(message, ToSupervisor::Tracks(_)).then(|| {
-            variant!(message, ToSupervisor::Tracks(tracks) => tracks.iter().any(|track| track.id == id))
+            let_assert!(ToSupervisor::Tracks(tracks) = message);
+            tracks.iter().any(|track| track.id == id)
         })
     }
 
@@ -1769,7 +1768,7 @@ mod tests {
         // Reported when it appeared: the derived track, what it came from,
         // its delay; then its counters.
         let announced = seen.iter().find(|m| has_track(m, "a1") == Some(true));
-        let tracks = variant!(announced, Some(ToSupervisor::Tracks(tracks)) => tracks);
+        let_assert!(Some(ToSupervisor::Tracks(tracks)) = announced);
         let a1 = tracks.iter().find(|track| track.id == "a1").unwrap();
         assert_eq!(
             (
@@ -1799,7 +1798,7 @@ mod tests {
             matches!(m, ToSupervisor::Stats(stats) if stats.tracks.iter().any(|(id, t)| id == "a1" && t.packets > 0))
         })
         .await;
-        let stats = variant!(message, ToSupervisor::Stats(stats) => stats);
+        let_assert!(ToSupervisor::Stats(stats) = message);
         assert_eq!(stats.sessions, 2);
 
         // The first to leave keeps it running; the last stops it.
@@ -1838,7 +1837,7 @@ mod tests {
             |m| matches!(m, ToSupervisor::Stats(stats) if stats.sessions == 0),
         )
         .await;
-        let stats = variant!(message, ToSupervisor::Stats(stats) => stats);
+        let_assert!(ToSupervisor::Stats(stats) = message);
         assert_eq!(stats.sessions, 0);
 
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
@@ -2130,7 +2129,7 @@ mod tests {
             |m| matches!(m, ToSupervisor::Stats(stats) if stats.sessions == 1),
         )
         .await;
-        let stats = variant!(message, ToSupervisor::Stats(stats) => stats);
+        let_assert!(ToSupervisor::Stats(stats) = message);
         assert!(stats.tracks.iter().all(|(id, _)| id != "a1"));
         assert_eq!(transcoder.started(), 0);
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
@@ -2905,7 +2904,7 @@ mod tests {
             h.next().await,
             ToSupervisor::SourceState(SourceState::Connecting { attempt: 1 })
         );
-        let tracks = variant!(h.next().await, ToSupervisor::Tracks(tracks) => tracks);
+        let_assert!(ToSupervisor::Tracks(tracks) = h.next().await);
         assert_eq!(h.next().await, ToSupervisor::SourceState(SourceState::Live));
         assert_eq!(tracks.len(), 1);
         assert_eq!(
@@ -2919,7 +2918,7 @@ mod tests {
         assert_eq!(tracks[0].sync, "arrival");
 
         h.clock.advance(STATS_INTERVAL);
-        let stats = variant!(h.next().await, ToSupervisor::Stats(stats) => stats);
+        let_assert!(ToSupervisor::Stats(stats) = h.next().await);
         assert_eq!(stats.tracks.len(), 1);
         assert_eq!(stats.tracks[0].0, "v0");
         assert_eq!(stats.sessions, 0);
@@ -3048,7 +3047,7 @@ mod tests {
                 .await
                 .unwrap();
             let err = within(h.worker).await.unwrap().unwrap_err();
-            let got = variant!(err, Error::SourceRejected { code, .. } => code);
+            let_assert!(Error::SourceRejected { code: got, .. } = err);
             assert_eq!(got, code, "{url}");
         }
         let mut h = start();
@@ -3073,7 +3072,7 @@ mod tests {
             .await
             .unwrap();
         let err = within(h.worker).await.unwrap().unwrap_err();
-        let got = variant!(err, Error::SourceRejected { code, .. } => code);
+        let_assert!(Error::SourceRejected { code: got, .. } = err);
         assert_eq!(got, "scheme_unsupported");
     }
 

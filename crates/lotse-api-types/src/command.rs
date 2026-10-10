@@ -574,15 +574,23 @@ mod tests {
 
     use super::*;
 
-    /// `let $pattern = $value else { panic!(..) };` with the failure arm on
-    /// the call's line, the twin of `lotse_core::let_assert!` (this crate
-    /// does not depend on core): a passing test runs that line, so the
-    /// line-coverage gate counts it.
+    /// A copy of `lotse_core::let_assert!`, identical to it, for this
+    /// crate's tests: `lotse-api-types` does not depend on `lotse-core`
+    /// and gains no dependency for a test macro. Binds `$pattern` in
+    /// `$value` or fails the test with the value, the failure arm on the
+    /// call's lines, which a passing test runs, so the line-coverage gate
+    /// counts them. Change both together.
     macro_rules! let_assert {
         ($pattern:pat = $value:expr) => {
             let value = $value;
             let $pattern = value else {
                 panic!("`{}` does not match {value:?}", stringify!($pattern));
+            };
+        };
+        ($pattern:pat = $value:expr, $($message:tt)+) => {
+            let value = $value;
+            let $pattern = value else {
+                panic!("`{}` does not match {value:?}: {}", stringify!($pattern), format_args!($($message)+));
             };
         };
     }

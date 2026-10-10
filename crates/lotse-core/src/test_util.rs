@@ -26,12 +26,16 @@ use crate::task::BoxFuture;
 use crate::track::{FrameSubscription, GopSnapshot, Track, Unit};
 use crate::transcode::{TrackHandle, TranscodeError, Transcoder};
 
-/// `let $pattern = $value else { panic!(..) };` for tests: binds the
-/// pattern's names, or fails the test with the value that did not match
-/// (and the message, if one follows). A test's `let`-`else` leaves its
-/// `panic!` on a line of its own that a passing test never runs; here the
-/// failure arm sits on the macro call's line, which the binding runs, so
-/// the line-coverage gate sees the line as executed.
+/// `let $pattern = $value else { panic!(..) };` for tests, the one such
+/// macro of the workspace: binds the pattern's names, or fails the test
+/// with the value that did not match (and the message, if one follows).
+/// A test's `let`-`else` leaves its `panic!` on a line of its own that a
+/// passing test never runs; here the failure arm sits on the macro call's
+/// lines, which the binding runs, so the line-coverage gate sees them as
+/// executed. Written `let_assert!(pattern = value)`, in the order of the
+/// `let` it stands for; rustfmt lays the call out as the assignment it
+/// parses as, or keeps it as written when the pattern is no expression
+/// (`mut`, `ref`), and the failure arm stays on the call either way.
 #[macro_export]
 macro_rules! let_assert {
     ($pattern:pat = $value:expr) => {

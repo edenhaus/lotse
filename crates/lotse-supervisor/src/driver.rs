@@ -930,13 +930,14 @@ mod tests {
 
     use lotse_api::ConnectionId;
     use lotse_core::clock::{Clock, FakeClock, SystemClock};
+    use lotse_core::let_assert;
     use tokio_util::task::TaskTracker;
 
     use super::*;
     use crate::net::demux::Registrations;
     use crate::registry::State;
     use crate::session::SessionEntry;
-    use crate::test_support::{environment, let_expect, private_dir};
+    use crate::test_support::{environment, private_dir};
     use crate::worker::WorkerManager;
 
     fn shared(binary: &str) -> Arc<Shared> {
@@ -1005,12 +1006,15 @@ mod tests {
         let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
         assert!(sink.ice_tcp(fd(), peer, vec![1, 2]));
         assert!(!sink.ice_tcp(fd(), peer, vec![3]), "a full queue refuses");
-        let_expect!(rx.recv().await => Some(DriverCommand::IceTcp {
-            peer: got,
-            local_ufrag,
-            first_frame,
-            ..
-        }), "an ice-tcp hand-off");
+        let_assert!(
+            Some(DriverCommand::IceTcp {
+                peer: got,
+                local_ufrag,
+                first_frame,
+                ..
+            }) = rx.recv().await,
+            "an ice-tcp hand-off"
+        );
         assert_eq!((got, first_frame), (peer, vec![1, 2]));
         assert_eq!(local_ufrag, "abcd", "the session the sink belongs to");
     }

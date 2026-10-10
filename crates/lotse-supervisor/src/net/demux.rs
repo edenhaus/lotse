@@ -1068,13 +1068,14 @@ mod tests {
     )]
 
     use lotse_core::clock::{FakeClock, SystemClock};
+    use lotse_core::let_assert;
     use lotse_core::throttle::SUMMARY_INTERVAL;
 
     use super::super::udp::test_support::bind_dual_stack;
     use super::test_support::MemorySink;
     use super::*;
     use crate::net::stun::{Builder, Class, METHOD_BINDING};
-    use crate::test_support::{Captured, let_expect};
+    use crate::test_support::Captured;
 
     /// Polls `done` for up to five seconds: generous, because the receive
     /// thread competes with the rest of a full test run.
@@ -1833,7 +1834,7 @@ mod tests {
         .unwrap();
         let started = Demux::start(bound.socket, bound.local, vec![], Arc::new(SystemClock));
         setrlimit(Resource::Nproc, limit).unwrap();
-        let_expect!(started => Err(err), "no thread at the limit");
+        let_assert!(Err(err) = started, "no thread at the limit");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
     }
 

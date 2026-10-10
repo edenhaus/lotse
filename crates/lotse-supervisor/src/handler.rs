@@ -1202,6 +1202,7 @@ mod tests {
     use lotse_api::Event;
     use lotse_api_types::command::parse_command;
     use lotse_core::clock::{FakeClock, SystemClock};
+    use lotse_core::let_assert;
     use lotse_core::output::OutputShape;
     use lotse_core::test_util::FakeOutputFactory;
     use lotse_ipc::SessionEvent as Report;
@@ -1209,7 +1210,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::test_support::{Captured, environment, let_expect, private_dir, settings};
+    use crate::test_support::{Captured, environment, private_dir, settings};
 
     #[test]
     fn the_schema_advertises_the_identifier_rule_the_core_checks() {
@@ -1233,20 +1234,17 @@ mod tests {
     }
 
     fn result(outcome: Outcome) -> Value {
-        let seen = format!("{outcome:?}");
-        let_expect!(outcome => Outcome::Result(value), "a result, not {seen}");
+        let_assert!(Outcome::Result(value) = outcome);
         value
     }
 
     fn error(outcome: Outcome) -> ApiError {
-        let seen = format!("{outcome:?}");
-        let_expect!(outcome => Outcome::Error(err), "an error, not {seen}");
+        let_assert!(Outcome::Error(err) = outcome);
         err
     }
 
     fn subscription(outcome: Outcome) -> mpsc::Receiver<Event> {
-        let seen = format!("{outcome:?}");
-        let_expect!(outcome => Outcome::Subscribed(rx), "a subscription, not {seen}");
+        let_assert!(Outcome::Subscribed(rx) = outcome);
         rx
     }
 
@@ -2755,7 +2753,10 @@ mod tests {
         let _f = subscription(call_on(&s, 1, &offer(2, "front", Some("f1"))).await);
         let _b = subscription(call_on(&s, 1, &offer(3, "back", Some("b1"))).await);
         for (session, audio, orientation) in [("f1", true, 6), ("b1", false, 1)] {
-            let_expect!(rx.recv().await => Some(DriverCommand::OpenSession(spec)), "an offer");
+            let_assert!(
+                Some(DriverCommand::OpenSession(spec)) = rx.recv().await,
+                "an offer"
+            );
             assert_eq!(
                 (spec.session_id.as_str(), spec.audio, spec.orientation),
                 (session, audio, orientation)
@@ -2784,7 +2785,10 @@ mod tests {
             Some(DriverCommand::Orientation { .. })
         ));
         let _b2 = subscription(call_on(&s, 1, &offer(5, "back", Some("b2"))).await);
-        let_expect!(rx.recv().await => Some(DriverCommand::OpenSession(spec)), "an offer");
+        let_assert!(
+            Some(DriverCommand::OpenSession(spec)) = rx.recv().await,
+            "an offer"
+        );
         assert_eq!((spec.session_id.as_str(), spec.orientation), ("b2", 8));
         // The supervisor's close reaches the worker; a gone worker's does not.
         result(
@@ -2795,11 +2799,14 @@ mod tests {
             )
             .await,
         );
-        let_expect!(rx.recv().await => Some(DriverCommand::CloseSession {
-            session_id,
-            code,
-            ..
-        }), "a close");
+        let_assert!(
+            Some(DriverCommand::CloseSession {
+                session_id,
+                code,
+                ..
+            }) = rx.recv().await,
+            "a close"
+        );
         assert_eq!((session_id.as_str(), code), ("f1", "session_closed"));
         s.shared.lock().close_sessions_where(
             |_| true,
@@ -2845,10 +2852,13 @@ mod tests {
         // The open session of the turned stream turns; the other stream's
         // hears nothing.
         result(call(&s, &put("back", "off", "rotate_right")).await);
-        let_expect!(rx.recv().await => Some(DriverCommand::Orientation {
-            session_id,
-            orientation,
-        }), "an orientation");
+        let_assert!(
+            Some(DriverCommand::Orientation {
+                session_id,
+                orientation,
+            }) = rx.recv().await,
+            "an orientation"
+        );
         assert_eq!((session_id.as_str(), orientation), ("b1", 8));
         assert!(rx.try_recv().is_err(), "one session turns");
         // A put that keeps the orientation tells no session about it.
@@ -3082,14 +3092,17 @@ mod tests {
         let mut events =
             subscription(call_on(&s, 1, &turn_offer(2, server.udp_addr(), "pw")).await);
         next(&mut events).await;
-        let_expect!(next_command(&mut rx).await => DriverCommand::RelayCandidate {
-            session_id,
-            relayed,
-            server: via,
-            local,
-            tcp,
-            grant: _,
-        }, "a relay candidate");
+        let_assert!(
+            DriverCommand::RelayCandidate {
+                session_id,
+                relayed,
+                server: via,
+                local,
+                tcp,
+                grant: _,
+            } = next_command(&mut rx).await,
+            "a relay candidate"
+        );
         let allocation = turn.allocations().remove(0);
         assert_eq!(
             (session_id.as_str(), relayed, via, local, tcp),
@@ -3128,12 +3141,15 @@ mod tests {
         for _ in 0..2 {
             report(&s, "s1", Report::ChannelWanted { relayed, peer });
         }
-        let_expect!(next_command(&mut rx).await => DriverCommand::RelayChannel {
-            session_id,
-            relayed: on,
-            peer: to,
-            channel,
-        }, "a relay channel");
+        let_assert!(
+            DriverCommand::RelayChannel {
+                session_id,
+                relayed: on,
+                peer: to,
+                channel,
+            } = next_command(&mut rx).await,
+            "a relay channel"
+        );
         assert_eq!(
             (session_id.as_str(), on, to, channel),
             ("s1", relayed, peer, 0x4000)
