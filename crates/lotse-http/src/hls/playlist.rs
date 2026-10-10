@@ -514,12 +514,38 @@ mod tests {
     }
 
     #[test]
-    fn rfc8216bis_4_4_4_7_mediamtx_low_latency_starts_at_its_first_segment_with_media() {
+    fn rfc8216_6_3_3_mediamtx_live_starts_once_a_segment_is_buffered() {
+        // MediaMTX 1.21.1's MPEG-TS playlist right after the path became
+        // ready, and its next reload (captured 2026-10-08): one segment,
+        // then two. Started at the only segment, playback has nothing
+        // buffered, every later segment arrives after its media is due, and
+        // live sessions drop the video as late.
+        let first = parse_media(include_str!("../../testdata/mediamtx_mpegts_0.m3u8"));
+        assert_eq!(first.segments.len(), 1);
+        assert_eq!(start_index(&first), None);
+        let mut tracker = Tracker::new();
+        let update = tracker.update(&first);
+        assert!(update.segments.is_empty());
+        assert_eq!(update.reload_after, Some(Duration::from_secs(1)));
+        let update = tracker.update(&parse_media(include_str!(
+            "../../testdata/mediamtx_mpegts_1.m3u8"
+        )));
+        let sequences: Vec<(u64, bool)> = update
+            .segments
+            .iter()
+            .map(|fetch| (fetch.sequence, fetch.discontinuity))
+            .collect();
+        assert_eq!(sequences, [(0, false), (1, false)]);
+    }
+
+    #[test]
+    fn rfc8216bis_4_4_4_7_mediamtx_low_latency_starts_at_its_first_segments_with_media() {
         // MediaMTX 1.21.1's low-latency playlist right after the path
         // became ready, and its next reload (captured 2026-10-08): six
         // `EXT-X-GAP` placeholders at `gap.mp4`, a URI it answers with 401.
         let first = parse_media(include_str!("../../testdata/mediamtx_low_latency_0.m3u8"));
-        assert_eq!(start_index(&first), Some(6));
+        // One segment with media: nothing would be buffered yet.
+        assert_eq!(start_index(&first), None);
         let mut tracker = Tracker::new();
         let update = tracker.update(&first);
         let sequences = |update: &Update| -> Vec<(u64, bool)> {
@@ -529,13 +555,13 @@ mod tests {
                 .map(|fetch| (fetch.sequence, fetch.discontinuity))
                 .collect()
         };
-        assert_eq!(sequences(&update), [(7, false)]);
-        let update = tracker.update(&parse_media(include_str!(
-            "../../testdata/mediamtx_low_latency_1.m3u8"
-        )));
-        assert_eq!(sequences(&update), [(8, false)]);
+        assert_eq!(sequences(&update), []);
+        let second = parse_media(include_str!("../../testdata/mediamtx_low_latency_1.m3u8"));
+        assert_eq!(start_index(&second), Some(5));
+        let update = tracker.update(&second);
+        assert_eq!(sequences(&update), [(7, false), (8, false)]);
         assert!(
-            update.segments[0]
+            update.segments[1]
                 .segment
                 .uri
                 .path()

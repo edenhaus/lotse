@@ -151,7 +151,8 @@ fn audio_rendition<'a>(audio: &'a [AudioRendition], group: &str) -> Option<&'a A
 }
 
 /// The index of the segment to start playing at, `None` for a playlist
-/// without segments.
+/// without segments, and for a live one with fewer than two that have
+/// media.
 ///
 /// With `EXT-X-START` (RFC 8216 §4.3.5.2), the segment that contains its
 /// `TIME-OFFSET`: from the start of the playlist when positive, from its
@@ -167,8 +168,10 @@ fn audio_rendition<'a>(audio: &'a [AudioRendition], group: &str) -> Option<&'a A
 /// a live playlist at its second-newest segment with media: segments marked
 /// `EXT-X-GAP` (draft-pantos-hls-rfc8216bis §4.4.4.7), which a low-latency
 /// server lists as placeholders before it has made enough segments, are
-/// not counted; the newest one when only one has media, and `None` while
-/// none has.
+/// not counted. A live playlist with only one segment with media, as a
+/// server lists right after the stream started, is not started yet: the
+/// newest segment leaves nothing buffered, so every later segment arrives
+/// after its media is due (§6.3.3 asks for three target durations).
 /// SPEC-DEVIATION: §6.3.3 says a live client SHOULD NOT start at a segment
 /// that starts less than three target durations from the end. The
 /// second-newest segment cuts the latency to one or two target durations,
@@ -190,8 +193,8 @@ pub fn start_index(playlist: &MediaPlaylist) -> Option<usize> {
                 .rev()
                 .filter(|(_, segment)| !segment.gap)
                 .map(|(index, _)| index);
-            let newest = with_media.next()?;
-            Some(with_media.next().unwrap_or(newest))
+            with_media.next()?;
+            with_media.next()
         }
     }
 }
@@ -791,13 +794,15 @@ mod tests {
         // SPEC-DEVIATION (§6.3.3): not three target durations from the end.
         assert_eq!(start_index(&live(0, 0, &["a", "b", "c", "d"])), Some(2));
         assert_eq!(start_index(&live(0, 0, &["a", "b"])), Some(0));
-        assert_eq!(start_index(&live(0, 0, &["a"])), Some(0));
+        // Nothing would be buffered: wait for the next segment.
+        assert_eq!(start_index(&live(0, 0, &["a"])), None);
         assert_eq!(start_index(&live(0, 0, &[])), None);
     }
 
     #[test]
     fn rfc8216bis_4_4_4_7_live_starts_at_the_second_newest_segment_with_media() {
-        assert_eq!(start_index(&live(0, 0, &["?a", "?b", "c"])), Some(2));
+        assert_eq!(start_index(&live(0, 0, &["?a", "b", "?c", "d"])), Some(1));
+        assert_eq!(start_index(&live(0, 0, &["?a", "?b", "c"])), None);
         assert_eq!(
             start_index(&live(0, 0, &["?a", "b", "?c", "d", "?e"])),
             Some(1)
@@ -1037,9 +1042,16 @@ mod tests {
             yielded(&update),
             vec![fetch(14, 0, true, "o"), fetch(15, 0, false, "p")]
         );
+        // A restarted stream of one segment starts once it has two.
         let update = tracker.update(&live(9, 0, &["x"]));
         assert_eq!(update.event, Some(Event::Restart));
-        assert_eq!(yielded(&update), vec![fetch(9, 0, true, "x")]);
+        assert_eq!(yielded(&update), vec![]);
+        let update = tracker.update(&live(9, 0, &["x", "y"]));
+        assert_eq!(update.event, None);
+        assert_eq!(
+            yielded(&update),
+            vec![fetch(9, 0, true, "x"), fetch(10, 0, false, "y")]
+        );
     }
 
     #[test]
@@ -1088,11 +1100,11 @@ mod tests {
     #[test]
     fn rfc8216_4_3_3_3_discontinuity_sequence_change_without_a_tag_starts_a_timeline() {
         let mut tracker = Tracker::new();
-        tracker.update(&live(0, 0, &["a"]));
-        let update = tracker.update(&live(1, 3, &["b", "c"]));
+        tracker.update(&live(0, 0, &["a", "b"]));
+        let update = tracker.update(&live(2, 3, &["c", "d"]));
         assert_eq!(
             yielded(&update),
-            vec![fetch(1, 3, true, "b"), fetch(2, 3, false, "c")]
+            vec![fetch(2, 3, true, "c"), fetch(3, 3, false, "d")]
         );
     }
 

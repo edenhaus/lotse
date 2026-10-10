@@ -460,8 +460,10 @@ async fn rfc8216_6_2_1_a_live_playlist_without_a_new_segment_for_three_target_du
     rig.server.live(playlist, 3);
     rig.server
         .push_segment(playlist, "/stall/0.m2t", 1.0, LIVE_0);
+    rig.server
+        .push_segment(playlist, "/stall/1.m2t", 1.0, LIVE_1);
     let harness = rig.start(playlist);
-    rig.wait("the segment", || rig.seen("/stall/0.m2t") == 1)
+    rig.wait("the segments", || rig.seen("/stall/1.m2t") == 1)
         .await;
     // Loads at 0 s (a new segment: the next after the target duration),
     // then every half of it (RFC 8216 §6.3.4): 1, 1.5, 2, 2.5 and 3 s.
@@ -490,8 +492,10 @@ async fn rfc8216_4_3_3_4_an_ended_playlist_is_no_stall() {
     rig.server.live(playlist, 3);
     rig.server
         .push_segment(playlist, "/late/0.m2t", 1.0, LIVE_0);
+    rig.server
+        .push_segment(playlist, "/late/1.m2t", 1.0, LIVE_1);
     let harness = rig.start(playlist);
-    rig.wait("the segment", || rig.seen("/late/0.m2t") == 1)
+    rig.wait("the segments", || rig.seen("/late/1.m2t") == 1)
         .await;
     load_then_advance(&rig, playlist, 1, Duration::from_secs(1)).await;
     for count in 2..=4 {
