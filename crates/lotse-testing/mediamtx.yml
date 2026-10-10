@@ -41,6 +41,8 @@ metrics: false
 pprof: false
 playback: false
 rtmp: false
+# Off unless a test asks for HLS: `lotse_testing::mediamtx::hls_env` turns it on with MTX_HLS*
+# variables (variant, segment length, HTTPS).
 hls: false
 webrtc: false
 srt: false

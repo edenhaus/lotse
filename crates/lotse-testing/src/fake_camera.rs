@@ -276,6 +276,9 @@ pub struct CameraTls {
     pub(crate) config: Arc<rustls::ServerConfig>,
     /// The certificate, DER.
     certificate: CertificateDer<'static>,
+    /// Its private key, PKCS #8 DER: a server outside this process (MediaMTX)
+    /// reads both as PEM files.
+    key: Vec<u8>,
 }
 
 impl fmt::Debug for CameraTls {
@@ -304,7 +307,8 @@ impl CameraTls {
         let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
         let generated = rcgen::generate_simple_self_signed(names).map_err(io::Error::other)?;
         let certificate = generated.cert.der().clone();
-        let key = PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
+        let key_der = generated.signing_key.serialize_der();
+        let key = PrivatePkcs8KeyDer::from(key_der.clone());
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -316,12 +320,24 @@ impl CameraTls {
         Ok(Self {
             config: Arc::new(config),
             certificate,
+            key: key_der,
         })
     }
 
     /// The certificate, DER-encoded.
     pub fn certificate_der(&self) -> &[u8] {
         &self.certificate
+    }
+
+    /// The certificate as a PEM `CERTIFICATE` block (RFC 7468 §5), for a
+    /// server in another process.
+    pub fn certificate_pem(&self) -> String {
+        pem("CERTIFICATE", &self.certificate)
+    }
+
+    /// The private key as a PEM `PRIVATE KEY` block, PKCS #8 (RFC 7468 §10).
+    pub fn private_key_pem(&self) -> String {
+        pem("PRIVATE KEY", &self.key)
     }
 
     /// The certificate's SHA-256 as colon-separated uppercase hex pairs,
@@ -333,6 +349,21 @@ impl CameraTls {
             .collect::<Vec<_>>()
             .join(":")
     }
+}
+
+/// `der` as an RFC 7468 PEM block labelled `label`: the base64 text in
+/// lines of 64 characters (§2), between the encapsulation boundaries.
+fn pem(label: &str, der: &[u8]) -> String {
+    let text = base64::encode(der);
+    let lines: Vec<String> = text
+        .as_bytes()
+        .chunks(64)
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .collect();
+    format!(
+        "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+        lines.join("\n")
+    )
 }
 
 /// The first RTP timestamp.
@@ -1544,6 +1575,27 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn rfc7468_pem_blocks_wrap_the_der_at_64_characters() {
+        assert_eq!(
+            pem("X", &[0_u8; 51]),
+            format!(
+                "-----BEGIN X-----\n{}\n{}\n-----END X-----\n",
+                "A".repeat(64),
+                "A".repeat(4)
+            )
+        );
+        let tls = CameraTls::self_signed(&["127.0.0.1"]).unwrap();
+        assert!(
+            tls.certificate_pem()
+                .starts_with("-----BEGIN CERTIFICATE-----\nMII")
+        );
+        assert!(
+            tls.private_key_pem()
+                .ends_with("\n-----END PRIVATE KEY-----\n")
+        );
+    }
 
     #[test]
     fn packets_and_reports_are_well_formed() {

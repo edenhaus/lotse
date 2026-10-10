@@ -21,10 +21,19 @@
 //! them), waits until MediaMTX's API reports the path ready with every
 //! track, and stops both when dropped; [`Camera::restart_publisher`]
 //! restarts ffmpeg, a camera that reboots.
+//!
+//! [`Camera::start_hls`] has MediaMTX serve the same path over HLS
+//! (RFC 8216) too, in the variant asked for ([`HlsVariant`]: MPEG-TS
+//! segments, fMP4 segments with the audio as a separate rendition, or
+//! low-latency HLS with partial segments), over HTTP or over HTTPS with a
+//! self-signed certificate ([`CameraTls`]) the test pins. [`TsServer`] is
+//! ffmpeg alone serving the stream as one raw MPEG-TS body (ISO/IEC
+//! 13818-1) over HTTP with `-listen 1`: one client, after which it exits.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::AsFd as _;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +42,8 @@ use lotse_core::clock::Clock;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
+
+use crate::fake_camera::CameraTls;
 
 /// The MediaMTX configuration, committed beside the crate's manifest.
 pub const CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/mediamtx.yml");
@@ -185,12 +196,29 @@ pub fn filter_graph(sample_rate: Option<u32>) -> String {
     }
 }
 
-/// ffmpeg's arguments: read the graph in real time (`-re`), encode the
-/// video with libx264 for low latency (`ultrafast`, `zerolatency`: no
-/// B-frames, no lookahead), Baseline, a keyframe forced on every flash
-/// and none between, the audio with [`Audio`]'s encoder, and publish to
-/// `url` over RTSP with RTP interleaved on TCP.
+/// ffmpeg's arguments: [`encoder_args`], published to `url` over RTSP
+/// with RTP interleaved on TCP.
 pub fn ffmpeg_args(audio: Audio, url: &str) -> Vec<String> {
+    let mut args = encoder_args(audio);
+    args.extend(["-f", "rtsp", "-rtsp_transport", "tcp", url].map(str::to_owned));
+    args
+}
+
+/// ffmpeg's arguments as an HTTP server: [`encoder_args`], muxed into
+/// MPEG-TS (ISO/IEC 13818-1) and served as one response body at `url` to
+/// the first client that asks (`-listen 1`, ffmpeg-protocols "http").
+pub fn ts_server_args(audio: Audio, url: &str) -> Vec<String> {
+    let mut args = encoder_args(audio);
+    args.extend(["-f", "mpegts", "-listen", "1", url].map(str::to_owned));
+    args
+}
+
+/// ffmpeg's input and encoder arguments: read the graph in real time
+/// (`-re`), encode the video with libx264 for low latency (`ultrafast`,
+/// `zerolatency`: no B-frames, no lookahead), Baseline, a keyframe forced
+/// on every flash and none between, and the audio with [`Audio`]'s
+/// encoder.
+pub fn encoder_args(audio: Audio) -> Vec<String> {
     let gop = FPS.to_string();
     let mut args: Vec<String> = [
         "-hide_banner",
@@ -227,8 +255,62 @@ pub fn ffmpeg_args(audio: Audio, url: &str) -> Vec<String> {
     args.push("-force_key_frames".to_owned());
     args.push(format!("expr:eq(mod(n,{FPS}),0)"));
     args.extend(audio.encoder().iter().map(|arg| (*arg).to_owned()));
-    args.extend(["-f", "rtsp", "-rtsp_transport", "tcp", url].map(str::to_owned));
     args
+}
+
+/// How MediaMTX packages the HLS it serves (`hlsVariant`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HlsVariant {
+    /// MPEG-TS segments, the audio multiplexed with the video (RFC 8216
+    /// §3.2).
+    MpegTs,
+    /// Fragmented MP4 segments (RFC 8216 §3.3); MediaMTX 1.21.1 puts the
+    /// audio in a separate rendition (`EXT-X-MEDIA`, §4.3.4.1).
+    Fmp4,
+    /// Low-latency HLS: fMP4 segments announced in partial segments as
+    /// they are made (`EXT-X-PART`), the full segments listed as well.
+    LowLatency,
+}
+
+impl HlsVariant {
+    /// MediaMTX's name of the variant.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MpegTs => "mpegts",
+            Self::Fmp4 => "fmp4",
+            Self::LowLatency => "lowLatency",
+        }
+    }
+}
+
+/// The length of an HLS segment: one group of pictures, the shortest
+/// MediaMTX can cut (it starts each segment at a keyframe).
+const HLS_SEGMENT: &str = "1s";
+
+/// The length of a low-latency partial segment.
+const HLS_PART: &str = "200ms";
+
+/// MediaMTX's variables that serve HLS in `variant`: segments of one
+/// second, made from the moment the path is ready rather than on the
+/// first request (`hlsAlwaysRemux`), over HTTPS with the PEM `key` and
+/// `certificate` files when `tls` names them.
+pub fn hls_env(variant: HlsVariant, tls: Option<(&Path, &Path)>) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("MTX_HLS", "yes".to_owned()),
+        ("MTX_HLSVARIANT", variant.name().to_owned()),
+        ("MTX_HLSALWAYSREMUX", "yes".to_owned()),
+        ("MTX_HLSSEGMENTDURATION", HLS_SEGMENT.to_owned()),
+        ("MTX_HLSPARTDURATION", HLS_PART.to_owned()),
+    ];
+    match tls {
+        None => env.push(("MTX_HLSENCRYPTION", "no".to_owned())),
+        Some((key, certificate)) => env.extend([
+            ("MTX_HLSENCRYPTION", "yes".to_owned()),
+            ("MTX_HLSSERVERKEY", key.display().to_string()),
+            ("MTX_HLSSERVERCERT", certificate.display().to_string()),
+        ]),
+    }
+    env
 }
 
 /// The addresses MediaMTX listens on, all on loopback.
@@ -241,6 +323,8 @@ pub struct Ports {
     pub rtp: u16,
     /// The HTTP API.
     pub api: u16,
+    /// HLS over HTTP or HTTPS, when [`hls_env`] turns it on.
+    pub hls: u16,
 }
 
 impl Ports {
@@ -251,6 +335,7 @@ impl Ports {
             rtsp: free_tcp_port()?,
             rtp: free_udp_pair()?,
             api: free_tcp_port()?,
+            hls: free_tcp_port()?,
         })
     }
 
@@ -263,6 +348,7 @@ impl Ports {
             ("MTX_RTPADDRESS", at(self.rtp)),
             ("MTX_RTCPADDRESS", at(self.rtp.saturating_add(1))),
             ("MTX_APIADDRESS", at(self.api)),
+            ("MTX_HLSADDRESS", at(self.hls)),
         ]
     }
 }
@@ -332,6 +418,11 @@ pub struct Camera {
     ports: Ports,
     /// What ffmpeg publishes.
     audio: Audio,
+    /// The HLS URL's scheme, when MediaMTX serves HLS.
+    hls: Option<&'static str>,
+    /// The directory of the HTTPS key and certificate files, removed on
+    /// drop.
+    tls_dir: Option<PathBuf>,
 }
 
 impl Camera {
@@ -339,13 +430,56 @@ impl Camera {
     /// is ready with all its tracks.
     pub async fn start(audio: Audio, clock: Arc<dyn Clock>) -> Result<Self, String> {
         let ports = Ports::free().map_err(|err| format!("free ports: {err}"))?;
+        Self::launch(audio, ports, Vec::new(), None, None, clock).await
+    }
+
+    /// As [`Self::start`], with MediaMTX serving the path over HLS in
+    /// `variant` too ([`Self::hls_url`]): over HTTPS with `tls`'s
+    /// certificate when there is one, else over HTTP.
+    pub async fn start_hls(
+        audio: Audio,
+        variant: HlsVariant,
+        tls: Option<&CameraTls>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, String> {
+        let ports = Ports::free().map_err(|err| format!("free ports: {err}"))?;
+        let Some(tls) = tls else {
+            let env = hls_env(variant, None);
+            return Self::launch(audio, ports, env, Some("http"), None, clock).await;
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "lotse-mediamtx-tls-{}-{}",
+            std::process::id(),
+            ports.hls
+        ));
+        let (key, certificate) = (dir.join("server.key"), dir.join("server.crt"));
+        std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&key, tls.private_key_pem()))
+            .and_then(|()| std::fs::write(&certificate, tls.certificate_pem()))
+            .map_err(|err| format!("{}: {err}", dir.display()))?;
+        let env = hls_env(variant, Some((&key, &certificate)));
+        Self::launch(audio, ports, env, Some("https"), Some(dir), clock).await
+    }
+
+    /// Starts MediaMTX on `ports` with the extra variables `env`, then
+    /// ffmpeg, and waits until the path is ready.
+    async fn launch(
+        audio: Audio,
+        ports: Ports,
+        env: Vec<(&'static str, String)>,
+        hls: Option<&'static str>,
+        tls_dir: Option<PathBuf>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, String> {
         let mut mediamtx = command("mediamtx").map_err(|err| format!("mediamtx: {err}"))?;
-        mediamtx.arg(CONFIG).envs(ports.env());
+        mediamtx.arg(CONFIG).envs(ports.env()).envs(env);
         let mut camera = Self {
             mediamtx: spawn(mediamtx)?,
             ffmpeg: None,
             ports,
             audio,
+            hls,
+            tls_dir,
         };
         camera.wait_api(&*clock).await?;
         camera.publish(&*clock).await?;
@@ -395,6 +529,13 @@ impl Camera {
     /// The URL ffmpeg publishes to and the daemon reads.
     pub fn url(&self) -> String {
         format!("rtsp://127.0.0.1:{}/{PATH}", self.ports.rtsp)
+    }
+
+    /// The multivariant playlist MediaMTX serves the path's HLS at; `None`
+    /// unless started with [`Self::start_hls`].
+    pub fn hls_url(&self) -> Option<String> {
+        self.hls
+            .map(|scheme| format!("{scheme}://127.0.0.1:{}/{PATH}/index.m3u8", self.ports.hls))
     }
 
     /// Where it listens.
@@ -526,6 +667,58 @@ impl Drop for Camera {
             let _killed = child.kill();
             let _reaped = child.wait();
         }
+        if let Some(dir) = &self.tls_dir {
+            // Left behind in the temporary directory at worst.
+            let _removed = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// ffmpeg as an HTTP server of the synthetic stream in raw MPEG-TS
+/// ([`ts_server_args`]) on a free loopback port. It serves one client:
+/// once that client hangs up, ffmpeg exits. Dropping it stops ffmpeg.
+#[derive(Debug)]
+pub struct TsServer {
+    /// ffmpeg.
+    ffmpeg: Child,
+    /// Where it listens.
+    port: u16,
+}
+
+impl TsServer {
+    /// Starts ffmpeg with `audio`. It listens a moment later, and only
+    /// then encodes: a client that connects first is refused and retries.
+    pub fn start(audio: Audio) -> Result<Self, String> {
+        let port = free_tcp_port().map_err(|err| format!("a free port: {err}"))?;
+        let mut ffmpeg = command("ffmpeg").map_err(|err| format!("ffmpeg: {err}"))?;
+        ffmpeg.args(ts_server_args(audio, &Self::url_at(port)));
+        Ok(Self {
+            ffmpeg: spawn(ffmpeg)?,
+            port,
+        })
+    }
+
+    /// The URL it serves the stream at.
+    pub fn url(&self) -> String {
+        Self::url_at(self.port)
+    }
+
+    /// The stream's URL on `port`.
+    fn url_at(port: u16) -> String {
+        format!("http://127.0.0.1:{port}/{PATH}.ts")
+    }
+
+    /// Stops ffmpeg.
+    pub fn stop(self) {
+        drop(self);
+    }
+}
+
+impl Drop for TsServer {
+    fn drop(&mut self) {
+        // Gone already is as good as stopped.
+        let _killed = self.ffmpeg.kill();
+        let _reaped = self.ffmpeg.wait();
     }
 }
 
@@ -662,6 +855,44 @@ mod tests {
             ("MTX_RTCPADDRESS", format!("127.0.0.1:{}", ports.rtp + 1))
         );
         assert_eq!(env[3].0, "MTX_APIADDRESS");
+        assert_eq!(
+            env[4],
+            ("MTX_HLSADDRESS", format!("127.0.0.1:{}", ports.hls))
+        );
+    }
+
+    #[test]
+    fn hls_is_served_in_the_variant_over_http_or_https() {
+        assert_eq!(
+            [HlsVariant::MpegTs, HlsVariant::Fmp4, HlsVariant::LowLatency].map(HlsVariant::name),
+            ["mpegts", "fmp4", "lowLatency"]
+        );
+        let plain = hls_env(HlsVariant::Fmp4, None);
+        assert!(plain.contains(&("MTX_HLS", "yes".to_owned())));
+        assert!(plain.contains(&("MTX_HLSVARIANT", "fmp4".to_owned())));
+        assert!(plain.contains(&("MTX_HLSALWAYSREMUX", "yes".to_owned())));
+        assert!(plain.contains(&("MTX_HLSSEGMENTDURATION", "1s".to_owned())));
+        assert!(plain.contains(&("MTX_HLSENCRYPTION", "no".to_owned())));
+        let tls = hls_env(
+            HlsVariant::MpegTs,
+            Some((Path::new("/k.pem"), Path::new("/c.pem"))),
+        );
+        assert!(tls.contains(&("MTX_HLSENCRYPTION", "yes".to_owned())));
+        assert!(tls.contains(&("MTX_HLSSERVERKEY", "/k.pem".to_owned())));
+        assert!(tls.contains(&("MTX_HLSSERVERCERT", "/c.pem".to_owned())));
+    }
+
+    #[test]
+    fn ffmpeg_serves_raw_mpegts_to_one_client() {
+        let line = ts_server_args(Audio::Aac, "http://127.0.0.1:1/cam.ts").join(" ");
+        assert!(line.starts_with("-hide_banner -loglevel warning -nostdin -re -f lavfi -i color="));
+        assert!(
+            line.ends_with(
+                "-c:a aac -b:a 32k -ac 1 -muxdelay 0 -f mpegts -listen 1 http://127.0.0.1:1/cam.ts"
+            ),
+            "{line}"
+        );
+        assert_eq!(TsServer::url_at(7), "http://127.0.0.1:7/cam.ts");
     }
 
     #[test]
@@ -712,9 +943,16 @@ mod tests {
                     rtsp: 1,
                     rtp: 2,
                     api,
+                    hls: 3,
                 },
                 audio: Audio::None,
+                hls: Some("https"),
+                tls_dir: None,
             };
+            assert_eq!(
+                camera.hls_url().as_deref(),
+                Some("https://127.0.0.1:3/cam/index.m3u8")
+            );
             assert_eq!(camera.url(), "rtsp://127.0.0.1:1/cam");
             assert_eq!(camera.path().await.unwrap(), Some(json!({ "ready": true })));
             assert_eq!(camera.path().await.unwrap(), None);
@@ -750,9 +988,13 @@ mod tests {
                     rtsp: 1,
                     rtp: 2,
                     api,
+                    hls: 3,
                 },
                 audio: Audio::Pcmu,
+                hls: None,
+                tls_dir: None,
             };
+            assert_eq!(camera.hls_url(), None);
             let clock: Arc<dyn Clock> = Arc::new(lotse_core::clock::SystemClock);
             let err = camera
                 .restart_publisher(Arc::clone(&clock))
@@ -775,6 +1017,8 @@ mod tests {
             ffmpeg: None,
             ports: Ports::free().unwrap(),
             audio: Audio::Pcmu,
+            hls: None,
+            tls_dir: None,
         };
         // Nothing answers on the API's port, and the process is gone soon.
         let err = camera
