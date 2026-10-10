@@ -8,9 +8,11 @@
 //! handle receives (the talk-back transcoder's G.711 frames, or a browser's
 //! Opus packets forwarded as they are) into [`BackchannelPacket`]s, the RTP
 //! header fields and the payload, without a wire format: whatever sends them
-//! on the RTSP session's interleaved channel serializes them. Neither is
-//! wired to the RTSP source yet, because retina cannot send (an upstream
-//! need).
+//! on the RTSP session's interleaved channel serializes them. [`session`]
+//! holds what surrounds them in the RTSP session: the `Require` header and
+//! its refusal, the backchannel media of the `DESCRIBE` answer, and the
+//! handle offered while the session plays. None of it is wired to the
+//! RTSP source yet, because retina cannot send (an upstream need).
 //!
 //! Implements RFC 8866 §5.14 (the `m=` format list, in order of preference),
 //! §6.4 (`a=ptime`) and §6.6 (`a=rtpmap`), with encoding names compared
@@ -21,6 +23,8 @@
 //! across silence) and §8.1 (a random SSRC); RFC 3551 §4.1 (the marker on
 //! the first packet of a talkspurt); ONVIF Streaming Specification §5.3 (the
 //! backchannel media whose format this is).
+
+pub mod session;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

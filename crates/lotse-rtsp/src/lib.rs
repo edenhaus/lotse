@@ -25,5 +25,5 @@ mod tap;
 pub mod tls;
 mod udp;
 
-pub use factory::{DEFAULT_PORT, DEFAULT_TLS_PORT, PROTOCOL, RtspFactory};
+pub use factory::{BACKCHANNEL, DEFAULT_PORT, DEFAULT_TLS_PORT, PROTOCOL, RtspFactory};
 pub use source::RtspSource;
