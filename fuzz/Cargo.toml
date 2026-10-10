@@ -195,3 +195,10 @@ path = "fuzz_targets/aac_adts.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ts_demux"
+path = "fuzz_targets/ts_demux.rs"
+test = false
+doc = false
+bench = false

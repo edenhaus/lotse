@@ -12,9 +12,16 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+bytes = { workspace = true } # the payloads of demultiplexed units
+lotse-codec = { workspace = true } # ADTS splitting of AAC from MPEG-TS
+lotse-core = { workspace = true } # the codecs and kinds of a demultiplexed program's tracks
 m3u8-rs = { workspace = true }
+mpeg2ts-reader = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true } # playlist URIs resolved against the playlist's own URL and checked for its origin
+
+[dev-dependencies]
+lotse-codec = { workspace = true, features = ["test-util"] } # the recorded ADTS of the AAC tests
 
 [lints]
 workspace = true

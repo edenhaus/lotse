@@ -12,3 +12,5 @@
 //! playlist).
 
 pub mod hls;
+pub mod media;
+pub mod ts;
