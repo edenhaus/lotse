@@ -5,15 +5,26 @@
 #
 # rustc adds `-Wl,-O1` to optimized links; zig 0.15 reports that setting as deprecated and
 # ignored, and rustc turns linker stderr into a `linker_messages` warning. Drop the flag.
+#
+# A coverage-instrumented link (`-C instrument-coverage`, cargo-llvm-cov) passes
+# `-u __llvm_profile_runtime` as two arguments; zig cc 0.15.2 takes the symbol for an input file
+# ("unrecognized file extension", observed 2026-10-10). Hand it to the linker as `-Wl,-u,<symbol>`.
 n=$#
 i=0
+undefined=false
 while [ "$i" -lt "$n" ]; do
   arg="$1"
   shift
-  case "$arg" in
-    -Wl,-O1) ;;
-    *) set -- "$@" "$arg" ;;
-  esac
+  if [ "$undefined" = true ]; then
+    set -- "$@" "-Wl,-u,$arg"
+    undefined=false
+  else
+    case "$arg" in
+      -Wl,-O1) ;;
+      -u) undefined=true ;;
+      *) set -- "$@" "$arg" ;;
+    esac
+  fi
   i=$((i + 1))
 done
 exec cargo-zigbuild zig cc -- -target x86_64-linux-musl "$@"
