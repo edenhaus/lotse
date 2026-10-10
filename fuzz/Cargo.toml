@@ -20,7 +20,7 @@ libfuzzer-sys = { version = "0.4", default-features = false, features = ["link_l
 lotse-api = { path = "../crates/lotse-api" }
 lotse-api-types = { path = "../crates/lotse-api-types" }
 lotse-codec = { path = "../crates/lotse-codec", features = ["test-util"] }
-lotse-core = { path = "../crates/lotse-core" }
+lotse-core = { path = "../crates/lotse-core", features = ["test-util"] }
 lotse-http = { path = "../crates/lotse-http" }
 lotse-ipc = { path = "../crates/lotse-ipc" }
 lotse-rtsp = { path = "../crates/lotse-rtsp" }
@@ -206,6 +206,13 @@ bench = false
 [[bin]]
 name = "fmp4_segment"
 path = "fuzz_targets/fmp4_segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hls_session"
+path = "fuzz_targets/hls_session.rs"
 test = false
 doc = false
 bench = false
