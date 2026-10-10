@@ -84,6 +84,9 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # for camera input: no panic on an `m=` line without a format, sdp-types 0.2, the response size
 # limit (`SessionOptions::max_message_size`) and a validated `Session` id.
 retina = { git = "https://github.com/scottlamb/retina", rev = "7698fa14924768f024aa16126a5e3ca324e5bfe6", default-features = false }
+# The HLS playlist parser of the HTTP source (RFC 8216 §4); only the parser feature, whose nom 7
+# is already in the tree via rtsp-types; chrono comes with it, for `EXT-X-PROGRAM-DATE-TIME`.
+m3u8-rs = { version = "6", default-features = false, features = ["parser"] }
 # RTSP message parsing and serialization for the fake camera of the tests.
 rtsp-types = { version = "0.1", default-features = false }
 # H.264 bitstream syntax (SPS profile, level and dimensions, SEI) on the side branch; the packet

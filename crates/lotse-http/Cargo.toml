@@ -1,0 +1,20 @@
+[package]
+name = "lotse-http"
+description = "HTTP source: HLS playlists and segments, raw MPEG-TS over HTTP."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+m3u8-rs = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true } # playlist URIs resolved against the playlist's own URL and checked for its origin
+
+[lints]
+workspace = true

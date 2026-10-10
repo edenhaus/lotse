@@ -21,6 +21,7 @@ lotse-api = { path = "../crates/lotse-api" }
 lotse-api-types = { path = "../crates/lotse-api-types" }
 lotse-codec = { path = "../crates/lotse-codec", features = ["test-util"] }
 lotse-core = { path = "../crates/lotse-core" }
+lotse-http = { path = "../crates/lotse-http" }
 lotse-ipc = { path = "../crates/lotse-ipc" }
 lotse-rtsp = { path = "../crates/lotse-rtsp" }
 lotse-supervisor = { path = "../crates/lotse-supervisor" }
@@ -32,6 +33,7 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 str0m = { version = "0.24", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "io-util", "macros"] }
 tokio-util = { version = "0.7", default-features = false }
+url = { version = "2", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "ipc_message"
@@ -169,6 +171,13 @@ bench = false
 [[bin]]
 name = "ws_message"
 path = "fuzz_targets/ws_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hls_playlist"
+path = "fuzz_targets/hls_playlist.rs"
 test = false
 doc = false
 bench = false
