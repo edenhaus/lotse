@@ -398,6 +398,10 @@ impl DemuxStats {
     }
 }
 
+/// How [`Demux`] starts its receive thread: [`std::thread::Builder::spawn`]
+/// on the named builder and the thread's body.
+type SpawnThread = fn(std::thread::Builder, Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>;
+
 /// The receive thread and what it shares.
 #[derive(Debug)]
 pub struct Demux {
@@ -428,15 +432,28 @@ impl Demux {
         hosts: Vec<SocketAddr>,
         clock: Arc<dyn Clock>,
     ) -> io::Result<Self> {
+        Self::start_with(socket, local, hosts, clock, std::thread::Builder::spawn)
+    }
+
+    /// [`Self::start`], with `spawn` starting the receive thread: the seam
+    /// a test makes fail, as a process at its thread limit would see it,
+    /// whatever user runs the test.
+    fn start_with(
+        socket: Arc<UdpSocket>,
+        local: SocketAddr,
+        hosts: Vec<SocketAddr>,
+        clock: Arc<dyn Clock>,
+        spawn: SpawnThread,
+    ) -> io::Result<Self> {
         let socket_state = UdpSocketState::new((&*socket).into())?;
         let registrations = Arc::new(Registrations::default());
         let responses = Arc::new(StunResponses::default());
         let stats = Arc::new(DemuxStats::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (relays, updates) = Relays::channel();
-        let thread = std::thread::Builder::new()
-            .name("lotse-demux".into())
-            .spawn({
+        let thread = spawn(
+            std::thread::Builder::new().name("lotse-demux".into()),
+            Box::new({
                 let registrations = Arc::clone(&registrations);
                 let responses = Arc::clone(&responses);
                 let stats = Arc::clone(&stats);
@@ -453,7 +470,8 @@ impl Demux {
                     );
                     receive_loop(&socket, &socket_state, &mut router, &stop);
                 }
-            })?;
+            }),
+        )?;
         Ok(Self {
             registrations,
             responses,
@@ -1817,23 +1835,18 @@ mod tests {
         assert_eq!(DemuxStats::get(&stats.unroutable), 1, "the read is routed");
     }
 
-    /// A process at its thread limit cannot start the receive thread; the
-    /// error is the caller's. nextest runs each test in its own process.
+    /// A receive thread that cannot start (as at the process's thread
+    /// limit, `EAGAIN`) is the caller's error.
     #[test]
     fn a_receive_thread_that_cannot_start_is_an_error() {
-        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
         let bound = super::super::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
-        let limit = getrlimit(Resource::Nproc);
-        setrlimit(
-            Resource::Nproc,
-            Rlimit {
-                current: Some(0),
-                maximum: limit.maximum,
-            },
-        )
-        .unwrap();
-        let started = Demux::start(bound.socket, bound.local, vec![], Arc::new(SystemClock));
-        setrlimit(Resource::Nproc, limit).unwrap();
+        let started = Demux::start_with(
+            bound.socket,
+            bound.local,
+            vec![],
+            Arc::new(SystemClock),
+            |_, _| Err(io::ErrorKind::WouldBlock.into()),
+        );
         let_assert!(Err(err) = started, "no thread at the limit");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
     }

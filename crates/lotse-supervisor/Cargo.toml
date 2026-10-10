@@ -35,7 +35,7 @@ lotse-ipc = { workspace = true }
 allocation-counter = { workspace = true } # the demux's allocation count (tests/allocations.rs)
 lotse-core = { workspace = true, features = ["test-util"] } # the fake source and clock
 lotse-testing = { workspace = true } # the fake TURN server
-rustix = { workspace = true, features = ["process"] } # signals to `run`, a reaped worker and a thread limit in the tests
+rustix = { workspace = true, features = ["process"] } # signals to `run`, a reaped worker and a descriptor limit in the tests
 tracing-subscriber = { workspace = true } # captures the demux's rate-limited log lines
 
 [lints]
