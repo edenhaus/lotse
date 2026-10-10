@@ -12,6 +12,7 @@
 //! §6.2, §6.3.1 and §A.1, §A.3, §A.8 (receiver reports to the camera), ONVIF Streaming
 //! Specification §5.3.
 
+pub mod backchannel;
 pub mod error;
 mod factory;
 mod fmtp;

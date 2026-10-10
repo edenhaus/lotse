@@ -1496,11 +1496,13 @@ version = "0.0.0-dev"
 dependencies = [
  "bytes",
  "futures-util",
+ "getrandom 0.3.4",
  "lotse-codec",
  "lotse-core",
  "lotse-testing",
  "retina",
  "rustls",
+ "sdp-types",
  "serde",
  "serde_json",
  "sha2",
