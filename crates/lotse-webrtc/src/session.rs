@@ -17,7 +17,8 @@
 //! candidates, offered or trickled, refused by address class),
 //! draft-ietf-mmusic-mdns-ice-candidates §3.2.1 (`.local` ones ignored),
 //! RFC 6347 §4.2.7 with RFC 5246 §7.2.1 (`close_notify` on close) and
-//! RFC 3550 §6.6 (BYE on close).
+//! RFC 3550 §6.6 (BYE on close) and §5.1 (the talk-back RTP header
+//! fields handed on as sent).
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -26,24 +27,27 @@ use std::time::{Duration, Instant};
 
 use lotse_codec::h264::LIBWEBRTC_MAX_FRAME_PACKETS;
 use lotse_core::codec::{Codec, CodecFamily};
-use lotse_core::media::MediaPacket;
+use lotse_core::media::{MediaPacket, RtpHeaderFields};
 use lotse_core::orientation::Orientation;
 use lotse_core::session::{
     SessionEngine, SessionEvent, SessionLimits, SessionOpenError, SessionOutput, SessionRequest,
     SessionStats, Transport,
 };
+use lotse_core::throttle::Throttle;
 use lotse_core::track::GopSnapshot;
+use lotse_core::uplink::{UplinkCodec, UplinkPacket};
 use str0m::change::SdpOffer;
 use str0m::format::{Codec as EngineCodec, PayloadParams};
 use str0m::media::{Media, MediaKind, Mid};
 use str0m::net::{DatagramRecv, Protocol, Receive, TcpType, Transmit};
+use str0m::rtp::RtpPacket;
 use str0m::{Candidate, Event, IceConnectionState, IceCreds, Input, Output, Rtc, RtcConfig};
 
-use crate::audio;
-use crate::audio::{AudioPlan, Talkback};
+use crate::audio::{self, AudioPlan, Talkback};
 use crate::capture_time::{CaptureTimeSender, WallAnchor};
 use crate::cvo::Cvo;
 use crate::sdp::{Sdp, Section, check_payload_types};
+use crate::talkback::{Depacketizer, Refused};
 use crate::video::{NegotiatedVideo, VideoPlan};
 use crate::writer::{AudioWriter, RTX_CACHE_PACKETS, VideoWriter};
 use crate::{install_crypto_provider, session_config};
@@ -118,6 +122,11 @@ pub struct Session {
     /// The SSRC of the audio send stream, when the answer carries audio:
     /// its RTP is marked for DSCP EF.
     audio_ssrc: Option<u32>,
+    /// Talk-back, when the answer receives it.
+    talkback: Option<TalkbackRx>,
+    /// Rate-limits the log line for RTP the viewer sent that is no
+    /// talk-back.
+    refused: Throttle,
     /// Outputs to serve before asking the engine.
     pending: VecDeque<SessionOutput>,
     /// When `ice_failed` fires while unconnected.
@@ -419,6 +428,82 @@ fn audio_writer(
     ))
 }
 
+/// Talk-back as the session receives it: the m-line it comes on and how
+/// its packets are taken.
+#[derive(Debug)]
+struct TalkbackRx {
+    /// The talk-back m-line: the dedicated one, or the `sendrecv`
+    /// downlink one.
+    mid: Mid,
+    /// Takes its RTP by payload type.
+    depacketizer: Depacketizer,
+    /// The codec of the last packet handed on, `None` before the first:
+    /// the start of talk-back and a change of codec are logged.
+    codec: Option<UplinkCodec>,
+}
+
+impl TalkbackRx {
+    /// The talk-back packet of an RTP packet the engine mapped to the
+    /// m-line `mid`, with header fields `rtp` and `payload`, received at
+    /// `arrival`; or why it is none. Logs the start of talk-back and a
+    /// change of codec.
+    fn take(
+        &mut self,
+        mid: Option<Mid>,
+        rtp: RtpHeaderFields,
+        payload: std::sync::Arc<[u8]>,
+        arrival: Instant,
+    ) -> Result<UplinkPacket, &'static str> {
+        if mid != Some(self.mid) {
+            return Err("not on the talk-back m-line");
+        }
+        let uplink = self
+            .depacketizer
+            .depacketize(rtp, payload, arrival)
+            .map_err(Refused::reason)?;
+        let codec = uplink.codec.name();
+        let (pt, ssrc) = (rtp.pt, rtp.ssrc);
+        match self.codec.replace(uplink.codec) {
+            None => tracing::info!(mid = %self.mid, pt, ssrc, codec, "talk-back uplink started"),
+            Some(old) if old == uplink.codec => {}
+            Some(old) => {
+                let from = old.name();
+                tracing::info!(mid = %self.mid, pt, ssrc, from, to = codec, "talk-back uplink changed codec");
+            }
+        }
+        Ok(uplink)
+    }
+}
+
+/// The audio family of one of str0m's codecs, the reverse of
+/// [`audio_engine_codec`].
+fn engine_family(codec: EngineCodec) -> Option<CodecFamily> {
+    match codec {
+        EngineCodec::Opus => Some(CodecFamily::Opus),
+        EngineCodec::PCMU => Some(CodecFamily::Pcmu),
+        EngineCodec::PCMA => Some(CodecFamily::Pcma),
+        EngineCodec::G722 => Some(CodecFamily::G722),
+        _ => None,
+    }
+}
+
+/// How the session receives talk-back on the m-line `mid` the plan
+/// negotiated it on: by the payload types the engine settled on with the
+/// offer (str0m takes the offer's numbers), every talk-back codec among
+/// them, since the browser may send any codec the m-line lists.
+fn talkback_rx(rtc: &Rtc, mid: &str) -> TalkbackRx {
+    let negotiated = rtc
+        .codec_config()
+        .params()
+        .iter()
+        .filter_map(|params| Some((*params.pt(), engine_family(params.spec().codec)?)));
+    TalkbackRx {
+        mid: Mid::from(mid),
+        depacketizer: Depacketizer::new(negotiated),
+        codec: None,
+    }
+}
+
 /// Whether `datagram`, as the engine sends it, is an RTP packet of the
 /// SSRC `audio`: a first byte in 128 to 191 is RTP or RTCP (RFC 7983 §7),
 /// a second byte in 192 to 223 RTCP (RFC 5761 §4), and the SSRC follows
@@ -642,6 +727,10 @@ impl Session {
             no_audio(&rtc, request, &plan, &mut pending);
         }
         log_talkback(&plan, request.backchannel.as_ref());
+        let talkback = match plan.talkback {
+            Talkback::Negotiated { mid, .. } => Some(talkback_rx(&rtc, mid)),
+            Talkback::Off(_) => None,
+        };
 
         push_opening_events(&mut pending, candidates, mid);
         tracing::info!(mid = %mid, pt = *pt, "session answered");
@@ -669,6 +758,8 @@ impl Session {
             audio,
             warned_over_limit: false,
             audio_ssrc,
+            talkback,
+            refused: Throttle::default(),
             pending,
             connect_deadline: Some(
                 now.checked_add(request.limits.connect_timeout)
@@ -794,6 +885,46 @@ impl Session {
                         message: err.to_string(),
                     }));
                 false
+            }
+        }
+    }
+
+    /// An RTP packet the viewer sent: a talk-back packet when it came on
+    /// the talk-back m-line in a talk-back codec, handed on as
+    /// [`SessionOutput::Uplink`] and counted; anything else is refused,
+    /// counted and logged, rate-limited. The m-line is the one str0m
+    /// mapped the packet's SSRC to (by `a=ssrc` or the RFC 8843 `mid`
+    /// header extension), which it does without regard to direction.
+    fn on_rtp(&mut self, packet: RtpPacket) {
+        let ssrc = *packet.header.ssrc;
+        let mid = self
+            .rtc
+            .direct_api()
+            .stream_rx(&packet.header.ssrc)
+            .map(|stream| stream.mid());
+        let rtp = RtpHeaderFields {
+            pt: *packet.header.payload_type,
+            seq: packet.header.sequence_number,
+            ts: packet.header.timestamp,
+            marker: packet.header.marker,
+            ssrc,
+        };
+        let taken = match self.talkback.as_mut() {
+            Some(talkback) => talkback.take(mid, rtp, packet.payload, packet.timestamp),
+            None => Err("talk-back not negotiated"),
+        };
+        let stats = &mut self.writer.stats;
+        match taken {
+            Ok(uplink) => {
+                stats.uplink_packets = stats.uplink_packets.saturating_add(1);
+                self.pending.push_back(SessionOutput::Uplink(uplink));
+            }
+            Err(reason) => {
+                stats.uplink_refused = stats.uplink_refused.saturating_add(1);
+                if let Some(count) = self.refused.hit(self.now) {
+                    let mid = mid.map(|mid| mid.to_string());
+                    tracing::debug!(reason, count, pt = rtp.pt, ssrc, mid, "viewer RTP refused");
+                }
             }
         }
     }
@@ -1076,6 +1207,7 @@ impl SessionEngine for Session {
                     return SessionOutput::Timeout(self.next_timeout(at));
                 }
                 Ok(Output::Transmit(transmit)) => return self.transmit(transmit),
+                Ok(Output::Event(Event::RtpPacket(packet))) => self.on_rtp(packet),
                 Ok(Output::Event(event)) => self.on_event(&event),
                 Err(err) => self.close(self.now, "internal_error", format!("engine: {err}")),
             }
@@ -1400,6 +1532,62 @@ mod tests {
             Some("a")
         );
         assert_eq!(first_mid("m=audiox 9 x 0\r\na=mid:a\r\n", "audio"), None);
+    }
+
+    #[test]
+    fn engine_codecs_map_back_to_audio_families() {
+        for family in audio::EVERY_CODEC {
+            assert_eq!(
+                audio_engine_codec(family).and_then(engine_family),
+                Some(family)
+            );
+        }
+        assert_eq!(engine_family(EngineCodec::H264), None);
+    }
+
+    #[test]
+    fn talk_back_is_only_what_the_engine_mapped_to_the_talk_back_m_line() {
+        use lotse_core::clock::{Clock as _, SystemClock};
+
+        let now = SystemClock.now();
+        let mut talkback = TalkbackRx {
+            mid: Mid::from("2"),
+            depacketizer: Depacketizer::new([(0, CodecFamily::Pcmu), (111, CodecFamily::Opus)]),
+            codec: None,
+        };
+        let rtp = |pt| RtpHeaderFields {
+            pt,
+            seq: 1,
+            ts: 160,
+            marker: false,
+            ssrc: 3,
+        };
+        let payload = || std::sync::Arc::<[u8]>::from(&[0xf8_u8, 1][..]);
+        // Another m-line, or one the engine could not tell.
+        for mid in [Some(Mid::from("0")), None] {
+            assert_eq!(
+                talkback.take(mid, rtp(0), payload(), now),
+                Err("not on the talk-back m-line")
+            );
+        }
+        assert_eq!(talkback.codec, None);
+        // The talk-back m-line: taken, and the codec remembered for the
+        // log of a change.
+        let mid = Some(Mid::from("2"));
+        assert!(talkback.take(mid, rtp(0), payload(), now).is_ok());
+        assert_eq!(talkback.codec, Some(UplinkCodec::Pcmu));
+        assert!(talkback.take(mid, rtp(0), payload(), now).is_ok());
+        assert_eq!(
+            talkback.take(mid, rtp(8), payload(), now),
+            Err("payload type of no talk-back codec")
+        );
+        assert_eq!(
+            talkback.codec,
+            Some(UplinkCodec::Pcmu),
+            "a refusal is no change"
+        );
+        assert!(talkback.take(mid, rtp(111), payload(), now).is_ok());
+        assert_eq!(talkback.codec, Some(UplinkCodec::Opus));
     }
 
     #[test]

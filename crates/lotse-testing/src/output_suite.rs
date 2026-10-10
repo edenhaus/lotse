@@ -439,6 +439,8 @@ impl SessionUnderTest {
                     self.events.push(SessionEvent::Closed { code, message });
                 }
                 SessionOutput::Event(event) => self.events.push(event),
+                // The suite's viewer sends no talk-back.
+                SessionOutput::Uplink(_) => {}
                 SessionOutput::Timeout(at) => {
                     self.timeout = Some(at);
                     return;

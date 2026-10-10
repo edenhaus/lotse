@@ -40,6 +40,10 @@ exclude_re = [
     # Only logs the talk-back decision; the answer it describes is asserted by the
     # talk-back fixtures.
     "replace log_talkback with \\(\\)",
+    # Only picks whether a change of the talk-back codec is logged; the codec is remembered
+    # either way.
+    "replace match guard old == uplink.codec with (true|false) in TalkbackRx::take",
+    "replace == with != in TalkbackRx::take",
     # G.711's sign (0x80), segment (0x70) and step (0x0f) bits are disjoint, so `|` and `^`
     # produce the same code.
     "g711.rs:.*replace \\| with \\^ in (mu|a)_encode$",

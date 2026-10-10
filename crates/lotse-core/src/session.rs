@@ -16,6 +16,7 @@ use crate::codec::{Codec, CodecFamily};
 use crate::media::MediaPacket;
 use crate::orientation::Orientation;
 use crate::track::{GopSnapshot, TrackEvent};
+use crate::uplink::UplinkPacket;
 
 /// The ICE credentials the supervisor chose for a session, so its demux
 /// can verify STUN integrity.
@@ -200,6 +201,10 @@ pub enum SessionOutput {
     },
     /// Something happened.
     Event(SessionEvent),
+    /// A talk-back packet the viewer sent, depacketized. The worker
+    /// publishes a session's on its [`UplinkTrack`](crate::uplink::UplinkTrack),
+    /// towards the connection's backchannel.
+    Uplink(UplinkPacket),
     /// Nothing more until `handle_timeout` at this instant, or until input.
     Timeout(Instant),
 }
@@ -239,6 +244,14 @@ pub struct SessionStats {
     pub audio_dropped: u64,
     /// Datagrams that were not valid input.
     pub bad_datagrams: u64,
+    /// Talk-back packets received and handed on as
+    /// [`SessionOutput::Uplink`]: `session/get`'s
+    /// `backchannel.packets_received`.
+    pub uplink_packets: u64,
+    /// RTP the viewer sent that is no talk-back packet: on another m-line
+    /// than talk-back's, in a payload type of no talk-back codec, or a
+    /// payload that is not one packet of its codec. Dropped.
+    pub uplink_refused: u64,
 }
 
 /// One session's engine. Every method is followed by a full `poll` drain

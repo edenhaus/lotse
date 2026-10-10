@@ -25,6 +25,7 @@ use crate::source_url::SourceUrl;
 use crate::task::BoxFuture;
 use crate::track::{FrameSubscription, GopSnapshot, Track, Unit};
 use crate::transcode::{TrackHandle, TranscodeError, Transcoder};
+use crate::uplink::{UplinkCodec, UplinkPacket};
 
 /// `let $pattern = $value else { panic!(..) };` for tests, the one such
 /// macro of the workspace: binds the pattern's names, or fails the test
@@ -567,7 +568,9 @@ impl OutputFactory for EchoSessionFactory {
 /// An engine that sends every datagram back where it came from, over the
 /// transport it came on (a datagram starting `tcp:` goes back over ICE-TCP
 /// whatever it came on, so a test can make a TCP send fail, and one
-/// starting `audio:` goes back marked as the audio track's), reports
+/// starting `audio:` goes back marked as the audio track's), hands on
+/// what follows `talk:` in a datagram starting with it as a PCMU talk-back
+/// packet (SSRC 1, 160 ticks after the last), reports
 /// `Connected` on the first, counts the video packets and joins it gets,
 /// reports the first audio packet with how long before its arrival it was
 /// captured (an `echo_audio` warning), takes every relay candidate with a
@@ -637,6 +640,32 @@ impl SessionEngine for EchoEngine {
             payload: bytes.to_vec(),
             audio: bytes.starts_with(b"audio:"),
         });
+        if let Some(talk) = bytes.strip_prefix(b"talk:") {
+            let count = self.stats.uplink_packets;
+            let ts = u32::try_from(count % (1 << 32))
+                .unwrap_or_default()
+                .wrapping_mul(160);
+            let seq = u16::try_from(count % (1 << 16)).unwrap_or_default();
+            self.stats.uplink_packets = count.saturating_add(1);
+            self.out.push_back(SessionOutput::Uplink(UplinkPacket {
+                codec: UplinkCodec::Pcmu,
+                packet: MediaPacket {
+                    arrival: now,
+                    rtp: crate::media::RtpHeaderFields {
+                        pt: 0,
+                        seq,
+                        ts,
+                        marker: false,
+                        ssrc: 1,
+                    },
+                    frame_start: true,
+                    keyframe_start: false,
+                    epoch: 0,
+                    lateness: Duration::ZERO,
+                    payload: Arc::from(talk),
+                },
+            }));
+        }
         if !self.connected {
             self.connected = true;
             self.out
@@ -1572,5 +1601,44 @@ mod tests {
             matches!(engine.poll(), SessionOutput::Timeout(_)),
             "closed once"
         );
+    }
+
+    #[test]
+    fn the_echo_engine_hands_what_follows_talk_on_as_pcmu_talk_back() {
+        use crate::clock::{Clock as _, SystemClock};
+
+        let now = SystemClock.now();
+        let mut engine = EchoEngine::new(now);
+        let browser: SocketAddr = "192.0.2.9:5000".parse().unwrap();
+        let daemon: SocketAddr = "192.0.2.1:18556".parse().unwrap();
+        engine.handle_datagram(now, Transport::Udp, browser, daemon, b"hi");
+        assert!(matches!(engine.poll(), SessionOutput::Transmit { .. }));
+        assert_eq!(engine.poll(), SessionOutput::Event(SessionEvent::Connected));
+        for k in 0..2_u16 {
+            engine.handle_datagram(now, Transport::Udp, browser, daemon, b"talk:\xff\xfe");
+            assert!(matches!(engine.poll(), SessionOutput::Transmit { .. }));
+            assert_eq!(
+                engine.poll(),
+                SessionOutput::Uplink(UplinkPacket {
+                    codec: UplinkCodec::Pcmu,
+                    packet: MediaPacket {
+                        arrival: now,
+                        rtp: crate::media::RtpHeaderFields {
+                            pt: 0,
+                            seq: k,
+                            ts: 160 * u32::from(k),
+                            marker: false,
+                            ssrc: 1,
+                        },
+                        frame_start: true,
+                        keyframe_start: false,
+                        epoch: 0,
+                        lateness: Duration::ZERO,
+                        payload: Arc::from(&[0xff_u8, 0xfe][..]),
+                    },
+                })
+            );
+        }
+        assert_eq!(engine.stats().uplink_packets, 2);
     }
 }

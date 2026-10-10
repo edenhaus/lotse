@@ -1,6 +1,7 @@
 //! Worker process: the IPC client, the source connection runner, the
-//! derived tracks, the session manager and the once-per-second stats push,
-//! for one camera connection.
+//! derived tracks, the session manager with each session's talk-back
+//! uplink track, and the once-per-second stats push, for one camera
+//! connection.
 //!
 //! Everything a worker does apart from parsing protocols. It takes the factory
 //! registries the binary filled, receives control messages from the
@@ -18,6 +19,7 @@ mod ice_tcp;
 pub mod relay;
 mod sendmsg;
 mod sessions;
+mod talkback;
 #[cfg(test)]
 mod test_logs;
 
@@ -2249,6 +2251,21 @@ mod tests {
             () = SystemClock.sleep(Duration::from_secs(5)) => panic!("no echo over udp"),
         };
         assert_eq!((&buf[..n], from), (&b"over udp"[..], shared_addr));
+
+        // Talk-back the engine hands on goes out on the session's uplink
+        // track (`talkback`), and the session goes on.
+        for payload in [&b"talk:\xff"[..], b"talk:\xfe", b"after talk"] {
+            lotse_ipc::datagram::encode(
+                "ufrag-echo",
+                browser.local_addr().unwrap(),
+                shared_addr,
+                payload,
+                &mut frame,
+            );
+            datagrams.send(&frame).unwrap();
+            let (n, _) = within(browser.recv_from(&mut buf)).await.unwrap();
+            assert_eq!(&buf[..n], payload);
+        }
 
         // A datagram that arrived on another of the host's addresses is
         // answered from that one (RFC 8445 §7.2.5.2.1), not from the one

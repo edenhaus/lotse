@@ -87,7 +87,7 @@ impl Pair {
                     self.connected = true;
                     self.session.join(self.now, None);
                 }
-                SessionOutput::Event(_) => {}
+                SessionOutput::Event(_) | SessionOutput::Uplink(_) => {}
                 SessionOutput::Timeout(_) => return,
             }
         }

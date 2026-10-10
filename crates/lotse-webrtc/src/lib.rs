@@ -15,9 +15,10 @@
 //! (feedback), RFC 4588 (RTX), RFC 6184 §8.2.2, RFC 7798 §7.2.2 (H.265
 //! offer/answer), RFC 9143 (BUNDLE; §9.1.1 payload type reuse), RFC 8837
 //! §5 (which datagrams are the audio track's, for their DSCP), 3GPP TS
-//! 26.114 §7.4.5 and RFC 8285 (the video orientation extension), and the
-//! webrtc.org `abs-capture-time` extension (observed behavior, not a
-//! standard; `capture_time`).
+//! 26.114 §7.4.5 and RFC 8285 (the video orientation extension), RFC 6716
+//! §3.4 (talk-back packets checked, [`talkback`]), and the webrtc.org
+//! `abs-capture-time` extension (observed behavior, not a standard;
+//! `capture_time`).
 
 mod audio;
 mod capture_time;
@@ -25,6 +26,7 @@ mod crypto;
 mod cvo;
 pub mod sdp;
 pub mod session;
+pub mod talkback;
 mod video;
 mod writer;
 

@@ -8,13 +8,14 @@
 //! the datagrams and the clock.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::crypto::CryptoProvider;
 use str0m::media::{KeyframeRequestKind, MediaKind, Mid};
 use str0m::net::{DatagramRecv, Protocol, Receive, TcpType};
-use str0m::rtp::{Extension, ExtensionMap, RtpPacket};
+use str0m::rtp::{Extension, ExtensionMap, RtpPacket, RtpWrite, SeqNo};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 
 /// The direction [`Viewer::audio_direction`] reports.
@@ -435,6 +436,38 @@ impl Viewer {
             stream.request_keyframe(KeyframeRequestKind::Pli);
         }
         self.drain(out);
+    }
+
+    /// Sends one RTP packet on the m-line talk-back is offered on, as a
+    /// browser does once the microphone track is in: payload type `pt`,
+    /// sequence number `seq`, timestamp `ts`, the marker and the payload,
+    /// written as they are (RTP mode). `Err` without talk-back offered, or
+    /// before the answer gave the viewer a send stream on it.
+    pub fn send_talkback(
+        &mut self,
+        now: Instant,
+        rtp: (u8, u16, u32, bool),
+        payload: &[u8],
+        out: &mut Vec<Outgoing>,
+    ) -> Result<(), String> {
+        let (pt, seq, ts, marker) = rtp;
+        let mid = self.talkback_mid.ok_or("no talk-back offered")?;
+        let mut api = self.rtc.direct_api();
+        let stream = api
+            .stream_tx_by_mid(mid, None)
+            .ok_or("no send stream on the talk-back m-line")?;
+        stream.write_rtp(
+            RtpWrite::new(
+                pt.into(),
+                SeqNo::from(u64::from(seq)),
+                ts,
+                now,
+                Arc::<[u8]>::from(payload),
+            )
+            .marker(marker),
+        );
+        self.drain(out);
+        Ok(())
     }
 
     /// Hangs up the way a browser does: DTLS `close_notify` goes out.

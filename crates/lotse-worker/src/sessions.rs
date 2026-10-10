@@ -52,6 +52,7 @@ use lotse_core::skew::AV_SYNC_LOST;
 use lotse_core::source::BackchannelSlot;
 use lotse_core::task::spawn_named;
 use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
+use lotse_core::uplink::UplinkTrack;
 use lotse_ipc::{SessionEvent as IpcEvent, SessionSpec, datagram};
 use tokio::net::UnixDatagram;
 use tokio::sync::mpsc;
@@ -61,6 +62,7 @@ use crate::derived::{DerivedTracks, Lease, PickedTrack};
 use crate::ice_tcp::Links;
 use crate::relay::{Egress, Relays};
 use crate::sendmsg;
+use crate::talkback;
 
 /// The bounded inbound queue per session:
 /// uplink only, so small.
@@ -770,6 +772,9 @@ struct Opened {
     /// The datagram-channel message to the supervisor being encoded,
     /// reused from frame to frame.
     uplink: Vec<u8>,
+    /// The track the viewer's talk-back goes out on, from its first
+    /// packet ([`talkback`]); closed with the session.
+    talkback: Option<UplinkTrack>,
 }
 
 /// What a session takes from the connection it opens on.
@@ -919,6 +924,7 @@ async fn open_session(
         _video_lease: picked.video.lease,
         relays: Relays::default(),
         uplink: Vec::new(),
+        talkback: None,
     };
     for relay in relays {
         add_relay(ctx, &mut opened, relay).await;
@@ -1011,6 +1017,7 @@ async fn drain(
                     ctx.emit(event).await;
                 }
             }
+            SessionOutput::Uplink(packet) => talkback::receive(&mut opened.talkback, packet),
             SessionOutput::Timeout(at) => return Some(at),
         }
     }
