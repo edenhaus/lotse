@@ -1,13 +1,21 @@
-//! TLS to an `rtsps://` camera: the client configuration, the certificate
-//! check the source options choose, and how a failed handshake becomes a
-//! [`SourceError`].
+//! TLS to a source's server (an `rtsps://` camera, an `https://` stream):
+//! the client configuration, the certificate check the source options
+//! choose, and how a failed handshake becomes a [`SourceError`].
 //!
-//! Implements RFC 7826 §19.2 (RTSP over TLS, which follows RFC 2818 for
-//! the server's identity) over RFC 8446 (TLS 1.3) and RFC 5246 (TLS 1.2,
-//! which many cameras are limited to), with RFC 6066 §3 server name
-//! indication (sent for a host name, never for an address literal). rustls
-//! with the `ring` provider does the protocol; this module only decides
-//! whom to trust:
+//! Runs in a worker, inside a source crate's connection attempt. Depends on
+//! `lotse-core` only (for [`SourceError`]), never on a source crate or a
+//! protocol engine: a source connects its own TCP stream, hands it to
+//! [`connect`] with the ALPN protocols of its scheme, and speaks its
+//! protocol over the stream it gets back.
+//!
+//! Standards: RFC 8446 (TLS 1.3) and RFC 5246 (TLS 1.2, which many cameras
+//! are limited to) through rustls, RFC 6066 §3 server name indication (sent
+//! for a host name, never for an address literal), RFC 7301 (ALPN, offered
+//! when the caller names protocols), RFC 5280 path validation and the
+//! RFC 2818 §3.1 / RFC 6125 host name check through `webpki`. RFC 7826
+//! §19.2 (`rtsps`) and RFC 9110 §4.3.4 (`https`) both take the server's
+//! identity from RFC 2818. rustls with the `ring` provider does the
+//! protocol; this crate only decides whom to trust:
 //!
 //! - **Roots** (the default): the chain must end in an embedded
 //!   `webpki-roots` anchor and the certificate must name the URL's host
@@ -24,7 +32,6 @@
 
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use lotse_core::source::SourceError;
@@ -35,9 +42,9 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, OtherError, RootCertStore};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
+pub use tokio_rustls::client::TlsStream;
 
 /// The length of a SHA-256 digest in bytes.
 const FINGERPRINT_LEN: usize = 32;
@@ -126,9 +133,9 @@ impl<'de> Deserialize<'de> for Fingerprint {
     }
 }
 
-/// Whom an `rtsps` connection trusts, from the source options.
+/// Whom a TLS connection trusts, from the source options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Trust {
+pub enum Trust {
     /// The embedded roots and the host name.
     Roots,
     /// Exactly the certificate with this fingerprint.
@@ -137,22 +144,22 @@ pub(crate) enum Trust {
     Insecure,
 }
 
-/// Where an `rtsps` connection goes and whom it trusts; built when the
-/// source is validated, so a host that cannot be a TLS server name fails
-/// at `stream/put`.
+/// Where a TLS connection goes and whom it trusts; built when the source
+/// is validated, so a host that cannot be a TLS server name fails at
+/// `stream/put`.
 #[derive(Debug, Clone)]
-pub(crate) struct TlsTarget {
+pub struct TlsTarget {
     /// The URL's host: the SNI and the name the certificate must carry
     /// with [`Trust::Roots`].
-    pub(crate) server_name: ServerName<'static>,
+    pub server_name: ServerName<'static>,
     /// The certificate check.
-    pub(crate) trust: Trust,
+    pub trust: Trust,
 }
 
 impl TlsTarget {
     /// The target for `host` as `SourceUrl::host` spells it (an IPv6
     /// literal in brackets).
-    pub(crate) fn new(host: &str, trust: Trust) -> Result<Self, String> {
+    pub fn new(host: &str, trust: Trust) -> Result<Self, String> {
         let bare = host
             .strip_prefix('[')
             .and_then(|inner| inner.strip_suffix(']'))
@@ -245,7 +252,8 @@ impl ServerCertVerifier for CameraVerifier {
             // the host name is not checked against the certificate (nor the
             // chain or validity period); the pin names one certificate, and
             // self-signed cameras rarely name the address they are reached
-            // by. gate: rtsps_plays_with_a_pinned_certificate_rfc7826_19_2
+            // by. gate: a_pin_accepts_exactly_its_certificate_whatever_it_names,
+            // rtsps_plays_with_a_pinned_certificate_rfc7826_19_2 (lotse-rtsp)
             Check::Pin(_) | Check::Insecure => Ok(ServerCertVerified::assertion()),
             Check::Roots(roots) => roots
                 .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
@@ -291,9 +299,14 @@ fn tls_failed(err: impl fmt::Display) -> SourceError {
 }
 
 /// The client configuration: the `ring` provider, TLS 1.3 and 1.2, the
-/// check `trust` asks for (against `roots` in [`Trust::Roots`]), no client
-/// certificate.
-fn client_config(trust: Trust, roots: RootCertStore) -> Result<ClientConfig, SourceError> {
+/// check `trust` asks for (against `roots` in [`Trust::Roots`]), the
+/// `alpn` protocols offered in preference order (RFC 7301 §3.1; none
+/// leaves the extension out), no client certificate.
+fn client_config(
+    trust: Trust,
+    roots: RootCertStore,
+    alpn: &[&[u8]],
+) -> Result<ClientConfig, SourceError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let check = match trust {
         Trust::Roots => Check::Roots(
@@ -308,19 +321,21 @@ fn client_config(trust: Trust, roots: RootCertStore) -> Result<ClientConfig, Sou
         check,
         algorithms: provider.signature_verification_algorithms,
     };
-    Ok(ClientConfig::builder_with_provider(provider)
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(tls_failed)?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth())
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+    Ok(config)
 }
 
 /// How a failed handshake reads as a [`SourceError`]: a refused
 /// certificate is `auth_failed` (the camera did not authenticate itself),
 /// any other TLS failure `protocol`, and an I/O failure underneath
 /// `unreachable`.
-pub(crate) fn classify(err: &io::Error) -> SourceError {
+pub fn classify(err: &io::Error) -> SourceError {
     match err
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>())
@@ -333,25 +348,34 @@ pub(crate) fn classify(err: &io::Error) -> SourceError {
     }
 }
 
-/// Connects to `addr` and completes the handshake for `target`, verifying
-/// against the embedded roots when the target trusts them.
-pub(crate) async fn connect(
-    addr: SocketAddr,
+/// Completes the handshake for `target` over `io`, a stream the caller
+/// connected, offering the `alpn` protocols (none for `rtsps`, which has
+/// never offered any), and verifying against the embedded roots
+/// when the target trusts them.
+pub async fn connect<Io>(
+    io: Io,
     target: &TlsTarget,
-) -> Result<TlsStream<TcpStream>, SourceError> {
-    connect_with_roots(addr, target, embedded_roots()).await
+    alpn: &[&[u8]],
+) -> Result<TlsStream<Io>, SourceError>
+where
+    Io: AsyncRead + AsyncWrite + Unpin,
+{
+    connect_with_roots(io, target, alpn, embedded_roots()).await
 }
 
 /// [`connect`] against `roots`, so tests can trust their own anchor.
-async fn connect_with_roots(
-    addr: SocketAddr,
+async fn connect_with_roots<Io>(
+    io: Io,
     target: &TlsTarget,
+    alpn: &[&[u8]],
     roots: RootCertStore,
-) -> Result<TlsStream<TcpStream>, SourceError> {
-    let config = client_config(target.trust, roots)?;
-    let tcp = crate::relay::tcp(addr).await?;
+) -> Result<TlsStream<Io>, SourceError>
+where
+    Io: AsyncRead + AsyncWrite + Unpin,
+{
+    let config = client_config(target.trust, roots, alpn)?;
     let stream = TlsConnector::from(Arc::new(config))
-        .connect(target.server_name.clone(), tcp)
+        .connect(target.server_name.clone(), io)
         .await
         .map_err(|err| classify(&err))?;
     let (_, session) = stream.get_ref();
@@ -365,14 +389,15 @@ async fn connect_with_roots(
     if target.trust == Trust::Insecure {
         tracing::warn!(
             fingerprint = presented.as_deref(),
-            "rtsps: insecure_tls: the camera's certificate is not verified; pin it with tls_fingerprint"
+            "tls: insecure_tls: the camera's certificate is not verified; pin it with tls_fingerprint"
         );
     }
     tracing::info!(
         trust = ?target.trust,
         version,
+        alpn = session.alpn_protocol().map(String::from_utf8_lossy).as_deref(),
         fingerprint = presented.as_deref(),
-        "rtsps: TLS established"
+        "tls: established"
     );
     Ok(stream)
 }
@@ -385,6 +410,11 @@ mod tests {
         reason = "test code"
     )]
 
+    use lotse_core::clock::SystemClock;
+    use lotse_testing::fake_camera::CameraTls;
+    use lotse_testing::{CameraConfig, FakeCamera};
+    use tokio::net::TcpStream;
+
     use super::*;
 
     /// FIPS 180-2 Appendix B.1: SHA-256("abc").
@@ -392,7 +422,7 @@ mod tests {
 
     #[test]
     fn a_verifier_without_roots_is_refused_as_protocol() {
-        let err = client_config(Trust::Roots, RootCertStore::empty()).unwrap_err();
+        let err = client_config(Trust::Roots, RootCertStore::empty(), &[]).unwrap_err();
         assert!(
             matches!(&err, SourceError::Protocol(m) if m.starts_with("tls: ")),
             "{err:?}"
@@ -491,19 +521,9 @@ mod tests {
         assert!(matches!(classify(&other), SourceError::Unreachable(_)));
     }
 
-    /// The handshake against a TLS fake camera whose own certificate is the
-    /// one trust anchor.
-    async fn with_own_anchor(names: &[&str], server_name: &str) -> Result<(), SourceError> {
-        use lotse_core::clock::SystemClock;
-        use lotse_testing::fake_camera::CameraTls;
-        use lotse_testing::{CameraConfig, FakeCamera};
-
-        let tls = CameraTls::self_signed(names).unwrap();
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(tls.certificate_der().to_vec()))
-            .unwrap();
-        let cam = FakeCamera::start(
+    /// A TLS fake camera serving `tls`.
+    async fn camera(tls: CameraTls) -> FakeCamera {
+        FakeCamera::start(
             CameraConfig {
                 tls: Some(tls),
                 ..CameraConfig::default()
@@ -511,9 +531,33 @@ mod tests {
             Arc::new(SystemClock),
         )
         .await
-        .unwrap();
-        let target = TlsTarget::new(server_name, Trust::Roots).unwrap();
-        let result = connect_with_roots(cam.addr(), &target, roots)
+        .unwrap()
+    }
+
+    /// The handshake with `cam` for `server_name` and `trust`, against
+    /// `roots`; the negotiated version.
+    async fn handshake(
+        cam: &FakeCamera,
+        server_name: &str,
+        trust: Trust,
+        roots: RootCertStore,
+    ) -> Result<Option<rustls::ProtocolVersion>, SourceError> {
+        let tcp = TcpStream::connect(cam.addr()).await.unwrap();
+        let target = TlsTarget::new(server_name, trust).unwrap();
+        let stream = connect_with_roots(tcp, &target, &[], roots).await?;
+        Ok(stream.get_ref().1.protocol_version())
+    }
+
+    /// The handshake against a TLS fake camera whose own certificate is the
+    /// one trust anchor.
+    async fn with_own_anchor(names: &[&str], server_name: &str) -> Result<(), SourceError> {
+        let tls = CameraTls::self_signed(names).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(tls.certificate_der().to_vec()))
+            .unwrap();
+        let cam = camera(tls).await;
+        let result = handshake(&cam, server_name, Trust::Roots, roots)
             .await
             .map(drop);
         cam.stop().await;
@@ -533,6 +577,104 @@ mod tests {
             matches!(&err, SourceError::AuthFailed(m) if m.contains("not trusted") && m.contains("not valid for name")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pin_accepts_exactly_its_certificate_whatever_it_names() {
+        let tls = CameraTls::self_signed(&["elsewhere.test"]).unwrap();
+        let pin = Fingerprint::of(tls.certificate_der());
+        let cam = camera(tls).await;
+        let version = handshake(&cam, "camera.test", Trust::Pin(pin), embedded_roots())
+            .await
+            .unwrap();
+        assert_eq!(version, Some(rustls::ProtocolVersion::TLSv1_3));
+        let wrong = Fingerprint::of(b"another certificate");
+        let err = handshake(&cam, "camera.test", Trust::Pin(wrong), embedded_roots())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SourceError::AuthFailed(m) if m.contains(&format!("does not match tls_fingerprint {wrong}; it presented {pin}"))),
+            "{err:?}"
+        );
+        cam.stop().await;
+    }
+
+    /// A log writer that keeps every line.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        /// Every line written so far, flushed first.
+        fn text(&self) -> String {
+            io::Write::flush(&mut self.clone()).unwrap();
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn insecure_accepts_any_certificate_over_tls_1_2_and_warns_rfc5246() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _logs = tracing::subscriber::set_default(subscriber);
+        let tls = CameraTls::tls12_only(&["elsewhere.test"]).unwrap();
+        let presented = Fingerprint::of(tls.certificate_der()).to_string();
+        let cam = camera(tls).await;
+        let tcp = TcpStream::connect(cam.addr()).await.unwrap();
+        let target = TlsTarget::new("camera.test", Trust::Insecure).unwrap();
+        let stream = connect(tcp, &target, &[b"http/1.1"]).await.unwrap();
+        assert_eq!(
+            stream.get_ref().1.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_2)
+        );
+        drop(stream);
+        cam.stop().await;
+        let logs = captured.text();
+        let warnings: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("insecure_tls"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{logs}");
+        assert!(
+            warnings[0].contains("WARN") && warnings[0].contains(&presented),
+            "{logs}"
+        );
+        assert!(
+            logs.lines()
+                .any(|l| l.contains("tls: established") && l.contains("Insecure")),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn the_alpn_protocols_are_offered_in_order_rfc7301_3_1() {
+        let offered = client_config(
+            Trust::Insecure,
+            RootCertStore::empty(),
+            &[b"h2", b"http/1.1"],
+        )
+        .unwrap();
+        assert_eq!(
+            offered.alpn_protocols,
+            [b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        let none = client_config(Trust::Insecure, RootCertStore::empty(), &[]).unwrap();
+        assert!(none.alpn_protocols.is_empty());
     }
 
     #[test]

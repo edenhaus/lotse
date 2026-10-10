@@ -134,10 +134,11 @@ dimpl = { version = "0.7", default-features = false, features = ["rust-crypto"] 
 aes = { version = "0.8", default-features = false }
 ctr = { version = "0.9", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
-# TLS for `rtsps://` cameras, with the `ring` provider so the static musl build carries no OpenSSL or
-# aws-lc of its own; TLS 1.2 stays on because cameras often speak nothing newer.
+# TLS of the sources (lotse-tls), `rtsps://` cameras first, with the `ring` provider so the static
+# musl build carries no OpenSSL or aws-lc of its own; TLS 1.2 stays on because cameras often speak
+# nothing newer.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-# rustls over tokio streams: the client half for `rtsps://`, the server half for the fake camera.
+# rustls over tokio streams: the client half of lotse-tls, the server half for the fake camera.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Mozilla's root certificates, embedded: the worker has no filesystem to read a CA bundle from.
 webpki-roots = { version = "1", default-features = false }
@@ -179,6 +180,7 @@ lotse-rtsp = { path = "crates/lotse-rtsp" }
 lotse-sandbox = { path = "crates/lotse-sandbox" }
 lotse-supervisor = { path = "crates/lotse-supervisor" }
 lotse-testing = { path = "crates/lotse-testing" }
+lotse-tls = { path = "crates/lotse-tls" }
 lotse-webrtc = { path = "crates/lotse-webrtc" }
 lotse-worker = { path = "crates/lotse-worker" }
 

@@ -6,12 +6,13 @@
 
 [dependents]
 # crate = the workspace crates that may depend on it directly
-lotse-core = ["lotse-codec", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-supervisor", "lotse-worker", "lotse-testing", "lotse"]
+lotse-core = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-supervisor", "lotse-worker", "lotse-testing", "lotse"]
 lotse-codec = ["lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-testing", "lotse"]
 lotse-ipc = ["lotse-supervisor", "lotse-worker", "lotse-snapshot"]
 lotse-sandbox = ["lotse"]
 lotse-api-types = ["lotse-api", "lotse-supervisor", "lotse", "lotse-testing"] # lotse-testing: the load generator reads `metrics/get`
 lotse-api = ["lotse-supervisor"]
+lotse-tls = ["lotse-rtsp"] # the sources' TLS client trust
 lotse-rtsp = ["lotse"]
 lotse-http = ["lotse"] # M6, the factory behind `source-http`
 lotse-webrtc = ["lotse", "lotse-testing"] # lotse-testing: dev-only, its reproduction test of an open str0m issue (Safari's ICE)
@@ -20,7 +21,7 @@ lotse-supervisor = ["lotse"]
 lotse-worker = ["lotse"]
 # Never of lotse-core: it depends on core itself, and a dev-dependency cycle compiles two copies of
 # core whose types do not unify. Core's own fakes live behind its `test-util` feature.
-lotse-testing = ["lotse-codec", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-api-types", "lotse-supervisor", "lotse-worker", "lotse"]
+lotse-testing = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-api-types", "lotse-supervisor", "lotse-worker", "lotse"]
 
 [dev-only]
 # allocation-counter: its global allocator replaces the daemon's in whatever links it.
@@ -36,9 +37,9 @@ mpeg2ts-reader = ["lotse-http"]
 mp4-atom = ["lotse-http"]
 str0m = ["lotse-webrtc", "lotse-testing"]
 dimpl = ["lotse-webrtc"] # DTLS of str0m's crypto provider
-rustls = ["lotse-rtsp", "lotse-testing"] # rtsps; the fake camera's TLS mode
-tokio-rustls = ["lotse-rtsp", "lotse-testing"]
-webpki-roots = ["lotse-rtsp"]
+rustls = ["lotse-tls", "lotse-testing"] # the sources' TLS client; the fake camera's TLS mode
+tokio-rustls = ["lotse-tls", "lotse-testing"]
+webpki-roots = ["lotse-tls"]
 rcgen = ["lotse-webrtc", "lotse-testing"] # the DTLS certificate; the fake camera's certificate
 axum = ["lotse-api", "lotse-testing"] # the control API; the dev viewer, a test crate never linked into the binary
 hyper = ["lotse-api", "lotse-http"] # the control API's HTTP/1.1 connection, under axum; the HTTP source's client

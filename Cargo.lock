@@ -1574,19 +1574,15 @@ dependencies = [
  "lotse-codec",
  "lotse-core",
  "lotse-testing",
+ "lotse-tls",
  "retina",
- "rustls",
  "serde",
  "serde_json",
- "sha2",
- "thiserror 2.0.21",
  "tokio",
- "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",
- "webpki-roots",
 ]
 
 [[package]]
@@ -1660,6 +1656,24 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "lotse-tls"
+version = "0.0.0-dev"
+dependencies = [
+ "lotse-core",
+ "lotse-testing",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots",
 ]
 
 [[package]]

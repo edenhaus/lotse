@@ -1,0 +1,32 @@
+[package]
+name = "lotse-tls"
+description = "TLS client trust of the sources: embedded roots, a certificate pin, or none."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+lotse-core = { workspace = true } # `SourceError`, what a failed handshake becomes
+rustls = { workspace = true } # the client configuration and the certificate verifier
+serde = { workspace = true } # the `tls_fingerprint` pin in a source's options
+sha2 = { workspace = true } # the `tls_fingerprint` pin of the server's leaf certificate
+thiserror = { workspace = true }
+tokio = { workspace = true } # `AsyncRead`/`AsyncWrite` of the stream the caller connected
+tokio-rustls = { workspace = true } # the TLS stream over it
+tracing = { workspace = true } # the `insecure_tls` warning and the established connection
+webpki-roots = { workspace = true } # the embedded roots a server is verified against without a pin
+
+[dev-dependencies]
+lotse-testing = { workspace = true } # the fake camera's TLS mode, the server of the handshake tests
+serde_json = { workspace = true } # the pin's serialized form
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] } # the handshake tests' runtime and TCP connections
+tracing-subscriber = { workspace = true } # captures the `insecure_tls` warning
+
+[lints]
+workspace = true

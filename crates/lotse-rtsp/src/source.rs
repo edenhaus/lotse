@@ -11,7 +11,7 @@
 //! through `lotse-codec`,
 //! RFC 3551 §6 (the
 //! static audio payload types), RFC 7587 (Opus), RFC 3640 (AAC), and
-//! RFC 7826 §19.2 for `rtsps` (the TLS stream in [`crate::tls`]), and
+//! RFC 7826 §19.2 for `rtsps` (the TLS stream from `lotse_tls`), and
 //! RFC 2326 §12.39 with RFC 3550 §11 for RTP over UDP ([`crate::udp`]). Every
 //! connection reaches retina through [`crate::relay`], and retina reads at
 //! most [`MAX_MESSAGE`] bytes of each RTSP message. The camera host is
@@ -44,6 +44,7 @@ use lotse_core::source_url::SourceUrl;
 use lotse_core::task::BoxFuture;
 use lotse_core::throttle::Throttle;
 use lotse_core::track::Track;
+use lotse_tls::TlsTarget;
 use retina::client::{
     Credentials, InitialSequenceNumberPolicy, InitialTimestampPolicy, PacketItem, PlayOptions,
     Session, SessionGroup, SessionOptions, SetupOptions, Stream, TcpTransportOptions,
@@ -58,7 +59,6 @@ use crate::options::{RtspOptions, Transport as MediaTransport};
 use crate::relay;
 use crate::relay::{First, Media};
 use crate::rtcp::{ReceiverReports, Seed, SetupRates};
-use crate::tls::{self, TlsTarget};
 use crate::udp::UdpRelay;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -158,7 +158,7 @@ impl Source for RtspSource {
                     // The TLS stream makes the attempt large: on the heap.
                     let handshake = || {
                         let tls = tls.clone();
-                        async move { tls::connect(addr, &tls).await }
+                        async move { lotse_tls::connect(relay::tcp(addr).await?, &tls, &[]).await }
                     };
                     Box::pin(attempt.run("TLS handshake", handshake)).await
                 }

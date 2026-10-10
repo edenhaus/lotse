@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::tls::Fingerprint;
+use lotse_tls::Fingerprint;
 
 /// The read deadline default, in milliseconds.
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;

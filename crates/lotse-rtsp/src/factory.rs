@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use lotse_core::source::{Direction, Source, SourceCapabilities, SourceConfigError, SourceFactory};
 use lotse_core::source_url::SourceUrl;
+use lotse_tls::{TlsTarget, Trust};
 
 use crate::options::{RtspOptions, Transport};
 use crate::source::RtspSource;
-use crate::tls::{TlsTarget, Trust};
 
 /// The protocol name reported for every scheme of this factory.
 pub const PROTOCOL: &str = "rtsp";
