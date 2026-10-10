@@ -16,10 +16,10 @@ use std::time::{Duration, Instant, SystemTime};
 use lotse_api::{ConnectionId, Event, EventClass};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::info::{ProcessMetrics, WorkerMetrics};
-use lotse_api_types::session::SessionEvent;
+use lotse_api_types::session::{Session, SessionEvent};
 use lotse_api_types::stream::{
-    AudioMode, ConnectionInfo, LastError, Orientation, SourceInfo, Stream, StreamEvent,
-    StreamState, StreamStats, TrackInfo, WorkerInfo,
+    AudioMode, ConnectionInfo, LastError, Orientation, SourceInfo, Stream, StreamBackchannel,
+    StreamEvent, StreamState, StreamStats, TalkerReason, TrackInfo, WorkerInfo,
 };
 use lotse_api_types::time::rfc3339;
 use lotse_core::clock::Clock;
@@ -27,7 +27,8 @@ use lotse_core::connection::{ConnectionError, ConnectionState};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_ipc::{
-    SessionEvent as WorkerSessionEvent, SessionSpec, TrackInfo as IpcTrackInfo, WorkerStats,
+    SessionEvent as WorkerSessionEvent, SessionSpec, TalkbackStats, TrackInfo as IpcTrackInfo,
+    WorkerStats,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::task::TaskTracker;
@@ -103,6 +104,15 @@ pub(crate) struct ConnectionSnapshot {
     pub(crate) stats: Option<WorkerStats>,
 }
 
+/// The talker of a connection's backchannel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Talker {
+    /// The session holding it; `None` when it is free.
+    pub(crate) session: Option<String>,
+    /// When that last changed; `None` before the first change.
+    pub(crate) since: Option<SystemTime>,
+}
+
 impl ConnectionSnapshot {
     /// An idle connection created at `now`.
     pub(crate) const fn idle(now: SystemTime) -> Self {
@@ -117,6 +127,16 @@ impl ConnectionSnapshot {
             tracks: Vec::new(),
             stats: None,
         }
+    }
+
+    /// The talk-back counters the worker last reported for `session_id`;
+    /// zero before the first report.
+    fn talkback(&self, session_id: &str) -> TalkbackStats {
+        self.stats
+            .as_ref()
+            .and_then(|stats| stats.talkback.iter().find(|(id, _)| id == session_id))
+            .map(|(_, counters)| *counters)
+            .unwrap_or_default()
     }
 }
 
@@ -209,6 +229,10 @@ pub(crate) struct ConnectionEntry {
     pub(crate) streams: BTreeSet<String>,
     /// What the driver passes on to the worker: session messages.
     pub(crate) commands: mpsc::Sender<DriverCommand>,
+    /// Who holds the connection's backchannel, as its worker reported;
+    /// kept here rather than in the driver's snapshot, which the driver
+    /// replaces.
+    pub(crate) talker: Talker,
 }
 
 /// Who ends a session, which decides who hears of it.
@@ -736,6 +760,96 @@ impl State {
         self.fan_out(stream_id, &event);
     }
 
+    /// A session as `session/get` returns it: with whether it holds its
+    /// connection's backchannel and its worker's last talk-back counters.
+    pub(crate) fn session_dto(&self, session_id: &str, entry: &SessionEntry) -> Session {
+        let connection = self.connections.get(&entry.connection);
+        entry.dto(
+            session_id,
+            connection.is_some_and(|c| c.talker.session.as_deref() == Some(session_id)),
+            connection
+                .map(|c| c.snapshot.talkback(session_id))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Applies a change of connection `id`'s talker that its worker
+    /// reported: a claim by one of the connection's sessions, or the
+    /// current talker letting go. Tells the subscribers of every stream on
+    /// the connection, and returns the talker after it; `None` when it does
+    /// not apply (a claim by a session the supervisor does not hold on the
+    /// connection, or a session that is not the talker letting go).
+    pub(crate) fn talker_changed(
+        &mut self,
+        id: &str,
+        session_id: &str,
+        reason: TalkerReason,
+        at: SystemTime,
+    ) -> Option<Talker> {
+        let sessions = &self.sessions;
+        let entry = self.connections.get_mut(id)?;
+        let applies = match reason {
+            TalkerReason::Claimed => sessions
+                .get(session_id)
+                .is_some_and(|session| session.connection == id),
+            TalkerReason::SessionClosed | TalkerReason::Released => {
+                entry.talker.session.as_deref() == Some(session_id)
+            }
+        };
+        let reason_name = reason.as_str();
+        if !applies {
+            tracing::debug!(
+                connection.id = id,
+                session.id = session_id,
+                reason = reason_name,
+                "talker change that does not apply; ignored"
+            );
+            return None;
+        }
+        let talker = Talker {
+            session: (reason == TalkerReason::Claimed).then(|| session_id.to_owned()),
+            since: Some(at),
+        };
+        entry.talker = talker.clone();
+        tracing::info!(
+            event = "talker_changed",
+            connection.id = id,
+            session.id = session_id,
+            reason = reason_name,
+            "backchannel talker changed"
+        );
+        let streams: Vec<String> = entry.streams.iter().cloned().collect();
+        for stream_id in streams {
+            let event = Event {
+                // A talker change is never coalesced with the stream's
+                // state, nor shed.
+                class: EventClass::Signaling,
+                payload: serde_json::to_value(StreamEvent::TalkerChanged {
+                    stream_id: stream_id.clone(),
+                    talker: talker.session.clone(),
+                    session_id: session_id.to_owned(),
+                    reason,
+                    since: rfc3339(at),
+                })
+                .unwrap_or_default(),
+            };
+            self.fan_out(&stream_id, &event);
+        }
+        Some(talker)
+    }
+
+    /// Connection `id`'s worker is gone, and its talker's session with it:
+    /// the backchannel is free (`session_closed`).
+    pub(crate) fn talker_gone(&mut self, id: &str, at: SystemTime) {
+        let talker = self
+            .connections
+            .get(id)
+            .and_then(|connection| connection.talker.session.clone());
+        if let Some(session_id) = talker {
+            let _free = self.talker_changed(id, &session_id, TalkerReason::SessionClosed, at);
+        }
+    }
+
     /// Queues `event` on every subscription matching `stream_id`; a closed
     /// subscription is forgotten, a full one drops the event.
     fn fan_out(&mut self, stream_id: &str, event: &Event) {
@@ -909,6 +1023,13 @@ impl State {
                 .map(|(id, _)| id.clone())
                 .collect(),
             stats: self.stream_stats(entry),
+            backchannel: self.first_connection(entry).map_or_else(
+                StreamBackchannel::default,
+                |connection| StreamBackchannel {
+                    talker: connection.talker.session.clone(),
+                    since: connection.talker.since.map(rfc3339),
+                },
+            ),
         };
         UnreadStream { stream, probes }
     }
@@ -1205,6 +1326,7 @@ mod tests {
                 snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
                 streams: ["front".to_owned(), "twin".to_owned()].into(),
                 commands,
+                talker: Talker::default(),
             },
         );
         state.streams.insert("front".into(), stream_on_c1(true));
@@ -1242,6 +1364,218 @@ mod tests {
         state.refresh_connection("c1");
     }
 
+    /// The talker of connection `c1`'s backchannel shows
+    /// on `stream/get` of every stream reading from it and on its
+    /// sessions' `session/get`, and each change reaches the subscribers of
+    /// those streams, never coalesced with their state.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        reason = "one talker's whole life"
+    )]
+    fn a_talker_change_reaches_every_stream_on_the_connection_and_its_sessions() {
+        let mut state = State::default();
+        let (demand, _demand) = watch::channel(0);
+        let (commands, _commands) = mpsc::channel(1);
+        state.connections.insert(
+            "c1".into(),
+            ConnectionEntry {
+                port: None,
+                loopback_relay: false,
+                key: ConnectionKey {
+                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    options: serde_json::Value::Null,
+                },
+                demand,
+                snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
+                streams: ["front".to_owned(), "twin".to_owned()].into(),
+                commands,
+                talker: Talker::default(),
+            },
+        );
+        state.streams.insert("front".into(), stream_on_c1(false));
+        state.streams.insert("twin".into(), stream_on_c1(false));
+        let mut elsewhere = stream_on_c1(false);
+        elsewhere.sources[0].connection = "c2".into();
+        state.streams.insert("other".into(), elsewhere);
+        let mut talking = session_on_c1(1, "front");
+        let _answered = talking.apply(WorkerSessionEvent::Answer {
+            sdp: "v=0".into(),
+            talkback: Some("pcmu".into()),
+        });
+        state.sessions.insert("s1".into(), talking);
+        state.sessions.insert("s2".into(), session_on_c1(2, "twin"));
+        let mut front = state.subscribe(ConnectionId(1), Some("front".into()));
+        let mut all = state.subscribe(ConnectionId(1), None);
+        let mut other = state.subscribe(ConnectionId(1), Some("other".into()));
+        for rx in [&mut front, &mut all, &mut other] {
+            while rx.try_recv().is_ok() {}
+        }
+        let dto = |state: &State, id: &str| state.session_dto(id, &state.sessions[id]);
+
+        // Nobody has talked yet.
+        assert_eq!(
+            state.stream("front").unwrap().stream.backchannel,
+            StreamBackchannel::default()
+        );
+        let s1 = dto(&state, "s1").backchannel;
+        assert_eq!(
+            (
+                s1.negotiated,
+                s1.codec.as_deref(),
+                s1.talker,
+                s1.packets_received
+            ),
+            (true, Some("pcmu"), false, 0)
+        );
+        // Changes that do not apply: a claim by a session the connection
+        // does not run, a session that is not the talker letting go, an
+        // unknown connection.
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_280_801);
+        assert_eq!(
+            state.talker_changed("c1", "ghost", TalkerReason::Claimed, at),
+            None
+        );
+        assert_eq!(
+            state.talker_changed("c1", "s2", TalkerReason::Released, at),
+            None
+        );
+        assert_eq!(
+            state.talker_changed("c9", "s1", TalkerReason::Claimed, at),
+            None
+        );
+        assert!(front.try_recv().is_err());
+
+        // s1 claims it: every stream on the connection hears it.
+        assert_eq!(
+            state.talker_changed("c1", "s1", TalkerReason::Claimed, at),
+            Some(Talker {
+                session: Some("s1".into()),
+                since: Some(at),
+            })
+        );
+        let event = front.try_recv().unwrap();
+        assert_eq!(event.class, EventClass::Signaling, "never coalesced");
+        assert_eq!(
+            event.payload,
+            serde_json::json!({ "type": "talker_changed", "stream_id": "front", "talker": "s1",
+                                "session_id": "s1", "reason": "claimed",
+                                "since": "2026-10-06T10:00:01.000Z" })
+        );
+        let streams: Vec<serde_json::Value> = std::iter::from_fn(|| all.try_recv().ok())
+            .map(|event| event.payload["stream_id"].clone())
+            .collect();
+        assert_eq!(
+            streams,
+            [serde_json::json!("front"), serde_json::json!("twin")]
+        );
+        assert!(other.try_recv().is_err(), "another connection's stream");
+        for stream in ["front", "twin"] {
+            assert_eq!(
+                state.stream(stream).unwrap().stream.backchannel,
+                StreamBackchannel {
+                    talker: Some("s1".into()),
+                    since: Some("2026-10-06T10:00:01.000Z".into()),
+                },
+                "{stream}"
+            );
+        }
+        assert_eq!(
+            state.stream("other").unwrap().stream.backchannel,
+            StreamBackchannel::default()
+        );
+        // The counters come with the worker's stats.
+        state.connections.get_mut("c1").unwrap().snapshot.stats = Some(WorkerStats {
+            talkback: vec![(
+                "s1".into(),
+                TalkbackStats {
+                    packets_received: 50,
+                    packets_dropped_busy: 0,
+                    bytes_sent: 8_000,
+                },
+            )],
+            ..WorkerStats::default()
+        });
+        let s1 = dto(&state, "s1").backchannel;
+        assert_eq!(
+            (
+                s1.talker,
+                s1.packets_received,
+                s1.packets_dropped_busy,
+                s1.bytes_sent
+            ),
+            (true, 50, 0, 8_000)
+        );
+        let s2 = dto(&state, "s2").backchannel;
+        assert_eq!(
+            s2,
+            lotse_api_types::session::SessionBackchannel::default(),
+            "not negotiated, not the talker, nothing counted"
+        );
+        // A session whose connection is gone reports nothing of it.
+        let (events, _events) = mpsc::channel(1);
+        let orphan = SessionEntry::new(
+            3,
+            "other".into(),
+            "c2".into(),
+            "u3".into(),
+            (ConnectionId(1), 3, events),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(!state.session_dto("s3", &orphan).backchannel.talker);
+
+        // The client releases it.
+        let released = at + Duration::from_secs(5);
+        assert_eq!(
+            state.talker_changed("c1", "s1", TalkerReason::Released, released),
+            Some(Talker {
+                session: None,
+                since: Some(released),
+            })
+        );
+        let event = front.try_recv().unwrap().payload;
+        assert_eq!(
+            (&event["talker"], &event["session_id"], &event["reason"]),
+            (
+                &serde_json::Value::Null,
+                &serde_json::json!("s1"),
+                &serde_json::json!("released")
+            )
+        );
+        assert!(!dto(&state, "s1").backchannel.talker);
+
+        // s2 claims it, and its worker goes: the channel is free again.
+        assert!(
+            state
+                .talker_changed("c1", "s2", TalkerReason::Claimed, released)
+                .is_some()
+        );
+        let _claimed = front.try_recv().unwrap();
+        let gone = released + Duration::from_secs(1);
+        state.talker_gone("c1", gone);
+        let event = front.try_recv().unwrap().payload;
+        assert_eq!(
+            (&event["session_id"], &event["reason"], &event["since"]),
+            (
+                &serde_json::json!("s2"),
+                &serde_json::json!("session_closed"),
+                &serde_json::json!("2026-10-06T10:00:07.000Z")
+            )
+        );
+        assert_eq!(
+            state.stream("twin").unwrap().stream.backchannel,
+            StreamBackchannel {
+                talker: None,
+                since: Some("2026-10-06T10:00:07.000Z".into()),
+            }
+        );
+        // Nobody talks: nothing more to free.
+        state.talker_gone("c1", gone);
+        state.talker_gone("c9", gone);
+        assert!(front.try_recv().is_err());
+    }
+
     /// A state with connection `c1`, whose driver queue holds one
     /// command, and its session `s1` (serial 1), gathering `gathers`.
     fn relay_state(gathers: usize) -> (State, mpsc::Receiver<DriverCommand>) {
@@ -1261,6 +1595,7 @@ mod tests {
                 snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
                 streams: BTreeSet::new(),
                 commands,
+                talker: Talker::default(),
             },
         );
         let mut session = session_on_c1(1, "front");
@@ -1404,7 +1739,10 @@ mod tests {
         state.session_relayed("s1", 1, None);
         let session = state.sessions.get_mut("s1").unwrap();
         session
-            .apply(lotse_ipc::SessionEvent::Answer { sdp: "v=0".into() })
+            .apply(lotse_ipc::SessionEvent::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            })
             .unwrap();
         session
             .apply(lotse_ipc::SessionEvent::Candidate {
@@ -1500,6 +1838,7 @@ mod tests {
             packets_lost: 4,
             packets_out_of_order: 5,
             datagrams_rejected: 6,
+            talkback: Vec::new(),
         };
         let stream = stream_stats_of(Some(&stats));
         assert_eq!(

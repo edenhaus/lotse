@@ -2191,6 +2191,12 @@ fn rfc8829_5_3_1_talk_back_is_answered_by_offer_shape_and_backchannel() {
         request.audio = Some(Arc::new(Codec::Pcmu));
         request.backchannel = backchannel.clone();
         let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+        // `session/get` reports the codec the answer named first.
+        assert_eq!(
+            pair.session.talkback(),
+            backchannel.as_ref().map(|_| UplinkCodec::Pcma),
+            "{what}"
+        );
         let sections = audio_sections(&answer);
         let dedicated = shape == TalkbackOffer::Dedicated;
         assert_eq!(

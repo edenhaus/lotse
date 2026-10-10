@@ -14,7 +14,7 @@ use crate::command::Command;
 use crate::frame::{Empty, EventFrame, Failure, Hello, Pong, Shutdown, Success};
 use crate::info::{InfoResult, Metrics};
 use crate::session::{Session, SessionEvent, SessionList};
-use crate::stream::{Stream, StreamEvent, StreamList, StreamPutResult};
+use crate::stream::{BackchannelReleaseResult, Stream, StreamEvent, StreamList, StreamPutResult};
 
 /// The committed bundle, byte for byte.
 pub const COMMITTED: &str = include_str!("../schema/api.json");
@@ -70,6 +70,10 @@ pub fn bundle() -> Value {
     results.insert(
         "session/list".into(),
         reference::<Success<SessionList>>(&mut generator),
+    );
+    results.insert(
+        "backchannel/release".into(),
+        reference::<Success<BackchannelReleaseResult>>(&mut generator),
     );
     let hello = reference::<Hello>(&mut generator);
     let shutdown = reference::<Shutdown>(&mut generator);

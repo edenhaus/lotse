@@ -16,7 +16,7 @@ use crate::codec::{Codec, CodecFamily};
 use crate::media::MediaPacket;
 use crate::orientation::Orientation;
 use crate::track::{GopSnapshot, TrackEvent};
-use crate::uplink::UplinkPacket;
+use crate::uplink::{UplinkCodec, UplinkPacket};
 
 /// The ICE credentials the supervisor chose for a session, so its demux
 /// can verify STUN integrity.
@@ -322,6 +322,10 @@ pub trait SessionEngine: fmt::Debug + Send {
 
     /// The counters now.
     fn stats(&self) -> SessionStats;
+
+    /// The talk-back codec the answer negotiated, which the browser sends
+    /// (`session/get`'s `backchannel.codec`); `None` when talk-back is off.
+    fn talkback(&self) -> Option<UplinkCodec>;
 }
 
 /// What a session does with one event of its video subscription, or with

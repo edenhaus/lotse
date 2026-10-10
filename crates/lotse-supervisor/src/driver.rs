@@ -115,6 +115,8 @@ pub(crate) enum DriverCommand {
         /// The channel number.
         channel: u16,
     },
+    /// Free the backchannel from its talker (`backchannel/release`).
+    ReleaseBackchannel,
     /// An ICE-TCP connection the acceptor verified for one of the
     /// worker's sessions.
     IceTcp {
@@ -139,7 +141,7 @@ impl DriverCommand {
             | Self::CloseSession { session_id, .. }
             | Self::RelayCandidate { session_id, .. }
             | Self::RelayChannel { session_id, .. } => Some(session_id),
-            Self::IceTcp { .. } | Self::SwitchSource(_) => None,
+            Self::IceTcp { .. } | Self::SwitchSource(_) | Self::ReleaseBackchannel => None,
         }
     }
 }
@@ -651,6 +653,18 @@ impl Driver {
                     now,
                 );
             }
+            WorkerEvent::Talker {
+                session_id,
+                reason,
+                at,
+            } => {
+                let _talker = self.shared.lock().talker_changed(
+                    &self.spec.connection_id,
+                    &session_id,
+                    reason,
+                    at,
+                );
+            }
             WorkerEvent::ChannelClosed => {
                 tracing::warn!("worker closed its channel; killing it");
                 if let Some(worker) = self.worker.as_mut() {
@@ -674,6 +688,7 @@ impl Driver {
         self.connect.release("worker exited");
         self.switch_connect.release("worker exited");
         self.snapshot.worker = None;
+        self.talker_gone();
         self.queued.clear();
         let connection = self.spec.connection_id.clone();
         self.shared.lock().close_sessions_where(
@@ -697,6 +712,15 @@ impl Driver {
         } else {
             tracing::info!(code = status.code(), "worker exited");
         }
+    }
+
+    /// The worker is gone, and the talker's session with it: the
+    /// backchannel is free.
+    fn talker_gone(&self) {
+        let now = self.shared.clock.wall_now();
+        self.shared
+            .lock()
+            .talker_gone(&self.spec.connection_id, now);
     }
 
     /// Feeds the machine and performs what it asks for, including the
@@ -726,6 +750,7 @@ impl Driver {
                 self.connect.release("worker stopped");
                 if let Some(worker) = self.worker.take() {
                     self.snapshot.worker = None;
+                    self.talker_gone();
                     let shared = Arc::clone(&self.shared);
                     let stop = async move {
                         let _status = worker.stop(shared.shutdown_budget, &shared.clock).await;
@@ -801,6 +826,10 @@ impl Driver {
             }
             DriverCommand::IceTcp { peer, .. } => {
                 tracing::debug!(%peer, "ice-tcp connection without a worker; closed");
+            }
+            // Without a worker no session talks.
+            DriverCommand::ReleaseBackchannel => {
+                tracing::debug!("backchannel release without a worker; nothing held");
             }
             command => self.queued.push(command),
         }
@@ -879,6 +908,7 @@ impl Driver {
                     .ice_tcp(stream, &local_ufrag, peer, first_frame)
                     .await
             }
+            DriverCommand::ReleaseBackchannel => worker.release_backchannel().await,
         };
         if let Err(err) = sent {
             // The exit follows and closes the sessions.
@@ -1093,6 +1123,8 @@ mod tests {
             code: "session_closed",
             message: String::new(),
         });
+        // Without a worker nobody talks: a release is not kept.
+        driver.queue(DriverCommand::ReleaseBackchannel);
         let left: Vec<Option<&str>> = driver
             .queued
             .iter()
@@ -1186,6 +1218,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// `backchannel/release` reaches the worker as its own message.
+    #[tokio::test]
+    async fn a_release_reaches_the_worker() {
+        let dir = private_dir("driver-release");
+        let out = dir.join("received");
+        let script = dir.join("worker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nexec cat > {}\n", out.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let shared = shared(script.to_str().unwrap());
+        let mut worker = shared.manager.spawn(&[], false).unwrap();
+        let (commands, _rx) = mpsc::channel(1);
+        Driver::send(
+            &mut worker,
+            &shared,
+            &commands,
+            DriverCommand::ReleaseBackchannel,
+        )
+        .await;
+        let expected = lotse_ipc::encode(&lotse_ipc::ToWorker::ReleaseBackchannel).unwrap();
+        let mut received = Vec::new();
+        for _ in 0..500 {
+            received = std::fs::read(&out).unwrap_or_default();
+            if !received.is_empty() {
+                break;
+            }
+            SystemClock.sleep(Duration::from_millis(10)).await;
+        }
+        assert!(received.ends_with(&expected), "{received:?}");
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+    }
+
     #[tokio::test]
     async fn sends_register_live_offers_only_and_survive_a_dead_worker() {
         let shared = shared("/usr/bin/true");
@@ -1240,9 +1308,88 @@ mod tests {
                 peer: "192.0.2.1:1".parse().unwrap(),
                 first_frame: vec![],
             },
+            DriverCommand::ReleaseBackchannel,
         ] {
+            assert_eq!(
+                command.session_id().is_none(),
+                matches!(
+                    command,
+                    DriverCommand::IceTcp { .. } | DriverCommand::ReleaseBackchannel
+                )
+            );
             Driver::send(&mut worker, &shared, &commands, command).await;
         }
+    }
+
+    /// The worker's talker reports reach the registry, and its exit frees
+    /// the backchannel: the talker's session is gone with it.
+    #[tokio::test]
+    async fn talker_reports_reach_the_registry_and_a_worker_exit_frees_the_backchannel() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        use lotse_api_types::stream::TalkerReason;
+
+        let shared = shared("/bin/sh");
+        let (demand_tx, demand) = watch::channel(0);
+        let (commands, _commands) = mpsc::channel(1);
+        let (events, _events) = mpsc::channel(1);
+        {
+            let mut state = shared.lock();
+            state.connections.insert(
+                "c1".into(),
+                crate::registry::ConnectionEntry {
+                    port: None,
+                    loopback_relay: false,
+                    key: crate::registry::ConnectionKey {
+                        url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        options: serde_json::Value::Null,
+                    },
+                    demand: demand_tx,
+                    snapshot: ConnectionSnapshot::idle(UNIX_EPOCH),
+                    streams: ["front".to_owned()].into(),
+                    commands,
+                    talker: crate::registry::Talker::default(),
+                },
+            );
+            state.streams.insert(
+                "front".into(),
+                crate::registry::StreamEntry {
+                    sources: vec![crate::registry::StreamSource {
+                        url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        options: serde_json::Map::new(),
+                        protocol: "fake",
+                        connection: "c1".into(),
+                    }],
+                    preload: false,
+                    audio: lotse_api_types::stream::AudioMode::Auto,
+                    orientation: lotse_api_types::stream::Orientation::NoTransform,
+                    created: UNIX_EPOCH,
+                },
+            );
+            state.sessions.insert(
+                "s1".into(),
+                SessionEntry::new(
+                    1,
+                    "front".into(),
+                    "c1".into(),
+                    "us1".into(),
+                    (ConnectionId(1), 1, events),
+                    UNIX_EPOCH,
+                ),
+            );
+        }
+        let mut driver = driver_on(&shared, demand);
+        let talker = |shared: &Shared| shared.lock().connections["c1"].talker.session.clone();
+        driver.on_worker_event(WorkerEvent::Talker {
+            session_id: "s1".into(),
+            reason: TalkerReason::Claimed,
+            at: UNIX_EPOCH,
+        });
+        assert_eq!(talker(&shared).as_deref(), Some("s1"));
+        driver.on_worker_event(WorkerEvent::Exited(ExitStatus::from_raw(0)));
+        drop(driver);
+        assert_eq!(talker(&shared), None);
+        assert!(shared.lock().connections["c1"].talker.since.is_some());
     }
 
     /// The driver's next wake if one is ready now, `None` otherwise.
@@ -1864,7 +2011,10 @@ mod tests {
         // A session event for a session that is gone changes nothing.
         driver.on_worker_event(WorkerEvent::Session {
             session_id: "gone".into(),
-            event: lotse_ipc::SessionEvent::Answer { sdp: "v=0".into() },
+            event: lotse_ipc::SessionEvent::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            },
         });
         assert!(shared.lock().sessions.is_empty());
         driver.on_worker_event(WorkerEvent::SwitchReport(WorkerReport::Backoff {

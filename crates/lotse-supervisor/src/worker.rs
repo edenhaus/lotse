@@ -17,8 +17,9 @@ use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use lotse_api_types::stream::TalkerReason;
 use lotse_core::clock::Clock;
 use lotse_core::connection::WorkerReport;
 use lotse_core::source::SourceError;
@@ -91,6 +92,15 @@ pub enum WorkerEvent {
         session_id: String,
         /// What happened.
         event: SessionEvent,
+    },
+    /// The talker of the connection's backchannel changed.
+    Talker {
+        /// The session it concerns.
+        session_id: String,
+        /// Why.
+        reason: TalkerReason,
+        /// When, on the worker's wall clock.
+        at: SystemTime,
     },
     /// The worker closed its channel cleanly.
     ChannelClosed,
@@ -312,6 +322,19 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>) -> WorkerEvent {
         ToSupervisor::Tracks(tracks) => WorkerEvent::Tracks(declared(tracks)),
         ToSupervisor::Stats(stats) => WorkerEvent::Stats(counted(stats)),
         ToSupervisor::Session { session_id, event } => WorkerEvent::Session { session_id, event },
+        ToSupervisor::Talker(change) => match TalkerReason::parse(&change.reason) {
+            Some(reason) => WorkerEvent::Talker {
+                session_id: change.session_id,
+                reason,
+                at: UNIX_EPOCH
+                    .checked_add(Duration::from_millis(change.at_ms))
+                    .unwrap_or(UNIX_EPOCH),
+            },
+            None => WorkerEvent::ChannelError(format!(
+                "talker change with an unknown reason {:?}",
+                change.reason
+            )),
+        },
     }
 }
 
@@ -549,6 +572,14 @@ impl Worker {
         self.control.send_msg(&message, &[]).await
     }
 
+    /// Frees the connection's backchannel from its talker
+    /// (`backchannel/release`).
+    pub async fn release_backchannel(&mut self) -> Result<(), IpcError> {
+        self.control
+            .send_msg(&ToWorker::ReleaseBackchannel, &[])
+            .await
+    }
+
     /// Closes a session with this `closed` code.
     pub async fn close_session(
         &mut self,
@@ -638,6 +669,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
 
     use lotse_core::clock::{FakeClock, SystemClock};
+    use lotse_ipc::TalkerChange;
 
     use super::*;
     use crate::test_support::Captured;
@@ -752,6 +784,36 @@ mod tests {
         ] {
             assert_eq!(source_error(code, "m"), expect);
         }
+    }
+
+    #[test]
+    fn talker_changes_map_onto_talker_events_and_an_unknown_reason_fails_the_channel() {
+        assert_eq!(
+            map_message(
+                ToSupervisor::Talker(TalkerChange {
+                    session_id: "s1".into(),
+                    reason: "released".into(),
+                    at_ms: 1_500,
+                }),
+                None
+            ),
+            WorkerEvent::Talker {
+                session_id: "s1".into(),
+                reason: TalkerReason::Released,
+                at: UNIX_EPOCH + Duration::from_millis(1_500),
+            }
+        );
+        assert_eq!(
+            map_message(
+                ToSupervisor::Talker(TalkerChange {
+                    session_id: "s1".into(),
+                    reason: "stolen".into(),
+                    at_ms: 0,
+                }),
+                None
+            ),
+            WorkerEvent::ChannelError("talker change with an unknown reason \"stolen\"".into())
+        );
     }
 
     fn track(id: &str) -> TrackInfo {
@@ -878,7 +940,10 @@ mod tests {
 
     #[test]
     fn a_session_message_maps_onto_its_session_s_event() {
-        let event = SessionEvent::Answer { sdp: "v=0".into() };
+        let event = SessionEvent::Answer {
+            sdp: "v=0".into(),
+            talkback: None,
+        };
         assert_eq!(
             map_message(
                 ToSupervisor::Session {

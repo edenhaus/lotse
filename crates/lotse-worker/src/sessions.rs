@@ -60,7 +60,7 @@ use crate::derived::{DerivedTracks, Lease, PickedTrack};
 use crate::ice_tcp::Links;
 use crate::relay::{Egress, Relays};
 use crate::sendmsg;
-use crate::talkback::{self, Arbiter, BACKCHANNEL_BUSY, Talkback};
+use crate::talkback::{self, Arbiter, BACKCHANNEL_BUSY, Talkback, TalkbackStats};
 
 /// The bounded inbound queue per session:
 /// uplink only, so small.
@@ -160,6 +160,8 @@ struct SessionHandle {
     control: mpsc::Sender<Control>,
     /// The task.
     task: JoinHandle<()>,
+    /// Its talk-back counters.
+    talkback: Arc<TalkbackStats>,
 }
 
 /// The manager.
@@ -246,6 +248,19 @@ impl SessionManager {
         self.sessions.len()
     }
 
+    /// The talk-back counters of every open session whose answer
+    /// negotiated talk-back, by session id.
+    pub(crate) fn talkback(&mut self) -> Vec<(String, lotse_ipc::TalkbackStats)> {
+        self.reap();
+        let mut report: Vec<_> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, handle)| Some((id.clone(), handle.talkback.report()?)))
+            .collect();
+        report.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        report
+    }
+
     /// Reports a session that never started.
     async fn refuse(&self, session_id: String, code: &'static str, message: String) {
         tracing::warn!(session = %session_id, code, message, "session refused");
@@ -305,6 +320,7 @@ impl SessionManager {
             .insert(spec.ice_ufrag.clone(), inbound_tx.clone());
         let session_id = spec.session_id.clone();
         let ufrag = spec.ice_ufrag.clone();
+        let talkback = Arc::new(TalkbackStats::default());
         let ConnectionMedia {
             tracks,
             mapper,
@@ -316,6 +332,7 @@ impl SessionManager {
             tracks,
             mapper,
             backchannel,
+            talkback: Arc::clone(&talkback),
             factory: Arc::clone(factory),
             limits,
             udp: Arc::clone(&self.udp),
@@ -336,6 +353,7 @@ impl SessionManager {
                 ufrag,
                 control: control_tx,
                 task,
+                talkback,
             },
         );
     }
@@ -527,6 +545,8 @@ struct SessionCtx {
     /// The arbiter of the connection's backchannel, when its protocol has
     /// one.
     backchannel: Option<Arc<Arbiter>>,
+    /// The session's talk-back counters, which the manager reports.
+    talkback: Arc<TalkbackStats>,
     /// The output that opens the session.
     factory: Arc<dyn OutputFactory>,
     /// The tunables.
@@ -915,7 +935,15 @@ async fn open_session(
             return None;
         }
     };
-    ctx.emit(IpcEvent::Answer { sdp: answer }).await;
+    let talkback = engine.talkback();
+    ctx.talkback
+        .negotiated
+        .store(talkback.is_some(), Ordering::Relaxed);
+    ctx.emit(IpcEvent::Answer {
+        sdp: answer,
+        talkback: talkback.map(|codec| codec.name().to_owned()),
+    })
+    .await;
     let mut opened = Opened {
         engine,
         family: video.codec().family(),
@@ -925,10 +953,13 @@ async fn open_session(
         _video_lease: picked.video.lease,
         relays: Relays::default(),
         uplink: Vec::new(),
-        talkback: ctx
-            .backchannel
-            .as_ref()
-            .map(|arbiter| Talkback::new(Arc::clone(arbiter), ctx.spec.session_id.clone())),
+        talkback: ctx.backchannel.as_ref().map(|arbiter| {
+            Talkback::new(
+                Arc::clone(arbiter),
+                ctx.spec.session_id.clone(),
+                Arc::clone(&ctx.talkback),
+            )
+        }),
     };
     for relay in relays {
         add_relay(ctx, &mut opened, relay).await;
@@ -1022,6 +1053,9 @@ async fn drain(
                 }
             }
             SessionOutput::Uplink(packet) => {
+                ctx.talkback
+                    .packets_received
+                    .store(opened.engine.stats().uplink_packets, Ordering::Relaxed);
                 if talkback::receive(opened.talkback.as_mut(), packet) {
                     ctx.emit(IpcEvent::Warning {
                         code: BACKCHANNEL_BUSY.to_owned(),
@@ -1291,6 +1325,10 @@ mod tests {
         fn stats(&self) -> SessionStats {
             SessionStats::default()
         }
+
+        fn talkback(&self) -> Option<lotse_core::uplink::UplinkCodec> {
+            None
+        }
     }
 
     /// The `webrtc` output of [`Scripted`] engines: H.264 video, and PCMU
@@ -1470,6 +1508,7 @@ mod tests {
             tracks: DerivedTracks::new(Arc::clone(publisher.tracks()), Vec::new(), clock.clone()),
             mapper: Arc::new(ClockMapper::new()),
             backchannel: None,
+            talkback: Arc::default(),
             factory: Arc::new(ScriptedOutput(Arc::clone(&script))),
             limits: SessionLimits::default(),
             udp: Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
@@ -1511,7 +1550,8 @@ mod tests {
         assert_eq!(
             rig.events(),
             [IpcEvent::Answer {
-                sdp: "answer".into()
+                sdp: "answer".into(),
+                talkback: None,
             }]
         );
         assert!(rig.script.called("open audio=true"));
@@ -1701,7 +1741,8 @@ mod tests {
             rig.events(),
             [
                 IpcEvent::Answer {
-                    sdp: "answer".into()
+                    sdp: "answer".into(),
+                    talkback: None,
                 },
                 IpcEvent::Relayed {
                     relayed,

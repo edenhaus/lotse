@@ -31,9 +31,9 @@
 //! closed queue drops it. Every change of the talker is logged and sent as
 //! a [`TalkerChanged`] event.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lotse_core::clock::Clock;
 use lotse_core::codec::Codec;
@@ -43,6 +43,7 @@ use lotse_core::task::spawn_named;
 use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
 use lotse_core::transcode::{TrackHandle, TranscodeError, UplinkFactory};
 use lotse_core::uplink::{UPLINK_TRACK, UplinkCodec, UplinkPacket, UplinkTrack};
+use lotse_ipc::TalkerChange;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -62,10 +63,6 @@ pub(crate) enum ChangeReason {
     /// The talker's session closed.
     SessionClosed,
     /// The client released the channel (`backchannel/release`).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "step 6's backchannel/release releases")
-    )]
     Released,
 }
 
@@ -93,10 +90,17 @@ pub(crate) struct TalkerChanged {
     pub(crate) at: SystemTime,
 }
 
-/// One session's talk-back counters: what it sent the device and what it
-/// lost on the way. Shared with the forwarder of its route.
+/// One session's talk-back counters: what it received, what it sent the
+/// device and what it lost on the way. Shared with the forwarder of its
+/// route, and with the session manager, which reports them
+/// (`session/get`'s `backchannel`).
 #[derive(Debug, Default)]
 pub(crate) struct TalkbackStats {
+    /// The answer negotiated talk-back: only such a session is reported.
+    pub(crate) negotiated: AtomicBool,
+    /// Talk-back packets the engine took (`SessionStats::uplink_packets`,
+    /// `session/get`'s `packets_received`).
+    pub(crate) packets_received: AtomicU64,
     /// Packets dropped because another session held the channel
     /// (`session/get`'s `packets_dropped_busy`).
     pub(crate) packets_dropped_busy: AtomicU64,
@@ -113,6 +117,52 @@ impl TalkbackStats {
     /// One more in `counter`.
     fn count(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The counters as the supervisor gets them; `None` when the answer
+    /// did not negotiate talk-back.
+    pub(crate) fn report(&self) -> Option<lotse_ipc::TalkbackStats> {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        self.negotiated
+            .load(Ordering::Relaxed)
+            .then(|| lotse_ipc::TalkbackStats {
+                packets_received: load(&self.packets_received),
+                packets_dropped_busy: load(&self.packets_dropped_busy),
+                bytes_sent: load(&self.bytes_sent),
+            })
+    }
+}
+
+/// A talker change as the supervisor gets it.
+pub(crate) fn talker_change(change: TalkerChanged) -> TalkerChange {
+    let at_ms = change.at.duration_since(UNIX_EPOCH).map_or(0, |since| {
+        u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+    });
+    TalkerChange {
+        session_id: change.session,
+        reason: change.reason.code().to_owned(),
+        at_ms,
+    }
+}
+
+/// The next talker change on `events`. A receiver that fell behind skips
+/// the oldest changes, logged, and goes on with the ones kept: each says
+/// who holds the channel after it, so the last one is the state. `None`
+/// once the arbiter is gone.
+pub(crate) async fn next_change(
+    events: &mut broadcast::Receiver<TalkerChanged>,
+) -> Option<TalkerChanged> {
+    loop {
+        match events.recv().await {
+            Ok(change) => return Some(change),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped,
+                    "talk-back: talker changes skipped for the supervisor; the latest follow"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
     }
 }
 
@@ -222,10 +272,6 @@ impl Arbiter {
     }
 
     /// The talker changes from now on, for `stream/subscribe`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "step 6 exposes the changes on stream/subscribe")
-    )]
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<TalkerChanged> {
         self.events.subscribe()
     }
@@ -233,10 +279,6 @@ impl Arbiter {
     /// Frees the channel, whoever holds it (`backchannel/release`): its
     /// route stops at once, and the next session to send claims it, the
     /// released one included. Returns the session that held it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "step 6's backchannel/release calls it")
-    )]
     pub(crate) fn release(&self) -> Option<String> {
         let talker = self.lock().talker.take()?;
         let (session, reason) = (talker.session.as_str(), ChangeReason::Released.code());
@@ -547,15 +589,16 @@ pub(crate) struct Talkback {
 }
 
 impl Talkback {
-    /// The talk-back of `session` on the connection `arbiter` arbitrates.
-    pub(crate) fn new(arbiter: Arc<Arbiter>, session: String) -> Self {
+    /// The talk-back of `session` on the connection `arbiter` arbitrates,
+    /// counting into `stats`.
+    pub(crate) fn new(arbiter: Arc<Arbiter>, session: String, stats: Arc<TalkbackStats>) -> Self {
         Self {
             arbiter,
             session,
             track: None,
             claim: None,
             flow: Flow::Idle,
-            stats: Arc::default(),
+            stats,
         }
     }
 
@@ -893,8 +936,8 @@ mod tests {
         let (arbiter, slot) = arbiter(None);
         let mut device = pcmu(&slot);
         let mut events = arbiter.subscribe();
-        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into());
-        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into());
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
         // Neither holds the channel before it sends.
         no_change(&mut events);
 
@@ -932,7 +975,7 @@ mod tests {
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("b", ChangeReason::Claimed));
         assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 4);
-        let mut c = Talkback::new(Arc::clone(&arbiter), "c".into());
+        let mut c = Talkback::new(Arc::clone(&arbiter), "c".into(), Arc::default());
         assert!(talk(&mut c, 0), "a new busy sender is warned");
         drop(c);
         no_change(&mut events);
@@ -953,8 +996,8 @@ mod tests {
         let mut events = arbiter.subscribe();
         assert_eq!(arbiter.release(), None, "nobody holds it");
         no_change(&mut events);
-        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into());
-        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into());
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
         assert!(!talk(&mut a, 0));
         assert_eq!(change(&mut events).1, ChangeReason::Claimed);
         assert_eq!(
@@ -980,10 +1023,10 @@ mod tests {
         assert_eq!(load(&a.stats.packets_dropped_busy), 1);
         // A stale claim frees nothing: a's session closing leaves b the
         // talker.
-        let mut c = Talkback::new(Arc::clone(&arbiter), "c".into());
+        let mut c = Talkback::new(Arc::clone(&arbiter), "c".into(), Arc::default());
         assert!(talk(&mut c, 0));
         drop(c);
-        let mut d = Talkback::new(Arc::clone(&arbiter), "d".into());
+        let mut d = Talkback::new(Arc::clone(&arbiter), "d".into(), Arc::default());
         drop(a);
         no_change(&mut events);
         assert!(talk(&mut d, 0), "b still holds it");
@@ -1002,15 +1045,15 @@ mod tests {
         let (arbiter, slot) = arbiter(None);
         let _device = pcmu(&slot);
         let mut events = arbiter.subscribe();
-        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into());
-        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into());
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
         assert!(!talk(&mut a, 0));
         assert_eq!(arbiter.release().as_deref(), Some("a"));
         assert!(!talk(&mut b, 0));
         let _claimed_released_claimed = (0..3).map(|_| change(&mut events)).count();
         drop(a);
         no_change(&mut events);
-        let mut c = Talkback::new(Arc::clone(&arbiter), "c".into());
+        let mut c = Talkback::new(Arc::clone(&arbiter), "c".into(), Arc::default());
         assert!(talk(&mut c, 0), "b still holds it");
     }
 
@@ -1020,8 +1063,8 @@ mod tests {
         let (arbiter, slot) = arbiter(None);
         let mut before = pcmu(&slot);
         let mut events = arbiter.subscribe();
-        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into());
-        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into());
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
         assert!(!talk(&mut a, 0));
         assert_eq!(within(before.recv()).await.unwrap().rtp.seq, 0);
 
@@ -1060,7 +1103,7 @@ mod tests {
         let (arbiter, slot) = arbiter(Some(Arc::new(Factory(Arc::clone(&uplink)))));
         let forty = Duration::from_millis(40);
         let mut device = offer(&slot, Codec::Pcma, forty, 64);
-        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into());
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         assert!(!a.receive(packet(UplinkCodec::Opus, 1, 0, &[1, 2, 3])));
         let out = within(device.recv()).await.unwrap();
         assert_eq!((out.rtp.ssrc, &out.payload[..]), (9, &[1, 2, 3][..]));
@@ -1127,7 +1170,7 @@ mod tests {
             Duration::from_millis(20),
             64,
         );
-        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into());
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         assert!(!a.receive(packet(UplinkCodec::Opus, 7, 0, &[9, 9])));
         // A new SSRC starts an epoch on the track; the forwarder skips the
         // event and forwards the packet.
@@ -1160,8 +1203,8 @@ mod tests {
             let forwards_g711 = uplink.is_none();
             let (arbiter, slot) = arbiter(uplink);
             let mut device = pcmu(&slot);
-            let mut a = Talkback::new(Arc::clone(&arbiter), "a".into());
-            let mut b = Talkback::new(Arc::clone(&arbiter), "b".into());
+            let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+            let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
             for seq in 0..2 {
                 assert!(!a.receive(packet(UplinkCodec::Opus, 1, seq, &[1])));
             }
@@ -1196,12 +1239,83 @@ mod tests {
     async fn a_full_backchannel_drops_and_counts() {
         let (arbiter, slot) = arbiter(None);
         let _device = offer(&slot, Codec::Pcmu, BackchannelHandle::DEFAULT_FRAME, 1);
-        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into());
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         for seq in 0..3 {
             assert!(!talk(&mut a, seq));
         }
         eventually("two dropped", || load(&a.stats.packets_dropped) == 2).await;
         assert_eq!(load(&a.stats.packets_sent), 1);
         assert_eq!(load(&a.stats.bytes_sent), 2);
+    }
+
+    /// `session/get`'s counters, only for a session whose answer
+    /// negotiated talk-back.
+    #[test]
+    fn only_a_negotiated_session_reports_its_counters() {
+        let stats = TalkbackStats::default();
+        assert_eq!(stats.report(), None);
+        stats.negotiated.store(true, Ordering::Relaxed);
+        stats.packets_received.store(5, Ordering::Relaxed);
+        TalkbackStats::count(&stats.packets_dropped_busy);
+        TalkbackStats::count(&stats.packets_sent);
+        stats.bytes_sent.store(160, Ordering::Relaxed);
+        assert_eq!(
+            stats.report(),
+            Some(lotse_ipc::TalkbackStats {
+                packets_received: 5,
+                packets_dropped_busy: 1,
+                bytes_sent: 160,
+            })
+        );
+    }
+
+    #[test]
+    fn talker_changes_reach_the_supervisor_in_milliseconds_since_the_epoch() {
+        let at = UNIX_EPOCH + Duration::from_millis(1_791_280_800_123);
+        for (reason, name) in [
+            (ChangeReason::Claimed, "claimed"),
+            (ChangeReason::SessionClosed, "session_closed"),
+            (ChangeReason::Released, "released"),
+        ] {
+            let change = talker_change(TalkerChanged {
+                session: "a".into(),
+                reason,
+                at,
+            });
+            assert_eq!(
+                change,
+                TalkerChange {
+                    session_id: "a".into(),
+                    reason: name.into(),
+                    at_ms: 1_791_280_800_123,
+                }
+            );
+        }
+        let before = talker_change(TalkerChanged {
+            session: "a".into(),
+            reason: ChangeReason::Claimed,
+            at: UNIX_EPOCH - Duration::from_secs(1),
+        });
+        assert_eq!(before.at_ms, 0);
+    }
+
+    /// A supervisor link that fell behind goes on with the latest changes,
+    /// and ends with the arbiter.
+    #[tokio::test]
+    async fn a_lagging_receiver_skips_to_the_latest_changes_and_ends_with_the_arbiter() {
+        let (arbiter, _slot) = arbiter(None);
+        let mut events = arbiter.subscribe();
+        for round in 0..=EVENT_CAPACITY {
+            arbiter.emit(&format!("s{round}"), ChangeReason::Claimed);
+        }
+        let first = within(next_change(&mut events)).await.unwrap();
+        assert_eq!(first.session, "s1", "the oldest change was skipped");
+        let mut last = first;
+        while let Ok(change) = events.try_recv() {
+            last = change;
+        }
+        assert_eq!(last.session, format!("s{EVENT_CAPACITY}"));
+        drop(arbiter);
+        assert_eq!(within(next_change(&mut events)).await, None);
     }
 }

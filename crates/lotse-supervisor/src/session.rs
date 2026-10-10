@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lotse_api::{ConnectionId, Event, EventClass};
-use lotse_api_types::session::{Session, SessionEvent};
+use lotse_api_types::session::{Session, SessionBackchannel, SessionEvent};
 use lotse_api_types::time::rfc3339;
 use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
@@ -113,6 +113,10 @@ const WARNING_CODES: [&str; 7] = [
     "invalid_candidate",
     "frame_over_browser_limit",
 ];
+
+/// The talk-back codecs a worker may report negotiated;
+/// anything else is taken as not negotiated.
+const TALKBACK_CODECS: [&str; 3] = ["opus", "pcmu", "pcma"];
 
 /// `RTCIceConnectionState` names.
 const ICE_STATES: [&str; 7] = [
@@ -200,6 +204,8 @@ pub(crate) struct SessionEntry {
     dtls: &'static str,
     /// The answer went out.
     pub(crate) answered: bool,
+    /// The talk-back codec the answer negotiated, if any.
+    talkback: Option<&'static str>,
     /// Browser candidates received so far.
     pub(crate) remote_candidates: u32,
     /// STUN gathers still running; end-of-candidates waits for them.
@@ -280,6 +286,7 @@ impl SessionEntry {
             ice: "new",
             dtls: "new",
             answered: false,
+            talkback: None,
             remote_candidates: 0,
             gathers: 0,
             worker_done: false,
@@ -529,11 +536,12 @@ impl SessionEntry {
         report: WorkerSessionEvent,
     ) -> Result<Vec<SessionEvent>, &'static str> {
         match report {
-            WorkerSessionEvent::Answer { sdp } => {
+            WorkerSessionEvent::Answer { sdp, talkback } => {
                 if self.answered {
                     return Err("a second answer");
                 }
                 self.answered = true;
+                self.talkback = talkback.and_then(|codec| known(&TALKBACK_CODECS, &codec));
                 self.mid = sdp
                     .lines()
                     .find_map(|line| line.strip_prefix("a=mid:"))
@@ -639,8 +647,15 @@ impl SessionEntry {
         }])
     }
 
-    /// The session as `session/get` returns it.
-    pub(crate) fn dto(&self, session_id: &str) -> Session {
+    /// The session as `session/get` returns it, with whether it holds its
+    /// connection's backchannel (`talker`) and its worker's last talk-back
+    /// counters.
+    pub(crate) fn dto(
+        &self,
+        session_id: &str,
+        talker: bool,
+        counters: lotse_ipc::TalkbackStats,
+    ) -> Session {
         Session {
             session_id: session_id.to_owned(),
             stream_id: self.stream_id.clone(),
@@ -649,6 +664,14 @@ impl SessionEntry {
             answered: self.answered,
             orphaned: self.owner.is_none(),
             since: rfc3339(self.since),
+            backchannel: SessionBackchannel {
+                negotiated: self.talkback.is_some(),
+                talker,
+                codec: self.talkback.map(str::to_owned),
+                packets_received: counters.packets_received,
+                packets_dropped_busy: counters.packets_dropped_busy,
+                bytes_sent: counters.bytes_sent,
+            },
         }
     }
 }
@@ -825,7 +848,10 @@ mod tests {
         let mut session = entry(tx);
         assert!(!session.answered);
         assert_eq!(
-            session.applied(WorkerSessionEvent::Answer { sdp: "v=0".into() }),
+            session.applied(WorkerSessionEvent::Answer {
+                sdp: "v=0".into(),
+                talkback: Some("pcma".into())
+            }),
             vec![SessionEvent::Answer { sdp: "v=0".into() }]
         );
         assert!(session.answered);
@@ -885,7 +911,12 @@ mod tests {
                 message: "m".into()
             }
         );
-        let dto = session.dto("s1");
+        let counters = lotse_ipc::TalkbackStats {
+            packets_received: 9,
+            packets_dropped_busy: 2,
+            bytes_sent: 1_120,
+        };
+        let dto = session.dto("s1", true, counters);
         assert_eq!(
             (
                 dto.ice.as_str(),
@@ -896,6 +927,50 @@ mod tests {
             ("connected", "new", true, false)
         );
         assert_eq!(dto.since, "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            dto.backchannel,
+            SessionBackchannel {
+                negotiated: true,
+                talker: true,
+                codec: Some("pcma".into()),
+                packets_received: 9,
+                packets_dropped_busy: 2,
+                bytes_sent: 1_120,
+            }
+        );
+    }
+
+    /// A worker names only a known talk-back codec; anything else, or
+    /// none, is talk-back off.
+    #[test]
+    fn a_talk_back_codec_outside_the_known_ones_is_not_negotiated() {
+        for (reported, codec) in [
+            (Some("opus"), Some("opus")),
+            (Some("pcmu"), Some("pcmu")),
+            (Some("pcma"), Some("pcma")),
+            (Some("g722"), None),
+            (None, None),
+        ] {
+            let (tx, _rx) = mpsc::channel(8);
+            let mut session = entry(tx);
+            assert_eq!(
+                session
+                    .dto("s1", false, lotse_ipc::TalkbackStats::default())
+                    .backchannel,
+                SessionBackchannel::default(),
+                "nothing negotiated before the answer"
+            );
+            let _events = session.apply(WorkerSessionEvent::Answer {
+                sdp: "v=0".into(),
+                talkback: reported.map(str::to_owned),
+            });
+            let dto = session.dto("s1", false, lotse_ipc::TalkbackStats::default());
+            assert_eq!(
+                (dto.backchannel.negotiated, dto.backchannel.codec.as_deref()),
+                (codec.is_some(), codec),
+                "{reported:?}"
+            );
+        }
     }
 
     #[test]
@@ -904,10 +979,12 @@ mod tests {
         let mut session = entry(tx);
         session.applied(WorkerSessionEvent::Answer {
             sdp: "v=0\r\na=mid:0\r\n".into(),
+            talkback: None,
         });
         assert_eq!(
             session.apply(WorkerSessionEvent::Answer {
-                sdp: "v=0\r\na=mid:1\r\n".into()
+                sdp: "v=0\r\na=mid:1\r\n".into(),
+                talkback: None,
             }),
             Err("a second answer")
         );
@@ -953,6 +1030,7 @@ mod tests {
         // A line and its mid count; the answer does not.
         session.applied(WorkerSessionEvent::Answer {
             sdp: "v=0".repeat(1000),
+            talkback: None,
         });
         session.applied(WorkerSessionEvent::Candidate {
             candidate: "c".repeat(1000),
@@ -1105,6 +1183,7 @@ mod tests {
         assert_eq!(session.gathered(None), vec![]);
         let answered = session.applied(WorkerSessionEvent::Answer {
             sdp: "v=0\r\nm=audio 9\r\na=mid:0\r\nm=video 9\r\na=mid:1\r\n".into(),
+            talkback: None,
         });
         assert_eq!(answered.len(), 2);
         assert_eq!(answered[1], candidate("candidate:s0", Some("0")));
@@ -1124,8 +1203,11 @@ mod tests {
         let mut slow = entry(tx);
         slow.gathering(1);
         assert_eq!(
-            slow.applied(WorkerSessionEvent::Answer { sdp: "v=0".into() })
-                .len(),
+            slow.applied(WorkerSessionEvent::Answer {
+                sdp: "v=0".into(),
+                talkback: None
+            })
+            .len(),
             1
         );
         assert_eq!(slow.applied(end()), vec![]);
@@ -1137,7 +1219,10 @@ mod tests {
         let mut early = entry(tx);
         early.gathering(1);
         assert_eq!(early.gather_deadline(), vec![]);
-        early.applied(WorkerSessionEvent::Answer { sdp: "v=0".into() });
+        early.applied(WorkerSessionEvent::Answer {
+            sdp: "v=0".into(),
+            talkback: None,
+        });
         assert_eq!(early.gathered(Some("c".into())), vec![candidate("c", None)]);
         // Without gathers the worker's end-of-candidates passes at once.
         assert_eq!(early.applied(end()), vec![candidate("", None)]);
@@ -1156,6 +1241,7 @@ mod tests {
         session.relay_handed_over(Lease::detached(other));
         session.applied(WorkerSessionEvent::Answer {
             sdp: "v=0\r\na=mid:0\r\n".into(),
+            talkback: None,
         });
         assert_eq!(session.applied(end()), vec![]);
         assert!(!session.candidates_done());
@@ -1249,7 +1335,12 @@ mod tests {
 
         let epoch = session.orphan();
         assert_eq!(epoch, session.orphan_epoch());
-        assert!(!session.is_owned() && session.dto("s1").orphaned);
+        assert!(
+            !session.is_owned()
+                && session
+                    .dto("s1", false, lotse_ipc::TalkbackStats::default())
+                    .orphaned
+        );
         for n in 0..ORPHAN_BUFFER + 2 {
             session.deliver(
                 "s1",

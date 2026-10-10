@@ -38,6 +38,19 @@
         }
       ]
     },
+    "BackchannelReleaseResult": {
+      "description": "`backchannel/release`'s result.",
+      "properties": {
+        "talker": {
+          "description": "The session that held the backchannel when the command arrived, as\nthe worker last reported it; null when it was free. A\n`talker_changed` with `released` follows on `stream/subscribe` when\none was released.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "BuildInfo": {
       "description": "How the daemon was built.",
       "properties": {
@@ -577,6 +590,33 @@
           ],
           "title": "SessionAdoptCommand",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`backchannel/release`: frees the camera's backchannel from its\ntalker.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "description": "The stream whose camera's backchannel to free.",
+              "type": "string"
+            },
+            "type": {
+              "const": "backchannel/release",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "stream_id"
+          ],
+          "title": "BackchannelReleaseCommand",
+          "type": "object"
         }
       ]
     },
@@ -807,6 +847,11 @@
         {
           "const": "backchannel_busy",
           "description": "Another session holds the backchannel.",
+          "type": "string"
+        },
+        {
+          "const": "backchannel_unsupported",
+          "description": "`backchannel/release` on a stream whose source protocol cannot\ncarry audio back.",
           "type": "string"
         },
         {
@@ -1381,6 +1426,18 @@
           "description": "The answer was sent.",
           "type": "boolean"
         },
+        "backchannel": {
+          "$ref": "#/$defs/SessionBackchannel",
+          "default": {
+            "bytes_sent": 0,
+            "codec": null,
+            "negotiated": false,
+            "packets_dropped_busy": 0,
+            "packets_received": 0,
+            "talker": false
+          },
+          "description": "Talk-back towards the camera's backchannel; all zero and `false`\nwhen the answer did not negotiate it."
+        },
         "dtls": {
           "description": "The DTLS state, as the browser names it.",
           "type": "string"
@@ -1415,6 +1472,51 @@
         "orphaned",
         "since"
       ],
+      "type": "object"
+    },
+    "SessionBackchannel": {
+      "description": "A session's talk-back, as `session/get` reports it.\nThe counters are the worker's, pushed once per second, so they may lag\nby that much; `negotiated`, `codec` and `talker` are current.",
+      "properties": {
+        "bytes_sent": {
+          "default": 0,
+          "description": "Payload bytes handed to the camera's backchannel, after the reverse\ntranscode.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "codec": {
+          "default": null,
+          "description": "The talk-back codec the answer named first on that m-line, which the\nbrowser sends (`opus`, `pcmu`, `pcma`); null when not negotiated.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "negotiated": {
+          "default": false,
+          "description": "The answer accepted the browser's talk-back m-line (`recvonly`, or\n`sendrecv` on its downlink audio m-line).",
+          "type": "boolean"
+        },
+        "packets_dropped_busy": {
+          "default": 0,
+          "description": "Of those, the ones dropped because another session held the\nbackchannel.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "packets_received": {
+          "default": 0,
+          "description": "Talk-back RTP packets the session received and took.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "talker": {
+          "default": false,
+          "description": "The session holds the camera's backchannel now: it sent first and\nkeeps it until it closes or `backchannel/release`.",
+          "type": "boolean"
+        }
+      },
       "type": "object"
     },
     "SessionEvent": {
@@ -1669,6 +1771,14 @@
     "Stream": {
       "description": "A stream, as `stream/get` returns it and `stream/list` lists it.",
       "properties": {
+        "backchannel": {
+          "$ref": "#/$defs/StreamBackchannel",
+          "default": {
+            "since": null,
+            "talker": null
+          },
+          "description": "Who talks to the camera through its backchannel."
+        },
         "last_error": {
           "anyOf": [
             {
@@ -1734,6 +1844,28 @@
       ],
       "type": "object"
     },
+    "StreamBackchannel": {
+      "description": "The talker of a stream's backchannel, as `stream/get` reports it.\nA camera has one backchannel, held by its source connection, so streams\nthat share the connection report the same talker.",
+      "properties": {
+        "since": {
+          "default": null,
+          "description": "When `talker` last changed, RFC 3339; null while nobody has talked\nsince the connection's worker started.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "talker": {
+          "default": null,
+          "description": "The session holding the backchannel, or null when it is free.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "StreamEvent": {
       "description": "An event of `stream/subscribe`.\nEach variant's schema title names the Python client's class for it.",
       "oneOf": [
@@ -1789,6 +1921,47 @@
             "stream_id"
           ],
           "title": "StreamEventStreamRemoved",
+          "type": "object"
+        },
+        {
+          "description": "The talker of the stream's backchannel changed. Sent to the\nsubscribers of every stream on the source connection, never\ncoalesced or shed.",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/TalkerReason",
+              "description": "Why."
+            },
+            "session_id": {
+              "description": "The session it concerns: the new talker, or the one that let go.",
+              "type": "string"
+            },
+            "since": {
+              "description": "When, RFC 3339: the `since` of `stream/get`'s `backchannel`.",
+              "type": "string"
+            },
+            "stream_id": {
+              "description": "The stream.",
+              "type": "string"
+            },
+            "talker": {
+              "description": "The session holding the backchannel now: `session_id` after a\nclaim, null otherwise.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "talker_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "stream_id",
+            "session_id",
+            "reason",
+            "since"
+          ],
+          "title": "StreamEventTalkerChanged",
           "type": "object"
         }
       ]
@@ -1955,6 +2128,36 @@
           "type": "integer"
         },
         "result": {
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_BackchannelReleaseResult": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/BackchannelReleaseResult",
           "description": "The command's result."
         },
         "success": {
@@ -2274,6 +2477,26 @@
       ],
       "type": "object"
     },
+    "TalkerReason": {
+      "description": "Why a stream's talker changed: the `reason` of `talker_changed`.",
+      "oneOf": [
+        {
+          "const": "claimed",
+          "description": "A session sent the first talk-back packet while nobody held the\nbackchannel, and holds it now.",
+          "type": "string"
+        },
+        {
+          "const": "session_closed",
+          "description": "The talker's session closed; the backchannel is free.",
+          "type": "string"
+        },
+        {
+          "const": "released",
+          "description": "`backchannel/release` freed it; the next session to send claims it.",
+          "type": "string"
+        }
+      ]
+    },
     "TrackInfo": {
       "description": "A track as `stream/get` reports it.",
       "properties": {
@@ -2457,7 +2680,7 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "api": "0.1.0",
+  "api": "0.1.1",
   "command": {
     "$ref": "#/$defs/Command"
   },
@@ -2479,6 +2702,9 @@
     "$ref": "#/$defs/Hello"
   },
   "results": {
+    "backchannel/release": {
+      "$ref": "#/$defs/Success_for_BackchannelReleaseResult"
+    },
     "info": {
       "$ref": "#/$defs/Success_for_InfoResult"
     },

@@ -8,13 +8,13 @@
 //! carries the major version.
 
 /// The API version in `hello.api` and the schema bundle's `api`.
-pub const API_VERSION: &str = "0.1.0";
+pub const API_VERSION: &str = "0.1.1";
 
 /// [`API_VERSION`], parsed; a test keeps the two equal.
 pub const CURRENT: ApiVersion = ApiVersion {
     major: 0,
     minor: 1,
-    patch: 0,
+    patch: 1,
 };
 
 /// The WebSocket path: `/v<major>/ws`; a test keeps it on [`CURRENT`]'s major.
@@ -92,11 +92,13 @@ mod tests {
     }
 
     #[test]
-    fn the_constants_agree_and_start_at_0_1_0() {
+    fn the_constants_agree_and_stay_below_1_0() {
         assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
         assert_eq!(CURRENT.to_string(), API_VERSION);
         assert_eq!(WS_PATH, format!("/v{}/ws", CURRENT.major));
-        assert_eq!(CURRENT, v(0, 1, 0), "unstable until lotse 1.0");
+        // 0.1.1: two-way audio (`backchannel` in `session/get` and
+        // `stream/get`, `talker_changed`, `backchannel/release`).
+        assert_eq!(CURRENT, v(0, 1, 1), "unstable until lotse 1.0");
     }
 
     #[test]

@@ -437,6 +437,9 @@ struct TalkbackRx {
     mid: Mid,
     /// Takes its RTP by payload type.
     depacketizer: Depacketizer,
+    /// The codec the answer named first on the m-line, which the browser
+    /// sends.
+    negotiated: UplinkCodec,
     /// The codec of the last packet handed on, `None` before the first:
     /// the start of talk-back and a change of codec are logged.
     codec: Option<UplinkCodec>,
@@ -491,17 +494,21 @@ fn engine_family(codec: EngineCodec) -> Option<CodecFamily> {
 /// negotiated it on: by the payload types the engine settled on with the
 /// offer (str0m takes the offer's numbers), every talk-back codec among
 /// them, since the browser may send any codec the m-line lists.
-fn talkback_rx(rtc: &Rtc, mid: &str) -> TalkbackRx {
-    let negotiated = rtc
+/// `codec` is the one the answer named first; the plan negotiates
+/// talk-back codecs only, so it is always one, and `None` never comes.
+fn talkback_rx(rtc: &Rtc, mid: &str, codec: CodecFamily) -> Option<TalkbackRx> {
+    let negotiated = UplinkCodec::of(codec)?;
+    let params = rtc
         .codec_config()
         .params()
         .iter()
         .filter_map(|params| Some((*params.pt(), engine_family(params.spec().codec)?)));
-    TalkbackRx {
+    Some(TalkbackRx {
         mid: Mid::from(mid),
-        depacketizer: Depacketizer::new(negotiated),
+        depacketizer: Depacketizer::new(params),
+        negotiated,
         codec: None,
-    }
+    })
 }
 
 /// Whether `datagram`, as the engine sends it, is an RTP packet of the
@@ -728,7 +735,7 @@ impl Session {
         }
         log_talkback(&plan, request.backchannel.as_ref());
         let talkback = match plan.talkback {
-            Talkback::Negotiated { mid, .. } => Some(talkback_rx(&rtc, mid)),
+            Talkback::Negotiated { mid, codec, .. } => talkback_rx(&rtc, mid, codec),
             Talkback::Off(_) => None,
         };
 
@@ -1217,6 +1224,10 @@ impl SessionEngine for Session {
     fn stats(&self) -> SessionStats {
         self.writer.stats
     }
+
+    fn talkback(&self) -> Option<UplinkCodec> {
+        self.talkback.as_ref().map(|talkback| talkback.negotiated)
+    }
 }
 
 #[cfg(test)]
@@ -1553,6 +1564,7 @@ mod tests {
         let mut talkback = TalkbackRx {
             mid: Mid::from("2"),
             depacketizer: Depacketizer::new([(0, CodecFamily::Pcmu), (111, CodecFamily::Opus)]),
+            negotiated: UplinkCodec::Pcmu,
             codec: None,
         };
         let rtp = |pt| RtpHeaderFields {

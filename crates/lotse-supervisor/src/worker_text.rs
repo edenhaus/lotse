@@ -68,7 +68,7 @@ const CANDIDATE_TYPES: [&str; 4] = ["host", "srflx", "prflx", "relay"];
 /// The error is the reason, for the log.
 pub(crate) fn check(report: &WorkerSessionEvent) -> Result<(), &'static str> {
     match report {
-        WorkerSessionEvent::Answer { sdp } => check_answer(sdp),
+        WorkerSessionEvent::Answer { sdp, .. } => check_answer(sdp),
         WorkerSessionEvent::Candidate { candidate, mid } => {
             if !candidate.is_empty() {
                 check_candidate(candidate)?;
@@ -250,7 +250,10 @@ a=candidate:5a6b 1 tcp 1684798975 2001:db8::1 18557 typ host tcptype passive\r\n
 a=end-of-candidates\r\n";
 
     fn answer(sdp: &str) -> Result<(), &'static str> {
-        check(&WorkerSessionEvent::Answer { sdp: sdp.into() })
+        check(&WorkerSessionEvent::Answer {
+            sdp: sdp.into(),
+            talkback: None,
+        })
     }
 
     fn candidate(line: &str) -> Result<(), &'static str> {

@@ -129,7 +129,8 @@ impl Handler for FakeHandler {
             | Command::SessionGet(_)
             | Command::SessionList(_)
             | Command::SessionClose(_)
-            | Command::SessionAdopt(_) => Outcome::Result(json!({})),
+            | Command::SessionAdopt(_)
+            | Command::BackchannelRelease(_) => Outcome::Result(json!({})),
             Command::Ping(_) | Command::Schema(_) | Command::Unsubscribe(_) => Outcome::Error(
                 ApiError::new(ErrorCode::InternalError, "the server answers these itself"),
             ),

@@ -120,6 +120,40 @@ pub struct Session {
     pub orphaned: bool,
     /// When the offer arrived, RFC 3339 UTC.
     pub since: String,
+    /// Talk-back towards the camera's backchannel; all zero and `false`
+    /// when the answer did not negotiate it.
+    #[serde(default)]
+    pub backchannel: SessionBackchannel,
+}
+
+/// A session's talk-back, as `session/get` reports it.
+/// The counters are the worker's, pushed once per second, so they may lag
+/// by that much; `negotiated`, `codec` and `talker` are current.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionBackchannel {
+    /// The answer accepted the browser's talk-back m-line (`recvonly`, or
+    /// `sendrecv` on its downlink audio m-line).
+    #[serde(default)]
+    pub negotiated: bool,
+    /// The session holds the camera's backchannel now: it sent first and
+    /// keeps it until it closes or `backchannel/release`.
+    #[serde(default)]
+    pub talker: bool,
+    /// The talk-back codec the answer named first on that m-line, which the
+    /// browser sends (`opus`, `pcmu`, `pcma`); null when not negotiated.
+    #[serde(default)]
+    pub codec: Option<String>,
+    /// Talk-back RTP packets the session received and took.
+    #[serde(default)]
+    pub packets_received: u64,
+    /// Of those, the ones dropped because another session held the
+    /// backchannel.
+    #[serde(default)]
+    pub packets_dropped_busy: u64,
+    /// Payload bytes handed to the camera's backchannel, after the reverse
+    /// transcode.
+    #[serde(default)]
+    pub bytes_sent: u64,
 }
 
 /// `session/list`'s result.
@@ -239,6 +273,7 @@ mod tests {
             answered: false,
             orphaned: true,
             since: "2026-09-30T10:00:00.000Z".into(),
+            backchannel: SessionBackchannel::default(),
         };
         let list = serde_json::to_value(SessionList {
             sessions: vec![session],
@@ -248,7 +283,30 @@ mod tests {
             list,
             json!({ "sessions": [{ "session_id": "s1", "stream_id": "front", "ice": "new",
                                    "dtls": "new", "answered": false, "orphaned": true,
-                                   "since": "2026-09-30T10:00:00.000Z" }] })
+                                   "since": "2026-09-30T10:00:00.000Z",
+                                   "backchannel": { "negotiated": false, "talker": false, "codec": null,
+                                                    "packets_received": 0, "packets_dropped_busy": 0,
+                                                    "bytes_sent": 0 } }] })
+        );
+    }
+
+    #[test]
+    fn a_session_from_a_daemon_without_talk_back_parses_with_it_off() {
+        let session: Session = serde_json::from_value(json!({
+            "session_id": "s1", "stream_id": "front", "ice": "new", "dtls": "new",
+            "answered": true, "orphaned": false, "since": "2026-09-30T10:00:00.000Z"
+        }))
+        .unwrap();
+        assert_eq!(session.backchannel, SessionBackchannel::default());
+        let partial: SessionBackchannel =
+            serde_json::from_value(json!({ "negotiated": true, "codec": "pcmu" })).unwrap();
+        assert_eq!(
+            (
+                partial.negotiated,
+                partial.codec.as_deref(),
+                partial.bytes_sent
+            ),
+            (true, Some("pcmu"), 0)
         );
     }
 }

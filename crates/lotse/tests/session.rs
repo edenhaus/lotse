@@ -250,7 +250,7 @@ async fn viewer_gets_h264(sandbox: &str) {
                 WorkerEvent::Session { session_id, event } => {
                     assert_eq!(session_id, "s1");
                     match &event {
-                        SessionEvent::Answer { sdp } => {
+                        SessionEvent::Answer { sdp, .. } => {
                             assert!(sdp.contains("a=ice-ufrag:lotseufrag"), "{sdp}");
                             viewer.accept_answer(sdp, &mut out).expect("answer applies");
                             send_all(&socket, &mut out).await;
@@ -451,7 +451,7 @@ async fn drive(
         tokio::select! {
             event = door.worker.next_event() => match event {
                 WorkerEvent::Session { event, .. } => {
-                    if let SessionEvent::Answer { sdp } = &event {
+                    if let SessionEvent::Answer { sdp, .. } = &event {
                         viewer.accept_answer(sdp, &mut out).expect("answer applies");
                         send_all(socket, &mut out).await;
                         door.worker
@@ -904,7 +904,7 @@ async fn two_sessions_on_one_stream_send_every_datagram() {
         let [buf_a, buf_b] = &mut buffers;
         tokio::select! {
             event = door.worker.next_event() => match event {
-                WorkerEvent::Session { session_id, event: SessionEvent::Answer { sdp } } => {
+                WorkerEvent::Session { session_id, event: SessionEvent::Answer { sdp, .. } } => {
                     let (socket, viewer, out, _) = if session_id == "s0" { &mut *first } else { &mut *second };
                     viewer.accept_answer(&sdp, out).expect("answer applies");
                     send_all(socket, out).await;
@@ -1087,7 +1087,7 @@ async fn rfc8829_5_3_1_a_video_first_session_answers_audio_inactive_and_plays_vi
     let answer = events
         .iter()
         .find_map(|e| match e {
-            SessionEvent::Answer { sdp } => Some(sdp.clone()),
+            SessionEvent::Answer { sdp, .. } => Some(sdp.clone()),
             _ => None,
         })
         .expect("an answer");
@@ -1193,7 +1193,7 @@ async fn a_viewer_gets_opus_from_an_aac_camera_in_sync_with_video_by_ebu_r37() {
     let answer = events
         .iter()
         .find_map(|event| match event {
-            SessionEvent::Answer { sdp } => Some(sdp.clone()),
+            SessionEvent::Answer { sdp, .. } => Some(sdp.clone()),
             _ => None,
         })
         .expect("an answer");
@@ -1349,7 +1349,7 @@ async fn h265_camera_plays_and_refuses(
     let answer = events
         .iter()
         .find_map(|e| match e {
-            SessionEvent::Answer { sdp } => Some(sdp.clone()),
+            SessionEvent::Answer { sdp, .. } => Some(sdp.clone()),
             _ => None,
         })
         .expect("an answer");

@@ -23,7 +23,7 @@ use lotse_api_types::info::{
     SupervisorMetrics,
 };
 use lotse_api_types::session::{SessionEvent, SessionList};
-use lotse_api_types::stream::{AudioMode, StreamList, StreamPutResult};
+use lotse_api_types::stream::{AudioMode, BackchannelReleaseResult, StreamList, StreamPutResult};
 use lotse_core::clock::Clock;
 use lotse_core::codec::CodecFamily;
 use lotse_core::connection::ConnectionConfig;
@@ -45,7 +45,7 @@ use crate::net::stun_client::StunClient;
 use crate::net::turn_client::TurnClient;
 use crate::registry::{
     CloseBy, ConnectionEntry, ConnectionKey, ConnectionSnapshot, Shared, State, StreamEntry,
-    StreamSource,
+    StreamSource, Talker,
 };
 use crate::session::{
     MAX_EARLY_CANDIDATES, MAX_REMOTE_CANDIDATES, SESSION_QUEUE, SOURCE_NOT_LIVE_AFTER,
@@ -57,8 +57,12 @@ use crate::{Settings, millis};
 /// The output kind that opens WebRTC sessions.
 const WEBRTC: &str = "webrtc";
 
-/// What `hello` and `info` announce beyond the outputs.
+/// What `hello` and `info` always announce beyond the outputs.
 const FEATURES: [&str; 1] = ["session_adopt"];
+
+/// The feature of two-way audio, announced only while it works end to end
+/// ([`Supervisor::features`]).
+const TWO_WAY_AUDIO: &str = "two_way_audio";
 
 /// The video codec families the daemon carries.
 const VIDEO_CODECS: [CodecFamily; 3] = [CodecFamily::H264, CodecFamily::H265, CodecFamily::Mjpeg];
@@ -249,7 +253,7 @@ impl Supervisor {
                 .map(str::to_owned)
                 .collect(),
             outputs: self.outputs(),
-            features: FEATURES.iter().map(|f| (*f).to_owned()).collect(),
+            features: self.features(),
             codecs: Codecs {
                 video: VIDEO_CODECS.iter().map(|c| c.name().to_owned()).collect(),
                 audio: AUDIO_CODECS.iter().map(|c| c.name().to_owned()).collect(),
@@ -263,6 +267,31 @@ impl Supervisor {
             },
             sandbox: self.identity.sandbox.clone(),
         }
+    }
+
+    /// What `hello` and `info` announce in `features`. `two_way_audio`
+    /// is there only when a viewer's talk-back can reach a camera: the
+    /// `webrtc` output answers talk-back, a reverse chain is registered
+    /// (`Registries::uplink`, which every G.711 camera needs) and at least
+    /// one source protocol declares it can carry audio back
+    /// (`SourceCapabilities::backchannel`, the gate the worker answers
+    /// talk-back behind).
+    fn features(&self) -> Vec<String> {
+        let sources = &self.registries.sources;
+        let backchannel = sources.schemes().into_iter().any(|scheme| {
+            sources
+                .get(scheme)
+                .is_some_and(|factory| factory.capabilities().backchannel)
+        });
+        let two_way_audio = backchannel
+            && self.registries.uplink.is_some()
+            && self.registries.outputs.get(WEBRTC).is_some();
+        FEATURES
+            .iter()
+            .copied()
+            .chain(two_way_audio.then_some(TWO_WAY_AUDIO))
+            .map(str::to_owned)
+            .collect()
     }
 
     /// The output kinds compiled in.
@@ -522,6 +551,7 @@ impl Supervisor {
                 snapshot: ConnectionSnapshot::idle(self.shared.clock.wall_now()),
                 streams: std::collections::BTreeSet::new(),
                 commands: commands.clone(),
+                talker: Talker::default(),
             },
         );
         let spec = driver_spec(&id, source);
@@ -859,23 +889,24 @@ impl Supervisor {
 
     /// `session/get`.
     fn session_get(&self, session_id: &str) -> Outcome {
-        match self.shared.lock().sessions.get(session_id) {
-            Some(session) => {
-                Outcome::Result(serde_json::to_value(session.dto(session_id)).unwrap_or_default())
-            }
+        let state = self.shared.lock();
+        match state.sessions.get(session_id) {
+            Some(session) => Outcome::Result(
+                serde_json::to_value(state.session_dto(session_id, session)).unwrap_or_default(),
+            ),
             None => Outcome::Error(session_not_found(session_id)),
         }
     }
 
     /// `session/list`.
     fn session_list(&self) -> Outcome {
-        let sessions = self
-            .shared
-            .lock()
+        let state = self.shared.lock();
+        let sessions = state
             .sessions
             .iter()
-            .map(|(id, session)| session.dto(id))
+            .map(|(id, session)| state.session_dto(id, session))
             .collect();
+        drop(state);
         Outcome::Result(serde_json::to_value(SessionList { sessions }).unwrap_or_default())
     }
 
@@ -913,6 +944,69 @@ impl Supervisor {
         Outcome::Subscribed(events)
     }
 
+    /// `backchannel/release`: frees the camera's backchannel from its
+    /// talker, on each of the stream's sources whose protocol can carry
+    /// audio back. Non-blocking: the worker releases it, and a
+    /// `talker_changed` with `released` follows on `stream/subscribe`.
+    /// Releasing a free backchannel succeeds.
+    fn backchannel_release(&self, stream_id: &str) -> Outcome {
+        let state = self.shared.lock();
+        let Some(stream) = state.streams.get(stream_id) else {
+            return Outcome::Error(
+                ApiError::new(ErrorCode::StreamNotFound, "no such stream")
+                    .with_detail("stream_id", stream_id),
+            );
+        };
+        let connections: Vec<&ConnectionEntry> = stream
+            .sources
+            .iter()
+            .filter(|source| {
+                self.registries
+                    .sources
+                    .get(source.url.scheme())
+                    .is_some_and(|factory| factory.capabilities().backchannel)
+            })
+            .filter_map(|source| state.connections.get(&source.connection))
+            .collect();
+        if connections.is_empty() {
+            return Outcome::Error(
+                ApiError::new(
+                    ErrorCode::BackchannelUnsupported,
+                    "the stream's source cannot carry audio back to the camera",
+                )
+                .with_detail("stream_id", stream_id),
+            );
+        }
+        // Sent whatever the supervisor last heard: a claim may be on its
+        // way, and the worker's release is idempotent.
+        let mut talker = None;
+        for connection in connections {
+            if let Some(session) = &connection.talker.session {
+                talker.get_or_insert_with(|| session.clone());
+            }
+            if connection
+                .commands
+                .try_send(DriverCommand::ReleaseBackchannel)
+                .is_err()
+            {
+                return Outcome::Error(
+                    ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
+                        .with_detail("limit", "connection_queue"),
+                );
+            }
+        }
+        drop(state);
+        tracing::info!(
+            event = "backchannel_release",
+            stream.id = stream_id,
+            talker = ?talker,
+            "backchannel release requested"
+        );
+        Outcome::Result(
+            serde_json::to_value(BackchannelReleaseResult { talker }).unwrap_or_default(),
+        )
+    }
+
     /// Answers one command.
     async fn dispatch(&self, connection: ConnectionId, command: Command) -> Outcome {
         match command {
@@ -940,6 +1034,7 @@ impl Supervisor {
             Command::SessionAdopt(adopt) => {
                 self.session_adopt(connection, adopt.id, &adopt.session_id)
             }
+            Command::BackchannelRelease(release) => self.backchannel_release(&release.stream_id),
             Command::Ping(_) | Command::Schema(_) | Command::Unsubscribe(_) => {
                 tracing::error!(
                     command = command.name(),
@@ -961,7 +1056,7 @@ impl Handler for Supervisor {
             api: API_VERSION.to_owned(),
             version: self.identity.version.clone(),
             outputs: self.outputs(),
-            features: FEATURES.iter().map(|f| (*f).to_owned()).collect(),
+            features: self.features(),
         }
     }
 
@@ -1204,7 +1299,7 @@ mod tests {
     use lotse_core::clock::{FakeClock, SystemClock};
     use lotse_core::let_assert;
     use lotse_core::output::OutputShape;
-    use lotse_core::test_util::FakeOutputFactory;
+    use lotse_core::test_util::{FakeOutputFactory, FakeSourceFactory};
     use lotse_ipc::SessionEvent as Report;
     use serde_json::{Value, json};
     use tokio::sync::mpsc;
@@ -1401,6 +1496,154 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A reverse chain that is never asked to run.
+    #[derive(Debug)]
+    struct IdleUplink;
+
+    impl lotse_core::transcode::UplinkFactory for IdleUplink {
+        fn transcoder(&self, _frame: Duration) -> Arc<dyn lotse_core::transcode::Transcoder> {
+            Arc::new(lotse_core::test_util::FakeTranscoder::aac_to_opus())
+        }
+    }
+
+    /// `two_way_audio` is announced only when a viewer's
+    /// talk-back can reach a camera: a source protocol that carries audio
+    /// back, a reverse chain, and the `webrtc` output.
+    #[tokio::test]
+    async fn two_way_audio_is_announced_only_when_talk_back_can_reach_a_camera() {
+        use lotse_core::transcode::UplinkFactory as _;
+
+        for (backchannel, uplink, webrtc, announced) in [
+            (true, true, true, true),
+            (false, true, true, false),
+            (true, false, true, false),
+            (true, true, false, false),
+        ] {
+            let mut environment = environment("/bin/sh");
+            if backchannel {
+                environment
+                    .registries
+                    .sources
+                    .register(Arc::new(FakeSourceFactory::with_backchannel(&["talk"])))
+                    .unwrap();
+            }
+            if uplink {
+                environment.registries.uplink = Some(Arc::new(IdleUplink));
+            }
+            if webrtc {
+                environment
+                    .registries
+                    .outputs
+                    .register(Arc::new(FakeOutputFactory(WEBRTC, OutputShape::Session)))
+                    .unwrap();
+            }
+            let s = Supervisor::new(
+                settings(PathBuf::from("/nonexistent/lotse.sock")),
+                environment,
+                Arc::new(SystemClock),
+            );
+            let expected: &[&str] = if announced {
+                &["session_adopt", "two_way_audio"]
+            } else {
+                &["session_adopt"]
+            };
+            let what = format!("backchannel {backchannel}, uplink {uplink}, webrtc {webrtc}");
+            assert_eq!(s.hello().features, expected, "{what}");
+            let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
+            assert_eq!(info["features"], json!(expected), "{what}");
+        }
+        assert!(
+            IdleUplink
+                .transcoder(Duration::from_millis(20))
+                .derive(&lotse_core::codec::Codec::Pcmu, CodecFamily::Pcmu)
+                .is_none()
+        );
+    }
+
+    /// `backchannel/release` frees the camera's
+    /// backchannel through the stream's connection, says who held it, and
+    /// is refused for an unknown stream and a protocol without one.
+    #[tokio::test]
+    async fn backchannel_release_reaches_the_connection_and_says_who_held_it() {
+        let dir = private_dir("release");
+        let door = FrontDoor {
+            registrations: Arc::new(Registrations::default()),
+            hosts: vec!["192.0.2.1:18556".parse().unwrap()],
+            tcp_hosts: Vec::new(),
+            stun: None,
+            turn: None,
+            demux: None,
+        };
+        let mut environment = webrtc_environment(&blocking_worker(&dir), door);
+        environment
+            .registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::with_backchannel(&["talk"])))
+            .unwrap();
+        let s = Supervisor::new(session_settings(), environment, Arc::new(SystemClock));
+        let release = |id: u64, stream_id: &str| json!({ "id": id, "type": "backchannel/release", "stream_id": stream_id });
+        let err = error(call_on(&s, 1, &release(1, "ghost")).await);
+        assert_eq!(
+            (err.code, &err.details["stream_id"]),
+            (ErrorCode::StreamNotFound, &json!("ghost"))
+        );
+        result(call(&s, &put("plain", "fake://127.0.0.1:1/", false)).await);
+        let err = error(call_on(&s, 1, &release(2, "plain")).await);
+        assert_eq!(
+            (err.code, &err.details["stream_id"]),
+            (ErrorCode::BackchannelUnsupported, &json!("plain"))
+        );
+
+        result(call(&s, &put("front", "talk://127.0.0.1:1/", false)).await);
+        let connection = s.shared.lock().streams["front"].sources[0]
+            .connection
+            .clone();
+        let _s1 = subscription(call_on(&s, 1, &offer(3, "front", Some("s1"))).await);
+        let (commands, mut sent) = mpsc::channel(1);
+        s.shared
+            .lock()
+            .connections
+            .get_mut(&connection)
+            .unwrap()
+            .commands = commands;
+        // Nobody holds it: still passed on, since a claim may be on its way.
+        assert_eq!(
+            result(call_on(&s, 1, &release(4, "front")).await),
+            json!({ "talker": null })
+        );
+        assert!(matches!(
+            sent.try_recv(),
+            Ok(DriverCommand::ReleaseBackchannel)
+        ));
+        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        assert!(
+            s.shared
+                .lock()
+                .talker_changed(
+                    &connection,
+                    "s1",
+                    lotse_api_types::stream::TalkerReason::Claimed,
+                    at
+                )
+                .is_some()
+        );
+        assert_eq!(
+            result(call_on(&s, 1, &release(5, "front")).await),
+            json!({ "talker": "s1" })
+        );
+        // A full queue is refused like any other command's.
+        let err = error(call_on(&s, 1, &release(6, "front")).await);
+        assert_eq!(
+            (err.code, &err.details["limit"]),
+            (ErrorCode::LimitReached, &json!("connection_queue"))
+        );
+        assert!(matches!(
+            sent.try_recv(),
+            Ok(DriverCommand::ReleaseBackchannel)
+        ));
+        s.shutdown().await;
     }
 
     #[tokio::test]
@@ -2061,17 +2304,25 @@ mod tests {
             "s1",
             Report::Answer {
                 sdp: "forged".into(),
+                talkback: None,
             },
             now,
         );
-        s.shared
-            .lock()
-            .session_report("c1", "ghost", Report::Answer { sdp: "x".into() }, now);
+        s.shared.lock().session_report(
+            "c1",
+            "ghost",
+            Report::Answer {
+                sdp: "x".into(),
+                talkback: None,
+            },
+            now,
+        );
         report(
             &s,
             "s1",
             Report::Answer {
                 sdp: "v=0\r\ns=answer\r\n".into(),
+                talkback: None,
             },
         );
         assert_eq!(
@@ -2249,6 +2500,7 @@ mod tests {
             "s1",
             Report::Answer {
                 sdp: "v=0\r\n<script>\r\n".into(),
+                talkback: None,
             },
         );
         assert_eq!(next(&mut first).await, refused);
@@ -2259,6 +2511,7 @@ mod tests {
             "s2",
             Report::Answer {
                 sdp: "v=0\r\n".into(),
+                talkback: None,
             },
         );
         assert_eq!(next(&mut second).await["type"], "answer");
@@ -2310,7 +2563,10 @@ mod tests {
             "candidate:1 1 udp 1 192.0.2.1 9 typ host ufrag {}",
             "x".repeat(970)
         );
-        let answer = || Report::Answer { sdp: sdp.clone() };
+        let answer = || Report::Answer {
+            sdp: sdp.clone(),
+            talkback: None,
+        };
         let candidate = || Report::Candidate {
             candidate: line.clone(),
             mid: Some("0".into()),
@@ -2368,6 +2624,7 @@ mod tests {
             "other",
             Report::Answer {
                 sdp: "v=0\r\n".into(),
+                talkback: None,
             },
         );
         assert_eq!(next(&mut other).await["type"], "answer");
@@ -2481,6 +2738,7 @@ mod tests {
             "s1",
             Report::Answer {
                 sdp: "v=0\r\ns=buffered\r\n".into(),
+                talkback: None,
             },
         );
         let err = error(
@@ -2964,6 +3222,7 @@ mod tests {
             "s1",
             Report::Answer {
                 sdp: "v=0\r\na=mid:0\r\n".into(),
+                talkback: None,
             },
         );
         assert_eq!(next(&mut events).await["type"], "answer");
@@ -3000,7 +3259,14 @@ mod tests {
         let silent = stun_server(None);
         let mut events = subscription(call_on(&s, 1, &stun_offer(2, "s1", silent)).await);
         next(&mut events).await;
-        report(&s, "s1", Report::Answer { sdp: "v=0".into() });
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            },
+        );
         assert_eq!(next(&mut events).await["type"], "answer");
         report(&s, "s1", end_of_candidates());
         tokio::task::yield_now().await;
@@ -3113,6 +3379,7 @@ mod tests {
             "s1",
             Report::Answer {
                 sdp: "v=0\r\na=mid:0\r\n".into(),
+                talkback: None,
             },
         );
         assert_eq!(next(&mut events).await["type"], "answer");
@@ -3237,7 +3504,14 @@ mod tests {
         let mut events =
             subscription(call_on(&s, 1, &turn_offer(2, server.udp_addr(), "wrong")).await);
         next(&mut events).await;
-        report(&s, "s1", Report::Answer { sdp: "v=0".into() });
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            },
+        );
         assert_eq!(next(&mut events).await["type"], "answer");
         report(&s, "s1", end_of_candidates());
         assert_eq!(

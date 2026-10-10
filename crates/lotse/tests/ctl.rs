@@ -82,6 +82,9 @@ fn check_info(socket: &Path) {
     );
     assert_eq!(info["sandbox"]["mode"], "off");
     assert!(!info["build"]["target"].as_str().unwrap().is_empty());
+    // No source this build carries declares a backchannel yet, so two-way
+    // audio stays off.
+    assert_eq!(info["features"], serde_json::json!(["session_adopt"]));
     let compact = ctl(socket, &["--compact", "info"]);
     assert!(compact.status.success());
     assert_eq!(

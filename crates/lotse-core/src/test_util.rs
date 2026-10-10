@@ -615,7 +615,8 @@ impl OutputFactory for FakeOutputFactory {
 /// output does; an offer of `"refuse"` is refused as invalid SDP. The
 /// answer is [`ECHO_ANSWER`], followed by ` audio=<codec>` with audio,
 /// ` backchannel=<codec>` with a backchannel and ` orientation=<name>` for
-/// a turned stream.
+/// a turned stream. Its engine reports talk-back negotiated in the
+/// backchannel's codec when that is one a viewer can send.
 #[derive(Debug)]
 pub struct EchoSessionFactory;
 
@@ -673,7 +674,14 @@ impl OutputFactory for EchoSessionFactory {
             .chain(orientation)
             .collect::<Vec<_>>()
             .join(" ");
-        Ok((Box::new(EchoEngine::new(now)), answer))
+        let talkback = request
+            .backchannel
+            .as_ref()
+            .and_then(|codec| UplinkCodec::of(codec.family()));
+        Ok((
+            Box::new(EchoEngine::new(now).with_talkback(talkback)),
+            answer,
+        ))
     }
 }
 
@@ -706,6 +714,8 @@ pub struct EchoEngine {
     stats: SessionStats,
     /// Every video change within the family is refused.
     refuse_video_changes: bool,
+    /// The talk-back codec it reports negotiated.
+    talkback: Option<UplinkCodec>,
 }
 
 impl EchoEngine {
@@ -718,7 +728,15 @@ impl EchoEngine {
             closed: false,
             stats: SessionStats::default(),
             refuse_video_changes: false,
+            talkback: None,
         }
+    }
+
+    /// The engine, reporting talk-back negotiated in `codec`.
+    #[must_use]
+    pub const fn with_talkback(mut self, codec: Option<UplinkCodec>) -> Self {
+        self.talkback = codec;
+        self
     }
 
     /// The engine, refusing every video change within the family, as one
@@ -872,6 +890,10 @@ impl SessionEngine for EchoEngine {
 
     fn stats(&self) -> SessionStats {
         self.stats
+    }
+
+    fn talkback(&self) -> Option<UplinkCodec> {
+        self.talkback
     }
 }
 
@@ -1588,7 +1610,9 @@ mod tests {
             limits: crate::session::SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
         };
-        let (mut engine, answer) = EchoSessionFactory.open_session(turned, now).unwrap();
+        let (mut engine, answer) = EchoSessionFactory
+            .open_session(turned.clone(), now)
+            .unwrap();
         assert_eq!(
             answer,
             format!("{ECHO_ANSWER} audio=pcmu backchannel=pcma orientation=rotate_180")
@@ -1601,6 +1625,14 @@ mod tests {
                 message: "rotate_left".into()
             })
         );
+        // Talk-back negotiated in the backchannel's codec, off without one.
+        assert_eq!(engine.talkback(), Some(UplinkCodec::Pcma));
+        let without = SessionRequest {
+            backchannel: None,
+            ..turned
+        };
+        let (engine, _answer) = EchoSessionFactory.open_session(without, now).unwrap();
+        assert_eq!(engine.talkback(), None);
     }
 
     #[test]
