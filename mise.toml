@@ -84,8 +84,33 @@ run = [
 ]
 
 [tasks.coverage]
-description = "Line-coverage gate: 100% over the workspace; Linux is the reference host"
-run = "cargo llvm-cov nextest --workspace --all-features --locked --no-tests=warn --fail-under-lines 100 --ignore-filename-regex 'crates/lotse-testing/'"
+description = "Line-coverage gate as CI's Tests jobs run it: the instrumented musl tests built (coverage-archive), then run and gated (coverage-musl); Linux only"
+depends = ["coverage-archive"]
+run = "mise run coverage-musl"
+
+# The tests embed the path of the `lotse` they start at compile time (`env!("CARGO_BIN_EXE_lotse")`),
+# and an archive unpacks its target directory as `target/` under the directory it is extracted to.
+# So the archive is built in target/cov/target and coverage-musl extracts it to target/cov: the
+# binaries land where they were built, as on every GitHub runner, whose checkout path is the same.
+[tasks.coverage-archive]
+description = "The host's musl tests built with coverage instrumentation and archived for other machines (CI's Coverage build job)"
+env = { CARGO_LLVM_COV_TARGET_DIR = "target/cov/target" }
+run = 'cargo llvm-cov nextest-archive --workspace --all-features --locked --target "$(uname -m)-unknown-linux-musl" --archive-file target/cov/nextest-archive.tar.zst'
+
+[tasks.coverage-musl]
+description = "Line-coverage gate on the host's musl target, run from coverage-archive's archive (CI's Tests jobs); writes target/cov/lcov.info"
+env = { CARGO_LLVM_COV_TARGET_DIR = "target/cov" }
+run = [
+  # `CARGO_TARGET_TMPDIR`, compiled in like the binary's path, which cargo creates when it builds
+  # and an archive does not carry; the tests' coverage wrapper for workers writes there.
+  'mkdir -p "target/cov/target/$(uname -m)-unknown-linux-musl/tmp"',
+  "cargo llvm-cov nextest --archive-file target/cov/nextest-archive.tar.zst --no-report --no-tests=warn --extract-overwrite",
+  # The report for Codecov first, so a run that misses the gate still uploads what it missed. lcov,
+  # not Codecov's own format: that one marks a line with an unrun region as partial, which Codecov
+  # counts as missed, so its line coverage would not be this gate's.
+  "cargo llvm-cov report --nextest-archive-file target/cov/nextest-archive.tar.zst --ignore-filename-regex 'crates/lotse-testing/' --lcov --output-path target/cov/lcov.info",
+  "cargo llvm-cov report --nextest-archive-file target/cov/nextest-archive.tar.zst --ignore-filename-regex 'crates/lotse-testing/' --fail-under-lines 100 --show-missing-lines",
+]
 
 [tasks.mutants]
 description = "Mutation-testing gate on the lines changed against a base ref (default origin/main)"
