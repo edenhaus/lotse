@@ -82,9 +82,14 @@ fn check_info(socket: &Path) {
     );
     assert_eq!(info["sandbox"]["mode"], "off");
     assert!(!info["build"]["target"].as_str().unwrap().is_empty());
-    // No source this build carries declares a backchannel yet, so two-way
-    // audio stays off.
-    assert_eq!(info["features"], serde_json::json!(["session_adopt"]));
+    // The fake source declares a backchannel and the build carries the
+    // talk-back transcoder and WebRTC, so two-way audio is on; a build
+    // without the fake source has no source that can carry audio back
+    // yet, and leaves it off.
+    assert_eq!(
+        info["features"],
+        serde_json::json!(["session_adopt", "two_way_audio"])
+    );
     let compact = ctl(socket, &["--compact", "info"]);
     assert!(compact.status.success());
     assert_eq!(

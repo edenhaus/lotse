@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::clock::Clock;
 use crate::codec::{Codec, CodecFamily, Kind};
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
 use crate::orientation::Orientation;
@@ -63,8 +64,11 @@ macro_rules! let_assert {
 /// clock runs 2 % fast, so the skew watchdog withdraws its audio, or
 /// `{"backchannel": "pcmu" | "pcma" | "opus"}` to offer a backchannel
 /// taking that codec in 20 ms frames while it runs (whose packets go into
-/// the factory's [`BackchannelCapture`], if it has one, else nowhere);
-/// anything else is rejected, so tests can see the validation error path.
+/// the factory's [`BackchannelCapture`], if it has one, else nowhere),
+/// `{"video": true}` to publish 30 fps H.264 on the video track
+/// ([`video_packet`]), or both of the last two together, the doorbell a
+/// talk-back test watches while it talks; anything else is rejected, so
+/// tests can see the validation error path.
 #[derive(Debug)]
 pub struct FakeSourceFactory {
     /// The schemes it claims.
@@ -124,11 +128,22 @@ impl FakeSourceFactory {
 }
 
 /// What the backchannels of a capturing [`FakeSourceFactory`] received, in
-/// order, across runs: the packets as the worker sent them to the device.
+/// order, across runs: the packets as the worker sent them to the device,
+/// each with when it arrived.
 #[derive(Debug, Clone)]
 pub struct BackchannelCapture {
     /// The packets; a waiter sees each one arrive.
-    packets: Arc<tokio::sync::watch::Sender<Vec<MediaPacket>>>,
+    packets: Arc<tokio::sync::watch::Sender<Vec<Captured>>>,
+}
+
+/// One packet a [`BackchannelCapture`] took.
+#[derive(Debug, Clone)]
+pub struct Captured {
+    /// When the fake camera took it off its backchannel, on the source's
+    /// injected clock: where a talk-back latency ends.
+    pub at: Instant,
+    /// The packet as the worker sent it.
+    pub packet: MediaPacket,
 }
 
 impl Default for BackchannelCapture {
@@ -142,6 +157,11 @@ impl Default for BackchannelCapture {
 impl BackchannelCapture {
     /// Every packet received so far.
     pub fn packets(&self) -> Vec<MediaPacket> {
+        Self::bare(&self.captured())
+    }
+
+    /// Every packet received so far, with when each arrived.
+    pub fn captured(&self) -> Vec<Captured> {
         self.packets.borrow().clone()
     }
 
@@ -151,22 +171,32 @@ impl BackchannelCapture {
         packets
             .wait_for(|packets| packets.len() >= count)
             .await
-            .map(|packets| packets.clone())
+            .map(|packets| Self::bare(&packets))
             .unwrap_or_default()
     }
 
-    /// Records one packet.
-    fn push(&self, packet: MediaPacket) {
-        self.packets.send_modify(|packets| packets.push(packet));
+    /// The packets of `captured`, without their arrival.
+    fn bare(captured: &[Captured]) -> Vec<MediaPacket> {
+        captured
+            .iter()
+            .map(|captured| captured.packet.clone())
+            .collect()
+    }
+
+    /// Records one packet that arrived `at`.
+    fn push(&self, at: Instant, packet: MediaPacket) {
+        self.packets
+            .send_modify(|packets| packets.push(Captured { at, packet }));
     }
 }
 
 /// Runs `live` to its end, taking what the backchannel receives
-/// meanwhile into `capture` if there is one.
+/// meanwhile into `capture` if there is one, stamped on `time`.
 async fn drain_while(
     live: impl Future<Output = SourceExit>,
     mut uplink: Option<tokio::sync::mpsc::Receiver<MediaPacket>>,
     capture: Option<BackchannelCapture>,
+    time: Arc<dyn Clock>,
 ) -> SourceExit {
     let mut live = std::pin::pin!(live);
     loop {
@@ -174,7 +204,7 @@ async fn drain_while(
             exit = &mut live => return exit,
             Some(packet) = next_uplink(&mut uplink) => {
                 if let Some(capture) = &capture {
-                    capture.push(packet);
+                    capture.push(time.now(), packet);
                 }
             }
         }
@@ -189,6 +219,39 @@ async fn next_uplink(
         Some(uplink) => uplink.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// A fake backchannel taking `codec` in 20 ms frames: the handle a source
+/// offers, and the receiving end it drains.
+fn fake_handle(codec: Codec) -> (BackchannelHandle, tokio::sync::mpsc::Receiver<MediaPacket>) {
+    let (sender, uplink) = tokio::sync::mpsc::channel(8);
+    (
+        BackchannelHandle {
+            codec,
+            frame: BackchannelHandle::DEFAULT_FRAME,
+            sender,
+        },
+        uplink,
+    )
+}
+
+/// The `backchannel` and `video` options of a fake source, when `options`
+/// holds one or both of them and nothing else, each valid: the codec of
+/// the backchannel to offer, if any, and whether to publish video.
+fn doorbell(options: &serde_json::Value) -> Option<(Option<Codec>, bool)> {
+    let serde_json::Value::Object(map) = options else {
+        return None;
+    };
+    let backchannel = match map.get("backchannel") {
+        Some(name) => Some(fake_backchannel(name.as_str()?)?),
+        None => None,
+    };
+    let video = match map.get("video") {
+        Some(video) => video.as_bool().filter(|video| *video)?,
+        None => false,
+    };
+    let known = usize::from(backchannel.is_some()).saturating_add(usize::from(video));
+    (known != 0 && known == map.len()).then_some((backchannel, video))
 }
 
 /// The backchannel codec a fake source's `backchannel` option names.
@@ -229,9 +292,7 @@ impl SourceFactory for FakeSourceFactory {
         let keyframes_every = one("keyframes_every_ms")
             .and_then(serde_json::Value::as_u64)
             .map(Duration::from_millis);
-        let backchannel = one("backchannel")
-            .and_then(serde_json::Value::as_str)
-            .and_then(fake_backchannel);
+        let doorbell = doorbell(options);
         let (crash, ready_after, audio) = match options {
             serde_json::Value::Null => (false, Duration::ZERO, FakeAudio::None),
             serde_json::Value::Object(map) if map.is_empty() => {
@@ -251,16 +312,17 @@ impl SourceFactory for FakeSourceFactory {
             _ if audio_name == Some("aac_drifting") => {
                 (false, Duration::ZERO, FakeAudio::AacDrifting)
             }
-            _ if backchannel.is_some() => (false, Duration::ZERO, FakeAudio::None),
+            _ if doorbell.is_some() => (false, Duration::ZERO, FakeAudio::None),
             other => {
                 return Err(SourceConfigError::InvalidOptions {
                     scheme,
                     message: format!(
-                        "fake source takes no options but {{\"crash\": true}}, {{\"ready_after_ms\": n}}, {{\"keyframes_every_ms\": n}}, {{\"audio\": true | \"aac\" | \"aac_drifting\"}} or {{\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"}}, got {other}"
+                        "fake source takes no options but {{\"crash\": true}}, {{\"ready_after_ms\": n}}, {{\"keyframes_every_ms\": n}}, {{\"audio\": true | \"aac\" | \"aac_drifting\"}}, {{\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"}} and {{\"video\": true}}, got {other}"
                     ),
                 });
             }
         };
+        let (backchannel, video) = doorbell.unwrap_or((None, false));
         Ok(Box::new(FakeSource {
             protocol: scheme,
             url: url.clone(),
@@ -269,6 +331,7 @@ impl SourceFactory for FakeSourceFactory {
             ready_after,
             audio,
             keyframes_every,
+            video,
             backchannel,
             capture: self.capture.clone(),
         }))
@@ -376,7 +439,10 @@ pub fn fake_aac() -> Codec {
 /// Sender Reports every second from a second after it went live, whose
 /// audio clock runs 2 % fast. With a backchannel it offers one in the slot
 /// before it goes live (20 ms frames), takes what arrives on it into its
-/// capture, if any, and withdraws it when its run ends.
+/// capture, if any, stamped with its arrival on the injected clock, and
+/// withdraws it when its run ends. With video it publishes a
+/// [`video_packet`] every [`VIDEO_FRAME`] on the injected clock while it
+/// runs.
 #[derive(Debug)]
 pub struct FakeSource {
     /// The protocol name it reports.
@@ -393,6 +459,8 @@ pub struct FakeSource {
     audio: FakeAudio,
     /// Publish a video keyframe packet this often, without audio.
     keyframes_every: Option<Duration>,
+    /// Whether it publishes video.
+    video: bool,
     /// The codec of the backchannel it offers, if any.
     backchannel: Option<Codec>,
     /// Where its backchannel puts what it receives.
@@ -415,6 +483,7 @@ impl Source for FakeSource {
             "audio": self.audio.name(),
             "keyframes_every_ms": self.keyframes_every.map(|every| u64::try_from(every.as_millis()).unwrap_or(u64::MAX)),
             "backchannel": self.backchannel.as_ref().map(Codec::name),
+            "video": self.video,
         })
     }
 
@@ -423,15 +492,13 @@ impl Source for FakeSource {
         let abort = self.abort;
         let audio = self.audio;
         let keyframes_every = self.keyframes_every;
+        let publishes_video = self.video;
         // The channel lives as long as the run: a worker's sender fails
         // once the run is over, as a camera session's would.
-        let (backchannel, uplink) = self
-            .backchannel
-            .clone()
-            .map(fake_backchannel_handle)
-            .unzip();
+        let (backchannel, uplink) = self.backchannel.clone().map(fake_handle).unzip();
         let capture = self.capture.clone();
         let slot = ctx.backchannel.clone();
+        let time = Arc::clone(&ctx.time);
         let ready_after = ctx.time.sleep(self.ready_after);
         let live = async move {
             // The ingest contract holds while waiting to go live too: a
@@ -460,6 +527,9 @@ impl Source for FakeSource {
                     if crash {
                         tracing::error!("fake source: crashing the process as requested");
                         abort();
+                    }
+                    if publishes_video {
+                        return fake_video(&video, &*ctx.time, &ctx.cancel).await;
                     }
                     return video_only(&ctx, &video, keyframes_every).await;
                 }
@@ -513,7 +583,7 @@ impl Source for FakeSource {
             }
         };
         Box::pin(async move {
-            let exit = drain_while(live, uplink, capture).await;
+            let exit = drain_while(live, uplink, capture, time).await;
             // Gone with the run, as a source's backchannel is for the
             // reconnect.
             slot.withdraw();
@@ -543,18 +613,40 @@ async fn video_only(ctx: &SourceCtx, video: &Track, every: Option<Duration>) -> 
     }
 }
 
-/// A fake backchannel taking `codec` in 20 ms frames: the handle a fake
-/// source offers, and the receiving end of its queue.
-fn fake_backchannel_handle(
-    codec: Codec,
-) -> (BackchannelHandle, tokio::sync::mpsc::Receiver<MediaPacket>) {
-    let (sender, uplink) = tokio::sync::mpsc::channel(8);
-    let handle = BackchannelHandle {
-        codec,
-        frame: BackchannelHandle::DEFAULT_FRAME,
-        sender,
-    };
-    (handle, uplink)
+/// How often a fake source with video publishes a frame: 30 fps.
+pub const VIDEO_FRAME: Duration = Duration::from_micros(33_333);
+
+/// The RTP timestamp step of one [`VIDEO_FRAME`] at 90 kHz (RFC 6184 §8.2.1).
+const VIDEO_TS_STEP: u32 = 3_000;
+
+/// How many frames a fake source's GOP holds: a keyframe every second.
+const VIDEO_GOP: u32 = 30;
+
+/// Publishes a [`video_packet`] every [`VIDEO_FRAME`] on `time` until
+/// `cancel`, on a fixed grid from the first, as a camera's encoder does:
+/// a late wake does not delay the frames after it, so the track never
+/// takes the stream for one that stalled.
+async fn fake_video(
+    track: &Track,
+    time: &dyn Clock,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> SourceExit {
+    let start = time.now();
+    let mut index = 0_u32;
+    loop {
+        track.publish_packet(video_packet(time.now(), index));
+        index = index.wrapping_add(1);
+        let due = VIDEO_FRAME
+            .checked_mul(index)
+            .and_then(|since| start.checked_add(since))
+            .unwrap_or(start);
+        tokio::select! {
+            () = time.sleep(due.saturating_duration_since(time.now())) => {}
+            () = cancel.cancelled() => {
+                return SourceExit::Ended(SourceError::Ended("cancelled".into()));
+            }
+        }
+    }
 }
 
 /// The fake source's video packet `seq`: a whole keyframe in one packet.
@@ -573,6 +665,35 @@ fn keyframe_packet(arrival: Instant, seq: u16) -> MediaPacket {
         epoch: 0,
         lateness: Duration::ZERO,
         payload: Arc::from(&[0x65_u8; 32][..]),
+    }
+}
+
+/// The fake source's video frame `index`, one RTP packet (RFC 6184 §5.6,
+/// a single NAL unit) with the marker set: an IDR slice header on every
+/// [`VIDEO_GOP`]th frame from the first, a non-IDR one between. The NAL
+/// units are not decodable; what reaches a viewer is the timing.
+fn video_packet(arrival: Instant, index: u32) -> MediaPacket {
+    let keyframe = index.is_multiple_of(VIDEO_GOP);
+    let payload: &[u8] = if keyframe {
+        &[0x65, 0x88, 0x84, 0x00]
+    } else {
+        &[0x41, 0x9a, 0x02, 0x00]
+    };
+    MediaPacket {
+        arrival,
+        rtp: crate::media::RtpHeaderFields {
+            pt: 96,
+            // Wraps after 65,536 frames, as RTP's does (RFC 3550 §5.1).
+            seq: u16::try_from(index & 0xffff).unwrap_or(0),
+            ts: index.wrapping_mul(VIDEO_TS_STEP),
+            marker: true,
+            ssrc: 1,
+        },
+        frame_start: true,
+        keyframe_start: keyframe,
+        epoch: 0,
+        lateness: Duration::ZERO,
+        payload: Arc::from(payload),
     }
 }
 
@@ -972,7 +1093,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::clock::{Clock as _, SystemClock};
+    use crate::clock::SystemClock;
     use crate::source::{BackchannelSlot, ClockInput, ResolvedPeer, TrackSet};
     use crate::track::{TrackId, TrackLimits};
 
@@ -1028,7 +1149,7 @@ mod tests {
     fn run_fake(
         factory: &FakeSourceFactory,
         options: &serde_json::Value,
-        clock: Arc<dyn crate::clock::Clock>,
+        clock: Arc<dyn Clock>,
     ) -> (
         tokio::task::JoinHandle<SourceExit>,
         Arc<TrackSet>,
@@ -1192,6 +1313,99 @@ mod tests {
             assert!(slot.current().is_none(), "withdrawn with the run");
             assert!(handle.sender.is_closed());
         }
+    }
+
+    /// The doorbell options: `backchannel` and `video`, alone or together
+    /// and nothing else; video is 30 fps H.264 on the injected clock with
+    /// a keyframe every second, and what the backchannel takes is stamped
+    /// with its arrival on the same clock.
+    #[tokio::test]
+    async fn a_fake_doorbell_publishes_video_and_stamps_what_its_backchannel_takes() {
+        use crate::clock::FakeClock;
+
+        let capture = BackchannelCapture::default();
+        let factory = FakeSourceFactory::capturing(&["fake"], capture.clone());
+        let url = SourceUrl::parse("fake://cam/").unwrap();
+        for refused in [
+            serde_json::json!({"video": false}),
+            serde_json::json!({"video": "yes"}),
+            serde_json::json!({"video": true, "extra": 1}),
+            serde_json::json!({"video": true, "backchannel": "g722"}),
+            serde_json::json!({"video": true, "audio": true}),
+        ] {
+            assert!(factory.validate(&url, &refused).is_err(), "{refused}");
+        }
+        let video_only = factory
+            .validate(&url, &serde_json::json!({"video": true}))
+            .unwrap();
+        assert_eq!(video_only.connection_options()["video"], true);
+        let source = factory
+            .validate(
+                &url,
+                &serde_json::json!({"backchannel": "pcmu", "video": true}),
+            )
+            .unwrap();
+        let clock = Arc::new(FakeClock::default());
+        let set = TrackSet::new(TrackLimits::default(), clock.now());
+        let (input, _reports) = ClockInput::channel(Arc::new(crate::clock_map::ClockMapper::new()));
+        let cancel = CancellationToken::new();
+        let slot = BackchannelSlot::default();
+        let run = source.run(SourceCtx {
+            peer: ResolvedPeer {
+                host: "cam".into(),
+                addrs: vec![],
+            },
+            tracks: set.publisher(),
+            clock: input,
+            time: clock.clone(),
+            backchannel: slot.clone(),
+            cancel: cancel.clone(),
+        });
+        let mut ready = set.ready();
+        let mut packets = {
+            let run = crate::task::spawn_named("test.fake_source", run);
+            assert!(ready.changed().await.is_ok());
+            let tracks = set.tracks();
+            assert_eq!(tracks.len(), 1, "video only");
+            (tracks[0].subscribe_packets(), run)
+        };
+        // Frame 0 went out as it went live, before the subscription; then
+        // one per frame duration, and the GOP restarts on frame 30.
+        let mut seen = Vec::new();
+        for _ in 1..=31 {
+            clock.advance(VIDEO_FRAME);
+            seen.push(within(packets.0.recv()).await.unwrap());
+        }
+        for (index, packet) in (1_u32..).zip(&seen) {
+            assert_eq!(u32::from(packet.rtp.seq), index);
+            assert_eq!(packet.rtp.ts, index * 3_000, "90 kHz at 30 fps");
+            assert!(packet.rtp.marker && packet.frame_start);
+            assert_eq!(packet.keyframe_start, index % 30 == 0, "frame {index}");
+            assert_eq!(
+                packet.payload[0] & 0x1f,
+                if index % 30 == 0 { 5 } else { 1 }
+            );
+        }
+        let handle = slot.current().expect("offered");
+        assert!(handle.sender.try_send(pcmu_packet(clock.now(), 7)).is_ok());
+        let captured = within(async {
+            loop {
+                if let Some(first) = capture.captured().first().cloned() {
+                    return first;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert_eq!(captured.packet.rtp.seq, 7);
+        assert_eq!(captured.at, clock.now(), "stamped on the injected clock");
+        assert_eq!(capture.packets().len(), 1);
+        cancel.cancel();
+        assert!(matches!(
+            packets.1.await.unwrap(),
+            SourceExit::Ended(SourceError::Ended(_))
+        ));
+        assert!(slot.current().is_none());
     }
 
     /// The ingest contract: a source honors `cancel` within 100 ms in every
@@ -1428,7 +1642,7 @@ mod tests {
             err,
             SourceConfigError::InvalidOptions {
                 scheme: "fake",
-                message: "fake source takes no options but {\"crash\": true}, {\"ready_after_ms\": n}, {\"keyframes_every_ms\": n}, {\"audio\": true | \"aac\" | \"aac_drifting\"} or {\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"}, got {\"transport\":\"udp\"}"
+                message: "fake source takes no options but {\"crash\": true}, {\"ready_after_ms\": n}, {\"keyframes_every_ms\": n}, {\"audio\": true | \"aac\" | \"aac_drifting\"}, {\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"} and {\"video\": true}, got {\"transport\":\"udp\"}"
                     .into()
             }
         );
@@ -1473,7 +1687,7 @@ mod tests {
                 .unwrap()
                 .connection_options()
         };
-        let defaults = serde_json::json!({"crash": false, "ready_after_ms": 0, "audio": "none", "keyframes_every_ms": null});
+        let defaults = serde_json::json!({"crash": false, "ready_after_ms": 0, "audio": "none", "keyframes_every_ms": null, "backchannel": null, "video": false});
         for same in [
             serde_json::Value::Null,
             serde_json::json!({}),
@@ -1506,6 +1720,11 @@ mod tests {
                 serde_json::json!({"audio": "aac_drifting"}),
                 "audio",
                 serde_json::json!("aac_drifting"),
+            ),
+            (
+                serde_json::json!({"video": true}),
+                "video",
+                serde_json::json!(true),
             ),
         ] {
             let mut expected = defaults.clone();
@@ -1772,7 +1991,7 @@ mod tests {
 
     #[test]
     fn the_echo_engine_hands_what_follows_talk_on_as_pcmu_talk_back() {
-        use crate::clock::{Clock as _, SystemClock};
+        use crate::clock::SystemClock;
 
         let now = SystemClock.now();
         let mut engine = EchoEngine::new(now);

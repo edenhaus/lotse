@@ -97,13 +97,13 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
     #[cfg(not(feature = "source-rtsp"))]
     drop(relay);
     #[cfg(feature = "source-fake")]
+    // With a backchannel, so the talk-back tests reach a worker's arbiter
+    // through the control API.
     registered(
         "fake source",
-        registries
-            .sources
-            .register(Arc::new(lotse_core::test_util::FakeSourceFactory::new(&[
-                "fake",
-            ]))),
+        registries.sources.register(Arc::new(
+            lotse_core::test_util::FakeSourceFactory::with_backchannel(&["fake"]),
+        )),
     );
     registries
 }
