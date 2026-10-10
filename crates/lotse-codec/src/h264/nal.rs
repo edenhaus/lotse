@@ -365,21 +365,18 @@ mod tests {
         assert!(matches!(parse(&[0x65, 1, 2]), Ok(Payload::Single(_))));
         let stap = stap_a(&[SPS, PPS]);
         assert_eq!(stap[0], 0x78, "NRI 3 from the SPS, type 24");
-        let Ok(Payload::StapA(units)) = parse(&stap) else {
-            panic!("stap-a");
-        };
+        lotse_core::let_assert!(Ok(Payload::StapA(units)) = parse(&stap));
         let units: Vec<&[u8]> = units.map(Result::unwrap).collect();
         assert_eq!(units, [SPS, PPS]);
         let fu = [0x7c, 0x85, 0xaa];
-        let Ok(Payload::FuA {
-            nal_header,
-            start,
-            end,
-            fragment,
-        }) = parse(&fu)
-        else {
-            panic!("fu-a");
-        };
+        lotse_core::let_assert!(
+            Ok(Payload::FuA {
+                nal_header,
+                start,
+                end,
+                fragment
+            }) = parse(&fu)
+        );
         assert_eq!(
             (nal_header, start, end, fragment),
             (0x65, true, false, &[0xaa][..])
@@ -405,18 +402,12 @@ mod tests {
             Err(PayloadError::BadFragmentType(STAP_A))
         ));
         // A STAP-A whose size runs past the end, and one with a zero size.
-        let Ok(Payload::StapA(mut units)) = parse(&[0x78, 0x00, 0x09, 0x67]) else {
-            panic!("stap-a");
-        };
+        lotse_core::let_assert!(Ok(Payload::StapA(mut units)) = parse(&[0x78, 0x00, 0x09, 0x67]));
         assert_eq!(units.next(), Some(Err(PayloadError::Truncated)));
         assert_eq!(units.next(), None);
-        let Ok(Payload::StapA(mut units)) = parse(&[0x78, 0x00, 0x00]) else {
-            panic!("stap-a");
-        };
+        lotse_core::let_assert!(Ok(Payload::StapA(mut units)) = parse(&[0x78, 0x00, 0x00]));
         assert_eq!(units.next(), Some(Err(PayloadError::Truncated)));
-        let Ok(Payload::StapA(mut units)) = parse(&[0x78, 0x00]) else {
-            panic!("stap-a");
-        };
+        lotse_core::let_assert!(Ok(Payload::StapA(mut units)) = parse(&[0x78, 0x00]));
         assert_eq!(units.next(), Some(Err(PayloadError::Truncated)));
         assert_eq!(fragment(&[], 10), Vec::<Bytes>::new());
     }
@@ -429,15 +420,14 @@ mod tests {
         assert!(parts.iter().all(|p| p.len() <= 100));
         let mut rebuilt = vec![];
         for (i, part) in parts.iter().enumerate() {
-            let Ok(Payload::FuA {
-                nal_header,
-                start,
-                end,
-                fragment,
-            }) = parse(part)
-            else {
-                panic!("fu-a");
-            };
+            lotse_core::let_assert!(
+                Ok(Payload::FuA {
+                    nal_header,
+                    start,
+                    end,
+                    fragment
+                }) = parse(part)
+            );
             assert_eq!(nal_header, 0x65);
             assert_eq!(start, i == 0);
             assert_eq!(end, i == 2);

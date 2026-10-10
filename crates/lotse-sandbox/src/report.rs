@@ -131,6 +131,19 @@ mod tests {
             report
         );
         assert_eq!(report.missing_layers(), ["landlock.net"]);
+        for status in [
+            LayerStatus::Enforced,
+            LayerStatus::Unavailable,
+            LayerStatus::Off,
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                serde_json::json!(status.name()),
+                "the API name is the serialized one"
+            );
+        }
+        assert_eq!(LayerStatus::Enforced.name(), "enforced");
+        assert_eq!(LayerStatus::Unavailable.name(), "unavailable");
         assert_eq!(LayerStatus::Off.name(), "off");
     }
 

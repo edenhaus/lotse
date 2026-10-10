@@ -420,6 +420,16 @@ mod tests {
 
     use super::*;
 
+    /// The wallclock of every `apply_track_event` and `apply_audio_event`
+    /// call here: one type, so one instantiation of each runs every arm,
+    /// which is the one the line-coverage gate counts.
+    type Wallclock<'a> = Box<dyn FnOnce(&MediaPacket) -> Instant + 'a>;
+
+    /// A wallclock that answers `now`.
+    fn at(now: Instant) -> Wallclock<'static> {
+        Box::new(move |_| now)
+    }
+
     #[test]
     fn credentials_redact_and_errors_map_to_codes() {
         let creds = IceCredentials {
@@ -469,7 +479,7 @@ mod tests {
             now,
             h264,
             Some(TrackEvent::TrackChanged(Arc::new(main))),
-            |_| now,
+            at(now),
         );
         assert!(
             matches!(
@@ -508,15 +518,16 @@ mod tests {
         });
         let h264 = CodecFamily::H264;
         let mut mapped = None;
+        let wallclock: Wallclock<'_> = Box::new(|p| {
+            mapped = Some(p.rtp.ts);
+            now
+        });
         apply_track_event(
             &mut engine,
             now,
             h264,
             Some(TrackEvent::Packet(packet)),
-            |p| {
-                mapped = Some(p.rtp.ts);
-                now
-            },
+            wallclock,
         );
         assert_eq!(mapped, Some(3_000), "the wallclock is asked for the packet");
         assert_eq!(engine.stats().packets, 1);
@@ -524,25 +535,36 @@ mod tests {
             TrackEvent::Gap { skipped: 4 },
             TrackEvent::EpochStart { epoch: 1 },
         ] {
-            apply_track_event(&mut engine, now, h264, Some(event), |_| now);
+            apply_track_event(&mut engine, now, h264, Some(event), at(now));
         }
         assert_eq!(
             engine.stats().skips,
             2,
             "a gap and a new epoch wait for a keyframe"
         );
-        // Within the family, and source loss: the session stays.
+        // Within the family, source loss, and a frame a packet
+        // subscription never yields: the session stays.
         let high = Codec::H264 {
             profile_level_id: Some([0x64, 0, 0x28]),
             sps: None,
             pps: None,
         };
+        let frame = crate::media::MediaFrame {
+            ts: crate::media::MediaTime::ZERO,
+            wallclock: now,
+            arrival: now,
+            keyframe: true,
+            discontinuity: false,
+            epoch: 0,
+            payload: bytes::Bytes::new(),
+        };
         for event in [
             TrackEvent::TrackChanged(Arc::new(high)),
             TrackEvent::SourceLost,
             TrackEvent::SourceRestored,
+            TrackEvent::Frame(Arc::new(frame)),
         ] {
-            apply_track_event(&mut engine, now, h264, Some(event), |_| now);
+            apply_track_event(&mut engine, now, h264, Some(event), at(now));
         }
         assert!(
             matches!(engine.poll(), SessionOutput::Timeout(_)),
@@ -559,7 +581,7 @@ mod tests {
             now,
             h264,
             Some(TrackEvent::TrackChanged(Arc::new(h265))),
-            |_| now,
+            at(now),
         );
         assert!(matches!(
             engine.poll(),
@@ -570,7 +592,7 @@ mod tests {
         ));
         // The track's end closes with stream_deleted.
         let mut engine = EchoEngine::new(now);
-        apply_track_event(&mut engine, now, h264, None, |_| now);
+        apply_track_event(&mut engine, now, h264, None, at(now));
         assert!(matches!(
             engine.poll(),
             SessionOutput::Event(SessionEvent::Closed {
@@ -605,15 +627,16 @@ mod tests {
         });
         let pcmu = CodecFamily::Pcmu;
         let mut mapped = None;
+        let wallclock: Wallclock<'_> = Box::new(|p| {
+            mapped = Some(p.rtp.ts);
+            now
+        });
         assert!(apply_audio_event(
             &mut engine,
             now,
             pcmu,
             Some(TrackEvent::Packet(packet)),
-            |p| {
-                mapped = Some(p.rtp.ts);
-                now
-            },
+            wallclock,
         ));
         assert_eq!(mapped, Some(160), "the wallclock is asked for the packet");
         assert_eq!(engine.stats().audio_packets, 1);
@@ -637,7 +660,7 @@ mod tests {
                 now,
                 pcmu,
                 Some(event),
-                |_| now
+                at(now)
             ));
         }
         assert_eq!(engine.stats().skips, 0);
@@ -650,7 +673,7 @@ mod tests {
             Some(TrackEvent::TrackChanged(Arc::new(Codec::Opus {
                 channels: 2
             }))),
-            |_| now,
+            at(now),
         ));
         assert!(matches!(
             engine.poll(),
@@ -661,7 +684,7 @@ mod tests {
         ));
         // The track's end stops the audio and keeps the session.
         let mut engine = EchoEngine::new(now);
-        assert!(!apply_audio_event(&mut engine, now, pcmu, None, |_| now));
+        assert!(!apply_audio_event(&mut engine, now, pcmu, None, at(now)));
         assert!(matches!(engine.poll(), SessionOutput::Timeout(_)));
     }
 }

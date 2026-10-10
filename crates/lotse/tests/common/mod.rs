@@ -26,7 +26,8 @@ use std::time::Duration;
 pub(crate) const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The binary with a clean environment, so the host's `LOTSE_*` and
-/// `RUST_LOG` cannot leak into the test.
+/// `RUST_LOG` cannot leak into the test. Under a coverage run it gets one
+/// variable, `LLVM_PROFILE_FILE` set to its own [`profile_file`].
 #[expect(
     clippy::disallowed_methods,
     reason = "the test drives the real binary; only the supervisor spawns processes in production"
@@ -34,7 +35,83 @@ pub(crate) const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) fn lotse() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lotse"));
     command.env_clear();
+    if let Some(profile) = profile_file() {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
     command
+}
+
+/// The `LLVM_PROFILE_FILE` of one more process under test when the test
+/// runs under `cargo llvm-cov`, `None` otherwise. Without one, an
+/// instrumented binary started with an empty environment writes
+/// `default.profraw` into its working directory, where `cargo llvm-cov`
+/// never looks, and nothing it ran is counted.
+///
+/// The file goes beside the run's own profiles under a name of its own
+/// ([`profile_prefix`]), created here writable by everyone: a process
+/// started as root drops to an unprivileged uid, sandbox off included,
+/// before it writes the profile at exit.
+pub(crate) fn profile_file() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut file = profile_prefix()?.into_os_string();
+    file.push(".profraw");
+    let file = PathBuf::from(file);
+    std::fs::File::create(&file).expect("profile file created");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666))
+        .expect("profile file writable");
+    Some(file)
+}
+
+/// A fresh path prefix for profiles of a coverage run: the run's directory,
+/// the test's pid and a counter. Not the run's own pattern: its `%m` merges
+/// profiles online, locking and mapping the file at exit, which the
+/// sandbox's seccomp filter does not allow, so a sandboxed process would
+/// die of `SIGSYS` instead of exiting 0. A sandboxed process cannot write
+/// its file either (Landlock), but that fails with a line on stderr and
+/// leaves the file empty, which `llvm-profdata` skips.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the coverage run's profile path, not configuration of the binary under test"
+)]
+fn profile_prefix() -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let run = PathBuf::from(std::env::var_os("LLVM_PROFILE_FILE")?);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    Some(run.with_file_name(format!("lotse-{}-{n}", std::process::id())))
+}
+
+/// The binary a test's worker manager starts. The manager starts workers
+/// with an empty environment, as in production, so under a coverage run
+/// this is a script that gives each worker a profile file as
+/// [`profile_file`] does, named after its pid, and `exec`s the binary (same
+/// pid, same exit status); otherwise the binary itself.
+pub(crate) fn worker_binary() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let binary = Path::new(env!("CARGO_BIN_EXE_lotse"));
+    let Some(prefix) = profile_prefix() else {
+        return binary.to_path_buf();
+    };
+    let (binary, prefix) = (binary.display().to_string(), prefix.display().to_string());
+    assert!(
+        !binary.contains('\'') && !prefix.contains('\''),
+        "single-quotable paths: {binary} {prefix}"
+    );
+    let name = prefix.rsplit('/').next().unwrap_or(&prefix);
+    let script = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.sh"));
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             profile='{prefix}-'$$'.profraw'\n\
+             : > \"$profile\" && chmod 666 \"$profile\"\n\
+             LLVM_PROFILE_FILE=\"$profile\" exec '{binary}' \"$@\"\n"
+        ),
+    )
+    .expect("worker script written");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("worker script executable");
+    script
 }
 
 /// A private 0700 directory for the socket path of one test, as the

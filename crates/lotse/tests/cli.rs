@@ -109,11 +109,13 @@ fn environment_overrides_the_file_and_flags_override_the_environment() {
         format!(
             // Ephemeral listeners, so a daemon on the default port does not
             // fail the test.
-            "socket = \"{}\"\nsandbox = \"off\"\n[webrtc]\nudp_listen = \"127.0.0.1:0\"\ntcp_listen = \"127.0.0.1:0\"\n[stream]\nlinger_ms = 1234\n[limits]\nmax_streams = 3\n[log]\nformat = \"json\"\n",
+            "socket = \"{}\"\nsandbox = \"off\"\n[webrtc]\nudp_listen = \"127.0.0.1:0\"\ntcp_listen = \"127.0.0.1:0\"\n[stream]\nlinger_ms = 1234\n[limits]\nmax_streams = 3\nsession_grace_ms = 4321\n[log]\nformat = \"json\"\n",
             dir.join("lotse.sock").display()
         ),
     )
     .expect("config written");
+    let socket = dir.join("env.sock");
+    let socket = socket.to_str().expect("utf-8");
     let mut daemon = Daemon::start(
         &[
             "--config",
@@ -121,13 +123,29 @@ fn environment_overrides_the_file_and_flags_override_the_environment() {
             "--max-streams",
             "7",
         ],
-        &[("LOTSE_LINGER_MS", "999"), ("LOTSE_MAX_STREAMS", "5")],
+        &[
+            ("LOTSE_SOCKET", socket),
+            ("LOTSE_LINGER_MS", "999"),
+            ("LOTSE_MAX_STREAMS", "5"),
+        ],
     );
-    // Settings are logged in a fixed order: limits before stream before log.
+    // Settings are logged in a fixed order: the socket first, then limits
+    // before stream before log.
+    let from_env = json(&daemon.wait_for("\"setting\":\"socket\""));
+    assert_eq!(
+        (from_env["value"].as_str(), from_env["source"].as_str()),
+        (Some(socket), Some("env"))
+    );
     let streams = json(&daemon.wait_for("\"setting\":\"limits.max_streams\""));
     assert_eq!(
         (streams["value"].as_str(), streams["source"].as_str()),
         (Some("7"), Some("flag"))
+    );
+    // Neither a flag nor a variable sets it: the file's value applies.
+    let grace = json(&daemon.wait_for("\"setting\":\"limits.session_grace_ms\""));
+    assert_eq!(
+        (grace["value"].as_str(), grace["source"].as_str()),
+        (Some("4321"), Some("file"))
     );
     let linger = json(&daemon.wait_for("\"setting\":\"stream.linger_ms\""));
     assert_eq!(
@@ -140,6 +158,7 @@ fn environment_overrides_the_file_and_flags_override_the_environment() {
         (Some("json"), Some("file"))
     );
     let ready = json(&daemon.wait_for("\"event\":\"ready\""));
+    assert_eq!(ready["socket"], socket);
     assert_eq!(ready["max_streams"], 7);
     assert_eq!(ready["linger_ms"], 999);
     let (code, _) = daemon.terminate();

@@ -840,14 +840,15 @@ async fn play(mut connected: Connected, options: &RtspOptions, ctx: &SourceCtx) 
                     on_rtp(entry, ctx, arrival, packet, &mut normalized);
                 }
             }
-            Some(Ok(PacketItem::Rtcp(compound))) => {
-                let arrival = ctx.time.now();
-                if let Some(Some(entry)) = connected.carried.get(compound.stream_id()) {
-                    on_rtcp(entry, ctx, arrival, &compound);
+            // RTCP, or an item kind retina may add, none of which carries
+            // media.
+            Some(Ok(item)) => {
+                if let PacketItem::Rtcp(compound) = item
+                    && let Some(Some(entry)) = connected.carried.get(compound.stream_id())
+                {
+                    on_rtcp(entry, ctx, ctx.time.now(), &compound);
                 }
             }
-            // retina may add item kinds; none of them carries media.
-            Some(Ok(_)) => {}
         }
     };
     drop(connected);
@@ -1237,17 +1238,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(video.sets, Sprop::H264(sets.clone()));
-        let Codec::H264 {
-            profile_level_id,
-            sps,
-            pps,
-        } = video.codec
-        else {
-            panic!("h264");
-        };
-        assert_eq!(profile_level_id, Some([0x42, 0xc0, 0x28]));
-        assert_eq!(sps, sets.sps);
-        assert_eq!(pps, sets.pps);
+        assert_eq!(
+            video.codec,
+            Codec::H264 {
+                profile_level_id: Some([0x42, 0xc0, 0x28]),
+                sps: sets.sps.clone(),
+                pps: sets.pps.clone(),
+            }
+        );
         assert_eq!(
             declare("video", "JPEG", 90_000, None, none.clone(), &[])
                 .unwrap()
@@ -1294,24 +1292,26 @@ mod tests {
             Bytes::from_static(&[0x67, 1]),
             Bytes::from_static(&[0x68, 2]),
         );
-        let Sprop::H264(sets) = video_sets(&VideoParametersCodec::H264 {
+        let sets = video_sets(&VideoParametersCodec::H264 {
             sps: sps.clone(),
             pps: pps.clone(),
-        }) else {
-            panic!("h264");
-        };
-        assert_eq!((sets.sps, sets.pps), (Some(sps), Some(pps)));
+        });
+        assert!(
+            matches!(&sets, Sprop::H264(sets) if (&sets.sps, &sets.pps) == (&Some(sps), &Some(pps))),
+            "{sets:?}"
+        );
         let vps = Bytes::from(h265::test_data::vps());
         let sps = Bytes::from(h265::test_data::sps(640, 480));
         let pps = Bytes::from(h265::test_data::pps());
-        let Sprop::H265(sets) = video_sets(&VideoParametersCodec::H265 {
+        let sets = video_sets(&VideoParametersCodec::H265 {
             vps: vps.clone(),
             sps: sps.clone(),
             pps: pps.clone(),
-        }) else {
-            panic!("h265");
-        };
-        assert_eq!(sets.units(), Some([&vps[..], &sps[..], &pps[..]]));
+        });
+        assert!(
+            matches!(&sets, Sprop::H265(sets) if sets.units() == Some([&vps[..], &sps[..], &pps[..]])),
+            "{sets:?}"
+        );
         assert_eq!(video_sets(&VideoParametersCodec::Jpeg), Sprop::None);
     }
 
@@ -1562,9 +1562,9 @@ mod tests {
         new_timeline(&mut carried, 0, &ctx, 55);
         assert_eq!((v0.epoch(), a0.epoch()), (1, 1), "one epoch for all tracks");
         assert_eq!(mapper.mode(v0.id()), SyncMode::Arrival);
-        let [Some(v), None, Some(a)] = carried.as_mut_slice() else {
-            panic!("the streams stay");
-        };
+        let [v, none, a] = <&mut [Option<Carried>; 3]>::try_from(carried.as_mut_slice()).unwrap();
+        assert!(none.is_none(), "the streams stay");
+        let (v, a) = (v.as_mut().unwrap(), a.as_mut().unwrap());
         assert_eq!(
             v.guard.observe(5_003_000, t0),
             None,
@@ -1829,13 +1829,14 @@ mod tests {
             &stap,
             &mut normalized,
         );
-        let Codec::H264 {
-            profile_level_id, ..
-        } = v1.codec().as_ref().clone()
-        else {
-            panic!("h264");
-        };
-        assert_eq!(profile_level_id, Some([0x42, 0xc0, 0x28]));
+        assert_eq!(
+            *v1.codec(),
+            Codec::H264 {
+                profile_level_id: Some([0x42, 0xc0, 0x28]),
+                sps: Some(Bytes::copy_from_slice(&sps)),
+                pps: Some(Bytes::copy_from_slice(&pps)),
+            }
+        );
         let stap_b = Bytes::from_static(&[25, 0]);
         on_video(
             &mut entry,
@@ -1897,27 +1898,15 @@ mod tests {
             ssrc: 1,
         };
         let aac = entry.aac.as_mut().unwrap();
+        // One stamp for every packet: one instance of `publish_aac`.
+        let stamp = |_| (t0, t0);
         // Two violations (one warning), then a good packet.
         for (seq, payload) in [(1, &[0x00_u8][..]), (2, &[0x00, 0x0d, 0x00][..])] {
-            publish_aac(
-                aac,
-                &a0,
-                &mut entry.unwrapper,
-                |_| (t0, t0),
-                rtp(seq, 0),
-                payload,
-            );
+            publish_aac(aac, &a0, &mut entry.unwrapper, stamp, rtp(seq, 0), payload);
         }
         assert!(frames.try_recv().unwrap().is_none(), "dropped");
         let good = lotse_codec::aac::packetize(&[b"ab", b"cd"]);
-        publish_aac(
-            aac,
-            &a0,
-            &mut entry.unwrapper,
-            |_| (t0, t0),
-            rtp(3, 5_000),
-            &good,
-        );
+        publish_aac(aac, &a0, &mut entry.unwrapper, stamp, rtp(3, 5_000), &good);
         let first = frames.try_recv().unwrap().unwrap();
         let second = frames.try_recv().unwrap().unwrap();
         assert_eq!((first.ts.ticks(), &first.payload[..]), (5_000, &b"ab"[..]));

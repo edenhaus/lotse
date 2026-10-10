@@ -179,9 +179,16 @@ mod tests {
         reason = "test code"
     )]
 
-    use clap::CommandFactory as _;
+    use clap::{CommandFactory as _, FromArgMatches};
 
     use super::*;
+
+    /// The arguments of `subcommand` in a command line that must parse to
+    /// it; parsed from its matches, so no other subcommand can stand in.
+    fn args_of<T: FromArgMatches>(command_line: &[&str], subcommand: &str) -> T {
+        let matches = Cli::command().try_get_matches_from(command_line).unwrap();
+        T::from_arg_matches(matches.subcommand_matches(subcommand).unwrap()).unwrap()
+    }
 
     #[test]
     fn the_command_line_is_well_formed() {
@@ -190,22 +197,21 @@ mod tests {
 
     #[test]
     fn serve_parses_flags_and_typed_values() {
-        let cli = Cli::try_parse_from([
-            "lotse",
+        let args: ServeArgs = args_of(
+            &[
+                "lotse",
+                "serve",
+                "--socket",
+                "/run/lotse.sock",
+                "--sandbox",
+                "require",
+                "--webrtc-tcp-listen",
+                "off",
+                "--log-format",
+                "text",
+            ],
             "serve",
-            "--socket",
-            "/run/lotse.sock",
-            "--sandbox",
-            "require",
-            "--webrtc-tcp-listen",
-            "off",
-            "--log-format",
-            "text",
-        ])
-        .unwrap();
-        let Command::Serve(args) = cli.command else {
-            panic!("serve expected");
-        };
+        );
         assert_eq!(
             args.socket.as_deref(),
             Some(std::path::Path::new("/run/lotse.sock"))
@@ -217,25 +223,24 @@ mod tests {
 
     #[test]
     fn worker_parses_the_supervisors_flags() {
-        let cli = Cli::try_parse_from([
-            "lotse",
+        let args: WorkerArgs = args_of(
+            &[
+                "lotse",
+                "worker",
+                "--log-format",
+                "text",
+                "--sandbox",
+                "off",
+                "--worker-threads",
+                "3",
+                "--max-sessions",
+                "32",
+                "--connect-ports",
+                "554,80",
+                "--loopback-relay",
+            ],
             "worker",
-            "--log-format",
-            "text",
-            "--sandbox",
-            "off",
-            "--worker-threads",
-            "3",
-            "--max-sessions",
-            "32",
-            "--connect-ports",
-            "554,80",
-            "--loopback-relay",
-        ])
-        .unwrap();
-        let Command::Worker(args) = cli.command else {
-            panic!("worker expected");
-        };
+        );
         assert_eq!(args.log_format, LogFormat::Text);
         assert_eq!(args.log_level, "info");
         assert_eq!(args.sandbox, Mode::Off);
@@ -247,10 +252,7 @@ mod tests {
         );
         assert_eq!(args.connect_ports, [554, 80]);
         assert!(args.loopback_relay);
-        let Command::Worker(bare) = Cli::try_parse_from(["lotse", "worker"]).unwrap().command
-        else {
-            panic!("worker expected");
-        };
+        let bare: WorkerArgs = args_of(&["lotse", "worker"], "worker");
         assert!(bare.connect_ports.is_empty());
         assert!(!bare.loopback_relay);
         assert_eq!(bare.sandbox, Mode::On);
@@ -260,64 +262,61 @@ mod tests {
     #[test]
     fn ctl_parses_its_commands() {
         use crate::ctl::{CtlCommand, StreamCommand};
-        let cli = Cli::try_parse_from([
-            "lotse",
+        let args: CtlArgs = args_of(
+            &[
+                "lotse",
+                "ctl",
+                "--socket",
+                "/run/lotse.sock",
+                "--compact",
+                "stream",
+                "put",
+                "front",
+                "--url",
+                "fake://cam/",
+                "--preload",
+                "--audio",
+                "off",
+                "--options",
+                "{}",
+            ],
             "ctl",
-            "--socket",
-            "/run/lotse.sock",
-            "--compact",
-            "stream",
-            "put",
-            "front",
-            "--url",
-            "fake://cam/",
-            "--preload",
-            "--audio",
-            "off",
-            "--options",
-            "{}",
-        ])
-        .unwrap();
-        let Command::Ctl(args) = cli.command else {
-            panic!("ctl expected");
-        };
+        );
         assert_eq!(args.socket, PathBuf::from("/run/lotse.sock"));
         assert!(args.compact);
-        let CtlCommand::Stream {
-            command:
-                StreamCommand::Put {
-                    stream_id,
-                    urls,
-                    url_file,
-                    options,
-                    preload,
-                    audio,
-                },
-        } = args.command
-        else {
-            panic!("stream put expected");
-        };
-        assert_eq!(
-            (stream_id.as_str(), preload, audio.as_str()),
-            ("front", true, "off")
+        assert!(
+            matches!(
+                &args.command,
+                CtlCommand::Stream {
+                    command: StreamCommand::Put {
+                        stream_id,
+                        urls,
+                        url_file: None,
+                        options,
+                        preload: true,
+                        audio,
+                    },
+                } if stream_id == "front"
+                    && urls == &["fake://cam/"]
+                    && options.as_deref() == Some("{}")
+                    && audio == "off"
+            ),
+            "{:?}",
+            args.command
         );
-        assert_eq!(urls, ["fake://cam/"]);
-        assert_eq!(url_file, None);
-        assert_eq!(options.as_deref(), Some("{}"));
-        let cli = Cli::try_parse_from([
-            "lotse",
+        let args: CtlArgs = args_of(
+            &[
+                "lotse",
+                "ctl",
+                "--socket",
+                "/s",
+                "stream",
+                "subscribe",
+                "--limit",
+                "2",
+            ],
             "ctl",
-            "--socket",
-            "/s",
-            "stream",
-            "subscribe",
-            "--limit",
-            "2",
-        ])
-        .unwrap();
-        let Command::Ctl(args) = cli.command else {
-            panic!("ctl expected");
-        };
+        );
         assert!(matches!(
             args.command,
             CtlCommand::Stream {
@@ -338,17 +337,30 @@ mod tests {
             let base = ["lotse", "ctl", "--socket", "/s", "stream", "put", "front"];
             Cli::try_parse_from(base.iter().chain(args))
         };
-        let Command::Ctl(args) = put(&["--url-file", "-"]).unwrap().command else {
-            panic!("ctl expected");
-        };
-        let CtlCommand::Stream {
-            command: StreamCommand::Put { urls, url_file, .. },
-        } = args.command
-        else {
-            panic!("stream put expected");
-        };
-        assert!(urls.is_empty());
-        assert_eq!(url_file, Some(PathBuf::from("-")));
+        let args: CtlArgs = args_of(
+            &[
+                "lotse",
+                "ctl",
+                "--socket",
+                "/s",
+                "stream",
+                "put",
+                "front",
+                "--url-file",
+                "-",
+            ],
+            "ctl",
+        );
+        assert!(
+            matches!(
+                &args.command,
+                CtlCommand::Stream {
+                    command: StreamCommand::Put { urls, url_file: Some(path), .. },
+                } if urls.is_empty() && path == std::path::Path::new("-")
+            ),
+            "{:?}",
+            args.command
+        );
         let err = put(&[]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let err = put(&["--url", "fake://cam/", "--url-file", "-"]).unwrap_err();

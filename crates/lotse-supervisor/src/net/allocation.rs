@@ -2123,13 +2123,9 @@ mod tests {
             .unwrap();
         rig.machine.remove_session(rig.now(), keeper);
         // The keeper's bindings and the permission's answers arrive for
-        // nobody.
+        // nobody, and the peer's permission was installed already.
         rig.pump();
-        assert!(
-            rig.events()
-                .iter()
-                .all(|e| matches!(e, Event::Permission { .. }))
-        );
+        assert_eq!(rig.events(), []);
         let early = rig.machine.bind_channel(rig.now(), lease, peer(5000));
         assert_eq!(early, Err(AllocationError::ChannelsExhausted));
     }

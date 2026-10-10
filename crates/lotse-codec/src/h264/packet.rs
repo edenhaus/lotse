@@ -883,15 +883,15 @@ mod tests {
         let mut unit = Vec::new();
         let mut flags = Vec::new();
         for packet in packets {
-            let Ok(Payload::FuA {
-                nal_header,
-                start,
-                end,
-                fragment,
-            }) = nal::parse(&packet.payload)
-            else {
-                panic!("an FU-A: {packet:?}");
-            };
+            lotse_core::let_assert!(
+                Ok(Payload::FuA {
+                    nal_header,
+                    start,
+                    end,
+                    fragment
+                }) = nal::parse(&packet.payload),
+                "an FU-A: {packet:?}"
+            );
             if start {
                 unit.push(nal_header);
             }

@@ -70,6 +70,11 @@ impl std::fmt::Debug for Resampler {
     }
 }
 
+/// A rubato refusal as [`ResampleError::Library`].
+fn library_error(err: impl std::fmt::Display) -> ResampleError {
+    ResampleError::Library(err.to_string())
+}
+
 impl Resampler {
     /// A resampler from `from_rate` to [`TARGET_RATE`] for `channels`
     /// interleaved channels, taking `chunk` samples per channel per call.
@@ -91,7 +96,7 @@ impl Resampler {
             .interpolation(SincInterpolationType::Linear);
         let ratio = f64::from(TARGET_RATE) / f64::from(from_rate);
         let inner = Async::<f32>::new_sinc(ratio, 1.0, &params, chunk, channels, FixedAsync::Input)
-            .map_err(|err| ResampleError::Library(err.to_string()))?;
+            .map_err(library_error)?;
         let out = vec![0.0; inner.output_frames_max().saturating_mul(channels)];
         Ok(Self {
             inner: Some(inner),
@@ -131,13 +136,12 @@ impl Resampler {
             return Ok(pcm);
         };
         let frames_out = self.out.len().checked_div(self.channels).unwrap_or(0);
-        let input = InterleavedSlice::new(pcm, self.channels, self.chunk)
-            .map_err(|err| ResampleError::Library(err.to_string()))?;
+        let input = InterleavedSlice::new(pcm, self.channels, self.chunk).map_err(library_error)?;
         let mut output = InterleavedSlice::new_mut(&mut self.out, self.channels, frames_out)
-            .map_err(|err| ResampleError::Library(err.to_string()))?;
+            .map_err(library_error)?;
         let (_, written) = inner
             .process_into_buffer(&input, &mut output, None)
-            .map_err(|err| ResampleError::Library(err.to_string()))?;
+            .map_err(library_error)?;
         Ok(self
             .out
             .get(..written.saturating_mul(self.channels))

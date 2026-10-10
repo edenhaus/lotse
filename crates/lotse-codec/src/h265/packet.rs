@@ -871,15 +871,15 @@ mod tests {
         let mut unit = Vec::new();
         let mut flags = Vec::new();
         for packet in packets {
-            let Ok(Payload::Fragment {
-                nal_header,
-                start,
-                end,
-                fragment,
-            }) = nal::parse(&packet.payload)
-            else {
-                panic!("a fragment: {packet:?}");
-            };
+            lotse_core::let_assert!(
+                Ok(Payload::Fragment {
+                    nal_header,
+                    start,
+                    end,
+                    fragment
+                }) = nal::parse(&packet.payload),
+                "a fragment: {packet:?}"
+            );
             if start {
                 unit.extend_from_slice(&nal_header);
             }

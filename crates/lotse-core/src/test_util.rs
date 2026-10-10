@@ -1,6 +1,7 @@
 //! Fakes for core's own contracts, behind the `test-util` feature: a source
 //! factory and source, an output factory, a session output whose engine
-//! echoes, and a transcoder that do nothing but honor the contracts. `lotse-testing` cannot hold them because it
+//! echoes, and a transcoder that do nothing but honor the contracts, and the
+//! tests' `let_assert!`. `lotse-testing` cannot hold them because it
 //! depends on this crate.
 
 use std::collections::VecDeque;
@@ -25,6 +26,32 @@ use crate::task::BoxFuture;
 use crate::track::{FrameSubscription, GopSnapshot, Track, Unit};
 use crate::transcode::{TrackHandle, TranscodeError, Transcoder};
 
+/// `let $pattern = $value else { panic!(..) };` for tests, the one such
+/// macro of the workspace: binds the pattern's names, or fails the test
+/// with the value that did not match (and the message, if one follows).
+/// A test's `let`-`else` leaves its `panic!` on a line of its own that a
+/// passing test never runs; here the failure arm sits on the macro call's
+/// lines, which the binding runs, so the line-coverage gate sees them as
+/// executed. Written `let_assert!(pattern = value)`, in the order of the
+/// `let` it stands for; rustfmt lays the call out as the assignment it
+/// parses as, or keeps it as written when the pattern is no expression
+/// (`mut`, `ref`), and the failure arm stays on the call either way.
+#[macro_export]
+macro_rules! let_assert {
+    ($pattern:pat = $value:expr) => {
+        let value = $value;
+        let $pattern = value else {
+            panic!("`{}` does not match {value:?}", stringify!($pattern));
+        };
+    };
+    ($pattern:pat = $value:expr, $($message:tt)+) => {
+        let value = $value;
+        let $pattern = value else {
+            panic!("`{}` does not match {value:?}: {}", stringify!($pattern), format_args!($($message)+));
+        };
+    };
+}
+
 /// A source factory for the given schemes. Options must be `null`, an
 /// empty object, `{"crash": true}` for the crash-injection test,
 /// `{"ready_after_ms": n}` to go live only after `n` ms on the injected
@@ -38,12 +65,28 @@ use crate::transcode::{TrackHandle, TranscodeError, Transcoder};
 pub struct FakeSourceFactory {
     /// The schemes it claims.
     schemes: &'static [&'static str],
+    /// What a crashing source calls once ready: aborts the process.
+    abort: fn() -> !,
 }
 
 impl FakeSourceFactory {
-    /// A factory claiming `schemes`.
+    /// A factory claiming `schemes` whose crashing sources abort the
+    /// process: `abort`, not `panic`, because the test profile ignores
+    /// `panic = "abort"`, and the point is the process dying, not the
+    /// unwinding.
     pub const fn new(schemes: &'static [&'static str]) -> Self {
-        Self { schemes }
+        Self {
+            schemes,
+            abort: std::process::abort,
+        }
+    }
+
+    /// This factory with its crashing sources calling `abort` instead of
+    /// aborting the process: the seam the crash path's own test needs, as
+    /// an aborted process cannot report on it (its coverage included).
+    #[must_use]
+    pub const fn aborting_with(self, abort: fn() -> !) -> Self {
+        Self { abort, ..self }
     }
 }
 
@@ -107,6 +150,7 @@ impl SourceFactory for FakeSourceFactory {
             protocol: scheme,
             url: url.clone(),
             crash,
+            abort: self.abort,
             ready_after,
             audio,
             keyframes_every,
@@ -222,6 +266,8 @@ pub struct FakeSource {
     url: SourceUrl,
     /// Abort the process once ready.
     crash: bool,
+    /// How it aborts: [`FakeSourceFactory::aborting_with`].
+    abort: fn() -> !,
     /// How long it takes to go live.
     ready_after: Duration,
     /// The audio track it carries.
@@ -250,6 +296,7 @@ impl Source for FakeSource {
 
     fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
         let crash = self.crash;
+        let abort = self.abort;
         let audio = self.audio;
         let keyframes_every = self.keyframes_every;
         let ready_after = ctx.time.sleep(self.ready_after);
@@ -275,10 +322,8 @@ impl Source for FakeSource {
                 FakeAudio::None => {
                     ctx.tracks.ready();
                     if crash {
-                        // `abort`, not `panic`: the test profile ignores `panic = "abort"`,
-                        // and the point is the process dying, not the unwinding.
                         tracing::error!("fake source: crashing the process as requested");
-                        std::process::abort();
+                        abort();
                     }
                     let Some(every) = keyframes_every else {
                         ctx.cancel.cancelled().await;
@@ -747,6 +792,101 @@ mod tests {
         let run = crate::task::spawn_named("test.fake_source", run);
         assert!(ready.changed().await.is_ok());
         assert_eq!(set.tracks().len(), 1);
+        cancel.cancel();
+        assert!(matches!(
+            run.await.unwrap(),
+            SourceExit::Ended(SourceError::Ended(_))
+        ));
+    }
+
+    /// The injected abort of `a_crashing_fake_source_aborts_once_ready`:
+    /// it ends the source's task, not the test's process.
+    fn crash() -> ! {
+        panic!("the injected abort")
+    }
+
+    /// A fake source of `options` running on `clock`: its run, its track
+    /// set and its cancel.
+    fn run_fake(
+        factory: &FakeSourceFactory,
+        options: &serde_json::Value,
+        clock: Arc<dyn crate::clock::Clock>,
+    ) -> (
+        tokio::task::JoinHandle<SourceExit>,
+        Arc<TrackSet>,
+        CancellationToken,
+    ) {
+        let url = SourceUrl::parse("fake://cam/").unwrap();
+        let source = factory.validate(&url, options).unwrap();
+        let set = TrackSet::new(TrackLimits::default(), clock.now());
+        let (input, _reports) = ClockInput::channel(Arc::new(crate::clock_map::ClockMapper::new()));
+        let cancel = CancellationToken::new();
+        let run = source.run(SourceCtx {
+            peer: ResolvedPeer {
+                host: "cam".into(),
+                addrs: vec![],
+            },
+            tracks: set.publisher(),
+            clock: input,
+            time: clock,
+            backchannel: BackchannelSlot::default(),
+            cancel: cancel.clone(),
+        });
+        let run = crate::task::spawn_named("test.fake_source", run);
+        (run, set, cancel)
+    }
+
+    #[tokio::test]
+    async fn a_crashing_fake_source_aborts_once_ready() {
+        let (logs, _guard) = crate::test_logs::Logs::capture();
+        let factory = FakeSourceFactory::new(&["fake"]).aborting_with(crash);
+        let (run, set, _cancel) = run_fake(
+            &factory,
+            &serde_json::json!({"crash": true}),
+            Arc::new(SystemClock),
+        );
+        let mut ready = set.ready();
+        assert!(ready.changed().await.is_ok());
+        // The crash follows the readiness in the same poll.
+        let err = run.await.unwrap_err();
+        assert!(err.is_panic());
+        assert_eq!(
+            err.into_panic().downcast_ref::<&str>(),
+            Some(&"the injected abort")
+        );
+        assert_eq!(
+            logs.count(
+                tracing::Level::ERROR,
+                "fake source: crashing the process as requested"
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fake_source_with_keyframes_publishes_one_every_interval() {
+        use crate::clock::FakeClock;
+
+        let factory = FakeSourceFactory::new(&["fake"]);
+        let options = serde_json::json!({"keyframes_every_ms": 40});
+        let url = SourceUrl::parse("fake://cam/").unwrap();
+        assert_eq!(
+            factory
+                .validate(&url, &options)
+                .unwrap()
+                .connection_options()["keyframes_every_ms"],
+            40
+        );
+        let clock = Arc::new(FakeClock::default());
+        let (run, set, cancel) = run_fake(&factory, &options, clock.clone());
+        let mut ready = set.ready();
+        assert!(ready.changed().await.is_ok());
+        let video = set.tracks().remove(0);
+        let mut packets = video.subscribe(Unit::Packets);
+        clock.advance(Duration::from_millis(40));
+        crate::let_assert!(Some(crate::track::TrackEvent::Packet(packet)) = packets.next().await);
+        assert!(packet.keyframe_start && packet.rtp.marker);
+        assert_eq!(packet.rtp.seq, 1, "the second keyframe, 40 ms on");
         cancel.cancel();
         assert!(matches!(
             run.await.unwrap(),
@@ -1254,14 +1394,15 @@ mod tests {
         assert_eq!(engine.poll(), echo);
         assert_eq!(engine.poll(), SessionOutput::Event(SessionEvent::Connected));
         assert_eq!(engine.poll(), echo, "connected once");
-        assert!(
-            matches!(
-                engine.poll(),
-                SessionOutput::Transmit {
-                    transport: Transport::Tcp,
-                    ..
-                }
-            ),
+        assert_eq!(
+            engine.poll(),
+            SessionOutput::Transmit {
+                transport: Transport::Tcp,
+                source: daemon,
+                destination: browser,
+                payload: b"tcp:x".to_vec(),
+                audio: false,
+            },
             "`tcp:` goes back over TCP"
         );
         engine.join(now, None);

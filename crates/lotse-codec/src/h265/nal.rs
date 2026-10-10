@@ -409,27 +409,22 @@ mod tests {
         assert!(matches!(parse(&[0x26, 0x01, 0xaa]), Ok(Payload::Single(_))));
         let ap = aggregate(&[VPS, SPS, PPS]);
         assert_eq!(&ap[..2], &[0x60, 0x01], "type 48, layer 0, tid 1");
-        let Ok(Payload::Aggregate(units)) = parse(&ap) else {
-            panic!("aggregate");
-        };
+        lotse_core::let_assert!(Ok(Payload::Aggregate(units)) = parse(&ap));
         let units: Vec<&[u8]> = units.map(Result::unwrap).collect();
         assert_eq!(units, [VPS, SPS, PPS]);
         // A unit of a header alone is a unit.
         let lone = aggregate(&[&IDR]);
-        let Ok(Payload::Aggregate(mut units)) = parse(&lone) else {
-            panic!("aggregate");
-        };
+        lotse_core::let_assert!(Ok(Payload::Aggregate(mut units)) = parse(&lone));
         assert_eq!(units.next(), Some(Ok(&IDR[..])));
         let fu = [0x62, 0x01, 0x80 | IDR_W_RADL, 0xbb];
-        let Ok(Payload::Fragment {
-            nal_header,
-            start,
-            end,
-            fragment,
-        }) = parse(&fu)
-        else {
-            panic!("fragment");
-        };
+        lotse_core::let_assert!(
+            Ok(Payload::Fragment {
+                nal_header,
+                start,
+                end,
+                fragment
+            }) = parse(&fu)
+        );
         assert_eq!(
             (nal_header, start, end, fragment),
             (IDR, true, false, &[0xbb][..])
@@ -483,9 +478,7 @@ mod tests {
             &[0x60, 0x01, 0x00, 0x01, 0x40],
             &[0x60, 0x01, 0x00],
         ] {
-            let Ok(Payload::Aggregate(mut units)) = parse(bytes) else {
-                panic!("aggregate");
-            };
+            lotse_core::let_assert!(Ok(Payload::Aggregate(mut units)) = parse(bytes));
             assert_eq!(units.next(), Some(Err(PayloadError::Truncated)));
             assert_eq!(units.next(), None);
         }
@@ -500,15 +493,14 @@ mod tests {
         assert!(parts.iter().all(|p| p.len() <= 100));
         let mut rebuilt = vec![];
         for (i, part) in parts.iter().enumerate() {
-            let Ok(Payload::Fragment {
-                nal_header,
-                start,
-                end,
-                fragment,
-            }) = parse(part)
-            else {
-                panic!("fragment");
-            };
+            lotse_core::let_assert!(
+                Ok(Payload::Fragment {
+                    nal_header,
+                    start,
+                    end,
+                    fragment
+                }) = parse(part)
+            );
             assert_eq!(nal_header, IDR);
             assert_eq!((start, end), (i == 0, i == 2));
             if start {

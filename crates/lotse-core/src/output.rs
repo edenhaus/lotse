@@ -162,6 +162,7 @@ mod tests {
     #[test]
     fn a_kind_without_sessions_wants_no_tracks_and_opens_none() {
         let factory = Snapshots;
+        assert_eq!(factory.shape(), OutputShape::Request);
         assert!(factory.session_tracks(true).is_empty());
         let request = SessionRequest {
             offer: String::new(),

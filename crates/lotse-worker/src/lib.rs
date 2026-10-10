@@ -18,6 +18,8 @@ mod ice_tcp;
 pub mod relay;
 mod sendmsg;
 mod sessions;
+#[cfg(test)]
+mod test_logs;
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
@@ -984,16 +986,26 @@ mod tests {
         reason = "test code"
     )]
 
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{AsRawFd as _, OwnedFd};
 
     use lotse_core::clock::FakeClock;
+    use lotse_core::codec::{Codec, Kind};
+    use lotse_core::let_assert;
     use lotse_core::output::OutputShape;
+    use lotse_core::source::{
+        Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor, SourceError,
+        SourceExit, SourceFactory,
+    };
+    use lotse_core::task::BoxFuture;
     use lotse_core::test_util::{
         ECHO_ANSWER, EchoSessionFactory, FakeOutputFactory, FakeSourceFactory,
     };
     use lotse_ipc::Receiver;
+    use tokio::sync::Notify;
+    use tracing::Level;
 
     use super::*;
+    use crate::test_logs::Logs;
 
     fn settings() -> Settings {
         Settings {
@@ -1138,15 +1150,23 @@ mod tests {
 
         /// The next `closed` event: its session id and code.
         async fn next_closed(&mut self) -> (String, String) {
-            loop {
-                if let ToSupervisor::Session {
+            let closed = |m: &ToSupervisor| {
+                matches!(
+                    m,
+                    ToSupervisor::Session {
+                        event: SessionEvent::Closed { .. },
+                        ..
+                    }
+                )
+            };
+            let message = next_where(self, &closed).await;
+            let_assert!(
+                ToSupervisor::Session {
                     session_id,
-                    event: SessionEvent::Closed { code, .. },
-                } = self.next().await
-                {
-                    return (session_id, code);
-                }
-            }
+                    event: SessionEvent::Closed { code, .. }
+                } = message
+            );
+            (session_id, code)
         }
     }
 
@@ -1198,59 +1218,31 @@ mod tests {
         h.tx.send_msg(&ToWorker::SwitchSource(standby), &[])
             .await
             .unwrap();
-        let mut seen = Vec::new();
-        loop {
-            match h.next().await {
-                ToSupervisor::SwitchState(SourceState::Live) => break,
-                ToSupervisor::SwitchState(state) => seen.push(state),
-                ToSupervisor::Stats(_) => {}
-                other => panic!("unexpected before the standby is live: {other:?}"),
-            }
-        }
+        let live = ToSupervisor::SwitchState(SourceState::Live);
+        let seen = messages_until_still(&mut h, |seen| seen.last() == Some(&live)).await;
         assert!(
             seen.iter()
-                .any(|state| matches!(state, SourceState::Connecting { .. })),
+                .all(|m| matches!(m, ToSupervisor::SwitchState(_))),
             "{seen:?}"
         );
-        // Its next keyframe, on the fake clock, switches: the worker says
-        // so and reports the tracks as they are now; the old source's
-        // `Stopped` is not the source's.
-        let mut steps = 0;
-        loop {
-            h.clock.advance(Duration::from_millis(10));
-            tokio::task::yield_now().await;
-            let message = tokio::select! {
-                message = h.rx.recv_msg::<ToSupervisor>() => message.unwrap().unwrap().0,
-                () = SystemClock.sleep(Duration::from_millis(50)) => { steps += 1; assert!(steps < 100, "no switch"); continue; }
-            };
-            match message {
-                ToSupervisor::Switched => break,
-                ToSupervisor::SwitchState(SourceState::Stopped) | ToSupervisor::Stats(_) => {}
-                other => panic!("unexpected before the switch: {other:?}"),
-            }
-        }
-        let tracks = loop {
-            match h.next().await {
-                ToSupervisor::Tracks(tracks) => break tracks,
-                ToSupervisor::Stats(_) => {}
-                other => panic!("unexpected after the switch: {other:?}"),
-            }
-        };
+        assert!(
+            seen.iter()
+                .any(|m| matches!(m, ToSupervisor::SwitchState(SourceState::Connecting { .. }))),
+            "{seen:?}"
+        );
+        // Its next keyframe, 10 ms on, switches: the worker says so and
+        // reports the tracks as they are now; the old source's `Stopped`
+        // is not the source's.
+        h.clock.advance(Duration::from_millis(10));
+        assert_eq!(h.next().await, ToSupervisor::Switched);
+        let_assert!(ToSupervisor::Tracks(tracks) = h.next().await);
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].codec, "h264");
         // A second later: counters, and no `Stopped` from the old source.
         h.clock.advance(STATS_INTERVAL);
-        loop {
-            match h.next().await {
-                ToSupervisor::Stats(stats) => {
-                    let video = stats.tracks.iter().find(|(id, _)| id == "v0").unwrap();
-                    assert!(video.1.packets >= 1, "{stats:?}");
-                    break;
-                }
-                ToSupervisor::Tracks(_) => {}
-                other => panic!("unexpected after the switch: {other:?}"),
-            }
-        }
+        let_assert!(ToSupervisor::Stats(stats) = h.next().await);
+        let video = stats.tracks.iter().find(|(id, _)| id == "v0").unwrap();
+        assert!(video.1.packets >= 1, "{stats:?}");
         // A standby pending at shutdown stops with the rest.
         h.tx.send_msg(
             &ToWorker::SwitchSource(spec("fake://cam3/", r#"{"ready_after_ms": 60000}"#)),
@@ -1261,14 +1253,13 @@ mod tests {
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1000 }, &[])
             .await
             .unwrap();
-        loop {
-            match h.next().await {
-                ToSupervisor::SourceState(SourceState::Stopped) => break,
-                ToSupervisor::SwitchState(_) | ToSupervisor::Stats(_) | ToSupervisor::Tracks(_) => {
-                }
-                other => panic!("unexpected at shutdown: {other:?}"),
-            }
-        }
+        let stopped = ToSupervisor::SourceState(SourceState::Stopped);
+        let seen = messages_until_still(&mut h, |seen| seen.contains(&stopped)).await;
+        assert!(
+            seen.iter()
+                .all(|m| matches!(m, ToSupervisor::SwitchState(_)) || *m == stopped),
+            "{seen:?}"
+        );
         assert!(matches!(h.worker.await, Ok(Ok(ExitReason::Shutdown))));
     }
 
@@ -1362,29 +1353,25 @@ mod tests {
 
     /// The next session event, skipping stats.
     async fn next_session(h: &mut Harness) -> (String, SessionEvent) {
-        loop {
-            if let ToSupervisor::Session { session_id, event } = h.next().await {
-                return (session_id, event);
-            }
-        }
+        let message = next_where(h, &|m| matches!(m, ToSupervisor::Session { .. })).await;
+        let_assert!(ToSupervisor::Session { session_id, event } = message);
+        (session_id, event)
     }
 
-    /// Waits for a session's answer, moving the fake clock until the source
-    /// is ready; the session events before it are skipped. Returns its SDP.
+    /// Waits for a session's answer, which must be its first event, moving
+    /// the fake clock until the source is ready. Returns its SDP.
     async fn answered(h: &mut Harness) -> String {
         let mut steps = 0;
-        loop {
+        let mut answer = None;
+        while answer.is_none() {
             steps += 1;
             assert!(steps < 2_000, "no answer within 100 s of fake time");
-            tokio::select! {
-                (_, event) = next_session(h) => if let SessionEvent::Answer { sdp } = event {
-                    return sdp;
-                },
-                () = SystemClock.sleep(Duration::from_millis(5)) => {
-                    h.clock.advance(Duration::from_millis(50));
-                }
-            }
+            answer = tokio::select! {
+                (_, event) = next_session(h) => { let_assert!(SessionEvent::Answer { sdp } = event); Some(sdp) }
+                () = SystemClock.sleep(Duration::from_millis(5)) => { h.clock.advance(Duration::from_millis(50)); None }
+            };
         }
+        answer.unwrap()
     }
 
     /// The worker's end, or a failed test after ten seconds of real time:
@@ -1418,18 +1405,18 @@ mod tests {
         want: impl Fn(&SessionEvent) -> bool,
     ) -> SessionEvent {
         let deadline = SystemClock.now() + Duration::from_secs(10);
-        loop {
+        let mut found = None;
+        while found.is_none() {
             assert!(
                 SystemClock.now() < deadline,
                 "no such session event within 10 s"
             );
-            tokio::select! {
-                (_, event) = next_session(h) => if want(&event) {
-                    return event;
-                },
-                () = tokio::task::yield_now() => h.clock.advance(Duration::from_millis(20)),
-            }
+            found = tokio::select! {
+                (_, event) = next_session(h) => Some(event).filter(|event| want(event)),
+                () = tokio::task::yield_now() => { h.clock.advance(Duration::from_millis(20)); None }
+            };
         }
+        found.unwrap()
     }
 
     // Multi-threaded, so a session task that never yields cannot keep the
@@ -1564,15 +1551,54 @@ mod tests {
     /// instead of hanging it. Unpaced, as [`session_event_where`].
     async fn message_where(h: &mut Harness, want: impl Fn(&ToSupervisor) -> bool) -> ToSupervisor {
         let deadline = SystemClock.now() + Duration::from_secs(10);
-        loop {
+        let mut found = None;
+        while found.is_none() {
             assert!(SystemClock.now() < deadline, "no such message within 10 s");
-            tokio::select! {
-                message = h.next() => if want(&message) {
-                    return message;
-                },
-                () = tokio::task::yield_now() => h.clock.advance(Duration::from_millis(20)),
-            }
+            found = tokio::select! {
+                message = h.next() => Some(message).filter(|message| want(message)),
+                () = tokio::task::yield_now() => { h.clock.advance(Duration::from_millis(20)); None }
+            };
         }
+        found.unwrap()
+    }
+
+    /// The worker's next message that `want` holds for, the ones before it
+    /// skipped; the fake clock stands still.
+    async fn next_where(
+        h: &mut Harness,
+        want: &(dyn Fn(&ToSupervisor) -> bool + Sync),
+    ) -> ToSupervisor {
+        let mut found = None;
+        while found.is_none() {
+            found = Some(h.next().await).filter(|message| want(message));
+        }
+        found.unwrap()
+    }
+
+    /// Steps the fake clock one stats interval at a time, after `each`,
+    /// until the counters it pushes satisfy `want`, which it returns; at
+    /// most 10 000 times.
+    async fn stats_where(
+        h: &mut Harness,
+        each: &mut (dyn FnMut() + Send),
+        want: &(dyn Fn(&WorkerStats) -> bool + Sync),
+    ) -> WorkerStats {
+        let mut found = None;
+        let mut pushes = 0;
+        while found.is_none() {
+            pushes += 1;
+            assert!(pushes < 10_000, "no such counters within 10 000 pushes");
+            each();
+            tokio::task::yield_now().await;
+            h.clock.advance(STATS_INTERVAL);
+            found = Some(h.next().await)
+                .filter(|m| matches!(m, ToSupervisor::Stats(stats) if want(stats)))
+                .map(|m| {
+                    let_assert!(ToSupervisor::Stats(stats) = m);
+                    stats
+                });
+        }
+        found.unwrap()
     }
 
     /// A worker with its sockets, running the fake source with an AAC
@@ -1626,11 +1652,13 @@ mod tests {
         (h, transcoder)
     }
 
+    /// Whether a `Tracks` message has track `id`; `None` for any other
+    /// message.
     fn has_track(message: &ToSupervisor, id: &str) -> Option<bool> {
-        match message {
-            ToSupervisor::Tracks(tracks) => Some(tracks.iter().any(|track| track.id == id)),
-            _ => None,
-        }
+        matches!(message, ToSupervisor::Tracks(_)).then(|| {
+            let_assert!(ToSupervisor::Tracks(tracks) = message);
+            tracks.iter().any(|track| track.id == id)
+        })
     }
 
     /// Steps the fake clock 20 ms at a time, keeping every message, until
@@ -1739,11 +1767,8 @@ mod tests {
 
         // Reported when it appeared: the derived track, what it came from,
         // its delay; then its counters.
-        let Some(ToSupervisor::Tracks(tracks)) =
-            seen.iter().find(|m| has_track(m, "a1") == Some(true))
-        else {
-            panic!("tracks");
-        };
+        let announced = seen.iter().find(|m| has_track(m, "a1") == Some(true));
+        let_assert!(Some(ToSupervisor::Tracks(tracks)) = announced);
         let a1 = tracks.iter().find(|track| track.id == "a1").unwrap();
         assert_eq!(
             (
@@ -1769,13 +1794,11 @@ mod tests {
             ),
             ("aac_lc", None, None)
         );
-        let ToSupervisor::Stats(stats) = message_where(&mut h, |m| {
+        let message = message_where(&mut h, |m| {
             matches!(m, ToSupervisor::Stats(stats) if stats.tracks.iter().any(|(id, t)| id == "a1" && t.packets > 0))
         })
-        .await
-        else {
-            panic!("stats");
-        };
+        .await;
+        let_assert!(ToSupervisor::Stats(stats) = message);
         assert_eq!(stats.sessions, 2);
 
         // The first to leave keeps it running; the last stops it.
@@ -1809,14 +1832,12 @@ mod tests {
         assert_eq!(transcoder.started(), 1);
         // Closed sessions stop counting without another opening: the soak
         // waits for every worker to report none.
-        let ToSupervisor::Stats(stats) = message_where(
+        let message = message_where(
             &mut h,
             |m| matches!(m, ToSupervisor::Stats(stats) if stats.sessions == 0),
         )
-        .await
-        else {
-            panic!("stats");
-        };
+        .await;
+        let_assert!(ToSupervisor::Stats(stats) = message);
         assert_eq!(stats.sessions, 0);
 
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
@@ -1842,13 +1863,14 @@ mod tests {
             .unwrap();
         // The fake clock stands still, so no counters come: the tracks come
         // with the transcoder.
-        loop {
-            let message = h.next().await;
-            assert!(!matches!(message, ToSupervisor::Stats(_)), "{message:?}");
-            if has_track(&message, "a1") == Some(true) {
-                break;
-            }
-        }
+        let seen = messages_until_still(&mut h, |seen| {
+            seen.iter().any(|m| has_track(m, "a1") == Some(true))
+        })
+        .await;
+        assert!(
+            seen.iter().all(|m| !matches!(m, ToSupervisor::Stats(_))),
+            "{seen:?}"
+        );
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
             .await
             .unwrap();
@@ -2056,6 +2078,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unmet_video_request_closes_the_session_and_stops_what_audio_started() {
+        assert_eq!(
+            lotse_core::output::OutputFactory::shape(&WantsH265),
+            OutputShape::Session
+        );
         let (mut h, transcoder) =
             aac_worker_with(derived::fake::Forwarding::default(), Arc::new(WantsH265)).await;
         let mut session = session_spec("h265");
@@ -2098,14 +2124,12 @@ mod tests {
             },
             "no audio"
         );
-        let ToSupervisor::Stats(stats) = message_where(
+        let message = message_where(
             &mut h,
             |m| matches!(m, ToSupervisor::Stats(stats) if stats.sessions == 1),
         )
-        .await
-        else {
-            panic!("stats");
-        };
+        .await;
+        let_assert!(ToSupervisor::Stats(stats) = message);
         assert!(stats.tracks.iter().all(|(id, _)| id != "a1"));
         assert_eq!(transcoder.started(), 0);
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
@@ -2231,18 +2255,7 @@ mod tests {
             &mut frame,
         );
         datagrams.send(&frame).unwrap();
-        let mut pushes = 0;
-        let stats = loop {
-            pushes += 1;
-            assert!(pushes < 100, "no failed send within 100 stats pushes");
-            tokio::task::yield_now().await;
-            h.clock.advance(STATS_INTERVAL);
-            if let ToSupervisor::Stats(stats) = h.next().await
-                && stats.send_failures > 0
-            {
-                break stats;
-            }
-        };
+        let stats = stats_where(&mut h, &mut || {}, &|stats| stats.send_failures > 0).await;
         assert_eq!((stats.sessions, stats.send_failures), (1, 1));
 
         // Closed by the supervisor: the connection goes with the session.
@@ -2416,13 +2429,7 @@ mod tests {
             (&buf[..n], from),
             (&b"\x40\x01\x00\x05bound"[..], shared_addr)
         );
-        let stats = loop {
-            tokio::task::yield_now().await;
-            h.clock.advance(STATS_INTERVAL);
-            if let ToSupervisor::Stats(stats) = h.next().await {
-                break stats;
-            }
-        };
+        let stats = stats_where(&mut h, &mut || {}, &|_| true).await;
         assert_eq!((stats.sessions, stats.send_failures), (1, 0));
         // A server the IPv4 socket cannot send to: the relayed datagram
         // fails at the socket and is counted, as a full buffer would be.
@@ -2438,17 +2445,11 @@ mod tests {
             .unwrap();
         let mut frame = Vec::new();
         lotse_ipc::datagram::encode("ufrag-relay", peer, unreachable, b"x", &mut frame);
-        let failures = loop {
+        let mut send = || {
             datagrams.send(&frame).unwrap();
-            tokio::task::yield_now().await;
-            h.clock.advance(STATS_INTERVAL);
-            if let ToSupervisor::Stats(stats) = h.next().await
-                && stats.send_failures > 0
-            {
-                break stats.send_failures;
-            }
         };
-        assert!(failures > 0);
+        let stats = stats_where(&mut h, &mut send, &|stats| stats.send_failures > 0).await;
+        assert!(stats.send_failures > 0);
 
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
             .await
@@ -2548,17 +2549,11 @@ mod tests {
         // frames are dropped and counted.
         let mut big = Vec::new();
         lotse_ipc::datagram::encode("ufrag-relay", peer, relayed, &[7; 1_200], &mut big);
-        loop {
-            // The worker's end may fill too; what it refuses is not needed.
+        // The worker's end may fill too; what it refuses is not needed.
+        let mut send = || {
             let _sent = datagrams.send(&big);
-            tokio::task::yield_now().await;
-            h.clock.advance(STATS_INTERVAL);
-            if let ToSupervisor::Stats(stats) = h.next().await
-                && stats.send_failures > 0
-            {
-                break;
-            }
-        }
+        };
+        stats_where(&mut h, &mut send, &|stats| stats.send_failures > 0).await;
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
             .await
             .unwrap();
@@ -2634,7 +2629,6 @@ mod tests {
     /// descriptor, so the table has no room for another; returns the
     /// limit to restore. nextest runs each test in its own process.
     fn starve_descriptors() -> rustix::process::Rlimit {
-        use std::os::fd::AsRawFd as _;
         let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
         let probe = std::fs::File::open("/dev/null").unwrap();
         let lowest = u64::try_from(probe.as_raw_fd()).unwrap();
@@ -2780,6 +2774,7 @@ mod tests {
 
     #[tokio::test]
     async fn sessions_are_refused_with_codes_and_closed_on_shutdown() {
+        let (logs, _guard) = Logs::capture();
         let mut h = start();
         h.next().await;
         // Before the sockets: nothing to send on.
@@ -2863,6 +2858,12 @@ mod tests {
             ended(h.worker).await.unwrap().unwrap(),
             ExitReason::Shutdown
         );
+        // The router's counters, at trace level with every push.
+        let counters = logs.lines(Level::TRACE, "session router counters");
+        assert_eq!(
+            counters[0].fields,
+            " sessions=0 unroutable=0 dropped=0 send_failures=0 relay_unbound=0"
+        );
     }
 
     #[tokio::test]
@@ -2903,9 +2904,7 @@ mod tests {
             h.next().await,
             ToSupervisor::SourceState(SourceState::Connecting { attempt: 1 })
         );
-        let ToSupervisor::Tracks(tracks) = h.next().await else {
-            panic!("tracks expected before live");
-        };
+        let_assert!(ToSupervisor::Tracks(tracks) = h.next().await);
         assert_eq!(h.next().await, ToSupervisor::SourceState(SourceState::Live));
         assert_eq!(tracks.len(), 1);
         assert_eq!(
@@ -2919,9 +2918,7 @@ mod tests {
         assert_eq!(tracks[0].sync, "arrival");
 
         h.clock.advance(STATS_INTERVAL);
-        let ToSupervisor::Stats(stats) = h.next().await else {
-            panic!("stats expected");
-        };
+        let_assert!(ToSupervisor::Stats(stats) = h.next().await);
         assert_eq!(stats.tracks.len(), 1);
         assert_eq!(stats.tracks[0].0, "v0");
         assert_eq!(stats.sessions, 0);
@@ -3050,9 +3047,7 @@ mod tests {
                 .await
                 .unwrap();
             let err = within(h.worker).await.unwrap().unwrap_err();
-            let Error::SourceRejected { code: got, .. } = err else {
-                panic!("{url}: {err}");
-            };
+            let_assert!(Error::SourceRejected { code: got, .. } = err);
             assert_eq!(got, code, "{url}");
         }
         let mut h = start();
@@ -3067,6 +3062,330 @@ mod tests {
             within(h.worker).await.unwrap().unwrap_err(),
             Error::SecondSource
         ));
+        // A standby is checked as a source is.
+        let mut h = start();
+        h.next().await;
+        h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "null")), &[])
+            .await
+            .unwrap();
+        h.tx.send_msg(&ToWorker::SwitchSource(spec("rtsp://cam/", "null")), &[])
+            .await
+            .unwrap();
+        let err = within(h.worker).await.unwrap().unwrap_err();
+        let_assert!(Error::SourceRejected { code: got, .. } = err);
+        assert_eq!(got, "scheme_unsupported");
+    }
+
+    /// The worker process: the control channel on stdin, a runtime of its
+    /// own, served until the supervisor says stop.
+    #[test]
+    fn run_serves_the_channel_on_stdin_until_shutdown() {
+        // Standard input that is no socket: no channel, no worker.
+        let dev_null = std::fs::File::open("/dev/null").unwrap();
+        rustix::stdio::dup2_stdin(&dev_null).unwrap();
+        let err = run(&settings(), Registries::default(), None).unwrap_err();
+        assert!(matches!(err, Error::Stdin(_)), "{err}");
+        let supervisor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (ours, theirs) = supervisor.block_on(async { Channel::pair().unwrap() });
+        rustix::stdio::dup2_stdin(&theirs).unwrap();
+        drop(theirs);
+        let worker = std::thread::spawn(|| run(&settings(), Registries::default(), None));
+        supervisor.block_on(async {
+            let (mut tx, mut rx) = ours.split();
+            let (ready, _) = rx.recv_msg::<ToSupervisor>().await.unwrap().unwrap();
+            assert_eq!(
+                ready,
+                ToSupervisor::Ready {
+                    pid: std::process::id()
+                }
+            );
+            tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1_000 }, &[])
+                .await
+                .unwrap();
+        });
+        assert_eq!(worker.join().unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
+    /// The worker's state between messages, as `serve` sets it up, with no
+    /// source, standby or sessions; and the supervisor's end.
+    fn serving(settings: &Settings) -> (Serving<'_>, Receiver) {
+        let (ours, theirs) = Channel::pair().unwrap();
+        let (tx, _) = Channel::from_fd(theirs).unwrap().split();
+        let (runner_tx, runner_rx) = mpsc::channel(64);
+        let (standby_tx, standby_rx) = mpsc::channel(64);
+        let serving = Serving {
+            tx,
+            registries: registries(),
+            clock: Arc::new(FakeClock::default()),
+            settings,
+            runner_tx,
+            runner_rx,
+            standby_tx,
+            standby_rx,
+            session_tx: mpsc::channel(1).0,
+            running: None,
+            standby: None,
+            sessions: None,
+            lost_hand_offs: Throttle::default(),
+        };
+        (serving, ours.split().1)
+    }
+
+    /// The tracks switching with no standby to take them, or no source
+    /// left to hand over, is logged and changes nothing.
+    #[tokio::test]
+    async fn a_switch_without_a_standby_or_a_source_is_ignored() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, _rx) = serving(&settings);
+        serving.on_switched(1).await.unwrap();
+        assert_eq!(
+            logs.count(Level::WARN, "tracks switched without a standby; ignored"),
+            1
+        );
+        let staging =
+            TrackSet::staging(&TrackSet::new(TrackLimits::default(), serving.clock.now()));
+        let runner = start_runner(
+            &spec("fake://cam/", "null"),
+            &serving.registries,
+            &serving.clock,
+            &settings,
+            serving.standby_tx.clone(),
+            Arc::clone(&staging),
+            "standby",
+        )
+        .unwrap();
+        serving.standby = Some(Standby { runner, staging });
+        serving.on_switched(1).await.unwrap();
+        assert!(serving.standby.is_none() && serving.running.is_none());
+        assert_eq!(
+            logs.count(
+                Level::INFO,
+                "tracks switched to the standby; stopping the old source"
+            ),
+            0
+        );
+    }
+
+    /// A shared socket the worker cannot move to the number its filter
+    /// names: no session manager, and sessions are refused.
+    #[tokio::test]
+    async fn sockets_the_session_manager_cannot_take_refuse_the_sessions() {
+        let (logs, _guard) = Logs::capture();
+        let (_kept, taken) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let mut settings = settings();
+        settings.shared_udp_fd = Some(taken.as_raw_fd());
+        let mut h = start_with_settings(registries(), settings);
+        h.next().await;
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (_ours, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
+        h.tx.send_msg(
+            &ToWorker::Sockets,
+            &[OwnedFd::from(udp).as_fd(), theirs.as_fd()],
+        )
+        .await
+        .unwrap();
+        h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "null")), &[])
+            .await
+            .unwrap();
+        h.tx.send_msg(&ToWorker::OpenSession(session_spec("s")), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            h.next_closed().await,
+            ("s".to_owned(), "internal_error".to_owned())
+        );
+        assert_eq!(
+            logs.count(
+                Level::ERROR,
+                "session manager not started; sessions refused"
+            ),
+            1
+        );
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            ended(h.worker).await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+    }
+
+    /// A source that goes live with one video track, then ignores its
+    /// cancel until `released`, as a camera library stuck in a call does;
+    /// it tells `cancelled` when its cancel came and when it returned.
+    #[derive(Debug)]
+    struct StubbornSource {
+        url: SourceUrl,
+        cancelled: Arc<Notify>,
+        released: Arc<Notify>,
+    }
+
+    impl Source for StubbornSource {
+        fn describe(&self) -> SourceDescriptor {
+            SourceDescriptor {
+                protocol: "stubborn",
+                url: self.url.clone(),
+                options: serde_json::Value::Null,
+            }
+        }
+
+        fn connection_options(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+            let cancelled = Arc::clone(&self.cancelled);
+            let released = Arc::clone(&self.released);
+            Box::pin(async move {
+                let h264 = Codec::H264 {
+                    profile_level_id: None,
+                    sps: None,
+                    pps: None,
+                };
+                ctx.tracks.declare(Kind::Video, h264, 90_000);
+                ctx.tracks.ready();
+                ctx.cancel.cancelled().await;
+                cancelled.notify_one();
+                released.notified().await;
+                cancelled.notify_one();
+                SourceExit::Ended(SourceError::Ended("released".into()))
+            })
+        }
+    }
+
+    /// The factory of `stubborn://` sources, which share one `cancelled`
+    /// and one `released`.
+    #[derive(Debug, Default)]
+    struct Stubborn {
+        cancelled: Arc<Notify>,
+        released: Arc<Notify>,
+    }
+
+    impl SourceFactory for Stubborn {
+        fn schemes(&self) -> &'static [&'static str] {
+            &["stubborn"]
+        }
+
+        fn capabilities(&self) -> SourceCapabilities {
+            FakeSourceFactory::new(&["stubborn"]).capabilities()
+        }
+
+        fn validate(
+            &self,
+            url: &SourceUrl,
+            _options: &serde_json::Value,
+        ) -> Result<Box<dyn Source>, SourceConfigError> {
+            Ok(Box::new(StubbornSource {
+                url: url.clone(),
+                cancelled: Arc::clone(&self.cancelled),
+                released: Arc::clone(&self.released),
+            }))
+        }
+    }
+
+    /// A worker with the fake and the stubborn sources whose runners
+    /// never give up on a source that ignores its cancel; and the
+    /// stubborn sources' `cancelled` and `released`.
+    fn stubborn_worker() -> (Harness, Arc<Notify>, Arc<Notify>) {
+        let stubborn = Stubborn::default();
+        let cancelled = Arc::clone(&stubborn.cancelled);
+        let released = Arc::clone(&stubborn.released);
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::new(&["fake"])))
+            .unwrap();
+        registries.sources.register(Arc::new(stubborn)).unwrap();
+        let mut settings = quiet_settings();
+        settings.runner.stop_grace = Duration::from_hours(24);
+        (
+            start_with_settings(Arc::new(registries), settings),
+            cancelled,
+            released,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_standby_that_ignores_its_cancel_is_aborted_after_the_grace() {
+        let (logs, _guard) = Logs::capture();
+        let (mut h, cancelled, _released) = stubborn_worker();
+        h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "null")), &[])
+            .await
+            .unwrap();
+        until_live(&mut h).await;
+        h.tx.send_msg(
+            &ToWorker::SwitchSource(spec("stubborn://cam2/", "null")),
+            &[],
+        )
+        .await
+        .unwrap();
+        let live = ToSupervisor::SwitchState(SourceState::Live);
+        next_where(&mut h, &|m| *m == live).await;
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1_000 }, &[])
+            .await
+            .unwrap();
+        // The standby heard its cancel after the worker began to wait.
+        cancelled.notified().await;
+        assert_eq!(
+            logs.count(
+                Level::WARN,
+                "the replaced source did not stop in time; aborted"
+            ),
+            0
+        );
+        h.clock.advance(SWITCH_STOP_GRACE);
+        let stopped = ToSupervisor::SourceState(SourceState::Stopped);
+        next_where(&mut h, &|m| *m == stopped).await;
+        assert_eq!(
+            ended(h.worker).await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "the replaced source did not stop in time; aborted"
+            )[0]
+            .fields,
+            " grace_ms=1000"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_that_ignores_its_cancel_fails_the_shutdown_at_its_deadline() {
+        let (mut h, cancelled, released) = stubborn_worker();
+        h.tx.send_msg(&ToWorker::RunSource(spec("stubborn://cam/", "null")), &[])
+            .await
+            .unwrap();
+        until_live(&mut h).await;
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 100 }, &[])
+            .await
+            .unwrap();
+        cancelled.notified().await;
+        h.clock.advance(Duration::from_millis(99));
+        tokio::task::yield_now().await;
+        assert!(!h.worker.is_finished());
+        h.clock.advance(Duration::from_millis(1));
+        let err = ended(h.worker).await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::ShutdownTimeout(100)), "{err}");
+        // Let go at last, the source returns to its runner.
+        released.notify_one();
+        cancelled.notified().await;
+        assert!(!Stubborn::default().capabilities().backchannel);
+        // What a runner reads of its source, never of this one.
+        let source = Stubborn::default()
+            .validate(
+                &SourceUrl::parse("stubborn://cam/").unwrap(),
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        assert_eq!(
+            (source.describe().protocol, source.connection_options()),
+            ("stubborn", serde_json::Value::Null)
+        );
     }
 
     #[test]

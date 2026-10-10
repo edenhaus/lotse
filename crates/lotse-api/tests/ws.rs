@@ -122,8 +122,9 @@ impl Handler for FakeHandler {
             }
             Command::Info(_) => Outcome::Result(json!({ "version": "0.0.0-test" })),
             Command::StreamList(_) => Outcome::Result(json!({ "streams": {} })),
+            // A result over the whole outbound budget.
+            Command::MetricsGet(_) => Outcome::Result(json!({ "pad": "x".repeat(2 << 20) })),
             Command::StreamDelete(_)
-            | Command::MetricsGet(_)
             | Command::WebrtcCandidate(_)
             | Command::SessionGet(_)
             | Command::SessionList(_)
@@ -274,6 +275,26 @@ impl std::io::Write for Captured {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+impl Captured {
+    /// Everything logged so far.
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+/// Captures this thread's log lines at `level` and above, field values
+/// included, until the guard is dropped.
+fn capture(level: tracing::Level) -> (Captured, tracing::subscriber::DefaultGuard) {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(level)
+        .with_ansi(false)
+        .finish();
+    (captured, tracing::subscriber::set_default(subscriber))
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -473,6 +494,7 @@ async fn unsubscribing_a_session_sends_its_closed_event_before_the_result() {
 
 #[tokio::test]
 async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
+    let (logs, _guard) = capture(tracing::Level::WARN);
     let running = start_limited("subscription-cap", FakeHandler::default(), 8, 2);
     let mut ws = connect(&running.socket).await;
     recv(&mut ws).await;
@@ -505,6 +527,17 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
     }
     assert_eq!(running.handler.subscribers.lock().unwrap().len(), 1);
     assert_eq!(running.handler.sessions.lock().unwrap().len(), 1);
+    let refusals: Vec<String> = logs
+        .text()
+        .lines()
+        .filter(|line| line.contains("subscription limit of the connection reached"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(refusals.len(), 3, "{refusals:?}");
+    assert!(
+        refusals[2].contains("id=5") && refusals[2].contains("session/adopt"),
+        "{refusals:?}"
+    );
     // Other commands are not affected.
     send(&mut ws, json!({ "id": 6, "type": "info" })).await;
     assert_eq!(recv(&mut ws).await["result"]["version"], "0.0.0-test");
@@ -646,6 +679,7 @@ async fn a_client_that_cannot_keep_up_is_disconnected_with_1008() {
 
 #[tokio::test]
 async fn rfc6455_s7_1_1_a_peer_that_never_reads_is_dropped_at_the_close_deadline() {
+    let (logs, _guard) = capture(tracing::Level::WARN);
     let flood = Arc::new(Notify::new());
     let handler = FakeHandler {
         flood: Some(Arc::clone(&flood)),
@@ -683,11 +717,75 @@ async fn rfc6455_s7_1_1_a_peer_that_never_reads_is_dropped_at_the_close_deadline
         "dropped without the close frame: {ended}"
     );
     assert!(frames < 2049, "not every event: {frames}");
+    let dropped = logs.text();
+    let dropped = dropped
+        .lines()
+        .find(|line| line.contains("did not take the close frame before the deadline"))
+        .unwrap_or_else(|| panic!("no deadline line in {dropped}"));
+    assert!(dropped.contains("overflow"), "{dropped}");
+    assert!(dropped.contains("queued_bytes="), "{dropped}");
 
     // The connection that took the slot is unaffected.
     send(&mut next, json!({ "id": 1, "type": "ping" })).await;
     assert_eq!(recv(&mut next).await, json!({ "id": 1, "type": "pong" }));
     next.close(None).await.unwrap();
+    running.finish().await;
+}
+
+#[tokio::test]
+async fn a_peer_gone_while_a_frame_is_written_ends_the_writer() {
+    let (logs, _guard) = capture(tracing::Level::DEBUG);
+    let flood = Arc::new(Notify::new());
+    let handler = FakeHandler {
+        flood: Some(Arc::clone(&flood)),
+        ..FakeHandler::default()
+    };
+    let running = start("gone", handler, 8);
+    let mut gone = connect(&running.socket).await;
+    send(&mut gone, json!({ "id": 1, "type": "stream/subscribe" })).await;
+    // Nothing is read: the writer waits on a full socket in a text frame,
+    // which fails once the peer is gone.
+    flood.notified().await;
+    drop(gone);
+    within_5_s(async {
+        while !logs.text().contains("control connection write failed") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    running.finish().await;
+}
+
+#[tokio::test]
+async fn a_result_over_the_outbound_budget_disconnects_with_1008() {
+    let running = start("huge-result", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    send(&mut ws, json!({ "id": 1, "type": "metrics/get" })).await;
+    assert_eq!(recv(&mut ws).await, json!({ "closed": 1008 }));
+    running.finish().await;
+}
+
+#[tokio::test]
+async fn rfc6455_s5_5_pings_change_nothing_and_a_close_frame_ends_the_connection() {
+    let running = start("peer-close", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    // §5.5.2: the WebSocket layer answers the ping; `recv` skips the pong.
+    ws.send(Message::Ping(vec![1].into())).await.unwrap();
+    ws.send(Message::Pong(vec![2].into())).await.unwrap();
+    send(&mut ws, json!({ "id": 1, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await, json!({ "id": 1, "type": "pong" }));
+    // §5.5.1: the peer's close frame ends the connection.
+    ws.send(Message::Close(None)).await.unwrap();
+    let ended = recv(&mut ws).await;
+    assert!(ended.get("closed").is_some(), "{ended}");
+    within_5_s(async {
+        while running.handler.closed.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
     running.finish().await;
 }
 

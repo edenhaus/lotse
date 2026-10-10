@@ -650,16 +650,12 @@ mod tests {
     use clap::{CommandFactory as _, FromArgMatches as _};
 
     use super::*;
-    use crate::cli::{Cli, Command};
+    use crate::cli::Cli;
 
     fn resolve(command_line: &[&str]) -> Result<(Settings, Vec<Provenance>), ConfigError> {
         let matches = Cli::command().try_get_matches_from(command_line).unwrap();
-        let cli = Cli::from_arg_matches(&matches).unwrap();
-        let Command::Serve(args) = cli.command else {
-            panic!("serve expected");
-        };
         let serve = matches.subcommand_matches("serve").unwrap();
-        load(&args, serve)
+        load(&ServeArgs::from_arg_matches(serve).unwrap(), serve)
     }
 
     fn source_of(provenance: &[Provenance], name: &str) -> (String, Source) {
@@ -923,8 +919,8 @@ mod tests {
         let line = warned
             .lines()
             .find(|line| line.contains("RUST_LOG is not a filter directive"))
-            .unwrap_or_else(|| panic!("no warning in {warned}"));
-        assert!(line.contains("WARN"), "{line}");
+            .unwrap_or_default();
+        assert!(line.contains("WARN"), "no warning in {warned}");
         assert!(line.contains("value=lotse=loudest"), "{line}");
         assert!(line.contains("reason=bad level"), "{line}");
         assert!(line.contains("log_level=warn"), "{line}");

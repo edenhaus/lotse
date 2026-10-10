@@ -25,6 +25,7 @@ seccompiler = { workspace = true }
 [dev-dependencies]
 rustix = { workspace = true, features = ["net"] } # the probe child's calls on the shared socket
 serde_json = { workspace = true } # the report's JSON shape, and the probe child's output
+tracing-subscriber = { workspace = true } # captures the `applying sandbox` and `sandbox applied` log lines
 
 [lints]
 workspace = true

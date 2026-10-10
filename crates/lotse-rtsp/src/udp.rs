@@ -212,6 +212,12 @@ fn punch(sockets: [&StdUdpSocket; 2], source: IpAddr, ports: Option<(u16, u16)>)
     }
 }
 
+/// A pair's sockets joined to the runtime: the `media` (RTP) one, then
+/// the `control` (RTCP) one.
+fn registered(media: StdUdpSocket, control: StdUdpSocket) -> io::Result<(UdpSocket, UdpSocket)> {
+    Ok((UdpSocket::from_std(media)?, UdpSocket::from_std(control)?))
+}
+
 /// No pair could be bound: the attempt fails like an unreachable camera
 /// and backs off.
 fn no_pair(err: &io::Error) -> SourceError {
@@ -483,6 +489,9 @@ pub(crate) struct UdpRelay {
     /// The camera's address: where its media comes from unless its answer
     /// names a `source`.
     camera: IpAddr,
+    /// Where the pairs listen: the wildcard address of the camera's
+    /// family; a test seam for a pair that cannot be bound.
+    pairs_on: IpAddr,
     /// retina's requests.
     retina: Framer,
     /// The camera's responses.
@@ -531,6 +540,7 @@ impl UdpRelay {
     ) -> Self {
         Self {
             camera,
+            pairs_on: wildcard(camera),
             retina: Framer::default(),
             from_camera: Framer::default(),
             setup: None,
@@ -655,7 +665,7 @@ impl UdpRelay {
     ) -> Result<(), SourceError> {
         let channel = interleaved_channel(headers.get("Transport").map_or("", |value| value));
         let (media, control, client_port) =
-            listening_pair(wildcard(self.camera)).map_err(|err| no_pair(&err))?;
+            listening_pair(self.pairs_on).map_err(|err| no_pair(&err))?;
         let transport = format!(
             "RTP/AVP/UDP;unicast;client_port={client_port}-{}",
             client_port | 1
@@ -867,10 +877,11 @@ impl UdpRelay {
             "rtsp udp: media over UDP"
         );
         punch([&setup.rtp, &setup.rtcp], source, ports);
+        let (media, control) = registered(setup.rtp, setup.rtcp).map_err(|err| no_pair(&err))?;
         let pair = Pair {
             channel,
-            rtp: UdpSocket::from_std(setup.rtp).map_err(|err| no_pair(&err))?,
-            rtcp: UdpSocket::from_std(setup.rtcp).map_err(|err| no_pair(&err))?,
+            rtp: media,
+            rtcp: control,
             source,
             ports,
             gate: Gate::default(),
@@ -1150,40 +1161,45 @@ mod tests {
         Ok(first)
     }
 
+    /// Candidates for [`pair_among`] on loopback: the first `blocked` ones
+    /// with their neighbor taken (bound into `held`), then any; each one's
+    /// port goes to `tried`. One closure type for every test, so one
+    /// instance of [`pair_among`] serves them all.
+    fn candidates<'a>(
+        blocked: usize,
+        held: &'a mut Vec<StdUdpSocket>,
+        tried: &'a mut Vec<u16>,
+    ) -> impl FnMut() -> io::Result<StdUdpSocket> + 'a {
+        move || {
+            let first = if tried.len() < blocked {
+                blocked_candidate(held)?
+            } else {
+                StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?
+            };
+            tried.push(first.local_addr()?.port());
+            Ok(first)
+        }
+    }
+
     #[test]
     fn rfc3550_11_a_taken_neighbor_moves_the_pair_to_another_candidate() {
         traced();
-        let mut held = Vec::new();
-        let mut blocked = Vec::new();
-        let (media, control) = pair_among(|| {
-            if blocked.is_empty() {
-                let first = blocked_candidate(&mut held)?;
-                blocked.push(first.local_addr()?.port());
-                Ok(first)
-            } else {
-                StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            }
-        })
-        .expect("another candidate completes a pair");
+        let (mut held, mut tried) = (Vec::new(), Vec::new());
+        let (media, control) = pair_among(candidates(1, &mut held, &mut tried))
+            .expect("another candidate completes a pair");
         let (even, odd) = (
             media.local_addr().unwrap().port(),
             control.local_addr().unwrap().port(),
         );
         assert_eq!((even % 2, odd), (0, even + 1));
-        assert_ne!(even / 2, blocked[0] / 2, "not the blocked candidate's pair");
+        assert_ne!(even / 2, tried[0] / 2, "not the blocked candidate's pair");
     }
 
     #[test]
     fn rfc3550_11_a_pair_takes_its_last_try_then_gives_up_and_a_failed_bind_at_once() {
         traced();
-        let mut held = Vec::new();
-        let mut ports = Vec::new();
-        let err = pair_among(|| {
-            let first = blocked_candidate(&mut held)?;
-            ports.push(first.local_addr()?.port());
-            Ok(first)
-        })
-        .unwrap_err();
+        let (mut held, mut ports) = (Vec::new(), Vec::new());
+        let err = pair_among(candidates(PAIR_TRIES, &mut held, &mut ports)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
         assert_eq!(ports.len(), PAIR_TRIES);
         // The candidates tried stay bound until the end: each try a new port.
@@ -1191,17 +1207,10 @@ mod tests {
         ports.dedup();
         assert_eq!(ports.len(), PAIR_TRIES);
         // The last try may still complete a pair.
-        let mut tries = 0;
-        let (media, _control) = pair_among(|| {
-            tries += 1;
-            if tries < PAIR_TRIES {
-                blocked_candidate(&mut held)
-            } else {
-                StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            }
-        })
-        .expect("the last candidate's pair");
-        assert_eq!(tries, PAIR_TRIES);
+        let mut tries = Vec::new();
+        let (media, _control) = pair_among(candidates(PAIR_TRIES - 1, &mut held, &mut tries))
+            .expect("the last candidate's pair");
+        assert_eq!(tries.len(), PAIR_TRIES);
         assert!(media.local_addr().unwrap().port().is_multiple_of(2));
         let mut calls = 0;
         let err = pair_among(|| {
@@ -1984,5 +1993,71 @@ mod tests {
             _ = relay.recv(0, &mut buf) => panic!("no pairs, no datagrams"),
             () = SystemClock.sleep(Duration::from_millis(20)) => {}
         }
+    }
+
+    #[test]
+    fn a_pair_that_cannot_be_bound_fails_the_setup_as_unreachable() {
+        let (mut relay, _ingest) = new_relay();
+        // TEST-NET-1 (RFC 5737 §3): no host has it, nothing binds there.
+        relay.pairs_on = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let mut out = Vec::new();
+        relay.camera_sent(DESCRIBED, &mut out).unwrap();
+        let err = relay.retina_wrote(SETUP, &mut out).unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Unreachable(m) if m.starts_with("rtsp udp: no RTP/RTCP port pair")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_pair_the_runtime_cannot_take_fails_the_answer_as_unreachable() {
+        let (mut relay, _ingest) = new_relay();
+        let mut out = Vec::new();
+        relay.camera_sent(DESCRIBED, &mut out).unwrap();
+        out.clear();
+        relay.retina_wrote(SETUP, &mut out).unwrap();
+        let port = client_port(&out);
+        // A runtime that is shut down registers no socket.
+        let gone = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let handle = gone.handle().clone();
+        drop(gone);
+        let _inside = handle.enter();
+        let transport = format!("RTP/AVP;unicast;client_port={port}-{}", port + 1);
+        let err = relay
+            .camera_sent(&answer(&transport), &mut out)
+            .unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Unreachable(m) if m.starts_with("rtsp udp: no RTP/RTCP port pair")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rfc3550_a_1_every_duplicate_is_counted_and_logged_once_per_interval() {
+        use lotse_core::clock::FakeClock;
+
+        let clock = Arc::new(FakeClock::from_system());
+        let mut relay = reporting_relay(&clock);
+        let (media, _control, server_port) =
+            listening_pair(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        relay
+            .camera_sent(
+                &answer(&format!(
+                    "RTP/AVP;unicast;server_port={server_port}-{}",
+                    server_port + 1
+                )),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let from = media.local_addr().unwrap();
+        // The second duplicate comes within the first one's interval: its
+        // line is held for the summary.
+        for seq in [1, 2, 2, 2] {
+            heard(&mut relay, from, false, &rtp(seq, 9));
+        }
+        assert_eq!(relay.ingest.snapshot().packets_out_of_order, 2);
     }
 }

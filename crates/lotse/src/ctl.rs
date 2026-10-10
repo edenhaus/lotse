@@ -228,10 +228,8 @@ fn print(value: &Value, compact: bool) {
     if compact {
         println!("{value}");
     } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-        );
+        // The alternate form is serde_json's pretty printer.
+        println!("{value:#}");
     }
 }
 
@@ -467,20 +465,20 @@ mod tests {
     #[test]
     fn subcommands_map_onto_command_frames() {
         assert_eq!(
-            command_of(&CtlCommand::Info, std::io::empty()).unwrap(),
+            command_of(&CtlCommand::Info, b"".as_slice()).unwrap(),
             json!({ "type": "info" })
         );
         assert_eq!(
-            command_of(&CtlCommand::Metrics, std::io::empty()).unwrap(),
+            command_of(&CtlCommand::Metrics, b"".as_slice()).unwrap(),
             json!({ "type": "metrics/get" })
         );
         assert_eq!(
-            command_of(&CtlCommand::Schema, std::io::empty()).unwrap(),
+            command_of(&CtlCommand::Schema, b"".as_slice()).unwrap(),
             json!({ "type": "schema" })
         );
         let stream = |command| CtlCommand::Stream { command };
         assert_eq!(
-            command_of(&stream(StreamCommand::List), std::io::empty()).unwrap(),
+            command_of(&stream(StreamCommand::List), b"".as_slice()).unwrap(),
             json!({ "type": "stream/list" })
         );
         assert_eq!(
@@ -488,7 +486,7 @@ mod tests {
                 &stream(StreamCommand::Get {
                     stream_id: "front".into()
                 }),
-                std::io::empty()
+                b"".as_slice()
             )
             .unwrap(),
             json!({ "type": "stream/get", "stream_id": "front" })
@@ -498,7 +496,7 @@ mod tests {
                 &stream(StreamCommand::Delete {
                     stream_id: "front".into()
                 }),
-                std::io::empty()
+                b"".as_slice()
             )
             .unwrap(),
             json!({ "type": "stream/delete", "stream_id": "front" })
@@ -514,22 +512,18 @@ mod tests {
             })
         };
         assert_eq!(
-            command_of(
-                &put(Some(r#"{"transport":"tcp"}"#), "off"),
-                std::io::empty()
-            )
-            .unwrap(),
+            command_of(&put(Some(r#"{"transport":"tcp"}"#), "off"), b"".as_slice()).unwrap(),
             json!({ "type": "stream/put", "stream_id": "front", "preload": true, "audio": "off",
                     "sources": [ { "url": "rtsp://cam/a", "options": { "transport": "tcp" } },
                                  { "url": "rtsp://cam/b", "options": { "transport": "tcp" } } ] })
         );
         assert_eq!(
-            command_of(&put(None, "auto"), std::io::empty()).unwrap()["sources"][0]["options"],
+            command_of(&put(None, "auto"), b"".as_slice()).unwrap()["sources"][0]["options"],
             json!({})
         );
-        let err = command_of(&put(None, "loud"), std::io::empty()).unwrap_err();
+        let err = command_of(&put(None, "loud"), b"".as_slice()).unwrap_err();
         assert!(err.to_string().contains("--audio"), "{err}");
-        let err = command_of(&put(Some("[]"), "auto"), std::io::empty()).unwrap_err();
+        let err = command_of(&put(Some("[]"), "auto"), b"".as_slice()).unwrap_err();
         assert!(err.to_string().contains("--options"), "{err}");
         assert!(
             command_of(
@@ -537,11 +531,11 @@ mod tests {
                     stream_id: None,
                     limit: None
                 }),
-                std::io::empty()
+                b"".as_slice()
             )
             .is_err()
         );
-        assert!(command_of(&CtlCommand::Raw { json: "{}".into() }, std::io::empty()).is_err());
+        assert!(command_of(&CtlCommand::Raw { json: "{}".into() }, b"".as_slice()).is_err());
     }
 
     #[test]
@@ -580,13 +574,13 @@ mod tests {
         );
         // No URL in the file is an error naming it and nothing it holds.
         std::fs::write(&file, " \n\n").unwrap();
-        let err = command_of(&put(path), std::io::empty()).unwrap_err();
+        let err = command_of(&put(path), b"".as_slice()).unwrap_err();
         assert_eq!(err.to_string(), format!("{path} holds no source URL"));
-        let err = command_of(&put("-"), std::io::empty()).unwrap_err();
+        let err = command_of(&put("-"), b"".as_slice()).unwrap_err();
         assert_eq!(err.to_string(), "stdin holds no source URL");
         let missing = dir.join("missing");
         let missing = missing.to_str().unwrap();
-        let err = command_of(&put(missing), std::io::empty()).unwrap_err();
+        let err = command_of(&put(missing), b"".as_slice()).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!("reading the source URLs from {missing}")
@@ -608,5 +602,319 @@ mod tests {
         assert_eq!(report(&pong, true), ExitCode::SUCCESS);
         assert_eq!(kind(&pong), Some("pong"));
         assert_eq!(id_of(&pong), Some(1));
+    }
+
+    /// One step of a scripted daemon.
+    enum Step {
+        /// Read the client's next frame, a command, and keep it.
+        Read,
+        /// Send this frame.
+        Send(Message),
+        /// Drop the connection without a closing handshake.
+        Drop,
+    }
+
+    /// A text frame of `value`.
+    fn text(value: &Value) -> Step {
+        Step::Send(Message::text(value.to_string()))
+    }
+
+    /// A daemon that accepts one connection on `listener` and upgrades it,
+    /// sends `hello` when `greet` and plays `script`; unless that ends in
+    /// [`Step::Drop`], it then reads on until the client is gone, so the
+    /// client answers a ping or reads to the end without a broken pipe.
+    /// Returns the commands it read.
+    async fn daemon(
+        listener: tokio::net::UnixListener,
+        greet: bool,
+        script: Vec<Step>,
+    ) -> Vec<Value> {
+        let (stream, _addr) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        if greet {
+            let hello = json!({ "type": "hello", "api": API_VERSION, "version": "0" });
+            ws.send(Message::text(hello.to_string())).await.unwrap();
+        }
+        let mut read = Vec::new();
+        for step in script {
+            match step {
+                Step::Read => {
+                    let frame = ws.next().await.unwrap().unwrap();
+                    read.push(serde_json::from_str(frame.to_text().unwrap()).unwrap());
+                }
+                Step::Send(message) => {
+                    // The client may be gone already, as after `--limit`.
+                    let _client_gone = ws.send(message).await;
+                }
+                Step::Drop => return read,
+            }
+        }
+        while let Some(Ok(_frame)) = ws.next().await {}
+        read
+    }
+
+    /// Runs `client` against a [`daemon`] playing `script` on a fresh
+    /// socket; returns what the client returned and the commands the daemon
+    /// read.
+    async fn against<T>(
+        test: &str,
+        greet: bool,
+        script: Vec<Step>,
+        client: impl AsyncFnOnce(&Path) -> T,
+    ) -> (T, Vec<Value>) {
+        let dir = std::env::temp_dir().join(format!("lotse-ctl-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("lotse.sock");
+        let _stale = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (out, read) = tokio::join!(client(&socket), daemon(listener, greet, script));
+        std::fs::remove_dir_all(&dir).unwrap();
+        (out, read)
+    }
+
+    /// Connects and runs `command` through [`Client::call`].
+    async fn call(socket: &Path, command: Value) -> anyhow::Result<Value> {
+        Client::connect(socket).await?.call(command).await
+    }
+
+    #[tokio::test]
+    async fn call_numbers_the_command_and_skips_everything_but_its_result() {
+        let script = vec![
+            Step::Read,
+            Step::Send(Message::Ping(b"ping".to_vec().into())),
+            Step::Send(Message::Binary(b"binary".to_vec().into())),
+            text(&json!({ "type": "event", "id": 1, "event": {} })),
+            text(&json!({ "type": "result", "id": 2, "success": true })),
+            text(&json!({ "type": "result", "id": 1, "success": true, "result": {} })),
+        ];
+        let (frame, read) = against("call", true, script, async |socket| {
+            call(socket, json!({ "type": "stream/list" }))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(
+            frame,
+            json!({ "type": "result", "id": 1, "success": true, "result": {} })
+        );
+        assert_eq!(read, [json!({ "type": "stream/list", "id": 1 })]);
+    }
+
+    #[tokio::test]
+    async fn call_fails_on_shutdown_close_a_dropped_connection_and_a_non_json_frame() {
+        let cases = [
+            (
+                text(&json!({ "type": "shutdown" })),
+                "the daemon is shutting down",
+            ),
+            (
+                Step::Send(Message::Close(None)),
+                "the daemon closed the connection before the result",
+            ),
+            (Step::Drop, "reading from the daemon"),
+            (
+                Step::Send(Message::text("not json")),
+                "the daemon sent a frame that is not JSON",
+            ),
+        ];
+        for (n, (last, expected)) in cases.into_iter().enumerate() {
+            let script = vec![Step::Read, last];
+            let (err, _read) = against(&format!("call-fails-{n}"), true, script, async |socket| {
+                call(socket, json!({ "type": "info" })).await.unwrap_err()
+            })
+            .await;
+            assert_eq!(err.to_string(), expected, "{err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_fails_without_an_upgrade_a_hello_or_a_compatible_api() {
+        // No upgrade: the listener closes the connection unanswered.
+        let dir = std::env::temp_dir().join(format!("lotse-ctl-no-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("lotse.sock");
+        let _stale = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (connected, ()) = tokio::join!(Client::connect(&socket), async {
+            drop(listener.accept().await.unwrap());
+        });
+        let err = connected.err().unwrap();
+        assert_eq!(err.to_string(), "websocket upgrade refused", "{err:#}");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let (err, _read) = against("no-hello", false, vec![Step::Drop], async |socket| {
+            Client::connect(socket).await.err().unwrap()
+        })
+        .await;
+        assert_eq!(err.to_string(), "reading from the daemon", "{err:#}");
+        let (err, _read) = against(
+            "closed-hello",
+            false,
+            vec![Step::Send(Message::Close(None))],
+            async |socket| Client::connect(socket).await.err().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            err.to_string(),
+            "the daemon closed the connection before hello"
+        );
+        let (err, _read) = against(
+            "old-hello",
+            false,
+            vec![text(&json!({ "type": "hello", "api": "9.0.0" }))],
+            async |socket| Client::connect(socket).await.err().unwrap(),
+        )
+        .await;
+        assert!(err.to_string().contains("the daemon speaks api"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn raw_keeps_a_given_id_and_prints_every_frame_up_to_its_result() {
+        let script = vec![
+            Step::Read,
+            text(&json!({ "type": "event", "id": 1, "event": {} })),
+            text(&json!({ "type": "pong", "id": 7 })),
+            Step::Read,
+            text(&json!({ "type": "result", "id": 8, "success": false, "error": {} })),
+            Step::Read,
+            text(&json!({ "type": "result", "id": 9, "success": true, "result": {} })),
+            Step::Read,
+            text(&json!({ "type": "shutdown" })),
+            // The last command, then the connection is dropped.
+            Step::Read,
+            Step::Drop,
+        ];
+        let (codes, read) = against("raw", true, script, async |socket| {
+            let mut client = Client::connect(socket).await.unwrap();
+            let mut codes = Vec::new();
+            for command in [
+                json!({ "type": "ping", "id": 7 }),
+                json!({ "type": "stream/get" }),
+                json!({ "type": "stream/list" }),
+                json!({ "type": "info" }),
+            ] {
+                codes.push(client.raw(command, true).await.unwrap());
+            }
+            let err = client.raw(json!([]), true).await.unwrap_err();
+            assert_eq!(err.to_string(), "a command is a JSON object");
+            let err = client
+                .raw(json!({ "type": "info" }), false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "reading from the daemon", "{err:#}");
+            codes
+        })
+        .await;
+        assert_eq!(
+            codes,
+            [
+                ExitCode::SUCCESS,
+                ExitCode::FAILURE,
+                ExitCode::SUCCESS,
+                ExitCode::FAILURE
+            ]
+        );
+        let ids: Vec<Option<u64>> = read.iter().map(id_of).collect();
+        assert_eq!(
+            ids,
+            [Some(7), Some(8), Some(9), Some(10), Some(11)],
+            "numbered on from a given id"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_fails_when_the_connection_closes_before_the_result() {
+        let script = vec![Step::Read, Step::Send(Message::Close(None))];
+        let (err, _read) = against("raw-closed", true, script, async |socket| {
+            let mut client = Client::connect(socket).await.unwrap();
+            client
+                .raw(json!({ "type": "info" }), true)
+                .await
+                .unwrap_err()
+        })
+        .await;
+        assert_eq!(
+            err.to_string(),
+            "the daemon closed the connection before the result"
+        );
+    }
+
+    /// `subscribe` against a daemon that answers its command with `result`
+    /// and then sends `then`; the exit code and the command it read.
+    async fn subscribe(
+        test: &str,
+        stream_id: Option<&str>,
+        limit: Option<u64>,
+        result: Value,
+        then: Vec<Step>,
+    ) -> (anyhow::Result<ExitCode>, Value) {
+        let mut script = vec![
+            Step::Read,
+            text(&json!({ "type": "event", "id": 1, "event": {} })),
+            text(&result),
+        ];
+        script.extend(then);
+        let (code, read) = against(test, true, script, async |socket| {
+            Client::connect(socket)
+                .await
+                .unwrap()
+                .subscribe(stream_id, limit)
+                .await
+        })
+        .await;
+        (code, read.into_iter().next().unwrap())
+    }
+
+    #[tokio::test]
+    async fn subscribe_prints_its_events_until_the_limit_a_close_or_shutdown() {
+        let ok = json!({ "type": "result", "id": 1, "success": true, "result": {} });
+        let events = || {
+            vec![
+                text(&json!({ "type": "event", "id": 1, "event": { "n": 1 } })),
+                text(&json!({ "type": "event", "id": 2, "event": { "n": 0 } })),
+                text(&json!({ "type": "pong", "id": 1 })),
+                text(&json!({ "type": "event", "id": 1, "event": { "n": 2 } })),
+            ]
+        };
+        let (code, command) =
+            subscribe("sub-limit", Some("front"), Some(2), ok.clone(), events()).await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            command,
+            json!({ "type": "stream/subscribe", "stream_id": "front", "id": 1 })
+        );
+        let mut closed = events();
+        closed.push(Step::Send(Message::Close(None)));
+        let (code, command) = subscribe("sub-close", None, None, ok.clone(), closed).await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(command, json!({ "type": "stream/subscribe", "id": 1 }));
+        let mut shutdown = events();
+        shutdown.push(text(&json!({ "type": "shutdown" })));
+        let (code, _command) = subscribe("sub-shutdown", None, None, ok, shutdown).await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn subscribe_reports_a_failed_result_and_fails_without_one() {
+        let failed = json!({ "type": "result", "id": 1, "success": false, "error": {} });
+        let (code, _command) = subscribe("sub-failed", None, None, failed, Vec::new()).await;
+        assert_eq!(code.unwrap(), ExitCode::FAILURE);
+        let shutdown = json!({ "type": "shutdown" });
+        let (code, _command) =
+            subscribe("sub-shutdown-first", None, None, shutdown, Vec::new()).await;
+        assert_eq!(code.unwrap_err().to_string(), "the daemon is shutting down");
+        let close = json!({ "type": "pong", "id": 1 });
+        let (code, _command) = subscribe(
+            "sub-closed-first",
+            None,
+            None,
+            close,
+            vec![Step::Send(Message::Close(None))],
+        )
+        .await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            "the daemon closed the connection before the result"
+        );
     }
 }

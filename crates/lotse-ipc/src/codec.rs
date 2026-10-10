@@ -118,6 +118,26 @@ mod tests {
             decode::<ToSupervisor>(&[0xff, 0xff, 0xff, 0xff, 0xff]).unwrap_err(),
             IpcError::Decode(_)
         ));
+        // The same instantiation refuses an oversize frame too.
+        assert!(matches!(
+            decode::<ToSupervisor>(&vec![0; MAX_MESSAGE_BYTES + 1]).unwrap_err(),
+            IpcError::TooLarge { .. }
+        ));
+    }
+
+    /// A value whose serialization fails, as serde lets any type's.
+    struct Unserializable;
+
+    impl Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("refused")) // codespell:ignore ser
+        }
+    }
+
+    #[test]
+    fn a_value_that_fails_to_serialize_is_an_encode_error() {
+        let err = encode(&Unserializable).unwrap_err();
+        assert!(matches!(err, IpcError::Encode(_)), "{err}");
     }
 
     #[test]

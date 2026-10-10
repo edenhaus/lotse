@@ -661,9 +661,7 @@ mod tests {
         // Silence for the video stall timeout: the first loss after a live
         // period is retried at once, as a hot swap.
         tick(&h, DEFAULT_STALL_VIDEO).await;
-        let Some(RunnerEvent::Reconnecting { error }) = next(&mut h.events).await else {
-            panic!("reconnecting expected");
-        };
+        crate::let_assert!(Some(RunnerEvent::Reconnecting { error }) = next(&mut h.events).await);
         assert_eq!(error.code(), "source_timeout");
         assert!(error.to_string().contains("no video for"), "{error}");
         assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Live));
@@ -684,9 +682,10 @@ mod tests {
             let polled = next
                 .as_mut()
                 .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
-            let std::task::Poll::Ready(Some(event)) = polled else {
-                panic!("queued events expected, got {seen:?}");
-            };
+            crate::let_assert!(
+                std::task::Poll::Ready(Some(event)) = polled,
+                "queued events expected, got {seen:?}"
+            );
             seen.push(event);
         }
         assert_eq!(
@@ -701,9 +700,9 @@ mod tests {
 
         // The second loss before stable streaming waits out the schedule.
         tick(&h, DEFAULT_STALL_VIDEO).await;
-        let Some(RunnerEvent::Backoff { error, retry_in }) = next(&mut h.events).await else {
-            panic!("backoff expected");
-        };
+        crate::let_assert!(
+            Some(RunnerEvent::Backoff { error, retry_in }) = next(&mut h.events).await
+        );
         assert_eq!(error.code(), "source_timeout");
         assert!(retry_in >= Duration::from_millis(800) && retry_in <= Duration::from_millis(1200));
         assert!(h.events.try_recv().is_err(), "waiting");
@@ -763,9 +762,7 @@ mod tests {
             payload: bytes::Bytes::from_static(&[0]),
         }));
         tick(&h, DEFAULT_STALL_VIDEO).await;
-        let Some(RunnerEvent::Reconnecting { error }) = next(&mut h.events).await else {
-            panic!("reconnecting expected");
-        };
+        crate::let_assert!(Some(RunnerEvent::Reconnecting { error }) = next(&mut h.events).await);
         assert!(
             error.to_string().contains("no video for 5000 ms"),
             "{error}"
@@ -775,6 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn stable_streaming_resets_the_backoff() {
+        let (logs, _guard) = Logs::capture();
         let config = RunnerConfig {
             stable_after: Duration::from_secs(10),
             ..RunnerConfig::default()
@@ -811,7 +809,50 @@ mod tests {
             next(&mut h.events).await,
             Some(RunnerEvent::Reconnecting { .. })
         ));
+        let reset = logs.lines(
+            tracing::Level::DEBUG,
+            "stable streaming; reconnect backoff reset",
+        );
+        assert_eq!(reset.len(), 1);
+        assert_eq!(reset[0].fields, " live_ms=18000");
         h.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_readiness_withdrawn_before_live_keeps_the_attempt_waiting() {
+        let mut h = start_with(
+            RunnerConfig::default(),
+            &serde_json::json!({"ready_after_ms": 1000}),
+        );
+        assert_eq!(
+            next(&mut h.events).await,
+            Some(RunnerEvent::Connecting { attempt: 1 })
+        );
+        assert!(quiet(&mut h.events).await, "the source is not ready yet");
+        // A change of the readiness to `false` wakes the attempt, which
+        // goes on waiting.
+        h.tracks.reset_ready();
+        assert!(quiet(&mut h.events).await, "not ready is not live");
+        tick(&h, Duration::from_secs(1)).await;
+        assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Live));
+        h.cancel.cancel();
+        assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Stopped));
+        h.runner.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_watchdog_checks_an_audio_track_against_its_own_timeout() {
+        let mut h = start_with(RunnerConfig::default(), &serde_json::json!({"audio": true}));
+        next(&mut h.events).await;
+        assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Live));
+        let kinds: Vec<Kind> = h.tracks.tracks().iter().map(|t| t.kind()).collect();
+        assert_eq!(kinds, [Kind::Video, Kind::Audio]);
+        // One check with both tracks inside their timeouts: no event.
+        tick(&h, DEFAULT_STALL_CHECK).await;
+        assert!(quiet(&mut h.events).await);
+        h.cancel.cancel();
+        assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Stopped));
+        h.runner.await.unwrap();
     }
 
     #[tokio::test]
@@ -933,21 +974,15 @@ mod tests {
             Some(RunnerEvent::Reconnecting { .. })
         ));
         assert_eq!(next(&mut events).await, Some(RunnerEvent::Live));
-        let mut packets = Vec::new();
-        while let Some(event) = sub.next().await {
-            let TrackEvent::Packet(p) = event else {
-                continue;
-            };
-            packets.push((p.rtp.seq, p.epoch));
-            if p.rtp.seq == 1 {
-                break;
+        // Control events first; the subscription began after the first
+        // connection's packet, so the first packet is the second's.
+        let first = loop {
+            crate::let_assert!(Some(event) = sub.next().await);
+            if let TrackEvent::Packet(p) = event {
+                break p;
             }
-        }
-        assert_eq!(
-            packets.last(),
-            Some(&(1, 1)),
-            "the second connection's packet: {packets:?}"
-        );
+        };
+        assert_eq!((first.rtp.seq, first.epoch), (1, 1));
         cancel.cancel();
         runner.await.unwrap();
     }
@@ -1016,21 +1051,14 @@ mod tests {
             clock.advance(Duration::from_secs(1));
             tokio::task::yield_now().await;
         }
-        let Some(RunnerEvent::Backoff { error, .. }) = next(&mut events).await else {
-            panic!("backoff expected");
-        };
+        crate::let_assert!(Some(RunnerEvent::Backoff { error, .. }) = next(&mut events).await);
         assert_eq!(
             error.to_string(),
             "source timed out: no tracks declared within 3000 ms"
         );
+        // The fake clock stands still, so the retry is still waiting.
         cancel.cancel();
-        // The cancel may race a retry that already started; it ends either way.
-        while let Some(event) = next(&mut events).await {
-            if event == RunnerEvent::Stopped {
-                break;
-            }
-            assert!(matches!(event, RunnerEvent::Connecting { .. }), "{event:?}");
-        }
+        assert_eq!(next(&mut events).await, Some(RunnerEvent::Stopped));
         runner.await.unwrap();
 
         // A resolved exit without the watchdog is reported as a protocol error.
@@ -1086,6 +1114,33 @@ mod tests {
         }
     }
 
+    /// The run of a [`Deaf`] source: its first poll declares a video track
+    /// and reports ready; it never completes, as an upstream await that
+    /// never comes back would not.
+    struct DeafRun {
+        ctx: SourceCtx,
+        live: bool,
+        _dropped: DropCount,
+    }
+
+    impl Future for DeafRun {
+        type Output = SourceExit;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<SourceExit> {
+            if !self.live {
+                self.live = true;
+                self.ctx
+                    .tracks
+                    .declare(Kind::Video, crate::codec::Codec::Pcmu, 90_000);
+                self.ctx.tracks.ready();
+            }
+            std::task::Poll::Pending
+        }
+    }
+
     impl Source for Deaf {
         fn describe(&self) -> crate::source::SourceDescriptor {
             crate::source::SourceDescriptor {
@@ -1097,15 +1152,12 @@ mod tests {
         fn connection_options(&self) -> serde_json::Value {
             serde_json::Value::Null
         }
-        fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+        fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
             self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dropped = DropCount(Arc::clone(&self.dropped));
-            Box::pin(async move {
-                let _dropped = dropped;
-                ctx.tracks
-                    .declare(Kind::Video, crate::codec::Codec::Pcmu, 90_000);
-                ctx.tracks.ready();
-                std::future::pending::<SourceExit>().await
+            Box::pin(DeafRun {
+                ctx,
+                live: false,
+                _dropped: DropCount(Arc::clone(&self.dropped)),
             })
         }
     }
@@ -1181,9 +1233,7 @@ mod tests {
         );
         assert_eq!(warnings.count(tracing::Level::WARN, DROPPED), 0);
         h.clock.advance(Duration::from_millis(1));
-        let Some(RunnerEvent::Reconnecting { error }) = next(&mut h.events).await else {
-            panic!("reconnecting expected");
-        };
+        crate::let_assert!(Some(RunnerEvent::Reconnecting { error }) = next(&mut h.events).await);
         assert!(error.to_string().contains("no video for"), "{error}");
         assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(warnings.count(tracing::Level::WARN, DROPPED), 1);

@@ -234,6 +234,8 @@ mod tests {
         reason = "test code"
     )]
 
+    use tracing_subscriber::fmt::MakeWriter as _;
+
     use super::*;
 
     #[test]
@@ -304,7 +306,9 @@ mod tests {
     /// Regression for `off` skipping the drop: started as root (as a
     /// deployment may start it in a container), the process ended up
     /// parsing camera bytes as root. Only a root run reaches the drop;
-    /// unprivileged it keeps its own ids.
+    /// unprivileged it keeps its own ids. The drop is per thread at the
+    /// syscall level, so it ends with this test's thread.
+    #[cfg(target_os = "linux")]
     #[test]
     fn off_still_drops_root_to_the_configured_ids() {
         let started_as_root = rustix::process::geteuid().is_root();
@@ -314,26 +318,67 @@ mod tests {
             gid: 4343,
             ..SandboxConfig::default()
         };
-        match apply(
-            &Profile::Worker {
-                connect_ports: vec![554],
-            },
-            &config,
-        ) {
-            Ok(report) => {
-                assert!(!rustix::process::geteuid().is_root(), "still root");
-                assert_eq!((report.uid, report.gid), (current_uid(), current_gid()));
-                if started_as_root {
-                    assert_eq!((report.uid, report.gid), (4242, 4343));
-                    assert_eq!(rustix::process::getegid().as_raw(), 4343);
-                }
-                assert_eq!(report.seccomp, LayerStatus::Off);
-            }
+        let worker = Profile::Worker {
+            connect_ports: vec![554],
+        };
+        let report = apply(&worker, &config).unwrap();
+        assert!(!rustix::process::geteuid().is_root(), "still root");
+        assert_eq!((report.uid, report.gid), (current_uid(), current_gid()));
+        let dropped = (report.uid, report.gid, rustix::process::getegid().as_raw());
+        assert!(
+            !started_as_root || dropped == (4242, 4343, 4343),
+            "{dropped:?}"
+        );
+        assert_eq!(report.seccomp, LayerStatus::Off);
+    }
+
+    /// Started as root on a platform without the drop, `off` refuses to
+    /// run rather than keep root.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn off_refuses_root_where_there_is_no_drop() {
+        let config = SandboxConfig {
+            mode: Mode::Off,
+            ..SandboxConfig::default()
+        };
+        let started_as_root = rustix::process::geteuid().is_root();
+        match apply(&Profile::Decoder, &config) {
+            Ok(report) => assert!(!started_as_root, "{report:?}"),
             Err(err) => {
-                assert!(started_as_root && cfg!(not(target_os = "linux")), "{err}");
+                assert!(started_as_root, "{err}");
                 assert!(matches!(err, SandboxError::RootUnsupported), "{err}");
             }
         }
+    }
+
+    /// The log lines of [`apply_logs_the_profile_and_mode_then_every_layers_status`].
+    static LOGS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    #[test]
+    fn apply_logs_the_profile_and_mode_then_every_layers_status() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| LOGS.make_writer())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let config = SandboxConfig {
+            mode: Mode::Off,
+            ..SandboxConfig::default()
+        };
+        let report = tracing::subscriber::with_default(subscriber, || {
+            apply(&Profile::Decoder, &config).unwrap()
+        });
+        let logs = String::from_utf8(LOGS.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("applying sandbox profile=\"decoder\" mode=\"off\""),
+            "{logs}"
+        );
+        assert!(logs.contains("sandbox is off"), "{logs}");
+        let applied = format!(
+            "sandbox applied uid={} gid={} no_new_privs=false seccomp=\"off\" landlock_fs=\"off\" landlock_net=\"off\" landlock_abi=0 notes=[]",
+            report.uid, report.gid
+        );
+        assert!(logs.contains(&applied), "{logs}");
     }
 
     #[cfg(not(target_os = "linux"))]

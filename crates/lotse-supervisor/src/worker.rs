@@ -635,6 +635,10 @@ mod tests {
         reason = "test code"
     )]
 
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use lotse_core::clock::{FakeClock, SystemClock};
+
     use super::*;
     use crate::test_support::Captured;
 
@@ -870,6 +874,170 @@ mod tests {
         drop((tx, theirs_rx));
         assert_eq!(events.recv().await.unwrap(), WorkerEvent::ChannelClosed);
         reader.await.unwrap();
+    }
+
+    #[test]
+    fn a_session_message_maps_onto_its_session_s_event() {
+        let event = SessionEvent::Answer { sdp: "v=0".into() };
+        assert_eq!(
+            map_message(
+                ToSupervisor::Session {
+                    session_id: "s1".into(),
+                    event: event.clone(),
+                },
+                None
+            ),
+            WorkerEvent::Session {
+                session_id: "s1".into(),
+                event
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_that_does_not_decode_ends_the_relay_as_a_channel_error() {
+        let (ours, theirs) = Channel::pair().unwrap();
+        let (mut tx, _theirs_rx) = Channel::from_fd(theirs).unwrap().split();
+        let (_control, rx) = ours.split();
+        let (events_tx, mut events) = mpsc::channel(4);
+        let reader = spawn_named("test.relay", relay(rx, events_tx));
+        tx.send(&[0xff; 3], &[]).await.unwrap();
+        let event = events.recv().await.unwrap();
+        assert!(
+            matches!(&event, WorkerEvent::ChannelError(message) if !message.is_empty()),
+            "{event:?}"
+        );
+        reader.await.unwrap();
+        assert!(events.recv().await.is_none(), "nothing after the error");
+    }
+
+    /// A worker script at `dir/worker.sh` that writes its arguments to
+    /// `dir/args` and what it is sent to `dir/received`.
+    fn recording_worker(dir: &std::path::Path) -> PathBuf {
+        let script = dir.join("worker.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexec cat > {}\n",
+                dir.join("args").display(),
+                dir.join("received").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        script
+    }
+
+    /// The messages in `bytes`, up to a frame still being written.
+    fn decode_all(bytes: &[u8]) -> Vec<ToWorker> {
+        let mut messages = Vec::new();
+        let mut rest = bytes;
+        while let Some((prefix, tail)) = rest.split_at_checked(4)
+            && let Ok(len) = usize::try_from(u32::from_le_bytes(prefix.try_into().unwrap()))
+            && let Some((frame, tail)) = tail.split_at_checked(len)
+        {
+            messages.push(lotse_ipc::decode::<ToWorker>(frame).unwrap());
+            rest = tail;
+        }
+        messages
+    }
+
+    /// What the recording worker received once it holds `count` messages,
+    /// looking every 10 ms for up to five seconds.
+    async fn received(dir: &std::path::Path, count: usize) -> Vec<ToWorker> {
+        let mut messages = Vec::new();
+        let mut looks = 0;
+        while messages.len() < count && looks < 500 {
+            SystemClock.sleep(Duration::from_millis(10)).await;
+            looks += 1;
+            messages = decode_all(&std::fs::read(dir.join("received")).unwrap_or_default());
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn a_worker_gets_its_sockets_first_and_its_flags_and_grants() {
+        let dir = crate::test_support::private_dir("worker-recording");
+        let mut config = crate::test_support::environment("/bin/sh").worker;
+        config.binary = recording_worker(&dir);
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let manager = WorkerManager::new(config, Some(udp));
+        let mut worker = manager.spawn(&[554, 8554], true).unwrap();
+        let spec = SourceSpec {
+            connection_id: "c1".into(),
+            url: "fake://cam/".into(),
+            options: "{}".into(),
+            peer_host: "cam".into(),
+            peer_addrs: vec![],
+        };
+        worker.run_source(&spec).await.unwrap();
+        worker.grant_switch_connect().await.unwrap();
+        assert_eq!(
+            received(&dir, 3).await,
+            [
+                ToWorker::Sockets,
+                ToWorker::RunSource(spec),
+                ToWorker::SwitchConnectGranted
+            ],
+            "the sockets ride on the first message, once"
+        );
+        let args = std::fs::read_to_string(dir.join("args")).unwrap();
+        assert!(
+            args.contains("--connect-ports\n554,8554\n--loopback-relay\n"),
+            "{args}"
+        );
+        // A kill is sent once, however often it is asked for.
+        let captured = Captured::default();
+        let _logs = captured.install();
+        worker.kill("silent");
+        worker.kill("channel closed");
+        assert_eq!(captured.lines("worker killed").len(), 1);
+        // Its channel's end may come first.
+        let mut event = WorkerEvent::ChannelClosed;
+        while event == WorkerEvent::ChannelClosed {
+            event = worker.next_event().await;
+        }
+        assert!(
+            matches!(&event, WorkerEvent::Exited(status) if status.signal() == Some(9)),
+            "{event:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_worker_reaped_elsewhere_is_a_channel_error_and_stops_without_a_status() {
+        use rustix::process::{Pid, WaitOptions, waitpid};
+        let manager = WorkerManager::new(
+            crate::test_support::environment("/usr/bin/true").worker,
+            None,
+        );
+        let mut worker = manager.spawn(&[], false).unwrap();
+        // Reaped before the runtime looks: its wait fails with `ECHILD`.
+        let pid = Pid::from_raw(i32::try_from(worker.pid()).unwrap()).unwrap();
+        let (reaped, _status) = waitpid(Some(pid), WaitOptions::empty()).unwrap().unwrap();
+        assert_eq!(reaped, pid);
+        // Its channel's end may come first.
+        let mut event = WorkerEvent::ChannelClosed;
+        while event == WorkerEvent::ChannelClosed {
+            event = worker.next_event().await;
+        }
+        assert!(
+            matches!(&event, WorkerEvent::ChannelError(message) if message.starts_with("waiting for the worker: ")),
+            "{event:?}"
+        );
+        let captured = Captured::default();
+        let _logs = captured.install();
+        // The fake clock never moves: the failed wait ends the stop.
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::default());
+        let status = worker.stop(Duration::from_secs(1), &clock).await;
+        assert_eq!(status, ExitStatus::default());
+        assert_eq!(
+            captured.lines("worker unreachable for shutdown").len(),
+            1,
+            "its channel is gone"
+        );
+        assert_eq!(captured.lines("worker exit could not be observed").len(), 1);
     }
 
     #[tokio::test]

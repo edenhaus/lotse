@@ -101,8 +101,9 @@ fn get_addr(bytes: &[u8]) -> Result<SocketAddr, DatagramError> {
             IpAddr::V4(Ipv4Addr::from(octets))
         }
         6 => {
-            let octets: [u8; 16] =
-                <[u8; 16]>::try_from(address).map_err(|_| DatagramError::Truncated(bytes.len()))?;
+            let octets: [u8; 16] = <[u8; 16]>::try_from(address)
+                .ok()
+                .ok_or(DatagramError::Truncated(bytes.len()))?;
             IpAddr::V6(Ipv6Addr::from(octets))
         }
         other => return Err(DatagramError::BadFamily(other)),

@@ -60,7 +60,7 @@ pub enum StunClientError {
     NoMappedAddress,
     /// No entropy for a transaction id.
     #[error("transaction id: {0}")]
-    Entropy(String),
+    Entropy(getrandom::Error),
 }
 
 /// The client.
@@ -119,8 +119,7 @@ impl StunClient {
     /// One transaction with retransmissions (§6.2.1).
     async fn gather(&self, server: SocketAddr) -> Result<SocketAddr, StunClientError> {
         let mut transaction_id = [0_u8; 12];
-        getrandom::fill(&mut transaction_id)
-            .map_err(|err| StunClientError::Entropy(err.to_string()))?;
+        getrandom::fill(&mut transaction_id).map_err(StunClientError::Entropy)?;
         let request = stun::binding_request(transaction_id);
         let local = self.socket.local_addr().ok();
         let mut reply = self.responses.expect(transaction_id);
@@ -176,7 +175,7 @@ mod tests {
         reason = "test code"
     )]
 
-    use lotse_core::clock::SystemClock;
+    use lotse_core::clock::{FakeClock, SystemClock};
 
     use super::super::demux::Demux;
     use super::super::stun::{Builder, Class, METHOD_BINDING};
@@ -193,9 +192,7 @@ mod tests {
         let thread = std::thread::spawn(move || {
             let mut buf = [0_u8; 1500];
             for _ in 0..answers {
-                let Ok((n, from)) = socket.recv_from(&mut buf) else {
-                    return;
-                };
+                let (n, from) = socket.recv_from(&mut buf).unwrap();
                 let request = stun::parse(&buf[..n]).unwrap();
                 assert!(request.is_binding_request());
                 let reply = if error {
@@ -301,6 +298,55 @@ mod tests {
         assert_eq!(err.to_string(), "no answer from the stun server");
         drop(thread);
         demux.stop();
+    }
+
+    #[tokio::test]
+    async fn a_request_the_socket_cannot_send_is_an_error() {
+        let bound = super::super::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = StunClient::new(
+            bound.socket,
+            Arc::new(StunResponses::default()),
+            Arc::new(FakeClock::default()),
+            StunClientConfig::default(),
+        );
+        // An IPv4 socket has no way to an IPv6 server.
+        let err = client
+            .reflexive("[::1]:3478".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StunClientError::Send(_)), "{err}");
+    }
+
+    /// A transaction whose waiter goes (the demux forgot it) ends at once
+    /// as a timeout, without waiting out the retransmissions (RFC 8489
+    /// §6.2.1).
+    #[tokio::test]
+    async fn rfc8489_6_2_1_a_transaction_given_up_elsewhere_ends_as_a_timeout() {
+        let bound = super::super::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let responses = Arc::new(StunResponses::default());
+        // The fake clock never moves: no retransmission, no timeout.
+        let client = StunClient::new(
+            bound.socket,
+            Arc::clone(&responses),
+            Arc::new(FakeClock::default()),
+            StunClientConfig::default(),
+        );
+        let mut gathering = Box::pin(client.reflexive(server.local_addr().unwrap()));
+        // One poll sends the request and waits for the answer.
+        let early = tokio::select! {
+            biased;
+            out = &mut gathering => Some(out),
+            () = std::future::ready(()) => None,
+        };
+        assert!(early.is_none(), "still waiting");
+        let mut buf = [0_u8; 1500];
+        let (n, _) = server.recv_from(&mut buf).unwrap();
+        let request = stun::parse(&buf[..n]).unwrap();
+        assert_eq!(responses.outstanding(), 1);
+        responses.forget(&request.transaction_id);
+        let err = gathering.await.unwrap_err();
+        assert!(matches!(err, StunClientError::Timeout), "{err}");
     }
 
     #[tokio::test]

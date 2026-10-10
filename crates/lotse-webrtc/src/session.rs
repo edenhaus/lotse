@@ -783,9 +783,10 @@ impl Session {
                         self.disconnect_deadline =
                             self.now.checked_add(self.limits.disconnect_timeout);
                     }
-                    IceConnectionState::Connected | IceConnectionState::Completed
-                        if self.state == State::Disconnected =>
-                    {
+                    // `Connected` or `Completed`, in one guard: the or-pattern
+                    // with a guard counts no coverage for its guard (rustc
+                    // 1.98, observed 2026-10-10).
+                    _ if ice.is_connected() && self.state == State::Disconnected => {
                         tracing::info!("consent regained");
                         self.state = State::Connected;
                         self.disconnect_deadline = None;
@@ -1362,6 +1363,11 @@ mod tests {
             "m=audio 9 x 0\r\na=rtpmap:0\r\n",
             CodecFamily::Pcmu
         ));
+        // Without an audio m-line nothing is listed.
+        assert!(!offer_lists_audio(
+            "m=video 9 x 96\r\na=rtpmap:96 H264/90000\r\n",
+            CodecFamily::Pcmu
+        ));
         assert_eq!(audio_encoding_name(CodecFamily::Pcma), Some("PCMA"));
         assert_eq!(audio_encoding_name(CodecFamily::G722), Some("G722"));
         assert_eq!(audio_encoding_name(CodecFamily::Mjpeg), None);
@@ -1495,7 +1501,15 @@ mod tests {
 
     #[test]
     fn ice_names_and_the_video_mid_are_read() {
-        assert_eq!(ice_name(IceConnectionState::Completed), "completed");
+        for (state, name) in [
+            (IceConnectionState::New, "new"),
+            (IceConnectionState::Checking, "checking"),
+            (IceConnectionState::Connected, "connected"),
+            (IceConnectionState::Completed, "completed"),
+            (IceConnectionState::Disconnected, "disconnected"),
+        ] {
+            assert_eq!(ice_name(state), name);
+        }
         assert_eq!(
             video_mid(
                 "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\n"

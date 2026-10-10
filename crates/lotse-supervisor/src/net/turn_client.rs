@@ -95,7 +95,7 @@ pub enum TurnError {
     Closing,
     /// No entropy for the transaction ids.
     #[error("transaction id entropy: {0}")]
-    Entropy(String),
+    Entropy(getrandom::Error),
 }
 
 /// Where a joining session's lease goes, with the relayed address.
@@ -305,7 +305,7 @@ impl TurnClient {
             return Ok(handle.clone());
         }
         let mut seed = [0; 32];
-        getrandom::fill(&mut seed).map_err(|err| TurnError::Entropy(err.to_string()))?;
+        getrandom::fill(&mut seed).map_err(TurnError::Entropy)?;
         let machine = Allocation::new(
             server,
             transport,
@@ -662,6 +662,7 @@ impl Driver {
         frames: mpsc::Receiver<Outbound>,
     ) {
         let (queue, inbound) = mpsc::channel(INBOUND_QUEUE);
+        let reader = Box::new(reader);
         let _reader = spawn_named("turn.tcp_reader", read_stream(reader, self.server, queue));
         let link = Link::Stream {
             writer: Box::new(writer),
@@ -963,7 +964,7 @@ pub async fn uplink(client: Arc<TurnClient>, datagrams: UnixDatagram, owner: Rel
 /// for the task; ends with the stream, on a message neither is (§12), or
 /// with the task.
 async fn read_stream(
-    mut reader: impl AsyncRead + Unpin,
+    mut reader: Box<dyn AsyncRead + Send + Unpin>,
     server: SocketAddr,
     queue: mpsc::Sender<RawReply>,
 ) {
@@ -1914,7 +1915,7 @@ mod tests {
             let (reader, mut server) = tokio::io::duplex(64);
             let message = turn::refresh([1; 12], Duration::ZERO).build();
             server.write_all(&message).await.unwrap();
-            read_stream(reader, "192.0.2.1:3478".parse().unwrap(), queue).await;
+            read_stream(Box::new(reader), "192.0.2.1:3478".parse().unwrap(), queue).await;
         })
         .await;
     }
@@ -1926,6 +1927,12 @@ mod tests {
             let stale = driver.machine.add_session(&creds("alice")).unwrap();
             driver.machine.add_session(&creds("alice")).unwrap();
             driver.machine.remove_session(driver.clock.now(), stale);
+            // A grant that arrives after its lease went is ignored.
+            driver.command(Command::Grant {
+                lease: stale,
+                owner: RelayOwner::next(),
+            });
+            assert!(driver.owners.is_empty());
             let (reply, permit) = oneshot::channel();
             driver.command(Command::Permit {
                 lease: stale,

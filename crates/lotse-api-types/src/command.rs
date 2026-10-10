@@ -574,6 +574,27 @@ mod tests {
 
     use super::*;
 
+    /// A copy of `lotse_core::let_assert!`, identical to it, for this
+    /// crate's tests: `lotse-api-types` does not depend on `lotse-core`
+    /// and gains no dependency for a test macro. Binds `$pattern` in
+    /// `$value` or fails the test with the value, the failure arm on the
+    /// call's lines, which a passing test runs, so the line-coverage gate
+    /// counts them. Change both together.
+    macro_rules! let_assert {
+        ($pattern:pat = $value:expr) => {
+            let value = $value;
+            let $pattern = value else {
+                panic!("`{}` does not match {value:?}", stringify!($pattern));
+            };
+        };
+        ($pattern:pat = $value:expr, $($message:tt)+) => {
+            let value = $value;
+            let $pattern = value else {
+                panic!("`{}` does not match {value:?}: {}", stringify!($pattern), format_args!($($message)+));
+            };
+        };
+    }
+
     #[test]
     fn every_command_parses_from_the_contract_shape() {
         let put = parse_command(
@@ -583,9 +604,8 @@ mod tests {
                  "preload": true, "audio": "off", "orientation": "rotate_left" }"#,
         )
         .unwrap();
-        let Command::StreamPut(put) = put else {
-            panic!("stream/put");
-        };
+        assert_eq!((put.name(), put.id()), ("stream/put", 3));
+        let_assert!(Command::StreamPut(put) = put);
         assert_eq!(
             (put.id, put.stream_id.as_str(), put.preload, put.audio),
             (3, "front", true, AudioMode::Off)
@@ -639,7 +659,9 @@ mod tests {
             ),
         ];
         for (index, (text, name)) in cases.iter().enumerate() {
-            let command = parse_command(text).unwrap_or_else(|err| panic!("{text}: {err}"));
+            let command = parse_command(text);
+            assert!(command.is_ok(), "{text}: {command:?}");
+            let command = command.unwrap();
             assert_eq!(command.name(), *name);
             assert_eq!(command.id(), u64::try_from(index).unwrap() + 1);
             // Commands serialize back into the same shape, for `lotse ctl`.
@@ -652,9 +674,7 @@ mod tests {
             r#"{"id":1,"type":"stream/put","stream_id":"x","sources":[{"url":"rtsp://c/"}]}"#,
         )
         .unwrap();
-        let Command::StreamPut(minimal) = minimal else {
-            panic!("stream/put");
-        };
+        let_assert!(Command::StreamPut(minimal) = minimal);
         assert!(
             !minimal.preload
                 && minimal.audio == AudioMode::Auto
@@ -662,18 +682,18 @@ mod tests {
                 && minimal.sources[0].options.is_empty()
         );
         // A client may send only the offer and the stream; the rest defaults.
-        let Command::WebrtcOffer(offer) =
-            parse_command(r#"{"id":1,"type":"webrtc/offer","stream_id":"x","sdp":"v=0"}"#).unwrap()
-        else {
-            panic!("webrtc/offer");
-        };
+        let_assert!(
+            Command::WebrtcOffer(offer) =
+                parse_command(r#"{"id":1,"type":"webrtc/offer","stream_id":"x","sdp":"v=0"}"#)
+                    .unwrap()
+        );
         assert_eq!((offer.session_id, offer.ice_servers), (None, None));
-        let Command::WebrtcCandidate(candidate) =
-            parse_command(r#"{"id":1,"type":"webrtc/candidate","session_id":"s","candidate":""}"#)
-                .unwrap()
-        else {
-            panic!("webrtc/candidate");
-        };
+        let_assert!(
+            Command::WebrtcCandidate(candidate) = parse_command(
+                r#"{"id":1,"type":"webrtc/candidate","session_id":"s","candidate":""}"#
+            )
+            .unwrap()
+        );
         assert_eq!((candidate.sdp_mid, candidate.sdp_mline_index), (None, None));
     }
 
@@ -789,21 +809,14 @@ mod tests {
             ]
         };
         for frame in frames(MAX_ID_CHARS) {
-            assert!(
-                parse_command(&frame.to_string()).is_ok(),
-                "{}",
-                frame["type"]
-            );
+            let kind = &frame["type"];
+            assert!(parse_command(&frame.to_string()).is_ok(), "{kind}");
         }
         for frame in frames(MAX_ID_CHARS + 1) {
+            let kind = &frame["type"];
             let err = parse_command(&frame.to_string()).unwrap_err();
             assert_eq!(err.id, Some(1));
-            assert_eq!(
-                err.error.code,
-                ErrorCode::InvalidStreamId,
-                "{}",
-                frame["type"]
-            );
+            assert_eq!(err.error.code, ErrorCode::InvalidStreamId, "{kind}");
             assert_eq!(err.error.details["field"], "stream_id");
             assert_eq!(err.error.details["type"], frame["type"]);
             assert_eq!(
@@ -878,10 +891,10 @@ mod tests {
         #[derive(Debug, Deserialize)]
         enum Never {}
         let err = serde_json::from_str::<Never>(r#""secret""#).unwrap_err();
+        let message = describe(&err);
         assert!(
-            describe(&err).starts_with("unknown variant, there are no variants"),
-            "{}",
-            describe(&err)
+            message.starts_with("unknown variant, there are no variants"),
+            "{message}"
         );
         let custom = |message: &str| describe(&serde_json::Error::custom(message));
         assert_eq!(custom("unknown variant `secret"), "unknown variant");

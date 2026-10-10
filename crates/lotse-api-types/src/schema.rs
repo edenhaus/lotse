@@ -138,12 +138,12 @@ mod tests {
     /// it `const`, a one-element `enum` or a one-constant `oneOf`.
     fn tag_of(bundle: &Value, schema: &Value) -> String {
         let property = resolve(bundle, &resolve(bundle, schema)["properties"]["type"]);
-        property["const"]
+        let tag = property["const"]
             .as_str()
             .or_else(|| property["enum"][0].as_str())
-            .or_else(|| property["oneOf"][0]["const"].as_str())
-            .unwrap_or_else(|| panic!("no tag in {property}"))
-            .to_owned()
+            .or_else(|| property["oneOf"][0]["const"].as_str());
+        assert!(tag.is_some(), "no tag in {property}");
+        tag.unwrap().to_owned()
     }
 
     /// Every `$ref` anywhere under `value`.
@@ -189,7 +189,7 @@ mod tests {
         let names: Vec<&str> = variants
             .iter()
             .map(|v| {
-                v["properties"]["type"]["const"]
+                resolve(&bundle, v)["properties"]["type"]["const"]
                     .as_str()
                     .expect("type const")
             })

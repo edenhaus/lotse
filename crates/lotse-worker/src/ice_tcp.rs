@@ -265,31 +265,17 @@ mod tests {
     }
 
     /// A pair whose worker end was accepted on a listener bound at `bind`,
-    /// the browser connecting to `ip` at its port. The connection must
-    /// arrive here: macOS picks `[::]:0`'s port among the IPv6 ports only,
-    /// and std's `SO_REUSEADDR` lets it share one with another process's
-    /// `127.0.0.1` listener, which then takes the IPv4 connection
-    /// (observed 2026-10-07), so such a port is given up for another.
+    /// the browser connecting to `ip` at its port.
     async fn pair_on(bind: &str, ip: &str) -> (std::net::TcpStream, TcpStream) {
-        let mut tries = 0;
-        loop {
-            tries += 1;
-            assert!(tries <= 100, "no port at {bind} that {ip} reaches");
-            let std_listener = std::net::TcpListener::bind(bind).unwrap();
-            std_listener.set_nonblocking(true).unwrap();
-            let listener = TcpListener::from_std(std_listener).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let browser = TcpStream::connect((ip, port)).await.unwrap();
-            let ours = tokio::select! {
-                accepted = listener.accept() => Some(accepted.unwrap().0),
-                () = SystemClock.sleep(Duration::from_secs(1)) => None,
-            };
-            if let Some(ours) = ours.filter(|ours| {
-                ours.peer_addr().unwrap().port() == browser.local_addr().unwrap().port()
-            }) {
-                return (ours.into_std().unwrap(), browser);
-            }
-        }
+        let listener = TcpListener::bind(bind).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let browser = TcpStream::connect((ip, port)).await.unwrap();
+        let (ours, _) = within(listener.accept()).await.unwrap();
+        assert_eq!(
+            ours.peer_addr().unwrap().port(),
+            browser.local_addr().unwrap().port()
+        );
+        (ours.into_std().unwrap(), browser)
     }
 
     /// Attaches the worker end of `ours` for `peer` and checks that a frame
@@ -406,23 +392,9 @@ mod tests {
         // the writer goes too.
         drop(browser);
         let link = links.by_peer.get(&peer).unwrap();
-        for _ in 0..10_000 {
-            if link.reader.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(link.reader.is_finished());
+        until(&mut || link.reader.is_finished()).await;
         // Writes to the gone browser fail; the writer ends and sends drop.
-        let mut refused = false;
-        for _ in 0..10_000 {
-            if !links.send(peer, vec![1; 1024]) {
-                refused = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(refused, "sends to a dead peer stop being accepted");
+        until(&mut || !links.send(peer, vec![1; 1024])).await;
     }
 
     #[tokio::test]
@@ -451,7 +423,7 @@ mod tests {
     }
 
     /// Polls until `done` holds, yielding to the tasks in between.
-    async fn until(mut done: impl FnMut() -> bool) {
+    async fn until(done: &mut (dyn FnMut() -> bool + Send)) {
         let mut turns = 0;
         while !done() {
             assert!(turns < 10_000, "not within 10 000 turns");
@@ -508,7 +480,7 @@ mod tests {
         let gone = browsers.pop().unwrap();
         let gone_peer = gone.local_addr().unwrap();
         drop(gone);
-        until(|| links.by_peer[&gone_peer].reader.is_finished()).await;
+        until(&mut || links.by_peer[&gone_peer].reader.is_finished()).await;
         let (ours, browser) = pair().await;
         let peer = browser.local_addr().unwrap();
         assert!(links.attach(ours, peer, inbound).unwrap().is_some());
@@ -539,7 +511,7 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         assert!(closed(&mut browser).await);
         let link = &links.by_peer[&peer];
-        until(|| link.reader.is_finished() && link.writer.is_finished()).await;
+        until(&mut || link.reader.is_finished() && link.writer.is_finished()).await;
         assert!(!links.send(peer, b"gone".to_vec()));
     }
 
@@ -564,7 +536,7 @@ mod tests {
         let link = &links.by_peer[&peer];
         assert!(!link.writer.is_finished());
         clock.advance(LINK_IDLE);
-        until(|| link.reader.is_finished() && link.writer.is_finished()).await;
+        until(&mut || link.reader.is_finished() && link.writer.is_finished()).await;
         drop(browser);
     }
 

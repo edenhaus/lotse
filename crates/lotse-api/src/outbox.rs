@@ -267,9 +267,7 @@ mod tests {
             .unwrap();
         let mut texts = Vec::new();
         for _ in 0..3 {
-            let Some(Outgoing::Text { text, .. }) = outbox.pop().await else {
-                panic!("text")
-            };
+            lotse_core::let_assert!(Some(Outgoing::Text { text, .. }) = outbox.pop().await);
             texts.push(text);
         }
         assert_eq!(texts, ["back-1", "answer", "front-2"]);

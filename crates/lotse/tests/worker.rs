@@ -16,8 +16,9 @@
     reason = "test code; the helpers outside #[test] functions panic on harness failures"
 )]
 
+mod common;
+
 use std::os::unix::process::ExitStatusExt as _;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +34,7 @@ fn manager_with_sandbox(sandbox: &str) -> WorkerManager {
     let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("a udp socket");
     WorkerManager::new(
         WorkerConfig {
-            binary: PathBuf::from(env!("CARGO_BIN_EXE_lotse")),
+            binary: common::worker_binary(),
             log_format: "json".into(),
             log_level: "debug".into(),
             sandbox: sandbox.into(),
@@ -88,6 +89,21 @@ async fn a_worker_runs_the_fake_source_and_stops_within_the_budget() {
     };
     assert_eq!(stats.tracks[0].0, "v0");
 
+    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    assert!(exit.success(), "clean exit, got {exit:?}");
+}
+
+/// A worker asked for a loopback relay binds it before its sandbox and
+/// still starts and stops cleanly; here without a sandbox, the relay path
+/// the sandboxed `rtsps` test below takes under one.
+#[tokio::test]
+async fn a_worker_with_a_loopback_relay_starts_and_stops_cleanly() {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let mut worker = manager().spawn(&[], true).expect("spawns");
+    assert!(matches!(
+        worker.next_event().await,
+        WorkerEvent::Ready { .. }
+    ));
     let exit = worker.stop(Duration::from_secs(5), &clock).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
 }

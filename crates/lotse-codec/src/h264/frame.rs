@@ -261,9 +261,8 @@ impl Depacketizer {
     /// known parameter sets before an IDR that lacks them, unless that
     /// makes the unit oversize.
     fn append(&mut self, unit: &[u8]) {
-        let Some(&header) = unit.first() else {
-            return;
-        };
+        // No caller passes an empty unit; one would be dropped as filler.
+        let header = unit.first().copied().unwrap_or(nal::NAL_FILLER);
         let mut sets = Vec::new();
         let unit_type = nal::nal_type(header);
         match unit_type {
@@ -580,6 +579,10 @@ mod tests {
         f.push(2, false, &[0x0c, 0xff]);
         f.push(2, true, &slice(3));
         assert_eq!(f.take()[0].payload, annex_b(&[&slice(3)]));
+        // A unit of filler alone is no frame.
+        f.push(10, true, &[0x0c, 0xff]);
+        assert!(f.take().is_empty());
+        assert_eq!(f.d.stats().frames, 1);
         let mut out = Vec::new();
         assert_eq!(
             f.d.push(f.seq, 3, false, &[nal::STAP_B], &mut out),

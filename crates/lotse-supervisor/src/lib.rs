@@ -314,18 +314,28 @@ pub async fn serve(
         "front door stopping"
     );
     let _joined = lotse_core::task::spawn_blocking_named("demux.stop", move || demux.stop()).await;
+    api_stopped(api, clock.as_ref(), settings.shutdown_budget).await;
+    tracing::info!(reason = reason.name(), "supervisor stopped");
+    Ok(reason)
+}
+
+/// Waits up to `budget` for the control API server's task to end, and
+/// logs it when the server failed, the task did, or the budget ran out.
+async fn api_stopped(
+    api: tokio::task::JoinHandle<Result<(), lotse_api::ServeError>>,
+    clock: &dyn Clock,
+    budget: Duration,
+) {
     tokio::select! {
         result = api => match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => tracing::error!(error = %err, "control API server failed"),
             Err(err) => tracing::error!(error = %err, "control API task failed"),
         },
-        () = clock.sleep(settings.shutdown_budget) => {
+        () = clock.sleep(budget) => {
             tracing::warn!("control API connections missed the shutdown budget");
         }
     }
-    tracing::info!(reason = reason.name(), "supervisor stopped");
-    Ok(reason)
 }
 
 /// What sessions need from the front door: the demux's registrations, the
@@ -439,10 +449,11 @@ pub(crate) mod test_support {
     pub(crate) fn private_dir(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lotse-sup-{test}-{}", std::process::id()));
         let _existing = std::fs::remove_dir_all(&dir);
+        let shown = dir.display().to_string();
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
-            .unwrap_or_else(|err| panic!("{}: {err}", dir.display()));
+            .expect(&shown);
         dir
     }
 
@@ -520,7 +531,7 @@ pub(crate) mod test_support {
         registries
             .sources
             .register(Arc::new(FakeSourceFactory::new(&["fake"])))
-            .unwrap_or_else(|err| panic!("{err}"));
+            .expect("the fake source registers");
         Environment {
             registries,
             worker: WorkerConfig {
@@ -567,8 +578,16 @@ mod tests {
         reason = "test code"
     )]
 
+    use lotse_core::clock::FakeClock;
+
     use super::*;
-    use crate::test_support::{environment, private_dir, settings};
+    use crate::test_support::{Captured, environment, private_dir, settings};
+
+    /// The shutdown the tests ask for: one future type, so one
+    /// instantiation of `serve` runs every path the tests take.
+    fn requested() -> std::future::Ready<ShutdownReason> {
+        std::future::ready(ShutdownReason::Requested)
+    }
 
     #[tokio::test]
     async fn serve_runs_until_the_shutdown_future_resolves() {
@@ -579,9 +598,13 @@ mod tests {
         assert!(listeners.udp.local.port() > 0);
         assert!(listeners.tcp.is_some());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let reason = serve(&settings, listeners, environment("/bin/sh"), clock, async {
-            ShutdownReason::Requested
-        })
+        let reason = serve(
+            &settings,
+            listeners,
+            environment("/bin/sh"),
+            clock,
+            requested(),
+        )
         .await
         .unwrap();
         assert_eq!(reason, ShutdownReason::Requested);
@@ -593,11 +616,146 @@ mod tests {
         let err = bind(&busy).unwrap_err();
         assert!(matches!(err, BindError::Udp { .. }), "{err}");
         assert!(err.to_string().starts_with("webrtc udp socket 127.0.0.1:"));
+        // So is a listening TCP port.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut busy = settings.clone();
+        busy.tcp_listen = Some(taken.local_addr().unwrap());
+        busy.socket = dir.join("third.sock");
+        let err = bind(&busy).unwrap_err();
+        assert!(matches!(err, BindError::Tcp { .. }), "{err}");
+        assert!(err.to_string().starts_with("ice-tcp listener 127.0.0.1:"));
         assert!(
             Error::FrontDoor(io::Error::other("x"))
                 .to_string()
                 .starts_with("network front door")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_logs_its_start_and_stop_and_runs_without_ice_tcp() {
+        let dir = private_dir("serve-logs");
+        let mut settings = settings(dir.join("lotse.sock"));
+        settings.tcp_listen = None;
+        let listeners = bind(&settings).unwrap();
+        assert!(listeners.tcp.is_none(), "ice-tcp off binds no listener");
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let reason = serve(
+            &settings,
+            listeners,
+            environment("/bin/sh"),
+            clock,
+            requested(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reason, ShutdownReason::Requested);
+        let ready = captured.lines("supervisor ready");
+        assert_eq!(ready.len(), 1, "{ready:?}");
+        assert!(
+            ready[0].contains("tcp_listen=None") && ready[0].contains("linger_ms=5000"),
+            "{ready:?}"
+        );
+        let stopping = captured.lines("shutting down");
+        assert!(
+            stopping[0].contains("reason=\"requested\"") && stopping[0].contains("budget_ms=2000"),
+            "{stopping:?}"
+        );
+        let front_door = captured.lines("front door stopping");
+        assert!(
+            front_door[0].contains("received=0") && front_door[0].contains("ice_tcp_accepted=0"),
+            "{front_door:?}"
+        );
+        assert_eq!(captured.lines("supervisor stopped").len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_api_server_s_end_is_logged_and_waited_for_within_the_budget() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        // The fake clock never moves: only a zero budget runs out.
+        let clock = FakeClock::default();
+        let budget = Duration::from_secs(1);
+        api_stopped(spawn_named("test.api", async { Ok(()) }), &clock, budget).await;
+        let failed = async {
+            Err(lotse_api::ServeError::Register(io::Error::other(
+                "no reactor",
+            )))
+        };
+        api_stopped(spawn_named("test.api", failed), &clock, budget).await;
+        let aborted = spawn_named("test.api", std::future::pending());
+        aborted.abort();
+        api_stopped(aborted, &clock, budget).await;
+        let hanging = spawn_named("test.api", std::future::pending());
+        api_stopped(hanging, &clock, Duration::ZERO).await;
+        let server = captured.lines("control API server failed");
+        assert_eq!(server.len(), 1, "{server:?}");
+        assert!(server[0].contains("no reactor"), "{server:?}");
+        let task = captured.lines("control API task failed");
+        assert_eq!(task.len(), 1, "{task:?}");
+        assert!(task[0].contains("cancelled"), "{task:?}");
+        assert_eq!(
+            captured
+                .lines("control API connections missed the shutdown budget")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn run_serves_until_sigterm_or_sigint() {
+        use rustix::process::{Signal, getpid, kill_process};
+        let dir = private_dir("run");
+        for (n, (signal, expected)) in [
+            (Signal::TERM, ShutdownReason::Sigterm),
+            (Signal::INT, ShutdownReason::Sigint),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let settings = settings(dir.join(format!("{n}.sock")));
+            let listeners = bind(&settings).unwrap();
+            let captured = Captured::default();
+            let logs = captured.clone();
+            // `run` serves on the thread that calls it, so its lines reach
+            // that thread's subscriber.
+            let runner = std::thread::spawn(move || {
+                let _logs = logs.install();
+                run(&settings, listeners, environment("/bin/sh"))
+            });
+            // The handlers are installed before `ready` is logged, so the
+            // signal reaches them, not the default action.
+            let mut ready = Vec::new();
+            let mut looks = 0;
+            while ready.is_empty() && looks < 1_000 {
+                std::thread::park_timeout(Duration::from_millis(10));
+                looks += 1;
+                ready = captured.lines("supervisor ready");
+            }
+            assert_eq!(ready.len(), 1, "ready once");
+            kill_process(getpid(), signal).unwrap();
+            assert_eq!(runner.join().unwrap().unwrap(), expected);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_listener_the_runtime_cannot_poll_ends_run_with_an_error() {
+        let dir = private_dir("run-unpollable");
+        let mut settings = settings(dir.join("lotse.sock"));
+        settings.tcp_listen = None;
+        let mut listeners = bind(&settings).unwrap();
+        // A regular file in place of the ICE-TCP listener: epoll refuses it.
+        let file = std::fs::File::create(dir.join("not-a-socket")).unwrap();
+        let not_a_socket = std::net::TcpListener::from(std::os::fd::OwnedFd::from(file));
+        // Non-blocking, as the runtime requires of what it registers.
+        not_a_socket.set_nonblocking(true).unwrap();
+        listeners.tcp = Some(not_a_socket);
+        let err = run(&settings, listeners, environment("/bin/sh")).unwrap_err();
+        assert!(matches!(err, Error::FrontDoor(_)), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
