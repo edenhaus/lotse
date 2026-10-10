@@ -304,6 +304,56 @@ fn iso13818_1_2_4_3_2_mpegts_is_three_sync_bytes_188_apart() {
     assert!(!is_mpegts(b"#EXTM3U"));
 }
 
+/// The queue as (track or barrier, decoding time).
+fn queued(queue: &VecDeque<Item>) -> Vec<(char, i64)> {
+    queue
+        .iter()
+        .map(|item| match item {
+            Item::Unit(unit) => (if unit.track == 0 { 'v' } else { 'a' }, unit.decode_time),
+            Item::Layout(_) => ('l', 0),
+            Item::Epoch => ('e', 0),
+        })
+        .collect()
+}
+
+#[test]
+fn iso13818_1_2_4_2_6_units_queue_in_decoding_order_within_one_second() {
+    let unit = |track, decode_time| {
+        Item::Unit(Unit {
+            track,
+            decode_time,
+            ts: decode_time,
+            payload: Bytes::new(),
+        })
+    };
+    let mut queue = VecDeque::new();
+    for item in [unit(0, 0), unit(0, 9_000), unit(0, 90_000), unit(1, 0)] {
+        enqueue(&mut queue, item);
+    }
+    // The audio frame goes ahead of the video decoded after it, up to a
+    // second after it, and behind the one decoded with it.
+    assert_eq!(
+        queued(&queue),
+        [('v', 0), ('a', 0), ('v', 9_000), ('v', 90_000)]
+    );
+    // A unit more than a second before the last is another timeline.
+    enqueue(&mut queue, unit(1, -1));
+    assert_eq!(queue.back().map(Item::order), Some(Some(-1)));
+    // Nothing moves ahead of a layout or an epoch.
+    for barrier in [
+        Item::Layout(Layout {
+            program_number: 1,
+            tracks: Vec::new(),
+        }),
+        Item::Epoch,
+    ] {
+        let mut queue = VecDeque::from([unit(0, 9_000)]);
+        enqueue(&mut queue, barrier);
+        enqueue(&mut queue, unit(1, 0));
+        assert_eq!(queued(&queue)[2], ('a', 0));
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn the_source_describes_itself_without_secrets() {
     let url = SourceUrl::parse("https://user:secret@camera.example/live.m3u8").unwrap();

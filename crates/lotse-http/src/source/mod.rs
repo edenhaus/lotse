@@ -379,6 +379,39 @@ impl From<Event> for Item {
     }
 }
 
+/// How far, in 90 kHz ticks, a unit moves ahead of the queued units of
+/// its stream to stand in decoding order: one second, the longest any
+/// data stays in the decoder's buffers (ISO/IEC 13818-1 §2.4.2.6, T-STD),
+/// so the longest a multiplex delivers a unit before its decoding time. A
+/// demultiplexer hands an audio PES packet's frames on only once it ends,
+/// after the video multiplexed alongside it; queued as they came, they
+/// would be released when that video is, up to a PES packet's duration
+/// late (ffmpeg's default `-max_delay` packs 0.7 s of audio into one). A
+/// unit decoded more than this before the units queued ahead of it
+/// starts another timeline (a timestamp reset) and stays behind them.
+const REORDER_TICKS: i64 = 90_000;
+
+/// Queues `item` behind the items of `queue`, a unit ahead of the units of
+/// its timeline it is decoded before (within [`REORDER_TICKS`]): never
+/// ahead of a layout or an epoch, nor of a unit with the same decoding
+/// time, which keep their order.
+fn enqueue(queue: &mut VecDeque<Item>, item: Item) {
+    let mut at = queue.len();
+    if let Item::Unit(unit) = &item {
+        while let Some(before) = at.checked_sub(1) {
+            let Some(Item::Unit(queued)) = queue.get(before) else {
+                break;
+            };
+            let ahead = queued.decode_time.saturating_sub(unit.decode_time);
+            if ahead <= 0 || ahead > REORDER_TICKS {
+                break;
+            }
+            at = before;
+        }
+    }
+    queue.insert(at, item);
+}
+
 /// Transport packets a segment's continuity errors say were lost
 /// (ISO/IEC 13818-1 §2.4.3.3).
 #[derive(Debug)]
@@ -390,7 +423,8 @@ struct Lost(u64);
 struct Stream {
     /// Its segments.
     feed: Feed,
-    /// What its reader produced and the merge has not taken yet.
+    /// What its reader produced and the merge has not taken yet, units in
+    /// decoding order ([`enqueue`]).
     queue: VecDeque<Item>,
     /// The MPEG-TS reader of the current timeline, with the continuity
     /// errors already counted.
@@ -477,7 +511,9 @@ impl Stream {
                 events.extend(units.into_iter().map(Event::Unit));
             }
         }
-        self.queue.extend(events.into_iter().map(Item::from));
+        for event in events {
+            enqueue(&mut self.queue, Item::from(event));
+        }
         Ok(lost)
     }
 }

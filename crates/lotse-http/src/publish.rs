@@ -44,7 +44,7 @@ use lotse_core::ingest::IngestCounters;
 use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields};
 use lotse_core::source::{ClockInput, SourceError, TrackPublisher, TrackSet};
 use lotse_core::throttle::Throttle;
-use lotse_core::track::Track;
+use lotse_core::track::{Track, TrackId};
 use lotse_core::{Codec, Kind};
 
 use crate::media::{Layout, LayoutTrack, Unit};
@@ -78,6 +78,34 @@ impl Declared {
             clock_rate: track.clock_rate,
         }
     }
+}
+
+/// The codec to declare the carried track of `declared` with on `set`:
+/// `declared`'s own, except on a reconnect, when it names the codec
+/// without parameter sets (MPEG-TS carries them in band, ISO/IEC 13818-1
+/// §2.4.3.7) and the track already has that codec with the sets of the
+/// last attempt. The track keeps those then: the stream's first keyframe
+/// brings its own and changes the codec only if they differ, where
+/// declaring the bare codec would announce two codec changes (to no sets
+/// and back) on every reconnect of an unchanged stream. The carried track
+/// of a kind is its first ([`TrackPublisher::declare`] numbers them).
+fn codec_to_declare(set: &TrackSet, declared: &Declared) -> Codec {
+    let bare = matches!(
+        declared.codec,
+        Codec::H264 {
+            profile_level_id: None,
+            sps: None,
+            pps: None,
+        } | Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        }
+    );
+    set.get(TrackId::new(declared.kind, 0))
+        .map(|track| track.codec())
+        .filter(|kept| bare && kept.family() == declared.codec.family())
+        .map_or_else(|| declared.codec.clone(), |kept| kept.as_ref().clone())
 }
 
 /// The program's carried tracks changed: they need a new declaration,
@@ -406,7 +434,8 @@ impl Publisher {
                 clock_rate = this.clock_rate,
                 "http: declaring a track of the program"
             );
-            let track = tracks.declare(this.kind, this.codec.clone(), this.clock_rate);
+            let codec = codec_to_declare(tracks.tracks(), &this);
+            let track = tracks.declare(this.kind, codec, this.clock_rate);
             carried.push(Carried::new(track, &this));
             declared.push(this);
         }
@@ -1034,6 +1063,59 @@ mod tests {
             f.publisher.due(&next, later),
             Some(later + Duration::from_millis(100))
         );
+    }
+
+    /// The next attempt's publisher on the same tracks, as a reconnect
+    /// makes it.
+    fn reconnect(f: &Fixture, layout: &Layout) -> Publisher {
+        let (clock, _reports) = ClockInput::channel(Arc::clone(&f.mapper));
+        Publisher::new(&mut f.set.publisher(), clock, layout, LEAD).unwrap()
+    }
+
+    #[test]
+    fn iso13818_1_2_4_3_7_a_reconnect_keeps_the_codec_its_track_has_until_the_stream_brings_another()
+     {
+        let (program, units) = demux(H264_AAC);
+        let mut f = start(&program, LEAD);
+        play(&mut f.publisher, units, f.t0);
+        let video = Arc::clone(&f.set.tracks()[0]);
+        let audio = Arc::clone(&f.set.tracks()[1]);
+        let had = video.codec();
+        assert_h264_codec(&had);
+        let sound = audio.codec();
+
+        // MPEG-TS declares H.264 without sets: the track keeps the ones it
+        // has, and the same in-band sets change nothing (the codec is not
+        // even stored anew).
+        let (_, units) = demux(H264_AAC);
+        let mut again = reconnect(&f, &program);
+        assert!(Arc::ptr_eq(&video.codec(), &had));
+        assert!(Arc::ptr_eq(&audio.codec(), &sound));
+        play(&mut again, units, f.t0 + Duration::from_secs(10));
+        assert!(Arc::ptr_eq(&video.codec(), &had));
+        assert_eq!(video.stats().frames, 20);
+
+        // A codec with its own sets (an fMP4 init segment) is declared as
+        // it is.
+        let sets = Codec::H264 {
+            profile_level_id: Some([0x64, 0, 0x1f]),
+            sps: Some(Bytes::from_static(&[0x67, 0x64])),
+            pps: Some(Bytes::from_static(&[0x68, 1])),
+        };
+        let _ = reconnect(
+            &f,
+            &layout(vec![track(Kind::Video, sets.clone(), 90_000, 1)]),
+        );
+        assert_eq!(*video.codec(), sets);
+        // Another family without sets is declared bare.
+        let (h265, _) = demux(H265_V1);
+        let _ = reconnect(&f, &h265);
+        let bare = Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        };
+        assert_eq!(*video.codec(), bare);
     }
 
     #[test]
