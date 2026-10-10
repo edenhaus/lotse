@@ -777,6 +777,9 @@ async fn run(
         Ok(connected) => play(connected, &options, &ctx).await,
         Err(err) => err,
     };
+    // retina's messages may echo a URL built from the source URL's path
+    // and query (a control URL it cannot join to its base).
+    let exit = exit.scrubbed(&url);
     tear_down(&group, &ctx, &exit).await;
     SourceExit::Ended(exit)
 }

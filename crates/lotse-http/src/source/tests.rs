@@ -19,7 +19,7 @@ use lotse_core::track::{FrameSubscription, Track};
 use lotse_core::{Codec, Kind};
 use lotse_testing::Harness;
 use lotse_testing::fake_camera::CameraTls;
-use lotse_testing::fake_http::{FakeHttp, Reply};
+use lotse_testing::fake_http::{Challenge, FakeHttp, Reply};
 use lotse_tls::{Fingerprint, TlsTarget, Trust};
 
 use super::test_data::{LIVE_0, LIVE_1, LIVE_2};
@@ -374,6 +374,81 @@ async fn the_source_describes_itself_without_secrets() {
         source.request_keyframe(),
         lotse_core::source::KeyframeRequest::Unsupported
     ));
+}
+
+/// A camera key in the path, a token in the query of every URL and a
+/// Digest password: none of them in any log line (down to `trace`), in
+/// the exit, or in the description, through a redirect, a multivariant
+/// playlist, its variant, its segments and a missing one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
+    const SECRETS: [&str; 3] = ["camkey7f3a", "tok9d2e", "pw5b1c"];
+    let rig = Rig::new().await;
+    let logs = Captured::default();
+    let writer = logs.clone();
+    let _trace = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    );
+    rig.server
+        .require(Some((Challenge::DigestSha256, "admin", "pw5b1c")));
+    rig.server.set(
+        "/camkey7f3a/start?token=tok9d2e",
+        Reply::Redirect {
+            status: 302,
+            location: "/camkey7f3a/live/index.m3u8?token=tok9d2e".into(),
+        },
+    );
+    rig.playlist(
+        "/camkey7f3a/live/index.m3u8?token=tok9d2e",
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhigh/index.m3u8?token=tok9d2e\n",
+    );
+    for (i, body) in [LIVE_0, LIVE_1].into_iter().enumerate() {
+        rig.body(
+            &format!("/camkey7f3a/live/high/{i}.m2t?token=tok9d2e"),
+            MP2T,
+            body,
+        );
+    }
+    rig.playlist(
+        "/camkey7f3a/live/high/index.m3u8?token=tok9d2e",
+        &media_playlist(
+            "",
+            &[
+                "0.m2t?token=tok9d2e",
+                "1.m2t?token=tok9d2e",
+                "gone.m2t?token=tok9d2e",
+            ],
+            true,
+        ),
+    );
+    let url = rig
+        .server
+        .url("/camkey7f3a/start?token=tok9d2e")
+        .replace("://", "://admin:pw5b1c@");
+    let source = HttpSource::new(SourceUrl::parse(&url).unwrap(), options(), None);
+    let described = source.describe();
+    assert_eq!(
+        described.url.to_string(),
+        format!("http://****@{}/****?****", rig.server.addr())
+    );
+    let mut harness = rig.run(&source);
+    assert!(harness.wait_ready_within().await);
+    let err = rig.exit(harness).await;
+    assert_protocol(&err, "404");
+    assert_eq!(rig.seen("/camkey7f3a/live/high/1.m2t?token=tok9d2e"), 1);
+    let printed = format!("{err} {err:?} {described:?} {source:?}");
+    let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("http: following a redirect"), "{logged}");
+    assert!(logged.contains("segment fetched"), "{logged}");
+    for secret in SECRETS {
+        assert!(!logged.contains(secret), "{secret} logged:\n{logged}");
+        assert!(!printed.contains(secret), "{secret} printed:\n{printed}");
+    }
+    rig.stop().await;
 }
 
 #[tokio::test(flavor = "current_thread")]

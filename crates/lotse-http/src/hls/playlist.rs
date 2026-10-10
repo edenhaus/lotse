@@ -21,8 +21,10 @@
 //! `EXT-X-MAP` to the next segment only, and turns `EXT-X-KEY:METHOD=NONE`
 //! without an IV into an unknown tag; both are corrected here.
 
+use std::fmt;
 use std::time::Duration;
 
+use lotse_core::secret::RedactedUrl;
 use m3u8_rs::{AlternativeMediaType, ExtTag, KeyMethod};
 use url::Url;
 
@@ -69,8 +71,9 @@ pub struct MultivariantPlaylist {
     pub audio: Vec<AudioRendition>,
 }
 
-/// One `EXT-X-STREAM-INF` variant (RFC 8216 §4.3.4.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One `EXT-X-STREAM-INF` variant (RFC 8216 §4.3.4.2). `Debug` prints
+/// the URI redacted ([`RedactedUrl`]): it shares the source URL's secrets.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Variant {
     /// Its media playlist, resolved and of the playlist's origin.
     pub uri: Url,
@@ -83,7 +86,8 @@ pub struct Variant {
 }
 
 /// One `EXT-X-MEDIA` rendition of `TYPE=AUDIO` (RFC 8216 §4.3.4.1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` prints the URI redacted ([`RedactedUrl`]).
+#[derive(Clone, PartialEq, Eq)]
 pub struct AudioRendition {
     /// The `GROUP-ID` attribute a variant's `AUDIO` attribute names.
     pub group_id: String,
@@ -114,8 +118,9 @@ pub struct MediaPlaylist {
     pub segments: Vec<Segment>,
 }
 
-/// One media segment (RFC 8216 §3, §4.3.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One media segment (RFC 8216 §3, §4.3.2). `Debug` prints the URIs
+/// redacted ([`RedactedUrl`]).
+#[derive(Clone, PartialEq, Eq)]
 pub struct Segment {
     /// The segment, resolved and of the playlist's origin.
     pub uri: Url,
@@ -129,6 +134,40 @@ pub struct Segment {
     /// `EXT-X-GAP` (draft-pantos-hls-rfc8216bis §4.4.4.7): the segment has
     /// no media, and its URI "SHOULD NOT be loaded by clients".
     pub gap: bool,
+}
+
+impl fmt::Debug for Variant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Variant")
+            .field("uri", &RedactedUrl::new(&self.uri))
+            .field("bandwidth", &self.bandwidth)
+            .field("codecs", &self.codecs)
+            .field("audio_group", &self.audio_group)
+            .finish()
+    }
+}
+
+impl fmt::Debug for AudioRendition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AudioRendition")
+            .field("group_id", &self.group_id)
+            .field("name", &self.name)
+            .field("default", &self.default)
+            .field("uri", &self.uri.as_ref().map(RedactedUrl::new))
+            .finish()
+    }
+}
+
+impl fmt::Debug for Segment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Segment")
+            .field("uri", &RedactedUrl::new(&self.uri))
+            .field("duration", &self.duration)
+            .field("discontinuity", &self.discontinuity)
+            .field("map", &self.map.as_ref().map(RedactedUrl::new))
+            .field("gap", &self.gap)
+            .finish()
+    }
 }
 
 /// `EXT-X-START` (RFC 8216 §4.3.5.2): where to start playing.
@@ -458,6 +497,38 @@ mod tests {
     /// A media playlist with a target duration of 2 and `body` after it.
     fn media_with(body: &str) -> String {
         format!("#EXTM3U\n#EXT-X-TARGETDURATION:2\n{body}")
+    }
+
+    #[test]
+    fn debug_prints_every_uri_redacted() {
+        let multivariant = parse_multivariant(
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"en\",DEFAULT=YES,URI=\"key1/en.m3u8?t=tok1\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"avc1.42c00c\",AUDIO=\"a\"\nkey1/hi.m3u8?t=tok1\n",
+        );
+        let media = parse_media(&media_with(
+            "#EXT-X-MAP:URI=\"key1/init.mp4?t=tok1\"\n#EXTINF:2,\nkey1/a.m4s?t=tok1\n",
+        ));
+        let mut tracker = Tracker::new();
+        let _update = tracker.update(&media);
+        let debug = format!("{multivariant:?} {media:?} {tracker:?}");
+        let shown = "Url(\"http://camera.example:8080/****?****\")";
+        for field in [
+            format!(
+                "uri: {shown}, bandwidth: 1, codecs: Some(\"avc1.42c00c\"), audio_group: Some(\"a\")"
+            ),
+            format!("group_id: \"a\", name: \"en\", default: true, uri: Some({shown})"),
+            format!(
+                "uri: {shown}, duration: 2s, discontinuity: false, map: Some({shown}), gap: false"
+            ),
+            format!("len: 1, last: Some({shown}), end_list: false"),
+        ] {
+            assert!(debug.contains(&field), "{field} not in {debug}");
+        }
+        assert!(
+            !debug.contains("key1") && !debug.contains("tok1"),
+            "{debug}"
+        );
     }
 
     #[test]

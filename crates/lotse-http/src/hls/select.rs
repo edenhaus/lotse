@@ -13,7 +13,10 @@
 //! with the codec names of RFC 6381 §3.3, and skips `EXT-X-GAP` segments
 //! (draft-pantos-hls-rfc8216bis §4.4.4.7).
 
+use std::fmt;
 use std::time::Duration;
+
+use lotse_core::secret::RedactedUrl;
 
 use super::playlist::{AudioRendition, MediaPlaylist, MultivariantPlaylist, Segment, Variant};
 
@@ -277,8 +280,9 @@ pub struct Update {
 /// What tells two loads of a media playlist apart (RFC 8216 §6.3.4,
 /// "changed"): segments are only added at the end and removed at the
 /// start, so a playlist that changed differs in its media sequence, its
-/// length, its last segment or its end.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// length, its last segment or its end. `Debug` prints the URI redacted
+/// ([`RedactedUrl`]).
+#[derive(Clone, PartialEq, Eq)]
 struct Fingerprint {
     /// `EXT-X-MEDIA-SEQUENCE`.
     media_sequence: u64,
@@ -290,6 +294,18 @@ struct Fingerprint {
     last: Option<url::Url>,
     /// `EXT-X-ENDLIST`.
     end_list: bool,
+}
+
+impl fmt::Debug for Fingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fingerprint")
+            .field("media_sequence", &self.media_sequence)
+            .field("discontinuity_sequence", &self.discontinuity_sequence)
+            .field("len", &self.len)
+            .field("last", &self.last.as_ref().map(RedactedUrl::new))
+            .field("end_list", &self.end_list)
+            .finish()
+    }
 }
 
 impl Fingerprint {

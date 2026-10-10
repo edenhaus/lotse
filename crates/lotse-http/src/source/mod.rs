@@ -287,7 +287,7 @@ async fn attempt<C: Connect + Clone + 'static>(
     let mut first = client(connector.clone());
     tracing::info!(host = %ctx.peer.host, scheme = url.scheme(), "http: fetching the source");
     let sniffed = cancellable(&ctx.cancel, async {
-        sniff(first.get(url.url()).await?).await
+        sniff(first.get(url.expose_url()).await?).await
     })
     .await?;
     let feeds = match sniffed {

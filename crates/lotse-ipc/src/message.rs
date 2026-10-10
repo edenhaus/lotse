@@ -204,7 +204,8 @@ pub enum SessionEvent {
 }
 
 /// A source connection to run. Carries the credentials, which exist in the
-/// supervisor and in the one worker that uses them; `Debug` redacts the URL.
+/// supervisor and in the one worker that uses them; `Debug` redacts the URL
+/// and the options, whose values can carry a secret too.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceSpec {
     /// The supervisor's id for the connection, echoed in reports.
@@ -224,7 +225,7 @@ impl fmt::Debug for SourceSpec {
         f.debug_struct("SourceSpec")
             .field("connection_id", &self.connection_id)
             .field("url", &"****")
-            .field("options", &self.options)
+            .field("options", &"****")
             .field("peer_host", &self.peer_host)
             .field("peer_addrs", &self.peer_addrs)
             .finish()
@@ -420,6 +421,7 @@ mod tests {
         let text = format!("{spec:?}");
         assert!(!text.contains("hunter2"), "{text}");
         assert!(text.contains("url: \"****\""), "{text}");
+        assert!(text.contains("options: \"****\""), "{text}");
         assert!(text.contains("192.168.1.10:554"), "{text}");
         let wrapped = ToWorker::RunSource(spec);
         assert!(!format!("{wrapped:?}").contains("hunter2"));

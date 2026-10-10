@@ -51,6 +51,7 @@ use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HOST, LOCATION, USER_AGENT, WWW
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use lotse_core::clock::Clock;
+use lotse_core::secret::RedactedUrl;
 use lotse_core::source::{ResolvedPeer, SourceError};
 use lotse_core::source_url::{Credentials, SourceUrl};
 use lotse_core::task::{BoxFuture, spawn_named};
@@ -150,7 +151,7 @@ impl<C: Connect> Client<C> {
     ) -> Self {
         Self {
             connector,
-            origin: url.url().origin(),
+            origin: url.expose_url().origin(),
             peer,
             credentials: url.credentials().cloned(),
             clock,
@@ -399,8 +400,8 @@ impl<C: Connect> Client<C> {
 }
 
 /// A 2xx answer: its status, `Content-Type`, the URL it came from after
-/// redirects, and its unread body.
-#[derive(Debug)]
+/// redirects, and its unread body. `Debug` prints the URL redacted
+/// ([`RedactedUrl`]).
 pub struct Response {
     /// The 2xx status.
     status: StatusCode,
@@ -413,6 +414,17 @@ pub struct Response {
     url: Url,
     /// The body.
     body: Body,
+}
+
+impl fmt::Debug for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("content_type", &self.content_type)
+            .field("url", &RedactedUrl::new(&self.url))
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 impl Response {
@@ -685,6 +697,13 @@ mod tests {
             Some("application/vnd.apple.mpegurl")
         );
         assert_eq!(response.url().as_str(), s.fake.url("/live/a.m3u8?token=1"));
+        let debug = format!("{response:?}");
+        assert!(
+            debug.contains(&format!("url: Url(\"http://{}/****?****\")", s.fake.addr()))
+                && debug.contains("status: 200")
+                && !debug.contains("token"),
+            "{debug}"
+        );
         assert_eq!(
             &response.into_body().bytes(1024).await.unwrap()[..],
             b"#EXTM3U\n"
@@ -719,7 +738,7 @@ mod tests {
             CancellationToken::new(),
         );
         fake.set("/a", Reply::body("text/plain", "x"));
-        let response = client.get(source.url()).await.unwrap();
+        let response = client.get(source.expose_url()).await.unwrap();
         assert_eq!(response.content_type(), Some("text/plain"));
         assert_eq!(fake.requests()[0].host.as_deref(), Some("cam.example"));
     }
@@ -1333,7 +1352,7 @@ mod tests {
             TIMEOUT,
             CancellationToken::new(),
         );
-        let mut get = Box::pin(client.get(source.url()));
+        let mut get = Box::pin(client.get(source.expose_url()));
         assert!(poll_once(&mut get).await.is_none());
         clock.advance(TIMEOUT);
         assert_eq!(
@@ -1374,7 +1393,7 @@ mod tests {
             TIMEOUT,
             CancellationToken::new(),
         );
-        let err = client.get(source.url()).await.unwrap_err();
+        let err = client.get(source.expose_url()).await.unwrap_err();
         assert!(
             matches!(&err, SourceError::Protocol(m) if m.starts_with("the answer is not HTTP/1.1")),
             "{err:?}"

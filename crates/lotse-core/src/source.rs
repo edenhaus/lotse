@@ -215,6 +215,22 @@ impl SourceError {
             Self::Ended(_) => "source_ended",
         }
     }
+
+    /// The same error with its message scrubbed of `url`'s secrets
+    /// ([`RedactedUrl::scrub`](crate::secret::RedactedUrl::scrub)): for a
+    /// message that carries a third-party library's text, which may echo
+    /// a URL built from the source URL.
+    #[must_use]
+    pub fn scrubbed(self, url: &SourceUrl) -> Self {
+        let shown = url.redacted();
+        match self {
+            Self::Unreachable(message) => Self::Unreachable(shown.scrub(&message)),
+            Self::AuthFailed(message) => Self::AuthFailed(shown.scrub(&message)),
+            Self::Timeout(message) => Self::Timeout(shown.scrub(&message)),
+            Self::Protocol(message) => Self::Protocol(shown.scrub(&message)),
+            Self::Ended(message) => Self::Ended(shown.scrub(&message)),
+        }
+    }
 }
 
 /// The addresses a source connects to. Resolved by the supervisor: workers
@@ -1049,6 +1065,34 @@ mod tests {
         assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
         slot.withdraw();
         assert!(slot.current().is_none());
+    }
+
+    #[test]
+    fn a_scrubbed_source_error_keeps_its_kind_and_loses_the_urls_secrets() {
+        let url = SourceUrl::parse("rtsp://u:p@cam/KEY/live?token=TOK").unwrap();
+        let text = || "join rtsp://127.0.0.1:9/KEY/live?token=TOK to /KEY/live".to_owned();
+        let shown = "join rtsp://127.0.0.1:9/****?**** to /****";
+        for (err, scrubbed) in [
+            (
+                SourceError::Unreachable(text()),
+                SourceError::Unreachable(shown.into()),
+            ),
+            (
+                SourceError::AuthFailed(text()),
+                SourceError::AuthFailed(shown.into()),
+            ),
+            (
+                SourceError::Timeout(text()),
+                SourceError::Timeout(shown.into()),
+            ),
+            (
+                SourceError::Protocol(text()),
+                SourceError::Protocol(shown.into()),
+            ),
+            (SourceError::Ended(text()), SourceError::Ended(shown.into())),
+        ] {
+            assert_eq!(err.scrubbed(&url), scrubbed);
+        }
     }
 
     #[test]

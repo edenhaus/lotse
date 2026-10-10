@@ -1023,14 +1023,18 @@ mod tests {
     fn the_spec_logs_without_its_credentials() {
         let spec = DriverSpec {
             connection_id: "c1".into(),
-            url: "rtsps://admin:secret@cam/".into(),
-            options: "{}".into(),
+            url: "rtsps://admin:secret@cam/key?token=tok".into(),
+            options: r#"{"onvif":{"url":"http://admin:secret@cam/onvif","profile_token":"p"}}"#
+                .into(),
             host: "cam".into(),
             port: Some(322),
             loopback_relay: true,
         };
         let logged = format!("{spec:?}");
-        assert!(!logged.contains("secret"), "{logged}");
+        for secret in ["secret", "key", "tok"] {
+            assert!(!logged.contains(secret), "{logged}");
+        }
+        assert!(logged.contains(r#"options: ["onvif"]"#), "{logged}");
         assert!(
             logged.contains("port: Some(322)") && logged.contains("loopback_relay: true"),
             "{logged}"

@@ -1633,7 +1633,7 @@
           "description": "The connection's state."
         },
         "url": {
-          "description": "The URL, credentials redacted.",
+          "description": "The URL redacted to its origin, `scheme://[****@]host[:port]`, then\n`/****` when the path is anything but empty or `/` and `?****` when\na query is present: the path and query can carry secrets (a camera\nkey, a session token) as the userinfo can.",
           "type": "string"
         }
       },
