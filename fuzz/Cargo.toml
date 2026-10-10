@@ -71,6 +71,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "annexb_normalize"
+path = "fuzz_targets/annexb_normalize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "stun_message"
 path = "fuzz_targets/stun_message.rs"
 test = false
