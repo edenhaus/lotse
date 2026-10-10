@@ -10,7 +10,8 @@
 //! (`EXT-X-START`), §6.3.2 (media sequence numbers), §4.3.3.3
 //! (discontinuity sequence numbers), §6.3.3 (where a live client starts,
 //! with a [`SPEC-DEVIATION`](start_index)) and §6.3.4 (reload intervals),
-//! with the codec names of RFC 6381 §3.3.
+//! with the codec names of RFC 6381 §3.3, and skips `EXT-X-GAP` segments
+//! (draft-pantos-hls-rfc8216bis §4.4.4.7).
 
 use std::time::Duration;
 
@@ -163,7 +164,11 @@ fn audio_rendition<'a>(audio: &'a [AudioRendition], group: &str) -> Option<&'a A
 ///
 /// Without it, a playlist with `EXT-X-ENDLIST` starts at its first segment,
 /// as a recording plays from its start (§6.3.3 places no limit on it), and
-/// a live playlist at its second-newest segment.
+/// a live playlist at its second-newest segment with media: segments marked
+/// `EXT-X-GAP` (draft-pantos-hls-rfc8216bis §4.4.4.7), which a low-latency
+/// server lists as placeholders before it has made enough segments, are
+/// not counted; the newest one when only one has media, and `None` while
+/// none has.
 /// SPEC-DEVIATION: §6.3.3 says a live client SHOULD NOT start at a segment
 /// that starts less than three target durations from the end. The
 /// second-newest segment cuts the latency to one or two target durations,
@@ -171,12 +176,24 @@ fn audio_rendition<'a>(audio: &'a [AudioRendition], group: &str) -> Option<&'a A
 /// buffered when the next one is late.
 #[must_use]
 pub fn start_index(playlist: &MediaPlaylist) -> Option<usize> {
-    let last = playlist.segments.len().checked_sub(1)?;
-    Some(match playlist.start {
-        Some(start) => offset_index(&playlist.segments, start.time_offset),
-        None if playlist.end_list => 0,
-        None => last.saturating_sub(1),
-    })
+    if playlist.segments.is_empty() {
+        return None;
+    }
+    match playlist.start {
+        Some(start) => Some(offset_index(&playlist.segments, start.time_offset)),
+        None if playlist.end_list => Some(0),
+        None => {
+            let mut with_media = playlist
+                .segments
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, segment)| !segment.gap)
+                .map(|(index, _)| index);
+            let newest = with_media.next()?;
+            Some(with_media.next().unwrap_or(newest))
+        }
+    }
 }
 
 /// The index of the segment that contains `offset` seconds into the
@@ -213,7 +230,8 @@ pub struct Fetch {
     pub discontinuity_sequence: u64,
     /// Whether it starts a new timeline: its discontinuity sequence number
     /// differs from the previous segment yielded, or segments were lost or
-    /// the stream restarted before it ([`Event`]). The first segment
+    /// the stream restarted before it ([`Event`]), or an `EXT-X-GAP`
+    /// segment, never yielded, came between the two. The first segment
     /// yielded starts the first timeline and is not flagged.
     pub discontinuity: bool,
     /// The segment.
@@ -240,7 +258,9 @@ pub enum Event {
 /// What one load of a media playlist adds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Update {
-    /// The segments to fetch, in order, each once over the tracker's life.
+    /// The segments to fetch, in order, each once over the tracker's life;
+    /// never one marked `EXT-X-GAP`, whose URI "SHOULD NOT be loaded by
+    /// clients" (draft-pantos-hls-rfc8216bis §4.4.4.7).
     pub segments: Vec<Fetch>,
     /// A gap or restart found, if any.
     pub event: Option<Event>,
@@ -351,8 +371,16 @@ impl Tracker {
 
         let mut segments = Vec::new();
         if let Some(next) = next {
+            let mut after = next;
             for (sequence, discontinuity_sequence, segment) in numbered {
                 if sequence < next {
+                    continue;
+                }
+                after = sequence.saturating_add(1);
+                if segment.gap {
+                    // Its media is missing, so the segment after it starts
+                    // a new timeline, unless none was yielded before it.
+                    self.pending_discontinuity |= self.last_discontinuity.is_some();
                     continue;
                 }
                 let discontinuity = self.pending_discontinuity
@@ -368,11 +396,7 @@ impl Tracker {
                     segment: segment.clone(),
                 });
             }
-            self.next = Some(
-                segments
-                    .last()
-                    .map_or(next, |fetch| fetch.sequence.saturating_add(1)),
-            );
+            self.next = Some(after);
         }
 
         let finished = playlist.end_list && self.next.is_none_or(|next| next >= end);
@@ -482,12 +506,14 @@ mod tests {
             duration: Duration::from_secs(seconds),
             discontinuity,
             map: None,
+            gap: false,
         }
     }
 
     /// A live playlist with a target duration of 2 whose segments, each
     /// two seconds, are numbered from `media_sequence`; a name starting
-    /// with `!` carries `EXT-X-DISCONTINUITY`.
+    /// with `!` carries `EXT-X-DISCONTINUITY`, one starting with `?`
+    /// `EXT-X-GAP`.
     fn live(media_sequence: u64, discontinuity_sequence: u64, names: &[&str]) -> MediaPlaylist {
         MediaPlaylist {
             target_duration: Duration::from_secs(2),
@@ -497,9 +523,14 @@ mod tests {
             start: None,
             segments: names
                 .iter()
-                .map(|name| match name.strip_prefix('!') {
-                    Some(name) => segment(name, 2, true),
-                    None => segment(name, 2, false),
+                .map(|name| {
+                    let (gap, name) = name.strip_prefix('?').map_or((false, *name), |n| (true, n));
+                    let mut segment = match name.strip_prefix('!') {
+                        Some(name) => segment(name, 2, true),
+                        None => segment(name, 2, false),
+                    };
+                    segment.gap = gap;
+                    segment
                 })
                 .collect(),
         }
@@ -762,6 +793,50 @@ mod tests {
         assert_eq!(start_index(&live(0, 0, &["a", "b"])), Some(0));
         assert_eq!(start_index(&live(0, 0, &["a"])), Some(0));
         assert_eq!(start_index(&live(0, 0, &[])), None);
+    }
+
+    #[test]
+    fn rfc8216bis_4_4_4_7_live_starts_at_the_second_newest_segment_with_media() {
+        assert_eq!(start_index(&live(0, 0, &["?a", "?b", "c"])), Some(2));
+        assert_eq!(
+            start_index(&live(0, 0, &["?a", "b", "?c", "d", "?e"])),
+            Some(1)
+        );
+        assert_eq!(start_index(&live(0, 0, &["a", "?b", "c", "d"])), Some(2));
+        assert_eq!(start_index(&live(0, 0, &["?a", "?b"])), None);
+        // EXT-X-START and EXT-X-ENDLIST choose as before; the tracker skips
+        // the gaps.
+        assert_eq!(start_index(&ended(live(0, 0, &["?a", "b"]))), Some(0));
+    }
+
+    #[test]
+    fn rfc8216bis_4_4_4_7_gap_segments_are_never_fetched_and_end_the_timeline() {
+        let mut tracker = Tracker::new();
+        let update = tracker.update(&live(0, 0, &["a", "b", "?c", "d"]));
+        assert_eq!(
+            yielded(&update),
+            vec![fetch(1, 0, false, "b"), fetch(3, 0, true, "d")]
+        );
+        // A gap at the end flags the segment after it, in a later load.
+        let update = tracker.update(&live(1, 0, &["b", "?c", "d", "?e"]));
+        assert_eq!(yielded(&update), vec![]);
+        assert_eq!(update.reload_after, TARGET);
+        let update = tracker.update(&live(2, 0, &["?c", "d", "?e", "f"]));
+        assert_eq!(yielded(&update), vec![fetch(5, 0, true, "f")]);
+        assert_eq!(update.event, None);
+        // Two gaps in a row are one break.
+        let update = tracker.update(&live(4, 0, &["?e", "f", "?g", "?h", "i"]));
+        assert_eq!(yielded(&update), vec![fetch(8, 0, true, "i")]);
+    }
+
+    #[test]
+    fn rfc8216bis_4_4_4_7_gaps_before_the_first_segment_start_no_new_timeline() {
+        let mut tracker = Tracker::new();
+        let update = tracker.update(&with_start(live(0, 0, &["?a", "?b", "c", "d"]), 0.0));
+        assert_eq!(
+            yielded(&update),
+            vec![fetch(2, 0, false, "c"), fetch(3, 0, false, "d")]
+        );
     }
 
     #[test]

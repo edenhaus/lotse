@@ -5,7 +5,9 @@
 //! `EXT-X-DISCONTINUITY`, `EXT-X-KEY`, `EXT-X-MAP`), §4.3.3 (media playlist
 //! tags), §4.3.4 (multivariant playlist tags: `EXT-X-MEDIA`,
 //! `EXT-X-STREAM-INF`, `EXT-X-I-FRAME-STREAM-INF`) and §4.3.5.2
-//! (`EXT-X-START`). Every URI is resolved against the playlist's URL
+//! (`EXT-X-START`), and `EXT-X-GAP` from RFC 8216's revision,
+//! draft-pantos-hls-rfc8216bis §4.4.4.7, which low-latency servers put on
+//! placeholder segments. Every URI is resolved against the playlist's URL
 //! (RFC 3986 §5.2, §4.1 of RFC 8216) and must share its origin (RFC 6454
 //! §4: scheme, host and port), because the worker may connect to the
 //! playlist's host only. Fragments are dropped: they are never sent
@@ -124,6 +126,9 @@ pub struct Segment {
     /// The `EXT-X-MAP` (§4.3.2.5) in effect: the last one before this
     /// segment, resolved and of the playlist's origin.
     pub map: Option<Url>,
+    /// `EXT-X-GAP` (draft-pantos-hls-rfc8216bis §4.4.4.7): the segment has
+    /// no media, and its URI "SHOULD NOT be loaded by clients".
+    pub gap: bool,
 }
 
 /// `EXT-X-START` (RFC 8216 §4.3.5.2): where to start playing.
@@ -351,6 +356,7 @@ fn media(playlist: m3u8_rs::MediaPlaylist, base: &Url) -> Result<MediaPlaylist, 
             duration,
             discontinuity: segment.discontinuity,
             map: map.clone(),
+            gap: has_tag(&segment.unknown_tags, "X-GAP"),
         });
     }
     Ok(MediaPlaylist {
@@ -419,6 +425,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::hls::{Tracker, Update, start_index};
 
     const BASE: &str = "http://camera.example:8080/live/index.m3u8";
 
@@ -474,15 +481,65 @@ mod tests {
                         duration: Duration::from_millis(3500),
                         discontinuity: false,
                         map: None,
+                        gap: false,
                     },
                     Segment {
                         uri: url("/live/seg121.ts?token=a"),
                         duration: Duration::from_secs(4),
                         discontinuity: true,
                         map: None,
+                        gap: false,
                     },
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn rfc8216bis_4_4_4_7_gap_segments_are_marked() {
+        // MediaMTX 1.21.1's low-latency playlist right after the path
+        // became ready (captured 2026-10-08): six placeholders before the
+        // first segment with media, the partial segments as unknown tags.
+        let playlist = parse_media(include_str!("../../testdata/mediamtx_low_latency_0.m3u8"));
+        let gaps: Vec<bool> = playlist.segments.iter().map(|s| s.gap).collect();
+        assert_eq!(gaps, [true, true, true, true, true, true, false]);
+        assert_eq!(playlist.segments[0].uri.path(), "/live/gap.mp4");
+        assert!(
+            playlist.segments[6]
+                .uri
+                .path()
+                .ends_with("_video1_seg7.mp4")
+        );
+        assert!(playlist.segments.iter().all(|s| s.map.is_some()));
+    }
+
+    #[test]
+    fn rfc8216bis_4_4_4_7_mediamtx_low_latency_starts_at_its_first_segment_with_media() {
+        // MediaMTX 1.21.1's low-latency playlist right after the path
+        // became ready, and its next reload (captured 2026-10-08): six
+        // `EXT-X-GAP` placeholders at `gap.mp4`, a URI it answers with 401.
+        let first = parse_media(include_str!("../../testdata/mediamtx_low_latency_0.m3u8"));
+        assert_eq!(start_index(&first), Some(6));
+        let mut tracker = Tracker::new();
+        let update = tracker.update(&first);
+        let sequences = |update: &Update| -> Vec<(u64, bool)> {
+            update
+                .segments
+                .iter()
+                .map(|fetch| (fetch.sequence, fetch.discontinuity))
+                .collect()
+        };
+        assert_eq!(sequences(&update), [(7, false)]);
+        let update = tracker.update(&parse_media(include_str!(
+            "../../testdata/mediamtx_low_latency_1.m3u8"
+        )));
+        assert_eq!(sequences(&update), [(8, false)]);
+        assert!(
+            update.segments[0]
+                .segment
+                .uri
+                .path()
+                .ends_with("_video1_seg8.mp4")
         );
     }
 
