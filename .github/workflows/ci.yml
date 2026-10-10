@@ -307,12 +307,74 @@ jobs:
           shared-key: coverage
       - run: mise run coverage
 
-  mutants:
-    name: Mutants (changed lines)
+  # How many Mutants jobs the PR needs, from its changed lines' mutants (scripts/mutants-shards.sh):
+  # up to 10 a job, at most 8 jobs, none when it has no mutants. Listing them builds nothing.
+  mutants-plan:
+    name: Mutants plan
     if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      shards: ${{ steps.plan.outputs.shards }}
+    env:
+      BASE_REF: ${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # `--in-diff` needs the merge base
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: rust cargo:cargo-mutants
+      - id: plan
+        run: scripts/mutants-shards.sh "origin/$BASE_REF" >>"$GITHUB_OUTPUT"
+
+  # The Mutants jobs' build cache, made on main, whose caches every PR restores: each package's tests
+  # built alone (`mise run mutants-cache`), as cargo-mutants builds a mutant. The Mutants jobs save
+  # none: a job that misses a mutant fails, and rust-cache saves only after a job that passes.
+  mutants-cache:
+    name: Mutants cache
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env: # the Mutants jobs' build: rust-cache keys on these, cargo on the profile
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: rust cmake github:nextest-rs/nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mutants
+      - run: mise run mutants-cache
+
+  # The changed lines' mutants, one after another, split into consecutive slices over the plan's
+  # shards (cargo-mutants' default `slice` sharding). Each shard mutates its checkout in place, so
+  # main's cached target/ builds; a copy of the tree would build from cold. No baseline: its build
+  # selects all of the shard's packages at once, the one build the cache does not hold. The Tests
+  # jobs take its place: the shards start only after the unmutated tests passed there, since a
+  # failing test would make every mutant look caught. No debug info: every mutant relinks the test
+  # binaries, and debug info is most of what the linker writes.
+  mutants:
+    name: Mutants (changed lines, shard ${{ matrix.shard }})
+    needs: [mutants-plan, tests]
+    if: needs.mutants-plan.outputs.shards != '[]' # and, implied, every needed job passed
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.mutants-plan.outputs.shards) }}
     runs-on: ubuntu-latest
     env:
       BASE_REF: ${{ github.base_ref }}
+      SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ needs.mutants-plan.outputs.count }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -325,7 +387,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: mutants
-      - run: mise run mutants "origin/$BASE_REF"
+          save-if: false # the Mutants cache job's, from main
+      - run: mise run mutants --shard "$SHARD/$SHARDS" --in-place --skip-baseline "origin/$BASE_REF"
 
   # The fuzz targets, built once (cargo-fuzz's release build with AddressSanitizer, on the pinned
   # nightly) when the change reaches what they are built from. On a PR only the targets built from

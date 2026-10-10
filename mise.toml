@@ -89,11 +89,33 @@ run = "cargo llvm-cov nextest --workspace --all-features --locked --no-tests=war
 
 [tasks.mutants]
 description = "Mutation-testing gate on the lines changed against a base ref (default origin/main)"
-usage = 'arg "[base]" help="git ref to diff against" default="origin/main"'
+usage = '''
+arg "[base]" help="git ref to diff against" default="origin/main"
+flag "--shard <shard>" help="only this slice of the mutants, k/n with k from 0 (CI's Mutants jobs)"
+flag "--in-place" help="mutate the checked-out tree, not a copy, so its target/ builds (CI's throwaway checkout; an interrupted run can leave a mutation behind)"
+flag "--skip-baseline" help="no test run of the unmutated tree first; the tests' 240 s timeout is set instead of 5x the baseline's (CI, whose Mutants jobs start after its Tests jobs passed)"
+'''
 run = """
 diff="$(mktemp)"
 git diff "${usage_base}...HEAD" > "$diff"
-cargo mutants --workspace --all-features --test-tool nextest --in-diff "$diff"
+set --
+[ -z "${usage_shard:-}" ] || set -- "$@" --shard "$usage_shard"
+[ "${usage_in_place:-false}" != true ] || set -- "$@" --in-place
+# 240 s: nextest ends a hung test after 180 s (.config/nextest.toml), with room for the run around it.
+[ "${usage_skip_baseline:-false}" != true ] || set -- "$@" --baseline=skip --timeout 240
+cargo mutants --workspace --all-features --test-tool nextest --in-diff "$diff" "$@"
+"""
+
+[tasks.mutants-cache]
+description = "The Mutants jobs' build: each package's tests built alone, as cargo-mutants builds a mutant (CI's Mutants cache job)"
+# A dependency's features depend on which packages a build selects, so a workspace build would
+# leave other variants of tokio, serde_json and the like than the ones a mutant's build needs.
+# lotse-testing has no mutants (.cargo/mutants.toml), so it is never built alone.
+run = """
+for manifest in crates/*/Cargo.toml; do
+  case "$manifest" in crates/lotse-testing/*) continue ;; esac
+  cargo nextest run --no-run --all-features --manifest-path "$manifest"
+done
 """
 
 [tasks.turn-e2e]
