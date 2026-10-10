@@ -290,6 +290,7 @@ impl SessionUnderTest {
             tcp_candidates: vec![],
             video: track.codec(),
             audio: None,
+            backchannel: None,
             orientation: lotse_core::Orientation::default(),
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
@@ -438,6 +439,8 @@ impl SessionUnderTest {
                     self.events.push(SessionEvent::Closed { code, message });
                 }
                 SessionOutput::Event(event) => self.events.push(event),
+                // The suite's viewer sends no talk-back.
+                SessionOutput::Uplink(_) => {}
                 SessionOutput::Timeout(at) => {
                     self.timeout = Some(at);
                     return;

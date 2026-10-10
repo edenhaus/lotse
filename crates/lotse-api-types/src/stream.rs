@@ -291,6 +291,64 @@ pub struct Stream {
     pub sessions: Vec<String>,
     /// The counters.
     pub stats: StreamStats,
+    /// Who talks to the camera through its backchannel.
+    #[serde(default)]
+    pub backchannel: StreamBackchannel,
+}
+
+/// The talker of a stream's backchannel, as `stream/get` reports it.
+/// A camera has one backchannel, held by its source connection, so streams
+/// that share the connection report the same talker.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct StreamBackchannel {
+    /// The session holding the backchannel, or null when it is free.
+    #[serde(default)]
+    pub talker: Option<String>,
+    /// When `talker` last changed, RFC 3339; null while nobody has talked
+    /// since the connection's worker started.
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+/// Why a stream's talker changed: the `reason` of `talker_changed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TalkerReason {
+    /// A session sent the first talk-back packet while nobody held the
+    /// backchannel, and holds it now.
+    Claimed,
+    /// The talker's session closed; the backchannel is free.
+    SessionClosed,
+    /// `backchannel/release` freed it; the next session to send claims it.
+    Released,
+}
+
+impl TalkerReason {
+    /// The API name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::SessionClosed => "session_closed",
+            Self::Released => "released",
+        }
+    }
+
+    /// The reason for its API name.
+    pub fn parse(name: &str) -> Option<Self> {
+        [Self::Claimed, Self::SessionClosed, Self::Released]
+            .into_iter()
+            .find(|reason| reason.as_str() == name)
+    }
+}
+
+/// `backchannel/release`'s result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BackchannelReleaseResult {
+    /// The session that held the backchannel when the command arrived, as
+    /// the worker last reported it; null when it was free. A
+    /// `talker_changed` with `released` follows on `stream/subscribe` when
+    /// one was released.
+    pub talker: Option<String>,
 }
 
 /// `stream/list`'s result.
@@ -327,6 +385,23 @@ pub enum StreamEvent {
     StreamRemoved {
         /// The stream.
         stream_id: String,
+    },
+    /// The talker of the stream's backchannel changed. Sent to the
+    /// subscribers of every stream on the source connection, never
+    /// coalesced or shed.
+    #[schemars(title = "StreamEventTalkerChanged")]
+    TalkerChanged {
+        /// The stream.
+        stream_id: String,
+        /// The session holding the backchannel now: `session_id` after a
+        /// claim, null otherwise.
+        talker: Option<String>,
+        /// The session it concerns: the new talker, or the one that let go.
+        session_id: String,
+        /// Why.
+        reason: TalkerReason,
+        /// When, RFC 3339: the `since` of `stream/get`'s `backchannel`.
+        since: String,
     },
 }
 
@@ -461,6 +536,10 @@ mod tests {
             ],
             sessions: vec![],
             stats: StreamStats::default(),
+            backchannel: StreamBackchannel {
+                talker: Some("s1".into()),
+                since: Some("2026-09-28T11:02:04.000Z".into()),
+            },
         };
         let json = serde_json::to_value(&stream).unwrap();
         assert_eq!(json["state"], "live");
@@ -508,6 +587,57 @@ mod tests {
         assert_eq!(partial.stalls, 3);
         assert_eq!(partial.age_skips, 0);
         assert_eq!(partial.frames_over_browser_limit, 0);
+    }
+
+    #[test]
+    fn talker_changes_serialize_like_the_contract_examples() {
+        let event = StreamEvent::TalkerChanged {
+            stream_id: "front".into(),
+            talker: Some("s1".into()),
+            session_id: "s1".into(),
+            reason: TalkerReason::Claimed,
+            since: "2026-10-07T10:00:00.000Z".into(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json,
+            json!({ "type": "talker_changed", "stream_id": "front", "talker": "s1",
+                    "session_id": "s1", "reason": "claimed", "since": "2026-10-07T10:00:00.000Z" })
+        );
+        assert_eq!(serde_json::from_value::<StreamEvent>(json).unwrap(), event);
+        for (reason, name) in [
+            (TalkerReason::Claimed, "claimed"),
+            (TalkerReason::SessionClosed, "session_closed"),
+            (TalkerReason::Released, "released"),
+        ] {
+            assert_eq!(reason.as_str(), name);
+            assert_eq!(serde_json::to_value(reason).unwrap(), name);
+            assert_eq!(TalkerReason::parse(name), Some(reason));
+        }
+        assert_eq!(TalkerReason::parse("stolen"), None);
+        assert_eq!(
+            serde_json::to_value(BackchannelReleaseResult { talker: None }).unwrap(),
+            json!({ "talker": null })
+        );
+    }
+
+    #[test]
+    fn a_stream_from_a_daemon_without_talk_back_parses_with_nobody_talking() {
+        let stream: Stream = serde_json::from_value(json!({
+            "stream_id": "front", "state": "idle", "preload": false,
+            "since": "2026-09-28T11:02:03.000Z", "last_error": null, "sources": [],
+            "tracks": [], "sessions": [], "stats": {}
+        }))
+        .unwrap();
+        assert_eq!(stream.backchannel, StreamBackchannel::default());
+        assert_eq!(
+            serde_json::to_value(StreamBackchannel {
+                talker: Some("s1".into()),
+                since: Some("2026-09-28T11:02:04.000Z".into()),
+            })
+            .unwrap(),
+            json!({ "talker": "s1", "since": "2026-09-28T11:02:04.000Z" })
+        );
     }
 
     #[test]

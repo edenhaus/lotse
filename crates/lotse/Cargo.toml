@@ -48,6 +48,7 @@ lotse-worker = { workspace = true }
 rustix = { workspace = true, features = ["process"] } # SIGTERM to the daemon under test
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] } # the worker-manager and session tests drive a worker; the ICE-TCP viewer frames its connection
 tokio-util = { workspace = true } # the cancellation token of the ICE-TCP acceptor the signaling test runs
+lotse-ipc = { workspace = true } # the talk-back tone test serves a worker in-process and speaks the supervisor's end of its channel
 lotse-testing = { workspace = true } # the fake camera and the headless viewer of the session test
 
 [lints]

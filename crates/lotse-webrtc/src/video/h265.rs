@@ -400,6 +400,7 @@ mod tests {
                 tcp_candidates: vec![],
                 video: std::sync::Arc::new(Codec::Mjpeg),
                 audio: None,
+                backchannel: None,
                 orientation: lotse_core::Orientation::default(),
                 limits: SessionLimits::default(),
                 wall: std::time::SystemTime::UNIX_EPOCH,
@@ -409,7 +410,9 @@ mod tests {
                 high_tier,
                 level_id: None,
             });
-            let mut rtc = crate::session::build_config(&request, &video, None).build(now);
+            let mut rtc =
+                crate::session::build_config(&request, &video, &crate::audio::EVERY_CODEC)
+                    .build(now);
             rtc.sdp_api()
                 .accept_offer(SdpOffer::from_sdp_string(&offer).unwrap())
                 .unwrap();

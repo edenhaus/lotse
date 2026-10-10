@@ -15,6 +15,7 @@ use anyhow::Context as _;
 use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _};
 use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
 use lotse_codec::transcode::AacToOpus;
+use lotse_codec::transcode::uplink::ToG711Factory;
 use lotse_core::clock::SystemClock;
 use lotse_core::registry::Registries;
 use lotse_core::runner::RunnerConfig;
@@ -76,6 +77,9 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
     registries
         .transcoders
         .register(Arc::new(AacToOpus::new(Arc::new(SystemClock))));
+    // Talk-back to the camera's G.711, framed per backchannel: apart from
+    // the downlink list, so no viewer is offered it.
+    registries.uplink = Some(Arc::new(ToG711Factory::new(Arc::new(SystemClock))));
     #[cfg(feature = "output-webrtc")]
     registered(
         "webrtc output",
@@ -93,13 +97,13 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
     #[cfg(not(feature = "source-rtsp"))]
     drop(relay);
     #[cfg(feature = "source-fake")]
+    // With a backchannel, so the talk-back tests reach a worker's arbiter
+    // through the control API.
     registered(
         "fake source",
-        registries
-            .sources
-            .register(Arc::new(lotse_core::test_util::FakeSourceFactory::new(&[
-                "fake",
-            ]))),
+        registries.sources.register(Arc::new(
+            lotse_core::test_util::FakeSourceFactory::with_backchannel(&["fake"]),
+        )),
     );
     registries
 }

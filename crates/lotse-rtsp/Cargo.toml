@@ -14,13 +14,15 @@ categories.workspace = true
 [dependencies]
 bytes = { workspace = true }
 futures-util = { workspace = true } # the session's packet stream
+getrandom = { workspace = true } # the backchannel stream's random SSRC, sequence number and timestamp
 retina = { workspace = true, features = ["h265"] } # `h265`: the RFC 7798 §7.1 `sprop-vps`, `sprop-sps` and `sprop-pps` of an H.265 camera's SDP
 serde = { workspace = true }
 serde_json = { workspace = true }
+sdp-types = { workspace = true } # the camera's backchannel media: payload type and `a=ptime`
 rustls = { workspace = true } # `rtsps`: the client configuration and the certificate verifier
 sha2 = { workspace = true } # the `tls_fingerprint` pin of the camera's leaf certificate
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "net", "io-util", "sync"] } # `select!` over packets and cancellation; the `rtsps` relay's sockets and copy loop; `sync`: the TCP relay's wake-up when a receiver report is first scheduled
+tokio = { workspace = true, features = ["macros", "net", "io-util", "sync"] } # `select!` over packets and cancellation; the `rtsps` relay's sockets and copy loop; `sync`: the TCP relay's wake-up when a receiver report is first scheduled, and the backchannel's queue
 tokio-rustls = { workspace = true } # the TLS stream to an `rtsps` camera
 tracing = { workspace = true }
 url = { workspace = true } # the URL retina connects to, host replaced by the resolved address

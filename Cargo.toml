@@ -86,10 +86,15 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 retina = { git = "https://github.com/scottlamb/retina", rev = "7698fa14924768f024aa16126a5e3ca324e5bfe6", default-features = false }
 # RTSP message parsing and serialization for the fake camera of the tests.
 rtsp-types = { version = "0.1", default-features = false }
+# SDP media descriptions in `lotse-rtsp`: the payload type and `a=ptime` of a camera's backchannel
+# media; the version retina parses with, already in the tree.
+sdp-types = { version = "0.2", default-features = false }
 # H.264 bitstream syntax (SPS profile, level and dimensions, SEI) on the side branch; the packet
 # layer parses only NAL headers itself.
 h264-reader = { version = "0.9", default-features = false }
-# Transaction ids of the STUN client (RFC 8489 §5: 96 bits, unpredictable); the OS entropy source.
+# Transaction ids of the STUN client (RFC 8489 §5: 96 bits, unpredictable); the random SSRC,
+# sequence number and timestamp a camera's backchannel stream starts at (RFC 3550 §5.1, §8.1); the
+# OS entropy source.
 getrandom = { version = "0.3", default-features = false }
 # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5) in the supervisor's demux and in str0m's crypto provider.
 hmac = { version = "0.12", default-features = false }

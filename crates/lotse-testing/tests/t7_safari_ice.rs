@@ -302,6 +302,7 @@ impl Safari {
                 pps: None,
             }),
             audio: None,
+            backchannel: None,
             orientation: lotse_core::Orientation::default(),
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
@@ -353,6 +354,8 @@ impl Safari {
                     }
                 },
                 SessionOutput::Event(event) => self.events.push(event),
+                // The Safari stand-in sends no talk-back.
+                SessionOutput::Uplink(_) => {}
                 SessionOutput::Timeout(at) => {
                     self.session_timeout = Some(at);
                     return;

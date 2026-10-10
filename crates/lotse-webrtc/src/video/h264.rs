@@ -242,12 +242,14 @@ mod tests {
                 pps: None,
             }),
             audio: None,
+            backchannel: None,
             orientation: lotse_core::Orientation::default(),
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
         };
         let video = super::super::VideoPlan::for_codec(&request.video).unwrap();
-        let mut rtc = crate::session::build_config(&request, &video, None).build(now);
+        let mut rtc =
+            crate::session::build_config(&request, &video, &crate::audio::EVERY_CODEC).build(now);
         rtc.sdp_api()
             .accept_offer(SdpOffer::from_sdp_string(&offer).unwrap())
             .unwrap();

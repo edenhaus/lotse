@@ -10,7 +10,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -302,13 +302,24 @@ impl ClockInput {
 
 /// A source's reverse audio path into the device, offered when the protocol
 /// has one (RTSP with the ONVIF backchannel). Packets sent here reach the
-/// device; the codec is what it accepts.
+/// device; the codec and the frame duration are what it accepts.
 #[derive(Debug, Clone)]
 pub struct BackchannelHandle {
     /// The codec the device accepts.
     pub codec: Codec,
-    /// Where uplink packets go.
+    /// The audio one packet carries, as the device asks for it (RTSP: the
+    /// backchannel media's `a=ptime`, RFC 8866 §6.4), else
+    /// [`BackchannelHandle::DEFAULT_FRAME`]. The talk-back transcoder
+    /// frames G.711 to it; a forwarded packet keeps the sender's.
+    pub frame: Duration,
+    /// Where uplink packets go. Never waited on: a full queue drops.
     pub sender: mpsc::Sender<MediaPacket>,
+}
+
+impl BackchannelHandle {
+    /// 20 ms, RFC 3551 §4.5's default packetization interval: the frame
+    /// of a device that names none.
+    pub const DEFAULT_FRAME: Duration = Duration::from_millis(20);
 }
 
 /// The slot a source fills when it offers a backchannel. Shared with the
@@ -661,7 +672,7 @@ mod tests {
             frame_start: keyframe_start,
             keyframe_start,
             epoch: 0,
-            lateness: std::time::Duration::ZERO,
+            lateness: Duration::ZERO,
             payload: Arc::from(&[0_u8; 10][..]),
         }
     }
@@ -1021,9 +1032,11 @@ mod tests {
         let (sender, _rx) = mpsc::channel(1);
         slot.offer(BackchannelHandle {
             codec: Codec::Pcmu,
+            frame: BackchannelHandle::DEFAULT_FRAME,
             sender,
         });
         assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
+        assert_eq!(BackchannelHandle::DEFAULT_FRAME, Duration::from_millis(20));
         slot.withdraw();
         assert!(slot.current().is_none());
     }

@@ -104,6 +104,9 @@ pub enum ToWorker {
         /// The `closed` event's message.
         message: String,
     },
+    /// Free the connection's backchannel from its talker
+    /// (`backchannel/release`); a `Talker` report follows when one held it.
+    ReleaseBackchannel,
 }
 
 /// A session to open: the browser's offer, the ICE credentials the
@@ -155,6 +158,9 @@ pub enum SessionEvent {
     Answer {
         /// The SDP.
         sdp: String,
+        /// The talk-back codec the answer negotiated (`opus`, `pcmu`,
+        /// `pcma`); `None` when talk-back is off.
+        talkback: Option<String>,
     },
     /// A local candidate; empty means end of candidates.
     Candidate {
@@ -268,6 +274,32 @@ pub enum ToSupervisor {
         /// What happened.
         event: SessionEvent,
     },
+    /// The talker of the connection's backchannel changed.
+    Talker(TalkerChange),
+}
+
+/// A change of the connection's talker: the session it concerns, the new
+/// talker after `claimed`, the one that let go after `session_closed` or
+/// `released`, when the channel is free.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkerChange {
+    /// The session.
+    pub session_id: String,
+    /// `claimed`, `session_closed` or `released`.
+    pub reason: String,
+    /// When, in milliseconds since the Unix epoch.
+    pub at_ms: u64,
+}
+
+/// One session's talk-back counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TalkbackStats {
+    /// Talk-back packets the session received and took.
+    pub packets_received: u64,
+    /// Those dropped because another session held the backchannel.
+    pub packets_dropped_busy: u64,
+    /// Payload bytes handed to the backchannel.
+    pub bytes_sent: u64,
 }
 
 /// The source connection's state, mirroring the runner's events with
@@ -368,6 +400,8 @@ pub struct WorkerStats {
     /// Datagrams the source refused before reading them: another sender,
     /// not RTP, another synchronization source.
     pub datagrams_rejected: u64,
+    /// Per session whose answer negotiated talk-back, keyed by session id.
+    pub talkback: Vec<(String, TalkbackStats)>,
 }
 
 #[cfg(test)]
@@ -479,6 +513,7 @@ mod tests {
                 packets_lost: 4,
                 packets_out_of_order: 5,
                 datagrams_rejected: 6,
+                talkback: vec![],
             }),
             ToSupervisor::Session {
                 session_id: "s1".into(),
@@ -528,5 +563,44 @@ mod tests {
             );
         }
         assert_eq!(WorkerStats::default().sessions, 0);
+    }
+
+    #[test]
+    fn the_talk_back_messages_round_trip() {
+        for message in [
+            ToSupervisor::Stats(WorkerStats {
+                talkback: vec![(
+                    "s1".into(),
+                    TalkbackStats {
+                        packets_received: 7,
+                        packets_dropped_busy: 1,
+                        bytes_sent: 960,
+                    },
+                )],
+                ..WorkerStats::default()
+            }),
+            ToSupervisor::Talker(TalkerChange {
+                session_id: "s1".into(),
+                reason: "claimed".into(),
+                at_ms: 1_791_280_800_000,
+            }),
+            ToSupervisor::Session {
+                session_id: "s1".into(),
+                event: SessionEvent::Answer {
+                    sdp: "v=0".into(),
+                    talkback: Some("pcmu".into()),
+                },
+            },
+        ] {
+            assert_eq!(
+                decode::<ToSupervisor>(&encode(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+        let release = ToWorker::ReleaseBackchannel;
+        assert_eq!(
+            decode::<ToWorker>(&encode(&release).unwrap()).unwrap(),
+            release
+        );
     }
 }

@@ -193,6 +193,17 @@ pub struct SessionListCommand {
     pub id: u64,
 }
 
+/// `backchannel/release`: frees the camera's backchannel from whichever
+/// session holds it, so the next session to send claims it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BackchannelRelease {
+    /// The command id.
+    pub id: u64,
+    /// The stream whose camera's backchannel to free.
+    pub stream_id: String,
+}
+
 /// Every command, tagged by `type`. Each variant's schema title names the
 /// Python client's class for it (`StreamPutCommand`), and its `type` names
 /// the client's method: `domain/verb` is `client.domain.verb(...)`, a type
@@ -267,6 +278,11 @@ pub enum Command {
     #[serde(rename = "session/adopt")]
     #[schemars(title = "SessionAdoptCommand")]
     SessionAdopt(SessionRef),
+    /// `backchannel/release`: frees the camera's backchannel from its
+    /// talker.
+    #[serde(rename = "backchannel/release")]
+    #[schemars(title = "BackchannelReleaseCommand")]
+    BackchannelRelease(BackchannelRelease),
 }
 
 impl Command {
@@ -288,6 +304,7 @@ impl Command {
         "session/list",
         "session/close",
         "session/adopt",
+        "backchannel/release",
     ];
 
     /// The command's id.
@@ -307,6 +324,7 @@ impl Command {
             Self::WebrtcCandidate(c) => c.id,
             Self::SessionGet(c) | Self::SessionClose(c) | Self::SessionAdopt(c) => c.id,
             Self::SessionList(c) => c.id,
+            Self::BackchannelRelease(c) => c.id,
         }
     }
 
@@ -329,6 +347,7 @@ impl Command {
             Self::SessionList(_) => "session/list",
             Self::SessionClose(_) => "session/close",
             Self::SessionAdopt(_) => "session/adopt",
+            Self::BackchannelRelease(_) => "backchannel/release",
         }
     }
 }
@@ -512,7 +531,10 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             cap_chars("session_id", &session.session_id, MAX_ID_CHARS)?;
         }
         Command::StreamGet(StreamGet { stream_id, .. })
-        | Command::StreamDelete(StreamDelete { stream_id, .. }) => cap_stream_id(stream_id)?,
+        | Command::StreamDelete(StreamDelete { stream_id, .. })
+        | Command::BackchannelRelease(BackchannelRelease { stream_id, .. }) => {
+            cap_stream_id(stream_id)?;
+        }
         Command::StreamSubscribe(subscribe) => {
             cap_stream_id(subscribe.stream_id.as_deref().unwrap_or_default())?;
         }
@@ -656,6 +678,10 @@ mod tests {
             (
                 r#"{"id":16,"type":"session/adopt","session_id":"s"}"#,
                 "session/adopt",
+            ),
+            (
+                r#"{"id":17,"type":"backchannel/release","stream_id":"front"}"#,
+                "backchannel/release",
             ),
         ];
         for (index, (text, name)) in cases.iter().enumerate() {

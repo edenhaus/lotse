@@ -16,6 +16,7 @@ use crate::codec::{Codec, CodecFamily};
 use crate::media::MediaPacket;
 use crate::orientation::Orientation;
 use crate::track::{GopSnapshot, TrackEvent};
+use crate::uplink::{UplinkCodec, UplinkPacket};
 
 /// The ICE credentials the supervisor chose for a session, so its demux
 /// can verify STUN integrity.
@@ -97,6 +98,12 @@ pub struct SessionRequest {
     pub video: Arc<Codec>,
     /// The audio track's codec, when the stream has one and audio is on.
     pub audio: Option<Arc<Codec>>,
+    /// The codec the connection's backchannel takes, when its source
+    /// protocol can carry audio back (`SourceCapabilities::backchannel`,
+    /// the feature's gate) and the source offers one now. `None` answers
+    /// talk-back `inactive`. Never whether another session talks: the
+    /// answer stays a function of the offer and this.
+    pub backchannel: Option<Codec>,
     /// How the stream's picture is turned for display: the stream's
     /// `orientation`, which an output marks when the viewer can apply it.
     pub orientation: Orientation,
@@ -194,6 +201,10 @@ pub enum SessionOutput {
     },
     /// Something happened.
     Event(SessionEvent),
+    /// A talk-back packet the viewer sent, depacketized. The worker
+    /// publishes a session's on its [`UplinkTrack`](crate::uplink::UplinkTrack),
+    /// towards the connection's backchannel.
+    Uplink(UplinkPacket),
     /// Nothing more until `handle_timeout` at this instant, or until input.
     Timeout(Instant),
 }
@@ -233,6 +244,14 @@ pub struct SessionStats {
     pub audio_dropped: u64,
     /// Datagrams that were not valid input.
     pub bad_datagrams: u64,
+    /// Talk-back packets received and handed on as
+    /// [`SessionOutput::Uplink`]: `session/get`'s
+    /// `backchannel.packets_received`.
+    pub uplink_packets: u64,
+    /// RTP the viewer sent that is no talk-back packet: on another m-line
+    /// than talk-back's, in a payload type of no talk-back codec, or a
+    /// payload that is not one packet of its codec. Dropped.
+    pub uplink_refused: u64,
 }
 
 /// One session's engine. Every method is followed by a full `poll` drain
@@ -303,6 +322,10 @@ pub trait SessionEngine: fmt::Debug + Send {
 
     /// The counters now.
     fn stats(&self) -> SessionStats;
+
+    /// The talk-back codec the answer negotiated, which the browser sends
+    /// (`session/get`'s `backchannel.codec`); `None` when talk-back is off.
+    fn talkback(&self) -> Option<UplinkCodec>;
 }
 
 /// What a session does with one event of its video subscription, or with

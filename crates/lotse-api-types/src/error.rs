@@ -60,6 +60,9 @@ pub enum ErrorCode {
     FrameOverBrowserLimit,
     /// Another session holds the backchannel.
     BackchannelBusy,
+    /// `backchannel/release` on a stream whose source protocol cannot
+    /// carry audio back.
+    BackchannelUnsupported,
     /// Audio withdrawn because sync could not be held.
     AvSyncLost,
     /// The browser closed the peer connection.
@@ -112,6 +115,7 @@ impl ErrorCode {
             Self::H264ProfileMismatch => "h264_profile_mismatch",
             Self::FrameOverBrowserLimit => "frame_over_browser_limit",
             Self::BackchannelBusy => "backchannel_busy",
+            Self::BackchannelUnsupported => "backchannel_unsupported",
             Self::AvSyncLost => "av_sync_lost",
             Self::PeerClosed => "peer_closed",
             Self::SessionClosed => "session_closed",
@@ -213,6 +217,7 @@ mod tests {
             ErrorCode::TurnUnsupported,
             ErrorCode::H264ProfileMismatch,
             ErrorCode::BackchannelBusy,
+            ErrorCode::BackchannelUnsupported,
             ErrorCode::AvSyncLost,
             ErrorCode::PeerClosed,
             ErrorCode::SessionClosed,
