@@ -21,6 +21,16 @@
 //! Receiver Reports (RFC 3550 §6.4.2). In TLS mode it serves
 //! `rtsps` (RFC 7826 §19.2) with a self-signed certificate generated at
 //! test time, over TLS 1.3 and 1.2 or 1.2 only.
+//!
+//! With [`CameraBackchannel`] it offers the ONVIF backchannel (ONVIF
+//! Streaming Specification §5.3) to a `DESCRIBE` with `Require:
+//! www.onvif.org/ver20/backchannel` (RFC 2326 §12.32): a PCMU, PCMA (RFC
+//! 3551 §4.5.14) or Opus (RFC 7587 §7) `a=sendonly` media with a chosen
+//! payload type and `a=ptime` (RFC 8866 §6.4, §6.6), set up interleaved on
+//! its own channel pair in the same session, whose RTP after `PLAY` it
+//! parses (RFC 3550 §5.1) and records ([`Stats::backchannel`]), RTCP on the
+//! odd channel counted. Quirk modes: the `Require` tag refused with `551`
+//! (RFC 2326 §11.3.13) or `400`, and one payload type taken only.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -37,8 +47,8 @@ use lotse_codec::h265;
 use lotse_core::clock::Clock;
 use lotse_core::task::spawn_named;
 use rtsp_types::headers::{
-    AUTHORIZATION, CONTENT_BASE, CONTENT_TYPE, CSEQ, PUBLIC, RTP_INFO, SESSION, TRANSPORT,
-    WWW_AUTHENTICATE,
+    AUTHORIZATION, CONTENT_BASE, CONTENT_TYPE, CSEQ, PUBLIC, REQUIRE, RTP_INFO, SESSION, TRANSPORT,
+    UNSUPPORTED, WWW_AUTHENTICATE,
 };
 use rtsp_types::{Data, Message, Method, ParseError, Request, Response, StatusCode, Version};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -266,6 +276,181 @@ impl CameraAudio {
     }
 }
 
+/// The `Require` option tag that asks for the ONVIF backchannel (ONVIF
+/// Streaming Specification §5.3.1, RFC 2326 §12.32).
+pub const BACKCHANNEL_REQUIRE: &str = "www.onvif.org/ver20/backchannel";
+
+/// The codec of the ONVIF backchannel the camera receives on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackchannelCodec {
+    /// G.711 µ-law at 8000 Hz (RFC 3551 §4.5.14), static payload type 0.
+    #[default]
+    Pcmu,
+    /// G.711 A-law at 8000 Hz (RFC 3551 §4.5.14), static payload type 8.
+    Pcma,
+    /// Opus, `opus/48000/2` (RFC 7587 §7), dynamic payload type 111 unless
+    /// configured.
+    Opus,
+}
+
+impl BackchannelCodec {
+    /// The payload type the SDP announces when none is configured: the
+    /// static one for G.711 (RFC 3551 Table 4), 111 for Opus.
+    pub const fn default_payload_type(self) -> u8 {
+        match self {
+            Self::Pcmu => 0,
+            Self::Pcma => 8,
+            Self::Opus => 111,
+        }
+    }
+
+    /// The `a=rtpmap` encoding (RFC 8866 §6.6).
+    const fn rtpmap(self) -> &'static str {
+        match self {
+            Self::Pcmu => "PCMU/8000",
+            Self::Pcma => "PCMA/8000",
+            Self::Opus => "opus/48000/2",
+        }
+    }
+}
+
+/// How the camera answers a `DESCRIBE` that carries the backchannel's
+/// `Require` tag. The refusals are a camera without the backchannel, and
+/// the `400 Bad Request` some Dahua and Amcrest firmwares answer instead
+/// (observed behavior).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequireAnswer {
+    /// The SDP, with the backchannel media added (ONVIF Streaming
+    /// Specification §5.3.2).
+    #[default]
+    Honor,
+    /// `551 Option not supported` with the tag in `Unsupported` (RFC 2326
+    /// §11.3.13, §12.40), as ONVIF Streaming Specification §5.3.2.1 has a
+    /// server without the backchannel answer.
+    OptionNotSupported,
+    /// `400 Bad Request`, as other firmwares answer instead.
+    BadRequest,
+}
+
+/// The ONVIF backchannel the camera offers (ONVIF Streaming Specification
+/// §5.3): with `Require: www.onvif.org/ver20/backchannel` on `DESCRIBE`,
+/// an `a=sendonly` audio media after the others, set up TCP interleaved on
+/// its own channel pair in the same session; a `SETUP` of it over UDP gets
+/// `461`, as lotse sets it up interleaved only.
+/// After `PLAY` the RTP that arrives on its channel is recorded
+/// ([`Stats::backchannel`]) and RTCP on the next channel counted.
+#[derive(Debug, Clone, Default)]
+pub struct CameraBackchannel {
+    /// The codec the media announces.
+    pub codec: BackchannelCodec,
+    /// The payload type it announces; the codec's default when `None`.
+    pub payload_type: Option<u8>,
+    /// Its `a=ptime` in milliseconds (RFC 8866 §6.4); none when `None`.
+    pub ptime: Option<u32>,
+    /// How a `DESCRIBE` with `Require` is answered.
+    pub require: RequireAnswer,
+    /// Record only RTP of this payload type and refuse the rest: the
+    /// cameras that take only a fixed one (observed behavior); any payload
+    /// type when `None`.
+    pub accept_only: Option<u8>,
+}
+
+impl CameraBackchannel {
+    /// A backchannel in `codec`, with its default payload type and no
+    /// quirks.
+    pub fn new(codec: BackchannelCodec) -> Self {
+        Self {
+            codec,
+            ..Self::default()
+        }
+    }
+
+    /// The payload type the SDP announces.
+    pub fn payload_type(&self) -> u8 {
+        self.payload_type
+            .unwrap_or_else(|| self.codec.default_payload_type())
+    }
+
+    /// The media description (RFC 8866 §5.14), `a=sendonly` in the
+    /// camera's frame of reference (ONVIF Streaming Specification §5.3.2).
+    fn sdp(&self, base: &str) -> String {
+        let pt = self.payload_type();
+        let ptime = self
+            .ptime
+            .map(|ms| format!("a=ptime:{ms}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "m=audio 0 RTP/AVP {pt}\r\na=rtpmap:{pt} {}\r\n{ptime}a=sendonly\r\na=control:{base}{BACKCHANNEL_CONTROL}\r\n",
+            self.codec.rtpmap()
+        )
+    }
+}
+
+/// The last path segment of the backchannel media's control URL.
+pub const BACKCHANNEL_CONTROL: &str = "backchannel";
+
+/// One RTP packet the camera received on its backchannel (RFC 3550 §5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackchannelRtp {
+    /// The payload type.
+    pub payload_type: u8,
+    /// The marker bit.
+    pub marker: bool,
+    /// The sequence number.
+    pub sequence_number: u16,
+    /// The RTP timestamp.
+    pub timestamp: u32,
+    /// The synchronization source.
+    pub ssrc: u32,
+    /// The payload, after the CSRC list and a header extension, without
+    /// padding.
+    pub payload: Vec<u8>,
+    /// When the camera read it, on the camera's clock.
+    pub arrival: Instant,
+}
+
+impl BackchannelRtp {
+    /// Parses an RTP packet (RFC 3550 §5.1, §5.3.1): version 2, its CSRC
+    /// list, header extension and padding skipped; `None` if malformed.
+    fn parse(packet: &[u8], arrival: Instant) -> Option<Self> {
+        let (header, rest) = packet.split_at_checked(12)?;
+        let word =
+            |at: usize| -> Option<[u8; 4]> { header.get(at..at.checked_add(4)?)?.try_into().ok() };
+        let [first, second, seq_hi, seq_lo] = word(0)?;
+        if first >> 6 != 2 {
+            return None;
+        }
+        let csrcs = usize::from(first & 0x0f).checked_mul(4)?;
+        let (_csrcs, mut rest) = rest.split_at_checked(csrcs)?;
+        if first & 0x10 != 0 {
+            let (extension, after) = rest.split_at_checked(4)?;
+            let length = extension.get(2..4)?.try_into().ok()?;
+            let words = usize::from(u16::from_be_bytes(length));
+            let (_extension, after) = after.split_at_checked(words.checked_mul(4)?)?;
+            rest = after;
+        }
+        if first & 0x20 != 0 {
+            let padding = usize::from(*rest.last()?);
+            rest = rest.get(..rest.len().checked_sub(padding)?)?;
+        }
+        Some(Self {
+            payload_type: second & 0x7f,
+            marker: second & 0x80 != 0,
+            sequence_number: u16::from_be_bytes([seq_hi, seq_lo]),
+            timestamp: u32::from_be_bytes(word(4)?),
+            ssrc: u32::from_be_bytes(word(8)?),
+            payload: rest.to_vec(),
+            arrival,
+        })
+    }
+}
+
+/// Whether `packet` reads as RTCP (RFC 3550 §6.1, §12.1): version 2 and a
+/// packet type from SR (200) to APP (204).
+fn is_rtcp(packet: &[u8]) -> bool {
+    matches!(packet, [first, kind, _, _, ..] if first >> 6 == 2 && (200..=204).contains(kind))
+}
+
 /// The camera's TLS mode: a self-signed certificate generated at test time
 /// (`rcgen`, valid until 4096), so nothing ever expires and no key sits in
 /// the repository.
@@ -417,6 +602,9 @@ pub struct CameraConfig {
     /// address, `127.0.0.1` by default; `::1` makes the camera's endpoint
     /// differ from a client's own IPv4 loopback.
     pub ip: IpAddr,
+    /// Offer an ONVIF backchannel to a `DESCRIBE` that asks for one; a
+    /// `Require` tag is ignored without, as many cameras do.
+    pub backchannel: Option<CameraBackchannel>,
 }
 
 /// How the camera answers `PLAY`; every other request is answered as
@@ -506,6 +694,7 @@ impl Default for CameraConfig {
             omit_rtptime: false,
             play: PlayAnswer::Play,
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            backchannel: None,
         }
     }
 }
@@ -541,6 +730,23 @@ pub struct Stats {
     pub datagrams_received: AtomicU64,
     /// The RTCP the client sent, in arrival order.
     pub rtcp: Mutex<Vec<ClientRtcp>>,
+    /// `DESCRIBE` requests answered with the backchannel media.
+    pub backchannel_describes: AtomicU64,
+    /// `DESCRIBE` requests refused for their backchannel `Require` tag
+    /// ([`RequireAnswer`]).
+    pub require_rejected: AtomicU64,
+    /// `SETUP` requests of the backchannel answered (also in
+    /// [`Self::setups`]).
+    pub backchannel_setups: AtomicU64,
+    /// RTP packets recorded from the backchannel.
+    pub backchannel_packets: AtomicU64,
+    /// RTCP packets received on the backchannel's odd channel.
+    pub backchannel_rtcp: AtomicU64,
+    /// Packets on the backchannel's channels refused: RTP before `PLAY`,
+    /// malformed, or of a payload type the camera does not take.
+    pub backchannel_refused: AtomicU64,
+    /// The RTP recorded from the backchannel, in arrival order.
+    received: Mutex<Vec<BackchannelRtp>>,
 }
 
 /// One RTCP compound packet the client sent the camera.
@@ -577,12 +783,29 @@ impl Stats {
             .clone()
     }
 
+    /// The RTP recorded from the backchannel so far, in arrival order.
+    pub fn backchannel(&self) -> Vec<BackchannelRtp> {
+        self.received
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Records one RTCP packet from the client.
     fn record_rtcp(&self, rtcp: ClientRtcp) {
         self.rtcp
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(rtcp);
+    }
+
+    /// Records one backchannel packet.
+    fn record(&self, packet: BackchannelRtp) {
+        Self::bump(&self.backchannel_packets);
+        self.received
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(packet);
     }
 }
 
@@ -743,21 +966,41 @@ async fn accept_loop(
     }
 }
 
-/// The SDP for the stream, with `session_lines` after `t=` and
-/// `video_fmtp` at the end of the video's `fmtp`.
+/// The SDP for the stream, with `session_lines` after `t=`, `video_fmtp`
+/// at the end of the video's `fmtp` and the backchannel media last.
 fn sdp(
     base: &str,
     video: CameraVideo,
     audio: Option<CameraAudio>,
     session_lines: &str,
     video_fmtp: &str,
+    backchannel: Option<&CameraBackchannel>,
 ) -> String {
     format!(
         "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=fake camera\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
-         {session_lines}a=control:{base}\r\n{}{}",
+         {session_lines}a=control:{base}\r\n{}{}{}",
         video.sdp(base, video_fmtp),
         audio.map(|audio| audio.sdp(base)).unwrap_or_default(),
+        backchannel
+            .map(|backchannel| backchannel.sdp(base))
+            .unwrap_or_default(),
     )
+}
+
+impl CameraConfig {
+    /// The SDP a `DESCRIBE` of the presentation at `base` (its URL, ending
+    /// in `/`) is answered with: with the backchannel media when
+    /// `backchannel` and the camera offers one.
+    pub fn sdp(&self, base: &str, backchannel: bool) -> String {
+        sdp(
+            base,
+            self.video,
+            self.audio,
+            &self.sdp_session_lines,
+            &self.video_fmtp,
+            self.backchannel.as_ref().filter(|_| backchannel),
+        )
+    }
 }
 
 /// The state of one connection.
@@ -788,6 +1031,11 @@ struct Connection {
     udp: Option<UdpSide>,
     /// It hung at `PLAY` ([`PlayAnswer::Never`]) and answers nothing.
     hung: bool,
+    /// The last `DESCRIBE` offered the backchannel media.
+    backchannel_offered: bool,
+    /// The interleaved RTP channel of the backchannel, once set up; RTCP
+    /// on the next one.
+    backchannel_channel: Option<u8>,
 }
 
 /// The camera's UDP side of one connection: its port pair, the client's
@@ -965,6 +1213,8 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         peer,
         udp: None,
         hung: false,
+        backchannel_offered: false,
+        backchannel_channel: None,
     };
     let frame_interval = Duration::from_secs(1)
         .checked_div(connection.config.fps.max(1))
@@ -998,28 +1248,8 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(n) => n,
                 };
                 inbound.extend_from_slice(read_buf.get(..n).unwrap_or(&[]));
-                loop {
-                    match Message::<Vec<u8>>::parse(&inbound) {
-                        Ok((message, consumed)) => {
-                            inbound.drain(..consumed);
-                            let Some(request) = request_of(message, &connection.stats, &*clock) else {
-                                continue;
-                            };
-                            let (response, close) = connection.respond(&request);
-                            let Some(bytes) = response else {
-                                continue;
-                            };
-                            if stream.write_all(&bytes).await.is_err() {
-                                return;
-                            }
-                            if close {
-                                let _flushed = stream.shutdown().await;
-                                return;
-                            }
-                        }
-                        Err(ParseError::Incomplete(_)) => break,
-                        Err(ParseError::Error) => return,
-                    }
+                if !connection.serve_inbound(&mut stream, &mut inbound, clock.now()).await {
+                    return;
                 }
             }
             () = &mut tick, if connection.playing => {
@@ -1050,31 +1280,47 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// The request in `message`, `None` for anything else; interleaved data
-/// on an odd channel is the client's RTCP (RFC 2326 §10.12), recorded.
-fn request_of(
-    message: Message<Vec<u8>>,
-    stats: &Stats,
-    clock: &dyn Clock,
-) -> Option<Request<Vec<u8>>> {
-    match message {
-        Message::Request(request) => Some(request),
-        Message::Data(data) => {
-            if data.channel_id() & 1 == 1 {
-                stats.record_rtcp(ClientRtcp {
-                    at: clock.now(),
-                    channel: Some(data.channel_id()),
-                    udp: false,
-                    packet: data.as_slice().to_vec(),
-                });
-            }
-            None
-        }
-        Message::Response(_) => None,
-    }
-}
-
 impl Connection {
+    /// Handles every whole message in `inbound`, read at `arrival`:
+    /// requests answered on `stream` (none once it hung at `PLAY`),
+    /// interleaved frames handed to [`Self::receive`]; the rest stays for
+    /// the next read. `false` when the connection ends: a write failed, a
+    /// `TEARDOWN`, or bytes that are no RTSP.
+    async fn serve_inbound<S: AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        inbound: &mut Vec<u8>,
+        arrival: Instant,
+    ) -> bool {
+        loop {
+            let (message, consumed) = match Message::<Vec<u8>>::parse(inbound.as_slice()) {
+                Ok(parsed) => parsed,
+                Err(ParseError::Incomplete(_)) => return true,
+                Err(ParseError::Error) => return false,
+            };
+            inbound.drain(..consumed);
+            let request = match message {
+                Message::Request(request) => request,
+                Message::Data(data) => {
+                    self.receive(data.channel_id(), data.as_slice(), arrival);
+                    continue;
+                }
+                Message::Response(_) => continue,
+            };
+            let (response, close) = self.respond(&request);
+            let Some(bytes) = response else {
+                continue;
+            };
+            if stream.write_all(&bytes).await.is_err() {
+                return false;
+            }
+            if close {
+                let _flushed = stream.shutdown().await;
+                return false;
+            }
+        }
+    }
+
     /// Sends one packet of `channel`: as a datagram if the channel was set
     /// up over UDP, else interleaved on `stream` (RFC 2326 §10.12).
     async fn deliver<S: AsyncWrite + Unpin>(
@@ -1193,7 +1439,7 @@ impl Connection {
                     false,
                 )
             }
-            Method::Describe => (self.describe(&cseq), false),
+            Method::Describe => (self.describe(request, &cseq), false),
             Method::Setup => (self.setup(request, &cseq), false),
             Method::Play => (self.play(&cseq), false),
             Method::GetParameter => {
@@ -1227,22 +1473,75 @@ impl Connection {
             .is_some_and(|given| given.as_str() == expected)
     }
 
-    /// DESCRIBE: the SDP.
-    fn describe(&self, cseq: &str) -> Response<Vec<u8>> {
+    /// DESCRIBE: the SDP, with the backchannel media when the request
+    /// carries its `Require` tag and the camera offers one (ONVIF Streaming
+    /// Specification §5.3.1, §5.3.2), or the quirk's refusal.
+    fn describe(&mut self, request: &Request<Vec<u8>>, cseq: &str) -> Response<Vec<u8>> {
+        let asked = request.header(&REQUIRE).is_some_and(|tags| {
+            tags.as_str()
+                .split(',')
+                .any(|tag| tag.trim() == BACKCHANNEL_REQUIRE)
+        });
+        let offered = match self.config.backchannel.as_ref().map(|b| b.require) {
+            Some(RequireAnswer::Honor) => asked,
+            Some(RequireAnswer::OptionNotSupported) if asked => {
+                Stats::bump(&self.stats.require_rejected);
+                return reply(cseq, StatusCode::OptionNotSupported)
+                    .header(UNSUPPORTED, BACKCHANNEL_REQUIRE)
+                    .build(Vec::new());
+            }
+            Some(RequireAnswer::BadRequest) if asked => {
+                Stats::bump(&self.stats.require_rejected);
+                return reply(cseq, StatusCode::BadRequest).build(Vec::new());
+            }
+            _ => false,
+        };
+        self.backchannel_offered = offered;
         Stats::bump(&self.stats.describes);
+        if offered {
+            Stats::bump(&self.stats.backchannel_describes);
+        }
         reply(cseq, StatusCode::Ok)
             .header(CONTENT_TYPE, "application/sdp")
             .header(CONTENT_BASE, self.base.clone())
-            .build(
-                sdp(
-                    &self.base,
-                    self.config.video,
-                    self.config.audio,
-                    &self.config.sdp_session_lines,
-                    &self.config.video_fmtp,
-                )
-                .into_bytes(),
-            )
+            .build(self.config.sdp(&self.base, offered).into_bytes())
+    }
+
+    /// One interleaved frame from the client (RFC 2326 §10.12): one on an
+    /// odd channel is the client's RTCP, recorded; after `PLAY`, RTP on the
+    /// backchannel's channel is recorded and RTCP on the next one counted,
+    /// anything else on them refused. Frames on other channels are
+    /// otherwise ignored.
+    fn receive(&self, channel: u8, packet: &[u8], arrival: Instant) {
+        if channel & 1 == 1 {
+            self.stats.record_rtcp(ClientRtcp {
+                at: arrival,
+                channel: Some(channel),
+                udp: false,
+                packet: packet.to_vec(),
+            });
+        }
+        let Some(rtp_channel) = self.backchannel_channel else {
+            return;
+        };
+        if channel == rtp_channel.wrapping_add(1) {
+            if is_rtcp(packet) {
+                Stats::bump(&self.stats.backchannel_rtcp);
+            } else {
+                Stats::bump(&self.stats.backchannel_refused);
+            }
+            return;
+        }
+        if channel != rtp_channel {
+            return;
+        }
+        let accept_only = self.config.backchannel.as_ref().and_then(|b| b.accept_only);
+        match BackchannelRtp::parse(packet, arrival) {
+            Some(rtp) if self.playing && accept_only.is_none_or(|pt| pt == rtp.payload_type) => {
+                self.stats.record(rtp);
+            }
+            _ => Stats::bump(&self.stats.backchannel_refused),
+        }
     }
 
     /// SETUP: TCP interleaved, or RTP over UDP to the `client_port` pair.
@@ -1251,6 +1550,16 @@ impl Connection {
             .header(&TRANSPORT)
             .map(|v| v.as_str().to_owned())
             .unwrap_or_default();
+        let backchannel = request
+            .request_uri()
+            .is_some_and(|uri| uri.as_str().ends_with(BACKCHANNEL_CONTROL));
+        if backchannel && !self.backchannel_offered {
+            return reply(cseq, StatusCode::NotFound).build(Vec::new());
+        }
+        if backchannel && (transport.contains("client_port=") || !transport.contains("RTP/AVP/TCP"))
+        {
+            return reply(cseq, StatusCode::UnsupportedTransport).build(Vec::new());
+        }
         if transport.contains("client_port=") && self.config.udp.service != UdpService::Refuse {
             return self.setup_udp(request, &transport, cseq);
         }
@@ -1273,6 +1582,10 @@ impl Connection {
             .is_some_and(|uri| uri.as_str().ends_with("track1"))
         {
             self.audio_channel = Some(channel);
+        }
+        if backchannel {
+            Stats::bump(&self.stats.backchannel_setups);
+            self.backchannel_channel = Some(channel);
         }
         reply(cseq, StatusCode::Ok)
             .header(
@@ -1567,6 +1880,7 @@ mod tests {
             None,
             "",
             "",
+            None,
         );
         assert!(text.contains("sprop-parameter-sets="));
         assert!(!text.contains("m=audio"));
@@ -1576,6 +1890,7 @@ mod tests {
             Some(CameraAudio::Pcmu),
             "",
             ";x-own=1",
+            None,
         );
         assert!(with_audio.contains(";x-own=1\r\na=control:rtsp://127.0.0.1:1/stream/track0"));
         assert!(with_audio.contains("m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000"));
@@ -1586,6 +1901,7 @@ mod tests {
             Some(CameraAudio::Aac),
             "a=x-own:1\r\n",
             "",
+            None,
         );
         assert!(with_aac.contains("t=0 0\r\na=x-own:1\r\na=control:"));
         assert!(with_aac.contains("a=rtpmap:97 MPEG4-GENERIC/16000/1"));
@@ -1606,6 +1922,7 @@ mod tests {
             None,
             "",
             ";sprop-max-don-diff=2",
+            None,
         );
         assert!(h265.contains("a=rtpmap:96 H265/90000\r\na=fmtp:96 profile-id=1;sprop-vps="));
         assert!(h265.contains(";sprop-max-don-diff=2\r\na=control:"));
@@ -1630,6 +1947,7 @@ mod tests {
             None,
             "",
             "",
+            None,
         );
         assert!(high.contains("a=fmtp:96 profile-id=1;tier-flag=1;sprop-vps="));
         let (vps, sps) = CameraVideo::H265HighTier.h265_sets();
@@ -1639,5 +1957,494 @@ mod tests {
             idr[0],
             h265::nal::aggregate(&[&vps, &sps, &h265::test_data::pps()])
         );
+    }
+
+    /// A raw RTSP client over TCP: requests written by hand, answers read
+    /// with `rtsp-types`, interleaved frames from the camera skipped.
+    struct Client {
+        stream: tokio::net::TcpStream,
+        inbound: Vec<u8>,
+        cseq: u32,
+        clock: Arc<dyn Clock>,
+    }
+
+    impl Client {
+        async fn connect(camera: &FakeCamera) -> Self {
+            Self {
+                stream: tokio::net::TcpStream::connect(camera.addr()).await.unwrap(),
+                inbound: Vec::new(),
+                cseq: 0,
+                clock: clock(),
+            }
+        }
+
+        async fn request(
+            &mut self,
+            method: &str,
+            uri: &str,
+            headers: &[&str],
+        ) -> Response<Vec<u8>> {
+            self.cseq += 1;
+            let mut text = format!("{method} {uri} RTSP/1.0\r\nCSeq: {}\r\n", self.cseq);
+            for header in headers {
+                text.push_str(header);
+                text.push_str("\r\n");
+            }
+            text.push_str("\r\n");
+            self.stream.write_all(text.as_bytes()).await.unwrap();
+            let deadline = self.clock.sleep(Duration::from_secs(5));
+            tokio::pin!(deadline);
+            loop {
+                match Message::<Vec<u8>>::parse(&self.inbound) {
+                    Ok((message, consumed)) => {
+                        self.inbound.drain(..consumed);
+                        if let Message::Response(response) = message {
+                            return response;
+                        }
+                        continue;
+                    }
+                    Err(ParseError::Incomplete(_)) => {}
+                    Err(ParseError::Error) => panic!("unparsable answer"),
+                }
+                let mut buf = [0_u8; 4096];
+                tokio::select! {
+                    read = self.stream.read(&mut buf) => {
+                        let n = read.unwrap();
+                        assert!(n > 0, "the camera hung up");
+                        self.inbound.extend_from_slice(&buf[..n]);
+                    }
+                    () = &mut deadline => panic!("no answer to {method}"),
+                }
+            }
+        }
+
+        async fn send(&mut self, channel: u8, packet: &[u8]) {
+            self.stream
+                .write_all(&interleave(channel, packet))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn clock() -> Arc<dyn Clock> {
+        Arc::new(lotse_core::clock::SystemClock)
+    }
+
+    fn with_backchannel(backchannel: CameraBackchannel) -> CameraConfig {
+        CameraConfig {
+            // Few packets, so an unread socket never fills while the test
+            // sends.
+            fps: 5,
+            backchannel: Some(backchannel),
+            ..CameraConfig::default()
+        }
+    }
+
+    async fn eventually(clock: &Arc<dyn Clock>, mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if done() {
+                return true;
+            }
+            clock.sleep(Duration::from_millis(10)).await;
+        }
+        done()
+    }
+
+    const REQUIRE_BACKCHANNEL: &str = "Require: www.onvif.org/ver20/backchannel";
+
+    fn base(camera: &FakeCamera) -> String {
+        format!("rtsp://{}/stream/", camera.addr())
+    }
+
+    fn body(response: &Response<Vec<u8>>) -> String {
+        String::from_utf8(response.body().clone()).unwrap()
+    }
+
+    #[test]
+    fn onvif_5_3_1_the_backchannel_media_is_sendonly_in_its_codec_payload_type_and_ptime() {
+        let base = "rtsp://127.0.0.1:1/stream/";
+        let mu_law = CameraBackchannel::new(BackchannelCodec::Pcmu).sdp(base);
+        assert_eq!(
+            mu_law,
+            "m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendonly\r\n\
+             a=control:rtsp://127.0.0.1:1/stream/backchannel\r\n"
+        );
+        let pcma = CameraBackchannel::new(BackchannelCodec::Pcma);
+        assert_eq!(pcma.payload_type(), 8);
+        assert!(
+            pcma.sdp(base)
+                .starts_with("m=audio 0 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n")
+        );
+        // RFC 7587 §7: always two channels in the rtpmap.
+        let opus = CameraBackchannel::new(BackchannelCodec::Opus);
+        assert_eq!(opus.payload_type(), 111);
+        assert!(opus.sdp(base).contains("a=rtpmap:111 opus/48000/2\r\n"));
+        let custom = CameraBackchannel {
+            payload_type: Some(96),
+            ptime: Some(40),
+            ..CameraBackchannel::new(BackchannelCodec::Pcma)
+        };
+        assert!(custom.sdp(base).starts_with(
+            "m=audio 0 RTP/AVP 96\r\na=rtpmap:96 PCMA/8000\r\na=ptime:40\r\na=sendonly\r\n"
+        ));
+        // The whole SDP: the backchannel last, only when asked and offered.
+        let config = CameraConfig {
+            audio: Some(CameraAudio::Pcmu),
+            backchannel: Some(custom),
+            ..CameraConfig::default()
+        };
+        let offered = config.sdp(base, true);
+        assert!(offered.ends_with(&config.backchannel.as_ref().unwrap().sdp(base)));
+        assert!(offered.contains("track1\r\nm=audio 0 RTP/AVP 96"));
+        assert!(!config.sdp(base, false).contains("a=sendonly"));
+        assert!(
+            !CameraConfig::default()
+                .sdp(base, true)
+                .contains("a=sendonly")
+        );
+    }
+
+    #[test]
+    fn rfc3550_5_1_backchannel_rtp_is_parsed_past_csrcs_extension_and_padding() {
+        let at = clock().now();
+        let plain = BackchannelRtp::parse(&rtp_of(8, 0xabcd, 7, 160, true, &[1, 2]), at).unwrap();
+        assert_eq!(
+            plain,
+            BackchannelRtp {
+                payload_type: 8,
+                marker: true,
+                sequence_number: 7,
+                timestamp: 160,
+                ssrc: 0xabcd,
+                payload: vec![1, 2],
+                arrival: at,
+            }
+        );
+        let unmarked = BackchannelRtp::parse(&rtp_of(0, 1, 1, 1, false, &[]), at).unwrap();
+        assert!(!unmarked.marker);
+        assert!(unmarked.payload.is_empty());
+        // Two CSRCs, a one-word extension and three bytes of padding
+        // (RFC 3550 §5.1, §5.3.1).
+        let mut full = rtp_of(0, 1, 2, 3, false, &[]);
+        full[0] = 0x80 | 0x20 | 0x10 | 2;
+        full.extend_from_slice(&[0; 8]);
+        full.extend_from_slice(&[0xbe, 0xde, 0, 1, 9, 9, 9, 9]);
+        full.extend_from_slice(&[5, 6, 0, 0, 3]);
+        assert_eq!(
+            BackchannelRtp::parse(&full, at).unwrap().payload,
+            vec![5, 6]
+        );
+        let mut version1 = rtp_of(0, 1, 2, 3, false, &[1]);
+        version1[0] = 0x40;
+        assert_eq!(BackchannelRtp::parse(&version1, at), None);
+        assert_eq!(BackchannelRtp::parse(&[0x80; 11], at), None);
+        let mut short_csrc = rtp_of(0, 1, 2, 3, false, &[1]);
+        short_csrc[0] = 0x82;
+        assert_eq!(BackchannelRtp::parse(&short_csrc, at), None);
+        let mut short_extension = rtp_of(0, 1, 2, 3, false, &[0xbe, 0xde, 0, 2, 0, 0, 0, 0]);
+        short_extension[0] = 0x90;
+        assert_eq!(BackchannelRtp::parse(&short_extension, at), None);
+        let mut no_extension_header = rtp_of(0, 1, 2, 3, false, &[0xbe, 0xde]);
+        no_extension_header[0] = 0x90;
+        assert_eq!(BackchannelRtp::parse(&no_extension_header, at), None);
+        let mut overpadded = rtp_of(0, 1, 2, 3, false, &[1, 9]);
+        overpadded[0] = 0xa0;
+        assert_eq!(BackchannelRtp::parse(&overpadded, at), None);
+        let mut padding_only = rtp_of(0, 1, 2, 3, false, &[]);
+        padding_only[0] = 0xa0;
+        assert_eq!(BackchannelRtp::parse(&padding_only, at), None);
+        // RTCP: version 2, SR to APP (RFC 3550 §12.1).
+        assert!(is_rtcp(&[0x81, 201, 0, 1]));
+        assert!(is_rtcp(&[0x80, 200, 0, 6, 0]));
+        assert!(is_rtcp(&[0x80, 204, 0, 0]));
+        assert!(!is_rtcp(&[0x80, 199, 0, 0]));
+        assert!(!is_rtcp(&[0x80, 205, 0, 0]));
+        assert!(!is_rtcp(&[0x40, 201, 0, 0]));
+        assert!(!is_rtcp(&[0x80, 201, 0]));
+    }
+
+    #[tokio::test]
+    async fn onvif_5_3_describe_with_require_offers_the_backchannel_and_without_it_nothing_changes()
+    {
+        let camera = FakeCamera::start(
+            with_backchannel(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+            clock(),
+        )
+        .await
+        .unwrap();
+        let url = camera.url();
+        let mut client = Client::connect(&camera).await;
+        let plain = client.request("DESCRIBE", &url, &[]).await;
+        assert_eq!(plain.status(), StatusCode::Ok);
+        let config = with_backchannel(CameraBackchannel::new(BackchannelCodec::Pcmu));
+        assert_eq!(body(&plain), config.sdp(&base(&camera), false));
+        assert!(!body(&plain).contains("a=sendonly"));
+        // Another option tag alongside (RFC 2326 §12.32 lists them comma-separated).
+        let asked = client
+            .request(
+                "DESCRIBE",
+                &url,
+                &["Require: x-other, www.onvif.org/ver20/backchannel"],
+            )
+            .await;
+        assert_eq!(asked.status(), StatusCode::Ok);
+        assert_eq!(body(&asked), config.sdp(&base(&camera), true));
+        assert!(body(&asked).contains("a=sendonly\r\na=control:"));
+        // An unrelated tag alone is not the backchannel's.
+        let other = client
+            .request("DESCRIBE", &url, &["Require: x-other"])
+            .await;
+        assert!(!body(&other).contains("a=sendonly"));
+        let stats = camera.stats();
+        assert_eq!(Stats::get(&stats.describes), 3);
+        assert_eq!(Stats::get(&stats.backchannel_describes), 1);
+        assert_eq!(Stats::get(&stats.require_rejected), 0);
+        // A camera without a backchannel ignores the tag.
+        let without = FakeCamera::start(CameraConfig::default(), clock())
+            .await
+            .unwrap();
+        let mut client = Client::connect(&without).await;
+        let ignored = client
+            .request("DESCRIBE", &without.url(), &[REQUIRE_BACKCHANNEL])
+            .await;
+        assert_eq!(ignored.status(), StatusCode::Ok);
+        assert_eq!(
+            body(&ignored),
+            CameraConfig::default().sdp(&base(&without), false)
+        );
+        assert_eq!(Stats::get(&without.stats().backchannel_describes), 0);
+        without.stop().await;
+        camera.stop().await;
+    }
+
+    #[tokio::test]
+    async fn onvif_5_3_the_backchannel_is_set_up_on_its_own_channels_and_records_rtp_after_play() {
+        let clock = clock();
+        let camera = FakeCamera::start(
+            with_backchannel(CameraBackchannel::new(BackchannelCodec::Pcma)),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
+        let url = camera.url();
+        let back = format!("{}{BACKCHANNEL_CONTROL}", base(&camera));
+        let mut client = Client::connect(&camera).await;
+        client
+            .request("DESCRIBE", &url, &[REQUIRE_BACKCHANNEL])
+            .await;
+        let video = client
+            .request(
+                "SETUP",
+                &format!("{}track0", base(&camera)),
+                &["Transport: RTP/AVP/TCP;unicast;interleaved=0-1"],
+            )
+            .await;
+        assert_eq!(video.status(), StatusCode::Ok);
+        let setup = client
+            .request(
+                "SETUP",
+                &back,
+                &[
+                    "Transport: RTP/AVP/TCP;unicast;interleaved=4-5",
+                    "Session: 12345678",
+                    REQUIRE_BACKCHANNEL,
+                ],
+            )
+            .await;
+        assert_eq!(setup.status(), StatusCode::Ok);
+        assert_eq!(
+            setup.header(&TRANSPORT).unwrap().as_str(),
+            "RTP/AVP/TCP;unicast;interleaved=4-5"
+        );
+        assert!(
+            setup
+                .header(&SESSION)
+                .unwrap()
+                .as_str()
+                .starts_with("12345678;")
+        );
+        // Before PLAY nothing is recorded.
+        client
+            .send(4, &rtp_of(8, 0x77, 1, 0, true, &[0xd5; 160]))
+            .await;
+        let play = client
+            .request("PLAY", &url, &["Session: 12345678", REQUIRE_BACKCHANNEL])
+            .await;
+        assert_eq!(play.status(), StatusCode::Ok);
+        let before = clock.now();
+        client
+            .send(4, &rtp_of(8, 0x77, 2, 160, true, &[0xd5; 160]))
+            .await;
+        client
+            .send(4, &rtp_of(8, 0x77, 3, 320, false, &[0x55; 160]))
+            .await;
+        // A Receiver Report on the odd channel (RFC 3550 §6.4.2), then junk on both.
+        client.send(5, &[0x80, 201, 0, 1, 0, 0, 0, 0x77]).await;
+        client.send(5, &[1, 2, 3]).await;
+        client.send(4, &[0x80, 8, 0]).await;
+        // A client's report on the video's RTCP channel is not the backchannel's.
+        client.send(1, &[0x80, 201, 0, 1, 0, 0, 0, 0x77]).await;
+        let stats = camera.stats();
+        assert!(eventually(&clock, || Stats::get(&stats.backchannel_refused) == 3).await);
+        assert_eq!(Stats::get(&stats.backchannel_packets), 2);
+        assert_eq!(Stats::get(&stats.backchannel_rtcp), 1);
+        assert_eq!(Stats::get(&stats.backchannel_setups), 1);
+        assert_eq!(Stats::get(&stats.setups), 2);
+        let received = stats.backchannel();
+        assert_eq!(received.len(), 2);
+        let first = &received[0];
+        assert_eq!(
+            (
+                first.payload_type,
+                first.marker,
+                first.sequence_number,
+                first.timestamp,
+                first.ssrc
+            ),
+            (8, true, 2, 160, 0x77)
+        );
+        assert_eq!(first.payload, vec![0xd5; 160]);
+        assert_eq!(
+            (received[1].sequence_number, received[1].marker),
+            (3, false)
+        );
+        assert_eq!(received[1].payload, vec![0x55; 160]);
+        assert!(first.arrival >= before);
+        assert!(received[1].arrival >= first.arrival);
+        // The video kept flowing to the client meanwhile.
+        assert!(eventually(&clock, || Stats::get(&stats.packets) > 0).await);
+        let teardown = client
+            .request(
+                "TEARDOWN",
+                &url,
+                &["Session: 12345678", REQUIRE_BACKCHANNEL],
+            )
+            .await;
+        assert_eq!(teardown.status(), StatusCode::Ok);
+        camera.stop().await;
+    }
+
+    #[tokio::test]
+    async fn rfc2326_11_3_11_a_udp_setup_of_the_backchannel_is_refused_and_one_not_offered_is_not_found()
+     {
+        let camera = FakeCamera::start(
+            with_backchannel(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+            clock(),
+        )
+        .await
+        .unwrap();
+        let back = format!("{}{BACKCHANNEL_CONTROL}", base(&camera));
+        let mut client = Client::connect(&camera).await;
+        // Not offered by this connection's DESCRIBE.
+        client.request("DESCRIBE", &camera.url(), &[]).await;
+        let unknown = client
+            .request(
+                "SETUP",
+                &back,
+                &["Transport: RTP/AVP/TCP;unicast;interleaved=2-3"],
+            )
+            .await;
+        assert_eq!(unknown.status(), StatusCode::NotFound);
+        client
+            .request("DESCRIBE", &camera.url(), &[REQUIRE_BACKCHANNEL])
+            .await;
+        let udp = client
+            .request(
+                "SETUP",
+                &back,
+                &["Transport: RTP/AVP;unicast;client_port=5000-5001"],
+            )
+            .await;
+        assert_eq!(udp.status(), StatusCode::UnsupportedTransport);
+        let no_transport = client.request("SETUP", &back, &[]).await;
+        assert_eq!(no_transport.status(), StatusCode::UnsupportedTransport);
+        let stats = camera.stats();
+        assert_eq!(Stats::get(&stats.setups), 0);
+        assert_eq!(Stats::get(&stats.udp_setups), 0);
+        assert_eq!(Stats::get(&stats.backchannel_setups), 0);
+        // Frames on a channel nobody set up are ignored.
+        client.send(4, &rtp_of(0, 1, 1, 0, true, &[0xff])).await;
+        let options = client.request("OPTIONS", &camera.url(), &[]).await;
+        assert_eq!(options.status(), StatusCode::Ok);
+        assert_eq!(Stats::get(&stats.backchannel_refused), 0);
+        camera.stop().await;
+    }
+
+    #[tokio::test]
+    async fn dahua_require_is_refused_with_551_or_400_and_a_retry_without_it_plays_onvif_5_3_2_1() {
+        for (answer, status) in [
+            (
+                RequireAnswer::OptionNotSupported,
+                StatusCode::OptionNotSupported,
+            ),
+            (RequireAnswer::BadRequest, StatusCode::BadRequest),
+        ] {
+            let camera = FakeCamera::start(
+                with_backchannel(CameraBackchannel {
+                    require: answer,
+                    ..CameraBackchannel::new(BackchannelCodec::Pcmu)
+                }),
+                clock(),
+            )
+            .await
+            .unwrap();
+            let mut client = Client::connect(&camera).await;
+            let refused = client
+                .request("DESCRIBE", &camera.url(), &[REQUIRE_BACKCHANNEL])
+                .await;
+            assert_eq!(refused.status(), status);
+            let unsupported = refused.header(&UNSUPPORTED).map(|v| v.as_str().to_owned());
+            if answer == RequireAnswer::OptionNotSupported {
+                assert_eq!(unsupported.as_deref(), Some(BACKCHANNEL_REQUIRE));
+            } else {
+                assert_eq!(unsupported, None);
+            }
+            let retry = client.request("DESCRIBE", &camera.url(), &[]).await;
+            assert_eq!(retry.status(), StatusCode::Ok);
+            assert!(!body(&retry).contains("a=sendonly"));
+            let stats = camera.stats();
+            assert_eq!(Stats::get(&stats.require_rejected), 1);
+            assert_eq!(Stats::get(&stats.describes), 1);
+            assert_eq!(Stats::get(&stats.backchannel_describes), 0);
+            camera.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_camera_that_takes_one_payload_type_refuses_rtp_of_another() {
+        let clock = clock();
+        let camera = FakeCamera::start(
+            with_backchannel(CameraBackchannel {
+                payload_type: Some(96),
+                accept_only: Some(8),
+                ..CameraBackchannel::new(BackchannelCodec::Pcma)
+            }),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
+        let mut client = Client::connect(&camera).await;
+        let described = client
+            .request("DESCRIBE", &camera.url(), &[REQUIRE_BACKCHANNEL])
+            .await;
+        assert!(body(&described).contains("m=audio 0 RTP/AVP 96\r\na=rtpmap:96 PCMA/8000"));
+        let back = format!("{}{BACKCHANNEL_CONTROL}", base(&camera));
+        client
+            .request(
+                "SETUP",
+                &back,
+                &["Transport: RTP/AVP/TCP;unicast;interleaved=2-3"],
+            )
+            .await;
+        client
+            .request("PLAY", &camera.url(), &["Session: 12345678"])
+            .await;
+        client.send(2, &rtp_of(96, 1, 1, 0, true, &[0xd5])).await;
+        client.send(2, &rtp_of(8, 1, 2, 160, false, &[0xd5])).await;
+        let stats = camera.stats();
+        assert!(eventually(&clock, || Stats::get(&stats.backchannel_packets) == 1).await);
+        assert_eq!(Stats::get(&stats.backchannel_refused), 1);
+        assert_eq!(stats.backchannel()[0].payload_type, 8);
+        camera.stop().await;
     }
 }

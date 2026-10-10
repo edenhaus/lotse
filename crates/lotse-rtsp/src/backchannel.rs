@@ -508,6 +508,54 @@ mod tests {
     }
 
     #[test]
+    fn onvif_5_3_the_fake_cameras_backchannel_media_gives_its_codec_payload_type_and_ptime() {
+        use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel};
+
+        let cases = [
+            (
+                CameraBackchannel::new(BackchannelCodec::Pcmu),
+                g711(Codec::Pcmu, 0),
+            ),
+            (
+                CameraBackchannel {
+                    payload_type: Some(97),
+                    ptime: Some(40),
+                    ..CameraBackchannel::new(BackchannelCodec::Pcma)
+                },
+                BackchannelFormat {
+                    ptime: Some(Duration::from_millis(40)),
+                    ..g711(Codec::Pcma, 97)
+                },
+            ),
+            (
+                CameraBackchannel::new(BackchannelCodec::Opus),
+                BackchannelFormat {
+                    codec: Codec::Opus { channels: 2 },
+                    payload_type: 111,
+                    clock_rate: 48_000,
+                    ptime: None,
+                },
+            ),
+        ];
+        for (backchannel, expected) in cases {
+            let config = lotse_testing::CameraConfig {
+                audio: Some(lotse_testing::fake_camera::CameraAudio::Pcmu),
+                backchannel: Some(backchannel),
+                ..lotse_testing::CameraConfig::default()
+            };
+            let sdp = config.sdp("rtsp://127.0.0.1:1/stream/", true);
+            let session = sdp_types::Session::parse(sdp.as_bytes()).unwrap();
+            let sendonly: Vec<&Media> = session
+                .medias
+                .iter()
+                .filter(|media| media.has_attribute("sendonly"))
+                .collect();
+            assert_eq!(sendonly.len(), 1);
+            assert_eq!(backchannel_format(sendonly[0]), Some(expected));
+        }
+    }
+
+    #[test]
     fn a_media_without_a_format_the_chain_produces_has_none() {
         assert_eq!(format(&["m=video 0 RTP/AVP 0"]), None);
         assert_eq!(format(&["m=audio 0 RTP/AVP 9"]), None);
