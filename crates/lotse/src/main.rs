@@ -15,6 +15,7 @@ use anyhow::Context as _;
 use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _};
 use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
 use lotse_codec::transcode::AacToOpus;
+use lotse_codec::transcode::uplink::ToG711Factory;
 use lotse_core::clock::SystemClock;
 use lotse_core::registry::Registries;
 use lotse_core::runner::RunnerConfig;
@@ -76,6 +77,9 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
     registries
         .transcoders
         .register(Arc::new(AacToOpus::new(Arc::new(SystemClock))));
+    // Talk-back to the camera's G.711, framed per backchannel: apart from
+    // the downlink list, so no viewer is offered it.
+    registries.uplink = Some(Arc::new(ToG711Factory::new(Arc::new(SystemClock))));
     #[cfg(feature = "output-webrtc")]
     registered(
         "webrtc output",

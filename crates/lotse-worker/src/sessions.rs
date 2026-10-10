@@ -49,10 +49,8 @@ use lotse_core::session::{
     Transport, apply_audio_event, apply_track_event,
 };
 use lotse_core::skew::AV_SYNC_LOST;
-use lotse_core::source::BackchannelSlot;
 use lotse_core::task::spawn_named;
 use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
-use lotse_core::uplink::UplinkTrack;
 use lotse_ipc::{SessionEvent as IpcEvent, SessionSpec, datagram};
 use tokio::net::UnixDatagram;
 use tokio::sync::mpsc;
@@ -62,7 +60,7 @@ use crate::derived::{DerivedTracks, Lease, PickedTrack};
 use crate::ice_tcp::Links;
 use crate::relay::{Egress, Relays};
 use crate::sendmsg;
-use crate::talkback;
+use crate::talkback::{self, Arbiter, BACKCHANNEL_BUSY, Talkback};
 
 /// The bounded inbound queue per session:
 /// uplink only, so small.
@@ -526,8 +524,9 @@ struct SessionCtx {
     tracks: Arc<DerivedTracks>,
     /// The connection's clock mapper.
     mapper: Arc<ClockMapper>,
-    /// The connection's backchannel slot, when its protocol has one.
-    backchannel: Option<BackchannelSlot>,
+    /// The arbiter of the connection's backchannel, when its protocol has
+    /// one.
+    backchannel: Option<Arc<Arbiter>>,
     /// The output that opens the session.
     factory: Arc<dyn OutputFactory>,
     /// The tunables.
@@ -772,9 +771,10 @@ struct Opened {
     /// The datagram-channel message to the supervisor being encoded,
     /// reused from frame to frame.
     uplink: Vec<u8>,
-    /// The track the viewer's talk-back goes out on, from its first
-    /// packet ([`talkback`]); closed with the session.
-    talkback: Option<UplinkTrack>,
+    /// The viewer's talk-back towards the connection's backchannel
+    /// ([`talkback`]), when it has one; dropped with the session, which
+    /// frees the channel if the session held it.
+    talkback: Option<Talkback>,
 }
 
 /// What a session takes from the connection it opens on.
@@ -783,9 +783,10 @@ pub(crate) struct ConnectionMedia {
     pub(crate) tracks: Arc<DerivedTracks>,
     /// The connection's clock mapper.
     pub(crate) mapper: Arc<ClockMapper>,
-    /// The connection's backchannel slot, when its source protocol can
-    /// carry audio back; talk-back is answered from what it holds.
-    pub(crate) backchannel: Option<BackchannelSlot>,
+    /// The arbiter of the connection's backchannel, when its source
+    /// protocol can carry audio back: talk-back is answered from what its
+    /// slot holds, and the session's uplink goes through it.
+    pub(crate) backchannel: Option<Arc<Arbiter>>,
 }
 
 /// A relay candidate handed over before the engine exists.
@@ -901,7 +902,7 @@ async fn open_session(
         backchannel: ctx
             .backchannel
             .as_ref()
-            .and_then(BackchannelSlot::current)
+            .and_then(|arbiter| arbiter.offered())
             .map(|handle| handle.codec),
         orientation: Orientation::from_code(ctx.spec.orientation).unwrap_or_default(),
         limits: ctx.limits,
@@ -924,7 +925,10 @@ async fn open_session(
         _video_lease: picked.video.lease,
         relays: Relays::default(),
         uplink: Vec::new(),
-        talkback: None,
+        talkback: ctx
+            .backchannel
+            .as_ref()
+            .map(|arbiter| Talkback::new(Arc::clone(arbiter), ctx.spec.session_id.clone())),
     };
     for relay in relays {
         add_relay(ctx, &mut opened, relay).await;
@@ -1017,7 +1021,15 @@ async fn drain(
                     ctx.emit(event).await;
                 }
             }
-            SessionOutput::Uplink(packet) => talkback::receive(&mut opened.talkback, packet),
+            SessionOutput::Uplink(packet) => {
+                if talkback::receive(opened.talkback.as_mut(), packet) {
+                    ctx.emit(IpcEvent::Warning {
+                        code: BACKCHANNEL_BUSY.to_owned(),
+                        message: "another session holds the camera's backchannel; this session's talk-back is dropped".to_owned(),
+                    })
+                    .await;
+                }
+            }
             SessionOutput::Timeout(at) => return Some(at),
         }
     }

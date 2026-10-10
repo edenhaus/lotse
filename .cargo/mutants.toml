@@ -43,6 +43,12 @@ exclude_re = [
     # Only picks whether a change of the talk-back codec is logged; the codec is remembered
     # either way.
     "replace match guard old == uplink.codec with (true|false) in TalkbackRx::take",
+    # Only the level and message of the talk-back state logs, and whether the end-of-session
+    # counters are logged; the states and counters themselves are asserted by the arbitration tests.
+    "talkback.rs:.*in log_change$",
+    "talkback.rs:.*replace log_change with \\(\\)",
+    "talkback.rs:.*in Talkback::log_end$",
+    "talkback.rs:.*replace Talkback::log_end with \\(\\)",
     "replace == with != in TalkbackRx::take",
     # G.711's sign (0x80), segment (0x70) and step (0x0f) bits are disjoint, so `|` and `^`
     # produce the same code.

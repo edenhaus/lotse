@@ -50,7 +50,7 @@ use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields};
 use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
 use lotse_core::track::{FrameSubscription, SubscriptionError, Track};
-use lotse_core::transcode::{TrackHandle, TranscodeError, Transcoder};
+use lotse_core::transcode::{TrackHandle, TranscodeError, Transcoder, UplinkFactory};
 use tokio_util::sync::CancellationToken;
 
 use super::rtp_ts;
@@ -105,6 +105,18 @@ impl FrameSize {
         }
     }
 
+    /// The frame closest to `duration` that the chain frames: its whole
+    /// 8 kHz samples (125 µs each), clamped to [`FrameSize::MIN`] and
+    /// [`FrameSize::MAX`].
+    pub fn clamped(duration: Duration) -> Self {
+        let samples = duration
+            .as_micros()
+            .checked_div(125)
+            .unwrap_or_default()
+            .clamp(u128::from(Self::MIN), u128::from(Self::MAX));
+        Self(u16::try_from(samples).unwrap_or(Self::MAX))
+    }
+
     /// The samples per frame.
     pub const fn samples(self) -> u16 {
         self.0
@@ -138,6 +150,34 @@ impl ToG711 {
     /// packet arrived; decoding at 8 kHz adds no filter delay.
     pub fn delay(frame: FrameSize) -> Duration {
         frame.duration()
+    }
+}
+
+/// The talk-back transcoder of every frame size, as the binary registers
+/// it for the worker ([`Registries::uplink`](lotse_core::registry::Registries::uplink)):
+/// a [`ToG711`] per backchannel, framed as its device asks.
+#[derive(Debug)]
+pub struct ToG711Factory {
+    /// The clock every transcoder it builds reads.
+    clock: Arc<dyn Clock>,
+}
+
+impl ToG711Factory {
+    /// A factory whose transcoders read time from `clock`.
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self { clock }
+    }
+}
+
+impl UplinkFactory for ToG711Factory {
+    /// A [`ToG711`] of [`FrameSize::clamped`] `frame`: a device asking for
+    /// less than 10 ms or more than 120 ms gets the nearest the chain
+    /// frames, and the transcoder's start log names the frame it got.
+    fn transcoder(&self, frame: Duration) -> Arc<dyn Transcoder> {
+        Arc::new(ToG711::new(
+            Arc::clone(&self.clock),
+            FrameSize::clamped(frame),
+        ))
     }
 }
 
@@ -834,6 +874,18 @@ mod tests {
         assert_eq!(FrameSize::new(79), None);
         assert_eq!(FrameSize::new(961), None);
         assert_eq!(ToG711::delay(FrameSize::new(320).unwrap()), ms(40));
+        // A device's frame duration, in whole samples, clamped.
+        assert_eq!(FrameSize::clamped(ms(20)), FrameSize::DEFAULT);
+        assert_eq!(FrameSize::clamped(ms(10)).samples(), 80);
+        assert_eq!(FrameSize::clamped(ms(120)).samples(), 960);
+        assert_eq!(
+            FrameSize::clamped(Duration::from_micros(30_100)).samples(),
+            240
+        );
+        assert_eq!(FrameSize::clamped(ms(5)).samples(), FrameSize::MIN);
+        assert_eq!(FrameSize::clamped(Duration::ZERO).samples(), FrameSize::MIN);
+        assert_eq!(FrameSize::clamped(ms(121)).samples(), FrameSize::MAX);
+        assert_eq!(FrameSize::clamped(Duration::MAX).samples(), FrameSize::MAX);
         assert_eq!(
             MAX_CONCEALMENT.as_millis() * 8,
             MAX_CONCEALMENT_SAMPLES as u128
@@ -861,6 +913,25 @@ mod tests {
         }
         for from in [Codec::Opus { channels: 3 }, Codec::G722] {
             assert_eq!(transcoder.derive(&from, CodecFamily::Pcmu), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_factory_frames_as_the_device_asks() {
+        let clock = Arc::new(FakeClock::from_system());
+        let factory = ToG711Factory::new(clock.clone());
+        let input = track(Codec::Pcmu, 8_000, 0, TrackLimits::default(), clock.now());
+        for (asked, framed) in [(ms(40), ms(40)), (ms(20), ms(20)), (ms(200), ms(120))] {
+            let transcoder = factory.transcoder(asked);
+            assert_eq!(
+                transcoder.derive(&Codec::Opus { channels: 1 }, CodecFamily::Pcma),
+                Some(Codec::Pcma)
+            );
+            let output = track(Codec::Pcmu, 8_000, 1, TrackLimits::default(), clock.now());
+            let handle = transcoder
+                .spawn(input.subscribe_frames(), &Codec::Pcmu, output)
+                .unwrap();
+            assert_eq!(handle.delay, framed, "one frame of {asked:?}");
         }
     }
 

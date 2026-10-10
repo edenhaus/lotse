@@ -1,7 +1,7 @@
 //! Worker process: the IPC client, the source connection runner, the
 //! derived tracks, the session manager with each session's talk-back
-//! uplink track, and the once-per-second stats push, for one camera
-//! connection.
+//! uplink track, the arbiter that picks the backchannel's one talker, and
+//! the once-per-second stats push, for one camera connection.
 //!
 //! Everything a worker does apart from parsing protocols. It takes the factory
 //! registries the binary filled, receives control messages from the
@@ -51,6 +51,7 @@ use tracing::Instrument as _;
 
 use crate::derived::DerivedTracks;
 use crate::sessions::{ConnectionMedia, SessionManager};
+use crate::talkback::Arbiter;
 
 /// How often the worker pushes its counters.
 pub const STATS_INTERVAL: Duration = Duration::from_secs(1);
@@ -170,11 +171,12 @@ struct Running {
     /// The tracks as last reported to the supervisor; empty until the
     /// source first went live.
     reported: Vec<TrackInfo>,
-    /// The connection's backchannel slot, when its source protocol can
-    /// carry audio back (`SourceCapabilities::backchannel`, the gate of
-    /// two-way audio): sessions answer talk-back from what it holds. `None`
-    /// for a protocol without one, whose slot no session reads.
-    backchannel: Option<BackchannelSlot>,
+    /// The arbiter of the connection's backchannel, when its source
+    /// protocol can carry audio back (`SourceCapabilities::backchannel`,
+    /// the gate of two-way audio): sessions answer talk-back from what its
+    /// slot holds, and it picks the one talker. `None` for a protocol
+    /// without one, whose slot no session reads.
+    backchannel: Option<Arc<Arbiter>>,
 }
 
 /// One source runner's handles.
@@ -547,10 +549,22 @@ impl Serving<'_> {
             mapper: std::mem::replace(&mut running.mapper, standby.runner.mapper),
             task: std::mem::replace(&mut running.task, standby.runner.task),
             gate: std::mem::replace(&mut running.gate, standby.runner.gate),
-            // Sessions opened from now on answer talk-back from the new
-            // source's slot; the old one is withdrawn as its source stops.
-            backchannel: std::mem::replace(&mut running.backchannel, standby.runner.backchannel),
+            backchannel: None,
         };
+        // The connection's arbiter follows the new source's backchannel:
+        // the talker keeps the channel, and sessions opened from now on
+        // answer talk-back from what the new source offers.
+        match (&running.backchannel, standby.runner.backchannel) {
+            (Some(arbiter), slot) => arbiter.follow(slot.unwrap_or_default()),
+            (None, Some(slot)) => {
+                running.backchannel = Some(Arc::new(Arbiter::new(
+                    slot,
+                    self.registries.uplink.clone(),
+                    Arc::clone(&self.clock),
+                )));
+            }
+            (None, None) => {}
+        }
         stop_runner(old, &self.clock).await;
         // The old runner's last reports, `Stopped` included, are not the
         // source's any more; the standby's channel is.
@@ -600,7 +614,7 @@ impl Serving<'_> {
                         ConnectionMedia {
                             tracks: Arc::clone(&source.tracks),
                             mapper: Arc::clone(&source.mapper),
-                            backchannel: source.backchannel.clone(),
+                            backchannel: source.backchannel.as_ref().map(Arc::clone),
                         },
                         &self.registries,
                         self.settings.session,
@@ -721,7 +735,13 @@ fn start_source(
         task: runner.task,
         gate: runner.gate,
         reported: Vec::new(),
-        backchannel: runner.backchannel,
+        backchannel: runner.backchannel.map(|slot| {
+            Arc::new(Arbiter::new(
+                slot,
+                registries.uplink.clone(),
+                Arc::clone(clock),
+            ))
+        }),
     })
 }
 
@@ -1023,7 +1043,7 @@ mod tests {
     };
     use lotse_core::task::BoxFuture;
     use lotse_core::test_util::{
-        ECHO_ANSWER, EchoSessionFactory, FakeOutputFactory, FakeSourceFactory,
+        BackchannelCapture, ECHO_ANSWER, EchoSessionFactory, FakeOutputFactory, FakeSourceFactory,
     };
     use lotse_ipc::Receiver;
     use tokio::sync::Notify;
@@ -1497,6 +1517,113 @@ mod tests {
                 .unwrap();
             assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
         }
+    }
+
+    /// Claim and hold through the worker: the first session
+    /// to send talk-back reaches the camera, the second gets exactly one
+    /// `backchannel_busy` and its packets go nowhere, and closing the
+    /// holder's session hands the channel to the next sender.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_session_to_talk_holds_the_backchannel_and_a_second_gets_one_busy_warning() {
+        let camera = BackchannelCapture::default();
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::capturing(
+                &["fake"],
+                camera.clone(),
+            )))
+            .unwrap();
+        registries
+            .outputs
+            .register(Arc::new(EchoSessionFactory))
+            .unwrap();
+        let mut h = start_with_settings(Arc::new(registries), quiet_settings());
+        h.next().await;
+        let shared = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let shared_addr = shared.local_addr().unwrap();
+        let (datagrams, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
+        h.tx.send_msg(
+            &ToWorker::Sockets,
+            &[OwnedFd::from(shared).as_fd(), theirs.as_fd()],
+        )
+        .await
+        .unwrap();
+        h.tx.send_msg(
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"backchannel": "pcmu"}"#)),
+            &[],
+        )
+        .await
+        .unwrap();
+        until_live(&mut h).await;
+        for id in ["a", "b"] {
+            h.tx.send_msg(&ToWorker::OpenSession(session_spec(id)), &[])
+                .await
+                .unwrap();
+            session_event_where(&mut h, |e| matches!(e, SessionEvent::Answer { .. })).await;
+        }
+        let browser = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let datagrams = std::os::unix::net::UnixDatagram::from(datagrams);
+        let talk = |session: &str, sample: u8| {
+            let mut frame = Vec::new();
+            lotse_ipc::datagram::encode(
+                &format!("ufrag-{session}"),
+                browser.local_addr().unwrap(),
+                shared_addr,
+                &[b't', b'a', b'l', b'k', b':', sample],
+                &mut frame,
+            );
+            datagrams.send(&frame).unwrap();
+        };
+        let samples = |packets: Vec<lotse_core::media::MediaPacket>| -> Vec<u8> {
+            packets.iter().map(|packet| packet.payload[0]).collect()
+        };
+
+        talk("a", 1);
+        assert_eq!(samples(within(camera.wait_for(1)).await), [1]);
+        talk("b", 2);
+        talk("b", 3);
+        let busy = |e: &SessionEvent| matches!(e, SessionEvent::Warning { code, .. } if code == "backchannel_busy");
+        let mut seen = messages_until(&mut h, |seen| {
+            session_events(seen).any(|(session, event)| session == "b" && busy(event))
+        })
+        .await;
+        talk("a", 4);
+        assert_eq!(
+            samples(within(camera.wait_for(2)).await),
+            [1, 4],
+            "nothing of b's"
+        );
+
+        h.tx.send_msg(
+            &ToWorker::CloseSession {
+                session_id: "a".into(),
+                code: "session_closed".into(),
+                message: "closed".into(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        seen.extend(messages_until(&mut h, |seen| closed(seen, "a")).await);
+        talk("b", 5);
+        assert_eq!(samples(within(camera.wait_for(3)).await), [1, 4, 5]);
+
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        while let Some(Ok(Some((message, _)))) = tokio::select! {
+            message = h.rx.recv_msg::<ToSupervisor>() => Some(message),
+            () = SystemClock.sleep(Duration::from_secs(5)) => None,
+        } {
+            seen.push(message);
+        }
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+        let warnings: Vec<&str> = session_events(&seen)
+            .filter(|(_, event)| busy(event))
+            .map(|(session, _)| session)
+            .collect();
+        assert_eq!(warnings, ["b"], "exactly one, to the second sender");
     }
 
     // Multi-threaded, so a session task that never yields cannot keep the
