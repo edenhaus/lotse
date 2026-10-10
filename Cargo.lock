@@ -1539,6 +1539,8 @@ dependencies = [
  "m3u8-rs",
  "mpeg2ts-reader",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
  "url",
 ]
 

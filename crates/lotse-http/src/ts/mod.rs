@@ -55,7 +55,7 @@
 
 mod align;
 #[cfg(test)]
-mod test_data;
+pub(crate) mod test_data;
 
 use bytes::Bytes;
 use lotse_codec::aac::{AdtsConfig, AdtsFrame, AdtsSplitter, FRAME_SAMPLES};

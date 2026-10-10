@@ -43,24 +43,24 @@
 
 /// One second of H.264 (no B-frames) and AAC-LC 48 kHz mono: 10 access
 /// units and 48 AAC frames.
-pub(super) const H264_AAC: &[u8] = include_bytes!("../../testdata/h264_aac.m2t");
+pub(crate) const H264_AAC: &[u8] = include_bytes!("../../testdata/h264_aac.m2t");
 
 /// One second of H.264 with B-frames, its PTS and DTS wrapping: 10 access
 /// units.
-pub(super) const H264_BFRAMES_WRAP: &[u8] = include_bytes!("../../testdata/h264_bframes_wrap.m2t");
+pub(crate) const H264_BFRAMES_WRAP: &[u8] = include_bytes!("../../testdata/h264_bframes_wrap.m2t");
 
 /// One second of H.265 with table version 1: 10 access units.
-pub(super) const H265_V1: &[u8] = include_bytes!("../../testdata/h265_v1.m2t");
+pub(crate) const H265_V1: &[u8] = include_bytes!("../../testdata/h265_v1.m2t");
 
 /// Half a second of H.264 and AAC-LC 16 kHz mono: 5 access units and 9
 /// AAC frames.
-pub(super) const H264_AAC16K: &[u8] = include_bytes!("../../testdata/h264_aac16k.m2t");
+pub(crate) const H264_AAC16K: &[u8] = include_bytes!("../../testdata/h264_aac16k.m2t");
 
 /// Half a second of H.264, MPEG-1 audio and AAC in LATM, in two programs.
-pub(super) const PROGRAMS: &[u8] = include_bytes!("../../testdata/programs.m2t");
+pub(crate) const PROGRAMS: &[u8] = include_bytes!("../../testdata/programs.m2t");
 
 /// The PID of the video stream, as ffmpeg numbers it.
-pub(super) const VIDEO_PID: u16 = 0x100;
+pub(crate) const VIDEO_PID: u16 = 0x100;
 
 /// The PID of the first audio stream, as ffmpeg numbers it.
-pub(super) const AUDIO_PID: u16 = 0x101;
+pub(crate) const AUDIO_PID: u16 = 0x101;

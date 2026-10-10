@@ -1,6 +1,8 @@
 //! HTTP source (M6): HLS with MPEG-TS and fragmented MP4 segments, and raw
 //! MPEG-TS over HTTP. So far the HLS playlist parser and the choice of
-//! variant, audio rendition and segments from the parsed playlists.
+//! variant, audio rendition and segments from the parsed playlists, the
+//! MPEG-TS demultiplexer, and the pacing and publishing of its units on
+//! the tracks.
 //!
 //! Runs in a worker, on bytes from the network: every parser here is fuzzed.
 //! May depend on `lotse-core` and `lotse-codec` only, never on another source
@@ -13,4 +15,6 @@
 
 pub mod hls;
 pub mod media;
+pub mod pace;
+pub mod publish;
 pub mod ts;

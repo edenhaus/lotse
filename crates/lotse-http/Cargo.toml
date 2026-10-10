@@ -14,14 +14,16 @@ categories.workspace = true
 [dependencies]
 bytes = { workspace = true } # the payloads of demultiplexed units
 lotse-codec = { workspace = true } # ADTS splitting of AAC from MPEG-TS
-lotse-core = { workspace = true } # the codecs and kinds of a demultiplexed program's tracks
+lotse-core = { workspace = true } # the codecs and kinds of a demultiplexed program's tracks, and the tracks it is published on
 m3u8-rs = { workspace = true }
 mpeg2ts-reader = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true } # the declared tracks, new epochs and losses of the published program
 url = { workspace = true } # playlist URIs resolved against the playlist's own URL and checked for its origin
 
 [dev-dependencies]
 lotse-codec = { workspace = true, features = ["test-util"] } # the recorded ADTS of the AAC tests
+tracing-subscriber = { workspace = true } # captures the publisher's log lines
 
 [lints]
 workspace = true
