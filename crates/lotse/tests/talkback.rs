@@ -104,9 +104,24 @@ const BURSTS: u32 = 5;
 /// Packets a tone test sends.
 const TONE_PACKETS: u32 = LEAD + BURSTS * (BURST.0 + BURST.1);
 
-/// The daemon's share of the uplink latency, onset in to
-/// onset out at the backchannel handle, for 20 ms G.711 frames.
-const UPLINK_LATENCY: Duration = Duration::from_millis(40);
+/// The daemon's share of the uplink latency, from the browser handing a
+/// packet to its socket to the camera taking the frame it completes, for
+/// 20 ms packets into 20 ms G.711 frames: a median, so one late wake of a
+/// loaded machine cannot fail it. The chain adds no wait there
+/// (`ToG711::delay` is zero: no playout buffer, each frame leaves with its
+/// packet), so this covers the path alone, with margin for a loaded
+/// machine: SRTP and the depacketizer, the talker's route, the transcoder
+/// task, the backchannel handle, and for the RTSP source retina's
+/// interleaved write and the camera's read.
+const UPLINK_LATENCY: Duration = Duration::from_millis(10);
+
+/// How long a tone test keeps listening after the camera took a frame for
+/// every packet: no frame may follow, the talker having stopped.
+const QUIET: Duration = Duration::from_millis(200);
+
+/// The packet of the PCMU tone test the network loses: in the silence
+/// after the first burst.
+const LOST: u32 = LEAD + BURST.0 + 5;
 
 /// Whether packet `index` of a tone test carries the tone.
 const fn tone_on(index: u32) -> bool {
@@ -154,8 +169,12 @@ struct Mic {
     marker: bool,
     /// When the next packet is due.
     next: Instant,
-    /// When each packet was handed to the socket, by index.
+    /// When each packet was handed to the socket, by index; for a lost
+    /// one, when it would have been.
     sent: Vec<Instant>,
+    /// The packets the network loses, by index: their sequence numbers
+    /// and timestamps pass, but they never reach the socket.
+    lost: Vec<u32>,
     /// Every packet's payload, by index.
     payloads: Vec<Vec<u8>>,
 }
@@ -170,8 +189,20 @@ impl Mic {
             marker: true,
             next: clock().now(),
             sent: Vec::new(),
+            lost: Vec::new(),
             payloads: Vec::new(),
         }
+    }
+
+    /// The same microphone behind a network that loses packet `index`.
+    fn losing(mut self, index: u32) -> Self {
+        self.lost.push(index);
+        self
+    }
+
+    /// The packets that reach the socket, of those sent so far.
+    fn delivered(&self) -> usize {
+        self.sent.len() - self.lost.len()
     }
 
     fn pcmu() -> Self {
@@ -315,14 +346,16 @@ impl Peer {
             && mic.next <= now
         {
             let (payload, step) = mic.encode();
-            self.viewer
-                .send_talkback(
-                    now,
-                    (pt, mic.seq, mic.ts, mic.marker),
-                    &payload,
-                    &mut self.out,
-                )
-                .expect("a send stream on the talk-back m-line");
+            if !mic.lost.contains(&mic.index) {
+                self.viewer
+                    .send_talkback(
+                        now,
+                        (pt, mic.seq, mic.ts, mic.marker),
+                        &payload,
+                        &mut self.out,
+                    )
+                    .expect("a send stream on the talk-back m-line");
+            }
             mic.sent.push(now);
             mic.payloads.push(payload);
             mic.index += 1;
@@ -652,11 +685,16 @@ async fn tone_run(camera: &str, audio_codecs: Option<&str>, mic: Mic) -> ToneRun
         .pump(&mut [&mut peer], |_, peers| peers[0].sent() >= TONE_PACKETS)
         .await;
     let mic = peer.mute();
-    // Every packet's frame, and the playout buffer's one frame after it.
+    // Every delivered packet's frame, then a while for anything after it.
+    let delivered = mic.delivered();
     worker
         .pump(&mut [&mut peer], |_, _| {
-            capture.packets().len() >= TONE_PACKETS as usize
+            capture.packets().len() >= delivered
         })
+        .await;
+    let quiet = clock().now() + QUIET;
+    worker
+        .pump(&mut [&mut peer], |_, _| clock().now() >= quiet)
         .await;
     let pt = peer.pt.expect("a talk-back payload type");
     worker.stop().await;
@@ -707,63 +745,83 @@ impl From<&BackchannelRtp> for Frame {
     }
 }
 
-/// The frames of one talkspurt as the camera took them, `frame` apart:
-/// whole G.711 frames of the camera's `pt` and `frame`'s samples, with
-/// continuous timestamps and sequence numbers, the marker on the first
-/// only, paced on the frame grid.
-fn check_frames(frames: &[Frame], pt: u8, frame: Duration) {
+/// The frames of one talk spurt as the camera took them from `mic`'s
+/// packets, `frame` to a frame (a whole number of [`FRAME`]s): whole G.711
+/// frames of the camera's `pt` and `frame`'s samples, the marker on the
+/// first only (RFC 3551 §4.1), sequence numbers one apart, and timestamps
+/// that put each frame where its audio sat on the browser's timeline, so
+/// they run on over a lost packet (RFC 3550 §5.1). No pacing: each frame
+/// leaves after the browser sent the last packet it carries, never before
+/// (the camera gets no audio the browser did not send, no burst ahead of
+/// it), and within [`UPLINK_LATENCY`] of it in the median. Returns each
+/// frame's slot: the index of its first packet, `frame` apart.
+fn check_frames(frames: &[Frame], pt: u8, frame: Duration, mic: &Mic) -> Vec<usize> {
+    let per_frame = usize::try_from(frame.as_millis() / FRAME.as_millis()).unwrap();
     let samples = u32::try_from(frame.as_millis() * 8).unwrap();
-    // RFC 3551 §4.5.14: 8000 Hz, a frame of `samples`; RFC 3550 §5.1: one
-    // sequence number and `samples` timestamp ticks apart, the marker on
-    // the spurt's first only (RFC 3551 §4.1).
-    for (i, packet) in frames.iter().enumerate() {
+    // The frames the delivered packets fill, by slot.
+    let mut slots: Vec<usize> = (0..mic.sent.len())
+        .filter(|&index| !mic.lost.contains(&(index as u32)))
+        .map(|index| index / per_frame * per_frame)
+        .collect();
+    slots.dedup();
+    assert!(
+        frames.len() <= slots.len(),
+        "{} frames from the audio of {} packets",
+        frames.len(),
+        mic.delivered()
+    );
+    let mut lags = Vec::new();
+    for (i, (packet, &slot)) in frames.iter().zip(&slots).enumerate() {
+        // RFC 3551 §4.5.14: 8000 Hz, a frame of `samples`.
         assert_eq!(packet.pt, pt, "frame {i}");
         assert_eq!(packet.payload.len(), samples as usize, "frame {i}");
         assert_eq!(packet.marker, i == 0, "frame {i}");
-        if let Some(next) = frames.get(i + 1) {
-            assert_eq!(
-                next.ts.wrapping_sub(packet.ts),
-                samples,
-                "continuous timestamps after frame {i}"
-            );
-            assert_eq!(next.seq.wrapping_sub(packet.seq), 1);
-        }
+        assert_eq!(packet.seq.wrapping_sub(frames[0].seq), i as u16);
+        assert_eq!(
+            packet.ts.wrapping_sub(frames[0].ts),
+            (slot - slots[0]) as u32 * 160,
+            "frame {i} on the browser's timeline"
+        );
+        let last = mic.sent[slot + per_frame - 1];
+        assert!(
+            packet.at >= last,
+            "frame {i} left before the browser sent its audio"
+        );
+        lags.push(packet.at.duration_since(last));
     }
-    // Paced on an absolute schedule: no drift over the run, each frame
-    // near its slot (a loaded machine may wake the camera's task late).
-    let first = frames[0].at;
-    let span = frames[frames.len() - 1].at.duration_since(first);
-    let mean = span / (frames.len() as u32 - 1);
+    let median = percentile(&lags, 50);
     assert!(
-        mean.abs_diff(frame) <= Duration::from_micros(500),
-        "frames every {mean:?} on average"
+        median <= UPLINK_LATENCY,
+        "frames {median:?} after their last packet in the median: {lags:?}"
     );
-    let off_grid: Vec<Duration> = frames
-        .iter()
-        .enumerate()
-        .map(|(i, at)| at.at.duration_since(first).abs_diff(frame * i as u32))
-        .collect();
-    let p95 = percentile(&off_grid, 95);
-    assert!(
-        p95 <= Duration::from_millis(5),
-        "p95 {p95:?} off the {frame:?} grid"
-    );
+    slots.truncate(frames.len());
+    slots
 }
 
 /// The checks every tone run passes:
-/// whole 20 ms G.711 frames of the camera's law with continuous
-/// timestamps, paced at the frame duration ([`check_frames`]); the tone
-/// at its frequency in every burst; and the daemon's share of the
-/// latency, onset in to onset out at the camera. Returns the latency of
-/// each onset.
+/// whole 20 ms G.711 frames of the camera's law on the browser's
+/// timeline, each right after its packet ([`check_frames`]), one per
+/// delivered packet and none after; the tone at its frequency in every
+/// burst; and the daemon's share of the latency, onset in to onset out at
+/// the camera. Returns the latency of each onset.
 fn check_tone(frames: &[Frame], mic: &Mic, law: Law) -> Vec<Duration> {
-    let frames = &frames[..TONE_PACKETS as usize];
-    check_frames(frames, law.payload_type(), FRAME);
+    let slots = check_frames(frames, law.payload_type(), FRAME, mic);
+    assert_eq!(
+        frames.len(),
+        mic.delivered(),
+        "a frame for each packet the browser delivered, nothing more"
+    );
+    // Each packet's audio by its index; a lost one's is silence.
+    let mut pcm = vec![vec![0_i16; 160]; TONE_PACKETS as usize];
+    let mut at = vec![None; TONE_PACKETS as usize];
+    for ((frame, samples), &slot) in frames.iter().zip(decode(frames, law)).zip(&slots) {
+        pcm[slot] = samples;
+        at[slot] = Some(frame.at);
+    }
 
     // The tone survives at its frequency: in each burst's inner frames
     // (its edges carry the onset and the decay), nearly all of the energy
     // is at 1 kHz, next to none at the neighbours.
-    let pcm = decode(frames, law);
     for (burst, &onset) in onsets().iter().enumerate() {
         let inner: Vec<i16> = pcm[onset as usize + 1..(onset + BURST.0) as usize - 1]
             .iter()
@@ -804,8 +862,8 @@ fn check_tone(frames: &[Frame], mic: &Mic, law: Law) -> Vec<Duration> {
         .iter()
         .zip(&onsets_out)
         .map(|(&onset_in, &onset_out)| {
-            frames[onset_out]
-                .at
+            at[onset_out]
+                .expect("a loud frame arrived")
                 .saturating_duration_since(mic.sent[onset_in as usize])
         })
         .collect()
@@ -820,7 +878,8 @@ fn decode(frames: &[Frame], law: Law) -> Vec<Vec<i16>> {
 }
 
 /// The latency gate on a run's onsets: their median, so one late wake of
-/// a loaded machine cannot fail it, within 40 ms. Returns the median.
+/// a loaded machine cannot fail it, within [`UPLINK_LATENCY`]. Returns the
+/// median.
 fn check_latency(latencies: &[Duration]) -> Duration {
     let median = percentile(latencies, 50);
     assert!(
@@ -832,10 +891,11 @@ fn check_latency(latencies: &[Duration]) -> Duration {
 
 /// The reverse chain: a browser that offers only Opus talks to a PCMU
 /// camera. libopus's packets go through the depacketizer, the talker's
-/// route and `ToG711` (Opus decoded at 8 kHz, μ-law encoded, one-frame
-/// playout) into the backchannel handle as the tone, paced and in time.
+/// route and `ToG711` (Opus decoded at 8 kHz, μ-law encoded, each frame
+/// sent as its packet completes it) into the backchannel handle as the
+/// tone, in time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc6716_an_opus_tone_reaches_a_pcmu_camera_at_its_frequency_paced_within_40_ms() {
+async fn rfc6716_an_opus_tone_reaches_a_pcmu_camera_at_its_frequency_within_10_ms() {
     let run = tone_run(
         "pcmu",
         Some("a=rtpmap:111 opus/48000/2\na=fmtp:111 minptime=10;useinbandfec=1"),
@@ -851,25 +911,37 @@ async fn rfc6716_an_opus_tone_reaches_a_pcmu_camera_at_its_frequency_paced_withi
 
 /// The reverse chain, G.711 in and out: the browser offers PCMU and
 /// the camera wants PCMU, so the answer names PCMU and the codes pass
-/// through untouched; only framing and pacing apply.
+/// through untouched; only the RTP header changes. The network loses one
+/// packet: nothing is sent in its place, and the timestamps run on over
+/// it (RFC 3550 §5.1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc3551_4_5_14_a_pcmu_tone_passes_through_to_a_pcmu_camera_paced_within_40_ms() {
-    let run = tone_run("pcmu", None, Mic::pcmu()).await;
+async fn rfc3551_4_5_14_a_pcmu_tone_passes_through_to_a_pcmu_camera_within_10_ms() {
+    let run = tone_run("pcmu", None, Mic::pcmu().losing(LOST)).await;
     assert_eq!(run.pt, 0, "the browser sends PCMU (RFC 3551 Table 4)");
     assert_eq!(run.talkback.as_deref(), Some("pcmu"));
     let latencies = check_tone(&run.frames(), &run.mic, Law::Mu);
-    // The frames are the browser's packets, code for code; at most a
-    // packet late for its slot (concealed) and the one it displaced differ.
+    // The frames are the browser's delivered packets, code for code.
+    let delivered: Vec<&Vec<u8>> = run
+        .mic
+        .payloads
+        .iter()
+        .enumerate()
+        .filter(|&(index, _)| index as u32 != LOST)
+        .map(|(_, payload)| payload)
+        .collect();
     let identical = run
         .captured
         .iter()
-        .zip(&run.mic.payloads)
+        .zip(&delivered)
         .filter(|(frame, sent)| *frame.packet.payload == sent[..])
         .count();
-    assert!(
-        identical + 2 >= TONE_PACKETS as usize,
-        "{identical} of {TONE_PACKETS} frames as sent"
-    );
+    assert_eq!(identical, delivered.len(), "frames as sent");
+    let frames = run.frames();
+    let after = &frames[LOST as usize];
+    let before = &frames[LOST as usize - 1];
+    assert_eq!(after.ts.wrapping_sub(before.ts), 320, "RFC 3550 §5.1");
+    assert_eq!(after.seq.wrapping_sub(before.seq), 1);
+    assert!(!after.marker, "a lost packet does not end the spurt");
     let median = check_latency(&latencies);
     println!("PCMU to PCMU: uplink latency per onset {latencies:?}, median {median:?}");
 }
@@ -937,11 +1009,11 @@ async fn camera_frames(
 /// The browser's PCMU tone through the RTSP source to the camera
 /// (ONVIF Streaming Specification §5.3): retina sends the talk-back
 /// chain's frames on the backchannel's interleaved channel, and the
-/// camera takes them in its payload type and `a=ptime`, continuous, paced
-/// and within the daemon's 40 ms.
+/// camera takes them in its payload type and `a=ptime`, continuous, each
+/// right after its packet, and within the daemon's 10 ms.
 #[cfg(feature = "source-rtsp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onvif_5_3_a_pcmu_tone_through_the_rtsp_source_reaches_the_camera_paced_within_40_ms() {
+async fn onvif_5_3_a_pcmu_tone_through_the_rtsp_source_reaches_the_camera_within_10_ms() {
     let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
     let mut worker = InProcess::rtsp(&camera).await;
     let mut peer = talking(&mut worker, false, Mic::pcmu()).await;
@@ -949,6 +1021,11 @@ async fn onvif_5_3_a_pcmu_tone_through_the_rtsp_source_reaches_the_camera_paced_
         .pump(&mut [&mut peer], |_, peers| peers[0].sent() >= TONE_PACKETS)
         .await;
     let mic = peer.mute();
+    camera_frames(&mut worker, &mut peer, &camera, TONE_PACKETS.into()).await;
+    let quiet = clock().now() + QUIET;
+    worker
+        .pump(&mut [&mut peer], |_, _| clock().now() >= quiet)
+        .await;
     let frames = camera_frames(&mut worker, &mut peer, &camera, TONE_PACKETS.into()).await;
     let latencies = check_tone(&frames, &mic, Law::Mu);
     assert_eq!(Stats::get(&camera.stats().backchannel_refused), 0);
@@ -959,7 +1036,8 @@ async fn onvif_5_3_a_pcmu_tone_through_the_rtsp_source_reaches_the_camera_paced_
 }
 
 /// RFC 8866 §6.4: a camera whose backchannel asks for `a=ptime:40` takes
-/// 40 ms frames of 320 samples, paced 40 ms apart, the tone in them.
+/// 40 ms frames of 320 samples, each as the browser's second 20 ms packet
+/// for it arrives, the tone in them.
 #[cfg(feature = "source-rtsp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc8866_6_4_a_cameras_ptime_of_40_ms_frames_the_tone_in_40_ms_packets() {
@@ -969,11 +1047,11 @@ async fn rfc8866_6_4_a_cameras_ptime_of_40_ms_frames_the_tone_in_40_ms_packets()
     worker
         .pump(&mut [&mut peer], |_, peers| peers[0].sent() >= TONE_PACKETS)
         .await;
-    let _mic = peer.mute();
+    let mic = peer.mute();
     let count = TONE_PACKETS / 2;
     let frames = camera_frames(&mut worker, &mut peer, &camera, count.into()).await;
     let frames = &frames[..count as usize];
-    check_frames(frames, Law::Mu.payload_type(), FRAME * 2);
+    check_frames(frames, Law::Mu.payload_type(), FRAME * 2, &mic);
     // Two of the browser's packets a frame: the first burst's inner
     // frames carry the tone.
     let pcm = decode(frames, Law::Mu);

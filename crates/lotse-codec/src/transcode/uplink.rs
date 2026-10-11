@@ -1,6 +1,5 @@
 //! The talk-back transcoder: a session's uplink audio in, G.711 frames of
-//! the camera's frame size out, paced at the media rate behind a one-frame
-//! playout buffer.
+//! the camera's frame size out, each sent as soon as it is complete.
 //!
 //! It is the reverse instance of the [`Transcoder`] contract, not a second
 //! abstraction: the input is a frame subscription of the uplink track (one
@@ -10,34 +9,47 @@
 //!
 //! The chain is [`Decoder`] (Opus at 8 kHz: libopus band-limits, so no
 //! resampler follows) or a G.711 decode → [`Law::encode`] in the camera's
-//! law → a FIFO of codes (one byte per sample) → one frame per frame
-//! duration. When the browser already sends the camera's law the codes
-//! pass through untouched; only the framing and pacing change. Packets are
-//! decoded as they arrive, nothing waits for a full frame but the frame
-//! itself, and:
+//! law → the frame being filled (one byte per sample) → the camera's
+//! frames. When the browser already sends the camera's law the codes pass
+//! through untouched; only the framing and the RTP header change. Nothing
+//! waits but a frame for its last sample: no playout buffer, no pacing, no
+//! timer. The frames follow the input's timing, so the camera never gets
+//! audio earlier than it arrived, nor more of it. The camera absorbs the
+//! network's jitter itself: a Reolink `TrackMix WiFi` (firmware
+//! `v3.0.0.3748_2408281837`), observed 2026-10-11, buffers about 1.1 s of
+//! backchannel audio whatever the packet size (10, 20 and 40 ms tried),
+//! and a one-frame playout lead in front of it changed nothing measurable.
 //!
-//! - **Playout.** A talk spurt's first frame leaves one frame duration
-//!   after its first packet arrived (the playout buffer, which absorbs that
-//!   much network jitter), every later one a frame duration after the one
-//!   before, with timestamps a frame's samples apart: several cameras
-//!   (Reolink, Dahua) crackle or mute on irregular pacing.
-//! - **Loss.** A frame that comes due without enough audio is completed by
-//!   concealment (Opus PLC, silence for G.711 input) instead of waited for;
-//!   a packet arriving after its audio was concealed is dropped. A gap in
-//!   the input timestamps is concealed when the next packet arrives.
-//! - **Talk spurts.** After [`MAX_CONCEALMENT`] concealed in a row the
-//!   spurt ends and nothing is sent until the next packet, which starts a
-//!   new spurt: marker set, timestamp advanced by the time that passed.
-//! - **Backlog.** More than a frame of audio still queued after a frame
-//!   left means the input runs ahead (a fast sender clock, or a spurt
-//!   anchored on a late packet): the oldest audio is dropped down to half a
-//!   frame, so a sample waits at most two frame durations.
+//! - **Framing.** Each packet is decoded as it arrives into the frame
+//!   being filled, and every frame it completes leaves at once, with the
+//!   packet that carried its last sample. Between packets the chain holds
+//!   less than one frame: nothing queues, so there is no backlog to bound.
+//! - **Gaps.** A gap in the input timestamps up to [`MAX_GAP`] (a lost
+//!   packet, one that does not decode, a lag on the side branch) is not
+//!   filled: concealment sent when the next packet reveals the gap would
+//!   reach the camera as extra audio in a burst, and a camera that plays
+//!   everything it receives keeps that delay for the rest of the session.
+//!   The output timestamps advance by the gap instead, at the end of the
+//!   frame being filled when the gap falls inside one. Opus input runs
+//!   libopus's loss concealment over the gap and discards it, so the next
+//!   packet decodes from the state libopus expects after a loss.
+//! - **Late packets.** A packet behind the input already taken (late,
+//!   reordered, duplicated) is dropped: its place on the timeline has
+//!   passed.
+//! - **Talk spurts.** A gap over [`MAX_GAP`] in the input timestamps, or a
+//!   sender silent for longer than that, starts a new spurt: marker set,
+//!   timestamp advanced by the time that passed. The partial frame the last
+//!   spurt left is dropped, less than one frame of its tail: telling a
+//!   tail from a slow packet takes a timer, and sending it with the next
+//!   spurt would put it ahead of that spurt's audio, late and in a burst.
+//!   Stopping the task drops it too.
 //!
 //! Implements ITU-T G.711 at the RTP clock of RFC 3551 §4.5.14 (8 kHz,
 //! static payload types of Table 4), with the marker on the first packet of
 //! a talkspurt (RFC 3551 §4.1) and timestamps that advance with the
-//! sampling clock across silence (RFC 3550 §5.1); Opus input at the 48 kHz
-//! clock of RFC 7587 §4.1, concealed per RFC 6716 §4.4.
+//! sampling clock across silence and loss (RFC 3550 §5.1); Opus input at
+//! the 48 kHz clock of RFC 7587 §4.1, its losses run through the decoder's
+//! concealment per RFC 6716 §4.4.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -68,14 +80,19 @@ const OPUS_TICKS_PER_SAMPLE: i64 = 6;
 /// samples at 8 kHz.
 const CONCEAL_STEP: usize = 20;
 
-/// The most audio concealed in a row before a talk spurt ends: 100 ms. A
-/// short network stall is bridged without a new spurt; a sender that
-/// stopped (a muted or replaced track) is not imitated for longer, and its
-/// next packet starts a new spurt with the marker set.
-pub const MAX_CONCEALMENT: Duration = Duration::from_millis(100);
+/// The longest gap a talk spurt bridges: 100 ms. A lost packet or a short
+/// network stall keeps the spurt, its timestamps advanced by the gap; a
+/// longer gap in the input timestamps, or a sender silent for longer (a
+/// muted or replaced track), starts a new spurt with the marker set.
+pub const MAX_GAP: Duration = Duration::from_millis(100);
 
-/// [`MAX_CONCEALMENT`] in 8 kHz samples.
-const MAX_CONCEALMENT_SAMPLES: usize = 800;
+/// [`MAX_GAP`] in 8 kHz samples.
+const MAX_GAP_SAMPLES: i64 = 800;
+
+/// The input packet [`ToG711::delay`] assumes: RFC 3551 §4.5's default
+/// packetization interval of 20 ms, which a browser's talk-back keeps
+/// without an `a=ptime`.
+const INPUT_PACKET: Duration = Duration::from_millis(20);
 
 /// The G.711 samples one output frame carries: the camera's frame
 /// duration at 8 kHz, one byte per sample.
@@ -90,9 +107,8 @@ impl FrameSize {
     /// The smallest frame: 10 ms.
     pub const MIN: u16 = 80;
 
-    /// The largest frame: 120 ms, the most one Opus concealment call
-    /// produces (RFC 6716 §3.2.5), and well inside one packet at 1 byte
-    /// per sample.
+    /// The largest frame: 120 ms, Opus's longest packet (RFC 6716
+    /// §3.2.5), and well inside one packet at 1 byte per sample.
     pub const MAX: u16 = 960;
 
     /// A frame of `samples` at 8 kHz, between [`FrameSize::MIN`] and
@@ -133,7 +149,7 @@ impl FrameSize {
 /// its own chain.
 #[derive(Debug)]
 pub struct ToG711 {
-    /// Times the playout and each packet's release.
+    /// Stamps each frame's release and rate-limits the log lines.
     clock: Arc<dyn Clock>,
     /// The camera's frame size.
     frame: FrameSize,
@@ -145,11 +161,18 @@ impl ToG711 {
         Self { clock, frame }
     }
 
-    /// The delay the chain adds for frames of `frame`: the playout buffer,
-    /// one frame. A packet's first sample leaves that long after the
-    /// packet arrived; decoding at 8 kHz adds no filter delay.
+    /// The delay the chain adds for frames of `frame`, as its handle
+    /// reports it: the longest a frame leaves after the capture time its
+    /// timestamp claims, for input that arrives on time in packets of
+    /// 20 ms, RFC 3551 §4.5's default packetization interval, which a
+    /// browser's talk-back keeps without an `a=ptime`. A frame leaves with the packet that carries its
+    /// last sample, so its first sample waits for the rest of the frame:
+    /// `frame` less one packet, nothing when a packet fills a frame or
+    /// more. Packets of another duration wait less than one frame. Nothing
+    /// else waits: there is no playout buffer, and decoding at 8 kHz adds
+    /// no filter delay.
     pub fn delay(frame: FrameSize) -> Duration {
-        frame.duration()
+        frame.duration().saturating_sub(INPUT_PACKET)
     }
 }
 
@@ -260,22 +283,38 @@ impl Input {
     }
 }
 
-/// The talk spurt being played out.
+/// The duration of `samples` at 8 kHz, 125 µs each; none for a negative
+/// count.
+fn span(samples: i64) -> Duration {
+    Duration::from_micros(u64::try_from(samples).unwrap_or(0).saturating_mul(125))
+}
+
+/// The whole 8 kHz samples in `duration`.
+fn samples_in(duration: Duration) -> i64 {
+    i64::try_from(duration.as_micros() / 125).unwrap_or(i64::MAX)
+}
+
+/// The talk spurt being sent: where its next frame sits on the output
+/// timeline.
 #[derive(Debug, Clone, Copy)]
 struct Spurt {
-    /// When the next frame is due.
-    due: Instant,
-    /// The next frame's 8 kHz timestamp, unwrapped.
+    /// The 8 kHz timestamp of the next frame's first sample, unwrapped.
     ts: i64,
     /// The capture time of the next frame's first sample.
     wallclock: Instant,
-    /// Samples concealed in a row, up to the last frame sent.
-    concealed: usize,
+    /// Samples the input skipped inside the frame being filled: the frame
+    /// after it starts that much later.
+    skipped: i64,
+    /// When the audio taken so far ends: the last packet's capture time
+    /// plus its duration. A packet captured more than [`MAX_GAP`] later
+    /// finds the sender stopped.
+    end: Instant,
     /// The next frame is the spurt's first.
     first: bool,
 }
 
-/// One running chain: the input decoder, the FIFO and the playout.
+/// One running chain: the input decoder, the frame being filled and the
+/// spurt's place on the output timeline.
 #[derive(Debug)]
 struct Chain {
     /// The uplink's codec and its decoder.
@@ -286,31 +325,26 @@ struct Chain {
     frame: FrameSize,
     /// The G.711 track the frames go to.
     output: Arc<Track>,
-    /// Times the playout and each packet's release.
+    /// Stamps each frame's release and rate-limits the log lines.
     clock: Arc<dyn Clock>,
-    /// Encoded samples not yet sent, oldest first.
+    /// The frame being filled, encoded, oldest first: fewer samples than a
+    /// frame once a packet's frames have left.
     fifo: VecDeque<u8>,
     /// The input timestamp the next packet should carry; `None` until a
-    /// packet sets it, so the first packet after a reset is taken as is.
+    /// packet sets it, so the first packet of a timeline is taken as is.
     expected: Option<i64>,
     /// The input epoch of the last packet.
     epoch: Option<u32>,
-    /// The talk spurt being played out; `None` between spurts.
+    /// The talk spurt being sent; `None` before the first packet.
     spurt: Option<Spurt>,
-    /// Where the last spurt left off: when its next frame would have been
-    /// due, and that frame's timestamp. The next spurt's timestamps
-    /// continue from there by the time that passed.
-    resume: Option<(Instant, i64)>,
     /// The next packet's sequence number.
     seq: u16,
-    /// Packets that arrived after their audio was concealed.
+    /// Packets dropped behind the input already taken.
     late: Throttle,
-    /// Input timeline jumps.
-    jumps: Throttle,
+    /// Gaps in the input bridged.
+    gaps: Throttle,
     /// Packets that failed to decode.
     failures: Throttle,
-    /// Backlogs dropped.
-    backlogs: Throttle,
     /// Lags on the input subscription.
     lags: Throttle,
 }
@@ -335,24 +369,18 @@ impl Chain {
             expected: None,
             epoch: None,
             spurt: None,
-            resume: None,
             seq: 0,
             late: Throttle::default(),
-            jumps: Throttle::default(),
+            gaps: Throttle::default(),
             failures: Throttle::default(),
-            backlogs: Throttle::default(),
             lags: Throttle::default(),
         }
     }
 
-    /// Samples per frame.
-    fn frame_samples(&self) -> usize {
-        usize::from(self.frame.samples())
-    }
-
-    /// One uplink packet: starts a spurt if none runs, conceals a gap
-    /// before it, drops it when its audio was already concealed, and
-    /// queues its audio.
+    /// One uplink packet: dropped when it is behind the input already
+    /// taken; otherwise it starts a spurt, a new one after a long gap or
+    /// silence, or bridges a short gap before it, and its audio goes into
+    /// the frame being filled, sending every frame that completes.
     fn packet(&mut self, frame: &MediaFrame) {
         let now = self.clock.now();
         let ts = frame.ts.ticks();
@@ -368,20 +396,48 @@ impl Chain {
             self.epoch = Some(frame.epoch);
             self.expected = None;
         }
-        if self.spurt.is_none() {
-            self.start(now, frame.wallclock);
-        }
-        if let Some(expected) = self.expected
-            && !self.fill_gap(now, ts, expected)
-        {
+        let ahead = self
+            .expected
+            .map_or(0, |expected| ts.saturating_sub(expected));
+        if ahead < 0 {
+            if let Some(count) = self.late.hit(now) {
+                tracing::debug!(
+                    track = %self.output.id(),
+                    late_ticks = ahead.saturating_neg(),
+                    ts,
+                    count,
+                    "uplink: late packet dropped; its place has passed"
+                );
+            }
             return;
         }
+        let gap = ahead
+            .checked_div(self.input.ticks_per_sample())
+            .unwrap_or(0);
+        let mut spurt = match self.spurt {
+            None => self.start(frame.wallclock, 0, "first_packet"),
+            Some(spurt) if gap > MAX_GAP_SAMPLES => {
+                self.restart(&spurt, frame.wallclock, "input_gap")
+            }
+            Some(spurt) if frame.wallclock.saturating_duration_since(spurt.end) > MAX_GAP => {
+                self.restart(&spurt, frame.wallclock, "sender_stopped")
+            }
+            Some(spurt) if gap > 0 => self.bridge(spurt, gap, now),
+            Some(spurt) => spurt,
+        };
+        // The packet's place is taken even if it does not decode: its
+        // span is the next packet's gap, bridged once.
+        self.expected = Some(ts);
         match self.decode(&frame.payload) {
             Ok(samples) => {
-                let ticks = i64::try_from(samples)
-                    .unwrap_or(i64::MAX)
-                    .saturating_mul(self.input.ticks_per_sample());
-                self.expected = Some(ts.saturating_add(ticks));
+                let samples = i64::try_from(samples).unwrap_or(i64::MAX);
+                self.expected =
+                    Some(ts.saturating_add(samples.saturating_mul(self.input.ticks_per_sample())));
+                spurt.end = frame
+                    .wallclock
+                    .checked_add(span(samples))
+                    .unwrap_or(frame.wallclock);
+                spurt = self.flush(spurt, now);
             }
             Err(err) => {
                 if let Some(count) = self.failures.hit(now) {
@@ -390,76 +446,87 @@ impl Chain {
                         error = %err,
                         ts,
                         count,
-                        "uplink: packet dropped; its audio is concealed"
+                        "uplink: packet dropped; it does not decode"
                     );
                 }
             }
         }
+        self.spurt = Some(spurt);
     }
 
-    /// Handles a packet at `ts` against the `expected` timestamp: `false`
-    /// when it is late and dropped. A gap up to [`MAX_CONCEALMENT`] is
-    /// concealed; a longer one is a jump in the sender's timeline, taken
-    /// as is.
-    fn fill_gap(&mut self, now: Instant, ts: i64, expected: i64) -> bool {
-        let ahead = ts.saturating_sub(expected);
-        if ahead < 0 {
-            if let Some(count) = self.late.hit(now) {
-                tracing::debug!(
-                    track = %self.output.id(),
-                    late_ticks = ahead.saturating_neg(),
-                    ts,
-                    count,
-                    "uplink: late packet dropped; its audio was concealed"
-                );
-            }
-            return false;
-        }
-        let gap = usize::try_from(
-            ahead
-                .checked_div(self.input.ticks_per_sample())
-                .unwrap_or(0),
-        )
-        .unwrap_or(usize::MAX);
-        if gap > MAX_CONCEALMENT_SAMPLES {
-            if let Some(count) = self.jumps.hit(now) {
-                tracing::debug!(
-                    track = %self.output.id(),
-                    gap_samples = gap,
-                    ts,
-                    count,
-                    "uplink: input timeline jumped; resyncing"
-                );
-            }
-        } else {
-            // A packet on time conceals nothing.
-            self.conceal(gap);
-        }
-        true
-    }
-
-    /// Starts a talk spurt on a packet that arrived at `now`, captured at
-    /// `wallclock`: its first frame is due one frame later, its timestamp
-    /// continues the last spurt's by the time that passed.
-    fn start(&mut self, now: Instant, wallclock: Instant) {
-        let due = now.checked_add(self.frame.duration()).unwrap_or(now);
-        let ts = self.resume.map_or(0, |(at, ts)| {
-            let silence = due.saturating_duration_since(at).as_micros() / 125;
-            ts.saturating_add(i64::try_from(silence).unwrap_or(i64::MAX))
-        });
-        tracing::debug!(track = %self.output.id(), ts, "uplink: talk spurt started");
-        self.fifo.clear();
-        self.expected = None;
-        self.spurt = Some(Spurt {
-            due,
+    /// A talk spurt at timestamp `ts` on a packet captured at `wallclock`:
+    /// its first frame carries the marker.
+    fn start(&self, wallclock: Instant, ts: i64, reason: &'static str) -> Spurt {
+        tracing::debug!(track = %self.output.id(), ts, reason, "uplink: talk spurt started");
+        Spurt {
             ts,
             wallclock,
-            concealed: 0,
+            skipped: 0,
+            end: wallclock,
             first: true,
-        });
+        }
     }
 
-    /// Decodes one payload into the FIFO; the samples it carried.
+    /// Ends `spurt` for `reason`; the next, on a packet captured at
+    /// `wallclock`. The partial frame is dropped; the new spurt's
+    /// timestamp continues from where the old one's audio ended, advanced
+    /// by the time that passed since (RFC 3550 §5.1).
+    fn restart(&mut self, spurt: &Spurt, wallclock: Instant, reason: &'static str) -> Spurt {
+        let dropped = self.fifo.len();
+        let end = spurt
+            .ts
+            .saturating_add(i64::try_from(dropped).unwrap_or(i64::MAX))
+            .saturating_add(spurt.skipped);
+        let silence = wallclock.saturating_duration_since(spurt.end);
+        tracing::debug!(
+            track = %self.output.id(),
+            ts = end,
+            dropped_samples = dropped,
+            silence_ms = silence.as_millis(),
+            reason,
+            "uplink: talk spurt ended"
+        );
+        self.fifo.clear();
+        self.start(wallclock, end.saturating_add(samples_in(silence)), reason)
+    }
+
+    /// Bridges a gap of `gap` samples, up to [`MAX_GAP`], in `spurt`
+    /// before the packet being taken: nothing is sent for it, and the
+    /// output timeline moves on by it, at once when no frame is being
+    /// filled, else after that frame, which the gap falls inside. Opus
+    /// runs its loss concealment over the gap and discards the samples, so
+    /// the next packet decodes as libopus expects after a loss (RFC 6716
+    /// §4.4).
+    fn bridge(&mut self, mut spurt: Spurt, gap: i64, now: Instant) -> Spurt {
+        if let Input::Opus(decoder) = &mut self.input {
+            let steps = usize::try_from(gap).unwrap_or(0).div_ceil(CONCEAL_STEP);
+            let concealed = decoder
+                .conceal(steps.saturating_mul(CONCEAL_STEP))
+                .map_or(0, <[i16]>::len);
+            tracing::trace!(track = %self.output.id(), concealed, "uplink: loss run through the decoder");
+        }
+        if self.fifo.is_empty() {
+            spurt.ts = spurt.ts.saturating_add(gap);
+            spurt.wallclock = spurt
+                .wallclock
+                .checked_add(span(gap))
+                .unwrap_or(spurt.wallclock);
+        } else {
+            spurt.skipped = spurt.skipped.saturating_add(gap);
+        }
+        if let Some(count) = self.gaps.hit(now) {
+            tracing::debug!(
+                track = %self.output.id(),
+                gap_samples = gap,
+                count,
+                "uplink: input gap bridged; timestamps advanced by it"
+            );
+        }
+        spurt
+    }
+
+    /// Decodes one payload into the frame being filled; the samples it
+    /// carried.
     fn decode(&mut self, payload: &[u8]) -> Result<usize, OpusError> {
         let law = self.law;
         match &mut self.input {
@@ -477,114 +544,37 @@ impl Chain {
         }
     }
 
-    /// Conceals at least `samples` into the FIFO and moves the expected
-    /// input timestamp past them; the samples added. Opus conceals in
-    /// whole 2.5 ms steps; should libopus refuse, silence fills in.
-    fn conceal(&mut self, samples: usize) -> usize {
-        let silence = self.law.silence();
-        let law = self.law;
-        let (span, pcm) = match &mut self.input {
-            Input::Opus(decoder) => {
-                let span = samples.div_ceil(CONCEAL_STEP).saturating_mul(CONCEAL_STEP);
-                (span, decoder.conceal(span).unwrap_or_default())
-            }
-            Input::G711(_) => (samples, &[][..]),
-        };
-        self.fifo.extend(
-            pcm.iter()
-                .map(|s| law.encode(*s))
-                .chain(std::iter::repeat(silence))
-                .take(span),
-        );
-        let ticks = i64::try_from(span)
-            .unwrap_or(i64::MAX)
-            .saturating_mul(self.input.ticks_per_sample());
-        self.expected = self.expected.map(|ts| ts.saturating_add(ticks));
-        span
-    }
-
-    /// Sends every frame due at `now`, concealing what is missing, and
-    /// ends the spurt once concealment runs past [`MAX_CONCEALMENT`].
-    /// Returns when the next frame is due, `None` between spurts: the task
-    /// sleeps until then, so a release that sent nothing cannot make it
-    /// spin.
-    fn release(&mut self, now: Instant) -> Option<Instant> {
-        let need = self.frame_samples();
-        while let Some(mut spurt) = self.spurt.filter(|spurt| spurt.due <= now) {
-            let deficit = need.saturating_sub(self.fifo.len());
-            if deficit == 0 {
-                spurt.concealed = 0;
-            } else if spurt.concealed.saturating_add(deficit) > MAX_CONCEALMENT_SAMPLES {
-                self.end(&spurt);
-                return None;
-            } else {
-                spurt.concealed = spurt.concealed.saturating_add(self.conceal(deficit));
-            }
+    /// Sends every frame of `spurt` the last packet completed, released
+    /// at `now`; the spurt moved on past them.
+    fn flush(&mut self, mut spurt: Spurt, now: Instant) -> Spurt {
+        let need = usize::from(self.frame.samples());
+        let complete = self.fifo.len().checked_div(need).unwrap_or(0);
+        for _ in 0..complete {
             let payload: Bytes = self.fifo.drain(..need.min(self.fifo.len())).collect();
             self.publish(&spurt, payload, now);
-            self.trim(now);
-            spurt.due = spurt
-                .due
-                .checked_add(self.frame.duration())
-                .unwrap_or(spurt.due);
+            let step = i64::from(self.frame.samples()).saturating_add(spurt.skipped);
+            spurt.ts = spurt.ts.saturating_add(step);
             spurt.wallclock = spurt
                 .wallclock
-                .checked_add(self.frame.duration())
+                .checked_add(span(step))
                 .unwrap_or(spurt.wallclock);
-            spurt.ts = spurt.ts.saturating_add(i64::from(self.frame.samples()));
+            spurt.skipped = 0;
             spurt.first = false;
-            self.spurt = Some(spurt);
         }
-        self.spurt.map(|spurt| spurt.due)
-    }
-
-    /// Ends `spurt`: the sender stopped. The rest of the FIFO is dropped
-    /// and the next packet starts a new spurt.
-    fn end(&mut self, spurt: &Spurt) {
-        tracing::debug!(
-            track = %self.output.id(),
-            ts = spurt.ts,
-            concealed_ms = spurt.concealed / 8,
-            reason = "input_stopped",
-            "uplink: talk spurt ended"
-        );
-        self.resume = Some((spurt.due, spurt.ts));
-        self.spurt = None;
-        self.fifo.clear();
-        self.expected = None;
-    }
-
-    /// Drops the oldest audio down to half a frame when more than a frame
-    /// stays queued after a frame left.
-    fn trim(&mut self, now: Instant) {
-        let need = self.frame_samples();
-        if self.fifo.len() <= need {
-            return;
-        }
-        let dropped = self.fifo.len().saturating_sub(need / 2);
-        self.fifo.drain(..dropped);
-        if let Some(count) = self.backlogs.hit(now) {
-            tracing::debug!(
-                track = %self.output.id(),
-                dropped_samples = dropped,
-                count,
-                "uplink: input ahead of playout; oldest audio dropped"
-            );
-        }
+        spurt
     }
 
     /// The input subscription skipped `skipped` packets: their audio is
-    /// concealed as it comes due, and the next packet is taken as is.
+    /// lost, and the next packet bridges it as a gap.
     fn lagged(&mut self, skipped: u64) {
         if let Some(count) = self.lags.hit(self.clock.now()) {
             tracing::warn!(
                 track = %self.output.id(),
                 skipped,
                 count,
-                "transcoder lagged behind the uplink; resyncing"
+                "transcoder lagged behind the uplink; its packets are lost"
             );
         }
-        self.expected = None;
     }
 
     /// Publishes one frame released at `now`, on the side branch and then
@@ -621,24 +611,11 @@ impl Chain {
     }
 }
 
-/// The transcoder task: packets in and paced frames out until `stop` is
-/// cancelled or the input track is gone; what is queued then is dropped
-/// with the talker.
-///
-/// Each turn sends what is due, then waits for a packet, the stop token or
-/// the next frame's release.
+/// The transcoder task: packets in, the frames they complete out, until
+/// `stop` is cancelled or the input track is gone; the partial frame is
+/// dropped with the talker.
 async fn run(mut chain: Chain, mut input: FrameSubscription, stop: CancellationToken) {
     let reason = loop {
-        let now = chain.clock.now();
-        let next = chain
-            .release(now)
-            .map(|due| chain.clock.sleep(due.saturating_duration_since(now)));
-        let release = async {
-            match next {
-                Some(sleep) => sleep.await,
-                None => std::future::pending().await,
-            }
-        };
         tokio::select! {
             biased;
             () = stop.cancelled() => break "cancelled",
@@ -647,10 +624,14 @@ async fn run(mut chain: Chain, mut input: FrameSubscription, stop: CancellationT
                 Err(SubscriptionError::Lagged(skipped)) => chain.lagged(skipped),
                 Err(SubscriptionError::Closed) => break "input_closed",
             },
-            () = release => {}
         }
     };
-    tracing::info!(track = %chain.output.id(), reason, "transcoder stopped");
+    tracing::info!(
+        track = %chain.output.id(),
+        reason,
+        dropped_samples = chain.fifo.len(),
+        "transcoder stopped"
+    );
 }
 
 #[cfg(test)]
@@ -675,7 +656,8 @@ mod tests {
 
     const STARTED: &str = "uplink: talk spurt started";
     const ENDED: &str = "uplink: talk spurt ended";
-    const LATE: &str = "uplink: late packet dropped; its audio was concealed";
+    const LATE: &str = "uplink: late packet dropped; its place has passed";
+    const BRIDGED: &str = "uplink: input gap bridged; timestamps advanced by it";
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -700,6 +682,8 @@ mod tests {
         output: Arc<Track>,
         packets: PacketSubscription,
         frames: FrameSubscription,
+        /// The capture time of every frame released, after the start.
+        wallclocks: Vec<Duration>,
         handle: Option<TrackHandle>,
     }
 
@@ -730,6 +714,7 @@ mod tests {
                 output,
                 packets,
                 frames,
+                wallclocks: Vec::new(),
                 handle: Some(handle),
             }
         }
@@ -761,7 +746,7 @@ mod tests {
         }
 
         /// Runs the clock to `at` after the start in 1 ms steps, letting
-        /// the task release what comes due at each, and returns what it
+        /// the task take what was published at each, and returns what it
         /// released.
         async fn run_to(&mut self, at: Duration) -> Vec<Arc<MediaPacket>> {
             let mut out = Vec::new();
@@ -771,6 +756,8 @@ mod tests {
                     let frame = self.frames.try_recv().unwrap().expect("its frame first");
                     assert_eq!(rtp_ts(frame.ts.ticks()), packet.rtp.ts);
                     assert_eq!(&frame.payload[..], &packet.payload[..]);
+                    self.wallclocks
+                        .push(frame.wallclock.saturating_duration_since(self.start));
                     out.push(packet);
                 }
                 let left = (self.start + at).saturating_duration_since(self.clock.now());
@@ -781,9 +768,9 @@ mod tests {
             }
         }
 
-        /// Publishes `payloads` in real time, one every 20 ms from `from`
-        /// after the start, `ticks` apart from `ts0`, skipping the indices
-        /// in `lost`; then runs to `until`. Returns what was released.
+        /// Publishes `payloads` in real time, one every 20 ms from the
+        /// start, `ticks` apart from 0, skipping the indices in `lost`;
+        /// then runs to `until`. Returns what was released.
         async fn feed(
             &mut self,
             payloads: &[Bytes],
@@ -837,12 +824,45 @@ mod tests {
             .collect()
     }
 
+    /// libopus's 8 kHz decode of `packets`, μ-law encoded, with the loss
+    /// of the packets in `lost` run through its concealment or not.
+    fn reference(packets: &[Bytes], lost: &[usize], conceal: bool) -> Vec<u8> {
+        let mut decoder = Decoder::new(8_000).unwrap();
+        let mut out = Vec::new();
+        for (k, packet) in packets.iter().enumerate() {
+            if lost.contains(&k) {
+                if conceal {
+                    decoder.conceal(160).unwrap();
+                }
+                continue;
+            }
+            out.extend(
+                decoder
+                    .decode(packet)
+                    .unwrap()
+                    .iter()
+                    .map(|s| Law::Mu.encode(*s)),
+            );
+        }
+        out
+    }
+
     /// `count` 20 ms G.711 packets of distinct codes: packet `k` holds
     /// `k`, `k + 1`, ... so every sample is traceable.
     fn codes(count: usize) -> Vec<Bytes> {
         (0..count)
             .map(|k| (0..160).map(|n| ((k * 7 + n) % 251) as u8).collect())
             .collect()
+    }
+
+    /// The payloads of `packets`, one stream.
+    fn sent(packets: &[Arc<MediaPacket>]) -> Vec<u8> {
+        packets.iter().flat_map(|p| p.payload.to_vec()).collect()
+    }
+
+    /// The payloads of `packets`, one stream.
+    fn fed(packets: &[Bytes]) -> Vec<u8> {
+        packets.iter().flat_map(|p| p.to_vec()).collect()
     }
 
     /// Decodes `packets` of `law` into one stream.
@@ -865,6 +885,14 @@ mod tests {
             .collect()
     }
 
+    fn timestamps(packets: &[Arc<MediaPacket>]) -> Vec<u32> {
+        packets.iter().map(|p| p.rtp.ts).collect()
+    }
+
+    fn markers(packets: &[Arc<MediaPacket>]) -> Vec<bool> {
+        packets.iter().map(|p| p.rtp.marker).collect()
+    }
+
     #[test]
     fn rfc3551_4_5_a_frame_is_10_to_120_ms_20_by_default() {
         assert_eq!(FrameSize::DEFAULT.samples(), 160);
@@ -873,7 +901,6 @@ mod tests {
         assert_eq!(FrameSize::new(960).unwrap().duration(), ms(120));
         assert_eq!(FrameSize::new(79), None);
         assert_eq!(FrameSize::new(961), None);
-        assert_eq!(ToG711::delay(FrameSize::new(320).unwrap()), ms(40));
         // A device's frame duration, in whole samples, clamped.
         assert_eq!(FrameSize::clamped(ms(20)), FrameSize::DEFAULT);
         assert_eq!(FrameSize::clamped(ms(10)).samples(), 80);
@@ -886,10 +913,19 @@ mod tests {
         assert_eq!(FrameSize::clamped(Duration::ZERO).samples(), FrameSize::MIN);
         assert_eq!(FrameSize::clamped(ms(121)).samples(), FrameSize::MAX);
         assert_eq!(FrameSize::clamped(Duration::MAX).samples(), FrameSize::MAX);
-        assert_eq!(
-            MAX_CONCEALMENT.as_millis() * 8,
-            MAX_CONCEALMENT_SAMPLES as u128
-        );
+        assert_eq!(MAX_GAP.as_millis() * 8, MAX_GAP_SAMPLES as u128);
+        assert_eq!((span(8), span(-1), samples_in(ms(1))), (ms(1), ms(0), 8));
+    }
+
+    #[test]
+    fn rfc3551_4_5_the_delay_is_the_wait_for_the_rest_of_a_frame_of_20_ms_packets() {
+        assert_eq!(INPUT_PACKET, ms(20));
+        // A 20 ms packet fills a 20 ms frame, or two 10 ms ones: no wait.
+        assert_eq!(ToG711::delay(FrameSize::DEFAULT), Duration::ZERO);
+        assert_eq!(ToG711::delay(FrameSize::new(80).unwrap()), Duration::ZERO);
+        // A 40 ms frame waits for its second packet.
+        assert_eq!(ToG711::delay(FrameSize::new(320).unwrap()), ms(20));
+        assert_eq!(ToG711::delay(FrameSize::new(960).unwrap()), ms(100));
     }
 
     #[test]
@@ -921,7 +957,11 @@ mod tests {
         let clock = Arc::new(FakeClock::from_system());
         let factory = ToG711Factory::new(clock.clone());
         let input = track(Codec::Pcmu, 8_000, 0, TrackLimits::default(), clock.now());
-        for (asked, framed) in [(ms(40), ms(40)), (ms(20), ms(20)), (ms(200), ms(120))] {
+        for (asked, delay) in [
+            (ms(40), ms(20)),
+            (ms(20), Duration::ZERO),
+            (ms(200), ms(100)),
+        ] {
             let transcoder = factory.transcoder(asked);
             assert_eq!(
                 transcoder.derive(&Codec::Opus { channels: 1 }, CodecFamily::Pcma),
@@ -931,7 +971,7 @@ mod tests {
             let handle = transcoder
                 .spawn(input.subscribe_frames(), &Codec::Pcmu, output)
                 .unwrap();
-            assert_eq!(handle.delay, framed, "one frame of {asked:?}");
+            assert_eq!(handle.delay, delay, "the rest of a frame of {asked:?}");
         }
     }
 
@@ -978,7 +1018,7 @@ mod tests {
     async fn rfc3551_4_5_14_an_opus_tone_comes_out_as_a_pcmu_tone() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::opus();
-        assert_eq!(rig.handle.as_ref().unwrap().delay, ms(20));
+        assert_eq!(rig.handle.as_ref().unwrap().delay, Duration::ZERO);
         let input = opus_tone(50);
         let out = rig.feed(&input, 960, &[], ms(1_400)).await;
         assert_eq!(
@@ -986,43 +1026,32 @@ mod tests {
             1
         );
         // Exactly libopus's 8 kHz decode of each packet, μ-law encoded:
-        // nothing concealed, nothing dropped (RFC 7587 §4.1: 960 ticks of
-        // the 48 kHz clock are 160 samples).
-        let mut reference = Decoder::new(8_000).unwrap();
-        let expected: Vec<u8> = input
-            .iter()
-            .flat_map(|p| {
-                reference
-                    .decode(p)
-                    .unwrap()
-                    .iter()
-                    .map(|s| Law::Mu.encode(*s))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let sent: Vec<u8> = out[..50].iter().flat_map(|p| p.payload.to_vec()).collect();
-        assert_eq!(sent, expected);
-        // 50 packets of audio, then 100 ms of concealment ends the spurt.
-        assert_eq!(out.len(), 55);
-        let decoded = pcm(Law::Mu, &out[..50]);
+        // nothing dropped, nothing added, not even after the talker
+        // stopped (RFC 7587 §4.1: 960 ticks of the 48 kHz clock are 160
+        // samples).
+        assert_eq!(out.len(), 50);
+        assert_eq!(sent(&out), reference(&input, &[], false));
+        let decoded = pcm(Law::Mu, &out);
         let steady = &decoded[1_600..];
         let crossings = steady.windows(2).filter(|w| w[0] <= 0 && w[1] > 0).count();
         let freq = crossings as f64 * 8_000.0 / steady.len() as f64;
         assert!((freq - 1_000.0).abs() < 10.0, "{freq:.1} Hz");
         assert!((rms(steady) - 0.354).abs() < 0.05, "{}", rms(steady));
-        assert_eq!(logs.count(Level::DEBUG, ENDED), 1);
+        assert_eq!(logs.count(Level::DEBUG, STARTED), 1);
+        assert_eq!(logs.count(Level::DEBUG, ENDED), 0);
+        assert_eq!(logs.count(Level::DEBUG, BRIDGED), 0);
     }
 
     #[tokio::test]
-    async fn rfc3551_4_1_paced_frames_with_continuous_timestamps_and_one_marker() {
+    async fn rfc3551_4_1_each_frame_leaves_with_its_packet_on_continuous_timestamps_with_one_marker()
+     {
         let mut rig = Rig::opus();
         let out = rig.feed(&opus_tone(10), 960, &[], ms(400)).await;
-        assert_eq!(out.len(), 15);
-        // The one-frame playout buffer: the first frame leaves 20 ms after
-        // the first packet arrived, every later one 20 ms after the last.
+        assert_eq!(out.len(), 10);
+        // No playout buffer: each frame leaves as its packet arrives.
         let times = arrivals(&rig, &out);
         for (k, at) in times.iter().enumerate() {
-            assert_eq!(*at, ms(20 + 20 * k as u64), "{k}");
+            assert_eq!(*at, ms(20 * k as u64), "{k}");
         }
         for (k, packet) in out.iter().enumerate() {
             assert_eq!(packet.payload.len(), 160);
@@ -1053,25 +1082,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_40_ms_camera_frame_takes_two_packets() {
+    async fn a_40_ms_camera_frame_leaves_with_its_second_packet() {
         let mut rig = Rig::pcmu(FrameSize::new(320).unwrap());
         let input = codes(10);
         let out = rig.feed(&input, 160, &[], ms(600)).await;
+        // Packet 2 i + 1 completes frame i at 40 i + 20 ms; packet 2 i
+        // waited for it.
         let times = arrivals(&rig, &out);
-        assert_eq!(times[0], ms(40));
-        assert!(
-            times
-                .windows(2)
-                .all(|w| w[1].checked_sub(w[0]) == Some(ms(40))),
-            "{times:?}"
+        assert_eq!(times, (0..5).map(|i| ms(40 * i + 20)).collect::<Vec<_>>());
+        assert_eq!(
+            rig.wallclocks,
+            (0..5).map(|i| ms(40 * i)).collect::<Vec<_>>()
         );
         assert!(out.iter().all(|p| p.payload.len() == 320));
-        assert!(out.windows(2).all(|w| w[1].rtp.ts - w[0].rtp.ts == 320));
+        assert_eq!(timestamps(&out), [0, 320, 640, 960, 1_280]);
         // Passthrough: the codes reach the camera untouched, two packets
         // to a frame.
-        let sent: Vec<u8> = out[..5].iter().flat_map(|p| p.payload.to_vec()).collect();
-        let fed: Vec<u8> = input.iter().flat_map(|p| p.to_vec()).collect();
-        assert_eq!(sent, fed);
+        assert_eq!(sent(&out), fed(&input));
+    }
+
+    #[tokio::test]
+    async fn a_10_ms_camera_frame_splits_each_packet() {
+        let mut rig = Rig::pcmu(FrameSize::new(80).unwrap());
+        let input = codes(3);
+        let out = rig.feed(&input, 160, &[], ms(100)).await;
+        assert_eq!(out.len(), 6);
+        assert!(out.iter().all(|p| p.payload.len() == 80));
+        // Both halves leave as the packet arrives, 80 samples and 10 ms
+        // of capture time apart.
+        assert_eq!(
+            arrivals(&rig, &out),
+            [ms(0), ms(0), ms(20), ms(20), ms(40), ms(40)]
+        );
+        assert_eq!(timestamps(&out), [0, 80, 160, 240, 320, 400]);
+        assert_eq!(
+            rig.wallclocks,
+            [ms(0), ms(10), ms(20), ms(30), ms(40), ms(50)]
+        );
+        assert_eq!(markers(&out), [true, false, false, false, false, false]);
+        assert_eq!(sent(&out), fed(&input));
+    }
+
+    #[tokio::test]
+    async fn a_frame_leaves_with_the_packet_that_completes_it() {
+        // 30 ms frames from 20 ms packets.
+        let mut rig = Rig::pcmu(FrameSize::new(240).unwrap());
+        let input = codes(4);
+        let out = rig.feed(&input, 160, &[], ms(200)).await;
+        assert_eq!(arrivals(&rig, &out), [ms(20), ms(40)]);
+        assert_eq!(timestamps(&out), [0, 240]);
+        assert_eq!(rig.wallclocks, [ms(0), ms(30)]);
+        assert_eq!(sent(&out), fed(&input[..3]));
     }
 
     #[tokio::test]
@@ -1079,6 +1140,7 @@ mod tests {
         let mut rig = Rig::start(&Codec::Pcmu, Law::A, FrameSize::DEFAULT);
         let input = codes(3);
         let out = rig.feed(&input, 160, &[], ms(100)).await;
+        assert_eq!(out.len(), 3);
         for (packet, fed) in out.iter().zip(&input) {
             assert_eq!(packet.rtp.pt, 8, "RFC 3551 Table 4");
             let expected: Vec<u8> = fed.iter().map(|c| Law::A.transcode(Law::Mu, *c)).collect();
@@ -1087,132 +1149,179 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfc6716_4_4_a_lost_packet_is_concealed_in_place() {
+    async fn rfc6716_4_4_a_lost_opus_packet_runs_through_the_decoder_and_is_not_sent() {
+        let (logs, _guard) = Logs::capture();
         let mut rig = Rig::opus();
-        let out = rig.feed(&opus_tone(30), 960, &[15], ms(800)).await;
-        assert_eq!(out.len(), 35, "the same frames as without the loss");
-        assert!(out.windows(2).all(|w| w[1].rtp.ts - w[0].rtp.ts == 160));
-        // PLC continues the tone through the lost 20 ms.
-        let concealed = pcm(Law::Mu, &out[15..16]);
-        assert!(rms(&concealed) > 0.1, "{}", rms(&concealed));
+        let input = opus_tone(30);
+        let out = rig.feed(&input, 960, &[15], ms(800)).await;
+        assert_eq!(out.len(), 29, "nothing for the lost packet");
+        // The decoder concealed the loss and the next packet decoded from
+        // there; the concealed audio itself was not sent.
+        let bridged = reference(&input, &[15], true);
+        assert_eq!(sent(&out), bridged);
+        assert_ne!(bridged, reference(&input, &[15], false));
+        // RFC 3550 §5.1: the timestamps run on over the loss.
+        assert_eq!(out[15].rtp.ts, 16 * 160);
+        assert_eq!(out[15].rtp.seq, 15);
+        assert!(!out[15].rtp.marker, "the spurt goes on");
+        assert_eq!(arrivals(&rig, &out[15..16]), [ms(320)]);
+        assert_eq!(logs.count(Level::DEBUG, BRIDGED), 1);
+        assert_eq!(logs.count(Level::DEBUG, STARTED), 1);
     }
 
     #[tokio::test]
-    async fn lost_g711_is_silence() {
+    async fn rfc3550_5_1_a_lost_g711_packet_advances_the_timestamps_without_audio() {
         let mut rig = Rig::pcmu(FrameSize::DEFAULT);
         let input = codes(6);
         let out = rig.feed(&input, 160, &[3], ms(200)).await;
-        assert!(out[3].payload.iter().all(|c| *c == 0xff));
-        assert_eq!(&out[4].payload[..], &input[4][..]);
+        assert_eq!(out.len(), 5);
+        assert_eq!(&out[3].payload[..], &input[4][..]);
+        assert_eq!(timestamps(&out), [0, 160, 320, 640, 800]);
+        assert_eq!(rig.wallclocks[3], ms(80));
+        assert_eq!(out[3].rtp.seq, 3);
+        assert_eq!(markers(&out), [true, false, false, false, false]);
     }
 
     #[tokio::test]
-    async fn jitter_within_the_playout_buffer_changes_nothing() {
-        let input = opus_tone(10);
-        let mut steady = Rig::opus();
-        let reference = steady.feed(&input, 960, &[], ms(300)).await;
-        let mut rig = Rig::opus();
-        let mut out = rig.feed(&input[..4], 960, &[], ms(80 + 15)).await;
-        rig.publish(4 * 960, &input[4]);
-        for (k, packet) in input.iter().enumerate().skip(5) {
-            out.extend(rig.run_to(ms(20 * k as u64)).await);
-            rig.publish(k as i64 * 960, packet);
-        }
-        out.extend(rig.run_to(ms(300)).await);
-        let payloads =
-            |p: &[Arc<MediaPacket>]| p.iter().map(|p| p.payload.clone()).collect::<Vec<_>>();
-        assert_eq!(payloads(&out), payloads(&reference));
-    }
-
-    #[tokio::test]
-    async fn a_packet_after_its_audio_was_concealed_is_dropped() {
+    async fn a_gap_inside_a_frame_moves_the_next_frames_timestamp() {
         let (logs, _guard) = Logs::capture();
-        let mut rig = Rig::pcmu(FrameSize::DEFAULT);
-        let input = codes(8);
-        let mut out = rig.feed(&input[..3], 160, &[], ms(60)).await;
-        // Packet 3 is due by 80 ms, when its frame leaves, and arrives at
-        // 85, after packet 4 came on time: its audio was concealed, so it
-        // is dropped.
-        out.extend(rig.run_to(ms(80)).await);
-        rig.publish(4 * 160, &input[4]);
-        out.extend(rig.run_to(ms(85)).await);
-        rig.publish(3 * 160, &input[3]);
-        // A duplicate is late too; the second drop is counted, not logged.
-        rig.publish(3 * 160, &input[3]);
-        out.extend(rig.run_to(ms(200)).await);
-        assert!(out[3].payload.iter().all(|c| *c == 0xff));
-        assert_eq!(&out[4].payload[..], &input[4][..]);
-        assert_eq!(logs.count(Level::DEBUG, LATE), 1);
-        assert!(out.windows(2).all(|w| w[1].rtp.ts - w[0].rtp.ts == 160));
+        let mut rig = Rig::pcmu(FrameSize::new(320).unwrap());
+        let input = codes(6);
+        let out = rig.feed(&input, 160, &[1], ms(200)).await;
+        // Packet 1 is lost with packet 0 in the frame: the frame closes
+        // with packet 2 and the gap moves to its end.
+        assert_eq!(out.len(), 2);
+        assert_eq!(&out[0].payload[..160], &input[0][..]);
+        assert_eq!(&out[0].payload[160..], &input[2][..]);
+        assert_eq!(&out[1].payload[..], &fed(&input[3..5])[..]);
+        assert_eq!(timestamps(&out), [0, 480]);
+        assert_eq!(rig.wallclocks, [ms(0), ms(60)]);
+        assert_eq!(arrivals(&rig, &out), [ms(40), ms(80)]);
+        assert_eq!(markers(&out), [true, false]);
+        assert_eq!(logs.count(Level::DEBUG, BRIDGED), 1);
     }
 
     #[tokio::test]
-    async fn a_gap_in_the_timestamps_is_concealed_when_the_next_packet_arrives() {
-        let mut rig = Rig::pcmu(FrameSize::DEFAULT);
-        let input = codes(8);
-        let mut out = rig.feed(&input[..3], 160, &[], ms(60)).await;
-        // Packet 3 never comes; packet 4 arrives in packet 3's slot.
-        rig.publish(4 * 160, &input[4]);
-        out.extend(rig.run_to(ms(200)).await);
-        assert!(out[3].payload.iter().all(|c| *c == 0xff));
-        assert_eq!(&out[4].payload[..], &input[4][..]);
-    }
-
-    #[tokio::test]
-    async fn rfc3550_5_1_a_new_spurt_continues_the_clock_with_the_marker() {
-        let (logs, _guard) = Logs::capture();
-        let mut rig = Rig::pcmu(FrameSize::DEFAULT);
-        let input = codes(11);
-        let mut out = rig.feed(&input[..10], 160, &[], ms(1_000)).await;
-        // 10 frames, 100 ms of concealment, then silence until a packet.
-        assert_eq!(out.len(), 15);
-        assert!(
-            out[10..]
-                .iter()
-                .all(|p| p.payload.iter().all(|c| *c == 0xff))
-        );
-        assert_eq!(logs.count(Level::DEBUG, ENDED), 1);
-        rig.publish(123_456, &input[10]);
-        out.extend(rig.run_to(ms(1_100)).await);
-        let next = &out[15];
-        assert_eq!(arrivals(&rig, &out[15..16]), [ms(1_020)]);
-        assert!(next.rtp.marker, "RFC 3551 §4.1");
-        // Due at 1020 ms, 1000 ms after the first frame: 8000 ticks on.
-        assert_eq!(next.rtp.ts, 8_000);
-        assert_eq!(next.rtp.seq, 15);
-        assert_eq!(&next.payload[..], &input[10][..]);
-        assert_eq!(logs.count(Level::DEBUG, STARTED), 2);
-    }
-
-    #[tokio::test]
-    async fn a_jump_in_the_input_timeline_is_taken_as_is() {
+    async fn a_late_or_duplicate_packet_is_dropped() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::pcmu(FrameSize::DEFAULT);
         let input = codes(6);
         let mut out = rig.feed(&input[..3], 160, &[], ms(60)).await;
-        rig.publish(3 * 160 + 100_000, &input[3]);
+        // Packet 4 overtakes packet 3, which arrives at 65 ms, behind the
+        // audio already taken: dropped. A duplicate is late too; the
+        // second drop is counted, not logged.
+        rig.publish(4 * 160, &input[4]);
+        out.extend(rig.run_to(ms(65)).await);
+        rig.publish(3 * 160, &input[3]);
+        rig.publish(4 * 160, &input[4]);
         out.extend(rig.run_to(ms(80)).await);
-        rig.publish(4 * 160 + 200_000, &input[4]);
+        rig.publish(5 * 160, &input[5]);
         out.extend(rig.run_to(ms(200)).await);
-        assert_eq!(&out[3].payload[..], &input[3][..]);
-        assert_eq!(&out[4].payload[..], &input[4][..]);
-        assert_eq!(
-            logs.count(Level::DEBUG, "uplink: input timeline jumped; resyncing"),
-            1
-        );
+        assert_eq!(out.len(), 5);
+        assert_eq!(&out[3].payload[..], &input[4][..]);
+        assert_eq!(&out[4].payload[..], &input[5][..]);
+        assert_eq!(timestamps(&out), [0, 160, 320, 640, 800]);
+        assert_eq!(logs.count(Level::DEBUG, LATE), 1);
     }
 
     #[tokio::test]
-    async fn a_gap_of_100_ms_is_concealed_a_longer_one_is_a_jump() {
-        for (gap, concealed) in [(800, true), (808, false)] {
+    async fn rfc3551_4_1_a_gap_over_100_ms_starts_a_new_spurt_with_the_marker() {
+        for (gap, new_spurt) in [(800, false), (808, true)] {
+            let (logs, _guard) = Logs::capture();
             let mut rig = Rig::pcmu(FrameSize::DEFAULT);
             let input = codes(4);
             let mut out = rig.feed(&input[..3], 160, &[], ms(60)).await;
             rig.publish(3 * 160 + gap, &input[3]);
             out.extend(rig.run_to(ms(80)).await);
-            let silent = out[3].payload.iter().all(|c| *c == 0xff);
-            assert_eq!(silent, concealed, "{gap}");
+            assert_eq!(&out[3].payload[..], &input[3][..]);
+            assert_eq!(out[3].rtp.marker, new_spurt, "{gap}");
+            // A bridged gap moves the timestamps on; a new spurt continues
+            // them by the time that passed, none here.
+            let ts = if new_spurt { 480 } else { 480 + 800 };
+            assert_eq!(out[3].rtp.ts, ts, "{gap}");
+            assert_eq!(logs.count(Level::DEBUG, BRIDGED), usize::from(!new_spurt));
+            if new_spurt {
+                let ended = logs.fields(Level::DEBUG, ENDED);
+                assert_eq!(ended.len(), 1);
+                assert!(ended[0].contains(&"reason=\"input_gap\"".to_owned()));
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn rfc3550_5_1_a_sender_back_after_100_ms_starts_a_new_spurt_on_the_clock() {
+        for (pause, new_spurt) in [(100, false), (101, true), (800, true)] {
+            let (logs, _guard) = Logs::capture();
+            let mut rig = Rig::pcmu(FrameSize::DEFAULT);
+            let input = codes(11);
+            // Ten packets, their audio ending at 200 ms; the next one on
+            // the sender's timeline, `pause` ms later.
+            let mut out = rig.feed(&input[..10], 160, &[], ms(200 + pause)).await;
+            assert_eq!(out.len(), 10);
+            rig.publish(1_600, &input[10]);
+            out.extend(rig.run_to(ms(200 + pause + 1)).await);
+            let next = &out[10];
+            assert_eq!(next.rtp.marker, new_spurt, "{pause} ms, RFC 3551 §4.1");
+            let ts = if new_spurt {
+                1_600 + 8 * pause as u32
+            } else {
+                1_600
+            };
+            assert_eq!(next.rtp.ts, ts, "{pause} ms");
+            assert_eq!(next.rtp.seq, 10);
+            assert_eq!(&next.payload[..], &input[10][..]);
+            assert_eq!(
+                logs.count(Level::DEBUG, STARTED),
+                1 + usize::from(new_spurt)
+            );
+            let ended = logs.fields(Level::DEBUG, ENDED);
+            assert_eq!(ended.len(), usize::from(new_spurt));
+            if new_spurt {
+                assert!(ended[0].contains(&"reason=\"sender_stopped\"".to_owned()));
+                assert!(ended[0].contains(&format!("silence_ms={pause}")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_spurt_drops_the_partial_frame() {
+        let (logs, _guard) = Logs::capture();
+        let mut rig = Rig::pcmu(FrameSize::new(320).unwrap());
+        let input = codes(5);
+        let mut out = rig.feed(&input[..3], 160, &[], ms(500)).await;
+        assert_eq!(out.len(), 1, "packet 2 waits for the rest of its frame");
+        // The sender comes back at 500 ms: packet 2's half frame is
+        // dropped, the new spurt's first frame is packets 3 and 4.
+        rig.publish(3 * 160, &input[3]);
+        out.extend(rig.run_to(ms(520)).await);
+        rig.publish(4 * 160, &input[4]);
+        out.extend(rig.run_to(ms(600)).await);
+        assert_eq!(out.len(), 2);
+        assert_eq!(&out[1].payload[..], &fed(&input[3..5])[..]);
+        assert!(out[1].rtp.marker);
+        // Packet 2's audio ended at 480 ticks, 60 ms; 440 ms passed.
+        assert_eq!(out[1].rtp.ts, 480 + 440 * 8);
+        let ended = logs.fields(Level::DEBUG, ENDED);
+        assert_eq!(ended.len(), 1);
+        assert!(ended[0].contains(&"dropped_samples=160".to_owned()));
+        assert!(ended[0].contains(&"ts=480".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn a_new_spurt_starts_where_the_skipped_audio_ended() {
+        // 60 ms frames: packet 0, packet 1 lost, packet 2 leave a frame of
+        // 40 ms of audio spanning 60 ms when a jump in the input timeline
+        // ends the spurt. The next one continues at 480, not at 320.
+        let mut rig = Rig::pcmu(FrameSize::new(480).unwrap());
+        let input = codes(3);
+        let mut out = rig.feed(&input, 160, &[1], ms(60)).await;
+        assert!(out.is_empty());
+        for k in 0..3_u64 {
+            rig.publish(100_000 + 160 * k as i64, &input[0]);
+            out.extend(rig.run_to(ms(80 + 20 * k)).await);
+        }
+        assert_eq!(timestamps(&out), [480]);
+        assert_eq!(markers(&out), [true]);
     }
 
     #[tokio::test]
@@ -1221,11 +1330,14 @@ mod tests {
         let mut rig = Rig::pcmu(FrameSize::DEFAULT);
         let input = codes(6);
         let mut out = rig.feed(&input[..3], 160, &[], ms(60)).await;
-        // A new timeline that starts behind the old one is not late.
+        // A new timeline that starts behind the old one is not late, and
+        // its audio continues the spurt.
         rig.input().start_epoch();
         rig.publish(0, &input[3]);
         out.extend(rig.run_to(ms(200)).await);
         assert_eq!(&out[3].payload[..], &input[3][..]);
+        assert_eq!(timestamps(&out), [0, 160, 320, 480]);
+        assert!(!out[3].rtp.marker);
         assert_eq!(
             logs.count(Level::DEBUG, "uplink: new input timeline; resyncing"),
             1
@@ -1233,53 +1345,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_backlog_is_dropped_to_half_a_frame() {
-        let (logs, _guard) = Logs::capture();
-        let mut rig = Rig::pcmu(FrameSize::DEFAULT);
-        let input = codes(3);
-        // Three packets at once: two frames more than the playout holds.
-        for (k, payload) in input.iter().enumerate() {
-            rig.publish(160 * k as i64, payload);
-        }
-        let out = rig.run_to(ms(40)).await;
-        assert_eq!(&out[0].payload[..], &input[0][..]);
-        // The oldest 240 samples went; the newest 80 lead the next frame.
-        assert_eq!(&out[1].payload[..80], &input[2][80..]);
-        // Another burst drops again, counted rather than logged.
-        for (k, payload) in input.iter().enumerate() {
-            rig.publish(160 * (k as i64 + 3), payload);
-        }
-        rig.run_to(ms(60)).await;
-        let dropped = logs.fields(
-            Level::DEBUG,
-            "uplink: input ahead of playout; oldest audio dropped",
-        );
-        assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0][1], "dropped_samples=240");
-    }
-
-    #[tokio::test]
-    async fn a_packet_that_does_not_decode_is_concealed() {
+    async fn a_packet_that_does_not_decode_is_bridged() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::opus();
         let mut input = opus_tone(10);
         input[5] = Bytes::from_static(&[0xfb]);
         input[6] = Bytes::new();
         let out = rig.feed(&input, 960, &[], ms(400)).await;
-        assert_eq!(out.len(), 15);
-        assert!(out.windows(2).all(|w| w[1].rtp.ts - w[0].rtp.ts == 160));
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[5].rtp.ts, 7 * 160);
+        assert!(!out[5].rtp.marker);
         assert_eq!(
-            logs.count(
-                Level::WARN,
-                "uplink: packet dropped; its audio is concealed"
-            ),
+            logs.count(Level::WARN, "uplink: packet dropped; it does not decode"),
             1
         );
+        assert_eq!(logs.count(Level::DEBUG, BRIDGED), 1);
         assert_eq!(logs.count(Level::DEBUG, LATE), 0);
     }
 
     #[tokio::test]
-    async fn a_lagging_subscription_resyncs() {
+    async fn a_lagging_subscription_loses_the_skipped_packets() {
         let (logs, _guard) = Logs::capture();
         let limits = TrackLimits {
             frame_capacity: 2,
@@ -1290,19 +1375,22 @@ mod tests {
         for (k, payload) in input.iter().enumerate() {
             rig.publish(160 * k as i64, payload);
         }
-        let out = rig.run_to(ms(40)).await;
+        let mut out = rig.run_to(ms(40)).await;
         // The first three were skipped; the spurt starts on the fourth.
         assert_eq!(&out[0].payload[..], &input[3][..]);
         assert_eq!(&out[1].payload[..], &input[4][..]);
-        // A second lag is counted, not logged.
+        // A second lag is counted, not logged; the skipped audio is a
+        // gap the timestamps run over.
         for (k, payload) in input.iter().enumerate() {
             rig.publish(160 * (k as i64 + 5), payload);
         }
-        rig.run_to(ms(60)).await;
+        out.extend(rig.run_to(ms(60)).await);
+        assert_eq!(&out[2].payload[..], &input[3][..]);
+        assert_eq!(timestamps(&out), [0, 160, 800, 960]);
         assert_eq!(
             logs.count(
                 Level::WARN,
-                "transcoder lagged behind the uplink; resyncing"
+                "transcoder lagged behind the uplink; its packets are lost"
             ),
             1
         );
@@ -1311,7 +1399,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_handle_or_the_input_stops_the_task() {
         let (logs, _guard) = Logs::capture();
-        let mut rig = Rig::pcmu(FrameSize::DEFAULT);
+        let mut rig = Rig::pcmu(FrameSize::new(320).unwrap());
         rig.publish(0, &codes(1)[0]);
         settle().await;
         rig.handle = None;
@@ -1323,13 +1411,19 @@ mod tests {
         stopped(&rig.output, 2).await;
         let reasons = logs.fields(Level::INFO, "transcoder stopped");
         assert_eq!(reasons.len(), 2);
-        assert!(
-            reasons[0].contains(&"reason=\"cancelled\"".to_owned()),
-            "{reasons:?}"
-        );
-        assert!(
-            reasons[1].contains(&"reason=\"input_closed\"".to_owned()),
-            "{reasons:?}"
-        );
+        // The half frame the talker left is dropped with it.
+        for (fields, reason, dropped) in [
+            (&reasons[0], "cancelled", 160),
+            (&reasons[1], "input_closed", 0),
+        ] {
+            assert!(
+                fields.contains(&format!("reason=\"{reason}\"")),
+                "{fields:?}"
+            );
+            assert!(
+                fields.contains(&format!("dropped_samples={dropped}")),
+                "{fields:?}"
+            );
+        }
     }
 }
