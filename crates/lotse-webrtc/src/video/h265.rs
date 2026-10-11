@@ -404,6 +404,7 @@ mod tests {
                 orientation: lotse_core::Orientation::default(),
                 limits: SessionLimits::default(),
                 wall: std::time::SystemTime::UNIX_EPOCH,
+                talkback_required: false,
             };
             let video = super::super::VideoPlan::H265(Plan {
                 profiles: profiles.to_vec(),

@@ -93,9 +93,21 @@ pub enum SessionEvent {
         message: String,
     },
     /// The last event; the subscription ends with it.
+    ///
+    /// `backchannel_unavailable`: the offer requests two-way audio (an
+    /// audio m-line the browser offers `sendonly` or `sendrecv`) on a
+    /// stream that opted in to the camera's backchannel (an RTSP source's
+    /// `backchannel` option), and the session cannot have it: the camera
+    /// offers no backchannel, setting it up failed, it takes a codec
+    /// talk-back cannot feed, or the talk-back m-line lists neither its
+    /// codec nor Opus. The message says which. Such a session is never
+    /// played without talk-back; on a stream that did not opt in, the
+    /// request is answered without it instead (the dedicated m-line
+    /// `inactive`, a `sendrecv` one send-only).
     #[schemars(title = "SessionEventClosed")]
     Closed {
-        /// The stable code (`peer_closed`, `session_closed`, ...).
+        /// The stable code (`peer_closed`, `session_closed`,
+        /// `backchannel_unavailable`, ...).
         code: String,
         /// For humans.
         message: String,

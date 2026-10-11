@@ -76,6 +76,7 @@ fn request(offer: &str, video: Arc<Codec>) -> SessionRequest {
         orientation: Orientation::default(),
         limits: SessionLimits::default(),
         wall: SystemClock.wall_now(),
+        talkback_required: false,
     }
 }
 
@@ -2259,6 +2260,68 @@ fn rfc8829_5_3_1_talk_back_is_answered_by_offer_shape_and_backchannel() {
             "{what}"
         );
     }
+}
+
+/// On a stream that asked for the camera's backchannel
+/// (`talkback_required`), an offer that requests talk-back on either shape
+/// (a `sendonly` or a `sendrecv` audio m-line, RFC 8866 §6.7) is answered
+/// with talk-back or refused with `backchannel_unavailable` and why, never
+/// answered without it; an offer that requests none opens as ever.
+#[test]
+fn rfc8866_6_7_a_talk_back_request_on_a_stream_that_asks_for_the_backchannel_is_met_or_refused() {
+    use lotse_testing::viewer::TalkbackOffer;
+
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let refused = |reason: &str| Err(SessionOpenError::BackchannelUnavailable(reason.to_owned()));
+    for (shape, backchannel, expected) in [
+        (
+            TalkbackOffer::Dedicated,
+            Some(Codec::Pcma),
+            Ok(UplinkCodec::Pcma),
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            Some(Codec::Pcmu),
+            Ok(UplinkCodec::Pcmu),
+        ),
+        (
+            TalkbackOffer::Dedicated,
+            None,
+            refused("the camera offers no backchannel"),
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            None,
+            refused("the camera offers no backchannel"),
+        ),
+        (
+            TalkbackOffer::Dedicated,
+            Some(Codec::G722),
+            refused("the backchannel takes a codec talk-back cannot feed"),
+        ),
+    ] {
+        let what = format!("{shape:?} with {backchannel:?}");
+        let viewer =
+            Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, shape).expect("a viewer");
+        let mut request = request(viewer.offer(), h264(None));
+        request.audio = Some(Arc::new(Codec::Pcmu));
+        request.backchannel = backchannel;
+        request.talkback_required = true;
+        let opened = Session::answer(&request, now).map(|(session, _)| session.talkback());
+        assert_eq!(opened, expected.map(Some), "{what}");
+        if let Err(err) = Session::answer(&request, now) {
+            assert_eq!(err.code(), "backchannel_unavailable", "{what}");
+        }
+    }
+    // A viewer that only receives (`recvonly` audio) requests no
+    // talk-back: it plays without a backchannel.
+    let viewer = Viewer::new_with_audio(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let mut request = request(viewer.offer(), h264(None));
+    request.audio = Some(Arc::new(Codec::Pcmu));
+    request.talkback_required = true;
+    let (session, _) = Session::answer(&request, now).expect("an answer without talk-back");
+    assert_eq!(session.talkback(), None);
 }
 
 /// A connected pair whose viewer offers talk-back in `shape`, for a PCMU

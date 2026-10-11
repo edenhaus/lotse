@@ -125,6 +125,7 @@ fuzz_target!(|data: &[u8]| {
         orientation: Orientation::ALL[usize::from(pick >> 5)],
         limits: SessionLimits::default(),
         wall: SystemTime::UNIX_EPOCH,
+        talkback_required: false,
     };
     let answered = Session::answer(&request, Instant::now());
     if checked.is_err() {

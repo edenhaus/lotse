@@ -54,6 +54,7 @@ fn spec(id: &str, offer: &str, local: SocketAddr) -> SessionSpec {
         tcp_candidates: vec![],
         audio: false,
         orientation: 1,
+        talkback_required: false,
     }
 }
 

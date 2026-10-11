@@ -1171,6 +1171,7 @@ mod tests {
             tcp_candidates: vec![],
             audio: false,
             orientation: 1,
+            talkback_required: false,
         }
     }
 

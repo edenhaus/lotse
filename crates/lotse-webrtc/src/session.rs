@@ -432,8 +432,8 @@ fn audio_writer(
 /// its packets are taken.
 #[derive(Debug)]
 struct TalkbackRx {
-    /// The talk-back m-line: the dedicated one, or the `sendrecv`
-    /// downlink one.
+    /// The talk-back m-line: the dedicated one, or the first `sendrecv`
+    /// one, the downlink one as a rule.
     mid: Mid,
     /// Takes its RTP by payload type.
     depacketizer: Depacketizer,
@@ -605,6 +605,27 @@ fn push_opening_events(pending: &mut VecDeque<SessionOutput>, candidates: Vec<St
     }));
 }
 
+/// Refuses a talk-back request `plan` cannot meet on a stream that asked
+/// for the camera's backchannel (`request.talkback_required`): such a
+/// stream never plays one without talk-back.
+fn require_talkback(
+    request: &SessionRequest,
+    plan: &AudioPlan<'_>,
+) -> Result<(), SessionOpenError> {
+    match plan.talkback {
+        Talkback::Off(reason) if request.talkback_required => {
+            let backchannel = request.backchannel.as_ref().map(Codec::name);
+            tracing::info!(
+                reason,
+                backchannel,
+                "talk-back unavailable; session refused"
+            );
+            Err(SessionOpenError::BackchannelUnavailable(reason.to_owned()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Logs what the answer did with talk-back: the m-line and codec it is
 /// received in, or why it is not.
 fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&Codec>) {
@@ -620,6 +641,7 @@ fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&Codec>) {
             tracing::info!(mid, codec, backchannel, m_line, "talk-back negotiated");
         }
         Talkback::Off(reason) => tracing::info!(reason, "talk-back not negotiated"),
+        Talkback::NotRequested => tracing::debug!("talk-back not requested"),
     }
 }
 
@@ -675,6 +697,7 @@ impl Session {
             request.audio.as_deref(),
             request.backchannel.as_ref(),
         );
+        require_talkback(request, &plan)?;
         let send = request
             .audio
             .as_deref()
@@ -736,7 +759,7 @@ impl Session {
         log_talkback(&plan, request.backchannel.as_ref());
         let talkback = match plan.talkback {
             Talkback::Negotiated { mid, codec, .. } => talkback_rx(&rtc, mid, codec),
-            Talkback::Off(_) => None,
+            Talkback::Off(_) | Talkback::NotRequested => None,
         };
 
         push_opening_events(&mut pending, candidates, mid);
@@ -1438,6 +1461,7 @@ mod tests {
                 orientation: Orientation::default(),
                 limits: SessionLimits::default(),
                 wall: std::time::SystemTime::UNIX_EPOCH,
+                talkback_required: false,
             };
             let video = VideoPlan::for_codec(&request.video).unwrap();
             let mut rtc = build_config(&request, &video, codecs).build(now);
@@ -1502,6 +1526,7 @@ mod tests {
             orientation: Orientation::default(),
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
+            talkback_required: false,
         };
         let panicked = std::panic::catch_unwind(|| {
             let video = VideoPlan::for_codec(&request.video).unwrap();

@@ -130,6 +130,14 @@ pub struct Unsubscribe {
 
 /// `webrtc/offer`: opens a session; the subscription's events carry the
 /// whole signaling conversation.
+///
+/// The answer comes once the source is live. An offer that requests
+/// two-way audio on a stream that opted in to the camera's backchannel is
+/// answered from the camera's backchannel as the live source offers it:
+/// sent right after a `stream/put` that opted in a connection running
+/// without it, it waits for the connection's restart to ask for it, and
+/// fails with `closed` `backchannel_unavailable` when that restart fails
+/// or the camera offers none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WebrtcOffer {

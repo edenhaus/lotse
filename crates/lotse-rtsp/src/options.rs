@@ -99,7 +99,11 @@ pub struct RtspOptions {
     /// connection key ([`Self::connection_key`]): the connection a stream
     /// shares asks iff one of its streams does, an opt-in restarts a
     /// connection running without it once, and the last opt-out takes
-    /// effect when the connection next connects.
+    /// effect when the connection next connects. On a stream that opts in,
+    /// a session whose offer requests talk-back is never played without
+    /// it: one the backchannel cannot serve closes with
+    /// `backchannel_unavailable`, and one offered while the connection
+    /// restarts to ask is answered once the restart resolved.
     pub backchannel: bool,
     /// Keyframe requests through ONVIF.
     pub onvif_keyframe: OnvifKeyframe,

@@ -88,7 +88,7 @@ pub(crate) const SOURCE_NOT_LIVE_AFTER: Duration = Duration::from_secs(10);
 
 /// The `closed` codes of the API; anything else a worker reports is an
 /// `internal_error`.
-const CLOSED_CODES: [&str; 12] = [
+const CLOSED_CODES: [&str; 13] = [
     "peer_closed",
     "session_closed",
     "stream_deleted",
@@ -99,6 +99,7 @@ const CLOSED_CODES: [&str; 12] = [
     "invalid_sdp",
     "no_video_track",
     "video_codec_unsupported",
+    "backchannel_unavailable",
     "shutting_down",
     "internal_error",
 ];
@@ -840,6 +841,19 @@ mod tests {
         assert_eq!(long.len(), 2_000);
         let distinct: std::collections::BTreeSet<u8> = long.bytes().collect();
         assert_eq!(distinct.len(), 62);
+    }
+
+    /// A talk-back request the stream's backchannel cannot meet closes
+    /// with its own code.
+    #[test]
+    fn backchannel_unavailable_is_a_closed_code() {
+        assert_eq!(
+            closed_event("backchannel_unavailable", "m"),
+            SessionEvent::Closed {
+                code: "backchannel_unavailable".into(),
+                message: "m".into()
+            }
+        );
     }
 
     #[test]

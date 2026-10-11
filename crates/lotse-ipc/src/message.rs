@@ -138,6 +138,10 @@ pub struct SessionSpec {
     /// The stream's orientation by its number, 1 (none) to 8
     /// (`lotse_core::Orientation::code`).
     pub orientation: u8,
+    /// The stream asked for the camera's backchannel: a talk-back request
+    /// the session cannot meet refuses it with `backchannel_unavailable`
+    /// (`lotse_core::session::SessionRequest::talkback_required`).
+    pub talkback_required: bool,
 }
 
 impl fmt::Debug for SessionSpec {
@@ -152,6 +156,7 @@ impl fmt::Debug for SessionSpec {
             .field("tcp_candidates", &self.tcp_candidates)
             .field("audio", &self.audio)
             .field("orientation", &self.orientation)
+            .field("talkback_required", &self.talkback_required)
             .finish()
     }
 }
@@ -435,6 +440,7 @@ mod tests {
             tcp_candidates: vec!["192.0.2.1:18557".parse().unwrap()],
             audio: true,
             orientation: 6,
+            talkback_required: false,
         };
         let text = format!("{spec:?}");
         assert!(!text.contains("hunter2"), "{text}");

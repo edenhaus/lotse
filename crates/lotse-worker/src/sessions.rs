@@ -927,6 +927,7 @@ async fn open_session(
         orientation: Orientation::from_code(ctx.spec.orientation).unwrap_or_default(),
         limits: ctx.limits,
         wall: ctx.clock.wall_now(),
+        talkback_required: ctx.spec.talkback_required,
     };
     let (engine, answer) = match ctx.factory.open_session(request, now) {
         Ok(opened) => opened,
@@ -1416,6 +1417,7 @@ mod tests {
             tcp_candidates: vec![],
             audio,
             orientation: 1,
+            talkback_required: false,
         }
     }
 

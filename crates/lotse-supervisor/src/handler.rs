@@ -689,12 +689,7 @@ impl Supervisor {
         })?;
         let audio = stream.audio == AudioMode::Auto;
         let orientation = stream.orientation;
-        let (connection_id, commands) = stream
-            .sources
-            .first()
-            .and_then(|source| state.connections.get_key_value(&source.connection))
-            .map(|(id, entry)| (id.clone(), entry.commands.clone()))
-            .ok_or_else(|| internal("the stream has no source connection"))?;
+        let (connection_id, commands, talkback_required) = session_connection(&state, stream)?;
         if state.sessions.contains_key(&session_id) {
             return Err(
                 ApiError::new(ErrorCode::SessionIdInUse, "the session id is already open")
@@ -712,6 +707,7 @@ impl Supervisor {
             tcp_candidates: self.shared.tcp_hosts.clone(),
             audio,
             orientation: orientation.code(),
+            talkback_required,
         };
         commands
             .try_send(DriverCommand::OpenSession(spec))
@@ -751,6 +747,7 @@ impl Supervisor {
             connection.id = %connection_id,
             control.connection = connection.0,
             audio,
+            talkback_required,
             orientation = ?orientation,
             hosts,
             "session opened; offer handed to the connection"
@@ -1241,6 +1238,25 @@ fn check_session_limits(
         }
     }
     Ok(())
+}
+
+/// The connection a session of `stream` opens on (its first source's),
+/// that connection's command queue, and whether the stream asked for the
+/// camera's backchannel there: a talk-back request it cannot meet then
+/// fails the session with `backchannel_unavailable` rather than playing
+/// without talk-back.
+fn session_connection(
+    state: &State,
+    stream: &StreamEntry,
+) -> Result<(String, mpsc::Sender<DriverCommand>, bool), ApiError> {
+    stream
+        .sources
+        .first()
+        .and_then(|source| {
+            let (id, entry) = state.connections.get_key_value(&source.connection)?;
+            Some((id.clone(), entry.commands.clone(), source.spec.backchannel))
+        })
+        .ok_or_else(|| internal("the stream has no source connection"))
 }
 
 /// Closes session `serial` under `session_id` with `source_not_live` if it
@@ -3095,6 +3111,7 @@ mod tests {
             );
             assert_eq!(spec.ice_ufrag, s.shared.lock().sessions[session].ufrag);
             assert_eq!(spec.ice_pass.len(), 24);
+            assert!(!spec.talkback_required, "neither opted in");
         }
         // A put that changes only the orientation is a change, keeps the
         // connection and the open session, and reaches the next offer.
@@ -3138,6 +3155,28 @@ mod tests {
         );
         assert!(s.shared.lock().sessions.is_empty());
         assert!(rx.try_recv().is_err(), "nothing for a worker that is gone");
+        s.shutdown().await;
+    }
+
+    /// The offer of a stream that opted in to the camera's backchannel
+    /// tells the worker so: a talk-back request it cannot meet fails the
+    /// session (`backchannel_unavailable`) instead of playing without.
+    #[tokio::test]
+    async fn an_offer_on_a_stream_that_opted_in_requires_its_talk_back() {
+        let dir = private_dir("talkback-required");
+        let s = with_webrtc(&blocking_worker(&dir), Arc::new(SystemClock));
+        let put = json!({ "id": 1, "type": "stream/put", "stream_id": "door",
+            "sources": [{ "url": "fake://127.0.0.1:4/", "options": { "talk": true } }] });
+        result(call(&s, &put.to_string()).await);
+        let (tx, mut rx) = mpsc::channel(8);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        let _door = subscription(call_on(&s, 1, &offer(2, "door", Some("d1"))).await);
+        let_assert!(
+            Some(DriverCommand::OpenSession(spec)) = rx.recv().await,
+            "an offer"
+        );
+        assert_eq!(spec.session_id, "d1");
+        assert!(spec.talkback_required);
         s.shutdown().await;
     }
 

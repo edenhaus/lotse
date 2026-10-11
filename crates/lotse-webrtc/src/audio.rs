@@ -156,8 +156,13 @@ pub(crate) enum Talkback<'a> {
         /// A dedicated talk-back m-line rather than the downlink one.
         dedicated: bool,
     },
-    /// Not negotiated, and why.
+    /// Requested and not negotiated, and why: an audio m-line the
+    /// browser offers to send on (`sendonly` or `sendrecv`, RFC 8866
+    /// §6.7) asks for two-way audio, which the session cannot receive.
     Off(&'static str),
+    /// Not requested: no audio m-line with a mid the browser offers to
+    /// send on.
+    NotRequested,
 }
 
 /// What the session does with the offer's audio m-lines.
@@ -179,8 +184,10 @@ impl<'a> AudioPlan<'a> {
     /// backchannel's (`backchannel`).
     ///
     /// Talk-back goes on the first audio m-line the browser offers
-    /// `sendonly` (the dedicated one), or else on a `sendrecv` downlink
-    /// m-line, never on both: a session has one uplink. It takes the
+    /// `sendonly` (the dedicated one), or else on the first it offers
+    /// `sendrecv`, the downlink m-line as a rule, never on both: a session
+    /// has one uplink. Either requests it (RFC 8866 §6.7: the browser
+    /// offers to send there). It takes the
     /// backchannel's codec when that m-line lists it (G.711 from the
     /// browser, no transcode), else Opus; a backchannel in another codec
     /// is one no uplink chain feeds.
@@ -199,14 +206,15 @@ impl<'a> AudioPlan<'a> {
         let dedicated = lines
             .iter()
             .find(|(_, _, offered)| *offered == Direction::SendOnly);
-        let uplink = match (dedicated, downlink) {
-            (Some(line), _) => Some((line, true)),
-            (None, Some(line)) if line.2 == Direction::SendRecv => Some((line, false)),
-            _ => None,
-        };
+        let uplink = dedicated.map(|line| (line, true)).or_else(|| {
+            lines
+                .iter()
+                .find(|(_, _, offered)| *offered == Direction::SendRecv)
+                .map(|line| (line, false))
+        });
         let talkback = match (uplink, backchannel.map(Codec::family)) {
-            (None, _) => Talkback::Off("the offer has no talk-back m-line"),
-            (Some(_), None) => Talkback::Off("the stream has no backchannel"),
+            (None, _) => Talkback::NotRequested,
+            (Some(_), None) => Talkback::Off("the camera offers no backchannel"),
             (Some(_), Some(family))
                 if !matches!(
                     family,
@@ -419,7 +427,7 @@ mod tests {
         let plan = AudioPlan::new(DEDICATED, Some(&opus), None);
         assert_eq!(
             plan.talkback,
-            Talkback::Off("the stream has no backchannel")
+            Talkback::Off("the camera offers no backchannel")
         );
         assert_eq!(plan.answer(Some("2")), Direction::Inactive);
         assert_eq!(plan.answer(Some("0")), Direction::SendOnly);
@@ -434,7 +442,7 @@ mod tests {
         let plan = AudioPlan::new(&sendrecv, Some(&opus), None);
         assert_eq!(
             plan.talkback,
-            Talkback::Off("the stream has no backchannel")
+            Talkback::Off("the camera offers no backchannel")
         );
         assert_eq!(plan.answer(Some("0")), Direction::SendOnly);
         // A downlink that carries no stream audio still takes talk-back
@@ -524,10 +532,7 @@ mod tests {
             Some(&pcmu),
             Some(&pcmu),
         );
-        assert_eq!(
-            plan.talkback,
-            Talkback::Off("the offer has no talk-back m-line")
-        );
+        assert_eq!(plan.talkback, Talkback::NotRequested);
         assert_eq!(plan.answer(Some("0")), Direction::SendOnly);
         // The downlink is the first audio m-line the browser receives on:
         // a `sendonly` or `inactive` one before it is not, nor one without
@@ -543,6 +548,19 @@ mod tests {
         let plan = AudioPlan::new(offer, Some(&Codec::Pcma), None);
         assert_eq!(plan.send, None);
         assert_eq!(plan.answer(Some("d")), Direction::Inactive);
+        // A `sendrecv` m-line after a `recvonly` downlink requests talk-back
+        // too (RFC 8866 §6.7): it comes up there, the downlink only sends.
+        let offer = "v=0\r\nm=audio 9 x 0\r\na=mid:d\r\na=recvonly\r\na=rtpmap:0 PCMU/8000\r\nm=audio 9 x 0\r\na=mid:s\r\na=sendrecv\r\na=rtpmap:0 PCMU/8000\r\n";
+        let plan = AudioPlan::new(offer, Some(&pcmu), Some(&pcmu));
+        assert_eq!(plan.downlink, Some("d"));
+        assert_eq!(plan.talkback, negotiated("s", CodecFamily::Pcmu, false));
+        assert_eq!(plan.answer(Some("d")), Direction::SendOnly);
+        assert_eq!(plan.answer(Some("s")), Direction::RecvOnly);
+        let plan = AudioPlan::new(offer, Some(&pcmu), None);
+        assert_eq!(
+            plan.talkback,
+            Talkback::Off("the camera offers no backchannel")
+        );
         // No audio m-line the browser receives on.
         let plan = AudioPlan::new("v=0\r\nm=video 9 x 96\r\na=mid:v\r\n", Some(&pcmu), None);
         assert_eq!((plan.downlink, plan.send), (None, None));

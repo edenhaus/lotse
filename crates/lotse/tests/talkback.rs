@@ -532,6 +532,7 @@ impl InProcess {
                     tcp_candidates: vec![],
                     audio,
                     orientation: 1,
+                    talkback_required: false,
                 }),
                 &[],
             )
