@@ -296,7 +296,8 @@ let features = [];
 // Talk-back: the send-only audio transceiver the offer carried, and the
 // microphone while Talk is on, the one track on its sender.
 let talkTransceiver, mic;
-// How long Play waits for the camera's backchannel before it offers.
+// How long Play waits for a live connection's restart to offer the
+// camera's backchannel before it offers.
 const BACKCHANNEL_WAIT_MS = 10000;
 // The last second's cumulative jitter-buffer counters per inbound stream,
 // so the page shows the current buffer rather than the session average.
@@ -569,25 +570,37 @@ async function play() {
   statsTimer = setInterval(stats, 1000);
 }
 
-// Waits up to BACKCHANNEL_WAIT_MS for stream/get to report a source's
-// backchannel: the daemon answers talk-back only from one the camera
-// already offers, and an opt-in first restarts a connection running
-// without it. Logs what it found; the offer goes out either way.
+// Waits, when it has to, for stream/get to report a source's backchannel:
+// the daemon answers talk-back only from one the camera offers when the
+// session opens. A connection that is not live connects for this offer
+// and asks for the backchannel then, before the session opens, so there
+// is nothing to wait for. A live one without it restarts once to ask, and
+// keeps playing the old source until the new one is live: an offer before
+// then would open on the old one, so it waits, up to BACKCHANNEL_WAIT_MS
+// (the camera may have none). Logs what it found; the offer goes out
+// either way.
 async function waitForBackchannel(streamId, mine) {
   const until = performance.now() + BACKCHANNEL_WAIT_MS;
-  log("waiting for the camera's backchannel…");
+  let waiting = false;
   while (mine === attempt) {
     const got = await call({ type: "stream/get", stream_id: streamId });
+    const sources = got.success ? got.result.sources : [];
     const offered = got.success ? got.result.sources.find((s) => s.backchannel)?.backchannel : undefined;
     if (offered) {
       log(`camera backchannel: ${offered.codec}, ${offered.state}`, "good");
       return;
     }
-    if (performance.now() >= until) {
-      log(`no backchannel after ${BACKCHANNEL_WAIT_MS / 1000} s: the camera has none, refused it or is not live; talk-back will not be negotiated`, "bad");
+    if (!sources.some((s) => s.state === "live")) {
+      log("the camera connects for this offer and asks for its backchannel then");
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (!waiting) log("waiting for the camera's backchannel: the live connection restarts once to ask for it…");
+    waiting = true;
+    if (performance.now() >= until) {
+      log(`no backchannel after ${BACKCHANNEL_WAIT_MS / 1000} s: the camera has none or refused it; talk-back will not be negotiated`, "bad");
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
 }
 

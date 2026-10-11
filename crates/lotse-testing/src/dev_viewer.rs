@@ -706,6 +706,18 @@ mod tests {
             "{play}"
         );
         assert!(page.contains(r"got.result.sources.find((s) => s.backchannel)?.backchannel"));
+        // Only a live connection is waited for: one that is not connects
+        // for the offer and asks for the backchannel before the session
+        // opens, so waiting there only delays the first frame.
+        let waits = page
+            .split("async function waitForBackchannel(streamId, mine)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("waitForBackchannel()");
+        let not_live = waits
+            .find(r#"if (!sources.some((s) => s.state === "live")) {"#)
+            .expect("returns when nothing is live");
+        assert!(not_live < waits.find("waiting = true;").unwrap(), "{waits}");
         // Talk is usable only when the answer took the m-line.
         assert!(page.contains(r#"talkTransceiver.currentDirection === "sendonly""#));
         // The microphone is asked for on Talk, not on Play, and leaves the
