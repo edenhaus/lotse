@@ -1667,6 +1667,66 @@ mod tests {
         }
     }
 
+    /// A switch to a standby source hands the connection's talk-back to
+    /// the backchannel the standby offers: the arbiter follows it when the
+    /// running source's protocol had one, and is created when only the
+    /// standby's has one. The counters name the new codec once switched.
+    #[tokio::test]
+    async fn a_switch_source_hands_talk_back_to_the_standby_s_backchannel() {
+        for (running, before) in [
+            (r#"{"backchannel": "pcmu", "video": true}"#, Some("pcmu")),
+            (r#"{"video": true}"#, None),
+        ] {
+            let mut registries = Registries::default();
+            registries
+                .sources
+                .register(Arc::new(FakeSourceFactory::with_backchannel(&["talk"])))
+                .unwrap();
+            registries
+                .sources
+                .register(Arc::new(FakeSourceFactory::new(&["fake"])))
+                .unwrap();
+            let mut h = start_with_settings(Arc::new(registries), quiet_settings());
+            h.tx.send_msg(&ToWorker::Sockets, &[]).await.unwrap();
+            // A source whose protocol has a backchannel, or one whose has
+            // none, as the counters say.
+            let url = if before.is_some() {
+                "talk://cam/"
+            } else {
+                "fake://cam/"
+            };
+            h.tx.send_msg(&ToWorker::RunSource(spec(url, running)), &[])
+                .await
+                .unwrap();
+            until_live(&mut h).await;
+            let stats = stats_where(&mut h, &mut || {}, &|_| true).await;
+            assert_eq!(stats.backchannel.as_deref(), before, "{running}");
+            // The standby offers PCMA; its keyframe a second after it went
+            // live switches, and the counters follow its backchannel.
+            h.tx.send_msg(
+                &ToWorker::SwitchSource(spec(
+                    "talk://cam2/",
+                    r#"{"backchannel": "pcma", "video": true}"#,
+                )),
+                &[],
+            )
+            .await
+            .unwrap();
+            next_where(&mut h, &|m| {
+                *m == ToSupervisor::SwitchState(SourceState::Live)
+            })
+            .await;
+            stats_where(&mut h, &mut || {}, &|stats| {
+                stats.backchannel.as_deref() == Some("pcma")
+            })
+            .await;
+            h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1000 }, &[])
+                .await
+                .unwrap();
+            assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+        }
+    }
+
     /// Claim and hold through the worker: the first session
     /// to send talk-back reaches the camera, the second gets exactly one
     /// `backchannel_busy` and its packets go nowhere, and closing the
