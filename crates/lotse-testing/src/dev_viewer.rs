@@ -17,8 +17,10 @@
 //! through them, and the viewer's page runs only its own inline script and
 //! style, matched by hash (CSP Level 3 §2.3.1), and connects only to its
 //! own origin. A browser message the daemon would refuse as too large is
-//! refused at the relay already. A development tool, never part of the
-//! daemon.
+//! refused at the relay already. Its talk-back needs the microphone, which
+//! browsers expose to a secure context only: on plain HTTP, a page opened
+//! at a loopback address (W3C Secure Contexts §3.1). A development tool,
+//! never part of the daemon.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -597,7 +599,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert!(page.contains("sources: [{ url }], orientation }"));
+        assert!(page.contains("sources: [source(url, talkback)], orientation }"));
         assert!(page.contains(r#"const CVO = "urn:3gpp:video-orientation";"#));
         assert!(page.contains("extmapId(answer, \"video\", CVO)"));
         // A change while playing puts the stream again and keeps the
@@ -608,7 +610,7 @@ mod tests {
             .and_then(|rest| rest.split("\n});").next())
             .expect("the orientation handler");
         assert!(handler.contains(
-            r#"send({ type: "stream/put", stream_id: streamId, sources: [{ url }], orientation }"#
+            r#"send({ type: "stream/put", stream_id: streamId, sources: [source(url, talkback)], orientation }"#
         ));
         assert!(!handler.contains("play()"), "{handler}");
         // The saved-streams list shows URLs masked.
@@ -666,6 +668,81 @@ mod tests {
         );
         cancel.cancel();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Talk-back (2026-10-11): the opt-in puts the RTSP option
+    /// `backchannel`, the offer carries a send-only audio m-line, which the
+    /// daemon answers recvonly (RFC 3264 §6.1), and the microphone goes on
+    /// it only while Talk is on, so nothing claims the backchannel before.
+    #[test]
+    fn rfc3264_s6_1_talk_back_offers_a_sendonly_m_line_and_sends_only_while_talking() {
+        let page = PAGE;
+        assert!(page.contains(r#"<input id="talkback" type="checkbox">"#));
+        assert!(page.contains(r#"<button id="talk" type="button" class="secondary" disabled"#));
+        // The option only when opted in, so a camera without a backchannel
+        // never sees the request.
+        assert!(page.contains("(talkback ? { url, options: { backchannel: true } } : { url })"));
+        assert!(page.contains(
+            r#"call({ type: "stream/put", stream_id: streamId, sources: [source(url, talkback)], orientation })"#
+        ));
+        // The microphone API exists only in a secure context; without it
+        // the offer goes out without talk-back.
+        assert!(page.contains(
+            r#"if (navigator.mediaDevices?.getUserMedia) {
+      talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });"#
+        ));
+        // The offer waits for the camera's backchannel, which the answer
+        // is built from.
+        let play = page
+            .split("async function play()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("play()");
+        let wait = play
+            .find("await waitForBackchannel(streamId, mine);")
+            .expect("waits");
+        assert!(
+            wait < play.find(r#"type: "webrtc/offer""#).unwrap(),
+            "{play}"
+        );
+        assert!(page.contains(r"got.result.sources.find((s) => s.backchannel)?.backchannel"));
+        // Talk is usable only when the answer took the m-line.
+        assert!(page.contains(r#"talkTransceiver.currentDirection === "sendonly""#));
+        // The microphone is asked for on Talk, not on Play, and leaves the
+        // sender when talking stops.
+        assert!(!play.contains("getUserMedia({"), "{play}");
+        let start = page
+            .split("async function startTalking()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("startTalking()");
+        assert!(start.contains("navigator.mediaDevices.getUserMedia({ audio: true })"));
+        assert!(start.contains("transceiver.sender.replaceTrack(track)"));
+        let stop = page
+            .split("async function stopTalking()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("stopTalking()");
+        assert!(stop.contains("transceiver.sender.replaceTrack(null)"));
+        // The backchannel is released only when this session holds it, so
+        // stopping never takes it from another viewer.
+        let check = stop
+            .find("!got.result.backchannel.talker) return;")
+            .expect("checks the talker");
+        assert!(
+            check
+                < stop
+                    .find(r#"call({ type: "backchannel/release", stream_id: streamId })"#)
+                    .expect("releases"),
+            "{stop}"
+        );
+        // Teardown stops the microphone.
+        let teardown = page
+            .split("function teardown(quiet)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("teardown()");
+        assert!(teardown.contains("releaseMic();"), "{teardown}");
     }
 
     type Connected = Result<

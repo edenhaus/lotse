@@ -71,9 +71,11 @@
           <option value="rotate_right">rotate_right</option>
         </select>
       </label>
+      <label class="check" title="stream/put's RTSP option backchannel: the daemon asks the camera for its ONVIF backchannel, and the offer carries a send-only audio m-line for the microphone; changing it while playing plays again"><input id="talkback" type="checkbox"> Two-way audio (camera backchannel)</label>
       <div class="buttons">
         <button id="play" type="submit" disabled>Play</button>
         <button id="stop" type="button" class="secondary" disabled>Stop</button>
+        <button id="talk" type="button" class="secondary" disabled title="Sends the microphone to the camera's speaker; the browser asks for it on the first press">Talk</button>
       </div>
     </form>
     <section>
@@ -90,6 +92,8 @@
         <dt>Audio</dt><dd id="s-audio">–</dd>
         <dt>Audio buffer</dt><dd id="s-abuf">–</dd>
         <dt title="The browser's estimate from the daemon's Sender Reports: shows what it aligns to, not whether the camera's timestamps are right">A/V playout</dt><dd id="s-av">–</dd>
+        <dt title="The backchannel of session/get: what the daemon received and handed to the camera">Talk-back</dt><dd id="s-talk">–</dd>
+        <dt title="The browser's outbound talk-back RTP">Uplink</dt><dd id="s-uplink">–</dd>
         <dt>Path</dt><dd id="s-path">–</dd>
       </dl>
     </section>
@@ -187,14 +191,15 @@ function load() {
 const isOrientation = (value) => [...$("orientation").options].some((o) => o.value === value);
 const { saved, credentials } = load();
 const savedCredentials = new Map(Array.isArray(credentials.saved) ? credentials.saved.filter(Array.isArray) : []);
-// The saved streams, each { id, label, stream, url, orientation } with the
+// The saved streams, each { id, label, stream, url, orientation, talkback } with the
 // URL as typed, the credentials of this tab put back; and which one the
 // fields show, if any.
 let entries = (Array.isArray(saved.saved) ? saved.saved : [])
   .filter((e) => e && typeof e.id === "string" && typeof e.url === "string" && typeof e.stream === "string")
   .map((e) => ({ id: e.id, label: typeof e.label === "string" ? e.label : "", stream: e.stream,
                  url: withUserinfo(e.url, savedCredentials.get(e.id)),
-                 orientation: isOrientation(e.orientation) ? e.orientation : "no_transform" }));
+                 orientation: isOrientation(e.orientation) ? e.orientation : "no_transform",
+                 talkback: e.talkback === true }));
 let selectedId = typeof saved.selected === "string" ? saved.selected : undefined;
 let storageWarned = false;
 
@@ -215,6 +220,7 @@ function save() {
       url: current.bare,
       stun: $("stun").value.trim(),
       orientation: $("orientation").value,
+      talkback: $("talkback").checked,
       saved: split.map(({ entry, bare }) => ({ ...entry, url: bare })),
       selected: selectedId ?? null,
     }));
@@ -250,7 +256,7 @@ function renderSaved() {
   for (const entry of entries) {
     const shown = masked(entry.url);
     const option = new Option(entry.label ? `${entry.label}: ${shown}` : shown, entry.id);
-    option.title = `${entry.stream}, ${entry.orientation}, ${shown}`;
+    option.title = `${entry.stream}, ${entry.orientation}${entry.talkback ? ", two-way audio" : ""}, ${shown}`;
     list.add(option);
   }
   list.value = selected() ? selectedId : "";
@@ -264,6 +270,7 @@ function syncSelection() {
 
 for (const id of ["stream", "stun"]) if (typeof saved[id] === "string" && saved[id]) $(id).value = saved[id];
 if (isOrientation(saved.orientation)) $("orientation").value = saved.orientation;
+$("talkback").checked = saved.talkback === true;
 cameraUrl = typeof saved.url === "string" ? withUserinfo(saved.url, credentials.url) : "";
 showUrl();
 syncSelection();
@@ -281,8 +288,16 @@ $("stream").addEventListener("input", syncSelection);
 
 let ws, nextId = 1, pc, offerId, sessionId, offerAccepted = false, pendingCandidates = [];
 let statsTimer, playClicked, lastOffer, offeredCvo, attempt = 0;
-// The playing session's stream and camera URL, and its answer.
+// The playing session's stream, camera URL and talk-back opt-in, and its
+// answer.
 let playing, lastAnswer;
+// What the daemon's hello announced (`two_way_audio` among them).
+let features = [];
+// Talk-back: the send-only audio transceiver the offer carried, and the
+// microphone while Talk is on, the one track on its sender.
+let talkTransceiver, mic;
+// How long Play waits for the camera's backchannel before it offers.
+const BACKCHANNEL_WAIT_MS = 10000;
 // The last second's cumulative jitter-buffer counters per inbound stream,
 // so the page shows the current buffer rather than the session average.
 let previous = new Map();
@@ -294,6 +309,13 @@ function send(command, onResult) {
   ws.send(JSON.stringify({ id, ...command }));
   return id;
 }
+
+// `command`'s result frame.
+const call = (command) => new Promise((resolve) => send(command, resolve));
+
+// The source `stream/put` gets: the RTSP option `backchannel` only when
+// talk-back is on, so a camera without one never sees the request.
+const source = (url, talkback) => (talkback ? { url, options: { backchannel: true } } : { url });
 
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
@@ -308,7 +330,8 @@ function connect() {
     if (frame.type === "hello") {
       $("hello").textContent = `lotse ${frame.version}, api ${frame.api}`;
       $("play").disabled = false;
-      log(`hello: outputs ${frame.outputs.join(", ")}`);
+      features = Array.isArray(frame.features) ? frame.features : [];
+      log(`hello: outputs ${frame.outputs.join(", ")}; features ${features.join(", ") || "none"}`);
     } else if (frame.type === "result") {
       const callback = results.get(frame.id);
       results.delete(frame.id);
@@ -367,6 +390,7 @@ async function onSessionEvent(event) {
       showCvo(event.sdp);
       await pc.setRemoteDescription({ type: "answer", sdp: event.sdp });
       log("answer applied");
+      if (talkTransceiver) answeredTalkback();
       break;
     case "candidate":
       try {
@@ -421,12 +445,13 @@ async function play() {
   const url = cameraUrl;
   const stun = $("stun").value.trim();
   const orientation = $("orientation").value;
-  playing = { streamId, url };
+  const talkback = $("talkback").checked;
+  playing = { streamId, url, talkback };
   lastAnswer = undefined;
   save();
   $("play").disabled = true;
   $("stop").disabled = false;
-  for (const id of ["s-ttff", "s-video", "s-cvo", "s-fps", "s-decoded", "s-lost", "s-vbuf", "s-audio", "s-abuf", "s-av", "s-path"]) $(id).textContent = "–";
+  for (const id of ["s-ttff", "s-video", "s-cvo", "s-fps", "s-decoded", "s-lost", "s-vbuf", "s-audio", "s-abuf", "s-av", "s-talk", "s-uplink", "s-path"]) $(id).textContent = "–";
   $("s-cvo").className = "";
   previous = new Map();
   // Play is a user gesture, so the browser lets the element start with
@@ -439,9 +464,7 @@ async function play() {
   sessionId = `viewer-${Date.now()}`;
 
   // The offer needs the stream, so it waits for the put's result.
-  const put = new Promise((resolve) => {
-    send({ type: "stream/put", stream_id: streamId, sources: [{ url }], orientation }, resolve);
-  });
+  const put = call({ type: "stream/put", stream_id: streamId, sources: [source(url, talkback)], orientation });
 
   const peer = new RTCPeerConnection({ iceServers: stun ? [{ urls: stun }] : [] });
   pc = peer;
@@ -458,6 +481,21 @@ async function play() {
     // The daemon answers it with the camera's audio: G.711, G.722 or Opus
     // cut through, AAC transcoded to Opus; or inactive without usable audio.
     peer.addTransceiver("audio", { direction: "recvonly" });
+  }
+  if (talkback) {
+    // Talk-back goes up on a dedicated send-only m-line, which the daemon
+    // answers recvonly in the backchannel's codec or Opus (RFC 3264 §6.1)
+    // when the camera offers a backchannel, inactive otherwise. It carries
+    // no track until Talk, so nothing is sent and nothing claims the
+    // backchannel before then.
+    if (!features.includes("two_way_audio")) log("the daemon announces no two_way_audio: talk-back will not be negotiated", "bad");
+    if (navigator.mediaDevices?.getUserMedia) {
+      talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });
+    } else {
+      // Browsers hide the microphone outside a secure context, which plain
+      // http is only on loopback (W3C Secure Contexts §3.1).
+      log("no microphone here: open the page at http://localhost or http://127.0.0.1 (a secure context); offering without talk-back", "bad");
+    }
   }
   // The daemon puts audio and video in one stream (one msid), so the
   // browser keeps them in sync; both tracks go to the one element.
@@ -513,6 +551,8 @@ async function play() {
   if (mine !== attempt) return;
   if (!putResult.success) { teardown(true); return; }
   log(`stream ${streamId} ${putResult.result.created ? "created" : "updated or unchanged"}, ${orientation}`);
+  if (talkTransceiver) await waitForBackchannel(streamId, mine);
+  if (mine !== attempt) return;
   offerId = send({
     type: "webrtc/offer",
     stream_id: streamId,
@@ -527,6 +567,108 @@ async function play() {
     pendingCandidates = [];
   });
   statsTimer = setInterval(stats, 1000);
+}
+
+// Waits up to BACKCHANNEL_WAIT_MS for stream/get to report a source's
+// backchannel: the daemon answers talk-back only from one the camera
+// already offers, and an opt-in first restarts a connection running
+// without it. Logs what it found; the offer goes out either way.
+async function waitForBackchannel(streamId, mine) {
+  const until = performance.now() + BACKCHANNEL_WAIT_MS;
+  log("waiting for the camera's backchannel…");
+  while (mine === attempt) {
+    const got = await call({ type: "stream/get", stream_id: streamId });
+    const offered = got.success ? got.result.sources.find((s) => s.backchannel)?.backchannel : undefined;
+    if (offered) {
+      log(`camera backchannel: ${offered.codec}, ${offered.state}`, "good");
+      return;
+    }
+    if (performance.now() >= until) {
+      log(`no backchannel after ${BACKCHANNEL_WAIT_MS / 1000} s: the camera has none, refused it or is not live; talk-back will not be negotiated`, "bad");
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
+// What the answer did with the talk-back m-line: recvonly makes the
+// browser's side sendonly and Talk usable; inactive refused it, and the
+// daemon logs why ("talk-back not negotiated").
+function answeredTalkback() {
+  const negotiated = talkTransceiver.currentDirection === "sendonly";
+  $("talk").disabled = !negotiated;
+  $("s-talk").textContent = negotiated ? "negotiated; press Talk" : "not negotiated (the daemon log says why)";
+  $("s-talk").className = negotiated ? "" : "bad";
+  log(negotiated ? "talk-back negotiated" : "talk-back not negotiated: the answer's m-line is inactive", negotiated ? "good" : "bad");
+}
+
+// Puts the microphone on the talk-back m-line. Its first packet claims the
+// camera's backchannel if nobody holds it; else the daemon drops it and
+// warns backchannel_busy. The browser asks for the microphone on this
+// click, not on Play's.
+async function startTalking() {
+  const mine = attempt;
+  const transceiver = talkTransceiver;
+  $("talk").disabled = true;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    log(`no microphone: ${err.name}: ${err.message}`, "bad");
+    $("talk").disabled = mine !== attempt;
+    return;
+  }
+  if (mine !== attempt) {
+    for (const track of stream.getTracks()) track.stop();
+    return;
+  }
+  mic = stream;
+  const track = stream.getAudioTracks()[0];
+  // Unplugged, or the permission taken back.
+  track.addEventListener("ended", () => { if (mic === stream) stopTalking(); });
+  await transceiver.sender.replaceTrack(track);
+  if (mine !== attempt) return;
+  $("talk").textContent = "Stop talking";
+  $("talk").disabled = false;
+  log(`talking: ${track.label || "microphone"}`, "good");
+}
+
+// Stops the microphone.
+function releaseMic() {
+  if (mic) for (const track of mic.getTracks()) track.stop();
+  mic = undefined;
+  $("talk").textContent = "Talk";
+}
+
+// Takes the microphone off the m-line, which ends the uplink, and frees
+// the camera's backchannel if this session holds it: the talker keeps it
+// until its session closes or backchannel/release, so without the release
+// no other viewer could talk while this one plays.
+async function stopTalking() {
+  const mine = attempt;
+  const transceiver = talkTransceiver;
+  const session = sessionId;
+  releaseMic();
+  if (!transceiver || !playing) return;
+  const { streamId } = playing;
+  await transceiver.sender.replaceTrack(null);
+  if (mine !== attempt) return;
+  log("talking stopped");
+  const got = await call({ type: "session/get", session_id: session });
+  if (mine !== attempt || !got.success || !got.result.backchannel.talker) return;
+  const released = await call({ type: "backchannel/release", stream_id: streamId });
+  if (released.success) log(`backchannel released from ${released.result.talker ?? "nobody"}`);
+}
+
+// The talk-back counters of session/get, which the worker pushes once per
+// second.
+function showTalkback(got) {
+  if (!got.success) return;
+  const b = got.result.backchannel;
+  if (!b.negotiated) return;
+  const holds = b.talker ? "holds the backchannel" : "does not hold the backchannel";
+  $("s-talk").textContent = `${b.codec}, ${holds}, ${b.packets_received} packets received, ${b.packets_dropped_busy} dropped busy, ${b.bytes_sent} bytes to the camera`;
+  $("s-talk").className = b.talker ? "good" : "";
 }
 
 // One inbound stream's jitter buffer over the last second: what it holds
@@ -561,6 +703,9 @@ function watchFirstFrame(mine) {
 
 async function stats() {
   if (!pc) return;
+  if (offerAccepted && talkTransceiver?.currentDirection === "sendonly") {
+    send({ type: "session/get", session_id: sessionId }, showTalkback);
+  }
   const report = await pc.getStats();
   let pair;
   const playout = {};
@@ -584,6 +729,11 @@ async function stats() {
       $("s-audio").textContent = `${name}, ${s.packetsReceived ?? 0} packets, ${s.packetsLost ?? 0} lost`;
       $("s-abuf").textContent = buffer(s);
       playout.audio = s.estimatedPlayoutTimestamp;
+    }
+    if (s.type === "outbound-rtp" && s.kind === "audio") {
+      const codec = s.codecId ? report.get(s.codecId) : undefined;
+      const name = codec ? `${codec.mimeType.replace("audio/", "")} ${codec.clockRate / 1000} kHz` : "?";
+      $("s-uplink").textContent = `${name}, ${s.packetsSent ?? 0} packets sent${mic ? "" : " (not talking)"}`;
     }
     if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") pair = s;
   });
@@ -612,12 +762,16 @@ function teardown(quiet) {
   if (pc) pc.close();
   pc = undefined;
   playing = undefined;
+  releaseMic();
+  talkTransceiver = undefined;
+  $("talk").disabled = true;
   $("play").disabled = !ws || ws.readyState !== WebSocket.OPEN;
   $("stop").disabled = true;
 }
 
 $("form").addEventListener("submit", (event) => { event.preventDefault(); play(); });
 $("stop").addEventListener("click", () => teardown(false));
+$("talk").addEventListener("click", () => (mic ? stopTalking() : startTalking()));
 // The orientation reaches the open session too, from its next frame, so
 // a change while playing only puts the stream again: no new session.
 $("orientation").addEventListener("change", () => {
@@ -627,12 +781,21 @@ $("orientation").addEventListener("change", () => {
   save();
   renderSaved();
   if (!playing) return;
-  const { streamId, url } = playing;
-  send({ type: "stream/put", stream_id: streamId, sources: [{ url }], orientation }, (result) => {
+  const { streamId, url, talkback } = playing;
+  send({ type: "stream/put", stream_id: streamId, sources: [source(url, talkback)], orientation }, (result) => {
     if (!result.success) return;
     log(`orientation ${orientation}: stream ${streamId} put again; the session turns from its next frame`);
     if (lastAnswer !== undefined) showCvo(lastAnswer);
   });
+});
+// The opt-in changes the source and the offer, so a change while playing
+// plays again.
+$("talkback").addEventListener("change", () => {
+  const entry = matching();
+  if (entry) entry.talkback = $("talkback").checked;
+  save();
+  renderSaved();
+  if (playing && $("form").reportValidity()) play();
 });
 // Picking a saved stream fills the fields and plays it.
 $("saved").addEventListener("change", () => {
@@ -644,6 +807,7 @@ $("saved").addEventListener("change", () => {
     cameraUrl = entry.url;
     showUrl();
     $("orientation").value = entry.orientation;
+    $("talkback").checked = entry.talkback;
     $("label").value = entry.label;
   }
   save();
@@ -654,7 +818,7 @@ $("saved").addEventListener("change", () => {
 $("save-entry").addEventListener("click", () => {
   const stream = $("stream").value.trim();
   if (!cameraUrl || !$("form").reportValidity()) return;
-  const fields = { label: $("label").value.trim(), stream, url: cameraUrl, orientation: $("orientation").value };
+  const fields = { label: $("label").value.trim(), stream, url: cameraUrl, orientation: $("orientation").value, talkback: $("talkback").checked };
   const entry = matching();
   if (entry) Object.assign(entry, fields);
   else entries.push({ id: `${Date.now().toString(36)}-${entries.length}`, ...fields });
