@@ -27,6 +27,12 @@ use tokio::sync::mpsc;
 
 use super::{BackchannelFormat, BackchannelPacket, Initial, Packetizer, backchannel_format};
 
+/// The option tag of the ONVIF backchannel, which a client sends in a
+/// `Require` header (RFC 2326 §12.32) to ask for it: ONVIF Streaming
+/// Specification §5.3.1. retina adds it to the `DESCRIBE` and to the
+/// backchannel's `SETUP`, by which the UDP relay knows that `SETUP`.
+pub const REQUIRE_TAG: &str = "www.onvif.org/ver20/backchannel";
+
 /// RFC 2326 §11.3.13: `551 Option not supported`, the answer ONVIF
 /// Streaming Specification §5.3.2.1 gives a server without the
 /// backchannel.

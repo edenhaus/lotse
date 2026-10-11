@@ -34,6 +34,9 @@ exclude_re = [
     "rtcp.rs:.*replace \\| with \\^ in Report::interleave$",
     # Only logs, rate-limited, why a receiver report did not leave.
     "replace UdpRelay::sent with \\(\\)$",
+    # Only logs that the backchannel's SETUP stays TCP interleaved; the request passes on unchanged
+    # through the arm after it all the same.
+    "delete match arm \"SETUP\" in UdpRelay::retina_wrote$",
     # Only picks whether the rate-limited unroutable warning is logged.
     "replace \\|\\| with && in Peers::route",
     "replace == with != in Peers::route",
