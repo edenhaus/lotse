@@ -100,10 +100,11 @@ pub enum SessionEvent {
     /// `backchannel` option), and the session cannot have it: the camera
     /// offers no backchannel, setting it up failed, it takes a codec
     /// talk-back cannot feed, or the talk-back m-line lists neither its
-    /// codec nor Opus. The message says which. Such a session is never
-    /// played without talk-back; on a stream that did not opt in, the
-    /// request is answered without it instead (the dedicated m-line
-    /// `inactive`, a `sendrecv` one send-only).
+    /// codec nor Opus (nor, for a G.711 backchannel, the other G.711
+    /// law, which talk-back converts). The message says which. Such a
+    /// session is never played without talk-back; on a stream that did
+    /// not opt in, the request is answered without it instead (the
+    /// dedicated m-line `inactive`, a `sendrecv` one send-only).
     #[schemars(title = "SessionEventClosed")]
     Closed {
         /// The stable code (`peer_closed`, `session_closed`,

@@ -1,5 +1,5 @@
 //! Two-way audio end to end: headless str0m viewers negotiate the dedicated talk-back m-line and send
-//! a real tone, Opus from libopus or PCMU, towards a camera whose
+//! a real tone, Opus from libopus or G.711 in either law, towards a camera whose
 //! backchannel is the fake source's.
 //!
 //! Two layers. The tone tests serve a worker in-process
@@ -147,9 +147,9 @@ fn tone_sample(n: u64, rate: u32, packet: u32) -> f64 {
 
 /// What a talking viewer's microphone encodes.
 enum MicCodec {
-    /// PCMU at 8 kHz with lotse-codec's G.711 (ITU-T G.711), as a browser
-    /// sends it natively.
-    Pcmu,
+    /// G.711 of this law at 8 kHz with lotse-codec's G.711 (ITU-T G.711),
+    /// as a browser sends it natively.
+    G711(Law),
     /// Opus at 48 kHz from libopus (RFC 6716), through lotse-codec's
     /// encoder: never a hand-written one.
     Opus(Box<Encoder>),
@@ -206,7 +206,11 @@ impl Mic {
     }
 
     fn pcmu() -> Self {
-        Self::new(MicCodec::Pcmu)
+        Self::new(MicCodec::G711(Law::Mu))
+    }
+
+    fn pcma() -> Self {
+        Self::new(MicCodec::G711(Law::A))
     }
 
     fn opus() -> Self {
@@ -216,7 +220,7 @@ impl Mic {
     /// The sampling rate of its timestamps.
     const fn rate(&self) -> u32 {
         match self.codec {
-            MicCodec::Pcmu => 8_000,
+            MicCodec::G711(_) => 8_000,
             MicCodec::Opus(_) => 48_000,
         }
     }
@@ -225,12 +229,11 @@ impl Mic {
     fn encode(&mut self) -> (Vec<u8>, u32) {
         let packet = self.index;
         match &mut self.codec {
-            MicCodec::Pcmu => {
+            MicCodec::G711(law) => {
+                let law = *law;
                 let first = u64::from(packet) * 160;
                 let payload = (first..first + 160)
-                    .map(|n| {
-                        Law::Mu.encode((tone_sample(n, 8_000, packet) * 32_767.0).round() as i16)
-                    })
+                    .map(|n| law.encode((tone_sample(n, 8_000, packet) * 32_767.0).round() as i16))
                     .collect();
                 (payload, 160)
             }
@@ -944,6 +947,54 @@ async fn rfc3551_4_5_14_a_pcmu_tone_passes_through_to_a_pcmu_camera_within_10_ms
     assert!(!after.marker, "a lost packet does not end the spurt");
     let median = check_latency(&latencies);
     println!("PCMU to PCMU: uplink latency per onset {latencies:?}, median {median:?}");
+}
+
+/// The cross-law rows: a browser that leaves the camera's G.711 law out
+/// of its talk-back m-line, offering the other law and Opus, sends the
+/// other law (RFC 7874 §3 has every browser implement both), and the
+/// reverse chain converts each code by G.711's tables (ITU-T G.711
+/// Tables 3 and 4): the camera gets its own law, code for code the
+/// table's image of what the browser sent, as the tone, in time.
+async fn cross_law(camera: &str, offered: &str, mic: Mic, from: Law, to: Law) -> Duration {
+    let codecs =
+        format!("a=rtpmap:111 opus/48000/2\na=fmtp:111 minptime=10;useinbandfec=1\n{offered}");
+    let run = tone_run(camera, Some(&codecs), mic).await;
+    assert_eq!(
+        run.pt,
+        from.payload_type(),
+        "the browser sends its own law (RFC 3551 Table 4)"
+    );
+    assert_eq!(run.talkback.as_deref(), Some(from.codec().name()));
+    let latencies = check_tone(&run.frames(), &run.mic, to);
+    let converted = run
+        .captured
+        .iter()
+        .zip(&run.mic.payloads)
+        .filter(|(frame, sent)| {
+            let table: Vec<u8> = sent.iter().map(|&code| to.transcode(from, code)).collect();
+            *frame.packet.payload == table[..]
+        })
+        .count();
+    assert_eq!(
+        converted,
+        run.mic.payloads.len(),
+        "frames converted code for code"
+    );
+    check_latency(&latencies)
+}
+
+/// PCMU from the browser to a PCMA camera (G.711 Table 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g711_table_3_a_pcmu_tone_reaches_a_pcma_camera_converted_within_10_ms() {
+    let median = cross_law("pcma", "a=rtpmap:0 PCMU/8000", Mic::pcmu(), Law::Mu, Law::A).await;
+    println!("PCMU to PCMA: uplink latency median {median:?}");
+}
+
+/// PCMA from the browser to a PCMU camera (G.711 Table 4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g711_table_4_a_pcma_tone_reaches_a_pcmu_camera_converted_within_10_ms() {
+    let median = cross_law("pcmu", "a=rtpmap:8 PCMA/8000", Mic::pcma(), Law::A, Law::Mu).await;
+    println!("PCMA to PCMU: uplink latency median {median:?}");
 }
 
 // ---------------------------------------------------------------------

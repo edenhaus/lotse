@@ -8,10 +8,12 @@
 //! sends.
 //!
 //! The chain is [`Decoder`] (Opus at 8 kHz: libopus band-limits, so no
-//! resampler follows) or a G.711 decode → [`Law::encode`] in the camera's
-//! law → the frame being filled (one byte per sample) → the camera's
-//! frames. When the browser already sends the camera's law the codes pass
-//! through untouched; only the framing and the RTP header change. Nothing
+//! resampler follows) → [`Law::encode`] in the camera's law, or for G.711
+//! input [`Law::transcode`] to the camera's law (G.711's conversion
+//! tables, code by code, when the browser sends the other law) → the frame
+//! being filled (one byte per sample) → the camera's frames. When the
+//! browser already sends the camera's law the codes pass through
+//! untouched; only the framing and the RTP header change. Nothing
 //! waits but a frame for its last sample: no playout buffer, no pacing, no
 //! timer. The frames follow the input's timing, so the camera never gets
 //! audio earlier than it arrived, nor more of it. The camera absorbs the
@@ -44,8 +46,9 @@
 //!   spurt would put it ahead of that spurt's audio, late and in a burst.
 //!   Stopping the task drops it too.
 //!
-//! Implements ITU-T G.711 at the RTP clock of RFC 3551 §4.5.14 (8 kHz,
-//! static payload types of Table 4), with the marker on the first packet of
+//! Implements ITU-T G.711 (its laws, and Tables 3 and 4 between them) at
+//! the RTP clock of RFC 3551 §4.5.14 (8 kHz, static payload types of
+//! Table 4), with the marker on the first packet of
 //! a talkspurt (RFC 3551 §4.1) and timestamps that advance with the
 //! sampling clock across silence and loss (RFC 3550 §5.1); Opus input at
 //! the 48 kHz clock of RFC 7587 §4.1, its losses run through the decoder's
@@ -1135,16 +1138,51 @@ mod tests {
         assert_eq!(sent(&out), fed(&input[..3]));
     }
 
+    /// Every 8-bit code five times over, in 20 ms packets: 8 packets of
+    /// 160 samples, code `n % 256` at sample `n`.
+    fn every_code() -> Vec<Bytes> {
+        let codes: Vec<u8> = (0..=u8::MAX).cycle().take(8 * 160).collect();
+        codes.chunks(160).map(Bytes::copy_from_slice).collect()
+    }
+
     #[tokio::test]
-    async fn pcmu_is_converted_for_a_pcma_camera() {
+    async fn g711_table_3_converts_pcmu_from_the_browser_for_a_pcma_camera() {
         let mut rig = Rig::start(&Codec::Pcmu, Law::A, FrameSize::DEFAULT);
-        let input = codes(3);
-        let out = rig.feed(&input, 160, &[], ms(100)).await;
-        assert_eq!(out.len(), 3);
-        for (packet, fed) in out.iter().zip(&input) {
-            assert_eq!(packet.rtp.pt, 8, "RFC 3551 Table 4");
-            let expected: Vec<u8> = fed.iter().map(|c| Law::A.transcode(Law::Mu, *c)).collect();
-            assert_eq!(&packet.payload[..], &expected[..]);
+        let input = every_code();
+        let out = rig.feed(&input, 160, &[], ms(200)).await;
+        assert_eq!(out.len(), 8, "a frame per packet, each as it arrives");
+        assert!(out.iter().all(|p| p.rtp.pt == 8), "RFC 3551 Table 4");
+        let (fed, sent) = (fed(&input), sent(&out));
+        let expected: Vec<u8> = fed.iter().map(|c| Law::A.transcode(Law::Mu, *c)).collect();
+        assert_eq!(sent, expected, "sample for sample");
+        // Full scale (codes 0x00 and 0x80) and the two zeros (0x7f and
+        // 0xff), at their places in the first packet; 0x20 is where Table 3
+        // and the path through linear part.
+        for (code, a) in [
+            (0x00, 0x2a),
+            (0x80, 0xaa),
+            (0x7f, 0x55),
+            (0xff, 0xd5),
+            (0x20, 0x0a),
+        ] {
+            assert_eq!(sent[code], a, "μ {code:#04x}");
+        }
+    }
+
+    #[tokio::test]
+    async fn g711_table_4_converts_pcma_from_the_browser_for_a_pcmu_camera() {
+        let mut rig = Rig::start(&Codec::Pcma, Law::Mu, FrameSize::DEFAULT);
+        let input = every_code();
+        let out = rig.feed(&input, 160, &[], ms(200)).await;
+        assert_eq!(out.len(), 8, "a frame per packet, each as it arrives");
+        assert!(out.iter().all(|p| p.rtp.pt == 0), "RFC 3551 Table 4");
+        let (fed, sent) = (fed(&input), sent(&out));
+        let expected: Vec<u8> = fed.iter().map(|c| Law::Mu.transcode(Law::A, *c)).collect();
+        assert_eq!(sent, expected, "sample for sample");
+        // Full scale (0x2a and 0xaa) and the quietest steps (0x55 and 0xd5,
+        // which Table 4 takes to μ-law's second step, not to zero).
+        for (code, mu) in [(0x2a, 0x00), (0xaa, 0x80), (0x55, 0x7e), (0xd5, 0xfe)] {
+            assert_eq!(sent[code], mu, "A {code:#04x}");
         }
     }
 

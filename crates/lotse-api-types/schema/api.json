@@ -1659,7 +1659,7 @@
           "type": "object"
         },
         {
-          "description": "The last event; the subscription ends with it.\n\n`backchannel_unavailable`: the offer requests two-way audio (an\naudio m-line the browser offers `sendonly` or `sendrecv`) on a\nstream that opted in to the camera's backchannel (an RTSP source's\n`backchannel` option), and the session cannot have it: the camera\noffers no backchannel, setting it up failed, it takes a codec\ntalk-back cannot feed, or the talk-back m-line lists neither its\ncodec nor Opus. The message says which. Such a session is never\nplayed without talk-back; on a stream that did not opt in, the\nrequest is answered without it instead (the dedicated m-line\n`inactive`, a `sendrecv` one send-only).",
+          "description": "The last event; the subscription ends with it.\n\n`backchannel_unavailable`: the offer requests two-way audio (an\naudio m-line the browser offers `sendonly` or `sendrecv`) on a\nstream that opted in to the camera's backchannel (an RTSP source's\n`backchannel` option), and the session cannot have it: the camera\noffers no backchannel, setting it up failed, it takes a codec\ntalk-back cannot feed, or the talk-back m-line lists neither its\ncodec nor Opus (nor, for a G.711 backchannel, the other G.711\nlaw, which talk-back converts). The message says which. Such a\nsession is never played without talk-back; on a stream that did\nnot opt in, the request is answered without it instead (the\ndedicated m-line `inactive`, a `sendrecv` one send-only).",
           "properties": {
             "code": {
               "description": "The stable code (`peer_closed`, `session_closed`,\n`backchannel_unavailable`, ...).",

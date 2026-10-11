@@ -11,7 +11,8 @@
 //! compare case-insensitively), RFC 8829 §5.3.1 (an answer's direction is
 //! the offered one reversed, intersected with what the answerer does),
 //! RFC 3264 §6.1 (an m-line answered `inactive` keeps its place and lists
-//! formats of the offer).
+//! formats of the offer; the answer's first format is the one sent),
+//! RFC 7874 §3 (a WebRTC endpoint implements Opus, PCMA and PCMU).
 
 use lotse_core::codec::{Codec, CodecFamily};
 
@@ -141,6 +142,18 @@ fn lists(section: &Section<'_>, family: CodecFamily) -> bool {
         })
 }
 
+/// The other G.711 law of `family` (ITU-T G.711; PCMU and PCMA at 8 kHz,
+/// the static payload types 0 and 8 of RFC 3551 Table 4, §4.5.14), which
+/// talk-back converts to the backchannel's law; `None` for any other
+/// family.
+const fn other_law(family: CodecFamily) -> Option<CodecFamily> {
+    match family {
+        CodecFamily::Pcmu => Some(CodecFamily::Pcma),
+        CodecFamily::Pcma => Some(CodecFamily::Pcmu),
+        _ => None,
+    }
+}
+
 /// Talk-back as the answer has it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Talkback<'a> {
@@ -187,10 +200,16 @@ impl<'a> AudioPlan<'a> {
     /// `sendonly` (the dedicated one), or else on the first it offers
     /// `sendrecv`, the downlink m-line as a rule, never on both: a session
     /// has one uplink. Either requests it (RFC 8866 §6.7: the browser
-    /// offers to send there). It takes the
-    /// backchannel's codec when that m-line lists it (G.711 from the
-    /// browser, no transcode), else Opus; a backchannel in another codec
-    /// is one no uplink chain feeds.
+    /// offers to send there). It takes, of the codecs that m-line lists,
+    /// the backchannel's own (its codes pass through), else for a G.711
+    /// backchannel the other law (converted code by code, ITU-T G.711
+    /// Tables 3 and 4), else Opus (decoded and encoded in the
+    /// backchannel's law, or forwarded as received to an Opus one): a
+    /// browser implements all three (RFC 7874 §3), so a G.711 camera keeps
+    /// G.711 from a browser that leaves its law out. A backchannel in
+    /// another codec is one no uplink chain feeds. The answer names the
+    /// codec first on that m-line, which the browser sends (RFC 3264
+    /// §6.1).
     pub(crate) fn new(offer: &'a str, audio: Option<&Codec>, backchannel: Option<&Codec>) -> Self {
         let sdp = Sdp::parse(offer);
         let lines: Vec<(&Section<'a>, &'a str, Direction)> = sdp
@@ -224,8 +243,9 @@ impl<'a> AudioPlan<'a> {
                 Talkback::Off("the backchannel takes a codec talk-back cannot feed")
             }
             (Some(((section, mid, _), dedicated)), Some(family)) => {
-                match [family, CodecFamily::Opus]
+                match [Some(family), other_law(family), Some(CodecFamily::Opus)]
                     .into_iter()
+                    .flatten()
                     .find(|family| lists(section, *family))
                 {
                     Some(codec) => Talkback::Negotiated {
@@ -464,37 +484,125 @@ mod tests {
         assert_eq!(plan.codecs(), EVERY_CODEC);
     }
 
+    /// [`DEDICATED`] with its talk-back m-line listing only `codecs`
+    /// (`opus`, `PCMU`, `PCMA`, `G722`), in that order.
+    fn talking_in(codecs: &[&str]) -> String {
+        let (pts, rtpmaps): (Vec<&str>, Vec<String>) = codecs
+            .iter()
+            .map(|codec| {
+                let (pt, encoding) = match *codec {
+                    "opus" => ("111", "opus/48000/2"),
+                    "PCMU" => ("0", "PCMU/8000"),
+                    "PCMA" => ("8", "PCMA/8000"),
+                    _ => ("9", "G722/8000"),
+                };
+                (pt, format!("a=rtpmap:{pt} {encoding}\r\n"))
+            })
+            .unzip();
+        // The talk-back m-line is the offer's last.
+        let (before, _) = DEDICATED
+            .split_once("m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2")
+            .unwrap();
+        format!(
+            "{before}m=audio 9 UDP/TLS/RTP/SAVPF {}\r\na=mid:2\r\na=sendonly\r\n{}",
+            pts.join(" "),
+            rtpmaps.concat()
+        )
+    }
+
+    /// The codec talk-back is received in on the dedicated m-line for a
+    /// backchannel in `camera` when that m-line lists `codecs`, or why it
+    /// is off.
+    fn talkback_for(camera: &Codec, codecs: &[&str]) -> Result<CodecFamily, &'static str> {
+        let offer = talking_in(codecs);
+        let talkback =
+            AudioPlan::new(&offer, Some(&Codec::Opus { channels: 2 }), Some(camera)).talkback;
+        if let Talkback::Off(reason) = talkback {
+            return Err(reason);
+        }
+        EVERY_CODEC
+            .into_iter()
+            .find(|codec| talkback == negotiated("2", *codec, true))
+            .ok_or("not on the dedicated m-line")
+    }
+
     #[test]
-    fn talk_back_takes_the_backchannels_codec_else_opus_else_none() {
-        let pcmu = Codec::Pcmu;
-        // An Opus backchannel: Opus, forwarded without a transcode.
-        let plan = AudioPlan::new(DEDICATED, Some(&pcmu), Some(&Codec::Opus { channels: 2 }));
+    fn rfc3264_6_1_rfc7874_3_a_g711_camera_takes_its_law_then_the_other_law_then_opus() {
+        const NONE: &str = "the talk-back m-line lists neither the backchannel's codec nor Opus";
+        for (camera, law, other, other_name) in [
+            (Codec::Pcmu, CodecFamily::Pcmu, CodecFamily::Pcma, "PCMA"),
+            (Codec::Pcma, CodecFamily::Pcma, CodecFamily::Pcmu, "PCMU"),
+        ] {
+            let name = encoding_name(law).unwrap();
+            // The camera's law first, wherever the offer puts it.
+            for codecs in [
+                &["opus", "PCMU", "PCMA"][..],
+                &["PCMA", "PCMU", "opus"],
+                &[name, "opus"],
+                &[name],
+            ] {
+                assert_eq!(
+                    talkback_for(&camera, codecs),
+                    Ok(law),
+                    "{camera:?} {codecs:?}"
+                );
+            }
+            // Without it, the other law (ITU-T G.711 Tables 3 and 4), still
+            // before Opus.
+            for codecs in [
+                &["opus", other_name][..],
+                &[other_name, "opus"],
+                &[other_name],
+            ] {
+                assert_eq!(
+                    talkback_for(&camera, codecs),
+                    Ok(other),
+                    "{camera:?} {codecs:?}"
+                );
+            }
+            // Opus only when neither law is offered.
+            for codecs in [&["opus"][..], &["G722", "opus"]] {
+                assert_eq!(
+                    talkback_for(&camera, codecs),
+                    Ok(CodecFamily::Opus),
+                    "{camera:?} {codecs:?}"
+                );
+            }
+            // Nothing the uplink chain takes: off, for the same reason.
+            assert_eq!(talkback_for(&camera, &["G722"]), Err(NONE), "{camera:?}");
+        }
+        // The other law goes first on the talk-back m-line, beside the
+        // downlink's Opus.
+        let offer = talking_in(&["opus", "PCMU"]);
+        let plan = AudioPlan::new(
+            &offer,
+            Some(&Codec::Opus { channels: 2 }),
+            Some(&Codec::Pcma),
+        );
+        assert_eq!(plan.codecs(), [CodecFamily::Pcmu, CodecFamily::Opus]);
+        assert_eq!(plan.answer(Some("2")), Direction::RecvOnly);
+        let g722 = talking_in(&["G722"]);
+        let plan = AudioPlan::new(&g722, None, Some(&Codec::Pcma));
+        assert_eq!(plan.answer(Some("2")), Direction::Inactive);
+        assert_eq!(other_law(CodecFamily::Opus), None);
+        assert_eq!(other_law(CodecFamily::G722), None);
+    }
+
+    #[test]
+    fn rfc7587_an_opus_camera_takes_opus_only_and_the_off_reasons_stay() {
+        let opus = Codec::Opus { channels: 2 };
+        // An Opus backchannel: Opus, forwarded without a transcode; G.711
+        // from the browser is never taken for it.
+        let plan = AudioPlan::new(DEDICATED, Some(&Codec::Pcmu), Some(&opus));
         assert_eq!(plan.talkback, negotiated("2", CodecFamily::Opus, true));
         assert_eq!(plan.codecs(), [CodecFamily::Opus, CodecFamily::Pcmu]);
-        // Talk-back in the stream audio's own codec: listed once.
-        let plan = AudioPlan::new(DEDICATED, Some(&pcmu), Some(&pcmu));
-        assert_eq!(plan.codecs(), [CodecFamily::Pcmu]);
-        // A talk-back m-line without PCMA: Opus, transcoded to PCMA.
-        let only_opus = DEDICATED.replacen(
-            "m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2\r\na=sendonly\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000",
-            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:2\r\na=sendonly\r\na=rtpmap:111 opus/48000/2",
-            1,
-        );
-        assert_ne!(only_opus, DEDICATED);
-        let plan = AudioPlan::new(&only_opus, Some(&pcmu), Some(&Codec::Pcma));
-        assert_eq!(plan.talkback, negotiated("2", CodecFamily::Opus, true));
-        // Neither the backchannel's codec nor Opus: off.
-        let only_pcmu = only_opus.replace(
-            "111\r\na=mid:2\r\na=sendonly\r\na=rtpmap:111 opus/48000/2",
-            "0\r\na=mid:2\r\na=sendonly\r\na=rtpmap:0 PCMU/8000",
-        );
-        assert_ne!(only_pcmu, only_opus);
-        let plan = AudioPlan::new(&only_pcmu, Some(&pcmu), Some(&Codec::Pcma));
         assert_eq!(
-            plan.talkback,
-            Talkback::Off("the talk-back m-line lists neither the backchannel's codec nor Opus")
+            talkback_for(&opus, &["PCMU", "PCMA"]),
+            Err("the talk-back m-line lists neither the backchannel's codec nor Opus")
         );
-        assert_eq!(plan.answer(Some("2")), Direction::Inactive);
+        // Talk-back in the stream audio's own codec: listed once.
+        let plan = AudioPlan::new(DEDICATED, Some(&Codec::Pcmu), Some(&Codec::Pcmu));
+        assert_eq!(plan.codecs(), [CodecFamily::Pcmu]);
         // A backchannel in a codec the uplink chain cannot produce.
         for codec in [
             Codec::G722,
@@ -504,13 +612,19 @@ mod tests {
                 pps: None,
             },
         ] {
-            let plan = AudioPlan::new(DEDICATED, Some(&pcmu), Some(&codec));
+            let plan = AudioPlan::new(DEDICATED, Some(&Codec::Pcmu), Some(&codec));
             assert_eq!(
                 plan.talkback,
                 Talkback::Off("the backchannel takes a codec talk-back cannot feed"),
                 "{codec:?}"
             );
         }
+        // No backchannel at all.
+        let plan = AudioPlan::new(DEDICATED, Some(&Codec::Pcmu), None);
+        assert_eq!(
+            plan.talkback,
+            Talkback::Off("the camera offers no backchannel")
+        );
     }
 
     #[test]

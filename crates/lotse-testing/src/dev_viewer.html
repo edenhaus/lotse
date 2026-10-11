@@ -489,7 +489,8 @@ async function play() {
   }
   if (talkback) {
     // Talk-back goes up on a dedicated send-only m-line, which the daemon
-    // answers recvonly in the backchannel's codec or Opus (RFC 3264 §6.1)
+    // answers recvonly in the backchannel's codec, else for a G.711 camera
+    // the other G.711 law (converted), else Opus (RFC 3264 §6.1)
     // from the backchannel the live source offers: the stream opted in, so
     // without one the session closes with backchannel_unavailable rather
     // than playing without talk-back. An offer right after a put that
