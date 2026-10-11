@@ -65,9 +65,6 @@ use crate::sendmsg;
 /// uplink only, so small.
 const INBOUND_CAPACITY: usize = 256;
 
-/// How long a session waits for the source to declare its tracks.
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// How long `close_all` waits for the session tasks.
 const CLOSE_BUDGET: Duration = Duration::from_secs(1);
 
@@ -663,6 +660,10 @@ fn egress_source(pinned: bool, source: SocketAddr) -> Option<IpAddr> {
 /// closes the session first. Returns the close to report, if any. Relay
 /// candidates that arrive meanwhile wait in `relays` for the engine; an
 /// orientation change goes into the spec the answer reads.
+///
+/// No deadline of its own: the source's attempt is bounded by its own
+/// deadlines and the runner's ready timeout, and the supervisor closes
+/// the session with the source's error when the attempt fails.
 async fn wait_ready(
     ctx: &mut SessionCtx,
     control: &mut mpsc::Receiver<Control>,
@@ -672,8 +673,6 @@ async fn wait_ready(
     if *ready.borrow_and_update() {
         return None;
     }
-    let timeout = ctx.clock.sleep(READY_TIMEOUT);
-    tokio::pin!(timeout);
     loop {
         tokio::select! {
             // The session holds the track set, so its sender outlives this
@@ -698,9 +697,6 @@ async fn wait_ready(
                 }
                 None => return Some(("shutting_down", "the worker is stopping".to_owned())),
             },
-            () = &mut timeout => {
-                return Some(("source_not_live", format!("the source declared no tracks within {} s", READY_TIMEOUT.as_secs())));
-            }
         }
     }
 }
@@ -1677,22 +1673,23 @@ mod tests {
         );
     }
 
+    /// The supervisor closes a waiting session when its source fails; the
+    /// session keeps no deadline of its own.
     #[tokio::test]
-    async fn a_source_that_declares_no_tracks_within_the_ready_timeout_closes_the_session() {
+    async fn a_session_waits_for_the_tracks_however_long_the_source_takes() {
         let (mut rig, session) = session(Script::default(), false, false);
         let mut session = pin!(session);
         assert!(poll_once(&mut session).await.is_pending());
-        rig.clock
-            .advance(READY_TIMEOUT.checked_sub(Duration::from_millis(1)).unwrap());
+        rig.clock.advance(Duration::from_secs(3600));
         assert!(poll_once(&mut session).await.is_pending());
-        rig.clock.advance(Duration::from_millis(1));
-        assert!(poll_once(&mut session).await.is_ready());
+        assert!(rig.events().is_empty());
+        rig.publisher.ready();
+        assert!(poll_once(&mut session).await.is_pending());
         assert_eq!(
             rig.events(),
-            [closed(
-                "source_not_live",
-                "the source declared no tracks within 10 s"
-            )]
+            [IpcEvent::Answer {
+                sdp: "answer".into()
+            }]
         );
     }
 

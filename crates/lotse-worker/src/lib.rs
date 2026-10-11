@@ -1284,7 +1284,7 @@ mod tests {
     /// a fake source without `ready_after_ms` no fake time, so a test that
     /// steps the clock freely waits here first: stepped before the source
     /// declares its tracks, the clock outruns a worker a loaded machine
-    /// starves and passes the sessions' 10 s ready timeout.
+    /// starves and passes the runner's ready timeout.
     async fn until_live(h: &mut Harness) {
         while !matches!(h.next().await, ToSupervisor::SourceState(SourceState::Live)) {}
     }
@@ -1323,10 +1323,10 @@ mod tests {
         h.tx.send_msg(&ToWorker::OpenSession(spec), &[])
             .await
             .unwrap();
-        // The source's sleep starts when the runner gets to it, the
-        // session's 10 s ready timeout when the session task does: step the
+        // The source's sleep starts when the runner gets to it: step the
         // clock until the answer, paced in real time so a busy machine
-        // cannot run the clock past the timeout before the runner starts.
+        // cannot run the clock past the runner's ready timeout before the
+        // source declares its tracks.
         let mut steps = 0;
         let answered = loop {
             steps += 1;
@@ -2587,7 +2587,11 @@ mod tests {
             .await
             .unwrap();
         // A session still waiting for tracks has sent no answer, so no
-        // browser can know its TCP candidate: closed.
+        // browser can know its TCP candidate: closed. Its source is never
+        // granted a connect, so it never declares them.
+        h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "null")), &[])
+            .await
+            .unwrap();
         h.tx.send_msg(&ToWorker::OpenSession(session_spec("waiting")), &[])
             .await
             .unwrap();
@@ -2604,11 +2608,21 @@ mod tests {
             .unwrap();
         drop(fd);
         assert!(closed_by_daemon(browser).await);
-        // The session ends; its task is gone: closed.
-        h.clock.advance(Duration::from_secs(10));
+        // The supervisor closes the session, whose task is then gone:
+        // closed.
+        h.tx.send_msg(
+            &ToWorker::CloseSession {
+                session_id: "waiting".into(),
+                code: "session_closed".into(),
+                message: String::new(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(
             h.next_closed().await,
-            ("waiting".to_owned(), "source_not_live".to_owned())
+            ("waiting".to_owned(), "session_closed".to_owned())
         );
         let (browser, fd, peer) = tcp_pair();
         h.tx.send_msg(&ice_tcp("ufrag-waiting", peer), &[fd.as_fd()])
@@ -2803,6 +2817,17 @@ mod tests {
             h.next_closed().await,
             ("nosource".to_owned(), "source_not_live".to_owned())
         );
+        // A stats tick before a source runs pushes only the router's
+        // counters, to the log.
+        h.clock.advance(STATS_INTERVAL);
+        let deadline = SystemClock.now() + Duration::from_secs(10);
+        while logs
+            .lines(Level::TRACE, "session router counters")
+            .is_empty()
+        {
+            assert!(SystemClock.now() < deadline, "no stats tick");
+            tokio::task::yield_now().await;
+        }
         h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "null")), &[])
             .await
             .unwrap();

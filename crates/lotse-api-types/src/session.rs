@@ -92,12 +92,21 @@ pub enum SessionEvent {
         /// For humans.
         message: String,
     },
-    /// The last event; the subscription ends with it.
+    /// The last event; the subscription ends with it. A session still
+    /// waiting for its answer has no deadline of its own: it waits while
+    /// its source connects, and closes with the source's error as soon as
+    /// the attempt fails, at once when the offer reaches a source that has
+    /// already failed. An answered session rides a reconnect instead.
     #[schemars(title = "SessionEventClosed")]
     Closed {
-        /// The stable code (`peer_closed`, `session_closed`, ...).
+        /// The stable code (`peer_closed`, `session_closed`, ...). Before
+        /// the answer, a failed source closes the session with its error's
+        /// code, the one `stream/get` reports as `last_error`:
+        /// `source_unreachable`, `source_auth_failed`, `source_timeout`,
+        /// `source_protocol_error`, `source_ended` or `worker_crashed`.
         code: String,
-        /// For humans.
+        /// For humans; for a source's error, its text as `last_error`
+        /// carries it, never the source's credentials.
         message: String,
     },
 }

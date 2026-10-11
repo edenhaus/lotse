@@ -1907,6 +1907,131 @@ mod tests {
         drop((owned, demand_tx));
     }
 
+    /// Stream `front` on connection `c1` from `url`, as the registry
+    /// keeps them, with session `s1` waiting for its answer on it; the
+    /// session's events go to the receiver returned.
+    fn waiting_session(shared: &Shared, url: &str) -> mpsc::Receiver<lotse_api::Event> {
+        use lotse_api_types::stream::{AudioMode, Orientation};
+
+        use crate::registry::{ConnectionEntry, ConnectionKey, StreamEntry, StreamSource};
+
+        let url: lotse_core::source_url::SourceUrl = url.parse().unwrap();
+        let mut state = shared.lock();
+        state.streams.insert(
+            "front".into(),
+            StreamEntry {
+                sources: vec![StreamSource {
+                    url: url.clone(),
+                    options: serde_json::Map::new(),
+                    protocol: "fake",
+                    connection: "c1".into(),
+                }],
+                preload: false,
+                audio: AudioMode::Auto,
+                orientation: Orientation::NoTransform,
+                created: UNIX_EPOCH,
+            },
+        );
+        state.connections.insert(
+            "c1".into(),
+            ConnectionEntry {
+                key: ConnectionKey {
+                    url,
+                    options: serde_json::json!({}),
+                },
+                port: None,
+                loopback_relay: false,
+                demand: watch::channel(1).0,
+                snapshot: ConnectionSnapshot::idle(UNIX_EPOCH),
+                streams: ["front".to_owned()].into(),
+                commands: mpsc::channel(4).0,
+            },
+        );
+        let (events, rx) = mpsc::channel(4);
+        state.sessions.insert(
+            "s1".into(),
+            SessionEntry::new(
+                1,
+                "front".into(),
+                "c1".into(),
+                "us1".into(),
+                (ConnectionId(1), 1, events),
+                UNIX_EPOCH,
+            ),
+        );
+        rx
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_closes_the_waiting_session_with_its_error_and_no_credentials() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = Driver::new(
+            DriverSpec {
+                connection_id: "c1".into(),
+                url: "fake://admin:hunter2@cam.example/".into(),
+                options: "{}".into(),
+                host: "cam.example".into(),
+                port: None,
+                loopback_relay: false,
+            },
+            Arc::clone(&shared),
+            demand,
+            mpsc::channel(4),
+            ConnectionConfig::default(),
+        );
+        let mut events = waiting_session(&shared, "fake://admin:hunter2@cam.example/");
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        driver.publish();
+        assert!(shared.lock().sessions.contains_key("s1"), "connecting");
+        driver
+            .handle(Wake::Resolved(Err("no such host".into())))
+            .await;
+        driver.publish();
+        let closed = events.try_recv().expect("closed at once").payload;
+        assert_eq!(
+            closed,
+            serde_json::json!({ "type": "closed", "code": "source_unreachable",
+                "message": "source unreachable: resolving cam.example: no such host" })
+        );
+        let text = closed.to_string();
+        assert!(
+            !text.contains("admin") && !text.contains("hunter2"),
+            "{text}"
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(shared.lock().sessions.is_empty());
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_cannot_start_closes_the_waiting_session_with_worker_crashed() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/nonexistent/lotse", clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let mut events = waiting_session(&shared, "fake://127.0.0.1/");
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        driver
+            .handle(Wake::Resolved(Ok(vec!["127.0.0.1:1".parse().unwrap()])))
+            .await;
+        assert_eq!(driver.machine.state(), ConnectionState::Restarting);
+        driver.publish();
+        assert_eq!(
+            events.try_recv().expect("closed at once").payload,
+            serde_json::json!({ "type": "closed", "code": "worker_crashed",
+                "message": "worker crashed" })
+        );
+        assert!(shared.lock().sessions.is_empty());
+        drop((driver, demand_tx));
+    }
+
     #[tokio::test]
     async fn a_source_too_large_for_the_channel_still_leaves_the_worker_timed() {
         let dir = private_dir("driver-too-large");

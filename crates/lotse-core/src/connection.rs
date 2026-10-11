@@ -51,6 +51,17 @@ impl ConnectionState {
             Self::Restarting => "restarting",
         }
     }
+
+    /// Whether the state follows a failure: the live source dropped
+    /// (`Reconnecting`), an attempt failed (`Backoff`) or the worker
+    /// crashed (`Restarting`). The machine's last error then says why; in
+    /// any other state it is stale, from an attempt before the current one.
+    pub const fn failed(self) -> bool {
+        match self {
+            Self::Reconnecting | Self::Backoff | Self::Restarting => true,
+            Self::Idle | Self::Connecting | Self::Live | Self::Draining => false,
+        }
+    }
 }
 
 /// The last thing that went wrong on a connection.
@@ -420,6 +431,23 @@ mod tests {
         assert_eq!(source.code(), "source_timeout");
         assert_eq!(source.to_string(), "source timed out: stall");
         assert_eq!(ConnectionConfig::default().linger, DEFAULT_LINGER);
+    }
+
+    #[test]
+    fn only_the_states_after_a_failure_are_failed() {
+        let failed: Vec<S> = [
+            S::Idle,
+            S::Connecting,
+            S::Live,
+            S::Reconnecting,
+            S::Backoff,
+            S::Draining,
+            S::Restarting,
+        ]
+        .into_iter()
+        .filter(|s| s.failed())
+        .collect();
+        assert_eq!(failed, [S::Reconnecting, S::Backoff, S::Restarting]);
     }
 
     #[test]

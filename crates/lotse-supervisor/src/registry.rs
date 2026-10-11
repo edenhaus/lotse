@@ -118,6 +118,16 @@ impl ConnectionSnapshot {
             stats: None,
         }
     }
+
+    /// The error a session waiting for its answer closes with: the last
+    /// error while the state follows a failure
+    /// ([`ConnectionState::failed`]). In any other state the last error is
+    /// stale (an idle or connecting connection keeps the one of its
+    /// previous attempt), and a session waits for the outcome of the
+    /// attempt under way or the one its offer starts.
+    pub(crate) fn failure(&self) -> Option<&ConnectionError> {
+        self.last_error.as_ref().filter(|_| self.state.failed())
+    }
 }
 
 /// The worker process running a connection.
@@ -221,6 +231,9 @@ pub(crate) enum CloseBy {
     /// The owner's `unsubscribe`: the worker is told, and the `closed`
     /// event is returned for the server to send before the result.
     Unsubscribe,
+    /// An offer to a connection that already failed: the session never
+    /// went to the driver, so only the owner hears of it.
+    Offer,
     /// The worker is gone: only the owner hears of it.
     WorkerGone,
 }
@@ -416,7 +429,7 @@ impl State {
         by: CloseBy,
     ) -> Option<Event> {
         let mut entry = self.finish_session(session_id)?;
-        if by != CloseBy::WorkerGone
+        if !matches!(by, CloseBy::WorkerGone | CloseBy::Offer)
             && let Some(connection) = self.connections.get(&entry.connection)
             && connection
                 .commands
@@ -459,6 +472,61 @@ impl State {
             .collect();
         for id in ids {
             let _event = self.close_session(&id, code, message, by);
+        }
+    }
+
+    /// Closes session `session_id`, `entry`, at its offer with `error`:
+    /// its connection already failed (in `connection_state`), so the offer
+    /// never went to the driver and the owner alone hears of it
+    /// ([`CloseBy::Offer`]).
+    pub(crate) fn close_offer(
+        &mut self,
+        session_id: &str,
+        entry: SessionEntry,
+        error: &ConnectionError,
+        connection_state: ConnectionState,
+    ) {
+        tracing::info!(
+            event = "session_source_failed",
+            session.id = session_id,
+            stream.id = %entry.stream_id,
+            connection.id = %entry.connection,
+            connection.state = connection_state.name(),
+            error.code = error.code(),
+            error = %error,
+            reason = "the offer reached a connection whose source already failed",
+            "offer closed at once with its source's error"
+        );
+        self.sessions.insert(session_id.to_owned(), entry);
+        let _event =
+            self.close_session(session_id, error.code(), &error.to_string(), CloseBy::Offer);
+    }
+
+    /// Closes every session of connection `connection` that has no answer
+    /// yet with `error`, the failure its connection just reported: its
+    /// code is the `closed` event's, its text the message (the text
+    /// `stream/get`'s `last_error` carries, which never holds the URL's
+    /// credentials). A session that was answered plays on and rides the
+    /// reconnect.
+    pub(crate) fn close_waiting(&mut self, connection: &str, error: &ConnectionError) {
+        let waiting: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.connection == connection && !session.answered)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let message = error.to_string();
+        for id in waiting {
+            tracing::info!(
+                event = "session_source_failed",
+                session.id = %id,
+                connection.id = connection,
+                error.code = error.code(),
+                error = %message,
+                reason = "the source connection failed before the session was answered",
+                "session closed with its source's error"
+            );
+            let _event = self.close_session(&id, error.code(), &message, CloseBy::Supervisor);
         }
     }
 
@@ -1044,15 +1112,23 @@ impl Shared {
     }
 
     /// Stores a driver's snapshot and, when its state changed, tells the
-    /// subscribers of every stream on the connection.
+    /// subscribers of every stream on the connection. A snapshot after a
+    /// failure ([`ConnectionSnapshot::failure`]) closes the connection's
+    /// sessions that are still waiting for their answer with that failure
+    /// ([`State::close_waiting`]): the daemon keeps no deadline of its own
+    /// for them, the source's own ones bound how long they wait.
     pub(crate) fn update_connection(&self, id: &str, snapshot: ConnectionSnapshot, changed: bool) {
         let mut state = self.lock();
         let Some(entry) = state.connections.get_mut(id) else {
             return;
         };
+        let failure = snapshot.failure().cloned();
         entry.snapshot = snapshot;
+        let streams: Vec<String> = entry.streams.iter().cloned().collect();
+        if let Some(error) = failure {
+            state.close_waiting(id, &error);
+        }
         if changed {
-            let streams: Vec<String> = entry.streams.iter().cloned().collect();
             for stream in streams {
                 state.notify_stream(&stream);
             }
@@ -1066,10 +1142,10 @@ impl Shared {
     }
 
     /// Runs `task` on the maps after `delay` on the injected clock: a
-    /// timer of session `session_id` (grace, `source_not_live`, the gather
-    /// deadline), which the session keeps and aborts when it ends. A timer
-    /// also checks the session's serial, since a session that is already
-    /// gone by the time the timer is kept leaves it to fire.
+    /// timer of session `session_id` (grace, the gather deadline), which
+    /// the session keeps and aborts when it ends. A timer also checks the
+    /// session's serial, since a session that is already gone by the time
+    /// the timer is kept leaves it to fire.
     pub(crate) fn after(
         self: &Arc<Self>,
         session_id: &str,
@@ -1267,6 +1343,58 @@ mod tests {
         session.gathering(gathers);
         state.sessions.insert("s1".into(), session);
         (state, rx)
+    }
+
+    #[test]
+    fn only_the_last_error_of_a_failed_connection_is_a_failure() {
+        use lotse_core::source::SourceError;
+        let error = ConnectionError::Source(SourceError::AuthFailed("401".into()));
+        let snapshot = |state, last_error| ConnectionSnapshot {
+            state,
+            last_error,
+            ..ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH)
+        };
+        // A stale error: the attempt under way, or the one an offer
+        // starts, decides.
+        for state in [
+            ConnectionState::Idle,
+            ConnectionState::Connecting,
+            ConnectionState::Live,
+            ConnectionState::Draining,
+        ] {
+            assert_eq!(snapshot(state, Some(error.clone())).failure(), None);
+        }
+        for state in [
+            ConnectionState::Reconnecting,
+            ConnectionState::Backoff,
+            ConnectionState::Restarting,
+        ] {
+            assert_eq!(snapshot(state, Some(error.clone())).failure(), Some(&error));
+            assert_eq!(snapshot(state, None).failure(), None);
+        }
+    }
+
+    #[test]
+    fn a_session_closed_at_its_offer_is_never_named_to_the_driver() {
+        let (mut state, mut rx) = relay_state(0);
+        state.streams.insert("front".into(), stream_on_c1(false));
+        state
+            .connections
+            .get_mut("c1")
+            .unwrap()
+            .streams
+            .insert("front".into());
+        let_assert!(
+            Some(event) = state.close_session("s1", "source_timeout", "late", CloseBy::Offer)
+        );
+        assert_eq!(event.payload["code"], "source_timeout");
+        assert!(rx.try_recv().is_err(), "the driver never had it");
+        state
+            .sessions
+            .insert("s2".into(), session_on_c1(2, "front"));
+        let _event = state.close_session("s2", "source_timeout", "late", CloseBy::Supervisor);
+        let_assert!(Ok(DriverCommand::CloseSession { session_id, .. }) = rx.try_recv());
+        assert_eq!(session_id, "s2");
     }
 
     fn relayed(port: u16) -> Relayed {

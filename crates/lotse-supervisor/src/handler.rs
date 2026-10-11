@@ -48,8 +48,8 @@ use crate::registry::{
     StreamSource,
 };
 use crate::session::{
-    MAX_EARLY_CANDIDATES, MAX_REMOTE_CANDIDATES, SESSION_QUEUE, SOURCE_NOT_LIVE_AFTER,
-    SessionEntry, api_event, ice_credentials, ulid,
+    MAX_EARLY_CANDIDATES, MAX_REMOTE_CANDIDATES, SESSION_QUEUE, SessionEntry, api_event,
+    ice_credentials, ulid,
 };
 use crate::worker::{WorkerConfig, WorkerManager};
 use crate::{Settings, millis};
@@ -613,6 +613,13 @@ impl Supervisor {
     /// `webrtc/offer`: validates, registers the session on the stream's
     /// connection (which raises its demand) and hands the offer to its
     /// driver; the answer arrives as an event once the tracks are known.
+    /// The session waits as long as the source's own deadlines let the
+    /// attempt run: a failure closes it with the source's error
+    /// ([`State::close_waiting`](crate::registry::State::close_waiting)).
+    /// An offer to a connection that already failed
+    /// ([`ConnectionSnapshot::failure`]) closes at once with that error and
+    /// never reaches the driver; a stale error of an idle or connecting
+    /// connection does not count, the session waits for the attempt.
     fn webrtc_offer(
         &self,
         connection: ConnectionId,
@@ -646,11 +653,15 @@ impl Supervisor {
         })?;
         let audio = stream.audio == AudioMode::Auto;
         let orientation = stream.orientation;
-        let (connection_id, commands) = stream
+        let (connection_id, commands, failure) = stream
             .sources
             .first()
             .and_then(|source| state.connections.get_key_value(&source.connection))
-            .map(|(id, entry)| (id.clone(), entry.commands.clone()))
+            .map(|(id, entry)| {
+                let snapshot = &entry.snapshot;
+                let failure = snapshot.failure().map(|e| (e.clone(), snapshot.state));
+                (id.clone(), entry.commands.clone(), failure)
+            })
             .ok_or_else(|| internal("the stream has no source connection"))?;
         if state.sessions.contains_key(&session_id) {
             return Err(
@@ -670,12 +681,11 @@ impl Supervisor {
             audio,
             orientation: orientation.code(),
         };
-        commands
-            .try_send(DriverCommand::OpenSession(spec))
-            .map_err(|_| {
-                ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
-                    .with_detail("limit", "connection_queue")
-            })?;
+        // An offer to a connection that already failed is not handed on:
+        // the session closes below with the failure.
+        if failure.is_none() {
+            hand_over(&commands, spec)?;
+        }
         state.last_session = state.last_session.saturating_add(1);
         let serial = state.last_session;
         let (events, rx) = mpsc::channel(SESSION_QUEUE);
@@ -696,6 +706,10 @@ impl Supervisor {
         for warning in &ice.warnings {
             entry.deliver(&session_id, api_event(warning));
         }
+        if let Some((error, connection_state)) = failure {
+            state.close_offer(&session_id, entry, &error, connection_state);
+            return Ok(rx);
+        }
         entry.gathering(stun_servers.len().saturating_add(turn_servers.len()));
         state.sessions.insert(session_id.clone(), entry);
         state.refresh_connection(&connection_id);
@@ -713,11 +727,6 @@ impl Supervisor {
             "session opened; offer handed to the connection"
         );
         self.start_gathering(&session_id, serial, stun_servers, turn_servers);
-        let id = session_id.clone();
-        self.shared
-            .after(&session_id, serial, SOURCE_NOT_LIVE_AFTER, move |state| {
-                close_if_not_live(state, &id, serial);
-            });
         Ok(rx)
     }
 
@@ -1134,21 +1143,15 @@ fn check_session_limits(
     Ok(())
 }
 
-/// Closes session `serial` under `session_id` with `source_not_live` if it
-/// still has no answer: the source declared no tracks in time.
-fn close_if_not_live(state: &mut State, session_id: &str, serial: u64) {
-    if state
-        .sessions
-        .get(session_id)
-        .is_some_and(|session| session.serial == serial && !session.answered)
-    {
-        let _event = state.close_session(
-            session_id,
-            "source_not_live",
-            "the source declared no tracks within 10 s of the offer",
-            CloseBy::Supervisor,
-        );
-    }
+/// Hands the offer `spec` to its connection's driver; a full queue is
+/// `limit_reached`.
+fn hand_over(commands: &mpsc::Sender<DriverCommand>, spec: SessionSpec) -> Result<(), ApiError> {
+    commands
+        .try_send(DriverCommand::OpenSession(spec))
+        .map_err(|_| {
+            ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
+                .with_detail("limit", "connection_queue")
+        })
 }
 
 /// `session_not_found` for `session_id`.
@@ -1202,8 +1205,10 @@ mod tests {
     use lotse_api::Event;
     use lotse_api_types::command::parse_command;
     use lotse_core::clock::{FakeClock, SystemClock};
+    use lotse_core::connection::{ConnectionError, ConnectionState};
     use lotse_core::let_assert;
     use lotse_core::output::OutputShape;
+    use lotse_core::source::SourceError;
     use lotse_core::test_util::FakeOutputFactory;
     use lotse_ipc::SessionEvent as Report;
     use serde_json::{Value, json};
@@ -2160,14 +2165,32 @@ mod tests {
         s.shutdown().await;
     }
 
+    /// A session timer's task that leaves the maps as they are.
+    fn untouched(_: &mut State) {}
+
     #[tokio::test]
     async fn unsubscribe_and_session_close_end_sessions_idempotently() {
         let dir = private_dir("close");
         let s = with_webrtc(&blocking_worker(&dir), Arc::new(SystemClock));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let _s1 = subscription(call_on(&s, 1, &offer(5, "front", Some("s1"))).await);
-        // The source_not_live timer is the session's, and ends with it
-        // rather than sleeping out its 10 s.
+        // A session keeps no timer of its own for its source; one it is
+        // given (grace, the gather deadline) is the session's, and ends
+        // with it rather than sleeping out its delay.
+        assert!(s.shared.lock().sessions["s1"].timers().is_empty());
+        let serial = s.shared.lock().sessions["s1"].serial;
+        // One that fired is dropped as the next is kept.
+        s.shared.after("s1", serial, Duration::ZERO, untouched);
+        let fired = s.shared.lock().sessions["s1"].timers()[0].clone();
+        for _ in 0..1000 {
+            if fired.is_finished() {
+                break;
+            }
+            SystemClock.sleep(Duration::from_millis(1)).await;
+        }
+        assert!(fired.is_finished());
+        s.shared
+            .after("s1", serial, Duration::from_secs(3600), untouched);
         let timers = s.shared.lock().sessions["s1"].timers().to_vec();
         assert_eq!(timers.len(), 1);
         let timer = timers[0].clone();
@@ -2513,8 +2536,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(s.shared.lock().sessions.contains_key("s1"));
         // Orphaned again and not adopted: closed when the grace expires.
-        // The fired timers (source_not_live, the first grace) are dropped
-        // as the new grace timer is kept.
+        // The fired first grace timer is dropped as the new one is kept.
         s.connection_closed(ConnectionId(2));
         assert_eq!(s.shared.lock().sessions["s1"].timers().len(), 1);
         clock.advance(Duration::from_millis(9_999));
@@ -2532,21 +2554,246 @@ mod tests {
         shutdown_on(&s, &clock).await;
     }
 
+    /// What a driver publishes for its connection: `state`, with `error`
+    /// as the last error.
+    fn snapshot(state: ConnectionState, error: Option<ConnectionError>) -> ConnectionSnapshot {
+        ConnectionSnapshot {
+            state,
+            last_error: error,
+            ..ConnectionSnapshot::idle(std::time::UNIX_EPOCH)
+        }
+    }
+
+    /// The event delivered already: what the tests here wait for is
+    /// delivered under the lock, so a missing one fails at once.
+    fn delivered(rx: &mut mpsc::Receiver<Event>) -> Value {
+        rx.try_recv().expect("an event delivered").payload
+    }
+
+    /// Whether the subscription ended: its session is gone.
+    fn ended(rx: &mut mpsc::Receiver<Event>) -> bool {
+        matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected))
+    }
+
+    /// Lets the connection's driver run up to its first wait, so its first
+    /// snapshot is in before the test publishes its own.
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
-    async fn a_session_without_an_answer_closes_with_source_not_live() {
-        let dir = private_dir("notlive");
+    async fn a_waiting_session_closes_with_its_source_s_error_as_soon_as_the_attempt_fails() {
+        let dir = private_dir("srcfail");
         let clock = Arc::new(FakeClock::from_system());
         let s = with_webrtc(&blocking_worker(&dir), clock.clone());
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
-        next(&mut events).await;
-        clock.advance(SOURCE_NOT_LIVE_AFTER);
-        let closed = next(&mut events).await;
-        assert_eq!(
-            (&closed["type"], &closed["code"]),
-            (&json!("closed"), &json!("source_not_live"))
+        assert_eq!(delivered(&mut events)["type"], "session");
+        // No deadline of the daemon's own: the source's bound the wait.
+        assert!(s.shared.lock().sessions["s1"].timers().is_empty());
+        let connection = s.shared.lock().sessions["s1"].connection.clone();
+        let captured = Captured::default();
+        let _logs = captured.install();
+        // RFC 2326 §7.1.1: a 401 is a credential failure.
+        let error = SourceError::AuthFailed(
+            "401 Unauthorized response to DESCRIBE CSeq=1: Unauthorized".into(),
         );
-        assert!(events.recv().await.is_none());
+        s.shared.update_connection(
+            &connection,
+            snapshot(
+                ConnectionState::Backoff,
+                Some(ConnectionError::Source(error)),
+            ),
+            true,
+        );
+        assert_eq!(
+            delivered(&mut events),
+            json!({ "type": "closed", "code": "source_auth_failed",
+                "message": "source authentication failed: 401 Unauthorized response to DESCRIBE CSeq=1: Unauthorized" })
+        );
+        assert!(ended(&mut events));
+        assert!(s.shared.lock().sessions.is_empty());
+        let logged = captured.lines("session closed with its source's error");
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(
+            logged[0].contains("session.id=s1")
+                && logged[0].contains("error.code=\"source_auth_failed\"")
+                && logged[0].contains("before the session was answered"),
+            "{logged:?}"
+        );
+        shutdown_on(&s, &clock).await;
+    }
+
+    #[tokio::test]
+    async fn an_offer_to_a_connection_that_already_failed_closes_at_once_with_its_error() {
+        let dir = private_dir("srcfailed");
+        let clock = Arc::new(FakeClock::from_system());
+        let s = with_webrtc(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let connection = s.shared.lock().streams["front"].sources[0]
+            .connection
+            .clone();
+        settle().await;
+        let failures = [
+            (
+                ConnectionState::Backoff,
+                ConnectionError::Source(SourceError::Unreachable(
+                    "Unable to connect to RTSP server: Connection refused (os error 111)".into(),
+                )),
+                "source_unreachable",
+            ),
+            (
+                ConnectionState::Reconnecting,
+                ConnectionError::Source(SourceError::Ended("the camera closed the session".into())),
+                "source_ended",
+            ),
+            (
+                ConnectionState::Restarting,
+                ConnectionError::WorkerCrashed,
+                "worker_crashed",
+            ),
+        ];
+        for (index, (state, error, code)) in failures.into_iter().enumerate() {
+            let message = error.to_string();
+            s.shared
+                .update_connection(&connection, snapshot(state, Some(error)), true);
+            let captured = Captured::default();
+            let _logs = captured.install();
+            let id = format!("s{index}");
+            let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some(&id))).await);
+            assert_eq!(
+                delivered(&mut events),
+                json!({ "type": "session", "session_id": id })
+            );
+            assert_eq!(
+                delivered(&mut events),
+                json!({ "type": "closed", "code": code, "message": message })
+            );
+            assert!(ended(&mut events));
+            let state_now = s.shared.lock();
+            assert!(state_now.sessions.is_empty());
+            assert_eq!(
+                *state_now.connections[&connection].demand.borrow(),
+                0,
+                "no attempt for it"
+            );
+            drop(state_now);
+            let logged = captured.lines("offer closed at once with its source's error");
+            assert!(
+                logged[0].contains(&format!("connection.state=\"{}\"", state.name()))
+                    && logged[0].contains(&format!("error.code=\"{code}\"")),
+                "{logged:?}"
+            );
+            let closed = captured.lines("session closed");
+            assert!(
+                closed.iter().any(|line| line.contains("by=Offer")),
+                "{closed:?}"
+            );
+        }
+        shutdown_on(&s, &clock).await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_error_does_not_close_an_offer_that_starts_a_fresh_attempt() {
+        let dir = private_dir("srcstale");
+        let clock = Arc::new(FakeClock::from_system());
+        let s = with_webrtc(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let connection = s.shared.lock().streams["front"].sources[0]
+            .connection
+            .clone();
+        settle().await;
+        let stale = ConnectionError::Source(SourceError::AuthFailed("401".into()));
+        s.shared.update_connection(
+            &connection,
+            snapshot(ConnectionState::Idle, Some(stale.clone())),
+            true,
+        );
+        let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        assert_eq!(delivered(&mut events)["type"], "session");
+        assert_eq!(
+            *s.shared.lock().connections[&connection].demand.borrow(),
+            1,
+            "the offer starts an attempt"
+        );
+        // The attempt connects with the stale error still on the snapshot.
+        s.shared.update_connection(
+            &connection,
+            snapshot(ConnectionState::Connecting, Some(stale)),
+            true,
+        );
+        assert!(s.shared.lock().sessions.contains_key("s1"));
+        assert!(events.try_recv().is_err(), "nothing yet");
+        // Its own outcome closes it.
+        s.shared.update_connection(
+            &connection,
+            snapshot(
+                ConnectionState::Backoff,
+                Some(ConnectionError::Source(SourceError::Timeout(
+                    "DESCRIBE: no response within 10000 ms".into(),
+                ))),
+            ),
+            true,
+        );
+        assert_eq!(
+            delivered(&mut events),
+            json!({ "type": "closed", "code": "source_timeout",
+                "message": "source timed out: DESCRIBE: no response within 10000 ms" })
+        );
+        shutdown_on(&s, &clock).await;
+    }
+
+    #[tokio::test]
+    async fn an_answered_session_rides_a_failed_reconnect_and_a_waiting_one_closes() {
+        let dir = private_dir("srcride");
+        let clock = Arc::new(FakeClock::from_system());
+        let s = with_webrtc(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut playing = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        let mut waiting = subscription(call_on(&s, 1, &offer(3, "front", Some("s2"))).await);
+        assert_eq!(delivered(&mut playing)["type"], "session");
+        assert_eq!(delivered(&mut waiting)["type"], "session");
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0\r\n".into(),
+            },
+        );
+        assert_eq!(delivered(&mut playing)["type"], "answer");
+        let connection = s.shared.lock().sessions["s1"].connection.clone();
+        s.shared.update_connection(
+            &connection,
+            snapshot(
+                ConnectionState::Reconnecting,
+                Some(ConnectionError::Source(SourceError::Ended(
+                    "the camera closed the session".into(),
+                ))),
+            ),
+            true,
+        );
+        assert_eq!(
+            delivered(&mut waiting),
+            json!({ "type": "closed", "code": "source_ended",
+                "message": "source ended: the camera closed the session" })
+        );
+        assert!(ended(&mut waiting));
+        // The reconnect fails too: the answered session still plays on.
+        s.shared.update_connection(
+            &connection,
+            snapshot(
+                ConnectionState::Backoff,
+                Some(ConnectionError::Source(SourceError::Unreachable(
+                    "Unable to connect to RTSP server: Connection refused (os error 111)".into(),
+                ))),
+            ),
+            true,
+        );
+        let sessions: Vec<String> = s.shared.lock().sessions.keys().cloned().collect();
+        assert_eq!(sessions, ["s1"]);
+        assert!(playing.try_recv().is_err(), "no closed for it");
         shutdown_on(&s, &clock).await;
     }
 
@@ -2956,9 +3203,8 @@ mod tests {
         let nat = stun_server(Some("203.0.113.7:40000".parse().unwrap()));
         let mut events = subscription(call_on(&s, 1, &stun_offer(2, "s1", nat)).await);
         next(&mut events).await;
-        // The gather deadline is the session's timer too, beside
-        // source_not_live.
-        assert_eq!(s.shared.lock().sessions["s1"].timers().len(), 2);
+        // The gather deadline is the session's one timer.
+        assert_eq!(s.shared.lock().sessions["s1"].timers().len(), 1);
         report(
             &s,
             "s1",
