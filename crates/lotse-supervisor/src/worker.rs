@@ -472,6 +472,15 @@ impl Worker {
             .await
     }
 
+    /// Tells the worker to stop its source, then connect `spec` as its
+    /// standby, which takes the tracks over at its first keyframe: one
+    /// camera session at a time.
+    pub async fn restart_source(&mut self, spec: &SourceSpec) -> Result<(), IpcError> {
+        self.control
+            .send_msg(&ToWorker::RestartSource(spec.clone()), &[])
+            .await
+    }
+
     /// Lets the standby's announced attempt go ahead.
     pub async fn grant_switch_connect(&mut self) -> Result<(), IpcError> {
         self.control
@@ -1037,12 +1046,14 @@ mod tests {
             peer_addrs: vec![],
         };
         worker.run_source(&spec).await.unwrap();
+        worker.restart_source(&spec).await.unwrap();
         worker.grant_switch_connect().await.unwrap();
         assert_eq!(
-            received(&dir, 3).await,
+            received(&dir, 4).await,
             [
                 ToWorker::Sockets,
-                ToWorker::RunSource(spec),
+                ToWorker::RunSource(spec.clone()),
+                ToWorker::RestartSource(spec),
                 ToWorker::SwitchConnectGranted
             ],
             "the sockets ride on the first message, once"

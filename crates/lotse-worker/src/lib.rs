@@ -392,7 +392,8 @@ impl Serving<'_> {
                     tracing::debug!("connect grant without a source; ignored");
                 }
             }
-            ToWorker::SwitchSource(spec) => self.on_switch_source(&spec).await?,
+            ToWorker::SwitchSource(spec) => self.on_switch_source(&spec, false).await?,
+            ToWorker::RestartSource(spec) => self.on_switch_source(&spec, true).await?,
             ToWorker::SwitchConnectGranted => {
                 if let Some(standby) = &self.standby {
                     standby.runner.gate.grant();
@@ -499,15 +500,24 @@ impl Serving<'_> {
 
     /// `SwitchSource`: connects `spec` as the standby of the running
     /// source, replacing a standby still on its way; a standby before any
-    /// source is a protocol error.
-    async fn on_switch_source(&mut self, spec: &SourceSpec) -> Result<(), Error> {
-        let Some(running) = &self.running else {
+    /// source is a protocol error. `RestartSource` (`restart`) stops the
+    /// running source's runner first, so the camera sees its teardown
+    /// before the standby connects: one camera session at a time, a gap
+    /// for the viewers until the standby's first keyframe. The tracks, the
+    /// sessions and the backchannel's arbiter stay, and the switch goes
+    /// on as for any standby.
+    async fn on_switch_source(&mut self, spec: &SourceSpec, restart: bool) -> Result<(), Error> {
+        let Some(running) = self.running.as_mut() else {
             return Err(Error::SwitchWithoutSource);
         };
         if let Some(replaced) = self.standby.take() {
             tracing::info!("standby source replaced before it took over");
             replaced.staging.disarm();
             stop_runner(replaced.runner, &self.clock).await;
+        }
+        if restart {
+            tracing::info!("source restart: the running source stops before the new one connects");
+            stop_task(&running.cancel, &mut running.task, &self.clock).await;
         }
         let staging = TrackSet::staging(running.tracks.tracks());
         let runner = start_runner(
@@ -866,10 +876,21 @@ fn start_runner(
 /// that does not stop in time is aborted, as nothing of the connection's
 /// depends on it any more.
 async fn stop_runner(runner: Runner, clock: &Arc<dyn Clock>) {
-    runner.cancel.cancel();
     let mut task = runner.task;
+    stop_task(&runner.cancel, &mut task, clock).await;
+}
+
+/// Cancels a runner's `task` and waits for it, aborting it after
+/// [`SWITCH_STOP_GRACE`]. A task that is already finished, as the one a
+/// restart stopped, is not waited for again: polling a `JoinHandle` after
+/// it returned panics.
+async fn stop_task(cancel: &CancellationToken, task: &mut JoinHandle<()>, clock: &Arc<dyn Clock>) {
+    cancel.cancel();
+    if task.is_finished() {
+        return;
+    }
     tokio::select! {
-        _ = &mut task => {}
+        _ = &mut *task => {}
         () = clock.sleep(SWITCH_STOP_GRACE) => {
             tracing::warn!(
                 grace_ms = SWITCH_STOP_GRACE.as_millis(),
@@ -911,10 +932,13 @@ async fn stop_source(
     };
     source.cancel.cancel();
     let task = source.task;
-    tokio::select! {
-        _ = task => {}
-        () = clock.sleep(deadline) => {
-            return Err(Error::ShutdownTimeout(u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX)));
+    // A restart may have stopped it already ([`stop_task`]).
+    if !task.is_finished() {
+        tokio::select! {
+            _ = task => {}
+            () = clock.sleep(deadline) => {
+                return Err(Error::ShutdownTimeout(u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX)));
+            }
         }
     }
     let derived = source
@@ -1354,6 +1378,63 @@ mod tests {
                 .all(|m| matches!(m, ToSupervisor::SwitchState(_)) || *m == stopped),
             "{seen:?}"
         );
+        assert!(matches!(h.worker.await, Ok(Ok(ExitReason::Shutdown))));
+    }
+
+    #[tokio::test]
+    async fn a_restart_source_stops_the_running_source_then_switches_like_a_standby() {
+        let mut h = start_with_settings(registries(), quiet_settings());
+        h.tx.send_msg(
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"keyframes_every_ms": 10}"#)),
+            &[],
+        )
+        .await
+        .unwrap();
+        until_live(&mut h).await;
+        // The running source stops before its replacement connects: its
+        // `Stopped` is reported as the source's, which a plain switch
+        // never does, and the replacement goes live as a standby.
+        h.tx.send_msg(
+            &ToWorker::RestartSource(spec(
+                "fake://cam/",
+                r#"{"keyframes_every_ms": 10, "talk": true}"#,
+            )),
+            &[],
+        )
+        .await
+        .unwrap();
+        let stopped = ToSupervisor::SourceState(SourceState::Stopped);
+        let live = ToSupervisor::SwitchState(SourceState::Live);
+        let seen = messages_until_still(&mut h, |seen| {
+            seen.contains(&stopped) && seen.contains(&live)
+        })
+        .await;
+        assert!(
+            seen.iter()
+                .any(|m| matches!(m, ToSupervisor::SwitchState(SourceState::Connecting { .. }))),
+            "{seen:?}"
+        );
+        // Its first keyframe takes the tracks over; the stopped source,
+        // already waited for, is not waited for again.
+        h.clock.advance(Duration::from_millis(10));
+        assert_eq!(h.next().await, ToSupervisor::Switched);
+        let_assert!(ToSupervisor::Tracks(tracks) = h.next().await);
+        assert_eq!(tracks.len(), 1);
+        // A restart whose replacement never goes live leaves no source
+        // running: the shutdown does not wait for the stopped one again.
+        h.tx.send_msg(
+            &ToWorker::RestartSource(spec("fake://cam/", r#"{"ready_after_ms": 60000}"#)),
+            &[],
+        )
+        .await
+        .unwrap();
+        next_where(&mut h, &|m| {
+            *m == ToSupervisor::SourceState(SourceState::Stopped)
+        })
+        .await;
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1000 }, &[])
+            .await
+            .unwrap();
         assert!(matches!(h.worker.await, Ok(Ok(ExitReason::Shutdown))));
     }
 

@@ -154,6 +154,17 @@ pub trait Source: fmt::Debug + Send + Sync {
     /// so the value never reaches a log line or the API.
     fn connection_options(&self) -> serde_json::Value;
 
+    /// Whether the source asks the device for its backchannel, two-way
+    /// audio's path to the camera's speaker (RTSP `backchannel`, ONVIF
+    /// Streaming Specification §5.3.1): only when its stream opted in, as
+    /// the client knows which cameras talk back. Left out of
+    /// [`Self::connection_options`], so streams sharing a connection may
+    /// differ here: the supervisor has the connection ask iff one of its
+    /// sources does. `false` for a protocol without a backchannel.
+    fn wants_backchannel(&self) -> bool {
+        false
+    }
+
     /// Runs one connection (or one publisher session) until it ends. Must
     /// honor `ctx.cancel` within 100 ms, send the protocol's teardown, and
     /// return a typed exit. Boxed so `dyn Source` stays object-safe.

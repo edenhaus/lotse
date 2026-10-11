@@ -1754,7 +1754,7 @@
             }
           ],
           "default": null,
-          "description": "The camera's backchannel, which the connection offers while live:\nwhat a microphone button is gated on. Null when it offers none (the\ncamera has none, refused it, or the stream asks for none), and while\nthe connection is not live."
+          "description": "The camera's backchannel, which the connection offers while live:\nwhat a microphone button is gated on. Null when it offers none (the\ncamera has none or refused it, or no stream on the connection opted\nin: an RTSP source's `backchannel` option, off by default, which\nrestarts a connection running without it once), and while the\nconnection is not live."
         },
         "connection": {
           "$ref": "#/$defs/ConnectionInfo",

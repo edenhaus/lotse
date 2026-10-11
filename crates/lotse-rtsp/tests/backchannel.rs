@@ -63,7 +63,22 @@ fn peer(camera: &FakeCamera) -> ResolvedPeer {
     }
 }
 
+/// The RTSP source of `camera` with `options`, opted in to the backchannel
+/// unless they say otherwise: it is off by default.
 fn source(camera: &FakeCamera, options: &serde_json::Value) -> Box<dyn Source> {
+    let mut options = if options.is_null() {
+        json!({})
+    } else {
+        options.clone()
+    };
+    if let Some(fields) = options.as_object_mut() {
+        fields.entry("backchannel").or_insert(json!(true));
+    }
+    as_given(camera, &options)
+}
+
+/// The RTSP source of `camera` with `options` as they are.
+fn as_given(camera: &FakeCamera, options: &serde_json::Value) -> Box<dyn Source> {
     RtspFactory::default()
         .validate(&SourceUrl::parse(&camera.url()).unwrap(), options)
         .expect("valid source")
@@ -361,16 +376,23 @@ async fn rfc2326_10_4_a_camera_that_hangs_up_at_the_backchannels_setup_ends_the_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onvif_5_3_1_a_stream_that_asks_for_no_backchannel_sends_no_require() {
-    let cam = camera(config(None, BackchannelCodec::Pcmu, |_| {})).await;
-    let source = source(&cam, &json!({ "backchannel": false }));
-    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
-    assert!(harness.wait_ready().await, "ready");
-    assert_eq!(count(&cam.stats().describes), 1);
-    assert_eq!(count(&cam.stats().backchannel_describes), 0);
-    assert!(harness.backchannel.current().is_none());
-    let _exit = finish(harness).await;
-    cam.stop().await;
+async fn onvif_5_3_1_a_stream_that_does_not_opt_in_sends_no_require() {
+    // Off by default: no option, or `backchannel: false`.
+    for options in [
+        serde_json::Value::Null,
+        json!({}),
+        json!({ "backchannel": false }),
+    ] {
+        let cam = camera(config(None, BackchannelCodec::Pcmu, |_| {})).await;
+        let source = as_given(&cam, &options);
+        let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+        assert!(harness.wait_ready().await, "{options}: ready");
+        assert_eq!(count(&cam.stats().describes), 1, "{options}");
+        assert_eq!(count(&cam.stats().backchannel_describes), 0, "{options}");
+        assert!(harness.backchannel.current().is_none(), "{options}");
+        let _exit = finish(harness).await;
+        cam.stop().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

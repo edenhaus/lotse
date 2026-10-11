@@ -192,8 +192,10 @@ pub struct SourceInfo {
     pub reconnects: u32,
     /// The camera's backchannel, which the connection offers while live:
     /// what a microphone button is gated on. Null when it offers none (the
-    /// camera has none, refused it, or the stream asks for none), and while
-    /// the connection is not live.
+    /// camera has none or refused it, or no stream on the connection opted
+    /// in: an RTSP source's `backchannel` option, off by default, which
+    /// restarts a connection running without it once), and while the
+    /// connection is not live.
     #[serde(default)]
     pub backchannel: Option<SourceBackchannel>,
     /// Protocol-specific detail, documented by the scheme's options schema.

@@ -169,6 +169,14 @@ mod tests {
             source.request_keyframe(),
             lotse_core::source::KeyframeRequest::Unsupported
         ));
+        // ONVIF Streaming Specification §5.3.1: the `Require` header only
+        // for a stream that opted in, on the same connection either way.
+        assert!(!source.wants_backchannel(), "opt-in");
+        let talking = factory
+            .validate(&url, &json!({ "backchannel": true }))
+            .unwrap();
+        assert!(talking.wants_backchannel());
+        assert_eq!(talking.connection_options(), source.connection_options());
         let udp = factory
             .validate(&url, &json!({ "transport": "udp" }))
             .unwrap();

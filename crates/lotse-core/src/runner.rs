@@ -1026,6 +1026,7 @@ mod tests {
             (Silent.describe().protocol, Silent.connection_options()),
             ("silent", serde_json::Value::Null)
         );
+        assert!(!Silent.wants_backchannel(), "no backchannel unless asked");
         let runner = SourceRunner::new(
             Box::new(Silent),
             ResolvedPeer {

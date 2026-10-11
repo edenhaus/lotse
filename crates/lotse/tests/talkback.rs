@@ -411,11 +411,18 @@ impl InProcess {
         Self::start_with(factory, "fake://cam/", options, vec![]).await
     }
 
-    /// The worker running the RTSP source against `camera`.
+    /// The worker running the RTSP source against `camera`, opted in to
+    /// its backchannel.
     #[cfg(feature = "source-rtsp")]
     async fn rtsp(camera: &FakeCamera) -> Self {
         let factory = Arc::new(lotse_rtsp::RtspFactory::default());
-        Self::start_with(factory, &camera.url(), "{}", vec![camera.addr()]).await
+        Self::start_with(
+            factory,
+            &camera.url(),
+            r#"{"backchannel": true}"#,
+            vec![camera.addr()],
+        )
+        .await
     }
 
     /// The worker running `url` with `options` from `factory`, resolved

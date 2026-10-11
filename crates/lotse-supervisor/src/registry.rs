@@ -192,6 +192,9 @@ pub(crate) struct StreamSource {
     pub(crate) protocol: &'static str,
     /// The connection's id.
     pub(crate) connection: String,
+    /// What the connection's driver runs for this source; its
+    /// `backchannel` says whether the source asks for the camera's.
+    pub(crate) spec: DriverSpec,
 }
 
 /// A stream's desired state.
@@ -222,6 +225,9 @@ pub(crate) struct ConnectionEntry {
     pub(crate) port: Option<u16>,
     /// The worker binds a loopback relay listener before its sandbox.
     pub(crate) loopback_relay: bool,
+    /// Whether the spec its driver last got asks for the camera's
+    /// backchannel ([`State::follow_backchannel`]).
+    pub(crate) backchannel: bool,
     /// The demand the driver follows; dropping it stops the driver.
     pub(crate) demand: watch::Sender<u32>,
     /// What the driver last reported.
@@ -315,6 +321,7 @@ impl State {
             return;
         };
         entry.key = key;
+        entry.backchannel = spec.backchannel;
         if entry
             .commands
             .try_send(DriverCommand::SwitchSource(spec))
@@ -323,6 +330,62 @@ impl State {
             tracing::warn!(
                 connection.id = id,
                 "driver queue full; the connection keeps its source until the next put"
+            );
+        }
+    }
+
+    /// Has connection `id` ask for the camera's backchannel iff a source on
+    /// it does (ONVIF Streaming Specification §5.3.1, the `Require`
+    /// header), after `stream_id`'s put or delete. When that changes, its
+    /// driver gets the spec of a source that asks as the rule now says
+    /// ([`DriverCommand::Backchannel`]): an upgrade restarts a running
+    /// source once, a downgrade is deferred to the connection's next
+    /// connect. A connection that already asks is unaffected by streams
+    /// that do not; one gone (its last stream left) has nothing to follow.
+    pub(crate) fn follow_backchannel(&mut self, id: &str, stream_id: &str) {
+        // A source that asks if there is one, else any.
+        let chosen = self
+            .streams
+            .values()
+            .flat_map(|stream| &stream.sources)
+            .filter(|source| source.connection == id)
+            .max_by_key(|source| source.spec.backchannel)
+            .map(|source| source.spec.clone());
+        let (Some(spec), Some(entry)) = (chosen, self.connections.get_mut(id)) else {
+            return;
+        };
+        let (before, after) = (entry.backchannel, spec.backchannel);
+        if before == after {
+            return;
+        }
+        let decision = if after {
+            "upgrade: restarting the source once"
+        } else {
+            "downgrade deferred to next connect"
+        };
+        tracing::info!(
+            connection.id = id,
+            stream.id = stream_id,
+            backchannel.before = before,
+            backchannel.after = after,
+            reason = if after {
+                "a stream on the connection asks for the camera's backchannel"
+            } else {
+                "no stream on the connection asks for the camera's backchannel"
+            },
+            decision,
+            "connection backchannel changed"
+        );
+        if entry
+            .commands
+            .try_send(DriverCommand::Backchannel(spec))
+            .is_ok()
+        {
+            entry.backchannel = after;
+        } else {
+            tracing::warn!(
+                connection.id = id,
+                "driver queue full; the connection asks for the backchannel as before until the next put"
             );
         }
     }
@@ -1262,10 +1325,25 @@ mod tests {
         }
     }
 
+    /// The spec of a fake source on connection `connection` that asks for
+    /// the backchannel or not.
+    fn spec_on(connection: &str, backchannel: bool) -> DriverSpec {
+        DriverSpec {
+            connection_id: connection.into(),
+            url: "fake://127.0.0.1/".into(),
+            options: "{}".into(),
+            host: "127.0.0.1".into(),
+            port: None,
+            loopback_relay: false,
+            backchannel,
+        }
+    }
+
     /// A stream reading from connection `c1`.
     fn stream_on_c1(preload: bool) -> StreamEntry {
         StreamEntry {
             sources: vec![StreamSource {
+                spec: spec_on("c1", false),
                 url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                 options: serde_json::Map::new(),
                 protocol: "fake",
@@ -1338,6 +1416,7 @@ mod tests {
             ConnectionEntry {
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -1403,6 +1482,7 @@ mod tests {
             ConnectionEntry {
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -1606,6 +1686,7 @@ mod tests {
             ConnectionEntry {
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -1666,6 +1747,7 @@ mod tests {
             ConnectionEntry {
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -1696,6 +1778,93 @@ mod tests {
     }
 
     #[test]
+    fn a_connection_asks_for_the_backchannel_iff_a_source_on_it_does_onvif_5_3_1() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let mut state = State::default();
+        let (demand, _demand) = watch::channel(0);
+        let (commands, mut rx) = mpsc::channel(1);
+        let key = ConnectionKey {
+            url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+            options: serde_json::Value::Null,
+        };
+        state.connections.insert(
+            "c1".into(),
+            ConnectionEntry {
+                port: None,
+                loopback_relay: false,
+                backchannel: false,
+                key: key.clone(),
+                demand,
+                snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
+                streams: ["front".to_owned(), "twin".to_owned()].into(),
+                commands,
+                talker: Talker::default(),
+            },
+        );
+        let on_c1 = |backchannel: bool| {
+            let mut entry = stream_on_c1(false);
+            entry.sources[0].spec = spec_on("c1", backchannel);
+            entry
+        };
+        let asks = |state: &State| state.connections["c1"].backchannel;
+        state.streams.insert("front".into(), on_c1(false));
+        state.streams.insert("twin".into(), on_c1(false));
+        // Nobody asks, as before: nothing to do.
+        state.follow_backchannel("c1", "front");
+        assert!(rx.try_recv().is_err());
+        // A stream asks: the connection does, with that source's spec, and
+        // its driver restarts the source once (upgrade).
+        state.streams.insert("twin".into(), on_c1(true));
+        state.follow_backchannel("c1", "twin");
+        let_assert!(Ok(DriverCommand::Backchannel(sent)) = rx.try_recv());
+        assert!(sent.backchannel);
+        assert!(asks(&state));
+        let upgrade = captured.lines("connection backchannel changed");
+        assert_eq!(upgrade.len(), 1);
+        for field in [
+            "connection.id=\"c1\"",
+            "stream.id=\"twin\"",
+            "backchannel.before=false",
+            "backchannel.after=true",
+            "upgrade: restarting the source once",
+        ] {
+            assert!(upgrade[0].contains(field), "{field}: {}", upgrade[0]);
+        }
+        // Any stream asking wins: one that does not changes nothing.
+        state.streams.insert("front".into(), on_c1(false));
+        state.follow_backchannel("c1", "front");
+        assert!(rx.try_recv().is_err(), "it asks already");
+        assert!(asks(&state));
+        // The last one asking changes its mind: the driver hears of it and
+        // defers it to the next connect (downgrade).
+        state.streams.insert("twin".into(), on_c1(false));
+        state.follow_backchannel("c1", "twin");
+        let_assert!(Ok(DriverCommand::Backchannel(sent)) = rx.try_recv());
+        assert!(!sent.backchannel);
+        assert!(!asks(&state));
+        assert_eq!(
+            captured.lines("downgrade deferred to next connect").len(),
+            1
+        );
+        // A full queue: the connection asks as before until the next put.
+        state.streams.insert("twin".into(), on_c1(true));
+        state.follow_backchannel("c1", "twin");
+        state.streams.insert("twin".into(), on_c1(false));
+        state.follow_backchannel("c1", "twin");
+        assert!(asks(&state), "as before");
+        assert_eq!(captured.lines("driver queue full").len(), 1);
+        let_assert!(Ok(DriverCommand::Backchannel(sent)) = rx.try_recv());
+        assert!(sent.backchannel);
+        // A connection gone has nothing to follow; a switch carries its
+        // source's ask.
+        state.follow_backchannel("gone", "front");
+        assert!(rx.try_recv().is_err());
+        state.switch_connection("c1", key, spec_on("c1", false));
+        assert!(!asks(&state));
+    }
+
+    #[test]
     fn a_switch_reaches_the_driver_unless_its_connection_is_gone_or_its_queue_is_full() {
         let captured = Captured::default();
         let _logs = captured.install();
@@ -1711,6 +1880,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: None,
             loopback_relay: false,
+            backchannel: false,
         };
         state.switch_connection(
             "gone",

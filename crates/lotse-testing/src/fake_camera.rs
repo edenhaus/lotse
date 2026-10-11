@@ -731,6 +731,12 @@ pub struct Stats {
     /// TEARDOWN requests, answered unless the camera hung
     /// ([`PlayAnswer::Never`]).
     pub teardowns: AtomicU64,
+    /// Sessions playing now: `PLAY` answered, and neither torn down nor
+    /// closed since.
+    pub playing: AtomicU64,
+    /// The most sessions that played at once: a client that never holds
+    /// two camera sessions keeps it at 1.
+    pub max_playing: AtomicU64,
     /// `GET_PARAMETER` and OPTIONS requests while playing.
     pub keepalives: AtomicU64,
     /// Requests refused for missing or wrong credentials.
@@ -1310,7 +1316,33 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+/// A connection that ends, however, plays no more.
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.set_playing(false);
+    }
+}
+
 impl Connection {
+    /// Marks the connection playing or not, keeping [`Stats::playing`] and
+    /// [`Stats::max_playing`].
+    fn set_playing(&mut self, playing: bool) {
+        if self.playing == playing {
+            return;
+        }
+        self.playing = playing;
+        if playing {
+            let now = self
+                .stats
+                .playing
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            self.stats.max_playing.fetch_max(now, Ordering::Relaxed);
+        } else {
+            self.stats.playing.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     /// Handles every whole message in `inbound`, read at `arrival`:
     /// requests answered on `stream` (none once it hung at `PLAY`),
     /// interleaved frames handed to [`Self::receive`]; the rest stays for
@@ -1478,7 +1510,7 @@ impl Connection {
             }
             Method::Teardown => {
                 Stats::bump(&self.stats.teardowns);
-                self.playing = false;
+                self.set_playing(false);
                 (reply(&cseq, StatusCode::Ok).build(Vec::new()), true)
             }
             _ => (
@@ -1718,7 +1750,7 @@ impl Connection {
             // `respond` leaves it unanswered for `PlayAnswer::Never`.
             return reply(cseq, StatusCode::ServiceUnavailable).build(Vec::new());
         }
-        self.playing = true;
+        self.set_playing(true);
         let rtptime = |ts: u32| {
             if self.config.omit_rtptime {
                 String::new()
@@ -2445,6 +2477,49 @@ mod tests {
             assert_eq!(Stats::get(&stats.backchannel_describes), 0);
             camera.stop().await;
         }
+    }
+
+    #[tokio::test]
+    async fn the_camera_counts_the_sessions_playing_and_the_most_at_once() {
+        let clock = clock();
+        let camera = FakeCamera::start(
+            with_backchannel(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
+        let playing = |stats: &Stats| (Stats::get(&stats.playing), Stats::get(&stats.max_playing));
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut client = Client::connect(&camera).await;
+            client.request("DESCRIBE", &camera.url(), &[]).await;
+            client
+                .request(
+                    "SETUP",
+                    &format!("{}track0", base(&camera)),
+                    &["Transport: RTP/AVP/TCP;unicast;interleaved=0-1"],
+                )
+                .await;
+            let play = client
+                .request("PLAY", &camera.url(), &["Session: 12345678"])
+                .await;
+            assert_eq!(play.status(), StatusCode::Ok);
+            // A second PLAY on the same session counts once.
+            client
+                .request("PLAY", &camera.url(), &["Session: 12345678"])
+                .await;
+            clients.push(client);
+        }
+        let stats = camera.stats();
+        assert_eq!(playing(stats), (2, 2));
+        // One torn down, the other hung up on: none plays, two did at once.
+        let mut torn = clients.remove(0);
+        torn.request("TEARDOWN", &camera.url(), &["Session: 12345678"])
+            .await;
+        assert_eq!(playing(stats), (1, 2));
+        drop(clients);
+        assert!(eventually(&clock, || playing(stats) == (0, 2)).await);
+        camera.stop().await;
     }
 
     #[tokio::test]

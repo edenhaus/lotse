@@ -63,6 +63,14 @@ pub(crate) enum DriverCommand {
     /// Run this source from now on: a worker switches to it in place, the
     /// next worker starts with it.
     SwitchSource(DriverSpec),
+    /// The connection's rule for the camera's backchannel changed (a
+    /// stream on it opted in, or the last one out): run this spec, which
+    /// asks as the rule now says, from the next connect on. A running
+    /// source that does not ask while the spec does is restarted once to
+    /// ask (upgrade); one that asks while the spec does not keeps it until
+    /// the connection next connects (downgrade deferred), as a reconnect
+    /// for that alone would cost the viewers a gap for nothing.
+    Backchannel(DriverSpec),
     /// Open this session.
     OpenSession(SessionSpec),
     /// A trickled browser candidate.
@@ -141,7 +149,10 @@ impl DriverCommand {
             | Self::CloseSession { session_id, .. }
             | Self::RelayCandidate { session_id, .. }
             | Self::RelayChannel { session_id, .. } => Some(session_id),
-            Self::IceTcp { .. } | Self::SwitchSource(_) | Self::ReleaseBackchannel => None,
+            Self::IceTcp { .. }
+            | Self::SwitchSource(_)
+            | Self::Backchannel(_)
+            | Self::ReleaseBackchannel => None,
         }
     }
 }
@@ -176,7 +187,7 @@ impl DatagramSink for SessionSink {
 }
 
 /// What the driver needs to start a worker for its connection.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DriverSpec {
     /// The connection's id.
     pub(crate) connection_id: String,
@@ -190,6 +201,10 @@ pub(crate) struct DriverSpec {
     pub(crate) port: Option<u16>,
     /// The worker binds a loopback relay listener before its sandbox.
     pub(crate) loopback_relay: bool,
+    /// The source asks the camera for its backchannel
+    /// ([`Source::wants_backchannel`](lotse_core::source::Source::wants_backchannel)),
+    /// as its options say.
+    pub(crate) backchannel: bool,
 }
 
 impl DriverSpec {
@@ -223,6 +238,7 @@ impl fmt::Debug for DriverSpec {
         out.field("host", &self.host)
             .field("port", &self.port)
             .field("loopback_relay", &self.loopback_relay)
+            .field("backchannel", &self.backchannel)
             .finish()
     }
 }
@@ -342,6 +358,13 @@ pub(crate) struct Driver {
     snapshot: ConnectionSnapshot,
     /// The state and error last published, to detect a change.
     published: (ConnectionState, Option<ConnectionError>),
+    /// Whether the worker's source asks for the camera's backchannel: the
+    /// spec's when the worker started it or last switched to it.
+    /// Meaningless without a worker.
+    running_backchannel: bool,
+    /// The switch under way restarts the source (`RestartSource`) instead
+    /// of connecting a standby beside it: an upgrade asked for it.
+    restart: bool,
 }
 
 impl Driver {
@@ -376,6 +399,8 @@ impl Driver {
             resolve_backoff: ReconnectBackoff::new(0),
             snapshot,
             published: (ConnectionState::Idle, None),
+            running_backchannel: false,
+            restart: false,
         }
     }
 
@@ -438,6 +463,7 @@ impl Driver {
             | Wake::SwitchConnect(SlotWake::LeaseExpired) => {}
             Wake::Worker(event) => self.on_worker_event(event),
             Wake::Command(DriverCommand::SwitchSource(spec)) => self.on_switch_source(spec),
+            Wake::Command(DriverCommand::Backchannel(spec)) => self.on_backchannel(spec),
             Wake::Command(command) => match self.worker.as_mut() {
                 Some(worker) => {
                     Self::send(worker, &self.shared, &self.commands_tx, command).await;
@@ -513,11 +539,18 @@ impl Driver {
             Wake::SwitchResolved(Ok(addrs)) => {
                 self.pending = Pending::Nothing;
                 self.resolve_backoff.reset();
+                let restart = std::mem::take(&mut self.restart);
                 if let Some(worker) = self.worker.as_mut() {
                     let spec = self.spec.source_spec(addrs);
-                    if let Err(err) = worker.switch_source(&spec).await {
-                        tracing::warn!(pid = worker.pid(), error = %err, "source switch could not be sent to the worker");
+                    let sent = if restart {
+                        worker.restart_source(&spec).await
+                    } else {
+                        worker.switch_source(&spec).await
+                    };
+                    if let Err(err) = sent {
+                        tracing::warn!(pid = worker.pid(), error = %err, restart, "source switch could not be sent to the worker");
                     }
+                    self.running_backchannel = self.spec.backchannel;
                 } else {
                     tracing::debug!(
                         "source to switch to resolved without a worker; the next worker starts with it"
@@ -565,6 +598,47 @@ impl Driver {
             self.start_resolving_switch();
         } else if matches!(self.pending, Pending::Resolving(_)) {
             self.start_resolving();
+        }
+    }
+
+    /// `Backchannel`: the connection runs `spec` from now on, which differs
+    /// from the last in whether it asks for the camera's backchannel
+    /// (ONVIF Streaming Specification §5.3.1). A running source that does
+    /// not ask while `spec` does is restarted once, through the switch
+    /// path with the running source stopped first (`RestartSource`), so
+    /// the camera holds one session at a time. One that asks while `spec`
+    /// does not keeps the backchannel until the connection next connects
+    /// with `spec`: a new worker, a crash's restart, a source switch.
+    /// Without a worker, the next one starts with `spec`.
+    fn on_backchannel(&mut self, spec: DriverSpec) {
+        let before = self.running_backchannel;
+        let after = spec.backchannel;
+        self.spec = spec;
+        match (self.worker.is_some(), before, after) {
+            (true, false, true) => {
+                tracing::info!(
+                    backchannel.before = before,
+                    backchannel.after = after,
+                    reason = "a stream on the connection asks for the camera's backchannel",
+                    "backchannel upgrade: restarting the source once"
+                );
+                self.restart = true;
+                self.start_resolving_switch();
+            }
+            (true, true, false) => tracing::info!(
+                backchannel.before = before,
+                backchannel.after = after,
+                reason = "no stream on the connection asks for the camera's backchannel any more",
+                "backchannel downgrade deferred to next connect"
+            ),
+            (true, ..) => tracing::debug!(
+                backchannel = after,
+                "the running source already asks for the backchannel as the connection's streams do"
+            ),
+            (false, ..) => tracing::info!(
+                backchannel = after,
+                "no worker runs; the next connect asks for the backchannel as the connection's streams do"
+            ),
         }
     }
 
@@ -795,6 +869,8 @@ impl Driver {
         match self.shared.manager.spawn(&ports, self.spec.loopback_relay) {
             Ok(mut worker) => {
                 let spec = self.spec.source_spec(addrs);
+                self.running_backchannel = self.spec.backchannel;
+                self.restart = false;
                 if let Err(err) = worker.run_source(&spec).await {
                     tracing::warn!(pid = worker.pid(), error = %err, "source could not be sent to the worker");
                 }
@@ -847,7 +923,7 @@ impl Driver {
         let session = command.session_id().map(str::to_owned);
         let sent = match command {
             // Handled by the driver itself, never queued for a worker.
-            DriverCommand::SwitchSource(_) => return,
+            DriverCommand::SwitchSource(_) | DriverCommand::Backchannel(_) => return,
             DriverCommand::OpenSession(spec) => {
                 let sink = Arc::new(SessionSink {
                     local_ufrag: spec.ice_ufrag.clone(),
@@ -1058,6 +1134,7 @@ mod tests {
             host: "cam".into(),
             port: Some(322),
             loopback_relay: true,
+            backchannel: false,
         };
         let logged = format!("{spec:?}");
         assert!(!logged.contains("secret"), "{logged}");
@@ -1076,6 +1153,7 @@ mod tests {
             host: "cam".into(),
             port: None,
             loopback_relay: false,
+            backchannel: false,
         };
         let logged = format!(
             "{:?}",
@@ -1103,6 +1181,7 @@ mod tests {
                 host: "h".into(),
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
             },
             shared("/bin/sh"),
             demand,
@@ -1340,6 +1419,7 @@ mod tests {
                 crate::registry::ConnectionEntry {
                     port: None,
                     loopback_relay: false,
+                    backchannel: false,
                     key: crate::registry::ConnectionKey {
                         url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                         options: serde_json::Value::Null,
@@ -1355,6 +1435,7 @@ mod tests {
                 "front".into(),
                 crate::registry::StreamEntry {
                     sources: vec![crate::registry::StreamSource {
+                        spec: spec_of("fake://127.0.0.1/"),
                         url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                         options: serde_json::Map::new(),
                         protocol: "fake",
@@ -1426,6 +1507,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
             },
             Arc::clone(shared),
             demand,
@@ -1581,6 +1663,7 @@ mod tests {
             host: host.into(),
             port: Some(1),
             loopback_relay: false,
+            backchannel: false,
         };
         // Without a worker the spec is taken for the next one, nothing more.
         driver
@@ -1664,6 +1747,112 @@ mod tests {
                 "127.0.0.1:1".parse().unwrap(),
             ])))
             .await;
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        drop(driver);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_backchannel_upgrade_restarts_the_running_source_once_and_a_downgrade_waits() {
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let dir = private_dir("driver-backchannel");
+        let out = dir.join("received");
+        let script = dir.join("worker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nexec cat > {}\n", out.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let shared = shared(script.to_str().unwrap());
+        let (_demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let spec = |options: &str, backchannel: bool| DriverSpec {
+            connection_id: "c1".into(),
+            url: "fake://127.0.0.1:1/".into(),
+            options: options.into(),
+            host: "127.0.0.1".into(),
+            port: Some(1),
+            loopback_relay: false,
+            backchannel,
+        };
+        let source = |options: &str| SourceSpec {
+            connection_id: "c1".into(),
+            url: "fake://127.0.0.1:1/".into(),
+            options: options.into(),
+            peer_host: "127.0.0.1".into(),
+            peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
+        };
+        let backchannel = |options: &str, asks: bool| {
+            Wake::Command(DriverCommand::Backchannel(spec(options, asks)))
+        };
+        // Without a worker the next one starts with the spec, nothing more.
+        driver.handle(backchannel(r#"{"talk":true}"#, true)).await;
+        assert!(driver.spec.backchannel);
+        assert!(ready_wake(&mut driver).await.is_none(), "nothing pending");
+        assert_eq!(captured.lines("no worker runs").len(), 1);
+        driver
+            .spawn_worker(vec!["127.0.0.1:1".parse().unwrap()])
+            .await;
+        recorded(
+            &out,
+            &lotse_ipc::ToWorker::RunSource(source(r#"{"talk":true}"#)),
+        )
+        .await;
+        // A source that asks keeps the backchannel when no stream asks any
+        // more, until the connection next connects (downgrade deferred);
+        // asked again meanwhile, it still has it.
+        driver.handle(backchannel("{}", false)).await;
+        assert!(!driver.spec.backchannel, "the next connect's");
+        assert!(ready_wake(&mut driver).await.is_none(), "no reconnect");
+        let deferred = captured.lines("backchannel downgrade deferred to next connect");
+        assert_eq!(deferred.len(), 1);
+        for field in ["backchannel.before=true", "backchannel.after=false"] {
+            assert!(deferred[0].contains(field), "{field}: {deferred:?}");
+        }
+        driver.handle(backchannel(r#"{"talk":true}"#, true)).await;
+        assert!(ready_wake(&mut driver).await.is_none(), "it asks already");
+        // The next connect, a source switch, runs the spec as it is then.
+        driver
+            .handle(Wake::Command(DriverCommand::SwitchSource(spec(
+                "{}", false,
+            ))))
+            .await;
+        step(&mut driver).await;
+        recorded(&out, &lotse_ipc::ToWorker::SwitchSource(source("{}"))).await;
+        // Now a stream asks: the running source restarts once, through the
+        // switch path with the old source stopped first (upgrade).
+        driver.handle(backchannel(r#"{"talk":true}"#, true)).await;
+        assert!(matches!(driver.pending, Pending::ResolvingSwitch(_)));
+        assert_eq!(
+            captured
+                .lines("backchannel upgrade: restarting the source once")
+                .len(),
+            1
+        );
+        step(&mut driver).await;
+        let restart = lotse_ipc::ToWorker::RestartSource(source(r#"{"talk":true}"#));
+        recorded(&out, &restart).await;
+        // Asked again, it asks already; a later switch is a plain one.
+        driver.handle(backchannel(r#"{"talk":true}"#, true)).await;
+        assert!(ready_wake(&mut driver).await.is_none(), "restarted once");
+        driver
+            .handle(Wake::Command(DriverCommand::SwitchSource(spec(
+                r#"{"talk":true}"#,
+                true,
+            ))))
+            .await;
+        step(&mut driver).await;
+        let switch = lotse_ipc::ToWorker::SwitchSource(source(r#"{"talk":true}"#));
+        let messages = recorded(&out, &switch).await;
+        assert_eq!(
+            messages.iter().filter(|m| **m == restart).count(),
+            1,
+            "{messages:?}"
+        );
+        let worker = driver.worker.take().unwrap();
         let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
         drop(driver);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1876,6 +2065,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: Some(1),
             loopback_relay: false,
+            backchannel: false,
         }
     }
 
@@ -2114,6 +2304,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
             },
             Arc::clone(&shared),
             demand,

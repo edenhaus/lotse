@@ -19,7 +19,8 @@
 //! supervisor resolved.
 //!
 //! The ONVIF backchannel (ONVIF Streaming Specification §5.3) lives in the
-//! same session: the `DESCRIBE` asks for it with the `Require` header
+//! same session: when the stream opted in (`backchannel`, off by default),
+//! the `DESCRIBE` asks for it with the `Require` header
 //! (§5.3.1), described again without it on a fresh connection when the
 //! camera refuses it (§5.3.2.1, [`Require`]); its `a=sendonly` audio media
 //! (§5.3.2) is never a track, is set up last, TCP interleaved on its own
@@ -91,7 +92,10 @@ pub struct RtspSource {
     /// The worker's pre-bound relay listener, if it has one.
     relay: Option<Arc<TcpListener>>,
     /// Whether the camera refused the backchannel's `Require` header,
-    /// remembered across the connection's attempts.
+    /// remembered across the connection's attempts. A source that does not
+    /// ask never learns anything here, so the new source the worker builds
+    /// when a stream's opt-in restarts a connection, which only replaces a
+    /// source that did not ask, loses nothing.
     require: Require,
 }
 
@@ -124,6 +128,10 @@ impl Source for RtspSource {
 
     fn connection_options(&self) -> serde_json::Value {
         self.options.connection_key()
+    }
+
+    fn wants_backchannel(&self) -> bool {
+        self.options.backchannel
     }
 
     fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {

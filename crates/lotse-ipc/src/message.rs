@@ -45,6 +45,11 @@ pub enum ToWorker {
     /// switch to it at its first keyframe, and the old source stops. A
     /// standby still connecting is replaced.
     SwitchSource(SourceSpec),
+    /// Stop the running source, then connect this one as its standby, as
+    /// `SwitchSource` does: the camera holds one session at a time, and
+    /// the viewers see a gap instead. A connection whose streams now ask
+    /// for the camera's backchannel restarts its source this way once.
+    RestartSource(SourceSpec),
     /// The grant for the standby's last announced attempt.
     SwitchConnectGranted,
     /// Open a viewer session on this connection's tracks.

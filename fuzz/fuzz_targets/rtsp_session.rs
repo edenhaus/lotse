@@ -13,12 +13,13 @@
 //! and the Sender Reports into the clock mapper. Once the camera hangs up
 //! the attempt ends with a typed error.
 //!
-//! The `DESCRIBE` asks for the ONVIF backchannel (ONVIF Streaming
-//! Specification §5.3.1), so a fuzzed `a=sendonly` audio media takes the
-//! backchannel's path (§5.3.2): retina's stream direction, our reading of
-//! its format and `a=ptime` from the raw SDP (RFC 8866 §5.14, §6.4, §6.6,
-//! §6.7) and its matching stream, its `SETUP` last with the fuzzed
-//! answer, and once offered one packet through retina's send path. A
+//! The source opts in, so the `DESCRIBE` asks for the ONVIF backchannel
+//! (ONVIF Streaming Specification §5.3.1), and a fuzzed `a=sendonly`
+//! audio media takes the backchannel's path (§5.3.2): retina's stream
+//! direction, our reading of its format and `a=ptime` from the raw SDP
+//! (RFC 8866 §5.14, §6.4, §6.6, §6.7) and its matching stream, its
+//! `SETUP` last with the fuzzed answer, and once offered one packet
+//! through retina's send path. A
 //! `551` or `400` to `DESCRIBE` (a whole-response section) describes again
 //! without the header, on a second connection the camera plays the same
 //! script to.
@@ -348,7 +349,7 @@ fuzz_target!(|data: &[u8]| {
         let source = RtspFactory::default()
             .validate(
                 &url,
-                &serde_json::json!({ "timeout_ms": 2_000, "transport": transport }),
+                &serde_json::json!({ "timeout_ms": 2_000, "transport": transport, "backchannel": true }),
             )
             .expect("a valid source");
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);

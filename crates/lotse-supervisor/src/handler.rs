@@ -145,6 +145,9 @@ struct ValidatedSource {
     /// The worker needs a loopback relay listener bound before its sandbox
     /// ([`SourceFactory::loopback_relay`](lotse_core::source::SourceFactory::loopback_relay)).
     loopback_relay: bool,
+    /// The source asks for the camera's backchannel
+    /// ([`Source::wants_backchannel`](lotse_core::source::Source::wants_backchannel)).
+    backchannel: bool,
 }
 
 /// The supervisor: the registry and the API handler over it.
@@ -372,6 +375,7 @@ impl Supervisor {
             .validate(&url, &options)
             .map_err(|err| ApiError::new(ErrorCode::InvalidRequest, err.to_string()))?;
         let described = built.describe();
+        let backchannel = built.wants_backchannel();
         let default_port = factory.default_port(url.scheme());
         let loopback_relay = factory.loopback_relay(url.scheme());
         Ok(ValidatedSource {
@@ -386,6 +390,7 @@ impl Supervisor {
             protocol: described.protocol,
             default_port,
             loopback_relay,
+            backchannel,
         })
     }
 
@@ -400,7 +405,11 @@ impl Supervisor {
     /// on from its first keyframe; otherwise the stream moves to another
     /// connection and its sessions on the old one close with
     /// `stream_changed`. A changed orientation reaches the open sessions
-    /// that stay.
+    /// that stay. Each connection the put touched then asks for the
+    /// camera's backchannel iff a source on it does
+    /// ([`State::follow_backchannel`]): `backchannel` is not part of the
+    /// key, so opting in restarts the shared connection once instead of
+    /// opening a second camera session.
     fn stream_put(&self, put: StreamPut) -> Outcome {
         let stream_id = match StreamId::new(&put.stream_id) {
             Ok(id) => id,
@@ -470,6 +479,7 @@ impl Supervisor {
         );
         for connection in connections {
             state.refresh_connection(&connection);
+            state.follow_backchannel(&connection, stream_id.as_str());
         }
         close_moved_sessions(&mut state, stream_id.as_str());
         if reoriented {
@@ -526,6 +536,7 @@ impl Supervisor {
                 entry.streams.insert(stream_id.as_str().to_owned());
             }
             sources.push(StreamSource {
+                spec: driver_spec(&connection, &source),
                 url: source.url,
                 options: source.options,
                 protocol: source.protocol,
@@ -547,6 +558,7 @@ impl Supervisor {
                 key: source.key.clone(),
                 port: source.url.port().or(source.default_port),
                 loopback_relay: source.loopback_relay,
+                backchannel: source.backchannel,
                 demand,
                 snapshot: ConnectionSnapshot::idle(self.shared.clock.wall_now()),
                 streams: std::collections::BTreeSet::new(),
@@ -613,6 +625,7 @@ impl Supervisor {
             state.streams.remove(stream_id).map(|entry| {
                 for source in entry.sources {
                     state.refresh_connection(&source.connection);
+                    state.follow_backchannel(&source.connection, stream_id);
                 }
                 state.notify_removed(stream_id);
             })
@@ -1170,6 +1183,7 @@ fn driver_spec(id: &str, source: &ValidatedSource) -> DriverSpec {
         host: source.url.host().to_owned(),
         port: source.url.port().or(source.default_port),
         loopback_relay: source.loopback_relay,
+        backchannel: source.backchannel,
     }
 }
 
@@ -2047,6 +2061,56 @@ mod tests {
         // unchanged.
         let put = result(call(&s, &put_options(&json!({ "ready_after_ms": 1000 }))).await);
         assert_eq!(put["created"], false);
+        assert_eq!(worker_pid(&s).await, first);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn opting_in_to_the_backchannel_restarts_the_shared_connection_once_onvif_5_3_1() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let dir = private_dir("backchannel-opt-in");
+        let s = with_webrtc(&recording_worker(&dir), Arc::new(SystemClock));
+        result(call(&s, &put_options(&json!({}))).await);
+        let mut s1 = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        assert_eq!(next(&mut s1).await["type"], "session");
+        let first = worker_pid(&s).await;
+        wait_received(&dir, first, b"fake://127.0.0.1:1/").await;
+        let asks = |s: &Supervisor| s.shared.lock().connections["c1"].backchannel;
+        assert!(!asks(&s), "opt-in");
+        // The stream opts in: the same connection, worker and session, its
+        // source restarted once with the backchannel asked for.
+        let put = result(call(&s, &put_options(&json!({ "talk": true }))).await);
+        assert_eq!(put["created"], false);
+        assert_eq!(front_connection(&s).await, "c1");
+        assert_eq!(s.shared.lock().connections.len(), 1, "no second session");
+        assert!(asks(&s));
+        wait_received(&dir, first, br#"{"talk":true}"#).await;
+        assert_eq!(worker_pid(&s).await, first, "the same worker");
+        assert!(s.shared.lock().sessions.contains_key("s1"));
+        assert_eq!(
+            s.shared.lock().streams["front"].sources[0].options["talk"],
+            true,
+            "the stream keeps its options as given"
+        );
+        assert_eq!(
+            captured
+                .lines("backchannel upgrade: restarting the source once")
+                .len(),
+            1
+        );
+        // Opting out again does not reconnect: deferred to the next connect.
+        result(call(&s, &put_options(&json!({}))).await);
+        assert!(!asks(&s));
+        let deferred = || captured.lines("backchannel downgrade deferred to next connect");
+        for _ in 0..500 {
+            if !deferred().is_empty() {
+                break;
+            }
+            SystemClock.sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(deferred().len(), 1);
         assert_eq!(worker_pid(&s).await, first);
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();

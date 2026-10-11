@@ -68,7 +68,10 @@ macro_rules! let_assert {
 /// `{"video": true}` to publish 30 fps H.264 on the video track
 /// ([`video_packet`]), or both of the last two together, the doorbell a
 /// talk-back test watches while it talks; anything else is rejected, so
-/// tests can see the validation error path.
+/// tests can see the validation error path. Beside any of these,
+/// `{"talk": true}` has the source ask for the device's backchannel
+/// ([`Source::wants_backchannel`]), left out of its connection options as
+/// RTSP's `backchannel` is.
 #[derive(Debug)]
 pub struct FakeSourceFactory {
     /// The schemes it claims.
@@ -284,6 +287,13 @@ impl SourceFactory for FakeSourceFactory {
         options: &serde_json::Value,
     ) -> Result<Box<dyn Source>, SourceConfigError> {
         let scheme = self.schemes.first().copied().unwrap_or("fake");
+        let Some((talk, options)) = take_talk(options) else {
+            return Err(SourceConfigError::InvalidOptions {
+                scheme,
+                message: "fake source's talk must be true or false".to_owned(),
+            });
+        };
+        let options = &options;
         let one = |key: &str| match options {
             serde_json::Value::Object(map) if map.len() == 1 => map.get(key),
             _ => None,
@@ -334,8 +344,24 @@ impl SourceFactory for FakeSourceFactory {
             video,
             backchannel,
             capture: self.capture.clone(),
+            talk,
         }))
     }
+}
+
+/// A fake source's `talk` option taken out of `options`: whether it asks
+/// for the backchannel (absent: no), and the options without it; `None`
+/// when it is not a bool.
+fn take_talk(options: &serde_json::Value) -> Option<(bool, serde_json::Value)> {
+    let serde_json::Value::Object(map) = options else {
+        return Some((false, options.clone()));
+    };
+    let mut rest = map.clone();
+    let talk = match rest.remove("talk") {
+        Some(talk) => talk.as_bool()?,
+        None => false,
+    };
+    Some((talk, serde_json::Value::Object(rest)))
 }
 
 /// The audio track a [`FakeSource`] carries.
@@ -465,6 +491,8 @@ pub struct FakeSource {
     backchannel: Option<Codec>,
     /// Where its backchannel puts what it receives.
     capture: Option<BackchannelCapture>,
+    /// Whether it asks for the device's backchannel (`talk`).
+    talk: bool,
 }
 
 impl Source for FakeSource {
@@ -485,6 +513,10 @@ impl Source for FakeSource {
             "backchannel": self.backchannel.as_ref().map(Codec::name),
             "video": self.video,
         })
+    }
+
+    fn wants_backchannel(&self) -> bool {
+        self.talk
     }
 
     fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
@@ -1731,6 +1763,30 @@ mod tests {
             expected[field] = value;
             assert_eq!(key(options), expected);
         }
+    }
+
+    #[test]
+    fn a_fake_source_asks_for_the_backchannel_only_with_talk_and_on_the_same_connection() {
+        let factory = FakeSourceFactory::new(&["fake"]);
+        let url = SourceUrl::parse("fake://cam/").unwrap();
+        let source = |options: serde_json::Value| factory.validate(&url, &options).unwrap();
+        let quiet = source(serde_json::Value::Null);
+        assert!(!quiet.wants_backchannel());
+        for (options, talk) in [
+            (serde_json::json!({"talk": false}), false),
+            (serde_json::json!({"talk": true}), true),
+        ] {
+            let built = source(options);
+            assert_eq!(built.wants_backchannel(), talk);
+            assert_eq!(built.connection_options(), quiet.connection_options());
+        }
+        let slow = source(serde_json::json!({"talk": true, "ready_after_ms": 5}));
+        assert!(slow.wants_backchannel());
+        assert_eq!(slow.connection_options()["ready_after_ms"], 5);
+        let err = factory
+            .validate(&url, &serde_json::json!({"talk": "yes"}))
+            .unwrap_err();
+        assert!(err.to_string().contains("talk must be"), "{err}");
     }
 
     #[test]

@@ -42,7 +42,7 @@ use lotse_supervisor::net::turn_client::TurnClient;
 use lotse_supervisor::net::udp::{bind_tcp, bind_udp};
 use lotse_supervisor::worker::WorkerConfig;
 use lotse_supervisor::{Environment, FrontDoor, Identity, Limits, Settings, Supervisor};
-use lotse_testing::fake_camera::Stats;
+use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel, Stats};
 use lotse_testing::fake_turn::{FakeTurn, FakeTurnServer};
 use lotse_testing::viewer::{Outgoing, Viewer};
 use lotse_testing::{CameraConfig, FakeCamera};
@@ -394,6 +394,96 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
     assert_eq!(front["sessions"], json!(["ha-1"]));
     assert_eq!(front["last_error"], Value::Null);
     assert_eq!(front["sources"][0]["connection"]["id"], "c1");
+
+    s.shutdown().await;
+    demux.stop();
+    stop_tcp.cancel();
+    cam.stop().await;
+}
+
+/// `stream/get` of `stream_id` once `done` holds for it, looked at every
+/// 50 ms for up to ten seconds.
+async fn stream_where(s: &Supervisor, stream_id: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let get = json!({ "id": 9, "type": "stream/get", "stream_id": stream_id });
+    for _ in 0..200 {
+        let stream = result(call(s, 1, &get).await);
+        if done(&stream) {
+            return stream;
+        }
+        clock().sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "{stream_id} never got there: {}",
+        result(call(s, 1, &get).await)
+    );
+}
+
+/// Talk-back is opt-in (ONVIF Streaming Specification §5.3.1): a stream
+/// without `backchannel` describes its camera without the `Require`
+/// header, and no backchannel is offered. Put again with `backchannel:
+/// true`, the same stream keeps its connection, which restarts its source
+/// once: exactly one more `DESCRIBE`, carrying `Require`, the old session
+/// torn down before the new one plays, so the camera never serves two at
+/// once, and the backchannel is offered from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_1_opting_in_restarts_the_connection_once_with_the_require_header() {
+    let cam = FakeCamera::start(
+        CameraConfig {
+            backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+            ..CameraConfig::default()
+        },
+        clock(),
+    )
+    .await
+    .expect("camera");
+    let Daemon {
+        supervisor: s,
+        demux,
+        stop_tcp,
+        ..
+    } = supervisor();
+    let put = |id: u64, options: Value| {
+        json!({ "id": id, "type": "stream/put", "stream_id": "door", "preload": true,
+                "sources": [{ "url": cam.url(), "options": options }] })
+    };
+    let stats = cam.stats();
+    result(call(&s, 1, &put(1, json!({}))).await);
+    let door = stream_where(&s, "door", |door| door["state"] == "live").await;
+    assert_eq!(door["sources"][0]["backchannel"], Value::Null);
+    assert_eq!(Stats::get(&stats.describes), 1);
+    assert_eq!(
+        Stats::get(&stats.backchannel_describes),
+        0,
+        "no Require without opting in"
+    );
+
+    let answer = result(call(&s, 1, &put(2, json!({ "backchannel": true }))).await);
+    assert_eq!(answer["created"], false);
+    let door = stream_where(&s, "door", |door| {
+        door["sources"][0]["backchannel"]["codec"] == "pcmu"
+    })
+    .await;
+    assert_eq!(door["sources"][0]["backchannel"]["state"], "available");
+    assert_eq!(door["sources"][0]["connection"]["id"], "c1");
+    assert_eq!(door["state"], "live");
+    assert_eq!(Stats::get(&stats.describes), 2, "exactly one reconnect");
+    assert_eq!(
+        Stats::get(&stats.backchannel_describes),
+        1,
+        "its DESCRIBE carries Require"
+    );
+    assert_eq!(Stats::get(&stats.require_rejected), 0);
+    assert_eq!(Stats::get(&stats.backchannel_setups), 1);
+    assert_eq!(Stats::get(&stats.teardowns), 1, "the old session");
+    assert_eq!(
+        Stats::get(&stats.max_playing),
+        1,
+        "one camera session at a time"
+    );
+    // The same put again changes nothing.
+    result(call(&s, 1, &put(3, json!({ "backchannel": true }))).await);
+    clock().sleep(Duration::from_millis(500)).await;
+    assert_eq!(Stats::get(&stats.describes), 2);
 
     s.shutdown().await;
     demux.stop();
