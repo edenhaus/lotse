@@ -190,11 +190,39 @@ pub struct SourceInfo {
     pub state: StreamState,
     /// Reconnects so far.
     pub reconnects: u32,
+    /// The camera's backchannel, which the connection offers while live:
+    /// what a microphone button is gated on. Null when it offers none (the
+    /// camera has none, refused it, or the stream asks for none), and while
+    /// the connection is not live.
+    #[serde(default)]
+    pub backchannel: Option<SourceBackchannel>,
     /// Protocol-specific detail, documented by the scheme's options schema.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub details: serde_json::Map<String, serde_json::Value>,
     /// The shared connection.
     pub connection: ConnectionInfo,
+}
+
+/// A source's backchannel as `stream/get` reports it: the camera's reverse
+/// audio path (an RTSP camera's ONVIF backchannel, ONVIF Streaming
+/// Specification §5.3), one per connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SourceBackchannel {
+    /// The codec the camera takes (`pcmu`, `pcma`, `opus`); a viewer's
+    /// talk-back in another codec is transcoded to it.
+    pub codec: String,
+    /// Whether a session holds it.
+    pub state: BackchannelState,
+}
+
+/// Whether a session holds a source's backchannel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BackchannelState {
+    /// Nobody talks: the next session to send claims it.
+    Available,
+    /// A session holds it, the stream's `backchannel.talker`.
+    InUse,
 }
 
 /// A track as `stream/get` reports it.
@@ -501,6 +529,10 @@ mod tests {
                 protocol: "rtsp".into(),
                 state: StreamState::Live,
                 reconnects: 2,
+                backchannel: Some(SourceBackchannel {
+                    codec: "pcmu".into(),
+                    state: BackchannelState::Available,
+                }),
                 details: serde_json::Map::new(),
                 connection: ConnectionInfo {
                     id: "c3".into(),
@@ -630,6 +662,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(stream.backchannel, StreamBackchannel::default());
+        let source: SourceInfo = serde_json::from_value(json!({
+            "url": "rtsp://cam/", "protocol": "rtsp", "state": "live", "reconnects": 0,
+            "connection": { "id": "c1", "worker": null }
+        }))
+        .unwrap();
+        assert_eq!(source.backchannel, None, "a source without one");
+        assert_eq!(
+            serde_json::to_value(SourceBackchannel {
+                codec: "pcmu".into(),
+                state: BackchannelState::InUse,
+            })
+            .unwrap(),
+            json!({ "codec": "pcmu", "state": "in_use" })
+        );
+        for (state, name) in [
+            (BackchannelState::Available, "available"),
+            (BackchannelState::InUse, "in_use"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), name);
+        }
         assert_eq!(
             serde_json::to_value(StreamBackchannel {
                 talker: Some("s1".into()),

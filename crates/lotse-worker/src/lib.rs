@@ -681,6 +681,11 @@ impl Serving<'_> {
                 self.tx.send_msg(&ToSupervisor::Tracks(tracks), &[]).await?;
             }
             let mut stats = worker_stats(&source.tracks, &source.mapper);
+            stats.backchannel = source
+                .backchannel
+                .as_ref()
+                .and_then(|arbiter| arbiter.offered())
+                .map(|handle| handle.codec.name().to_owned());
             if let Some(manager) = &mut self.sessions {
                 stats.sessions = u32::try_from(manager.len()).unwrap_or(u32::MAX);
                 stats.send_failures = manager.stats().send_failures.load(Ordering::Relaxed);
@@ -1043,6 +1048,7 @@ fn worker_stats(tracks: &DerivedTracks, mapper: &ClockMapper) -> WorkerStats {
         packets_out_of_order: ingest.packets_out_of_order,
         datagrams_rejected: ingest.datagrams_rejected,
         talkback: Vec::new(),
+        backchannel: None,
         tasks: u64::try_from(
             tokio::runtime::Handle::current()
                 .metrics()
@@ -1510,7 +1516,8 @@ mod tests {
 
     /// Talk-back is answered from the backchannel the source offers, and
     /// only when its protocol declares one: the gate that keeps two-way
-    /// audio off until a source can send.
+    /// audio off for a source that cannot send. The counters report the
+    /// offered backchannel's codec behind the same gate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_session_learns_the_backchannel_only_behind_the_protocols_gate() {
         for (factory, options, expected, talkback) in [
@@ -1563,10 +1570,14 @@ mod tests {
                 answer,
                 SessionEvent::Answer {
                     sdp: expected,
-                    talkback
+                    talkback: talkback.clone()
                 },
                 "{options}"
             );
+            // The counters name the codec of the backchannel offered, for
+            // `stream/get`; none behind the gate.
+            let stats = stats_where(&mut h, &mut || {}, &|_| true).await;
+            assert_eq!(stats.backchannel, talkback, "{options}");
             h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
                 .await
                 .unwrap();

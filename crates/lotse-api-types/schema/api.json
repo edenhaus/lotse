@@ -51,6 +51,21 @@
       },
       "type": "object"
     },
+    "BackchannelState": {
+      "description": "Whether a session holds a source's backchannel.",
+      "oneOf": [
+        {
+          "const": "available",
+          "description": "Nobody talks: the next session to send claims it.",
+          "type": "string"
+        },
+        {
+          "const": "in_use",
+          "description": "A session holds it, the stream's `backchannel.talker`.",
+          "type": "string"
+        }
+      ]
+    },
     "BuildInfo": {
       "description": "How the daemon was built.",
       "properties": {
@@ -1708,9 +1723,39 @@
         }
       ]
     },
+    "SourceBackchannel": {
+      "description": "A source's backchannel as `stream/get` reports it: the camera's reverse\naudio path (an RTSP camera's ONVIF backchannel, ONVIF Streaming\nSpecification §5.3), one per connection.",
+      "properties": {
+        "codec": {
+          "description": "The codec the camera takes (`pcmu`, `pcma`, `opus`); a viewer's\ntalk-back in another codec is transcoded to it.",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/BackchannelState",
+          "description": "Whether a session holds it."
+        }
+      },
+      "required": [
+        "codec",
+        "state"
+      ],
+      "type": "object"
+    },
     "SourceInfo": {
       "description": "A source as `stream/get` reports it.",
       "properties": {
+        "backchannel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceBackchannel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The camera's backchannel, which the connection offers while live:\nwhat a microphone button is gated on. Null when it offers none (the\ncamera has none, refused it, or the stream asks for none), and while\nthe connection is not live."
+        },
         "connection": {
           "$ref": "#/$defs/ConnectionInfo",
           "description": "The shared connection."

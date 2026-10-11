@@ -96,8 +96,9 @@ mod tests {
         assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
         assert_eq!(CURRENT.to_string(), API_VERSION);
         assert_eq!(WS_PATH, format!("/v{}/ws", CURRENT.major));
-        // 0.1.1: two-way audio (`backchannel` in `session/get` and
-        // `stream/get`, `talker_changed`, `backchannel/release`).
+        // 0.1.1: two-way audio (`backchannel` in `session/get`, in
+        // `stream/get` and its `sources[]`, `talker_changed`,
+        // `backchannel/release`).
         assert_eq!(CURRENT, v(0, 1, 1), "unstable until lotse 1.0");
     }
 

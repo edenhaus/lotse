@@ -1377,13 +1377,28 @@ async fn session_where(
     }
 }
 
+/// Pumps until `stream/get`'s source backchannel satisfies `want`, which
+/// the worker's counters reach within a stats push or two.
+async fn source_where(api: &mut Api, peers: &mut [&mut ApiPeer], want: &Value) -> Value {
+    let deadline = clock().now() + Duration::from_secs(10);
+    loop {
+        let stream = api.stream().await;
+        if stream["sources"][0]["backchannel"] == *want {
+            return stream;
+        }
+        assert!(clock().now() < deadline, "{stream}");
+        pump_for(api, peers, Duration::from_millis(100)).await;
+    }
+}
+
 /// Talker arbitration through the control API: two viewers negotiate
 /// talk-back; neither holds the backchannel until it sends; the first
 /// sender claims it, the second gets exactly one `backchannel_busy` and its
 /// packets are dropped; the holder going silent keeps it; closing the
 /// holder's session frees it, and so does `backchannel/release`. Each
 /// change is a `talker_changed`, and `session/get` and `stream/get` say
-/// who holds it.
+/// who holds it; `stream/get`'s source says the camera's codec and whether
+/// the backchannel is in use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api() {
     let mut api = Api::start(&json!({ "backchannel": "pcmu" })).await;
@@ -1413,6 +1428,12 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         api.stream().await["backchannel"],
         json!({ "talker": null, "since": null })
     );
+    source_where(
+        &mut api,
+        &mut [&mut a, &mut b],
+        &json!({ "codec": "pcmu", "state": "available" }),
+    )
+    .await;
     pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(300)).await;
     assert!(api.talker_changes().is_empty(), "{:?}", api.stream_seen);
 
@@ -1436,6 +1457,13 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         api.stream().await["backchannel"],
         json!({ "talker": "a", "since": claim["since"] })
     );
+    let stream = source_where(
+        &mut api,
+        &mut [&mut a, &mut b],
+        &json!({ "codec": "pcmu", "state": "in_use" }),
+    )
+    .await;
+    assert_eq!(stream["sources"][0]["state"], "live");
 
     // b sends while a holds it: one warning, every packet dropped. The
     // counters are read once b paused and its packets are through: the

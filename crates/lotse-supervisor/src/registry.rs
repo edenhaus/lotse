@@ -18,8 +18,9 @@ use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::info::{ProcessMetrics, WorkerMetrics};
 use lotse_api_types::session::{Session, SessionEvent};
 use lotse_api_types::stream::{
-    AudioMode, ConnectionInfo, LastError, Orientation, SourceInfo, Stream, StreamBackchannel,
-    StreamEvent, StreamState, StreamStats, TalkerReason, TrackInfo, WorkerInfo,
+    AudioMode, BackchannelState, ConnectionInfo, LastError, Orientation, SourceBackchannel,
+    SourceInfo, Stream, StreamBackchannel, StreamEvent, StreamState, StreamStats, TalkerReason,
+    TrackInfo, WorkerInfo,
 };
 use lotse_api_types::time::rfc3339;
 use lotse_core::clock::Clock;
@@ -986,6 +987,7 @@ impl State {
                     protocol: source.protocol.to_owned(),
                     state: snapshot.map_or(StreamState::Idle, |s| api_state(s.state)),
                     reconnects: snapshot.map_or(0, |s| s.reconnects),
+                    backchannel: connection.and_then(source_backchannel),
                     details: serde_json::Map::new(),
                     connection: ConnectionInfo {
                         id: source.connection.clone(),
@@ -1033,6 +1035,24 @@ impl State {
         };
         UnreadStream { stream, probes }
     }
+}
+
+/// The backchannel `connection` offers, as `stream/get` reports it on each
+/// of its sources: the codec of the handle its worker last saw the source
+/// offer, while the connection is live (a crashed worker's last counters
+/// say nothing of the restarted one), in use while a session holds it.
+fn source_backchannel(connection: &ConnectionEntry) -> Option<SourceBackchannel> {
+    let snapshot = &connection.snapshot;
+    if snapshot.state != ConnectionState::Live {
+        return None;
+    }
+    let codec = snapshot.stats.as_ref()?.backchannel.clone()?;
+    let state = if connection.talker.session.is_some() {
+        BackchannelState::InUse
+    } else {
+        BackchannelState::Available
+    };
+    Some(SourceBackchannel { codec, state })
 }
 
 /// A stream's DTO built under the registry lock, its workers' `pss_bytes`
@@ -1576,6 +1596,65 @@ mod tests {
         assert!(front.try_recv().is_err());
     }
 
+    #[test]
+    fn onvif_5_3_a_source_reports_the_backchannel_its_live_connection_offers() {
+        let mut state = State::default();
+        let (demand, _demand) = watch::channel(0);
+        let (commands, _commands) = mpsc::channel(1);
+        state.connections.insert(
+            "c1".into(),
+            ConnectionEntry {
+                port: None,
+                loopback_relay: false,
+                key: ConnectionKey {
+                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    options: serde_json::Value::Null,
+                },
+                demand,
+                snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
+                streams: ["front".to_owned()].into(),
+                commands,
+                talker: Talker::default(),
+            },
+        );
+        state.streams.insert("front".into(), stream_on_c1(false));
+        let reported = |state: &State| {
+            state.stream("front").unwrap().stream.sources[0]
+                .backchannel
+                .clone()
+        };
+        assert_eq!(reported(&state), None, "idle");
+        let connection = state.connections.get_mut("c1").unwrap();
+        connection.snapshot.state = ConnectionState::Live;
+        assert_eq!(reported(&state), None, "no counters yet");
+        let connection = state.connections.get_mut("c1").unwrap();
+        connection.snapshot.stats = Some(WorkerStats::default());
+        assert_eq!(reported(&state), None, "the source offers none");
+        let connection = state.connections.get_mut("c1").unwrap();
+        connection.snapshot.stats = Some(WorkerStats {
+            backchannel: Some("pcma".into()),
+            ..WorkerStats::default()
+        });
+        let available = SourceBackchannel {
+            codec: "pcma".into(),
+            state: BackchannelState::Available,
+        };
+        assert_eq!(reported(&state), Some(available.clone()));
+        let connection = state.connections.get_mut("c1").unwrap();
+        connection.talker.session = Some("s1".into());
+        assert_eq!(
+            reported(&state),
+            Some(SourceBackchannel {
+                state: BackchannelState::InUse,
+                ..available
+            })
+        );
+        // A reconnect: the last counters say nothing of the next session.
+        let connection = state.connections.get_mut("c1").unwrap();
+        connection.snapshot.state = ConnectionState::Reconnecting;
+        assert_eq!(reported(&state), None, "not live");
+    }
+
     /// A state with connection `c1`, whose driver queue holds one
     /// command, and its session `s1` (serial 1), gathering `gathers`.
     fn relay_state(gathers: usize) -> (State, mpsc::Receiver<DriverCommand>) {
@@ -1839,6 +1918,7 @@ mod tests {
             packets_out_of_order: 5,
             datagrams_rejected: 6,
             talkback: Vec::new(),
+            backchannel: None,
         };
         let stream = stream_stats_of(Some(&stats));
         assert_eq!(

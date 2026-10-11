@@ -402,6 +402,9 @@ pub struct WorkerStats {
     pub datagrams_rejected: u64,
     /// Per session whose answer negotiated talk-back, keyed by session id.
     pub talkback: Vec<(String, TalkbackStats)>,
+    /// The codec of the backchannel the running source offers now, by its
+    /// API name (`pcmu`); `None` while it offers none.
+    pub backchannel: Option<String>,
 }
 
 #[cfg(test)]
@@ -514,6 +517,7 @@ mod tests {
                 packets_out_of_order: 5,
                 datagrams_rejected: 6,
                 talkback: vec![],
+                backchannel: Some("pcmu".into()),
             }),
             ToSupervisor::Session {
                 session_id: "s1".into(),
