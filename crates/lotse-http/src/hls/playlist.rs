@@ -477,16 +477,14 @@ mod tests {
     }
 
     fn parse_media(text: &str) -> MediaPlaylist {
-        let Playlist::Media(playlist) = parse(text.as_bytes(), &base()).unwrap() else {
-            panic!("not a media playlist");
-        };
+        lotse_core::let_assert!(Ok(Playlist::Media(playlist)) = parse(text.as_bytes(), &base()));
         playlist
     }
 
     fn parse_multivariant(text: &str) -> MultivariantPlaylist {
-        let Playlist::Multivariant(playlist) = parse(text.as_bytes(), &base()).unwrap() else {
-            panic!("not a multivariant playlist");
-        };
+        lotse_core::let_assert!(
+            Ok(Playlist::Multivariant(playlist)) = parse(text.as_bytes(), &base())
+        );
         playlist
     }
 
