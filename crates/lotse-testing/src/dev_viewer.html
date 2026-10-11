@@ -296,9 +296,6 @@ let features = [];
 // Talk-back: the send-only audio transceiver the offer carried, and the
 // microphone while Talk is on, the one track on its sender.
 let talkTransceiver, mic;
-// How long Play waits for a live connection's restart to offer the
-// camera's backchannel before it offers.
-const BACKCHANNEL_WAIT_MS = 10000;
 // The last second's cumulative jitter-buffer counters per inbound stream,
 // so the page shows the current buffer rather than the session average.
 let previous = new Map();
@@ -420,6 +417,13 @@ async function onSessionEvent(event) {
     case "closed":
       log(`closed: ${event.code}: ${event.message}`, event.code === "session_closed" ? undefined : "bad");
       $("s-state").textContent = `closed (${event.code})`;
+      if (event.code === "backchannel_unavailable") {
+        // The stream opted in, so the daemon never plays a talk-back
+        // request without talk-back; nor does the page retry without.
+        $("s-talk").textContent = `unavailable: ${event.message}`;
+        $("s-talk").className = "bad";
+        log(`two-way audio unavailable, the session failed: ${event.message}; turn two-way audio off to play without it`, "bad");
+      }
       offerId = undefined; // the subscription ended with this event
       teardown(true);
       break;
@@ -486,9 +490,12 @@ async function play() {
   if (talkback) {
     // Talk-back goes up on a dedicated send-only m-line, which the daemon
     // answers recvonly in the backchannel's codec or Opus (RFC 3264 §6.1)
-    // when the camera offers a backchannel, inactive otherwise. It carries
-    // no track until Talk, so nothing is sent and nothing claims the
-    // backchannel before then.
+    // from the backchannel the live source offers: the stream opted in, so
+    // without one the session closes with backchannel_unavailable rather
+    // than playing without talk-back. An offer right after a put that
+    // opted in a live connection waits in the daemon for its restart to
+    // ask for the backchannel. It carries no track until Talk, so nothing
+    // is sent and nothing claims the backchannel before then.
     if (!features.includes("two_way_audio")) log("the daemon announces no two_way_audio: talk-back will not be negotiated", "bad");
     if (navigator.mediaDevices?.getUserMedia) {
       talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });
@@ -552,8 +559,6 @@ async function play() {
   if (mine !== attempt) return;
   if (!putResult.success) { teardown(true); return; }
   log(`stream ${streamId} ${putResult.result.created ? "created" : "updated or unchanged"}, ${orientation}`);
-  if (talkTransceiver) await waitForBackchannel(streamId, mine);
-  if (mine !== attempt) return;
   offerId = send({
     type: "webrtc/offer",
     stream_id: streamId,
@@ -568,40 +573,6 @@ async function play() {
     pendingCandidates = [];
   });
   statsTimer = setInterval(stats, 1000);
-}
-
-// Waits, when it has to, for stream/get to report a source's backchannel:
-// the daemon answers talk-back only from one the camera offers when the
-// session opens. A connection that is not live connects for this offer
-// and asks for the backchannel then, before the session opens, so there
-// is nothing to wait for. A live one without it restarts once to ask, and
-// keeps playing the old source until the new one is live: an offer before
-// then would open on the old one, so it waits, up to BACKCHANNEL_WAIT_MS
-// (the camera may have none). Logs what it found; the offer goes out
-// either way.
-async function waitForBackchannel(streamId, mine) {
-  const until = performance.now() + BACKCHANNEL_WAIT_MS;
-  let waiting = false;
-  while (mine === attempt) {
-    const got = await call({ type: "stream/get", stream_id: streamId });
-    const sources = got.success ? got.result.sources : [];
-    const offered = got.success ? got.result.sources.find((s) => s.backchannel)?.backchannel : undefined;
-    if (offered) {
-      log(`camera backchannel: ${offered.codec}, ${offered.state}`, "good");
-      return;
-    }
-    if (!sources.some((s) => s.state === "live")) {
-      log("the camera connects for this offer and asks for its backchannel then");
-      return;
-    }
-    if (!waiting) log("waiting for the camera's backchannel: the live connection restarts once to ask for it…");
-    waiting = true;
-    if (performance.now() >= until) {
-      log(`no backchannel after ${BACKCHANNEL_WAIT_MS / 1000} s: the camera has none or refused it; talk-back will not be negotiated`, "bad");
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
 }
 
 // What the answer did with the talk-back m-line: recvonly makes the

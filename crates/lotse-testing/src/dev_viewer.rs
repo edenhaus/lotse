@@ -691,33 +691,34 @@ mod tests {
             r#"if (navigator.mediaDevices?.getUserMedia) {
       talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });"#
         ));
-        // The offer waits for the camera's backchannel, which the answer
-        // is built from.
+        // The offer goes out right after the put's result, talk-back or
+        // not: the daemon holds it while the connection restarts to ask for
+        // the backchannel, so the page neither waits nor polls.
         let play = page
             .split("async function play()")
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
             .expect("play()");
-        let wait = play
-            .find("await waitForBackchannel(streamId, mine);")
-            .expect("waits");
-        assert!(
-            wait < play.find(r#"type: "webrtc/offer""#).unwrap(),
-            "{play}"
-        );
-        assert!(page.contains(r"got.result.sources.find((s) => s.backchannel)?.backchannel"));
-        // Only a live connection is waited for: one that is not connects
-        // for the offer and asks for the backchannel before the session
-        // opens, so waiting there only delays the first frame.
-        let waits = page
-            .split("async function waitForBackchannel(streamId, mine)")
+        let awaited = "const putResult = await put;";
+        let put = play.find(awaited).expect("awaits the put") + awaited.len();
+        let offer = play.find(r#"type: "webrtc/offer""#).expect("offers");
+        let between = &play[put..offer];
+        assert!(!between.contains("await"), "{between}");
+        assert!(!page.contains(r#"type: "stream/get""#), "no polling");
+        assert!(!page.contains("setTimeout(resolve"), "no waiting");
+        // A talk-back request the daemon cannot meet fails the session; the
+        // page says why and does not retry without talk-back.
+        let closed = page
+            .split(r#"case "closed":"#)
             .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("waitForBackchannel()");
-        let not_live = waits
-            .find(r#"if (!sources.some((s) => s.state === "live")) {"#)
-            .expect("returns when nothing is live");
-        assert!(not_live < waits.find("waiting = true;").unwrap(), "{waits}");
+            .and_then(|rest| rest.split("break;").next())
+            .expect("the closed event");
+        assert!(
+            closed.contains(r#"if (event.code === "backchannel_unavailable") {"#),
+            "{closed}"
+        );
+        assert!(closed.contains("${event.message}"), "{closed}");
+        assert!(!closed.contains("play()"), "no retry: {closed}");
         // Talk is usable only when the answer took the m-line.
         assert!(page.contains(r#"talkTransceiver.currentDirection === "sendonly""#));
         // The microphone is asked for on Talk, not on Play, and leaves the
