@@ -5,10 +5,8 @@
 //! refused `SETUP` of it means, and the handle a playing session offers
 //! on the connection's [`BackchannelSlot`].
 //!
-//! Every piece is complete without a send path, and none is called by
-//! [`crate::RtspSource`] yet: retina 0.4 can neither ask for the
-//! backchannel, set it up nor send on it (an upstream need), and each one
-//! hooks into the source once it can.
+//! [`crate::RtspSource`] calls each piece in its attempts: retina asks for
+//! the backchannel, sets it up and sends on it.
 //!
 //! Implements ONVIF Streaming Specification §5.3.1 (the `Require` tag on
 //! `DESCRIBE`), §5.3.2 (the backchannel media, `a=sendonly` audio) and

@@ -30,7 +30,9 @@
 //! its own channel pair in the same session, whose RTP after `PLAY` it
 //! parses (RFC 3550 §5.1) and records ([`Stats::backchannel`]), RTCP on the
 //! odd channel counted. Quirk modes: the `Require` tag refused with `551`
-//! (RFC 2326 §11.3.13) or `400`, and one payload type taken only.
+//! (RFC 2326 §11.3.13) or `400`, one payload type taken only, and the
+//! backchannel's `SETUP` refused with `453` (RFC 2326 §11.3.3) or hung up
+//! on.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -332,6 +334,20 @@ pub enum RequireAnswer {
     BadRequest,
 }
 
+/// How the camera answers the `SETUP` of its backchannel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackchannelSetup {
+    /// Set up, TCP interleaved.
+    #[default]
+    Accept,
+    /// `453 Not Enough Bandwidth` (RFC 2326 §11.3.3), as a camera whose one
+    /// backchannel another client holds may answer; the media streams
+    /// play on.
+    Busy,
+    /// No answer: the camera closes the connection.
+    HangUp,
+}
+
 /// The ONVIF backchannel the camera offers (ONVIF Streaming Specification
 /// §5.3): with `Require: www.onvif.org/ver20/backchannel` on `DESCRIBE`,
 /// an `a=sendonly` audio media after the others, set up TCP interleaved on
@@ -353,6 +369,8 @@ pub struct CameraBackchannel {
     /// cameras that take only a fixed one (observed behavior); any payload
     /// type when `None`.
     pub accept_only: Option<u8>,
+    /// How its `SETUP` is answered.
+    pub setup: BackchannelSetup,
 }
 
 impl CameraBackchannel {
@@ -1003,6 +1021,18 @@ impl CameraConfig {
     }
 }
 
+/// Whether a connection still answers requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answering {
+    /// It does.
+    Yes,
+    /// It hung at `PLAY` ([`PlayAnswer::Never`]) and answers nothing.
+    Hung,
+    /// It closes the connection instead of the next answer
+    /// ([`BackchannelSetup::HangUp`]).
+    HangUp,
+}
+
 /// The state of one connection.
 struct Connection {
     /// The camera's settings.
@@ -1029,8 +1059,8 @@ struct Connection {
     peer: IpAddr,
     /// The UDP side, once a `SETUP` asked for it.
     udp: Option<UdpSide>,
-    /// It hung at `PLAY` ([`PlayAnswer::Never`]) and answers nothing.
-    hung: bool,
+    /// Whether it still answers.
+    answering: Answering,
     /// The last `DESCRIBE` offered the backchannel media.
     backchannel_offered: bool,
     /// The interleaved RTP channel of the backchannel, once set up; RTCP
@@ -1212,7 +1242,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         audio_sent: 0,
         peer,
         udp: None,
-        hung: false,
+        answering: Answering::Yes,
         backchannel_offered: false,
         backchannel_channel: None,
     };
@@ -1308,10 +1338,9 @@ impl Connection {
                 Message::Response(_) => continue,
             };
             let (response, close) = self.respond(&request);
-            let Some(bytes) = response else {
-                continue;
-            };
-            if stream.write_all(&bytes).await.is_err() {
+            if let Some(bytes) = response
+                && stream.write_all(&bytes).await.is_err()
+            {
                 return false;
             }
             if close {
@@ -1395,15 +1424,16 @@ impl Connection {
         }
         if *request.method() == Method::Play {
             match self.config.play {
-                PlayAnswer::Never => self.hung = true,
+                PlayAnswer::Never => self.answering = Answering::Hung,
                 PlayAnswer::Unreadable => bytes.extend_from_slice(UNREADABLE),
                 PlayAnswer::Play | PlayAnswer::Refuse => {}
             }
         }
-        if self.hung {
-            return (None, false);
+        match self.answering {
+            Answering::Yes => (Some(bytes), close),
+            Answering::Hung => (None, false),
+            Answering::HangUp => (None, true),
         }
-        (Some(bytes), close)
     }
 
     /// The answer to one request; `true` closes the connection afterwards.
@@ -1559,6 +1589,13 @@ impl Connection {
         if backchannel && (transport.contains("client_port=") || !transport.contains("RTP/AVP/TCP"))
         {
             return reply(cseq, StatusCode::UnsupportedTransport).build(Vec::new());
+        }
+        match self.config.backchannel.as_ref().map(|b| b.setup) {
+            Some(BackchannelSetup::Busy) if backchannel => {
+                return reply(cseq, StatusCode::NotEnoughBandwidth).build(Vec::new());
+            }
+            Some(BackchannelSetup::HangUp) if backchannel => self.answering = Answering::HangUp,
+            _ => {}
         }
         if transport.contains("client_port=") && self.config.udp.service != UdpService::Refuse {
             return self.setup_udp(request, &transport, cseq);

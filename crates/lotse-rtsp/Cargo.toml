@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 sdp-types = { workspace = true } # the camera's backchannel media: payload type and `a=ptime`
 rustls = { workspace = true } # `rtsps`: the client configuration and the certificate verifier
 sha2 = { workspace = true } # the `tls_fingerprint` pin of the camera's leaf certificate
+socket2 = { workspace = true } # `TCP_QUICKACK` on the relay's side of retina's connection, whose Nagle would hold the backchannel's packets
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "io-util", "sync"] } # `select!` over packets and cancellation; the `rtsps` relay's sockets and copy loop; `sync`: the TCP relay's wake-up when a receiver report is first scheduled, and the backchannel's queue
 tokio-rustls = { workspace = true } # the TLS stream to an `rtsps` camera

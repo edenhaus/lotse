@@ -11,8 +11,9 @@
 //! on the RTSP session's interleaved channel serializes them. [`session`]
 //! holds what surrounds them in the RTSP session: the `Require` header and
 //! its refusal, the backchannel media of the `DESCRIBE` answer, and the
-//! handle offered while the session plays. None of it is wired to the
-//! RTSP source yet, because retina cannot send (an upstream need).
+//! handle offered while the session plays; the RTSP source hands retina
+//! the stamped packets, and retina serializes them on the backchannel's
+//! interleaved channel with its own SSRC and sequence numbers.
 //!
 //! Implements RFC 8866 §5.14 (the `m=` format list, in order of preference),
 //! §6.4 (`a=ptime`) and §6.6 (`a=rtpmap`), with encoding names compared

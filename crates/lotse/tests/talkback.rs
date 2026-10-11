@@ -11,10 +11,14 @@
 //! through the control API: the supervisor in-process with the real demux
 //! and a real `lotse worker` subprocess, whose fake source declares a
 //! backchannel, the talker read from `talker_changed`, `session/get` and
-//! `stream/get`. The RTSP source cannot send yet (retina cannot; an
-//! upstream need).
+//! `stream/get`. The RTSP tests serve the same in-process worker with
+//! the RTSP source against the fake camera, whose ONVIF backchannel
+//! (ONVIF Streaming Specification §5.3) records what arrives: the tone,
+//! its `a=ptime` framing, a reconnect under a talker, and the downlink's
+//! A/V sync while talking.
 //! Needs the `source-fake` feature (on with `--all-features`) and
-//! `output-webrtc` (a default).
+//! `output-webrtc` (a default); the RTSP tests `source-rtsp` (a default)
+//! too.
 
 #![cfg(all(feature = "source-fake", feature = "output-webrtc"))]
 #![allow(
@@ -49,18 +53,28 @@ use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::registry::Registries;
 use lotse_core::runner::RunnerConfig;
 use lotse_core::session::SessionLimits;
+use lotse_core::source::SourceFactory;
 use lotse_core::task::spawn_named;
 use lotse_core::test_util::{BackchannelCapture, Captured, FakeSourceFactory};
 use lotse_core::track::TrackLimits;
 use lotse_ipc::{
-    Channel, SessionEvent, SessionSpec, SourceSpec, SourceState, ToSupervisor, ToWorker,
+    Channel, SessionEvent, SessionSpec, SourceSpec, SourceState, TalkerChange, ToSupervisor,
+    ToWorker,
 };
 use lotse_supervisor::api::{ConnectionId, Event, Handler as _, Outcome};
 use lotse_supervisor::net::demux::{Demux, Registration, WorkerSink};
 use lotse_supervisor::net::udp::bind_udp;
 use lotse_supervisor::worker::WorkerConfig;
 use lotse_supervisor::{Environment, FrontDoor, Identity, Limits, Settings, Supervisor};
+#[cfg(feature = "source-rtsp")]
+use lotse_testing::fake_camera::{
+    BackchannelCodec, BackchannelRtp, CameraAudio, CameraBackchannel, Stats,
+};
+#[cfg(feature = "source-rtsp")]
+use lotse_testing::viewer::capture_seconds;
 use lotse_testing::viewer::{Outgoing, TalkbackOffer, Viewer, with_audio_codecs};
+#[cfg(feature = "source-rtsp")]
+use lotse_testing::{CameraConfig, FakeCamera};
 use serde_json::{Value, json};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -386,19 +400,34 @@ struct InProcess {
     worker: tokio::task::JoinHandle<Result<lotse_worker::ExitReason, lotse_worker::Error>>,
     /// Every session event, in order.
     events: Vec<(String, SessionEvent)>,
+    /// Every change of the talker, in order.
+    talkers: Vec<TalkerChange>,
     live: bool,
 }
 
 impl InProcess {
     async fn start(capture: &BackchannelCapture, options: &str) -> Self {
+        let factory = Arc::new(FakeSourceFactory::capturing(&["fake"], capture.clone()));
+        Self::start_with(factory, "fake://cam/", options, vec![]).await
+    }
+
+    /// The worker running the RTSP source against `camera`.
+    #[cfg(feature = "source-rtsp")]
+    async fn rtsp(camera: &FakeCamera) -> Self {
+        let factory = Arc::new(lotse_rtsp::RtspFactory::default());
+        Self::start_with(factory, &camera.url(), "{}", vec![camera.addr()]).await
+    }
+
+    /// The worker running `url` with `options` from `factory`, resolved
+    /// to `peer_addrs`, until the source is live.
+    async fn start_with(
+        factory: Arc<dyn SourceFactory>,
+        url: &str,
+        options: &str,
+        peer_addrs: Vec<SocketAddr>,
+    ) -> Self {
         let mut registries = Registries::default();
-        registries
-            .sources
-            .register(Arc::new(FakeSourceFactory::capturing(
-                &["fake"],
-                capture.clone(),
-            )))
-            .unwrap();
+        registries.sources.register(factory).unwrap();
         registries
             .outputs
             .register(Arc::new(lotse_webrtc::WebRtcFactory))
@@ -442,10 +471,10 @@ impl InProcess {
         tx.send_msg(
             &ToWorker::RunSource(SourceSpec {
                 connection_id: "c1".into(),
-                url: "fake://cam/".into(),
+                url: url.into(),
                 options: options.into(),
                 peer_host: "cam".into(),
-                peer_addrs: vec![],
+                peer_addrs,
             }),
             &[],
         )
@@ -460,6 +489,7 @@ impl InProcess {
             registrations: Vec::new(),
             worker,
             events: Vec::new(),
+            talkers: Vec::new(),
             live: false,
         };
         worker.pump(&mut [], |w, _| w.live).await;
@@ -469,6 +499,11 @@ impl InProcess {
     /// Opens session `id` on `offer`, registered with the demux under its
     /// own credentials.
     async fn open(&mut self, id: &str, offer: &str) {
+        self.open_with(id, offer, false).await;
+    }
+
+    /// [`Self::open`], with the camera's `audio` asked for.
+    async fn open_with(&mut self, id: &str, offer: &str, audio: bool) {
         let ufrag = format!("ufrag{id}");
         let pass = "talkbackpassword01234567";
         self.registrations.push(self.demux.registrations().register(
@@ -488,7 +523,7 @@ impl InProcess {
                     ice_pass: pass.into(),
                     candidates: vec![self.local],
                     tcp_candidates: vec![],
-                    audio: false,
+                    audio,
                     orientation: 1,
                 }),
                 &[],
@@ -518,6 +553,7 @@ impl InProcess {
                             .unwrap();
                     }
                     ToSupervisor::SourceState(SourceState::Live) => self.live = true,
+                    ToSupervisor::Talker(change) => self.talkers.push(change),
                     ToSupervisor::Session { session_id, event } => {
                         let index: usize = session_id.parse().expect("sessions named by index");
                         let peer = &mut *peers[index];
@@ -560,6 +596,13 @@ impl InProcess {
         let exit = self.worker.await.unwrap().unwrap();
         assert_eq!(exit, lotse_worker::ExitReason::Shutdown);
         self.demux.stop();
+    }
+}
+
+impl ToneRun {
+    /// What the camera's backchannel took.
+    fn frames(&self) -> Vec<Frame> {
+        self.captured.iter().map(Frame::from).collect()
     }
 }
 
@@ -617,29 +660,65 @@ async fn tone_run(camera: &str, audio_codecs: Option<&str>, mic: Mic) -> ToneRun
     }
 }
 
-/// The checks every tone run passes:
-/// whole G.711 frames of the camera's law with continuous timestamps,
-/// paced at the frame duration; the tone at its frequency in every burst;
-/// and the daemon's share of the latency, onset in to onset out at the
-/// handle. Returns the latency of each onset.
-fn check_tone(run: &ToneRun, law: Law) -> Vec<Duration> {
-    let frames = &run.captured[..TONE_PACKETS as usize];
-    // RFC 3551 §4.5.14: the law's static payload type, 8000 Hz, 20 ms
-    // frames of 160 samples; RFC 3550 §5.1: one sequence number and 160
-    // timestamp ticks apart, the marker on the spurt's first only
-    // (RFC 3551 §4.1).
-    for (i, frame) in frames.iter().enumerate() {
-        let packet = &frame.packet;
-        assert_eq!(packet.rtp.pt, law.payload_type(), "frame {i}");
-        assert_eq!(packet.payload.len(), 160, "frame {i}");
-        assert_eq!(packet.rtp.marker, i == 0, "frame {i}");
+/// One frame as the camera's backchannel took it: the RTP header fields
+/// that matter, the payload, and when it arrived.
+struct Frame {
+    pt: u8,
+    seq: u16,
+    ts: u32,
+    marker: bool,
+    payload: Vec<u8>,
+    at: Instant,
+}
+
+impl From<&Captured> for Frame {
+    fn from(captured: &Captured) -> Self {
+        let rtp = captured.packet.rtp;
+        Self {
+            pt: rtp.pt,
+            seq: rtp.seq,
+            ts: rtp.ts,
+            marker: rtp.marker,
+            payload: captured.packet.payload.to_vec(),
+            at: captured.at,
+        }
+    }
+}
+
+#[cfg(feature = "source-rtsp")]
+impl From<&BackchannelRtp> for Frame {
+    fn from(rtp: &BackchannelRtp) -> Self {
+        Self {
+            pt: rtp.payload_type,
+            seq: rtp.sequence_number,
+            ts: rtp.timestamp,
+            marker: rtp.marker,
+            payload: rtp.payload.clone(),
+            at: rtp.arrival,
+        }
+    }
+}
+
+/// The frames of one talkspurt as the camera took them, `frame` apart:
+/// whole G.711 frames of the camera's `pt` and `frame`'s samples, with
+/// continuous timestamps and sequence numbers, the marker on the first
+/// only, paced on the frame grid.
+fn check_frames(frames: &[Frame], pt: u8, frame: Duration) {
+    let samples = u32::try_from(frame.as_millis() * 8).unwrap();
+    // RFC 3551 §4.5.14: 8000 Hz, a frame of `samples`; RFC 3550 §5.1: one
+    // sequence number and `samples` timestamp ticks apart, the marker on
+    // the spurt's first only (RFC 3551 §4.1).
+    for (i, packet) in frames.iter().enumerate() {
+        assert_eq!(packet.pt, pt, "frame {i}");
+        assert_eq!(packet.payload.len(), samples as usize, "frame {i}");
+        assert_eq!(packet.marker, i == 0, "frame {i}");
         if let Some(next) = frames.get(i + 1) {
             assert_eq!(
-                next.packet.rtp.ts.wrapping_sub(packet.rtp.ts),
-                160,
+                next.ts.wrapping_sub(packet.ts),
+                samples,
                 "continuous timestamps after frame {i}"
             );
-            assert_eq!(next.packet.rtp.seq.wrapping_sub(packet.rtp.seq), 1);
+            assert_eq!(next.seq.wrapping_sub(packet.seq), 1);
         }
     }
     // Paced on an absolute schedule: no drift over the run, each frame
@@ -648,34 +727,35 @@ fn check_tone(run: &ToneRun, law: Law) -> Vec<Duration> {
     let span = frames[frames.len() - 1].at.duration_since(first);
     let mean = span / (frames.len() as u32 - 1);
     assert!(
-        mean.abs_diff(FRAME) <= Duration::from_micros(500),
+        mean.abs_diff(frame) <= Duration::from_micros(500),
         "frames every {mean:?} on average"
     );
     let off_grid: Vec<Duration> = frames
         .iter()
         .enumerate()
-        .map(|(i, frame)| frame.at.duration_since(first).abs_diff(FRAME * i as u32))
+        .map(|(i, at)| at.at.duration_since(first).abs_diff(frame * i as u32))
         .collect();
     let p95 = percentile(&off_grid, 95);
     assert!(
         p95 <= Duration::from_millis(5),
-        "p95 {p95:?} off the 20 ms grid"
+        "p95 {p95:?} off the {frame:?} grid"
     );
+}
+
+/// The checks every tone run passes:
+/// whole 20 ms G.711 frames of the camera's law with continuous
+/// timestamps, paced at the frame duration ([`check_frames`]); the tone
+/// at its frequency in every burst; and the daemon's share of the
+/// latency, onset in to onset out at the camera. Returns the latency of
+/// each onset.
+fn check_tone(frames: &[Frame], mic: &Mic, law: Law) -> Vec<Duration> {
+    let frames = &frames[..TONE_PACKETS as usize];
+    check_frames(frames, law.payload_type(), FRAME);
 
     // The tone survives at its frequency: in each burst's inner frames
     // (its edges carry the onset and the decay), nearly all of the energy
     // is at 1 kHz, next to none at the neighbours.
-    let pcm: Vec<Vec<i16>> = frames
-        .iter()
-        .map(|frame| {
-            frame
-                .packet
-                .payload
-                .iter()
-                .map(|&code| law.decode(code))
-                .collect()
-        })
-        .collect();
+    let pcm = decode(frames, law);
     for (burst, &onset) in onsets().iter().enumerate() {
         let inner: Vec<i16> = pcm[onset as usize + 1..(onset + BURST.0) as usize - 1]
             .iter()
@@ -718,8 +798,16 @@ fn check_tone(run: &ToneRun, law: Law) -> Vec<Duration> {
         .map(|(&onset_in, &onset_out)| {
             frames[onset_out]
                 .at
-                .saturating_duration_since(run.mic.sent[onset_in as usize])
+                .saturating_duration_since(mic.sent[onset_in as usize])
         })
+        .collect()
+}
+
+/// The samples of each of `frames` in `law`.
+fn decode(frames: &[Frame], law: Law) -> Vec<Vec<i16>> {
+    frames
+        .iter()
+        .map(|frame| frame.payload.iter().map(|&code| law.decode(code)).collect())
         .collect()
 }
 
@@ -748,7 +836,7 @@ async fn rfc6716_an_opus_tone_reaches_a_pcmu_camera_at_its_frequency_paced_withi
     .await;
     assert_eq!(run.pt, 111, "the browser sends Opus");
     assert_eq!(run.talkback.as_deref(), Some("opus"));
-    let latencies = check_tone(&run, Law::Mu);
+    let latencies = check_tone(&run.frames(), &run.mic, Law::Mu);
     let median = check_latency(&latencies);
     println!("Opus to PCMU: uplink latency per onset {latencies:?}, median {median:?}");
 }
@@ -761,7 +849,7 @@ async fn rfc3551_4_5_14_a_pcmu_tone_passes_through_to_a_pcmu_camera_paced_within
     let run = tone_run("pcmu", None, Mic::pcmu()).await;
     assert_eq!(run.pt, 0, "the browser sends PCMU (RFC 3551 Table 4)");
     assert_eq!(run.talkback.as_deref(), Some("pcmu"));
-    let latencies = check_tone(&run, Law::Mu);
+    let latencies = check_tone(&run.frames(), &run.mic, Law::Mu);
     // The frames are the browser's packets, code for code; at most a
     // packet late for its slot (concealed) and the one it displaced differ.
     let identical = run
@@ -776,6 +864,225 @@ async fn rfc3551_4_5_14_a_pcmu_tone_passes_through_to_a_pcmu_camera_paced_within
     );
     let median = check_latency(&latencies);
     println!("PCMU to PCMU: uplink latency per onset {latencies:?}, median {median:?}");
+}
+
+// ---------------------------------------------------------------------
+// The RTSP source, in the in-process worker, against the fake camera's
+// ONVIF backchannel.
+// ---------------------------------------------------------------------
+
+/// A fake camera with video, `audio` and an ONVIF backchannel in `codec`
+/// that asks for `ptime` ms packets (`a=ptime`, RFC 8866 §6.4).
+#[cfg(feature = "source-rtsp")]
+async fn rtsp_camera(
+    audio: Option<CameraAudio>,
+    codec: BackchannelCodec,
+    ptime: u32,
+) -> FakeCamera {
+    let config = CameraConfig {
+        audio,
+        backchannel: Some(CameraBackchannel {
+            ptime: Some(ptime),
+            ..CameraBackchannel::new(codec)
+        }),
+        ..CameraConfig::default()
+    };
+    FakeCamera::start(config, clock())
+        .await
+        .expect("the camera")
+}
+
+/// Session 0 of `worker`: a viewer that negotiates talk-back, the
+/// camera's audio asked for when `audio`, and talks `mic`.
+#[cfg(feature = "source-rtsp")]
+async fn talking(worker: &mut InProcess, audio: bool, mic: Mic) -> Peer {
+    let mut peer = Peer::new(None).await;
+    worker.open_with("0", &peer.offer, audio).await;
+    worker
+        .pump(&mut [&mut peer], |_, peers| peers[0].viewer.is_connected())
+        .await;
+    peer.talk(mic);
+    peer
+}
+
+/// Everything `camera`'s backchannel took, once it took `count` packets.
+#[cfg(feature = "source-rtsp")]
+async fn camera_frames(
+    worker: &mut InProcess,
+    peer: &mut Peer,
+    camera: &FakeCamera,
+    count: u64,
+) -> Vec<Frame> {
+    worker
+        .pump(&mut [peer], |_, _| {
+            Stats::get(&camera.stats().backchannel_packets) >= count
+        })
+        .await;
+    camera
+        .stats()
+        .backchannel()
+        .iter()
+        .map(Frame::from)
+        .collect()
+}
+
+/// The browser's PCMU tone through the RTSP source to the camera
+/// (ONVIF Streaming Specification §5.3): retina sends the talk-back
+/// chain's frames on the backchannel's interleaved channel, and the
+/// camera takes them in its payload type and `a=ptime`, continuous, paced
+/// and within the daemon's 40 ms.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_a_pcmu_tone_through_the_rtsp_source_reaches_the_camera_paced_within_40_ms() {
+    let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
+    let mut worker = InProcess::rtsp(&camera).await;
+    let mut peer = talking(&mut worker, false, Mic::pcmu()).await;
+    worker
+        .pump(&mut [&mut peer], |_, peers| peers[0].sent() >= TONE_PACKETS)
+        .await;
+    let mic = peer.mute();
+    let frames = camera_frames(&mut worker, &mut peer, &camera, TONE_PACKETS.into()).await;
+    let latencies = check_tone(&frames, &mic, Law::Mu);
+    assert_eq!(Stats::get(&camera.stats().backchannel_refused), 0);
+    let median = check_latency(&latencies);
+    println!("PCMU through RTSP: uplink latency per onset {latencies:?}, median {median:?}");
+    worker.stop().await;
+    camera.stop().await;
+}
+
+/// RFC 8866 §6.4: a camera whose backchannel asks for `a=ptime:40` takes
+/// 40 ms frames of 320 samples, paced 40 ms apart, the tone in them.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc8866_6_4_a_cameras_ptime_of_40_ms_frames_the_tone_in_40_ms_packets() {
+    let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 40).await;
+    let mut worker = InProcess::rtsp(&camera).await;
+    let mut peer = talking(&mut worker, false, Mic::pcmu()).await;
+    worker
+        .pump(&mut [&mut peer], |_, peers| peers[0].sent() >= TONE_PACKETS)
+        .await;
+    let _mic = peer.mute();
+    let count = TONE_PACKETS / 2;
+    let frames = camera_frames(&mut worker, &mut peer, &camera, count.into()).await;
+    let frames = &frames[..count as usize];
+    check_frames(frames, Law::Mu.payload_type(), FRAME * 2);
+    // Two of the browser's packets a frame: the first burst's inner
+    // frames carry the tone.
+    let pcm = decode(frames, Law::Mu);
+    let onset = (LEAD / 2) as usize;
+    for (i, samples) in pcm.iter().enumerate().take(onset + 5).skip(onset + 1) {
+        let share = tone_share(samples, TONE_HZ);
+        assert!(share > 0.8, "frame {i}: {share:.3} of the energy at 1 kHz");
+    }
+    worker.stop().await;
+    camera.stop().await;
+}
+
+/// A reconnect under a talker: the camera drops the connection, the
+/// source withdraws the handle and offers it again after the new `SETUP`,
+/// and the talker keeps the channel (one claim, never released, no
+/// `backchannel_busy`); the camera takes a fresh RTP stream (RFC 3550
+/// §5.1, §8.1: another SSRC), whose first packet starts a talkspurt
+/// (RFC 3551 §4.1).
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3550_8_1_a_reconnect_offers_the_backchannel_again_and_the_talker_keeps_it() {
+    let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
+    let mut worker = InProcess::rtsp(&camera).await;
+    let mut peer = talking(&mut worker, false, Mic::pcmu()).await;
+    let before = camera_frames(&mut worker, &mut peer, &camera, 25)
+        .await
+        .len();
+    camera.drop_connections();
+    worker
+        .pump(&mut [&mut peer], |_, _| {
+            let stats = camera.stats();
+            Stats::get(&stats.backchannel_setups) == 2
+                && Stats::get(&stats.backchannel_packets) >= before as u64 + 25
+        })
+        .await;
+    let _mic = peer.mute();
+    let recorded = camera.stats().backchannel();
+    let split = recorded
+        .iter()
+        .position(|packet| packet.ssrc != recorded[0].ssrc)
+        .expect("a second RTP stream");
+    let (old, new) = recorded.split_at(split);
+    assert!(
+        new.iter().all(|packet| packet.ssrc == new[0].ssrc),
+        "one stream per SETUP"
+    );
+    for stream in [old, new] {
+        assert!(stream[0].marker, "a stream starts a talkspurt");
+        for pair in stream.windows(2) {
+            assert_eq!(
+                pair[1].sequence_number,
+                pair[0].sequence_number.wrapping_add(1)
+            );
+        }
+    }
+    let changes: Vec<(&str, &str)> = worker
+        .talkers
+        .iter()
+        .map(|change| (change.session_id.as_str(), change.reason.as_str()))
+        .collect();
+    assert_eq!(
+        changes,
+        [("0", "claimed")],
+        "the claim outlives the reconnect"
+    );
+    assert!(
+        !worker.events.iter().any(|(_, event)| matches!(
+            event,
+            SessionEvent::Warning { code, .. } if code == "backchannel_busy"
+        )),
+        "{:?}",
+        worker.events
+    );
+    assert_eq!(Stats::get(&camera.stats().connections), 2);
+    worker.stop().await;
+    camera.stop().await;
+}
+
+/// Downlink A/V sync with talk-back active, which needs audio, video and
+/// a backchannel on one source: while the viewer talks, the daemon's
+/// Sender Reports (RFC 3550 §6.4.1) still put the camera's audio within
+/// 40 ms of its video, which the camera captured together.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3550_6_4_1_downlink_audio_stays_in_sync_with_video_while_talking() {
+    let camera = rtsp_camera(Some(CameraAudio::Pcmu), BackchannelCodec::Pcmu, 20).await;
+    let mut worker = InProcess::rtsp(&camera).await;
+    let mut peer = talking(&mut worker, true, Mic::pcmu()).await;
+    // Three seconds of audio with talk-back flowing all along: long
+    // enough for Sender Reports of both.
+    worker
+        .pump(&mut [&mut peer], |_, peers| {
+            let viewer = &peers[0].viewer;
+            Stats::get(&camera.stats().backchannel_packets) >= 100
+                && viewer.audio_packets().len() >= 150
+                && viewer
+                    .audio_packets()
+                    .last()
+                    .is_some_and(|packet| packet.last_sender_info.is_some())
+                && viewer
+                    .packets()
+                    .last()
+                    .is_some_and(|packet| packet.last_sender_info.is_some())
+        })
+        .await;
+    assert!(peer.sent() >= 100, "talking all along");
+    let viewer = &peer.viewer;
+    let audio_at = capture_seconds(viewer.audio_packets().last().unwrap()).expect("an audio SR");
+    let video_at = capture_seconds(viewer.packets().last().unwrap()).expect("a video SR");
+    let offset_ms = (audio_at - video_at) * 1_000.0;
+    println!("A/V offset while talking: {offset_ms:.1} ms");
+    assert!(
+        offset_ms.abs() < 40.0,
+        "audio {offset_ms:.1} ms from video by the daemon's Sender Reports"
+    );
+    worker.stop().await;
+    camera.stop().await;
 }
 
 // ---------------------------------------------------------------------

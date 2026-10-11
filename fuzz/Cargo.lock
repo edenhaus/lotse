@@ -1411,6 +1411,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2 0.6.5",
  "thiserror",
  "tokio",
  "tokio-rustls",
