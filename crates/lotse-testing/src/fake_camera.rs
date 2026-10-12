@@ -29,10 +29,10 @@
 //! payload type and `a=ptime` (RFC 8866 §6.4, §6.6), set up interleaved on
 //! its own channel pair in the same session, whose RTP after `PLAY` it
 //! parses (RFC 3550 §5.1) and records ([`Stats::backchannel`]), RTCP on the
-//! odd channel counted. Quirk modes: the `Require` tag refused with `551`
-//! (RFC 2326 §11.3.13) or `400`, one payload type taken only, and the
-//! backchannel's `SETUP` refused with `453` (RFC 2326 §11.3.3) or hung up
-//! on.
+//! odd channel counted. Other modes: the `Require` tag refused with `551`
+//! (RFC 2326 §11.3.13, ONVIF Streaming Specification §5.3.2), only the
+//! offered payload type taken (§5.3.2), and the backchannel's `SETUP`
+//! refused with `453` (RFC 2326 §11.3.3) or hung up on.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -317,9 +317,7 @@ impl BackchannelCodec {
 }
 
 /// How the camera answers a `DESCRIBE` that carries the backchannel's
-/// `Require` tag. The refusals are a camera without the backchannel, and
-/// the `400 Bad Request` some Dahua and Amcrest firmwares answer instead
-/// (observed behavior).
+/// `Require` tag: with the backchannel, or refused as a camera without it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RequireAnswer {
     /// The SDP, with the backchannel media added (ONVIF Streaming
@@ -327,11 +325,9 @@ pub enum RequireAnswer {
     #[default]
     Honor,
     /// `551 Option not supported` with the tag in `Unsupported` (RFC 2326
-    /// §11.3.13, §12.40), as ONVIF Streaming Specification §5.3.2.1 has a
+    /// §11.3.13, §12.40), as ONVIF Streaming Specification §5.3.2 has a
     /// server without the backchannel answer.
     OptionNotSupported,
-    /// `400 Bad Request`, as other firmwares answer instead.
-    BadRequest,
 }
 
 /// How the camera answers the `SETUP` of its backchannel.
@@ -365,9 +361,10 @@ pub struct CameraBackchannel {
     pub ptime: Option<u32>,
     /// How a `DESCRIBE` with `Require` is answered.
     pub require: RequireAnswer,
-    /// Record only RTP of this payload type and refuse the rest: the
-    /// cameras that take only a fixed one (observed behavior); any payload
-    /// type when `None`.
+    /// Record only RTP of this payload type and refuse the rest, as a
+    /// camera that matches what it receives against its own `a=rtpmap`
+    /// fields (ONVIF Streaming Specification §5.3.2); any payload type
+    /// when `None`.
     pub accept_only: Option<u8>,
     /// How its `SETUP` is answered.
     pub setup: BackchannelSetup,
@@ -1537,7 +1534,7 @@ impl Connection {
 
     /// DESCRIBE: the SDP, with the backchannel media when the request
     /// carries its `Require` tag and the camera offers one (ONVIF Streaming
-    /// Specification §5.3.1, §5.3.2), or the quirk's refusal.
+    /// Specification §5.3.1, §5.3.2), or its refusal with `551` (§5.3.2).
     fn describe(&mut self, request: &Request<Vec<u8>>, cseq: &str) -> Response<Vec<u8>> {
         let asked = request.header(&REQUIRE).is_some_and(|tags| {
             tags.as_str()
@@ -1551,10 +1548,6 @@ impl Connection {
                 return reply(cseq, StatusCode::OptionNotSupported)
                     .header(UNSUPPORTED, BACKCHANNEL_REQUIRE)
                     .build(Vec::new());
-            }
-            Some(RequireAnswer::BadRequest) if asked => {
-                Stats::bump(&self.stats.require_rejected);
-                return reply(cseq, StatusCode::BadRequest).build(Vec::new());
             }
             _ => false,
         };
@@ -2440,43 +2433,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dahua_require_is_refused_with_551_or_400_and_a_retry_without_it_plays_onvif_5_3_2_1() {
-        for (answer, status) in [
-            (
-                RequireAnswer::OptionNotSupported,
-                StatusCode::OptionNotSupported,
-            ),
-            (RequireAnswer::BadRequest, StatusCode::BadRequest),
-        ] {
-            let camera = FakeCamera::start(
-                with_backchannel(CameraBackchannel {
-                    require: answer,
-                    ..CameraBackchannel::new(BackchannelCodec::Pcmu)
-                }),
-                clock(),
-            )
-            .await
-            .unwrap();
-            let mut client = Client::connect(&camera).await;
-            let refused = client
-                .request("DESCRIBE", &camera.url(), &[REQUIRE_BACKCHANNEL])
-                .await;
-            assert_eq!(refused.status(), status);
-            let unsupported = refused.header(&UNSUPPORTED).map(|v| v.as_str().to_owned());
-            if answer == RequireAnswer::OptionNotSupported {
-                assert_eq!(unsupported.as_deref(), Some(BACKCHANNEL_REQUIRE));
-            } else {
-                assert_eq!(unsupported, None);
-            }
-            let retry = client.request("DESCRIBE", &camera.url(), &[]).await;
-            assert_eq!(retry.status(), StatusCode::Ok);
-            assert!(!body(&retry).contains("a=sendonly"));
-            let stats = camera.stats();
-            assert_eq!(Stats::get(&stats.require_rejected), 1);
-            assert_eq!(Stats::get(&stats.describes), 1);
-            assert_eq!(Stats::get(&stats.backchannel_describes), 0);
-            camera.stop().await;
-        }
+    async fn onvif_5_3_2_require_is_refused_with_551_and_a_retry_without_it_plays() {
+        let camera = FakeCamera::start(
+            with_backchannel(CameraBackchannel {
+                require: RequireAnswer::OptionNotSupported,
+                ..CameraBackchannel::new(BackchannelCodec::Pcmu)
+            }),
+            clock(),
+        )
+        .await
+        .unwrap();
+        let mut client = Client::connect(&camera).await;
+        let refused = client
+            .request("DESCRIBE", &camera.url(), &[REQUIRE_BACKCHANNEL])
+            .await;
+        assert_eq!(refused.status(), StatusCode::OptionNotSupported);
+        let unsupported = refused.header(&UNSUPPORTED).map(|v| v.as_str().to_owned());
+        assert_eq!(unsupported.as_deref(), Some(BACKCHANNEL_REQUIRE));
+        let retry = client.request("DESCRIBE", &camera.url(), &[]).await;
+        assert_eq!(retry.status(), StatusCode::Ok);
+        assert!(!body(&retry).contains("a=sendonly"));
+        let stats = camera.stats();
+        assert_eq!(Stats::get(&stats.require_rejected), 1);
+        assert_eq!(Stats::get(&stats.describes), 1);
+        assert_eq!(Stats::get(&stats.backchannel_describes), 0);
+        camera.stop().await;
     }
 
     #[tokio::test]

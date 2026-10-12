@@ -237,34 +237,33 @@ async fn onvif_5_3_2_the_backchannel_is_set_up_last_offered_and_its_packets_reac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onvif_5_3_2_1_a_551_or_400_to_require_is_described_again_without_it_and_remembered() {
-    for answer in [RequireAnswer::OptionNotSupported, RequireAnswer::BadRequest] {
-        let cam = camera(config(None, BackchannelCodec::Pcmu, |backchannel| {
-            backchannel.require = answer;
-        }))
-        .await;
-        let source = source(&cam, &serde_json::Value::Null);
-        let mut first = Harness::start(source.as_ref(), peer(&cam), clock());
-        assert!(first.wait_ready().await, "{answer:?}: plays without it");
-        let stats = cam.stats();
-        // The refusal, then the same attempt asked again without the
-        // header on a fresh connection, at once.
-        assert_eq!(count(&stats.require_rejected), 1, "{answer:?}");
-        assert_eq!(count(&stats.connections), 2, "{answer:?}");
-        assert_eq!(count(&stats.describes), 1, "{answer:?}");
-        assert_eq!(count(&stats.backchannel_describes), 0, "{answer:?}");
-        assert!(first.backchannel.current().is_none(), "{answer:?}: none");
-        assert_eq!(first.tracks.tracks().len(), 1, "{answer:?}: the video");
-        let _exit = finish(first).await;
-        // The source's next attempt, a reconnect, leaves the header out.
-        let mut second = Harness::start(source.as_ref(), peer(&cam), clock());
-        assert!(second.wait_ready().await, "{answer:?}");
-        assert_eq!(count(&stats.require_rejected), 1, "{answer:?}: remembered");
-        assert_eq!(count(&stats.connections), 3, "{answer:?}");
-        assert_eq!(count(&stats.describes), 2, "{answer:?}");
-        let _exit = finish(second).await;
-        cam.stop().await;
-    }
+async fn onvif_5_3_2_a_551_to_require_is_described_again_without_it_and_remembered() {
+    let answer = RequireAnswer::OptionNotSupported;
+    let cam = camera(config(None, BackchannelCodec::Pcmu, |backchannel| {
+        backchannel.require = answer;
+    }))
+    .await;
+    let source = source(&cam, &serde_json::Value::Null);
+    let mut first = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(first.wait_ready().await, "{answer:?}: plays without it");
+    let stats = cam.stats();
+    // The refusal, then the same attempt asked again without the
+    // header on a fresh connection, at once.
+    assert_eq!(count(&stats.require_rejected), 1, "{answer:?}");
+    assert_eq!(count(&stats.connections), 2, "{answer:?}");
+    assert_eq!(count(&stats.describes), 1, "{answer:?}");
+    assert_eq!(count(&stats.backchannel_describes), 0, "{answer:?}");
+    assert!(first.backchannel.current().is_none(), "{answer:?}: none");
+    assert_eq!(first.tracks.tracks().len(), 1, "{answer:?}: the video");
+    let _exit = finish(first).await;
+    // The source's next attempt, a reconnect, leaves the header out.
+    let mut second = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(second.wait_ready().await, "{answer:?}");
+    assert_eq!(count(&stats.require_rejected), 1, "{answer:?}: remembered");
+    assert_eq!(count(&stats.connections), 3, "{answer:?}");
+    assert_eq!(count(&stats.describes), 2, "{answer:?}");
+    let _exit = finish(second).await;
+    cam.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

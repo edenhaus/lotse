@@ -59,7 +59,8 @@ pub struct BackchannelFormat {
     /// The codec the camera accepts: PCMU, PCMA or Opus.
     pub codec: Codec,
     /// The payload type the camera's SDP gives that codec, which may be a
-    /// dynamic one (some cameras take only the number they offered).
+    /// dynamic one: the camera matches what it receives against its own
+    /// `a=rtpmap` fields (ONVIF Streaming Specification §5.3.2).
     pub payload_type: u8,
     /// The RTP clock rate: 8000 for G.711, 48000 for Opus.
     pub clock_rate: u32,

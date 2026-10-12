@@ -9,12 +9,11 @@
 //! the backchannel, sets it up and sends on it.
 //!
 //! Implements ONVIF Streaming Specification §5.3.1 (the `Require` tag on
-//! `DESCRIBE`), §5.3.2 (the backchannel media, `a=sendonly` audio) and
-//! §5.3.2.1 (a server without it answers `551 Option not supported`, RFC
-//! 2326 §11.3.13); RFC 8866 §5.14 (the first payload type of an `m=`
-//! line) and §6.7 (the direction attribute, at media level, else at
-//! session level, else `sendrecv`). The `400 Bad Request` some Dahua and
-//! Amcrest firmwares answer instead is observed behavior.
+//! `DESCRIBE`) and §5.3.2 (a server without the backchannel answers `551
+//! Option not supported`, RFC 2326 §11.3.13; the backchannel media are
+//! `a=sendonly`, and the client chooses which one it uses); RFC 8866 §5.14
+//! (the first payload type of an `m=` line) and §6.7 (the direction
+//! attribute, at media level, else at session level, else `sendrecv`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,13 +31,8 @@ use super::{BackchannelFormat, BackchannelPacket, Initial, Packetizer, backchann
 pub const REQUIRE_TAG: &str = "www.onvif.org/ver20/backchannel";
 
 /// RFC 2326 §11.3.13: `551 Option not supported`, the answer ONVIF
-/// Streaming Specification §5.3.2.1 gives a server without the
-/// backchannel.
+/// Streaming Specification §5.3.2 gives a server without the backchannel.
 pub const OPTION_NOT_SUPPORTED: u16 = 551;
-
-/// `400 Bad Request`, which some Dahua and Amcrest firmwares answer to the
-/// `Require` header instead (observed behavior).
-pub const BAD_REQUEST: u16 = 400;
 
 /// How many packets the backchannel's queue holds: 160 ms of 20 ms
 /// frames. The talker's forwarder never waits on it and drops when it is
@@ -78,12 +72,12 @@ impl Require {
 
     /// Whether a failed `DESCRIBE` is retried without the header, on a
     /// fresh connection: it carried the header (`sent`) and the camera
-    /// answered `551 Option not supported` (ONVIF Streaming Specification
-    /// §5.3.2.1) or `400 Bad Request` (the Dahua and Amcrest quirk).
-    /// Anything else, or a status without the header sent, is the
-    /// attempt's error as it is.
+    /// answered `551 Option not supported`, after which "the client can
+    /// then try to establish an RTSP connection without backchannel" (ONVIF
+    /// Streaming Specification §5.3.2). Anything else, or a status without
+    /// the header sent, is the attempt's error as it is.
     pub fn retry_without(sent: bool, status: Option<u16>) -> bool {
-        let retry = sent && matches!(status, Some(OPTION_NOT_SUPPORTED | BAD_REQUEST));
+        let retry = sent && status == Some(OPTION_NOT_SUPPORTED);
         if retry {
             tracing::info!(
                 status,
@@ -107,11 +101,11 @@ impl Require {
 }
 
 /// Whether the `SETUP` of the backchannel failing with `status` leaves the
-/// attempt to play without it: any RTSP status does (some cameras take one
-/// backchannel at a time and refuse a second client's, or refuse the
-/// transport), since the backchannel is optional and the media streams
-/// are already set up. Without a status the connection failed, and the
-/// attempt ends with that error.
+/// attempt to play without it: any RTSP status does, since the
+/// backchannel is optional, the media streams are already set up, and a
+/// refused `SETUP` leaves retina's session usable without that stream.
+/// Without a status the connection failed, and the attempt ends with that
+/// error.
 pub fn play_without(status: Option<u16>) -> bool {
     match status {
         Some(status) => {
@@ -150,16 +144,15 @@ fn direction(attributes: &[sdp_types::Attribute]) -> Option<&str> {
 }
 
 /// The backchannel of a `DESCRIBE` answer's SDP `sdp`, sent with the
-/// `Require` header: the first media description that is audio, is
-/// `sendonly` (the camera only receives on it, ONVIF Streaming
-/// Specification §5.3.2; RFC 8866 §6.7: its own direction attribute, else
-/// the session's) and has a format the talk-back chain produces
-/// ([`backchannel_format`]). When every media description is `sendonly`,
-/// the camera describes its own direction and none is a backchannel.
-/// retina's proposed `StreamDirection::Sending` applies the same rule to
-/// the media-level attribute only, so the source sets a backchannel up
-/// only where both agree. `None` also for an SDP that does not parse; the
-/// relay's guard has refused one retina could not read.
+/// `Require` header: the first media description that is `sendonly` (media
+/// the client sends to the camera, ONVIF Streaming Specification §5.3.2;
+/// RFC 8866 §6.7: its own direction attribute, else the session's), is
+/// audio and has a format the talk-back chain produces
+/// ([`backchannel_format`]). Of the backchannels a camera lists, the client
+/// chooses which one it uses (§5.3.2), and talk-back uses audio. retina's
+/// proposed `StreamDirection::Sending` reads the same direction
+/// attributes. `None` also for an SDP that does not parse; the relay's
+/// guard has refused one retina could not read.
 pub fn offer(sdp: &[u8]) -> Option<Offer> {
     let session = match sdp_types::Session::parse(sdp) {
         Ok(session) => session,
@@ -171,10 +164,6 @@ pub fn offer(sdp: &[u8]) -> Option<Offer> {
     let default = direction(&session.attributes);
     let sendonly =
         |media: &sdp_types::Media| direction(&media.attributes).or(default) == Some("sendonly");
-    if session.medias.iter().all(sendonly) {
-        tracing::debug!("backchannel: every media is sendonly; the camera describes its own");
-        return None;
-    }
     let offer = session
         .medias
         .iter()
@@ -332,15 +321,21 @@ mod tests {
     }
 
     #[test]
-    fn onvif_5_3_2_1_a_551_or_400_to_the_require_header_is_retried_without_it() {
-        for status in [OPTION_NOT_SUPPORTED, BAD_REQUEST] {
-            assert!(Require::retry_without(true, Some(status)), "{status}");
-            assert!(
-                !Require::retry_without(false, Some(status)),
-                "{status} without the header is the camera's own error"
-            );
-        }
-        for status in [Some(401), Some(404), Some(454), Some(461), Some(500), None] {
+    fn onvif_5_3_2_a_551_to_the_require_header_is_retried_without_it() {
+        assert!(Require::retry_without(true, Some(OPTION_NOT_SUPPORTED)));
+        assert!(
+            !Require::retry_without(false, Some(OPTION_NOT_SUPPORTED)),
+            "a 551 without the header is the camera's own error"
+        );
+        for status in [
+            Some(400),
+            Some(401),
+            Some(404),
+            Some(454),
+            Some(461),
+            Some(500),
+            None,
+        ] {
             assert!(!Require::retry_without(true, status), "{status:?}");
         }
         assert_eq!(OPTION_NOT_SUPPORTED, 551, "RFC 2326 §11.3.13");
@@ -500,7 +495,7 @@ mod tests {
             "m=audio 0 RTP/AVP 0",
             "a=sendonly",
         ]);
-        assert_eq!(offer(&all), None);
+        assert_eq!(offer(&all).map(|offer| offer.media), Some(1));
         let overridden = sdp(&[
             "a=recvonly",
             "m=video 0 RTP/AVP 96",
@@ -511,14 +506,14 @@ mod tests {
     }
 
     #[test]
-    fn a_server_whose_every_media_is_sendonly_describes_its_own_direction() {
+    fn onvif_5_3_2_every_media_sendonly_still_offers_its_audio_backchannel() {
         let answer = sdp(&[
             "m=video 0 RTP/AVP 96",
             "a=sendonly",
             "m=audio 0 RTP/AVP 0",
             "a=sendonly",
         ]);
-        assert_eq!(offer(&answer), None);
+        assert_eq!(offer(&answer).map(|offer| offer.media), Some(1));
     }
 
     #[test]

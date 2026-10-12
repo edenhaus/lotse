@@ -22,7 +22,7 @@
 //! same session: when the stream opted in (`backchannel`, off by default),
 //! the `DESCRIBE` asks for it with the `Require` header
 //! (§5.3.1), described again without it on a fresh connection when the
-//! camera refuses it (§5.3.2.1, [`Require`]); its `a=sendonly` audio media
+//! camera refuses it (§5.3.2, [`Require`]); its `a=sendonly` audio media
 //! (§5.3.2) is never a track, is set up last, TCP interleaved on its own
 //! channel pair, and once playing offered on the connection's
 //! [`lotse_core::source::BackchannelSlot`], whose packets retina sends
@@ -152,7 +152,7 @@ impl Source for RtspSource {
             // a `DESCRIBE` the camera refused for the backchannel's
             // `Require` header is asked again without it on a fresh
             // connection at once (ONVIF Streaming Specification
-            // §5.3.2.1), not after a reconnect's backoff.
+            // §5.3.2), not after a reconnect's backoff.
             let mut without = false;
             loop {
                 let ask = Ask {
