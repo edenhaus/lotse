@@ -68,7 +68,7 @@ use lotse_core::track::{FrameSubscription, SubscriptionError, Track};
 use lotse_core::transcode::{TrackHandle, TranscodeError, Transcoder, UplinkFactory};
 use tokio_util::sync::CancellationToken;
 
-use super::rtp_ts;
+use super::{failed, rtp_ts};
 use crate::g711::{Law, SAMPLE_RATE};
 use crate::opus::{Decoder, OpusError};
 
@@ -246,9 +246,7 @@ impl Transcoder for ToG711 {
         }
         let source = match Law::of(from) {
             Some(from) => Input::G711(from),
-            None => Input::Opus(
-                Decoder::new(SAMPLE_RATE).map_err(|err| TranscodeError::Failed(err.to_string()))?,
-            ),
+            None => Input::Opus(Decoder::new(SAMPLE_RATE).map_err(failed)?),
         };
         let chain = Chain::new(source, law, self.frame, output, Arc::clone(&self.clock));
         let delay = Self::delay(self.frame);

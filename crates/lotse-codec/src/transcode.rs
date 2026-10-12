@@ -196,7 +196,7 @@ impl Transcoder for AacToOpus {
     }
 }
 
-/// A refusal of the resampler or the Opus encoder as [`TranscodeError::Failed`].
+/// A refusal of the resampler or an Opus codec as [`TranscodeError::Failed`].
 fn failed(err: impl std::fmt::Display) -> TranscodeError {
     TranscodeError::Failed(err.to_string())
 }
