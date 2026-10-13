@@ -11,6 +11,8 @@
 //! it, or when it belongs to anyone but the uid the daemon started as. The
 //! directory holding it must belong to that uid too and must not be
 //! writable by the group or others, so nobody else can replace the file.
+//! Starts sharing the directory take turns under an exclusive `flock` on
+//! it, so concurrent first starts agree on one identity.
 //!
 //! Standards: RFC 5280 §4.1.2.5 (validity: `notAfter` 99991231235959Z, "no
 //! well-defined expiration date"), RFC 5958 (PKCS #8 private keys), RFC
@@ -148,7 +150,7 @@ impl ServerIdentity {
     /// and the file must belong to `owner_uid`, the uid the daemon
     /// started as.
     pub fn load_or_create(dir: &Path, owner_uid: u32) -> Result<Self, IdentityError> {
-        check_directory(dir, owner_uid)?;
+        let _locked = lock_directory(dir, owner_uid)?;
         match Self::load(dir, owner_uid) {
             Err(IdentityError::Missing(_)) => {
                 let pem = generate(&rcgen::PKCS_ECDSA_P256_SHA256)?;
@@ -223,13 +225,18 @@ fn io_error(path: &str, source: io::Error) -> IdentityError {
 }
 
 /// Refuses a data directory that is missing, not a directory, writable by
-/// the group or others, or not `owner_uid`'s.
-fn check_directory(dir: &Path, owner_uid: u32) -> Result<(), IdentityError> {
+/// the group or others, or not `owner_uid`'s, and takes an exclusive
+/// `flock` on it, held until the returned handle drops: two daemons
+/// sharing the directory make and read the identity one at a time, so
+/// neither removes the other's partial file or renames over the identity
+/// the other already serves.
+fn lock_directory(dir: &Path, owner_uid: u32) -> Result<std::fs::File, IdentityError> {
     let text = dir.display().to_string();
-    let meta = std::fs::metadata(dir).map_err(|source| IdentityError::Directory {
+    let directory = |source| IdentityError::Directory {
         path: text.clone(),
         source,
-    })?;
+    };
+    let meta = std::fs::metadata(dir).map_err(directory)?;
     if !meta.is_dir() {
         return Err(IdentityError::NotADirectory(text));
     }
@@ -244,7 +251,9 @@ fn check_directory(dir: &Path, owner_uid: u32) -> Result<(), IdentityError> {
             expected: owner_uid,
         });
     }
-    Ok(())
+    let handle = std::fs::File::open(dir).map_err(directory)?;
+    handle.lock().map_err(directory)?;
+    Ok(handle)
 }
 
 /// A fresh key for `alg` and its self-signed certificate, as the PEM text
@@ -336,6 +345,33 @@ mod tests {
         let shown = format!("{made:?}");
         assert!(shown.contains("<redacted>"), "{shown}");
         assert!(!shown.contains("PRIVATE"), "{shown}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_starts_agree_on_one_identity() {
+        // Each thread opens the directory itself, so each holds its own
+        // lock, as two daemons would.
+        let dir = data_dir("concurrent", 0o700);
+        let starts = 8;
+        let barrier = std::sync::Barrier::new(starts);
+        let pins: Vec<Fingerprint> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..starts)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        ServerIdentity::load_or_create(&dir, uid()).map(|made| made.pin())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap().unwrap())
+                .collect()
+        });
+        let kept = ServerIdentity::load(&dir, uid()).unwrap().pin();
+        assert!(pins.iter().all(|pin| *pin == kept), "{pins:?} vs {kept}");
+        assert!(!dir.join(PARTIAL_FILE).exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
