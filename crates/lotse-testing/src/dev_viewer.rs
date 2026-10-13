@@ -630,8 +630,19 @@ mod tests {
         );
         assert_eq!(
             page.matches("streamTyped = typedStream();").count(),
-            3,
-            "on load, on typing and on choosing a saved stream"
+            2,
+            "guessed on load and on choosing a saved stream only"
+        );
+        // Typing marks any non-empty id as the user's, the default `cam`
+        // and the name's slug included.
+        let input = page
+            .split(r#"$("stream").addEventListener("input", () => {"#)
+            .nth(1)
+            .and_then(|rest| rest.split("\n});\n").next())
+            .expect("typing a stream id");
+        assert!(
+            input.contains(r#"streamTyped = $("stream").value.trim() !== "";"#),
+            "{input}"
         );
     }
 

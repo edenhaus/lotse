@@ -326,13 +326,16 @@ if (Object.keys(credentials).length && save()) {
 $("url").addEventListener("focus", showUrl);
 $("url").addEventListener("input", () => { cameraUrl = $("url").value.trim(); syncSelection(); });
 $("url").addEventListener("blur", () => { save(); showUrl(); });
-// Whether the stream id is one the name did not give: neither empty, the
-// page's default, nor the name's slug.
+// Whether a stream id nobody just typed is one the name did not give:
+// neither empty, the page's default, nor the name's slug. On load and on
+// choosing a saved stream, this is the best guess.
 const typedStream = () => !["", $("stream").defaultValue, slugify($("label").value)].includes($("stream").value.trim());
 // Whether the stream id was typed by hand, so the name leaves it alone.
 let streamTyped = typedStream();
+// Any id typed here is the user's, even the default or the name's slug;
+// emptying the field hands it back to the name.
 $("stream").addEventListener("input", () => {
-  streamTyped = typedStream();
+  streamTyped = $("stream").value.trim() !== "";
   syncSelection();
 });
 // An emptied stream id is handed back to the name once the field is left,
