@@ -495,6 +495,71 @@ mod tests {
         }
     }
 
+    /// The panel sits right of the video or below it, as its dock buttons
+    /// on the title line choose, and the choice is kept with the other
+    /// settings.
+    #[test]
+    fn the_panel_docks_right_of_or_below_the_video() {
+        let page = PAGE;
+        assert!(page.contains(r#"<div class="app" id="app">"#));
+        let header = page
+            .split("<header>")
+            .nth(1)
+            .and_then(|rest| rest.split("</header>").next())
+            .expect("the title line");
+        assert!(
+            header.contains("<h1>")
+                && header.contains(
+                    r#"<button id="dock-right" type="button" title="Panel right of the video""#
+                )
+                && header.contains(
+                    r#"<button id="dock-below" type="button" title="Panel below the video""#
+                ),
+            "{header}"
+        );
+        // Below, the video keeps the full width and the panel is three
+        // columns: the fields, the session, and the widest, the log. A
+        // narrow window stacks them as before and has no dock buttons.
+        let below = page
+            .split("@media (min-width: 761px) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }\n").next())
+            .expect("the panel below the video is styled for wide windows only");
+        assert!(
+            below.contains(".app.below { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }")
+                && below.contains("grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1.8fr);")
+                && below.contains(".app.below .col, .app.below #log { min-height: 0; overflow-y: auto; }"),
+            "{below}"
+        );
+        let aside = page
+            .split("<aside>")
+            .nth(1)
+            .and_then(|rest| rest.split("</aside>").next())
+            .expect("the panel");
+        assert_eq!(aside.matches(r#"<div class="col">"#).count(), 2, "{aside}");
+        assert!(
+            aside.trim_end().ends_with(r#"<pre id="log"></pre>"#),
+            "{aside}"
+        );
+        assert!(page.contains("    .dock { display: none; }\n"));
+        // The pressed button shows where the panel is; a stored choice is
+        // applied on load, and anything else puts the panel right.
+        assert!(page.contains(r#"let panel = saved.panel === "below" ? "below" : "right";"#));
+        assert!(page.contains(r#"$("app").classList.toggle("below", panel === "below");"#));
+        assert!(page.contains(
+            r#"for (const side of ["right", "below"]) $(`dock-${side}`).setAttribute("aria-pressed", String(panel === side));"#
+        ));
+        assert!(page.contains(
+            r#"$(`dock-${side}`).addEventListener("click", () => { panel = side; placePanel(); save(); });"#
+        ));
+        let save = page
+            .split("function save()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the page saves its settings in save()");
+        assert!(save.contains("      panel,\n"), "{save}");
+    }
+
     /// CSP Level 3 §2.3.1: a hash-source is the base64 SHA-256 of the
     /// element's content, exactly as between its tags.
     #[test]
