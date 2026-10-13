@@ -2645,7 +2645,7 @@ mod tests {
                 "source_unreachable",
             ),
             (
-                ConnectionState::Reconnecting,
+                ConnectionState::Backoff,
                 ConnectionError::Source(SourceError::Ended("the camera closed the session".into())),
                 "source_ended",
             ),
@@ -2746,7 +2746,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_answered_session_rides_a_failed_reconnect_and_a_waiting_one_closes() {
+    async fn a_waiting_session_rides_a_reconnect_and_closes_only_when_it_fails() {
         let dir = private_dir("srcride");
         let clock = Arc::new(FakeClock::from_system());
         let s = with_webrtc(&blocking_worker(&dir), clock.clone());
@@ -2774,13 +2774,11 @@ mod tests {
             ),
             true,
         );
-        assert_eq!(
-            delivered(&mut waiting),
-            json!({ "type": "closed", "code": "source_ended",
-                "message": "source ended: the camera closed the session" })
-        );
-        assert!(ended(&mut waiting));
-        // The reconnect fails too: the answered session still plays on.
+        // The worker retries at once: both sessions wait for it.
+        assert!(s.shared.lock().sessions.contains_key("s2"));
+        assert!(waiting.try_recv().is_err(), "no closed for a drop");
+        // The retry fails: the waiting session closes with its error, the
+        // answered one plays on.
         s.shared.update_connection(
             &connection,
             snapshot(
@@ -2791,6 +2789,12 @@ mod tests {
             ),
             true,
         );
+        assert_eq!(
+            delivered(&mut waiting),
+            json!({ "type": "closed", "code": "source_unreachable",
+                "message": "source unreachable: Unable to connect to RTSP server: Connection refused (os error 111)" })
+        );
+        assert!(ended(&mut waiting));
         let sessions: Vec<String> = s.shared.lock().sessions.keys().cloned().collect();
         assert_eq!(sessions, ["s1"]);
         assert!(playing.try_recv().is_err(), "no closed for it");

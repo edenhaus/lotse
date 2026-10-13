@@ -1542,7 +1542,7 @@
           "type": "object"
         },
         {
-          "description": "The last event; the subscription ends with it. A session still\nwaiting for its answer has no deadline of its own: it waits while\nits source connects, and closes with the source's error as soon as\nthe attempt fails, at once when the offer reaches a source that has\nalready failed. An answered session rides a reconnect instead.",
+          "description": "The last event; the subscription ends with it. A session still\nwaiting for its answer has no deadline of its own: it waits while\nits source connects, and closes with the source's error as soon as\nthe attempt fails, at once when the offer reaches a source that has\nalready failed. A live source that drops is retried at once, and the\nsession waits for the retry; only a retry that fails closes it. An\nanswered session rides every reconnect instead.",
           "properties": {
             "code": {
               "description": "The stable code (`peer_closed`, `session_closed`, ...). Before\nthe answer, a failed source closes the session with its error's\ncode, the one `stream/get` reports as `last_error`:\n`source_unreachable`, `source_auth_failed`, `source_timeout`,\n`source_protocol_error`, `source_ended` or `worker_crashed`.",

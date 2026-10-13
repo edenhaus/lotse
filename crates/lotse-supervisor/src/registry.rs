@@ -1354,21 +1354,19 @@ mod tests {
             last_error,
             ..ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH)
         };
-        // A stale error: the attempt under way, or the one an offer
+        // A stale error, or the drop a reconnect under way may still
+        // recover from: the attempt under way, or the one an offer
         // starts, decides.
         for state in [
             ConnectionState::Idle,
             ConnectionState::Connecting,
             ConnectionState::Live,
+            ConnectionState::Reconnecting,
             ConnectionState::Draining,
         ] {
             assert_eq!(snapshot(state, Some(error.clone())).failure(), None);
         }
-        for state in [
-            ConnectionState::Reconnecting,
-            ConnectionState::Backoff,
-            ConnectionState::Restarting,
-        ] {
+        for state in [ConnectionState::Backoff, ConnectionState::Restarting] {
             assert_eq!(snapshot(state, Some(error.clone())).failure(), Some(&error));
             assert_eq!(snapshot(state, None).failure(), None);
         }

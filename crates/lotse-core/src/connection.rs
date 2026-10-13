@@ -52,14 +52,18 @@ impl ConnectionState {
         }
     }
 
-    /// Whether the state follows a failure: the live source dropped
-    /// (`Reconnecting`), an attempt failed (`Backoff`) or the worker
-    /// crashed (`Restarting`). The machine's last error then says why; in
-    /// any other state it is stale, from an attempt before the current one.
+    /// Whether the state follows a failed attempt: an attempt failed
+    /// (`Backoff`) or the worker crashed (`Restarting`). The machine's last
+    /// error then says why; in any other state it is stale, from an attempt
+    /// before the current one. A live source that dropped (`Reconnecting`)
+    /// is not one yet: the worker retries at once, and only a retry that
+    /// fails moves on to `Backoff`.
     pub const fn failed(self) -> bool {
         match self {
-            Self::Reconnecting | Self::Backoff | Self::Restarting => true,
-            Self::Idle | Self::Connecting | Self::Live | Self::Draining => false,
+            Self::Backoff | Self::Restarting => true,
+            Self::Idle | Self::Connecting | Self::Live | Self::Reconnecting | Self::Draining => {
+                false
+            }
         }
     }
 }
@@ -447,7 +451,7 @@ mod tests {
         .into_iter()
         .filter(|s| s.failed())
         .collect();
-        assert_eq!(failed, [S::Reconnecting, S::Backoff, S::Restarting]);
+        assert_eq!(failed, [S::Backoff, S::Restarting]);
     }
 
     #[test]
