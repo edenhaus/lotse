@@ -528,7 +528,7 @@ mod tests {
         assert!(
             below.contains(".app.below { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }")
                 && below.contains("grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1.8fr);")
-                && below.contains(".app.below .col, .app.below #log { min-height: 0; overflow-y: auto; }"),
+                && below.contains(".app.below .col, .app.below #log { min-height: 0; overflow: hidden auto; }"),
             "{below}"
         );
         let aside = page

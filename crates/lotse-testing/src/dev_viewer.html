@@ -48,7 +48,10 @@
   @media (min-width: 761px) {
     .app.below { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
     .app.below aside { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1.8fr); grid-template-rows: minmax(0, 1fr); gap: 24px; border-left: 0; border-top: 1px solid var(--line); height: 40vh; height: 40dvh; overflow: hidden; }
-    .app.below .col, .app.below #log { min-height: 0; overflow-y: auto; }
+    /* Vertical scrolling only: `overflow-y` alone makes `overflow-x` auto too
+       (CSS Overflow 3 §3.1), and a column rounded a pixel narrower than its
+       content then scrolls sideways (Chrome on macOS, 2026-10-13). */
+    .app.below .col, .app.below #log { min-height: 0; overflow: hidden auto; }
   }
   @media (max-width: 760px) {
     .app { grid-template-columns: minmax(0, 1fr); height: auto; }
