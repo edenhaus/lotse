@@ -481,18 +481,22 @@ async fn a_full_pool_still_lets_a_known_client_reconnect() {
     running.finish().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_closes_handshakes_in_progress() {
     let allowed = ClientIdentity::generate().unwrap();
     let running = start("shutdown", vec![allowed.pin]);
-    let mut stalled = TcpStream::connect(running.addr).await.unwrap();
+    let stalled = TcpStream::connect(running.addr).await.unwrap();
     let stream = connect(running.addr, running.config(ClientCert::Own(&allowed)))
         .await
         .unwrap();
     assert_eq!(hello(stream).await["type"], "hello");
     running.shutdown.cancel();
-    assert!(drain(&mut stalled).await.is_empty());
     running.server.await.unwrap().unwrap();
+    // Closed by the time `serve` returns, not some time after: a read
+    // that cannot wait finds EOF, not `WouldBlock`.
+    let mut stalled = stalled.into_std().unwrap();
+    stalled.set_nonblocking(true).unwrap();
+    assert_eq!(io::Read::read(&mut stalled, &mut [0_u8; 1]).unwrap(), 0);
     assert!(
         TcpStream::connect(running.addr).await.is_err(),
         "no longer listening"

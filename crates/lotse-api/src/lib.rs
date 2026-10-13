@@ -309,10 +309,14 @@ impl Server {
             }
         }
         drop(unix);
-        drop(authenticated);
         if let Some(accepting) = tls {
             let _stopped = accepting.await;
+            // Every handshake task holds a sender, so the channel closes
+            // once the last one has ended and closed its socket. One that
+            // authenticated meanwhile is dropped here, closed.
+            while authenticated.recv().await.is_some() {}
         }
+        drop(authenticated);
         let _drained = admission
             .pending
             .acquire_many(u32::from(MAX_PENDING_UPGRADES))
