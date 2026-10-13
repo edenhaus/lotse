@@ -2126,6 +2126,24 @@ mod tests {
         on(&mut driver, WorkerEvent::Switched);
         assert_eq!(driver.machine.state(), ConnectionState::Live);
         assert_eq!(driver.machine.failure(), None);
+        // The switch is over: the source's own failed attempt counts.
+        on(
+            &mut driver,
+            WorkerEvent::Report(WorkerReport::Reconnecting(SourceError::Timeout(
+                "stall".into(),
+            ))),
+        );
+        on(
+            &mut driver,
+            WorkerEvent::Report(backoff(SourceError::Timeout("new".into()))),
+        );
+        assert_eq!(
+            events.try_recv().expect("closed").payload,
+            serde_json::json!({ "type": "closed", "code": "source_timeout",
+                "message": "source timed out: new" })
+        );
+        let mut events = waiting_session(&shared, "fake://127.0.0.1/");
+        on(&mut driver, WorkerEvent::Report(WorkerReport::Live));
         // A switch away from a source whose attempt then fails: its
         // failure is not the new source's.
         driver.on_switch_source(driver.spec.clone());
