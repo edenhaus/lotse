@@ -934,11 +934,15 @@ impl Driver {
     }
 
     /// Publishes the snapshot; a state or error change also tells the
-    /// subscribers.
+    /// subscribers. The last error is the failure waiting sessions close
+    /// with when there is one: during a switch, the new source's, not the
+    /// old one's the machine holds.
     fn publish(&mut self) {
         let state = self.machine.state();
         let failure = self.failure();
-        let error = self.machine.last_error().cloned();
+        let error = failure
+            .clone()
+            .or_else(|| self.machine.last_error().cloned());
         let changed = (state, error.as_ref()) != (self.published.0, self.published.1.as_ref());
         if changed {
             self.snapshot.since = self.shared.clock.wall_now();
@@ -2193,6 +2197,52 @@ mod tests {
             events.try_recv().expect("closed").payload,
             serde_json::json!({ "type": "closed", "code": "source_auth_failed",
                 "message": "source authentication failed: 401" })
+        );
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn the_last_error_during_a_switch_is_the_failure_a_waiting_session_closes_with() {
+        let shared = shared("/usr/bin/true");
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        let on = |driver: &mut Driver, event| {
+            driver.on_worker_event(event);
+            driver.publish();
+        };
+        on(&mut driver, WorkerEvent::Report(WorkerReport::Live));
+        driver.on_switch_source(driver.spec.clone());
+        assert_eq!(driver.snapshot.switches, 1, "the switch is counted");
+        // The new source fails while the old one streams.
+        let new = SourceError::AuthFailed("401".into());
+        on(
+            &mut driver,
+            WorkerEvent::SwitchReport(WorkerReport::Backoff {
+                error: new.clone(),
+                retry_in: Duration::from_secs(1),
+            }),
+        );
+        // Then the old one drops and its retry fails.
+        on(
+            &mut driver,
+            WorkerEvent::Report(WorkerReport::Reconnecting(SourceError::Timeout(
+                "stall".into(),
+            ))),
+        );
+        on(
+            &mut driver,
+            WorkerEvent::Report(WorkerReport::Backoff {
+                error: SourceError::Unreachable("old".into()),
+                retry_in: Duration::from_secs(1),
+            }),
+        );
+        let new = Some(ConnectionError::Source(new));
+        assert_eq!(driver.snapshot.failure, new);
+        assert_eq!(
+            driver.snapshot.last_error, new,
+            "the one sessions close with"
         );
         drop((driver, demand_tx));
     }
