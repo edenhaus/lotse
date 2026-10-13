@@ -54,4 +54,6 @@ exclude_re = [
     "h265/packet.rs:\\d+:27: replace > with >= in PacketNormalizer::pack_units",
     # retina's RTP channel is even, so OR-ing in the RTCP bit and XOR-ing it set the same channel.
     "lotse-rtsp/src/udp.rs:.*replace \\| with \\^ in UdpRelay::datagram$",
+    # A leaked empty Vec is the empty slice: the same (absent) hint list.
+    "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
 ]

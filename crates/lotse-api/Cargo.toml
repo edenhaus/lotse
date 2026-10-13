@@ -1,6 +1,6 @@
 [package]
 name = "lotse-api"
-description = "Control API: axum on a Unix socket, peer-credential check, WebSocket dispatch and snapshot route."
+description = "Control API: axum on a Unix socket with a peer-credential check and an opt-in mutual-TLS listener, WebSocket dispatch and snapshot route."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,10 +16,13 @@ axum = { workspace = true }
 futures-util = { workspace = true }
 hyper = { workspace = true } # the HTTP/1.1 connection with the upgrade limits; `axum::serve` sets none
 hyper-util = { workspace = true } # `TokioIo` and the tower-to-hyper adapter for the router
+rcgen = { workspace = true } # the TLS listener's self-signed server certificate, made on the first start
+rustls = { workspace = true } # the TLS listener: TLS 1.3, the client-pin verifier
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "sync", "macros"] } # the Unix and dev TCP listeners, channels
+tokio = { workspace = true, features = ["net", "sync", "macros"] } # the Unix and TLS listeners, channels
+tokio-rustls = { workspace = true } # the TLS listener's handshake on a tokio stream
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 rustix = { workspace = true, features = ["process", "fs"] } # umask around the bind (`fs` for the mode type)
@@ -30,6 +33,7 @@ lotse-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "time"] } # `time`: a real-time bound where a regression would hang a test
 lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock` drives the upgrade deadline
 tokio-tungstenite = { version = "0.29", default-features = false } # the client side of the tests; axum's own WebSocket engine
+lotse-testing = { workspace = true } # the TLS listener's clients, well-behaved and not
 tracing-subscriber = { workspace = true } # captures log lines with their spans
 
 [lints]

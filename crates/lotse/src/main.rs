@@ -1,7 +1,7 @@
 //! lotse: a small, fast, memory-safe media daemon.
 //!
 //! One binary, three process kinds (`serve`, `worker`, `decode`) plus the
-//! `ctl` client, dispatched from the command line. The binary is the only
+//! `ctl` client and the `identity` tool, dispatched from the command line. The binary is the only
 //! place that names concrete sources, outputs and transcoders: it registers
 //! the ones its Cargo features enable and hands the registries to
 //! `lotse-supervisor` or `lotse-worker`. It also reads the configuration
@@ -28,6 +28,7 @@ use crate::cli::{Cli, Command, ServeArgs, WorkerArgs};
 mod cli;
 mod config;
 mod ctl;
+mod identity;
 mod logging;
 
 /// Parses the command line and dispatches. Exit code 0 on a clean stop, 1
@@ -63,6 +64,7 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Ctl(args) => ctl::run(args),
+        Command::Identity(args) => identity::run(args),
     }
 }
 

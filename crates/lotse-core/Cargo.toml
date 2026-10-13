@@ -20,7 +20,9 @@ test-util = []
 arc-swap = { workspace = true }
 bytes = { workspace = true }
 percent-encoding = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true } # the SHA-256 of a certificate pin (`fingerprint`)
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros", "time"] } # channels for the fan-out; `select!`; the runtime timer behind `SystemClock::sleep`
 tokio-util = { workspace = true }

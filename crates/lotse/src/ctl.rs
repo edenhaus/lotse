@@ -2,12 +2,12 @@
 //!
 //! Speaks the WebSocket API like any other client: connect, `hello`, one
 //! command, its `result`, and for a subscription the events after it.
-//! Results and events are printed as JSON on stdout, the one place in the
-//! binary that writes there; a failed result prints its `error` and exits 1.
+//! Results and events are printed as JSON on stdout, which only this and
+//! `lotse identity` write to; a failed result prints its `error` and exits 1.
 
 #![expect(
     clippy::print_stdout,
-    reason = "`lotse ctl` output is the one stdout writer in the binary (Cargo.toml lints)"
+    reason = "`lotse ctl` output is one of the binary's two stdout writers, with `lotse identity` (Cargo.toml lints)"
 )]
 
 use std::io::Read;
