@@ -69,17 +69,17 @@
 </style>
 </head>
 <body>
-<div class="app" id="app">
+<div class="app below" id="app">
   <div class="stage"><video id="video" autoplay muted playsinline controls></video></div>
   <aside>
     <div class="col">
       <header>
         <h1>lotse dev viewer <small id="hello">connecting to the daemon…</small></h1>
         <div class="dock" role="group" aria-label="Panel position">
-          <button id="dock-right" type="button" title="Panel right of the video" aria-label="Panel right of the video" aria-pressed="true">
+          <button id="dock-right" type="button" title="Panel right of the video" aria-label="Panel right of the video" aria-pressed="false">
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor"/><rect x="9.5" y="2.5" width="5" height="11" fill="currentColor" fill-opacity=".45"/></svg>
           </button>
-          <button id="dock-below" type="button" title="Panel below the video" aria-label="Panel below the video" aria-pressed="false">
+          <button id="dock-below" type="button" title="Panel below the video" aria-label="Panel below the video" aria-pressed="true">
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor"/><rect x="1.5" y="9.5" width="13" height="4" fill="currentColor" fill-opacity=".45"/></svg>
           </button>
         </div>
@@ -230,9 +230,9 @@ function load() {
 
 const isOrientation = (value) => [...$("orientation").options].some((o) => o.value === value);
 const { saved, credentials } = load();
-// Where the panel sits: "right" of the video, or "below" it for a
-// landscape stream.
-let panel = saved.panel === "below" ? "below" : "right";
+// Where the panel sits: "below" the video, the default, or "right" of it
+// for a portrait stream.
+let panel = saved.panel === "right" ? "right" : "below";
 // Puts the panel where `panel` says and marks its dock button pressed.
 function placePanel() {
   $("app").classList.toggle("below", panel === "below");

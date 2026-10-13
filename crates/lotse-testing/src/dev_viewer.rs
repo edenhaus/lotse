@@ -501,7 +501,10 @@ mod tests {
     #[test]
     fn the_panel_docks_right_of_or_below_the_video() {
         let page = PAGE;
-        assert!(page.contains(r#"<div class="app" id="app">"#));
+        assert!(page.contains(r#"<div class="app below" id="app">"#));
+        assert!(page.contains(
+            r#"title="Panel below the video" aria-label="Panel below the video" aria-pressed="true""#
+        ));
         let header = page
             .split("<header>")
             .nth(1)
@@ -543,8 +546,8 @@ mod tests {
         );
         assert!(page.contains("    .dock { display: none; }\n"));
         // The pressed button shows where the panel is; a stored choice is
-        // applied on load, and anything else puts the panel right.
-        assert!(page.contains(r#"let panel = saved.panel === "below" ? "below" : "right";"#));
+        // applied on load, and anything else puts the panel below, the default.
+        assert!(page.contains(r#"let panel = saved.panel === "right" ? "right" : "below";"#));
         assert!(page.contains(r#"$("app").classList.toggle("below", panel === "below");"#));
         assert!(page.contains(
             r#"for (const side of ["right", "below"]) $(`dock-${side}`).setAttribute("aria-pressed", String(panel === side));"#
