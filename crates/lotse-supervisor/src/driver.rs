@@ -540,13 +540,17 @@ impl Driver {
                     retry_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
                     "host of the source to switch to could not be resolved; retrying"
                 );
-                self.snapshot.last_error = Some(ConnectionError::Source(SourceError::Unreachable(
-                    format!("resolving {}: {message}", self.spec.host),
+                let error = ConnectionError::Source(SourceError::Unreachable(format!(
+                    "resolving {}: {message}",
+                    self.spec.host
                 )));
+                self.snapshot.last_error = Some(error.clone());
+                self.switch_failure = Some(error);
                 self.pending = Pending::RetrySwitch(self.shared.clock.sleep(retry_in));
             }
             Wake::RetrySwitchResolve => {
                 self.pending = Pending::Nothing;
+                self.switch_failure = None;
                 if self.worker.is_some() {
                     self.start_resolving_switch();
                 }
@@ -2174,6 +2178,45 @@ mod tests {
             serde_json::json!({ "type": "closed", "code": "source_auth_failed",
                 "message": "source authentication failed: 401" })
         );
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_session_closes_with_the_failed_lookup_of_the_source_switched_to() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        // The old source's retry has failed, and the switch away from it
+        // waits for the new host.
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Live));
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Reconnecting(
+            SourceError::Timeout("stall".into()),
+        )));
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Backoff {
+            error: SourceError::Unreachable("old".into()),
+            retry_in: Duration::from_secs(1),
+        }));
+        driver.on_switch_source(driver.spec.clone());
+        let mut events = waiting_session(&shared, "fake://127.0.0.1/");
+        driver.publish();
+        assert!(events.try_recv().is_err(), "still waiting");
+        // The new host does not resolve: neither source can answer.
+        driver
+            .handle(Wake::SwitchResolved(Err("no such host".into())))
+            .await;
+        driver.publish();
+        assert_eq!(
+            events.try_recv().expect("closed").payload,
+            serde_json::json!({ "type": "closed", "code": "source_unreachable",
+                "message": "source unreachable: resolving 127.0.0.1: no such host" })
+        );
+        // The next lookup is the new source's next attempt.
+        driver.handle(Wake::RetrySwitchResolve).await;
+        driver.publish();
+        assert_eq!(driver.snapshot.failure, None);
         drop((driver, demand_tx));
     }
 
