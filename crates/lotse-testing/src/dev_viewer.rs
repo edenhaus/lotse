@@ -436,66 +436,59 @@ mod tests {
         .await
     }
 
-    /// The page keeps saved camera URLs in localStorage without their
-    /// userinfo (RFC 3986 §3.2.1) and the userinfo in sessionStorage only.
+    /// The page keeps saved camera URLs in localStorage with their
+    /// userinfo (RFC 3986 §3.2.1), so a new tab gets them back, and moves
+    /// what earlier pages kept in a tab's sessionStorage there.
     #[test]
-    fn rfc3986_s3_2_1_the_page_keeps_no_userinfo_in_local_storage() {
+    fn rfc3986_s3_2_1_the_page_keeps_userinfo_in_local_storage() {
         let page = PAGE;
         let save = page
             .split("function save()")
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
             .expect("the page saves its settings in save()");
-        // Credentials never reach localStorage, which outlives the tab and
-        // any page later served on the origin reads (DEV-1, 2026-10-05):
-        // every URL it gets is split at its userinfo (RFC 3986 §3.2.1), and
-        // the userinfo goes to sessionStorage.
-        let (local, session) = save
-            .split_once("sessionStorage.setItem(STORE,")
-            .expect("the credentials go to sessionStorage");
-        let local = local
-            .split_once("localStorage.setItem(STORE,")
-            .expect("the settings go to localStorage")
-            .1;
+        // The URLs go to localStorage as typed, and nothing to
+        // sessionStorage, which a new tab does not see.
         assert!(
-            save.contains("const current = splitUserinfo(cameraUrl);")
-                && save.contains("entries.map((e) => ({ entry: e, ...splitUserinfo(e.url) }))"),
-            "{save}"
+            save.contains("localStorage.setItem(STORE,")
+                && save.contains("url: cameraUrl,")
+                && save.contains("saved: entries,")
+                && !save.contains("splitUserinfo"),
+            "localStorage gets the URLs with their userinfo: {save}"
         );
-        assert!(
-            local.contains("url: current.bare,")
-                && local
-                    .contains("saved: split.map(({ entry, bare }) => ({ ...entry, url: bare })),")
-                && !local.contains("cameraUrl")
-                && !local.contains("userinfo")
-                && !local.contains("entries"),
-            "localStorage gets URLs without userinfo only: {local}"
-        );
-        assert!(
-            session.contains("url: current.userinfo,")
-                && session.contains("[s.entry.id, s.userinfo]"),
-            "{session}"
-        );
+        assert!(!page.contains("sessionStorage.setItem"), "{page}");
         // The userinfo ends at the authority's last `@`: the split and
         // the mask take the same greedy run of authority characters.
         assert!(page.contains(r"/^([a-z][a-z0-9+.-]*:\/\/)([^\/?#]*@)/i.exec(url)"));
-        // A reload puts this tab's credentials back; a stored URL with its
-        // own userinfo, or anything not userinfo, is left as it is.
+        // The credentials an earlier page left in this tab are put back; a
+        // stored URL with its own userinfo, or anything not userinfo, is
+        // left as it is.
         assert!(page.contains(
             r#"if (typeof userinfo !== "string" || !/^[^\/?#]*@$/.test(userinfo) || splitUserinfo(url).userinfo) return url;"#
         ));
+        assert!(page.contains("credentials = parsed(sessionStorage.getItem(STORE));"));
         assert!(page.contains("url: withUserinfo(e.url, savedCredentials.get(e.id)),"));
         assert!(page.contains("withUserinfo(saved.url, credentials.url)"));
-        // Saved streams match without their userinfo, so the password
-        // typed again in a new tab updates the entry instead of adding one.
+        // Saved streams match without their userinfo, so a changed
+        // password updates the entry instead of adding one.
         assert!(page.contains("splitUserinfo(e.url).bare === bare && e.stream === stream"));
-        // What earlier pages stored with credentials is rewritten on load.
+        // What earlier pages kept in sessionStorage moves to localStorage
+        // on load, and sessionStorage is cleared.
+        // sessionStorage is cleared only once localStorage has taken the
+        // credentials: a failed write keeps them for the next load.
         let migrate = page
-            .split("if (hasUserinfo(saved.url) || (Array.isArray(saved.saved) && saved.saved.some((e) => hasUserinfo(e?.url)))) {")
+            .split("if (Object.keys(credentials).length && save()) {")
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
-            .expect("stored credentials are scrubbed on load");
-        assert!(migrate.contains("save();"), "{migrate}");
+            .expect("tab credentials move on load once saved");
+        assert!(
+            migrate.contains("sessionStorage.removeItem(STORE);"),
+            "{migrate}"
+        );
+        assert!(
+            save.contains("    }));\n    return true;\n  } catch (err) {\n    storageFailed(err);\n    return false;\n  }"),
+            "save() says whether localStorage took the settings: {save}"
+        );
         // Every storage access is inside a `try`, so the page works without
         // storage.
         let accesses = page
@@ -506,6 +499,172 @@ mod tests {
             let (_, since) = page[..at].rsplit_once("try {").expect("a try");
             assert!(!since.contains("catch"), "storage outside try: {since}");
         }
+    }
+
+    /// The panel sits right of the video or below it, as its dock buttons
+    /// on the title line choose, and the choice is kept with the other
+    /// settings.
+    #[test]
+    fn the_panel_docks_right_of_or_below_the_video() {
+        let page = PAGE;
+        assert!(page.contains(r#"<div class="app below" id="app">"#));
+        assert!(page.contains(
+            r#"title="Panel below the video" aria-label="Panel below the video" aria-pressed="true""#
+        ));
+        let header = page
+            .split("<header>")
+            .nth(1)
+            .and_then(|rest| rest.split("</header>").next())
+            .expect("the title line");
+        assert!(
+            header.contains("<h1>")
+                && header.contains(
+                    r#"<button id="dock-right" type="button" title="Panel right of the video""#
+                )
+                && header.contains(
+                    r#"<button id="dock-below" type="button" title="Panel below the video""#
+                ),
+            "{header}"
+        );
+        // Below, the video keeps the full width and the panel is three
+        // columns: the fields, the session, and the widest, the log. A
+        // narrow window stacks them as before and has no dock buttons.
+        let below = page
+            .split("@media (min-width: 761px) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }\n").next())
+            .expect("the panel below the video is styled for wide windows only");
+        assert!(
+            below.contains(".app.below { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }")
+                && below.contains("grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1.8fr);")
+                && below.contains(".app.below .col, .app.below #log { min-height: 0; overflow: hidden auto; }"),
+            "{below}"
+        );
+        let aside = page
+            .split("<aside>")
+            .nth(1)
+            .and_then(|rest| rest.split("</aside>").next())
+            .expect("the panel");
+        assert_eq!(aside.matches(r#"<div class="col">"#).count(), 2, "{aside}");
+        assert!(
+            aside.trim_end().ends_with(r#"<pre id="log"></pre>"#),
+            "{aside}"
+        );
+        assert!(page.contains("    .dock { display: none; }\n"));
+        // The pressed button shows where the panel is; a stored choice is
+        // applied on load, and anything else puts the panel below, the default.
+        assert!(page.contains(r#"let panel = saved.panel === "right" ? "right" : "below";"#));
+        assert!(page.contains(r#"$("app").classList.toggle("below", panel === "below");"#));
+        assert!(page.contains(
+            r#"for (const side of ["right", "below"]) $(`dock-${side}`).setAttribute("aria-pressed", String(panel === side));"#
+        ));
+        assert!(page.contains(
+            r#"$(`dock-${side}`).addEventListener("click", () => { panel = side; placePanel(); save(); });"#
+        ));
+        let save = page
+            .split("function save()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the page saves its settings in save()");
+        assert!(save.contains("      panel,\n"), "{save}");
+    }
+
+    /// A new stream's id is its name as a slug until the id is typed by
+    /// hand; Play and Stop sit under the name, the stream id last.
+    #[test]
+    fn the_stream_id_follows_the_name_until_typed() {
+        let page = PAGE;
+        let form = page
+            .split(r#"<form id="form">"#)
+            .nth(1)
+            .and_then(|rest| rest.split("</form>").next())
+            .expect("the form");
+        let at = |what: &str| {
+            form.find(what)
+                .unwrap_or_else(|| panic!("{what} in {form}"))
+        };
+        assert!(at(r#"id="label""#) < at(r#"id="play""#) && at(r#"id="play""#) < at(r#"id="url""#));
+        assert!(
+            form.trim_end().ends_with(r#"<input id="stream" value="cam" pattern="[A-Za-z0-9._\-]{1,128}" required></label>"#),
+            "{form}"
+        );
+        // The slug fits the stream id's pattern: lowercase ASCII letters
+        // and digits joined by `_`, at most 128 characters.
+        let slugify = page
+            .split("function slugify(name) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the name's slug");
+        assert!(
+            slugify
+                .contains(r#".replace(/[^a-z0-9]+/g, "_").slice(0, 128).replace(/^_+|_+$/g, "");"#),
+            "{slugify}"
+        );
+        // Typing a stream id stops the name driving it, unless it is
+        // empty, the default or the slug; a saved stream keeps its id.
+        assert!(page.contains(
+            r#"const typedStream = () => !["", $("stream").defaultValue, slugify($("label").value)].includes($("stream").value.trim());"#
+        ));
+        let label = page
+            .split(r#"$("label").addEventListener("input", () => {"#)
+            .nth(1)
+            .and_then(|rest| rest.split("\n});\n").next())
+            .expect("the name drives the stream id");
+        assert!(
+            label.contains("if (streamTyped || selected() || !slug) return;")
+                && label.contains(r#"$("stream").value = slug;"#),
+            "{label}"
+        );
+        // An emptied stream id goes back to the name's slug when the field
+        // is left, not while it is empty.
+        let blur = page
+            .split(r#"$("stream").addEventListener("blur", () => {"#)
+            .nth(1)
+            .and_then(|rest| rest.split("\n});\n").next())
+            .expect("an emptied stream id is handed back to the name");
+        assert!(
+            blur.contains(r#"if ($("stream").value.trim() || !slug) return;"#)
+                && blur.contains(r#"$("stream").value = slug;"#)
+                && blur.contains("streamTyped = false;"),
+            "{blur}"
+        );
+        assert_eq!(
+            page.matches("streamTyped = typedStream();").count(),
+            2,
+            "guessed on load and on choosing a saved stream only"
+        );
+        // Typing marks any non-empty id as the user's, the default `cam`
+        // and the name's slug included.
+        let input = page
+            .split(r#"$("stream").addEventListener("input", () => {"#)
+            .nth(1)
+            .and_then(|rest| rest.split("\n});\n").next())
+            .expect("typing a stream id");
+        assert!(
+            input.contains(r#"streamTyped = $("stream").value.trim() !== "";"#),
+            "{input}"
+        );
+    }
+
+    /// CSS Color Adjustment Level 1 §2.1: the page declares both schemes,
+    /// so native scrollbars and controls follow the dark one; its
+    /// scrollable parts have thin, muted scrollbars (CSS Scrollbars Styling
+    /// Level 1 §2, §3).
+    #[test]
+    fn css_color_adjust_1_s2_1_scrollbars_follow_the_color_scheme() {
+        let style = PAGE
+            .split("<style>")
+            .nth(1)
+            .and_then(|rest| rest.split("</style>").next())
+            .expect("the page's style");
+        assert!(
+            style.contains(":root { color-scheme: light dark; scrollbar-color: color-mix(in srgb, var(--muted) 50%, transparent) transparent; }"),
+            "{style}"
+        );
+        assert!(
+            style.contains("aside, .col, #log { scrollbar-width: thin; }"),
+            "{style}"
+        );
     }
 
     /// CSP Level 3 §2.3.1: a hash-source is the base64 SHA-256 of the
