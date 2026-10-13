@@ -699,12 +699,7 @@ async fn wait_ready(
                 }
             }
             // A manager that is gone ends the control queue too.
-            Ok(()) = close.changed() => {
-                let request = close.borrow_and_update().clone();
-                if request.is_some() {
-                    return request;
-                }
-            }
+            Ok(request) = close.wait_for(Option::is_some) => return request.clone(),
             message = control.recv() => match message {
                 Some(Control::Candidate(_)) => {}
                 Some(Control::Orientation(orientation)) => ctx.spec.orientation = orientation.code(),
