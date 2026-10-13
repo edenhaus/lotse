@@ -511,7 +511,8 @@ impl Supervisor {
         state.next_connection = state.next_connection.saturating_add(1);
         let id = format!("c{}", state.next_connection);
         let (demand, demand_rx) = watch::channel(0);
-        let (commands, commands_rx) = mpsc::channel(COMMAND_QUEUE);
+        let sessions = usize::try_from(self.settings.limits.max_sessions).unwrap_or(usize::MAX);
+        let (commands, commands_rx) = mpsc::channel(COMMAND_QUEUE.saturating_add(sessions));
         state.connections.insert(
             id.clone(),
             ConnectionEntry {
@@ -3105,6 +3106,13 @@ mod tests {
         let dir = private_dir("closeslot");
         let s = with_webrtc(&blocking_worker(&dir), Arc::new(SystemClock));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        // The queue holds a close for every session the daemon allows
+        // besides its own room.
+        let sessions = usize::try_from(s.settings.limits.max_sessions).unwrap();
+        assert_eq!(
+            s.shared.lock().connections["c1"].commands.max_capacity(),
+            COMMAND_QUEUE + sessions
+        );
         let (tx, mut rx) = mpsc::channel(4);
         s.shared.lock().connections.get_mut("c1").unwrap().commands = tx.clone();
         let _s1 = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);

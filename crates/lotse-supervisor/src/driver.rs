@@ -49,7 +49,10 @@ use crate::net::turn_client::LeaseGrant;
 use crate::registry::{CloseBy, ConnectionSnapshot, Shared, WorkerProcess};
 use crate::worker::{Worker, WorkerEvent};
 
-/// Session messages a driver holds, queued or in flight.
+/// Session messages a driver holds, queued or in flight, besides the
+/// close each open session reserves (`SessionEntry::close_slot`): a
+/// driver's queue holds this many and one more per session the daemon
+/// allows, so the reserved closes never take room from the rest.
 pub(crate) const COMMAND_QUEUE: usize = 256;
 
 /// A worker that sent nothing for this long is killed: it sends its
