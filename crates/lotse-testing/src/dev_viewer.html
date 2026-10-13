@@ -113,17 +113,16 @@ const $ = (id) => document.getElementById(id);
 // edited, so a screenshot never shows it. The real URL is kept in `cameraUrl`:
 // focusing the field shows it for editing and copying, and Play sends it.
 // The saved-streams list shows it masked too.
-// Credentials never reach localStorage, which any page later served on
-// this origin (localhost:8080, say) reads and which stays on disk: it keeps
-// every URL without its userinfo, and the userinfo goes to sessionStorage,
-// which this tab alone sees and closing it clears. So a reload keeps the
-// real URL, and a new tab gets it back without user and password.
+// localStorage keeps the URLs with their credentials, so a new tab and a
+// restarted browser get them back: this is a test tool on the developer's
+// machine, and retyping every camera's password costs more than what any
+// page later served on this origin (localhost:8080, say) could read.
 let cameraUrl = "";
 const MASK = "•".repeat(8);
 // The video orientation RTP header extension (3GPP TS 26.114 §6.2.3.3).
 const CVO = "urn:3gpp:video-orientation";
 // The key in localStorage (the settings) and in sessionStorage (the
-// credentials).
+// credentials pages before 2026-10-13 kept in the tab only).
 const STORE = "lotse-dev-viewer";
 // A URL's scheme and `//`, after which its authority starts (RFC 3986 §3).
 const SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
@@ -143,14 +142,12 @@ function splitUserinfo(url) {
 }
 
 // `url` with `userinfo` put back, unless it has userinfo of its own; a
-// `userinfo` that is not one (sessionStorage holds what any page on this
-// origin wrote) is ignored.
+// `userinfo` that is not one (storage holds what any page on this origin
+// wrote) is ignored.
 function withUserinfo(url, userinfo) {
   if (typeof userinfo !== "string" || !/^[^\/?#]*@$/.test(userinfo) || splitUserinfo(url).userinfo) return url;
   return url.replace(SCHEME, (scheme) => scheme + userinfo);
 }
-
-const hasUserinfo = (url) => typeof url === "string" && splitUserinfo(url).userinfo !== "";
 
 function showUrl() {
   const field = $("url");
@@ -171,8 +168,9 @@ function parsed(text) {
   return value && typeof value === "object" ? value : {};
 }
 
-// The settings localStorage held and the credentials sessionStorage held,
-// or nothing: storage can be disabled, full, or hold anything.
+// The settings localStorage held and the credentials an earlier page left
+// in sessionStorage, or nothing: storage can be disabled, full, or hold
+// anything.
 function load() {
   let settings = {}, credentials = {};
   try {
@@ -188,8 +186,8 @@ const isOrientation = (value) => [...$("orientation").options].some((o) => o.val
 const { saved, credentials } = load();
 const savedCredentials = new Map(Array.isArray(credentials.saved) ? credentials.saved.filter(Array.isArray) : []);
 // The saved streams, each { id, label, stream, url, orientation } with the
-// URL as typed, the credentials of this tab put back; and which one the
-// fields show, if any.
+// URL as typed, the credentials an earlier page left in this tab put
+// back; and which one the fields show, if any.
 let entries = (Array.isArray(saved.saved) ? saved.saved : [])
   .filter((e) => e && typeof e.id === "string" && typeof e.url === "string" && typeof e.stream === "string")
   .map((e) => ({ id: e.id, label: typeof e.label === "string" ? e.label : "", stream: e.stream,
@@ -203,28 +201,17 @@ function storageFailed(err) {
   storageWarned = true;
 }
 
-// Keeps the fields and the saved streams: every URL without its userinfo
-// in localStorage, the userinfo in this tab's sessionStorage, which a
-// reload keeps.
+// Keeps the fields and the saved streams in localStorage, every URL with
+// its userinfo.
 function save() {
-  const current = splitUserinfo(cameraUrl);
-  const split = entries.map((e) => ({ entry: e, ...splitUserinfo(e.url) }));
   try {
     localStorage.setItem(STORE, JSON.stringify({
       stream: $("stream").value.trim(),
-      url: current.bare,
+      url: cameraUrl,
       stun: $("stun").value.trim(),
       orientation: $("orientation").value,
-      saved: split.map(({ entry, bare }) => ({ ...entry, url: bare })),
+      saved: entries,
       selected: selectedId ?? null,
-    }));
-  } catch (err) {
-    storageFailed(err);
-  }
-  try {
-    sessionStorage.setItem(STORE, JSON.stringify({
-      url: current.userinfo,
-      saved: split.filter((s) => s.userinfo).map((s) => [s.entry.id, s.userinfo]),
     }));
   } catch (err) {
     storageFailed(err);
@@ -235,7 +222,7 @@ const selected = () => entries.find((e) => e.id === selectedId);
 // The saved stream the fields show: the selected one while they still
 // match it, else the first that matches, else none. URLs match without
 // their userinfo, so typing the password into a stream saved without it
-// (a new tab) keeps it selected, and Save updates it.
+// keeps it selected, and Save updates it.
 function matching() {
   const stream = $("stream").value.trim();
   const bare = splitUserinfo(cameraUrl).bare;
@@ -268,11 +255,14 @@ cameraUrl = typeof saved.url === "string" ? withUserinfo(saved.url, credentials.
 showUrl();
 syncSelection();
 if (selected()) $("label").value = selected().label;
-// Pages before 2026-10-08 kept URLs with their credentials: they move to
-// sessionStorage now, and localStorage is rewritten without them.
-if (hasUserinfo(saved.url) || (Array.isArray(saved.saved) && saved.saved.some((e) => hasUserinfo(e?.url)))) {
+// Pages before 2026-10-13 kept the credentials in this tab's
+// sessionStorage only: they move to localStorage, which every tab reads.
+if (Object.keys(credentials).length) {
   save();
-  log("camera credentials removed from local storage; this tab keeps them until it closes");
+  try {
+    sessionStorage.removeItem(STORE);
+  } catch {}
+  log("this tab's camera credentials are kept in local storage now");
 }
 $("url").addEventListener("focus", showUrl);
 $("url").addEventListener("input", () => { cameraUrl = $("url").value.trim(); syncSelection(); });
@@ -661,8 +651,7 @@ $("save-entry").addEventListener("click", () => {
   selectedId = (entry ?? entries[entries.length - 1]).id;
   save();
   renderSaved();
-  const forTab = hasUserinfo(cameraUrl) ? "; its user and password only until this tab closes" : "";
-  log(`saved ${fields.label || masked(cameraUrl)}${forTab}`);
+  log(`saved ${fields.label || masked(cameraUrl)}`);
 });
 $("delete-entry").addEventListener("click", () => {
   const entry = selected();

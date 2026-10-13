@@ -436,66 +436,53 @@ mod tests {
         .await
     }
 
-    /// The page keeps saved camera URLs in localStorage without their
-    /// userinfo (RFC 3986 §3.2.1) and the userinfo in sessionStorage only.
+    /// The page keeps saved camera URLs in localStorage with their
+    /// userinfo (RFC 3986 §3.2.1), so a new tab gets them back, and moves
+    /// what earlier pages kept in a tab's sessionStorage there.
     #[test]
-    fn rfc3986_s3_2_1_the_page_keeps_no_userinfo_in_local_storage() {
+    fn rfc3986_s3_2_1_the_page_keeps_userinfo_in_local_storage() {
         let page = PAGE;
         let save = page
             .split("function save()")
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
             .expect("the page saves its settings in save()");
-        // Credentials never reach localStorage, which outlives the tab and
-        // any page later served on the origin reads (DEV-1, 2026-10-05):
-        // every URL it gets is split at its userinfo (RFC 3986 §3.2.1), and
-        // the userinfo goes to sessionStorage.
-        let (local, session) = save
-            .split_once("sessionStorage.setItem(STORE,")
-            .expect("the credentials go to sessionStorage");
-        let local = local
-            .split_once("localStorage.setItem(STORE,")
-            .expect("the settings go to localStorage")
-            .1;
+        // The URLs go to localStorage as typed, and nothing to
+        // sessionStorage, which a new tab does not see.
         assert!(
-            save.contains("const current = splitUserinfo(cameraUrl);")
-                && save.contains("entries.map((e) => ({ entry: e, ...splitUserinfo(e.url) }))"),
-            "{save}"
+            save.contains("localStorage.setItem(STORE,")
+                && save.contains("url: cameraUrl,")
+                && save.contains("saved: entries,")
+                && !save.contains("splitUserinfo"),
+            "localStorage gets the URLs with their userinfo: {save}"
         );
-        assert!(
-            local.contains("url: current.bare,")
-                && local
-                    .contains("saved: split.map(({ entry, bare }) => ({ ...entry, url: bare })),")
-                && !local.contains("cameraUrl")
-                && !local.contains("userinfo")
-                && !local.contains("entries"),
-            "localStorage gets URLs without userinfo only: {local}"
-        );
-        assert!(
-            session.contains("url: current.userinfo,")
-                && session.contains("[s.entry.id, s.userinfo]"),
-            "{session}"
-        );
+        assert!(!page.contains("sessionStorage.setItem"), "{page}");
         // The userinfo ends at the authority's last `@`: the split and
         // the mask take the same greedy run of authority characters.
         assert!(page.contains(r"/^([a-z][a-z0-9+.-]*:\/\/)([^\/?#]*@)/i.exec(url)"));
-        // A reload puts this tab's credentials back; a stored URL with its
-        // own userinfo, or anything not userinfo, is left as it is.
+        // The credentials an earlier page left in this tab are put back; a
+        // stored URL with its own userinfo, or anything not userinfo, is
+        // left as it is.
         assert!(page.contains(
             r#"if (typeof userinfo !== "string" || !/^[^\/?#]*@$/.test(userinfo) || splitUserinfo(url).userinfo) return url;"#
         ));
+        assert!(page.contains("credentials = parsed(sessionStorage.getItem(STORE));"));
         assert!(page.contains("url: withUserinfo(e.url, savedCredentials.get(e.id)),"));
         assert!(page.contains("withUserinfo(saved.url, credentials.url)"));
-        // Saved streams match without their userinfo, so the password
-        // typed again in a new tab updates the entry instead of adding one.
+        // Saved streams match without their userinfo, so a changed
+        // password updates the entry instead of adding one.
         assert!(page.contains("splitUserinfo(e.url).bare === bare && e.stream === stream"));
-        // What earlier pages stored with credentials is rewritten on load.
+        // What earlier pages kept in sessionStorage moves to localStorage
+        // on load, and sessionStorage is cleared.
         let migrate = page
-            .split("if (hasUserinfo(saved.url) || (Array.isArray(saved.saved) && saved.saved.some((e) => hasUserinfo(e?.url)))) {")
+            .split("if (Object.keys(credentials).length) {")
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
-            .expect("stored credentials are scrubbed on load");
-        assert!(migrate.contains("save();"), "{migrate}");
+            .expect("tab credentials move on load");
+        assert!(
+            migrate.contains("save();") && migrate.contains("sessionStorage.removeItem(STORE);"),
+            "{migrate}"
+        );
         // Every storage access is inside a `try`, so the page works without
         // storage.
         let accesses = page
