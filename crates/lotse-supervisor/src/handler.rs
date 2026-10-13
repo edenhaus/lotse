@@ -520,6 +520,7 @@ impl Supervisor {
                 loopback_relay: source.loopback_relay,
                 demand,
                 snapshot: ConnectionSnapshot::idle(self.shared.clock.wall_now()),
+                switches: 0,
                 streams: std::collections::BTreeSet::new(),
                 commands: commands.clone(),
             },
@@ -2810,6 +2811,40 @@ mod tests {
             *s.shared.lock().connections[&connection].demand.borrow(),
             1,
             "handed to the driver"
+        );
+        // The driver reports the old source's failure again before it
+        // takes the switch: the session still waits.
+        s.shared.update_connection(
+            &connection,
+            snapshot(
+                ConnectionState::Backoff,
+                Some(ConnectionError::Source(SourceError::AuthFailed(
+                    "401".into(),
+                ))),
+            ),
+            true,
+        );
+        assert!(events.try_recv().is_err(), "no closed with the old error");
+        assert_eq!(
+            s.shared.lock().connections[&connection].snapshot.failure,
+            None
+        );
+        // The new source's own failure closes it.
+        s.shared.update_connection(
+            &connection,
+            ConnectionSnapshot {
+                switches: 1,
+                ..snapshot(
+                    ConnectionState::Backoff,
+                    Some(ConnectionError::Source(SourceError::Timeout("new".into()))),
+                )
+            },
+            true,
+        );
+        assert_eq!(
+            delivered(&mut events),
+            json!({ "type": "closed", "code": "source_timeout",
+                "message": "source timed out: new" })
         );
         shutdown_on(&s, &clock).await;
     }

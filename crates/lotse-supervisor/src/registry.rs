@@ -94,6 +94,9 @@ pub(crate) struct ConnectionSnapshot {
     /// A stale error, or a drop the worker retries, is none: the session
     /// waits for the attempt under way or the one its offer starts.
     pub(crate) failure: Option<ConnectionError>,
+    /// The source switches the driver has taken
+    /// ([`ConnectionEntry::switches`]).
+    pub(crate) switches: u64,
     /// When the current state began.
     pub(crate) since: SystemTime,
     /// Source reconnects so far.
@@ -117,6 +120,7 @@ impl ConnectionSnapshot {
             state: ConnectionState::Idle,
             last_error: None,
             failure: None,
+            switches: 0,
             since: now,
             reconnects: 0,
             worker: None,
@@ -213,6 +217,11 @@ pub(crate) struct ConnectionEntry {
     pub(crate) demand: watch::Sender<u32>,
     /// What the driver last reported.
     pub(crate) snapshot: ConnectionSnapshot,
+    /// The source switches queued for the driver: until its snapshot
+    /// counts as many ([`ConnectionSnapshot::switches`]), the driver has
+    /// not taken them all, and the failure it reports is a source's the
+    /// connection switched away from.
+    pub(crate) switches: u64,
     /// The streams reading from it.
     pub(crate) streams: BTreeSet<String>,
     /// What the driver passes on to the worker: session messages.
@@ -312,6 +321,7 @@ impl State {
             );
             return;
         }
+        entry.switches = entry.switches.wrapping_add(1);
         // The failure is the old source's: an offer before the driver
         // takes the switch waits for the new one.
         entry.snapshot.failure = None;
@@ -1118,12 +1128,22 @@ impl Shared {
     /// failure ([`ConnectionSnapshot::failure`]) closes the connection's
     /// sessions that are still waiting for their answer with that failure
     /// ([`State::close_waiting`]): the daemon keeps no deadline of its own
-    /// for them, the source's own ones bound how long they wait.
-    pub(crate) fn update_connection(&self, id: &str, snapshot: ConnectionSnapshot, changed: bool) {
+    /// for them, the source's own ones bound how long they wait. A
+    /// snapshot from before the driver took every switch queued has no
+    /// failure: it is a source's the connection switched away from.
+    pub(crate) fn update_connection(
+        &self,
+        id: &str,
+        mut snapshot: ConnectionSnapshot,
+        changed: bool,
+    ) {
         let mut state = self.lock();
         let Some(entry) = state.connections.get_mut(id) else {
             return;
         };
+        if snapshot.switches != entry.switches {
+            snapshot.failure = None;
+        }
         let failure = snapshot.failure.clone();
         entry.snapshot = snapshot;
         let streams: Vec<String> = entry.streams.iter().cloned().collect();
@@ -1281,6 +1301,7 @@ mod tests {
                 },
                 demand,
                 snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
+                switches: 0,
                 streams: ["front".to_owned(), "twin".to_owned()].into(),
                 commands,
             },
@@ -1337,6 +1358,7 @@ mod tests {
                 },
                 demand,
                 snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
+                switches: 0,
                 streams: BTreeSet::new(),
                 commands,
             },

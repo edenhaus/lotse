@@ -575,6 +575,7 @@ impl Driver {
         self.spec = spec;
         self.switching = true;
         self.switch_failure = None;
+        self.snapshot.switches = self.snapshot.switches.wrapping_add(1);
         if self.worker.is_some() {
             self.start_resolving_switch();
         } else if matches!(self.pending, Pending::Resolving(_)) {
@@ -936,6 +937,7 @@ impl Driver {
     /// subscribers.
     fn publish(&mut self) {
         let state = self.machine.state();
+        let failure = self.failure();
         let error = self.machine.last_error().cloned();
         let changed = (state, error.as_ref()) != (self.published.0, self.published.1.as_ref());
         if changed {
@@ -944,7 +946,7 @@ impl Driver {
             self.snapshot.last_error.clone_from(&error);
             self.published = (state, error);
         }
-        self.snapshot.failure = self.failure();
+        self.snapshot.failure = failure;
         self.shared
             .update_connection(&self.spec.connection_id, self.snapshot.clone(), changed);
     }
@@ -1964,6 +1966,10 @@ mod tests {
 
         let url: lotse_core::source_url::SourceUrl = url.parse().unwrap();
         let mut state = shared.lock();
+        let switches = state
+            .connections
+            .get("c1")
+            .map_or(0, |entry| entry.switches);
         state.streams.insert(
             "front".into(),
             StreamEntry {
@@ -1990,6 +1996,7 @@ mod tests {
                 loopback_relay: false,
                 demand: watch::channel(1).0,
                 snapshot: ConnectionSnapshot::idle(UNIX_EPOCH),
+                switches,
                 streams: ["front".to_owned()].into(),
                 commands: mpsc::channel(4).0,
             },
@@ -2007,6 +2014,15 @@ mod tests {
             ),
         );
         rx
+    }
+
+    /// The driver takes a switch to the same source that the registry
+    /// queued for connection `c1`: both count it.
+    fn take_switch(shared: &Shared, driver: &mut Driver) {
+        if let Some(entry) = shared.lock().connections.get_mut("c1") {
+            entry.switches += 1;
+        }
+        driver.on_switch_source(driver.spec.clone());
     }
 
     #[tokio::test]
@@ -2107,7 +2123,7 @@ mod tests {
         // A switch while the old source streams: the new one failing
         // leaves the old one to answer.
         on(&mut driver, WorkerEvent::Report(WorkerReport::Live));
-        driver.on_switch_source(driver.spec.clone());
+        take_switch(&shared, &mut driver);
         on(
             &mut driver,
             WorkerEvent::SwitchReport(backoff(SourceError::AuthFailed("401".into()))),
@@ -2150,7 +2166,7 @@ mod tests {
         on(&mut driver, WorkerEvent::Report(WorkerReport::Live));
         // A switch away from a source whose attempt then fails: its
         // failure is not the new source's.
-        driver.on_switch_source(driver.spec.clone());
+        take_switch(&shared, &mut driver);
         on(
             &mut driver,
             WorkerEvent::Report(WorkerReport::Reconnecting(SourceError::Timeout(
@@ -2199,8 +2215,8 @@ mod tests {
             error: SourceError::Unreachable("old".into()),
             retry_in: Duration::from_secs(1),
         }));
-        driver.on_switch_source(driver.spec.clone());
         let mut events = waiting_session(&shared, "fake://127.0.0.1/");
+        take_switch(&shared, &mut driver);
         driver.publish();
         assert!(events.try_recv().is_err(), "still waiting");
         // The new host does not resolve: neither source can answer.
