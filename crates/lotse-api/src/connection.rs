@@ -7,13 +7,14 @@
 //! browser sends, is refused with 403 as §4.2.2 allows: the control API is
 //! not for web pages) and the RFC 6455 §7.4.1 close codes: `1001` going
 //! away on shutdown, `1003` for a binary frame, `1008` policy violation on
-//! an overflowed outbound queue. Commands are processed one at a time per connection;
-//! every one is non-blocking by contract. On close the sessions are
+//! an overflowed outbound queue or a removed client. Commands are processed
+//! one at a time per connection; every one is non-blocking by contract. On close the sessions are
 //! orphaned and the slot released first; the writer then gets
 //! [`CLOSE_TIMEOUT`] to deliver the queue and the close frame, after which
 //! the socket is dropped (RFC 6455 §7.1.1).
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -23,14 +24,19 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt as _, StreamExt as _};
+use lotse_api_types::clients::ClientList;
 use lotse_api_types::command::Command;
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Empty, EventFrame, Failure, Pong, Shutdown, Success};
 use lotse_api_types::pairing::PairingCreateResult;
+use lotse_core::fingerprint::Fingerprint;
+use lotse_core::task::spawn_blocking_named;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+use crate::clients::{ClientStore, Removal};
 use crate::listener::PeerInfo;
 use crate::outbox::{Class, Outbox, Outgoing};
 use crate::pairing::Pairing;
@@ -45,7 +51,8 @@ const CLOSE_GOING_AWAY: u16 = 1001;
 /// RFC 6455 §7.4.1: unsupported data (a binary frame).
 const CLOSE_UNSUPPORTED_DATA: u16 = 1003;
 
-/// RFC 6455 §7.4.1: policy violation (the outbound queue overflowed).
+/// RFC 6455 §7.4.1: policy violation (the outbound queue overflowed, or
+/// the client was removed).
 const CLOSE_POLICY_VIOLATION: u16 = 1008;
 
 /// A JSON error body for a refused upgrade.
@@ -101,15 +108,133 @@ pub(crate) async fn upgrade<H: Handler>(
         .on_upgrade(move |socket| run(socket, state, peer, slot))
 }
 
-/// The answer to `pairing/create` command `id`, as [`pairing_create`]
-/// decides it. Not generic over the handler, so every handler's connection
-/// shares this one function.
-fn pairing_answer(pairing: Option<&Pairing>, peer: &PeerInfo, id: u64) -> serde_json::Value {
-    let frame = match pairing_create(pairing, peer) {
+/// The answer to a command about the TLS listener's clients
+/// (`pairing/create`, `clients/list`, `clients/remove`), which the server
+/// answers itself. Not generic over the handler, so every handler's
+/// connection shares this one function.
+async fn listener_answer(
+    pairing: Option<&Pairing>,
+    clients: Option<&Arc<ClientStore>>,
+    peer: &PeerInfo,
+    command: Command,
+) -> serde_json::Value {
+    let id = command.id();
+    let outcome = match command {
+        Command::ClientsList(_) => clients_list(clients).map(to_json),
+        Command::ClientsRemove(remove) => clients_remove(clients, peer, &remove.pin)
+            .await
+            .map(to_json),
+        _ => pairing_create(pairing, peer).map(to_json),
+    };
+    let frame = match outcome {
         Ok(result) => serde_json::to_value(Success::new(id, result)),
         Err(error) => serde_json::to_value(Failure::new(Some(id), error)),
     };
     frame.unwrap_or_default()
+}
+
+/// `value` as JSON.
+fn to_json<T: serde::Serialize>(value: T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or_default()
+}
+
+/// The refusal of a command about the TLS listener when there is none.
+fn listener_off() -> ApiError {
+    ApiError::new(ErrorCode::InvalidRequest, "the control TLS listener is off")
+}
+
+/// `clients/list`: every pin the TLS listener lets in.
+fn clients_list(clients: Option<&Arc<ClientStore>>) -> Result<ClientList, ApiError> {
+    clients
+        .map(|clients| clients.list())
+        .ok_or_else(listener_off)
+}
+
+/// `clients/remove`: removes an enrolled pin and closes its connections.
+/// Over the TLS listener a client may remove only itself; a fixed pin
+/// stays; a pin that is not enrolled is already removed.
+async fn clients_remove(
+    clients: Option<&Arc<ClientStore>>,
+    peer: &PeerInfo,
+    pin: &str,
+) -> Result<Empty, ApiError> {
+    let Ok(pin) = Fingerprint::parse(pin) else {
+        return Err(ApiError::new(
+            ErrorCode::InvalidRequest,
+            "`pin` must be a certificate's SHA-256 as 64 hex digits, optionally with a colon between each pair",
+        )
+        .with_detail("field", "pin"));
+    };
+    let Some(clients) = clients else {
+        return Err(listener_off());
+    };
+    if matches!(peer, PeerInfo::Tls { pin: own, .. } if *own != pin) {
+        tracing::warn!(%peer, client_pin = %pin, "clients/remove refused: a client may remove only itself");
+        return Err(ApiError::new(
+            ErrorCode::NotPermitted,
+            "over the TLS listener a client may remove only itself",
+        ));
+    }
+    let store = Arc::clone(clients);
+    let removed = spawn_blocking_named("api.clients_remove", move || store.remove(pin));
+    match removed
+        .await
+        .map_err(io::Error::other)
+        .and_then(|removal| removal)
+    {
+        Ok(Removal::Removed { closed }) => {
+            tracing::info!(
+                event = "control_client_removed",
+                client_pin = %pin,
+                by = %peer,
+                closed,
+                "control client removed"
+            );
+            Ok(Empty::default())
+        }
+        Ok(Removal::Unknown) => {
+            tracing::info!(client_pin = %pin, by = %peer, "clients/remove: the pin is not enrolled, nothing to remove");
+            Ok(Empty::default())
+        }
+        Ok(Removal::Fixed) => {
+            tracing::warn!(%peer, client_pin = %pin, "clients/remove refused: the pin is fixed by the configuration");
+            Err(ApiError::new(
+                ErrorCode::NotPermitted,
+                "the pin is fixed by the configuration; remove it from `--control-clients`",
+            ))
+        }
+        Err(err) => {
+            tracing::error!(%peer, client_pin = %pin, error = %err, "removing the control client failed");
+            Err(ApiError::new(
+                ErrorCode::InternalError,
+                "the client list could not be stored",
+            ))
+        }
+    }
+}
+
+/// The token that closes connection `id` once its client is removed:
+/// registered with the TLS listener's clients for a peer that came through
+/// it, never cancelled for a peer on the socket.
+fn attach(clients: Option<&ClientStore>, peer: &PeerInfo, id: ConnectionId) -> CancellationToken {
+    match (clients, peer) {
+        (Some(clients), PeerInfo::Tls { pin, .. }) => clients.attach(id, *pin),
+        _ => CancellationToken::new(),
+    }
+}
+
+/// Forgets connection `id`, which closed.
+fn detach(clients: Option<&ClientStore>, id: ConnectionId) {
+    if let Some(clients) = clients {
+        clients.detach(id);
+    }
+}
+
+/// Closes a connection whose client was removed, and names why.
+fn client_removed(outbox: &Outbox) -> &'static str {
+    tracing::info!("control connection closing: its client was removed");
+    outbox.close(CLOSE_POLICY_VIOLATION, "client removed");
+    "client removed"
 }
 
 /// `pairing/create`: a new code for the TLS listener, replacing any open
@@ -127,10 +252,7 @@ fn pairing_create(
         ));
     }
     let Some(pairing) = pairing else {
-        return Err(ApiError::new(
-            ErrorCode::InvalidRequest,
-            "the control TLS listener is off",
-        ));
+        return Err(listener_off());
     };
     let Some(code) = pairing.open() else {
         tracing::error!(%peer, "pairing/create failed: the system provides no randomness");
@@ -208,6 +330,7 @@ async fn serve<H: Handler>(
         subscriptions: HashMap::new(),
         peer,
     };
+    let removed = attach(connection.state.clients.as_deref(), &connection.peer, id);
     connection.send(Class::Signaling, &connection.state.handler.hello());
 
     let closed_by = loop {
@@ -231,6 +354,7 @@ async fn serve<H: Handler>(
                 connection.outbox.close(CLOSE_POLICY_VIOLATION, "outbound queue overflowed");
                 break "overflow";
             }
+            () = removed.cancelled() => break client_removed(&connection.outbox),
             () = connection.state.shutdown.cancelled() => {
                 connection.send(Class::Signaling, &Shutdown::default());
                 connection.outbox.close(CLOSE_GOING_AWAY, "shutting down");
@@ -247,6 +371,7 @@ async fn serve<H: Handler>(
     // sessions are orphaned and its slot is free while the writer drains.
     let deadline = connection.state.clock.sleep(CLOSE_TIMEOUT);
     connection.state.handler.connection_closed(id);
+    detach(connection.state.clients.as_deref(), id);
     drop(slot);
     tokio::select! {
         _written = &mut writer => {}
@@ -323,6 +448,19 @@ impl<H: Handler> Connection<H> {
         open < self.state.config.max_subscriptions
     }
 
+    /// Answers `command`, one about the TLS listener's clients, which the
+    /// server answers itself.
+    async fn listener_command(&self, command: Command) {
+        let answer = listener_answer(
+            self.state.pairing.as_deref(),
+            self.state.clients.as_ref(),
+            &self.peer,
+            command,
+        )
+        .await;
+        self.send(Class::Signaling, &answer);
+    }
+
     /// One text frame: parse, check the id, dispatch, answer.
     async fn command(&mut self, text: &str) {
         let command = match lotse_api_types::parse_command(text) {
@@ -352,10 +490,9 @@ impl<H: Handler> Connection<H> {
         tracing::debug!(id, command = command.name(), "command");
         match command {
             Command::Ping(_) => self.send(Class::Signaling, &Pong::new(id)),
-            Command::PairingCreate(_) => {
-                let answer = pairing_answer(self.state.pairing.as_deref(), &self.peer, id);
-                self.send(Class::Signaling, &answer);
-            }
+            command @ (Command::PairingCreate(_)
+            | Command::ClientsList(_)
+            | Command::ClientsRemove(_)) => self.listener_command(command).await,
             Command::Schema(_) => self.send(
                 Class::Signaling,
                 &Success::new(id, lotse_api_types::schema::bundle()),
@@ -455,8 +592,12 @@ mod tests {
     use super::*;
     use crate::pairing::test_support::NO_RANDOM;
 
-    #[test]
-    fn pairing_create_needs_the_socket_a_listener_and_randomness() {
+    fn command(text: &str) -> Command {
+        lotse_api_types::parse_command(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pairing_create_needs_the_socket_a_listener_and_randomness() {
         let unix = PeerInfo::Unix { uid: 0, pid: None };
         let tls = PeerInfo::Tls {
             pin: Fingerprint::of(b"client"),
@@ -480,10 +621,118 @@ mod tests {
             code(pairing_create(Some(&broken), &unix)),
             ErrorCode::InternalError
         );
-        let answer = pairing_answer(Some(&working), &unix, 7);
+        let create = |id: u64| command(&format!(r#"{{"id":{id},"type":"pairing/create"}}"#));
+        let answer = listener_answer(Some(&working), None, &unix, create(7)).await;
         assert_eq!(answer["id"], 7);
         assert_eq!(answer["success"], true);
-        let answer = pairing_answer(None, &unix, 8);
+        let answer = listener_answer(None, None, &unix, create(8)).await;
         assert_eq!(answer["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn clients_remove_takes_an_enrolled_pin_from_the_socket_or_the_client_itself() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let (logs, _guard) = crate::pairing::test_support::capture();
+        let dir =
+            std::env::temp_dir().join(format!("lotse-connection-clients-{}", std::process::id()));
+        let _gone = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let runtime = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        let fixed = Fingerprint::of(b"fixed");
+        let store = Arc::new(
+            ClientStore::open(&std::fs::File::open(&dir).unwrap(), &dir, &[fixed], runtime)
+                .unwrap(),
+        );
+        let (own, other) = (Fingerprint::of(b"own"), Fingerprint::of(b"other"));
+        store.enroll(own).unwrap();
+        store.enroll(other).unwrap();
+        let unix = PeerInfo::Unix { uid: 0, pid: None };
+        let tls = PeerInfo::Tls {
+            pin: own,
+            addr: "192.0.2.1:1".parse().unwrap(),
+        };
+        let clients = Some(&store);
+        let code = |result: Result<Empty, ApiError>| result.unwrap_err().code;
+
+        let refused = clients_remove(clients, &unix, "not a pin")
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::InvalidRequest);
+        assert_eq!(refused.details["field"], "pin");
+        let own_text = own.to_string();
+        assert_eq!(
+            code(clients_remove(None, &unix, &own_text).await),
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            code(clients_remove(clients, &tls, &other.to_string()).await),
+            ErrorCode::NotPermitted
+        );
+        assert!(store.allows(&other));
+        assert_eq!(
+            code(clients_remove(clients, &unix, &fixed.to_hex()).await),
+            ErrorCode::NotPermitted
+        );
+        let session = store.attach(ConnectionId(1), own);
+        // Without colons it is the same pin.
+        assert!(clients_remove(clients, &tls, &own.to_hex()).await.is_ok());
+        assert!(!store.allows(&own));
+        assert!(session.is_cancelled());
+        assert!(
+            clients_remove(clients, &unix, &own_text).await.is_ok(),
+            "idempotent"
+        );
+        let blocker = dir.join(crate::clients::CLIENTS_DIR).join("pins.partial");
+        std::fs::create_dir(&blocker).unwrap();
+        assert_eq!(
+            code(clients_remove(clients, &unix, &other.to_string()).await),
+            ErrorCode::InternalError
+        );
+        std::fs::remove_dir(&blocker).unwrap();
+        let text = logs.text();
+        for line in [
+            "clients/remove refused: a client may remove only itself",
+            "clients/remove refused: the pin is fixed by the configuration",
+            "the pin is not enrolled, nothing to remove",
+            "removing the control client failed",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        let removed = text
+            .lines()
+            .find(|line| line.contains("control client removed"))
+            .unwrap();
+        assert!(removed.contains(&format!("client_pin={own}")), "{removed}");
+        assert!(removed.contains("closed=1"), "{removed}");
+
+        let list = command(r#"{"id":3,"type":"clients/list"}"#);
+        let answer = listener_answer(None, clients, &unix, list.clone()).await;
+        assert_eq!(answer["id"], 3);
+        let listed = answer["result"]["clients"].as_array().unwrap();
+        assert_eq!(listed.len(), 2, "{answer}");
+        let answer = listener_answer(None, None, &unix, list).await;
+        assert_eq!(answer["error"]["code"], "invalid_request");
+        let remove = command(&format!(
+            r#"{{"id":4,"type":"clients/remove","pin":"{other}"}}"#
+        ));
+        let answer = listener_answer(None, clients, &unix, remove).await;
+        assert_eq!(answer["success"], true, "{answer}");
+        assert_eq!(answer["result"], serde_json::json!({}));
+        assert!(!store.allows(&other));
+        let text = logs.text();
+        let removed = text
+            .lines()
+            .rfind(|line| line.contains("control client removed"))
+            .unwrap();
+        assert!(
+            removed.contains(&format!("client_pin={other}")),
+            "{removed}"
+        );
+        assert!(removed.contains("by=uid 0"), "{removed}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -63,6 +63,22 @@
       ],
       "type": "object"
     },
+    "ClientList": {
+      "description": "`clients/list`'s result.",
+      "properties": {
+        "clients": {
+          "description": "Every allowed pin, ordered by pin.",
+          "items": {
+            "$ref": "#/$defs/ControlClient"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "clients"
+      ],
+      "type": "object"
+    },
     "Codecs": {
       "description": "The codecs the daemon can carry.",
       "properties": {
@@ -198,6 +214,56 @@
             "id"
           ],
           "title": "PairingCreateCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`clients/list`: every client the control TLS listener lets in, fixed\nby the configuration or enrolled by pairing.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "clients/list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "title": "ClientsListCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`clients/remove`: removes an enrolled client and closes its control\nconnections; idempotent. Over the TLS listener a client may remove\nonly itself; a fixed pin cannot be removed.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pin": {
+              "description": "The client certificate's SHA-256, 64 hex digits, optionally with a\ncolon between each pair.",
+              "maxLength": 95,
+              "type": "string"
+            },
+            "type": {
+              "const": "clients/remove",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "pin"
+          ],
+          "title": "ClientsRemoveCommand",
           "type": "object"
         },
         {
@@ -626,6 +692,29 @@
       ],
       "type": "object"
     },
+    "ControlClient": {
+      "description": "One client certificate the control TLS listener lets in.",
+      "properties": {
+        "connected": {
+          "description": "A control connection authenticated with this pin is open.",
+          "type": "boolean"
+        },
+        "fixed": {
+          "description": "The pin comes from the configuration (`--control-clients`), which\n`clients/remove` cannot change; otherwise it was enrolled by pairing.",
+          "type": "boolean"
+        },
+        "pin": {
+          "description": "The SHA-256 of the client's certificate, as lowercase hex pairs\njoined by colons.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pin",
+        "fixed",
+        "connected"
+      ],
+      "type": "object"
+    },
     "DemuxMetrics": {
       "description": "The supervisor's demux counters: what the receive thread did with each\ndatagram on the shared UDP socket.",
       "properties": {
@@ -773,7 +862,7 @@
         },
         {
           "const": "not_permitted",
-          "description": "The command is not allowed on this connection (`pairing/create`\nover the TLS listener).",
+          "description": "The command is not allowed on this connection (`pairing/create`\nover the TLS listener, `clients/remove` of another client over it),\nor not for this target (`clients/remove` of a fixed pin).",
           "type": "string"
         },
         {
@@ -2022,6 +2111,36 @@
       ],
       "type": "object"
     },
+    "Success_for_ClientList": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/ClientList",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
     "Success_for_Empty": {
       "description": "A successful `result`: exactly one per command.",
       "properties": {
@@ -2557,6 +2676,12 @@
     "$ref": "#/$defs/Hello"
   },
   "results": {
+    "clients/list": {
+      "$ref": "#/$defs/Success_for_ClientList"
+    },
+    "clients/remove": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
     "info": {
       "$ref": "#/$defs/Success_for_InfoResult"
     },

@@ -133,7 +133,9 @@ impl Handler for FakeHandler {
             Command::Ping(_)
             | Command::Schema(_)
             | Command::Unsubscribe(_)
-            | Command::PairingCreate(_) => Outcome::Error(ApiError::new(
+            | Command::PairingCreate(_)
+            | Command::ClientsList(_)
+            | Command::ClientsRemove(_) => Outcome::Error(ApiError::new(
                 ErrorCode::InternalError,
                 "the server answers these itself",
             )),
@@ -819,14 +821,22 @@ async fn rfc6455_s5_5_pings_change_nothing_and_a_close_frame_ends_the_connection
 }
 
 #[tokio::test]
-async fn pairing_create_without_a_tls_listener_is_an_invalid_request() {
+async fn the_tls_listener_commands_without_one_are_invalid_requests() {
     let running = start("pairing-off", FakeHandler::default(), 8);
     let mut ws = connect(&running.socket).await;
     recv(&mut ws).await;
-    send(&mut ws, json!({ "id": 1, "type": "pairing/create" })).await;
-    let answer = recv(&mut ws).await;
-    assert_eq!(answer["success"], false, "{answer}");
-    assert_eq!(answer["error"]["code"], "invalid_request");
+    let pin = "ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad";
+    for (id, command) in [
+        (1, json!({ "id": 1, "type": "pairing/create" })),
+        (2, json!({ "id": 2, "type": "clients/list" })),
+        (3, json!({ "id": 3, "type": "clients/remove", "pin": pin })),
+    ] {
+        send(&mut ws, command).await;
+        let answer = recv(&mut ws).await;
+        assert_eq!(answer["id"], id, "{answer}");
+        assert_eq!(answer["success"], false, "{answer}");
+        assert_eq!(answer["error"]["code"], "invalid_request");
+    }
     running.finish().await;
 }
 

@@ -1024,3 +1024,210 @@ async fn pairing_create_issues_codes_on_the_socket_and_refuses_tls_clients() {
     assert_eq!(answer["error"]["code"], "not_permitted");
     running.finish().await;
 }
+
+/// A server whose data directory already holds `enrolled`, as pairing
+/// leaves it, with `fixed` from the configuration.
+fn start_enrolled(name: &str, fixed: Vec<Fingerprint>, enrolled: &[Fingerprint]) -> Running {
+    let (dir, data) = dirs(name);
+    let clients = data.join("clients");
+    private_dir(&clients);
+    let mut pins = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(clients.join("pins"))
+        .unwrap();
+    for pin in enrolled {
+        io::Write::write_all(&mut pins, format!("{pin}\n").as_bytes()).unwrap();
+    }
+    start_in(dir, data, fixed)
+}
+
+/// Sends `command` and returns the next frame, its answer.
+async fn call<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, command: Value) -> Value
+where
+    S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    ws.send(Message::Text(command.to_string().into()))
+        .await
+        .unwrap();
+    match within_5_s(ws.next()).await {
+        Some(Ok(Message::Text(text))) => serde_json::from_str(text.as_str()).unwrap(),
+        other => panic!("no answer: {other:?}"),
+    }
+}
+
+/// The close frame the server sends next: its code and reason.
+async fn close_frame<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> (u16, String)
+where
+    S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match within_5_s(ws.next()).await {
+        Some(Ok(Message::Close(Some(frame)))) => (frame.code.into(), frame.reason.to_string()),
+        other => panic!("no close frame: {other:?}"),
+    }
+}
+
+/// A WebSocket on the control socket, after its `hello`.
+async fn local(running: &Running) -> tokio_tungstenite::WebSocketStream<tokio::net::UnixStream> {
+    let socket = tokio::net::UnixStream::connect(running.dir.join("lotse.sock"))
+        .await
+        .unwrap();
+    upgraded(socket).await
+}
+
+/// A WebSocket over TLS as `client`, after its `hello`.
+async fn remote(
+    running: &Running,
+    client: &ClientIdentity,
+) -> tokio_tungstenite::WebSocketStream<TlsStream<TcpStream>> {
+    let stream = connect(running.addr, running.config(ClientCert::Own(client)))
+        .await
+        .unwrap();
+    upgraded(stream).await
+}
+
+/// `clients/remove` of `pin` as command `id`.
+fn remove(id: u64, pin: Fingerprint) -> Value {
+    serde_json::json!({ "id": id, "type": "clients/remove", "pin": pin.to_string() })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removing_a_client_closes_its_connection_and_refuses_it_from_then_on() {
+    let (logs, _guard) = capture();
+    let fixed = ClientIdentity::generate().unwrap();
+    let enrolled = ClientIdentity::generate().unwrap();
+    let running = start_enrolled("remove", vec![fixed.pin], &[enrolled.pin]);
+    let mut admin = local(&running).await;
+    let mut gone = remote(&running, &enrolled).await;
+    let mut other = remote(&running, &fixed).await;
+
+    let mut expected = vec![
+        serde_json::json!({ "pin": fixed.pin.to_string(), "fixed": true, "connected": true }),
+        serde_json::json!({ "pin": enrolled.pin.to_string(), "fixed": false, "connected": true }),
+    ];
+    expected.sort_by_key(|client| client["pin"].as_str().unwrap().to_owned());
+    let listed = call(
+        &mut admin,
+        serde_json::json!({ "id": 1, "type": "clients/list" }),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["clients"],
+        Value::Array(expected.clone()),
+        "{listed}"
+    );
+    let listed = call(
+        &mut other,
+        serde_json::json!({ "id": 1, "type": "clients/list" }),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["clients"],
+        Value::Array(expected),
+        "over TLS too"
+    );
+
+    // Over TLS a client removes only itself, and no one removes a fixed pin.
+    for (id, pin) in [(2, enrolled.pin), (3, fixed.pin)] {
+        let answer = call(&mut other, remove(id, pin)).await;
+        assert_eq!(answer["error"]["code"], "not_permitted", "{answer}");
+    }
+    let answer = call(&mut admin, remove(2, fixed.pin)).await;
+    assert_eq!(answer["error"]["code"], "not_permitted", "{answer}");
+
+    let answer = call(&mut admin, remove(3, enrolled.pin)).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    assert_eq!(answer["result"], serde_json::json!({}));
+    // RFC 6455 §7.4.1: 1008, policy violation.
+    assert_eq!(
+        close_frame(&mut gone).await,
+        (1008, "client removed".to_owned())
+    );
+    let answer =
+        exchange(connect(running.addr, running.config(ClientCert::Own(&enrolled))).await).await;
+    assert!(refused(&answer), "{answer:?}");
+    let removed = logs.text();
+    let line = removed
+        .lines()
+        .find(|line| line.contains("control client removed"))
+        .unwrap();
+    assert!(
+        line.contains(&enrolled.pin.to_string()) && line.contains("closed=1"),
+        "{line}"
+    );
+    assert!(line.contains("by=uid"), "{line}");
+    // Idempotent: a pin that is not enrolled is already removed.
+    let answer = call(&mut admin, remove(4, enrolled.pin)).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    // The fixed client kept its connection.
+    let listed = call(
+        &mut other,
+        serde_json::json!({ "id": 4, "type": "clients/list" }),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["clients"].as_array().unwrap().len(),
+        1,
+        "{listed}"
+    );
+    // Once its connection is gone, the fixed client is listed as not
+    // connected.
+    drop(other);
+    let mut id = 5;
+    within_5_s(async {
+        loop {
+            let list = serde_json::json!({ "id": id, "type": "clients/list" });
+            let listed = call(&mut admin, list).await;
+            if listed["result"]["clients"][0]["connected"] == false {
+                break;
+            }
+            id += 1;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    drop(admin);
+
+    let (dir, data) = running.stop().await;
+    assert_eq!(
+        std::fs::read_to_string(data.join("clients").join("pins")).unwrap(),
+        ""
+    );
+    let running = start_in(dir, data, vec![fixed.pin]);
+    let answer =
+        exchange(connect(running.addr, running.config(ClientCert::Own(&enrolled))).await).await;
+    assert!(
+        refused(&answer),
+        "still refused after a restart: {answer:?}"
+    );
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_client_that_removes_itself_gets_its_result_before_the_close() {
+    let (logs, _guard) = capture();
+    let client = ClientIdentity::generate().unwrap();
+    let running = start_enrolled("remove-self", vec![], &[client.pin]);
+    let mut ws = remote(&running, &client).await;
+    let answer = call(&mut ws, remove(1, client.pin)).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    assert_eq!(
+        close_frame(&mut ws).await,
+        (1008, "client removed".to_owned())
+    );
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|line| line.contains("control client removed"))
+        .unwrap();
+    assert!(
+        line.contains(&format!("by=client {}", client.pin)),
+        "{line}"
+    );
+    assert!(
+        text.contains("control connection closing: its client was removed"),
+        "{text}"
+    );
+    running.finish().await;
+}

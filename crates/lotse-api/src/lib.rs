@@ -130,9 +130,9 @@ pub enum Outcome {
     Subscribed(mpsc::Receiver<Event>),
 }
 
-/// What the supervisor implements. `ping`, `schema`, `unsubscribe` and
-/// `pairing/create` are answered by the server itself; everything else
-/// goes here.
+/// What the supervisor implements. `ping`, `schema`, `unsubscribe`,
+/// `pairing/create`, `clients/list` and `clients/remove` are answered by
+/// the server itself; everything else goes here.
 pub trait Handler: Send + Sync + 'static {
     /// The `hello` frame's content.
     fn hello(&self) -> Hello;
@@ -196,6 +196,10 @@ struct AppState<H> {
     /// The TLS listener's pairing, for `pairing/create`; `None` without a
     /// listener.
     pairing: Option<Arc<pairing::Pairing>>,
+    /// The TLS listener's clients, for `clients/list` and `clients/remove`
+    /// and to close a removed client's connections; `None` without a
+    /// listener.
+    clients: Option<Arc<clients::ClientStore>>,
 }
 
 impl<H> Clone for AppState<H> {
@@ -208,6 +212,7 @@ impl<H> Clone for AppState<H> {
             shutdown: self.shutdown.clone(),
             clock: Arc::clone(&self.clock),
             pairing: self.pairing.clone(),
+            clients: self.clients.clone(),
         }
     }
 }
@@ -281,7 +286,7 @@ impl Server {
         // Each queued connection holds one of `pending`'s permits, so the
         // queue never fills and a handshake task never waits to send.
         let (admitted, mut authenticated) = mpsc::channel(usize::from(MAX_PENDING_UPGRADES));
-        let (tls, pairing) = match self.tls {
+        let (tls, pairing, clients) = match self.tls {
             Some(bound) => {
                 let pairing = bound.pairing(Arc::clone(&clock));
                 let config = bound
@@ -290,6 +295,7 @@ impl Server {
                 let listener = tokio::net::TcpListener::from_std(bound.listener)
                     .map_err(ServeError::Register)?;
                 tls::announce_first_code(&pairing, &bound.store, &clock, &shutdown);
+                let clients = Arc::clone(&bound.store);
                 let accepting = spawn_named(
                     "api.tls_accept",
                     tls::accept_loop(
@@ -306,9 +312,9 @@ impl Server {
                         },
                     ),
                 );
-                (Some(accepting), Some(pairing))
+                (Some(accepting), Some(pairing), Some(clients))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         let state = AppState {
             handler,
@@ -318,6 +324,7 @@ impl Server {
             shutdown: shutdown.clone(),
             clock: Arc::clone(&clock),
             pairing,
+            clients,
         };
         let app = Router::new()
             .route(lotse_api_types::WS_PATH, get(connection::upgrade::<H>))
@@ -560,6 +567,7 @@ mod tests {
             shutdown,
             clock: Arc::new(lotse_core::clock::FakeClock::default()),
             pairing: None,
+            clients: None,
         }
     }
 

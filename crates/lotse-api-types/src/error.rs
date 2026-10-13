@@ -36,7 +36,8 @@ pub enum ErrorCode {
     /// The command arrived during graceful shutdown.
     ShuttingDown,
     /// The command is not allowed on this connection (`pairing/create`
-    /// over the TLS listener).
+    /// over the TLS listener, `clients/remove` of another client over it),
+    /// or not for this target (`clients/remove` of a fixed pin).
     NotPermitted,
     /// An invariant failed; a bug, always logged with context.
     InternalError,

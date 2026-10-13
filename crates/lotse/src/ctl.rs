@@ -55,6 +55,12 @@ pub(crate) enum CtlCommand {
         #[command(subcommand)]
         command: StreamCommand,
     },
+    /// The control TLS listener's clients.
+    Clients {
+        /// What to do.
+        #[command(subcommand)]
+        command: ClientsCommand,
+    },
     /// Send one command as written and print every frame up to its result;
     /// `id` is filled in when missing.
     Raw {
@@ -116,6 +122,21 @@ pub(crate) enum StreamCommand {
         /// Stop after this many events.
         #[arg(long, value_name = "N")]
         limit: Option<u64>,
+    },
+}
+
+/// `lotse ctl clients ...`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ClientsCommand {
+    /// Every client certificate pin the TLS listener lets in, fixed by the
+    /// configuration or enrolled by pairing.
+    List,
+    /// Remove an enrolled client and close its connections; succeeds when
+    /// it is not enrolled.
+    Remove {
+        /// The client certificate's SHA-256, 64 hex digits, optionally with
+        /// a colon between each pair.
+        pin: String,
     },
 }
 
@@ -187,6 +208,10 @@ fn command_of(command: &CtlCommand, stdin: impl Read) -> anyhow::Result<Value> {
         CtlCommand::Info => json!({ "type": "info" }),
         CtlCommand::Metrics => json!({ "type": "metrics/get" }),
         CtlCommand::Schema => json!({ "type": "schema" }),
+        CtlCommand::Clients { command } => match command {
+            ClientsCommand::List => json!({ "type": "clients/list" }),
+            ClientsCommand::Remove { pin } => json!({ "type": "clients/remove", "pin": pin }),
+        },
         CtlCommand::Stream { command } => match command {
             StreamCommand::List => json!({ "type": "stream/list" }),
             StreamCommand::Get { stream_id } => {
@@ -509,6 +534,19 @@ mod tests {
         assert_eq!(
             command_of(&CtlCommand::Schema, b"".as_slice()).unwrap(),
             json!({ "type": "schema" })
+        );
+        let clients = |command| CtlCommand::Clients { command };
+        assert_eq!(
+            command_of(&clients(ClientsCommand::List), b"".as_slice()).unwrap(),
+            json!({ "type": "clients/list" })
+        );
+        assert_eq!(
+            command_of(
+                &clients(ClientsCommand::Remove { pin: "ab".into() }),
+                b"".as_slice()
+            )
+            .unwrap(),
+            json!({ "type": "clients/remove", "pin": "ab" })
         );
         let stream = |command| CtlCommand::Stream { command };
         assert_eq!(
