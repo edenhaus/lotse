@@ -684,9 +684,7 @@ impl Supervisor {
         };
         // An offer to a connection that already failed is not handed on:
         // the session closes below with the failure.
-        if failure.is_none() {
-            hand_over(&commands, spec)?;
-        }
+        let close_slot = hand_over(&commands, spec, failure.is_some())?;
         state.last_session = state.last_session.saturating_add(1);
         let serial = state.last_session;
         let (events, rx) = mpsc::channel(SESSION_QUEUE);
@@ -698,6 +696,7 @@ impl Supervisor {
             (connection, offer.id, events),
             self.shared.clock.wall_now(),
         );
+        entry.close_slot = close_slot;
         entry.deliver(
             &session_id,
             api_event(&SessionEvent::Session {
@@ -1144,15 +1143,26 @@ fn check_session_limits(
     Ok(())
 }
 
-/// Hands the offer `spec` to its connection's driver; a full queue is
-/// `limit_reached`.
-fn hand_over(commands: &mpsc::Sender<DriverCommand>, spec: SessionSpec) -> Result<(), ApiError> {
-    commands
-        .try_send(DriverCommand::OpenSession(spec))
-        .map_err(|_| {
-            ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
-                .with_detail("limit", "connection_queue")
-        })
+/// Hands the offer `spec` to its connection's driver, unless the
+/// connection `failed` already, and returns the slot reserved behind it
+/// for the session's close ([`SessionEntry::close_slot`]); a queue
+/// without room for both is `limit_reached`.
+fn hand_over(
+    commands: &mpsc::Sender<DriverCommand>,
+    spec: SessionSpec,
+    failed: bool,
+) -> Result<Option<mpsc::OwnedPermit<DriverCommand>>, ApiError> {
+    if failed {
+        return Ok(None);
+    }
+    let busy = |_| {
+        ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
+            .with_detail("limit", "connection_queue")
+    };
+    let open = commands.clone().try_reserve_owned().map_err(busy)?;
+    let close = commands.clone().try_reserve_owned().map_err(busy)?;
+    drop(open.send(DriverCommand::OpenSession(spec)));
+    Ok(Some(close))
 }
 
 /// `session_not_found` for `session_id`.
@@ -3087,6 +3097,45 @@ mod tests {
         s.shutdown().await;
     }
 
+    /// The offer reserves its close a slot in the driver's queue: a queue
+    /// that fills up meanwhile still takes the close, behind what came
+    /// before it.
+    #[tokio::test]
+    async fn a_close_reaches_the_driver_through_a_full_queue() {
+        let dir = private_dir("closeslot");
+        let s = with_webrtc(&blocking_worker(&dir), Arc::new(SystemClock));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let (tx, mut rx) = mpsc::channel(4);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx.clone();
+        let _s1 = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        let filler = || DriverCommand::Candidate {
+            session_id: "x".into(),
+            candidate: String::new(),
+        };
+        while tx.try_send(filler()).is_ok() {}
+        result(
+            call_on(
+                &s,
+                1,
+                &json!({ "id": 3, "type": "session/close", "session_id": "s1" }),
+            )
+            .await,
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(DriverCommand::OpenSession(_))
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                rx.recv().await,
+                Some(DriverCommand::Candidate { .. })
+            ));
+        }
+        let_assert!(Some(DriverCommand::CloseSession { session_id, .. }) = rx.recv().await);
+        assert_eq!(session_id, "s1");
+        s.shutdown().await;
+    }
+
     #[tokio::test]
     async fn a_full_driver_queue_is_limit_reached_and_nothing_leaks() {
         let dir = private_dir("full");
@@ -3106,6 +3155,29 @@ mod tests {
             (ErrorCode::LimitReached, &json!("connection_queue"))
         );
         assert!(!s.shared.lock().sessions.contains_key("s2"));
+        // Room for the offer but not for its close is no room either.
+        let (one_free, mut one_free_rx) = mpsc::channel(2);
+        one_free
+            .try_send(DriverCommand::Candidate {
+                session_id: "x".into(),
+                candidate: String::new(),
+            })
+            .unwrap();
+        let full = std::mem::replace(
+            &mut s.shared.lock().connections.get_mut("c1").unwrap().commands,
+            one_free,
+        );
+        let err = error(call_on(&s, 1, &offer(3, "front", Some("s2"))).await);
+        assert_eq!(err.details["limit"], json!("connection_queue"));
+        assert!(matches!(
+            one_free_rx.try_recv(),
+            Ok(DriverCommand::Candidate { .. })
+        ));
+        assert!(
+            one_free_rx.try_recv().is_err(),
+            "the offer is not handed on"
+        );
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = full;
         let err = error(call_on(&s, 1, &json!({ "id": 4, "type": "webrtc/candidate", "session_id": "s1", "candidate": "" })).await);
         assert_eq!(err.code, ErrorCode::LimitReached);
         // Another connection closing leaves the session with its owner.

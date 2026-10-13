@@ -42,6 +42,7 @@ use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
 use lotse_ipc::SessionEvent as WorkerSessionEvent;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::OwnedPermit;
 use tokio::task::AbortHandle;
 
 use crate::net::turn_client::Lease;
@@ -249,6 +250,10 @@ pub(crate) struct SessionEntry {
     /// Its one-shot timers (the gather deadline, grace), aborted when the
     /// entry is dropped: no timer task outlives its session.
     timers: Vec<AbortHandle>,
+    /// The slot in its driver's queue reserved for its close at the
+    /// offer, behind the offer: a full queue never drops the close, which
+    /// the worker's session waits for without a deadline of its own.
+    pub(crate) close_slot: Option<OwnedPermit<crate::driver::DriverCommand>>,
 }
 
 impl Drop for SessionEntry {
@@ -302,6 +307,7 @@ impl SessionEntry {
             channel_requests: Vec::new(),
             since,
             timers: Vec::new(),
+            close_slot: None,
         }
     }
 

@@ -441,21 +441,23 @@ impl State {
         by: CloseBy,
     ) -> Option<Event> {
         let mut entry = self.finish_session(session_id)?;
-        if !matches!(by, CloseBy::WorkerGone | CloseBy::Offer)
-            && let Some(connection) = self.connections.get(&entry.connection)
-            && connection
-                .commands
-                .try_send(DriverCommand::CloseSession {
-                    session_id: session_id.to_owned(),
-                    code,
-                    message: message.to_owned(),
-                })
-                .is_err()
-        {
-            tracing::warn!(
-                session.id = session_id,
-                "driver queue full; the worker closes the session with its connection"
-            );
+        if !matches!(by, CloseBy::WorkerGone | CloseBy::Offer) {
+            let close = DriverCommand::CloseSession {
+                session_id: session_id.to_owned(),
+                code,
+                message: message.to_owned(),
+            };
+            // The slot the offer reserved always takes it.
+            if let Some(slot) = entry.close_slot.take() {
+                drop(slot.send(close));
+            } else if let Some(connection) = self.connections.get(&entry.connection)
+                && connection.commands.try_send(close).is_err()
+            {
+                tracing::warn!(
+                    session.id = session_id,
+                    "driver queue full; the worker closes the session with its connection"
+                );
+            }
         }
         tracing::info!(event = "session_closed", session.id = session_id, stream.id = %entry.stream_id, code, detail = message, by = ?by, "session closed");
         let event = api_event(&SessionEvent::Closed {
