@@ -85,7 +85,10 @@
           <button id="save-entry" type="button" class="secondary">Save</button>
           <button id="delete-entry" type="button" class="secondary" disabled>Delete</button>
         </div>
-        <label>Stream id <input id="stream" value="cam" pattern="[A-Za-z0-9._\-]{1,128}" required></label>
+        <div class="buttons">
+          <button id="play" type="submit" disabled>Play</button>
+          <button id="stop" type="button" class="secondary" disabled>Stop</button>
+        </div>
         <label>Camera URL <input id="url" placeholder="rtsp://user:pass@192.168.1.10:554/stream1" autocomplete="off" spellcheck="false" required></label>
         <label>STUN server (optional) <input id="stun" placeholder="stun:stun.l.google.com:19302"></label>
         <label title="stream/put's orientation; changing it while playing puts the stream again, and the open session turns from its next frame">Orientation (CVO)
@@ -100,10 +103,7 @@
             <option value="rotate_right">rotate_right</option>
           </select>
         </label>
-        <div class="buttons">
-          <button id="play" type="submit" disabled>Play</button>
-          <button id="stop" type="button" class="secondary" disabled>Stop</button>
-        </div>
+        <label title="The name as a slug until edited here; clearing it hands it back to the name">Stream id <input id="stream" value="cam" pattern="[A-Za-z0-9._\-]{1,128}" required></label>
       </form>
     </div>
     <div class="col">
@@ -179,6 +179,14 @@ function splitUserinfo(url) {
 function withUserinfo(url, userinfo) {
   if (typeof userinfo !== "string" || !/^[^\/?#]*@$/.test(userinfo) || splitUserinfo(url).userinfo) return url;
   return url.replace(SCHEME, (scheme) => scheme + userinfo);
+}
+
+// `name` as a stream id: lowercase ASCII letters and digits, accents
+// dropped, every other run of characters one `_`, at most the 128
+// characters the stream id's pattern allows.
+function slugify(name) {
+  return name.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_").slice(0, 128).replace(/^_+|_+$/g, "");
 }
 
 function showUrl() {
@@ -309,7 +317,23 @@ if (Object.keys(credentials).length) {
 $("url").addEventListener("focus", showUrl);
 $("url").addEventListener("input", () => { cameraUrl = $("url").value.trim(); syncSelection(); });
 $("url").addEventListener("blur", () => { save(); showUrl(); });
-$("stream").addEventListener("input", syncSelection);
+// Whether the stream id is one the name did not give: neither empty, the
+// page's default, nor the name's slug.
+const typedStream = () => !["", $("stream").defaultValue, slugify($("label").value)].includes($("stream").value.trim());
+// Whether the stream id was typed by hand, so the name leaves it alone.
+let streamTyped = typedStream();
+$("stream").addEventListener("input", () => {
+  streamTyped = typedStream();
+  syncSelection();
+});
+// A new stream's id follows its name until it is typed; a saved stream
+// keeps its id when renamed, so Save updates it.
+$("label").addEventListener("input", () => {
+  const slug = slugify($("label").value);
+  if (streamTyped || selected() || !slug) return;
+  $("stream").value = slug;
+  syncSelection();
+});
 for (const side of ["right", "below"]) {
   $(`dock-${side}`).addEventListener("click", () => { panel = side; placePanel(); save(); });
 }
@@ -681,6 +705,7 @@ $("saved").addEventListener("change", () => {
     $("orientation").value = entry.orientation;
     $("label").value = entry.label;
   }
+  streamTyped = typedStream();
   save();
   if (entry && $("form").reportValidity()) play();
 });

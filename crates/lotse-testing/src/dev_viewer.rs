@@ -560,6 +560,59 @@ mod tests {
         assert!(save.contains("      panel,\n"), "{save}");
     }
 
+    /// A new stream's id is its name as a slug until the id is typed by
+    /// hand; Play and Stop sit under the name, the stream id last.
+    #[test]
+    fn the_stream_id_follows_the_name_until_typed() {
+        let page = PAGE;
+        let form = page
+            .split(r#"<form id="form">"#)
+            .nth(1)
+            .and_then(|rest| rest.split("</form>").next())
+            .expect("the form");
+        let at = |what: &str| {
+            form.find(what)
+                .unwrap_or_else(|| panic!("{what} in {form}"))
+        };
+        assert!(at(r#"id="label""#) < at(r#"id="play""#) && at(r#"id="play""#) < at(r#"id="url""#));
+        assert!(
+            form.trim_end().ends_with(r#"<input id="stream" value="cam" pattern="[A-Za-z0-9._\-]{1,128}" required></label>"#),
+            "{form}"
+        );
+        // The slug fits the stream id's pattern: lowercase ASCII letters
+        // and digits joined by `_`, at most 128 characters.
+        let slugify = page
+            .split("function slugify(name) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the name's slug");
+        assert!(
+            slugify
+                .contains(r#".replace(/[^a-z0-9]+/g, "_").slice(0, 128).replace(/^_+|_+$/g, "");"#),
+            "{slugify}"
+        );
+        // Typing a stream id stops the name driving it, unless it is
+        // empty, the default or the slug; a saved stream keeps its id.
+        assert!(page.contains(
+            r#"const typedStream = () => !["", $("stream").defaultValue, slugify($("label").value)].includes($("stream").value.trim());"#
+        ));
+        let label = page
+            .split(r#"$("label").addEventListener("input", () => {"#)
+            .nth(1)
+            .and_then(|rest| rest.split("\n});\n").next())
+            .expect("the name drives the stream id");
+        assert!(
+            label.contains("if (streamTyped || selected() || !slug) return;")
+                && label.contains(r#"$("stream").value = slug;"#),
+            "{label}"
+        );
+        assert_eq!(
+            page.matches("streamTyped = typedStream();").count(),
+            3,
+            "on load, on typing and on choosing a saved stream"
+        );
+    }
+
     /// CSP Level 3 §2.3.1: a hash-source is the base64 SHA-256 of the
     /// element's content, exactly as between its tags.
     #[test]
