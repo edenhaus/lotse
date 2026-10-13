@@ -703,6 +703,10 @@ impl Driver {
         self.switch_connect.release("worker exited");
         self.snapshot.worker = None;
         self.queued.clear();
+        // The old source and the standby went with the worker: the next
+        // one runs the source switched to, and a crash is the failure an
+        // offer meanwhile closes with.
+        self.end_switch();
         let connection = self.spec.connection_id.clone();
         self.shared.lock().close_sessions_where(
             |session| session.connection == connection,
@@ -2197,6 +2201,25 @@ mod tests {
             events.try_recv().expect("closed").payload,
             serde_json::json!({ "type": "closed", "code": "source_auth_failed",
                 "message": "source authentication failed: 401" })
+        );
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn a_worker_crash_during_a_switch_is_the_failure_an_offer_closes_with() {
+        let shared = shared("/usr/bin/true");
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Live));
+        driver.on_switch_source(driver.spec.clone());
+        driver.on_worker_event(WorkerEvent::Exited(ExitStatus::from_raw(9)));
+        driver.publish();
+        assert_eq!(driver.machine.state(), ConnectionState::Restarting);
+        assert_eq!(
+            driver.snapshot.failure,
+            Some(ConnectionError::WorkerCrashed)
         );
         drop((driver, demand_tx));
     }
