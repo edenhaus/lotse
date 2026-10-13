@@ -613,6 +613,27 @@ mod tests {
         );
     }
 
+    /// CSS Color Adjustment Level 1 §2.1: the page declares both schemes,
+    /// so native scrollbars and controls follow the dark one; its
+    /// scrollable parts have thin, muted scrollbars (CSS Scrollbars Styling
+    /// Level 1 §2, §3).
+    #[test]
+    fn css_color_adjust_1_s2_1_scrollbars_follow_the_color_scheme() {
+        let style = PAGE
+            .split("<style>")
+            .nth(1)
+            .and_then(|rest| rest.split("</style>").next())
+            .expect("the page's style");
+        assert!(
+            style.contains(":root { color-scheme: light dark; scrollbar-color: color-mix(in srgb, var(--muted) 50%, transparent) transparent; }"),
+            "{style}"
+        );
+        assert!(
+            style.contains("aside, .col, #log { scrollbar-width: thin; }"),
+            "{style}"
+        );
+    }
+
     /// CSP Level 3 §2.3.1: a hash-source is the base64 SHA-256 of the
     /// element's content, exactly as between its tags.
     #[test]

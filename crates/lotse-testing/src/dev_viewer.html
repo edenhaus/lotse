@@ -9,7 +9,13 @@
   @media (prefers-color-scheme: dark) {
     :root { --bg: #14171c; --panel: #1c2027; --text: #e6e9ef; --muted: #99a2b3; --line: #2d333d; --accent: #6b9bff; --bad: #ff7b6b; --good: #5fd08f; }
   }
+  /* Native controls and scrollbars in the page's scheme (CSS Color
+     Adjustment Level 1 §2.1), the scrollbars thin and muted (CSS Scrollbars
+     Styling Level 1 §2, §3): without a color-scheme Chrome draws its light
+     ones in the dark scheme too (Chrome on macOS, 2026-10-13). */
+  :root { color-scheme: light dark; scrollbar-color: color-mix(in srgb, var(--muted) 50%, transparent) transparent; }
   * { box-sizing: border-box; }
+  aside, .col, #log { scrollbar-width: thin; }
   html, body { height: 100%; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; overflow-x: hidden; }
   /* The video takes everything the side panel leaves; below 760 px the
