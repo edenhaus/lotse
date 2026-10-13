@@ -256,7 +256,7 @@ function storageFailed(err) {
 }
 
 // Keeps the fields and the saved streams in localStorage, every URL with
-// its userinfo.
+// its userinfo; whether localStorage took them.
 function save() {
   try {
     localStorage.setItem(STORE, JSON.stringify({
@@ -268,8 +268,10 @@ function save() {
       saved: entries,
       selected: selectedId ?? null,
     }));
+    return true;
   } catch (err) {
     storageFailed(err);
+    return false;
   }
 }
 
@@ -313,8 +315,9 @@ syncSelection();
 if (selected()) $("label").value = selected().label;
 // Pages before 2026-10-13 kept the credentials in this tab's
 // sessionStorage only: they move to localStorage, which every tab reads.
-if (Object.keys(credentials).length) {
-  save();
+// sessionStorage keeps them until localStorage has taken them, so a failed
+// write loses nothing and the next load tries again.
+if (Object.keys(credentials).length && save()) {
   try {
     sessionStorage.removeItem(STORE);
   } catch {}
@@ -331,6 +334,16 @@ let streamTyped = typedStream();
 $("stream").addEventListener("input", () => {
   streamTyped = typedStream();
   syncSelection();
+});
+// An emptied stream id is handed back to the name once the field is left,
+// not while it is empty, which is also on the way to typing a new one.
+$("stream").addEventListener("blur", () => {
+  const slug = slugify($("label").value);
+  if ($("stream").value.trim() || !slug) return;
+  $("stream").value = slug;
+  streamTyped = false;
+  syncSelection();
+  save();
 });
 // A new stream's id follows its name until it is typed; a saved stream
 // keeps its id when renamed, so Save updates it.

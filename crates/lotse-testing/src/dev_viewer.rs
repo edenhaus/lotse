@@ -474,14 +474,20 @@ mod tests {
         assert!(page.contains("splitUserinfo(e.url).bare === bare && e.stream === stream"));
         // What earlier pages kept in sessionStorage moves to localStorage
         // on load, and sessionStorage is cleared.
+        // sessionStorage is cleared only once localStorage has taken the
+        // credentials: a failed write keeps them for the next load.
         let migrate = page
-            .split("if (Object.keys(credentials).length) {")
+            .split("if (Object.keys(credentials).length && save()) {")
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
-            .expect("tab credentials move on load");
+            .expect("tab credentials move on load once saved");
         assert!(
-            migrate.contains("save();") && migrate.contains("sessionStorage.removeItem(STORE);"),
+            migrate.contains("sessionStorage.removeItem(STORE);"),
             "{migrate}"
+        );
+        assert!(
+            save.contains("    }));\n    return true;\n  } catch (err) {\n    storageFailed(err);\n    return false;\n  }"),
+            "save() says whether localStorage took the settings: {save}"
         );
         // Every storage access is inside a `try`, so the page works without
         // storage.
@@ -608,6 +614,19 @@ mod tests {
             label.contains("if (streamTyped || selected() || !slug) return;")
                 && label.contains(r#"$("stream").value = slug;"#),
             "{label}"
+        );
+        // An emptied stream id goes back to the name's slug when the field
+        // is left, not while it is empty.
+        let blur = page
+            .split(r#"$("stream").addEventListener("blur", () => {"#)
+            .nth(1)
+            .and_then(|rest| rest.split("\n});\n").next())
+            .expect("an emptied stream id is handed back to the name");
+        assert!(
+            blur.contains(r#"if ($("stream").value.trim() || !slug) return;"#)
+                && blur.contains(r#"$("stream").value = slug;"#)
+                && blur.contains("streamTyped = false;"),
+            "{blur}"
         );
         assert_eq!(
             page.matches("streamTyped = typedStream();").count(),
