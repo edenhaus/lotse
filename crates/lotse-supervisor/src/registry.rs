@@ -87,6 +87,13 @@ pub(crate) struct ConnectionSnapshot {
     pub(crate) state: ConnectionState,
     /// The last error, if the connection is not live.
     pub(crate) last_error: Option<ConnectionError>,
+    /// The failure the connection's sessions still waiting for their
+    /// answer close with, and an offer closes with at once: a failed
+    /// attempt of the current source, or a worker crash
+    /// ([`ConnectionMachine::failure`](lotse_core::connection::ConnectionMachine::failure)).
+    /// A stale error, or a drop the worker retries, is none: the session
+    /// waits for the attempt under way or the one its offer starts.
+    pub(crate) failure: Option<ConnectionError>,
     /// When the current state began.
     pub(crate) since: SystemTime,
     /// Source reconnects so far.
@@ -109,6 +116,7 @@ impl ConnectionSnapshot {
         Self {
             state: ConnectionState::Idle,
             last_error: None,
+            failure: None,
             since: now,
             reconnects: 0,
             worker: None,
@@ -117,16 +125,6 @@ impl ConnectionSnapshot {
             tracks: Vec::new(),
             stats: None,
         }
-    }
-
-    /// The error a session waiting for its answer closes with: the last
-    /// error while the state follows a failure
-    /// ([`ConnectionState::failed`]). In any other state the last error is
-    /// stale (an idle or connecting connection keeps the one of its
-    /// previous attempt), and a session waits for the outcome of the
-    /// attempt under way or the one its offer starts.
-    pub(crate) fn failure(&self) -> Option<&ConnectionError> {
-        self.last_error.as_ref().filter(|_| self.state.failed())
     }
 }
 
@@ -303,6 +301,9 @@ impl State {
             return;
         };
         entry.key = key;
+        // The failure is the old source's: an offer before the driver
+        // takes the switch waits for the new one.
+        entry.snapshot.failure = None;
         if entry
             .commands
             .try_send(DriverCommand::SwitchSource(spec))
@@ -1122,7 +1123,7 @@ impl Shared {
         let Some(entry) = state.connections.get_mut(id) else {
             return;
         };
-        let failure = snapshot.failure().cloned();
+        let failure = snapshot.failure.clone();
         entry.snapshot = snapshot;
         let streams: Vec<String> = entry.streams.iter().cloned().collect();
         if let Some(error) = failure {
@@ -1346,33 +1347,6 @@ mod tests {
     }
 
     #[test]
-    fn only_the_last_error_of_a_failed_connection_is_a_failure() {
-        use lotse_core::source::SourceError;
-        let error = ConnectionError::Source(SourceError::AuthFailed("401".into()));
-        let snapshot = |state, last_error| ConnectionSnapshot {
-            state,
-            last_error,
-            ..ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH)
-        };
-        // A stale error, or the drop a reconnect under way may still
-        // recover from: the attempt under way, or the one an offer
-        // starts, decides.
-        for state in [
-            ConnectionState::Idle,
-            ConnectionState::Connecting,
-            ConnectionState::Live,
-            ConnectionState::Reconnecting,
-            ConnectionState::Draining,
-        ] {
-            assert_eq!(snapshot(state, Some(error.clone())).failure(), None);
-        }
-        for state in [ConnectionState::Backoff, ConnectionState::Restarting] {
-            assert_eq!(snapshot(state, Some(error.clone())).failure(), Some(&error));
-            assert_eq!(snapshot(state, None).failure(), None);
-        }
-    }
-
-    #[test]
     fn a_session_closed_at_its_offer_is_never_named_to_the_driver() {
         let (mut state, mut rx) = relay_state(0);
         state.streams.insert("front".into(), stream_on_c1(false));
@@ -1430,7 +1404,14 @@ mod tests {
             spec("fake://127.0.0.1/a"),
         );
         assert!(rx.try_recv().is_err(), "no connection, no switch");
+        state.connections.get_mut("c1").unwrap().snapshot.failure = Some(ConnectionError::Source(
+            lotse_core::source::SourceError::AuthFailed("401".into()),
+        ));
         state.switch_connection("c1", key("fake://127.0.0.1/b"), spec("fake://127.0.0.1/b"));
+        assert_eq!(
+            state.connections["c1"].snapshot.failure, None,
+            "the old source's failure is not the new one's"
+        );
         // The queue holds one: the next switch keeps its key, not its source.
         state.switch_connection("c1", key("fake://127.0.0.1/c"), spec("fake://127.0.0.1/c"));
         assert_eq!(

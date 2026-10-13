@@ -96,9 +96,11 @@ pub enum SessionEvent {
     /// waiting for its answer has no deadline of its own: it waits while
     /// its source connects, and closes with the source's error as soon as
     /// the attempt fails, at once when the offer reaches a source that has
-    /// already failed. A live source that drops is retried at once, and the
-    /// session waits for the retry; only a retry that fails closes it. An
-    /// answered session rides every reconnect instead.
+    /// already failed. A live source that drops is retried, at once or
+    /// after a delay, and the session waits for the retry; only a retry
+    /// that fails closes it. While a `stream/put` switches the stream to
+    /// another source, the old source's failures do not count. An answered
+    /// session rides every reconnect instead.
     #[schemars(title = "SessionEventClosed")]
     Closed {
         /// The stable code (`peer_closed`, `session_closed`, ...). Before

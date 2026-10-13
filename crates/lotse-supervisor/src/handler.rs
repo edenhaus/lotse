@@ -659,7 +659,7 @@ impl Supervisor {
             .and_then(|source| state.connections.get_key_value(&source.connection))
             .map(|(id, entry)| {
                 let snapshot = &entry.snapshot;
-                let failure = snapshot.failure().map(|e| (e.clone(), snapshot.state));
+                let failure = snapshot.failure.clone().map(|e| (e, snapshot.state));
                 (id.clone(), entry.commands.clone(), failure)
             })
             .ok_or_else(|| internal("the stream has no source connection"))?;
@@ -2555,12 +2555,31 @@ mod tests {
     }
 
     /// What a driver publishes for its connection: `state`, with `error`
-    /// as the last error.
+    /// as the last error, a failure after a failed attempt or a crash.
     fn snapshot(state: ConnectionState, error: Option<ConnectionError>) -> ConnectionSnapshot {
+        let failed = matches!(
+            state,
+            ConnectionState::Backoff | ConnectionState::Restarting
+        );
         ConnectionSnapshot {
             state,
+            failure: error.clone().filter(|_| failed),
             last_error: error,
             ..ConnectionSnapshot::idle(std::time::UNIX_EPOCH)
+        }
+    }
+
+    /// What a driver publishes after a live source dropped and its retry
+    /// waits out a delay: no failure.
+    fn dropped() -> ConnectionSnapshot {
+        ConnectionSnapshot {
+            failure: None,
+            ..snapshot(
+                ConnectionState::Backoff,
+                Some(ConnectionError::Source(SourceError::Ended(
+                    "the camera closed the session".into(),
+                ))),
+            )
         }
     }
 
@@ -2692,6 +2711,17 @@ mod tests {
                 "{closed:?}"
             );
         }
+        // A live source that dropped and waits out a delay before its
+        // retry has not failed: the offer waits for the retry.
+        s.shared.update_connection(&connection, dropped(), true);
+        let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some("s9"))).await);
+        assert_eq!(delivered(&mut events)["type"], "session");
+        assert!(events.try_recv().is_err(), "no closed for a drop");
+        assert_eq!(
+            *s.shared.lock().connections[&connection].demand.borrow(),
+            1,
+            "handed to the driver"
+        );
         shutdown_on(&s, &clock).await;
     }
 
@@ -2746,6 +2776,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_offer_after_a_source_switch_waits_for_the_new_source() {
+        let dir = private_dir("srcswitch");
+        let clock = Arc::new(FakeClock::from_system());
+        let s = with_webrtc(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let connection = s.shared.lock().streams["front"].sources[0]
+            .connection
+            .clone();
+        settle().await;
+        s.shared.update_connection(
+            &connection,
+            snapshot(
+                ConnectionState::Backoff,
+                Some(ConnectionError::Source(SourceError::AuthFailed(
+                    "401".into(),
+                ))),
+            ),
+            true,
+        );
+        // The put switches the connection to another source; the offer
+        // comes before its driver takes the switch.
+        result(call(&s, &put("front", "fake://127.0.0.1:1/other", false)).await);
+        assert_eq!(
+            s.shared.lock().streams["front"].sources[0].connection,
+            connection,
+            "switched in place"
+        );
+        let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        assert_eq!(delivered(&mut events)["type"], "session");
+        assert!(events.try_recv().is_err(), "no closed with the old error");
+        assert_eq!(
+            *s.shared.lock().connections[&connection].demand.borrow(),
+            1,
+            "handed to the driver"
+        );
+        shutdown_on(&s, &clock).await;
+    }
+
+    #[tokio::test]
+    async fn an_offer_closed_at_once_keeps_its_close_after_every_warning() {
+        let dir = private_dir("srcwarn");
+        let clock = Arc::new(FakeClock::from_system());
+        let s = with_webrtc(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let connection = s.shared.lock().streams["front"].sources[0]
+            .connection
+            .clone();
+        settle().await;
+        s.shared.update_connection(
+            &connection,
+            snapshot(
+                ConnectionState::Backoff,
+                Some(ConnectionError::Source(SourceError::Timeout("late".into()))),
+            ),
+            true,
+        );
+        // As many turns: URLs as an offer may carry, each worth a warning.
+        let servers: Vec<Value> = (0..lotse_api_types::limits::MAX_ICE_SERVERS)
+            .map(|server| {
+                let urls: Vec<String> = (0..lotse_api_types::limits::MAX_ICE_URLS)
+                    .map(|url| format!("turns:t{server}-{url}.example"))
+                    .collect();
+                json!({ "urls": urls })
+            })
+            .collect();
+        let mut request = offer(2, "front", Some("s1"));
+        request["ice_servers"] = json!(servers);
+        let mut events = subscription(call_on(&s, 1, &request).await);
+        assert_eq!(delivered(&mut events)["type"], "session");
+        for _ in 0..crate::gather::MAX_WARNINGS {
+            assert_eq!(delivered(&mut events)["type"], "warning");
+        }
+        assert_eq!(
+            delivered(&mut events),
+            json!({ "type": "closed", "code": "source_timeout",
+                "message": "source timed out: late" })
+        );
+        assert!(ended(&mut events));
+        // The queue holds the session event, every warning and the close.
+        const { assert!(crate::gather::MAX_WARNINGS + 2 <= SESSION_QUEUE) };
+        shutdown_on(&s, &clock).await;
+    }
+
+    #[tokio::test]
     async fn a_waiting_session_rides_a_reconnect_and_closes_only_when_it_fails() {
         let dir = private_dir("srcride");
         let clock = Arc::new(FakeClock::from_system());
@@ -2775,6 +2889,11 @@ mod tests {
             true,
         );
         // The worker retries at once: both sessions wait for it.
+        assert!(s.shared.lock().sessions.contains_key("s2"));
+        assert!(waiting.try_recv().is_err(), "no closed for a drop");
+        // The source went live again and dropped again; its retry waits
+        // out a delay this time, and both sessions wait for it too.
+        s.shared.update_connection(&connection, dropped(), true);
         assert!(s.shared.lock().sessions.contains_key("s2"));
         assert!(waiting.try_recv().is_err(), "no closed for a drop");
         // The retry fails: the waiting session closes with its error, the

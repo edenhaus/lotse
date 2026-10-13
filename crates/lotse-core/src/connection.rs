@@ -51,21 +51,6 @@ impl ConnectionState {
             Self::Restarting => "restarting",
         }
     }
-
-    /// Whether the state follows a failed attempt: an attempt failed
-    /// (`Backoff`) or the worker crashed (`Restarting`). The machine's last
-    /// error then says why; in any other state it is stale, from an attempt
-    /// before the current one. A live source that dropped (`Reconnecting`)
-    /// is not one yet: the worker retries at once, and only a retry that
-    /// fails moves on to `Backoff`.
-    pub const fn failed(self) -> bool {
-        match self {
-            Self::Backoff | Self::Restarting => true,
-            Self::Idle | Self::Connecting | Self::Live | Self::Reconnecting | Self::Draining => {
-                false
-            }
-        }
-    }
 }
 
 /// The last thing that went wrong on a connection.
@@ -175,6 +160,9 @@ pub struct ConnectionMachine {
     worker_since: Option<Instant>,
     /// The last error, cleared when the connection goes live.
     last_error: Option<ConnectionError>,
+    /// The `Backoff` under way follows a live source that dropped, not an
+    /// attempt that failed: the source may well come back.
+    dropped: bool,
     /// Worker crashes so far, for `stream/get`.
     crashes: u32,
 }
@@ -190,6 +178,7 @@ impl ConnectionMachine {
             stopping: false,
             worker_since: None,
             last_error: None,
+            dropped: false,
             crashes: 0,
         }
     }
@@ -207,6 +196,27 @@ impl ConnectionMachine {
     /// The last error, if the connection is not live.
     pub const fn last_error(&self) -> Option<&ConnectionError> {
         self.last_error.as_ref()
+    }
+
+    /// The failure a viewer still waiting for its answer cannot ride out:
+    /// the last error while an attempt failed (`Backoff`) or the worker
+    /// crashed (`Restarting`). In any other state the last error is stale,
+    /// from an attempt before the current one, or a drop the worker is
+    /// retrying: a live source that dropped is retried at once
+    /// (`Reconnecting`) or, after its first drop since streaming stably,
+    /// after a delay (`Backoff` from `Live`), and only a retry that fails
+    /// is one.
+    pub const fn failure(&self) -> Option<&ConnectionError> {
+        match self.state {
+            ConnectionState::Backoff if !self.dropped => self.last_error.as_ref(),
+            ConnectionState::Restarting => self.last_error.as_ref(),
+            ConnectionState::Idle
+            | ConnectionState::Connecting
+            | ConnectionState::Live
+            | ConnectionState::Reconnecting
+            | ConnectionState::Backoff
+            | ConnectionState::Draining => None,
+        }
     }
 
     /// Worker crashes so far.
@@ -252,6 +262,7 @@ impl ConnectionMachine {
                 reason,
                 demand = self.demand,
                 error = self.last_error.as_ref().map(ConnectionError::code),
+                failed = self.failure().is_some(),
                 "connection state changed"
             );
         }
@@ -308,8 +319,12 @@ impl ConnectionMachine {
                 self.last_error = Some(ConnectionError::Source(error));
                 self.state = S::Reconnecting;
             }
-            (S::Connecting | S::Reconnecting | S::Live, WorkerReport::Backoff { error, .. }) => {
+            (
+                from @ (S::Connecting | S::Reconnecting | S::Live),
+                WorkerReport::Backoff { error, .. },
+            ) => {
                 self.last_error = Some(ConnectionError::Source(error));
+                self.dropped = from == S::Live;
                 self.state = S::Backoff;
             }
             (
@@ -438,20 +453,59 @@ mod tests {
     }
 
     #[test]
-    fn only_the_states_after_a_failure_are_failed() {
-        let failed: Vec<S> = [
-            S::Idle,
-            S::Connecting,
-            S::Live,
-            S::Reconnecting,
-            S::Backoff,
-            S::Draining,
-            S::Restarting,
-        ]
-        .into_iter()
-        .filter(|s| s.failed())
-        .collect();
-        assert_eq!(failed, [S::Backoff, S::Restarting]);
+    fn a_failed_attempt_and_a_crash_are_failures_a_drop_is_not() {
+        let now = SystemClock.now();
+        let mut m = machine();
+        let backoff = |error| {
+            Input::Report(WorkerReport::Backoff {
+                error,
+                retry_in: Duration::from_secs(1),
+            })
+        };
+        m.handle(Input::Demand(1), now);
+        assert_eq!(m.failure(), None);
+        // The first attempt fails.
+        m.handle(backoff(SourceError::Unreachable("refused".into())), now);
+        assert_eq!(
+            m.failure().map(ConnectionError::code),
+            Some("source_unreachable")
+        );
+        // The retry connects: the error is stale.
+        m.handle(Input::Report(WorkerReport::Connecting), now);
+        assert_eq!(m.state(), S::Connecting);
+        assert_eq!(m.failure(), None);
+        m.handle(Input::Report(WorkerReport::Live), now);
+        assert_eq!(m.failure(), None);
+        // A live source that drops is retried, at once or after a delay.
+        m.handle(Input::Report(WorkerReport::Reconnecting(timeout())), now);
+        assert_eq!(m.failure(), None);
+        m.handle(Input::Report(WorkerReport::Live), now);
+        m.handle(backoff(SourceError::Ended("eof".into())), now);
+        assert_eq!(m.state(), S::Backoff);
+        assert_eq!(m.failure(), None, "a drop");
+        // Its retry fails.
+        m.handle(Input::Report(WorkerReport::Connecting), now);
+        m.handle(backoff(timeout()), now);
+        assert_eq!(
+            m.failure().map(ConnectionError::code),
+            Some("source_timeout")
+        );
+        // The immediate retry after a drop fails.
+        m.handle(Input::Report(WorkerReport::Live), now);
+        m.handle(Input::Report(WorkerReport::Reconnecting(timeout())), now);
+        m.handle(backoff(SourceError::Ended("eof".into())), now);
+        assert_eq!(m.failure().map(ConnectionError::code), Some("source_ended"));
+        // The worker crashes.
+        m.handle(Input::WorkerExited, now);
+        assert_eq!(m.state(), S::Restarting);
+        assert_eq!(m.failure(), Some(&ConnectionError::WorkerCrashed));
+        // Lingering is no failure, whatever came before.
+        m.handle(Input::CrashBackoffExpired, now);
+        m.handle(Input::Report(WorkerReport::Live), now);
+        m.handle(Input::Demand(0), now);
+        assert_eq!(m.state(), S::Draining);
+        m.handle(backoff(timeout()), now);
+        assert_eq!(m.failure(), None);
     }
 
     #[test]
@@ -627,7 +681,7 @@ mod tests {
         assert_eq!(
             changed.last().map(|line| line.fields.as_str()),
             Some(
-                " from=\"live\" to=\"restarting\" reason=\"worker exited\" demand=1 error=\"worker_crashed\""
+                " from=\"live\" to=\"restarting\" reason=\"worker exited\" demand=1 error=\"worker_crashed\" failed=true"
             )
         );
         // Reports from the dead worker are ignored.
