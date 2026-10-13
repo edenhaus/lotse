@@ -49,7 +49,10 @@ use crate::net::turn_client::LeaseGrant;
 use crate::registry::{CloseBy, ConnectionSnapshot, Shared, WorkerProcess};
 use crate::worker::{Worker, WorkerEvent};
 
-/// Session messages a driver holds, queued or in flight.
+/// Session messages a driver holds, queued or in flight, besides the
+/// close each open session reserves (`SessionEntry::close_slot`): a
+/// driver's queue holds this many and one more per session the daemon
+/// allows, so the reserved closes never take room from the rest.
 pub(crate) const COMMAND_QUEUE: usize = 256;
 
 /// A worker that sent nothing for this long is killed: it sends its
@@ -340,6 +343,12 @@ pub(crate) struct Driver {
     snapshot: ConnectionSnapshot,
     /// The state and error last published, to detect a change.
     published: (ConnectionState, Option<ConnectionError>),
+    /// A source switch is under way: the machine's reports are the old
+    /// source's until the tracks switch, or until the host lookup of a
+    /// new worker, which runs the source switched to.
+    switching: bool,
+    /// The failed attempt of the source to switch to, until its next one.
+    switch_failure: Option<ConnectionError>,
 }
 
 impl Driver {
@@ -374,6 +383,8 @@ impl Driver {
             resolve_backoff: ReconnectBackoff::new(0),
             snapshot,
             published: (ConnectionState::Idle, None),
+            switching: false,
+            switch_failure: None,
         }
     }
 
@@ -465,10 +476,12 @@ impl Driver {
             }
             Wake::Resolved(Ok(addrs)) => {
                 self.pending = Pending::Nothing;
+                self.end_switch();
                 self.resolve_backoff.reset();
                 self.spawn_worker(addrs).await;
             }
             Wake::Resolved(Err(message)) => {
+                self.end_switch();
                 let retry_in = self.resolve_backoff.next_delay(false);
                 tracing::warn!(
                     host = self.spec.host,
@@ -530,13 +543,17 @@ impl Driver {
                     retry_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
                     "host of the source to switch to could not be resolved; retrying"
                 );
-                self.snapshot.last_error = Some(ConnectionError::Source(SourceError::Unreachable(
-                    format!("resolving {}: {message}", self.spec.host),
+                let error = ConnectionError::Source(SourceError::Unreachable(format!(
+                    "resolving {}: {message}",
+                    self.spec.host
                 )));
+                self.snapshot.last_error = Some(error.clone());
+                self.switch_failure = Some(error);
                 self.pending = Pending::RetrySwitch(self.shared.clock.sleep(retry_in));
             }
             Wake::RetrySwitchResolve => {
                 self.pending = Pending::Nothing;
+                self.switch_failure = None;
                 if self.worker.is_some() {
                     self.start_resolving_switch();
                 }
@@ -559,6 +576,9 @@ impl Driver {
     fn on_switch_source(&mut self, spec: DriverSpec) {
         tracing::info!(spec = ?spec, "connection switches its source");
         self.spec = spec;
+        self.switching = true;
+        self.switch_failure = None;
+        self.snapshot.switches = self.snapshot.switches.wrapping_add(1);
         if self.worker.is_some() {
             self.start_resolving_switch();
         } else if matches!(self.pending, Pending::Resolving(_)) {
@@ -612,14 +632,19 @@ impl Driver {
             }
             WorkerEvent::SwitchReport(report) => match report {
                 WorkerReport::Connecting => {
+                    self.switch_failure = None;
                     self.switch_connect
                         .request(&self.shared.connects, "standby connecting");
                 }
                 WorkerReport::Reconnecting(_) => {
+                    self.switch_failure = None;
                     self.switch_connect
                         .request(&self.shared.connects, "standby reconnecting");
                 }
-                WorkerReport::Live => self.switch_connect.release("standby live"),
+                WorkerReport::Live => {
+                    self.switch_failure = None;
+                    self.switch_connect.release("standby live");
+                }
                 WorkerReport::Backoff { error, retry_in } => {
                     self.switch_connect.release("standby backoff");
                     tracing::warn!(
@@ -628,14 +653,20 @@ impl Driver {
                         retry_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
                         "the source to switch to failed; the old one keeps streaming"
                     );
-                    self.snapshot.last_error = Some(ConnectionError::Source(error));
+                    let error = ConnectionError::Source(error);
+                    self.snapshot.last_error = Some(error.clone());
+                    self.switch_failure = Some(error);
                 }
             },
             WorkerEvent::StandbyStopped => self.switch_connect.release("standby stopped"),
             WorkerEvent::Switched => {
                 self.switch_connect.release("switched");
                 self.snapshot.last_error = None;
+                self.end_switch();
                 tracing::info!("the tracks switched to the new source");
+                // The tracks switch at a keyframe of the new source, which
+                // is live; the old one's state is over.
+                self.feed(Input::Report(WorkerReport::Live));
             }
             WorkerEvent::Tracks(tracks) => {
                 tracing::info!(tracks = tracks.len(), "tracks declared");
@@ -675,6 +706,10 @@ impl Driver {
         self.switch_connect.release("worker exited");
         self.snapshot.worker = None;
         self.queued.clear();
+        // The old source and the standby went with the worker: the next
+        // one runs the source switched to, and a crash is the failure an
+        // offer meanwhile closes with.
+        self.end_switch();
         let connection = self.spec.connection_id.clone();
         self.shared.lock().close_sessions_where(
             |session| session.connection == connection,
@@ -886,11 +921,35 @@ impl Driver {
         }
     }
 
+    /// The switch is over: the machine's reports are the current source's.
+    fn end_switch(&mut self) {
+        self.switching = false;
+        self.switch_failure = None;
+    }
+
+    /// The failure a viewer waiting for its answer closes with
+    /// ([`ConnectionMachine::failure`]): during a switch, the old source's
+    /// does not count, and only when neither source can answer does the
+    /// new source's failed attempt.
+    fn failure(&self) -> Option<ConnectionError> {
+        if !self.switching {
+            return self.machine.failure().cloned();
+        }
+        self.machine
+            .failure()
+            .and_then(|_| self.switch_failure.clone())
+    }
+
     /// Publishes the snapshot; a state or error change also tells the
-    /// subscribers.
+    /// subscribers. The last error is the failure waiting sessions close
+    /// with when there is one: during a switch, the new source's, not the
+    /// old one's the machine holds.
     fn publish(&mut self) {
         let state = self.machine.state();
-        let error = self.machine.last_error().cloned();
+        let failure = self.failure();
+        let error = failure
+            .clone()
+            .or_else(|| self.machine.last_error().cloned());
         let changed = (state, error.as_ref()) != (self.published.0, self.published.1.as_ref());
         if changed {
             self.snapshot.since = self.shared.clock.wall_now();
@@ -898,6 +957,7 @@ impl Driver {
             self.snapshot.last_error.clone_from(&error);
             self.published = (state, error);
         }
+        self.snapshot.failure = failure;
         self.shared
             .update_connection(&self.spec.connection_id, self.snapshot.clone(), changed);
     }
@@ -1905,6 +1965,351 @@ mod tests {
         assert_eq!(driver.machine.crashes(), 1);
         assert_eq!(driver.machine.state(), ConnectionState::Restarting);
         drop((owned, demand_tx));
+    }
+
+    /// Stream `front` on connection `c1` from `url`, as the registry
+    /// keeps them, with session `s1` waiting for its answer on it; the
+    /// session's events go to the receiver returned.
+    fn waiting_session(shared: &Shared, url: &str) -> mpsc::Receiver<lotse_api::Event> {
+        use lotse_api_types::stream::{AudioMode, Orientation};
+
+        use crate::registry::{ConnectionEntry, ConnectionKey, StreamEntry, StreamSource};
+
+        let url: lotse_core::source_url::SourceUrl = url.parse().unwrap();
+        let mut state = shared.lock();
+        let switches = state
+            .connections
+            .get("c1")
+            .map_or(0, |entry| entry.switches);
+        state.streams.insert(
+            "front".into(),
+            StreamEntry {
+                sources: vec![StreamSource {
+                    url: url.clone(),
+                    options: serde_json::Map::new(),
+                    protocol: "fake",
+                    connection: "c1".into(),
+                }],
+                preload: false,
+                audio: AudioMode::Auto,
+                orientation: Orientation::NoTransform,
+                created: UNIX_EPOCH,
+            },
+        );
+        state.connections.insert(
+            "c1".into(),
+            ConnectionEntry {
+                key: ConnectionKey {
+                    url,
+                    options: serde_json::json!({}),
+                },
+                port: None,
+                loopback_relay: false,
+                demand: watch::channel(1).0,
+                snapshot: ConnectionSnapshot::idle(UNIX_EPOCH),
+                switches,
+                streams: ["front".to_owned()].into(),
+                commands: mpsc::channel(4).0,
+            },
+        );
+        let (events, rx) = mpsc::channel(4);
+        state.sessions.insert(
+            "s1".into(),
+            SessionEntry::new(
+                1,
+                "front".into(),
+                "c1".into(),
+                "us1".into(),
+                (ConnectionId(1), 1, events),
+                UNIX_EPOCH,
+            ),
+        );
+        rx
+    }
+
+    /// The driver takes a switch to the same source that the registry
+    /// queued for connection `c1`: both count it.
+    fn take_switch(shared: &Shared, driver: &mut Driver) {
+        if let Some(entry) = shared.lock().connections.get_mut("c1") {
+            entry.switches += 1;
+        }
+        driver.on_switch_source(driver.spec.clone());
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_closes_the_waiting_session_with_its_error_and_no_credentials() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = Driver::new(
+            DriverSpec {
+                connection_id: "c1".into(),
+                url: "fake://admin:hunter2@cam.example/".into(),
+                options: "{}".into(),
+                host: "cam.example".into(),
+                port: None,
+                loopback_relay: false,
+            },
+            Arc::clone(&shared),
+            demand,
+            mpsc::channel(4),
+            ConnectionConfig::default(),
+        );
+        let mut events = waiting_session(&shared, "fake://admin:hunter2@cam.example/");
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        driver.publish();
+        assert!(shared.lock().sessions.contains_key("s1"), "connecting");
+        driver
+            .handle(Wake::Resolved(Err("no such host".into())))
+            .await;
+        driver.publish();
+        let closed = events.try_recv().expect("closed at once").payload;
+        assert_eq!(
+            closed,
+            serde_json::json!({ "type": "closed", "code": "source_unreachable",
+                "message": "source unreachable: resolving cam.example: no such host" })
+        );
+        let text = closed.to_string();
+        assert!(
+            !text.contains("admin") && !text.contains("hunter2"),
+            "{text}"
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(shared.lock().sessions.is_empty());
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_cannot_start_closes_the_waiting_session_with_worker_crashed() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/nonexistent/lotse", clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let mut events = waiting_session(&shared, "fake://127.0.0.1/");
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        driver
+            .handle(Wake::Resolved(Ok(vec!["127.0.0.1:1".parse().unwrap()])))
+            .await;
+        assert_eq!(driver.machine.state(), ConnectionState::Restarting);
+        driver.publish();
+        assert_eq!(
+            events.try_recv().expect("closed at once").payload,
+            serde_json::json!({ "type": "closed", "code": "worker_crashed",
+                "message": "worker crashed" })
+        );
+        assert!(shared.lock().sessions.is_empty());
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_session_closes_only_with_a_failed_attempt_of_the_current_source() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let mut events = waiting_session(&shared, "fake://127.0.0.1/");
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        let on = |driver: &mut Driver, event| {
+            driver.on_worker_event(event);
+            driver.publish();
+        };
+        let backoff = |error| WorkerReport::Backoff {
+            error,
+            retry_in: Duration::from_secs(1),
+        };
+        // A live source drops and its retry waits out a delay.
+        on(&mut driver, WorkerEvent::Report(WorkerReport::Live));
+        on(
+            &mut driver,
+            WorkerEvent::Report(backoff(SourceError::Ended("eof".into()))),
+        );
+        assert_eq!(driver.machine.state(), ConnectionState::Backoff);
+        assert_eq!(driver.snapshot.failure, None, "a drop");
+        // A switch while the old source streams: the new one failing
+        // leaves the old one to answer.
+        on(&mut driver, WorkerEvent::Report(WorkerReport::Live));
+        take_switch(&shared, &mut driver);
+        on(
+            &mut driver,
+            WorkerEvent::SwitchReport(backoff(SourceError::AuthFailed("401".into()))),
+        );
+        assert_eq!(driver.snapshot.failure, None, "the old source is live");
+        on(&mut driver, WorkerEvent::SwitchReport(WorkerReport::Live));
+        // The old source drops and its retry fails while the new one is
+        // live: no failure, and the tracks switch to the new source.
+        on(
+            &mut driver,
+            WorkerEvent::Report(WorkerReport::Reconnecting(SourceError::Timeout(
+                "stall".into(),
+            ))),
+        );
+        on(
+            &mut driver,
+            WorkerEvent::Report(backoff(SourceError::Unreachable("old".into()))),
+        );
+        assert_eq!(driver.snapshot.failure, None, "the new source is live");
+        on(&mut driver, WorkerEvent::Switched);
+        assert_eq!(driver.machine.state(), ConnectionState::Live);
+        assert_eq!(driver.machine.failure(), None);
+        // The switch is over: the source's own failed attempt counts.
+        on(
+            &mut driver,
+            WorkerEvent::Report(WorkerReport::Reconnecting(SourceError::Timeout(
+                "stall".into(),
+            ))),
+        );
+        on(
+            &mut driver,
+            WorkerEvent::Report(backoff(SourceError::Timeout("new".into()))),
+        );
+        assert_eq!(
+            events.try_recv().expect("closed").payload,
+            serde_json::json!({ "type": "closed", "code": "source_timeout",
+                "message": "source timed out: new" })
+        );
+        let mut events = waiting_session(&shared, "fake://127.0.0.1/");
+        on(&mut driver, WorkerEvent::Report(WorkerReport::Live));
+        // A switch away from a source whose attempt then fails: its
+        // failure is not the new source's.
+        take_switch(&shared, &mut driver);
+        on(
+            &mut driver,
+            WorkerEvent::Report(WorkerReport::Reconnecting(SourceError::Timeout(
+                "stall".into(),
+            ))),
+        );
+        on(
+            &mut driver,
+            WorkerEvent::Report(backoff(SourceError::Unreachable("old".into()))),
+        );
+        assert!(driver.machine.failure().is_some());
+        assert_eq!(driver.snapshot.failure, None, "the old source's");
+        on(
+            &mut driver,
+            WorkerEvent::SwitchReport(WorkerReport::Connecting),
+        );
+        assert!(events.try_recv().is_err(), "still waiting");
+        // Neither source can answer: the new one's failure closes it.
+        on(
+            &mut driver,
+            WorkerEvent::SwitchReport(backoff(SourceError::AuthFailed("401".into()))),
+        );
+        assert_eq!(
+            events.try_recv().expect("closed").payload,
+            serde_json::json!({ "type": "closed", "code": "source_auth_failed",
+                "message": "source authentication failed: 401" })
+        );
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn a_worker_crash_during_a_switch_is_the_failure_an_offer_closes_with() {
+        let shared = shared("/usr/bin/true");
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Live));
+        driver.on_switch_source(driver.spec.clone());
+        driver.on_worker_event(WorkerEvent::Exited(ExitStatus::from_raw(9)));
+        driver.publish();
+        assert_eq!(driver.machine.state(), ConnectionState::Restarting);
+        assert_eq!(
+            driver.snapshot.failure,
+            Some(ConnectionError::WorkerCrashed)
+        );
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn the_last_error_during_a_switch_is_the_failure_a_waiting_session_closes_with() {
+        let shared = shared("/usr/bin/true");
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        let on = |driver: &mut Driver, event| {
+            driver.on_worker_event(event);
+            driver.publish();
+        };
+        on(&mut driver, WorkerEvent::Report(WorkerReport::Live));
+        driver.on_switch_source(driver.spec.clone());
+        assert_eq!(driver.snapshot.switches, 1, "the switch is counted");
+        // The new source fails while the old one streams.
+        let new = SourceError::AuthFailed("401".into());
+        on(
+            &mut driver,
+            WorkerEvent::SwitchReport(WorkerReport::Backoff {
+                error: new.clone(),
+                retry_in: Duration::from_secs(1),
+            }),
+        );
+        // Then the old one drops and its retry fails.
+        on(
+            &mut driver,
+            WorkerEvent::Report(WorkerReport::Reconnecting(SourceError::Timeout(
+                "stall".into(),
+            ))),
+        );
+        on(
+            &mut driver,
+            WorkerEvent::Report(WorkerReport::Backoff {
+                error: SourceError::Unreachable("old".into()),
+                retry_in: Duration::from_secs(1),
+            }),
+        );
+        let new = Some(ConnectionError::Source(new));
+        assert_eq!(driver.snapshot.failure, new);
+        assert_eq!(
+            driver.snapshot.last_error, new,
+            "the one sessions close with"
+        );
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_session_closes_with_the_failed_lookup_of_the_source_switched_to() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        // The old source's retry has failed, and the switch away from it
+        // waits for the new host.
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Live));
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Reconnecting(
+            SourceError::Timeout("stall".into()),
+        )));
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Backoff {
+            error: SourceError::Unreachable("old".into()),
+            retry_in: Duration::from_secs(1),
+        }));
+        let mut events = waiting_session(&shared, "fake://127.0.0.1/");
+        take_switch(&shared, &mut driver);
+        driver.publish();
+        assert!(events.try_recv().is_err(), "still waiting");
+        // The new host does not resolve: neither source can answer.
+        driver
+            .handle(Wake::SwitchResolved(Err("no such host".into())))
+            .await;
+        driver.publish();
+        assert_eq!(
+            events.try_recv().expect("closed").payload,
+            serde_json::json!({ "type": "closed", "code": "source_unreachable",
+                "message": "source unreachable: resolving 127.0.0.1: no such host" })
+        );
+        // The next lookup is the new source's next attempt.
+        driver.handle(Wake::RetrySwitchResolve).await;
+        driver.publish();
+        assert_eq!(driver.snapshot.failure, None);
+        drop((driver, demand_tx));
     }
 
     #[tokio::test]

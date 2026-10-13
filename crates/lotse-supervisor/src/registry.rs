@@ -87,6 +87,16 @@ pub(crate) struct ConnectionSnapshot {
     pub(crate) state: ConnectionState,
     /// The last error, if the connection is not live.
     pub(crate) last_error: Option<ConnectionError>,
+    /// The failure the connection's sessions still waiting for their
+    /// answer close with, and an offer closes with at once: a failed
+    /// attempt of the current source, or a worker crash
+    /// ([`ConnectionMachine::failure`](lotse_core::connection::ConnectionMachine::failure)).
+    /// A stale error, or a drop the worker retries, is none: the session
+    /// waits for the attempt under way or the one its offer starts.
+    pub(crate) failure: Option<ConnectionError>,
+    /// The source switches the driver has taken
+    /// ([`ConnectionEntry::switches`]).
+    pub(crate) switches: u64,
     /// When the current state began.
     pub(crate) since: SystemTime,
     /// Source reconnects so far.
@@ -109,6 +119,8 @@ impl ConnectionSnapshot {
         Self {
             state: ConnectionState::Idle,
             last_error: None,
+            failure: None,
+            switches: 0,
             since: now,
             reconnects: 0,
             worker: None,
@@ -205,6 +217,11 @@ pub(crate) struct ConnectionEntry {
     pub(crate) demand: watch::Sender<u32>,
     /// What the driver last reported.
     pub(crate) snapshot: ConnectionSnapshot,
+    /// The source switches queued for the driver: until its snapshot
+    /// counts as many ([`ConnectionSnapshot::switches`]), the driver has
+    /// not taken them all, and the failure it reports is a source's the
+    /// connection switched away from.
+    pub(crate) switches: u64,
     /// The streams reading from it.
     pub(crate) streams: BTreeSet<String>,
     /// What the driver passes on to the worker: session messages.
@@ -221,6 +238,9 @@ pub(crate) enum CloseBy {
     /// The owner's `unsubscribe`: the worker is told, and the `closed`
     /// event is returned for the server to send before the result.
     Unsubscribe,
+    /// An offer to a connection that already failed: the session never
+    /// went to the driver, so only the owner hears of it.
+    Offer,
     /// The worker is gone: only the owner hears of it.
     WorkerGone,
 }
@@ -299,7 +319,12 @@ impl State {
                 connection.id = id,
                 "driver queue full; the connection keeps its source until the next put"
             );
+            return;
         }
+        entry.switches = entry.switches.wrapping_add(1);
+        // The failure is the old source's: an offer before the driver
+        // takes the switch waits for the new one.
+        entry.snapshot.failure = None;
     }
 
     /// Recomputes which streams reference connection `id` and its demand
@@ -416,21 +441,23 @@ impl State {
         by: CloseBy,
     ) -> Option<Event> {
         let mut entry = self.finish_session(session_id)?;
-        if by != CloseBy::WorkerGone
-            && let Some(connection) = self.connections.get(&entry.connection)
-            && connection
-                .commands
-                .try_send(DriverCommand::CloseSession {
-                    session_id: session_id.to_owned(),
-                    code,
-                    message: message.to_owned(),
-                })
-                .is_err()
-        {
-            tracing::warn!(
-                session.id = session_id,
-                "driver queue full; the worker closes the session with its connection"
-            );
+        if !matches!(by, CloseBy::WorkerGone | CloseBy::Offer) {
+            let close = DriverCommand::CloseSession {
+                session_id: session_id.to_owned(),
+                code,
+                message: message.to_owned(),
+            };
+            // The slot the offer reserved always takes it.
+            if let Some(slot) = entry.close_slot.take() {
+                drop(slot.send(close));
+            } else if let Some(connection) = self.connections.get(&entry.connection)
+                && connection.commands.try_send(close).is_err()
+            {
+                tracing::warn!(
+                    session.id = session_id,
+                    "driver queue full; the worker closes the session with its connection"
+                );
+            }
         }
         tracing::info!(event = "session_closed", session.id = session_id, stream.id = %entry.stream_id, code, detail = message, by = ?by, "session closed");
         let event = api_event(&SessionEvent::Closed {
@@ -459,6 +486,61 @@ impl State {
             .collect();
         for id in ids {
             let _event = self.close_session(&id, code, message, by);
+        }
+    }
+
+    /// Closes session `session_id`, `entry`, at its offer with `error`:
+    /// its connection already failed (in `connection_state`), so the offer
+    /// never went to the driver and the owner alone hears of it
+    /// ([`CloseBy::Offer`]).
+    pub(crate) fn close_offer(
+        &mut self,
+        session_id: &str,
+        entry: SessionEntry,
+        error: &ConnectionError,
+        connection_state: ConnectionState,
+    ) {
+        tracing::info!(
+            event = "session_source_failed",
+            session.id = session_id,
+            stream.id = %entry.stream_id,
+            connection.id = %entry.connection,
+            connection.state = connection_state.name(),
+            error.code = error.code(),
+            error = %error,
+            reason = "the offer reached a connection whose source already failed",
+            "offer closed at once with its source's error"
+        );
+        self.sessions.insert(session_id.to_owned(), entry);
+        let _event =
+            self.close_session(session_id, error.code(), &error.to_string(), CloseBy::Offer);
+    }
+
+    /// Closes every session of connection `connection` that has no answer
+    /// yet with `error`, the failure its connection just reported: its
+    /// code is the `closed` event's, its text the message (the text
+    /// `stream/get`'s `last_error` carries, which never holds the URL's
+    /// credentials). A session that was answered plays on and rides the
+    /// reconnect.
+    pub(crate) fn close_waiting(&mut self, connection: &str, error: &ConnectionError) {
+        let waiting: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.connection == connection && !session.answered)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let message = error.to_string();
+        for id in waiting {
+            tracing::info!(
+                event = "session_source_failed",
+                session.id = %id,
+                connection.id = connection,
+                error.code = error.code(),
+                error = %message,
+                reason = "the source connection failed before the session was answered",
+                "session closed with its source's error"
+            );
+            let _event = self.close_session(&id, error.code(), &message, CloseBy::Supervisor);
         }
     }
 
@@ -1044,15 +1126,33 @@ impl Shared {
     }
 
     /// Stores a driver's snapshot and, when its state changed, tells the
-    /// subscribers of every stream on the connection.
-    pub(crate) fn update_connection(&self, id: &str, snapshot: ConnectionSnapshot, changed: bool) {
+    /// subscribers of every stream on the connection. A snapshot after a
+    /// failure ([`ConnectionSnapshot::failure`]) closes the connection's
+    /// sessions that are still waiting for their answer with that failure
+    /// ([`State::close_waiting`]): the daemon keeps no deadline of its own
+    /// for them, the source's own ones bound how long they wait. A
+    /// snapshot from before the driver took every switch queued has no
+    /// failure: it is a source's the connection switched away from.
+    pub(crate) fn update_connection(
+        &self,
+        id: &str,
+        mut snapshot: ConnectionSnapshot,
+        changed: bool,
+    ) {
         let mut state = self.lock();
         let Some(entry) = state.connections.get_mut(id) else {
             return;
         };
+        if snapshot.switches != entry.switches {
+            snapshot.failure = None;
+        }
+        let failure = snapshot.failure.clone();
         entry.snapshot = snapshot;
+        let streams: Vec<String> = entry.streams.iter().cloned().collect();
+        if let Some(error) = failure {
+            state.close_waiting(id, &error);
+        }
         if changed {
-            let streams: Vec<String> = entry.streams.iter().cloned().collect();
             for stream in streams {
                 state.notify_stream(&stream);
             }
@@ -1066,10 +1166,10 @@ impl Shared {
     }
 
     /// Runs `task` on the maps after `delay` on the injected clock: a
-    /// timer of session `session_id` (grace, `source_not_live`, the gather
-    /// deadline), which the session keeps and aborts when it ends. A timer
-    /// also checks the session's serial, since a session that is already
-    /// gone by the time the timer is kept leaves it to fire.
+    /// timer of session `session_id` (grace, the gather deadline), which
+    /// the session keeps and aborts when it ends. A timer also checks the
+    /// session's serial, since a session that is already gone by the time
+    /// the timer is kept leaves it to fire.
     pub(crate) fn after(
         self: &Arc<Self>,
         session_id: &str,
@@ -1203,6 +1303,7 @@ mod tests {
                 },
                 demand,
                 snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
+                switches: 0,
                 streams: ["front".to_owned(), "twin".to_owned()].into(),
                 commands,
             },
@@ -1259,6 +1360,7 @@ mod tests {
                 },
                 demand,
                 snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
+                switches: 0,
                 streams: BTreeSet::new(),
                 commands,
             },
@@ -1267,6 +1369,29 @@ mod tests {
         session.gathering(gathers);
         state.sessions.insert("s1".into(), session);
         (state, rx)
+    }
+
+    #[test]
+    fn a_session_closed_at_its_offer_is_never_named_to_the_driver() {
+        let (mut state, mut rx) = relay_state(0);
+        state.streams.insert("front".into(), stream_on_c1(false));
+        state
+            .connections
+            .get_mut("c1")
+            .unwrap()
+            .streams
+            .insert("front".into());
+        let_assert!(
+            Some(event) = state.close_session("s1", "source_timeout", "late", CloseBy::Offer)
+        );
+        assert_eq!(event.payload["code"], "source_timeout");
+        assert!(rx.try_recv().is_err(), "the driver never had it");
+        state
+            .sessions
+            .insert("s2".into(), session_on_c1(2, "front"));
+        let _event = state.close_session("s2", "source_timeout", "late", CloseBy::Supervisor);
+        let_assert!(Ok(DriverCommand::CloseSession { session_id, .. }) = rx.try_recv());
+        assert_eq!(session_id, "s2");
     }
 
     fn relayed(port: u16) -> Relayed {
@@ -1304,9 +1429,25 @@ mod tests {
             spec("fake://127.0.0.1/a"),
         );
         assert!(rx.try_recv().is_err(), "no connection, no switch");
+        state.connections.get_mut("c1").unwrap().snapshot.failure = Some(ConnectionError::Source(
+            lotse_core::source::SourceError::AuthFailed("401".into()),
+        ));
         state.switch_connection("c1", key("fake://127.0.0.1/b"), spec("fake://127.0.0.1/b"));
-        // The queue holds one: the next switch keeps its key, not its source.
+        assert_eq!(
+            state.connections["c1"].snapshot.failure, None,
+            "the old source's failure is not the new one's"
+        );
+        // The queue holds one: the next switch keeps its key, not its
+        // source, nor hides that source's failure.
+        let failed = Some(ConnectionError::Source(
+            lotse_core::source::SourceError::AuthFailed("401".into()),
+        ));
+        state.connections.get_mut("c1").unwrap().snapshot.failure = failed.clone();
         state.switch_connection("c1", key("fake://127.0.0.1/c"), spec("fake://127.0.0.1/c"));
+        assert_eq!(
+            state.connections["c1"].snapshot.failure, failed,
+            "the source kept is still failed"
+        );
         assert_eq!(
             state.connections["c1"].key,
             key("fake://127.0.0.1/c"),
