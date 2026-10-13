@@ -62,6 +62,9 @@ exclude_re = [
     # dropping them changes nothing a test can see. Column 60 drops `O_EXCL` and
     # `O_NOFOLLOW`, column 79 `O_NOFOLLOW` and `O_CLOEXEC`.
     "identity.rs:\\d+:(60|79): replace \\| with & in write_new$",
+    # An lstat error other than a missing file cannot be provoked on the directory the daemon
+    # made and checked a moment before; it is refused either way, as a file or by its check.
+    "clients.rs:.*replace match guard err.kind\\(\\) == io::ErrorKind::NotFound with true in read_pins$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
 ]

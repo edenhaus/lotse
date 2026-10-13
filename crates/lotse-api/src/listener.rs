@@ -19,6 +19,7 @@ use lotse_core::fingerprint::Fingerprint;
 use rustix::fs::Mode;
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::clients::ClientsError;
 use crate::identity::IdentityError;
 
 /// Who an authenticated peer is, as its listener learned it.
@@ -101,12 +102,12 @@ pub enum BindError {
         #[source]
         source: io::Error,
     },
-    /// The TLS listener has no client pin to allow.
-    #[error("the control TLS listener needs at least one client pin")]
-    NoClients,
     /// The TLS listener's server identity.
     #[error(transparent)]
     Identity(#[from] IdentityError),
+    /// The TLS listener's enrolled clients.
+    #[error(transparent)]
+    Clients(#[from] ClientsError),
     /// The TLS configuration could not be built.
     #[error("control TLS configuration: {0}")]
     Tls(#[source] rustls::Error),

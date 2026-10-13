@@ -95,6 +95,7 @@ fn supervisor_probe_child() {
         .port();
     let profile = Profile::Supervisor {
         binary: std::env::current_exe().expect("own path"),
+        state_dir: None,
     };
     let report = lotse_sandbox::apply(&profile, &SandboxConfig::default())
         .expect("supervisor profile applies");

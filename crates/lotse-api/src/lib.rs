@@ -22,7 +22,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::Duration;
@@ -41,12 +41,15 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
+mod clients;
 mod connection;
 pub mod identity;
 mod listener;
 mod outbox;
+pub mod pairing;
 pub mod tls;
 
+pub use clients::ClientsError;
 pub use listener::{BindError, PeerInfo};
 pub use tls::TlsConfig;
 
@@ -126,8 +129,9 @@ pub enum Outcome {
     Subscribed(mpsc::Receiver<Event>),
 }
 
-/// What the supervisor implements. `ping`, `schema` and `unsubscribe` are
-/// answered by the server itself; everything else goes here.
+/// What the supervisor implements. `ping`, `schema`, `unsubscribe` and
+/// `pairing/create` are answered by the server itself; everything else
+/// goes here.
 pub trait Handler: Send + Sync + 'static {
     /// The `hello` frame's content.
     fn hello(&self) -> Hello;
@@ -188,6 +192,9 @@ struct AppState<H> {
     shutdown: CancellationToken,
     /// Times the closing handshake ([`CLOSE_TIMEOUT`]).
     clock: Arc<dyn Clock>,
+    /// The TLS listener's pairing, for `pairing/create`; `None` without a
+    /// listener.
+    pairing: Option<Arc<pairing::Pairing>>,
 }
 
 impl<H> Clone for AppState<H> {
@@ -199,6 +206,7 @@ impl<H> Clone for AppState<H> {
             next_id: Arc::clone(&self.next_id),
             shutdown: self.shutdown.clone(),
             clock: Arc::clone(&self.clock),
+            pairing: self.pairing.clone(),
         }
     }
 }
@@ -220,6 +228,9 @@ pub enum ServeError {
     /// A listener could not be registered with the runtime.
     #[error("registering the listener with the runtime: {0}")]
     Register(#[source] std::io::Error),
+    /// The TLS listener's configuration could not be built.
+    #[error("control TLS configuration: {0}")]
+    Tls(#[source] rustls::Error),
 }
 
 impl Server {
@@ -235,6 +246,12 @@ impl Server {
             .map(|settings| tls::bind(settings, config.owner_uid))
             .transpose()?;
         Ok(Self { unix, tls, config })
+    }
+
+    /// The directory the daemon writes at runtime (the TLS listener's
+    /// enrolled clients), for the sandbox; `None` without a listener.
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.tls.as_ref().map(|bound| bound.store.dir())
     }
 
     /// The address the TLS listener is bound to, if there is one.
@@ -255,6 +272,41 @@ impl Server {
         shutdown: CancellationToken,
     ) -> Result<(), ServeError> {
         let allowed = [self.config.owner_uid, self.config.allow_uid];
+        let mut unix = listener::CheckedUnix::new(self.unix, allowed, Arc::clone(&clock))
+            .map_err(ServeError::Register)?;
+        let pending = Arc::new(Semaphore::new(usize::from(MAX_PENDING_UPGRADES)));
+        // Each queued connection holds one of `pending`'s permits, so the
+        // queue never fills and a handshake task never waits to send.
+        let (admitted, mut authenticated) = mpsc::channel(usize::from(MAX_PENDING_UPGRADES));
+        let (tls, pairing) = match self.tls {
+            Some(bound) => {
+                let pairing = bound.pairing(Arc::clone(&clock));
+                let config = bound
+                    .server_config(Arc::clone(&pairing))
+                    .map_err(ServeError::Tls)?;
+                let listener = tokio::net::TcpListener::from_std(bound.listener)
+                    .map_err(ServeError::Register)?;
+                tls::announce_first_code(&pairing, &bound.store, &clock, &shutdown);
+                let accepting = spawn_named(
+                    "api.tls_accept",
+                    tls::accept_loop(
+                        listener,
+                        tls::Handshakes {
+                            acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+                            gate: Arc::default(),
+                            clock: Arc::clone(&clock),
+                            shutdown: shutdown.clone(),
+                            upgrades: Arc::clone(&pending),
+                            admitted,
+                            store: bound.store,
+                            pairing: Arc::clone(&pairing),
+                        },
+                    ),
+                );
+                (Some(accepting), Some(pairing))
+            }
+            None => (None, None),
+        };
         let state = AppState {
             handler,
             config: self.config,
@@ -262,36 +314,11 @@ impl Server {
             next_id: Arc::new(AtomicU64::new(1)),
             shutdown: shutdown.clone(),
             clock: Arc::clone(&clock),
+            pairing,
         };
         let app = Router::new()
             .route(lotse_api_types::WS_PATH, get(connection::upgrade::<H>))
             .with_state(state);
-
-        let mut unix = listener::CheckedUnix::new(self.unix, allowed, Arc::clone(&clock))
-            .map_err(ServeError::Register)?;
-        let pending = Arc::new(Semaphore::new(usize::from(MAX_PENDING_UPGRADES)));
-        // Each queued connection holds one of `pending`'s permits, so the
-        // queue never fills and a handshake task never waits to send.
-        let (admitted, mut authenticated) = mpsc::channel(usize::from(MAX_PENDING_UPGRADES));
-        let tls = match self.tls {
-            Some(bound) => {
-                let listener = tokio::net::TcpListener::from_std(bound.listener)
-                    .map_err(ServeError::Register)?;
-                let handshakes = tls::Handshakes {
-                    acceptor: tokio_rustls::TlsAcceptor::from(bound.config),
-                    gate: Arc::default(),
-                    clock: Arc::clone(&clock),
-                    shutdown: shutdown.clone(),
-                    upgrades: Arc::clone(&pending),
-                    admitted,
-                };
-                Some(spawn_named(
-                    "api.tls_accept",
-                    tls::accept_loop(listener, handshakes),
-                ))
-            }
-            None => None,
-        };
         let mut http = http1::Builder::new();
         // Keep-alive stays on: hyper's `Connection: close` would replace the
         // 101's `Connection: Upgrade`. The deadline bounds what a kept-alive
@@ -529,6 +556,7 @@ mod tests {
             next_id: Arc::new(AtomicU64::new(1)),
             shutdown,
             clock: Arc::new(lotse_core::clock::FakeClock::default()),
+            pairing: None,
         }
     }
 

@@ -1,6 +1,7 @@
 //! The mutual-TLS listener end to end over real TCP: who gets in, who is
 //! refused before a byte of HTTP, the handshake deadline on the clock, the
-//! pre-authentication budget per address, and what is logged.
+//! pre-authentication budget per address, pairing with a one-time code,
+//! and what is logged.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -17,8 +18,9 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use futures_util::StreamExt as _;
+use futures_util::{SinkExt as _, StreamExt as _};
 use lotse_api::identity::{IDENTITY_FILE, ServerIdentity};
+use lotse_api::pairing::{CODE_LIFETIME, PAIR_TIMEOUT};
 use lotse_api::tls::{
     HANDSHAKE_TIMEOUT, MAX_HANDSHAKES_PER_ADDRESS, MAX_PENDING_HANDSHAKES, TlsConfig,
 };
@@ -68,6 +70,7 @@ impl Handler for Minimal {
 
 struct Running {
     dir: PathBuf,
+    data: PathBuf,
     addr: SocketAddr,
     server_pin: Fingerprint,
     shutdown: CancellationToken,
@@ -77,9 +80,15 @@ struct Running {
 
 impl Running {
     async fn finish(self) {
+        let (dir, _data) = self.stop().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Stops the server and keeps its directories for the next start.
+    async fn stop(self) -> (PathBuf, PathBuf) {
         self.shutdown.cancel();
         self.server.await.unwrap().unwrap();
-        std::fs::remove_dir_all(&self.dir).unwrap();
+        (self.dir, self.data)
     }
 
     fn config(&self, cert: ClientCert<'_>) -> Arc<rustls::ClientConfig> {
@@ -93,6 +102,10 @@ fn private_dir(path: &Path) {
 
 fn uid_of(path: &Path) -> u32 {
     std::fs::metadata(path).map(|m| m.uid()).unwrap()
+}
+
+fn gid_of(path: &Path) -> u32 {
+    std::fs::metadata(path).map(|m| m.gid()).unwrap()
 }
 
 /// A test directory with the socket's and the data directory inside.
@@ -117,13 +130,20 @@ fn config(dir: &Path, data: &Path, clients: Vec<Fingerprint>) -> Config {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             clients,
             data_dir: data.to_path_buf(),
+            state_owner: (uid, gid_of(dir)),
         }),
     }
 }
 
 fn start(name: &str, clients: Vec<Fingerprint>) -> Running {
     let (dir, data) = dirs(name);
+    start_in(dir, data, clients)
+}
+
+/// A server in directories an earlier one used.
+fn start_in(dir: PathBuf, data: PathBuf, clients: Vec<Fingerprint>) -> Running {
     let server = Server::bind(config(&dir, &data, clients)).unwrap();
+    assert_eq!(server.state_dir(), Some(data.join("clients").as_path()));
     let addr = server.tls_local_addr().unwrap();
     let server_pin = ServerIdentity::load(&data, uid_of(&dir)).unwrap().pin();
     let shutdown = CancellationToken::new();
@@ -138,6 +158,7 @@ fn start(name: &str, clients: Vec<Fingerprint>) -> Running {
     );
     Running {
         dir,
+        data,
         addr,
         server_pin,
         shutdown,
@@ -541,15 +562,6 @@ async fn shutdown_closes_handshakes_in_progress() {
 }
 
 #[test]
-fn a_listener_without_client_pins_does_not_start() {
-    let (dir, data) = dirs("no-pins");
-    let err = Server::bind(config(&dir, &data, vec![])).unwrap_err();
-    assert!(matches!(err, BindError::NoClients), "{err}");
-    assert!(err.to_string().contains("at least one client pin"), "{err}");
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
 fn a_data_directory_or_listen_address_that_does_not_work_stops_the_start() {
     let (dir, data) = dirs("bind-errors");
     let pin = ClientIdentity::generate().unwrap().pin;
@@ -569,6 +581,12 @@ fn a_data_directory_or_listen_address_that_does_not_work_stops_the_start() {
     let err = Server::bind(busy).unwrap_err();
     assert!(matches!(err, BindError::TlsListen { .. }), "{err}");
     assert!(err.to_string().starts_with("control TLS listener"), "{err}");
+
+    std::fs::remove_dir_all(data.join("clients")).unwrap();
+    std::fs::write(data.join("clients"), b"").unwrap();
+    let err = Server::bind(config(&dir, &data, vec![pin])).unwrap_err();
+    assert!(matches!(err, BindError::Clients(_)), "{err}");
+    assert!(err.to_string().starts_with("enrolled clients"), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -600,4 +618,403 @@ fn an_identity_whose_key_is_not_the_certificate_s_stops_the_start() {
         "{err}"
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The code a daemon without clients logs once its server task runs,
+/// failing after 5 s of real time.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a real-time bound on a test step; the server's own timers run on the fake clock"
+)]
+async fn logged_code(logs: &Captured) -> String {
+    let line = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let text = logs.text();
+            if let Some(line) = text
+                .lines()
+                .find(|line| line.contains("pairing code for the first client"))
+            {
+                return line.to_owned();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no code logged: {}", logs.text()));
+    let (_, after) = line.split_once(" code=").unwrap();
+    after.split_whitespace().next().unwrap().to_owned()
+}
+
+/// The secret, the code's last part.
+fn secret_of(code: &str) -> &str {
+    code.rsplit('-').next().unwrap()
+}
+
+/// One HTTP request on a connection whose client half of the handshake
+/// ran, and the answer's status and body: `(0, "")` when the server closed
+/// without a byte, an error when the handshake was refused.
+async fn request(
+    connected: io::Result<TlsStream<TcpStream>>,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> io::Result<(u16, String)> {
+    let mut stream = connected?;
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: lotse\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    let mut answer = Vec::new();
+    let read = within_5_s(stream.read_to_end(&mut answer)).await;
+    if answer.is_empty() {
+        read?;
+    }
+    let text = String::from_utf8_lossy(&answer).into_owned();
+    let status = text
+        .get(9..12)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default();
+    Ok((status, body))
+}
+
+/// `client` connects and sends `secret` to `POST /v1/pair`.
+async fn pair(
+    running: &Running,
+    client: &ClientIdentity,
+    secret: &str,
+) -> io::Result<(u16, String)> {
+    let connected = connect(running.addr, running.config(ClientCert::Own(client))).await;
+    let body = format!(r#"{{"secret":"{secret}"}}"#);
+    request(connected, "POST", "/v1/pair", &body).await
+}
+
+/// Whether a pairing attempt was refused in the handshake or closed
+/// without an answer.
+fn refused_pairing(answer: &io::Result<(u16, String)>) -> bool {
+    answer.as_ref().map_or(true, |(status, _)| *status == 0)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn without_a_client_the_first_code_is_logged_and_pairs_exactly_one() {
+    let (logs, _guard) = capture();
+    let running = start("pair-first", vec![]);
+    let code = logged_code(&logs).await;
+    let parts: Vec<&str> = code.split('-').collect();
+    assert_eq!(parts[0], "LOTSE1");
+    assert_eq!(
+        parts[1],
+        running.server_pin.to_hex(),
+        "the code pins this daemon"
+    );
+    let client = ClientIdentity::generate().unwrap();
+    let (status, _) = pair(&running, &client, parts[2]).await.unwrap();
+    assert_eq!(status, 204);
+    let pin = format!("client_pin={}", client.pin);
+    assert!(
+        logs.text()
+            .lines()
+            .any(|line| line.contains("control client enrolled by pairing") && line.contains(&pin)),
+        "{}",
+        logs.text()
+    );
+    // Enrolled: the certificate the handshake proved gets the API.
+    let stream = connect(running.addr, running.config(ClientCert::Own(&client)))
+        .await
+        .unwrap();
+    assert_eq!(hello(stream).await["type"], "hello");
+    // Used: another unknown certificate is refused in the handshake.
+    let other = ClientIdentity::generate().unwrap();
+    let answer = pair(&running, &other, parts[2]).await;
+    assert!(refused_pairing(&answer), "{answer:?}");
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_code_used_after_the_handshake_is_410_rfc9110_15_5_11() {
+    let (logs, _guard) = capture();
+    let running = start("pair-gone", vec![]);
+    let code = logged_code(&logs).await;
+    // Both handshakes pass while the code is open.
+    let late_client = ClientIdentity::generate().unwrap();
+    let late = connect(running.addr, running.config(ClientCert::Own(&late_client))).await;
+    let first = ClientIdentity::generate().unwrap();
+    let (status, _) = pair(&running, &first, secret_of(&code)).await.unwrap();
+    assert_eq!(status, 204);
+    let body = format!(r#"{{"secret":"{}"}}"#, secret_of(&code));
+    let (status, body) = request(late, "POST", "/v1/pair", &body).await.unwrap();
+    assert_eq!(status, 410, "{body}");
+    assert!(body.contains("not_permitted"), "{body}");
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_wrong_secret_is_403_and_leaves_the_code_open() {
+    let (logs, _guard) = capture();
+    let running = start("pair-wrong", vec![]);
+    let code = logged_code(&logs).await;
+    let client = ClientIdentity::generate().unwrap();
+    let (status, body) = pair(&running, &client, &"0".repeat(32)).await.unwrap();
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("not_permitted"), "{body}");
+    assert!(
+        logs.text()
+            .contains("pairing request refused: wrong secret")
+    );
+    let (status, _) = pair(&running, &client, secret_of(&code)).await.unwrap();
+    assert_eq!(status, 204);
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_expired_code_lets_no_unknown_certificate_in_and_the_log_says_what_to_do() {
+    let (logs, _guard) = capture();
+    let running = start("pair-expired", vec![]);
+    let code = logged_code(&logs).await;
+    running.clock.advance(CODE_LIFETIME);
+    let client = ClientIdentity::generate().unwrap();
+    let answer = pair(&running, &client, secret_of(&code)).await;
+    assert!(refused_pairing(&answer), "{answer:?}");
+    assert!(
+        logs.text()
+            .contains("first pairing code expired; get a new one with `lotse pair`"),
+        "{}",
+        logs.text()
+    );
+    assert_eq!(
+        logs.text().matches("LOTSE1-").count(),
+        1,
+        "the code is logged once, the hint carries none"
+    );
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn enrolling_before_the_first_code_expires_keeps_the_hint_out_of_the_log() {
+    let (logs, _guard) = capture();
+    let running = start("pair-quiet", vec![]);
+    let code = logged_code(&logs).await;
+    let client = ClientIdentity::generate().unwrap();
+    let (status, _) = pair(&running, &client, secret_of(&code)).await.unwrap();
+    assert_eq!(status, 204);
+    running.clock.advance(CODE_LIFETIME);
+    // A full exchange later, the expiry task has run.
+    let stream = connect(running.addr, running.config(ClientCert::Own(&client)))
+        .await
+        .unwrap();
+    assert_eq!(hello(stream).await["type"], "hello");
+    assert!(
+        !logs.text().contains("first pairing code expired"),
+        "{}",
+        logs.text()
+    );
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pairing_connection_reaches_nothing_but_the_pair_request() {
+    let (logs, _guard) = capture();
+    let running = start("pair-only", vec![]);
+    let code = logged_code(&logs).await;
+    let client = ClientIdentity::generate().unwrap();
+    let mut answers = Vec::new();
+    for (method, path, body) in [
+        ("GET", lotse_api_types::WS_PATH, String::new()),
+        ("GET", "/v1/pair", String::new()),
+        ("POST", "/v1/other", String::new()),
+        ("POST", "/v1/pair", "{}".to_owned()),
+        (
+            "POST",
+            "/v1/pair",
+            format!(r#"{{"secret":"{}"}}"#, "a".repeat(300)),
+        ),
+    ] {
+        let connected = connect(running.addr, running.config(ClientCert::Own(&client))).await;
+        let (status, _) = request(connected, method, path, &body).await.unwrap();
+        answers.push(status);
+    }
+    assert_eq!(answers, [404, 405, 404, 400, 413]);
+    assert!(
+        !logs.text().contains("control connection opened"),
+        "no WebSocket"
+    );
+    // None of it touched the code.
+    let (status, _) = pair(&running, &client, secret_of(&code)).await.unwrap();
+    assert_eq!(status, 204);
+    running.finish().await;
+}
+
+/// `future`, or a panic after 5 s of real time: a server that waits where
+/// it must not fails the test instead of hanging it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a real-time bound on a test step; the server's own timers run on the fake clock"
+)]
+async fn within_5_s<F: Future>(future: F) -> F::Output {
+    tokio::time::timeout(std::time::Duration::from_secs(5), future)
+        .await
+        .expect("finished within 5 s")
+}
+
+/// Reads until the server closes or errors, failing after 5 s of real time.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a real-time bound on a test step; the server's own timers run on the fake clock"
+)]
+async fn closed(stream: &mut TlsStream<TcpStream>) -> Vec<u8> {
+    let mut rest = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut rest),
+    )
+    .await;
+    assert!(read.is_ok(), "still open after 5 s");
+    rest
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pairing_connection_that_sends_nothing_is_closed_at_its_deadline() {
+    let (logs, _guard) = capture();
+    let running = start("pair-deadline", vec![]);
+    let code = logged_code(&logs).await;
+    let idle_client = ClientIdentity::generate().unwrap();
+    let mut idle = connect(running.addr, running.config(ClientCert::Own(&idle_client)))
+        .await
+        .unwrap();
+    // Served in order: once the next one is enrolled, the idle one waits
+    // on its deadline.
+    let client = ClientIdentity::generate().unwrap();
+    let (status, _) = pair(&running, &client, secret_of(&code)).await.unwrap();
+    assert_eq!(status, 204);
+    running.clock.advance(PAIR_TIMEOUT);
+    assert!(closed(&mut idle).await.is_empty());
+    assert!(
+        logs.text()
+            .contains("pairing connection closed: no request before the deadline"),
+        "{}",
+        logs.text()
+    );
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_enrolled_pin_survives_a_restart_and_no_code_is_logged_then() {
+    let (logs, _guard) = capture();
+    let running = start("pair-restart", vec![]);
+    let code = logged_code(&logs).await;
+    let client = ClientIdentity::generate().unwrap();
+    let (status, _) = pair(&running, &client, secret_of(&code)).await.unwrap();
+    assert_eq!(status, 204);
+    let (dir, data) = running.stop().await;
+    let pins = data.join("clients").join("pins");
+    assert_eq!(std::fs::metadata(&pins).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::read_to_string(&pins).unwrap(),
+        format!("{}\n", client.pin)
+    );
+
+    let running = start_in(dir, data, vec![]);
+    let stream = connect(running.addr, running.config(ClientCert::Own(&client)))
+        .await
+        .unwrap();
+    assert_eq!(hello(stream).await["type"], "hello");
+    assert_eq!(
+        logs.text()
+            .matches("pairing code for the first client")
+            .count(),
+        1,
+        "a client is enrolled: nothing secret at the second start"
+    );
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pin_that_cannot_be_stored_is_500_and_the_code_stays_open() {
+    let (logs, _guard) = capture();
+    let running = start("pair-store", vec![]);
+    let code = logged_code(&logs).await;
+    let blocker = running.data.join("clients").join("pins.partial");
+    std::fs::create_dir(&blocker).unwrap();
+    let client = ClientIdentity::generate().unwrap();
+    let (status, body) = pair(&running, &client, secret_of(&code)).await.unwrap();
+    assert_eq!(status, 500, "{body}");
+    assert!(logs.text().contains("enrolling the paired client failed"));
+    std::fs::remove_dir(&blocker).unwrap();
+    let (status, _) = pair(&running, &client, secret_of(&code)).await.unwrap();
+    assert_eq!(status, 204);
+    running.finish().await;
+}
+
+/// A WebSocket on `stream` after its `hello`.
+async fn upgraded<S>(stream: S) -> tokio_tungstenite::WebSocketStream<S>
+where
+    S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut ws, _) =
+        tokio_tungstenite::client_async(&format!("ws://lotse{}", lotse_api_types::WS_PATH), stream)
+            .await
+            .expect("upgrades");
+    assert!(
+        matches!(ws.next().await, Some(Ok(Message::Text(_)))),
+        "hello"
+    );
+    ws
+}
+
+/// Sends `pairing/create` as command `id` and returns the answer.
+async fn pairing_create<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, id: u64) -> Value
+where
+    S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let command = serde_json::json!({ "id": id, "type": "pairing/create" });
+    ws.send(Message::Text(command.to_string().into()))
+        .await
+        .unwrap();
+    match within_5_s(ws.next()).await {
+        Some(Ok(Message::Text(text))) => serde_json::from_str(text.as_str()).unwrap(),
+        other => panic!("no answer: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pairing_create_issues_codes_on_the_socket_and_refuses_tls_clients() {
+    let (logs, _guard) = capture();
+    let fixed = ClientIdentity::generate().unwrap();
+    let running = start("pair-create", vec![fixed.pin]);
+
+    let socket = tokio::net::UnixStream::connect(running.dir.join("lotse.sock"))
+        .await
+        .unwrap();
+    let mut local = upgraded(socket).await;
+    let answer = pairing_create(&mut local, 1).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    assert_eq!(answer["result"]["expires_in_ms"], 600_000);
+    let code = answer["result"]["code"].as_str().unwrap().to_owned();
+    assert!(
+        code.starts_with(&format!("LOTSE1-{}-", running.server_pin.to_hex())),
+        "{code}"
+    );
+    assert!(logs.text().contains("pairing code issued"));
+    assert!(
+        !logs.text().contains("pairing code for the first client"),
+        "a fixed client exists: no code at startup"
+    );
+    assert!(!logs.text().contains(secret_of(&code)), "never logged");
+
+    let client = ClientIdentity::generate().unwrap();
+    let (status, _) = pair(&running, &client, secret_of(&code)).await.unwrap();
+    assert_eq!(status, 204);
+
+    let stream = connect(running.addr, running.config(ClientCert::Own(&fixed)))
+        .await
+        .unwrap();
+    let mut remote = upgraded(stream).await;
+    let answer = pairing_create(&mut remote, 1).await;
+    assert_eq!(answer["success"], false, "{answer}");
+    assert_eq!(answer["error"]["code"], "not_permitted");
+    running.finish().await;
 }

@@ -22,7 +22,7 @@ const FINGERPRINT_LEN: usize = 32;
 /// prints). Printed as lowercase pairs joined by colons, which is also the
 /// canonical form in a camera's connection key, so every spelling of one pin
 /// is one camera session. Not a secret: a certificate is public.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Fingerprint([u8; FINGERPRINT_LEN]);
 
 /// Why a `tls_fingerprint` does not parse.
@@ -36,6 +36,15 @@ impl Fingerprint {
     /// The fingerprint of a DER-encoded certificate.
     pub fn of(der: &[u8]) -> Self {
         Self(Sha256::digest(der).into())
+    }
+
+    /// The digest as 64 lowercase hex digits, without colons.
+    pub fn to_hex(&self) -> String {
+        self.0
+            .iter()
+            .flat_map(|byte| [byte >> 4, byte & 0x0f])
+            .filter_map(|nibble| char::from_digit(u32::from(nibble), 16))
+            .collect()
     }
 
     /// Parses the hex form, with or without colons between the pairs.
@@ -162,6 +171,13 @@ mod tests {
             let err = Fingerprint::parse(bad).unwrap_err();
             assert!(err.to_string().contains("64 hex digits"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn the_hex_form_is_the_pairs_without_colons_and_parses_back() {
+        let pin = Fingerprint::of(b"abc");
+        assert_eq!(pin.to_hex(), ABC.replace(':', ""));
+        assert_eq!(Fingerprint::parse(&pin.to_hex()).unwrap(), pin);
     }
 
     #[test]

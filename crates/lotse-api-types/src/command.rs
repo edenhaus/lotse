@@ -47,6 +47,14 @@ pub struct Schema {
     pub id: u64,
 }
 
+/// `pairing/create`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PairingCreate {
+    /// The command id.
+    pub id: u64,
+}
+
 /// `stream/put`: the idempotent upsert of a stream's desired state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -216,6 +224,11 @@ pub enum Command {
     #[serde(rename = "schema")]
     #[schemars(title = "SchemaCommand")]
     Schema(Schema),
+    /// `pairing/create`: a one-time pairing code for the control TLS
+    /// listener, replacing any open one; only on the Unix socket.
+    #[serde(rename = "pairing/create")]
+    #[schemars(title = "PairingCreateCommand")]
+    PairingCreate(PairingCreate),
     /// `stream/put`: the idempotent upsert of a stream's desired state.
     #[serde(rename = "stream/put")]
     #[schemars(title = "StreamPutCommand")]
@@ -276,6 +289,7 @@ impl Command {
         "info",
         "metrics/get",
         "schema",
+        "pairing/create",
         "stream/put",
         "stream/get",
         "stream/list",
@@ -297,6 +311,7 @@ impl Command {
             Self::Info(c) => c.id,
             Self::MetricsGet(c) => c.id,
             Self::Schema(c) => c.id,
+            Self::PairingCreate(c) => c.id,
             Self::StreamPut(c) => c.id,
             Self::StreamGet(c) => c.id,
             Self::StreamList(c) => c.id,
@@ -317,6 +332,7 @@ impl Command {
             Self::Info(_) => "info",
             Self::MetricsGet(_) => "metrics/get",
             Self::Schema(_) => "schema",
+            Self::PairingCreate(_) => "pairing/create",
             Self::StreamPut(_) => "stream/put",
             Self::StreamGet(_) => "stream/get",
             Self::StreamList(_) => "stream/list",
@@ -520,6 +536,7 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
         | Command::Info(_)
         | Command::MetricsGet(_)
         | Command::Schema(_)
+        | Command::PairingCreate(_)
         | Command::StreamList(_)
         | Command::Unsubscribe(_)
         | Command::SessionList(_) => {}
@@ -657,6 +674,7 @@ mod tests {
                 r#"{"id":16,"type":"session/adopt","session_id":"s"}"#,
                 "session/adopt",
             ),
+            (r#"{"id":17,"type":"pairing/create"}"#, "pairing/create"),
         ];
         for (index, (text, name)) in cases.iter().enumerate() {
             let command = parse_command(text);

@@ -493,6 +493,7 @@ impl Resolver<'_> {
         args: &ServeArgs,
         data_dir: Option<PathBuf>,
         file: ControlFile,
+        state_owner: (u32, u32),
     ) -> Result<Option<ControlTls>, ConfigError> {
         let data_dir = self.pick_required(
             "data_dir",
@@ -519,6 +520,7 @@ impl Resolver<'_> {
             listen,
             clients: clients.0,
             data_dir: data_dir.ok_or(ConfigError::MissingDataDir)?.0,
+            state_owner,
         }))
     }
 
@@ -630,7 +632,9 @@ pub(crate) fn load(
         file.allow_uid,
         starting_uid,
     );
-    let control_tls = r.control(args, file.data_dir, file.control)?;
+    let own_gid = rustix::process::getgid().as_raw();
+    let state_owner = state_owner(starting_uid, (uid, gid), own_gid);
+    let control_tls = r.control(args, file.data_dir, file.control, state_owner)?;
     let mode = r.pick("sandbox", "sandbox", args.sandbox, file.sandbox, Mode::On);
     let udp_listen = r.pick(
         "webrtc.udp_listen",
@@ -685,6 +689,16 @@ pub(crate) fn load(
         },
     };
     Ok((settings, r.provenance))
+}
+
+/// Who owns what the daemon writes at runtime: the ids it drops to
+/// (`drop_to`) when started as root, else its own.
+const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u32, u32) {
+    if starting_uid == 0 {
+        drop_to
+    } else {
+        (starting_uid, own_gid)
+    }
 }
 
 /// The default of `webrtc.udp_listen` and `webrtc.tcp_listen`: dual-stack,
@@ -852,6 +866,12 @@ mod tests {
             source_of(&provenance, "control.listen"),
             ("127.0.0.1:18557".into(), Source::Flag)
         );
+    }
+
+    #[test]
+    fn runtime_state_belongs_to_the_ids_the_daemon_runs_as() {
+        assert_eq!(state_owner(0, (65534, 65533), 0), (65534, 65533));
+        assert_eq!(state_owner(1000, (65534, 65533), 100), (1000, 100));
     }
 
     #[test]

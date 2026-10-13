@@ -119,11 +119,15 @@ impl FromStr for Mode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Profile {
     /// The supervisor: reads `/etc/resolv.conf`, `/etc/hosts` and `/proc`,
-    /// re-executes its own binary, spawns processes, opens sockets.
+    /// re-executes its own binary, spawns processes, opens sockets, and
+    /// writes files in its state directory.
     Supervisor {
         /// The path of the daemon's own executable, which it re-executes
         /// for workers and decoders.
         binary: PathBuf,
+        /// The directory the supervisor writes at runtime (the control TLS
+        /// listener's enrolled clients), if it has one.
+        state_dir: Option<PathBuf>,
     },
     /// A worker: no filesystem, TCP only to its camera's ports, no
     /// subprocesses, threads only.
@@ -261,7 +265,8 @@ mod tests {
     fn profiles_and_config_have_names_and_documented_defaults() {
         assert_eq!(
             Profile::Supervisor {
-                binary: PathBuf::from("/lotse")
+                binary: PathBuf::from("/lotse"),
+                state_dir: None,
             }
             .name(),
             "supervisor"

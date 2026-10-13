@@ -128,6 +128,9 @@ webpki-roots = { version = "1", default-features = false }
 # algorithm, USERHASH and MESSAGE-INTEGRITY-SHA256 (RFC 8489 §18.5.1.2, §14.4, §14.6); already in
 # the tree via dimpl.
 sha2 = { version = "0.10", default-features = false }
+# Constant-time comparison of the control listener's pairing secret; already in the tree via the
+# RustCrypto ciphers.
+subtle = { version = "2", default-features = false }
 # Self-signed certificates with the `ring` backend (already linked for rustls): the DTLS certificate of
 # every WebRTC session, the control API's server certificate and the fake camera's TLS certificate;
 # `pem` writes the control API's identity file.

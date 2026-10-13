@@ -26,12 +26,14 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use lotse_api_types::command::Command;
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Empty, EventFrame, Failure, Pong, Shutdown, Success};
+use lotse_api_types::pairing::PairingCreateResult;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
 
 use crate::listener::PeerInfo;
 use crate::outbox::{Class, Outbox, Outgoing};
+use crate::pairing::Pairing;
 use crate::{
     AppState, CLOSE_TIMEOUT, ConnectionId, Event, Handler, MAX_MESSAGE_BYTES,
     OUTBOUND_BUDGET_BYTES, Outcome,
@@ -99,6 +101,48 @@ pub(crate) async fn upgrade<H: Handler>(
         .on_upgrade(move |socket| run(socket, state, peer, slot))
 }
 
+/// The answer to `pairing/create` command `id`, as [`pairing_create`]
+/// decides it. Not generic over the handler, so every handler's connection
+/// shares this one function.
+fn pairing_answer(pairing: Option<&Pairing>, peer: &PeerInfo, id: u64) -> serde_json::Value {
+    let frame = match pairing_create(pairing, peer) {
+        Ok(result) => serde_json::to_value(Success::new(id, result)),
+        Err(error) => serde_json::to_value(Failure::new(Some(id), error)),
+    };
+    frame.unwrap_or_default()
+}
+
+/// `pairing/create`: a new code for the TLS listener, replacing any open
+/// one. Only a peer on the Unix socket may ask: it already controls the
+/// daemon, while an enrolled TLS client must not enroll others.
+fn pairing_create(
+    pairing: Option<&Pairing>,
+    peer: &PeerInfo,
+) -> Result<PairingCreateResult, ApiError> {
+    if matches!(peer, PeerInfo::Tls { .. }) {
+        tracing::warn!(%peer, "pairing/create refused: not on the control socket");
+        return Err(ApiError::new(
+            ErrorCode::NotPermitted,
+            "pairing codes are issued on the control socket only",
+        ));
+    }
+    let Some(pairing) = pairing else {
+        return Err(ApiError::new(
+            ErrorCode::InvalidRequest,
+            "the control TLS listener is off",
+        ));
+    };
+    let Some(code) = pairing.open() else {
+        tracing::error!(%peer, "pairing/create failed: the system provides no randomness");
+        return Err(ApiError::new(
+            ErrorCode::InternalError,
+            "no randomness for a pairing code",
+        ));
+    };
+    tracing::info!(event = "pairing_code_issued", %peer, "pairing code issued");
+    Ok(code.result())
+}
+
 /// Releases the connection's slot when dropped.
 struct ConnectionSlot(Arc<AtomicU32>);
 
@@ -120,6 +164,8 @@ struct Connection<H> {
     last_id: Option<u64>,
     /// Open subscriptions by command id.
     subscriptions: HashMap<u64, JoinHandle<()>>,
+    /// Who is connected, as the listener authenticated it.
+    peer: PeerInfo,
 }
 
 /// Serves one connection until the peer leaves, the queue overflows or the
@@ -160,6 +206,7 @@ async fn serve<H: Handler>(
         outbox,
         last_id: None,
         subscriptions: HashMap::new(),
+        peer,
     };
     connection.send(Class::Signaling, &connection.state.handler.hello());
 
@@ -305,6 +352,10 @@ impl<H: Handler> Connection<H> {
         tracing::debug!(id, command = command.name(), "command");
         match command {
             Command::Ping(_) => self.send(Class::Signaling, &Pong::new(id)),
+            Command::PairingCreate(_) => {
+                let answer = pairing_answer(self.state.pairing.as_deref(), &self.peer, id);
+                self.send(Class::Signaling, &answer);
+            }
             Command::Schema(_) => self.send(
                 Class::Signaling,
                 &Success::new(id, lotse_api_types::schema::bundle()),
@@ -387,5 +438,52 @@ async fn forward(id: u64, mut events: mpsc::Receiver<Event>, outbox: Arc<Outbox>
         if outbox.push(event.class.into(), text).is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::arithmetic_side_effects,
+        clippy::missing_docs_in_private_items,
+        reason = "test code"
+    )]
+
+    use lotse_core::clock::FakeClock;
+    use lotse_core::fingerprint::Fingerprint;
+
+    use super::*;
+    use crate::pairing::test_support::NO_RANDOM;
+
+    #[test]
+    fn pairing_create_needs_the_socket_a_listener_and_randomness() {
+        let unix = PeerInfo::Unix { uid: 0, pid: None };
+        let tls = PeerInfo::Tls {
+            pin: Fingerprint::of(b"client"),
+            addr: "192.0.2.1:1".parse().unwrap(),
+        };
+        let clock = Arc::new(FakeClock::default());
+        let working = Pairing::new(
+            Fingerprint::of(b"server"),
+            clock.clone(),
+            rustls::crypto::ring::default_provider().secure_random,
+        );
+        let broken = Pairing::new(Fingerprint::of(b"server"), clock, &NO_RANDOM);
+        assert!(pairing_create(Some(&working), &unix).is_ok());
+        let code = |result: Result<PairingCreateResult, ApiError>| result.unwrap_err().code;
+        assert_eq!(
+            code(pairing_create(Some(&working), &tls)),
+            ErrorCode::NotPermitted
+        );
+        assert_eq!(code(pairing_create(None, &unix)), ErrorCode::InvalidRequest);
+        assert_eq!(
+            code(pairing_create(Some(&broken), &unix)),
+            ErrorCode::InternalError
+        );
+        let answer = pairing_answer(Some(&working), &unix, 7);
+        assert_eq!(answer["id"], 7);
+        assert_eq!(answer["success"], true);
+        let answer = pairing_answer(None, &unix, 8);
+        assert_eq!(answer["error"]["code"], "invalid_request");
     }
 }

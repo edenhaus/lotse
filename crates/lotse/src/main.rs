@@ -1,7 +1,8 @@
 //! lotse: a small, fast, memory-safe media daemon.
 //!
 //! One binary, three process kinds (`serve`, `worker`, `decode`) plus the
-//! `ctl` client and the `identity` tool, dispatched from the command line. The binary is the only
+//! `ctl` client and the `identity` and `pair` tools, dispatched from the
+//! command line. The binary is the only
 //! place that names concrete sources, outputs and transcoders: it registers
 //! the ones its Cargo features enable and hands the registries to
 //! `lotse-supervisor` or `lotse-worker`. It also reads the configuration
@@ -65,6 +66,7 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
         }
         Command::Ctl(args) => ctl::run(args),
         Command::Identity(args) => identity::run(args),
+        Command::Pair(args) => ctl::pair(args),
     }
 }
 
@@ -185,6 +187,7 @@ fn serve(args: &ServeArgs, matches: &ArgMatches) -> anyhow::Result<()> {
     let binary = std::env::current_exe().context("own executable path")?;
     let profile = Profile::Supervisor {
         binary: binary.clone(),
+        state_dir: listeners.api.state_dir().map(std::path::Path::to_path_buf),
     };
     let report = lotse_sandbox::apply(&profile, &settings.sandbox).context("sandbox")?;
 

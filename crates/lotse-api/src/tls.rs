@@ -14,7 +14,9 @@
 //! connection joins the Unix socket's path: the same upgrade limits,
 //! deadline and WebSocket API, its place among the
 //! [`MAX_PENDING_UPGRADES`](crate::MAX_PENDING_UPGRADES) taken and its [`UPGRADE_TIMEOUT`] started the
-//! moment it authenticates.
+//! moment it authenticates. While a pairing code is open ([`pairing`]),
+//! an unknown certificate passes too, still with its signature verified,
+//! but its connection reaches nothing but the pairing request.
 //!
 //! The handshake runs before anything is known about the peer, so it has
 //! its own budget, apart from the upgrade's: [`MAX_PENDING_HANDSHAKES`] at
@@ -49,6 +51,7 @@ use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::NoServerSessionStorage;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::{
     CertificateError, DigitallySignedStruct, DistinguishedName, OtherError, PeerIncompatible,
     PeerMisbehaved, ServerConfig, SignatureScheme,
@@ -59,8 +62,10 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::clients::ClientStore;
 use crate::identity::ServerIdentity;
 use crate::listener::{BindError, PeerInfo, accept_retrying};
+use crate::pairing::{self, CODE_LIFETIME, PairContext, Pairing};
 use crate::{UPGRADE_TIMEOUT, upgrade_slot};
 
 /// From accept to the end of the TLS handshake: 3 s. A TLS 1.3 handshake
@@ -96,38 +101,52 @@ const VERIFY_SCHEMES: [SignatureScheme; 2] = [
 pub struct TlsConfig {
     /// The address to listen on.
     pub listen: SocketAddr,
-    /// The pins of the client certificates allowed to connect; never empty.
+    /// The pins of the client certificates the configuration allows. They
+    /// are fixed: pairing adds pins of its own and removes none of these.
     pub clients: Vec<Fingerprint>,
-    /// Where the [`ServerIdentity`] is kept.
+    /// Where the [`ServerIdentity`] and the enrolled clients are kept.
     pub data_dir: PathBuf,
+    /// The uid and gid the daemon runs as after the privilege drop (the
+    /// starting ones when there is none), which own the enrolled clients'
+    /// directory because the daemon writes it at runtime.
+    pub state_owner: (u32, u32),
 }
 
-/// The listener bound, with the rustls configuration it serves.
+/// The listener bound, with what its handshakes are configured from once
+/// the clock is known.
 #[derive(Debug)]
 pub(crate) struct BoundTls {
     /// The listener, non-blocking.
     pub(crate) listener: std::net::TcpListener,
-    /// The handshake's configuration.
-    pub(crate) config: Arc<ServerConfig>,
+    /// The server's certificate and key, checked to match.
+    certified: Arc<CertifiedKey>,
+    /// The certificate's pin, the pairing code's first part.
+    server_pin: Fingerprint,
+    /// Who may connect.
+    pub(crate) store: Arc<ClientStore>,
 }
 
 /// Loads (or makes) the server identity in `settings.data_dir`, which
-/// `owner_uid` must own, builds the TLS configuration and binds the
-/// listener. Refuses an empty client allowlist: a listener nobody may use
-/// would only be attack surface.
+/// `owner_uid` must own, opens the client allowlist, and binds the
+/// listener. Without any client the listener still starts: only pairing
+/// is reachable then, and only while a code is open.
 pub(crate) fn bind(settings: &TlsConfig, owner_uid: u32) -> Result<BoundTls, BindError> {
-    if settings.clients.is_empty() {
-        return Err(BindError::NoClients);
-    }
     let identity = ServerIdentity::load_or_create(&settings.data_dir, owner_uid)?;
-    let config = server_config(&identity, &settings.clients).map_err(BindError::Tls)?;
+    let certified = CertifiedKey::from_der(
+        vec![identity.certificate.clone()],
+        identity.key.clone_key(),
+        &rustls::crypto::ring::default_provider(),
+    )
+    .map_err(BindError::Tls)?;
+    let store = ClientStore::open(&settings.data_dir, &settings.clients, settings.state_owner)?;
     let tcp = |source| BindError::TlsListen {
         addr: settings.listen,
         source,
     };
-    let listener = std::net::TcpListener::bind(settings.listen).map_err(tcp)?;
-    listener.set_nonblocking(true).map_err(tcp)?;
-    let local = listener.local_addr().map_err(tcp)?;
+    let listener = std::net::TcpListener::bind(settings.listen)
+        .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
+        .map_err(tcp)?;
+    let local = listener.local_addr().unwrap_or(settings.listen);
     tracing::info!(
         addr = %local,
         server_pin = %identity.pin(),
@@ -136,31 +155,49 @@ pub(crate) fn bind(settings: &TlsConfig, owner_uid: u32) -> Result<BoundTls, Bin
     );
     Ok(BoundTls {
         listener,
-        config: Arc::new(config),
+        certified: Arc::new(certified),
+        server_pin: identity.pin(),
+        store: Arc::new(store),
     })
 }
 
-/// The rustls configuration: TLS 1.3 only, `identity` as the server's
-/// certificate, [`PinVerifier`] for the client's, no resumption.
-fn server_config(
-    identity: &ServerIdentity,
-    clients: &[Fingerprint],
-) -> Result<ServerConfig, rustls::Error> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(PinVerifier {
-        pins: clients.iter().copied().collect(),
-        algorithms: provider.signature_verification_algorithms,
-    });
-    let mut config = ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(vec![identity.certificate.clone()], identity.key.clone_key())?;
-    // A resumed session restores the client's certificate without asking
-    // the verifier (rustls 0.23.45, `server/tls13.rs`); the connection is
-    // long-lived, so resumption would buy nothing and could outlive a pin.
-    config.session_storage = Arc::new(NoServerSessionStorage {});
-    config.send_tls13_tickets = 0;
-    Ok(config)
+impl BoundTls {
+    /// The pairing state for this listener, on `clock`.
+    pub(crate) fn pairing(&self, clock: Arc<dyn Clock>) -> Arc<Pairing> {
+        Arc::new(Pairing::new(
+            self.server_pin,
+            clock,
+            rustls::crypto::ring::default_provider().secure_random,
+        ))
+    }
+
+    /// The rustls configuration: TLS 1.3 only, the identity as the
+    /// server's certificate, [`PinVerifier`] for the client's with
+    /// `pairing` letting unknown ones through while a code is open, no
+    /// resumption.
+    pub(crate) fn server_config(
+        &self,
+        pairing: Arc<Pairing>,
+    ) -> Result<ServerConfig, rustls::Error> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(PinVerifier {
+            store: Arc::clone(&self.store),
+            pairing,
+            algorithms: provider.signature_verification_algorithms,
+        });
+        let resolver = Arc::new(SingleCertAndKey::from(Arc::clone(&self.certified)));
+        let versions = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13]);
+        let mut config = versions?
+            .with_client_cert_verifier(verifier)
+            .with_cert_resolver(resolver);
+        // A resumed session restores the client's certificate without asking
+        // the verifier (rustls 0.23.45, `server/tls13.rs`); the connection is
+        // long-lived, so resumption would buy nothing and could outlive a pin.
+        config.session_storage = Arc::new(NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+        Ok(config)
+    }
 }
 
 /// A client certificate not on the allowlist, as the handshake error
@@ -169,11 +206,14 @@ fn server_config(
 #[error("client certificate {0} is not allowed")]
 struct UnknownClient(Fingerprint);
 
-/// Accepts a client certificate by its pin and its handshake signature.
+/// Accepts a client certificate by its pin, or any while a pairing code is
+/// open, and always by its handshake signature.
 #[derive(Debug)]
 struct PinVerifier {
-    /// The allowed pins.
-    pins: HashSet<Fingerprint>,
+    /// Who may connect.
+    store: Arc<ClientStore>,
+    /// Whether a code is open.
+    pairing: Arc<Pairing>,
     /// The provider's signature algorithms, for the signature check.
     algorithms: WebPkiSupportedAlgorithms,
 }
@@ -183,8 +223,9 @@ impl ClientCertVerifier for PinVerifier {
         &[]
     }
 
-    /// The pin of the end-entity certificate must be allowed; intermediates
-    /// are ignored.
+    /// The pin of the end-entity certificate must be allowed, or a pairing
+    /// code open, which lets the connection pair and do nothing else;
+    /// intermediates are ignored.
     ///
     /// SPEC-DEVIATION: RFC 5280 §4.1.2.5 validity is not checked. The pin
     /// names exactly one certificate and is the authority, so a client is
@@ -196,7 +237,7 @@ impl ClientCertVerifier for PinVerifier {
         _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
         let pin = Fingerprint::of(end_entity);
-        if self.pins.contains(&pin) {
+        if self.store.allows(&pin) || self.pairing.is_open() {
             Ok(ClientCertVerified::assertion())
         } else {
             Err(rustls::Error::InvalidCertificate(CertificateError::Other(
@@ -379,6 +420,53 @@ impl Gate {
     }
 }
 
+/// While no client may connect, opens a pairing code and logs it, the one
+/// secret the daemon logs: useless once used, and expired after
+/// [`CODE_LIFETIME`], when the log says how to get another if still no
+/// client is enrolled. Once a client is enrolled nothing secret is logged
+/// at startup; later clients pair with `pairing/create`.
+pub(crate) fn announce_first_code(
+    pairing: &Pairing,
+    store: &Arc<ClientStore>,
+    clock: &Arc<dyn Clock>,
+    shutdown: &CancellationToken,
+) {
+    if !store.is_empty() {
+        return;
+    }
+    let Some(code) = pairing.open() else {
+        tracing::error!("no pairing code: the system provides no randomness");
+        return;
+    };
+    tracing::info!(
+        event = "pairing_code",
+        code = %code.reveal(),
+        expires_in_s = CODE_LIFETIME.as_secs(),
+        "pairing code for the first client"
+    );
+    spawn_named(
+        "api.pairing_expiry",
+        first_code_expired(Arc::clone(store), Arc::clone(clock), shutdown.clone()),
+    );
+}
+
+/// After the first code's lifetime, tells how to get a new one if still
+/// no client is enrolled.
+async fn first_code_expired(
+    store: Arc<ClientStore>,
+    clock: Arc<dyn Clock>,
+    shutdown: CancellationToken,
+) {
+    tokio::select! {
+        () = clock.sleep(CODE_LIFETIME) => {
+            if store.is_empty() {
+                tracing::info!("no control client paired and the first pairing code expired; get a new one with `lotse pair`");
+            }
+        }
+        () = shutdown.cancelled() => {}
+    }
+}
+
 /// A connection that finished its handshake, for the serve loop, with
 /// the upgrade's slot and deadline it took when it authenticated.
 pub(crate) struct Authenticated {
@@ -408,6 +496,10 @@ pub(crate) struct Handshakes {
     pub(crate) upgrades: Arc<Semaphore>,
     /// Where an authenticated connection goes.
     pub(crate) admitted: mpsc::Sender<Authenticated>,
+    /// Who may connect.
+    pub(crate) store: Arc<ClientStore>,
+    /// The open pairing code, for a connection that may only pair.
+    pub(crate) pairing: Arc<Pairing>,
 }
 
 /// Accepts TCP connections until shutdown, each into a handshake of its
@@ -458,10 +550,24 @@ async fn handshake(tcp: TcpStream, addr: SocketAddr, ticket: Ticket, h: Handshak
         }
         () = h.shutdown.cancelled() => return,
     };
-    drop(ticket);
     match accepted {
         Ok(stream) => {
             let Some(pin) = pin_of(&stream) else { return };
+            if !h.store.allows(&pin) {
+                // In only because a code is open: it may pair and do
+                // nothing else, within the budget its ticket holds.
+                tracing::info!(%addr, client_pin = %pin, "pairing connection opened");
+                let context = PairContext {
+                    pairing: Arc::clone(&h.pairing),
+                    store: Arc::clone(&h.store),
+                    pin,
+                    addr,
+                };
+                pairing::serve(stream, context, h.clock, h.shutdown).await;
+                drop(ticket);
+                return;
+            }
+            drop(ticket);
             h.gate.authenticated(addr.ip());
             tracing::info!(
                 event = "control_client_authenticated",
@@ -612,19 +718,31 @@ mod tests {
         assert!(!has_last);
     }
 
-    #[test]
-    fn the_listener_is_close_on_exec_so_no_worker_inherits_it() {
+    /// A listener bound in a fresh data directory, without clients.
+    fn bound(name: &str) -> (BoundTls, PathBuf) {
         use std::os::unix::fs::DirBuilderExt as _;
 
-        let dir = std::env::temp_dir().join(format!("lotse-tls-cloexec-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lotse-tls-{name}-{}", std::process::id()));
         let _gone = std::fs::remove_dir_all(&dir);
         std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         let settings = TlsConfig {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            clients: vec![Fingerprint::of(b"client")],
+            clients: vec![],
             data_dir: dir.clone(),
+            state_owner: (
+                rustix::process::getuid().as_raw(),
+                rustix::process::getgid().as_raw(),
+            ),
         };
-        let bound = bind(&settings, rustix::process::getuid().as_raw()).unwrap();
+        (
+            bind(&settings, rustix::process::getuid().as_raw()).unwrap(),
+            dir,
+        )
+    }
+
+    #[test]
+    fn the_listener_is_close_on_exec_so_no_worker_inherits_it() {
+        let (bound, dir) = bound("cloexec");
         let flags = rustix::io::fcntl_getfd(&bound.listener).unwrap();
         assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -632,11 +750,13 @@ mod tests {
 
     #[test]
     fn the_verifier_refuses_tls_1_2_and_hints_no_names() {
+        let (bound, dir) = bound("verifier");
         // A real DigitallySignedStruct, which only rustls can make: a
         // server's CertificateVerify, captured from a handshake.
         let dss = lotse_testing::control_tls::server_signature().unwrap();
         let verifier = PinVerifier {
-            pins: HashSet::new(),
+            store: Arc::clone(&bound.store),
+            pairing: bound.pairing(Arc::new(lotse_core::clock::FakeClock::default())),
             algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
         };
         let err = verifier
@@ -648,5 +768,43 @@ mod tests {
         );
         assert!(verifier.root_hint_subjects().is_empty());
         assert_eq!(verifier.supported_verify_schemes(), VERIFY_SCHEMES);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_first_code_is_announced_only_while_no_client_may_connect() {
+        let (captured, _guard) = pairing::test_support::capture();
+        let (bound, dir) = bound("announce");
+        let clock: Arc<dyn Clock> = Arc::new(lotse_core::clock::FakeClock::default());
+        let pairing = bound.pairing(Arc::clone(&clock));
+        let shutdown = CancellationToken::new();
+        announce_first_code(&pairing, &bound.store, &clock, &shutdown);
+        assert!(pairing.is_open());
+        assert_eq!(captured.text().matches("LOTSE1-").count(), 1);
+        bound.store.enroll(Fingerprint::of(b"client")).unwrap();
+        let later = bound.pairing(Arc::clone(&clock));
+        announce_first_code(&later, &bound.store, &clock, &shutdown);
+        assert!(!later.is_open(), "a client is enrolled");
+        assert_eq!(captured.text().matches("LOTSE1-").count(), 1);
+        shutdown.cancel();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_randomness_no_first_code_is_announced() {
+        let (captured, _guard) = pairing::test_support::capture();
+        let (bound, dir) = bound("no-random");
+        let clock: Arc<dyn Clock> = Arc::new(lotse_core::clock::FakeClock::default());
+        let pairing = Pairing::new(
+            Fingerprint::of(b"server"),
+            Arc::clone(&clock),
+            &pairing::test_support::NO_RANDOM,
+        );
+        announce_first_code(&pairing, &bound.store, &clock, &CancellationToken::new());
+        assert!(!pairing.is_open());
+        let logs = captured.text();
+        assert!(logs.contains("no pairing code"), "{logs}");
+        assert!(!logs.contains("LOTSE1"), "{logs}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

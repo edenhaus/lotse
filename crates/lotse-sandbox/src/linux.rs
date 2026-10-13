@@ -34,6 +34,8 @@ pub(crate) fn apply(
     config: &SandboxConfig,
 ) -> Result<SandboxReport, SandboxError> {
     let mut notes = Vec::new();
+    // Before the drop: the dropped uid may not reach a rule's path.
+    let rules = open_rules(profile);
     let (uid, gid) = drop_privileges(config)?;
     apply_rlimits(profile, config)?;
     rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable)
@@ -44,7 +46,7 @@ pub(crate) fn apply(
             .map_err(step("PR_SET_PDEATHSIG"))?;
     }
     rustix::thread::set_no_new_privs(true).map_err(step("PR_SET_NO_NEW_PRIVS"))?;
-    let landlock = apply_landlock(profile, config.mode, probe_abi(), &mut notes)?;
+    let landlock = apply_landlock(profile, rules, config.mode, probe_abi(), &mut notes)?;
     let seccomp = seccomp::apply(profile, config.mode, std::env::consts::ARCH, &mut notes)?;
     Ok(SandboxReport {
         mode: config.mode,
@@ -250,6 +252,7 @@ fn layer_status(status: &RulesetStatus, layer: &str, notes: &mut Vec<String>) ->
 /// Landlock ABI is `abi` ([`probe_abi`]; zero without Landlock).
 fn apply_landlock(
     profile: &Profile,
+    rules: Vec<OpenedRule>,
     mode: Mode,
     abi: u32,
     notes: &mut Vec<String>,
@@ -277,14 +280,14 @@ fn apply_landlock(
         .map_err(landlock_step)?
         .create()
         .map_err(landlock_step)?;
-    for (path, access) in fs_rules(profile) {
-        match PathFd::new(path) {
+    for (path, opened, access) in rules {
+        match opened {
             Ok(fd) => {
                 fs_ruleset = fs_ruleset
                     .add_rule(PathBeneath::new(fd, access))
                     .map_err(landlock_step)?;
             }
-            Err(err) => notes.push(format!("landlock: {} not granted: {err}", path.display())),
+            Err(err) => notes.push(format!("landlock: {path} not granted: {err}")),
         }
     }
     let fs = layer_status(
@@ -339,18 +342,48 @@ fn apply_landlock(
 /// for the worker's stdout (`Stdio::null()`), and nothing reads it. Only
 /// the binary is executable, so it must be static: a dynamic binary's
 /// loader needs the `execute` right too (release builds are static musl).
+/// The state directory, if any, is the one place the supervisor writes:
+/// it reads, creates, writes and removes regular files beneath it, which a
+/// rename within it needs (landlock(7): `REMOVE_FILE` and `MAKE_REG`).
 fn fs_rules(profile: &Profile) -> Vec<(&Path, BitFlags<AccessFs>)> {
     match profile {
-        Profile::Supervisor { binary } => vec![
-            (Path::new("/etc/resolv.conf"), AccessFs::ReadFile.into()),
-            (Path::new("/etc/hosts"), AccessFs::ReadFile.into()),
-            (Path::new("/proc"), AccessFs::ReadFile | AccessFs::ReadDir),
-            (Path::new("/dev/null"), AccessFs::WriteFile.into()),
-            (binary.as_path(), AccessFs::Execute | AccessFs::ReadFile),
-        ],
+        Profile::Supervisor { binary, state_dir } => {
+            let mut rules = vec![
+                (Path::new("/etc/resolv.conf"), AccessFs::ReadFile.into()),
+                (Path::new("/etc/hosts"), AccessFs::ReadFile.into()),
+                (Path::new("/proc"), AccessFs::ReadFile | AccessFs::ReadDir),
+                (Path::new("/dev/null"), AccessFs::WriteFile.into()),
+                (binary.as_path(), AccessFs::Execute | AccessFs::ReadFile),
+            ];
+            if let Some(dir) = state_dir {
+                rules.push((dir.as_path(), STATE_ACCESS));
+            }
+            rules
+        }
         Profile::Worker { .. } | Profile::Decoder => Vec::new(),
     }
 }
+
+/// A Landlock rule's path, opened (`O_PATH`) or why not, with its rights.
+type OpenedRule = (String, Result<PathFd, String>, BitFlags<AccessFs>);
+
+/// Opens `profile`'s rule paths. Called before the privilege drop: a rule
+/// names the inode, so a path only the starting uid can reach (a state
+/// directory under a root-only parent) still gets its rule.
+fn open_rules(profile: &Profile) -> Vec<OpenedRule> {
+    fs_rules(profile)
+        .into_iter()
+        .map(|(path, access)| {
+            let opened = PathFd::new(path).map_err(|err| err.to_string());
+            (path.display().to_string(), opened, access)
+        })
+        .collect()
+}
+
+/// What the supervisor may do beneath its state directory.
+const STATE_ACCESS: BitFlags<AccessFs> = landlock::make_bitflags!(AccessFs::{
+    ReadFile | WriteFile | ReadDir | RemoveFile | MakeReg
+});
 
 /// The TCP ports a profile's ruleset still allows, and for what.
 ///
@@ -496,6 +529,7 @@ mod tests {
         apply_rlimits(&Profile::Decoder, &SandboxConfig::default()).unwrap();
         let supervisor = Profile::Supervisor {
             binary: "/lotse".into(),
+            state_dir: None,
         };
         apply_rlimits(&supervisor, &SandboxConfig::default()).unwrap();
         let address_space = Some(DECODER_ADDRESS_SPACE);
@@ -530,7 +564,13 @@ mod tests {
         drop(lowest_free);
         rustix::process::setrlimit(Resource::Nofile, exhausted).unwrap();
         let mut notes = Vec::new();
-        let result = apply_landlock(&Profile::Decoder, Mode::On, 1, &mut notes);
+        let result = apply_landlock(
+            &Profile::Decoder,
+            open_rules(&Profile::Decoder),
+            Mode::On,
+            1,
+            &mut notes,
+        );
         rustix::process::setrlimit(Resource::Nofile, before).unwrap();
         let err = result.unwrap_err();
         assert!(
@@ -550,7 +590,14 @@ mod tests {
     #[test]
     fn landlock7_without_landlock_on_reports_it_and_require_refuses() {
         let mut notes = Vec::new();
-        let report = apply_landlock(&Profile::Decoder, Mode::On, 0, &mut notes).unwrap();
+        let report = apply_landlock(
+            &Profile::Decoder,
+            open_rules(&Profile::Decoder),
+            Mode::On,
+            0,
+            &mut notes,
+        )
+        .unwrap();
         assert_eq!(
             report,
             LandlockReport {
@@ -563,7 +610,14 @@ mod tests {
             notes,
             ["landlock: not supported or disabled by this kernel (needs Linux 5.13)"]
         );
-        let err = apply_landlock(&Profile::Decoder, Mode::Require, 0, &mut notes).unwrap_err();
+        let err = apply_landlock(
+            &Profile::Decoder,
+            open_rules(&Profile::Decoder),
+            Mode::Require,
+            0,
+            &mut notes,
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -580,12 +634,26 @@ mod tests {
     #[test]
     fn landlock7_tcp_rules_need_abi_4_and_require_refuses_without_them() {
         let mut notes = Vec::new();
-        let report = apply_landlock(&Profile::Decoder, Mode::On, 3, &mut notes).unwrap();
+        let report = apply_landlock(
+            &Profile::Decoder,
+            open_rules(&Profile::Decoder),
+            Mode::On,
+            3,
+            &mut notes,
+        )
+        .unwrap();
         assert_eq!((report.net, report.abi), (LayerStatus::Unavailable, 3));
         let tcp_note = "landlock.net: TCP rules need ABI 4 (Linux 6.7); this kernel has ABI 3";
         assert!(notes.iter().any(|note| note == tcp_note), "{notes:?}");
         let mut notes = Vec::new();
-        let err = apply_landlock(&Profile::Decoder, Mode::Require, 3, &mut notes).unwrap_err();
+        let err = apply_landlock(
+            &Profile::Decoder,
+            open_rules(&Profile::Decoder),
+            Mode::Require,
+            3,
+            &mut notes,
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -601,9 +669,11 @@ mod tests {
     fn landlock7_a_path_that_cannot_be_opened_is_noted_and_not_granted() {
         let profile = Profile::Supervisor {
             binary: "/nonexistent/lotse".into(),
+            state_dir: None,
         };
         let mut notes = Vec::new();
-        let report = apply_landlock(&profile, Mode::On, 4, &mut notes).unwrap();
+        let report =
+            apply_landlock(&profile, open_rules(&profile), Mode::On, 4, &mut notes).unwrap();
         assert_eq!(report.abi, 4);
         assert!(
             notes
@@ -636,7 +706,16 @@ mod tests {
     fn landlock7_each_profile_keeps_only_its_own_paths_and_ports() {
         let supervisor = Profile::Supervisor {
             binary: "/lotse".into(),
+            state_dir: None,
         };
+        let with_state = Profile::Supervisor {
+            binary: "/lotse".into(),
+            state_dir: Some("/data/clients".into()),
+        };
+        let last = fs_rules(&with_state).pop().unwrap();
+        assert_eq!(last, (Path::new("/data/clients"), STATE_ACCESS));
+        assert!(!STATE_ACCESS.contains(AccessFs::Execute));
+        assert!(!STATE_ACCESS.contains(AccessFs::MakeDir));
         let worker = Profile::Worker {
             connect_ports: vec![554, 80],
         };

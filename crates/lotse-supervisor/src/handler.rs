@@ -950,7 +950,10 @@ impl Supervisor {
             Command::SessionAdopt(adopt) => {
                 self.session_adopt(connection, adopt.id, &adopt.session_id)
             }
-            Command::Ping(_) | Command::Schema(_) | Command::Unsubscribe(_) => {
+            Command::Ping(_)
+            | Command::Schema(_)
+            | Command::Unsubscribe(_)
+            | Command::PairingCreate(_) => {
                 tracing::error!(
                     command = command.name(),
                     "the server answers this command itself"
@@ -1374,8 +1377,14 @@ mod tests {
         let _logs = captured.install();
         let err = error(call(&s, r#"{"id":3,"type":"ping"}"#).await);
         assert_eq!(err.code, ErrorCode::InternalError);
+        let err = error(call(&s, r#"{"id":4,"type":"pairing/create"}"#).await);
+        assert_eq!(err.code, ErrorCode::InternalError);
         let logged = captured.lines("the server answers this command itself");
         assert!(logged[0].contains("command=\"ping\""), "{logged:?}");
+        assert!(
+            logged[1].contains("command=\"pairing/create\""),
+            "{logged:?}"
+        );
     }
 
     #[tokio::test]
