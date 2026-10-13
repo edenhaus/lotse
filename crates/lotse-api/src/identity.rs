@@ -11,21 +11,26 @@
 //! it, or when it belongs to anyone but the uid the daemon started as. The
 //! directory holding it must belong to that uid too and must not be
 //! writable by the group or others, so nobody else can replace the file.
-//! Starts sharing the directory take turns under an exclusive `flock` on
-//! it, so concurrent first starts agree on one identity.
+//! The directory is opened once, then checked, locked and used through
+//! that descriptor (`openat`, `renameat`), so a directory swapped in at
+//! its path after the checks is never read or written. Starts sharing the
+//! directory take turns under an exclusive `flock` on it, so concurrent
+//! first starts agree on one identity.
 //!
 //! Standards: RFC 5280 §4.1.2.5 (validity: `notAfter` 99991231235959Z, "no
 //! well-defined expiration date"), RFC 5958 (PKCS #8 private keys), RFC
 //! 7468 (PEM), FIPS 186-4 (P-256 ECDSA).
 
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::{self, Write as _};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt as _;
+use std::path::Path;
 
 use lotse_core::fingerprint::Fingerprint;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SignatureAlgorithm};
+use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::io::Errno;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -150,12 +155,18 @@ impl ServerIdentity {
     /// and the file must belong to `owner_uid`, the uid the daemon
     /// started as.
     pub fn load_or_create(dir: &Path, owner_uid: u32) -> Result<Self, IdentityError> {
-        let _locked = lock_directory(dir, owner_uid)?;
-        match Self::load(dir, owner_uid) {
+        let locked = lock_directory(dir, owner_uid)?;
+        Self::load_or_create_in(&locked, dir, owner_uid)
+    }
+
+    /// [`Self::load_or_create`] in `handle`, `dir` opened, checked and
+    /// locked by [`lock_directory`]; `dir` only names it in messages.
+    fn load_or_create_in(handle: &File, dir: &Path, owner_uid: u32) -> Result<Self, IdentityError> {
+        match Self::load_in(handle, dir, owner_uid) {
             Err(IdentityError::Missing(_)) => {
                 let pem = generate(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-                write_new(dir, &pem)?;
-                let identity = Self::load(dir, owner_uid)?;
+                write_new(handle, dir, &pem)?;
+                let identity = Self::load_in(handle, dir, owner_uid)?;
                 tracing::info!(
                     event = "control_identity_created",
                     path = %dir.join(IDENTITY_FILE).display(),
@@ -171,14 +182,24 @@ impl ServerIdentity {
     /// The identity in `dir`, which must exist, be a regular file that
     /// only `owner_uid` can read, and hold a key and a certificate.
     pub fn load(dir: &Path, owner_uid: u32) -> Result<Self, IdentityError> {
-        let path = dir.join(IDENTITY_FILE);
-        let text = path.display().to_string();
+        let handle = open_directory(dir).map_err(|source| IdentityError::Directory {
+            path: dir.display().to_string(),
+            source,
+        })?;
+        Self::load_in(&handle, dir, owner_uid)
+    }
+
+    /// [`Self::load`] in `handle`, `dir` opened; `dir` only names it in
+    /// messages. A link in the file's place is refused, not followed.
+    fn load_in(handle: &File, dir: &Path, owner_uid: u32) -> Result<Self, IdentityError> {
+        let text = dir.join(IDENTITY_FILE).display().to_string();
         let io = |source: io::Error| io_error(&text, source);
-        let mut file = match std::fs::File::open(&path) {
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut file = match rustix::fs::openat(handle, IDENTITY_FILE, flags, Mode::empty()) {
+            Err(err) if err == Errno::NOENT => {
                 return Err(IdentityError::Missing(dir.display().to_string()));
             }
-            opened => opened.map_err(io)?,
+            opened => File::from(opened.map_err(io::Error::from).map_err(io)?),
         };
         let meta = file.metadata().map_err(io)?;
         if !meta.is_file() {
@@ -224,34 +245,48 @@ fn io_error(path: &str, source: io::Error) -> IdentityError {
     }
 }
 
-/// Refuses a data directory that is missing, not a directory, writable by
-/// the group or others, or not `owner_uid`'s, and takes an exclusive
-/// `flock` on it, held until the returned handle drops: two daemons
-/// sharing the directory make and read the identity one at a time, so
-/// neither removes the other's partial file or renames over the identity
-/// the other already serves.
-fn lock_directory(dir: &Path, owner_uid: u32) -> Result<std::fs::File, IdentityError> {
+/// `dir` opened as a directory, for every later step to go through. A
+/// link in its path is followed: the path is the operator's choice, and
+/// what is checked is the directory the descriptor holds.
+fn open_directory(dir: &Path) -> io::Result<File> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    Ok(File::from(rustix::fs::open(dir, flags, Mode::empty())?))
+}
+
+/// `dir` opened, refused when it is missing, not a directory, writable by
+/// the group or others, or not `owner_uid`'s, and held under an exclusive
+/// `flock` until the returned handle drops: two daemons sharing the
+/// directory make and read the identity one at a time, so neither removes
+/// the other's partial file or renames over the identity the other
+/// already serves.
+fn lock_directory(dir: &Path, owner_uid: u32) -> Result<File, IdentityError> {
     let text = dir.display().to_string();
-    let directory = |source| IdentityError::Directory {
-        path: text.clone(),
-        source,
+    let directory = |source: io::Error| {
+        if source.raw_os_error() == Some(Errno::NOTDIR.raw_os_error()) {
+            IdentityError::NotADirectory(text.clone())
+        } else {
+            IdentityError::Directory {
+                path: text.clone(),
+                source,
+            }
+        }
     };
-    let meta = std::fs::metadata(dir).map_err(directory)?;
-    if !meta.is_dir() {
-        return Err(IdentityError::NotADirectory(text));
-    }
+    let handle = open_directory(dir).map_err(directory)?;
+    let meta = handle.metadata().map_err(directory)?;
     let mode = meta.mode() & 0o777;
     if mode & 0o022 != 0 {
-        return Err(IdentityError::DirectoryMode { path: text, mode });
+        return Err(IdentityError::DirectoryMode {
+            path: text.clone(),
+            mode,
+        });
     }
     if meta.uid() != owner_uid {
         return Err(IdentityError::DirectoryOwner {
-            path: text,
+            path: text.clone(),
             owner: meta.uid(),
             expected: owner_uid,
         });
     }
-    let handle = std::fs::File::open(dir).map_err(directory)?;
     handle.lock().map_err(directory)?;
     Ok(handle)
 }
@@ -281,27 +316,25 @@ fn generate(alg: &'static SignatureAlgorithm) -> Result<String, IdentityError> {
     Ok(format!("{}{}", key.serialize_pem(), certificate.pem()))
 }
 
-/// Writes `pem` as [`IDENTITY_FILE`] in `dir`: to a new file created with
-/// mode 0600, synced, renamed into place, and the directory synced. A
-/// partial file a crash left behind is replaced.
-fn write_new(dir: &Path, pem: &str) -> Result<(), IdentityError> {
-    let partial: PathBuf = dir.join(PARTIAL_FILE);
-    let text = partial.display().to_string();
-    let _stale = std::fs::remove_file(&partial);
+/// Writes `pem` as [`IDENTITY_FILE`] in `handle`, the directory `dir`
+/// opened: to a new file created with mode 0600, synced, renamed into
+/// place, and the directory synced. A partial file a crash left behind is
+/// replaced.
+fn write_new(handle: &File, dir: &Path, pem: &str) -> Result<(), IdentityError> {
+    let text = dir.join(PARTIAL_FILE).display().to_string();
     let io = |source: io::Error| io_error(&text, source);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&partial)
-        .map_err(io)?;
+    let _stale = rustix::fs::unlinkat(handle, PARTIAL_FILE, AtFlags::empty());
+    let write_only = OFlags::WRONLY; // codespell:ignore wronly
+    let flags = write_only | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let created = rustix::fs::openat(handle, PARTIAL_FILE, flags, Mode::RUSR | Mode::WUSR);
+    let mut file = File::from(created.map_err(io::Error::from).map_err(io)?);
     file.write_all(pem.as_bytes()).map_err(io)?;
     file.sync_all().map_err(io)?;
     drop(file);
-    std::fs::rename(&partial, dir.join(IDENTITY_FILE)).map_err(io)?;
-    std::fs::File::open(dir)
-        .and_then(|dir| dir.sync_all())
-        .map_err(io)
+    rustix::fs::renameat(handle, PARTIAL_FILE, handle, IDENTITY_FILE)
+        .map_err(io::Error::from)
+        .map_err(io)?;
+    handle.sync_all().map_err(io)
 }
 
 #[cfg(test)]
@@ -313,6 +346,7 @@ mod tests {
     )]
 
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    use std::path::PathBuf;
 
     use super::*;
 
@@ -376,6 +410,23 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_swapped_in_after_the_checks_is_never_used() {
+        let dir = data_dir("swap", 0o700);
+        let locked = lock_directory(&dir, uid()).unwrap();
+        // Someone who may rename in the parent swaps another directory in.
+        let checked = PathBuf::from(format!("{}-checked", dir.display()));
+        let _gone = std::fs::remove_dir_all(&checked);
+        std::fs::rename(&dir, &checked).unwrap();
+        std::fs::DirBuilder::new().mode(0o777).create(&dir).unwrap();
+        let made = ServerIdentity::load_or_create_in(&locked, &dir, uid()).unwrap();
+        assert!(!dir.join(IDENTITY_FILE).exists(), "not written to the swap");
+        let kept = ServerIdentity::load(&checked, uid()).unwrap();
+        assert_eq!(kept.pin(), made.pin(), "written where checked");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&checked).unwrap();
+    }
+
+    #[test]
     fn the_certificate_never_expires_rfc5280_4_1_2_5() {
         let dir = data_dir("validity", 0o700);
         let made = ServerIdentity::load_or_create(&dir, uid()).unwrap();
@@ -424,6 +475,9 @@ mod tests {
 
     #[test]
     fn an_identity_others_can_read_or_someone_else_owns_is_refused() {
+        let missing = std::env::temp_dir().join("lotse-identity-load-missing-dir");
+        let err = ServerIdentity::load(&missing, uid()).unwrap_err();
+        assert!(matches!(err, IdentityError::Directory { .. }), "{err}");
         let dir = data_dir("file", 0o700);
         let err = ServerIdentity::load(&dir, uid()).unwrap_err();
         assert!(matches!(err, IdentityError::Missing(_)), "{err}");
@@ -458,14 +512,15 @@ mod tests {
         let (key, certificate) = made.split_at(made.find("-----BEGIN CERTIFICATE").unwrap());
         for (content, what) in [(certificate, "private key"), (key, "certificate")] {
             let _gone = std::fs::remove_file(&path);
-            write_new(&dir, content).unwrap();
+            write_new(&open_directory(&dir).unwrap(), &dir, content).unwrap();
             let err = ServerIdentity::load(&dir, uid()).unwrap_err();
             assert!(
                 matches!(&err, IdentityError::Pem { what: w, .. } if w.starts_with(what)),
                 "{err}"
             );
         }
-        // A link to itself: the open fails, and not as a missing file.
+        // A link in its place is refused, not followed, and not taken for
+        // a missing file.
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&path, &path).unwrap();
         let err = ServerIdentity::load(&dir, uid()).unwrap_err();
@@ -475,7 +530,7 @@ mod tests {
         std::fs::DirBuilder::new()
             .create(dir.join(PARTIAL_FILE))
             .unwrap();
-        let err = write_new(&dir, &made).unwrap_err();
+        let err = write_new(&open_directory(&dir).unwrap(), &dir, &made).unwrap_err();
         assert!(matches!(err, IdentityError::Io { .. }), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
