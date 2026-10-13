@@ -301,9 +301,6 @@ impl State {
             return;
         };
         entry.key = key;
-        // The failure is the old source's: an offer before the driver
-        // takes the switch waits for the new one.
-        entry.snapshot.failure = None;
         if entry
             .commands
             .try_send(DriverCommand::SwitchSource(spec))
@@ -313,7 +310,11 @@ impl State {
                 connection.id = id,
                 "driver queue full; the connection keeps its source until the next put"
             );
+            return;
         }
+        // The failure is the old source's: an offer before the driver
+        // takes the switch waits for the new one.
+        entry.snapshot.failure = None;
     }
 
     /// Recomputes which streams reference connection `id` and its demand
@@ -1412,8 +1413,17 @@ mod tests {
             state.connections["c1"].snapshot.failure, None,
             "the old source's failure is not the new one's"
         );
-        // The queue holds one: the next switch keeps its key, not its source.
+        // The queue holds one: the next switch keeps its key, not its
+        // source, nor hides that source's failure.
+        let failed = Some(ConnectionError::Source(
+            lotse_core::source::SourceError::AuthFailed("401".into()),
+        ));
+        state.connections.get_mut("c1").unwrap().snapshot.failure = failed.clone();
         state.switch_connection("c1", key("fake://127.0.0.1/c"), spec("fake://127.0.0.1/c"));
+        assert_eq!(
+            state.connections["c1"].snapshot.failure, failed,
+            "the source kept is still failed"
+        );
         assert_eq!(
             state.connections["c1"].key,
             key("fake://127.0.0.1/c"),
