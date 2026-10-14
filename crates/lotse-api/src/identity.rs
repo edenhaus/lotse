@@ -155,12 +155,12 @@ impl ServerIdentity {
     /// and the file must belong to `owner_uid`, the uid the daemon
     /// started as.
     pub fn load_or_create(dir: &Path, owner_uid: u32) -> Result<Self, IdentityError> {
-        let locked = lock_directory(dir, owner_uid)?;
+        let locked = checked_directory(dir, owner_uid, true)?;
         Self::load_or_create_in(&locked, dir, owner_uid)
     }
 
     /// [`Self::load_or_create`] in `handle`, `dir` opened, checked and
-    /// locked by [`lock_directory`]; `dir` only names it in messages.
+    /// locked by [`checked_directory`]; `dir` only names it in messages.
     fn load_or_create_in(handle: &File, dir: &Path, owner_uid: u32) -> Result<Self, IdentityError> {
         match Self::load_in(handle, dir, owner_uid) {
             Err(IdentityError::Missing(_)) => {
@@ -184,7 +184,7 @@ impl ServerIdentity {
     /// is checked as [`Self::load_or_create`] checks it, so this reads
     /// only an identity a start would serve.
     pub fn load(dir: &Path, owner_uid: u32) -> Result<Self, IdentityError> {
-        let handle = checked_directory(dir, owner_uid)?;
+        let handle = checked_directory(dir, owner_uid, false)?;
         Self::load_in(&handle, dir, owner_uid)
     }
 
@@ -254,8 +254,12 @@ fn open_directory(dir: &Path) -> io::Result<File> {
 
 /// `dir` opened, refused when it is missing, not a directory, writable by
 /// the group or others, or not `owner_uid`'s, so nobody else can have put
-/// or replaced what is in it.
-fn checked_directory(dir: &Path, owner_uid: u32) -> Result<File, IdentityError> {
+/// or replaced what is in it. With `lock`, it is held under an exclusive
+/// `flock` until the returned handle drops: two daemons sharing the
+/// directory make and read the identity one at a time, so neither removes
+/// the other's partial file or renames over the identity the other
+/// already serves.
+fn checked_directory(dir: &Path, owner_uid: u32, lock: bool) -> Result<File, IdentityError> {
     let text = dir.display().to_string();
     let directory = |source| directory_error(&text, source);
     let handle = open_directory(dir).map_err(directory)?;
@@ -274,20 +278,9 @@ fn checked_directory(dir: &Path, owner_uid: u32) -> Result<File, IdentityError> 
             expected: owner_uid,
         });
     }
-    Ok(handle)
-}
-
-/// `dir` opened and checked by [`checked_directory`], and held under an
-/// exclusive `flock` until the returned handle drops: two daemons sharing
-/// the directory make and read the identity one at a time, so neither
-/// removes the other's partial file or renames over the identity the
-/// other already serves.
-fn lock_directory(dir: &Path, owner_uid: u32) -> Result<File, IdentityError> {
-    let handle = checked_directory(dir, owner_uid)?;
-    let text = dir.display().to_string();
-    handle
-        .lock()
-        .map_err(|source| directory_error(&text, source))?;
+    if lock {
+        handle.lock().map_err(directory)?;
+    }
     Ok(handle)
 }
 
@@ -425,7 +418,7 @@ mod tests {
     #[test]
     fn a_directory_swapped_in_after_the_checks_is_never_used() {
         let dir = data_dir("swap", 0o700);
-        let locked = lock_directory(&dir, uid()).unwrap();
+        let locked = checked_directory(&dir, uid(), true).unwrap();
         // Someone who may rename in the parent swaps another directory in.
         let checked = PathBuf::from(format!("{}-checked", dir.display()));
         let _gone = std::fs::remove_dir_all(&checked);
