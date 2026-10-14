@@ -189,11 +189,15 @@ impl ServerIdentity {
     }
 
     /// [`Self::load`] in `handle`, `dir` opened; `dir` only names it in
-    /// messages. A link in the file's place is refused, not followed.
+    /// messages. A link in the file's place is refused, not followed, and
+    /// a FIFO is refused, not waited on.
     fn load_in(handle: &File, dir: &Path, owner_uid: u32) -> Result<Self, IdentityError> {
         let text = dir.join(IDENTITY_FILE).display().to_string();
         let io = |source: io::Error| io_error(&text, source);
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        // POSIX.1-2024 open(): without `O_NONBLOCK`, opening a FIFO for
+        // reading blocks until it has a writer, before the type check
+        // below can refuse it. On a regular file the flag changes nothing.
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
         let mut file = match rustix::fs::openat(handle, IDENTITY_FILE, flags, Mode::empty()) {
             Err(err) if err == Errno::NOENT => {
                 return Err(IdentityError::Missing(dir.display().to_string()));
@@ -520,6 +524,20 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::DirBuilder::new().create(&path).unwrap();
         let err = ServerIdentity::load(&dir, uid()).unwrap_err();
+        assert!(matches!(err, IdentityError::NotAFile(_)), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn posix_open_a_fifo_as_the_identity_is_refused_not_waited_on() {
+        let dir = data_dir("fifo", 0o700);
+        let handle = open_directory(&dir).unwrap();
+        rustix::fs::mkfifoat(&handle, IDENTITY_FILE, Mode::RUSR | Mode::WUSR).unwrap();
+        // No writer ever opens it: without `O_NONBLOCK` both would hang.
+        let err = ServerIdentity::load(&dir, uid()).unwrap_err();
+        assert!(matches!(err, IdentityError::NotAFile(_)), "{err}");
+        let err = ServerIdentity::load_or_create(&dir, uid()).unwrap_err();
         assert!(matches!(err, IdentityError::NotAFile(_)), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
