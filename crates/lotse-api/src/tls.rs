@@ -12,7 +12,9 @@
 //! Ed25519, and sessions are never resumed (no tickets, no session cache),
 //! so every connection checks its pin again. After the handshake the
 //! connection joins the Unix socket's path: the same upgrade limits,
-//! deadline and WebSocket API.
+//! deadline and WebSocket API, its place among the
+//! [`MAX_PENDING_UPGRADES`](crate::MAX_PENDING_UPGRADES) taken and its [`UPGRADE_TIMEOUT`] started the
+//! moment it authenticates.
 //!
 //! The handshake runs before anything is known about the peer, so it has
 //! its own budget, apart from the upgrade's: [`MAX_PENDING_HANDSHAKES`] at
@@ -40,7 +42,7 @@ use std::time::{Duration, Instant};
 use lotse_core::backoff::AcceptBackoff;
 use lotse_core::clock::Clock;
 use lotse_core::fingerprint::Fingerprint;
-use lotse_core::task::spawn_named;
+use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::throttle::Throttle;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::WebPkiSupportedAlgorithms;
@@ -52,13 +54,14 @@ use rustls::{
     PeerMisbehaved, ServerConfig, SignatureScheme,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::identity::ServerIdentity;
 use crate::listener::{BindError, PeerInfo, accept_retrying};
+use crate::{UPGRADE_TIMEOUT, upgrade_slot};
 
 /// From accept to the end of the TLS handshake: 3 s. A TLS 1.3 handshake
 /// is one round trip and the client's flight.
@@ -376,8 +379,18 @@ impl Gate {
     }
 }
 
-/// A connection that finished its handshake, for the serve loop.
-pub(crate) type Authenticated = (TlsStream<TcpStream>, PeerInfo);
+/// A connection that finished its handshake, for the serve loop, with
+/// the upgrade's slot and deadline it took when it authenticated.
+pub(crate) struct Authenticated {
+    /// The authenticated stream.
+    pub(crate) stream: TlsStream<TcpStream>,
+    /// Who it is.
+    pub(crate) peer: PeerInfo,
+    /// Its place among the connections awaiting the upgrade.
+    pub(crate) slot: OwnedSemaphorePermit,
+    /// [`UPGRADE_TIMEOUT`] from authentication.
+    pub(crate) deadline: BoxFuture<'static, ()>,
+}
 
 /// What every handshake needs.
 #[derive(Clone)]
@@ -390,6 +403,9 @@ pub(crate) struct Handshakes {
     pub(crate) clock: Arc<dyn Clock>,
     /// Cancelled on graceful shutdown.
     pub(crate) shutdown: CancellationToken,
+    /// The places of the connections awaiting the upgrade, shared with
+    /// the Unix socket.
+    pub(crate) upgrades: Arc<Semaphore>,
     /// Where an authenticated connection goes.
     pub(crate) admitted: mpsc::Sender<Authenticated>,
 }
@@ -454,7 +470,17 @@ async fn handshake(tcp: TcpStream, addr: SocketAddr, ticket: Ticket, h: Handshak
                 "control client authenticated"
             );
             let peer = PeerInfo::Tls { pin, addr };
-            let _closed = h.admitted.send((stream, peer)).await;
+            let Some(slot) = upgrade_slot(&h.upgrades, &peer) else {
+                return;
+            };
+            let deadline = h.clock.sleep(UPGRADE_TIMEOUT);
+            let tls = Authenticated {
+                stream,
+                peer,
+                slot,
+                deadline,
+            };
+            let _closed = h.admitted.send(tls).await;
         }
         Err(err) => {
             let Some(refused) = h.gate.failed(h.clock.now()) else {

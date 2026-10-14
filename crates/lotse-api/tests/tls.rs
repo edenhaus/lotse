@@ -22,7 +22,10 @@ use lotse_api::identity::{IDENTITY_FILE, ServerIdentity};
 use lotse_api::tls::{
     HANDSHAKE_TIMEOUT, MAX_HANDSHAKES_PER_ADDRESS, MAX_PENDING_HANDSHAKES, TlsConfig,
 };
-use lotse_api::{BindError, Config, ConnectionId, Handler, Outcome, ServeError, Server};
+use lotse_api::{
+    BindError, Config, ConnectionId, Handler, MAX_PENDING_UPGRADES, Outcome, ServeError, Server,
+    UPGRADE_TIMEOUT,
+};
 use lotse_api_types::command::Command;
 use lotse_api_types::frame::{Hello, HelloTag};
 use lotse_core::clock::FakeClock;
@@ -32,7 +35,7 @@ use lotse_testing::control_tls::{
 };
 use rustls::HandshakeKind;
 use serde_json::Value;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::client::TlsStream;
@@ -181,7 +184,7 @@ fn refused(answer: &io::Result<Vec<u8>>) -> bool {
     clippy::disallowed_methods,
     reason = "a real-time bound on a test step; the server's own timers run on the fake clock"
 )]
-async fn drain(stream: &mut TcpStream) -> Vec<u8> {
+async fn drain<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
     let mut rest = Vec::new();
     let read = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -478,6 +481,39 @@ async fn a_full_pool_still_lets_a_known_client_reconnect() {
     .unwrap();
     assert_eq!(hello(stream).await["type"], "hello", "the reserve");
     assert_eq!(stalled.len(), MAX_PENDING_HANDSHAKES, "held until here");
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_authenticated_connection_takes_its_upgrade_slot_and_deadline_at_once() {
+    let (logs, _guard) = capture();
+    let allowed = ClientIdentity::generate().unwrap();
+    let running = start("upgrade-slot", vec![allowed.pin]);
+    // Authenticated, then silent: each holds a slot from its handshake on.
+    let mut parked = Vec::new();
+    for i in 1..=MAX_PENDING_UPGRADES {
+        let from = IpAddr::V4(Ipv4Addr::new(127, 0, 3, u8::try_from(i).unwrap()));
+        let config = running.config(ClientCert::Own(&allowed));
+        parked.push(connect_from(from, running.addr, config).await.unwrap());
+    }
+    let one_more = connect(running.addr, running.config(ClientCert::Own(&allowed))).await;
+    assert!(refused(&exchange(one_more).await), "no slot left");
+    assert!(
+        logs.text()
+            .contains("too many connections awaiting the upgrade"),
+        "{}",
+        logs.text()
+    );
+    // Accepted in order: once the last one is refused, every parked one's
+    // deadline is set.
+    running.clock.advance(UPGRADE_TIMEOUT);
+    for stream in &mut parked {
+        assert!(drain(stream).await.is_empty(), "closed without a response");
+    }
+    let stream = connect(running.addr, running.config(ClientCert::Own(&allowed)))
+        .await
+        .unwrap();
+    assert_eq!(hello(stream).await["type"], "hello", "the slots came back");
     running.finish().await;
 }
 

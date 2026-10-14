@@ -83,7 +83,8 @@ pub const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connections accepted and not yet upgraded, at once: 8. One more is
-/// closed at accept, without a response.
+/// closed at accept, without a response. A TLS connection takes its place
+/// when it authenticates, and holds it while it waits for the serve loop.
 pub const MAX_PENDING_UPGRADES: u16 = 8;
 
 /// A control connection, numbered from one for the daemon's lifetime.
@@ -268,6 +269,9 @@ impl Server {
 
         let mut unix = listener::CheckedUnix::new(self.unix, allowed, Arc::clone(&clock))
             .map_err(ServeError::Register)?;
+        let pending = Arc::new(Semaphore::new(usize::from(MAX_PENDING_UPGRADES)));
+        // Each queued connection holds one of `pending`'s permits, so the
+        // queue never fills and a handshake task never waits to send.
         let (admitted, mut authenticated) = mpsc::channel(usize::from(MAX_PENDING_UPGRADES));
         let tls = match self.tls {
             Some(bound) => {
@@ -278,6 +282,7 @@ impl Server {
                     gate: Arc::default(),
                     clock: Arc::clone(&clock),
                     shutdown: shutdown.clone(),
+                    upgrades: Arc::clone(&pending),
                     admitted,
                 };
                 Some(spawn_named(
@@ -296,7 +301,7 @@ impl Server {
         let admission = Admission {
             app,
             http,
-            pending: Arc::new(Semaphore::new(usize::from(MAX_PENDING_UPGRADES))),
+            pending,
             clock,
             shutdown: shutdown.clone(),
         };
@@ -304,7 +309,7 @@ impl Server {
         loop {
             tokio::select! {
                 (stream, peer) = unix.accept() => admission.admit(stream, peer),
-                Some((stream, peer)) = authenticated.recv() => admission.admit(stream, peer),
+                Some(tls) = authenticated.recv() => admission.serve(tls.stream, tls.peer, tls.slot, tls.deadline),
                 () = shutdown.cancelled() => break,
             }
         }
@@ -313,7 +318,8 @@ impl Server {
             let _stopped = accepting.await;
             // Every handshake task holds a sender, so the channel closes
             // once the last one has ended and closed its socket. One that
-            // authenticated meanwhile is dropped here, closed.
+            // authenticated meanwhile is dropped here, closed, and gives its
+            // slot back.
             while authenticated.recv().await.is_some() {}
         }
         drop(authenticated);
@@ -349,14 +355,24 @@ impl Admission {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let Ok(permit) = Arc::clone(&self.pending).try_acquire_owned() else {
-            tracing::warn!(
-                %peer,
-                max = MAX_PENDING_UPGRADES,
-                "control connection refused: too many connections awaiting the upgrade"
-            );
+        let Some(slot) = upgrade_slot(&self.pending, &peer) else {
             return;
         };
+        self.serve(stream, peer, slot, self.clock.sleep(UPGRADE_TIMEOUT));
+    }
+
+    /// Serves `stream`, whose peer is `peer`, up to its upgrade, in the
+    /// pending `slot` it was given, and closes it at `deadline` if it has
+    /// not upgraded by then.
+    fn serve<S>(
+        &self,
+        stream: S,
+        peer: PeerInfo,
+        slot: OwnedSemaphorePermit,
+        deadline: BoxFuture<'static, ()>,
+    ) where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
         let service = TowerToHyperService::new(self.app.clone().layer(Extension(peer.clone())));
         let connection = self
             .http
@@ -364,15 +380,27 @@ impl Admission {
             .with_upgrades();
         spawn_named(
             "api.handshake",
-            handshake(
-                connection,
-                self.clock.sleep(UPGRADE_TIMEOUT),
-                self.shutdown.clone(),
-                peer,
-                permit,
-            ),
+            handshake(connection, deadline, self.shutdown.clone(), peer, slot),
         );
     }
+}
+
+/// A place among the [`MAX_PENDING_UPGRADES`] connections awaiting their
+/// upgrade, from `pending`, for `peer`; `None`, logged, when there is none
+/// and the connection is to be closed without a response.
+pub(crate) fn upgrade_slot(
+    pending: &Arc<Semaphore>,
+    peer: &PeerInfo,
+) -> Option<OwnedSemaphorePermit> {
+    let slot = Arc::clone(pending).try_acquire_owned().ok();
+    if slot.is_none() {
+        tracing::warn!(
+            %peer,
+            max = MAX_PENDING_UPGRADES,
+            "control connection refused: too many connections awaiting the upgrade"
+        );
+    }
+    slot
 }
 
 /// Drives one connection from accept to the upgrade, after which the
