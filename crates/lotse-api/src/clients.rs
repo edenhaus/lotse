@@ -21,9 +21,10 @@
 //! is enrolled.
 
 use std::collections::{BTreeSet, HashSet};
+use std::fs::File;
 use std::io::{self, Write as _};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError, RwLock};
 
@@ -122,10 +123,16 @@ pub(crate) struct ClientStore {
 }
 
 impl ClientStore {
-    /// Makes `<data_dir>/clients` if it is missing, owned by `runtime`
-    /// (the uid and gid the daemon runs as after the drop) and mode 0700,
-    /// checks it, and reads the enrolled pins. Runs before the drop.
+    /// Makes [`CLIENTS_DIR`] in the data directory `data` (opened and
+    /// checked by the caller; `data_dir` only names it) if it is missing,
+    /// owned by `runtime` (the uid and gid the daemon runs as after the
+    /// drop) and mode 0700, checks it, locks it, and reads the enrolled
+    /// pins. Every step goes through a descriptor: [`CLIENTS_DIR`] is made
+    /// and opened in `data`, [`PINS_FILE`] in [`CLIENTS_DIR`], neither
+    /// through a link, and each is checked as opened, so no path is looked
+    /// up twice. Runs before the drop.
     pub(crate) fn open(
+        data: &File,
         data_dir: &Path,
         fixed: &[Fingerprint],
         runtime: (u32, u32),
@@ -134,28 +141,31 @@ impl ClientStore {
         let text = dir.display().to_string();
         let io = |source: io::Error| io_error(&text, source);
         // A directory that exists already, or could not be made, is
-        // judged by the check below.
-        if std::fs::DirBuilder::new().mode(0o700).create(&dir).is_ok() {
-            std::os::unix::fs::chown(&dir, Some(runtime.0), Some(runtime.1)).map_err(io)?;
+        // judged by the checks below.
+        let made = rustix::fs::mkdirat(data, CLIENTS_DIR, Mode::RWXU).is_ok();
+        let handle = rustix::fs::openat(data, CLIENTS_DIR, OPEN, Mode::empty())
+            .map_err(io::Error::from)
+            .map_err(io)?;
+        let handle = File::from(handle);
+        if made {
+            std::os::unix::fs::fchown(&handle, Some(runtime.0), Some(runtime.1)).map_err(io)?;
             // Its entry in the data directory survives a crash too, or the
             // first enrollment synced inside it could vanish with it.
-            std::fs::File::open(data_dir)
-                .and_then(|parent| parent.sync_all())
-                .map_err(io)?;
+            data.sync_all().map_err(io)?;
         }
         check(
             &text,
-            &std::fs::symlink_metadata(&dir).map_err(io)?,
+            &handle.metadata().map_err(io)?,
             "directory",
             runtime.0,
         )?;
-        // Close-on-exec, as `std` opens every file: no worker inherits it.
-        let dir_fd = OwnedFd::from(std::fs::File::open(&dir).map_err(io)?);
-        match rustix::fs::flock(&dir_fd, FlockOperation::NonBlockingLockExclusive) {
+        match rustix::fs::flock(&handle, FlockOperation::NonBlockingLockExclusive) {
             Err(err) if err == Errno::WOULDBLOCK => return Err(ClientsError::InUse(text.clone())),
             locked => locked.map_err(io::Error::from).map_err(io)?,
         }
-        let enrolled = read_pins(&dir.join(PINS_FILE), runtime.0)?;
+        let enrolled = read_pins(&handle, &dir.join(PINS_FILE), runtime.0)?;
+        // Close-on-exec, as `OPEN` asks: no worker inherits it.
+        let dir_fd = OwnedFd::from(handle);
         tracing::info!(
             fixed = fixed.len(),
             enrolled = enrolled.len(),
@@ -286,17 +296,28 @@ fn check(
     Ok(())
 }
 
-/// The pins in `path`, none when it does not exist. Blank lines are
-/// skipped; anything else must be a pin.
-fn read_pins(path: &Path, owner: u32) -> Result<BTreeSet<Fingerprint>, ClientsError> {
+/// How [`ClientStore::open`] opens [`CLIENTS_DIR`] and [`read_pins`]
+/// [`PINS_FILE`]: read-only, a link in its place refused rather than
+/// followed, a FIFO opened without waiting for a writer (POSIX.1-2024
+/// `open()`) so the check after the open refuses it, close-on-exec.
+const OPEN: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::CLOEXEC);
+
+/// The pins in [`PINS_FILE`] in the directory `dir`, which `path` names,
+/// none when it does not exist. Blank lines are skipped; anything else
+/// must be a pin.
+fn read_pins(dir: &File, path: &Path, owner: u32) -> Result<BTreeSet<Fingerprint>, ClientsError> {
     let text = path.display().to_string();
     let io = |source: io::Error| io_error(&text, source);
-    let meta = match std::fs::symlink_metadata(path) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        found => found.map_err(io)?,
+    let mut file = match rustix::fs::openat(dir, PINS_FILE, OPEN, Mode::empty()) {
+        Err(err) if err == Errno::NOENT => return Ok(BTreeSet::new()),
+        opened => File::from(opened.map_err(io::Error::from).map_err(io)?),
     };
-    check(&text, &meta, "regular file", owner)?;
-    let content = std::fs::read_to_string(path).map_err(io)?;
+    check(&text, &file.metadata().map_err(io)?, "regular file", owner)?;
+    let mut content = String::new();
+    io::Read::read_to_string(&mut file, &mut content).map_err(io)?;
     let mut pins = BTreeSet::new();
     for (index, line) in content.lines().enumerate() {
         let line_number = index.saturating_add(1);
@@ -330,7 +351,7 @@ const PRIVATE: Mode = Mode::RUSR.union(Mode::WUSR);
 fn write_pins(dir: &OwnedFd, pins: &BTreeSet<Fingerprint>) -> io::Result<()> {
     let _stale = rustix::fs::unlinkat(dir, PARTIAL_FILE, AtFlags::empty());
     let fd = rustix::fs::openat(dir, PARTIAL_FILE, CREATE, PRIVATE)?;
-    let mut file = std::fs::File::from(fd);
+    let mut file = File::from(fd);
     let mut content = String::new();
     for pin in pins {
         content.push_str(&pin.to_string());
@@ -351,7 +372,7 @@ mod tests {
         reason = "test code"
     )]
 
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
     use super::*;
 
@@ -360,6 +381,15 @@ mod tests {
         let _gone = std::fs::remove_dir_all(&dir);
         std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         dir
+    }
+
+    /// The store in the data directory `dir`, opened as the caller does.
+    fn open(
+        dir: &Path,
+        fixed: &[Fingerprint],
+        runtime: (u32, u32),
+    ) -> Result<ClientStore, ClientsError> {
+        ClientStore::open(&File::open(dir).unwrap(), dir, fixed, runtime)
     }
 
     fn runtime() -> (u32, u32) {
@@ -373,7 +403,7 @@ mod tests {
     fn the_directory_is_made_private_and_enrolled_pins_survive_a_restart() {
         let dir = data_dir("enroll");
         let fixed = Fingerprint::of(b"fixed");
-        let store = ClientStore::open(&dir, &[fixed], runtime()).unwrap();
+        let store = open(&dir, &[fixed], runtime()).unwrap();
         let clients = dir.join(CLIENTS_DIR);
         assert_eq!(store.dir(), clients);
         let meta = std::fs::metadata(&clients).unwrap();
@@ -395,7 +425,7 @@ mod tests {
         assert!(!clients.join(PARTIAL_FILE).exists());
 
         drop(store);
-        let again = ClientStore::open(&dir, &[], runtime()).unwrap();
+        let again = open(&dir, &[], runtime()).unwrap();
         assert!(again.allows(&enrolled), "read back after a restart");
         assert!(
             !again.allows(&fixed),
@@ -407,7 +437,7 @@ mod tests {
     #[test]
     fn no_pins_means_empty_and_blank_lines_are_skipped() {
         let dir = data_dir("empty");
-        let store = ClientStore::open(&dir, &[], runtime()).unwrap();
+        let store = open(&dir, &[], runtime()).unwrap();
         assert!(store.is_empty());
         let file = dir.join(CLIENTS_DIR).join(PINS_FILE);
         let pin = Fingerprint::of(b"pin");
@@ -416,7 +446,7 @@ mod tests {
         let mut out = options.open(&file).unwrap();
         write!(out, "\n  {pin}  \n\n").unwrap();
         drop(store);
-        let store = ClientStore::open(&dir, &[], runtime()).unwrap();
+        let store = open(&dir, &[], runtime()).unwrap();
         assert!(store.allows(&pin));
         assert!(!store.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -431,7 +461,7 @@ mod tests {
             .create(&clients)
             .unwrap();
         std::fs::set_permissions(&clients, std::fs::Permissions::from_mode(0o750)).unwrap();
-        let err = ClientStore::open(&dir, &[], runtime()).unwrap_err();
+        let err = open(&dir, &[], runtime()).unwrap_err();
         assert!(
             matches!(err, ClientsError::Mode { mode: 0o750, .. }),
             "{err}"
@@ -439,29 +469,29 @@ mod tests {
         assert!(err.to_string().contains("0750"), "{err}");
         std::fs::set_permissions(&clients, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (uid, gid) = runtime();
-        let err = ClientStore::open(&dir, &[], (uid.wrapping_add(1), gid)).unwrap_err();
+        let err = open(&dir, &[], (uid.wrapping_add(1), gid)).unwrap_err();
         assert!(matches!(err, ClientsError::Owner { .. }), "{err}");
 
         let file = clients.join(PINS_FILE);
         std::fs::write(&file, b"").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = ClientStore::open(&dir, &[], runtime()).unwrap_err();
+        let err = open(&dir, &[], runtime()).unwrap_err();
         assert!(
             matches!(err, ClientsError::Mode { mode: 0o644, .. }),
             "{err}"
         );
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(&file, b"\xff not UTF-8\n").unwrap();
-        let err = ClientStore::open(&dir, &[], runtime()).unwrap_err();
+        let err = open(&dir, &[], runtime()).unwrap_err();
         assert!(matches!(err, ClientsError::Io { .. }), "{err}");
         std::fs::write(&file, b"not a pin\n").unwrap();
-        let err = ClientStore::open(&dir, &[], runtime()).unwrap_err();
+        let err = open(&dir, &[], runtime()).unwrap_err();
         assert!(matches!(err, ClientsError::Pin { line: 1, .. }), "{err}");
         assert!(err.to_string().contains("line 1"), "{err}");
 
         std::fs::remove_file(&file).unwrap();
         std::fs::DirBuilder::new().create(&file).unwrap();
-        let err = ClientStore::open(&dir, &[], runtime()).unwrap_err();
+        let err = open(&dir, &[], runtime()).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -473,16 +503,26 @@ mod tests {
             "{err}"
         );
         std::fs::remove_dir(&file).unwrap();
-        std::os::unix::fs::symlink(&file, &file).unwrap();
-        let err = ClientStore::open(&dir, &[], runtime()).unwrap_err();
-        assert!(
-            matches!(err, ClientsError::Kind { .. }),
-            "a link is not a file: {err}"
-        );
-
+        // A link in its place is refused, not followed, even to a valid
+        // list.
+        let elsewhere = data_dir("refuse-target");
+        let valid = elsewhere.join(PINS_FILE);
+        std::fs::write(&valid, b"").unwrap();
+        std::fs::set_permissions(&valid, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&valid, &file).unwrap();
+        let err = open(&dir, &[], runtime()).unwrap_err();
+        assert!(matches!(err, ClientsError::Io { .. }), "{err}");
+        // So is one in the directory's place.
         std::fs::remove_dir_all(&clients).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &clients).unwrap();
+        let err = open(&dir, &[], runtime()).unwrap_err();
+        assert!(matches!(err, ClientsError::Io { .. }), "{err}");
+        assert!(!elsewhere.join(PARTIAL_FILE).exists());
+        std::fs::remove_file(&clients).unwrap();
+        std::fs::remove_dir_all(&elsewhere).unwrap();
+
         std::fs::write(&clients, b"").unwrap();
-        let err = ClientStore::open(&dir, &[], runtime()).unwrap_err();
+        let err = open(&dir, &[], runtime()).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -493,20 +533,57 @@ mod tests {
             ),
             "{err}"
         );
-        let err = ClientStore::open(&dir.join("missing"), &[], runtime()).unwrap_err();
-        assert!(matches!(err, ClientsError::Io { .. }), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_store_is_made_in_the_data_directory_checked_not_the_one_its_path_names_now() {
+        let dir = data_dir("swap");
+        let data = File::open(&dir).unwrap();
+        // Someone who may rename in the parent swaps another directory in.
+        let checked = PathBuf::from(format!("{}-checked", dir.display()));
+        let _gone = std::fs::remove_dir_all(&checked);
+        std::fs::rename(&dir, &checked).unwrap();
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let store = ClientStore::open(&data, &dir, &[], runtime()).unwrap();
+        store.enroll(Fingerprint::of(b"pin")).unwrap();
+        assert!(!dir.join(CLIENTS_DIR).exists(), "not made in the swap");
+        assert!(checked.join(CLIENTS_DIR).join(PINS_FILE).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&checked).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn posix_open_a_fifo_as_the_pins_is_refused_not_waited_on() {
+        let dir = data_dir("fifo");
+        drop(open(&dir, &[], runtime()).unwrap());
+        let clients = File::open(dir.join(CLIENTS_DIR)).unwrap();
+        rustix::fs::mkfifoat(&clients, PINS_FILE, PRIVATE).unwrap();
+        // No writer ever opens it: without `O_NONBLOCK` this would hang.
+        let err = open(&dir, &[], runtime()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientsError::Kind {
+                    expected: "regular file",
+                    ..
+                }
+            ),
+            "{err}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_second_store_on_the_directory_is_refused_while_the_first_lives() {
         let dir = data_dir("in-use");
-        let first = ClientStore::open(&dir, &[], runtime()).unwrap();
-        let err = ClientStore::open(&dir, &[], runtime()).unwrap_err();
+        let first = open(&dir, &[], runtime()).unwrap();
+        let err = open(&dir, &[], runtime()).unwrap_err();
         assert!(matches!(err, ClientsError::InUse(_)), "{err}");
         assert!(err.to_string().contains("another lotse daemon"), "{err}");
         drop(first);
-        ClientStore::open(&dir, &[], runtime()).unwrap();
+        open(&dir, &[], runtime()).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -514,7 +591,7 @@ mod tests {
     fn a_failed_sync_after_the_rename_keeps_the_enrollment_and_says_so() {
         let (logs, _guard) = crate::pairing::test_support::capture();
         let dir = data_dir("sync-fails");
-        let store = ClientStore::open(&dir, &[], runtime())
+        let store = open(&dir, &[], runtime())
             .unwrap()
             .with_sync_dir(|_| Err(io::Error::other("disk")));
         let pin = Fingerprint::of(b"pin");
@@ -534,13 +611,11 @@ mod tests {
     #[test]
     fn a_write_in_progress_does_not_hold_up_the_readers() {
         let dir = data_dir("readers");
-        let store = ClientStore::open(&dir, &[], runtime())
-            .unwrap()
-            .with_sync_dir(|_| {
-                SYNCING.wait();
-                SYNCING.wait();
-                Ok(())
-            });
+        let store = open(&dir, &[], runtime()).unwrap().with_sync_dir(|_| {
+            SYNCING.wait();
+            SYNCING.wait();
+            Ok(())
+        });
         let pin = Fingerprint::of(b"pin");
         std::thread::scope(|scope| {
             let writer = scope.spawn(|| store.enroll(pin));
@@ -557,7 +632,7 @@ mod tests {
     #[test]
     fn a_failed_write_keeps_the_pin_out() {
         let dir = data_dir("write-fails");
-        let store = ClientStore::open(&dir, &[], runtime()).unwrap();
+        let store = open(&dir, &[], runtime()).unwrap();
         // A directory where the partial file goes: it can be neither
         // removed as a file nor created.
         std::fs::DirBuilder::new()

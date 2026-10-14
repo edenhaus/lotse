@@ -274,6 +274,15 @@ struct PairRequest {
 /// (either case); `None` for anything else. Runs on bytes from a client
 /// that only proved it holds some key: it never panics (fuzzed).
 pub fn parse_request(body: &[u8]) -> Option<[u8; SECRET_BYTES]> {
+    // RFC 8259 §2, §4: an object, so `{` after any whitespace. serde reads
+    // a struct from an array too (`["<32 hex digits>"]`), which is not the
+    // request.
+    let start = body
+        .iter()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
+    if start != Some(&b'{') {
+        return None;
+    }
     let request: PairRequest = serde_json::from_slice(body).ok()?;
     let digits = request.secret.as_bytes();
     if digits.len() != SECRET_BYTES.saturating_mul(2) || !digits.iter().all(u8::is_ascii_hexdigit) {
@@ -617,7 +626,8 @@ mod tests {
             rustix::process::getuid().as_raw(),
             rustix::process::getgid().as_raw(),
         );
-        let store = ClientStore::open(&dir, &[], runtime).unwrap();
+        let data = std::fs::File::open(&dir).unwrap();
+        let store = ClientStore::open(&data, &dir, &[], runtime).unwrap();
         (dir, store)
     }
 
@@ -729,6 +739,12 @@ mod tests {
         assert_eq!(hex(&parsed), secret);
         let upper = format!(r#"{{"secret":"{}"}}"#, secret.to_uppercase());
         assert_eq!(parse_request(upper.as_bytes()), Some(parsed));
+        let spaced = format!(" \t\r\n{{\"secret\":\"{secret}\"}} ");
+        assert_eq!(
+            parse_request(spaced.as_bytes()),
+            Some(parsed),
+            "§2 whitespace"
+        );
         for (case, bad) in [
             String::new(),
             "{}".to_owned(),
@@ -739,6 +755,10 @@ mod tests {
             format!(r#"{{"secret":"+{}"}}"#, &secret[1..]),
             format!(r#"{{"secret":"g{}"}}"#, &secret[1..]),
             format!(r#"{{"secret":"é{}"}}"#, &secret[2..]),
+            // An array: serde reads a struct from one, the request is an
+            // object. Found by the `pair_request` fuzz target.
+            format!(r#"["{secret}"]"#),
+            format!(r#" ["{secret}"]"#),
         ]
         .iter()
         .enumerate()

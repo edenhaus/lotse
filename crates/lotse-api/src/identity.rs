@@ -263,7 +263,11 @@ fn open_directory(dir: &Path) -> io::Result<File> {
 /// directory make and read the identity one at a time, so neither removes
 /// the other's partial file or renames over the identity the other
 /// already serves.
-fn checked_directory(dir: &Path, owner_uid: u32, lock: bool) -> Result<File, IdentityError> {
+pub(crate) fn checked_directory(
+    dir: &Path,
+    owner_uid: u32,
+    lock: bool,
+) -> Result<File, IdentityError> {
     let text = dir.display().to_string();
     let directory = |source| directory_error(&text, source);
     let handle = open_directory(dir).map_err(directory)?;

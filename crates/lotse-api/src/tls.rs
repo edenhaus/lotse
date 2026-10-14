@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use lotse_core::backoff::AcceptBackoff;
@@ -138,7 +138,15 @@ pub(crate) fn bind(settings: &TlsConfig, owner_uid: u32) -> Result<BoundTls, Bin
         &rustls::crypto::ring::default_provider(),
     )
     .map_err(BindError::Tls)?;
-    let store = ClientStore::open(&settings.data_dir, &settings.clients, settings.state_owner)?;
+    // Checked as the identity's was, and used through this descriptor
+    // from here on.
+    let data = crate::identity::checked_directory(&settings.data_dir, owner_uid, false)?;
+    let store = ClientStore::open(
+        &data,
+        &settings.data_dir,
+        &settings.clients,
+        settings.state_owner,
+    )?;
     let tcp = |source| BindError::TlsListen {
         addr: settings.listen,
         source,
@@ -446,20 +454,21 @@ pub(crate) fn announce_first_code(
     );
     spawn_named(
         "api.pairing_expiry",
-        first_code_expired(Arc::clone(store), Arc::clone(clock), shutdown.clone()),
+        first_code_expired(Arc::downgrade(store), Arc::clone(clock), shutdown.clone()),
     );
 }
 
 /// After the first code's lifetime, tells how to get a new one if still
-/// no client is enrolled.
+/// no client is enrolled. It holds the store only weakly: waiting, it
+/// keeps neither the store nor its directory's lock alive past the server.
 async fn first_code_expired(
-    store: Arc<ClientStore>,
+    store: Weak<ClientStore>,
     clock: Arc<dyn Clock>,
     shutdown: CancellationToken,
 ) {
     tokio::select! {
         () = clock.sleep(CODE_LIFETIME) => {
-            if store.is_empty() {
+            if store.upgrade().is_some_and(|store| store.is_empty()) {
                 tracing::info!("no control client paired and the first pairing code expired; get a new one with `lotse pair`");
             }
         }
@@ -764,6 +773,31 @@ mod tests {
         );
         assert!(verifier.root_hint_subjects().is_empty());
         assert_eq!(verifier.supported_verify_schemes(), VERIFY_SCHEMES);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_waiting_first_code_expiry_keeps_neither_the_store_nor_its_lock() {
+        let (captured, _guard) = pairing::test_support::capture();
+        let (bound, dir) = bound("expiry");
+        let fake = Arc::new(lotse_core::clock::FakeClock::default());
+        let clock: Arc<dyn Clock> = Arc::<lotse_core::clock::FakeClock>::clone(&fake);
+        let pairing = bound.pairing(Arc::clone(&clock));
+        let shutdown = CancellationToken::new();
+        announce_first_code(&pairing, &bound.store, &clock, &shutdown);
+        tokio::task::yield_now().await;
+        // The server is gone, its expiry still waiting: a restart in this
+        // runtime gets the directory at once.
+        drop(bound);
+        let runtime = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        let data = std::fs::File::open(&dir).unwrap();
+        ClientStore::open(&data, &dir, &[], runtime).unwrap();
+        fake.advance(CODE_LIFETIME);
+        tokio::task::yield_now().await;
+        assert!(!captured.text().contains("first pairing code expired"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
