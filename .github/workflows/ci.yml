@@ -18,7 +18,7 @@ name: CI
 # Caches: every run saves its Rust caches and restores the newest that fits. GitHub scopes a
 # PR's caches to that PR, so its next push starts from its own last build, and a new PR starts from
 # main's; the tools come from mise's cache, the browser test's Python packages from uv's, prek's
-# hooks from prek's.
+# hooks from prek's. The Fuzz jobs carry each target's corpus over the same way.
 
 on:
   push:
@@ -488,6 +488,12 @@ jobs:
 
   # Each group of targets at once (scripts/fuzz-parallel.sh), from the Fuzz build job's binaries:
   # 60 s each, 5 min each nightly. A failing input and the logs are uploaded.
+  #
+  # Each target's corpus is a cache of its own, so it carries over however the targets are
+  # grouped: the group's targets fill up to 4 fixed slots, t0 to t3, and each filled slot restores
+  # its target's newest corpus and saves the grown one. A cache is immutable, so every run saves
+  # under a key of its own and restores the newest by the target's prefix; scripts/fuzz.sh
+  # minimizes each corpus after a run without a finding, which keeps every saved one small.
   fuzz:
     name: Fuzz (${{ matrix.group }})
     needs: fuzz-build
@@ -515,12 +521,80 @@ jobs:
           mkdir "$FUZZ_BIN_DIR"
           # shellcheck disable=SC2086 # one argument per target
           tar --zstd -xf fuzz-targets.tar.zst -C "$FUZZ_BIN_DIR" $GROUP
+      - name: Fill the corpus slots
+        id: slots
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          # shellcheck disable=SC2086 # one argument per target
+          set -- $GROUP
+          [ "$#" -le 4 ] || { echo "::error::$# targets in one group, 4 corpus slots"; exit 1; }
+          slot=0
+          for target; do
+            echo "t$slot=$target" | tee -a "$GITHUB_OUTPUT"
+            slot=$((slot + 1))
+          done
+      - name: Restore the corpus of ${{ steps.slots.outputs.t0 }}
+        if: steps.slots.outputs.t0 != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ steps.slots.outputs.t0 }}
+          key: fuzz-corpus-${{ steps.slots.outputs.t0 }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-${{ steps.slots.outputs.t0 }}-
+      - name: Restore the corpus of ${{ steps.slots.outputs.t1 }}
+        if: steps.slots.outputs.t1 != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ steps.slots.outputs.t1 }}
+          key: fuzz-corpus-${{ steps.slots.outputs.t1 }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-${{ steps.slots.outputs.t1 }}-
+      - name: Restore the corpus of ${{ steps.slots.outputs.t2 }}
+        if: steps.slots.outputs.t2 != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ steps.slots.outputs.t2 }}
+          key: fuzz-corpus-${{ steps.slots.outputs.t2 }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-${{ steps.slots.outputs.t2 }}-
+      - name: Restore the corpus of ${{ steps.slots.outputs.t3 }}
+        if: steps.slots.outputs.t3 != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ steps.slots.outputs.t3 }}
+          key: fuzz-corpus-${{ steps.slots.outputs.t3 }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-${{ steps.slots.outputs.t3 }}-
       - name: Fuzz the group's targets for ${{ env.SECS }} s each
+        id: fuzz
         env:
           GROUP: ${{ matrix.group }}
         run: |
           # shellcheck disable=SC2086 # one argument per target
           scripts/fuzz-parallel.sh "$SECS" $GROUP
+      # Saved whenever the targets ran, a finding included (the failing input is an artifact, never
+      # in the corpus); not after a cancellation or timeout, which may stop scripts/fuzz.sh mid-merge.
+      - name: Save the corpus of ${{ steps.slots.outputs.t0 }}
+        if: ${{ !cancelled() && steps.fuzz.outcome != 'skipped' && steps.slots.outputs.t0 != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ steps.slots.outputs.t0 }}
+          key: fuzz-corpus-${{ steps.slots.outputs.t0 }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save the corpus of ${{ steps.slots.outputs.t1 }}
+        if: ${{ !cancelled() && steps.fuzz.outcome != 'skipped' && steps.slots.outputs.t1 != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ steps.slots.outputs.t1 }}
+          key: fuzz-corpus-${{ steps.slots.outputs.t1 }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save the corpus of ${{ steps.slots.outputs.t2 }}
+        if: ${{ !cancelled() && steps.fuzz.outcome != 'skipped' && steps.slots.outputs.t2 != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ steps.slots.outputs.t2 }}
+          key: fuzz-corpus-${{ steps.slots.outputs.t2 }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save the corpus of ${{ steps.slots.outputs.t3 }}
+        if: ${{ !cancelled() && steps.fuzz.outcome != 'skipped' && steps.slots.outputs.t3 != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ steps.slots.outputs.t3 }}
+          key: fuzz-corpus-${{ steps.slots.outputs.t3 }}-${{ github.run_id }}-${{ github.run_attempt }}
       - if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
