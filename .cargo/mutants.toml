@@ -54,6 +54,14 @@ exclude_re = [
     "h265/packet.rs:\\d+:27: replace > with >= in PacketNormalizer::pack_units",
     # retina's RTP channel is even, so OR-ing in the RTCP bit and XOR-ing it set the same channel.
     "lotse-rtsp/src/udp.rs:.*replace \\| with \\^ in UdpRelay::datagram$",
+    # The open flags and modes are disjoint bits, so `|` and `^` produce the same flags.
+    "identity.rs:.*replace \\| with \\^ in (ServerIdentity::load_in|open_directory|write_new)$",
+    # `write_new` unlinks the partial file's name just before, in a directory only the owner
+    # may write (checked) and only this start uses (locked), and nothing runs a program
+    # meanwhile: `O_EXCL`, `O_NOFOLLOW` and `O_CLOEXEC` guard what cannot happen there, so
+    # dropping them changes nothing a test can see. Column 60 drops `O_EXCL` and
+    # `O_NOFOLLOW`, column 79 `O_NOFOLLOW` and `O_CLOEXEC`.
+    "identity.rs:\\d+:(60|79): replace \\| with & in write_new$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
 ]

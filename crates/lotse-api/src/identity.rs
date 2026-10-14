@@ -180,12 +180,11 @@ impl ServerIdentity {
     }
 
     /// The identity in `dir`, which must exist, be a regular file that
-    /// only `owner_uid` can read, and hold a key and a certificate.
+    /// only `owner_uid` can read, and hold a key and a certificate. `dir`
+    /// is checked as [`Self::load_or_create`] checks it, so this reads
+    /// only an identity a start would serve.
     pub fn load(dir: &Path, owner_uid: u32) -> Result<Self, IdentityError> {
-        let handle = open_directory(dir).map_err(|source| IdentityError::Directory {
-            path: dir.display().to_string(),
-            source,
-        })?;
+        let handle = checked_directory(dir, owner_uid)?;
         Self::load_in(&handle, dir, owner_uid)
     }
 
@@ -254,23 +253,11 @@ fn open_directory(dir: &Path) -> io::Result<File> {
 }
 
 /// `dir` opened, refused when it is missing, not a directory, writable by
-/// the group or others, or not `owner_uid`'s, and held under an exclusive
-/// `flock` until the returned handle drops: two daemons sharing the
-/// directory make and read the identity one at a time, so neither removes
-/// the other's partial file or renames over the identity the other
-/// already serves.
-fn lock_directory(dir: &Path, owner_uid: u32) -> Result<File, IdentityError> {
+/// the group or others, or not `owner_uid`'s, so nobody else can have put
+/// or replaced what is in it.
+fn checked_directory(dir: &Path, owner_uid: u32) -> Result<File, IdentityError> {
     let text = dir.display().to_string();
-    let directory = |source: io::Error| {
-        if source.raw_os_error() == Some(Errno::NOTDIR.raw_os_error()) {
-            IdentityError::NotADirectory(text.clone())
-        } else {
-            IdentityError::Directory {
-                path: text.clone(),
-                source,
-            }
-        }
-    };
+    let directory = |source| directory_error(&text, source);
     let handle = open_directory(dir).map_err(directory)?;
     let meta = handle.metadata().map_err(directory)?;
     let mode = meta.mode() & 0o777;
@@ -287,8 +274,34 @@ fn lock_directory(dir: &Path, owner_uid: u32) -> Result<File, IdentityError> {
             expected: owner_uid,
         });
     }
-    handle.lock().map_err(directory)?;
     Ok(handle)
+}
+
+/// `dir` opened and checked by [`checked_directory`], and held under an
+/// exclusive `flock` until the returned handle drops: two daemons sharing
+/// the directory make and read the identity one at a time, so neither
+/// removes the other's partial file or renames over the identity the
+/// other already serves.
+fn lock_directory(dir: &Path, owner_uid: u32) -> Result<File, IdentityError> {
+    let handle = checked_directory(dir, owner_uid)?;
+    let text = dir.display().to_string();
+    handle
+        .lock()
+        .map_err(|source| directory_error(&text, source))?;
+    Ok(handle)
+}
+
+/// An error on the data directory `path`, which is not a directory when
+/// `source` says so.
+fn directory_error(path: &str, source: io::Error) -> IdentityError {
+    if source.raw_os_error() == Some(Errno::NOTDIR.raw_os_error()) {
+        IdentityError::NotADirectory(path.to_owned())
+    } else {
+        IdentityError::Directory {
+            path: path.to_owned(),
+            source,
+        }
+    }
 }
 
 /// A fresh key for `alg` and its self-signed certificate, as the PEM text
@@ -462,8 +475,20 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("0770"), "{err}");
+        // Reading checks the directory as a start does, even with an
+        // identity in it.
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ServerIdentity::load_or_create(&open, uid()).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let err = ServerIdentity::load(&open, uid()).unwrap_err();
+        assert!(
+            matches!(err, IdentityError::DirectoryMode { mode: 0o770, .. }),
+            "{err}"
+        );
         let private = data_dir("dir-owner", 0o750);
         let err = ServerIdentity::load_or_create(&private, uid().wrapping_add(1)).unwrap_err();
+        assert!(matches!(err, IdentityError::DirectoryOwner { .. }), "{err}");
+        let err = ServerIdentity::load(&private, uid().wrapping_add(1)).unwrap_err();
         assert!(matches!(err, IdentityError::DirectoryOwner { .. }), "{err}");
         let file = private.join("file");
         std::fs::write(&file, b"").unwrap();
@@ -491,7 +516,9 @@ mod tests {
             "{err}"
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
-        let err = ServerIdentity::load(&dir, uid().wrapping_add(1)).unwrap_err();
+        // The directory's owner is checked first; past it, the file's.
+        let handle = open_directory(&dir).unwrap();
+        let err = ServerIdentity::load_in(&handle, &dir, uid().wrapping_add(1)).unwrap_err();
         assert!(matches!(err, IdentityError::FileOwner { .. }), "{err}");
         assert!(
             ServerIdentity::load(&dir, uid()).is_ok(),
@@ -519,12 +546,15 @@ mod tests {
                 "{err}"
             );
         }
-        // A link in its place is refused, not followed, and not taken for
-        // a missing file.
+        // A link in its place is refused, not followed, even to a valid
+        // identity, and not taken for a missing file.
+        let elsewhere = data_dir("pem-link-target", 0o700);
+        ServerIdentity::load_or_create(&elsewhere, uid()).unwrap();
         std::fs::remove_file(&path).unwrap();
-        std::os::unix::fs::symlink(&path, &path).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join(IDENTITY_FILE), &path).unwrap();
         let err = ServerIdentity::load(&dir, uid()).unwrap_err();
         assert!(matches!(err, IdentityError::Io { .. }), "{err}");
+        std::fs::remove_dir_all(&elsewhere).unwrap();
         // A directory as the partial file cannot be replaced or opened.
         std::fs::remove_file(&path).unwrap();
         std::fs::DirBuilder::new()
