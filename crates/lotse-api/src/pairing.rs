@@ -17,9 +17,15 @@
 //! At most one code is open, for [`CODE_LIFETIME`] on the injected clock,
 //! and only in memory. A new one replaces it. A wrong secret leaves it open:
 //! a 128-bit secret cannot be guessed online, and closing the code would
-//! only let anyone stop the pairing. While no client is enrolled the
-//! daemon logs a code at startup; that is the one secret it ever logs, and
-//! it is useless once used or expired.
+//! only let anyone stop the pairing. A matching secret takes the code out
+//! while the pin is stored, so no second request can use it and nothing
+//! waits on the disk for the lock the handshakes read; a failed store puts
+//! it back, unless a new code replaced it meanwhile. The store runs to its
+//! end even when its connection is closed first, and the connection's
+//! admission lasts until then; one whose connection closed before it began
+//! stores nothing. While no client is enrolled the daemon logs a code at
+//! startup; that is the one secret it ever logs, and it is useless once
+//! used or expired.
 //!
 //! Standards: RFC 9110 §9.3.3 (`POST`), §15.3.5 (204), §15.5.1 (400),
 //! §15.5.4 (403), §15.5.11 (410), §15.6.1 (500); RFC 8259 (the JSON body);
@@ -46,12 +52,14 @@ use lotse_core::clock::Clock;
 use lotse_core::fingerprint::Fingerprint;
 use lotse_core::secret::Secret;
 use lotse_core::task::spawn_blocking_named;
+use lotse_core::task::spawn_named;
 use rustls::crypto::SecureRandom;
 use serde::Deserialize;
 use subtle::ConstantTimeEq as _;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::clients::ClientStore;
 use crate::{MAX_UPGRADE_HEADER_BYTES, MAX_UPGRADE_HEADERS};
@@ -87,10 +95,22 @@ struct OpenCode {
     expires: Instant,
 }
 
+/// The code slot, with a count of the codes opened so far: a redemption
+/// that took the code out puts it back only if no code was opened since.
+#[derive(Default)]
+struct Slot {
+    /// The open code, if any.
+    open: Option<OpenCode>,
+    /// Codes opened, wrapping.
+    generation: u64,
+}
+
 /// The pairing state: at most one open code.
 pub(crate) struct Pairing {
-    /// The open code, if any.
-    slot: Mutex<Option<OpenCode>>,
+    /// The open code. Its lock is only ever held to look at or change the
+    /// slot, never across storing a pin: the TLS verifier reads it on the
+    /// runtime's threads.
+    slot: Mutex<Slot>,
     /// The daemon's pin, the code's first part.
     server_pin: Fingerprint,
     /// Times the code's lifetime.
@@ -152,8 +172,12 @@ pub(crate) enum Redeemed {
     Enrolled,
     /// The secret is not the open code's; the code stays open.
     WrongSecret,
-    /// No code is open: it expired, or another client used it.
+    /// No code is open: it expired, or another client used it or is
+    /// using it.
     NoCode,
+    /// The connection closed before the request's turn: nothing was
+    /// tried.
+    Abandoned,
 }
 
 impl Pairing {
@@ -164,15 +188,15 @@ impl Pairing {
         random: &'static dyn SecureRandom,
     ) -> Self {
         Self {
-            slot: Mutex::new(None),
+            slot: Mutex::default(),
             server_pin,
             clock,
             random,
         }
     }
 
-    /// The open code, under the lock; a poisoned lock is still usable.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<OpenCode>> {
+    /// The slot, under the lock; a poisoned lock is still usable.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Slot> {
         self.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -183,10 +207,13 @@ impl Pairing {
         self.random.fill(&mut secret).ok()?;
         let expires = self.clock.now().checked_add(CODE_LIFETIME)?;
         let secret = Secret::new(secret);
-        *self.lock() = Some(OpenCode {
+        let mut slot = self.lock();
+        slot.open = Some(OpenCode {
             secret: secret.clone(),
             expires,
         });
+        slot.generation = slot.generation.wrapping_add(1);
+        drop(slot);
         Some(PairingCode {
             server_pin: self.server_pin,
             secret,
@@ -196,13 +223,17 @@ impl Pairing {
     /// Whether a code is open, so an unknown certificate may pair.
     pub(crate) fn is_open(&self) -> bool {
         let now = self.clock.now();
-        self.lock().as_ref().is_some_and(|open| now < open.expires)
+        self.lock()
+            .open
+            .as_ref()
+            .is_some_and(|open| now < open.expires)
     }
 
     /// Checks `secret` against the open code in constant time and, on a
-    /// match, runs `enroll` and closes the code, all under the lock, so a
-    /// code enrolls one client however many requests race. A failed
-    /// `enroll` leaves the code open. Blocking when `enroll` is.
+    /// match, takes the code out and runs `enroll` without the lock, so a
+    /// code enrolls one client however many requests race and the lock is
+    /// never held across `enroll`. A failed `enroll` puts the code back,
+    /// unless another was opened meanwhile. Blocking when `enroll` is.
     pub(crate) fn redeem(
         &self,
         secret: &[u8; SECRET_BYTES],
@@ -210,15 +241,23 @@ impl Pairing {
     ) -> io::Result<Redeemed> {
         let now = self.clock.now();
         let mut slot = self.lock();
-        let Some(open) = slot.as_ref().filter(|open| now < open.expires) else {
+        let Some(open) = slot.open.as_ref().filter(|open| now < open.expires) else {
             return Ok(Redeemed::NoCode);
         };
         if !bool::from(open.secret.expose_secret().ct_eq(secret)) {
             return Ok(Redeemed::WrongSecret);
         }
-        enroll()?;
-        *slot = None;
+        let taken = slot.open.take();
+        let generation = slot.generation;
         drop(slot);
+        if let Err(err) = enroll() {
+            let mut slot = self.lock();
+            if slot.generation == generation {
+                slot.open = taken;
+            }
+            drop(slot);
+            return Err(err);
+        }
         Ok(Redeemed::Enrolled)
     }
 }
@@ -252,18 +291,44 @@ pub fn parse_request(body: &[u8]) -> Option<[u8; SECRET_BYTES]> {
 #[derive(Clone)]
 pub(crate) struct PairContext {
     /// The open code.
-    pub(crate) pairing: Arc<Pairing>,
+    pairing: Arc<Pairing>,
     /// Where the pin is enrolled.
-    pub(crate) store: Arc<ClientStore>,
+    store: Arc<ClientStore>,
     /// The pin of the certificate the handshake proved.
-    pub(crate) pin: Fingerprint,
+    pin: Fingerprint,
     /// The client's address, for the log.
-    pub(crate) addr: SocketAddr,
+    addr: SocketAddr,
+    /// The connection's redemptions, which [`serve`] waits for: one runs
+    /// to its end even when its connection closes first.
+    redemptions: TaskTracker,
+    /// Cancelled once the connection is closed: a redemption that has not
+    /// begun by then does nothing.
+    closed: CancellationToken,
+}
+
+impl PairContext {
+    /// The context of a pairing connection from `addr`, whose handshake
+    /// proved `pin`.
+    pub(crate) fn new(
+        pairing: Arc<Pairing>,
+        store: Arc<ClientStore>,
+        pin: Fingerprint,
+        addr: SocketAddr,
+    ) -> Self {
+        Self {
+            pairing,
+            store,
+            pin,
+            addr,
+            redemptions: TaskTracker::new(),
+            closed: CancellationToken::new(),
+        }
+    }
 }
 
 /// Serves the one request a pairing connection may make, within
-/// [`PAIR_TIMEOUT`], then closes it. Anything but `POST /v1/pair` is 404
-/// (405 for another method on it).
+/// [`PAIR_TIMEOUT`], then closes it and waits for a redemption it began.
+/// Anything but `POST /v1/pair` is 404 (405 for another method on it).
 pub(crate) async fn serve(
     stream: TlsStream<TcpStream>,
     context: PairContext,
@@ -271,6 +336,7 @@ pub(crate) async fn serve(
     shutdown: CancellationToken,
 ) {
     let (pin, addr) = (context.pin, context.addr);
+    let (redemptions, closed) = (context.redemptions.clone(), context.closed.clone());
     let app = Router::new()
         .route(PAIR_PATH, post(pair))
         .layer(DefaultBodyLimit::max(MAX_PAIR_REQUEST_BYTES))
@@ -288,19 +354,19 @@ pub(crate) async fn serve(
         }
         () = shutdown.cancelled() => {}
     }
+    closed.cancel();
+    redemptions.close();
+    redemptions.wait().await;
 }
 
 /// `POST /v1/pair`: 204 once enrolled, 400 for a body that is not a
 /// secret, 403 for a wrong secret (the code stays open), 410 when no code
-/// is open any more, 500 when the pin could not be stored.
+/// is open any more, 500 when the pin could not be stored. The redemption
+/// is a task of its own, tracked by the connection, so it ends and is
+/// logged even if this handler is dropped with its connection.
 async fn pair(State(context): State<PairContext>, body: Bytes) -> Response {
-    let PairContext {
-        pairing,
-        store,
-        pin,
-        addr,
-    } = context;
     let Some(secret) = parse_request(&body) else {
+        let (pin, addr) = (context.pin, context.addr);
         tracing::info!(%addr, client_pin = %pin, "pairing request refused: not a secret");
         return error(
             StatusCode::BAD_REQUEST,
@@ -308,48 +374,74 @@ async fn pair(State(context): State<PairContext>, body: Bytes) -> Response {
             "the body must be {\"secret\": \"<32 hex digits>\"}",
         );
     };
-    let redeem = spawn_blocking_named("api.pair", move || {
-        pairing.redeem(&secret, || store.enroll(pin))
-    });
-    match redeem
+    let redemption = context
+        .redemptions
+        .track_future(redeem(context.clone(), secret));
+    match spawn_named("api.pair", redemption)
         .await
         .map_err(io::Error::other)
         .and_then(|redeemed| redeemed)
     {
-        Ok(Redeemed::Enrolled) => {
-            tracing::info!(
-                event = "control_client_enrolled",
-                client_pin = %pin,
-                %addr,
-                "control client enrolled by pairing"
-            );
-            StatusCode::NO_CONTENT.into_response()
+        Ok(Redeemed::Enrolled) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Redeemed::WrongSecret) => error(
+            StatusCode::FORBIDDEN,
+            ErrorCode::NotPermitted,
+            "the secret is not the open code's",
+        ),
+        Ok(Redeemed::NoCode | Redeemed::Abandoned) => error(
+            StatusCode::GONE,
+            ErrorCode::NotPermitted,
+            "no pairing code is open: it expired or was used",
+        ),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::InternalError,
+            "the client could not be stored",
+        ),
+    }
+}
+
+/// Redeems `secret` for the connection's pin on the blocking pool, unless
+/// the connection closed before its turn, and logs the outcome.
+async fn redeem(context: PairContext, secret: [u8; SECRET_BYTES]) -> io::Result<Redeemed> {
+    let PairContext {
+        pairing,
+        store,
+        pin,
+        addr,
+        closed,
+        ..
+    } = context;
+    let outcome = spawn_blocking_named("api.pair_store", move || {
+        if closed.is_cancelled() {
+            return Ok(Redeemed::Abandoned);
         }
+        pairing.redeem(&secret, || store.enroll(pin))
+    })
+    .await
+    .map_err(io::Error::other)
+    .and_then(|redeemed| redeemed);
+    match &outcome {
+        Ok(Redeemed::Enrolled) => tracing::info!(
+            event = "control_client_enrolled",
+            client_pin = %pin,
+            %addr,
+            "control client enrolled by pairing"
+        ),
         Ok(Redeemed::WrongSecret) => {
             tracing::warn!(%addr, client_pin = %pin, "pairing request refused: wrong secret");
-            error(
-                StatusCode::FORBIDDEN,
-                ErrorCode::NotPermitted,
-                "the secret is not the open code's",
-            )
         }
         Ok(Redeemed::NoCode) => {
             tracing::info!(%addr, client_pin = %pin, "pairing request refused: no code open");
-            error(
-                StatusCode::GONE,
-                ErrorCode::NotPermitted,
-                "no pairing code is open: it expired or was used",
-            )
+        }
+        Ok(Redeemed::Abandoned) => {
+            tracing::info!(%addr, client_pin = %pin, "pairing request dropped: its connection closed first");
         }
         Err(err) => {
             tracing::error!(%addr, client_pin = %pin, error = %err, "enrolling the paired client failed");
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorCode::InternalError,
-                "the client could not be stored",
-            )
         }
     }
+    outcome
 }
 
 /// A JSON error body.
@@ -366,9 +458,13 @@ mod tests {
         reason = "test code"
     )]
 
+    use std::os::unix::fs::DirBuilderExt as _;
+    use std::path::PathBuf;
+    use std::sync::Barrier;
+
     use lotse_core::clock::FakeClock;
 
-    use super::test_support::NO_RANDOM;
+    use super::test_support::{NO_RANDOM, capture};
     use super::*;
 
     fn pairing(clock: &Arc<FakeClock>) -> Pairing {
@@ -461,6 +557,149 @@ mod tests {
     }
 
     #[test]
+    fn a_matching_request_takes_the_code_out_while_it_stores_the_pin() {
+        let clock = Arc::new(FakeClock::default());
+        let pairing = pairing(&clock);
+        let code = pairing.open().unwrap();
+        let failed = pairing.redeem(&secret_of(&code), || {
+            // The lock is free: the handshakes' check and a racing request
+            // answer at once, and the code is no longer theirs.
+            assert!(!pairing.is_open());
+            assert_eq!(
+                pairing.redeem(&secret_of(&code), stored).unwrap(),
+                Redeemed::NoCode
+            );
+            Err(io::Error::other("disk"))
+        });
+        assert!(failed.is_err());
+        assert!(pairing.is_open(), "put back after the failed store");
+        assert_eq!(
+            pairing.redeem(&secret_of(&code), stored).unwrap(),
+            Redeemed::Enrolled
+        );
+    }
+
+    #[test]
+    fn a_failed_store_never_puts_back_a_code_a_new_one_replaced() {
+        let clock = Arc::new(FakeClock::default());
+        let pairing = pairing(&clock);
+        let first = pairing.open().unwrap();
+        let mut replacement = None;
+        let failed = pairing.redeem(&secret_of(&first), || {
+            replacement = pairing.open();
+            Err(io::Error::other("disk"))
+        });
+        assert!(failed.is_err());
+        let replacement = replacement.unwrap();
+        assert_eq!(
+            pairing.redeem(&secret_of(&first), stored).unwrap(),
+            Redeemed::WrongSecret,
+            "the replacement stays"
+        );
+        // Replaced and used meanwhile: the slot stays empty.
+        let failed = pairing.redeem(&secret_of(&replacement), || {
+            let newer = pairing.open().unwrap();
+            assert_eq!(
+                pairing.redeem(&secret_of(&newer), stored).unwrap(),
+                Redeemed::Enrolled
+            );
+            Err(io::Error::other("disk"))
+        });
+        assert!(failed.is_err());
+        assert!(!pairing.is_open());
+    }
+
+    fn store(name: &str) -> (PathBuf, ClientStore) {
+        let dir = std::env::temp_dir().join(format!("lotse-pairing-{name}-{}", std::process::id()));
+        let _gone = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let runtime = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        let store = ClientStore::open(&dir, &[], runtime).unwrap();
+        (dir, store)
+    }
+
+    fn addr() -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, 1], 50_000))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_redemption_is_logged_and_one_whose_connection_closed_first_stores_nothing() {
+        let (logs, _guard) = capture();
+        let (dir, store) = store("outcomes");
+        let store = Arc::new(store);
+        let clock = Arc::new(FakeClock::default());
+        let pairing = Arc::new(pairing(&clock));
+        let code = pairing.open().unwrap();
+        let pin = Fingerprint::of(b"client");
+        let context = || PairContext::new(Arc::clone(&pairing), Arc::clone(&store), pin, addr());
+        let closed = context();
+        closed.closed.cancel();
+        let outcome = redeem(closed, secret_of(&code)).await.unwrap();
+        assert_eq!(outcome, Redeemed::Abandoned);
+        assert!(pairing.is_open());
+        assert!(!store.allows(&pin));
+        assert!(logs.text().contains("its connection closed first"));
+        let outcome = redeem(context(), [0; SECRET_BYTES]).await.unwrap();
+        assert_eq!(outcome, Redeemed::WrongSecret);
+        assert!(logs.text().contains("wrong secret"));
+        let blocker = dir.join(crate::clients::CLIENTS_DIR).join("pins.partial");
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(redeem(context(), secret_of(&code)).await.is_err());
+        assert!(logs.text().contains("enrolling the paired client failed"));
+        std::fs::remove_dir(&blocker).unwrap();
+        let outcome = redeem(context(), secret_of(&code)).await.unwrap();
+        assert_eq!(outcome, Redeemed::Enrolled);
+        assert!(store.allows(&pin));
+        let outcome = redeem(context(), secret_of(&code)).await.unwrap();
+        assert_eq!(outcome, Redeemed::NoCode);
+        assert!(logs.text().contains("no code open"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Both sides of the store held open by
+    /// `a_redemption_outlives_its_connection_and_is_waited_for_and_logged`.
+    static STORING: Barrier = Barrier::new(2);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redemption_outlives_its_connection_and_is_waited_for_and_logged() {
+        let (logs, _guard) = capture();
+        let (dir, store) = store("outlives");
+        let store = Arc::new(store.with_sync_dir(|_| {
+            STORING.wait();
+            STORING.wait();
+            Ok(())
+        }));
+        let clock = Arc::new(FakeClock::default());
+        let pairing = Arc::new(pairing(&clock));
+        let code = pairing.open().unwrap();
+        let pin = Fingerprint::of(b"client");
+        let context = PairContext::new(Arc::clone(&pairing), Arc::clone(&store), pin, addr());
+        let (redemptions, closed) = (context.redemptions.clone(), context.closed.clone());
+        let body = format!(r#"{{"secret":"{}"}}"#, hex(&secret_of(&code)));
+        let handler = spawn_named("test.pair", pair(State(context), Bytes::from(body)));
+        spawn_blocking_named("test.storing", || STORING.wait())
+            .await
+            .unwrap();
+        // The connection closes mid-store, as `serve` closes it at the
+        // deadline: its handler is dropped, the store is not.
+        handler.abort();
+        closed.cancel();
+        redemptions.close();
+        assert_eq!(redemptions.len(), 1, "still storing");
+        spawn_blocking_named("test.stored", || STORING.wait())
+            .await
+            .unwrap();
+        redemptions.wait().await;
+        assert!(store.allows(&pin));
+        assert!(!pairing.is_open());
+        assert!(logs.text().contains("control client enrolled by pairing"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_code_expires_after_ten_minutes_on_the_clock() {
         let clock = Arc::new(FakeClock::default());
         let pairing = pairing(&clock);
@@ -490,7 +729,7 @@ mod tests {
         assert_eq!(hex(&parsed), secret);
         let upper = format!(r#"{{"secret":"{}"}}"#, secret.to_uppercase());
         assert_eq!(parse_request(upper.as_bytes()), Some(parsed));
-        for bad in [
+        for (case, bad) in [
             String::new(),
             "{}".to_owned(),
             r#"{"secret":1}"#.to_owned(),
@@ -500,8 +739,11 @@ mod tests {
             format!(r#"{{"secret":"+{}"}}"#, &secret[1..]),
             format!(r#"{{"secret":"g{}"}}"#, &secret[1..]),
             format!(r#"{{"secret":"é{}"}}"#, &secret[2..]),
-        ] {
-            assert_eq!(parse_request(bad.as_bytes()), None, "{bad}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(parse_request(bad.as_bytes()), None, "case {case}");
         }
     }
 }

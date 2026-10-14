@@ -557,12 +557,8 @@ async fn handshake(tcp: TcpStream, addr: SocketAddr, ticket: Ticket, h: Handshak
                 // In only because a code is open: it may pair and do
                 // nothing else, within the budget its ticket holds.
                 tracing::info!(%addr, client_pin = %pin, "pairing connection opened");
-                let context = PairContext {
-                    pairing: Arc::clone(&h.pairing),
-                    store: Arc::clone(&h.store),
-                    pin,
-                    addr,
-                };
+                let context =
+                    PairContext::new(Arc::clone(&h.pairing), Arc::clone(&h.store), pin, addr);
                 pairing::serve(stream, context, h.clock, h.shutdown).await;
                 drop(ticket);
                 return;

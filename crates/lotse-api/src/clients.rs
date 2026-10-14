@@ -9,21 +9,27 @@
 //! else. The data directory itself and the identity in it stay the
 //! starting uid's. The directory is opened before the drop and every write
 //! is relative to that descriptor (`openat`, `renameat`), so the dropped
-//! uid needs no access to the directories above it. The pins file is one
-//! pin per line, replaced whole on every change: written to a new file with
-//! mode 0600, synced, renamed into place and the directory synced, so a
-//! crash leaves the old list or the new one. Pins are public; the file is
-//! private so nobody else can read who is enrolled.
+//! uid needs no access to the directories above it. The directory is
+//! held under an exclusive `flock` for the store's lifetime, so a second
+//! daemon on the same data directory is refused rather than overwriting
+//! the enrollments of the first. The pins file is one pin per line,
+//! replaced whole on every change: written to a new file with mode 0600,
+//! synced, renamed into place and the directory synced, so a crash leaves
+//! the old list or the new one. The rename is the change: once it is done
+//! the new list is the one in force, even if the directory sync after it
+//! fails. Pins are public; the file is private so nobody else can read who
+//! is enrolled.
 
 use std::collections::{BTreeSet, HashSet};
 use std::io::{self, Write as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Mutex, PoisonError, RwLock};
 
 use lotse_core::fingerprint::Fingerprint;
-use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
+use rustix::io::Errno;
 
 /// The enrolled clients' directory in the data directory.
 pub(crate) const CLIENTS_DIR: &str = "clients";
@@ -80,6 +86,17 @@ pub enum ClientsError {
         /// The line, from 1.
         line: usize,
     },
+    /// Another daemon holds the directory.
+    #[error("enrolled clients {0} are in use by another lotse daemon on the same data directory")]
+    InUse(String),
+}
+
+/// Syncs [`CLIENTS_DIR`] after a rename in it.
+type SyncDir = fn(&OwnedFd) -> io::Result<()>;
+
+/// `fsync` of the directory, as every store but a test's does it.
+fn fsync_dir(dir: &OwnedFd) -> io::Result<()> {
+    Ok(rustix::fs::fsync(dir)?)
 }
 
 /// Who may connect: the fixed pins and the enrolled ones.
@@ -87,13 +104,21 @@ pub enum ClientsError {
 pub(crate) struct ClientStore {
     /// The configuration's pins, which no enrollment changes.
     fixed: HashSet<Fingerprint>,
-    /// The enrolled pins, as [`PINS_FILE`] holds them.
+    /// The enrolled pins, as [`PINS_FILE`] holds them. Its lock is only
+    /// ever held to read or to replace the set, never across a write to
+    /// disk: the TLS verifier reads it on the runtime's threads.
     enrolled: RwLock<BTreeSet<Fingerprint>>,
+    /// Held across a whole change of [`PINS_FILE`], so changes are written
+    /// one at a time and each starts from the set the last one left.
+    writing: Mutex<()>,
     /// [`CLIENTS_DIR`].
     dir: PathBuf,
-    /// [`CLIENTS_DIR`], opened before the privilege drop; every write is
-    /// relative to it.
+    /// [`CLIENTS_DIR`], opened before the privilege drop and locked for
+    /// the store's lifetime; every write is relative to it.
     dir_fd: OwnedFd,
+    /// Syncs [`CLIENTS_DIR`] after the rename: [`fsync_dir`], or a test's
+    /// fault.
+    sync_dir: SyncDir,
 }
 
 impl ClientStore {
@@ -112,6 +137,11 @@ impl ClientStore {
         // judged by the check below.
         if std::fs::DirBuilder::new().mode(0o700).create(&dir).is_ok() {
             std::os::unix::fs::chown(&dir, Some(runtime.0), Some(runtime.1)).map_err(io)?;
+            // Its entry in the data directory survives a crash too, or the
+            // first enrollment synced inside it could vanish with it.
+            std::fs::File::open(data_dir)
+                .and_then(|parent| parent.sync_all())
+                .map_err(io)?;
         }
         check(
             &text,
@@ -121,6 +151,10 @@ impl ClientStore {
         )?;
         // Close-on-exec, as `std` opens every file: no worker inherits it.
         let dir_fd = OwnedFd::from(std::fs::File::open(&dir).map_err(io)?);
+        match rustix::fs::flock(&dir_fd, FlockOperation::NonBlockingLockExclusive) {
+            Err(err) if err == Errno::WOULDBLOCK => return Err(ClientsError::InUse(text.clone())),
+            locked => locked.map_err(io::Error::from).map_err(io)?,
+        }
         let enrolled = read_pins(&dir.join(PINS_FILE), runtime.0)?;
         tracing::info!(
             fixed = fixed.len(),
@@ -130,9 +164,18 @@ impl ClientStore {
         Ok(Self {
             fixed: fixed.iter().copied().collect(),
             enrolled: RwLock::new(enrolled),
+            writing: Mutex::new(()),
             dir,
             dir_fd,
+            sync_dir: fsync_dir,
         })
+    }
+
+    /// This store with `sync_dir` in place of `fsync`, to fail or hold the
+    /// sync after the rename.
+    #[cfg(test)]
+    pub(crate) fn with_sync_dir(self, sync_dir: SyncDir) -> Self {
+        Self { sync_dir, ..self }
     }
 
     /// The directory the daemon writes at runtime, for the sandbox.
@@ -161,18 +204,41 @@ impl ClientStore {
     }
 
     /// Enrolls `pin`: the file first, then the set, so a pin is allowed
-    /// only once it is on disk. Blocking: run it off the runtime's threads.
+    /// only once it is on disk. An error means nothing changed. Once the
+    /// new file is renamed into place the pin is enrolled; a failed sync of
+    /// the directory after that is logged, as a crash could still lose the
+    /// enrollment. Blocking: run it off the runtime's threads.
     pub(crate) fn enroll(&self, pin: Fingerprint) -> io::Result<()> {
-        let mut enrolled = self
+        let writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = self
             .enrolled
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut next = enrolled.clone();
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         next.insert(pin);
         write_pins(&self.dir_fd, &next)?;
-        *enrolled = next;
-        drop(enrolled);
+        *self
+            .enrolled
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = next;
+        self.sync_after_rename(pin, "enrolled");
+        drop(writing);
         Ok(())
+    }
+
+    /// Syncs [`CLIENTS_DIR`] after [`PINS_FILE`] was renamed into place
+    /// for a `change` of `pin`. A failure is logged, not returned: the
+    /// change is made, and only a crash could still undo it.
+    fn sync_after_rename(&self, pin: Fingerprint, change: &'static str) {
+        if let Err(err) = (self.sync_dir)(&self.dir_fd) {
+            tracing::warn!(
+                path = %self.dir.display(),
+                client_pin = %pin,
+                change,
+                error = %err,
+                "enrolled clients changed, but syncing their directory failed: a crash may undo the change"
+            );
+        }
     }
 }
 
@@ -258,8 +324,9 @@ const CREATE: OFlags = OFlags::WRONLY
 const PRIVATE: Mode = Mode::RUSR.union(Mode::WUSR);
 
 /// Replaces [`PINS_FILE`] in the directory `dir` with `pins`: a new file
-/// with mode 0600, synced, renamed into place, the directory synced. A
-/// partial file a crash left behind is replaced.
+/// with mode 0600, synced and renamed into place; the caller syncs the
+/// directory. A partial file a crash left behind is replaced. An error
+/// means [`PINS_FILE`] is unchanged.
 fn write_pins(dir: &OwnedFd, pins: &BTreeSet<Fingerprint>) -> io::Result<()> {
     let _stale = rustix::fs::unlinkat(dir, PARTIAL_FILE, AtFlags::empty());
     let fd = rustix::fs::openat(dir, PARTIAL_FILE, CREATE, PRIVATE)?;
@@ -273,7 +340,6 @@ fn write_pins(dir: &OwnedFd, pins: &BTreeSet<Fingerprint>) -> io::Result<()> {
     file.sync_all()?;
     drop(file);
     rustix::fs::renameat(dir, PARTIAL_FILE, dir, PINS_FILE)?;
-    rustix::fs::fsync(dir)?;
     Ok(())
 }
 
@@ -328,6 +394,7 @@ mod tests {
         );
         assert!(!clients.join(PARTIAL_FILE).exists());
 
+        drop(store);
         let again = ClientStore::open(&dir, &[], runtime()).unwrap();
         assert!(again.allows(&enrolled), "read back after a restart");
         assert!(
@@ -348,6 +415,7 @@ mod tests {
         std::os::unix::fs::OpenOptionsExt::mode(options.write(true).create_new(true), 0o600);
         let mut out = options.open(&file).unwrap();
         write!(out, "\n  {pin}  \n\n").unwrap();
+        drop(store);
         let store = ClientStore::open(&dir, &[], runtime()).unwrap();
         assert!(store.allows(&pin));
         assert!(!store.is_empty());
@@ -427,6 +495,62 @@ mod tests {
         );
         let err = ClientStore::open(&dir.join("missing"), &[], runtime()).unwrap_err();
         assert!(matches!(err, ClientsError::Io { .. }), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_second_store_on_the_directory_is_refused_while_the_first_lives() {
+        let dir = data_dir("in-use");
+        let first = ClientStore::open(&dir, &[], runtime()).unwrap();
+        let err = ClientStore::open(&dir, &[], runtime()).unwrap_err();
+        assert!(matches!(err, ClientsError::InUse(_)), "{err}");
+        assert!(err.to_string().contains("another lotse daemon"), "{err}");
+        drop(first);
+        ClientStore::open(&dir, &[], runtime()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_sync_after_the_rename_keeps_the_enrollment_and_says_so() {
+        let (logs, _guard) = crate::pairing::test_support::capture();
+        let dir = data_dir("sync-fails");
+        let store = ClientStore::open(&dir, &[], runtime())
+            .unwrap()
+            .with_sync_dir(|_| Err(io::Error::other("disk")));
+        let pin = Fingerprint::of(b"pin");
+        store.enroll(pin).unwrap();
+        assert!(store.allows(&pin), "the renamed file is the list in force");
+        let file = dir.join(CLIENTS_DIR).join(PINS_FILE);
+        assert_eq!(std::fs::read_to_string(file).unwrap(), format!("{pin}\n"));
+        assert!(logs.text().contains("a crash may undo the change"));
+        assert!(logs.text().contains("change=\"enrolled\""));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Both sides of a sync held open by
+    /// `a_write_in_progress_does_not_hold_up_the_readers`.
+    static SYNCING: std::sync::Barrier = std::sync::Barrier::new(2);
+
+    #[test]
+    fn a_write_in_progress_does_not_hold_up_the_readers() {
+        let dir = data_dir("readers");
+        let store = ClientStore::open(&dir, &[], runtime())
+            .unwrap()
+            .with_sync_dir(|_| {
+                SYNCING.wait();
+                SYNCING.wait();
+                Ok(())
+            });
+        let pin = Fingerprint::of(b"pin");
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| store.enroll(pin));
+            SYNCING.wait();
+            // The write is still going: the verifier's reads answer anyway.
+            assert!(store.allows(&pin));
+            assert!(!store.is_empty());
+            SYNCING.wait();
+            writer.join().unwrap().unwrap();
+        });
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
