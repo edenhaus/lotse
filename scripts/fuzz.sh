@@ -14,9 +14,10 @@
 # failing input. A run without a finding then minimizes the corpus as `cargo fuzz cmin` does
 # (src/project.rs, `exec_cmin`): libFuzzer's `-merge=1` into an empty directory keeps a small set
 # of the corpus's inputs that covers all the corpus covers, and that set replaces the corpus. So a
-# corpus that carries over between runs (CI caches each target's) stays bounded by the target's
-# coverage instead of growing by every run's finds. A run with a finding exits with it and keeps
-# its corpus as is: the failing input is in fuzz/artifacts/, never in the corpus.
+# corpus that carries over between runs stays bounded by the target's coverage instead of growing
+# by every run's finds. A run with a finding exits with it and keeps its corpus as is: the failing
+# input is in fuzz/artifacts/, never in the corpus. To start from CI's corpora:
+# `git clone https://github.com/edenhaus/lotse-fuzz-corpus fuzz/corpus`.
 #
 # libFuzzer's options (https://llvm.org/docs/LibFuzzer.html#options), each limit a finding when
 # crossed (a `timeout-*` or `oom-*` artifact):
