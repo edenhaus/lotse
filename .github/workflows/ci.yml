@@ -444,6 +444,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       groups: ${{ steps.select.outputs.groups }}
+      corpus: ${{ steps.corpus.outputs.sha }}
     env:
       NIGHTLY: nightly-2026-10-01 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
       BIN_DIR: fuzz/target/x86_64-unknown-linux-gnu/release
@@ -473,6 +474,15 @@ jobs:
           # shellcheck disable=SC2046 # one argument per target
           scripts/fuzz-select.sh "$BIN_DIR" "$BASE" $(cargo "+$NIGHTLY" fuzz list) > selected
           echo "groups=$(jq -Rnc '[inputs] | [range(0; length; 4) as $i | .[$i:$i + 4] | join(" ")]' selected)" | tee -a "$GITHUB_OUTPUT"
+      # The corpus repository's commit that every Fuzz job of this run reads, and that the Fuzz
+      # corpus job commits this run's corpora on.
+      - name: Pin the corpus commit
+        id: corpus
+        if: steps.select.outputs.groups != '[]'
+        run: |
+          sha=$(git ls-remote "https://github.com/$FUZZ_CORPUS_REPO" refs/heads/main | cut -f1)
+          test -n "$sha"
+          echo "sha=$sha" | tee -a "$GITHUB_OUTPUT"
       # The binaries in a tarball, which keeps their mode (an artifact's zip does not).
       - name: Pack the selected targets
         if: steps.select.outputs.groups != '[]'
@@ -492,9 +502,9 @@ jobs:
   # 60 s each, 5 min each nightly. A failing input and the logs are uploaded.
   #
   # Each target starts from its corpus in the corpus repository (FUZZ_CORPUS_REPO, public, one
-  # directory per target), checked out read-only into fuzz/corpus/ on every run, however the
-  # targets are grouped; a target without one starts empty. On main the Fuzz corpus job pushes
-# the minimized corpora back.
+  # directory per target), checked out read-only into fuzz/corpus/ on every run at the commit the
+  # Fuzz build job pinned, however the targets are grouped; a target without one starts empty. On
+  # main the Fuzz corpus job pushes the minimized corpora back.
   fuzz:
     name: Fuzz (${{ matrix.group }})
     needs: fuzz-build
@@ -517,6 +527,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.FUZZ_CORPUS_REPO }}
+          ref: ${{ needs.fuzz-build.outputs.corpus }}
           path: fuzz/corpus
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -567,12 +578,17 @@ jobs:
   # The corpora of a run on main pushed to the corpus repository, the only write to it: each
   # target's directory replaced by the one its Fuzz job minimized, so inputs that no longer add
   # coverage go. It runs no code of this repository. The deploy key (write access to the corpus
-  # repository only) is a secret of the fuzz-corpus environment, which only main may use; runs
-  # take turns, and a push that lost a race rebases (inputs are named by their hash, so two runs'
-  # corpora never conflict) and tries again.
+  # repository only) is a secret of the fuzz-corpus environment, which only main may use.
+  #
+  # Runs on main overlap (each has a concurrency group of its own), so another run may have pushed
+  # since this one's Fuzz jobs read the corpus. The replacement is therefore committed on the commit
+  # they read and rebased onto the corpus repository's main: it deletes only inputs this run
+  # started from, and another run's new inputs stay (inputs are named by their hash, so two runs'
+  # corpora never conflict; the next run minimizes their union). Runs take turns, and a push that
+  # lost a race rebases again.
   fuzz-corpus:
     name: Fuzz corpus
-    needs: fuzz
+    needs: [fuzz-build, fuzz]
     if: ${{ !cancelled() && needs.fuzz.result != 'skipped' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     environment: fuzz-corpus
@@ -587,6 +603,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.FUZZ_CORPUS_REPO }}
+          ref: ${{ needs.fuzz-build.outputs.corpus }}
           path: corpus
           ssh-key: ${{ secrets.FUZZ_CORPUS_DEPLOY_KEY }}
           persist-credentials: true
@@ -599,6 +616,10 @@ jobs:
         working-directory: corpus
         env:
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898783+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898783+github-actions[bot]@users.noreply.github.com
         run: |
           if [ ! -d ../fuzz-corpus ]; then
             echo "No corpus to push"
@@ -614,16 +635,14 @@ jobs:
             echo "No corpus changed"
             exit 0
           fi
-          git -c user.name='github-actions[bot]' \
-            -c user.email='41898783+github-actions[bot]@users.noreply.github.com' \
-            commit -q -m "Corpora from $RUN"
-          branch=$(git branch --show-current)
+          git commit -q -m "Corpora from $RUN"
           for try in 1 2 3; do
-            if git push origin "HEAD:$branch"; then
+            git fetch -q origin main
+            git rebase -q FETCH_HEAD
+            if git push origin HEAD:main; then
               exit 0
             fi
-            echo "Push $try lost a race, rebasing"
-            git pull -q --rebase origin "$branch"
+            echo "Push $try lost a race"
           done
           echo "::error::The corpora were not pushed after 3 tries"
           exit 1
