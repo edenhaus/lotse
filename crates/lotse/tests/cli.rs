@@ -241,3 +241,234 @@ fn sandbox_on_lets_the_supervisor_run_under_its_profile() {
     let (code, _) = daemon.terminate();
     assert_eq!(code, Some(0));
 }
+
+#[test]
+fn the_control_tls_listener_starts_with_its_identity_and_identity_prints_its_pin() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let dir = socket_dir("control-tls");
+    let socket = dir.join("lotse.sock");
+    let data = dir.join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data)
+        .unwrap();
+    let data = data.to_str().expect("utf-8 path");
+    let output = lotse()
+        .args(["identity", "--data-dir", data])
+        .output()
+        .expect("runs");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "no identity before the first start"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("first start"));
+
+    let client = "ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad";
+    let mut daemon = Daemon::start(
+        &[
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "off",
+            "--socket",
+            socket.to_str().expect("utf-8 path"),
+            "--sandbox",
+            "off",
+            "--control-listen",
+            "127.0.0.1:0",
+        ],
+        &[("LOTSE_CONTROL_CLIENTS", client), ("LOTSE_DATA_DIR", data)],
+    );
+    let created = json(&daemon.wait_for("control identity generated"));
+    let bound = json(&daemon.wait_for("control TLS listener bound"));
+    assert_eq!(bound["server_pin"], created["server_pin"]);
+    assert_eq!(bound["clients"], 1);
+    daemon.wait_for("\"event\":\"ready\"");
+    let (code, rest) = daemon.terminate();
+    assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
+
+    let output = lotse()
+        .arg("identity")
+        .env("LOTSE_DATA_DIR", data)
+        .output()
+        .expect("runs");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        bound["server_pin"].as_str().unwrap()
+    );
+}
+
+#[test]
+fn without_a_client_the_daemon_logs_a_first_code_and_pair_prints_a_new_one() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let dir = socket_dir("pair");
+    let socket = dir.join("lotse.sock");
+    let socket = socket.to_str().expect("utf-8 path");
+    let data = dir.join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data)
+        .unwrap();
+    let data = data.to_str().expect("utf-8 path");
+    let mut daemon = Daemon::start(
+        &[
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "off",
+            "--socket",
+            socket,
+            "--sandbox",
+            "off",
+            "--control-listen",
+            "127.0.0.1:0",
+            "--data-dir",
+            data,
+        ],
+        &[],
+    );
+    let bound = json(&daemon.wait_for("control TLS listener bound"));
+    let pin = bound["server_pin"].as_str().unwrap().replace(':', "");
+    let first = json(&daemon.wait_for("pairing code for the first client"));
+    let first = first["code"].as_str().unwrap().to_owned();
+    assert!(first.starts_with(&format!("LOTSE1-{pin}-")), "{first}");
+
+    let output = lotse()
+        .args(["pair", "--socket", socket])
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "{output:?}");
+    let code = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    assert!(code.starts_with(&format!("LOTSE1-{pin}-")), "{code}");
+    assert_ne!(code, first, "a new code replaces the first");
+    daemon.wait_for("pairing code issued");
+    let (exit, rest) = daemon.terminate();
+    assert_eq!(exit, Some(0), "clean exit\n{}", rest.join("\n"));
+    assert!(
+        rest.iter().all(|line| !line.contains(&code)),
+        "the issued code is never logged"
+    );
+}
+
+#[test]
+fn pair_without_a_control_tls_listener_fails() {
+    let dir = socket_dir("pair-off");
+    let socket = dir.join("lotse.sock");
+    let socket = socket.to_str().expect("utf-8 path");
+    let mut daemon = Daemon::start(
+        &[
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "off",
+            "--socket",
+            socket,
+            "--sandbox",
+            "off",
+        ],
+        &[],
+    );
+    daemon.wait_for("\"event\":\"ready\"");
+    let output = lotse()
+        .args(["pair", "--socket", socket])
+        .output()
+        .expect("runs");
+    assert_eq!(output.status.code(), Some(1));
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(printed.contains("invalid_request"), "{printed}");
+    let (exit, _rest) = daemon.terminate();
+    assert_eq!(exit, Some(0));
+}
+
+#[test]
+fn ctl_clients_lists_the_pins_and_removes_an_enrolled_one_for_good() {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+
+    let dir = socket_dir("clients");
+    let socket = dir.join("lotse.sock");
+    let socket = socket.to_str().expect("utf-8 path");
+    let data = dir.join("data");
+    let mut private = std::fs::DirBuilder::new();
+    private.mode(0o700);
+    private.create(&data).unwrap();
+    private.create(data.join("clients")).unwrap();
+    let pins = data.join("clients").join("pins");
+    let fixed = "ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad";
+    let enrolled = ["11"; 32].join(":");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&pins)
+        .unwrap();
+    writeln!(file, "{enrolled}").unwrap();
+    drop(file);
+    // Owned by the uid the daemon runs as: root drops to nobody.
+    let meta = std::fs::metadata(&data).unwrap();
+    let owner = if meta.uid() == 0 {
+        (65534, 65534)
+    } else {
+        (meta.uid(), meta.gid())
+    };
+    for path in [data.join("clients"), pins.clone()] {
+        std::os::unix::fs::chown(path, Some(owner.0), Some(owner.1)).unwrap();
+    }
+    let mut daemon = Daemon::start(
+        &[
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "off",
+            "--socket",
+            socket,
+            "--sandbox",
+            "off",
+            "--control-listen",
+            "127.0.0.1:0",
+            "--data-dir",
+            data.to_str().expect("utf-8 path"),
+        ],
+        &[("LOTSE_CONTROL_CLIENTS", fixed)],
+    );
+    daemon.wait_for("\"event\":\"ready\"");
+    let ctl = |args: &[&str]| {
+        lotse()
+            .args(["ctl", "--socket", socket, "--compact", "clients"])
+            .args(args)
+            .output()
+            .expect("runs")
+    };
+    let printed = |output: &std::process::Output| -> serde_json::Value {
+        serde_json::from_slice(&output.stdout).expect("JSON on stdout")
+    };
+
+    let output = ctl(&["list"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        printed(&output),
+        serde_json::json!({ "clients": [
+            { "pin": enrolled, "fixed": false, "connected": false },
+            { "pin": fixed, "fixed": true, "connected": false },
+        ] })
+    );
+    let output = ctl(&["remove", fixed]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(printed(&output)["error"]["code"], "not_permitted");
+    let output = ctl(&["remove", &"11".repeat(32)]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(printed(&output), serde_json::json!({}));
+    daemon.wait_for("control client removed");
+    let output = ctl(&["list"]);
+    assert_eq!(
+        printed(&output)["clients"],
+        serde_json::json!([{ "pin": fixed, "fixed": true, "connected": false }])
+    );
+    let (exit, rest) = daemon.terminate();
+    assert_eq!(exit, Some(0), "clean exit\n{}", rest.join("\n"));
+    assert_eq!(std::fs::read_to_string(&pins).unwrap(), "");
+}

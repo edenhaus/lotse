@@ -1,0 +1,1152 @@
+//! The offer's audio m-lines: the one the stream's audio goes down on,
+//! the one talk-back comes up on, the direction each is answered with and
+//! the audio codecs the engine is configured with.
+//!
+//! A pure function of the offer, the stream's audio codec and its
+//! backchannel ([`TalkbackTarget`]), never of whether another session
+//! talks: the talker is claimed by the first uplink packet, not by the
+//! SDP.
+//!
+//! The talk-back m-line is answered with the codecs that reach the camera
+//! ([`TalkbackTarget::takes`], which the worker derives from the routes it
+//! can build) and nothing else, but for the stream audio's codec when
+//! the same `sendrecv` m-line also carries the downlink: the browser may
+//! send any codec the answer lists (RFC 3264 §7), so a listed codec the
+//! route cannot take would lose the talker's audio.
+//!
+//! Standards: RFC 8866 §6.7 (direction attributes, `sendrecv` when an
+//! m-line has none), §6.6 (`a=rtpmap`) and §6.15 (`a=fmtp`), RFC 4585
+//! §4.2 (`a=rtcp-fb`), RFC 3551 §6 (static payload types, Table 4),
+//! RFC 4855 §3 (encoding names compare case-insensitively), RFC 8829
+//! §5.3.1 (an answer's direction is the offered one reversed, intersected
+//! with what the answerer does), RFC 3264 §6.1 (an m-line answered
+//! `inactive` keeps its place and lists formats of the offer; what a
+//! `sendrecv` one lists) and §7 (the offerer sends the answer's first
+//! format, and may switch to any other it lists), RFC 7874 §3 (a WebRTC
+//! endpoint implements Opus, PCMA and PCMU).
+
+use lotse_core::codec::{Codec, CodecFamily};
+use lotse_core::session::TalkbackTarget;
+
+use crate::sdp::{Sdp, Section, static_encoding};
+
+/// Every audio codec the engine carries, in the session's order of
+/// preference.
+pub(crate) const EVERY_CODEC: [CodecFamily; 4] = [
+    CodecFamily::Opus,
+    CodecFamily::Pcmu,
+    CodecFamily::Pcma,
+    CodecFamily::G722,
+];
+
+/// A media direction attribute (RFC 8866 §6.7), from the side of whoever
+/// wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    /// `a=sendrecv`.
+    SendRecv,
+    /// `a=sendonly`.
+    SendOnly,
+    /// `a=recvonly`.
+    RecvOnly,
+    /// `a=inactive`.
+    Inactive,
+}
+
+impl Direction {
+    /// The direction of a side that sends when `send` and receives when
+    /// `receive`.
+    pub(crate) const fn new(send: bool, receive: bool) -> Self {
+        match (send, receive) {
+            (true, true) => Self::SendRecv,
+            (true, false) => Self::SendOnly,
+            (false, true) => Self::RecvOnly,
+            (false, false) => Self::Inactive,
+        }
+    }
+
+    /// The direction an SDP line states, or `None` for any other line.
+    pub(crate) fn parse(line: &str) -> Option<Self> {
+        match line {
+            "a=sendrecv" => Some(Self::SendRecv),
+            "a=sendonly" => Some(Self::SendOnly),
+            "a=recvonly" => Some(Self::RecvOnly),
+            "a=inactive" => Some(Self::Inactive),
+            _ => None,
+        }
+    }
+
+    /// The direction a media section states, `sendrecv` when it states
+    /// none (RFC 8866 §6.7). A session-level attribute is not read: JSEP
+    /// puts one in every m-line (RFC 8829 §5.2.1).
+    fn of(section: &Section<'_>) -> Self {
+        section
+            .lines()
+            .iter()
+            .find_map(|line| Self::parse(line))
+            .unwrap_or(Self::SendRecv)
+    }
+
+    /// Whether this side sends.
+    pub(crate) const fn sends(self) -> bool {
+        matches!(self, Self::SendRecv | Self::SendOnly)
+    }
+
+    /// Whether this side receives.
+    pub(crate) const fn receives(self) -> bool {
+        matches!(self, Self::SendRecv | Self::RecvOnly)
+    }
+
+    /// The same media seen from the other side.
+    const fn reversed(self) -> Self {
+        Self::new(self.receives(), self.sends())
+    }
+
+    /// The attribute line, without its line ending.
+    pub(crate) const fn attribute(self) -> &'static str {
+        match self {
+            Self::SendRecv => "a=sendrecv",
+            Self::SendOnly => "a=sendonly",
+            Self::RecvOnly => "a=recvonly",
+            Self::Inactive => "a=inactive",
+        }
+    }
+}
+
+/// The `a=rtpmap` encoding name of an audio family the engine carries:
+/// RFC 7587 §7 (`opus`), RFC 3551 §4.5.14 (`PCMU`, `PCMA`) and §4.5.2
+/// (`G722`).
+pub(crate) const fn encoding_name(family: CodecFamily) -> Option<&'static str> {
+    match family {
+        CodecFamily::Opus => Some("opus"),
+        CodecFamily::Pcmu => Some("PCMU"),
+        CodecFamily::Pcma => Some("PCMA"),
+        CodecFamily::G722 => Some("G722"),
+        _ => None,
+    }
+}
+
+/// The RTP clock of an audio family: 48 kHz for Opus (RFC 7587 §4.1),
+/// 8 kHz for G.711 and for G.722, whose RTP clock stays 8 kHz although it
+/// samples at 16 kHz (RFC 3551 §4.5.2).
+pub(crate) const fn clock_rate(family: CodecFamily) -> u32 {
+    match family {
+        CodecFamily::Opus => 48_000,
+        _ => 8_000,
+    }
+}
+
+/// The audio family the engine carries that an `a=rtpmap` encoding
+/// (`<name>/<clock>[/<channels>]`, RFC 8866 §6.6) names: its encoding
+/// name, case-insensitive (RFC 4855 §3), at its RTP clock rate; `None`
+/// for any other codec. The engine matches the rest.
+fn encoding_family(encoding: &str) -> Option<CodecFamily> {
+    let mut parts = encoding.split('/');
+    let name = parts.next()?;
+    let clock = parts.next().and_then(|clock| clock.parse::<u32>().ok())?;
+    EVERY_CODEC.into_iter().find(|family| {
+        encoding_name(*family).is_some_and(|known| known.eq_ignore_ascii_case(name))
+            && clock_rate(*family) == clock
+    })
+}
+
+/// Whether `section` lists `family` in an `a=rtpmap` (RFC 8866 §6.6), by
+/// [`encoding_family`].
+fn lists(section: &Section<'_>, family: CodecFamily) -> bool {
+    section
+        .attribute("rtpmap")
+        .filter_map(|rtpmap| rtpmap.split_once(' '))
+        .any(|(_, encoding)| encoding_family(encoding) == Some(family))
+}
+
+/// Whether `line` is the `a=rtpmap` (RFC 8866 §6.6), `a=fmtp` (§6.15) or
+/// `a=rtcp-fb` (RFC 4585 §4.2) line of one of the payload types `pts`.
+/// A wildcard `a=rtcp-fb:*` is of none.
+fn describes(line: &str, pts: &[u8]) -> bool {
+    ["a=rtpmap:", "a=fmtp:", "a=rtcp-fb:"]
+        .into_iter()
+        .filter_map(|prefix| line.strip_prefix(prefix))
+        .any(|rest| {
+            rest.split(' ')
+                .next()
+                .and_then(|pt| pt.parse::<u8>().ok())
+                .is_some_and(|pt| pts.contains(&pt))
+        })
+}
+
+/// `m_line` without the formats `pts` (RFC 8866 §5.14: `m=<media>
+/// <port> <proto> <fmt> ...`); without any, `m_line` as it is.
+fn without_formats(m_line: &str, pts: &[u8]) -> String {
+    let mut fields = m_line.split(' ');
+    let head: Vec<&str> = fields.by_ref().take(3).collect();
+    let kept = fields.filter(|format| !format.parse::<u8>().is_ok_and(|pt| pts.contains(&pt)));
+    head.into_iter().chain(kept).collect::<Vec<_>>().join(" ")
+}
+
+/// The other G.711 law of `family` (ITU-T G.711; PCMU and PCMA at 8 kHz,
+/// the static payload types 0 and 8 of RFC 3551 Table 4, §4.5.14), which
+/// talk-back converts to the backchannel's law; `None` for any other
+/// family.
+const fn other_law(family: CodecFamily) -> Option<CodecFamily> {
+    match family {
+        CodecFamily::Pcmu => Some(CodecFamily::Pcma),
+        CodecFamily::Pcma => Some(CodecFamily::Pcmu),
+        _ => None,
+    }
+}
+
+/// Talk-back as the answer has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Talkback<'a> {
+    /// Received on the m-line `mid` in `codec`: the browser's own
+    /// `sendonly` m-line when `dedicated`, else its `sendrecv` downlink
+    /// one.
+    Negotiated {
+        /// The m-line's mid.
+        mid: &'a str,
+        /// The codec the answer lists first on it, which the browser
+        /// sends (RFC 3264 §7).
+        codec: CodecFamily,
+        /// A dedicated talk-back m-line rather than the downlink one.
+        dedicated: bool,
+    },
+    /// Requested and not negotiated, and why: an audio m-line the
+    /// browser offers to send on (`sendonly` or `sendrecv`, RFC 8866
+    /// §6.7) asks for two-way audio, which the session cannot receive.
+    Off(&'static str),
+    /// Not requested: no audio m-line with a mid the browser offers to
+    /// send on.
+    NotRequested,
+}
+
+/// What the session does with the offer's audio m-lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AudioPlan<'a> {
+    /// The m-line the stream's audio goes down on: the first audio m-line
+    /// with a mid that the browser receives on (`recvonly` or
+    /// `sendrecv`).
+    pub(crate) downlink: Option<&'a str>,
+    /// The stream audio's family, when the engine carries it and the
+    /// downlink m-line lists it.
+    pub(crate) send: Option<CodecFamily>,
+    /// Where talk-back comes up.
+    pub(crate) talkback: Talkback<'a>,
+    /// The families of the uplink codecs that reach the backchannel
+    /// ([`TalkbackTarget::takes`]), which decide what talk-back takes
+    /// ([`AudioPlan::takes`]); empty without one.
+    reaching: Vec<CodecFamily>,
+}
+
+impl<'a> AudioPlan<'a> {
+    /// The plan for `offer`, the stream's audio codec (`audio`) and its
+    /// backchannel (`backchannel`).
+    ///
+    /// Talk-back goes on the first audio m-line the browser offers
+    /// `sendonly` (the dedicated one), or else on the first it offers
+    /// `sendrecv`, the downlink m-line as a rule, never on both: a session
+    /// has one uplink. Either requests it (RFC 8866 §6.7: the browser
+    /// offers to send there). It takes, of the codecs that m-line lists
+    /// and that reach the backchannel ([`TalkbackTarget::takes`]), the
+    /// backchannel's own (its codes pass through), else for a G.711
+    /// backchannel the other law (converted code by code, ITU-T G.711
+    /// Tables 3 and 4), else Opus (decoded and encoded in the
+    /// backchannel's law, or forwarded as received to an Opus one): a
+    /// browser implements all three (RFC 7874 §3), so a G.711 camera keeps
+    /// G.711 from a browser that leaves its law out. A backchannel no
+    /// uplink codec reaches, in a codec no route feeds or without the
+    /// reverse chain it needs, is off. The answer names the codec first on
+    /// that m-line, which the browser sends (RFC 3264 §6.1).
+    pub(crate) fn new(
+        offer: &'a str,
+        audio: Option<&Codec>,
+        backchannel: Option<&TalkbackTarget>,
+    ) -> Self {
+        let sdp = Sdp::parse(offer);
+        let lines: Vec<(&Section<'a>, &'a str, Direction)> = sdp
+            .media()
+            .iter()
+            .filter(|section| section.is("audio"))
+            .filter_map(|section| Some((section, section.mid()?, Direction::of(section))))
+            .collect();
+        let downlink = lines.iter().find(|(_, _, offered)| offered.receives());
+        let send = audio
+            .map(Codec::family)
+            .filter(|family| downlink.is_some_and(|(section, _, _)| lists(section, *family)));
+        let dedicated = lines
+            .iter()
+            .find(|(_, _, offered)| *offered == Direction::SendOnly);
+        let uplink = dedicated.map(|line| (line, true)).or_else(|| {
+            lines
+                .iter()
+                .find(|(_, _, offered)| *offered == Direction::SendRecv)
+                .map(|line| (line, false))
+        });
+        let reaching: Vec<CodecFamily> = backchannel
+            .map(|backchannel| {
+                backchannel
+                    .takes
+                    .iter()
+                    .map(|codec| codec.family())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let talkback = match (
+            uplink,
+            backchannel.map(|backchannel| backchannel.codec.family()),
+        ) {
+            (None, _) => Talkback::NotRequested,
+            (Some(_), None) => Talkback::Off("the camera offers no backchannel"),
+            (Some(_), Some(_)) if reaching.is_empty() => {
+                Talkback::Off("the backchannel takes a codec talk-back cannot feed")
+            }
+            (Some(((section, mid, _), dedicated)), Some(family)) => {
+                match [Some(family), other_law(family), Some(CodecFamily::Opus)]
+                    .into_iter()
+                    .flatten()
+                    .find(|family| reaching.contains(family) && lists(section, *family))
+                {
+                    Some(codec) => Talkback::Negotiated {
+                        mid,
+                        codec,
+                        dedicated,
+                    },
+                    None => Talkback::Off(
+                        "the talk-back m-line lists no codec that reaches the backchannel",
+                    ),
+                }
+            }
+        };
+        Self {
+            downlink: downlink.map(|(_, mid, _)| *mid),
+            send,
+            talkback,
+            reaching,
+        }
+    }
+
+    /// Whether talk-back the browser sends in `family` is taken: talk-back
+    /// is negotiated and `family` reaches its backchannel
+    /// ([`TalkbackTarget::takes`]).
+    pub(crate) fn takes(&self, family: CodecFamily) -> bool {
+        matches!(self.talkback, Talkback::Negotiated { .. }) && self.reaching.contains(&family)
+    }
+
+    /// The payload types of `section` the engine is not offered: on the
+    /// talk-back m-line, those of an audio codec the engine carries that
+    /// talk-back does not take ([`AudioPlan::takes`]), but for the stream
+    /// audio's when that m-line is the downlink too; none on any other
+    /// m-line. A format is read by its `a=rtpmap`, else as a static
+    /// payload type (RFC 3551 §6, Table 4), the way str0m reads it, which
+    /// also reads an `a=rtpmap` the format list leaves out. Formats of no
+    /// codec the engine carries stay: the engine answers none of them.
+    ///
+    /// Talk-back's own codec is always taken and listed, so the m-line
+    /// keeps a format.
+    ///
+    /// `SPEC-DEVIATION` (RFC 3264 §6.1: an m-line answered `sendrecv`
+    /// lists at least one codec the answerer both sends and receives):
+    /// on a `sendrecv` m-line that carries both, a stream audio codec
+    /// that does not reach the camera (G.711 or G.722 to an Opus
+    /// backchannel, G.722 to a G.711 one) stays listed beside talk-back's,
+    /// since the session sends it there, and an m-line has one format list
+    /// for both directions. The session then sends one codec and receives
+    /// another, neither both ways. Dropping either would lose the stream's
+    /// audio or talk-back, and no uplink chain produces Opus from G.711.
+    /// The browser sends talk-back's, first in the answer (RFC 3264 §7);
+    /// a packet in the other is refused on receipt, never routed, so it
+    /// cannot claim the backchannel.
+    fn unroutable(&self, section: &Section<'_>) -> Vec<u8> {
+        let Talkback::Negotiated { mid, .. } = self.talkback else {
+            return Vec::new();
+        };
+        if !section.is("audio") || section.mid() != Some(mid) {
+            return Vec::new();
+        }
+        let sent = self.send.filter(|_| self.downlink == Some(mid));
+        let mut families: Vec<(u8, Option<CodecFamily>)> = section
+            .attribute("rtpmap")
+            .filter_map(|rtpmap| {
+                let (pt, encoding) = rtpmap.split_once(' ')?;
+                Some((pt.parse().ok()?, encoding_family(encoding)))
+            })
+            .collect();
+        for pt in section.formats() {
+            if !families.iter().any(|(mapped, _)| *mapped == pt) {
+                families.push((pt, static_encoding(pt).and_then(encoding_family)));
+            }
+        }
+        families
+            .into_iter()
+            .filter(|(_, family)| {
+                family.is_some_and(|family| !self.takes(family) && Some(family) != sent)
+            })
+            .map(|(pt, _)| pt)
+            .collect()
+    }
+
+    /// The direction the session answers the audio m-line `mid` with: it
+    /// sends on the downlink m-line when it carries stream audio, and
+    /// receives on the talk-back one (RFC 8829 §5.3.1). Every other audio
+    /// m-line, one without a mid included, is `inactive` (RFC 3264 §6.1).
+    pub(crate) fn answer(&self, mid: Option<&str>) -> Direction {
+        let send = self.send.is_some() && mid.is_some() && mid == self.downlink;
+        let receive = matches!(self.talkback, Talkback::Negotiated { mid: talkback, .. } if mid == Some(talkback));
+        Direction::new(send, receive)
+    }
+
+    /// `offer` with each audio m-line's direction replaced, where it
+    /// differs, by the one str0m answers with [`AudioPlan::answer`]'s:
+    /// the answer's reversed. str0m answers each m-line with the offered
+    /// direction reversed and lets no local direction be set before the
+    /// answer is generated, while RFC 8829 §5.3.1 intersects the offered
+    /// direction with the local one. Rewriting the offer, not the answer,
+    /// keeps the engine's own state in line with the answer: an inactive
+    /// or receive-only m-line declares no send stream and no SSRC, so no
+    /// RTP can go out on it, and an m-line answered `inactive` keeps its
+    /// port, mid and BUNDLE membership.
+    ///
+    /// The talk-back m-line also loses the formats talk-back does not take
+    /// ([`AudioPlan::unroutable`]), with their `a=rtpmap`, `a=fmtp` and
+    /// `a=rtcp-fb` lines: str0m answers an m-line with the codecs it is
+    /// configured with that the offered m-line lists, and has one list for
+    /// all m-lines ([`AudioPlan::codecs`]), so only the offer narrows one
+    /// m-line. An answer lists formats of the offer (RFC 3264 §6.1), and
+    /// the browser may send any it lists (RFC 3264 §7).
+    pub(crate) fn engine_offer(&self, offer: &str) -> String {
+        let sdp = Sdp::parse(offer);
+        let mut out = String::with_capacity(offer.len().saturating_add(64));
+        let mut push = |line: &str| {
+            out.push_str(line);
+            out.push_str("\r\n");
+        };
+        for line in sdp.session() {
+            push(line);
+        }
+        for section in sdp.media() {
+            let offered = Direction::of(section);
+            let rewrite = section
+                .is("audio")
+                .then(|| self.answer(section.mid()).reversed())
+                .filter(|wanted| *wanted != offered);
+            let dropped = self.unroutable(section);
+            push(&without_formats(section.m_line(), &dropped));
+            for line in section.lines() {
+                if (rewrite.is_none() || Direction::parse(line).is_none())
+                    && !describes(line, &dropped)
+                {
+                    push(line);
+                }
+            }
+            if let Some(wanted) = rewrite {
+                push(wanted.attribute());
+            }
+        }
+        out
+    }
+
+    /// The audio codecs the engine is configured with, in its order of
+    /// preference: talk-back's first, then the stream audio's, or every
+    /// codec the engine carries when it sends none (so an `inactive`
+    /// m-line still lists formats of the offer, RFC 3264 §6.1, instead of
+    /// being rejected for lack of one).
+    ///
+    /// str0m answers every m-line with this one list, narrowed to what
+    /// that m-line offers, in this order: there is no list per m-line (an
+    /// upstream need), so [`AudioPlan::engine_offer`] narrows the
+    /// talk-back m-line to what talk-back takes.
+    /// Talk-back's codec first makes it the first on the talk-back m-line,
+    /// the one the browser sends (RFC 3264 §7); on the downlink m-line
+    /// it is listed beside the stream audio's, which is what the session
+    /// sends.
+    pub(crate) fn codecs(&self) -> Vec<CodecFamily> {
+        let mut codecs = Vec::with_capacity(EVERY_CODEC.len());
+        if let Talkback::Negotiated { codec, .. } = self.talkback {
+            codecs.push(codec);
+        }
+        let rest = match self.send {
+            Some(send) => &[send][..],
+            None => &EVERY_CODEC[..],
+        };
+        for family in rest {
+            if !codecs.contains(family) {
+                codecs.push(*family);
+            }
+        }
+        codecs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::missing_docs_in_private_items, reason = "test code")]
+
+    use lotse_core::uplink::UplinkCodec;
+
+    use super::*;
+
+    /// Downlink audio, video and a dedicated talk-back m-line, as a
+    /// talk-back capable frontend offers them, each audio m-line with
+    /// Opus, PCMU and PCMA.
+    const DEDICATED: &str = "v=0\r\na=group:BUNDLE 0 1 2\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:0\r\na=recvonly\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=recvonly\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2\r\na=sendonly\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n";
+
+    /// The downlink audio m-line turned `sendrecv`, as a player that sends
+    /// talk-back on its downlink m-line offers it (observed 2026-10-07).
+    fn sendrecv() -> String {
+        DEDICATED
+            .replacen("a=recvonly", "a=sendrecv", 1)
+            .split("m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2")
+            .next()
+            .unwrap()
+            .replace("a=group:BUNDLE 0 1 2", "a=group:BUNDLE 0 1")
+    }
+
+    /// `codec`'s backchannel as a worker with the reverse chain installed
+    /// routes to it (`Arbiter::takes` over `ToG711`): Opus and both G.711
+    /// laws to a G.711 camera, Opus forwarded as received to an Opus one,
+    /// nothing to any other.
+    fn reaching(codec: &Codec) -> TalkbackTarget {
+        let takes = match codec.family() {
+            CodecFamily::Pcmu | CodecFamily::Pcma => UplinkCodec::ALL.to_vec(),
+            CodecFamily::Opus => vec![UplinkCodec::Opus],
+            _ => Vec::new(),
+        };
+        TalkbackTarget {
+            codec: codec.clone(),
+            takes,
+        }
+    }
+
+    /// Whether talk-back in `from` reaches `backchannel` by [`reaching`].
+    fn routable(from: CodecFamily, backchannel: &Codec) -> bool {
+        reaching(backchannel)
+            .takes
+            .iter()
+            .any(|codec| codec.family() == from)
+    }
+
+    fn negotiated(mid: &str, codec: CodecFamily, dedicated: bool) -> Talkback<'_> {
+        Talkback::Negotiated {
+            mid,
+            codec,
+            dedicated,
+        }
+    }
+
+    #[test]
+    fn rfc8866_6_7_directions_parse_reverse_and_default_to_sendrecv() {
+        for direction in [
+            Direction::SendRecv,
+            Direction::SendOnly,
+            Direction::RecvOnly,
+            Direction::Inactive,
+        ] {
+            assert_eq!(Direction::parse(direction.attribute()), Some(direction));
+            assert_eq!(
+                Direction::new(direction.sends(), direction.receives()),
+                direction
+            );
+            assert_eq!(direction.reversed().reversed(), direction);
+        }
+        assert_eq!(Direction::SendOnly.reversed(), Direction::RecvOnly);
+        assert_eq!(Direction::SendRecv.reversed(), Direction::SendRecv);
+        assert_eq!(Direction::Inactive.reversed(), Direction::Inactive);
+        assert_eq!(Direction::parse("a=rtcp-mux"), None);
+        let sdp = Sdp::parse("m=audio 9 x 0\r\na=mid:a\r\nm=audio 9 x 0\r\na=inactive\r\n");
+        assert_eq!(Direction::of(&sdp.media()[0]), Direction::SendRecv);
+        assert_eq!(Direction::of(&sdp.media()[1]), Direction::Inactive);
+    }
+
+    #[test]
+    fn rfc8866_6_6_an_audio_m_line_lists_a_codec_by_encoding_name_and_clock() {
+        let sdp = Sdp::parse(
+            "m=audio 9 x 111 9 0\r\na=rtpmap:111 OPUS/48000/2\r\na=rtpmap:9 G722/16000\r\na=rtpmap:0\r\n",
+        );
+        let audio = &sdp.media()[0];
+        // Case-insensitive name (RFC 4855 §3), clock rate as offered.
+        assert!(lists(audio, CodecFamily::Opus));
+        // G.722's RTP clock is 8 kHz (RFC 3551 §4.5.2): 16000 is not it.
+        assert!(!lists(audio, CodecFamily::G722));
+        // An `a=rtpmap` without an encoding names nothing.
+        assert!(!lists(audio, CodecFamily::Pcmu));
+        assert!(!lists(audio, CodecFamily::AacLc));
+        assert_eq!(encoding_name(CodecFamily::Pcma), Some("PCMA"));
+        assert_eq!(encoding_name(CodecFamily::G722), Some("G722"));
+        assert_eq!(encoding_name(CodecFamily::Mjpeg), None);
+        // RFC 7587 §4.1; RFC 3551 §4.5.2.
+        assert_eq!(clock_rate(CodecFamily::Opus), 48_000);
+        assert_eq!(clock_rate(CodecFamily::G722), 8_000);
+        assert_eq!(clock_rate(CodecFamily::Pcmu), 8_000);
+    }
+
+    /// The fixture matrix: {dedicated talk-back m-line,
+    /// `sendrecv` downlink m-line} × {backchannel present, absent}.
+    #[test]
+    fn rfc8829_5_3_1_talk_back_is_received_only_with_a_backchannel() {
+        let opus = Codec::Opus { channels: 2 };
+        let sendrecv = sendrecv();
+        // Dedicated, with a PCMU backchannel the browser offers: received
+        // in PCMU on `2`, the downlink still sends Opus.
+        let plan = AudioPlan::new(DEDICATED, Some(&opus), Some(&reaching(&Codec::Pcmu)));
+        assert_eq!(plan.downlink, Some("0"));
+        assert_eq!(plan.send, Some(CodecFamily::Opus));
+        assert_eq!(plan.talkback, negotiated("2", CodecFamily::Pcmu, true));
+        assert_eq!(plan.answer(Some("0")), Direction::SendOnly);
+        assert_eq!(plan.answer(Some("2")), Direction::RecvOnly);
+        assert_eq!(plan.answer(Some("1")), Direction::Inactive, "not audio's");
+        assert_eq!(plan.answer(None), Direction::Inactive);
+        assert_eq!(
+            plan.codecs(),
+            [CodecFamily::Pcmu, CodecFamily::Opus],
+            "talk-back's first"
+        );
+        // Dedicated, without a backchannel: inactive.
+        let plan = AudioPlan::new(DEDICATED, Some(&opus), None);
+        assert_eq!(
+            plan.talkback,
+            Talkback::Off("the camera offers no backchannel")
+        );
+        assert_eq!(plan.answer(Some("2")), Direction::Inactive);
+        assert_eq!(plan.answer(Some("0")), Direction::SendOnly);
+        assert_eq!(plan.codecs(), [CodecFamily::Opus]);
+        // `sendrecv` downlink, with a backchannel: `sendrecv`, talk-back in
+        // the backchannel's codec on the downlink m-line.
+        let plan = AudioPlan::new(&sendrecv, Some(&opus), Some(&reaching(&Codec::Pcma)));
+        assert_eq!(plan.talkback, negotiated("0", CodecFamily::Pcma, false));
+        assert_eq!(plan.answer(Some("0")), Direction::SendRecv);
+        assert_eq!(plan.codecs(), [CodecFamily::Pcma, CodecFamily::Opus]);
+        // `sendrecv` downlink, without one: `sendonly`.
+        let plan = AudioPlan::new(&sendrecv, Some(&opus), None);
+        assert_eq!(
+            plan.talkback,
+            Talkback::Off("the camera offers no backchannel")
+        );
+        assert_eq!(plan.answer(Some("0")), Direction::SendOnly);
+        // A downlink that carries no stream audio still takes talk-back
+        // (`recvonly`), or is `inactive` without a backchannel.
+        let plan = AudioPlan::new(&sendrecv, None, Some(&reaching(&Codec::Pcmu)));
+        assert_eq!(plan.send, None);
+        assert_eq!(plan.answer(Some("0")), Direction::RecvOnly);
+        assert_eq!(
+            plan.codecs(),
+            [
+                CodecFamily::Pcmu,
+                CodecFamily::Opus,
+                CodecFamily::Pcma,
+                CodecFamily::G722
+            ]
+        );
+        let plan = AudioPlan::new(&sendrecv, None, None);
+        assert_eq!(plan.answer(Some("0")), Direction::Inactive);
+        assert_eq!(plan.codecs(), EVERY_CODEC);
+    }
+
+    /// The format list and the attribute lines of an audio m-line listing
+    /// `codecs` (`opus`, `PCMU`, `PCMA`, `G722`), in that order, as
+    /// browsers write them: Opus with its `a=fmtp` and `a=rtcp-fb`.
+    fn formats(codecs: &[&str]) -> (String, String) {
+        let (pts, lines): (Vec<&str>, Vec<String>) = codecs
+            .iter()
+            .map(|codec| {
+                let (pt, encoding, more) = match *codec {
+                    "opus" => (
+                        "111",
+                        "opus/48000/2",
+                        "a=fmtp:111 minptime=10;useinbandfec=1\r\na=rtcp-fb:111 transport-cc\r\n",
+                    ),
+                    "PCMU" => ("0", "PCMU/8000", ""),
+                    "PCMA" => ("8", "PCMA/8000", ""),
+                    _ => ("9", "G722/8000", ""),
+                };
+                (pt, format!("a=rtpmap:{pt} {encoding}\r\n{more}"))
+            })
+            .unzip();
+        (pts.join(" "), lines.concat())
+    }
+
+    /// [`DEDICATED`] with its talk-back m-line listing only `codecs`
+    /// (`opus`, `PCMU`, `PCMA`, `G722`), in that order.
+    fn talking_in(codecs: &[&str]) -> String {
+        let (pts, lines) = formats(codecs);
+        // The talk-back m-line is the offer's last.
+        let (before, _) = DEDICATED
+            .split_once("m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2")
+            .unwrap();
+        format!("{before}m=audio 9 UDP/TLS/RTP/SAVPF {pts}\r\na=mid:2\r\na=sendonly\r\n{lines}")
+    }
+
+    /// One `sendrecv` audio m-line (mid `0`) listing `codecs`, downlink and
+    /// talk-back in one, beside video.
+    fn shared_in(codecs: &[&str]) -> String {
+        let (pts, lines) = formats(codecs);
+        format!(
+            "v=0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF {pts}\r\na=mid:0\r\na=sendrecv\r\n{lines}m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=recvonly\r\n"
+        )
+    }
+
+    /// The section of the m-line `mid` in `sdp`.
+    fn with_mid<'a>(sdp: &'a Sdp<'a>, mid: &str) -> &'a Section<'a> {
+        sdp.media()
+            .iter()
+            .find(|section| section.mid() == Some(mid))
+            .unwrap()
+    }
+
+    /// The codecs str0m answers the m-line `mid` of `offer` with under
+    /// `plan`: those it is configured with ([`AudioPlan::codecs`]), in
+    /// that order, that the engine's offer lists there.
+    fn answered(plan: &AudioPlan<'_>, offer: &str, mid: &str) -> Vec<CodecFamily> {
+        let engine = plan.engine_offer(offer);
+        let sdp = Sdp::parse(&engine);
+        let section = with_mid(&sdp, mid);
+        plan.codecs()
+            .into_iter()
+            .filter(|family| lists(section, *family))
+            .collect()
+    }
+
+    /// The codec talk-back is received in on the dedicated m-line for a
+    /// backchannel in `camera` when that m-line lists `codecs`, or why it
+    /// is off.
+    fn talkback_for(camera: &Codec, codecs: &[&str]) -> Result<CodecFamily, &'static str> {
+        let offer = talking_in(codecs);
+        let talkback = AudioPlan::new(
+            &offer,
+            Some(&Codec::Opus { channels: 2 }),
+            Some(&reaching(camera)),
+        )
+        .talkback;
+        if let Talkback::Off(reason) = talkback {
+            return Err(reason);
+        }
+        EVERY_CODEC
+            .into_iter()
+            .find(|codec| talkback == negotiated("2", *codec, true))
+            .ok_or("not on the dedicated m-line")
+    }
+
+    #[test]
+    fn rfc3264_6_1_rfc7874_3_a_g711_camera_takes_its_law_then_the_other_law_then_opus() {
+        const NONE: &str = "the talk-back m-line lists no codec that reaches the backchannel";
+        for (camera, law, other, other_name) in [
+            (Codec::Pcmu, CodecFamily::Pcmu, CodecFamily::Pcma, "PCMA"),
+            (Codec::Pcma, CodecFamily::Pcma, CodecFamily::Pcmu, "PCMU"),
+        ] {
+            let name = encoding_name(law).unwrap();
+            // The camera's law first, wherever the offer puts it.
+            for codecs in [
+                &["opus", "PCMU", "PCMA"][..],
+                &["PCMA", "PCMU", "opus"],
+                &[name, "opus"],
+                &[name],
+            ] {
+                assert_eq!(
+                    talkback_for(&camera, codecs),
+                    Ok(law),
+                    "{camera:?} {codecs:?}"
+                );
+            }
+            // Without it, the other law (ITU-T G.711 Tables 3 and 4), still
+            // before Opus.
+            for codecs in [
+                &["opus", other_name][..],
+                &[other_name, "opus"],
+                &[other_name],
+            ] {
+                assert_eq!(
+                    talkback_for(&camera, codecs),
+                    Ok(other),
+                    "{camera:?} {codecs:?}"
+                );
+            }
+            // Opus only when neither law is offered.
+            for codecs in [&["opus"][..], &["G722", "opus"]] {
+                assert_eq!(
+                    talkback_for(&camera, codecs),
+                    Ok(CodecFamily::Opus),
+                    "{camera:?} {codecs:?}"
+                );
+            }
+            // Nothing the uplink chain takes: off, for the same reason.
+            assert_eq!(talkback_for(&camera, &["G722"]), Err(NONE), "{camera:?}");
+        }
+        // The other law goes first on the talk-back m-line, beside the
+        // downlink's Opus.
+        let offer = talking_in(&["opus", "PCMU"]);
+        let plan = AudioPlan::new(
+            &offer,
+            Some(&Codec::Opus { channels: 2 }),
+            Some(&reaching(&Codec::Pcma)),
+        );
+        assert_eq!(plan.codecs(), [CodecFamily::Pcmu, CodecFamily::Opus]);
+        assert_eq!(plan.answer(Some("2")), Direction::RecvOnly);
+        let g722 = talking_in(&["G722"]);
+        let plan = AudioPlan::new(&g722, None, Some(&reaching(&Codec::Pcma)));
+        assert_eq!(plan.answer(Some("2")), Direction::Inactive);
+        assert_eq!(other_law(CodecFamily::Opus), None);
+        assert_eq!(other_law(CodecFamily::G722), None);
+    }
+
+    #[test]
+    fn rfc7587_an_opus_camera_takes_opus_only_and_the_off_reasons_stay() {
+        let opus = Codec::Opus { channels: 2 };
+        // An Opus backchannel: Opus, forwarded without a transcode; G.711
+        // from the browser is never taken for it.
+        let plan = AudioPlan::new(DEDICATED, Some(&Codec::Pcmu), Some(&reaching(&opus)));
+        assert_eq!(plan.talkback, negotiated("2", CodecFamily::Opus, true));
+        assert_eq!(plan.codecs(), [CodecFamily::Opus, CodecFamily::Pcmu]);
+        assert_eq!(
+            talkback_for(&opus, &["PCMU", "PCMA"]),
+            Err("the talk-back m-line lists no codec that reaches the backchannel")
+        );
+        // Talk-back in the stream audio's own codec: listed once.
+        let plan = AudioPlan::new(DEDICATED, Some(&Codec::Pcmu), Some(&reaching(&Codec::Pcmu)));
+        assert_eq!(plan.codecs(), [CodecFamily::Pcmu]);
+        // A backchannel in a codec the uplink chain cannot produce.
+        for codec in [
+            Codec::G722,
+            Codec::H265 {
+                vps: None,
+                sps: None,
+                pps: None,
+            },
+        ] {
+            let plan = AudioPlan::new(DEDICATED, Some(&Codec::Pcmu), Some(&reaching(&codec)));
+            assert_eq!(
+                plan.talkback,
+                Talkback::Off("the backchannel takes a codec talk-back cannot feed"),
+                "{codec:?}"
+            );
+        }
+        // No backchannel at all.
+        let plan = AudioPlan::new(DEDICATED, Some(&Codec::Pcmu), None);
+        assert_eq!(
+            plan.talkback,
+            Talkback::Off("the camera offers no backchannel")
+        );
+    }
+
+    #[test]
+    fn one_uplink_per_session_and_the_m_line_roles_follow_the_offered_directions() {
+        let pcmu = Codec::Pcmu;
+        // A `sendrecv` downlink and a dedicated m-line: talk-back on the
+        // dedicated one, the downlink only sends.
+        let both = DEDICATED.replacen("a=recvonly", "a=sendrecv", 1);
+        let plan = AudioPlan::new(&both, Some(&pcmu), Some(&reaching(&pcmu)));
+        assert_eq!(plan.talkback, negotiated("2", CodecFamily::Pcmu, true));
+        assert_eq!(plan.answer(Some("0")), Direction::SendOnly);
+        assert_eq!(plan.answer(Some("2")), Direction::RecvOnly);
+        // No talk-back m-line at all.
+        let plan = AudioPlan::new(
+            DEDICATED
+                .split("m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2")
+                .next()
+                .unwrap(),
+            Some(&pcmu),
+            Some(&reaching(&pcmu)),
+        );
+        assert_eq!(plan.talkback, Talkback::NotRequested);
+        assert_eq!(plan.answer(Some("0")), Direction::SendOnly);
+        // The downlink is the first audio m-line the browser receives on:
+        // a `sendonly` or `inactive` one before it is not, nor one without
+        // a mid; a second receiving one is idle.
+        let offer = "v=0\r\nm=audio 9 x 0\r\na=rtpmap:0 PCMU/8000\r\nm=audio 9 x 0\r\na=mid:i\r\na=inactive\r\na=rtpmap:0 PCMU/8000\r\nm=audio 9 x 0\r\na=mid:t\r\na=sendonly\r\na=rtpmap:0 PCMU/8000\r\nm=audio 9 x 0\r\na=mid:d\r\na=rtpmap:0 PCMU/8000\r\nm=audio 9 x 0\r\na=mid:e\r\na=recvonly\r\na=rtpmap:0 PCMU/8000\r\n";
+        let plan = AudioPlan::new(offer, Some(&pcmu), Some(&reaching(&pcmu)));
+        assert_eq!(plan.downlink, Some("d"), "no attribute: sendrecv");
+        assert_eq!(plan.talkback, negotiated("t", CodecFamily::Pcmu, true));
+        assert_eq!(plan.answer(Some("d")), Direction::SendOnly);
+        assert_eq!(plan.answer(Some("e")), Direction::Inactive);
+        assert_eq!(plan.answer(Some("i")), Direction::Inactive);
+        // Stream audio the downlink does not list, or none: nothing sent.
+        let plan = AudioPlan::new(offer, Some(&Codec::Pcma), None);
+        assert_eq!(plan.send, None);
+        assert_eq!(plan.answer(Some("d")), Direction::Inactive);
+        // A `sendrecv` m-line after a `recvonly` downlink requests talk-back
+        // too (RFC 8866 §6.7): it comes up there, the downlink only sends.
+        let offer = "v=0\r\nm=audio 9 x 0\r\na=mid:d\r\na=recvonly\r\na=rtpmap:0 PCMU/8000\r\nm=audio 9 x 0\r\na=mid:s\r\na=sendrecv\r\na=rtpmap:0 PCMU/8000\r\n";
+        let plan = AudioPlan::new(offer, Some(&pcmu), Some(&reaching(&pcmu)));
+        assert_eq!(plan.downlink, Some("d"));
+        assert_eq!(plan.talkback, negotiated("s", CodecFamily::Pcmu, false));
+        assert_eq!(plan.answer(Some("d")), Direction::SendOnly);
+        assert_eq!(plan.answer(Some("s")), Direction::RecvOnly);
+        let plan = AudioPlan::new(offer, Some(&pcmu), None);
+        assert_eq!(
+            plan.talkback,
+            Talkback::Off("the camera offers no backchannel")
+        );
+        // No audio m-line the browser receives on.
+        let plan = AudioPlan::new("v=0\r\nm=video 9 x 96\r\na=mid:v\r\n", Some(&pcmu), None);
+        assert_eq!((plan.downlink, plan.send), (None, None));
+        assert_eq!(plan.answer(None), Direction::Inactive);
+    }
+
+    #[test]
+    fn rfc8829_5_3_1_the_engine_is_offered_each_audio_m_line_as_the_answer_reverses_it() {
+        let pcmu = Codec::Pcmu;
+        // Nothing to change: the offer as it was, line endings normalized.
+        let plan = AudioPlan::new(DEDICATED, Some(&pcmu), Some(&reaching(&pcmu)));
+        assert_eq!(plan.engine_offer(DEDICATED), DEDICATED);
+        // Without a backchannel the talk-back m-line becomes inactive; its
+        // other lines, and the video's, stay.
+        let plan = AudioPlan::new(DEDICATED, Some(&pcmu), None);
+        assert_eq!(
+            plan.engine_offer(DEDICATED),
+            DEDICATED.replace(
+                "a=mid:2\r\na=sendonly\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n",
+                "a=mid:2\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=inactive\r\n"
+            )
+        );
+        // A `sendrecv` downlink the session only sends on is offered to
+        // the engine `recvonly`, which answers it `sendonly`.
+        let sendrecv = sendrecv();
+        let plan = AudioPlan::new(&sendrecv, Some(&pcmu), None);
+        let rewritten = plan.engine_offer(&sendrecv);
+        assert!(!rewritten.contains("a=sendrecv"), "{rewritten}");
+        assert!(
+            rewritten.contains("a=rtpmap:8 PCMA/8000\r\na=recvonly\r\nm=video"),
+            "{rewritten}"
+        );
+        // With talk-back on it, as offered.
+        let plan = AudioPlan::new(&sendrecv, Some(&pcmu), Some(&reaching(&pcmu)));
+        assert_eq!(plan.engine_offer(&sendrecv), sendrecv);
+        // An m-line without a mid and one without an attribute, which
+        // counts as `sendrecv`, are written out `inactive`.
+        let offer = "v=0\r\nm=audio 9 x 8\r\na=sendrecv\r\nm=audio 9 x 0\r\na=mid:a\n";
+        let plan = AudioPlan::new(offer, None, None);
+        assert_eq!(
+            plan.engine_offer(offer),
+            "v=0\r\nm=audio 9 x 8\r\na=inactive\r\nm=audio 9 x 0\r\na=mid:a\r\na=inactive\r\n"
+        );
+    }
+
+    /// Without the reverse chain (`Registries::uplink` unset), only the
+    /// backchannel's own codec reaches it: talk-back is answered in it
+    /// alone, every other codec dropped from the talk-back m-line, and
+    /// off when the offer does not list it, never answered in a codec no
+    /// route takes (RFC 3264 §7).
+    #[test]
+    fn rfc3264_7_without_the_reverse_chain_talk_back_takes_only_the_backchannel_codec() {
+        use CodecFamily::{Opus, Pcmu};
+        let offer = talking_in(&["opus", "PCMU", "PCMA", "G722"]);
+        let forwarded = |codec: Codec| TalkbackTarget {
+            takes: UplinkCodec::of(codec.family()).into_iter().collect(),
+            codec,
+        };
+        for (backchannel, expected) in [(Codec::Pcmu, Pcmu), (Codec::Opus { channels: 2 }, Opus)] {
+            let target = forwarded(backchannel);
+            let plan = AudioPlan::new(&offer, None, Some(&target));
+            assert_eq!(plan.talkback, negotiated("2", expected, true));
+            assert_eq!(answered(&plan, &offer, "2"), [expected]);
+            for family in EVERY_CODEC {
+                assert_eq!(plan.takes(family), family == expected, "{family:?}");
+            }
+        }
+        // An Opus-only offer to a PCMU camera: nothing reaches it.
+        let opus_only = talking_in(&["opus"]);
+        let target = forwarded(Codec::Pcmu);
+        let plan = AudioPlan::new(&opus_only, None, Some(&target));
+        assert_eq!(
+            plan.talkback,
+            Talkback::Off("the talk-back m-line lists no codec that reaches the backchannel")
+        );
+        // A backchannel no uplink codec reaches is off whatever its codec.
+        let none = TalkbackTarget {
+            codec: Codec::Pcmu,
+            takes: Vec::new(),
+        };
+        assert_eq!(
+            AudioPlan::new(&offer, None, Some(&none)).talkback,
+            Talkback::Off("the backchannel takes a codec talk-back cannot feed")
+        );
+    }
+
+    /// The offered-codec matrix of a dedicated talk-back m-line that lists
+    /// Opus, PCMU, PCMA and G.722: for each backchannel and stream audio,
+    /// the answer lists only codecs that reach the camera there,
+    /// talk-back's first, which the browser sends (RFC 3264 §7); the
+    /// downlink m-line keeps its own list.
+    #[test]
+    fn rfc3264_7_a_dedicated_talk_back_m_line_lists_only_codecs_that_reach_the_camera() {
+        use CodecFamily::{Opus, Pcma, Pcmu};
+        let offer = talking_in(&["opus", "PCMU", "PCMA", "G722"]);
+        let opus = Codec::Opus { channels: 2 };
+        for (backchannel, audio, expected) in [
+            (Codec::Pcmu, Some(&opus), &[Pcmu, Opus][..]),
+            (Codec::Pcmu, Some(&Codec::Pcmu), &[Pcmu]),
+            (Codec::Pcmu, None, &[Pcmu, Opus, Pcma]),
+            (Codec::Pcma, Some(&opus), &[Pcma, Opus]),
+            (Codec::Pcma, Some(&Codec::Pcmu), &[Pcma, Pcmu]),
+            (Codec::Pcma, None, &[Pcma, Opus, Pcmu]),
+            // The finding's case: PCMU down, Opus up; PCMU is not listed
+            // for talk-back, nor G.722 without stream audio.
+            (opus.clone(), Some(&opus), &[Opus]),
+            (opus.clone(), Some(&Codec::Pcmu), &[Opus]),
+            (opus.clone(), None, &[Opus]),
+        ] {
+            let what = format!("{backchannel:?} up, {audio:?} down");
+            let plan = AudioPlan::new(&offer, audio, Some(&reaching(&backchannel)));
+            assert_eq!(answered(&plan, &offer, "2"), expected, "{what}");
+            // The engine is never offered a codec talk-back does not take
+            // on that m-line, nor its attribute lines.
+            let engine = plan.engine_offer(&offer);
+            let sdp = Sdp::parse(&engine);
+            let talkback = with_mid(&sdp, "2");
+            for family in EVERY_CODEC {
+                assert_eq!(
+                    lists(talkback, family),
+                    routable(family, &backchannel),
+                    "{what}: {family:?} in {engine}"
+                );
+            }
+            assert!(
+                talkback.formats().all(|pt| talkback
+                    .attribute("rtpmap")
+                    .any(|rtpmap| rtpmap.starts_with(&format!("{pt} ")))),
+                "{what}: {engine}"
+            );
+            // Opus reaches every backchannel: its a=fmtp and a=rtcp-fb stay.
+            for line in [
+                "a=fmtp:111 minptime=10;useinbandfec=1",
+                "a=rtcp-fb:111 transport-cc",
+            ] {
+                assert!(talkback.lines().contains(&line), "{what}: {engine}");
+            }
+            // The downlink m-line's formats and the video m-line as
+            // offered; only the downlink's direction may change.
+            let offered = Sdp::parse(&offer);
+            for mid in ["0", "1"] {
+                assert_eq!(
+                    with_mid(&sdp, mid).m_line(),
+                    with_mid(&offered, mid).m_line(),
+                    "{what}"
+                );
+                assert!(
+                    with_mid(&sdp, mid)
+                        .attribute("rtpmap")
+                        .eq(with_mid(&offered, mid).attribute("rtpmap")),
+                    "{what}"
+                );
+            }
+        }
+    }
+
+    /// A `sendrecv` m-line that carries the downlink and talk-back lists
+    /// the codecs that reach the camera and the stream audio's, which the
+    /// session sends there. When the stream audio's does not reach the
+    /// camera it stays all the same (the `SPEC-DEVIATION` of
+    /// [`AudioPlan::unroutable`]), after talk-back's, which the browser
+    /// sends (RFC 3264 §7).
+    #[test]
+    fn rfc3264_6_1_a_shared_sendrecv_m_line_keeps_the_stream_audio_beside_talk_back() {
+        use CodecFamily::{G722, Opus, Pcma, Pcmu};
+        let offer = shared_in(&["opus", "PCMU", "PCMA", "G722"]);
+        let opus = Codec::Opus { channels: 2 };
+        for (backchannel, audio, expected) in [
+            (Codec::Pcmu, Some(&opus), &[Pcmu, Opus][..]),
+            (Codec::Pcmu, Some(&Codec::Pcmu), &[Pcmu]),
+            (Codec::Pcmu, None, &[Pcmu, Opus, Pcma]),
+            (opus.clone(), Some(&opus), &[Opus]),
+            (opus.clone(), None, &[Opus]),
+            // The residual cases: sent down, not taken up.
+            (opus.clone(), Some(&Codec::Pcmu), &[Opus, Pcmu]),
+            (Codec::Pcma, Some(&Codec::G722), &[Pcma, G722]),
+        ] {
+            let what = format!("{backchannel:?} up, {audio:?} down");
+            let plan = AudioPlan::new(&offer, audio, Some(&reaching(&backchannel)));
+            assert_eq!(
+                plan.talkback,
+                negotiated("0", backchannel.family(), false),
+                "{what}"
+            );
+            assert_eq!(answered(&plan, &offer, "0"), expected, "{what}");
+            let send = audio.map(Codec::family);
+            for family in EVERY_CODEC {
+                assert_eq!(
+                    plan.takes(family),
+                    routable(family, &backchannel),
+                    "{what}: {family:?}"
+                );
+                let listed = lists(
+                    with_mid(&Sdp::parse(&plan.engine_offer(&offer)), "0"),
+                    family,
+                );
+                assert_eq!(
+                    listed,
+                    plan.takes(family) || send == Some(family),
+                    "{what}: {family:?}"
+                );
+            }
+        }
+        // A `sendrecv` m-line after the downlink one carries talk-back
+        // alone: the stream audio's goes down elsewhere and is dropped
+        // there like any other codec talk-back does not take.
+        let offer = "v=0\r\nm=audio 9 x 0 111\r\na=mid:d\r\na=recvonly\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:111 opus/48000/2\r\nm=audio 9 x 111 0\r\na=mid:s\r\na=sendrecv\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\n";
+        let plan = AudioPlan::new(offer, Some(&Codec::Pcmu), Some(&reaching(&opus)));
+        assert_eq!(plan.talkback, negotiated("s", Opus, false));
+        assert_eq!(answered(&plan, offer, "s"), [Opus]);
+        assert_eq!(answered(&plan, offer, "d"), [Opus, Pcmu], "as offered");
+        assert_eq!(
+            plan.engine_offer(offer),
+            "v=0\r\nm=audio 9 x 0 111\r\na=mid:d\r\na=recvonly\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:111 opus/48000/2\r\nm=audio 9 x 111\r\na=mid:s\r\na=rtpmap:111 opus/48000/2\r\na=sendonly\r\n"
+        );
+    }
+
+    /// The formats str0m reads on the talk-back m-line are the ones
+    /// narrowed: static payload types listed without an `a=rtpmap`
+    /// (RFC 3551 §6, Table 4) and an `a=rtpmap` the format list leaves
+    /// out. A format of no codec the engine carries stays (the engine
+    /// answers none), and so does a wildcard `a=rtcp-fb`.
+    #[test]
+    fn rfc3551_6_static_payload_types_and_unlisted_rtpmaps_are_narrowed_too() {
+        let offer = "v=0\r\nm=audio 9 x 111 9 0 13 101\r\na=mid:t\r\na=sendonly\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\na=rtcp-fb:* nack\r\na=fmtp:9\r\n";
+        let plan = AudioPlan::new(offer, None, Some(&reaching(&Codec::Opus { channels: 2 })));
+        assert_eq!(plan.talkback, negotiated("t", CodecFamily::Opus, true));
+        assert_eq!(
+            plan.engine_offer(offer),
+            "v=0\r\nm=audio 9 x 111 13 101\r\na=mid:t\r\na=sendonly\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\na=rtcp-fb:* nack\r\n"
+        );
+        assert_eq!(encoding_family("opus"), None, "no clock rate");
+        assert_eq!(encoding_family("pcma/8000"), Some(CodecFamily::Pcma));
+        assert_eq!(encoding_family("telephone-event/8000"), None);
+        assert!(describes("a=rtcp-fb:9 nack", &[9]));
+        assert!(!describes("a=rtcp-fb:90 nack", &[9]));
+        assert!(!describes("a=mid:9", &[9]));
+        assert_eq!(without_formats("m=audio 9 x 0 8", &[0, 8]), "m=audio 9 x");
+        assert_eq!(without_formats("m=audio 9 x 0 8", &[]), "m=audio 9 x 0 8");
+    }
+
+    /// m-lines that carry no talk-back keep every format they offer, so an
+    /// `inactive` one still lists formats of the offer (RFC 3264 §6.1).
+    #[test]
+    fn rfc3264_6_1_m_lines_without_talk_back_keep_their_formats() {
+        let opus = Codec::Opus { channels: 2 };
+        let offer = talking_in(&["opus", "PCMU", "PCMA", "G722"]);
+        // No backchannel, or one talk-back cannot feed: the talk-back
+        // m-line is inactive with what it offered.
+        for backchannel in [None, Some(&Codec::G722)] {
+            let plan = AudioPlan::new(
+                &offer,
+                Some(&Codec::Pcmu),
+                backchannel.map(reaching).as_ref(),
+            );
+            assert!(!plan.takes(CodecFamily::Pcmu), "{backchannel:?}");
+            let engine = plan.engine_offer(&offer);
+            assert!(
+                engine.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8 9\r\na=mid:2\r\n"),
+                "{engine}"
+            );
+            assert!(engine.contains("a=rtpmap:9 G722/8000\r\n"), "{engine}");
+            assert_eq!(
+                answered(&plan, &offer, "2"),
+                [CodecFamily::Pcmu],
+                "inactive, with a format of the offer"
+            );
+        }
+        // A talk-back m-line that lists nothing talk-back takes: off, and
+        // inactive with that.
+        let g722 = talking_in(&["G722"]);
+        let plan = AudioPlan::new(&g722, None, Some(&reaching(&opus)));
+        assert!(!plan.takes(CodecFamily::Opus));
+        assert_eq!(answered(&plan, &g722, "2"), [CodecFamily::G722]);
+        assert_eq!(plan.engine_offer(&g722).matches("G722").count(), 1);
+    }
+}

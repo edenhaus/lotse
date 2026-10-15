@@ -24,6 +24,8 @@ pub struct Harness {
     pub reports: mpsc::Receiver<ClockReport>,
     /// The mapper the hints belong to.
     pub mapper: Arc<ClockMapper>,
+    /// Where the source offers its backchannel, if it has one.
+    pub backchannel: BackchannelSlot,
     /// Ends the attempt.
     cancel: CancellationToken,
     /// The attempt.
@@ -37,12 +39,13 @@ impl Harness {
         let mapper = Arc::new(ClockMapper::new());
         let (clock_input, reports) = ClockInput::channel(Arc::clone(&mapper));
         let cancel = CancellationToken::new();
+        let backchannel = BackchannelSlot::default();
         let ctx = SourceCtx {
             peer,
             tracks: tracks.publisher(),
             clock: clock_input,
             time: clock,
-            backchannel: BackchannelSlot::default(),
+            backchannel: backchannel.clone(),
             cancel: cancel.clone(),
         };
         let run = spawn_named("harness.source", source.run(ctx));
@@ -50,6 +53,7 @@ impl Harness {
             tracks,
             reports,
             mapper,
+            backchannel,
             cancel,
             run,
         }

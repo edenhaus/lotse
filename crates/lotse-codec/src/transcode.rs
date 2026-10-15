@@ -31,11 +31,15 @@
 //! across a re-anchor, and the epoch starts when the new timeline's first
 //! packet is released, after the old timeline's last.
 //!
+//! The reverse instance of the same contract, uplink audio to the camera's
+//! G.711 for talk-back, is [`uplink::ToG711`].
+//!
 //! Implements RFC 7587 (Opus RTP: 48 kHz clock §4.1, one frame per
 //! packet §4.2) over RFC 6716 frames, from RFC 3640 AAC-LC frames
 //! (ISO/IEC 14496-3 §4, 1024 samples per frame).
 
 mod pace;
+pub mod uplink;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -192,7 +196,7 @@ impl Transcoder for AacToOpus {
     }
 }
 
-/// A refusal of the resampler or the Opus encoder as [`TranscodeError::Failed`].
+/// A refusal of the resampler or an Opus codec as [`TranscodeError::Failed`].
 fn failed(err: impl std::fmt::Display) -> TranscodeError {
     TranscodeError::Failed(err.to_string())
 }

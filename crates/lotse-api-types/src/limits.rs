@@ -32,6 +32,10 @@ pub const MAX_ICE_SERVERS: usize = 16;
 /// The most `urls` of one ICE server.
 pub const MAX_ICE_URLS: usize = 16;
 
+/// The longest certificate pin of `clients/remove`: 32 hex pairs and the
+/// 31 colons between them.
+pub const MAX_PIN_CHARS: usize = 95;
+
 /// The longest ICE server URL, TURN username or credential, trickled
 /// candidate or `sdp_mid`.
 pub const MAX_TEXT_CHARS: usize = 1024;

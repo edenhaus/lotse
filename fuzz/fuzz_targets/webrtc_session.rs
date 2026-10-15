@@ -87,7 +87,7 @@ impl Pair {
                     self.connected = true;
                     self.session.join(self.now, None);
                 }
-                SessionOutput::Event(_) => {}
+                SessionOutput::Event(_) | SessionOutput::Uplink(_) => {}
                 SessionOutput::Timeout(_) => return,
             }
         }
@@ -216,9 +216,11 @@ fuzz_target!(|data: &[u8]| {
             pps: None,
         }),
         audio: audio.then(|| Arc::new(Codec::Pcmu)),
+        backchannel: None,
         orientation: Orientation::ALL[usize::from((setup >> 1) & 7)],
         limits: SessionLimits::default(),
         wall: SystemTime::UNIX_EPOCH,
+        talkback_required: false,
     };
     let (session, answer) = match Session::answer(&request, t0) {
         Ok(answered) => answered,

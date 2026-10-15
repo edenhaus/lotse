@@ -12,6 +12,17 @@
 //! epochs, the H.264, H.265 and AAC normalizers, the track's publication,
 //! and the Sender Reports into the clock mapper. Once the camera hangs up
 //! the attempt ends with a typed error.
+//!
+//! The source opts in, so the `DESCRIBE` asks for the ONVIF backchannel
+//! (ONVIF Streaming Specification §5.3.1), and a fuzzed `a=sendonly`
+//! audio media takes the backchannel's path (§5.3.2): retina's stream
+//! direction, our reading of its format and `a=ptime` from the raw SDP
+//! (RFC 8866 §5.14, §6.4, §6.6, §6.7) and its matching stream, its
+//! `SETUP` last with the fuzzed answer, and once offered one packet
+//! through retina's send path. A
+//! `551` or `400` to `DESCRIBE` (a whole-response section) describes again
+//! without the header, on a second connection the camera plays the same
+//! script to.
 //! Run with `mise run fuzz rtsp_session`, which passes libFuzzer's time and
 //! memory limits (`scripts/fuzz.sh`).
 //!
@@ -40,6 +51,7 @@ use std::time::Duration;
 use libfuzzer_sys::fuzz_target;
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
+use lotse_core::media::{MediaPacket, RtpHeaderFields};
 use lotse_core::source::{
     BackchannelSlot, ClockInput, ResolvedPeer, SourceCtx, SourceExit, SourceFactory as _, TrackSet,
 };
@@ -169,11 +181,20 @@ async fn request(socket: &mut TcpStream, buf: &mut Vec<u8>) -> Option<(String, S
     }
 }
 
-/// Plays `script` to the first connection on `listener`, then hangs up.
+/// Plays `script` to every connection on `listener`, one at a time: the
+/// source's retry of a refused `Require` header comes on a second one.
 async fn camera(listener: TcpListener, base: String, script: Script<'_>) {
-    let Ok((mut socket, _)) = listener.accept().await else {
-        return;
-    };
+    loop {
+        let Ok((socket, _)) = listener.accept().await else {
+            return;
+        };
+        play(socket, &base, &script).await;
+    }
+}
+
+/// Plays `script` on `socket`, then hangs up; returns once the source
+/// closed its end.
+async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
     // A reset, not a TIME_WAIT, when the attempt is over: tens of
     // thousands of connections a minute would run out of ports.
     let _ = socket.set_zero_linger();
@@ -238,7 +259,7 @@ async fn camera(listener: TcpListener, base: String, script: Script<'_>) {
         }
         if then_stream {
             if script.flags & 0x18 == 0x10 {
-                send_datagrams(&script, &client_ports).await;
+                send_datagrams(script, &client_ports).await;
             } else {
                 let _ = socket.write_all(&script.stream()).await;
             }
@@ -246,10 +267,37 @@ async fn camera(listener: TcpListener, base: String, script: Script<'_>) {
         }
     }
     let _ = socket.shutdown().await;
-    // Held open, reading, until the attempt is over and the runtime drops
-    // it: the source must end on the hang-up alone.
+    // Held open, reading, until the source closes it: the source must end
+    // on the hang-up alone.
     let mut sink = [0_u8; 1024];
     while matches!(socket.read(&mut sink).await, Ok(n) if n > 0) {}
+}
+
+/// The talker's half: once the source offers a backchannel on `slot`, one
+/// 20 ms PCMU packet into it, for retina to send on what the fuzzed SDP
+/// and `SETUP` answer made of it.
+async fn talk(slot: BackchannelSlot) {
+    loop {
+        if let Some(handle) = slot.current() {
+            let _ = handle.sender.try_send(MediaPacket {
+                arrival: std::time::Instant::now(),
+                rtp: RtpHeaderFields {
+                    pt: 0,
+                    seq: 1,
+                    ts: 160,
+                    marker: true,
+                    ssrc: 1,
+                },
+                frame_start: true,
+                keyframe_start: false,
+                epoch: 0,
+                lateness: Duration::ZERO,
+                payload: Arc::from(&[0xff_u8; 160][..]),
+            });
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     std::future::pending::<()>().await;
 }
 
@@ -301,13 +349,14 @@ fuzz_target!(|data: &[u8]| {
         let source = RtspFactory::default()
             .validate(
                 &url,
-                &serde_json::json!({ "timeout_ms": 2_000, "transport": transport }),
+                &serde_json::json!({ "timeout_ms": 2_000, "transport": transport, "backchannel": true }),
             )
             .expect("a valid source");
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let tracks = TrackSet::new(TrackLimits::default(), clock.now());
         let mapper = Arc::new(ClockMapper::new());
         let (clock_input, mut reports) = ClockInput::channel(Arc::clone(&mapper));
+        let slot = BackchannelSlot::default();
         let ctx = SourceCtx {
             peer: ResolvedPeer {
                 host: "127.0.0.1".into(),
@@ -316,7 +365,7 @@ fuzz_target!(|data: &[u8]| {
             tracks: tracks.publisher(),
             clock: clock_input,
             time: clock,
-            backchannel: BackchannelSlot::default(),
+            backchannel: slot.clone(),
             cancel: CancellationToken::new(),
         };
         // The runner's half: Sender Reports reach the mapper while the
@@ -331,6 +380,7 @@ fuzz_target!(|data: &[u8]| {
             exit = source.run(ctx) => exit,
             () = camera(listener, base, script) => unreachable!("the camera never ends"),
             () = ingest => unreachable!("the ingest never ends"),
+            () = talk(slot) => unreachable!("the talker never ends"),
         };
         assert!(
             matches!(exit, SourceExit::Ended(_)),

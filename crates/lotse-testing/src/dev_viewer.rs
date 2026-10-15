@@ -17,8 +17,10 @@
 //! through them, and the viewer's page runs only its own inline script and
 //! style, matched by hash (CSP Level 3 §2.3.1), and connects only to its
 //! own origin. A browser message the daemon would refuse as too large is
-//! refused at the relay already. A development tool, never part of the
-//! daemon.
+//! refused at the relay already. Its talk-back needs the microphone, which
+//! browsers expose to a secure context only: on plain HTTP, a page opened
+//! at a loopback address (W3C Secure Contexts §3.1). A development tool,
+//! never part of the daemon.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -756,7 +758,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert!(page.contains("sources: [{ url }], orientation }"));
+        assert!(page.contains("sources: [source(url, talkback)], orientation }"));
         assert!(page.contains(r#"const CVO = "urn:3gpp:video-orientation";"#));
         assert!(page.contains("extmapId(answer, \"video\", CVO)"));
         // A change while playing puts the stream again and keeps the
@@ -767,7 +769,7 @@ mod tests {
             .and_then(|rest| rest.split("\n});").next())
             .expect("the orientation handler");
         assert!(handler.contains(
-            r#"send({ type: "stream/put", stream_id: streamId, sources: [{ url }], orientation }"#
+            r#"send({ type: "stream/put", stream_id: streamId, sources: [source(url, talkback)], orientation }"#
         ));
         assert!(!handler.contains("play()"), "{handler}");
         // The saved-streams list shows URLs masked.
@@ -825,6 +827,154 @@ mod tests {
         );
         cancel.cancel();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Talk-back (2026-10-11): the opt-in puts the RTSP option
+    /// `backchannel`, the offer carries a send-only audio m-line, which the
+    /// daemon answers recvonly (RFC 3264 §6.1), and the microphone goes on
+    /// it only while Talk is on, so nothing claims the backchannel before.
+    #[test]
+    fn rfc3264_s6_1_talk_back_offers_a_sendonly_m_line_and_sends_only_while_talking() {
+        let page = PAGE;
+        assert!(page.contains(r#"<input id="talkback" type="checkbox">"#));
+        assert!(page.contains(r#"<button id="talk" type="button" class="secondary" disabled"#));
+        // The option only when opted in, so a camera without a backchannel
+        // never sees the request.
+        assert!(page.contains("(talkback ? { url, options: { backchannel: true } } : { url })"));
+        assert!(page.contains(
+            r#"call({ type: "stream/put", stream_id: streamId, sources: [source(url, talkback)], orientation })"#
+        ));
+        // The microphone API exists only in a secure context; without it
+        // the offer goes out without talk-back.
+        assert!(page.contains(
+            r#"if (navigator.mediaDevices?.getUserMedia) {
+      talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });"#
+        ));
+        // The offer goes out right after the put's result, talk-back or
+        // not: the daemon holds it while the connection restarts to ask for
+        // the backchannel, so the page neither waits nor polls.
+        let play = page
+            .split("async function play()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("play()");
+        let awaited = "const putResult = await put;";
+        let put = play.find(awaited).expect("awaits the put") + awaited.len();
+        let offer = play.find(r#"type: "webrtc/offer""#).expect("offers");
+        let between = &play[put..offer];
+        assert!(!between.contains("await"), "{between}");
+        assert!(!page.contains(r#"type: "stream/get""#), "no polling");
+        assert!(!play.contains("setTimeout("), "no waiting: {play}");
+        // A talk-back request the daemon cannot meet fails the session; the
+        // page says why and does not retry without talk-back.
+        let closed = page
+            .split(r#"case "closed":"#)
+            .nth(1)
+            .and_then(|rest| rest.split("break;").next())
+            .expect("the closed event");
+        assert!(
+            closed.contains(r#"if (event.code === "backchannel_unavailable") {"#),
+            "{closed}"
+        );
+        assert!(closed.contains("${event.message}"), "{closed}");
+        assert!(!closed.contains("play()"), "no retry: {closed}");
+        // Talk is usable only when the answer took the m-line.
+        assert!(page.contains(r#"talkTransceiver.currentDirection === "sendonly""#));
+        // The microphone is asked for on Talk, not on Play, and leaves the
+        // sender when talking stops.
+        assert!(!play.contains("getUserMedia({"), "{play}");
+        let start = page
+            .split("async function startTalking()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("startTalking()");
+        assert!(start.contains("navigator.mediaDevices.getUserMedia({ audio: true })"));
+        assert!(start.contains("transceiver.sender.replaceTrack(track)"));
+        let stop = page
+            .split("async function stopTalking()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("stopTalking()");
+        assert!(stop.contains("transceiver.sender.replaceTrack(null)"));
+        // The backchannel is released only from this session, decided in
+        // the worker in one step, so stopping never takes it from another
+        // viewer: no separate check of the talker races a claim.
+        assert!(
+            stop.contains(
+                r#"call({ type: "backchannel/release", stream_id: streamId, session_id: session })"#
+            ),
+            "{stop}"
+        );
+        assert!(!stop.contains("session/get"), "{stop}");
+        // Teardown stops the microphone.
+        let teardown = page
+            .split("function teardown(quiet)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("teardown()");
+        assert!(teardown.contains("releaseMic();"), "{teardown}");
+    }
+
+    /// Talk's start and stop are serialized per Play: a stale Play's
+    /// failure never touches a later one's controls, and Talk stays
+    /// disabled from a stop until the worker applied its release.
+    #[test]
+    fn talk_controls_follow_only_the_current_play_and_wait_for_the_release() {
+        let page = PAGE;
+        let start = page
+            .split("async function startTalking()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("startTalking()");
+        // A stale Play's failure leaves the controls alone: each failure
+        // returns for it before touching them, and Talk comes back only
+        // for the current one.
+        for failed in start.split("} catch (err) {").skip(1) {
+            let handler = failed.split("return;\n  }").next().unwrap();
+            let stale = handler
+                .find("if (mine !== attempt) return;")
+                .expect(handler);
+            for touch in ["log(", "$(\"talk\")", "releaseMic()"] {
+                assert!(
+                    handler.find(touch).is_none_or(|at| at > stale),
+                    "{touch} before the stale check: {handler}"
+                );
+            }
+            assert!(
+                handler.contains("$(\"talk\").disabled = false;"),
+                "{handler}"
+            );
+        }
+        let stop = page
+            .split("async function stopTalking()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("stopTalking()");
+        // Talk stays disabled from the stop until the worker applied the
+        // release, which session/get shows once the supervisor heard of
+        // it: the command's result only says it is queued.
+        let disabled = stop.find("$(\"talk\").disabled = true;").expect(stop);
+        let release = stop.find("backchannel/release").expect(stop);
+        let applied = stop
+            .find("await releaseApplied(session, mine)")
+            .expect(stop);
+        let enabled = stop
+            .find("if (mine === attempt) $(\"talk\").disabled = false;")
+            .expect(stop);
+        assert!(
+            disabled < release && release < applied && applied < enabled,
+            "{stop}"
+        );
+        let polls = page
+            .split("async function releaseApplied(session, mine)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("releaseApplied()");
+        assert!(
+            polls.contains(r#"call({ type: "session/get", session_id: session })"#),
+            "{polls}"
+        );
+        assert!(polls.contains("!got.result.backchannel.talker"), "{polls}");
     }
 
     type Connected = Result<

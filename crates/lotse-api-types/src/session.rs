@@ -101,11 +101,24 @@ pub enum SessionEvent {
     /// that fails closes it. While a `stream/put` switches the stream to
     /// another source, the old source's failures do not count. An answered
     /// session rides every reconnect instead.
+    ///
+    /// `backchannel_unavailable`: the offer requests two-way audio (an
+    /// audio m-line the browser offers `sendonly` or `sendrecv`) on a
+    /// stream that opted in to the camera's backchannel (an RTSP source's
+    /// `backchannel` option), and the session cannot have it: the camera
+    /// offers no backchannel, setting it up failed, it takes a codec
+    /// talk-back cannot feed, or the talk-back m-line lists neither its
+    /// codec nor Opus (nor, for a G.711 backchannel, the other G.711
+    /// law, which talk-back converts). The message says which. Such a
+    /// session is never played without talk-back; on a stream that did
+    /// not opt in, the request is answered without it instead (the
+    /// dedicated m-line `inactive`, a `sendrecv` one send-only).
     #[schemars(title = "SessionEventClosed")]
     Closed {
-        /// The stable code (`peer_closed`, `session_closed`, ...). Before
-        /// the answer, a failed source closes the session with its error's
-        /// code, the one `stream/get` reports as `last_error`:
+        /// The stable code (`peer_closed`, `session_closed`,
+        /// `backchannel_unavailable`, ...). Before the answer, a failed
+        /// source closes the session with its error's code, the one
+        /// `stream/get` reports as `last_error`:
         /// `source_unreachable`, `source_auth_failed`, `source_timeout`,
         /// `source_protocol_error`, `source_ended` or `worker_crashed`.
         code: String,
@@ -133,6 +146,40 @@ pub struct Session {
     pub orphaned: bool,
     /// When the offer arrived, RFC 3339 UTC.
     pub since: String,
+    /// Talk-back towards the camera's backchannel; all zero and `false`
+    /// when the answer did not negotiate it.
+    #[serde(default)]
+    pub backchannel: SessionBackchannel,
+}
+
+/// A session's talk-back, as `session/get` reports it.
+/// The counters are the worker's, pushed once per second, so they may lag
+/// by that much; `negotiated`, `codec` and `talker` are current.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionBackchannel {
+    /// The answer accepted the browser's talk-back m-line (`recvonly`, or
+    /// `sendrecv` on its downlink audio m-line).
+    #[serde(default)]
+    pub negotiated: bool,
+    /// The session holds the camera's backchannel now: it sent first and
+    /// keeps it until it closes or `backchannel/release`.
+    #[serde(default)]
+    pub talker: bool,
+    /// The talk-back codec the answer named first on that m-line, which the
+    /// browser sends (`opus`, `pcmu`, `pcma`); null when not negotiated.
+    #[serde(default)]
+    pub codec: Option<String>,
+    /// Talk-back RTP packets the session received and took.
+    #[serde(default)]
+    pub packets_received: u64,
+    /// Of those, the ones dropped because another session held the
+    /// backchannel.
+    #[serde(default)]
+    pub packets_dropped_busy: u64,
+    /// Payload bytes handed to the camera's backchannel, after the reverse
+    /// transcode.
+    #[serde(default)]
+    pub bytes_sent: u64,
 }
 
 /// `session/list`'s result.
@@ -252,6 +299,7 @@ mod tests {
             answered: false,
             orphaned: true,
             since: "2026-09-30T10:00:00.000Z".into(),
+            backchannel: SessionBackchannel::default(),
         };
         let list = serde_json::to_value(SessionList {
             sessions: vec![session],
@@ -261,7 +309,30 @@ mod tests {
             list,
             json!({ "sessions": [{ "session_id": "s1", "stream_id": "front", "ice": "new",
                                    "dtls": "new", "answered": false, "orphaned": true,
-                                   "since": "2026-09-30T10:00:00.000Z" }] })
+                                   "since": "2026-09-30T10:00:00.000Z",
+                                   "backchannel": { "negotiated": false, "talker": false, "codec": null,
+                                                    "packets_received": 0, "packets_dropped_busy": 0,
+                                                    "bytes_sent": 0 } }] })
+        );
+    }
+
+    #[test]
+    fn a_session_from_a_daemon_without_talk_back_parses_with_it_off() {
+        let session: Session = serde_json::from_value(json!({
+            "session_id": "s1", "stream_id": "front", "ice": "new", "dtls": "new",
+            "answered": true, "orphaned": false, "since": "2026-09-30T10:00:00.000Z"
+        }))
+        .unwrap();
+        assert_eq!(session.backchannel, SessionBackchannel::default());
+        let partial: SessionBackchannel =
+            serde_json::from_value(json!({ "negotiated": true, "codec": "pcmu" })).unwrap();
+        assert_eq!(
+            (
+                partial.negotiated,
+                partial.codec.as_deref(),
+                partial.bytes_sent
+            ),
+            (true, Some("pcmu"), 0)
         );
     }
 }

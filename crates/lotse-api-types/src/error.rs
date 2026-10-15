@@ -35,6 +35,10 @@ pub enum ErrorCode {
     SourceInUse,
     /// The command arrived during graceful shutdown.
     ShuttingDown,
+    /// The command is not allowed on this connection (`pairing/create`
+    /// over the TLS listener, `clients/remove` of another client over it),
+    /// or not for this target (`clients/remove` of a fixed pin).
+    NotPermitted,
     /// An invariant failed; a bug, always logged with context.
     InternalError,
     /// Connecting to the source failed.
@@ -60,6 +64,9 @@ pub enum ErrorCode {
     FrameOverBrowserLimit,
     /// Another session holds the backchannel.
     BackchannelBusy,
+    /// `backchannel/release` on a stream whose source protocol cannot
+    /// carry audio back.
+    BackchannelUnsupported,
     /// Audio withdrawn because sync could not be held.
     AvSyncLost,
     /// The browser closed the peer connection.
@@ -100,6 +107,7 @@ impl ErrorCode {
             Self::SchemeUnsupported => "scheme_unsupported",
             Self::SourceInUse => "source_in_use",
             Self::ShuttingDown => "shutting_down",
+            Self::NotPermitted => "not_permitted",
             Self::InternalError => "internal_error",
             Self::SourceUnreachable => "source_unreachable",
             Self::SourceAuthFailed => "source_auth_failed",
@@ -112,6 +120,7 @@ impl ErrorCode {
             Self::H264ProfileMismatch => "h264_profile_mismatch",
             Self::FrameOverBrowserLimit => "frame_over_browser_limit",
             Self::BackchannelBusy => "backchannel_busy",
+            Self::BackchannelUnsupported => "backchannel_unsupported",
             Self::AvSyncLost => "av_sync_lost",
             Self::PeerClosed => "peer_closed",
             Self::SessionClosed => "session_closed",
@@ -213,6 +222,7 @@ mod tests {
             ErrorCode::TurnUnsupported,
             ErrorCode::H264ProfileMismatch,
             ErrorCode::BackchannelBusy,
+            ErrorCode::BackchannelUnsupported,
             ErrorCode::AvSyncLost,
             ErrorCode::PeerClosed,
             ErrorCode::SessionClosed,
@@ -225,6 +235,7 @@ mod tests {
             ErrorCode::SnapshotTimeout,
             ErrorCode::SnapshotBusy,
             ErrorCode::FrameOverBrowserLimit,
+            ErrorCode::NotPermitted,
         ];
         for code in all {
             let json = serde_json::to_value(code).unwrap();

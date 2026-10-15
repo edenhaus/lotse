@@ -44,6 +44,7 @@ fn supervisor_with(connects: NonZeroUsize) -> Supervisor {
         socket: PathBuf::from("/nonexistent/lotse.sock"),
         owner_uid: 0,
         allow_uid: 0,
+        control_tls: None,
         udp_listen: "[::]:18556".parse().unwrap(),
         tcp_listen: None,
         limits: Limits {

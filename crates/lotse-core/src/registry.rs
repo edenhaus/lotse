@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::output::OutputFactory;
 use crate::source::SourceFactory;
-use crate::transcode::Transcoder;
+use crate::transcode::{Transcoder, UplinkFactory};
 
 /// Why a registration was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -119,6 +119,10 @@ pub struct Registries {
     pub outputs: OutputRegistry,
     /// Transcoders.
     pub transcoders: TranscoderRegistry,
+    /// The talk-back transcoder, apart from `transcoders` so negotiation
+    /// never offers a viewer a talk-back conversion; `None` forwards only
+    /// an uplink already in the device's codec.
+    pub uplink: Option<Arc<dyn UplinkFactory>>,
 }
 
 #[cfg(test)]
@@ -189,6 +193,10 @@ mod tests {
             .transcoders
             .register(Arc::new(FakeTranscoder::aac_to_opus()));
         assert_eq!(registries.transcoders.all().len(), 2);
+        assert!(
+            registries.uplink.is_none(),
+            "no talk-back transcoder by default"
+        );
         assert!(registries.sources.schemes().is_empty());
         assert!(registries.outputs.kinds().is_empty());
         assert_eq!(

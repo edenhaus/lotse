@@ -183,6 +183,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "pair_request"
+path = "fuzz_targets/pair_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "talkback_depacketize"
+path = "fuzz_targets/talkback_depacketize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "hls_playlist"
 path = "fuzz_targets/hls_playlist.rs"
 test = false

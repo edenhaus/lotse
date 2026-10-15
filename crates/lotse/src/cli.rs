@@ -1,6 +1,7 @@
 //! The command line: subcommands, flags and their `LOTSE_*` environment
 //! variables, plus `RUST_LOG`. Flags alone are enough: everything has a
-//! default except `--socket`.
+//! default except `--socket` (and `--data-dir` once `--control-listen` is
+//! set).
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -8,10 +9,11 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use lotse_core::fingerprint::Fingerprint;
 use lotse_sandbox::Mode;
 
 use crate::config::{LogFormat, TcpListen};
-use crate::ctl::CtlArgs;
+use crate::ctl::{CtlArgs, PairArgs};
 
 /// The one binary.
 #[derive(Debug, Parser)]
@@ -36,6 +38,20 @@ pub(crate) enum Command {
     Worker(WorkerArgs),
     /// Talk to a running daemon over its control socket; prints JSON.
     Ctl(CtlArgs),
+    /// Print the pin of the control TLS listener's certificate, the SHA-256
+    /// clients check, from the data directory.
+    Identity(IdentityArgs),
+    /// Print a one-time code that pairs a client with the control TLS
+    /// listener, asking the daemon over its control socket.
+    Pair(PairArgs),
+}
+
+/// `lotse identity`.
+#[derive(Debug, Args)]
+pub(crate) struct IdentityArgs {
+    /// The daemon's data directory, as `serve` has it.
+    #[arg(long, env = "LOTSE_DATA_DIR", value_name = "PATH")]
+    pub(crate) data_dir: PathBuf,
 }
 
 /// `lotse worker`: the flags the supervisor passes. No environment, no
@@ -103,6 +119,28 @@ pub(crate) struct ServeArgs {
     /// Peer uid allowed on the control socket; the starting uid by default.
     #[arg(long, env = "LOTSE_ALLOW_UID", value_name = "UID")]
     pub(crate) allow_uid: Option<u32>,
+
+    /// The control API over mutual TLS on this address, next to the socket;
+    /// off unless set. Needs `--data-dir` and at least one client pin.
+    #[arg(long, env = "LOTSE_CONTROL_LISTEN", value_name = "ADDR")]
+    pub(crate) control_listen: Option<SocketAddr>,
+
+    /// The client certificates allowed on the control TLS listener, by their
+    /// SHA-256 (64 hex digits, colons between the pairs optional),
+    /// comma-separated.
+    #[arg(
+        long,
+        env = "LOTSE_CONTROL_CLIENTS",
+        value_name = "PIN,...",
+        value_delimiter = ','
+    )]
+    pub(crate) control_clients: Option<Vec<Fingerprint>>,
+
+    /// Where the daemon keeps what outlives a restart: the control TLS
+    /// listener's key and certificate. Must exist, belong to the starting uid
+    /// and not be writable by the group or others.
+    #[arg(long, env = "LOTSE_DATA_DIR", value_name = "PATH")]
+    pub(crate) data_dir: Option<PathBuf>,
 
     /// Process isolation: `on` (best effort, reported), `require` (refuse to
     /// start without every layer) or `off` (debugging only: no Landlock or

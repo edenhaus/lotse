@@ -36,9 +36,28 @@ exclude_re = [
     "rtcp.rs:.*replace \\| with \\^ in Report::interleave$",
     # Only logs, rate-limited, why a receiver report did not leave.
     "replace UdpRelay::sent with \\(\\)$",
+    # Only logs that the backchannel's SETUP stays TCP interleaved; the request passes on unchanged
+    # through the arm after it all the same.
+    "delete match arm \"SETUP\" in UdpRelay::retina_wrote$",
     # Only picks whether the rate-limited unroutable warning is logged.
     "replace \\|\\| with && in Peers::route",
     "replace == with != in Peers::route",
+    # Only logs the talk-back decision; the answer it describes is asserted by the
+    # talk-back fixtures.
+    "replace log_talkback with \\(\\)",
+    # Only picks whether a change of the talk-back codec is logged; the codec is remembered
+    # either way.
+    "replace match guard old == uplink.codec with (true|false) in TalkbackRx::take",
+    # Only the level and message of the talk-back state logs, and whether the end-of-session
+    # counters are logged; the states and counters themselves are asserted by the arbitration tests.
+    "talkback.rs:.*in log_change$",
+    "talkback.rs:.*replace log_change with \\(\\)",
+    "talkback.rs:.*in Talkback::log_end$",
+    "talkback.rs:.*replace Talkback::log_end with \\(\\)",
+    "replace == with != in TalkbackRx::take",
+    # G.711's sign (0x80), segment (0x70) and step (0x0f) bits are disjoint, so `|` and `^`
+    # produce the same code.
+    "g711.rs:.*replace \\| with \\^ in (mu|a)_encode$",
     # The seconds shifted up 32 bits and the fraction below 2^32 occupy disjoint bits.
     "replace \\| with \\^ in ntp_timestamp",
     # The CVO flip bit and the rotation bits are disjoint, so `|` and `^` produce the same byte.
@@ -59,4 +78,19 @@ exclude_re = [
     # Reading one more piece of the body before the sniff decides the same: it looks at the
     # first bytes only, and every byte read is handed on either way.
     "lotse-http/src/source/mod.rs:.*replace < with <= in sniff$",
+    # The open flags and modes are disjoint bits, so `|` and `^` produce the same flags.
+    "identity.rs:.*replace \\| with \\^ in (ServerIdentity::load_in|open_directory|write_new)$",
+    # `write_new` unlinks the partial file's name just before, in a directory only the owner
+    # may write (checked) and only this start uses (locked), and nothing runs a program
+    # meanwhile: `O_EXCL`, `O_NOFOLLOW` and `O_CLOEXEC` guard what cannot happen there, so
+    # dropping them changes nothing a test can see. Column 60 drops `O_EXCL` and
+    # `O_NOFOLLOW`, column 79 `O_NOFOLLOW` and `O_CLOEXEC`.
+    "identity.rs:\\d+:(60|79): replace \\| with & in write_new$",
+    # A non-blocking `flock` on a directory the daemon just opened fails only with
+    # `EWOULDBLOCK` in a test: any other error is refused either way, as in use or as I/O.
+    "clients.rs:.*replace match guard err == Errno::WOULDBLOCK with true in ClientStore::open$",
+    # A directory sync shows only after a crash: skipping it changes nothing a test can see.
+    "clients.rs:.*replace fsync_dir -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
+    # A leaked empty Vec is the empty slice: the same (absent) hint list.
+    "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
 ]

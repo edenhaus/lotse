@@ -1,7 +1,8 @@
 //! lotse: a small, fast, memory-safe media daemon.
 //!
 //! One binary, three process kinds (`serve`, `worker`, `decode`) plus the
-//! `ctl` client, dispatched from the command line. The binary is the only
+//! `ctl` client and the `identity` and `pair` tools, dispatched from the
+//! command line. The binary is the only
 //! place that names concrete sources, outputs and transcoders: it registers
 //! the ones its Cargo features enable and hands the registries to
 //! `lotse-supervisor` or `lotse-worker`. It also reads the configuration
@@ -15,11 +16,12 @@ use anyhow::Context as _;
 use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _};
 use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
 use lotse_codec::transcode::AacToOpus;
+use lotse_codec::transcode::uplink::ToG711Factory;
 use lotse_core::clock::SystemClock;
 use lotse_core::registry::Registries;
 use lotse_core::runner::RunnerConfig;
 use lotse_core::track::TrackLimits;
-use lotse_sandbox::{Profile, SandboxConfig, SandboxReport};
+use lotse_sandbox::{Profile, SandboxConfig, SandboxReport, StateDir};
 use lotse_supervisor::worker::WorkerConfig;
 use lotse_supervisor::{Environment, Identity};
 
@@ -28,6 +30,7 @@ use crate::cli::{Cli, Command, ServeArgs, WorkerArgs};
 mod cli;
 mod config;
 mod ctl;
+mod identity;
 mod logging;
 
 /// Parses the command line and dispatches. Exit code 0 on a clean stop, 1
@@ -63,6 +66,8 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Ctl(args) => ctl::run(args),
+        Command::Identity(args) => identity::run(args),
+        Command::Pair(args) => ctl::pair(args),
     }
 }
 
@@ -76,6 +81,9 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
     registries
         .transcoders
         .register(Arc::new(AacToOpus::new(Arc::new(SystemClock))));
+    // Talk-back to the camera's G.711, framed per backchannel: apart from
+    // the downlink list, so no viewer is offered it.
+    registries.uplink = Some(Arc::new(ToG711Factory::new(Arc::new(SystemClock))));
     #[cfg(feature = "output-webrtc")]
     registered(
         "webrtc output",
@@ -100,13 +108,13 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
             .register(Arc::new(lotse_http::HttpFactory)),
     );
     #[cfg(feature = "source-fake")]
+    // With a backchannel, so the talk-back tests reach a worker's arbiter
+    // through the control API.
     registered(
         "fake source",
-        registries
-            .sources
-            .register(Arc::new(lotse_core::test_util::FakeSourceFactory::new(&[
-                "fake",
-            ]))),
+        registries.sources.register(Arc::new(
+            lotse_core::test_util::FakeSourceFactory::with_backchannel(&["fake"]),
+        )),
     );
     registries
 }
@@ -189,10 +197,26 @@ fn serve(args: &ServeArgs, matches: &ArgMatches) -> anyhow::Result<()> {
 
     let listeners = lotse_supervisor::bind(&settings.supervisor).context("sockets")?;
     let binary = std::env::current_exe().context("own executable path")?;
+    // The rule is made from the descriptor the directory was checked and
+    // locked through, not its path, which could name another by now. The
+    // copy is close-on-exec (`F_DUPFD_CLOEXEC`) and closed with the profile.
+    let state_dir = listeners
+        .api
+        .state_dir()
+        .map(|(path, fd)| {
+            fd.try_clone_to_owned().map(|fd| StateDir {
+                path: path.to_path_buf(),
+                fd,
+            })
+        })
+        .transpose()
+        .context("state directory")?;
     let profile = Profile::Supervisor {
         binary: binary.clone(),
+        state_dir,
     };
     let report = lotse_sandbox::apply(&profile, &settings.sandbox).context("sandbox")?;
+    drop(profile);
 
     let limits = &settings.supervisor.limits;
     let environment = Environment {

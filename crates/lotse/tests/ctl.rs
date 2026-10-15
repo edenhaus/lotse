@@ -92,6 +92,14 @@ fn check_info(socket: &Path) {
     }
     assert_eq!(info["sandbox"]["mode"], "off");
     assert!(!info["build"]["target"].as_str().unwrap().is_empty());
+    // The fake and the RTSP source declare a backchannel (the ONVIF one,
+    // ONVIF Streaming Specification §5.3) and the build carries the
+    // talk-back transcoder and WebRTC, so two-way audio is on, as in a
+    // release build, whose RTSP source alone carries it.
+    assert_eq!(
+        info["features"],
+        serde_json::json!(["session_adopt", "two_way_audio"])
+    );
     let compact = ctl(socket, &["--compact", "info"]);
     assert!(compact.status.success());
     assert_eq!(

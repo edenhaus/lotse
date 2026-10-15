@@ -123,7 +123,7 @@ impl<'a> Section<'a> {
 
     /// The payload type numbers of the `m=` line's format list
     /// (RFC 8866 §5.14); fields that are not one are skipped.
-    fn formats(&self) -> impl Iterator<Item = u8> + '_ {
+    pub(crate) fn formats(&self) -> impl Iterator<Item = u8> + '_ {
         self.m_line
             .split(' ')
             .skip(3)
@@ -174,7 +174,7 @@ fn encoding(rtpmap: &str) -> String {
 /// The encoding of a static payload type a format list names without an
 /// `a=rtpmap` (RFC 3551 §6, Table 4): the ones str0m 0.24 assigns too
 /// (`CodecSpec::from_static_pt`), so it can lock them. The rest it ignores.
-const fn static_encoding(pt: u8) -> Option<&'static str> {
+pub(crate) const fn static_encoding(pt: u8) -> Option<&'static str> {
     match pt {
         0 => Some("pcmu/8000"),
         8 => Some("pcma/8000"),

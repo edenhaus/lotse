@@ -473,7 +473,9 @@ const ARCH_SPECIFIC: &[i64] = &[];
 
 /// What only the supervisor does: spawn, signal and reap processes
 /// (`pidfd_open` is how tokio waits for a child), open any socket family,
-/// hand keyframes over by memfd. Its children inherit this filter, so it
+/// hand keyframes over by memfd, and replace a file in its state directory
+/// atomically (`fsync`, `renameat`/`renameat2`, `unlinkat`, relative to the
+/// directory's descriptor), where Landlock confines writes. Its children inherit this filter, so it
 /// also allows what they need to sandbox themselves: `prlimit64` and
 /// `prctl` for their limits and flags, the Landlock calls and `seccomp`,
 /// which can only add restrictions to the caller. `tgkill` and `getppid`
@@ -496,6 +498,10 @@ const SUPERVISOR: &[i64] = &[
     libc::SYS_landlock_add_rule,
     libc::SYS_landlock_restrict_self,
     libc::SYS_seccomp,
+    libc::SYS_fsync,
+    libc::SYS_renameat,
+    libc::SYS_renameat2,
+    libc::SYS_unlinkat,
 ];
 
 /// What a worker does beyond the common set (`socket`, `clone`, `tgkill`,
@@ -630,6 +636,7 @@ mod tests {
     fn supervisor() -> Profile {
         Profile::Supervisor {
             binary: "/lotse".into(),
+            state_dir: None,
         }
     }
 
@@ -928,6 +935,7 @@ mod tests {
         let empty = [
             Profile::Supervisor {
                 binary: "/lotse".into(),
+                state_dir: None,
             },
             Profile::Worker {
                 connect_ports: vec![554],
@@ -999,6 +1007,7 @@ mod tests {
     fn seccomp2_the_supervisors_filters_install_on_the_calling_thread() {
         let supervisor = Profile::Supervisor {
             binary: "/lotse".into(),
+            state_dir: None,
         };
         let mut notes = Vec::new();
         let status = apply(
@@ -1056,6 +1065,20 @@ mod tests {
             assert!(!SUPERVISOR.contains(&denied));
             assert!(!WORKER.contains(&denied));
             assert!(!DECODER.contains(&denied));
+        }
+        for writing in [
+            libc::SYS_fsync,
+            libc::SYS_renameat,
+            libc::SYS_renameat2,
+            libc::SYS_unlinkat,
+        ] {
+            assert!(SUPERVISOR.contains(&writing));
+            assert!(
+                !COMMON.contains(&writing),
+                "only the supervisor writes files"
+            );
+            assert!(!WORKER.contains(&writing));
+            assert!(!DECODER.contains(&writing));
         }
         assert!(!COMMON.contains(&libc::SYS_execve));
         assert!(!WORKER.contains(&libc::SYS_execve));

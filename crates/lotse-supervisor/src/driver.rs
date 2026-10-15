@@ -20,6 +20,15 @@
 //! holds one, and gives the permit back when the attempt ends, the worker
 //! exits or is stopped, or the driver stops ([`crate::connect`]).
 //!
+//! While a backchannel upgrade restarts the running source to ask for the
+//! camera's backchannel, the driver holds the offers that request
+//! talk-back on a stream that asked for it, with their later messages,
+//! and hands them to the worker once the new source took over, so their
+//! answers negotiate talk-back from the backchannel it offers; when the
+//! upgrade fails they close with `backchannel_unavailable` and why. Every
+//! end of the upgrade the worker reports releases them, and the
+//! handler's `source_not_live` deadline bounds the wait besides.
+//!
 //! A worker that can no longer be told what to do is killed, so its exit
 //! runs the crash path and the machine restarts it with backoff: one whose
 //! channel ended while it runs, and one that sent nothing for
@@ -66,6 +75,14 @@ pub(crate) enum DriverCommand {
     /// Run this source from now on: a worker switches to it in place, the
     /// next worker starts with it.
     SwitchSource(DriverSpec),
+    /// The connection's rule for the camera's backchannel changed (a
+    /// stream on it opted in, or the last one out): run this spec, which
+    /// asks as the rule now says, from the next connect on. A running
+    /// source that does not ask while the spec does is restarted once to
+    /// ask (upgrade); one that asks while the spec does not keeps it until
+    /// the connection next connects (downgrade deferred), as a reconnect
+    /// for that alone would cost the viewers a gap for nothing.
+    Backchannel(DriverSpec),
     /// Open this session.
     OpenSession(SessionSpec),
     /// A trickled browser candidate.
@@ -118,6 +135,11 @@ pub(crate) enum DriverCommand {
         /// The channel number.
         channel: u16,
     },
+    /// Free the backchannel from its talker (`backchannel/release`).
+    ReleaseBackchannel {
+        /// Only if this session holds it, which the worker decides.
+        session_id: Option<String>,
+    },
     /// An ICE-TCP connection the acceptor verified for one of the
     /// worker's sessions.
     IceTcp {
@@ -142,7 +164,10 @@ impl DriverCommand {
             | Self::CloseSession { session_id, .. }
             | Self::RelayCandidate { session_id, .. }
             | Self::RelayChannel { session_id, .. } => Some(session_id),
-            Self::IceTcp { .. } | Self::SwitchSource(_) => None,
+            Self::IceTcp { .. }
+            | Self::SwitchSource(_)
+            | Self::Backchannel(_)
+            | Self::ReleaseBackchannel { .. } => None,
         }
     }
 }
@@ -176,8 +201,105 @@ impl DatagramSink for SessionSink {
     }
 }
 
+/// The `closed` code of a talk-back request the camera's backchannel
+/// cannot meet on a stream that asked for it.
+const BACKCHANNEL_UNAVAILABLE: &str = "backchannel_unavailable";
+
+/// Whether `offer` requests talk-back: an audio m-line (RFC 8866 §5.14)
+/// with a mid (RFC 5888 §4) whose direction attribute, the first in its
+/// section, is `sendonly` or `sendrecv`, or that has none, which is
+/// `sendrecv` (RFC 8866 §6.7): the browser offers to send audio there. The
+/// rule the worker's WebRTC output answers talk-back by.
+fn requests_talk_back(offer: &str) -> bool {
+    /// One media section as far as read: whether it is audio, has a mid,
+    /// and its first direction attribute.
+    #[derive(Default)]
+    struct Section<'a> {
+        /// An `m=audio` section.
+        audio: bool,
+        /// It has an `a=mid`.
+        mid: bool,
+        /// Its first direction attribute, without `a=`.
+        direction: Option<&'a str>,
+    }
+    impl Section<'_> {
+        /// The section asks to send audio.
+        fn sends_audio(&self) -> bool {
+            self.audio && self.mid && matches!(self.direction, None | Some("sendrecv" | "sendonly"))
+        }
+    }
+    let mut section: Option<Section<'_>> = None;
+    for line in offer.lines() {
+        if let Some(media) = line.strip_prefix("m=") {
+            if section.as_ref().is_some_and(Section::sends_audio) {
+                return true;
+            }
+            section = Some(Section {
+                audio: media.split(' ').next() == Some("audio"),
+                ..Section::default()
+            });
+        } else if let Some(current) = section.as_mut()
+            && let Some(attribute) = line.strip_prefix("a=")
+        {
+            if attribute.starts_with("mid:") {
+                current.mid = true;
+            } else if current.direction.is_none()
+                && matches!(attribute, "sendrecv" | "sendonly" | "recvonly" | "inactive")
+            {
+                current.direction = Some(attribute);
+            }
+        }
+    }
+    section.as_ref().is_some_and(Section::sends_audio)
+}
+
+/// A backchannel upgrade under way: the running source restarts to ask
+/// for the camera's backchannel, and the talk-back requests that came
+/// meanwhile wait for it.
+#[derive(Debug, Default)]
+struct Upgrade {
+    /// The held sessions' messages in arrival order, each session's offer
+    /// first.
+    held: Vec<DriverCommand>,
+}
+
+impl Upgrade {
+    /// Whether `session_id` is held.
+    fn holds(&self, session_id: &str) -> bool {
+        self.held.iter().any(|command| {
+            matches!(command, DriverCommand::OpenSession(spec) if spec.session_id == session_id)
+        })
+    }
+
+    /// The held sessions' ids, in arrival order.
+    fn sessions(&self) -> Vec<&str> {
+        self.held
+            .iter()
+            .filter_map(|command| match command {
+                DriverCommand::OpenSession(spec) => Some(spec.session_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// How a backchannel upgrade ended for the sessions it held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpgradeEnd {
+    /// The new source took over: they open on it, and their answers
+    /// negotiate talk-back from the backchannel it offers, or refuse them
+    /// when it offers none.
+    Switched,
+    /// It failed, for this reason: they close with
+    /// `backchannel_unavailable`.
+    Failed,
+    /// The worker stopped: they wait for the next one, which starts with
+    /// the spec that asks for the backchannel.
+    NextWorker,
+}
+
 /// What the driver needs to start a worker for its connection.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DriverSpec {
     /// The connection's id.
     pub(crate) connection_id: String,
@@ -191,6 +313,10 @@ pub(crate) struct DriverSpec {
     pub(crate) port: Option<u16>,
     /// The worker binds a loopback relay listener before its sandbox.
     pub(crate) loopback_relay: bool,
+    /// The source asks the camera for its backchannel
+    /// ([`Source::wants_backchannel`](lotse_core::source::Source::wants_backchannel)),
+    /// as its options say.
+    pub(crate) backchannel: bool,
 }
 
 impl DriverSpec {
@@ -224,6 +350,7 @@ impl fmt::Debug for DriverSpec {
         out.field("host", &self.host)
             .field("port", &self.port)
             .field("loopback_relay", &self.loopback_relay)
+            .field("backchannel", &self.backchannel)
             .finish()
     }
 }
@@ -343,6 +470,16 @@ pub(crate) struct Driver {
     snapshot: ConnectionSnapshot,
     /// The state and error last published, to detect a change.
     published: (ConnectionState, Option<ConnectionError>),
+    /// Whether the worker's source asks for the camera's backchannel: the
+    /// spec's when the worker started it or last switched to it.
+    /// Meaningless without a worker.
+    running_backchannel: bool,
+    /// The switch under way restarts the source (`RestartSource`) instead
+    /// of connecting a standby beside it: an upgrade asked for it.
+    restart: bool,
+    /// The backchannel upgrade under way and the talk-back requests it
+    /// holds; `None` without one. Only ever `Some` with a worker.
+    upgrade: Option<Upgrade>,
     /// A source switch is under way: the machine's reports are the old
     /// source's until the tracks switch, or until the host lookup of a
     /// new worker, which runs the source switched to.
@@ -383,6 +520,9 @@ impl Driver {
             resolve_backoff: ReconnectBackoff::new(0),
             snapshot,
             published: (ConnectionState::Idle, None),
+            running_backchannel: false,
+            restart: false,
+            upgrade: None,
             switching: false,
             switch_failure: None,
         }
@@ -447,11 +587,13 @@ impl Driver {
             | Wake::SwitchConnect(SlotWake::LeaseExpired) => {}
             Wake::Worker(event) => self.on_worker_event(event),
             Wake::Command(DriverCommand::SwitchSource(spec)) => self.on_switch_source(spec),
-            Wake::Command(command) => match self.worker.as_mut() {
-                Some(worker) => {
+            Wake::Command(DriverCommand::Backchannel(spec)) => self.on_backchannel(spec),
+            Wake::Command(command) => match (self.hold(command), self.worker.as_mut()) {
+                (None, _) => {}
+                (Some(command), Some(worker)) => {
                     Self::send(worker, &self.shared, &self.commands_tx, command).await;
                 }
-                None => self.queue(command),
+                (Some(command), None) => self.queue(command),
             },
             Wake::LingerExpired => {
                 self.linger = None;
@@ -515,6 +657,12 @@ impl Driver {
             | Wake::RetrySwitchResolve
             | Wake::SwitchConnect(SlotWake::Grant) => self.handle_switch(wake).await,
         }
+        // Released from a hold while the worker runs: theirs now.
+        if let Some(worker) = self.worker.as_mut() {
+            for command in std::mem::take(&mut self.queued) {
+                Self::send(worker, &self.shared, &self.commands_tx, command).await;
+            }
+        }
     }
 
     /// Acts on what happened to a switch in progress: the source to
@@ -524,11 +672,18 @@ impl Driver {
             Wake::SwitchResolved(Ok(addrs)) => {
                 self.pending = Pending::Nothing;
                 self.resolve_backoff.reset();
+                let restart = std::mem::take(&mut self.restart);
                 if let Some(worker) = self.worker.as_mut() {
                     let spec = self.spec.source_spec(addrs);
-                    if let Err(err) = worker.switch_source(&spec).await {
-                        tracing::warn!(pid = worker.pid(), error = %err, "source switch could not be sent to the worker");
+                    let sent = if restart {
+                        worker.restart_source(&spec).await
+                    } else {
+                        worker.switch_source(&spec).await
+                    };
+                    if let Err(err) = sent {
+                        tracing::warn!(pid = worker.pid(), error = %err, restart, "source switch could not be sent to the worker");
                     }
+                    self.running_backchannel = self.spec.backchannel;
                 } else {
                     tracing::debug!(
                         "source to switch to resolved without a worker; the next worker starts with it"
@@ -543,10 +698,16 @@ impl Driver {
                     retry_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
                     "host of the source to switch to could not be resolved; retrying"
                 );
-                let error = ConnectionError::Source(SourceError::Unreachable(format!(
-                    "resolving {}: {message}",
-                    self.spec.host
-                )));
+                let error =
+                    SourceError::Unreachable(format!("resolving {}: {message}", self.spec.host));
+                self.end_upgrade(
+                    UpgradeEnd::Failed,
+                    &format!(
+                        "the camera's backchannel could not be set up: {}: {error}",
+                        error.code()
+                    ),
+                );
+                let error = ConnectionError::Source(error);
                 self.snapshot.last_error = Some(error.clone());
                 self.switch_failure = Some(error);
                 self.pending = Pending::RetrySwitch(self.shared.clock.sleep(retry_in));
@@ -583,6 +744,48 @@ impl Driver {
             self.start_resolving_switch();
         } else if matches!(self.pending, Pending::Resolving(_)) {
             self.start_resolving();
+        }
+    }
+
+    /// `Backchannel`: the connection runs `spec` from now on, which differs
+    /// from the last in whether it asks for the camera's backchannel
+    /// (ONVIF Streaming Specification §5.3.1). A running source that does
+    /// not ask while `spec` does is restarted once, through the switch
+    /// path with the running source stopped first (`RestartSource`), so
+    /// the camera holds one session at a time. One that asks while `spec`
+    /// does not keeps the backchannel until the connection next connects
+    /// with `spec`: a new worker, a crash's restart, a source switch.
+    /// Without a worker, the next one starts with `spec`.
+    fn on_backchannel(&mut self, spec: DriverSpec) {
+        let before = self.running_backchannel;
+        let after = spec.backchannel;
+        self.spec = spec;
+        match (self.worker.is_some(), before, after) {
+            (true, false, true) => {
+                tracing::info!(
+                    backchannel.before = before,
+                    backchannel.after = after,
+                    reason = "a stream on the connection asks for the camera's backchannel",
+                    "backchannel upgrade: restarting the source once; talk-back requests wait for it"
+                );
+                self.restart = true;
+                self.upgrade.get_or_insert_with(Upgrade::default);
+                self.start_resolving_switch();
+            }
+            (true, true, false) => tracing::info!(
+                backchannel.before = before,
+                backchannel.after = after,
+                reason = "no stream on the connection asks for the camera's backchannel any more",
+                "backchannel downgrade deferred to next connect"
+            ),
+            (true, ..) => tracing::debug!(
+                backchannel = after,
+                "the running source already asks for the backchannel as the connection's streams do"
+            ),
+            (false, ..) => tracing::info!(
+                backchannel = after,
+                "no worker runs; the next connect asks for the backchannel as the connection's streams do"
+            ),
         }
     }
 
@@ -630,6 +833,56 @@ impl Driver {
                 self.connect.release("source stopped");
                 tracing::debug!("worker source stopped");
             }
+            WorkerEvent::SwitchReport(_) | WorkerEvent::StandbyStopped | WorkerEvent::Switched => {
+                self.on_standby_event(event);
+            }
+            WorkerEvent::Tracks(tracks) => {
+                tracing::info!(tracks = tracks.len(), "tracks declared");
+                self.snapshot.tracks = tracks;
+            }
+            WorkerEvent::Stats(stats) => self.snapshot.stats = Some(stats),
+            WorkerEvent::Session { session_id, event } => {
+                let now = self.shared.clock.now();
+                self.shared.lock().session_report(
+                    &self.spec.connection_id,
+                    &session_id,
+                    event,
+                    now,
+                );
+            }
+            WorkerEvent::Talker {
+                session_id,
+                reason,
+                at,
+            } => {
+                let _talker = self.shared.lock().talker_changed(
+                    &self.spec.connection_id,
+                    &session_id,
+                    reason,
+                    at,
+                );
+            }
+            WorkerEvent::ChannelClosed => {
+                tracing::warn!("worker closed its channel; killing it");
+                if let Some(worker) = self.worker.as_mut() {
+                    worker.kill("channel closed");
+                }
+            }
+            WorkerEvent::ChannelError(message) => {
+                tracing::warn!(error = %message, "worker channel failed; killing it");
+                if let Some(worker) = self.worker.as_mut() {
+                    worker.kill("channel failed");
+                }
+            }
+            WorkerEvent::Exited(status) => self.on_worker_exited(status),
+        }
+    }
+
+    /// The standby source's report, its stop, or its taking over: its
+    /// connect permit, the last error, and the end of a backchannel
+    /// upgrade under way.
+    fn on_standby_event(&mut self, event: WorkerEvent) {
+        match event {
             WorkerEvent::SwitchReport(report) => match report {
                 WorkerReport::Connecting => {
                     self.switch_failure = None;
@@ -653,58 +906,51 @@ impl Driver {
                         retry_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
                         "the source to switch to failed; the old one keeps streaming"
                     );
+                    self.end_upgrade(
+                        UpgradeEnd::Failed,
+                        &format!(
+                            "the camera's backchannel could not be set up: {}: {error}",
+                            error.code()
+                        ),
+                    );
                     let error = ConnectionError::Source(error);
                     self.snapshot.last_error = Some(error.clone());
                     self.switch_failure = Some(error);
                 }
             },
-            WorkerEvent::StandbyStopped => self.switch_connect.release("standby stopped"),
+            WorkerEvent::StandbyStopped => {
+                self.switch_connect.release("standby stopped");
+                self.end_upgrade(
+                    UpgradeEnd::Failed,
+                    "the source asking for the camera's backchannel stopped before it took over",
+                );
+            }
             WorkerEvent::Switched => {
                 self.switch_connect.release("switched");
                 self.snapshot.last_error = None;
                 self.end_switch();
                 tracing::info!("the tracks switched to the new source");
+                self.end_upgrade(UpgradeEnd::Switched, "the new source took over");
                 // The tracks switch at a keyframe of the new source, which
                 // is live; the old one's state is over.
                 self.feed(Input::Report(WorkerReport::Live));
             }
-            WorkerEvent::Tracks(tracks) => {
-                tracing::info!(tracks = tracks.len(), "tracks declared");
-                self.snapshot.tracks = tracks;
-            }
-            WorkerEvent::Stats(stats) => self.snapshot.stats = Some(stats),
-            WorkerEvent::Session { session_id, event } => {
-                let now = self.shared.clock.now();
-                self.shared.lock().session_report(
-                    &self.spec.connection_id,
-                    &session_id,
-                    event,
-                    now,
-                );
-            }
-            WorkerEvent::ChannelClosed => {
-                tracing::warn!("worker closed its channel; killing it");
-                if let Some(worker) = self.worker.as_mut() {
-                    worker.kill("channel closed");
-                }
-            }
-            WorkerEvent::ChannelError(message) => {
-                tracing::warn!(error = %message, "worker channel failed; killing it");
-                if let Some(worker) = self.worker.as_mut() {
-                    worker.kill("channel failed");
-                }
-            }
-            WorkerEvent::Exited(status) => self.on_worker_exited(status),
+            _ => {}
         }
     }
 
     /// The worker process exited: its sessions close, the permits go
     /// back, and the machine restarts it with backoff if it crashed.
     fn on_worker_exited(&mut self, status: ExitStatus) {
+        self.end_upgrade(
+            UpgradeEnd::Failed,
+            "the camera's worker process exited before its backchannel was set up",
+        );
         self.worker = None;
         self.connect.release("worker exited");
         self.switch_connect.release("worker exited");
         self.snapshot.worker = None;
+        self.talker_gone();
         self.queued.clear();
         // The old source and the standby went with the worker: the next
         // one runs the source switched to, and a crash is the failure an
@@ -734,6 +980,15 @@ impl Driver {
         }
     }
 
+    /// The worker is gone, and the talker's session with it: the
+    /// backchannel is free.
+    fn talker_gone(&self) {
+        let now = self.shared.clock.wall_now();
+        self.shared
+            .lock()
+            .talker_gone(&self.spec.connection_id, now);
+    }
+
     /// Feeds the machine and performs what it asks for, including the
     /// inputs those actions produce at once.
     fn feed(&mut self, input: Input) {
@@ -756,11 +1011,13 @@ impl Driver {
                 None
             }
             Action::StopWorker => {
+                self.end_upgrade(UpgradeEnd::NextWorker, "the worker stopped");
                 self.pending = Pending::Nothing;
                 self.silence = None;
                 self.connect.release("worker stopped");
                 if let Some(worker) = self.worker.take() {
                     self.snapshot.worker = None;
+                    self.talker_gone();
                     let shared = Arc::clone(&self.shared);
                     let stop = async move {
                         let _status = worker.stop(shared.shutdown_budget, &shared.clock).await;
@@ -805,6 +1062,8 @@ impl Driver {
         match self.shared.manager.spawn(&ports, self.spec.loopback_relay) {
             Ok(mut worker) => {
                 let spec = self.spec.source_spec(addrs);
+                self.running_backchannel = self.spec.backchannel;
+                self.restart = false;
                 if let Err(err) = worker.run_source(&spec).await {
                     tracing::warn!(pid = worker.pid(), error = %err, "source could not be sent to the worker");
                 }
@@ -826,6 +1085,96 @@ impl Driver {
         }
     }
 
+    /// Holds `command` while a backchannel upgrade is under way when it is
+    /// a talk-back request of a stream that asked for the backchannel
+    /// ([`requests_talk_back`]), or a later message of a held session; a
+    /// close of a held session takes its messages out instead. Returns
+    /// any other message, to go on as ever: sessions that request no
+    /// talk-back are not delayed.
+    fn hold(&mut self, command: DriverCommand) -> Option<DriverCommand> {
+        let Some(upgrade) = self.upgrade.as_mut() else {
+            return Some(command);
+        };
+        match command {
+            DriverCommand::OpenSession(spec)
+                if spec.talkback_required && requests_talk_back(&spec.offer) =>
+            {
+                tracing::info!(
+                    session.id = %spec.session_id,
+                    held = upgrade.sessions().len().saturating_add(1),
+                    reason = "a talk-back request while the source restarts to ask for the camera's backchannel",
+                    "talk-back request held until the backchannel upgrade ends"
+                );
+                upgrade.held.push(DriverCommand::OpenSession(spec));
+                None
+            }
+            DriverCommand::CloseSession { session_id, .. } if upgrade.holds(&session_id) => {
+                upgrade
+                    .held
+                    .retain(|held| held.session_id() != Some(session_id.as_str()));
+                tracing::info!(
+                    session.id = %session_id,
+                    held = upgrade.sessions().len(),
+                    "held talk-back request closed before the backchannel upgrade ended"
+                );
+                None
+            }
+            command
+                if command
+                    .session_id()
+                    .is_some_and(|session_id| upgrade.holds(session_id)) =>
+            {
+                upgrade.held.push(command);
+                None
+            }
+            command => Some(command),
+        }
+    }
+
+    /// Ends the backchannel upgrade under way, if any, as `end` says, for
+    /// `reason`: its held sessions go to the worker ([`UpgradeEnd::Switched`],
+    /// sent once the wake is handled) or the next one
+    /// ([`UpgradeEnd::NextWorker`]), or close with `backchannel_unavailable`
+    /// ([`UpgradeEnd::Failed`]).
+    fn end_upgrade(&mut self, end: UpgradeEnd, reason: &str) {
+        let Some(upgrade) = self.upgrade.take() else {
+            return;
+        };
+        let sessions: Vec<String> = upgrade.sessions().into_iter().map(str::to_owned).collect();
+        match end {
+            UpgradeEnd::Switched | UpgradeEnd::NextWorker => {
+                tracing::info!(
+                    outcome = ?end,
+                    reason,
+                    held = sessions.len(),
+                    session.ids = ?sessions,
+                    backchannel = self.running_backchannel,
+                    "backchannel upgrade ended; held talk-back requests released"
+                );
+                self.queued.extend(upgrade.held);
+            }
+            UpgradeEnd::Failed => {
+                tracing::warn!(
+                    outcome = ?end,
+                    reason,
+                    held = sessions.len(),
+                    session.ids = ?sessions,
+                    "backchannel upgrade failed; held talk-back requests close with backchannel_unavailable"
+                );
+                let message = format!("two-way audio unavailable: {reason}");
+                let mut state = self.shared.lock();
+                for session_id in &sessions {
+                    let _closed = state.close_session(
+                        session_id,
+                        BACKCHANNEL_UNAVAILABLE,
+                        &message,
+                        CloseBy::Supervisor,
+                    );
+                }
+            }
+        }
+    }
+
     /// Holds a message until there is a worker. A close takes its session's
     /// messages out of the queue instead: the worker never saw it.
     fn queue(&mut self, command: DriverCommand) {
@@ -836,6 +1185,13 @@ impl Driver {
             }
             DriverCommand::IceTcp { peer, .. } => {
                 tracing::debug!(%peer, "ice-tcp connection without a worker; closed");
+            }
+            // Without a worker no session talks.
+            DriverCommand::ReleaseBackchannel { session_id } => {
+                tracing::debug!(
+                    session.id = ?session_id,
+                    "backchannel release without a worker; nothing held"
+                );
             }
             command => self.queued.push(command),
         }
@@ -853,7 +1209,7 @@ impl Driver {
         let session = command.session_id().map(str::to_owned);
         let sent = match command {
             // Handled by the driver itself, never queued for a worker.
-            DriverCommand::SwitchSource(_) => return,
+            DriverCommand::SwitchSource(_) | DriverCommand::Backchannel(_) => return,
             DriverCommand::OpenSession(spec) => {
                 let sink = Arc::new(SessionSink {
                     local_ufrag: spec.ice_ufrag.clone(),
@@ -914,6 +1270,9 @@ impl Driver {
                     .ice_tcp(stream, &local_ufrag, peer, first_frame)
                     .await
             }
+            DriverCommand::ReleaseBackchannel { session_id } => {
+                worker.release_backchannel(session_id).await
+            }
         };
         if let Err(err) = sent {
             // The exit follows and closes the sessions.
@@ -964,6 +1323,18 @@ impl Driver {
 
     /// The registry dropped the connection: stop the worker and exit.
     async fn stop_all(mut self) {
+        if let Some(upgrade) = self.upgrade.take()
+            && !upgrade.held.is_empty()
+        {
+            // Nothing references the connection any more: its streams,
+            // and their sessions, are gone.
+            tracing::info!(
+                held = upgrade.sessions().len(),
+                session.ids = ?upgrade.sessions(),
+                reason = "the connection stopped",
+                "backchannel upgrade ended; held talk-back requests dropped"
+            );
+        }
         self.pending = Pending::Nothing;
         self.linger = None;
         self.crash = None;
@@ -1032,6 +1403,7 @@ mod tests {
             tcp_candidates: vec![],
             audio: false,
             orientation: 1,
+            talkback_required: false,
         }
     }
 
@@ -1089,6 +1461,7 @@ mod tests {
             host: "cam".into(),
             port: Some(322),
             loopback_relay: true,
+            backchannel: false,
         };
         let logged = format!("{spec:?}");
         for secret in ["secret", "key", "tok"] {
@@ -1110,6 +1483,7 @@ mod tests {
             host: "cam".into(),
             port: None,
             loopback_relay: false,
+            backchannel: false,
         };
         let logged = format!(
             "{:?}",
@@ -1137,6 +1511,7 @@ mod tests {
                 host: "h".into(),
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
             },
             shared("/bin/sh"),
             demand,
@@ -1156,6 +1531,11 @@ mod tests {
             session_id: "a".into(),
             code: "session_closed",
             message: String::new(),
+        });
+        // Without a worker nobody talks: a release is not kept.
+        driver.queue(DriverCommand::ReleaseBackchannel { session_id: None });
+        driver.queue(DriverCommand::ReleaseBackchannel {
+            session_id: Some("b".into()),
         });
         let left: Vec<Option<&str>> = driver
             .queued
@@ -1250,6 +1630,61 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// `backchannel/release` reaches the worker as its own message, with
+    /// the session it is conditional on.
+    #[tokio::test]
+    async fn a_release_reaches_the_worker() {
+        let dir = private_dir("driver-release");
+        let out = dir.join("received");
+        let script = dir.join("worker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nexec cat > {}\n", out.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let shared = shared(script.to_str().unwrap());
+        let mut worker = shared.manager.spawn(&[], false).unwrap();
+        let (commands, _rx) = mpsc::channel(1);
+        Driver::send(
+            &mut worker,
+            &shared,
+            &commands,
+            DriverCommand::ReleaseBackchannel { session_id: None },
+        )
+        .await;
+        // A release for one session takes the session along.
+        Driver::send(
+            &mut worker,
+            &shared,
+            &commands,
+            DriverCommand::ReleaseBackchannel {
+                session_id: Some("s1".into()),
+            },
+        )
+        .await;
+        // Each on the wire as its frame: the length, u32 little-endian,
+        // then the message.
+        let mut expected = Vec::new();
+        for session_id in [None, Some("s1".to_owned())] {
+            let message =
+                lotse_ipc::encode(&lotse_ipc::ToWorker::ReleaseBackchannel { session_id }).unwrap();
+            expected.extend(u32::try_from(message.len()).unwrap().to_le_bytes());
+            expected.extend(message);
+        }
+        let mut received = Vec::new();
+        for _ in 0..500 {
+            received = std::fs::read(&out).unwrap_or_default();
+            if received.ends_with(&expected) {
+                break;
+            }
+            SystemClock.sleep(Duration::from_millis(10)).await;
+        }
+        assert!(received.ends_with(&expected), "{received:?}");
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+    }
+
     #[tokio::test]
     async fn sends_register_live_offers_only_and_survive_a_dead_worker() {
         let shared = shared("/usr/bin/true");
@@ -1304,9 +1739,93 @@ mod tests {
                 peer: "192.0.2.1:1".parse().unwrap(),
                 first_frame: vec![],
             },
+            DriverCommand::ReleaseBackchannel {
+                session_id: Some("live".into()),
+            },
         ] {
+            assert_eq!(
+                command.session_id().is_none(),
+                matches!(
+                    command,
+                    DriverCommand::IceTcp { .. } | DriverCommand::ReleaseBackchannel { .. }
+                )
+            );
             Driver::send(&mut worker, &shared, &commands, command).await;
         }
+    }
+
+    /// The worker's talker reports reach the registry, and its exit frees
+    /// the backchannel: the talker's session is gone with it.
+    #[tokio::test]
+    async fn talker_reports_reach_the_registry_and_a_worker_exit_frees_the_backchannel() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        use lotse_api_types::stream::TalkerReason;
+
+        let shared = shared("/bin/sh");
+        let (demand_tx, demand) = watch::channel(0);
+        let (commands, _commands) = mpsc::channel(1);
+        let (events, _events) = mpsc::channel(1);
+        {
+            let mut state = shared.lock();
+            state.connections.insert(
+                "c1".into(),
+                crate::registry::ConnectionEntry {
+                    port: None,
+                    loopback_relay: false,
+                    backchannel: false,
+                    key: crate::registry::ConnectionKey {
+                        url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        options: serde_json::Value::Null,
+                    },
+                    demand: demand_tx,
+                    snapshot: ConnectionSnapshot::idle(UNIX_EPOCH),
+                    switches: 0,
+                    streams: ["front".to_owned()].into(),
+                    commands,
+                    talker: crate::registry::Talker::default(),
+                },
+            );
+            state.streams.insert(
+                "front".into(),
+                crate::registry::StreamEntry {
+                    sources: vec![crate::registry::StreamSource {
+                        spec: spec_of("fake://127.0.0.1/"),
+                        url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        options: serde_json::Map::new(),
+                        protocol: "fake",
+                        connection: "c1".into(),
+                    }],
+                    preload: false,
+                    audio: lotse_api_types::stream::AudioMode::Auto,
+                    orientation: lotse_api_types::stream::Orientation::NoTransform,
+                    created: UNIX_EPOCH,
+                },
+            );
+            state.sessions.insert(
+                "s1".into(),
+                SessionEntry::new(
+                    1,
+                    "front".into(),
+                    "c1".into(),
+                    "us1".into(),
+                    (ConnectionId(1), 1, events),
+                    UNIX_EPOCH,
+                ),
+            );
+        }
+        let mut driver = driver_on(&shared, demand);
+        let talker = |shared: &Shared| shared.lock().connections["c1"].talker.session.clone();
+        driver.on_worker_event(WorkerEvent::Talker {
+            session_id: "s1".into(),
+            reason: TalkerReason::Claimed,
+            at: UNIX_EPOCH,
+        });
+        assert_eq!(talker(&shared).as_deref(), Some("s1"));
+        driver.on_worker_event(WorkerEvent::Exited(ExitStatus::from_raw(0)));
+        drop(driver);
+        assert_eq!(talker(&shared), None);
+        assert!(shared.lock().connections["c1"].talker.since.is_some());
     }
 
     /// The driver's next wake if one is ready now, `None` otherwise.
@@ -1343,6 +1862,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
             },
             Arc::clone(shared),
             demand,
@@ -1498,6 +2018,7 @@ mod tests {
             host: host.into(),
             port: Some(1),
             loopback_relay: false,
+            backchannel: false,
         };
         // Without a worker the spec is taken for the next one, nothing more.
         driver
@@ -1584,6 +2105,469 @@ mod tests {
         let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
         drop(driver);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_backchannel_upgrade_restarts_the_running_source_once_and_a_downgrade_waits() {
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let dir = private_dir("driver-backchannel");
+        let out = dir.join("received");
+        let script = dir.join("worker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nexec cat > {}\n", out.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let shared = shared(script.to_str().unwrap());
+        let (_demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let spec = |options: &str, backchannel: bool| DriverSpec {
+            connection_id: "c1".into(),
+            url: "fake://127.0.0.1:1/".into(),
+            options: options.into(),
+            host: "127.0.0.1".into(),
+            port: Some(1),
+            loopback_relay: false,
+            backchannel,
+        };
+        let source = |options: &str| SourceSpec {
+            connection_id: "c1".into(),
+            url: "fake://127.0.0.1:1/".into(),
+            options: options.into(),
+            peer_host: "127.0.0.1".into(),
+            peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
+        };
+        let backchannel = |options: &str, asks: bool| {
+            Wake::Command(DriverCommand::Backchannel(spec(options, asks)))
+        };
+        // Without a worker the next one starts with the spec, nothing more.
+        driver.handle(backchannel(r#"{"talk":true}"#, true)).await;
+        assert!(driver.spec.backchannel);
+        assert!(ready_wake(&mut driver).await.is_none(), "nothing pending");
+        assert_eq!(captured.lines("no worker runs").len(), 1);
+        assert!(driver.upgrade.is_none(), "nothing to hold without a worker");
+        driver
+            .spawn_worker(vec!["127.0.0.1:1".parse().unwrap()])
+            .await;
+        recorded(
+            &out,
+            &lotse_ipc::ToWorker::RunSource(source(r#"{"talk":true}"#)),
+        )
+        .await;
+        // A source that asks keeps the backchannel when no stream asks any
+        // more, until the connection next connects (downgrade deferred);
+        // asked again meanwhile, it still has it.
+        driver.handle(backchannel("{}", false)).await;
+        assert!(!driver.spec.backchannel, "the next connect's");
+        assert!(ready_wake(&mut driver).await.is_none(), "no reconnect");
+        let deferred = captured.lines("backchannel downgrade deferred to next connect");
+        assert_eq!(deferred.len(), 1);
+        for field in ["backchannel.before=true", "backchannel.after=false"] {
+            assert!(deferred[0].contains(field), "{field}: {deferred:?}");
+        }
+        driver.handle(backchannel(r#"{"talk":true}"#, true)).await;
+        assert!(ready_wake(&mut driver).await.is_none(), "it asks already");
+        // The next connect, a source switch, runs the spec as it is then.
+        driver
+            .handle(Wake::Command(DriverCommand::SwitchSource(spec(
+                "{}", false,
+            ))))
+            .await;
+        step(&mut driver).await;
+        recorded(&out, &lotse_ipc::ToWorker::SwitchSource(source("{}"))).await;
+        // Now a stream asks: the running source restarts once, through the
+        // switch path with the old source stopped first (upgrade).
+        driver.handle(backchannel(r#"{"talk":true}"#, true)).await;
+        assert!(matches!(driver.pending, Pending::ResolvingSwitch(_)));
+        assert_eq!(
+            captured
+                .lines("backchannel upgrade: restarting the source once")
+                .len(),
+            1
+        );
+        step(&mut driver).await;
+        let restart = lotse_ipc::ToWorker::RestartSource(source(r#"{"talk":true}"#));
+        recorded(&out, &restart).await;
+        // Asked again, it asks already; a later switch is a plain one.
+        driver.handle(backchannel(r#"{"talk":true}"#, true)).await;
+        assert!(ready_wake(&mut driver).await.is_none(), "restarted once");
+        driver
+            .handle(Wake::Command(DriverCommand::SwitchSource(spec(
+                r#"{"talk":true}"#,
+                true,
+            ))))
+            .await;
+        step(&mut driver).await;
+        let switch = lotse_ipc::ToWorker::SwitchSource(source(r#"{"talk":true}"#));
+        let messages = recorded(&out, &switch).await;
+        assert_eq!(
+            messages.iter().filter(|m| **m == restart).count(),
+            1,
+            "{messages:?}"
+        );
+        let worker = driver.worker.take().unwrap();
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        drop(driver);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An offer that requests talk-back on a dedicated `sendonly` audio
+    /// m-line, as a talk-back capable frontend offers it.
+    const TALK_BACK_OFFER: &str = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\na=recvonly\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=recvonly\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:2\r\na=sendonly\r\n";
+
+    #[test]
+    fn rfc8866_6_7_an_offer_requests_talk_back_with_an_audio_m_line_it_sends_on() {
+        assert!(requests_talk_back(TALK_BACK_OFFER), "sendonly");
+        assert!(requests_talk_back(
+            "v=0\nm=audio 9 x 0\na=mid:a\na=sendrecv\n"
+        ));
+        // No direction attribute is `sendrecv`, in the last section too.
+        assert!(requests_talk_back("v=0\r\nm=audio 9 x 0\r\na=mid:a\r\n"));
+        assert!(requests_talk_back(
+            "v=0\r\nm=audio 9 x 0\r\na=mid:a\r\nm=video 9 x 96\r\na=mid:v\r\na=recvonly\r\n"
+        ));
+        for (offer, why) in [
+            (
+                "v=0\r\nm=audio 9 x 0\r\na=mid:a\r\na=recvonly\r\n",
+                "receives only",
+            ),
+            (
+                "v=0\r\nm=audio 9 x 0\r\na=mid:a\r\na=inactive\r\nm=video 9 x 96\r\na=mid:v\r\na=sendrecv\r\n",
+                "only video sends",
+            ),
+            (
+                "v=0\r\nm=audio 9 x 0\r\na=sendonly\r\n",
+                "no mid (RFC 5888 §4)",
+            ),
+            (
+                "v=0\r\nm=audio 9 x 0\r\na=recvonly\r\na=mid:a\r\na=sendonly\r\n",
+                "the first direction attribute counts",
+            ),
+            (
+                "v=0\r\na=sendrecv\r\na=mid:x\r\n",
+                "session-level lines are no section",
+            ),
+            ("v=0\r\nm=audiox 9 x 0\r\na=mid:a\r\n", "not audio"),
+            ("", "empty"),
+        ] {
+            assert!(!requests_talk_back(offer), "{why}");
+        }
+    }
+
+    /// `spec(id)` with an offer that requests talk-back, on a stream that
+    /// asked for the backchannel.
+    fn talk_spec(session_id: &str) -> SessionSpec {
+        SessionSpec {
+            offer: TALK_BACK_OFFER.into(),
+            talkback_required: true,
+            ..spec(session_id)
+        }
+    }
+
+    /// Opens `ids` on the registry, as the handler does with their offers;
+    /// each session's events' receiving end.
+    fn open_sessions(shared: &Shared, ids: &[&str]) -> Vec<mpsc::Receiver<lotse_api::Event>> {
+        ids.iter()
+            .map(|id| {
+                let (events, rx) = mpsc::channel(8);
+                shared.lock().sessions.insert(
+                    (*id).to_owned(),
+                    SessionEntry::new(
+                        1,
+                        "front".into(),
+                        "c1".into(),
+                        format!("u{id}"),
+                        (ConnectionId(1), 1, events),
+                        UNIX_EPOCH,
+                    ),
+                );
+                rx
+            })
+            .collect()
+    }
+
+    /// The `closed` event `events` got, as `(code, message)`.
+    fn closed(events: &mut mpsc::Receiver<lotse_api::Event>) -> (String, String) {
+        let event = events.try_recv().expect("a closed event").payload;
+        assert_eq!(event["type"], "closed", "{event}");
+        (
+            event["code"].as_str().unwrap().to_owned(),
+            event["message"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// The driver's spec with the backchannel asked for.
+    fn asking() -> DriverCommand {
+        DriverCommand::Backchannel(DriverSpec {
+            backchannel: true,
+            ..spec_of("fake://127.0.0.1:1/")
+        })
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "the hold's life, message by message")]
+    async fn onvif_5_3_1_a_talk_back_request_waits_for_the_backchannel_upgrade_and_opens_on_the_new_source()
+     {
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let dir = private_dir("driver-hold");
+        let out = dir.join("received");
+        let shared = shared(&worker_script(
+            &dir,
+            &format!("exec cat > {}", out.display()),
+        ));
+        let (_demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let _events = open_sessions(&shared, &["talk", "plain", "other", "gone", "late"]);
+        driver.worker = Some(shared.manager.spawn(&[], false).unwrap());
+        let command = |command| Wake::Command(command);
+        driver.handle(command(asking())).await;
+        assert!(driver.upgrade.is_some());
+        // A talk-back request of a stream that asked for the backchannel
+        // waits, with its later messages; the rest go on: an offer without
+        // talk-back, one of a stream that did not ask, a close of a session
+        // not held.
+        driver
+            .handle(command(DriverCommand::OpenSession(talk_spec("talk"))))
+            .await;
+        driver.handle(command(candidate("talk"))).await;
+        let plain = SessionSpec {
+            talkback_required: true,
+            ..spec("plain")
+        };
+        driver
+            .handle(command(DriverCommand::OpenSession(plain.clone())))
+            .await;
+        let other = SessionSpec {
+            talkback_required: false,
+            ..talk_spec("other")
+        };
+        driver
+            .handle(command(DriverCommand::OpenSession(other.clone())))
+            .await;
+        // A held session that closes leaves the hold.
+        driver
+            .handle(command(DriverCommand::OpenSession(talk_spec("gone"))))
+            .await;
+        driver
+            .handle(command(DriverCommand::CloseSession {
+                session_id: "gone".into(),
+                code: "session_closed",
+                message: String::new(),
+            }))
+            .await;
+        assert_eq!(
+            captured
+                .lines("held talk-back request closed before the backchannel upgrade ended")
+                .len(),
+            1
+        );
+        let close_plain = lotse_ipc::ToWorker::CloseSession {
+            session_id: "plain".into(),
+            code: "session_closed".into(),
+            message: String::new(),
+        };
+        driver
+            .handle(command(DriverCommand::CloseSession {
+                session_id: "plain".into(),
+                code: "session_closed",
+                message: String::new(),
+            }))
+            .await;
+        assert_eq!(driver.upgrade.as_ref().unwrap().sessions(), ["talk"]);
+        let held = captured.lines("talk-back request held until the backchannel upgrade ends");
+        assert_eq!(held.len(), 2, "{held:?}");
+        assert!(
+            held[0].contains("session.id=talk") && held[0].contains("held=1"),
+            "{held:?}"
+        );
+        let messages = recorded(&out, &close_plain).await;
+        let opened = |messages: &[lotse_ipc::ToWorker]| -> Vec<String> {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    lotse_ipc::ToWorker::OpenSession(spec) => Some(spec.session_id.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(opened(&messages), ["plain", "other"]);
+        // The restart goes out; the new source takes over, and the held
+        // offer reaches the worker with its candidate, in order.
+        step(&mut driver).await;
+        driver.handle(Wake::Worker(WorkerEvent::Switched)).await;
+        assert!(driver.upgrade.is_none() && driver.queued.is_empty());
+        let talk_candidate = lotse_ipc::ToWorker::RemoteCandidate {
+            session_id: "talk".into(),
+            candidate: String::new(),
+        };
+        let messages = recorded(&out, &talk_candidate).await;
+        assert_eq!(opened(&messages), ["plain", "other", "talk"]);
+        let restart = messages
+            .iter()
+            .position(|m| matches!(m, lotse_ipc::ToWorker::RestartSource(_)))
+            .unwrap();
+        let talk = messages
+            .iter()
+            .position(|m| *m == lotse_ipc::ToWorker::OpenSession(talk_spec("talk")))
+            .unwrap();
+        assert!(restart < talk, "{messages:?}");
+        assert_eq!(messages.last(), Some(&talk_candidate));
+        let released = captured.lines("held talk-back requests released");
+        for field in [
+            "outcome=Switched",
+            "held=1",
+            r#"session.ids=["talk"]"#,
+            "backchannel=true",
+        ] {
+            assert!(released[0].contains(field), "{field}: {released:?}");
+        }
+        // Once it ended, a talk-back request goes on at once.
+        driver
+            .handle(command(DriverCommand::OpenSession(talk_spec("late"))))
+            .await;
+        let late = lotse_ipc::ToWorker::OpenSession(talk_spec("late"));
+        recorded(&out, &late).await;
+        let worker = driver.worker.take().unwrap();
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        drop(driver);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn onvif_5_3_1_every_failed_end_of_a_backchannel_upgrade_closes_its_held_talk_back_requests()
+     {
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (_demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let failures: [(&str, WorkerEvent, &str); 3] = [
+            (
+                "backoff",
+                WorkerEvent::SwitchReport(WorkerReport::Backoff {
+                    error: SourceError::AuthFailed("401 Unauthorized".into()),
+                    retry_in: Duration::from_secs(1),
+                }),
+                "two-way audio unavailable: the camera's backchannel could not be set up: source_auth_failed: source authentication failed: 401 Unauthorized",
+            ),
+            (
+                "stopped",
+                WorkerEvent::StandbyStopped,
+                "two-way audio unavailable: the source asking for the camera's backchannel stopped before it took over",
+            ),
+            (
+                "exited",
+                WorkerEvent::Exited(ExitStatus::from_raw(9)),
+                "two-way audio unavailable: the camera's worker process exited before its backchannel was set up",
+            ),
+        ];
+        for (id, failure, message) in failures {
+            let mut events = open_sessions(&shared, &[id]);
+            driver.worker = Some(dead_worker(&shared).await);
+            driver.handle(Wake::Command(asking())).await;
+            driver
+                .handle(Wake::Command(DriverCommand::OpenSession(talk_spec(id))))
+                .await;
+            driver.on_worker_event(failure);
+            assert!(driver.upgrade.is_none(), "{id}");
+            assert!(!shared.lock().sessions.contains_key(id), "{id}");
+            assert_eq!(
+                closed(&mut events[0]),
+                ("backchannel_unavailable".to_owned(), message.to_owned()),
+                "{id}"
+            );
+        }
+        // The host of the source to switch to does not resolve.
+        let mut events = open_sessions(&shared, &["unresolved"]);
+        driver.worker = Some(dead_worker(&shared).await);
+        driver.handle(Wake::Command(asking())).await;
+        driver
+            .handle(Wake::Command(DriverCommand::OpenSession(talk_spec(
+                "unresolved",
+            ))))
+            .await;
+        driver
+            .handle(Wake::SwitchResolved(Err("no such host".into())))
+            .await;
+        let (code, message) = closed(&mut events[0]);
+        assert_eq!(code, "backchannel_unavailable");
+        assert!(
+            message.starts_with(
+                "two-way audio unavailable: the camera's backchannel could not be set up: source_unreachable: "
+            ) && message.ends_with("resolving 127.0.0.1: no such host"),
+            "{message}"
+        );
+        let failed = captured.lines("backchannel upgrade failed");
+        assert_eq!(failed.len(), 4, "{failed:?}");
+        assert!(
+            failed[0].contains(r#"session.ids=["backoff"]"#),
+            "{failed:?}"
+        );
+        // A worker that stops leaves them to the next, which asks for the
+        // backchannel from the start.
+        driver.pending = Pending::Nothing;
+        let _events = open_sessions(&shared, &["next"]);
+        driver.handle(Wake::Command(asking())).await;
+        driver
+            .handle(Wake::Command(DriverCommand::OpenSession(talk_spec("next"))))
+            .await;
+        assert!(matches!(
+            driver.perform(Action::StopWorker),
+            Some(Input::WorkerExited)
+        ));
+        assert!(driver.upgrade.is_none() && driver.worker.is_none());
+        let queued: Vec<Option<&str>> = driver
+            .queued
+            .iter()
+            .map(DriverCommand::session_id)
+            .collect();
+        assert_eq!(queued, [Some("next")]);
+        assert_eq!(captured.lines("outcome=NextWorker").len(), 1);
+        // Nothing else is a standby's; an end without an upgrade is no end.
+        driver.on_standby_event(WorkerEvent::SourceStopped);
+        driver.on_worker_event(WorkerEvent::Switched);
+        assert_eq!(captured.lines("backchannel upgrade ended").len(), 1);
+        drop(driver);
+        shared.tracker.close();
+        while !shared.tracker.is_empty() {
+            clock.advance(shared.shutdown_budget);
+            SystemClock.sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A connection that stops drops the talk-back requests it holds:
+    /// nothing references it any more, so their sessions are gone.
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "`stop_all` consumes the driver, a move the lint does not see"
+    )]
+    async fn a_connection_that_stops_drops_the_talk_back_requests_it_holds() {
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let _events = open_sessions(&shared, &["dropped"]);
+        driver.worker = Some(dead_worker(&shared).await);
+        driver.handle(Wake::Command(asking())).await;
+        driver
+            .handle(Wake::Command(DriverCommand::OpenSession(talk_spec(
+                "dropped",
+            ))))
+            .await;
+        drop(driver.worker.take());
+        driver.stop_all().await;
+        let dropped = captured.lines("held talk-back requests dropped");
+        assert!(
+            dropped[0].contains(r#"session.ids=["dropped"]"#),
+            "{dropped:?}"
+        );
     }
 
     #[tokio::test]
@@ -1793,6 +2777,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: Some(1),
             loopback_relay: false,
+            backchannel: false,
         }
     }
 
@@ -1928,7 +2913,10 @@ mod tests {
         // A session event for a session that is gone changes nothing.
         driver.on_worker_event(WorkerEvent::Session {
             session_id: "gone".into(),
-            event: lotse_ipc::SessionEvent::Answer { sdp: "v=0".into() },
+            event: lotse_ipc::SessionEvent::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            },
         });
         assert!(shared.lock().sessions.is_empty());
         driver.on_worker_event(WorkerEvent::SwitchReport(WorkerReport::Backoff {
@@ -1977,8 +2965,9 @@ mod tests {
     fn waiting_session(shared: &Shared, url: &str) -> mpsc::Receiver<lotse_api::Event> {
         use lotse_api_types::stream::{AudioMode, Orientation};
 
-        use crate::registry::{ConnectionEntry, ConnectionKey, StreamEntry, StreamSource};
+        use crate::registry::{ConnectionEntry, ConnectionKey, StreamEntry, StreamSource, Talker};
 
+        let spec = spec_of(url);
         let url: lotse_core::source_url::SourceUrl = url.parse().unwrap();
         let mut state = shared.lock();
         let switches = state
@@ -1989,6 +2978,7 @@ mod tests {
             "front".into(),
             StreamEntry {
                 sources: vec![StreamSource {
+                    spec,
                     url: url.clone(),
                     options: serde_json::Map::new(),
                     protocol: "fake",
@@ -2009,11 +2999,13 @@ mod tests {
                 },
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
                 demand: watch::channel(1).0,
                 snapshot: ConnectionSnapshot::idle(UNIX_EPOCH),
                 switches,
                 streams: ["front".to_owned()].into(),
                 commands: mpsc::channel(4).0,
+                talker: Talker::default(),
             },
         );
         let (events, rx) = mpsc::channel(4);
@@ -2053,6 +3045,7 @@ mod tests {
                 host: "cam.example".into(),
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
             },
             Arc::clone(&shared),
             demand,
@@ -2373,6 +3366,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: None,
                 loopback_relay: false,
+                backchannel: false,
             },
             Arc::clone(&shared),
             demand,
