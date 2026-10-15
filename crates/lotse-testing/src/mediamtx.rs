@@ -59,6 +59,13 @@ pub const BEEP_FRAMES: u32 = 5;
 /// How long [`Camera::start`] waits for the path to be ready.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How often [`Camera::start`] starts MediaMTX on new ports when it exits
+/// before its API answers: a port [`Ports::free`] found was taken before
+/// MediaMTX bound it (observed in CI on 2026-10-15, MediaMTX 1.21.1:
+/// `bind: address already in use`, with the interop tests and their
+/// daemons binding port 0 alongside).
+const START_ATTEMPTS: u32 = 4;
+
 /// How often it asks.
 const POLL: Duration = Duration::from_millis(100);
 
@@ -245,7 +252,8 @@ pub struct Ports {
 
 impl Ports {
     /// Free ports, found by binding port 0 and letting go; another process
-    /// could take one in between, which a test would see as a failed start.
+    /// could take one in between, which [`Camera::start`] meets by starting
+    /// again on new ones.
     pub fn free() -> io::Result<Self> {
         Ok(Self {
             rtsp: free_tcp_port()?,
@@ -338,18 +346,49 @@ impl Camera {
     /// Starts MediaMTX and ffmpeg with `audio`, and waits until the path
     /// is ready with all its tracks.
     pub async fn start(audio: Audio, clock: Arc<dyn Clock>) -> Result<Self, String> {
-        let ports = Ports::free().map_err(|err| format!("free ports: {err}"))?;
-        let mut mediamtx = command("mediamtx").map_err(|err| format!("mediamtx: {err}"))?;
-        mediamtx.arg(CONFIG).envs(ports.env());
-        let mut camera = Self {
-            mediamtx: spawn(mediamtx)?,
-            ffmpeg: None,
-            ports,
-            audio,
-        };
-        camera.wait_api(&*clock).await?;
+        let mut camera = Self::start_mediamtx(audio, &*clock, |_ports| {
+            let mut mediamtx = command("mediamtx")?;
+            mediamtx.arg(CONFIG);
+            Ok(mediamtx)
+        })
+        .await?;
         camera.publish(&*clock).await?;
         Ok(camera)
+    }
+
+    /// Starts MediaMTX from the command `mediamtx` makes for the ports it
+    /// is given and waits until its API answers; on new ports, up to
+    /// [`START_ATTEMPTS`] times, while it exits before then. One that is
+    /// still running when its API times out is not started again.
+    async fn start_mediamtx(
+        audio: Audio,
+        clock: &dyn Clock,
+        mut mediamtx: impl FnMut(&Ports) -> io::Result<Command>,
+    ) -> Result<Self, String> {
+        let mut attempt = 1;
+        loop {
+            let ports = Ports::free().map_err(|err| format!("free ports: {err}"))?;
+            let mut mediamtx = mediamtx(&ports).map_err(|err| format!("mediamtx: {err}"))?;
+            mediamtx.envs(ports.env());
+            let mut camera = Self {
+                mediamtx: spawn(mediamtx)?,
+                ffmpeg: None,
+                ports,
+                audio,
+            };
+            match camera.wait_api(clock).await {
+                Ok(()) => return Ok(camera),
+                // Exited at start: one of its ports was taken meanwhile.
+                Err(err)
+                    if attempt < START_ATTEMPTS
+                        && matches!(camera.mediamtx.try_wait(), Ok(Some(_))) =>
+                {
+                    tracing::warn!(attempt, %err, "mediamtx did not start; new ports");
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Starts ffmpeg publishing and waits until the path is ready.
@@ -782,5 +821,81 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("mediamtx exited"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_mediamtx_that_exits_at_start_is_started_again_on_new_ports() {
+        let mut starts = 0;
+        let err = Camera::start_mediamtx(Audio::Pcmu, &lotse_core::clock::SystemClock, |_| {
+            starts += 1;
+            command("false")
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("mediamtx exited"), "{err}");
+        assert_eq!(starts, START_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn a_mediamtx_started_again_after_an_exit_starts() {
+        let (listening, listener) = tokio::sync::oneshot::channel();
+        let mut listening = Some(listening);
+        let mut starts = 0;
+        let start = Camera::start_mediamtx(Audio::Pcmu, &lotse_core::clock::SystemClock, |ports| {
+            starts += 1;
+            if starts == 1 {
+                return command("false");
+            }
+            // The second one stays up, and its API answers.
+            let api = TcpListener::bind((Ipv4Addr::LOCALHOST, ports.api))?;
+            listening.take().unwrap().send(api).unwrap();
+            let mut sleep = command("sleep")?;
+            sleep.arg("5");
+            Ok(sleep)
+        });
+        let serve = async {
+            let api = listener.await.unwrap();
+            api.set_nonblocking(true).unwrap();
+            let api = AsyncListener::from_std(api).unwrap();
+            let (mut stream, _) = api.accept().await.unwrap();
+            let mut request = vec![0_u8; 1024];
+            let _read = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.0 404 Not Found\r\n\r\n{}")
+                .await
+                .unwrap();
+            Ok(api.local_addr().unwrap().port())
+        };
+        // A failed start (the API's port taken before the stand-in bound
+        // it) ends the test instead of leaving the stand-in waiting.
+        let (camera, api) = tokio::try_join!(start, serve).unwrap();
+        assert_eq!(camera.ports().api, api);
+        assert_eq!(starts, 2);
+        camera.stop();
+    }
+
+    #[tokio::test]
+    async fn a_running_mediamtx_whose_api_times_out_is_not_started_again() {
+        let clock = lotse_core::clock::FakeClock::default();
+        let mut starts = 0;
+        // Nothing answers on the API's port, and the process stays up.
+        let start = Camera::start_mediamtx(Audio::Pcmu, &clock, |_| {
+            starts += 1;
+            let mut sleep = command("sleep")?;
+            sleep.arg("5");
+            Ok(sleep)
+        });
+        let advance = async {
+            loop {
+                clock.advance(POLL);
+                tokio::task::yield_now().await;
+            }
+        };
+        let err = tokio::select! {
+            result = start => result.unwrap_err(),
+            () = advance => unreachable!(),
+        };
+        assert!(err.contains("mediamtx's API"), "{err}");
+        assert_eq!(starts, 1);
     }
 }

@@ -40,6 +40,7 @@ libc = { workspace = true } # the control buffer's size for `recv_marked` (`cmsg
 nix = { workspace = true, features = ["net", "socket", "uio"] } # `recv_marked`: `recvmsg` with the `IP_TOS`/`IPV6_TCLASS` control messages, which safe Rust gets nowhere else
 
 [dev-dependencies]
+lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`: MediaMTX's start timing out without waiting
 lotse-webrtc = { workspace = true } # the session engine the Safari ICE reproduction (`tests/t7_safari_ice.rs`) drives; the crypto provider of the `lotse-load` example's viewers
 tokio = { workspace = true, features = ["rt-multi-thread"] } # the `lotse-load` example's runtime
 
