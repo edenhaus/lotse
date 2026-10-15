@@ -19,9 +19,10 @@
 //! media playlist is followed by a fetch task of its own (§6.3.2: the
 //! segments a reload adds, in order; §6.3.4: the reload interval), which
 //! fetches at most two segments ahead of the playback. Segments are
-//! MPEG-TS (§3.2), read with a demultiplexer per
-//! timeline, or fragmented MP4 (§3.3) read against their `EXT-X-MAP`
-//! init segment (§4.3.2.5). An `EXT-X-DISCONTINUITY` (§4.3.2.3), segments
+//! MPEG-TS (§3.2), read with a demultiplexer per timeline, which reads
+//! their `EXT-X-MAP` (§4.3.2.5) first when they have one (the PAT and
+//! PMT they leave out), or fragmented MP4 (§3.3) read against their
+//! `EXT-X-MAP` init segment. An `EXT-X-DISCONTINUITY` (§4.3.2.3), segments
 //! the playlist removed before they were fetched, and a restarted
 //! playlist start a new epoch with a fresh reader; a program whose tracks
 //! change ends the attempt, so the next one declares them anew; the end of
@@ -218,6 +219,19 @@ fn is_mpegts(bytes: &[u8]) -> bool {
     [0, TS_PACKET, 2 * TS_PACKET]
         .iter()
         .all(|&offset| bytes.get(offset) == Some(&SYNC_BYTE))
+}
+
+/// Whether `bytes` are whole transport packets: a non-empty multiple of
+/// [`TS_PACKET`] bytes, each starting with the sync byte (ISO/IEC 13818-1
+/// §2.4.3.2). The `EXT-X-MAP` of MPEG-TS segments is a PAT and a PMT
+/// (RFC 8216 §3.2), two packets: fewer than [`is_mpegts`] asks of a
+/// stream.
+fn is_mpegts_packets(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes.len().is_multiple_of(TS_PACKET)
+        && bytes
+            .chunks(TS_PACKET)
+            .all(|packet| packet.first() == Some(&SYNC_BYTE))
 }
 
 /// Tells what the first answer is, reading as much of its body as that
@@ -436,9 +450,8 @@ struct Stream {
     /// What its reader produced and the merge has not taken yet, units in
     /// decoding order ([`enqueue`]).
     queue: VecDeque<Item>,
-    /// The MPEG-TS reader of the current timeline, with the continuity
-    /// errors already counted.
-    ts: Option<(Demuxer, u64)>,
+    /// The MPEG-TS reader of the current timeline.
+    ts: Option<TsReader>,
     /// The fragmented MP4 reader of the current timeline, with the init
     /// segment it read.
     fmp4: Option<(fmp4::Reader, Bytes)>,
@@ -467,17 +480,34 @@ impl Stream {
     }
 
     /// Takes the feed's next segment into the queue: the continuity errors
-    /// it brought. An ended feed ([`SourceError::Ended`]) leaves the stream
-    /// to be played out; any other error ends the attempt, and so does a
-    /// feed whose task is gone without a reason: it was stopped.
+    /// it brought. An ended feed ([`SourceError::Ended`]) ends the input
+    /// ([`Stream::finish_input`]) and leaves the stream to be played out;
+    /// any other error ends the attempt, and so does a feed whose task is
+    /// gone without a reason: it was stopped.
     async fn receive(&mut self, max_frame_bytes: usize) -> Result<Lost, SourceError> {
         match self.feed.recv().await.ok_or_else(cancelled)? {
             Ok(segment) => self.read(segment, max_frame_bytes).map(Lost),
             Err(SourceError::Ended(reason)) => {
+                self.finish_input();
                 self.ended = Some(SourceError::Ended(reason));
                 Ok(Lost(0))
             }
             Err(err) => Err(err),
+        }
+    }
+
+    /// Ends what the reader still holds open, as the end of the input ends
+    /// it: the last PES packet of a raw MPEG-TS body, which a video
+    /// stream leaves unbounded (ISO/IEC 13818-1 §2.4.3.7,
+    /// `PES_packet_length` 0), ends only with the body. A segment's
+    /// readers hold nothing: each segment ends what it opened.
+    fn finish_input(&mut self) {
+        if let Some(reader) = self.ts.as_mut() {
+            let mut events = Vec::new();
+            reader.demuxer.flush(&mut events);
+            for event in events {
+                enqueue(&mut self.queue, Item::from(event));
+            }
         }
     }
 
@@ -492,17 +522,23 @@ impl Stream {
         let mut events = Vec::new();
         let mut lost = 0;
         match segment.format {
-            Format::Ts => {
-                let (demuxer, counted) = self
+            Format::Ts { init } => {
+                let reader = self
                     .ts
-                    .get_or_insert_with(|| (Demuxer::new(max_frame_bytes), 0));
-                demuxer.push(&segment.data, &mut events);
-                if segment.ends {
-                    demuxer.flush(&mut events);
+                    .get_or_insert_with(|| TsReader::new(max_frame_bytes));
+                if let Some(init) = init
+                    && reader.init.as_ref() != Some(&init)
+                {
+                    reader.demuxer.push(&init, &mut events);
+                    reader.init = Some(init);
                 }
-                let errors = demuxer.stats().continuity_errors;
-                lost = errors.saturating_sub(*counted);
-                *counted = errors;
+                reader.demuxer.push(&segment.data, &mut events);
+                if segment.ends {
+                    reader.demuxer.flush(&mut events);
+                }
+                let errors = reader.demuxer.stats().continuity_errors;
+                lost = errors.saturating_sub(reader.counted);
+                reader.counted = errors;
             }
             Format::Fmp4 { init } => {
                 let mut reader = match self.fmp4.take() {
@@ -525,6 +561,29 @@ impl Stream {
             enqueue(&mut self.queue, Item::from(event));
         }
         Ok(lost)
+    }
+}
+
+/// The MPEG-TS reader of one timeline.
+#[derive(Debug)]
+struct TsReader {
+    /// The demultiplexer.
+    demuxer: Demuxer,
+    /// The continuity errors already counted as lost packets.
+    counted: u64,
+    /// The `EXT-X-MAP` init segment it read, when the segments have one
+    /// (RFC 8216 §3.2): the next one is read only if it differs.
+    init: Option<Bytes>,
+}
+
+impl TsReader {
+    /// A fresh reader keeping PES packets up to `max_frame_bytes`.
+    fn new(max_frame_bytes: usize) -> Self {
+        Self {
+            demuxer: Demuxer::new(max_frame_bytes),
+            counted: 0,
+            init: None,
+        }
     }
 }
 

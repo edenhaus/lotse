@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use super::{cancelled, is_mpegts, protocol};
+use super::{cancelled, is_mpegts, is_mpegts_packets, protocol};
 use crate::client::{Body, Client, Connect};
 use crate::hls::{self, Event, Fetch, MediaPlaylist, Playlist, Tracker};
 
@@ -48,7 +48,12 @@ pub(super) type Feed = mpsc::Receiver<Result<Segment, SourceError>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Format {
     /// MPEG-TS (RFC 8216 §3.2).
-    Ts,
+    Ts {
+        /// The `EXT-X-MAP` init segment, when the playlist has one: the
+        /// PAT and PMT its segments leave out (§3.2, a segment holds
+        /// them or has an `EXT-X-MAP`). `None` for a raw body.
+        init: Option<Bytes>,
+    },
     /// Fragmented MP4 (RFC 8216 §3.3) against this init segment.
     Fmp4 {
         /// The `EXT-X-MAP` init segment.
@@ -130,7 +135,7 @@ async fn stream(
     loop {
         let segment = Segment {
             data: piece,
-            format: Format::Ts,
+            format: Format::Ts { init: None },
             discontinuity: false,
             ends: false,
         };
@@ -259,13 +264,20 @@ impl<C: Connect> Follower<C> {
     }
 
     /// Fetches one segment, and its init segment when the `EXT-X-MAP`
-    /// changed. A segment without one must be MPEG-TS (RFC 8216 §3.2).
+    /// changed. The init segment's first bytes tell MPEG-TS tables (RFC
+    /// 8216 §3.2) from a movie box (§3.3); a segment without one must be
+    /// MPEG-TS (§3.2).
     async fn segment(&mut self, fetch: Fetch) -> Result<Segment, SourceError> {
         let format = match &fetch.segment.map {
-            Some(map) => Format::Fmp4 {
-                init: self.init(map).await?,
-            },
-            None => Format::Ts,
+            Some(map) => {
+                let init = self.init(map).await?;
+                if is_mpegts_packets(&init) {
+                    Format::Ts { init: Some(init) }
+                } else {
+                    Format::Fmp4 { init }
+                }
+            }
+            None => Format::Ts { init: None },
         };
         let data = self
             .client
@@ -274,11 +286,20 @@ impl<C: Connect> Follower<C> {
             .into_body()
             .bytes(MAX_SEGMENT_BYTES)
             .await?;
-        if format == Format::Ts && !is_mpegts(&data) {
-            return Err(SourceError::Protocol(format!(
-                "segment {} of the {} playlist is neither MPEG-TS (RFC 8216 §3.2) nor fragmented MP4 with an EXT-X-MAP (§3.3); packed audio (§3.4) is not supported",
-                fetch.sequence, self.what
-            )));
+        match &format {
+            Format::Ts { init: None } if !is_mpegts(&data) => {
+                return Err(SourceError::Protocol(format!(
+                    "segment {} of the {} playlist is neither MPEG-TS (RFC 8216 §3.2) nor fragmented MP4 with an EXT-X-MAP (§3.3); packed audio (§3.4) is not supported",
+                    fetch.sequence, self.what
+                )));
+            }
+            Format::Ts { init: Some(_) } if !is_mpegts(&data) => {
+                return Err(SourceError::Protocol(format!(
+                    "segment {} of the {} playlist is not MPEG-TS, which its EXT-X-MAP is (RFC 8216 §3.2)",
+                    fetch.sequence, self.what
+                )));
+            }
+            Format::Ts { .. } | Format::Fmp4 { .. } => {}
         }
         tracing::debug!(
             playlist = self.what,

@@ -253,6 +253,20 @@ fn serve_vod(rig: &Rig, dir: &str) {
     );
 }
 
+/// The PID of a transport packet.
+fn packet_pid(packet: &[u8]) -> u16 {
+    (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2])
+}
+
+/// `ts` split into its PAT and PMT packets (ffmpeg's PMT PID 0x1000)
+/// and the rest.
+fn split_tables(ts: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (tables, rest): (Vec<&[u8]>, Vec<&[u8]>) = ts
+        .chunks(188)
+        .partition(|packet| matches!(packet_pid(packet), 0 | 0x1000));
+    (tables.concat(), rest.concat())
+}
+
 fn tracks(set: &TrackSet) -> (Arc<Track>, Arc<Track>) {
     let tracks = set.tracks();
     assert_eq!(tracks.len(), 2, "{tracks:?}");
@@ -302,6 +316,19 @@ fn iso13818_1_2_4_3_2_mpegts_is_three_sync_bytes_188_apart() {
     }
     assert!(!is_mpegts(&packets[..376]));
     assert!(!is_mpegts(b"#EXTM3U"));
+}
+
+#[test]
+fn iso13818_1_2_4_3_2_an_mpegts_map_is_whole_packets_however_few() {
+    let (tables, _) = split_tables(LIVE_0);
+    assert_eq!(tables.len(), 2 * 188);
+    assert!(is_mpegts_packets(&tables));
+    assert!(is_mpegts_packets(&tables[..188]));
+    assert!(!is_mpegts(&tables), "a stream needs three packets");
+    assert!(!is_mpegts_packets(&[]));
+    assert!(!is_mpegts_packets(&tables[..187]));
+    assert!(!is_mpegts_packets(&tables[1..189]));
+    assert!(!is_mpegts_packets(H264_AAC_INIT));
 }
 
 /// The queue as (track or barrier, decoding time).
@@ -683,6 +710,73 @@ async fn rfc8216_4_3_2_3_a_discontinuity_starts_an_epoch_with_a_fresh_demultiple
     rig.stop().await;
 }
 
+/// MPEG-TS segments without a PAT and PMT, which their `EXT-X-MAP`
+/// holds (RFC 8216 §3.2): the map is read before the first segment, and
+/// again by the fresh demultiplexer after a discontinuity.
+#[tokio::test(flavor = "current_thread")]
+async fn rfc8216_3_2_ts_segments_take_their_tables_from_their_ext_x_map() {
+    let rig = Rig::new().await;
+    let (tables, _) = split_tables(LIVE_0);
+    rig.body("/t/tables.ts", MP2T, tables);
+    for (i, body) in [LIVE_0, LIVE_1, LIVE_2].into_iter().enumerate() {
+        let (_, media) = split_tables(body);
+        assert!(!media.is_empty());
+        rig.body(&format!("/t/live_{i}.m2t"), MP2T, media);
+    }
+    rig.playlist(
+        "/t/index.m3u8",
+        &media_playlist(
+            "#EXT-X-MAP:URI=\"tables.ts\"\n",
+            &[
+                "live_0.m2t",
+                "live_1.m2t",
+                "#EXT-X-DISCONTINUITY",
+                "live_2.m2t",
+            ],
+            true,
+        ),
+    );
+    let harness = rig.start("/t/index.m3u8");
+    let set = Arc::clone(&harness.tracks);
+    let err = rig.exit(harness).await;
+    assert_ended_with(&err, "EXT-X-ENDLIST");
+    let (video, audio) = tracks(&set);
+    assert_eq!(video.stats().frames, 30);
+    assert_eq!(video.stats().keyframes, 3);
+    assert!(audio.stats().frames >= 140, "{:?}", audio.stats());
+    assert_eq!(video.epoch(), 1);
+    assert_eq!(rig.seen("/t/tables.ts"), 1);
+    assert_eq!(rig.logs.lines("init segment fetched").len(), 1);
+    // The fresh demultiplexer declares the same layout from the tables.
+    assert_eq!(rig.logs.lines("layout repeated").len(), 1);
+    rig.stop().await;
+}
+
+/// Without its tables, a segment is read against no program; a segment
+/// of another format than its map is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn rfc8216_3_2_a_segment_of_another_format_than_its_mpegts_map_is_refused() {
+    let rig = Rig::new().await;
+    let (tables, media) = split_tables(LIVE_0);
+    rig.body("/t/tables.ts", MP2T, tables);
+    rig.body("/t/live_0.m2t", MP2T, media);
+    rig.body("/t/0.m4s", MP4, H264_AAC_0);
+    rig.playlist(
+        "/t/mixed.m3u8",
+        &media_playlist(
+            "#EXT-X-MAP:URI=\"tables.ts\"\n",
+            &["live_0.m2t", "0.m4s"],
+            true,
+        ),
+    );
+    let err = rig.exit(rig.start("/t/mixed.m3u8")).await;
+    assert_protocol(
+        &err,
+        "segment 1 of the media playlist is not MPEG-TS, which its EXT-X-MAP is (RFC 8216 §3.2)",
+    );
+    rig.stop().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_program_whose_tracks_change_ends_the_attempt() {
     let rig = Rig::new().await;
@@ -1036,7 +1130,7 @@ fn drop_packet(bytes: &[u8], pid: u16, nth: usize) -> Vec<u8> {
     let mut seen = 0;
     let mut out = Vec::new();
     for packet in bytes.chunks(188) {
-        let this = (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]);
+        let this = packet_pid(packet);
         let start = packet[1] & 0x40 != 0;
         if this == pid && !start {
             seen += 1;
@@ -1072,6 +1166,25 @@ async fn iso13818_1_a_raw_mpegts_body_is_streamed_until_the_server_ends_it() {
     assert_ended_with(&err, "the server ended the MPEG-TS stream");
     assert!(video.stats().frames >= 8, "{:?}", video.stats());
     assert!(set.ingest().packets_lost >= 1, "{:?}", set.ingest());
+    rig.stop().await;
+}
+
+/// A raw body's last video PES packet is unbounded (ISO/IEC 13818-1
+/// §2.4.3.7) and ends only with the body: every frame of the body is
+/// published, the last one included.
+#[tokio::test(flavor = "current_thread")]
+async fn iso13818_1_2_4_3_7_a_raw_mpegts_body_s_last_unbounded_pes_is_published_when_it_ends() {
+    let rig = Rig::new().await;
+    rig.body("/whole.ts", MP2T, H264_AAC);
+    let harness = rig.start("/whole.ts");
+    let set = Arc::clone(&harness.tracks);
+    let err = rig.exit(harness).await;
+    assert_ended_with(&err, "the server ended the MPEG-TS stream");
+    let (video, audio) = tracks(&set);
+    // The fixture's 10 video and 48 audio frames, as the demultiplexer's
+    // tests count them.
+    assert_eq!(video.stats().frames, 10, "{:?}", video.stats());
+    assert_eq!(audio.stats().frames, 48, "{:?}", audio.stats());
     rig.stop().await;
 }
 
