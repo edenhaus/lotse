@@ -25,8 +25,8 @@ use lotse_api::tls::{
     HANDSHAKE_TIMEOUT, MAX_HANDSHAKES_PER_ADDRESS, MAX_PENDING_HANDSHAKES, TlsConfig,
 };
 use lotse_api::{
-    BindError, Config, ConnectionId, Handler, MAX_PENDING_UPGRADES, Outcome, ServeError, Server,
-    UPGRADE_TIMEOUT,
+    BindError, CLOSE_TIMEOUT, Config, ConnectionId, Handler, MAX_PENDING_UPGRADES, Outcome,
+    ServeError, Server, UPGRADE_TIMEOUT,
 };
 use lotse_api_types::command::Command;
 use lotse_api_types::frame::{Hello, HelloTag};
@@ -46,7 +46,12 @@ use tokio_util::sync::CancellationToken;
 
 const TLS13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
+/// Answers every command with `null`, but `metrics/get` never: a command
+/// the handler is still awaiting.
 struct Minimal;
+
+/// Notified each time [`Minimal`] begins a `metrics/get`.
+static STALLED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 impl Handler for Minimal {
     fn hello(&self) -> Hello {
@@ -62,9 +67,16 @@ impl Handler for Minimal {
     fn handle(
         &self,
         _connection: ConnectionId,
-        _command: Command,
+        command: Command,
     ) -> impl Future<Output = Outcome> + Send {
-        std::future::ready(Outcome::Result(Value::Null))
+        let stalls = matches!(command, Command::MetricsGet(_));
+        async move {
+            if stalls {
+                STALLED.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Outcome::Result(Value::Null)
+        }
     }
 }
 
@@ -1051,6 +1063,14 @@ where
     ws.send(Message::Text(command.to_string().into()))
         .await
         .unwrap();
+    next_text(ws).await
+}
+
+/// The next frame, a text one, as JSON.
+async fn next_text<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Value
+where
+    S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     match within_5_s(ws.next()).await {
         Some(Ok(Message::Text(text))) => serde_json::from_str(text.as_str()).unwrap(),
         other => panic!("no answer: {other:?}"),
@@ -1258,4 +1278,118 @@ async fn a_command_sent_after_self_removal_is_not_run() {
         "no pong after the removal"
     );
     running.finish().await;
+}
+
+/// Sends `metrics/get` as command `id`, which [`Minimal`] never answers,
+/// and waits until the handler has begun it.
+async fn stall<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, id: u64)
+where
+    S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let command = serde_json::json!({ "id": id, "type": "metrics/get" });
+    ws.send(Message::Text(command.to_string().into()))
+        .await
+        .unwrap();
+    within_5_s(STALLED.notified()).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_removal_closes_the_connection_while_the_handler_still_awaits_its_command() {
+    let (logs, _guard) = capture();
+    let client = ClientIdentity::generate().unwrap();
+    let running = start_enrolled("remove-while-handled", vec![], &[client.pin]);
+    let mut admin = local(&running).await;
+    let mut gone = remote(&running, &client).await;
+    // A command the handler answers is answered as ever.
+    let info = call(&mut gone, serde_json::json!({ "id": 1, "type": "info" })).await;
+    assert_eq!(info["result"], Value::Null, "{info}");
+    stall(&mut gone, 2).await;
+
+    let answer = call(&mut admin, remove(1, client.pin)).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    // The command still awaited is refused, then RFC 6455 §7.4.1: 1008.
+    let refused = next_text(&mut gone).await;
+    assert_eq!(refused["id"], 2, "{refused}");
+    assert_eq!(refused["error"]["code"], "not_permitted", "{refused}");
+    assert_eq!(
+        close_frame(&mut gone).await,
+        (1008, "client removed".to_owned())
+    );
+    let text = logs.text();
+    assert!(
+        text.contains(
+            "command dropped before the handler answered: the connection's client was removed"
+        ),
+        "{text}"
+    );
+    drop(admin);
+    within_5_s(running.finish()).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_closes_the_connection_while_the_handler_still_awaits_its_command() {
+    let (logs, _guard) = capture();
+    let running = start("shutdown-while-handled", vec![]);
+    let mut admin = local(&running).await;
+    stall(&mut admin, 1).await;
+
+    running.shutdown.cancel();
+    let refused = next_text(&mut admin).await;
+    assert_eq!(refused["id"], 1, "{refused}");
+    assert_eq!(refused["error"]["code"], "shutting_down", "{refused}");
+    assert_eq!(next_text(&mut admin).await["type"], "shutdown");
+    // RFC 6455 §7.4.1: 1001, going away.
+    assert_eq!(
+        close_frame(&mut admin).await,
+        (1001, "shutting down".to_owned())
+    );
+    within_5_s(running.finish()).await;
+    let text = logs.text();
+    assert!(
+        text.contains("command dropped before the handler answered: shutting down"),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn serving_ends_after_a_closing_connection_so_the_data_directory_binds_again_at_once() {
+    let (logs, _guard) = capture();
+    let running = start("stop-while-closing", vec![]);
+    let mut admin = local(&running).await;
+    // 32 schema bundles, about 2.5 MB, to a peer that reads none: they fill
+    // the socket and overflow the outbound queue, so the connection closes
+    // and waits on the clock for the peer to take the close frame.
+    for id in 1..=32_u64 {
+        let schema = serde_json::json!({ "id": id, "type": "schema" });
+        admin
+            .feed(Message::Text(schema.to_string().into()))
+            .await
+            .unwrap();
+    }
+    admin.flush().await.unwrap();
+    within_5_s(async {
+        while !logs.text().contains("outbound queue overflowed") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    running.shutdown.cancel();
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !running.server.is_finished(),
+        "serving ended while a connection still held the client store"
+    );
+    running.clock.advance(CLOSE_TIMEOUT);
+    let (dir, data) = within_5_s(running.stop()).await;
+    let text = logs.text();
+    assert!(
+        text.contains("control API stopped: every connection closed"),
+        "{text}"
+    );
+    // Nothing holds the client store's lock (flock(2)) any more.
+    within_5_s(start_in(dir, data, vec![]).finish()).await;
+    drop(admin);
 }

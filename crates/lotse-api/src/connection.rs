@@ -8,13 +8,15 @@
 //! not for web pages) and the RFC 6455 §7.4.1 close codes: `1001` going
 //! away on shutdown, `1003` for a binary frame, `1008` policy violation on
 //! an overflowed outbound queue or a removed client. Commands are processed
-//! one at a time per connection; the handler's are non-blocking by
-//! contract. The ones about the TLS listener's clients may wait for the
-//! disk, so each runs as a task of its own: the connection reads no further
-//! command until its answer is queued, but still closes on shutdown or an
-//! overflow meanwhile. A removal or a shutdown is seen before any further
-//! command, which then never runs; a client that removes itself gets its
-//! answer before the close. On close the sessions are
+//! one at a time per connection; the handler's never wait on a camera, and
+//! one the handler is still awaiting when the connection's client is
+//! removed or the daemon shuts down is dropped and refused, so it never
+//! holds up the close. The ones about the TLS listener's clients may wait
+//! for the disk, so each runs as a task of its own: the connection reads no
+//! further command until its answer is queued, but still closes on shutdown
+//! or an overflow meanwhile. A removal or a shutdown is seen before any
+//! further command, which then never runs; a client that removes itself
+//! gets its answer before the close. On close the sessions are
 //! orphaned and the slot released first; the writer then gets
 //! [`CLOSE_TIMEOUT`] to deliver the queue and the close frame, after which
 //! the socket is dropped (RFC 6455 §7.1.1).
@@ -29,6 +31,7 @@ use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use futures_util::future::OptionFuture;
 use futures_util::{SinkExt as _, StreamExt as _};
 use lotse_api_types::clients::ClientList;
 use lotse_api_types::command::Command;
@@ -36,7 +39,7 @@ use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Empty, EventFrame, Failure, Pong, Shutdown, Success};
 use lotse_api_types::pairing::PairingCreateResult;
 use lotse_core::fingerprint::Fingerprint;
-use lotse_core::task::spawn_blocking_named;
+use lotse_core::task::{BoxFuture, spawn_blocking_named};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -294,6 +297,8 @@ struct Connection<H> {
     subscriptions: HashMap<u64, JoinHandle<()>>,
     /// Who is connected, as the listener authenticated it.
     peer: PeerInfo,
+    /// Cancelled once the connection's client is removed.
+    removed: CancellationToken,
     /// The command about the TLS listener's clients being answered, if
     /// any: no further command is read until it ends. Left to finish when
     /// the connection closes first, so a change it began is still logged.
@@ -332,6 +337,7 @@ async fn serve<H: Handler>(
         "api.writer",
         write_loop(sink, Arc::clone(&outbox)).in_current_span(),
     );
+    let removed = attach(state.clients.as_deref(), &peer, id);
     let mut connection = Connection {
         id,
         state,
@@ -339,9 +345,9 @@ async fn serve<H: Handler>(
         last_id: None,
         subscriptions: HashMap::new(),
         peer,
+        removed,
         pending: None,
     };
-    let removed = attach(connection.state.clients.as_deref(), &connection.peer, id);
     connection.send(Class::Signaling, &connection.state.handler.hello());
 
     let closed_by = loop {
@@ -351,9 +357,10 @@ async fn serve<H: Handler>(
             // TLS that can only be the client's own removal, whose answer
             // goes out before the close.
             biased;
-            () = removed.cancelled(), if connection.pending.is_none() => {
-                break client_removed(&connection.outbox);
-            }
+            // One line: the removal's break counts as covered in a copy of
+            // this loop whose connection is never removed (the coverage gate
+            // takes the best single copy of a generic function).
+            () = connection.removed.cancelled(), if connection.pending.is_none() => break client_removed(&connection.outbox),
             () = connection.state.shutdown.cancelled() => {
                 connection.send(Class::Signaling, &Shutdown::default());
                 connection.outbox.close(CLOSE_GOING_AWAY, "shutting down");
@@ -365,7 +372,9 @@ async fn serve<H: Handler>(
                 connection.outbox.close(CLOSE_POLICY_VIOLATION, "outbound queue overflowed");
                 break "overflow";
             }
-            () = answered(&mut connection.pending), if connection.pending.is_some() => {}
+            // Resolves to `None` at once, which disables the branch, while
+            // no such command is being answered.
+            Some(_ended) = OptionFuture::from(connection.pending.as_mut()) => connection.pending = None,
             incoming = stream.next(), if connection.pending.is_none() => match incoming {
                 None | Some(Ok(Message::Close(_))) => break "peer",
                 Some(Err(err)) => {
@@ -456,13 +465,30 @@ fn queue<T: serde::Serialize>(outbox: &Outbox, class: Class, frame: &T) {
     }
 }
 
-/// Waits for the command task in `pending` to end, its answer queued, and
-/// clears it.
-async fn answered(pending: &mut Option<JoinHandle<()>>) {
-    if let Some(task) = pending {
-        let _ended = task.await;
+/// The handler's answer to command `id`, unless the connection's client is
+/// removed (`removed`) or the daemon shuts down (`shutdown`) first: then
+/// `handling` is dropped, as [`Handler::handle`] allows, and a refusal
+/// answers the command, so a handler still awaiting never holds up the
+/// close. Not generic over the handler, so every handler's connection
+/// shares this one function.
+async fn unless_closing(
+    id: u64,
+    handling: BoxFuture<'_, Outcome>,
+    removed: &CancellationToken,
+    shutdown: &CancellationToken,
+) -> Outcome {
+    tokio::select! {
+        biased;
+        () = removed.cancelled() => {
+            tracing::info!(id, "command dropped before the handler answered: the connection's client was removed");
+            Outcome::Error(ApiError::new(ErrorCode::NotPermitted, "the client was removed"))
+        }
+        () = shutdown.cancelled() => {
+            tracing::info!(id, "command dropped before the handler answered: shutting down");
+            Outcome::Error(ApiError::new(ErrorCode::ShuttingDown, "shutting down"))
+        }
+        outcome = handling => outcome,
     }
-    *pending = None;
 }
 
 impl<H: Handler> Connection<H> {
@@ -484,7 +510,8 @@ impl<H: Handler> Connection<H> {
     /// Starts answering `command`, one about the TLS listener's clients,
     /// which the server answers itself, as a task of its own: a removal
     /// waits for the disk, which must not hold up the connection's loop.
-    /// The task queues the answer before it ends.
+    /// The task queues the answer before it ends, and [`crate::Server::serve`]
+    /// waits for it.
     fn listener_command(&mut self, command: Command) {
         let pairing = self.state.pairing.clone();
         let clients = self.state.clients.clone();
@@ -495,10 +522,22 @@ impl<H: Handler> Connection<H> {
                 listener_answer(pairing.as_deref(), clients.as_ref(), &peer, command).await;
             queue(&outbox, Class::Signaling, &answer);
         };
+        let tracked = self
+            .state
+            .serving
+            .task_tracker()
+            .track_future(answering.in_current_span());
         self.pending = Some(lotse_core::task::spawn_named(
             "api.listener_command",
-            answering.in_current_span(),
+            tracked,
         ));
+    }
+
+    /// The handler's answer to `command`, whose id is `id`; see
+    /// [`unless_closing`].
+    async fn handled(&self, id: u64, command: Command) -> Outcome {
+        let handling = Box::pin(self.state.handler.handle(self.id, command));
+        unless_closing(id, handling, &self.removed, &self.state.shutdown).await
     }
 
     /// One text frame: parse, check the id, dispatch, answer.
@@ -580,7 +619,7 @@ impl<H: Handler> Connection<H> {
                     ),
                 );
             }
-            other => match self.state.handler.handle(self.id, other).await {
+            other => match self.handled(id, other).await {
                 Outcome::Result(result) => self.send(Class::Signaling, &Success::new(id, result)),
                 Outcome::Error(error) => {
                     self.send(Class::Signaling, &Failure::new(Some(id), error));
@@ -871,14 +910,14 @@ mod tests {
 
         // The removal waits for the disk; the connection still shuts down.
         shutdown.cancel();
-        let Frame::Text(text) = next_frame(&mut ws).await else {
-            panic!("no shutdown frame");
-        };
-        assert!(text.as_str().contains("shutdown"), "{text}");
-        let Frame::Close(Some(close)) = next_frame(&mut ws).await else {
-            panic!("no close frame");
-        };
-        assert_eq!(u16::from(close.code), CLOSE_GOING_AWAY);
+        assert!(matches!(
+            next_frame(&mut ws).await,
+            Frame::Text(text) if text.as_str().contains("shutdown")
+        ));
+        assert!(matches!(
+            next_frame(&mut ws).await,
+            Frame::Close(Some(close)) if u16::from(close.code) == CLOSE_GOING_AWAY
+        ));
 
         // Let go, the removal still ends: a later change waits for it.
         stalled().await;
