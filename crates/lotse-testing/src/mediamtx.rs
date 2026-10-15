@@ -59,6 +59,13 @@ pub const BEEP_FRAMES: u32 = 5;
 /// How long [`Camera::start`] waits for the path to be ready.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How often [`Camera::start`] starts MediaMTX on new ports when it exits
+/// before its API answers: a port [`Ports::free`] found was taken before
+/// MediaMTX bound it (observed in CI on 2026-10-15, MediaMTX 1.21.1:
+/// `bind: address already in use`, with the interop tests and their
+/// daemons binding port 0 alongside).
+const START_ATTEMPTS: u32 = 4;
+
 /// How often it asks.
 const POLL: Duration = Duration::from_millis(100);
 
@@ -245,7 +252,8 @@ pub struct Ports {
 
 impl Ports {
     /// Free ports, found by binding port 0 and letting go; another process
-    /// could take one in between, which a test would see as a failed start.
+    /// could take one in between, which [`Camera::start`] meets by starting
+    /// again on new ones.
     pub fn free() -> io::Result<Self> {
         Ok(Self {
             rtsp: free_tcp_port()?,
@@ -338,16 +346,46 @@ impl Camera {
     /// Starts MediaMTX and ffmpeg with `audio`, and waits until the path
     /// is ready with all its tracks.
     pub async fn start(audio: Audio, clock: Arc<dyn Clock>) -> Result<Self, String> {
-        let ports = Ports::free().map_err(|err| format!("free ports: {err}"))?;
-        let mut mediamtx = command("mediamtx").map_err(|err| format!("mediamtx: {err}"))?;
-        mediamtx.arg(CONFIG).envs(ports.env());
-        let mut camera = Self {
-            mediamtx: spawn(mediamtx)?,
-            ffmpeg: None,
-            ports,
-            audio,
+        Self::start_with(audio, clock, || {
+            let mut mediamtx = command("mediamtx")?;
+            mediamtx.arg(CONFIG);
+            Ok(mediamtx)
+        })
+        .await
+    }
+
+    /// [`Camera::start`] with MediaMTX's command from `mediamtx`, on new
+    /// ports up to [`START_ATTEMPTS`] times while it exits before its API
+    /// answers.
+    async fn start_with(
+        audio: Audio,
+        clock: Arc<dyn Clock>,
+        mut mediamtx: impl FnMut() -> io::Result<Command>,
+    ) -> Result<Self, String> {
+        let mut attempt = 1;
+        let mut camera = loop {
+            let ports = Ports::free().map_err(|err| format!("free ports: {err}"))?;
+            let mut mediamtx = mediamtx().map_err(|err| format!("mediamtx: {err}"))?;
+            mediamtx.envs(ports.env());
+            let mut camera = Self {
+                mediamtx: spawn(mediamtx)?,
+                ffmpeg: None,
+                ports,
+                audio,
+            };
+            match camera.wait_api(&*clock).await {
+                Ok(()) => break camera,
+                // Exited at start: one of its ports was taken meanwhile.
+                Err(err)
+                    if attempt < START_ATTEMPTS
+                        && matches!(camera.mediamtx.try_wait(), Ok(Some(_))) =>
+                {
+                    tracing::warn!(attempt, %err, "mediamtx did not start; new ports");
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(err) => return Err(err),
+            }
         };
-        camera.wait_api(&*clock).await?;
         camera.publish(&*clock).await?;
         Ok(camera)
     }
@@ -782,5 +820,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("mediamtx exited"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_mediamtx_that_exits_at_start_is_started_again_on_new_ports() {
+        let mut starts = 0;
+        let clock: Arc<dyn Clock> = Arc::new(lotse_core::clock::SystemClock);
+        let err = Camera::start_with(Audio::Pcmu, clock, || {
+            starts += 1;
+            command("false")
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("mediamtx exited"), "{err}");
+        assert_eq!(starts, START_ATTEMPTS);
     }
 }
