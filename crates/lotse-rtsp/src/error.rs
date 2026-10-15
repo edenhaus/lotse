@@ -34,24 +34,27 @@ pub fn classify(error: &retina::Error, url: &SourceUrl) -> SourceError {
 
 /// [`classify`] on a retina error's `text` and RTSP `status`: its first
 /// line, scrubbed of `url` ([`RedactedUrl::scrub`]), then as
-/// [`camera_text`], is the message.
+/// [`camera_text`], is the message. The kind follows the line as retina
+/// wrote it: scrubbed, a query that happens to occur in a prefix (`t` in
+/// `Timeout`) would change it.
 ///
 /// [`RedactedUrl::scrub`]: lotse_core::secret::RedactedUrl::scrub
 fn classify_text(text: &str, status: Option<u16>, url: &SourceUrl) -> SourceError {
-    let message = camera_text(&url.redacted().scrub(first_line(text)));
+    let line = first_line(text);
+    let message = camera_text(&url.redacted().scrub(line));
     if let Some(status) = status {
         return match status {
             401 | 403 => SourceError::AuthFailed(message),
             _ => SourceError::Protocol(message),
         };
     }
-    if message.starts_with("Unable to connect") {
+    if line.starts_with("Unable to connect") {
         SourceError::Unreachable(message)
-    } else if message.starts_with("Timeout") {
+    } else if line.starts_with("Timeout") {
         SourceError::Timeout(message)
-    } else if message.starts_with("Error reading from RTSP peer")
-        || message.starts_with("Error writing to RTSP peer")
-        || message.starts_with("Error receiving UDP packet")
+    } else if line.starts_with("Error reading from RTSP peer")
+        || line.starts_with("Error writing to RTSP peer")
+        || line.starts_with("Error receiving UDP packet")
     {
         SourceError::Ended(message)
     } else {
@@ -159,6 +162,27 @@ mod tests {
         assert_eq!(
             classify_text(&text, Some(400), &url),
             SourceError::Protocol(format!("Bad request {lead} /****"))
+        );
+    }
+
+    /// A query that occurs in a kind's prefix is scrubbed out of the
+    /// message, not out of the classification.
+    #[test]
+    fn a_query_echoed_in_a_kinds_prefix_keeps_the_kind() {
+        let url = SourceUrl::parse("rtsp://cam/live?t").unwrap();
+        assert_eq!(
+            classify_text("Timeout", None, &url),
+            SourceError::Timeout("Timeou****".into())
+        );
+        let url = SourceUrl::parse("rtsp://cam/live?connect").unwrap();
+        assert_eq!(
+            classify_text("Unable to connect to cam", None, &url),
+            SourceError::Unreachable("Unable to **** to cam".into())
+        );
+        let url = SourceUrl::parse("rtsp://cam/live?Error").unwrap();
+        assert_eq!(
+            classify_text("Error reading from RTSP peer", None, &url),
+            SourceError::Ended("**** reading from RTSP peer".into())
         );
     }
 
