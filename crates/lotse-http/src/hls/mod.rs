@@ -7,7 +7,7 @@ pub mod playlist;
 pub mod select;
 
 pub use playlist::{
-    AudioRendition, MAX_PLAYLIST_BYTES, MAX_RENDITIONS, MAX_SEGMENTS, MAX_VARIANTS, MediaPlaylist,
-    MultivariantPlaylist, Playlist, PlaylistError, Segment, Start, Variant, parse,
+    AudioRendition, MAX_PLAYLIST_BYTES, MAX_RENDITIONS, MAX_SEGMENTS, MAX_URL_BYTES, MAX_VARIANTS,
+    MediaPlaylist, MultivariantPlaylist, Playlist, PlaylistError, Segment, Start, Variant, parse,
 };
 pub use select::{Choice, Event, Fetch, SelectError, Tracker, Update, choose_variant, start_index};

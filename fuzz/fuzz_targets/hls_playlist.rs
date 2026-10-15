@@ -1,5 +1,6 @@
 //! `hls_playlist`: parsing an HLS playlist from arbitrary bytes never
-//! panics, and what it accepts is bounded, of the playlist's origin and
+//! panics, and what it accepts is bounded (its URLs included, an
+//! `EXT-X-MAP` held once for its segments), of the playlist's origin and
 //! without fragments. Each input is parsed as it is and behind `#EXTM3U`,
 //! so the fuzzer reaches the tags without first finding the header; a
 //! variant is chosen from every multivariant playlist accepted.
@@ -14,15 +15,19 @@
 
 use libfuzzer_sys::fuzz_target;
 use lotse_http::hls::{
-    Event, MAX_RENDITIONS, MAX_SEGMENTS, MAX_VARIANTS, MediaPlaylist, Playlist, Tracker,
-    choose_variant, parse, start_index,
+    Event, MAX_RENDITIONS, MAX_SEGMENTS, MAX_URL_BYTES, MAX_VARIANTS, MediaPlaylist, Playlist,
+    Tracker, choose_variant, parse, start_index,
 };
+use std::sync::Arc;
+
 use url::Url;
 
-/// Checks one URL a parsed playlist holds against the playlist's own.
-fn check(url: &Url, base: &Url) {
+/// Checks one URL a parsed playlist holds against the playlist's own,
+/// and returns its length.
+fn check(url: &Url, base: &Url) -> usize {
     assert_eq!(url.origin(), base.origin());
     assert!(url.fragment().is_none());
+    url.as_str().len()
 }
 
 /// Parses one input and checks what it accepts.
@@ -36,25 +41,36 @@ fn run(data: &[u8], base: &Url) {
                     .start
                     .is_none_or(|start| start.time_offset.is_finite())
             );
+            let mut urls = 0;
+            let mut last_map: Option<&Arc<Url>> = None;
             for segment in &playlist.segments {
                 assert!(!segment.duration.is_zero());
-                check(&segment.uri, base);
+                urls += check(&segment.uri, base);
                 if let Some(map) = &segment.map {
-                    check(map, base);
+                    let length = check(map, base);
+                    // A map is held once: a segment shares the one before
+                    // it unless another EXT-X-MAP came between them.
+                    if !last_map.is_some_and(|last| Arc::ptr_eq(last, map)) {
+                        urls += length;
+                    }
+                    last_map = Some(map);
                 }
             }
+            assert!(urls <= MAX_URL_BYTES, "{urls} bytes of URLs");
         }
         Ok(Playlist::Multivariant(playlist)) => {
             assert!(playlist.variants.len() <= MAX_VARIANTS);
             assert!(playlist.audio.len() <= MAX_RENDITIONS);
+            let mut urls = 0;
             for variant in &playlist.variants {
-                check(&variant.uri, base);
+                urls += check(&variant.uri, base);
             }
             for rendition in &playlist.audio {
                 if let Some(uri) = &rendition.uri {
-                    check(uri, base);
+                    urls += check(uri, base);
                 }
             }
+            assert!(urls <= MAX_URL_BYTES, "{urls} bytes of URLs");
             for max_bandwidth in [None, Some(1_000_000)] {
                 if let Ok(choice) = choose_variant(&playlist, max_bandwidth) {
                     assert!(playlist.variants.contains(&choice.variant));

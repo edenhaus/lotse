@@ -15,13 +15,16 @@
 //!
 //! Refused rather than half-played: encryption, byte ranges and I-frame-only
 //! playlists. The input is bounded ([`MAX_PLAYLIST_BYTES`]) and so are the
-//! lists built from it.
+//! lists built from it and the URLs its URIs resolve to
+//! ([`MAX_URL_BYTES`]); an `EXT-X-MAP` is held once for all the segments
+//! it applies to.
 //!
 //! `m3u8-rs` 6.0.1 (read 2026-10-08) attaches an `EXT-X-KEY` and an
 //! `EXT-X-MAP` to the next segment only, and turns `EXT-X-KEY:METHOD=NONE`
 //! without an IV into an unknown tag; both are corrected here.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use lotse_core::secret::RedactedUrl;
@@ -36,6 +39,13 @@ pub const MAX_PLAYLIST_BYTES: usize = 1 << 20;
 /// The most segments a media playlist may list. Not from the RFC: an hour
 /// of one-second segments, far more than a live playlist's window.
 pub const MAX_SEGMENTS: usize = 10_000;
+
+/// The most bytes of URLs a playlist's URIs may resolve to, in all. Not
+/// from the RFC: eight times [`MAX_PLAYLIST_BYTES`], over 800 bytes for
+/// each of [`MAX_SEGMENTS`] segments. Short relative URIs resolve against
+/// the playlist's URL, so their URLs can be far longer than the playlist
+/// text; the bound keeps them proportional to it.
+pub const MAX_URL_BYTES: usize = 8 * MAX_PLAYLIST_BYTES;
 
 /// The most `EXT-X-STREAM-INF` and `EXT-X-I-FRAME-STREAM-INF` variants a
 /// multivariant playlist may list. Not from the RFC.
@@ -129,8 +139,9 @@ pub struct Segment {
     /// `EXT-X-DISCONTINUITY` (§4.3.2.3) before this segment.
     pub discontinuity: bool,
     /// The `EXT-X-MAP` (§4.3.2.5) in effect: the last one before this
-    /// segment, resolved and of the playlist's origin.
-    pub map: Option<Url>,
+    /// segment, resolved and of the playlist's origin. Shared by the
+    /// segments it applies to.
+    pub map: Option<Arc<Url>>,
     /// `EXT-X-GAP` (draft-pantos-hls-rfc8216bis §4.4.4.7): the segment has
     /// no media, and its URI "SHOULD NOT be loaded by clients".
     pub gap: bool,
@@ -164,7 +175,7 @@ impl fmt::Debug for Segment {
             .field("uri", &RedactedUrl::new(&self.uri))
             .field("duration", &self.duration)
             .field("discontinuity", &self.discontinuity)
-            .field("map", &self.map.as_ref().map(RedactedUrl::new))
+            .field("map", &self.map.as_deref().map(RedactedUrl::new))
             .field("gap", &self.gap)
             .finish()
     }
@@ -212,6 +223,9 @@ pub enum PlaylistError {
         /// The bound.
         limit: usize,
     },
+    /// URIs that resolve to more than [`MAX_URL_BYTES`] of URLs in all.
+    #[error("the playlist's URIs resolve to more than the {MAX_URL_BYTES} bytes of URLs accepted")]
+    UrlsTooLong,
     /// A media playlist without `EXT-X-TARGETDURATION`, or with 0.
     #[error(
         "the media playlist has no EXT-X-TARGETDURATION of at least one second (RFC 8216 §4.3.3.1)"
@@ -302,11 +316,17 @@ pub fn parse(bytes: &[u8], base: &Url) -> Result<Playlist, PlaylistError> {
             offset: bytes.len().saturating_sub(unread),
         });
     };
+    let mut urls = Resolver {
+        base,
+        left: MAX_URL_BYTES,
+    };
     match playlist {
         m3u8_rs::Playlist::MasterPlaylist(playlist) => {
-            multivariant(playlist, base).map(Playlist::Multivariant)
+            multivariant(playlist, &mut urls).map(Playlist::Multivariant)
         }
-        m3u8_rs::Playlist::MediaPlaylist(playlist) => media(playlist, base).map(Playlist::Media),
+        m3u8_rs::Playlist::MediaPlaylist(playlist) => {
+            media(playlist, &mut urls).map(Playlist::Media)
+        }
     }
 }
 
@@ -314,7 +334,7 @@ pub fn parse(bytes: &[u8], base: &Url) -> Result<Playlist, PlaylistError> {
 /// playlist.
 fn multivariant(
     playlist: m3u8_rs::MasterPlaylist,
-    base: &Url,
+    urls: &mut Resolver<'_>,
 ) -> Result<MultivariantPlaylist, PlaylistError> {
     bound("variants", playlist.variants.len(), MAX_VARIANTS)?;
     bound("renditions", playlist.alternatives.len(), MAX_RENDITIONS)?;
@@ -324,7 +344,7 @@ fn multivariant(
         .filter(|variant| !variant.is_i_frame)
         .map(|variant| {
             Ok(Variant {
-                uri: resolve(base, &variant.uri, "variant")?,
+                uri: urls.resolve(&variant.uri, "variant")?,
                 bandwidth: variant.bandwidth,
                 codecs: variant.codecs,
                 audio_group: variant.audio,
@@ -339,7 +359,7 @@ fn multivariant(
             Ok(AudioRendition {
                 uri: media
                     .uri
-                    .map(|uri| resolve(base, &uri, "audio rendition"))
+                    .map(|uri| urls.resolve(&uri, "audio rendition"))
                     .transpose()?,
                 group_id: media.group_id,
                 name: media.name,
@@ -352,7 +372,10 @@ fn multivariant(
 
 /// The segments of a media playlist, with `EXT-X-MAP` carried forward to
 /// every segment it applies to (§4.3.2.5).
-fn media(playlist: m3u8_rs::MediaPlaylist, base: &Url) -> Result<MediaPlaylist, PlaylistError> {
+fn media(
+    playlist: m3u8_rs::MediaPlaylist,
+    urls: &mut Resolver<'_>,
+) -> Result<MediaPlaylist, PlaylistError> {
     if playlist.i_frames_only {
         return Err(PlaylistError::IFramesOnly);
     }
@@ -385,14 +408,14 @@ fn media(playlist: m3u8_rs::MediaPlaylist, base: &Url) -> Result<MediaPlaylist, 
             if segment_map.byte_range.is_some() {
                 return Err(PlaylistError::ByteRange { index });
             }
-            map = Some(resolve(base, &segment_map.uri, "EXT-X-MAP")?);
+            map = Some(Arc::new(urls.resolve(&segment_map.uri, "EXT-X-MAP")?));
         }
         let duration = Duration::try_from_secs_f32(segment.duration)
             .ok()
             .filter(|duration| !duration.is_zero())
             .ok_or(PlaylistError::SegmentDuration { index })?;
         segments.push(Segment {
-            uri: resolve(base, &segment.uri, "segment")?,
+            uri: urls.resolve(&segment.uri, "segment")?,
             duration,
             discontinuity: segment.discontinuity,
             map: map.clone(),
@@ -437,23 +460,40 @@ fn bound(what: &'static str, count: usize, limit: usize) -> Result<(), PlaylistE
     Ok(())
 }
 
-/// Resolves `reference` against `base` (RFC 3986 §5.2), requires `base`'s
-/// origin (RFC 6454 §5) and drops the fragment (RFC 3986 §3.5).
-fn resolve(base: &Url, reference: &str, what: &'static str) -> Result<Url, PlaylistError> {
-    if reference.is_empty() {
-        return Err(PlaylistError::MissingUri { what });
+/// Resolves the URIs of one playlist against its URL, within
+/// [`MAX_URL_BYTES`] of URLs in all.
+struct Resolver<'a> {
+    /// The playlist's URL.
+    base: &'a Url,
+    /// The bytes of URLs still allowed.
+    left: usize,
+}
+
+impl Resolver<'_> {
+    /// Resolves `reference` against the base (RFC 3986 §5.2), requires
+    /// its origin (RFC 6454 §5), drops the fragment (RFC 3986 §3.5) and
+    /// counts the URL against the budget.
+    fn resolve(&mut self, reference: &str, what: &'static str) -> Result<Url, PlaylistError> {
+        if reference.is_empty() {
+            return Err(PlaylistError::MissingUri { what });
+        }
+        let mut url = self
+            .base
+            .join(reference)
+            .map_err(|error| PlaylistError::InvalidUri { what, error })?;
+        if url.origin() != self.base.origin() {
+            return Err(PlaylistError::CrossOrigin {
+                what,
+                origin: url.origin().ascii_serialization(),
+            });
+        }
+        url.set_fragment(None);
+        self.left = self
+            .left
+            .checked_sub(url.as_str().len())
+            .ok_or(PlaylistError::UrlsTooLong)?;
+        Ok(url)
     }
-    let mut url = base
-        .join(reference)
-        .map_err(|error| PlaylistError::InvalidUri { what, error })?;
-    if url.origin() != base.origin() {
-        return Err(PlaylistError::CrossOrigin {
-            what,
-            origin: url.origin().ascii_serialization(),
-        });
-    }
-    url.set_fragment(None);
-    Ok(url)
 }
 
 #[cfg(test)]
@@ -691,7 +731,11 @@ mod tests {
             "#EXTINF:2,\nplain.ts\n#EXT-X-MAP:URI=\"init1.mp4\"\n#EXTINF:2,\na.m4s\n#EXTINF:2,\n\
              b.m4s\n#EXT-X-MAP:URI=\"/other/init2.mp4#x\"\n#EXTINF:2,\nc.m4s\n",
         ));
-        let maps: Vec<_> = playlist.segments.iter().map(|s| s.map.clone()).collect();
+        let maps: Vec<_> = playlist
+            .segments
+            .iter()
+            .map(|s| s.map.as_deref().cloned())
+            .collect();
         assert_eq!(
             maps,
             [
@@ -701,6 +745,8 @@ mod tests {
                 Some(url("/other/init2.mp4")),
             ]
         );
+        let (a, b) = (&playlist.segments[1].map, &playlist.segments[2].map);
+        assert!(Arc::ptr_eq(a.as_ref().unwrap(), b.as_ref().unwrap()));
     }
 
     #[test]
@@ -903,6 +949,61 @@ mod tests {
                 count: MAX_SEGMENTS + 1,
                 limit: MAX_SEGMENTS
             }
+        );
+    }
+
+    /// One `EXT-X-MAP` of half a mebibyte before every segment the bounds
+    /// allow: held once, not once per segment (gibibytes).
+    #[test]
+    fn a_map_is_held_once_for_all_its_segments() {
+        let map = format!("#EXT-X-MAP:URI=\"{}.mp4\"\n", "m".repeat(512 << 10));
+        let text = media_with(&format!(
+            "{map}{}",
+            "#EXTINF:1,\ns.ts\n".repeat(MAX_SEGMENTS)
+        ));
+        assert!(text.len() <= MAX_PLAYLIST_BYTES);
+        let playlist = parse_media(&text);
+        let first = playlist.segments[0].map.as_ref().unwrap();
+        assert!(first.as_str().len() > 512 << 10);
+        assert!(
+            playlist
+                .segments
+                .iter()
+                .all(|s| Arc::ptr_eq(s.map.as_ref().unwrap(), first))
+        );
+    }
+
+    /// A playlist URL whose directory makes each relative `s` resolve to
+    /// exactly a mebibyte: eight of them fill [`MAX_URL_BYTES`], so the
+    /// URLs of a short playlist stay bounded.
+    #[test]
+    fn resolved_urls_are_bounded_in_all() {
+        let prefix = "http://camera.example:8080/";
+        let dir = format!("{}/", "d".repeat((1 << 20) - prefix.len() - 2));
+        let long = Url::parse(&format!("{prefix}{dir}index.m3u8")).unwrap();
+        let parsed = |body: &str| parse(media_with(body).as_bytes(), &long);
+        lotse_core::let_assert!(
+            Ok(Playlist::Media(playlist)) = parsed(&"#EXTINF:1,\ns\n".repeat(8))
+        );
+        let lengths: Vec<_> = playlist
+            .segments
+            .iter()
+            .map(|s| s.uri.as_str().len())
+            .collect();
+        assert_eq!(lengths, [1 << 20; 8]);
+        assert_eq!(MAX_URL_BYTES, 8 << 20);
+        // One byte more is refused.
+        let err = parsed(&format!("{}#EXTINF:1,\nss\n", "#EXTINF:1,\ns\n".repeat(7))).unwrap_err();
+        assert_eq!(err, PlaylistError::UrlsTooLong);
+        assert_eq!(
+            err.to_string(),
+            "the playlist's URIs resolve to more than the 8388608 bytes of URLs accepted"
+        );
+        // A multivariant playlist's URIs count the same.
+        let variants = "#EXT-X-STREAM-INF:BANDWIDTH=1\nv\n".repeat(9);
+        assert_eq!(
+            parse(format!("#EXTM3U\n{variants}").as_bytes(), &long).unwrap_err(),
+            PlaylistError::UrlsTooLong
         );
     }
 
