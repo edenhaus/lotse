@@ -345,14 +345,18 @@ impl ClientStore {
         ClientList { clients }
     }
 
-    /// Removes the enrolled `pin`: the file first, then the set, then every
-    /// connection it has open is told to close, then the directory is
-    /// synced. All of it holds `writing`, so a new enrollment of `pin` waits
-    /// until its old connections are closed and never has one of its own
-    /// closed by this removal; closing before the sync keeps a slow disk
-    /// from keeping a removed client connected. A fixed pin stays.
-    /// Blocking: run it off the runtime's threads.
-    pub(crate) fn remove(&self, pin: Fingerprint) -> io::Result<Removal> {
+    /// Removes the enrolled `pin`, as connection `by` asked: the file first,
+    /// then the set, then every connection it has open is told to close,
+    /// then the directory is synced. All of it holds `writing`, so a new
+    /// enrollment of `pin` waits until its old connections are closed and
+    /// never has one of its own closed by this removal; closing before the
+    /// sync keeps a slow disk from keeping a removed client connected. `by`
+    /// itself is left open, counted among the closed, for it to close once
+    /// it has answered: a client removing itself gets the result first,
+    /// while any other connection of `pin` closes without waiting for
+    /// whatever it is answering. A fixed pin stays. Blocking: run it off
+    /// the runtime's threads.
+    pub(crate) fn remove(&self, pin: Fingerprint, by: ConnectionId) -> io::Result<Removal> {
         if self.fixed.contains(&pin) {
             return Ok(Removal::Fixed);
         }
@@ -371,9 +375,11 @@ impl ClientStore {
             .write()
             .unwrap_or_else(PoisonError::into_inner) = next;
         let mut closed: usize = 0;
-        for (open, token) in self.connections().values() {
+        for (id, (open, token)) in self.connections().iter() {
             if *open == pin {
-                token.cancel();
+                if *id != by {
+                    token.cancel();
+                }
                 closed = closed.saturating_add(1);
             }
         }
@@ -779,17 +785,30 @@ mod tests {
         expected.sort_by_key(|client| Fingerprint::parse(&client.pin).unwrap());
         assert_eq!(listed, expected);
 
-        assert_eq!(store.remove(fixed).unwrap(), Removal::Fixed);
+        assert_eq!(
+            store.remove(fixed, ConnectionId(9)).unwrap(),
+            Removal::Fixed
+        );
         assert!(store.allows(&fixed));
         assert_eq!(
-            store.remove(Fingerprint::of(b"unknown")).unwrap(),
+            store
+                .remove(Fingerprint::of(b"unknown"), ConnectionId(9))
+                .unwrap(),
             Removal::Unknown
         );
-        assert_eq!(store.remove(gone).unwrap(), Removal::Removed { closed: 2 });
-        assert!(first.is_cancelled() && second.is_cancelled());
+        // The second asked: it closes itself once it has answered.
+        assert_eq!(
+            store.remove(gone, ConnectionId(2)).unwrap(),
+            Removal::Removed { closed: 2 }
+        );
+        assert!(first.is_cancelled() && !second.is_cancelled());
         assert!(!other.is_cancelled() && !closed.is_cancelled());
         assert!(!store.allows(&gone));
-        assert_eq!(store.remove(gone).unwrap(), Removal::Unknown, "idempotent");
+        assert_eq!(
+            store.remove(gone, ConnectionId(9)).unwrap(),
+            Removal::Unknown,
+            "idempotent"
+        );
         let file = dir.join(CLIENTS_DIR).join(PINS_FILE);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{kept}\n"));
         // A connection of a pin removed since its handshake closes at once.
@@ -817,7 +836,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(file).unwrap(), format!("{pin}\n"));
         assert!(logs.text().contains("a crash may undo the change"));
         assert!(logs.text().contains("change=\"enrolled\""));
-        assert_eq!(store.remove(pin).unwrap(), Removal::Removed { closed: 0 });
+        assert_eq!(
+            store.remove(pin, ConnectionId(9)).unwrap(),
+            Removal::Removed { closed: 0 }
+        );
         assert!(!store.allows(&pin));
         assert!(logs.text().contains("change=\"removed\""));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -865,7 +887,7 @@ mod tests {
             Ok(())
         });
         std::thread::scope(|scope| {
-            let removal = scope.spawn(|| store.remove(pin));
+            let removal = scope.spawn(|| store.remove(pin, ConnectionId(9)));
             REMOVING.wait();
             // Syncing: the connection is already closed, and the next
             // change has to wait for the removal to end.
@@ -897,7 +919,7 @@ mod tests {
         std::fs::DirBuilder::new()
             .create(dir.join(CLIENTS_DIR).join(PARTIAL_FILE))
             .unwrap();
-        assert!(store.remove(pin).is_err());
+        assert!(store.remove(pin, ConnectionId(9)).is_err());
         assert!(store.allows(&pin));
         assert!(!token.is_cancelled());
         std::fs::remove_dir_all(&dir).unwrap();

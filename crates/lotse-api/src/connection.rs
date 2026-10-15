@@ -119,27 +119,33 @@ pub(crate) async fn upgrade<H: Handler>(
 
 /// The answer to a command about the TLS listener's clients
 /// (`pairing/create`, `clients/list`, `clients/remove`), which the server
-/// answers itself. Not generic over the handler, so every handler's
-/// connection shares this one function.
+/// answers itself, asked by connection `by`; and whether `by` closes once
+/// it has sent the answer: its client removed itself. Not generic over the
+/// handler, so every handler's connection shares this one function.
 async fn listener_answer(
     pairing: Option<&Pairing>,
     clients: Option<&Arc<ClientStore>>,
     peer: &PeerInfo,
+    by: ConnectionId,
     command: Command,
-) -> serde_json::Value {
+) -> (serde_json::Value, bool) {
     let id = command.id();
+    let mut leaving = false;
     let outcome = match command {
         Command::ClientsList(_) => clients_list(clients).map(to_json),
-        Command::ClientsRemove(remove) => clients_remove(clients, peer, &remove.pin)
-            .await
-            .map(to_json),
+        Command::ClientsRemove(remove) => {
+            let removed = clients_remove(clients, peer, by, &remove.pin).await;
+            // Over TLS a client may remove only itself.
+            leaving = removed.is_ok() && matches!(peer, PeerInfo::Tls { .. });
+            removed.map(to_json)
+        }
         _ => pairing_create(pairing, peer).map(to_json),
     };
     let frame = match outcome {
         Ok(result) => serde_json::to_value(Success::new(id, result)),
         Err(error) => serde_json::to_value(Failure::new(Some(id), error)),
     };
-    frame.unwrap_or_default()
+    (frame.unwrap_or_default(), leaving)
 }
 
 /// `value` as JSON.
@@ -159,12 +165,14 @@ fn clients_list(clients: Option<&Arc<ClientStore>>) -> Result<ClientList, ApiErr
         .ok_or_else(listener_off)
 }
 
-/// `clients/remove`: removes an enrolled pin and closes its connections.
-/// Over the TLS listener a client may remove only itself; a fixed pin
-/// stays; a pin that is not enrolled is already removed.
+/// `clients/remove`, asked by connection `by`: removes an enrolled pin and
+/// closes its connections but `by` (see [`ClientStore::remove`]). Over the
+/// TLS listener a client may remove only itself; a fixed pin stays; a pin
+/// that is not enrolled is already removed.
 async fn clients_remove(
     clients: Option<&Arc<ClientStore>>,
     peer: &PeerInfo,
+    by: ConnectionId,
     pin: &str,
 ) -> Result<Empty, ApiError> {
     let Ok(pin) = Fingerprint::parse(pin) else {
@@ -185,7 +193,7 @@ async fn clients_remove(
         ));
     }
     let store = Arc::clone(clients);
-    let removed = spawn_blocking_named("api.clients_remove", move || store.remove(pin));
+    let removed = spawn_blocking_named("api.clients_remove", move || store.remove(pin, by));
     match removed
         .await
         .map_err(io::Error::other)
@@ -353,14 +361,15 @@ async fn serve<H: Handler>(
     let closed_by = loop {
         tokio::select! {
             // In this order, so a removal or a shutdown wins over a command
-            // already received. A removal waits for a pending command: over
-            // TLS that can only be the client's own removal, whose answer
-            // goes out before the close.
+            // already received, a pending one too. A client removing itself
+            // is not told to close by the removal but by the command's own
+            // task, once the answer is queued, so it goes out before the
+            // close.
             biased;
             // One line: the removal's break counts as covered in a copy of
             // this loop whose connection is never removed (the coverage gate
             // takes the best single copy of a generic function).
-            () = connection.removed.cancelled(), if connection.pending.is_none() => break client_removed(&connection.outbox),
+            () = connection.removed.cancelled() => break client_removed(&connection.outbox),
             () = connection.state.shutdown.cancelled() => {
                 connection.send(Class::Signaling, &Shutdown::default());
                 connection.outbox.close(CLOSE_GOING_AWAY, "shutting down");
@@ -510,17 +519,23 @@ impl<H: Handler> Connection<H> {
     /// Starts answering `command`, one about the TLS listener's clients,
     /// which the server answers itself, as a task of its own: a removal
     /// waits for the disk, which must not hold up the connection's loop.
-    /// The task queues the answer before it ends, and [`crate::Server::serve`]
+    /// The task queues the answer before it ends, then closes the
+    /// connection if its client removed itself, and [`crate::Server::serve`]
     /// waits for it.
     fn listener_command(&mut self, command: Command) {
         let pairing = self.state.pairing.clone();
         let clients = self.state.clients.clone();
         let peer = self.peer.clone();
+        let by = self.id;
         let outbox = Arc::clone(&self.outbox);
+        let removed = self.removed.clone();
         let answering = async move {
-            let answer =
-                listener_answer(pairing.as_deref(), clients.as_ref(), &peer, command).await;
+            let (answer, leaving) =
+                listener_answer(pairing.as_deref(), clients.as_ref(), &peer, by, command).await;
             queue(&outbox, Class::Signaling, &answer);
+            if leaving {
+                removed.cancel();
+            }
         };
         let tracked = self
             .state
@@ -701,33 +716,20 @@ mod tests {
             ErrorCode::InternalError
         );
         let create = |id: u64| command(&format!(r#"{{"id":{id},"type":"pairing/create"}}"#));
-        let answer = listener_answer(Some(&working), None, &unix, create(7)).await;
+        let (answer, _) =
+            listener_answer(Some(&working), None, &unix, ConnectionId(1), create(7)).await;
         assert_eq!(answer["id"], 7);
         assert_eq!(answer["success"], true);
-        let answer = listener_answer(None, None, &unix, create(8)).await;
+        let (answer, _) = listener_answer(None, None, &unix, ConnectionId(1), create(8)).await;
         assert_eq!(answer["error"]["code"], "invalid_request");
     }
 
     #[tokio::test]
     async fn clients_remove_takes_an_enrolled_pin_from_the_socket_or_the_client_itself() {
-        use std::os::unix::fs::DirBuilderExt as _;
-
         let (logs, _guard) = crate::pairing::test_support::capture();
-        let dir =
-            std::env::temp_dir().join(format!("lotse-connection-clients-{}", std::process::id()));
-        let _gone = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-        let runtime = (
-            rustix::process::getuid().as_raw(),
-            rustix::process::getgid().as_raw(),
-        );
         let fixed = Fingerprint::of(b"fixed");
-        let store = Arc::new(
-            ClientStore::open(&std::fs::File::open(&dir).unwrap(), &dir, &[fixed], runtime)
-                .unwrap(),
-        );
         let (own, other) = (Fingerprint::of(b"own"), Fingerprint::of(b"other"));
-        store.enroll(own).unwrap();
+        let (store, dir) = store_with("clients", &[fixed], own, |_| Ok(()));
         store.enroll(other).unwrap();
         let unix = PeerInfo::Unix { uid: 0, pid: None };
         let tls = PeerInfo::Tls {
@@ -737,38 +739,45 @@ mod tests {
         let clients = Some(&store);
         let code = |result: Result<Empty, ApiError>| result.unwrap_err().code;
 
-        let refused = clients_remove(clients, &unix, "not a pin")
+        let refused = clients_remove(clients, &unix, ConnectionId(2), "not a pin")
             .await
             .unwrap_err();
         assert_eq!(refused.code, ErrorCode::InvalidRequest);
         assert_eq!(refused.details["field"], "pin");
         let own_text = own.to_string();
         assert_eq!(
-            code(clients_remove(None, &unix, &own_text).await),
+            code(clients_remove(None, &unix, ConnectionId(2), &own_text).await),
             ErrorCode::InvalidRequest
         );
         assert_eq!(
-            code(clients_remove(clients, &tls, &other.to_string()).await),
+            code(clients_remove(clients, &tls, ConnectionId(2), &other.to_string()).await),
             ErrorCode::NotPermitted
         );
         assert!(store.allows(&other));
         assert_eq!(
-            code(clients_remove(clients, &unix, &fixed.to_hex()).await),
+            code(clients_remove(clients, &unix, ConnectionId(2), &fixed.to_hex()).await),
             ErrorCode::NotPermitted
         );
         let session = store.attach(ConnectionId(1), own);
-        // Without colons it is the same pin.
-        assert!(clients_remove(clients, &tls, &own.to_hex()).await.is_ok());
+        // Without colons it is the same pin; asked by another connection of
+        // it, so this one is told to close.
+        assert!(
+            clients_remove(clients, &tls, ConnectionId(2), &own.to_hex())
+                .await
+                .is_ok()
+        );
         assert!(!store.allows(&own));
         assert!(session.is_cancelled());
         assert!(
-            clients_remove(clients, &unix, &own_text).await.is_ok(),
+            clients_remove(clients, &unix, ConnectionId(2), &own_text)
+                .await
+                .is_ok(),
             "idempotent"
         );
         let blocker = dir.join(crate::clients::CLIENTS_DIR).join("pins.partial");
         std::fs::create_dir(&blocker).unwrap();
         assert_eq!(
-            code(clients_remove(clients, &unix, &other.to_string()).await),
+            code(clients_remove(clients, &unix, ConnectionId(2), &other.to_string()).await),
             ErrorCode::InternalError
         );
         std::fs::remove_dir(&blocker).unwrap();
@@ -789,16 +798,17 @@ mod tests {
         assert!(removed.contains("closed=1"), "{removed}");
 
         let list = command(r#"{"id":3,"type":"clients/list"}"#);
-        let answer = listener_answer(None, clients, &unix, list.clone()).await;
+        let (answer, _) =
+            listener_answer(None, clients, &unix, ConnectionId(2), list.clone()).await;
         assert_eq!(answer["id"], 3);
         let listed = answer["result"]["clients"].as_array().unwrap();
         assert_eq!(listed.len(), 2, "{answer}");
-        let answer = listener_answer(None, None, &unix, list).await;
+        let (answer, _) = listener_answer(None, None, &unix, ConnectionId(2), list).await;
         assert_eq!(answer["error"]["code"], "invalid_request");
         let remove = command(&format!(
             r#"{{"id":4,"type":"clients/remove","pin":"{other}"}}"#
         ));
-        let answer = listener_answer(None, clients, &unix, remove).await;
+        let (answer, _) = listener_answer(None, clients, &unix, ConnectionId(2), remove).await;
         assert_eq!(answer["success"], true, "{answer}");
         assert_eq!(answer["result"], serde_json::json!({}));
         assert!(!store.allows(&other));
@@ -815,17 +825,120 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn only_a_client_that_removed_itself_leaves_and_only_after_the_answer() {
+        let (own, other) = (Fingerprint::of(b"own"), Fingerprint::of(b"other"));
+        let (store, dir) = store_with("leaving", &[], own, |_| Ok(()));
+        store.enroll(other).unwrap();
+        let clients = Some(&store);
+        let unix = PeerInfo::Unix { uid: 0, pid: None };
+        let tls = tls_peer(own, 1);
+        let remove = |id: u64, pin: Fingerprint| {
+            command(&format!(
+                r#"{{"id":{id},"type":"clients/remove","pin":"{pin}"}}"#
+            ))
+        };
+
+        let (answer, leaving) =
+            listener_answer(None, clients, &tls, ConnectionId(1), remove(1, other)).await;
+        assert_eq!(answer["error"]["code"], "not_permitted", "{answer}");
+        assert!(!leaving, "refused, the client stays");
+        let (answer, leaving) =
+            listener_answer(None, clients, &unix, ConnectionId(2), remove(2, other)).await;
+        assert_eq!(answer["success"], true, "{answer}");
+        assert!(!leaving, "the socket's peer stays");
+        let (answer, leaving) =
+            listener_answer(None, clients, &tls, ConnectionId(1), remove(3, own)).await;
+        assert_eq!(answer["success"], true, "{answer}");
+        assert!(leaving, "the client removed itself");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Both sides of the directory sync a removal is held in by
     /// `a_stalled_removal_does_not_hold_up_shutdown`.
     static STALLED: std::sync::Barrier = std::sync::Barrier::new(2);
 
-    /// Waits on [`STALLED`] off the runtime's thread.
-    async fn stalled() {
+    /// Both sides of each directory sync held open by
+    /// `a_client_removed_by_another_request_closes_while_its_own_removal_waits`.
+    static COMPETING: std::sync::Barrier = std::sync::Barrier::new(2);
+
+    /// Waits on `barrier` off the runtime's thread.
+    async fn stalled(barrier: &'static std::sync::Barrier) {
         spawn_blocking_named("test.stalled", || {
-            STALLED.wait();
+            barrier.wait();
         })
         .await
         .unwrap();
+    }
+
+    /// The store of a fresh data directory named after `test`, with the
+    /// `fixed` pins, `pin` enrolled and `sync_dir` in place of `fsync`; and
+    /// the directory.
+    fn store_with(
+        test: &str,
+        fixed: &[Fingerprint],
+        pin: Fingerprint,
+        sync_dir: fn(&std::os::fd::OwnedFd) -> io::Result<()>,
+    ) -> (Arc<ClientStore>, std::path::PathBuf) {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("lotse-connection-{test}-{}", std::process::id()));
+        let _gone = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let runtime = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        let store =
+            ClientStore::open(&std::fs::File::open(&dir).unwrap(), &dir, fixed, runtime).unwrap();
+        store.enroll(pin).unwrap();
+        (Arc::new(store.with_sync_dir(sync_dir)), dir)
+    }
+
+    /// A TLS peer authenticated with `pin`, from `port`.
+    fn tls_peer(pin: Fingerprint, port: u16) -> PeerInfo {
+        PeerInfo::Tls {
+            pin,
+            addr: std::net::SocketAddr::from(([192, 0, 2, 1], port)),
+        }
+    }
+
+    /// A WebSocket client of a connection served with `state` to `peer`,
+    /// past its `hello`.
+    async fn connect(
+        state: AppState<crate::tests::Minimal>,
+        peer: PeerInfo,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream> {
+        let app = axum::Router::new()
+            .route(
+                lotse_api_types::WS_PATH,
+                axum::routing::get(upgrade::<crate::tests::Minimal>),
+            )
+            .with_state(state)
+            .layer(Extension(peer));
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let serving = hyper::server::conn::http1::Builder::new()
+            .serve_connection(
+                hyper_util::rt::TokioIo::new(server),
+                hyper_util::service::TowerToHyperService::new(app),
+            )
+            .with_upgrades();
+        let _served = lotse_core::task::spawn_named("test.serve", serving);
+        let (mut ws, _) = tokio_tungstenite::client_async(
+            format!("ws://lotse{}", lotse_api_types::WS_PATH),
+            client,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                next_frame(&mut ws).await,
+                tokio_tungstenite::tungstenite::Message::Text(_)
+            ),
+            "hello"
+        );
+        ws
     }
 
     /// The next frame of `ws`, failing after 5 s of real time.
@@ -848,65 +961,27 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_stalled_removal_does_not_hold_up_shutdown() {
-        use std::os::unix::fs::DirBuilderExt as _;
-
         use tokio_tungstenite::tungstenite::Message as Frame;
 
-        let dir =
-            std::env::temp_dir().join(format!("lotse-connection-stalled-{}", std::process::id()));
-        let _gone = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-        let runtime = (
-            rustix::process::getuid().as_raw(),
-            rustix::process::getgid().as_raw(),
-        );
-        let store =
-            ClientStore::open(&std::fs::File::open(&dir).unwrap(), &dir, &[], runtime).unwrap();
         let (pin, unknown) = (Fingerprint::of(b"pin"), Fingerprint::of(b"unknown"));
-        store.enroll(pin).unwrap();
-        let store = Arc::new(store.with_sync_dir(|_| {
+        let (store, dir) = store_with("stalled", &[], pin, |_| {
             STALLED.wait();
             STALLED.wait();
             Ok(())
-        }));
+        });
         let state = crate::tests::state(4, false);
         let shutdown = state.shutdown.clone();
         let state = AppState {
             clients: Some(Arc::clone(&store)),
             ..state
         };
-        let peer = PeerInfo::Tls {
-            pin,
-            addr: "192.0.2.1:1".parse().unwrap(),
-        };
-        let app = axum::Router::new()
-            .route(
-                lotse_api_types::WS_PATH,
-                axum::routing::get(upgrade::<crate::tests::Minimal>),
-            )
-            .with_state(state)
-            .layer(Extension(peer));
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let serving = hyper::server::conn::http1::Builder::new()
-            .serve_connection(
-                hyper_util::rt::TokioIo::new(server),
-                hyper_util::service::TowerToHyperService::new(app),
-            )
-            .with_upgrades();
-        let _served = lotse_core::task::spawn_named("test.serve", serving);
-        let (mut ws, _) = tokio_tungstenite::client_async(
-            format!("ws://lotse{}", lotse_api_types::WS_PATH),
-            client,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(next_frame(&mut ws).await, Frame::Text(_)), "hello");
+        let mut ws = connect(state, tls_peer(pin, 1)).await;
         let remove =
             serde_json::json!({ "id": 1, "type": "clients/remove", "pin": pin.to_string() });
         ws.send(Frame::Text(remove.to_string().into()))
             .await
             .unwrap();
-        stalled().await;
+        stalled(&STALLED).await;
 
         // The removal waits for the disk; the connection still shuts down.
         shutdown.cancel();
@@ -920,10 +995,77 @@ mod tests {
         ));
 
         // Let go, the removal still ends: a later change waits for it.
-        stalled().await;
+        stalled(&STALLED).await;
         let later = Arc::clone(&store);
-        let after = spawn_blocking_named("test.after", move || later.remove(unknown));
+        let after =
+            spawn_blocking_named("test.after", move || later.remove(unknown, ConnectionId(9)));
         assert_eq!(after.await.unwrap().unwrap(), Removal::Unknown);
+        assert!(!store.allows(&pin));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_client_removed_by_another_request_closes_while_its_own_removal_waits() {
+        use tokio_tungstenite::tungstenite::Message as Frame;
+
+        let (pin, other) = (Fingerprint::of(b"pin"), Fingerprint::of(b"other"));
+        let (store, dir) = store_with("competing", &[], pin, |_| {
+            COMPETING.wait();
+            COMPETING.wait();
+            Ok(())
+        });
+        let state = AppState {
+            clients: Some(Arc::clone(&store)),
+            ..crate::tests::state(4, false)
+        };
+        let mut first = connect(state.clone(), tls_peer(pin, 1)).await;
+        let mut second = connect(state, tls_peer(pin, 2)).await;
+
+        // A change of another pin holds the store's writes up in its sync
+        // while both connections of `pin` ask to remove it.
+        let writer = Arc::clone(&store);
+        let held = spawn_blocking_named("test.enroll", move || writer.enroll(other));
+        stalled(&COMPETING).await;
+        let remove =
+            serde_json::json!({ "id": 1, "type": "clients/remove", "pin": pin.to_string() });
+        for ws in [&mut first, &mut second] {
+            ws.send(Frame::Text(remove.to_string().into()))
+                .await
+                .unwrap();
+        }
+        // Every task here runs on this thread: yielding lets both
+        // connections read their command and start answering it.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        stalled(&COMPETING).await;
+        held.await.unwrap().unwrap();
+
+        // One removal runs and is held in its own sync. The other
+        // connection's client is gone: it closes without waiting for its
+        // own removal, which waits for that sync.
+        stalled(&COMPETING).await;
+        let (closed, frame) = tokio::select! {
+            frame = next_frame(&mut first) => (0, frame),
+            frame = next_frame(&mut second) => (1, frame),
+        };
+        assert!(
+            matches!(&frame, Frame::Close(Some(close)) if u16::from(close.code) == CLOSE_POLICY_VIOLATION),
+            "{frame:?}"
+        );
+
+        // Let go, the client that removed itself has its answer, then the
+        // close.
+        stalled(&COMPETING).await;
+        let mut remover = if closed == 0 { second } else { first };
+        assert!(matches!(
+            next_frame(&mut remover).await,
+            Frame::Text(text) if text.as_str().contains(r#""success":true"#)
+        ));
+        assert!(matches!(
+            next_frame(&mut remover).await,
+            Frame::Close(Some(close)) if u16::from(close.code) == CLOSE_POLICY_VIOLATION
+        ));
         assert!(!store.allows(&pin));
         std::fs::remove_dir_all(&dir).unwrap();
     }
