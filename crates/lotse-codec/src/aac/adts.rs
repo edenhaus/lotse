@@ -117,8 +117,13 @@ pub struct AdtsStats {
 /// What to do at a position of the buffer.
 #[derive(Debug)]
 enum Step<'a> {
-    /// The bytes there may begin a frame that is not complete yet.
+    /// The bytes there may begin a frame that is not complete yet: too
+    /// few to tell, or a header out of sync, which the syncword after
+    /// its frame has to confirm.
     Wait,
+    /// A frame begins there, believed (in sync, its syncword seen), and
+    /// is not complete yet.
+    Begins,
     /// No frame begins there.
     Skip,
     /// A frame begins there.
@@ -161,13 +166,14 @@ fn step(rest: &[u8], synced: bool) -> Step<'_> {
         Some(false) => return Step::Skip,
         Some(true) => {}
     }
+    let incomplete = if synced { Step::Begins } else { Step::Wait };
     let header = match AdtsHeader::from_bytes(rest) {
         Ok(header) => header,
-        Err(AdtsHeaderError::NotEnoughData { .. }) => return Step::Wait,
+        Err(AdtsHeaderError::NotEnoughData { .. }) => return incomplete,
         Err(_) => return Step::Skip,
     };
     let Some(after) = rest.get(usize::from(header.frame_length())..) else {
-        return Step::Wait;
+        return incomplete;
     };
     if synced {
         return Step::Frame(header);
@@ -217,8 +223,11 @@ impl AdtsSplitter {
 
     /// Takes the next bytes of the stream and appends the frames they
     /// complete to `out`. Returns the sequence of the first frame that
-    /// begins in `data` and ends by its end, if any: the frame a PES
-    /// PTS on `data` times.
+    /// begins in `data`, if any, whether it ends by its end (it is in
+    /// `out`) or in a later push: the frame a PES PTS on `data` times
+    /// (ISO/IEC 13818-1 §2.4.3.7, the first access unit that commences
+    /// in the packet). A frame that begins out of sync is named only
+    /// once the syncword after it confirms it, so only when it ends.
     pub fn push(&mut self, data: &[u8], out: &mut Vec<AdtsFrame>) -> Option<u64> {
         let carried = self.pending.len();
         let mut buffer = std::mem::take(&mut self.pending);
@@ -228,6 +237,12 @@ impl AdtsSplitter {
         while let Some(rest) = buffer.get(position..) {
             match step(rest, self.synced) {
                 Step::Wait => break,
+                Step::Begins => {
+                    if first.is_none() && position >= carried {
+                        first = Some(self.sequence);
+                    }
+                    break;
+                }
                 Step::Skip => {
                     self.synced = false;
                     self.stats.skipped_bytes = self.stats.skipped_bytes.saturating_add(1);
@@ -421,11 +436,20 @@ mod tests {
         assert_eq!(first, Some(2));
         assert_eq!(payloads(&out), vec![&b"bbbbbb"[..], b"cc"]);
         assert_eq!(sequences(&out), vec![1, 2]);
-        // A frame that begins but does not end names nothing yet.
-        assert_eq!(push(&mut splitter, &a[..8]), (None, Vec::new()));
+        // A frame that begins but does not end is named by the push it
+        // begins in, not by the one that ends it.
+        assert_eq!(push(&mut splitter, &a[..8]), (Some(3), Vec::new()));
         assert_eq!(push(&mut splitter, &[]), (None, Vec::new()));
         let (first, out) = push(&mut splitter, &a[8..]);
         assert_eq!((first, sequences(&out)), (None, vec![3]));
+        // Begun with its syncword alone, or with a header short of its
+        // last byte: named as well.
+        for cut in [2, 6] {
+            let mut splitter = AdtsSplitter::new(LIMIT);
+            assert_eq!(push(&mut splitter, &a[..cut]), (Some(0), Vec::new()));
+            let (first, out) = push(&mut splitter, &a[cut..]);
+            assert_eq!((first, sequences(&out)), (None, vec![0]));
+        }
     }
 
     #[test]
@@ -441,7 +465,7 @@ mod tests {
         // A CRC header cut after its fixed seven bytes waits for the CRC.
         let mut splitter = AdtsSplitter::new(LIMIT);
         let frame = adts(LC, F16K, MONO, true, 1, b"x");
-        assert_eq!(push(&mut splitter, &frame[..8]), (None, Vec::new()));
+        assert_eq!(push(&mut splitter, &frame[..8]), (Some(0), Vec::new()));
         assert_eq!(splitter.buffered(), 8);
         let (_, out) = push(&mut splitter, &frame[8..]);
         assert_eq!(payloads(&out), vec![&b"x"[..]]);
@@ -452,7 +476,7 @@ mod tests {
         let frame = lc(b"truncated");
         let mut splitter = AdtsSplitter::new(LIMIT);
         let cut = frame.len() - 1;
-        assert_eq!(push(&mut splitter, &frame[..cut]), (None, Vec::new()));
+        assert_eq!(push(&mut splitter, &frame[..cut]), (Some(0), Vec::new()));
         assert_eq!(splitter.buffered(), cut);
         assert_eq!(splitter.stats(), AdtsStats::default());
         let (_, out) = push(&mut splitter, &frame[cut..]);

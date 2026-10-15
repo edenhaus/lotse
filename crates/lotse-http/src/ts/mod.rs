@@ -307,6 +307,11 @@ struct Audio {
     /// What timestamps count from; `None` before the first PTS and after
     /// a configuration change.
     anchor: Option<Anchor>,
+    /// The last PES packet's PTS and the sequence of the frame it times
+    /// (ISO/IEC 13818-1 §2.4.3.7: the first frame that begins in the
+    /// packet), while that frame has not come: it ends in a later
+    /// packet.
+    pending: Option<(u64, i64)>,
 }
 
 /// What an AAC frame changes in the layout.
@@ -324,14 +329,14 @@ enum Change {
 type TimedFrame = (i64, i64, Bytes);
 
 impl Audio {
-    /// Takes one frame of the PES packet whose PTS (if any) times frame
-    /// `first`: what it changes in the layout and, unless it is dropped,
-    /// the frame with its times.
+    /// Takes one frame, `timed` by a PES PTS and the sequence (its own or
+    /// an earlier one, dropped) that PTS is the time of, if any: what it
+    /// changes in the layout and, unless it is dropped, the frame with
+    /// its times.
     fn accept(
         &mut self,
         frame: AdtsFrame,
-        first: Option<u64>,
-        pts: Option<i64>,
+        timed: Option<(u64, i64)>,
         stats: &mut DemuxStats,
     ) -> (Change, Option<TimedFrame>) {
         let change = match self.config {
@@ -349,21 +354,19 @@ impl Audio {
             return (change, None);
         };
         let rate = i128::from(aac.sample_rate);
-        if first == Some(frame.sequence)
-            && let Some(pts) = pts
-        {
+        if let Some((sequence, pts)) = timed {
             let samples = i128::from(pts)
                 .saturating_mul(rate)
                 .div_euclid(i128::from(TS_CLOCK_RATE));
             let moved = self
                 .anchor
-                .map(|anchor| anchor.at(frame.sequence).abs_diff(samples));
+                .map(|anchor| anchor.at(sequence).abs_diff(samples));
             if moved.is_none_or(|moved| moved > REANCHOR_SAMPLES.unsigned_abs()) {
                 if moved.is_some() {
                     stats.audio_reanchors = stats.audio_reanchors.saturating_add(1);
                 }
                 self.anchor = Some(Anchor {
-                    sequence: frame.sequence,
+                    sequence,
                     samples: clamp(samples),
                 });
             }
@@ -428,6 +431,7 @@ impl Track {
                 splitter: AdtsSplitter::new(max_frame_bytes),
                 config: AudioConfig::Waiting,
                 anchor: None,
+                pending: None,
             }),
             StreamClass::Unsupported(kind, name) => Content::Unsupported(kind, name),
             StreamClass::Other => return None,
@@ -831,11 +835,27 @@ impl Ctx {
         {
             let mut frames = Vec::new();
             let first = audio.splitter.push(&pes.data, &mut frames);
-            let pts = pes.timing.map(|timing| timing.pts);
-            frames
+            // This packet's PTS times its first frame and those after it;
+            // the frames before it began in an earlier packet, whose PTS
+            // was kept for them.
+            let current = first.zip(pes.timing.map(|timing| timing.pts));
+            let pending = audio.pending;
+            let last = frames.last().map(|frame| frame.sequence);
+            let steps = frames
                 .into_iter()
-                .map(|frame| audio.accept(frame, first, pts, &mut self.stats))
-                .collect()
+                .map(|frame| {
+                    let timed = match current {
+                        Some((sequence, _)) if frame.sequence >= sequence => current,
+                        _ => pending,
+                    };
+                    audio.accept(frame, timed, &mut self.stats)
+                })
+                .collect();
+            // A PTS whose frame has not come yet waits for it.
+            audio.pending = current
+                .or(pending)
+                .filter(|&(sequence, _)| last.is_none_or(|last| last < sequence));
+            steps
         } else {
             let Some(timing) = pes.timing else {
                 self.stats.dropped_untimed = self.stats.dropped_untimed.saturating_add(1);

@@ -614,6 +614,39 @@ fn iso13818_1_2_4_3_7_adts_timestamps_restart_only_half_a_frame_or_more_away() {
     assert!(units(&ctx.events, 0).is_empty());
 }
 
+/// A PES packet's PTS times the first frame that begins in it (ISO/IEC
+/// 13818-1 §2.4.3.7), which may end in a later packet: that frame, and
+/// the ones before it in the later packet, keep the earlier PTS.
+#[test]
+fn iso13818_1_2_4_3_7_a_frame_split_across_pes_packets_keeps_the_pts_of_the_one_it_begins_in() {
+    let frame = |n: usize| {
+        let frames = adts_frames(SINE_48K_MONO, n + 1);
+        &frames[adts_frames(SINE_48K_MONO, n).len()..]
+    };
+    // Frame 0 begins in a packet with a PTS and ends in one without.
+    let mut ctx = audio_ctx(false);
+    feed(&mut ctx, &frame(0)[..8], Some(0));
+    assert!(ctx.events.is_empty());
+    feed(&mut ctx, &frame(0)[8..], None);
+    assert_eq!(timestamps(&ctx.events), [0]);
+    assert_eq!(ctx.stats.dropped_untimed, 0);
+    // Frame 1 ends in the packet frame 2 begins in: 1 counts from frame
+    // 0's PTS, 2 from its own (a restart: 5 000 ticks are 2 666 samples).
+    let mut rest = frame(1)[8..].to_vec();
+    rest.extend_from_slice(frame(2));
+    feed(&mut ctx, &frame(1)[..8], Some(1_920));
+    feed(&mut ctx, &rest, Some(5_000));
+    assert_eq!(timestamps(&ctx.events), [0, 1_024, 2_666]);
+    assert_eq!(ctx.stats.audio_reanchors, 1);
+    // A PTS kept for a frame applies once; the packets after it without
+    // a PTS count on.
+    feed(&mut ctx, &frame(3)[..8], None);
+    feed(&mut ctx, &frame(3)[8..], None);
+    assert_eq!(timestamps(&ctx.events), [0, 1_024, 2_666, 3_690]);
+    assert_eq!(ctx.stats.audio_reanchors, 1);
+    assert_eq!(ctx.stats.dropped_untimed, 0);
+}
+
 #[test]
 fn iso13818_7_6_2_a_configuration_change_before_the_layout_only_updates_it() {
     // Two AAC tracks; the first changes its configuration while the
