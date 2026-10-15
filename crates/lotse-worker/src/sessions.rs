@@ -936,8 +936,7 @@ async fn open_session(
         backchannel: ctx
             .backchannel
             .as_ref()
-            .and_then(|arbiter| arbiter.offered())
-            .map(|handle| handle.codec),
+            .and_then(|arbiter| arbiter.target()),
         orientation: Orientation::from_code(ctx.spec.orientation).unwrap_or_default(),
         limits: ctx.limits,
         wall: ctx.clock.wall_now(),

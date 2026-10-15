@@ -40,6 +40,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lotse_core::clock::Clock;
 use lotse_core::codec::Codec;
 use lotse_core::media::MediaPacket;
+use lotse_core::session::TalkbackTarget;
 use lotse_core::source::{BackchannelHandle, BackchannelSlot};
 use lotse_core::task::spawn_named;
 use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
@@ -262,6 +263,36 @@ impl Arbiter {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .current()
+    }
+
+    /// The backchannel the running source offers now, with the uplink
+    /// codecs that reach it, for a session to negotiate talk-back with:
+    /// each one [`Arbiter::reaches`] routes to its codec.
+    pub(crate) fn target(&self) -> Option<TalkbackTarget> {
+        let handle = self.offered()?;
+        let takes = UplinkCodec::ALL
+            .into_iter()
+            .filter(|from| self.reaches(*from, &handle))
+            .collect();
+        Some(TalkbackTarget {
+            codec: handle.codec,
+            takes,
+        })
+    }
+
+    /// Whether [`Arbiter::route`] finds a path for an uplink in `from` to
+    /// `handle`'s device: the reverse chain installed derives the device's
+    /// codec from it, or it is the device's own codec, forwarded as
+    /// received. Without a reverse chain (`uplink` unset) only the latter.
+    fn reaches(&self, from: UplinkCodec, handle: &BackchannelHandle) -> bool {
+        let to = handle.codec.family();
+        from.family() == to
+            || self.uplink.as_ref().is_some_and(|uplink| {
+                uplink
+                    .transcoder(handle.frame)
+                    .derive(&from.codec(), to)
+                    .is_some()
+            })
     }
 
     /// Arbitrates `slot` from now on: the connection switched to a source
@@ -1321,6 +1352,48 @@ mod tests {
                 // A G.711 device always takes the chain, which fails.
                 assert_eq!(load(&a.stats.packets_dropped), 3);
                 assert!(device.try_recv().is_err());
+            }
+        }
+    }
+
+    /// A session negotiates talk-back in the uplink codecs a route
+    /// reaches the device from, and in no other: every one through the
+    /// reverse chain to a G.711 device, the device's own codec alone
+    /// without the chain, Opus alone to an Opus device either way (no
+    /// chain produces Opus), none to a device in another codec.
+    #[tokio::test]
+    async fn a_session_negotiates_only_the_uplink_codecs_a_route_reaches() {
+        use UplinkCodec::{Opus, Pcma, Pcmu};
+        let chain =
+            || -> Option<Arc<dyn UplinkFactory>> { Some(Arc::new(Factory(Arc::default()))) };
+        let opus = Codec::Opus { channels: 2 };
+        for (uplink, device, takes) in [
+            (chain(), Codec::Pcmu, &[Opus, Pcmu, Pcma][..]),
+            (chain(), Codec::Pcma, &[Opus, Pcmu, Pcma]),
+            (chain(), opus.clone(), &[Opus]),
+            (chain(), Codec::G722, &[]),
+            (None, Codec::Pcmu, &[Pcmu]),
+            (None, Codec::Pcma, &[Pcma]),
+            (None, opus, &[Opus]),
+        ] {
+            let what = format!("{device:?}, chain: {}", uplink.is_some());
+            let (arbiter, slot) = arbiter(uplink);
+            assert_eq!(arbiter.target(), None, "{what}: nothing offered");
+            let _device = offer(&slot, device.clone(), BackchannelHandle::DEFAULT_FRAME, 1);
+            let target = arbiter.target().unwrap();
+            assert_eq!(target.codec, device, "{what}");
+            assert_eq!(target.takes, takes, "{what}");
+            // The route agrees, codec by codec.
+            for from in UplinkCodec::ALL {
+                let track = UplinkTrack::new(from, SystemClock.now());
+                let handle = arbiter.offered().unwrap();
+                let stats = Arc::new(TalkbackStats::default());
+                let route = arbiter.route(track.track(), from, handle, &stats);
+                assert_eq!(
+                    route.path.is_some(),
+                    takes.contains(&from),
+                    "{what}: {from:?}"
+                );
             }
         }
     }

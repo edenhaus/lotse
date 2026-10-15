@@ -31,7 +31,7 @@ use lotse_core::media::{MediaPacket, RtpHeaderFields};
 use lotse_core::orientation::Orientation;
 use lotse_core::session::{
     SessionEngine, SessionEvent, SessionLimits, SessionOpenError, SessionOutput, SessionRequest,
-    SessionStats, Transport,
+    SessionStats, TalkbackTarget, Transport,
 };
 use lotse_core::throttle::Throttle;
 use lotse_core::track::GopSnapshot;
@@ -623,7 +623,10 @@ fn require_talkback(
 ) -> Result<(), SessionOpenError> {
     match plan.talkback {
         Talkback::Off(reason) if request.talkback_required => {
-            let backchannel = request.backchannel.as_ref().map(Codec::name);
+            let backchannel = request
+                .backchannel
+                .as_ref()
+                .map(|backchannel| backchannel.codec.name());
             tracing::info!(
                 reason,
                 backchannel,
@@ -637,7 +640,7 @@ fn require_talkback(
 
 /// Logs what the answer did with talk-back: the m-line and codec it is
 /// received in, or why it is not.
-fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&Codec>) {
+fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&TalkbackTarget>) {
     match plan.talkback {
         Talkback::Negotiated {
             mid,
@@ -645,7 +648,7 @@ fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&Codec>) {
             dedicated,
         } => {
             let m_line = if dedicated { "dedicated" } else { "sendrecv" };
-            let backchannel = backchannel.map(Codec::name);
+            let backchannel = backchannel.map(|backchannel| backchannel.codec.name());
             let codec = codec.name();
             tracing::info!(mid, codec, backchannel, m_line, "talk-back negotiated");
         }

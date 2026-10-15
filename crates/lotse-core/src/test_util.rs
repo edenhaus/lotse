@@ -769,7 +769,8 @@ impl OutputFactory for FakeOutputFactory {
 /// answer is [`ECHO_ANSWER`], followed by ` audio=<codec>` with audio,
 /// ` backchannel=<codec>` with a backchannel and ` orientation=<name>` for
 /// a turned stream. Its engine reports talk-back negotiated in the
-/// backchannel's codec when that is one a viewer can send.
+/// backchannel's codec when that is one a viewer can send and that reaches
+/// the backchannel.
 #[derive(Debug)]
 pub struct EchoSessionFactory;
 
@@ -818,7 +819,7 @@ impl OutputFactory for EchoSessionFactory {
         let backchannel = request
             .backchannel
             .as_ref()
-            .map(|backchannel| format!("backchannel={}", backchannel.name()));
+            .map(|backchannel| format!("backchannel={}", backchannel.codec.name()));
         let orientation = (request.orientation != Orientation::NoTransform)
             .then(|| format!("orientation={}", request.orientation.name()));
         let answer = std::iter::once(ECHO_ANSWER.to_owned())
@@ -827,10 +828,10 @@ impl OutputFactory for EchoSessionFactory {
             .chain(orientation)
             .collect::<Vec<_>>()
             .join(" ");
-        let talkback = request
-            .backchannel
-            .as_ref()
-            .and_then(|codec| UplinkCodec::of(codec.family()));
+        let talkback = request.backchannel.as_ref().and_then(|backchannel| {
+            UplinkCodec::of(backchannel.codec.family())
+                .filter(|codec| backchannel.takes.contains(codec))
+        });
         Ok((
             Box::new(EchoEngine::new(now).with_talkback(talkback)),
             answer,
@@ -1126,6 +1127,7 @@ mod tests {
 
     use super::*;
     use crate::clock::SystemClock;
+    use crate::session::TalkbackTarget;
     use crate::source::{BackchannelSlot, ClockInput, ResolvedPeer, TrackSet};
     use crate::track::{TrackId, TrackLimits};
 
@@ -1880,7 +1882,10 @@ mod tests {
             tcp_candidates: vec![],
             video: Arc::new(Codec::Pcmu),
             audio: Some(Arc::new(Codec::Pcmu)),
-            backchannel: Some(Codec::Pcma),
+            backchannel: Some(TalkbackTarget {
+                codec: Codec::Pcma,
+                takes: vec![UplinkCodec::Pcma],
+            }),
             orientation: Orientation::Rotate180,
             limits: crate::session::SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
@@ -1903,6 +1908,16 @@ mod tests {
         );
         // Talk-back negotiated in the backchannel's codec, off without one.
         assert_eq!(engine.talkback(), Some(UplinkCodec::Pcma));
+        // Nor when its codec does not reach the backchannel.
+        let unroutable = SessionRequest {
+            backchannel: Some(TalkbackTarget {
+                codec: Codec::Pcma,
+                takes: vec![UplinkCodec::Opus],
+            }),
+            ..turned.clone()
+        };
+        let (engine, _answer) = EchoSessionFactory.open_session(unroutable, now).unwrap();
+        assert_eq!(engine.talkback(), None);
         let without = SessionRequest {
             backchannel: None,
             ..turned

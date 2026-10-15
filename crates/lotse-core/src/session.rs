@@ -98,13 +98,13 @@ pub struct SessionRequest {
     pub video: Arc<Codec>,
     /// The audio track's codec, when the stream has one and audio is on.
     pub audio: Option<Arc<Codec>>,
-    /// The codec the connection's backchannel takes, when its source
-    /// protocol can carry audio back (`SourceCapabilities::backchannel`,
-    /// the feature's gate) and the source offers one now. `None` answers
-    /// talk-back `inactive`, or refuses a talk-back request when
+    /// The connection's backchannel, when its source protocol can carry
+    /// audio back (`SourceCapabilities::backchannel`, the feature's gate)
+    /// and the source offers one now. `None` answers talk-back
+    /// `inactive`, or refuses a talk-back request when
     /// [`Self::talkback_required`]. Never whether another session talks:
     /// the answer stays a function of the offer and this.
-    pub backchannel: Option<Codec>,
+    pub backchannel: Option<TalkbackTarget>,
     /// How the stream's picture is turned for display: the stream's
     /// `orientation`, which an output marks when the viewer can apply it.
     pub orientation: Orientation,
@@ -120,6 +120,20 @@ pub struct SessionRequest {
     /// instead of answered without it. Without it such an offer is answered
     /// as the backchannel allows, talk-back `inactive` or not received.
     pub talkback_required: bool,
+}
+
+/// The backchannel a session negotiates talk-back with: the codec the
+/// camera takes and the uplink codecs that reach it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TalkbackTarget {
+    /// The codec the backchannel takes.
+    pub codec: Codec,
+    /// The uplink codecs the worker routes to it, through the reverse
+    /// chain it has installed or forwarded as received in the camera's
+    /// own codec; empty when none does. A session answers talk-back in
+    /// these only: the browser may send any codec the answer lists (RFC
+    /// 3264 §7), and one that does not reach the camera is lost.
+    pub takes: Vec<UplinkCodec>,
 }
 
 /// Why a session could not be opened; each maps to a `closed` code.

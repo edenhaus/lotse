@@ -40,6 +40,9 @@ pub enum UplinkCodec {
 }
 
 impl UplinkCodec {
+    /// Every uplink codec.
+    pub const ALL: [Self; 3] = [Self::Opus, Self::Pcmu, Self::Pcma];
+
     /// The uplink codec of `family`, if talk-back can arrive in it.
     pub const fn of(family: CodecFamily) -> Option<Self> {
         match family {
@@ -277,6 +280,13 @@ mod tests {
         for family in [CodecFamily::G722, CodecFamily::AacLc, CodecFamily::H264] {
             assert_eq!(UplinkCodec::of(family), None, "{family:?}");
         }
+        // `ALL` is every codec `of` names, once.
+        assert_eq!(
+            UplinkCodec::ALL
+                .map(UplinkCodec::family)
+                .map(UplinkCodec::of),
+            UplinkCodec::ALL.map(Some)
+        );
     }
 
     #[test]

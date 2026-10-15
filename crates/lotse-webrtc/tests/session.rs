@@ -33,12 +33,12 @@ use lotse_codec::h264::{
 };
 use lotse_core::Orientation;
 use lotse_core::clock::{Clock as _, SystemClock};
-use lotse_core::codec::{Codec, Kind};
+use lotse_core::codec::{Codec, CodecFamily, Kind};
 use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields};
 use lotse_core::output::OutputFactory as _;
 use lotse_core::session::{
     IceCredentials, SessionEngine, SessionEvent, SessionLimits, SessionOpenError, SessionOutput,
-    SessionRequest, Transport,
+    SessionRequest, TalkbackTarget, Transport,
 };
 use lotse_core::source::TrackSet;
 use lotse_core::track::{Track, TrackLimits};
@@ -2190,7 +2190,7 @@ fn rfc8829_5_3_1_talk_back_is_answered_by_offer_shape_and_backchannel() {
             Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, shape).expect("a viewer");
         let mut request = request(viewer.offer(), h264(None));
         request.audio = Some(Arc::new(Codec::Pcmu));
-        request.backchannel = backchannel.clone();
+        request.backchannel = backchannel.clone().map(chained);
         let (mut pair, answer) = Pair::with_request(&request, viewer, now);
         // `session/get` reports the codec the answer named first.
         assert_eq!(
@@ -2277,12 +2277,12 @@ fn rfc8866_6_7_a_talk_back_request_on_a_stream_that_asks_for_the_backchannel_is_
     for (shape, backchannel, expected) in [
         (
             TalkbackOffer::Dedicated,
-            Some(Codec::Pcma),
+            Some(chained(Codec::Pcma)),
             Ok(UplinkCodec::Pcma),
         ),
         (
             TalkbackOffer::SendRecv,
-            Some(Codec::Pcmu),
+            Some(chained(Codec::Pcmu)),
             Ok(UplinkCodec::Pcmu),
         ),
         (
@@ -2290,6 +2290,13 @@ fn rfc8866_6_7_a_talk_back_request_on_a_stream_that_asks_for_the_backchannel_is_
             None,
             refused("the camera offers no backchannel"),
         ),
+        // Without the reverse chain, only the camera's own codec reaches
+        // it: PCMU forwarded as received.
+        (
+            TalkbackOffer::Dedicated,
+            Some(forwarded(Codec::Pcmu)),
+            Ok(UplinkCodec::Pcmu),
+        ),
         (
             TalkbackOffer::SendRecv,
             None,
@@ -2297,7 +2304,7 @@ fn rfc8866_6_7_a_talk_back_request_on_a_stream_that_asks_for_the_backchannel_is_
         ),
         (
             TalkbackOffer::Dedicated,
-            Some(Codec::G722),
+            Some(chained(Codec::G722)),
             refused("the backchannel takes a codec talk-back cannot feed"),
         ),
     ] {
@@ -2324,6 +2331,27 @@ fn rfc8866_6_7_a_talk_back_request_on_a_stream_that_asks_for_the_backchannel_is_
     assert_eq!(session.talkback(), None);
 }
 
+/// `codec`'s backchannel as a worker with the reverse chain installed
+/// routes to it: Opus and both G.711 laws to a G.711 camera, Opus to an
+/// Opus one, nothing to any other.
+fn chained(codec: Codec) -> TalkbackTarget {
+    let takes = match codec.family() {
+        CodecFamily::Pcmu | CodecFamily::Pcma => UplinkCodec::ALL.to_vec(),
+        CodecFamily::Opus => vec![UplinkCodec::Opus],
+        _ => Vec::new(),
+    };
+    TalkbackTarget { codec, takes }
+}
+
+/// `codec`'s backchannel without the reverse chain: its own codec,
+/// forwarded as received, reaches it.
+fn forwarded(codec: Codec) -> TalkbackTarget {
+    TalkbackTarget {
+        takes: UplinkCodec::of(codec.family()).into_iter().collect(),
+        codec,
+    }
+}
+
 /// A connected pair whose viewer offers talk-back in `shape`, for a PCMU
 /// stream and a backchannel of `backchannel`.
 fn talkback_pair(
@@ -2335,7 +2363,7 @@ fn talkback_pair(
     let viewer = Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, shape).expect("a viewer");
     let mut request = request(viewer.offer(), h264(None));
     request.audio = Some(Arc::new(Codec::Pcmu));
-    request.backchannel = backchannel;
+    request.backchannel = backchannel.map(chained);
     let (mut pair, answer) = Pair::with_request(&request, viewer, now);
     pair.connect(&answer);
     (pair, answer)
@@ -2502,7 +2530,7 @@ fn rfc3264_7_the_talk_back_m_line_lists_only_codecs_that_reach_the_camera() {
         (
             TalkbackOffer::Dedicated,
             None,
-            Codec::Pcmu,
+            chained(Codec::Pcmu),
             all,
             &[UplinkCodec::Pcmu, UplinkCodec::Opus][..],
             1,
@@ -2510,7 +2538,7 @@ fn rfc3264_7_the_talk_back_m_line_lists_only_codecs_that_reach_the_camera() {
         (
             TalkbackOffer::Dedicated,
             Some(Codec::Pcmu),
-            opus.clone(),
+            chained(opus.clone()),
             &["opus/48000/2"],
             &[UplinkCodec::Opus],
             1,
@@ -2518,7 +2546,7 @@ fn rfc3264_7_the_talk_back_m_line_lists_only_codecs_that_reach_the_camera() {
         (
             TalkbackOffer::SendRecv,
             None,
-            Codec::Pcmu,
+            chained(Codec::Pcmu),
             all,
             &[UplinkCodec::Pcmu, UplinkCodec::Opus],
             1,
@@ -2526,10 +2554,19 @@ fn rfc3264_7_the_talk_back_m_line_lists_only_codecs_that_reach_the_camera() {
         (
             TalkbackOffer::SendRecv,
             Some(Codec::Pcmu),
-            opus,
+            chained(opus),
             &["opus/48000/2", "PCMU/8000"],
             &[UplinkCodec::Opus],
             1,
+        ),
+        // Without the reverse chain a PCMU camera takes PCMU alone.
+        (
+            TalkbackOffer::Dedicated,
+            None,
+            forwarded(Codec::Pcmu),
+            &["PCMU/8000"],
+            &[UplinkCodec::Pcmu],
+            2,
         ),
     ] {
         let what = format!("{shape:?}, {audio:?} down, {backchannel:?} up");
