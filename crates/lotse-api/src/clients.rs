@@ -26,7 +26,9 @@
 //! itself and checks its pin under the connections' lock, and a removal
 //! changes the pins before it looks for connections under that lock: a
 //! connection that authenticated just before its pin was removed is closed
-//! either way.
+//! either way. A removal holds the lock that orders changes until its
+//! connections are closed, so a new enrollment of the same pin waits and
+//! its fresh connection is never closed by the removal before it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
@@ -344,8 +346,12 @@ impl ClientStore {
     }
 
     /// Removes the enrolled `pin`: the file first, then the set, then every
-    /// connection it has open is told to close. A fixed pin stays. Blocking:
-    /// run it off the runtime's threads.
+    /// connection it has open is told to close, then the directory is
+    /// synced. All of it holds `writing`, so a new enrollment of `pin` waits
+    /// until its old connections are closed and never has one of its own
+    /// closed by this removal; closing before the sync keeps a slow disk
+    /// from keeping a removed client connected. A fixed pin stays.
+    /// Blocking: run it off the runtime's threads.
     pub(crate) fn remove(&self, pin: Fingerprint) -> io::Result<Removal> {
         if self.fixed.contains(&pin) {
             return Ok(Removal::Fixed);
@@ -364,8 +370,6 @@ impl ClientStore {
             .enrolled
             .write()
             .unwrap_or_else(PoisonError::into_inner) = next;
-        self.sync_after_rename(pin, "removed");
-        drop(writing);
         let mut closed: usize = 0;
         for (open, token) in self.connections().values() {
             if *open == pin {
@@ -373,6 +377,8 @@ impl ClientStore {
                 closed = closed.saturating_add(1);
             }
         }
+        self.sync_after_rename(pin, "removed");
+        drop(writing);
         Ok(Removal::Removed { closed })
     }
 }
@@ -839,6 +845,45 @@ mod tests {
             SYNCING.wait();
             writer.join().unwrap().unwrap();
         });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Both sides of each sync held open by
+    /// `a_reenrollment_waits_for_the_removal_to_close_its_connections`.
+    static REMOVING: std::sync::Barrier = std::sync::Barrier::new(2);
+
+    #[test]
+    fn a_reenrollment_waits_for_the_removal_to_close_its_connections() {
+        let dir = data_dir("reenroll");
+        let store = open(&dir, &[], runtime()).unwrap();
+        let pin = Fingerprint::of(b"pin");
+        store.enroll(pin).unwrap();
+        let old = store.attach(ConnectionId(1), pin);
+        let store = store.with_sync_dir(|_| {
+            REMOVING.wait();
+            REMOVING.wait();
+            Ok(())
+        });
+        std::thread::scope(|scope| {
+            let removal = scope.spawn(|| store.remove(pin));
+            REMOVING.wait();
+            // Syncing: the connection is already closed, and the next
+            // change has to wait for the removal to end.
+            assert!(old.is_cancelled());
+            assert!(!store.allows(&pin));
+            assert!(store.writing.try_lock().is_err());
+            let enrollment = scope.spawn(|| store.enroll(pin));
+            REMOVING.wait();
+            assert_eq!(
+                removal.join().unwrap().unwrap(),
+                Removal::Removed { closed: 1 }
+            );
+            REMOVING.wait();
+            REMOVING.wait();
+            enrollment.join().unwrap().unwrap();
+        });
+        assert!(store.allows(&pin));
+        assert!(!store.attach(ConnectionId(2), pin).is_cancelled());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

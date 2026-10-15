@@ -8,7 +8,13 @@
 //! not for web pages) and the RFC 6455 §7.4.1 close codes: `1001` going
 //! away on shutdown, `1003` for a binary frame, `1008` policy violation on
 //! an overflowed outbound queue or a removed client. Commands are processed
-//! one at a time per connection; every one is non-blocking by contract. On close the sessions are
+//! one at a time per connection; the handler's are non-blocking by
+//! contract. The ones about the TLS listener's clients may wait for the
+//! disk, so each runs as a task of its own: the connection reads no further
+//! command until its answer is queued, but still closes on shutdown or an
+//! overflow meanwhile. A removal or a shutdown is seen before any further
+//! command, which then never runs; a client that removes itself gets its
+//! answer before the close. On close the sessions are
 //! orphaned and the slot released first; the writer then gets
 //! [`CLOSE_TIMEOUT`] to deliver the queue and the close frame, after which
 //! the socket is dropped (RFC 6455 §7.1.1).
@@ -288,6 +294,10 @@ struct Connection<H> {
     subscriptions: HashMap<u64, JoinHandle<()>>,
     /// Who is connected, as the listener authenticated it.
     peer: PeerInfo,
+    /// The command about the TLS listener's clients being answered, if
+    /// any: no further command is read until it ends. Left to finish when
+    /// the connection closes first, so a change it began is still logged.
+    pending: Option<JoinHandle<()>>,
 }
 
 /// Serves one connection until the peer leaves, the queue overflows or the
@@ -329,13 +339,34 @@ async fn serve<H: Handler>(
         last_id: None,
         subscriptions: HashMap::new(),
         peer,
+        pending: None,
     };
     let removed = attach(connection.state.clients.as_deref(), &connection.peer, id);
     connection.send(Class::Signaling, &connection.state.handler.hello());
 
     let closed_by = loop {
         tokio::select! {
-            incoming = stream.next() => match incoming {
+            // In this order, so a removal or a shutdown wins over a command
+            // already received. A removal waits for a pending command: over
+            // TLS that can only be the client's own removal, whose answer
+            // goes out before the close.
+            biased;
+            () = removed.cancelled(), if connection.pending.is_none() => {
+                break client_removed(&connection.outbox);
+            }
+            () = connection.state.shutdown.cancelled() => {
+                connection.send(Class::Signaling, &Shutdown::default());
+                connection.outbox.close(CLOSE_GOING_AWAY, "shutting down");
+                break "shutdown";
+            }
+            () = connection.outbox.overflowed() => {
+                let counters = connection.outbox.stats();
+                tracing::warn!(dropped = counters.dropped, coalesced = counters.coalesced, "outbound queue overflowed; disconnecting the slow client");
+                connection.outbox.close(CLOSE_POLICY_VIOLATION, "outbound queue overflowed");
+                break "overflow";
+            }
+            () = answered(&mut connection.pending), if connection.pending.is_some() => {}
+            incoming = stream.next(), if connection.pending.is_none() => match incoming {
                 None | Some(Ok(Message::Close(_))) => break "peer",
                 Some(Err(err)) => {
                     tracing::debug!(error = %err, "control connection read failed");
@@ -348,18 +379,6 @@ async fn serve<H: Handler>(
                 }
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
             },
-            () = connection.outbox.overflowed() => {
-                let counters = connection.outbox.stats();
-                tracing::warn!(dropped = counters.dropped, coalesced = counters.coalesced, "outbound queue overflowed; disconnecting the slow client");
-                connection.outbox.close(CLOSE_POLICY_VIOLATION, "outbound queue overflowed");
-                break "overflow";
-            }
-            () = removed.cancelled() => break client_removed(&connection.outbox),
-            () = connection.state.shutdown.cancelled() => {
-                connection.send(Class::Signaling, &Shutdown::default());
-                connection.outbox.close(CLOSE_GOING_AWAY, "shutting down");
-                break "shutdown";
-            }
         }
     };
 
@@ -428,14 +447,28 @@ async fn write_loop(
     }
 }
 
+/// Queues a frame on `outbox`; results and frames of the connection itself
+/// are signaling, never dropped.
+fn queue<T: serde::Serialize>(outbox: &Outbox, class: Class, frame: &T) {
+    let text = serde_json::to_string(frame).unwrap_or_default();
+    if outbox.push(class, text).is_err() {
+        tracing::debug!("frame not queued: the outbound queue overflowed");
+    }
+}
+
+/// Waits for the command task in `pending` to end, its answer queued, and
+/// clears it.
+async fn answered(pending: &mut Option<JoinHandle<()>>) {
+    if let Some(task) = pending {
+        let _ended = task.await;
+    }
+    *pending = None;
+}
+
 impl<H: Handler> Connection<H> {
-    /// Queues a frame; results and frames of the connection itself are
-    /// signaling, never dropped.
+    /// Queues a frame; see [`queue`].
     fn send<T: serde::Serialize>(&self, class: Class, frame: &T) {
-        let text = serde_json::to_string(frame).unwrap_or_default();
-        if self.outbox.push(class, text).is_err() {
-            tracing::debug!("frame not queued: the outbound queue overflowed");
-        }
+        queue(&self.outbox, class, frame);
     }
 
     /// Whether another subscription fits under `max_subscriptions`, after
@@ -448,17 +481,24 @@ impl<H: Handler> Connection<H> {
         open < self.state.config.max_subscriptions
     }
 
-    /// Answers `command`, one about the TLS listener's clients, which the
-    /// server answers itself.
-    async fn listener_command(&self, command: Command) {
-        let answer = listener_answer(
-            self.state.pairing.as_deref(),
-            self.state.clients.as_ref(),
-            &self.peer,
-            command,
-        )
-        .await;
-        self.send(Class::Signaling, &answer);
+    /// Starts answering `command`, one about the TLS listener's clients,
+    /// which the server answers itself, as a task of its own: a removal
+    /// waits for the disk, which must not hold up the connection's loop.
+    /// The task queues the answer before it ends.
+    fn listener_command(&mut self, command: Command) {
+        let pairing = self.state.pairing.clone();
+        let clients = self.state.clients.clone();
+        let peer = self.peer.clone();
+        let outbox = Arc::clone(&self.outbox);
+        let answering = async move {
+            let answer =
+                listener_answer(pairing.as_deref(), clients.as_ref(), &peer, command).await;
+            queue(&outbox, Class::Signaling, &answer);
+        };
+        self.pending = Some(lotse_core::task::spawn_named(
+            "api.listener_command",
+            answering.in_current_span(),
+        ));
     }
 
     /// One text frame: parse, check the id, dispatch, answer.
@@ -492,7 +532,7 @@ impl<H: Handler> Connection<H> {
             Command::Ping(_) => self.send(Class::Signaling, &Pong::new(id)),
             command @ (Command::PairingCreate(_)
             | Command::ClientsList(_)
-            | Command::ClientsRemove(_)) => self.listener_command(command).await,
+            | Command::ClientsRemove(_)) => self.listener_command(command),
             Command::Schema(_) => self.send(
                 Class::Signaling,
                 &Success::new(id, lotse_api_types::schema::bundle()),
@@ -733,6 +773,119 @@ mod tests {
             "{removed}"
         );
         assert!(removed.contains("by=uid 0"), "{removed}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Both sides of the directory sync a removal is held in by
+    /// `a_stalled_removal_does_not_hold_up_shutdown`.
+    static STALLED: std::sync::Barrier = std::sync::Barrier::new(2);
+
+    /// Waits on [`STALLED`] off the runtime's thread.
+    async fn stalled() {
+        spawn_blocking_named("test.stalled", || {
+            STALLED.wait();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The next frame of `ws`, failing after 5 s of real time.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a real-time bound on a test step; the server's own timers run on the fake clock"
+    )]
+    async fn next_frame<S>(
+        ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    ) -> tokio_tungstenite::tungstenite::Message
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("a frame within 5 s")
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_removal_does_not_hold_up_shutdown() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        use tokio_tungstenite::tungstenite::Message as Frame;
+
+        let dir =
+            std::env::temp_dir().join(format!("lotse-connection-stalled-{}", std::process::id()));
+        let _gone = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let runtime = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        let store =
+            ClientStore::open(&std::fs::File::open(&dir).unwrap(), &dir, &[], runtime).unwrap();
+        let (pin, unknown) = (Fingerprint::of(b"pin"), Fingerprint::of(b"unknown"));
+        store.enroll(pin).unwrap();
+        let store = Arc::new(store.with_sync_dir(|_| {
+            STALLED.wait();
+            STALLED.wait();
+            Ok(())
+        }));
+        let state = crate::tests::state(4, false);
+        let shutdown = state.shutdown.clone();
+        let state = AppState {
+            clients: Some(Arc::clone(&store)),
+            ..state
+        };
+        let peer = PeerInfo::Tls {
+            pin,
+            addr: "192.0.2.1:1".parse().unwrap(),
+        };
+        let app = axum::Router::new()
+            .route(
+                lotse_api_types::WS_PATH,
+                axum::routing::get(upgrade::<crate::tests::Minimal>),
+            )
+            .with_state(state)
+            .layer(Extension(peer));
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let serving = hyper::server::conn::http1::Builder::new()
+            .serve_connection(
+                hyper_util::rt::TokioIo::new(server),
+                hyper_util::service::TowerToHyperService::new(app),
+            )
+            .with_upgrades();
+        let _served = lotse_core::task::spawn_named("test.serve", serving);
+        let (mut ws, _) = tokio_tungstenite::client_async(
+            format!("ws://lotse{}", lotse_api_types::WS_PATH),
+            client,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(next_frame(&mut ws).await, Frame::Text(_)), "hello");
+        let remove =
+            serde_json::json!({ "id": 1, "type": "clients/remove", "pin": pin.to_string() });
+        ws.send(Frame::Text(remove.to_string().into()))
+            .await
+            .unwrap();
+        stalled().await;
+
+        // The removal waits for the disk; the connection still shuts down.
+        shutdown.cancel();
+        let Frame::Text(text) = next_frame(&mut ws).await else {
+            panic!("no shutdown frame");
+        };
+        assert!(text.as_str().contains("shutdown"), "{text}");
+        let Frame::Close(Some(close)) = next_frame(&mut ws).await else {
+            panic!("no close frame");
+        };
+        assert_eq!(u16::from(close.code), CLOSE_GOING_AWAY);
+
+        // Let go, the removal still ends: a later change waits for it.
+        stalled().await;
+        let later = Arc::clone(&store);
+        let after = spawn_blocking_named("test.after", move || later.remove(unknown));
+        assert_eq!(after.await.unwrap().unwrap(), Removal::Unknown);
+        assert!(!store.allows(&pin));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

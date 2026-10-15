@@ -1231,3 +1231,31 @@ async fn a_client_that_removes_itself_gets_its_result_before_the_close() {
     );
     running.finish().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_command_sent_after_self_removal_is_not_run() {
+    let client = ClientIdentity::generate().unwrap();
+    let running = start_enrolled("remove-then-more", vec![], &[client.pin]);
+    let mut ws = remote(&running, &client).await;
+    // One flush: the commands after the removal are already received
+    // while it runs.
+    let ping = |id: u64| serde_json::json!({ "id": id, "type": "ping" });
+    for command in [remove(1, client.pin), ping(2), ping(3), ping(4)] {
+        ws.feed(Message::Text(command.to_string().into()))
+            .await
+            .unwrap();
+    }
+    ws.flush().await.unwrap();
+    let answer: Value = match within_5_s(ws.next()).await {
+        Some(Ok(Message::Text(text))) => serde_json::from_str(text.as_str()).unwrap(),
+        other => panic!("no answer: {other:?}"),
+    };
+    assert_eq!(answer["id"], 1, "{answer}");
+    assert_eq!(answer["success"], true, "{answer}");
+    assert_eq!(
+        close_frame(&mut ws).await,
+        (1008, "client removed".to_owned()),
+        "no pong after the removal"
+    );
+    running.finish().await;
+}

@@ -489,7 +489,7 @@ mod tests {
     use super::*;
 
     /// A handler that keeps every default.
-    struct Minimal;
+    pub(crate) struct Minimal;
 
     impl Handler for Minimal {
         fn hello(&self) -> Hello {
@@ -547,7 +547,7 @@ mod tests {
 
     /// What every connection shares, with `max_connections` and the
     /// shutdown begun or not.
-    fn state(max_connections: u32, shutting_down: bool) -> AppState<Minimal> {
+    pub(crate) fn state(max_connections: u32, shutting_down: bool) -> AppState<Minimal> {
         let shutdown = CancellationToken::new();
         if shutting_down {
             shutdown.cancel();
