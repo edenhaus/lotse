@@ -53,7 +53,7 @@ use lotse_core::task::spawn_named;
 use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
 use lotse_ipc::{SessionEvent as IpcEvent, SessionSpec, datagram};
 use tokio::net::UnixDatagram;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::derived::{DerivedTracks, Lease, PickedTrack};
@@ -65,9 +65,6 @@ use crate::talkback::{self, Arbiter, BACKCHANNEL_BUSY, Talkback, TalkbackStats};
 /// The bounded inbound queue per session:
 /// uplink only, so small.
 const INBOUND_CAPACITY: usize = 256;
-
-/// How long a session waits for the source to declare its tracks.
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long `close_all` waits for the session tasks.
 const CLOSE_BUDGET: Duration = Duration::from_secs(1);
@@ -86,6 +83,12 @@ pub(crate) struct Inbound {
     pub(crate) payload: Vec<u8>,
 }
 
+/// The close a session was asked for, the first one: the `closed` code
+/// and message. It travels apart from [`Control`] so a full control queue
+/// never drops it, and a session that waits for its tracks without a
+/// deadline of its own always hears it.
+type CloseRequest = Option<(&'static str, String)>;
+
 /// What the manager tells a session task.
 #[derive(Debug)]
 enum Control {
@@ -93,13 +96,6 @@ enum Control {
     Candidate(String),
     /// The stream's orientation changed.
     Orientation(Orientation),
-    /// Close with this code.
-    Close {
-        /// The `closed` code.
-        code: &'static str,
-        /// The message.
-        message: String,
-    },
     /// A relay candidate the supervisor allocated for this session.
     Relay {
         /// The relayed address.
@@ -158,6 +154,8 @@ struct SessionHandle {
     ufrag: String,
     /// The task's control queue.
     control: mpsc::Sender<Control>,
+    /// The task's close, which no full queue drops.
+    close: watch::Sender<CloseRequest>,
     /// The task.
     task: JoinHandle<()>,
     /// Its talk-back counters.
@@ -314,6 +312,7 @@ impl SessionManager {
         };
         let (inbound_tx, inbound) = mpsc::channel(INBOUND_CAPACITY);
         let (control_tx, control) = mpsc::channel(64);
+        let (close_tx, close) = watch::channel(None);
         self.routes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -345,13 +344,14 @@ impl SessionManager {
         let span = tracing::info_span!("session", id = %session_id);
         let task = spawn_named(
             "session",
-            tracing::Instrument::instrument(run_session(ctx, inbound, control), span),
+            tracing::Instrument::instrument(run_session(ctx, inbound, control, close), span),
         );
         self.sessions.insert(
             session_id,
             SessionHandle {
                 ufrag,
                 control: control_tx,
+                close: close_tx,
                 task,
                 talkback,
             },
@@ -432,9 +432,13 @@ impl SessionManager {
         self.send(session_id, Control::Orientation(orientation));
     }
 
-    /// Closes a session.
+    /// Closes a session; a session asked already keeps its first close.
     pub(crate) fn close(&self, session_id: &str, code: &'static str, message: String) {
-        self.send(session_id, Control::Close { code, message });
+        let Some(handle) = self.sessions.get(session_id) else {
+            tracing::debug!(session = session_id, code, "close for an unknown session");
+            return;
+        };
+        request_close(&handle.close, code, message);
     }
 
     /// Hands a control message to a session; unknown or gone sessions
@@ -457,10 +461,7 @@ impl SessionManager {
     pub(crate) async fn close_all(&mut self, code: &'static str, message: &str) {
         let sessions = std::mem::take(&mut self.sessions);
         for handle in sessions.values() {
-            let _sent = handle.control.try_send(Control::Close {
-                code,
-                message: message.to_owned(),
-            });
+            request_close(&handle.close, code, message.to_owned());
         }
         let budget = self.clock.sleep(CLOSE_BUDGET);
         tokio::pin!(budget);
@@ -488,6 +489,17 @@ impl Drop for SessionManager {
             handle.task.abort();
         }
     }
+}
+
+/// Asks a session to close with `code`, unless it was asked already.
+fn request_close(close: &watch::Sender<CloseRequest>, code: &'static str, message: String) {
+    close.send_if_modified(|request| {
+        let first = request.is_none();
+        if first {
+            *request = Some((code, message));
+        }
+        first
+    });
 }
 
 /// Reads the datagram channel and queues each frame for its session.
@@ -692,17 +704,20 @@ fn egress_source(pinned: bool, source: SocketAddr) -> Option<IpAddr> {
 /// closes the session first. Returns the close to report, if any. Relay
 /// candidates that arrive meanwhile wait in `relays` for the engine; an
 /// orientation change goes into the spec the answer reads.
+///
+/// No deadline of its own: the source's attempt is bounded by its own
+/// deadlines and the runner's ready timeout, and the supervisor closes
+/// the session with the source's error when the attempt fails.
 async fn wait_ready(
     ctx: &mut SessionCtx,
     control: &mut mpsc::Receiver<Control>,
+    close: &mut watch::Receiver<CloseRequest>,
     relays: &mut Vec<PendingRelay>,
 ) -> Option<(&'static str, String)> {
     let mut ready = ctx.tracks.tracks().ready();
     if *ready.borrow_and_update() {
         return None;
     }
-    let timeout = ctx.clock.sleep(READY_TIMEOUT);
-    tokio::pin!(timeout);
     loop {
         tokio::select! {
             // The session holds the track set, so its sender outlives this
@@ -712,8 +727,9 @@ async fn wait_ready(
                     return None;
                 }
             }
+            // A manager that is gone ends the control queue too.
+            Ok(request) = close.wait_for(Option::is_some) => return request.clone(),
             message = control.recv() => match message {
-                Some(Control::Close { code, message }) => return Some((code, message)),
                 Some(Control::Candidate(_)) => {}
                 Some(Control::Orientation(orientation)) => ctx.spec.orientation = orientation.code(),
                 Some(Control::Relay { relayed, server, local, tcp }) => relays.push(PendingRelay { relayed, server, local, tcp }),
@@ -727,9 +743,6 @@ async fn wait_ready(
                 }
                 None => return Some(("shutting_down", "the worker is stopping".to_owned())),
             },
-            () = &mut timeout => {
-                return Some(("source_not_live", format!("the source declared no tracks within {} s", READY_TIMEOUT.as_secs())));
-            }
         }
     }
 }
@@ -868,9 +881,10 @@ async fn next_audio(audio: &mut Option<AudioSubscription>) -> Option<TrackEvent>
 async fn open_session(
     ctx: &mut SessionCtx,
     control: &mut mpsc::Receiver<Control>,
+    close: &mut watch::Receiver<CloseRequest>,
 ) -> Option<Opened> {
     let mut relays = Vec::new();
-    if let Some((code, message)) = wait_ready(ctx, control, &mut relays).await {
+    if let Some((code, message)) = wait_ready(ctx, control, close, &mut relays).await {
         ctx.finish(code, message).await;
         return None;
     }
@@ -1112,8 +1126,9 @@ async fn run_session(
     mut ctx: SessionCtx,
     mut inbound: mpsc::Receiver<Inbound>,
     mut control: mpsc::Receiver<Control>,
+    mut close: watch::Receiver<CloseRequest>,
 ) {
-    let Some(mut opened) = open_session(&mut ctx, &mut control).await else {
+    let Some(mut opened) = open_session(&mut ctx, &mut control, &mut close).await else {
         return;
     };
     let local = ctx.udp.local_addr().ok();
@@ -1169,7 +1184,6 @@ async fn run_session(
                 match message {
                     Some(Control::Candidate(candidate)) => opened.engine.add_remote_candidate(now, &candidate),
                     Some(Control::Orientation(orientation)) => opened.engine.set_orientation(orientation),
-                    Some(Control::Close { code, message }) => opened.engine.close(now, code, message),
                     Some(Control::Relay { relayed, server, local, tcp }) => add_relay(&ctx, &mut opened, PendingRelay { relayed, server, local, tcp }).await,
                     Some(Control::Channel { relayed, peer, channel }) => {
                         let bound = opened.relays.bind(relayed, peer, channel);
@@ -1184,6 +1198,12 @@ async fn run_session(
                         }
                     }
                     None => opened.engine.close(now, "shutting_down", "the worker is stopping".to_owned()),
+                }
+            }
+            Ok(()) = close.changed() => {
+                let request = close.borrow_and_update().clone();
+                if let Some((code, message)) = request {
+                    opened.engine.close(ctx.clock.now(), code, message);
                 }
             }
             () = sleep => opened.engine.handle_timeout(ctx.clock.now()),
@@ -1475,6 +1495,7 @@ mod tests {
         script: Arc<Script>,
         events: mpsc::Receiver<(String, IpcEvent)>,
         control: mpsc::Sender<Control>,
+        close: watch::Sender<CloseRequest>,
         inbound: mpsc::Sender<Inbound>,
     }
 
@@ -1502,6 +1523,7 @@ mod tests {
         let script = Arc::new(script);
         let (events_tx, events) = mpsc::channel(64);
         let (control, control_rx) = mpsc::channel(64);
+        let (close, close_rx) = watch::channel(None);
         let (inbound, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
         let (uplink, _supervisor) = UnixDatagram::pair().unwrap();
         let ctx = SessionCtx {
@@ -1526,9 +1548,10 @@ mod tests {
             script,
             events,
             control,
+            close,
             inbound,
         };
-        (rig, run_session(ctx, inbound_rx, control_rx))
+        (rig, run_session(ctx, inbound_rx, control_rx, close_rx))
     }
 
     fn closed(code: &str, message: &str) -> IpcEvent {
@@ -1700,10 +1723,7 @@ mod tests {
         rig.publisher.tracks().reset_ready();
         assert!(poll_once(&mut session).await.is_pending());
         assert!(rig.events().is_empty());
-        rig.control(Control::Close {
-            code: "session_closed",
-            message: "bye".into(),
-        });
+        request_close(&rig.close, "session_closed", "bye".into());
         assert!(poll_once(&mut session).await.is_ready());
         assert_eq!(rig.events(), [closed("session_closed", "bye")]);
         assert!(rig.script.calls.lock().unwrap().is_empty(), "never opened");
@@ -1766,22 +1786,24 @@ mod tests {
         );
     }
 
+    /// The supervisor closes a waiting session when its source fails; the
+    /// session keeps no deadline of its own.
     #[tokio::test]
-    async fn a_source_that_declares_no_tracks_within_the_ready_timeout_closes_the_session() {
+    async fn a_session_waits_for_the_tracks_however_long_the_source_takes() {
         let (mut rig, session) = session(Script::default(), false, false);
         let mut session = pin!(session);
         assert!(poll_once(&mut session).await.is_pending());
-        rig.clock
-            .advance(READY_TIMEOUT.checked_sub(Duration::from_millis(1)).unwrap());
+        rig.clock.advance(Duration::from_secs(3600));
         assert!(poll_once(&mut session).await.is_pending());
-        rig.clock.advance(Duration::from_millis(1));
-        assert!(poll_once(&mut session).await.is_ready());
+        assert!(rig.events().is_empty());
+        rig.publisher.ready();
+        assert!(poll_once(&mut session).await.is_pending());
         assert_eq!(
             rig.events(),
-            [closed(
-                "source_not_live",
-                "the source declared no tracks within 10 s"
-            )]
+            [IpcEvent::Answer {
+                sdp: "answer".into(),
+                talkback: None,
+            }]
         );
     }
 
@@ -1902,7 +1924,8 @@ mod tests {
     }
 
     /// The manager never waits on a session: what its full control queue
-    /// cannot take is dropped, an ICE-TCP connection closed.
+    /// cannot take is dropped, an ICE-TCP connection closed, but a close
+    /// still reaches it.
     #[tokio::test]
     async fn a_session_whose_control_queue_is_full_drops_messages_and_closes_hand_offs() {
         let (logs, _guard) = Logs::capture();
@@ -1926,6 +1949,15 @@ mod tests {
             1
         );
         assert_eq!(browser.read(&mut [0_u8; 1]).unwrap(), 0, "closed");
+        // A close is never dropped, and the first one asked is the one.
+        m.manager.close("a", "session_closed", "bye".into());
+        m.manager.close("a", "shutting_down", "later".into());
+        assert_eq!(
+            m.events.recv().await.unwrap(),
+            ("a".to_owned(), closed("session_closed", "bye"))
+        );
+        m.manager.close("nobody", "session_closed", String::new());
+        assert_eq!(logs.count(Level::DEBUG, "close for an unknown session"), 1);
     }
 
     #[tokio::test]

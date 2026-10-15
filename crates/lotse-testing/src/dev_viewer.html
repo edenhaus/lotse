@@ -9,7 +9,13 @@
   @media (prefers-color-scheme: dark) {
     :root { --bg: #14171c; --panel: #1c2027; --text: #e6e9ef; --muted: #99a2b3; --line: #2d333d; --accent: #6b9bff; --bad: #ff7b6b; --good: #5fd08f; }
   }
+  /* Native controls and scrollbars in the page's scheme (CSS Color
+     Adjustment Level 1 §2.1), the scrollbars thin and muted (CSS Scrollbars
+     Styling Level 1 §2, §3): without a color-scheme Chrome draws its light
+     ones in the dark scheme too (Chrome on macOS, 2026-10-13). */
+  :root { color-scheme: light dark; scrollbar-color: color-mix(in srgb, var(--muted) 50%, transparent) transparent; }
   * { box-sizing: border-box; }
+  aside, .col, #log { scrollbar-width: thin; }
   html, body { height: 100%; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; overflow-x: hidden; }
   /* The video takes everything the side panel leaves; below 760 px the
@@ -18,6 +24,8 @@
   .stage { background: #000; min-width: 0; min-height: 0; }
   video { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
   aside { background: var(--panel); border-left: 1px solid var(--line); padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
   h1 { font-size: 16px; margin: 0; }
   h1 small { display: block; color: var(--muted); font-weight: normal; font-size: 12px; }
   h2 { font-size: 12px; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
@@ -31,79 +39,109 @@
   button { font: inherit; padding: 5px 12px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
   button.secondary { background: transparent; color: var(--accent); }
   button:disabled { opacity: .45; cursor: default; }
+  .dock { display: flex; gap: 2px; }
+  .dock button { padding: 3px; line-height: 0; background: transparent; border-color: transparent; color: var(--muted); }
+  .dock button[aria-pressed="true"] { color: var(--accent); border-color: var(--line); }
   dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; }
   dt { color: var(--muted); }
   dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
   #log { margin: 0; min-height: 120px; flex: 1 0 120px; overflow: auto; font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
   .bad { color: var(--bad); } .good { color: var(--good); }
+  /* The panel below the video, for a landscape stream: the video keeps the
+     full width, and the panel is a strip of three columns that scroll on
+     their own: the stream's fields, the session, and the log, widest so
+     its lines stay readable. */
+  @media (min-width: 761px) {
+    .app.below { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+    .app.below aside { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1.8fr); grid-template-rows: minmax(0, 1fr); gap: 24px; border-left: 0; border-top: 1px solid var(--line); height: 40vh; height: 40dvh; overflow: hidden; }
+    /* Vertical scrolling only: `overflow-y` alone makes `overflow-x` auto too
+       (CSS Overflow 3 §3.1), and a column rounded a pixel narrower than its
+       content then scrolls sideways (Chrome on macOS, 2026-10-13). */
+    .app.below .col, .app.below #log { min-height: 0; overflow: hidden auto; }
+  }
   @media (max-width: 760px) {
     .app { grid-template-columns: minmax(0, 1fr); height: auto; }
     .stage { height: min(75vh, 100vw); height: min(75dvh, 100vw); }
     aside { border-left: 0; overflow: visible; }
     #log { max-height: 50vh; }
+    .dock { display: none; }
   }
 </style>
 </head>
 <body>
-<div class="app">
+<div class="app below" id="app">
   <div class="stage"><video id="video" autoplay muted playsinline controls></video></div>
   <aside>
-    <h1>lotse dev viewer <small id="hello">connecting to the daemon…</small></h1>
-    <form id="form">
-      <label>Saved streams <select id="saved"><option value="">(not saved)</option></select></label>
-      <div class="buttons">
-        <input id="label" placeholder="Name (optional)" aria-label="Name for the saved stream" autocomplete="off">
-        <button id="save-entry" type="button" class="secondary">Save</button>
-        <button id="delete-entry" type="button" class="secondary" disabled>Delete</button>
-      </div>
-      <label>Stream id <input id="stream" value="cam" pattern="[A-Za-z0-9._\-]{1,128}" required></label>
-      <label>Camera URL <input id="url" placeholder="rtsp://user:pass@192.168.1.10:554/stream1" autocomplete="off" spellcheck="false" required></label>
-      <label>STUN server (optional) <input id="stun" placeholder="stun:stun.l.google.com:19302"></label>
-      <label title="stream/put's orientation; changing it while playing puts the stream again, and the open session turns from its next frame">Orientation (CVO)
-        <select id="orientation">
-          <option value="no_transform">no_transform</option>
-          <option value="mirror">mirror</option>
-          <option value="rotate_180">rotate_180</option>
-          <option value="flip">flip</option>
-          <option value="rotate_left_and_flip">rotate_left_and_flip</option>
-          <option value="rotate_left">rotate_left</option>
-          <option value="rotate_right_and_flip">rotate_right_and_flip</option>
-          <option value="rotate_right">rotate_right</option>
-        </select>
-      </label>
-      <label class="check" title="stream/put's RTSP option backchannel: the daemon asks the camera for its ONVIF backchannel, and the offer carries a send-only audio m-line for the microphone; changing it while playing plays again"><input id="talkback" type="checkbox"> Two-way audio (camera backchannel)</label>
-      <div class="buttons">
-        <button id="play" type="submit" disabled>Play</button>
-        <button id="stop" type="button" class="secondary" disabled>Stop</button>
-        <button id="talk" type="button" class="secondary" disabled title="Sends the microphone to the camera's speaker; the browser asks for it on the first press">Talk</button>
-      </div>
-    </form>
-    <section>
-      <h2>Session</h2>
-      <dl id="stats">
-        <dt>Session</dt><dd id="s-state">–</dd>
-        <dt>First frame</dt><dd id="s-ttff">–</dd>
-        <dt>Video</dt><dd id="s-video">–</dd>
-        <dt title="Whether the answer's video m-line carries urn:3gpp:video-orientation">CVO</dt><dd id="s-cvo">–</dd>
-        <dt>Frame rate</dt><dd id="s-fps">–</dd>
-        <dt>Decoded</dt><dd id="s-decoded">–</dd>
-        <dt>Lost</dt><dd id="s-lost">–</dd>
-        <dt>Video buffer</dt><dd id="s-vbuf">–</dd>
-        <dt>Audio</dt><dd id="s-audio">–</dd>
-        <dt>Audio buffer</dt><dd id="s-abuf">–</dd>
-        <dt title="The browser's estimate from the daemon's Sender Reports: shows what it aligns to, not whether the camera's timestamps are right">A/V playout</dt><dd id="s-av">–</dd>
-        <dt title="The backchannel of session/get: what the daemon received and handed to the camera">Talk-back</dt><dd id="s-talk">–</dd>
-        <dt title="The browser's outbound talk-back RTP">Uplink</dt><dd id="s-uplink">–</dd>
-        <dt>Path</dt><dd id="s-path">–</dd>
-      </dl>
-    </section>
-    <section>
-      <h2>Offer</h2>
-      <label class="check"><input id="audio" type="checkbox" checked> Offer audio (receive-only)</label>
-      <label class="check"><input id="constrained-high" type="checkbox" checked> Offer Constrained High (640c1f)</label>
-      <label class="check"><input id="playout-delay" type="checkbox" checked> Offer playout-delay (daemon sends min 0 / max 0)</label>
-      <div class="buttons"><button id="copy-offer" type="button" class="secondary" disabled>Copy offer SDP</button></div>
-    </section>
+    <div class="col">
+      <header>
+        <h1>lotse dev viewer <small id="hello">connecting to the daemon…</small></h1>
+        <div class="dock" role="group" aria-label="Panel position">
+          <button id="dock-right" type="button" title="Panel right of the video" aria-label="Panel right of the video" aria-pressed="false">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor"/><rect x="9.5" y="2.5" width="5" height="11" fill="currentColor" fill-opacity=".45"/></svg>
+          </button>
+          <button id="dock-below" type="button" title="Panel below the video" aria-label="Panel below the video" aria-pressed="true">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor"/><rect x="1.5" y="9.5" width="13" height="4" fill="currentColor" fill-opacity=".45"/></svg>
+          </button>
+        </div>
+      </header>
+      <form id="form">
+        <label>Saved streams <select id="saved"><option value="">(not saved)</option></select></label>
+        <div class="buttons">
+          <input id="label" placeholder="Name (optional)" aria-label="Name for the saved stream" autocomplete="off">
+          <button id="save-entry" type="button" class="secondary">Save</button>
+          <button id="delete-entry" type="button" class="secondary" disabled>Delete</button>
+        </div>
+        <div class="buttons">
+          <button id="play" type="submit" disabled>Play</button>
+          <button id="stop" type="button" class="secondary" disabled>Stop</button>
+          <button id="talk" type="button" class="secondary" disabled title="Sends the microphone to the camera's speaker; the browser asks for it on the first press">Talk</button>
+        </div>
+        <label>Camera URL <input id="url" placeholder="rtsp://user:pass@192.168.1.10:554/stream1" autocomplete="off" spellcheck="false" required></label>
+        <label>STUN server (optional) <input id="stun" placeholder="stun:stun.l.google.com:19302"></label>
+        <label title="stream/put's orientation; changing it while playing puts the stream again, and the open session turns from its next frame">Orientation (CVO)
+          <select id="orientation">
+            <option value="no_transform">no_transform</option>
+            <option value="mirror">mirror</option>
+            <option value="rotate_180">rotate_180</option>
+            <option value="flip">flip</option>
+            <option value="rotate_left_and_flip">rotate_left_and_flip</option>
+            <option value="rotate_left">rotate_left</option>
+            <option value="rotate_right_and_flip">rotate_right_and_flip</option>
+            <option value="rotate_right">rotate_right</option>
+          </select>
+        </label>
+        <label class="check" title="stream/put's RTSP option backchannel: the daemon asks the camera for its ONVIF backchannel, and the offer carries a send-only audio m-line for the microphone; changing it while playing plays again"><input id="talkback" type="checkbox"> Two-way audio (camera backchannel)</label>
+        <label title="The name as a slug until edited here; clearing it hands it back to the name">Stream id <input id="stream" value="cam" pattern="[A-Za-z0-9._\-]{1,128}" required></label>
+      </form>
+    </div>
+    <div class="col">
+      <section>
+        <h2>Session</h2>
+        <dl id="stats">
+          <dt>Session</dt><dd id="s-state">–</dd>
+          <dt>First frame</dt><dd id="s-ttff">–</dd>
+          <dt>Video</dt><dd id="s-video">–</dd>
+          <dt title="Whether the answer's video m-line carries urn:3gpp:video-orientation">CVO</dt><dd id="s-cvo">–</dd>
+          <dt>Frame rate</dt><dd id="s-fps">–</dd>
+          <dt>Decoded</dt><dd id="s-decoded">–</dd>
+          <dt>Lost</dt><dd id="s-lost">–</dd>
+          <dt>Video buffer</dt><dd id="s-vbuf">–</dd>
+          <dt>Audio</dt><dd id="s-audio">–</dd>
+          <dt>Audio buffer</dt><dd id="s-abuf">–</dd>
+          <dt title="The browser's estimate from the daemon's Sender Reports: shows what it aligns to, not whether the camera's timestamps are right">A/V playout</dt><dd id="s-av">–</dd>
+          <dt title="The backchannel of session/get: what the daemon received and handed to the camera">Talk-back</dt><dd id="s-talk">–</dd>
+          <dt title="The browser's outbound talk-back RTP">Uplink</dt><dd id="s-uplink">–</dd>
+          <dt>Path</dt><dd id="s-path">–</dd>
+        </dl>
+      </section>
+      <section>
+        <h2>Offer</h2>
+        <label class="check"><input id="audio" type="checkbox" checked> Offer audio (receive-only)</label>
+        <label class="check"><input id="constrained-high" type="checkbox" checked> Offer Constrained High (640c1f)</label>
+        <label class="check"><input id="playout-delay" type="checkbox" checked> Offer playout-delay (daemon sends min 0 / max 0)</label>
+        <div class="buttons"><button id="copy-offer" type="button" class="secondary" disabled>Copy offer SDP</button></div>
+      </section>
+    </div>
     <pre id="log"></pre>
   </aside>
 </div>
@@ -117,17 +155,16 @@ const $ = (id) => document.getElementById(id);
 // edited, so a screenshot never shows it. The real URL is kept in `cameraUrl`:
 // focusing the field shows it for editing and copying, and Play sends it.
 // The saved-streams list shows it masked too.
-// Credentials never reach localStorage, which any page later served on
-// this origin (localhost:8080, say) reads and which stays on disk: it keeps
-// every URL without its userinfo, and the userinfo goes to sessionStorage,
-// which this tab alone sees and closing it clears. So a reload keeps the
-// real URL, and a new tab gets it back without user and password.
+// localStorage keeps the URLs with their credentials, so a new tab and a
+// restarted browser get them back: this is a test tool on the developer's
+// machine, and retyping every camera's password costs more than what any
+// page later served on this origin (localhost:8080, say) could read.
 let cameraUrl = "";
 const MASK = "•".repeat(8);
 // The video orientation RTP header extension (3GPP TS 26.114 §6.2.3.3).
 const CVO = "urn:3gpp:video-orientation";
 // The key in localStorage (the settings) and in sessionStorage (the
-// credentials).
+// credentials pages before 2026-10-13 kept in the tab only).
 const STORE = "lotse-dev-viewer";
 // A URL's scheme and `//`, after which its authority starts (RFC 3986 §3).
 const SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
@@ -147,14 +184,20 @@ function splitUserinfo(url) {
 }
 
 // `url` with `userinfo` put back, unless it has userinfo of its own; a
-// `userinfo` that is not one (sessionStorage holds what any page on this
-// origin wrote) is ignored.
+// `userinfo` that is not one (storage holds what any page on this origin
+// wrote) is ignored.
 function withUserinfo(url, userinfo) {
   if (typeof userinfo !== "string" || !/^[^\/?#]*@$/.test(userinfo) || splitUserinfo(url).userinfo) return url;
   return url.replace(SCHEME, (scheme) => scheme + userinfo);
 }
 
-const hasUserinfo = (url) => typeof url === "string" && splitUserinfo(url).userinfo !== "";
+// `name` as a stream id: lowercase ASCII letters and digits, accents
+// dropped, every other run of characters one `_`, at most the 128
+// characters the stream id's pattern allows.
+function slugify(name) {
+  return name.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_").slice(0, 128).replace(/^_+|_+$/g, "");
+}
 
 function showUrl() {
   const field = $("url");
@@ -175,8 +218,9 @@ function parsed(text) {
   return value && typeof value === "object" ? value : {};
 }
 
-// The settings localStorage held and the credentials sessionStorage held,
-// or nothing: storage can be disabled, full, or hold anything.
+// The settings localStorage held and the credentials an earlier page left
+// in sessionStorage, or nothing: storage can be disabled, full, or hold
+// anything.
 function load() {
   let settings = {}, credentials = {};
   try {
@@ -190,10 +234,18 @@ function load() {
 
 const isOrientation = (value) => [...$("orientation").options].some((o) => o.value === value);
 const { saved, credentials } = load();
+// Where the panel sits: "below" the video, the default, or "right" of it
+// for a portrait stream.
+let panel = saved.panel === "right" ? "right" : "below";
+// Puts the panel where `panel` says and marks its dock button pressed.
+function placePanel() {
+  $("app").classList.toggle("below", panel === "below");
+  for (const side of ["right", "below"]) $(`dock-${side}`).setAttribute("aria-pressed", String(panel === side));
+}
 const savedCredentials = new Map(Array.isArray(credentials.saved) ? credentials.saved.filter(Array.isArray) : []);
-// The saved streams, each { id, label, stream, url, orientation, talkback } with the
-// URL as typed, the credentials of this tab put back; and which one the
-// fields show, if any.
+// The saved streams, each { id, label, stream, url, orientation, talkback }
+// with the URL as typed, the credentials an earlier page left in this tab
+// put back; and which one the fields show, if any.
 let entries = (Array.isArray(saved.saved) ? saved.saved : [])
   .filter((e) => e && typeof e.id === "string" && typeof e.url === "string" && typeof e.stream === "string")
   .map((e) => ({ id: e.id, label: typeof e.label === "string" ? e.label : "", stream: e.stream,
@@ -208,32 +260,24 @@ function storageFailed(err) {
   storageWarned = true;
 }
 
-// Keeps the fields and the saved streams: every URL without its userinfo
-// in localStorage, the userinfo in this tab's sessionStorage, which a
-// reload keeps.
+// Keeps the fields and the saved streams in localStorage, every URL with
+// its userinfo; whether localStorage took them.
 function save() {
-  const current = splitUserinfo(cameraUrl);
-  const split = entries.map((e) => ({ entry: e, ...splitUserinfo(e.url) }));
   try {
     localStorage.setItem(STORE, JSON.stringify({
       stream: $("stream").value.trim(),
-      url: current.bare,
+      url: cameraUrl,
       stun: $("stun").value.trim(),
       orientation: $("orientation").value,
       talkback: $("talkback").checked,
-      saved: split.map(({ entry, bare }) => ({ ...entry, url: bare })),
+      panel,
+      saved: entries,
       selected: selectedId ?? null,
     }));
+    return true;
   } catch (err) {
     storageFailed(err);
-  }
-  try {
-    sessionStorage.setItem(STORE, JSON.stringify({
-      url: current.userinfo,
-      saved: split.filter((s) => s.userinfo).map((s) => [s.entry.id, s.userinfo]),
-    }));
-  } catch (err) {
-    storageFailed(err);
+    return false;
   }
 }
 
@@ -241,7 +285,7 @@ const selected = () => entries.find((e) => e.id === selectedId);
 // The saved stream the fields show: the selected one while they still
 // match it, else the first that matches, else none. URLs match without
 // their userinfo, so typing the password into a stream saved without it
-// (a new tab) keeps it selected, and Save updates it.
+// keeps it selected, and Save updates it.
 function matching() {
   const stream = $("stream").value.trim();
   const bare = splitUserinfo(cameraUrl).bare;
@@ -271,20 +315,57 @@ function syncSelection() {
 for (const id of ["stream", "stun"]) if (typeof saved[id] === "string" && saved[id]) $(id).value = saved[id];
 if (isOrientation(saved.orientation)) $("orientation").value = saved.orientation;
 $("talkback").checked = saved.talkback === true;
+placePanel();
 cameraUrl = typeof saved.url === "string" ? withUserinfo(saved.url, credentials.url) : "";
 showUrl();
 syncSelection();
 if (selected()) $("label").value = selected().label;
-// Pages before 2026-10-08 kept URLs with their credentials: they move to
-// sessionStorage now, and localStorage is rewritten without them.
-if (hasUserinfo(saved.url) || (Array.isArray(saved.saved) && saved.saved.some((e) => hasUserinfo(e?.url)))) {
-  save();
-  log("camera credentials removed from local storage; this tab keeps them until it closes");
+// Pages before 2026-10-13 kept the credentials in this tab's
+// sessionStorage only: they move to localStorage, which every tab reads.
+// sessionStorage keeps them until localStorage has taken them, so a failed
+// write loses nothing and the next load tries again.
+if (Object.keys(credentials).length && save()) {
+  try {
+    sessionStorage.removeItem(STORE);
+  } catch {}
+  log("this tab's camera credentials are kept in local storage now");
 }
 $("url").addEventListener("focus", showUrl);
 $("url").addEventListener("input", () => { cameraUrl = $("url").value.trim(); syncSelection(); });
 $("url").addEventListener("blur", () => { save(); showUrl(); });
-$("stream").addEventListener("input", syncSelection);
+// Whether a stream id nobody just typed is one the name did not give:
+// neither empty, the page's default, nor the name's slug. On load and on
+// choosing a saved stream, this is the best guess.
+const typedStream = () => !["", $("stream").defaultValue, slugify($("label").value)].includes($("stream").value.trim());
+// Whether the stream id was typed by hand, so the name leaves it alone.
+let streamTyped = typedStream();
+// Any id typed here is the user's, even the default or the name's slug;
+// emptying the field hands it back to the name.
+$("stream").addEventListener("input", () => {
+  streamTyped = $("stream").value.trim() !== "";
+  syncSelection();
+});
+// An emptied stream id is handed back to the name once the field is left,
+// not while it is empty, which is also on the way to typing a new one.
+$("stream").addEventListener("blur", () => {
+  const slug = slugify($("label").value);
+  if ($("stream").value.trim() || !slug) return;
+  $("stream").value = slug;
+  streamTyped = false;
+  syncSelection();
+  save();
+});
+// A new stream's id follows its name until it is typed; a saved stream
+// keeps its id when renamed, so Save updates it.
+$("label").addEventListener("input", () => {
+  const slug = slugify($("label").value);
+  if (streamTyped || selected() || !slug) return;
+  $("stream").value = slug;
+  syncSelection();
+});
+for (const side of ["right", "below"]) {
+  $(`dock-${side}`).addEventListener("click", () => { panel = side; placePanel(); save(); });
+}
 
 let ws, nextId = 1, pc, offerId, sessionId, offerAccepted = false, pendingCandidates = [];
 let statsTimer, playClicked, lastOffer, offeredCvo, attempt = 0;
@@ -795,6 +876,7 @@ $("saved").addEventListener("change", () => {
     $("talkback").checked = entry.talkback;
     $("label").value = entry.label;
   }
+  streamTyped = typedStream();
   save();
   if (entry && $("form").reportValidity()) play();
 });
@@ -810,8 +892,7 @@ $("save-entry").addEventListener("click", () => {
   selectedId = (entry ?? entries[entries.length - 1]).id;
   save();
   renderSaved();
-  const forTab = hasUserinfo(cameraUrl) ? "; its user and password only until this tab closes" : "";
-  log(`saved ${fields.label || masked(cameraUrl)}${forTab}`);
+  log(`saved ${fields.label || masked(cameraUrl)}`);
 });
 $("delete-entry").addEventListener("click", () => {
   const entry = selected();

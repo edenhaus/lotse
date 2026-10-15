@@ -38,7 +38,9 @@ each arch at 100 % again on the PR (`.github/codecov.yml`, one flag per
 arch, OIDC, no secret; an upload that fails fails the job). Its Fuzz build job compiles the
 fuzz targets once for the Fuzz jobs, which run up to 4 targets each in
 parallel: on a PR only the targets built from a file it changed
-(`scripts/fuzz-select.sh`), else all, 5 min each nightly; every compiling job keeps a Rust
+(`scripts/fuzz-select.sh`), else all, 5 min each nightly, each target from
+its corpus in `edenhaus/lotse-fuzz-corpus`, which only `main`'s Fuzz corpus
+job writes (a deploy key in the `fuzz-corpus` environment); every compiling job keeps a Rust
 cache, saved by every run and restored from the PR's own (GitHub scopes
 them to it) or else from `main`'s; only the Mutants jobs save none and
 restore the one the Mutants cache job builds on `main`. A new job goes into `ci.yml`; workflow

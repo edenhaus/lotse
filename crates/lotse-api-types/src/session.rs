@@ -92,7 +92,15 @@ pub enum SessionEvent {
         /// For humans.
         message: String,
     },
-    /// The last event; the subscription ends with it.
+    /// The last event; the subscription ends with it. A session still
+    /// waiting for its answer has no deadline of its own: it waits while
+    /// its source connects, and closes with the source's error as soon as
+    /// the attempt fails, at once when the offer reaches a source that has
+    /// already failed. A live source that drops is retried, at once or
+    /// after a delay, and the session waits for the retry; only a retry
+    /// that fails closes it. While a `stream/put` switches the stream to
+    /// another source, the old source's failures do not count. An answered
+    /// session rides every reconnect instead.
     ///
     /// `backchannel_unavailable`: the offer requests two-way audio (an
     /// audio m-line the browser offers `sendonly` or `sendrecv`) on a
@@ -108,9 +116,14 @@ pub enum SessionEvent {
     #[schemars(title = "SessionEventClosed")]
     Closed {
         /// The stable code (`peer_closed`, `session_closed`,
-        /// `backchannel_unavailable`, ...).
+        /// `backchannel_unavailable`, ...). Before the answer, a failed
+        /// source closes the session with its error's code, the one
+        /// `stream/get` reports as `last_error`:
+        /// `source_unreachable`, `source_auth_failed`, `source_timeout`,
+        /// `source_protocol_error`, `source_ended` or `worker_crashed`.
         code: String,
-        /// For humans.
+        /// For humans; for a source's error, its text as `last_error`
+        /// carries it, never the source's credentials.
         message: String,
     },
 }
