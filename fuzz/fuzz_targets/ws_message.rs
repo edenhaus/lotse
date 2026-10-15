@@ -70,6 +70,7 @@ fn socket() -> &'static PathBuf {
             allow_uid: uid,
             max_connections: 1024,
             max_subscriptions: 1024,
+            tls: None,
         })
         .expect("the control socket binds");
         std::thread::spawn(move || {

@@ -191,6 +191,7 @@ fn start_limited(
         allow_uid: uid,
         max_connections,
         max_subscriptions,
+        tls: None,
     })
     .unwrap();
     let handler = Arc::new(handler);

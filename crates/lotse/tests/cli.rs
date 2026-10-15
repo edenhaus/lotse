@@ -241,3 +241,62 @@ fn sandbox_on_lets_the_supervisor_run_under_its_profile() {
     let (code, _) = daemon.terminate();
     assert_eq!(code, Some(0));
 }
+
+#[test]
+fn the_control_tls_listener_starts_with_its_identity_and_identity_prints_its_pin() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let dir = socket_dir("control-tls");
+    let socket = dir.join("lotse.sock");
+    let data = dir.join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data)
+        .unwrap();
+    let data = data.to_str().expect("utf-8 path");
+    let output = lotse()
+        .args(["identity", "--data-dir", data])
+        .output()
+        .expect("runs");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "no identity before the first start"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("first start"));
+
+    let client = "ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad";
+    let mut daemon = Daemon::start(
+        &[
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "off",
+            "--socket",
+            socket.to_str().expect("utf-8 path"),
+            "--sandbox",
+            "off",
+            "--control-listen",
+            "127.0.0.1:0",
+        ],
+        &[("LOTSE_CONTROL_CLIENTS", client), ("LOTSE_DATA_DIR", data)],
+    );
+    let created = json(&daemon.wait_for("control identity generated"));
+    let bound = json(&daemon.wait_for("control TLS listener bound"));
+    assert_eq!(bound["server_pin"], created["server_pin"]);
+    assert_eq!(bound["clients"], 1);
+    daemon.wait_for("\"event\":\"ready\"");
+    let (code, rest) = daemon.terminate();
+    assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
+
+    let output = lotse()
+        .arg("identity")
+        .env("LOTSE_DATA_DIR", data)
+        .output()
+        .expect("runs");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        bound["server_pin"].as_str().unwrap()
+    );
+}

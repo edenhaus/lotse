@@ -3,9 +3,11 @@
 //! connection, ended ones forgotten), the bounded outbound queue and the
 //! close codes.
 //!
-//! Implements RFC 6455 §7.4.1 close codes: `1001` going away on shutdown,
-//! `1003` for a binary frame, `1008` policy violation on an overflowed
-//! outbound queue. Commands are processed one at a time per connection;
+//! Implements RFC 6455 §10.2 (an upgrade carrying `Origin`, which only a
+//! browser sends, is refused with 403 as §4.2.2 allows: the control API is
+//! not for web pages) and the RFC 6455 §7.4.1 close codes: `1001` going
+//! away on shutdown, `1003` for a binary frame, `1008` policy violation on
+//! an overflowed outbound queue. Commands are processed one at a time per connection;
 //! every one is non-blocking by contract. On close the sessions are
 //! orphaned and the slot released first; the writer then gets
 //! [`CLOSE_TIMEOUT`] to deliver the queue and the close frame, after which
@@ -18,7 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use axum::Extension;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt as _, StreamExt as _};
 use lotse_api_types::command::Command;
@@ -50,14 +52,23 @@ fn refuse(status: StatusCode, code: ErrorCode, message: &str) -> Response {
     (status, [("content-type", "application/json")], body).into_response()
 }
 
-/// `GET /v0/ws` ([`lotse_api_types::WS_PATH`]): the shutdown and
-/// connection-limit checks, then the upgrade. The peer's uid was checked
-/// at accept.
+/// `GET /v0/ws` ([`lotse_api_types::WS_PATH`]): the `Origin`, shutdown
+/// and connection-limit checks, then the upgrade. The peer was
+/// authenticated by its listener.
 pub(crate) async fn upgrade<H: Handler>(
     State(state): State<AppState<H>>,
     Extension(peer): Extension<PeerInfo>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if headers.contains_key(header::ORIGIN) {
+        tracing::warn!(%peer, "control connection refused: the request carries Origin, as only a browser sends");
+        return refuse(
+            StatusCode::FORBIDDEN,
+            ErrorCode::InvalidRequest,
+            "requests carrying Origin are refused: the control API is not for browsers",
+        );
+    }
     if state.shutdown.is_cancelled() {
         return refuse(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -135,7 +146,7 @@ async fn serve<H: Handler>(
     slot: ConnectionSlot,
     id: ConnectionId,
 ) {
-    tracing::info!(uid = peer.uid, pid = ?peer.pid, "control connection opened");
+    tracing::info!(%peer, "control connection opened");
 
     let (sink, mut stream) = socket.split();
     let outbox = Arc::new(Outbox::new(OUTBOUND_BUDGET_BYTES));

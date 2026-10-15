@@ -1,10 +1,12 @@
 //! Control API server: axum on the Unix socket, peer-credential check,
+//! the opt-in mutual-TLS listener ([`tls`]) with its server identity,
 //! WebSocket command and subscription dispatch, and the snapshot route.
 //!
 //! Runs in the supervisor. Defines the [`Handler`] trait the supervisor
 //! implements, so this crate never depends on the supervisor (dependency
-//! inversion). Its own accept loop checks the peer's uid before any byte
-//! is read and serves each connection on hyper's HTTP/1.1 with its own
+//! inversion). Its own accept loops authenticate the peer before any byte
+//! is read (the uid on the socket, the certificate pin over TLS) and serve
+//! each connection on hyper's HTTP/1.1 with its own
 //! upgrade limits (`axum::serve` sets none): a 16 KiB request head, 32
 //! header fields, a deadline from accept to the upgrade on the injected
 //! clock, and a bound on connections awaiting it. Enforces the request
@@ -14,10 +16,12 @@
 //! overflows it, and a deadline on the closing handshake, so a peer that
 //! stops reading cannot hold a connection or its slot.
 //!
-//! Standards: RFC 6455 (WebSocket, close codes §7.4.1), RFC 9110 (HTTP),
-//! RFC 6585 §5 (431 for an oversized request head), unix(7) `SO_PEERCRED`.
+//! Standards: RFC 6455 (WebSocket, close codes §7.4.1, `Origin` §10.2),
+//! RFC 9110 (HTTP), RFC 6585 §5 (431 for an oversized request head),
+//! unix(7) `SO_PEERCRED`, RFC 8446 (TLS 1.3, in [`tls`]).
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -33,14 +37,18 @@ use lotse_api_types::error::ApiError;
 use lotse_api_types::frame::Hello;
 use lotse_core::clock::Clock;
 use lotse_core::task::{BoxFuture, spawn_named};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 mod connection;
+pub mod identity;
 mod listener;
 mod outbox;
+pub mod tls;
 
 pub use listener::{BindError, PeerInfo};
+pub use tls::TlsConfig;
 
 /// The largest inbound WebSocket message, and so frame: 64 KiB, enough for
 /// an SDP offer with many candidates. A frame announcing more is refused
@@ -75,7 +83,8 @@ pub const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connections accepted and not yet upgraded, at once: 8. One more is
-/// closed at accept, without a response.
+/// closed at accept, without a response. A TLS connection takes its place
+/// when it authenticates, and holds it while it waits for the serve loop.
 pub const MAX_PENDING_UPGRADES: u16 = 8;
 
 /// A control connection, numbered from one for the daemon's lifetime.
@@ -161,6 +170,8 @@ pub struct Config {
     /// `webrtc/offer`, `session/adopt`); one more is answered
     /// `limit_reached` before the handler sees it. Ended ones do not count.
     pub max_subscriptions: u32,
+    /// The mutual-TLS listener, if one is configured.
+    pub tls: Option<TlsConfig>,
 }
 
 /// What every connection shares.
@@ -192,11 +203,13 @@ impl<H> Clone for AppState<H> {
     }
 }
 
-/// The listener, bound in the main thread before the privilege drop.
+/// The listeners, bound in the main thread before the privilege drop.
 #[derive(Debug)]
 pub struct Server {
     /// The Unix socket.
     unix: std::os::unix::net::UnixListener,
+    /// The TLS listener, if configured.
+    tls: Option<tls::BoundTls>,
     /// The settings.
     config: Config,
 }
@@ -212,16 +225,29 @@ pub enum ServeError {
 impl Server {
     /// Binds the Unix socket synchronously, with the control plane's checks:
     /// no abstract namespace, a 0700 directory owned by `owner_uid`, umask
-    /// 0177 around the bind.
+    /// 0177 around the bind. With [`Config::tls`], also loads or makes the
+    /// server identity and binds the TLS listener ([`tls`]).
     pub fn bind(config: Config) -> Result<Self, BindError> {
         let unix = listener::bind_unix(&config.socket, config.owner_uid)?;
-        Ok(Self { unix, config })
+        let tls = config
+            .tls
+            .as_ref()
+            .map(|settings| tls::bind(settings, config.owner_uid))
+            .transpose()?;
+        Ok(Self { unix, tls, config })
+    }
+
+    /// The address the TLS listener is bound to, if there is one.
+    pub fn tls_local_addr(&self) -> Option<SocketAddr> {
+        self.tls
+            .as_ref()
+            .and_then(|bound| bound.listener.local_addr().ok())
     }
 
     /// Serves until `shutdown` is cancelled: then no new connections, the
-    /// ones not yet upgraded are closed, every upgraded one gets `shutdown`
-    /// and a `1001` close, and the call returns. `clock` times the upgrade
-    /// and close deadlines.
+    /// ones not yet upgraded (or still in their TLS handshake) are closed,
+    /// every upgraded one gets `shutdown` and a `1001` close, and the call
+    /// returns. `clock` times the handshake, upgrade and close deadlines.
     pub async fn serve<H: Handler>(
         self,
         handler: Arc<H>,
@@ -243,48 +269,138 @@ impl Server {
 
         let mut unix = listener::CheckedUnix::new(self.unix, allowed, Arc::clone(&clock))
             .map_err(ServeError::Register)?;
+        let pending = Arc::new(Semaphore::new(usize::from(MAX_PENDING_UPGRADES)));
+        // Each queued connection holds one of `pending`'s permits, so the
+        // queue never fills and a handshake task never waits to send.
+        let (admitted, mut authenticated) = mpsc::channel(usize::from(MAX_PENDING_UPGRADES));
+        let tls = match self.tls {
+            Some(bound) => {
+                let listener = tokio::net::TcpListener::from_std(bound.listener)
+                    .map_err(ServeError::Register)?;
+                let handshakes = tls::Handshakes {
+                    acceptor: tokio_rustls::TlsAcceptor::from(bound.config),
+                    gate: Arc::default(),
+                    clock: Arc::clone(&clock),
+                    shutdown: shutdown.clone(),
+                    upgrades: Arc::clone(&pending),
+                    admitted,
+                };
+                Some(spawn_named(
+                    "api.tls_accept",
+                    tls::accept_loop(listener, handshakes),
+                ))
+            }
+            None => None,
+        };
         let mut http = http1::Builder::new();
         // Keep-alive stays on: hyper's `Connection: close` would replace the
         // 101's `Connection: Upgrade`. The deadline bounds what a kept-alive
         // connection can send before it upgrades.
         http.max_buf_size(MAX_UPGRADE_HEADER_BYTES)
             .max_headers(MAX_UPGRADE_HEADERS);
-        let pending = Arc::new(Semaphore::new(usize::from(MAX_PENDING_UPGRADES)));
+        let admission = Admission {
+            app,
+            http,
+            pending,
+            clock,
+            shutdown: shutdown.clone(),
+        };
         tracing::info!(event = "api_listening", "control API listening");
         loop {
-            let (stream, peer) = tokio::select! {
-                accepted = unix.accept() => accepted,
+            tokio::select! {
+                (stream, peer) = unix.accept() => admission.admit(stream, peer),
+                Some(tls) = authenticated.recv() => admission.serve(tls.stream, tls.peer, tls.slot, tls.deadline),
                 () = shutdown.cancelled() => break,
-            };
-            let Ok(permit) = Arc::clone(&pending).try_acquire_owned() else {
-                tracing::warn!(
-                    uid = peer.uid,
-                    pid = ?peer.pid,
-                    max = MAX_PENDING_UPGRADES,
-                    "control connection refused: too many connections awaiting the upgrade"
-                );
-                continue;
-            };
-            let service = TowerToHyperService::new(app.clone().layer(Extension(peer.clone())));
-            let connection = http
-                .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades();
-            spawn_named(
-                "api.handshake",
-                handshake(
-                    connection,
-                    clock.sleep(UPGRADE_TIMEOUT),
-                    shutdown.clone(),
-                    peer,
-                    permit,
-                ),
-            );
+            }
         }
         drop(unix);
-        let _drained = pending.acquire_many(u32::from(MAX_PENDING_UPGRADES)).await;
+        if let Some(accepting) = tls {
+            let _stopped = accepting.await;
+            // Every handshake task holds a sender, so the channel closes
+            // once the last one has ended and closed its socket. One that
+            // authenticated meanwhile is dropped here, closed, and gives its
+            // slot back.
+            while authenticated.recv().await.is_some() {}
+        }
+        drop(authenticated);
+        let _drained = admission
+            .pending
+            .acquire_many(u32::from(MAX_PENDING_UPGRADES))
+            .await;
         tracing::info!("control API stopped accepting");
         Ok(())
     }
+}
+
+/// What every authenticated connection is served with, from either
+/// listener.
+struct Admission {
+    /// The router, with the shared state.
+    app: Router,
+    /// HTTP/1.1 with the upgrade limits.
+    http: http1::Builder,
+    /// Connections accepted and not yet upgraded.
+    pending: Arc<Semaphore>,
+    /// Times the upgrade deadline.
+    clock: Arc<dyn Clock>,
+    /// Cancelled on graceful shutdown.
+    shutdown: CancellationToken,
+}
+
+impl Admission {
+    /// Serves `stream`, whose peer is `peer`, up to its upgrade, unless
+    /// [`MAX_PENDING_UPGRADES`] connections are already waiting for theirs:
+    /// then it is closed without a response.
+    fn admit<S>(&self, stream: S, peer: PeerInfo)
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let Some(slot) = upgrade_slot(&self.pending, &peer) else {
+            return;
+        };
+        self.serve(stream, peer, slot, self.clock.sleep(UPGRADE_TIMEOUT));
+    }
+
+    /// Serves `stream`, whose peer is `peer`, up to its upgrade, in the
+    /// pending `slot` it was given, and closes it at `deadline` if it has
+    /// not upgraded by then.
+    fn serve<S>(
+        &self,
+        stream: S,
+        peer: PeerInfo,
+        slot: OwnedSemaphorePermit,
+        deadline: BoxFuture<'static, ()>,
+    ) where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let service = TowerToHyperService::new(self.app.clone().layer(Extension(peer.clone())));
+        let connection = self
+            .http
+            .serve_connection(TokioIo::new(stream), service)
+            .with_upgrades();
+        spawn_named(
+            "api.handshake",
+            handshake(connection, deadline, self.shutdown.clone(), peer, slot),
+        );
+    }
+}
+
+/// A place among the [`MAX_PENDING_UPGRADES`] connections awaiting their
+/// upgrade, from `pending`, for `peer`; `None`, logged, when there is none
+/// and the connection is to be closed without a response.
+pub(crate) fn upgrade_slot(
+    pending: &Arc<Semaphore>,
+    peer: &PeerInfo,
+) -> Option<OwnedSemaphorePermit> {
+    let slot = Arc::clone(pending).try_acquire_owned().ok();
+    if slot.is_none() {
+        tracing::warn!(
+            %peer,
+            max = MAX_PENDING_UPGRADES,
+            "control connection refused: too many connections awaiting the upgrade"
+        );
+    }
+    slot
 }
 
 /// Drives one connection from accept to the upgrade, after which the
@@ -303,21 +419,19 @@ async fn handshake<F>(
     tokio::select! {
         served = connection => {
             if let Err(err) = served {
-                tracing::debug!(uid = peer.uid, pid = ?peer.pid, error = %err, "control connection ended before the upgrade");
+                tracing::debug!(%peer, error = %err, "control connection ended before the upgrade");
             }
         }
         () = deadline => {
             let timeout_ms = UPGRADE_TIMEOUT.as_millis();
             tracing::warn!(
-                uid = peer.uid,
-                pid = ?peer.pid,
+                %peer,
                 timeout_ms,
                 "control connection closed: no upgrade before the deadline"
             );
         }
         () = shutdown.cancelled() => tracing::debug!(
-            uid = peer.uid,
-            pid = ?peer.pid,
+            %peer,
             "control connection closed before the upgrade: shutting down"
         ),
     }
@@ -409,6 +523,7 @@ mod tests {
                 allow_uid: 0,
                 max_connections,
                 max_subscriptions: 1,
+                tls: None,
             },
             connections: Arc::new(AtomicU32::new(0)),
             next_id: Arc::new(AtomicU64::new(1)),
@@ -417,12 +532,17 @@ mod tests {
         }
     }
 
-    /// `upgrade`'s answer for `state`, its status and its error code.
-    async fn answer(state: AppState<Minimal>) -> (u16, serde_json::Value) {
-        let peer = PeerInfo { uid: 0, pid: None };
+    /// `upgrade`'s answer for `state` and `headers`, its status and its
+    /// error code.
+    async fn answer_with(
+        state: AppState<Minimal>,
+        headers: axum::http::HeaderMap,
+    ) -> (u16, serde_json::Value) {
+        let peer = PeerInfo::Unix { uid: 0, pid: None };
         let response = connection::upgrade(
             axum::extract::State(state),
             Extension(peer),
+            headers,
             ws_upgrade().await,
         )
         .await;
@@ -433,6 +553,28 @@ mod tests {
         let code = serde_json::from_slice::<serde_json::Value>(&body)
             .map_or(serde_json::Value::Null, |error| error["code"].clone());
         (status, code)
+    }
+
+    /// `upgrade`'s answer for `state` to a request without `Origin`.
+    async fn answer(state: AppState<Minimal>) -> (u16, serde_json::Value) {
+        answer_with(state, axum::http::HeaderMap::new()).await
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_carrying_origin_is_refused_with_403_rfc6455_10_2() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("origin", "https://example.com".parse().unwrap());
+        let state = state(1, false);
+        let connections = Arc::clone(&state.connections);
+        assert_eq!(
+            answer_with(state, headers).await,
+            (403, ErrorCode::InvalidRequest.as_str().into())
+        );
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "no slot taken"
+        );
     }
 
     /// The upgrade handler driven directly, every check in one

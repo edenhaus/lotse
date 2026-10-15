@@ -49,6 +49,8 @@ mod worker_text;
 
 pub use handler::{Environment, FrontDoor, Identity, Supervisor};
 pub use lotse_api::Server as ApiServer;
+pub use lotse_api::TlsConfig as ControlTls;
+pub use lotse_api::identity::{IdentityError, ServerIdentity};
 
 use crate::net::demux::Demux;
 use crate::net::tcp::{IceTcpConfig, IceTcpStats};
@@ -100,6 +102,8 @@ pub struct Settings {
     pub owner_uid: u32,
     /// The peer uid allowed on the control socket.
     pub allow_uid: u32,
+    /// The control API's mutual-TLS listener, if configured.
+    pub control_tls: Option<ControlTls>,
     /// The shared WebRTC UDP socket.
     pub udp_listen: SocketAddr,
     /// The ICE-TCP listener, or `None` for `off`.
@@ -140,8 +144,8 @@ impl ShutdownReason {
 /// Why a socket could not be bound.
 #[derive(Debug, thiserror::Error)]
 pub enum BindError {
-    /// The control socket.
-    #[error("control socket: {0}")]
+    /// The control socket or the control TLS listener.
+    #[error("control API: {0}")]
     Control(#[from] lotse_api::BindError),
     /// The shared WebRTC UDP socket.
     #[error("webrtc udp socket {addr}: {source}")]
@@ -214,6 +218,7 @@ pub fn bind(settings: &Settings) -> Result<Listeners, BindError> {
             .max_sessions
             .saturating_add(settings.limits.max_streams)
             .saturating_add(1),
+        tls: settings.control_tls.clone(),
     })?;
     Ok(Listeners { api, udp, tcp })
 }
@@ -469,6 +474,7 @@ pub(crate) mod test_support {
             socket,
             owner_uid: uid,
             allow_uid: uid,
+            control_tls: None,
             udp_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             tcp_listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             limits: Limits {
