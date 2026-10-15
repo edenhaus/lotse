@@ -346,26 +346,29 @@ impl Camera {
     /// Starts MediaMTX and ffmpeg with `audio`, and waits until the path
     /// is ready with all its tracks.
     pub async fn start(audio: Audio, clock: Arc<dyn Clock>) -> Result<Self, String> {
-        Self::start_with(audio, clock, || {
+        let mut camera = Self::start_mediamtx(audio, &*clock, |_ports| {
             let mut mediamtx = command("mediamtx")?;
             mediamtx.arg(CONFIG);
             Ok(mediamtx)
         })
-        .await
+        .await?;
+        camera.publish(&*clock).await?;
+        Ok(camera)
     }
 
-    /// [`Camera::start`] with MediaMTX's command from `mediamtx`, on new
-    /// ports up to [`START_ATTEMPTS`] times while it exits before its API
-    /// answers.
-    async fn start_with(
+    /// Starts MediaMTX from the command `mediamtx` makes for the ports it
+    /// is given and waits until its API answers; on new ports, up to
+    /// [`START_ATTEMPTS`] times, while it exits before then. One that is
+    /// still running when its API times out is not started again.
+    async fn start_mediamtx(
         audio: Audio,
-        clock: Arc<dyn Clock>,
-        mut mediamtx: impl FnMut() -> io::Result<Command>,
+        clock: &dyn Clock,
+        mut mediamtx: impl FnMut(&Ports) -> io::Result<Command>,
     ) -> Result<Self, String> {
         let mut attempt = 1;
-        let mut camera = loop {
+        loop {
             let ports = Ports::free().map_err(|err| format!("free ports: {err}"))?;
-            let mut mediamtx = mediamtx().map_err(|err| format!("mediamtx: {err}"))?;
+            let mut mediamtx = mediamtx(&ports).map_err(|err| format!("mediamtx: {err}"))?;
             mediamtx.envs(ports.env());
             let mut camera = Self {
                 mediamtx: spawn(mediamtx)?,
@@ -373,8 +376,8 @@ impl Camera {
                 ports,
                 audio,
             };
-            match camera.wait_api(&*clock).await {
-                Ok(()) => break camera,
+            match camera.wait_api(clock).await {
+                Ok(()) => return Ok(camera),
                 // Exited at start: one of its ports was taken meanwhile.
                 Err(err)
                     if attempt < START_ATTEMPTS
@@ -385,9 +388,7 @@ impl Camera {
                 }
                 Err(err) => return Err(err),
             }
-        };
-        camera.publish(&*clock).await?;
-        Ok(camera)
+        }
     }
 
     /// Starts ffmpeg publishing and waits until the path is ready.
@@ -825,8 +826,7 @@ mod tests {
     #[tokio::test]
     async fn a_mediamtx_that_exits_at_start_is_started_again_on_new_ports() {
         let mut starts = 0;
-        let clock: Arc<dyn Clock> = Arc::new(lotse_core::clock::SystemClock);
-        let err = Camera::start_with(Audio::Pcmu, clock, || {
+        let err = Camera::start_mediamtx(Audio::Pcmu, &lotse_core::clock::SystemClock, |_| {
             starts += 1;
             command("false")
         })
@@ -834,5 +834,67 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("mediamtx exited"), "{err}");
         assert_eq!(starts, START_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn a_mediamtx_started_again_after_an_exit_starts() {
+        let (listening, listener) = tokio::sync::oneshot::channel();
+        let mut listening = Some(listening);
+        let mut starts = 0;
+        let start = Camera::start_mediamtx(Audio::Pcmu, &lotse_core::clock::SystemClock, |ports| {
+            starts += 1;
+            if starts == 1 {
+                return command("false");
+            }
+            // The second one stays up, and its API answers.
+            let api = TcpListener::bind((Ipv4Addr::LOCALHOST, ports.api))?;
+            listening.take().unwrap().send(api).unwrap();
+            let mut sleep = command("sleep")?;
+            sleep.arg("5");
+            Ok(sleep)
+        });
+        let serve = async {
+            let api = listener.await.unwrap();
+            api.set_nonblocking(true).unwrap();
+            let api = AsyncListener::from_std(api).unwrap();
+            let (mut stream, _) = api.accept().await.unwrap();
+            let mut request = vec![0_u8; 1024];
+            let _read = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.0 404 Not Found\r\n\r\n{}")
+                .await
+                .unwrap();
+            api.local_addr().unwrap().port()
+        };
+        let (camera, api) = tokio::join!(start, serve);
+        let camera = camera.unwrap();
+        assert_eq!(camera.ports().api, api);
+        assert_eq!(starts, 2);
+        camera.stop();
+    }
+
+    #[tokio::test]
+    async fn a_running_mediamtx_whose_api_times_out_is_not_started_again() {
+        let clock = lotse_core::clock::FakeClock::default();
+        let mut starts = 0;
+        // Nothing answers on the API's port, and the process stays up.
+        let start = Camera::start_mediamtx(Audio::Pcmu, &clock, |_| {
+            starts += 1;
+            let mut sleep = command("sleep")?;
+            sleep.arg("5");
+            Ok(sleep)
+        });
+        let advance = async {
+            loop {
+                clock.advance(POLL);
+                tokio::task::yield_now().await;
+            }
+        };
+        let err = tokio::select! {
+            result = start => result.unwrap_err(),
+            () = advance => unreachable!(),
+        };
+        assert!(err.contains("mediamtx's API"), "{err}");
+        assert_eq!(starts, 1);
     }
 }
