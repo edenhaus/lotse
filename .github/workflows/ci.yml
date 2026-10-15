@@ -577,8 +577,9 @@ jobs:
 
   # The corpora of a run on main pushed to the corpus repository, the only write to it: each
   # target's directory replaced by the one its Fuzz job minimized, so inputs that no longer add
-  # coverage go. It runs no code of this repository. The deploy key (write access to the corpus
-  # repository only) is a secret of the fuzz-corpus environment, which only main may use.
+  # coverage go. It runs no code of this repository. It pushes with a token of the lotse-bot app,
+  # whose private key is a secret of the lotse-bot environment, which only main may use; the token
+  # reaches the corpus repository only and lasts an hour.
   #
   # Runs on main overlap (each has a concurrency group of its own), so another run may have pushed
   # since this one's Fuzz jobs read the corpus. The replacement is therefore committed on the commit
@@ -591,21 +592,26 @@ jobs:
     needs: [fuzz-build, fuzz]
     if: ${{ !cancelled() && needs.fuzz.result != 'skipped' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    environment: fuzz-corpus
+    environment: lotse-bot
     permissions: {}
     concurrency:
       group: fuzz-corpus
       cancel-in-progress: false
     steps:
-      # GitHub's host key is pinned by actions/checkout (src/git-auth-helper.ts, v7.0.1, the same
-      # as `gh api meta` on 2026-10-14), and ssh-strict keeps it checked. The key stays for the
-      # push below.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          client-id: ${{ vars.LOTSE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.LOTSE_BOT_PRIVATE_KEY }}
+          repositories: lotse-fuzz-corpus
+          permission-contents: write # the push below
+      # The token stays for the push below.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.FUZZ_CORPUS_REPO }}
           ref: ${{ needs.fuzz-build.outputs.corpus }}
           path: corpus
-          ssh-key: ${{ secrets.FUZZ_CORPUS_DEPLOY_KEY }}
+          token: ${{ steps.app.outputs.token }}
           persist-credentials: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -888,12 +894,15 @@ jobs:
 
   # A change to the API schema on main asks lotse-clients to sync it: its sync-schema.yml opens or
   # updates a PR with the schema and the regenerated models, whose CI runs the contract tests
-  # against this commit.
+  # against this commit. The lotse-bot app's private key is a secret of the lotse-bot environment,
+  # which only main may use.
   clients:
     name: Ask lotse-clients to sync the schema
     needs: changes
     if: github.event_name == 'push' && needs.changes.outputs.schema == 'true'
     runs-on: ubuntu-latest
+    environment: lotse-bot
+    permissions: {}
     # The newest schema is the one to sync; lotse-clients' run supersedes an older one anyway.
     concurrency:
       group: clients
