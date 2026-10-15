@@ -590,6 +590,11 @@ fn timestamps(events: &[Event]) -> Vec<i64> {
     units(events, 0).iter().map(|unit| unit.ts).collect()
 }
 
+/// ADTS frame `n` of `adts`.
+fn adts_frame(adts: &[u8], n: usize) -> &[u8] {
+    &adts_frames(adts, n + 1)[adts_frames(adts, n).len()..]
+}
+
 #[test]
 fn iso13818_1_2_4_3_7_adts_timestamps_restart_only_half_a_frame_or_more_away() {
     let mut ctx = audio_ctx(false);
@@ -619,10 +624,7 @@ fn iso13818_1_2_4_3_7_adts_timestamps_restart_only_half_a_frame_or_more_away() {
 /// the ones before it in the later packet, keep the earlier PTS.
 #[test]
 fn iso13818_1_2_4_3_7_a_frame_split_across_pes_packets_keeps_the_pts_of_the_one_it_begins_in() {
-    let frame = |n: usize| {
-        let frames = adts_frames(SINE_48K_MONO, n + 1);
-        &frames[adts_frames(SINE_48K_MONO, n).len()..]
-    };
+    let frame = |n: usize| adts_frame(SINE_48K_MONO, n);
     // Frame 0 begins in a packet with a PTS and ends in one without.
     let mut ctx = audio_ctx(false);
     feed(&mut ctx, &frame(0)[..8], Some(0));
@@ -645,6 +647,33 @@ fn iso13818_1_2_4_3_7_a_frame_split_across_pes_packets_keeps_the_pts_of_the_one_
     assert_eq!(timestamps(&ctx.events), [0, 1_024, 2_666, 3_690]);
     assert_eq!(ctx.stats.audio_reanchors, 1);
     assert_eq!(ctx.stats.dropped_untimed, 0);
+}
+
+/// A PES packet's PTS waits (ISO/IEC 13818-1 §2.4.3.7) only while the
+/// frame it times has not come: past the last frame its packet ends, it
+/// times that frame in the packet that ends it; once the frame came, it
+/// times nothing more, not even a frame whose new configuration left
+/// nothing to count from.
+#[test]
+fn iso13818_1_2_4_3_7_a_pts_waits_only_while_its_frame_has_not_come() {
+    let frame = |n: usize| adts_frame(SINE_48K_MONO, n);
+    let mut ctx = audio_ctx(false);
+    let mut first = frame(0).to_vec();
+    first.extend_from_slice(&frame(1)[..8]);
+    feed(&mut ctx, &first, Some(0));
+    // Frame 1 ends where frame 2 begins, under a PTS 2 666 samples in.
+    let mut second = frame(1)[8..].to_vec();
+    second.extend_from_slice(&frame(2)[..8]);
+    feed(&mut ctx, &second, Some(5_000));
+    assert_eq!(timestamps(&ctx.events), [0, 1_024]);
+    // Frame 2 ends in a packet without a PTS: the kept one times it.
+    feed(&mut ctx, &frame(2)[8..], None);
+    assert_eq!(timestamps(&ctx.events), [0, 1_024, 2_666]);
+    assert_eq!(ctx.stats.audio_reanchors, 1);
+    // A 16 kHz frame without a PTS: frame 2's PTS is spent.
+    feed(&mut ctx, adts_frame(SINE_16K_MONO, 0), None);
+    assert_eq!(timestamps(&ctx.events), [0, 1_024, 2_666]);
+    assert_eq!(ctx.stats.dropped_untimed, 1);
 }
 
 #[test]
