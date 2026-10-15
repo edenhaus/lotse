@@ -227,7 +227,11 @@ impl AdtsSplitter {
     /// `out`) or in a later push: the frame a PES PTS on `data` times
     /// (ISO/IEC 13818-1 §2.4.3.7, the first access unit that commences
     /// in the packet). A frame that begins out of sync is named only
-    /// once the syncword after it confirms it, so only when it ends.
+    /// once the syncword after it confirms it, so only when it ends. A
+    /// header named on its first bytes may prove unreadable once the
+    /// rest comes; it is skipped, and the frame that does begin later
+    /// takes its sequence and is named again: names never go back, but
+    /// one may repeat.
     pub fn push(&mut self, data: &[u8], out: &mut Vec<AdtsFrame>) -> Option<u64> {
         let carried = self.pending.len();
         let mut buffer = std::mem::take(&mut self.pending);
@@ -450,6 +454,27 @@ mod tests {
             let (first, out) = push(&mut splitter, &a[cut..]);
             assert_eq!((first, sequences(&out)), (None, vec![0]));
         }
+    }
+
+    #[test]
+    fn iso13818_1_2_4_3_7_a_named_header_that_proves_unreadable_names_its_sequence_again() {
+        // A CRC header cut before its CRC is named; its sampling
+        // frequency index 0xf, the escape to an explicit frequency
+        // (ISO/IEC 14496-3 §1.6.3.3) that an ADTS header has no room for,
+        // which adts-reader 0.4.0 checks only once the CRC is there,
+        // makes it no frame.
+        let bad = adts(LC, 0xf, MONO, true, 1, b"zz");
+        let mut data = bad[7..].to_vec();
+        data.extend(lc(b"real"));
+        data.extend(lc(b"next"));
+        let mut splitter = AdtsSplitter::new(LIMIT);
+        assert_eq!(push(&mut splitter, &bad[..7]), (Some(0), Vec::new()));
+        // The frame that does begin takes the sequence named for it.
+        let (first, out) = push(&mut splitter, &data);
+        assert_eq!(first, Some(0));
+        assert_eq!(payloads(&out), vec![&b"real"[..], b"next"]);
+        assert_eq!(sequences(&out), vec![0, 1]);
+        assert_eq!(splitter.stats().skipped_bytes, bad.len() as u64);
     }
 
     #[test]

@@ -28,8 +28,10 @@ fuzz_target!(|data: &[u8]| {
         let before = frames.len();
         let anchor = pieces.push(piece, &mut frames);
         if let Some(anchor) = anchor {
+            // A header named on its first bytes that proves unreadable
+            // leaves its sequence to the next frame, which names it again.
             assert!(
-                last_anchor.is_none_or(|last| anchor > last),
+                last_anchor.is_none_or(|last| anchor >= last),
                 "anchors go back"
             );
             last_anchor = Some(anchor);
