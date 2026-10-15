@@ -612,23 +612,33 @@ impl Camera {
     }
 
     /// The API's view of the path (`GET /v3/paths/get/cam`): its tracks,
-    /// readers and byte counts; `None` while nobody publishes.
+    /// readers and byte counts; `None` while nobody publishes. A path
+    /// being torn down answers HTTP 500 with the error `terminated`
+    /// (observed of MediaMTX v1.21.1 on 2026-10-15, polled right after
+    /// ffmpeg was killed): nobody publishes it either.
     pub async fn path(&self) -> Result<Option<Value>, String> {
-        self.api(&format!("/v3/paths/get/{PATH}")).await
+        let endpoint = format!("/v3/paths/get/{PATH}");
+        let (status, body) = get(self.api_address(), &endpoint).await?;
+        let terminated = status == 500
+            && serde_json::from_str::<Value>(&body).is_ok_and(|answer| {
+                answer.get("error").and_then(Value::as_str) == Some("terminated")
+            });
+        if terminated {
+            return Ok(None);
+        }
+        json_answer(&endpoint, status, &body)
     }
 
     /// `GET` of the API's `endpoint` (`/v3/rtspsessions/list`) as JSON;
     /// `None` on 404.
     pub async fn api(&self, endpoint: &str) -> Result<Option<Value>, String> {
-        let api = SocketAddr::from((Ipv4Addr::LOCALHOST, self.ports.api));
-        let (status, body) = get(api, endpoint).await?;
-        match status {
-            200 => serde_json::from_str(&body)
-                .map(Some)
-                .map_err(|err| format!("{endpoint}: {err}: {body}")),
-            404 => Ok(None),
-            _ => Err(format!("{endpoint}: HTTP {status}: {body}")),
-        }
+        let (status, body) = get(self.api_address(), endpoint).await?;
+        json_answer(endpoint, status, &body)
+    }
+
+    /// Where the API listens.
+    fn api_address(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, self.ports.api))
     }
 
     /// Fails when a process has exited.
@@ -801,6 +811,18 @@ pub fn ready_with(path: &Value, audio: Audio) -> bool {
         .chain(audio.mediamtx_codec())
         .collect();
     path.get("ready").and_then(Value::as_bool) == Some(true) && codecs == wanted
+}
+
+/// The JSON of an API answer: `None` on 404, an error naming `endpoint`
+/// on any status but 200 or on a body that is not JSON.
+fn json_answer(endpoint: &str, status: u16, body: &str) -> Result<Option<Value>, String> {
+    match status {
+        200 => serde_json::from_str(body)
+            .map(Some)
+            .map_err(|err| format!("{endpoint}: {err}: {body}")),
+        404 => Ok(None),
+        _ => Err(format!("{endpoint}: HTTP {status}: {body}")),
+    }
 }
 
 /// `GET path` over HTTP/1.0 (RFC 1945 §5, §6): the status and the body,
@@ -990,6 +1012,8 @@ mod tests {
                 "HTTP/1.0 404 Not Found\r\n\r\n{}",
                 "HTTP/1.0 500 Oops\r\n\r\nbroken",
                 "HTTP/1.0 200 OK\r\n\r\nnot json",
+                "HTTP/1.0 500 Internal Server Error\r\n\r\n{\"status\":\"error\",\"error\":\"terminated\"}",
+                "HTTP/1.0 500 Internal Server Error\r\n\r\n{\"status\":\"error\",\"error\":\"other\"}",
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = vec![0_u8; 1024];
@@ -1021,6 +1045,9 @@ mod tests {
             assert_eq!(camera.path().await.unwrap(), None);
             assert!(camera.path().await.unwrap_err().contains("HTTP 500"));
             assert!(camera.path().await.unwrap_err().contains("not json"));
+            // A path being torn down (MediaMTX v1.21.1): nobody publishes.
+            assert_eq!(camera.path().await.unwrap(), None);
+            assert!(camera.path().await.unwrap_err().contains("other"));
             camera.stop();
         };
         tokio::join!(serve, client);
@@ -1034,6 +1061,8 @@ mod tests {
             for answer in [
                 "HTTP/1.0 200 OK\r\n\r\n{\"ready\":true}",
                 "HTTP/1.0 200 OK\r\n\r\n{\"ready\":false}",
+                "HTTP/1.0 200 OK\r\n\r\n{\"ready\":true}",
+                "HTTP/1.0 500 Internal Server Error\r\n\r\n{\"status\":\"error\",\"error\":\"terminated\"}",
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = vec![0_u8; 1024];
@@ -1065,6 +1094,8 @@ mod tests {
                 .unwrap_err();
             assert!(err.contains("ffmpeg is not running"), "{err}");
             // Ready once, then not: gone.
+            camera.wait_gone(&*clock).await.unwrap();
+            // Ready once, then being torn down: gone as well.
             camera.wait_gone(&*clock).await.unwrap();
             camera.stop();
         };
