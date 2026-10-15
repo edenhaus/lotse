@@ -90,7 +90,20 @@ pub struct OnvifEndpoint {
 pub struct RtspOptions {
     /// `tcp` (default) or `udp`.
     pub transport: Transport,
-    /// Request the ONVIF backchannel if offered (M4).
+    /// Ask the camera for its ONVIF backchannel, two-way audio's path to
+    /// its speaker: the `DESCRIBE` carries `Require:
+    /// www.onvif.org/ver20/backchannel` (ONVIF Streaming Specification
+    /// §5.3.1) and the backchannel is set up when offered. Off by default:
+    /// the client knows which cameras talk back and opts a stream in, so a
+    /// camera without one never sees the header. Not part of the
+    /// connection key ([`Self::connection_key`]): the connection a stream
+    /// shares asks iff one of its streams does, an opt-in restarts a
+    /// connection running without it once, and the last opt-out takes
+    /// effect when the connection next connects. On a stream that opts in,
+    /// a session whose offer requests talk-back is never played without
+    /// it: one the backchannel cannot serve closes with
+    /// `backchannel_unavailable`, and one offered while the connection
+    /// restarts to ask is answered once the restart resolved.
     pub backchannel: bool,
     /// Keyframe requests through ONVIF.
     pub onvif_keyframe: OnvifKeyframe,
@@ -114,7 +127,7 @@ impl Default for RtspOptions {
     fn default() -> Self {
         Self {
             transport: Transport::Tcp,
-            backchannel: true,
+            backchannel: false,
             onvif_keyframe: OnvifKeyframe::Auto,
             onvif: None,
             tls_fingerprint: None,
@@ -148,7 +161,8 @@ impl RtspOptions {
     /// every field with its default applied, so `{}` and the defaults
     /// spelled out are one key, minus `backchannel`, which is deliberately
     /// not in the key so enabling talk-back never opens a second camera
-    /// session.
+    /// session: the supervisor asks for the backchannel on the shared
+    /// connection when one of its streams does.
     pub fn connection_key(&self) -> serde_json::Value {
         let mut key = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
         if let Some(fields) = key.as_object_mut() {
@@ -182,17 +196,19 @@ mod tests {
         let defaults = RtspOptions::parse(&serde_json::Value::Null).unwrap();
         assert_eq!(defaults, RtspOptions::default());
         assert_eq!(defaults.timeout_ms, 10_000);
-        assert!(defaults.backchannel);
+        assert!(!defaults.backchannel, "opt-in");
         assert_eq!(defaults.user_agent(), DEFAULT_USER_AGENT);
         assert_eq!(RtspOptions::parse(&json!({})).unwrap(), defaults);
         let full = RtspOptions::parse(&json!({
-            "transport": "udp", "backchannel": false, "onvif_keyframe": "off",
+            "transport": "udp", "backchannel": true, "onvif_keyframe": "off",
             "onvif": { "url": "http://cam/onvif/device_service", "profile_token": "p0" },
             "tls_fingerprint": PIN, "insecure_tls": true, "timeout_ms": 5000,
             "user_agent": "test/1"
         }))
         .unwrap();
         assert_eq!(full.transport, Transport::Udp);
+        assert!(full.backchannel);
+        assert_eq!(full.redacted()["backchannel"], true);
         assert_eq!(full.onvif_keyframe, OnvifKeyframe::Off);
         assert_eq!(full.onvif.as_ref().unwrap().profile_token, "p0");
         assert_eq!(full.user_agent(), "test/1");
@@ -269,6 +285,7 @@ mod tests {
             json!({ "timeout_ms": 10_000, "transport": "tcp" }),
             json!({ "transport": "tcp", "timeout_ms": 10_000, "insecure_tls": false }),
             json!({ "backchannel": false }),
+            json!({ "backchannel": true }),
         ] {
             assert_eq!(key(same.clone()), defaults, "{same}");
         }

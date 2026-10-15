@@ -158,6 +158,14 @@ pub struct Unsubscribe {
 
 /// `webrtc/offer`: opens a session; the subscription's events carry the
 /// whole signaling conversation.
+///
+/// The answer comes once the source is live. An offer that requests
+/// two-way audio on a stream that opted in to the camera's backchannel is
+/// answered from the camera's backchannel as the live source offers it:
+/// sent right after a `stream/put` that opted in a connection running
+/// without it, it waits for the connection's restart to ask for it, and
+/// fails with `closed` `backchannel_unavailable` when that restart fails
+/// or the camera offers none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WebrtcOffer {
@@ -219,6 +227,27 @@ pub struct SessionRef {
 pub struct SessionListCommand {
     /// The command id.
     pub id: u64,
+}
+
+/// `backchannel/release`: frees the camera's backchannel from whichever
+/// session holds it, or only from `session_id`, so the next session to
+/// send claims it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BackchannelRelease {
+    /// The command id.
+    pub id: u64,
+    /// The stream whose camera's backchannel to free.
+    pub stream_id: String,
+    /// Free it only if this session holds it when the worker handles the
+    /// release, checked atomically against a claim, so a viewer that
+    /// stops talking never frees the backchannel another session claimed
+    /// in the meantime; a release that finds another talker, or none,
+    /// changes nothing. Absent, it is freed from whichever session holds
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = ID_PATTERN))]
+    pub session_id: Option<String>,
 }
 
 /// Every command, tagged by `type`. Each variant's schema title names the
@@ -311,6 +340,11 @@ pub enum Command {
     #[serde(rename = "session/adopt")]
     #[schemars(title = "SessionAdoptCommand")]
     SessionAdopt(SessionRef),
+    /// `backchannel/release`: frees the camera's backchannel from its
+    /// talker, or only from the session given.
+    #[serde(rename = "backchannel/release")]
+    #[schemars(title = "BackchannelReleaseCommand")]
+    BackchannelRelease(BackchannelRelease),
 }
 
 impl Command {
@@ -335,6 +369,7 @@ impl Command {
         "session/list",
         "session/close",
         "session/adopt",
+        "backchannel/release",
     ];
 
     /// The command's id.
@@ -357,6 +392,7 @@ impl Command {
             Self::WebrtcCandidate(c) => c.id,
             Self::SessionGet(c) | Self::SessionClose(c) | Self::SessionAdopt(c) => c.id,
             Self::SessionList(c) => c.id,
+            Self::BackchannelRelease(c) => c.id,
         }
     }
 
@@ -382,6 +418,7 @@ impl Command {
             Self::SessionList(_) => "session/list",
             Self::SessionClose(_) => "session/close",
             Self::SessionAdopt(_) => "session/adopt",
+            Self::BackchannelRelease(_) => "backchannel/release",
         }
     }
 }
@@ -565,7 +602,14 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             cap_chars("session_id", &session.session_id, MAX_ID_CHARS)?;
         }
         Command::StreamGet(StreamGet { stream_id, .. })
-        | Command::StreamDelete(StreamDelete { stream_id, .. }) => cap_stream_id(stream_id)?,
+        | Command::StreamDelete(StreamDelete { stream_id, .. }) => {
+            cap_stream_id(stream_id)?;
+        }
+        Command::BackchannelRelease(release) => {
+            cap_stream_id(&release.stream_id)?;
+            let session_id = release.session_id.as_deref().unwrap_or_default();
+            cap_chars("session_id", session_id, MAX_ID_CHARS)?;
+        }
         Command::StreamSubscribe(subscribe) => {
             cap_stream_id(subscribe.stream_id.as_deref().unwrap_or_default())?;
         }
@@ -652,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn every_command_parses_from_the_contract_shape() {
+    fn stream_put_parses_from_the_contract_shape() {
         let put = parse_command(
             r#"{ "id": 3, "type": "stream/put", "stream_id": "front",
                  "sources": [ { "url": "rtsp://user:pass@192.168.1.10:554/h264",
@@ -668,7 +712,10 @@ mod tests {
         );
         assert_eq!(put.sources[0].options["transport"], "tcp");
         assert_eq!(put.orientation, Orientation::RotateLeft);
+    }
 
+    #[test]
+    fn every_command_parses_from_the_contract_shape() {
         let cases = [
             (r#"{"id":1,"type":"ping"}"#, "ping"),
             (r#"{"id":2,"type":"info"}"#, "info"),
@@ -713,10 +760,14 @@ mod tests {
                 r#"{"id":16,"type":"session/adopt","session_id":"s"}"#,
                 "session/adopt",
             ),
-            (r#"{"id":17,"type":"pairing/create"}"#, "pairing/create"),
-            (r#"{"id":18,"type":"clients/list"}"#, "clients/list"),
             (
-                r#"{"id":19,"type":"clients/remove","pin":"00"}"#,
+                r#"{"id":17,"type":"backchannel/release","stream_id":"front"}"#,
+                "backchannel/release",
+            ),
+            (r#"{"id":18,"type":"pairing/create"}"#, "pairing/create"),
+            (r#"{"id":19,"type":"clients/list"}"#, "clients/list"),
+            (
+                r#"{"id":20,"type":"clients/remove","pin":"00"}"#,
                 "clients/remove",
             ),
         ];
@@ -755,6 +806,41 @@ mod tests {
             .unwrap()
         );
         assert_eq!((candidate.sdp_mid, candidate.sdp_mline_index), (None, None));
+    }
+
+    #[test]
+    fn a_release_frees_whoever_holds_the_backchannel_or_only_the_session_it_names() {
+        let_assert!(
+            Command::BackchannelRelease(release) =
+                parse_command(r#"{"id":1,"type":"backchannel/release","stream_id":"x"}"#).unwrap()
+        );
+        assert_eq!(release.session_id, None);
+        let conditional = parse_command(
+            r#"{"id":2,"type":"backchannel/release","stream_id":"x","session_id":"s1"}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&conditional).unwrap();
+        assert_eq!(json["session_id"], "s1");
+        assert_eq!(
+            serde_json::from_value::<Command>(json).unwrap(),
+            conditional
+        );
+        let_assert!(Command::BackchannelRelease(release) = conditional);
+        assert_eq!(
+            (release.stream_id.as_str(), release.session_id.as_deref()),
+            ("x", Some("s1"))
+        );
+        // Unconditional, it serializes without the field.
+        let json = serde_json::to_value(Command::BackchannelRelease(BackchannelRelease {
+            id: 3,
+            stream_id: "x".into(),
+            session_id: None,
+        }))
+        .unwrap();
+        assert_eq!(
+            json,
+            json!({ "id": 3, "type": "backchannel/release", "stream_id": "x" })
+        );
     }
 
     /// `frame` parsed, or the field and message of its refusal; the
@@ -850,6 +936,13 @@ mod tests {
                 "{kind}"
             );
         }
+        // So is the session a release is conditional on.
+        let release_as = |n| json!({ "id": 1, "type": "backchannel/release", "stream_id": "a", "session_id": text(n) });
+        assert!(limited(&release_as(MAX_ID_CHARS)).is_ok());
+        assert_eq!(
+            limited(&release_as(MAX_ID_CHARS + 1)).unwrap_err().0,
+            "session_id"
+        );
         // The offer's own session id is capped like the looked-up ones.
         let offer_as = |n| json!({ "id": 1, "type": "webrtc/offer", "stream_id": "a", "session_id": text(n), "sdp": "v=0" });
         assert!(limited(&offer_as(MAX_ID_CHARS)).is_ok());
@@ -869,6 +962,7 @@ mod tests {
                 json!({ "id": 1, "type": "stream/delete", "stream_id": id(n) }),
                 json!({ "id": 1, "type": "stream/subscribe", "stream_id": id(n) }),
                 json!({ "id": 1, "type": "webrtc/offer", "stream_id": id(n), "sdp": "v=0" }),
+                json!({ "id": 1, "type": "backchannel/release", "stream_id": id(n), "session_id": "s" }),
             ]
         };
         for frame in frames(MAX_ID_CHARS) {
@@ -1008,6 +1102,21 @@ mod tests {
         );
         assert!(err.error.message.contains("extra"), "{}", err.error.message);
         assert_eq!(err.error.details["type"], "ping");
+
+        // A release names its session as `session_id`, nothing else.
+        let err = parse_command(
+            r#"{"id": 9, "type": "backchannel/release", "stream_id": "x", "session": "s"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            (err.id, err.error.code),
+            (Some(9), ErrorCode::InvalidRequest)
+        );
+        assert!(
+            err.error.message.starts_with("unknown field `session`"),
+            "{}",
+            err.error.message
+        );
 
         let err = parse_command(r#"{"id": 7, "type": "stream/get"}"#).unwrap_err();
         assert!(

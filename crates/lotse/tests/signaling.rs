@@ -42,9 +42,9 @@ use lotse_supervisor::net::turn_client::TurnClient;
 use lotse_supervisor::net::udp::{bind_tcp, bind_udp};
 use lotse_supervisor::worker::WorkerConfig;
 use lotse_supervisor::{Environment, FrontDoor, Identity, Limits, Settings, Supervisor};
-use lotse_testing::fake_camera::Stats;
+use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel, Stats};
 use lotse_testing::fake_turn::{FakeTurn, FakeTurnServer};
-use lotse_testing::viewer::{Outgoing, Viewer};
+use lotse_testing::viewer::{Outgoing, TalkbackOffer, Viewer};
 use lotse_testing::{CameraConfig, FakeCamera};
 use serde_json::{Value, json};
 use tokio::net::UdpSocket;
@@ -400,6 +400,320 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
     demux.stop();
     stop_tcp.cancel();
     cam.stop().await;
+}
+
+/// `stream/get` of `stream_id` once `done` holds for it, looked at every
+/// 50 ms for up to ten seconds.
+async fn stream_where(s: &Supervisor, stream_id: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let get = json!({ "id": 9, "type": "stream/get", "stream_id": stream_id });
+    for _ in 0..200 {
+        let stream = result(call(s, 1, &get).await);
+        if done(&stream) {
+            return stream;
+        }
+        clock().sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "{stream_id} never got there: {}",
+        result(call(s, 1, &get).await)
+    );
+}
+
+/// Talk-back is opt-in (ONVIF Streaming Specification §5.3.1): a stream
+/// without `backchannel` describes its camera without the `Require`
+/// header, and no backchannel is offered. Put again with `backchannel:
+/// true`, the same stream keeps its connection, which restarts its source
+/// once: exactly one more `DESCRIBE`, carrying `Require`, the old session
+/// torn down before the new one plays, so the camera never serves two at
+/// once, and the backchannel is offered from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_1_opting_in_restarts_the_connection_once_with_the_require_header() {
+    let cam = FakeCamera::start(
+        CameraConfig {
+            backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+            ..CameraConfig::default()
+        },
+        clock(),
+    )
+    .await
+    .expect("camera");
+    let Daemon {
+        supervisor: s,
+        demux,
+        stop_tcp,
+        ..
+    } = supervisor();
+    let put = |id: u64, options: Value| {
+        json!({ "id": id, "type": "stream/put", "stream_id": "door", "preload": true,
+                "sources": [{ "url": cam.url(), "options": options }] })
+    };
+    let stats = cam.stats();
+    result(call(&s, 1, &put(1, json!({}))).await);
+    let door = stream_where(&s, "door", |door| door["state"] == "live").await;
+    assert_eq!(door["sources"][0]["backchannel"], Value::Null);
+    assert_eq!(Stats::get(&stats.describes), 1);
+    assert_eq!(
+        Stats::get(&stats.backchannel_describes),
+        0,
+        "no Require without opting in"
+    );
+
+    let answer = result(call(&s, 1, &put(2, json!({ "backchannel": true }))).await);
+    assert_eq!(answer["created"], false);
+    let door = stream_where(&s, "door", |door| {
+        door["sources"][0]["backchannel"]["codec"] == "pcmu"
+    })
+    .await;
+    assert_eq!(door["sources"][0]["backchannel"]["state"], "available");
+    assert_eq!(door["sources"][0]["connection"]["id"], "c1");
+    assert_eq!(door["state"], "live");
+    assert_eq!(Stats::get(&stats.describes), 2, "exactly one reconnect");
+    assert_eq!(
+        Stats::get(&stats.backchannel_describes),
+        1,
+        "its DESCRIBE carries Require"
+    );
+    assert_eq!(Stats::get(&stats.require_rejected), 0);
+    assert_eq!(Stats::get(&stats.backchannel_setups), 1);
+    assert_eq!(Stats::get(&stats.teardowns), 1, "the old session");
+    assert_eq!(
+        Stats::get(&stats.max_playing),
+        1,
+        "one camera session at a time"
+    );
+    // The same put again changes nothing.
+    result(call(&s, 1, &put(3, json!({ "backchannel": true }))).await);
+    clock().sleep(Duration::from_millis(500)).await;
+    assert_eq!(Stats::get(&stats.describes), 2);
+
+    s.shutdown().await;
+    demux.stop();
+    stop_tcp.cancel();
+    cam.stop().await;
+}
+
+/// A viewer that offers talk-back in `shape` (a `sendonly` or `sendrecv`
+/// audio m-line), as `session_id` on `stream_id`.
+struct Talker {
+    viewer: Viewer,
+    socket: UdpSocket,
+    events: mpsc::Receiver<Event>,
+    seen: Vec<Value>,
+}
+
+impl Talker {
+    /// Offers, as a client relays a browser's offer.
+    async fn offer(
+        s: &Supervisor,
+        stream_id: &str,
+        session_id: &str,
+        shape: TalkbackOffer,
+    ) -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("viewer socket");
+        lotse_webrtc::install_crypto_provider();
+        let viewer = Viewer::new_with_talkback(socket.local_addr().unwrap(), clock().now(), shape)
+            .expect("a viewer");
+        let events = subscription(
+            call(
+                s,
+                1,
+                &json!({ "id": 20, "type": "webrtc/offer", "stream_id": stream_id,
+                         "session_id": session_id, "sdp": viewer.offer() }),
+            )
+            .await,
+        );
+        Self {
+            viewer,
+            socket,
+            events,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Drives it until it connects or its session closes; the `closed`
+    /// event's code and message, if it closed.
+    async fn settle(&mut self) -> Option<(String, String)> {
+        drive(
+            &mut self.viewer,
+            &self.socket,
+            &mut self.events,
+            &mut self.seen,
+            relay_signaling,
+            |seen, viewer| viewer.is_connected() || seen.iter().any(|e| e["type"] == "closed"),
+        )
+        .await;
+        self.seen.iter().find(|e| e["type"] == "closed").map(|e| {
+            (
+                e["code"].as_str().unwrap().to_owned(),
+                e["message"].as_str().unwrap().to_owned(),
+            )
+        })
+    }
+}
+
+/// `session/get`'s `backchannel` of `session_id`.
+async fn session_backchannel(s: &Supervisor, session_id: &str) -> Value {
+    result(
+        call(
+            s,
+            1,
+            &json!({ "id": 21, "type": "session/get", "session_id": session_id }),
+        )
+        .await,
+    )["backchannel"]
+        .clone()
+}
+
+/// A client opts a stream in to the camera's backchannel while its
+/// connection plays without it, and offers talk-back right after the put's
+/// result, as a client does: the offer waits for the connection's restart
+/// (ONVIF Streaming Specification §5.3.1) and its answer negotiates
+/// talk-back in the camera's codec from the restarted source, rather than
+/// opening on the source without the backchannel. A session already
+/// playing is not held and keeps playing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_1_an_offer_right_after_the_opt_in_negotiates_talk_back_from_the_restarted_source()
+ {
+    let cam = FakeCamera::start(
+        CameraConfig {
+            fps: 30,
+            gop: 10,
+            backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+            ..CameraConfig::default()
+        },
+        clock(),
+    )
+    .await
+    .expect("camera");
+    let Daemon {
+        supervisor: s,
+        demux,
+        stop_tcp,
+        ..
+    } = supervisor();
+    let put = |id: u64, options: Value| {
+        json!({ "id": id, "type": "stream/put", "stream_id": "door",
+                "sources": [{ "url": cam.url(), "options": options }] })
+    };
+    result(call(&s, 1, &put(1, json!({}))).await);
+    let mut before = Talker::offer(&s, "door", "before", TalkbackOffer::Dedicated).await;
+    assert_eq!(before.settle().await, None);
+    assert_eq!(session_backchannel(&s, "before").await["negotiated"], false);
+
+    result(call(&s, 1, &put(2, json!({ "backchannel": true }))).await);
+    let mut talker = Talker::offer(&s, "door", "talk", TalkbackOffer::Dedicated).await;
+    assert_eq!(talker.settle().await, None, "{:?}", talker.seen);
+    let backchannel = session_backchannel(&s, "talk").await;
+    assert_eq!(backchannel["negotiated"], true, "{backchannel}");
+    assert_eq!(backchannel["codec"], "pcmu", "{backchannel}");
+    assert_eq!(
+        talker.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::SendOnly)
+    );
+    assert_eq!(Stats::get(&cam.stats().describes), 2, "restarted once");
+    // The session that played before was not held, nor closed.
+    let packets = before.viewer.packets().len();
+    drive(
+        &mut before.viewer,
+        &before.socket,
+        &mut before.events,
+        &mut before.seen,
+        relay_signaling,
+        |seen, viewer| {
+            viewer.packets().len() >= packets + 30 || seen.iter().any(|e| e["type"] == "closed")
+        },
+    )
+    .await;
+    assert!(
+        before.seen.iter().all(|e| e["type"] != "closed"),
+        "{:?}",
+        before.seen
+    );
+
+    s.shutdown().await;
+    demux.stop();
+    stop_tcp.cancel();
+    cam.stop().await;
+}
+
+/// The talk-back request of a stream that opted in is met from the live
+/// source's backchannel or fails with `backchannel_unavailable`, never
+/// played without it; one of a stream that did not opt in plays without.
+/// A cold start decides once the source is live, as the camera offers its
+/// backchannel then: a camera with one negotiates, a camera without one
+/// (which ignores the `Require` tag, ONVIF Streaming Specification §5.3.1)
+/// fails it, with a `sendonly` and a `sendrecv` request alike
+/// (RFC 8866 §6.7); so does an opt-in that restarts a live connection to a
+/// camera without one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_1_a_talk_back_request_on_an_opted_in_stream_is_met_or_fails_with_backchannel_unavailable()
+ {
+    let config = |backchannel: bool| CameraConfig {
+        fps: 30,
+        gop: 10,
+        backchannel: backchannel.then(|| CameraBackchannel::new(BackchannelCodec::Pcmu)),
+        ..CameraConfig::default()
+    };
+    let talking = FakeCamera::start(config(true), clock())
+        .await
+        .expect("camera");
+    let mute = FakeCamera::start(config(false), clock())
+        .await
+        .expect("camera");
+    let plain = FakeCamera::start(config(false), clock())
+        .await
+        .expect("camera");
+    let Daemon {
+        supervisor: s,
+        demux,
+        stop_tcp,
+        ..
+    } = supervisor();
+    let put = |id: u64, stream_id: &str, cam: &FakeCamera, options: Value| {
+        json!({ "id": id, "type": "stream/put", "stream_id": stream_id,
+                "sources": [{ "url": cam.url(), "options": options }] })
+    };
+    let opted_in = json!({ "backchannel": true });
+    result(call(&s, 1, &put(1, "talking", &talking, opted_in.clone())).await);
+    result(call(&s, 1, &put(2, "mute", &mute, opted_in.clone())).await);
+    result(call(&s, 1, &put(3, "plain", &plain, json!({}))).await);
+    let unavailable = Some((
+        "backchannel_unavailable".to_owned(),
+        "two-way audio unavailable: the camera offers no backchannel".to_owned(),
+    ));
+
+    let mut talker = Talker::offer(&s, "talking", "t1", TalkbackOffer::Dedicated).await;
+    assert_eq!(talker.settle().await, None, "{:?}", talker.seen);
+    assert_eq!(session_backchannel(&s, "t1").await["negotiated"], true);
+    for shape in [TalkbackOffer::Dedicated, TalkbackOffer::SendRecv] {
+        let id = format!("m-{shape:?}");
+        let mut talker = Talker::offer(&s, "mute", &id, shape).await;
+        assert_eq!(talker.settle().await, unavailable, "{shape:?}");
+        assert!(
+            talker.seen.iter().all(|e| e["type"] != "answer"),
+            "{shape:?}"
+        );
+    }
+    // Not opted in: answered without talk-back, the m-line `inactive`.
+    let mut talker = Talker::offer(&s, "plain", "p1", TalkbackOffer::Dedicated).await;
+    assert_eq!(talker.settle().await, None, "{:?}", talker.seen);
+    assert_eq!(session_backchannel(&s, "p1").await["negotiated"], false);
+    assert_eq!(
+        talker.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::Inactive)
+    );
+    // Opted in while live: the restarted source has no backchannel either.
+    result(call(&s, 1, &put(4, "plain", &plain, opted_in)).await);
+    let mut late = Talker::offer(&s, "plain", "p2", TalkbackOffer::Dedicated).await;
+    assert_eq!(late.settle().await, unavailable, "{:?}", late.seen);
+    assert_eq!(Stats::get(&plain.stats().describes), 2, "restarted once");
+
+    s.shutdown().await;
+    demux.stop();
+    stop_tcp.cancel();
+    for cam in [talking, mute, plain] {
+        cam.stop().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

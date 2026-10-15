@@ -1402,6 +1402,7 @@ dependencies = [
  "lotse-api-types",
  "lotse-codec",
  "lotse-core",
+ "lotse-ipc",
  "lotse-rtsp",
  "lotse-sandbox",
  "lotse-supervisor",
@@ -1509,13 +1510,16 @@ version = "0.0.0-dev"
 dependencies = [
  "bytes",
  "futures-util",
+ "getrandom 0.3.4",
  "lotse-codec",
  "lotse-core",
  "lotse-testing",
  "retina",
  "rustls",
+ "sdp-types",
  "serde",
  "serde_json",
+ "socket2 0.6.5",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -2184,7 +2188,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "retina"
 version = "0.4.21"
-source = "git+https://github.com/scottlamb/retina?rev=7698fa14924768f024aa16126a5e3ca324e5bfe6#7698fa14924768f024aa16126a5e3ca324e5bfe6"
+source = "git+https://github.com/edenhaus/retina?rev=ef3f0097a2f5be8849d08a4375f3c8a062effcdb#ef3f0097a2f5be8849d08a4375f3c8a062effcdb"
 dependencies = [
  "base64 0.22.1",
  "bitstream-io 2.6.0",

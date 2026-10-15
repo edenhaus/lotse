@@ -62,6 +62,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # retina, pinned to a commit of main until its next release (the root `Cargo.toml`).
-    "https://github.com/scottlamb/retina",
+    # retina, pinned to the fork's ONVIF backchannel branch until it lands upstream (the root
+    # `Cargo.toml`).
+    "https://github.com/edenhaus/retina",
 ]

@@ -71,6 +71,19 @@ pub trait Transcoder: fmt::Debug + Send + Sync {
     ) -> Result<TrackHandle, TranscodeError>;
 }
 
+/// Builds the talk-back transcoder for a device's frame duration: the
+/// reverse chain (Opus or G.711 uplink to the device's G.711), whose frame
+/// is a construction parameter since [`Transcoder::spawn`] has no slot for
+/// it. Registered apart from the downlink transcoders
+/// ([`Registries::uplink`](crate::registry::Registries::uplink)), so
+/// negotiation never offers a viewer a talk-back conversion.
+pub trait UplinkFactory: fmt::Debug + Send + Sync {
+    /// The transcoder producing packets of `frame`
+    /// ([`BackchannelHandle::frame`](crate::source::BackchannelHandle::frame));
+    /// one outside the range it frames is clamped into it.
+    fn transcoder(&self, frame: Duration) -> Arc<dyn Transcoder>;
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

@@ -135,7 +135,8 @@ async fn a_worker_crash_is_observed_and_contained() {
             | WorkerEvent::SourceStopped
             | WorkerEvent::SwitchReport(_)
             | WorkerEvent::StandbyStopped
-            | WorkerEvent::Switched) => {
+            | WorkerEvent::Switched
+            | WorkerEvent::Talker { .. }) => {
                 panic!("unexpected {other:?}")
             }
         }

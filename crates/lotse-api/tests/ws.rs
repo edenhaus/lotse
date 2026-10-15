@@ -129,7 +129,8 @@ impl Handler for FakeHandler {
             | Command::SessionGet(_)
             | Command::SessionList(_)
             | Command::SessionClose(_)
-            | Command::SessionAdopt(_) => Outcome::Result(json!({})),
+            | Command::SessionAdopt(_)
+            | Command::BackchannelRelease(_) => Outcome::Result(json!({})),
             Command::Ping(_)
             | Command::Schema(_)
             | Command::Unsubscribe(_)
@@ -784,6 +785,37 @@ async fn a_peer_gone_while_a_frame_is_written_ends_the_writer() {
         }
     })
     .await;
+    running.finish().await;
+}
+
+#[tokio::test]
+async fn a_subscription_the_handler_could_not_queue_for_disconnects_with_1008() {
+    let (logs, _guard) = capture(tracing::Level::WARN);
+    let running = start("handler-overflow", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    send(&mut ws, json!({ "id": 1, "type": "stream/subscribe" })).await;
+    assert_eq!(recv(&mut ws).await["result"], json!({}));
+    let events = running.handler.subscribers.lock().unwrap()[0].clone();
+    events.send(FakeHandler::event("a", "idle")).await.unwrap();
+    // The handler's queue had no room for an event that is never dropped.
+    events
+        .send(Event {
+            class: EventClass::Overflowed,
+            payload: Value::Null,
+        })
+        .await
+        .unwrap();
+    let _after = events.send(FakeHandler::event("a", "live")).await;
+    // What came before still goes out, then the close; nothing after.
+    assert_eq!(recv(&mut ws).await["event"]["state"], "idle");
+    assert_eq!(recv(&mut ws).await, json!({ "closed": 1008 }));
+    assert!(
+        logs.text()
+            .contains("subscription queue overflowed with an event that is never dropped"),
+        "{}",
+        logs.text()
+    );
     running.finish().await;
 }
 

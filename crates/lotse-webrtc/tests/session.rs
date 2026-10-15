@@ -33,15 +33,16 @@ use lotse_codec::h264::{
 };
 use lotse_core::Orientation;
 use lotse_core::clock::{Clock as _, SystemClock};
-use lotse_core::codec::{Codec, Kind};
+use lotse_core::codec::{Codec, CodecFamily, Kind};
 use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields};
 use lotse_core::output::OutputFactory as _;
 use lotse_core::session::{
     IceCredentials, SessionEngine, SessionEvent, SessionLimits, SessionOpenError, SessionOutput,
-    SessionRequest, Transport,
+    SessionRequest, TalkbackTarget, Transport,
 };
 use lotse_core::source::TrackSet;
 use lotse_core::track::{Track, TrackLimits};
+use lotse_core::uplink::{UplinkCodec, UplinkPacket};
 use lotse_testing::viewer::{
     Direction, Outgoing, Viewer, capture_seconds, with_audio_codecs, with_video_codecs,
 };
@@ -71,9 +72,11 @@ fn request(offer: &str, video: Arc<Codec>) -> SessionRequest {
         tcp_candidates: vec![DAEMON_TCP.parse().unwrap()],
         video,
         audio: None,
+        backchannel: None,
         orientation: Orientation::default(),
         limits: SessionLimits::default(),
         wall: SystemClock.wall_now(),
+        talkback_required: false,
     }
 }
 
@@ -92,6 +95,8 @@ struct Pair {
     marked: Vec<(bool, Vec<u8>)>,
     to_daemon: Vec<Outgoing>,
     session_timeout: Option<Instant>,
+    /// The talk-back packets the session handed on.
+    uplink: Vec<UplinkPacket>,
 }
 
 impl Pair {
@@ -151,6 +156,7 @@ impl Pair {
             marked: Vec::new(),
             to_daemon: Vec::new(),
             session_timeout: None,
+            uplink: Vec::new(),
         };
         pair.drain();
         (pair, answer)
@@ -177,6 +183,7 @@ impl Pair {
                         .push((transport, source, destination, payload));
                 }
                 SessionOutput::Event(event) => self.events.push(event),
+                SessionOutput::Uplink(packet) => self.uplink.push(packet),
                 SessionOutput::Timeout(at) => {
                     self.session_timeout = Some(at);
                     return;
@@ -1160,7 +1167,7 @@ fn transmitted(outputs: &[SessionOutput]) -> Vec<&[u8]> {
         .iter()
         .filter_map(|output| match output {
             SessionOutput::Transmit { payload, .. } => Some(payload.as_slice()),
-            SessionOutput::Event(_) | SessionOutput::Timeout(_) => None,
+            SessionOutput::Event(_) | SessionOutput::Uplink(_) | SessionOutput::Timeout(_) => None,
         })
         .collect()
 }
@@ -2103,6 +2110,502 @@ fn rfc8829_5_3_1_the_viewer_plays_video_beside_an_inactive_audio_m_line() {
     assert_eq!(pair.session.stats().audio_dropped, 1);
 }
 
+/// The audio m-sections of `sdp`, in order, each with its `m=` line
+/// first.
+fn audio_sections(sdp: &str) -> Vec<Vec<&str>> {
+    let mut sections: Vec<Vec<&str>> = Vec::new();
+    let mut inside = false;
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            inside = line.starts_with("m=audio ");
+            if inside {
+                sections.push(Vec::new());
+            }
+        }
+        if inside {
+            sections.last_mut().unwrap().push(line);
+        }
+    }
+    sections
+}
+
+/// The encoding an m-section names first in its format list: the codec
+/// the offerer sends with on it (RFC 3264 §6.1).
+fn first_encoding<'a>(section: &[&'a str]) -> &'a str {
+    let pt = &payload_types(section)[0];
+    section
+        .iter()
+        .find_map(|line| line.strip_prefix(&format!("a=rtpmap:{pt} ")))
+        .unwrap()
+}
+
+/// The fixture matrix, {dedicated talk-back m-line,
+/// `sendrecv` downlink m-line} × {backchannel present, absent}, with a
+/// PCMU stream and a PCMA backchannel: talk-back is received only with a
+/// backchannel, in its codec first; the downlink plays either way. The
+/// request carries no talker, so whether another session talks cannot
+/// change the answer.
+#[test]
+fn rfc8829_5_3_1_talk_back_is_answered_by_offer_shape_and_backchannel() {
+    use lotse_testing::viewer::TalkbackOffer;
+
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    for (shape, backchannel, downlink, talkback, viewer_downlink, viewer_talkback) in [
+        (
+            TalkbackOffer::Dedicated,
+            Some(Codec::Pcma),
+            "a=sendonly",
+            "a=recvonly",
+            Direction::RecvOnly,
+            Direction::SendOnly,
+        ),
+        (
+            TalkbackOffer::Dedicated,
+            None,
+            "a=sendonly",
+            "a=inactive",
+            Direction::RecvOnly,
+            Direction::Inactive,
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            Some(Codec::Pcma),
+            "a=sendrecv",
+            "a=sendrecv",
+            Direction::SendRecv,
+            Direction::SendRecv,
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            None,
+            "a=sendonly",
+            "a=sendonly",
+            Direction::RecvOnly,
+            Direction::RecvOnly,
+        ),
+    ] {
+        let what = format!("{shape:?} with {backchannel:?}");
+        let viewer =
+            Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, shape).expect("a viewer");
+        let mut request = request(viewer.offer(), h264(None));
+        request.audio = Some(Arc::new(Codec::Pcmu));
+        request.backchannel = backchannel.clone().map(chained);
+        let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+        // `session/get` reports the codec the answer named first.
+        assert_eq!(
+            pair.session.talkback(),
+            backchannel.as_ref().map(|_| UplinkCodec::Pcma),
+            "{what}"
+        );
+        let sections = audio_sections(&answer);
+        let dedicated = shape == TalkbackOffer::Dedicated;
+        assert_eq!(
+            sections.len(),
+            if dedicated { 2 } else { 1 },
+            "{what}: {answer}"
+        );
+        let (down, up) = (&sections[0], sections.last().unwrap());
+        assert!(down.contains(&downlink), "{what}: {answer}");
+        assert!(up.contains(&talkback), "{what}: {answer}");
+        // The session sends PCMU on the downlink m-line in every case.
+        assert!(down.contains(&"a=rtpmap:0 PCMU/8000"), "{what}: {answer}");
+        if backchannel.is_some() {
+            assert_eq!(first_encoding(up), "PCMA/8000", "{what}: {answer}");
+        }
+        if dedicated && backchannel.is_none() {
+            assert_inactive_audio(
+                &request.offer.replacen("m=audio", "m=audiox", 1),
+                &answer.replacen("m=audio", "m=audiox", 1),
+            );
+        }
+        // No SSRC on the talk-back m-line: the daemon sends nothing there.
+        if dedicated {
+            assert!(
+                !up.iter().any(|line| line.starts_with("a=ssrc:")),
+                "{what}: {answer}"
+            );
+        }
+
+        pair.connect(&answer);
+        assert!(
+            !pair
+                .events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Warning { .. })),
+            "{what}: {:?}",
+            pair.events
+        );
+        assert_eq!(
+            pair.viewer.audio_direction(),
+            Some(viewer_downlink),
+            "{what}"
+        );
+        assert_eq!(
+            pair.viewer.talkback_direction(),
+            Some(viewer_talkback),
+            "{what}"
+        );
+        for seq in 0..5_u16 {
+            let packet = audio_packet(seq, u32::from(seq) * 160, 0, pair.now);
+            pair.session.write_audio(pair.now, &packet, pair.now);
+        }
+        pair.drain();
+        pair.run_until(|p| p.viewer.audio_packets().len() >= 5, 500, &what);
+        assert!(
+            pair.viewer
+                .audio_packets()
+                .iter()
+                .all(|packet| *packet.header.payload_type == 0),
+            "{what}"
+        );
+    }
+}
+
+/// On a stream that asked for the camera's backchannel
+/// (`talkback_required`), an offer that requests talk-back on either shape
+/// (a `sendonly` or a `sendrecv` audio m-line, RFC 8866 §6.7) is answered
+/// with talk-back or refused with `backchannel_unavailable` and why, never
+/// answered without it; an offer that requests none opens as ever.
+#[test]
+fn rfc8866_6_7_a_talk_back_request_on_a_stream_that_asks_for_the_backchannel_is_met_or_refused() {
+    use lotse_testing::viewer::TalkbackOffer;
+
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let refused = |reason: &str| Err(SessionOpenError::BackchannelUnavailable(reason.to_owned()));
+    for (shape, backchannel, expected) in [
+        (
+            TalkbackOffer::Dedicated,
+            Some(chained(Codec::Pcma)),
+            Ok(UplinkCodec::Pcma),
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            Some(chained(Codec::Pcmu)),
+            Ok(UplinkCodec::Pcmu),
+        ),
+        (
+            TalkbackOffer::Dedicated,
+            None,
+            refused("the camera offers no backchannel"),
+        ),
+        // Without the reverse chain, only the camera's own codec reaches
+        // it: PCMU forwarded as received.
+        (
+            TalkbackOffer::Dedicated,
+            Some(forwarded(Codec::Pcmu)),
+            Ok(UplinkCodec::Pcmu),
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            None,
+            refused("the camera offers no backchannel"),
+        ),
+        (
+            TalkbackOffer::Dedicated,
+            Some(chained(Codec::G722)),
+            refused("the backchannel takes a codec talk-back cannot feed"),
+        ),
+    ] {
+        let what = format!("{shape:?} with {backchannel:?}");
+        let viewer =
+            Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, shape).expect("a viewer");
+        let mut request = request(viewer.offer(), h264(None));
+        request.audio = Some(Arc::new(Codec::Pcmu));
+        request.backchannel = backchannel;
+        request.talkback_required = true;
+        let opened = Session::answer(&request, now).map(|(session, _)| session.talkback());
+        assert_eq!(opened, expected.map(Some), "{what}");
+        if let Err(err) = Session::answer(&request, now) {
+            assert_eq!(err.code(), "backchannel_unavailable", "{what}");
+        }
+    }
+    // A viewer that only receives (`recvonly` audio) requests no
+    // talk-back: it plays without a backchannel.
+    let viewer = Viewer::new_with_audio(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let mut request = request(viewer.offer(), h264(None));
+    request.audio = Some(Arc::new(Codec::Pcmu));
+    request.talkback_required = true;
+    let (session, _) = Session::answer(&request, now).expect("an answer without talk-back");
+    assert_eq!(session.talkback(), None);
+}
+
+/// `codec`'s backchannel as a worker with the reverse chain installed
+/// routes to it: Opus and both G.711 laws to a G.711 camera, Opus to an
+/// Opus one, nothing to any other.
+fn chained(codec: Codec) -> TalkbackTarget {
+    let takes = match codec.family() {
+        CodecFamily::Pcmu | CodecFamily::Pcma => UplinkCodec::ALL.to_vec(),
+        CodecFamily::Opus => vec![UplinkCodec::Opus],
+        _ => Vec::new(),
+    };
+    TalkbackTarget { codec, takes }
+}
+
+/// `codec`'s backchannel without the reverse chain: its own codec,
+/// forwarded as received, reaches it.
+fn forwarded(codec: Codec) -> TalkbackTarget {
+    TalkbackTarget {
+        takes: UplinkCodec::of(codec.family()).into_iter().collect(),
+        codec,
+    }
+}
+
+/// A connected pair whose viewer offers talk-back in `shape`, for a PCMU
+/// stream and a backchannel of `backchannel`.
+fn talkback_pair(
+    shape: lotse_testing::viewer::TalkbackOffer,
+    backchannel: Option<Codec>,
+) -> (Pair, String) {
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, shape).expect("a viewer");
+    let mut request = request(viewer.offer(), h264(None));
+    request.audio = Some(Arc::new(Codec::Pcmu));
+    request.backchannel = backchannel.map(chained);
+    let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+    pair.connect(&answer);
+    (pair, answer)
+}
+
+/// Sends `packets` (payload type, payload) on the viewer's talk-back
+/// m-line, 20 ms apart, the first with the marker, and moves them.
+fn talk(pair: &mut Pair, packets: &[(u8, &[u8])]) {
+    for (k, (pt, payload)) in packets.iter().enumerate() {
+        let k = k as u16;
+        pair.viewer
+            .send_talkback(
+                pair.now,
+                (*pt, 100 + k, 1_000 + u32::from(k) * 160, k == 0),
+                payload,
+                &mut pair.to_daemon,
+            )
+            .expect("a talk-back send stream");
+        pair.step();
+    }
+    pair.settle_talkback();
+}
+
+impl Pair {
+    /// Steps until the datagrams in flight have arrived.
+    fn settle_talkback(&mut self) {
+        for _ in 0..5 {
+            self.step();
+        }
+    }
+}
+
+/// What the viewer sends on the talk-back m-line,
+/// on either offer shape, is handed on as uplink packets with the header
+/// fields as sent, taken by payload type: the backchannel's PCMA the
+/// answer names first, and the stream's PCMU that the m-line lists too
+/// (RFC 3264 §7: the browser may send any listed codec).
+#[test]
+fn rfc3264_6_1_talk_back_rtp_is_handed_on_by_payload_type_in_any_listed_codec() {
+    use lotse_testing::viewer::TalkbackOffer;
+
+    for shape in [TalkbackOffer::Dedicated, TalkbackOffer::SendRecv] {
+        let (mut pair, _) = talkback_pair(shape, Some(Codec::Pcma));
+        let a_law = [0xd5_u8; 160];
+        let mu_law = [0xff_u8; 160];
+        talk(&mut pair, &[(8, &a_law), (8, &a_law), (0, &mu_law)]);
+        let got: Vec<_> = pair
+            .uplink
+            .iter()
+            .map(|up| {
+                (
+                    up.codec,
+                    up.packet.rtp.pt,
+                    up.packet.rtp.seq,
+                    up.packet.rtp.ts,
+                    up.packet.rtp.marker,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (UplinkCodec::Pcma, 8, 100, 1_000, true),
+                (UplinkCodec::Pcma, 8, 101, 1_160, false),
+                (UplinkCodec::Pcmu, 0, 102, 1_320, false),
+            ],
+            "{shape:?}"
+        );
+        assert_eq!(&pair.uplink[2].packet.payload[..], &mu_law[..]);
+        let ssrc = pair.uplink[0].packet.rtp.ssrc;
+        assert!(pair.uplink.iter().all(|up| up.packet.rtp.ssrc == ssrc));
+        assert!(pair.uplink.iter().all(|up| up.packet.frame_start));
+        let stats = pair.session.stats();
+        assert_eq!(
+            (stats.uplink_packets, stats.uplink_refused),
+            (3, 0),
+            "{shape:?}"
+        );
+    }
+}
+
+/// An Opus backchannel: talk-back in Opus, whose packets are checked
+/// against RFC 6716 §3.4 before they go on; one that breaks it is
+/// refused and counted, and the next goes on.
+#[test]
+fn rfc6716_3_4_an_opus_talk_back_packet_that_is_no_packet_is_refused() {
+    use lotse_testing::viewer::TalkbackOffer;
+
+    let (mut pair, _) = talkback_pair(TalkbackOffer::Dedicated, Some(Codec::Opus { channels: 2 }));
+    // A CELT 20 ms code 0 packet, a code 1 packet of an odd length (R3),
+    // and another good one.
+    talk(
+        &mut pair,
+        &[(111, &[0xf8, 1, 2]), (111, &[0xf9, 1]), (111, &[0xf8, 3])],
+    );
+    let got: Vec<_> = pair
+        .uplink
+        .iter()
+        .map(|up| (up.codec, up.packet.rtp.seq, up.packet.payload.to_vec()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (UplinkCodec::Opus, 100, vec![0xf8, 1, 2]),
+            (UplinkCodec::Opus, 102, vec![0xf8, 3]),
+        ]
+    );
+    let stats = pair.session.stats();
+    assert_eq!((stats.uplink_packets, stats.uplink_refused), (2, 1));
+}
+
+/// RTP the viewer sends that is no talk-back is refused and counted,
+/// never handed on: on a talk-back m-line answered `inactive` (no
+/// backchannel; a browser sends on it anyway once it has a track), on a
+/// `sendrecv` one answered `sendonly`, and in a payload type of no
+/// talk-back codec (the video's) on the talk-back m-line itself.
+#[test]
+fn rfc3264_6_1_rtp_that_is_no_talk_back_is_refused_and_counted() {
+    use lotse_testing::viewer::TalkbackOffer;
+
+    for shape in [TalkbackOffer::Dedicated, TalkbackOffer::SendRecv] {
+        let (mut pair, _) = talkback_pair(shape, None);
+        talk(&mut pair, &[(0, &[0xff; 160]), (0, &[0xff; 160])]);
+        assert!(pair.uplink.is_empty(), "{shape:?}");
+        let stats = pair.session.stats();
+        assert_eq!(
+            (stats.uplink_packets, stats.uplink_refused),
+            (0, 2),
+            "{shape:?}"
+        );
+    }
+    let (mut pair, answer) = talkback_pair(TalkbackOffer::Dedicated, Some(Codec::Pcma));
+    let h264 = section(&answer, "video")
+        .iter()
+        .find_map(|line| line.strip_prefix("a=rtpmap:")?.strip_suffix(" H264/90000"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    talk(&mut pair, &[(h264, &[0x65; 10]), (8, &[0xd5; 160])]);
+    assert_eq!(pair.uplink.len(), 1);
+    assert_eq!(pair.uplink[0].packet.rtp.seq, 101, "the PCMA one");
+    let stats = pair.session.stats();
+    assert_eq!((stats.uplink_packets, stats.uplink_refused), (1, 1));
+}
+
+/// The answer's talk-back m-line lists only codecs that reach the camera,
+/// though the viewer offers Opus, G.722, PCMU and PCMA on it and the engine
+/// answers every m-line from one codec list: without stream audio no
+/// G.722, and with PCMU down and an Opus backchannel no PCMU on a
+/// dedicated m-line. A `sendrecv` m-line that carries the stream's PCMU
+/// too lists it after Opus, the codec the browser sends (RFC 3264 §7);
+/// a packet in a codec that does not reach the camera is refused there,
+/// never handed on, or dropped by the engine already when no m-line
+/// negotiated it (G.722 beside stream audio).
+#[test]
+fn rfc3264_7_the_talk_back_m_line_lists_only_codecs_that_reach_the_camera() {
+    use lotse_testing::viewer::TalkbackOffer;
+
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let opus = Codec::Opus { channels: 2 };
+    let all = &["PCMU/8000", "opus/48000/2", "PCMA/8000"][..];
+    for (shape, audio, backchannel, expected, taken, refused) in [
+        (
+            TalkbackOffer::Dedicated,
+            None,
+            chained(Codec::Pcmu),
+            all,
+            &[UplinkCodec::Pcmu, UplinkCodec::Opus][..],
+            1,
+        ),
+        (
+            TalkbackOffer::Dedicated,
+            Some(Codec::Pcmu),
+            chained(opus.clone()),
+            &["opus/48000/2"],
+            &[UplinkCodec::Opus],
+            1,
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            None,
+            chained(Codec::Pcmu),
+            all,
+            &[UplinkCodec::Pcmu, UplinkCodec::Opus],
+            1,
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            Some(Codec::Pcmu),
+            chained(opus),
+            &["opus/48000/2", "PCMU/8000"],
+            &[UplinkCodec::Opus],
+            1,
+        ),
+        // Without the reverse chain a PCMU camera takes PCMU alone.
+        (
+            TalkbackOffer::Dedicated,
+            None,
+            forwarded(Codec::Pcmu),
+            &["PCMU/8000"],
+            &[UplinkCodec::Pcmu],
+            2,
+        ),
+    ] {
+        let what = format!("{shape:?}, {audio:?} down, {backchannel:?} up");
+        let viewer =
+            Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, shape).expect("a viewer");
+        let mut request = request(viewer.offer(), h264(None));
+        request.audio = audio.map(Arc::new);
+        request.backchannel = Some(backchannel);
+        let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+        let sections = audio_sections(&answer);
+        let up = sections.last().unwrap();
+        let encodings: Vec<&str> = payload_types(up)
+            .iter()
+            .map(|pt| {
+                up.iter()
+                    .find_map(|line| line.strip_prefix(&format!("a=rtpmap:{pt} ")))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(encodings, expected, "{what}: {answer}");
+        assert_eq!(pair.session.talkback(), Some(taken[0]), "{what}");
+
+        // PCMU, G.722 and Opus on the talk-back m-line, whatever it lists.
+        pair.connect(&answer);
+        talk(
+            &mut pair,
+            &[(0, &[0xff; 160]), (9, &[0x55; 160]), (111, &[0xf8, 1, 2])],
+        );
+        let got: Vec<UplinkCodec> = pair.uplink.iter().map(|up| up.codec).collect();
+        assert_eq!(got, taken, "{what}");
+        let stats = pair.session.stats();
+        assert_eq!(
+            (stats.uplink_packets, stats.uplink_refused),
+            (taken.len() as u64, refused),
+            "{what}"
+        );
+    }
+}
+
 #[test]
 fn a_capture_time_ahead_of_now_never_zeroes_the_sender_report() {
     // str0m derives a Sender Report's RTP time from the last packet's
@@ -2175,7 +2678,7 @@ fn the_cut_through_writer_allocates_nothing_and_str0m_one_vec_per_datagram() {
                 loop {
                     match session.poll() {
                         SessionOutput::Transmit { .. } => datagrams += 1,
-                        SessionOutput::Event(_) => {}
+                        SessionOutput::Event(_) | SessionOutput::Uplink(_) => {}
                         SessionOutput::Timeout(_) => break,
                     }
                 }

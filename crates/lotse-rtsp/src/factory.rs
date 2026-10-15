@@ -22,6 +22,14 @@ pub const DEFAULT_PORT: u16 = 554;
 /// RTSP 1.0.
 pub const DEFAULT_TLS_PORT: u16 = 322;
 
+/// Whether the RTSP source can send on the camera's ONVIF backchannel, as
+/// [`SourceFactory::capabilities`] declares it: the worker offers talk-back
+/// on this protocol's streams, and the daemon announces `two_way_audio`,
+/// only when it is `true`. It is: the source requests, sets up, offers and
+/// drains the backchannel ([`crate::backchannel::session`]) through
+/// retina's send path.
+pub const BACKCHANNEL: bool = true;
+
 /// The factory, with the loopback listener a sandboxed worker bound for
 /// the `rtsps` relay before its sandbox, if any.
 #[derive(Debug, Default)]
@@ -81,7 +89,7 @@ impl SourceFactory for RtspFactory {
     fn capabilities(&self) -> SourceCapabilities {
         SourceCapabilities {
             direction: Direction::Pull,
-            backchannel: false,
+            backchannel: BACKCHANNEL,
             keyframe_request: false,
             snapshot_uri: false,
         }
@@ -146,6 +154,7 @@ mod tests {
         let factory = RtspFactory::default();
         assert_eq!(factory.schemes(), ["rtsp", "rtsps"]);
         assert_eq!(factory.capabilities().direction, Direction::Pull);
+        assert!(factory.capabilities().backchannel, "the ONVIF backchannel");
         let url = SourceUrl::parse("rtsp://user:pass@192.168.1.10/h264").unwrap();
         let source = factory.validate(&url, &serde_json::Value::Null).unwrap();
         let described = source.describe();
@@ -160,6 +169,14 @@ mod tests {
             source.request_keyframe(),
             lotse_core::source::KeyframeRequest::Unsupported
         ));
+        // ONVIF Streaming Specification §5.3.1: the `Require` header only
+        // for a stream that opted in, on the same connection either way.
+        assert!(!source.wants_backchannel(), "opt-in");
+        let talking = factory
+            .validate(&url, &json!({ "backchannel": true }))
+            .unwrap();
+        assert!(talking.wants_backchannel());
+        assert_eq!(talking.connection_options(), source.connection_options());
         let udp = factory
             .validate(&url, &json!({ "transport": "udp" }))
             .unwrap();

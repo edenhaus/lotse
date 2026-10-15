@@ -47,7 +47,7 @@ use tracing::Instrument as _;
 
 use crate::clients::{ClientStore, Removal};
 use crate::listener::PeerInfo;
-use crate::outbox::{Class, Outbox, Outgoing};
+use crate::outbox::{Class, Outbox, Outgoing, Overflow};
 use crate::pairing::Pairing;
 use crate::{
     AppState, CLOSE_TIMEOUT, ConnectionId, Event, Handler, MAX_MESSAGE_BYTES,
@@ -600,10 +600,8 @@ impl<H: Handler> Connection<H> {
                         task.abort();
                         let subscription = unsubscribe.subscription;
                         if let Some(last) = self.state.handler.unsubscribed(self.id, subscription) {
-                            self.send(
-                                last.class.into(),
-                                &EventFrame::new(subscription, last.payload),
-                            );
+                            // An overflow wakes the loop, which logs it.
+                            let _overflowed = deliver(&self.outbox, subscription, last);
                         }
                         self.send(Class::Signaling, &Success::new(id, Empty::default()));
                     }
@@ -665,14 +663,29 @@ const fn opens_subscription(command: &Command) -> bool {
 }
 
 /// Forwards a subscription's events as frames until it ends or the queue
-/// overflows.
+/// overflows, here or in the handler's own queue.
 async fn forward(id: u64, mut events: mpsc::Receiver<Event>, outbox: Arc<Outbox>) {
     while let Some(event) = events.recv().await {
-        let text = serde_json::to_string(&EventFrame::new(id, event.payload)).unwrap_or_default();
-        if outbox.push(event.class.into(), text).is_err() {
+        if deliver(&outbox, id, event).is_err() {
             break;
         }
     }
+}
+
+/// Queues `event` of subscription `id` as a frame. The handler's
+/// [`crate::EventClass::Overflowed`] queues nothing and overflows the
+/// outbox: the client is disconnected rather than left with a hole in
+/// events it is promised.
+fn deliver(outbox: &Outbox, id: u64, event: Event) -> Result<(), Overflow> {
+    let Some(class) = Class::of(event.class) else {
+        tracing::warn!(
+            subscription = id,
+            "subscription queue overflowed with an event that is never dropped"
+        );
+        return Err(outbox.overflow());
+    };
+    let text = serde_json::to_string(&EventFrame::new(id, event.payload)).unwrap_or_default();
+    outbox.push(class, text)
 }
 
 #[cfg(test)]

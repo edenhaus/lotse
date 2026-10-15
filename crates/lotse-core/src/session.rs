@@ -16,6 +16,7 @@ use crate::codec::{Codec, CodecFamily};
 use crate::media::MediaPacket;
 use crate::orientation::Orientation;
 use crate::track::{GopSnapshot, TrackEvent};
+use crate::uplink::{UplinkCodec, UplinkPacket};
 
 /// The ICE credentials the supervisor chose for a session, so its demux
 /// can verify STUN integrity.
@@ -97,6 +98,13 @@ pub struct SessionRequest {
     pub video: Arc<Codec>,
     /// The audio track's codec, when the stream has one and audio is on.
     pub audio: Option<Arc<Codec>>,
+    /// The connection's backchannel, when its source protocol can carry
+    /// audio back (`SourceCapabilities::backchannel`, the feature's gate)
+    /// and the source offers one now. `None` answers talk-back
+    /// `inactive`, or refuses a talk-back request when
+    /// [`Self::talkback_required`]. Never whether another session talks:
+    /// the answer stays a function of the offer and this.
+    pub backchannel: Option<TalkbackTarget>,
     /// How the stream's picture is turned for display: the stream's
     /// `orientation`, which an output marks when the viewer can apply it.
     pub orientation: Orientation,
@@ -106,6 +114,26 @@ pub struct SessionRequest {
     /// anchor that puts the session's capture times, which are monotonic,
     /// on the wall clock a receiver compares them with (`abs-capture-time`).
     pub wall: SystemTime,
+    /// The stream asked for the camera's backchannel (its source's
+    /// `backchannel` option): an offer that requests talk-back the session
+    /// cannot receive is refused ([`SessionOpenError::BackchannelUnavailable`])
+    /// instead of answered without it. Without it such an offer is answered
+    /// as the backchannel allows, talk-back `inactive` or not received.
+    pub talkback_required: bool,
+}
+
+/// The backchannel a session negotiates talk-back with: the codec the
+/// camera takes and the uplink codecs that reach it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TalkbackTarget {
+    /// The codec the backchannel takes.
+    pub codec: Codec,
+    /// The uplink codecs the worker routes to it, through the reverse
+    /// chain it has installed or forwarded as received in the camera's
+    /// own codec; empty when none does. A session answers talk-back in
+    /// these only: the browser may send any codec the answer lists (RFC
+    /// 3264 §7), and one that does not reach the camera is lost.
+    pub takes: Vec<UplinkCodec>,
 }
 
 /// Why a session could not be opened; each maps to a `closed` code.
@@ -123,6 +151,11 @@ pub enum SessionOpenError {
     /// The output kind does not open sessions.
     #[error("{0} outputs do not open sessions")]
     NotASession(&'static str),
+    /// The offer requests talk-back on a stream that asked for the
+    /// camera's backchannel ([`SessionRequest::talkback_required`]), and
+    /// the session cannot receive it, for this reason.
+    #[error("two-way audio unavailable: {0}")]
+    BackchannelUnavailable(String),
 }
 
 impl SessionOpenError {
@@ -133,6 +166,7 @@ impl SessionOpenError {
             Self::NoVideoTrack => "no_video_track",
             Self::VideoCodecUnsupported(_) => "video_codec_unsupported",
             Self::NotASession(_) => "internal_error",
+            Self::BackchannelUnavailable(_) => "backchannel_unavailable",
         }
     }
 }
@@ -194,6 +228,10 @@ pub enum SessionOutput {
     },
     /// Something happened.
     Event(SessionEvent),
+    /// A talk-back packet the viewer sent, depacketized. The worker
+    /// publishes a session's on its [`UplinkTrack`](crate::uplink::UplinkTrack),
+    /// towards the connection's backchannel.
+    Uplink(UplinkPacket),
     /// Nothing more until `handle_timeout` at this instant, or until input.
     Timeout(Instant),
 }
@@ -233,6 +271,14 @@ pub struct SessionStats {
     pub audio_dropped: u64,
     /// Datagrams that were not valid input.
     pub bad_datagrams: u64,
+    /// Talk-back packets received and handed on as
+    /// [`SessionOutput::Uplink`]: `session/get`'s
+    /// `backchannel.packets_received`.
+    pub uplink_packets: u64,
+    /// RTP the viewer sent that is no talk-back packet: on another m-line
+    /// than talk-back's, in a payload type of no talk-back codec, or a
+    /// payload that is not one packet of its codec. Dropped.
+    pub uplink_refused: u64,
 }
 
 /// One session's engine. Every method is followed by a full `poll` drain
@@ -303,6 +349,10 @@ pub trait SessionEngine: fmt::Debug + Send {
 
     /// The counters now.
     fn stats(&self) -> SessionStats;
+
+    /// The talk-back codec the answer negotiated, which the browser sends
+    /// (`session/get`'s `backchannel.codec`); `None` when talk-back is off.
+    fn talkback(&self) -> Option<UplinkCodec>;
 }
 
 /// What a session does with one event of its video subscription, or with
@@ -448,6 +498,13 @@ mod tests {
             "video_codec_unsupported"
         );
         assert_eq!(SessionOpenError::NotASession("x").code(), "internal_error");
+        let unavailable =
+            SessionOpenError::BackchannelUnavailable("the camera offers no backchannel".into());
+        assert_eq!(unavailable.code(), "backchannel_unavailable");
+        assert_eq!(
+            unavailable.to_string(),
+            "two-way audio unavailable: the camera offers no backchannel"
+        );
         assert_eq!(
             SessionLimits::default().max_packet_age,
             Duration::from_millis(150)

@@ -80,16 +80,22 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio", "
 # `Stream`/`Sink` adapters for the WebSocket halves; the WebSocket types come from axum.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # The RTSP client with the camera quirk history the design chose; packets are taken as RTP, so the
-# H.265 depacketizer feature is off. Pinned to a commit of main until a release carries its fixes
-# for camera input: no panic on an `m=` line without a format, sdp-types 0.2, the response size
-# limit (`SessionOptions::max_message_size`) and a validated `Session` id.
-retina = { git = "https://github.com/scottlamb/retina", rev = "7698fa14924768f024aa16126a5e3ca324e5bfe6", default-features = false }
+# H.265 depacketizer feature is off. Pinned to the fork's ONVIF backchannel branch until that lands
+# upstream: the backchannel (`SessionOptions::backchannel`, a sending stream, `SendingPacket`) on
+# top of main's fixes for camera input: no panic on an `m=` line without a format, sdp-types 0.2,
+# the response size limit (`SessionOptions::max_message_size`) and a validated `Session` id.
+retina = { git = "https://github.com/edenhaus/retina", rev = "ef3f0097a2f5be8849d08a4375f3c8a062effcdb", default-features = false }
 # RTSP message parsing and serialization for the fake camera of the tests.
 rtsp-types = { version = "0.1", default-features = false }
+# SDP media descriptions in `lotse-rtsp`: the payload type and `a=ptime` of a camera's backchannel
+# media; the version retina parses with, already in the tree.
+sdp-types = { version = "0.2", default-features = false }
 # H.264 bitstream syntax (SPS profile, level and dimensions, SEI) on the side branch; the packet
 # layer parses only NAL headers itself.
 h264-reader = { version = "0.9", default-features = false }
-# Transaction ids of the STUN client (RFC 8489 §5: 96 bits, unpredictable); the OS entropy source.
+# Transaction ids of the STUN client (RFC 8489 §5: 96 bits, unpredictable); the random SSRC,
+# sequence number and timestamp a camera's backchannel stream starts at (RFC 3550 §5.1, §8.1); the
+# OS entropy source.
 getrandom = { version = "0.3", default-features = false }
 # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5) in the supervisor's demux and in str0m's crypto provider.
 hmac = { version = "0.12", default-features = false }

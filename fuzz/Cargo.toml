@@ -179,3 +179,10 @@ path = "fuzz_targets/pair_request.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "talkback_depacketize"
+path = "fuzz_targets/talkback_depacketize.rs"
+test = false
+doc = false
+bench = false

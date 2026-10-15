@@ -1,6 +1,7 @@
 //! Worker process: the IPC client, the source connection runner, the
-//! derived tracks, the session manager and the once-per-second stats push,
-//! for one camera connection.
+//! derived tracks, the session manager with each session's talk-back
+//! uplink track, the arbiter that picks the backchannel's one talker, and
+//! the once-per-second stats push, for one camera connection.
 //!
 //! Everything a worker does apart from parsing protocols. It takes the factory
 //! registries the binary filled, receives control messages from the
@@ -18,6 +19,7 @@ mod ice_tcp;
 pub mod relay;
 mod sendmsg;
 mod sessions;
+mod talkback;
 #[cfg(test)]
 mod test_logs;
 
@@ -48,7 +50,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::derived::DerivedTracks;
-use crate::sessions::SessionManager;
+use crate::sessions::{ConnectionMedia, SessionManager};
+use crate::talkback::{Arbiter, TalkerChanged, TalkerFeed};
 
 /// How often the worker pushes its counters.
 pub const STATS_INTERVAL: Duration = Duration::from_secs(1);
@@ -168,6 +171,14 @@ struct Running {
     /// The tracks as last reported to the supervisor; empty until the
     /// source first went live.
     reported: Vec<TrackInfo>,
+    /// The arbiter of the connection's backchannel, when its source
+    /// protocol can carry audio back (`SourceCapabilities::backchannel`,
+    /// the gate of two-way audio): sessions answer talk-back from what its
+    /// slot holds, and it picks the one talker. `None` for a protocol
+    /// without one, whose slot no session reads.
+    backchannel: Option<Arc<Arbiter>>,
+    /// The arbiter's talker changes, for the supervisor.
+    talker: Option<TalkerFeed>,
 }
 
 /// One source runner's handles.
@@ -180,6 +191,8 @@ struct Runner {
     task: JoinHandle<()>,
     /// Where its attempts wait for the supervisor's grants.
     gate: ConnectGate,
+    /// Its backchannel slot, when its source protocol has one.
+    backchannel: Option<BackchannelSlot>,
 }
 
 /// The standby source a `SwitchSource` started: it declares into a staging
@@ -202,6 +215,8 @@ enum RunningWake {
     Tracks(Vec<TrackInfo>),
     /// The tracks switched to the standby with this tag.
     Switched(u8),
+    /// The connection's talker changed.
+    Talker(TalkerChanged),
 }
 
 /// Serves the supervisor on `channel` until it says stop or goes away.
@@ -282,6 +297,10 @@ pub async fn serve(
                         serving.tx.send_msg(&ToSupervisor::Tracks(tracks), &[]).await?;
                     }
                     RunningWake::Switched(tag) => serving.on_switched(tag).await?,
+                    RunningWake::Talker(change) => {
+                        let change = talkback::talker_change(change);
+                        serving.tx.send_msg(&ToSupervisor::Talker(change), &[]).await?;
+                    }
                 }
             }
             () = &mut stats_tick => {
@@ -373,7 +392,8 @@ impl Serving<'_> {
                     tracing::debug!("connect grant without a source; ignored");
                 }
             }
-            ToWorker::SwitchSource(spec) => self.on_switch_source(&spec).await?,
+            ToWorker::SwitchSource(spec) => self.on_switch_source(&spec, false).await?,
+            ToWorker::RestartSource(spec) => self.on_switch_source(&spec, true).await?,
             ToWorker::SwitchConnectGranted => {
                 if let Some(standby) = &self.standby {
                     standby.runner.gate.grant();
@@ -440,6 +460,9 @@ impl Serving<'_> {
                     manager.close(&session_id, sessions::close_code(&code), message);
                 }
             }
+            ToWorker::ReleaseBackchannel { session_id } => {
+                self.release_backchannel(session_id.as_deref());
+            }
             ToWorker::Shutdown { deadline_ms } => {
                 return self.on_shutdown(deadline_ms).await.map(Some);
             }
@@ -479,15 +502,24 @@ impl Serving<'_> {
 
     /// `SwitchSource`: connects `spec` as the standby of the running
     /// source, replacing a standby still on its way; a standby before any
-    /// source is a protocol error.
-    async fn on_switch_source(&mut self, spec: &SourceSpec) -> Result<(), Error> {
-        let Some(running) = &self.running else {
+    /// source is a protocol error. `RestartSource` (`restart`) stops the
+    /// running source's runner first, so the camera sees its teardown
+    /// before the standby connects: one camera session at a time, a gap
+    /// for the viewers until the standby's first keyframe. The tracks, the
+    /// sessions and the backchannel's arbiter stay, and the switch goes
+    /// on as for any standby.
+    async fn on_switch_source(&mut self, spec: &SourceSpec, restart: bool) -> Result<(), Error> {
+        let Some(running) = self.running.as_mut() else {
             return Err(Error::SwitchWithoutSource);
         };
         if let Some(replaced) = self.standby.take() {
             tracing::info!("standby source replaced before it took over");
             replaced.staging.disarm();
             stop_runner(replaced.runner, &self.clock).await;
+        }
+        if restart {
+            tracing::info!("source restart: the running source stops before the new one connects");
+            stop_task(&running.cancel, &mut running.task, &self.clock).await;
         }
         let staging = TrackSet::staging(running.tracks.tracks());
         let runner = start_runner(
@@ -538,7 +570,24 @@ impl Serving<'_> {
             mapper: std::mem::replace(&mut running.mapper, standby.runner.mapper),
             task: std::mem::replace(&mut running.task, standby.runner.task),
             gate: std::mem::replace(&mut running.gate, standby.runner.gate),
+            backchannel: None,
         };
+        // The connection's arbiter follows the new source's backchannel:
+        // the talker keeps the channel, and sessions opened from now on
+        // answer talk-back from what the new source offers.
+        match (&running.backchannel, standby.runner.backchannel) {
+            (Some(arbiter), slot) => arbiter.follow(slot.unwrap_or_default()),
+            (None, Some(slot)) => {
+                let arbiter = Arc::new(Arbiter::new(
+                    slot,
+                    self.registries.uplink.clone(),
+                    Arc::clone(&self.clock),
+                ));
+                running.talker = Some(TalkerFeed::new(&arbiter));
+                running.backchannel = Some(arbiter);
+            }
+            (None, None) => {}
+        }
         stop_runner(old, &self.clock).await;
         // The old runner's last reports, `Stopped` included, are not the
         // source's any more; the standby's channel is.
@@ -552,6 +601,21 @@ impl Serving<'_> {
             .send_msg(&ToSupervisor::Tracks(running.reported.clone()), &[])
             .await?;
         Ok(())
+    }
+
+    /// Frees the backchannel from its talker, or only from `only`
+    /// (`backchannel/release`); the arbiter decides, logs it and reports
+    /// the change.
+    fn release_backchannel(&self, only: Option<&str>) {
+        if let Some(arbiter) = self
+            .running
+            .as_ref()
+            .and_then(|source| source.backchannel.as_ref())
+        {
+            let _held = arbiter.release(only);
+        } else {
+            tracing::debug!("backchannel release without a backchannel; ignored");
+        }
     }
 
     /// The shared UDP socket and the datagram channel: the session manager
@@ -585,8 +649,11 @@ impl Serving<'_> {
                 manager
                     .open(
                         spec,
-                        Arc::clone(&source.tracks),
-                        Arc::clone(&source.mapper),
+                        ConnectionMedia {
+                            tracks: Arc::clone(&source.tracks),
+                            mapper: Arc::clone(&source.mapper),
+                            backchannel: source.backchannel.as_ref().map(Arc::clone),
+                        },
                         &self.registries,
                         self.settings.session,
                     )
@@ -627,10 +694,16 @@ impl Serving<'_> {
                 self.tx.send_msg(&ToSupervisor::Tracks(tracks), &[]).await?;
             }
             let mut stats = worker_stats(&source.tracks, &source.mapper);
+            stats.backchannel = source
+                .backchannel
+                .as_ref()
+                .and_then(|arbiter| arbiter.offered())
+                .map(|handle| handle.codec.name().to_owned());
             if let Some(manager) = &mut self.sessions {
                 stats.sessions = u32::try_from(manager.len()).unwrap_or(u32::MAX);
                 stats.send_failures = manager.stats().send_failures.load(Ordering::Relaxed);
                 stats.relay_unbound = manager.stats().relay_unbound.load(Ordering::Relaxed);
+                stats.talkback = manager.talkback();
             }
             self.tx.send_msg(&ToSupervisor::Stats(stats), &[]).await?;
         }
@@ -697,6 +770,14 @@ fn start_source(
         Arc::clone(clock),
     );
     let changes = tracks.changes();
+    let backchannel = runner.backchannel.map(|slot| {
+        Arc::new(Arbiter::new(
+            slot,
+            registries.uplink.clone(),
+            Arc::clone(clock),
+        ))
+    });
+    let talker = backchannel.as_ref().map(TalkerFeed::new);
     Ok(Running {
         cancel: runner.cancel,
         tracks,
@@ -706,6 +787,8 @@ fn start_source(
         task: runner.task,
         gate: runner.gate,
         reported: Vec::new(),
+        backchannel,
+        talker,
     })
 }
 
@@ -746,12 +829,20 @@ fn start_runner(
             code: "invalid_request",
             message: err.to_string(),
         })?;
+    // Two-way audio stays off for a protocol that cannot carry audio
+    // back, whatever its source puts in the slot.
+    let backchannel = factory
+        .capabilities()
+        .backchannel
+        .then(BackchannelSlot::default);
+    let capable = backchannel.is_some();
     tracing::info!(
         connection = %spec.connection_id,
         url = %url,
         peer = %spec.peer_host,
         addrs = ?spec.peer_addrs,
         role,
+        backchannel = capable,
         "running source"
     );
 
@@ -766,7 +857,7 @@ fn start_runner(
         },
         native,
         Arc::clone(&mapper),
-        BackchannelSlot::default(),
+        backchannel.clone().unwrap_or_default(),
         Arc::clone(clock),
         settings.runner,
         ReconnectBackoff::new(jitter_seed(clock.as_ref())),
@@ -780,6 +871,7 @@ fn start_runner(
         mapper,
         task,
         gate,
+        backchannel,
     })
 }
 
@@ -787,10 +879,21 @@ fn start_runner(
 /// that does not stop in time is aborted, as nothing of the connection's
 /// depends on it any more.
 async fn stop_runner(runner: Runner, clock: &Arc<dyn Clock>) {
-    runner.cancel.cancel();
     let mut task = runner.task;
+    stop_task(&runner.cancel, &mut task, clock).await;
+}
+
+/// Cancels a runner's `task` and waits for it, aborting it after
+/// [`SWITCH_STOP_GRACE`]. A task that is already finished, as the one a
+/// restart stopped, is not waited for again: polling a `JoinHandle` after
+/// it returned panics.
+async fn stop_task(cancel: &CancellationToken, task: &mut JoinHandle<()>, clock: &Arc<dyn Clock>) {
+    cancel.cancel();
+    if task.is_finished() {
+        return;
+    }
     tokio::select! {
-        _ = &mut task => {}
+        _ = &mut *task => {}
         () = clock.sleep(SWITCH_STOP_GRACE) => {
             tracing::warn!(
                 grace_ms = SWITCH_STOP_GRACE.as_millis(),
@@ -832,10 +935,13 @@ async fn stop_source(
     };
     source.cancel.cancel();
     let task = source.task;
-    tokio::select! {
-        _ = task => {}
-        () = clock.sleep(deadline) => {
-            return Err(Error::ShutdownTimeout(u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX)));
+    // A restart may have stopped it already ([`stop_task`]).
+    if !task.is_finished() {
+        tokio::select! {
+            _ = task => {}
+            () = clock.sleep(deadline) => {
+                return Err(Error::ShutdownTimeout(u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX)));
+            }
         }
     }
     let derived = source
@@ -890,8 +996,9 @@ fn source_state(event: RunnerEvent) -> SourceState {
     }
 }
 
-/// The tracks, native then derived, once one changed, or the switch to a
-/// standby; never without a source.
+/// The tracks, native then derived, once one changed, the switch to a
+/// standby, or a change of the connection's talker; never without a
+/// source.
 async fn watch_running(running: &mut Option<Running>) -> Option<RunningWake> {
     let source = running.as_mut()?;
     tokio::select! {
@@ -904,7 +1011,19 @@ async fn watch_running(running: &mut Option<Running>) -> Option<RunningWake> {
             changed.ok()?;
             Some(RunningWake::Switched(*source.switched.borrow_and_update()))
         }
+        change = talker_changed(source.talker.as_mut()) => Some(RunningWake::Talker(change)),
     }
+}
+
+/// The next change of the connection's talker; never without a
+/// backchannel.
+async fn talker_changed(talker: Option<&mut TalkerFeed>) -> TalkerChanged {
+    if let Some(talker) = talker
+        && let Some(change) = talker.next().await
+    {
+        return change;
+    }
+    std::future::pending().await
 }
 
 /// The tracks as the API reports them, native then derived. A derived
@@ -955,6 +1074,8 @@ fn worker_stats(tracks: &DerivedTracks, mapper: &ClockMapper) -> WorkerStats {
         packets_lost: ingest.packets_lost,
         packets_out_of_order: ingest.packets_out_of_order,
         datagrams_rejected: ingest.datagrams_rejected,
+        talkback: Vec::new(),
+        backchannel: None,
         tasks: u64::try_from(
             tokio::runtime::Handle::current()
                 .metrics()
@@ -998,7 +1119,7 @@ mod tests {
     };
     use lotse_core::task::BoxFuture;
     use lotse_core::test_util::{
-        ECHO_ANSWER, EchoSessionFactory, FakeOutputFactory, FakeSourceFactory,
+        BackchannelCapture, ECHO_ANSWER, EchoSessionFactory, FakeOutputFactory, FakeSourceFactory,
     };
     use lotse_ipc::Receiver;
     use tokio::sync::Notify;
@@ -1053,6 +1174,7 @@ mod tests {
             tcp_candidates: vec![],
             audio: false,
             orientation: 1,
+            talkback_required: false,
         }
     }
 
@@ -1264,6 +1386,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_restart_source_stops_the_running_source_then_switches_like_a_standby() {
+        let mut h = start_with_settings(registries(), quiet_settings());
+        h.tx.send_msg(
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"keyframes_every_ms": 10}"#)),
+            &[],
+        )
+        .await
+        .unwrap();
+        until_live(&mut h).await;
+        // The running source stops before its replacement connects: its
+        // `Stopped` is reported as the source's, which a plain switch
+        // never does, and the replacement goes live as a standby.
+        h.tx.send_msg(
+            &ToWorker::RestartSource(spec(
+                "fake://cam/",
+                r#"{"keyframes_every_ms": 10, "talk": true}"#,
+            )),
+            &[],
+        )
+        .await
+        .unwrap();
+        let stopped = ToSupervisor::SourceState(SourceState::Stopped);
+        let live = ToSupervisor::SwitchState(SourceState::Live);
+        let seen = messages_until_still(&mut h, |seen| {
+            seen.contains(&stopped) && seen.contains(&live)
+        })
+        .await;
+        assert!(
+            seen.iter()
+                .any(|m| matches!(m, ToSupervisor::SwitchState(SourceState::Connecting { .. }))),
+            "{seen:?}"
+        );
+        // Its first keyframe takes the tracks over; the stopped source,
+        // already waited for, is not waited for again.
+        h.clock.advance(Duration::from_millis(10));
+        assert_eq!(h.next().await, ToSupervisor::Switched);
+        let_assert!(ToSupervisor::Tracks(tracks) = h.next().await);
+        assert_eq!(tracks.len(), 1);
+        // A restart whose replacement never goes live leaves no source
+        // running: the shutdown does not wait for the stopped one again.
+        h.tx.send_msg(
+            &ToWorker::RestartSource(spec("fake://cam/", r#"{"ready_after_ms": 60000}"#)),
+            &[],
+        )
+        .await
+        .unwrap();
+        next_where(&mut h, &|m| {
+            *m == ToSupervisor::SourceState(SourceState::Stopped)
+        })
+        .await;
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1000 }, &[])
+            .await
+            .unwrap();
+        assert!(matches!(h.worker.await, Ok(Ok(ExitReason::Shutdown))));
+    }
+
+    #[tokio::test]
     async fn a_switch_before_any_source_is_a_protocol_error() {
         let mut h = start();
         h.tx.send_msg(&ToWorker::SwitchConnectGranted, &[])
@@ -1341,7 +1520,8 @@ mod tests {
             (
                 "echo".to_owned(),
                 SessionEvent::Answer {
-                    sdp: ECHO_ANSWER.to_owned()
+                    sdp: ECHO_ANSWER.to_owned(),
+                    talkback: None,
                 }
             )
         );
@@ -1367,7 +1547,7 @@ mod tests {
             steps += 1;
             assert!(steps < 2_000, "no answer within 100 s of fake time");
             answer = tokio::select! {
-                (_, event) = next_session(h) => { let_assert!(SessionEvent::Answer { sdp } = event); Some(sdp) }
+                (_, event) = next_session(h) => { let_assert!(SessionEvent::Answer { sdp, .. } = event); Some(sdp) }
                 () = SystemClock.sleep(Duration::from_millis(5)) => { h.clock.advance(Duration::from_millis(50)); None }
             };
         }
@@ -1419,6 +1599,334 @@ mod tests {
         found.unwrap()
     }
 
+    /// Talk-back is answered from the backchannel the source offers, and
+    /// only when its protocol declares one: the gate that keeps two-way
+    /// audio off for a source that cannot send. The counters report the
+    /// offered backchannel's codec behind the same gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_learns_the_backchannel_only_behind_the_protocols_gate() {
+        for (factory, options, expected, talkback) in [
+            (
+                FakeSourceFactory::with_backchannel(&["fake"]),
+                r#"{"backchannel": "pcma"}"#,
+                format!("{ECHO_ANSWER} backchannel=pcma"),
+                Some("pcma".to_owned()),
+            ),
+            (
+                FakeSourceFactory::with_backchannel(&["fake"]),
+                "{}",
+                ECHO_ANSWER.to_owned(),
+                None,
+            ),
+            (
+                FakeSourceFactory::new(&["fake"]),
+                r#"{"backchannel": "pcma"}"#,
+                ECHO_ANSWER.to_owned(),
+                None,
+            ),
+        ] {
+            let mut registries = Registries::default();
+            registries.sources.register(Arc::new(factory)).unwrap();
+            registries
+                .outputs
+                .register(Arc::new(EchoSessionFactory))
+                .unwrap();
+            let mut h = start_with_settings(Arc::new(registries), quiet_settings());
+            h.next().await;
+            let shared = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let (_datagrams, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
+            h.tx.send_msg(
+                &ToWorker::Sockets,
+                &[OwnedFd::from(shared).as_fd(), theirs.as_fd()],
+            )
+            .await
+            .unwrap();
+            h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", options)), &[])
+                .await
+                .unwrap();
+            until_live(&mut h).await;
+            h.tx.send_msg(&ToWorker::OpenSession(session_spec("talk")), &[])
+                .await
+                .unwrap();
+            let answer =
+                session_event_where(&mut h, |e| matches!(e, SessionEvent::Answer { .. })).await;
+            // The answer names the talk-back codec it negotiated.
+            assert_eq!(
+                answer,
+                SessionEvent::Answer {
+                    sdp: expected,
+                    talkback: talkback.clone()
+                },
+                "{options}"
+            );
+            // The counters name the codec of the backchannel offered, for
+            // `stream/get`; none behind the gate.
+            let stats = stats_where(&mut h, &mut || {}, &|_| true).await;
+            assert_eq!(stats.backchannel, talkback, "{options}");
+            h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+                .await
+                .unwrap();
+            assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+        }
+    }
+
+    /// A switch to a standby source hands the connection's talk-back to
+    /// the backchannel the standby offers: the arbiter follows it when the
+    /// running source's protocol had one, and is created when only the
+    /// standby's has one. The counters name the new codec once switched.
+    #[tokio::test]
+    async fn a_switch_source_hands_talk_back_to_the_standby_s_backchannel() {
+        for (running, before) in [
+            (r#"{"backchannel": "pcmu", "video": true}"#, Some("pcmu")),
+            (r#"{"video": true}"#, None),
+        ] {
+            let mut registries = Registries::default();
+            registries
+                .sources
+                .register(Arc::new(FakeSourceFactory::with_backchannel(&["talk"])))
+                .unwrap();
+            registries
+                .sources
+                .register(Arc::new(FakeSourceFactory::new(&["fake"])))
+                .unwrap();
+            let mut h = start_with_settings(Arc::new(registries), quiet_settings());
+            h.tx.send_msg(&ToWorker::Sockets, &[]).await.unwrap();
+            // A source whose protocol has a backchannel, or one whose has
+            // none, as the counters say.
+            let url = if before.is_some() {
+                "talk://cam/"
+            } else {
+                "fake://cam/"
+            };
+            h.tx.send_msg(&ToWorker::RunSource(spec(url, running)), &[])
+                .await
+                .unwrap();
+            until_live(&mut h).await;
+            let stats = stats_where(&mut h, &mut || {}, &|_| true).await;
+            assert_eq!(stats.backchannel.as_deref(), before, "{running}");
+            // The standby offers PCMA; its keyframe a second after it went
+            // live switches, and the counters follow its backchannel.
+            h.tx.send_msg(
+                &ToWorker::SwitchSource(spec(
+                    "talk://cam2/",
+                    r#"{"backchannel": "pcma", "video": true}"#,
+                )),
+                &[],
+            )
+            .await
+            .unwrap();
+            next_where(&mut h, &|m| {
+                *m == ToSupervisor::SwitchState(SourceState::Live)
+            })
+            .await;
+            stats_where(&mut h, &mut || {}, &|stats| {
+                stats.backchannel.as_deref() == Some("pcma")
+            })
+            .await;
+            h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1000 }, &[])
+                .await
+                .unwrap();
+            assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+        }
+    }
+
+    /// Claim and hold through the worker: the first session
+    /// to send talk-back reaches the camera, the second gets exactly one
+    /// `backchannel_busy` and its packets go nowhere, and closing the
+    /// holder's session hands the channel to the next sender.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(clippy::too_many_lines, reason = "two talkers' whole lives")]
+    async fn the_first_session_to_talk_holds_the_backchannel_and_a_second_gets_one_busy_warning() {
+        let camera = BackchannelCapture::default();
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::capturing(
+                &["fake"],
+                camera.clone(),
+            )))
+            .unwrap();
+        registries
+            .outputs
+            .register(Arc::new(EchoSessionFactory))
+            .unwrap();
+        let mut h = start_with_settings(Arc::new(registries), quiet_settings());
+        h.next().await;
+        let shared = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let shared_addr = shared.local_addr().unwrap();
+        let (datagrams, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
+        h.tx.send_msg(
+            &ToWorker::Sockets,
+            &[OwnedFd::from(shared).as_fd(), theirs.as_fd()],
+        )
+        .await
+        .unwrap();
+        h.tx.send_msg(
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"backchannel": "pcmu"}"#)),
+            &[],
+        )
+        .await
+        .unwrap();
+        until_live(&mut h).await;
+        for id in ["a", "b"] {
+            h.tx.send_msg(&ToWorker::OpenSession(session_spec(id)), &[])
+                .await
+                .unwrap();
+            session_event_where(&mut h, |e| matches!(e, SessionEvent::Answer { .. })).await;
+        }
+        let browser = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let datagrams = std::os::unix::net::UnixDatagram::from(datagrams);
+        let talk = |session: &str, sample: u8| {
+            let mut frame = Vec::new();
+            lotse_ipc::datagram::encode(
+                &format!("ufrag-{session}"),
+                browser.local_addr().unwrap(),
+                shared_addr,
+                &[b't', b'a', b'l', b'k', b':', sample],
+                &mut frame,
+            );
+            datagrams.send(&frame).unwrap();
+        };
+        let samples = |packets: Vec<lotse_core::media::MediaPacket>| -> Vec<u8> {
+            packets.iter().map(|packet| packet.payload[0]).collect()
+        };
+
+        talk("a", 1);
+        assert_eq!(samples(within(camera.wait_for(1)).await), [1]);
+        talk("b", 2);
+        talk("b", 3);
+        let busy = |e: &SessionEvent| matches!(e, SessionEvent::Warning { code, .. } if code == "backchannel_busy");
+        let mut seen = messages_until(&mut h, |seen| {
+            session_events(seen).any(|(session, event)| session == "b" && busy(event))
+        })
+        .await;
+        talk("a", 4);
+        assert_eq!(
+            samples(within(camera.wait_for(2)).await),
+            [1, 4],
+            "nothing of b's"
+        );
+        // `session/get`'s counters come with the stats, per session.
+        let counted = |seen: &[ToSupervisor]| {
+            seen.iter().any(|message| {
+                matches!(message, ToSupervisor::Stats(stats) if stats.talkback == [
+                    ("a".to_owned(), lotse_ipc::TalkbackStats { packets_received: 2, packets_dropped_busy: 0, bytes_sent: 2 }),
+                    ("b".to_owned(), lotse_ipc::TalkbackStats { packets_received: 2, packets_dropped_busy: 2, bytes_sent: 0 }),
+                ])
+            })
+        };
+        seen.extend(messages_until(&mut h, counted).await);
+
+        h.tx.send_msg(
+            &ToWorker::CloseSession {
+                session_id: "a".into(),
+                code: "session_closed".into(),
+                message: "closed".into(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        seen.extend(messages_until(&mut h, |seen| closed(seen, "a")).await);
+        talk("b", 5);
+        assert_eq!(samples(within(camera.wait_for(3)).await), [1, 4, 5]);
+        // A release for a, which no longer holds it, frees nothing of b's:
+        // b's next packet reaches the camera without a new claim.
+        h.tx.send_msg(
+            &ToWorker::ReleaseBackchannel {
+                session_id: Some("a".into()),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        talk("b", 6);
+        assert_eq!(samples(within(camera.wait_for(4)).await), [1, 4, 5, 6]);
+        // The client frees the channel from b (`backchannel/release`).
+        h.tx.send_msg(
+            &ToWorker::ReleaseBackchannel {
+                session_id: Some("b".into()),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        let released = |seen: &[ToSupervisor]| {
+            seen.iter().any(|message| {
+                matches!(message, ToSupervisor::Talker(change) if change.reason == "released")
+            })
+        };
+        seen.extend(messages_until(&mut h, released).await);
+
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        while let Some(Ok(Some((message, _)))) = tokio::select! {
+            message = h.rx.recv_msg::<ToSupervisor>() => Some(message),
+            () = SystemClock.sleep(Duration::from_secs(5)) => None,
+        } {
+            seen.push(message);
+        }
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+        let warnings: Vec<&str> = session_events(&seen)
+            .filter(|(_, event)| busy(event))
+            .map(|(session, _)| session)
+            .collect();
+        assert_eq!(warnings, ["b"], "exactly one, to the second sender");
+        // Every change of the talker reached the supervisor, in order.
+        let changes: Vec<(&str, &str)> = seen
+            .iter()
+            .filter_map(|message| match message {
+                ToSupervisor::Talker(change) => {
+                    Some((change.session_id.as_str(), change.reason.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                ("a", "claimed"),
+                ("a", "session_closed"),
+                ("b", "claimed"),
+                ("b", "released")
+            ]
+        );
+    }
+
+    /// A release on a connection whose protocol has no backchannel does
+    /// nothing, and nothing is reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_without_a_backchannel_is_ignored() {
+        let mut h = start_with_settings(echo_registries(), quiet_settings());
+        h.next().await;
+        h.tx.send_msg(&ToWorker::ReleaseBackchannel { session_id: None }, &[])
+            .await
+            .unwrap();
+        h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "{}")), &[])
+            .await
+            .unwrap();
+        until_live(&mut h).await;
+        h.tx.send_msg(&ToWorker::ReleaseBackchannel { session_id: None }, &[])
+            .await
+            .unwrap();
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(Ok(Some((message, _)))) = tokio::select! {
+            message = h.rx.recv_msg::<ToSupervisor>() => Some(message),
+            () = SystemClock.sleep(Duration::from_secs(5)) => None,
+        } {
+            seen.push(message);
+        }
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+        assert!(
+            !seen.iter().any(|m| matches!(m, ToSupervisor::Talker(_))),
+            "{seen:?}"
+        );
+    }
+
     // Multi-threaded, so a session task that never yields cannot keep the
     // test from failing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1451,7 +1959,8 @@ mod tests {
         assert_eq!(
             answer,
             SessionEvent::Answer {
-                sdp: format!("{ECHO_ANSWER} audio=pcmu")
+                sdp: format!("{ECHO_ANSWER} audio=pcmu"),
+                talkback: None,
             }
         );
         // Its packets reach the engine; the echo reports the first.
@@ -1746,7 +2255,8 @@ mod tests {
             assert_eq!(
                 *answer,
                 SessionEvent::Answer {
-                    sdp: format!("{ECHO_ANSWER} audio=opus")
+                    sdp: format!("{ECHO_ANSWER} audio=opus"),
+                    talkback: None,
                 }
             );
         }
@@ -1975,7 +2485,8 @@ mod tests {
         assert_eq!(
             answers(&seen),
             [&SessionEvent::Answer {
-                sdp: format!("{ECHO_ANSWER} audio=opus")
+                sdp: format!("{ECHO_ANSWER} audio=opus"),
+                talkback: None,
             }]
         );
         assert!(!av_sync_lost(&seen, "early"));
@@ -2006,7 +2517,8 @@ mod tests {
         assert_eq!(
             answers(&seen),
             [&SessionEvent::Answer {
-                sdp: ECHO_ANSWER.to_owned()
+                sdp: ECHO_ANSWER.to_owned(),
+                talkback: None,
             }]
         );
         assert_eq!(transcoder.started(), 1);
@@ -2042,7 +2554,8 @@ mod tests {
         assert_eq!(
             answer,
             SessionEvent::Answer {
-                sdp: ECHO_ANSWER.to_owned()
+                sdp: ECHO_ANSWER.to_owned(),
+                talkback: None,
             },
             "video only"
         );
@@ -2120,7 +2633,8 @@ mod tests {
         assert_eq!(
             answer,
             SessionEvent::Answer {
-                sdp: ECHO_ANSWER.to_owned()
+                sdp: ECHO_ANSWER.to_owned(),
+                talkback: None,
             },
             "no audio"
         );
@@ -2171,6 +2685,21 @@ mod tests {
             () = SystemClock.sleep(Duration::from_secs(5)) => panic!("no echo over udp"),
         };
         assert_eq!((&buf[..n], from), (&b"over udp"[..], shared_addr));
+
+        // Talk-back the engine hands on goes out on the session's uplink
+        // track (`talkback`), and the session goes on.
+        for payload in [&b"talk:\xff"[..], b"talk:\xfe", b"after talk"] {
+            lotse_ipc::datagram::encode(
+                "ufrag-echo",
+                browser.local_addr().unwrap(),
+                shared_addr,
+                payload,
+                &mut frame,
+            );
+            datagrams.send(&frame).unwrap();
+            let (n, _) = within(browser.recv_from(&mut buf)).await.unwrap();
+            assert_eq!(&buf[..n], payload);
+        }
 
         // A datagram that arrived on another of the host's addresses is
         // answered from that one (RFC 8445 §7.2.5.2.1), not from the one

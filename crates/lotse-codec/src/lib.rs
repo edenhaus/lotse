@@ -7,9 +7,10 @@
 //! the binary, which registers the transcoders.
 //!
 //! Standards: ISO/IEC 14496-10 and RFC 6184 (H.264), ITU-T H.265 and RFC 7798,
-//! RFC 3640 and ISO/IEC 14496-3 (AAC), ITU-T G.711, RFC 6716 (Opus).
+//! RFC 3640 and ISO/IEC 14496-3 (AAC), ITU-T G.711 and RFC 3551, RFC 6716 (Opus).
 
 pub mod aac;
+pub mod g711;
 pub mod h264;
 pub mod h265;
 pub mod opus;

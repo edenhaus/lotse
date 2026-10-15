@@ -70,16 +70,25 @@ Open <http://127.0.0.1:8080>, enter the camera's `rtsp://user:pass@host/path`
 URL and press Play. The video fills the window beside the controls (below
 them on a phone). The field shows the password masked unless you are
 editing it, so screenshots do not leak it; copying and reloads keep the
-real URL. *Save* keeps the stream id, URL, an optional name and the
-orientation in the browser's local storage, the URL without its user and
-password: those stay with the tab (session storage), so a reload keeps
+real URL. *Save* keeps the stream id, URL, an optional name, the
+orientation and the two-way audio choice in the browser's local storage,
+the URL without its user and password: those stay with the tab (session
+storage), so a reload keeps
 them and a new tab asks for them again (pick the stream, type them into
 the URL and *Save*). Picking a saved stream plays it, and the list shows
 its password masked too. *Orientation* is
 `stream/put`'s `orientation`: changing it while playing puts the stream
 again and the open session turns the picture from its next frame, without
 reconnecting; the CVO row says whether the answer negotiated the video
-orientation extension or the browser did not offer it. The page shows
+orientation extension or the browser did not offer it. *Two-way audio*
+puts the stream with the RTSP option `backchannel` and offers a
+send-only audio m-line right after; the daemon answers it from the
+camera's backchannel once the connection asks for it, or closes the
+session with `backchannel_unavailable` and why (the page logs it); *Talk* then
+asks for the microphone and sends it to the camera's speaker, and
+stopping releases the backchannel for other viewers. The browser offers
+the microphone only to a page opened at `localhost` or a loopback
+address. The page shows
 the session's progress, the time to the first frame and the browser's
 receive statistics. `lotse-dev-viewer` relays the page to the daemon's
 socket and nothing else.
