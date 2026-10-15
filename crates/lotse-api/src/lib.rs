@@ -22,6 +22,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -249,8 +250,10 @@ impl Server {
     }
 
     /// The directory the daemon writes at runtime (the TLS listener's
-    /// enrolled clients), for the sandbox; `None` without a listener.
-    pub fn state_dir(&self) -> Option<&Path> {
+    /// enrolled clients), for the sandbox: its path, for the logs, and the
+    /// descriptor it was checked and locked through, which the sandbox's
+    /// rule must be made from; `None` without a listener.
+    pub fn state_dir(&self) -> Option<(&Path, BorrowedFd<'_>)> {
         self.tls.as_ref().map(|bound| bound.store.dir())
     }
 

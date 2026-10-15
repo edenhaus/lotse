@@ -23,7 +23,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{self, Write as _};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError, RwLock};
@@ -148,6 +148,12 @@ impl ClientStore {
             .map_err(io)?;
         let handle = File::from(handle);
         if made {
+            // mkdir(2) takes the umask's bits off the mode (umask(2)), and
+            // a umask such as 0200 would leave the daemon a directory it
+            // cannot write: the mode is set whole through the descriptor.
+            rustix::fs::fchmod(&handle, Mode::RWXU)
+                .map_err(io::Error::from)
+                .map_err(io)?;
             std::os::unix::fs::fchown(&handle, Some(runtime.0), Some(runtime.1)).map_err(io)?;
             // Its entry in the data directory survives a crash too, or the
             // first enrollment synced inside it could vanish with it.
@@ -188,9 +194,10 @@ impl ClientStore {
         Self { sync_dir, ..self }
     }
 
-    /// The directory the daemon writes at runtime, for the sandbox.
-    pub(crate) fn dir(&self) -> &Path {
-        &self.dir
+    /// The directory the daemon writes at runtime, for the sandbox: its
+    /// path, and the descriptor it was checked and is locked through.
+    pub(crate) fn dir(&self) -> (&Path, BorrowedFd<'_>) {
+        (&self.dir, self.dir_fd.as_fd())
     }
 
     /// Whether `pin` may connect.
@@ -405,8 +412,13 @@ mod tests {
         let fixed = Fingerprint::of(b"fixed");
         let store = open(&dir, &[fixed], runtime()).unwrap();
         let clients = dir.join(CLIENTS_DIR);
-        assert_eq!(store.dir(), clients);
         let meta = std::fs::metadata(&clients).unwrap();
+        let (path, fd) = store.dir();
+        assert_eq!(path, clients);
+        // A copy shares the lock (flock(2)): this one is closed at once.
+        let opened = File::from(fd.try_clone_to_owned().unwrap());
+        assert_eq!(opened.metadata().unwrap().ino(), meta.ino());
+        drop(opened);
         assert_eq!(meta.mode() & 0o777, 0o700);
         assert!(store.allows(&fixed));
         assert!(!store.is_empty(), "a fixed pin is a client");
@@ -431,6 +443,28 @@ mod tests {
             !again.allows(&fixed),
             "fixed pins come from the configuration only"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression: under umask 0200 the directory was made 0500, which the
+    /// check passes, and every enrollment failed. Nextest runs each test in
+    /// a process of its own, and the umask is put back anyway.
+    #[test]
+    fn umask2_the_directory_is_0700_whatever_the_umask_and_takes_an_enrollment() {
+        let dir = data_dir("umask");
+        let previous = rustix::process::umask(Mode::WUSR);
+        let opened = open(&dir, &[], runtime());
+        let enrolled = opened
+            .as_ref()
+            .ok()
+            .map(|store| store.enroll(Fingerprint::of(b"pin")));
+        rustix::process::umask(previous);
+        let store = opened.unwrap();
+        enrolled.unwrap().unwrap();
+        let clients = dir.join(CLIENTS_DIR);
+        let meta = std::fs::metadata(&clients).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o700);
+        assert!(store.allows(&Fingerprint::of(b"pin")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

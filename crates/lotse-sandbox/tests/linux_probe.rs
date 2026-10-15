@@ -15,12 +15,14 @@
 use std::io::{IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, UdpSocket};
-use std::os::fd::{AsFd as _, AsRawFd as _};
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt as _;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-use lotse_sandbox::{LayerStatus, Mode, Profile, SandboxConfig, SandboxReport};
+use lotse_sandbox::{LayerStatus, Mode, Profile, SandboxConfig, SandboxReport, StateDir};
 use rustix::net::{
     RecvAncillaryBuffer, RecvFlags, SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
 };
@@ -29,7 +31,8 @@ use rustix::process::{DumpableBehavior, Resource, Rlimit};
 /// The variable that turns this binary into the probe child.
 const PROBE: &str = "LOTSE_SANDBOX_PROBE";
 
-/// The variable that turns this binary into the supervisor probe child.
+/// The variable that turns this binary into the supervisor probe child;
+/// its value is the state directory to make.
 const SUPERVISOR_PROBE: &str = "LOTSE_SANDBOX_SUPERVISOR_PROBE";
 
 /// The variable that turns this binary into the escape probe child; its
@@ -72,22 +75,42 @@ fn probe_child() {
     println!("spawn:{spawned:?}");
 }
 
+/// Where the supervisor probe child moves the state directory it opened,
+/// before it makes another at its path.
+fn checked_state(state: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-checked", state.display()))
+}
+
 /// The supervisor probe child: sandbox itself as the supervisor, print the
 /// report, then try what spawning a worker needs from the inherited domain
 /// (`/dev/null` for its stdout, a pidfd to reap it, a TCP listener on port
 /// 0 for its relay) and what it does not (reading `/dev/null`, a fixed TCP
-/// port). Last, it does what a worker does under the supervisor's
-/// inherited filter and domain: bind its relay, apply the worker profile,
-/// and connect to the relay.
+/// port). It writes in the state directory it opened, which was swapped
+/// for another before the sandbox, and in the one at its path now. Last,
+/// it does what a worker does under the supervisor's inherited filter and
+/// domain: bind its relay, apply the worker profile, and connect to the
+/// relay.
 #[test]
 #[expect(
     clippy::disallowed_methods,
     reason = "the probe child reads the variable that marks it"
 )]
 fn supervisor_probe_child() {
-    if std::env::var_os(SUPERVISOR_PROBE).is_none() {
+    let Some(state) = std::env::var_os(SUPERVISOR_PROBE).map(PathBuf::from) else {
         return;
-    }
+    };
+    // The state directory, opened as the daemon opens it, then swapped for
+    // another by someone who may rename in its parent. Both are open to
+    // everyone, so only Landlock decides, whatever uid the drop leaves.
+    let open_to_all = |dir: &Path| {
+        std::fs::create_dir(dir).expect("state directory");
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777)).expect("mode");
+    };
+    open_to_all(&state);
+    let fd = OwnedFd::from(std::fs::File::open(&state).expect("state directory opens"));
+    let checked = checked_state(&state);
+    std::fs::rename(&state, &checked).expect("swapped out");
+    open_to_all(&state);
     // A port that was free a moment ago, found before the sandbox.
     let fixed = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .and_then(|listener| listener.local_addr())
@@ -95,7 +118,10 @@ fn supervisor_probe_child() {
         .port();
     let profile = Profile::Supervisor {
         binary: std::env::current_exe().expect("own path"),
-        state_dir: None,
+        state_dir: Some(StateDir {
+            path: state.clone(),
+            fd,
+        }),
     };
     let report = lotse_sandbox::apply(&profile, &SandboxConfig::default())
         .expect("supervisor profile applies");
@@ -113,6 +139,10 @@ fn supervisor_probe_child() {
     println!("null_write:{null_write:?}");
     let null_read = kind(std::fs::File::open("/dev/null").map(drop));
     println!("null_read:{null_read:?}");
+    let state_write = kind(std::fs::write(checked.join("pins"), b""));
+    println!("state_write:{state_write:?}");
+    let swapped_write = kind(std::fs::write(state.join("pins"), b""));
+    println!("swapped_write:{swapped_write:?}");
     let bind_any = kind(std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map(drop));
     println!("bind_any:{bind_any:?}");
     let bind_fixed = kind(std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, fixed)).map(drop));
@@ -320,11 +350,23 @@ fn run_probe(
 /// `/dev/null` a worker's spawn opens and every TCP `bind`, so no worker
 /// started and none could bind its loopback relay; its seccomp filter,
 /// also inherited, killed the supervisor at `pidfd_open` and a worker at
-/// its first Landlock call.
+/// its first Landlock call. The supervisor writes in the state directory
+/// it was given open, never in one swapped in at its path.
 #[test]
 fn a_supervisor_can_spawn_and_its_workers_bind_an_ephemeral_port_only() {
-    let (report, stdout, stderr, status) =
-        run_probe("supervisor_probe_child", SUPERVISOR_PROBE, "1");
+    let state = std::env::temp_dir().join(format!("lotse-probe-state-{}", std::process::id()));
+    let checked = checked_state(&state);
+    for dir in [&state, &checked] {
+        let _gone = std::fs::remove_dir_all(dir);
+    }
+    let (report, stdout, stderr, status) = run_probe(
+        "supervisor_probe_child",
+        SUPERVISOR_PROBE,
+        state.to_str().expect("a UTF-8 temporary directory"),
+    );
+    for dir in [&state, &checked] {
+        std::fs::remove_dir_all(dir).expect("the probe's state directories");
+    }
     assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(report.mode, Mode::On);
     assert!(report.no_new_privs);
@@ -348,6 +390,13 @@ fn a_supervisor_can_spawn_and_its_workers_bind_an_ephemeral_port_only() {
         );
     };
     denied("null_read", report.landlock.fs == LayerStatus::Enforced);
+    // Regression: the rule was made from the state directory's path, so
+    // the directory swapped in got the rights and the checked one none.
+    assert!(
+        stdout.contains("state_write:Ok(())"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    denied("swapped_write", report.landlock.fs == LayerStatus::Enforced);
     denied("bind_fixed", report.landlock.net == LayerStatus::Enforced);
     assert!(
         stdout.contains("pidfd:Ok(())"),

@@ -198,7 +198,10 @@ fn start_limited(
         tls: None,
     })
     .unwrap();
-    assert_eq!(server.state_dir(), None, "no TLS listener writes nothing");
+    assert!(
+        server.state_dir().is_none(),
+        "no TLS listener writes nothing"
+    );
     let handler = Arc::new(handler);
     let shutdown = CancellationToken::new();
     let clock = Arc::new(FakeClock::default());

@@ -27,6 +27,14 @@
 //! startup; that is the one secret it ever logs, and it is useless once
 //! used or expired.
 //!
+//! While a code is open anyone with a certificate can connect again and
+//! again, one connection after another within the handshake budget, so
+//! what a pairing connection logs before its pin is enrolled is
+//! rate-limited, each kind of line on its own: the first is logged, then
+//! one per [`SUMMARY_INTERVAL`](lotse_core::throttle::SUMMARY_INTERVAL)
+//! with the count since the last. An enrollment and a failure to store
+//! one need the secret, and are always logged.
+//!
 //! Standards: RFC 9110 §9.3.3 (`POST`), §15.3.5 (204), §15.5.1 (400),
 //! §15.5.4 (403), §15.5.11 (410), §15.6.1 (500); RFC 8259 (the JSON body);
 //! RFC 8446 §4.4.2 (the certificate the enrolled pin is taken from).
@@ -53,6 +61,7 @@ use lotse_core::fingerprint::Fingerprint;
 use lotse_core::secret::Secret;
 use lotse_core::task::spawn_blocking_named;
 use lotse_core::task::spawn_named;
+use lotse_core::throttle::Throttle;
 use rustls::crypto::SecureRandom;
 use serde::Deserialize;
 use subtle::ConstantTimeEq as _;
@@ -105,12 +114,49 @@ struct Slot {
     generation: u64,
 }
 
+/// A line a pairing connection logs before its pin is enrolled, which
+/// anyone with a certificate can make the daemon log while a code is open.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Unpaired {
+    /// A connection with an unknown certificate passed its handshake.
+    Opened,
+    /// It sent no request before [`PAIR_TIMEOUT`].
+    Idle,
+    /// Its request is not a secret.
+    NotASecret,
+    /// Its secret is not the open code's.
+    WrongSecret,
+    /// No code was open by its request's turn.
+    NoCode,
+    /// It closed before its request's turn.
+    Abandoned,
+}
+
+/// The rate limit of each [`Unpaired`] line.
+#[derive(Debug, Default)]
+struct UnpairedLines {
+    /// [`Unpaired::Opened`].
+    opened: Throttle,
+    /// [`Unpaired::Idle`].
+    idle: Throttle,
+    /// [`Unpaired::NotASecret`].
+    not_a_secret: Throttle,
+    /// [`Unpaired::WrongSecret`].
+    wrong_secret: Throttle,
+    /// [`Unpaired::NoCode`].
+    no_code: Throttle,
+    /// [`Unpaired::Abandoned`].
+    abandoned: Throttle,
+}
+
 /// The pairing state: at most one open code.
 pub(crate) struct Pairing {
     /// The open code. Its lock is only ever held to look at or change the
     /// slot, never across storing a pin: the TLS verifier reads it on the
     /// runtime's threads.
     slot: Mutex<Slot>,
+    /// The rate limits of the lines logged before a pin is enrolled.
+    unpaired: Mutex<UnpairedLines>,
     /// The daemon's pin, the code's first part.
     server_pin: Fingerprint,
     /// Times the code's lifetime.
@@ -189,10 +235,29 @@ impl Pairing {
     ) -> Self {
         Self {
             slot: Mutex::default(),
+            unpaired: Mutex::default(),
             server_pin,
             clock,
             random,
         }
+    }
+
+    /// Counts one `line` now: `Some(count)` when it is due, `count` being
+    /// the occurrences it covers, `None` while it is held back.
+    pub(crate) fn unpaired(&self, line: Unpaired) -> Option<u64> {
+        let now = self.clock.now();
+        let mut lines = self.unpaired.lock().unwrap_or_else(PoisonError::into_inner);
+        let throttle = match line {
+            Unpaired::Opened => &mut lines.opened,
+            Unpaired::Idle => &mut lines.idle,
+            Unpaired::NotASecret => &mut lines.not_a_secret,
+            Unpaired::WrongSecret => &mut lines.wrong_secret,
+            Unpaired::NoCode => &mut lines.no_code,
+            Unpaired::Abandoned => &mut lines.abandoned,
+        };
+        let due = throttle.hit(now);
+        drop(lines);
+        due
     }
 
     /// The slot, under the lock; a poisoned lock is still usable.
@@ -345,6 +410,7 @@ pub(crate) async fn serve(
     shutdown: CancellationToken,
 ) {
     let (pin, addr) = (context.pin, context.addr);
+    let pairing = Arc::clone(&context.pairing);
     let (redemptions, closed) = (context.redemptions.clone(), context.closed.clone());
     let app = Router::new()
         .route(PAIR_PATH, post(pair))
@@ -357,15 +423,21 @@ pub(crate) async fn serve(
     let connection = http.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app));
     tokio::select! {
         _served = connection => {}
-        () = clock.sleep(PAIR_TIMEOUT) => {
-            let timeout_ms = PAIR_TIMEOUT.as_millis();
-            tracing::info!(%addr, client_pin = %pin, timeout_ms, "pairing connection closed: no request before the deadline");
-        }
+        () = clock.sleep(PAIR_TIMEOUT) => idle(&pairing, addr, pin),
         () = shutdown.cancelled() => {}
     }
     closed.cancel();
     redemptions.close();
     redemptions.wait().await;
+}
+
+/// Logs, rate-limited, that the pairing connection from `addr` with `pin`
+/// sent no request before [`PAIR_TIMEOUT`].
+fn idle(pairing: &Pairing, addr: SocketAddr, pin: Fingerprint) {
+    if let Some(count) = pairing.unpaired(Unpaired::Idle) {
+        let timeout_ms = PAIR_TIMEOUT.as_millis();
+        tracing::info!(%addr, client_pin = %pin, timeout_ms, count, "pairing connection closed: no request before the deadline");
+    }
 }
 
 /// `POST /v1/pair`: 204 once enrolled, 400 for a body that is not a
@@ -375,8 +447,7 @@ pub(crate) async fn serve(
 /// logged even if this handler is dropped with its connection.
 async fn pair(State(context): State<PairContext>, body: Bytes) -> Response {
     let Some(secret) = parse_request(&body) else {
-        let (pin, addr) = (context.pin, context.addr);
-        tracing::info!(%addr, client_pin = %pin, "pairing request refused: not a secret");
+        not_a_secret(&context);
         return error(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidRequest,
@@ -410,6 +481,15 @@ async fn pair(State(context): State<PairContext>, body: Bytes) -> Response {
     }
 }
 
+/// Logs, rate-limited, that the pairing request on `context`'s connection
+/// is not a secret.
+fn not_a_secret(context: &PairContext) {
+    if let Some(count) = context.pairing.unpaired(Unpaired::NotASecret) {
+        let (pin, addr) = (context.pin, context.addr);
+        tracing::info!(%addr, client_pin = %pin, count, "pairing request refused: not a secret");
+    }
+}
+
 /// Redeems `secret` for the connection's pin on the blocking pool, unless
 /// the connection closed before its turn, and logs the outcome.
 async fn redeem(context: PairContext, secret: [u8; SECRET_BYTES]) -> io::Result<Redeemed> {
@@ -421,11 +501,12 @@ async fn redeem(context: PairContext, secret: [u8; SECRET_BYTES]) -> io::Result<
         closed,
         ..
     } = context;
+    let redeeming = Arc::clone(&pairing);
     let outcome = spawn_blocking_named("api.pair_store", move || {
         if closed.is_cancelled() {
             return Ok(Redeemed::Abandoned);
         }
-        pairing.redeem(&secret, || store.enroll(pin))
+        redeeming.redeem(&secret, || store.enroll(pin))
     })
     .await
     .map_err(io::Error::other)
@@ -438,13 +519,19 @@ async fn redeem(context: PairContext, secret: [u8; SECRET_BYTES]) -> io::Result<
             "control client enrolled by pairing"
         ),
         Ok(Redeemed::WrongSecret) => {
-            tracing::warn!(%addr, client_pin = %pin, "pairing request refused: wrong secret");
+            if let Some(count) = pairing.unpaired(Unpaired::WrongSecret) {
+                tracing::warn!(%addr, client_pin = %pin, count, "pairing request refused: wrong secret");
+            }
         }
         Ok(Redeemed::NoCode) => {
-            tracing::info!(%addr, client_pin = %pin, "pairing request refused: no code open");
+            if let Some(count) = pairing.unpaired(Unpaired::NoCode) {
+                tracing::info!(%addr, client_pin = %pin, count, "pairing request refused: no code open");
+            }
         }
         Ok(Redeemed::Abandoned) => {
-            tracing::info!(%addr, client_pin = %pin, "pairing request dropped: its connection closed first");
+            if let Some(count) = pairing.unpaired(Unpaired::Abandoned) {
+                tracing::info!(%addr, client_pin = %pin, count, "pairing request dropped: its connection closed first");
+            }
         }
         Err(err) => {
             tracing::error!(%addr, client_pin = %pin, error = %err, "enrolling the paired client failed");
@@ -472,6 +559,7 @@ mod tests {
     use std::sync::Barrier;
 
     use lotse_core::clock::FakeClock;
+    use lotse_core::throttle::SUMMARY_INTERVAL;
 
     use super::test_support::{NO_RANDOM, capture};
     use super::*;
@@ -666,6 +754,97 @@ mod tests {
         let outcome = redeem(context(), secret_of(&code)).await.unwrap();
         assert_eq!(outcome, Redeemed::NoCode);
         assert!(logs.text().contains("no code open"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn each_line_before_pairing_is_rate_limited_on_its_own() {
+        let clock = Arc::new(FakeClock::default());
+        let pairing = pairing(&clock);
+        let lines = [
+            Unpaired::Opened,
+            Unpaired::Idle,
+            Unpaired::NotASecret,
+            Unpaired::WrongSecret,
+            Unpaired::NoCode,
+            Unpaired::Abandoned,
+        ];
+        for line in lines {
+            assert_eq!(pairing.unpaired(line), Some(1), "{line:?} first");
+        }
+        for line in lines {
+            assert_eq!(pairing.unpaired(line), None, "{line:?} again");
+        }
+        clock.advance(
+            SUMMARY_INTERVAL
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+        );
+        assert_eq!(pairing.unpaired(Unpaired::Opened), None);
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(pairing.unpaired(Unpaired::Opened), Some(3));
+        for line in &lines[1..] {
+            assert_eq!(pairing.unpaired(*line), Some(2), "{line:?} summary");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_refusals_are_logged_once_per_interval_with_their_count() {
+        let (logs, _guard) = capture();
+        let (dir, store) = store("throttled");
+        let store = Arc::new(store);
+        let clock = Arc::new(FakeClock::default());
+        let pairing = Arc::new(pairing(&clock));
+        let code = pairing.open().unwrap();
+        let pin = Fingerprint::of(b"client");
+        let context = || PairContext::new(Arc::clone(&pairing), Arc::clone(&store), pin, addr());
+        let lines = |text: &str| {
+            logs.text()
+                .lines()
+                .filter(|line| line.contains(text))
+                .count()
+        };
+        let counted = |text: &str, count: &str| {
+            logs.text()
+                .lines()
+                .filter(|line| line.contains(text) && line.ends_with(count))
+                .count()
+        };
+        for _ in 0..3 {
+            let outcome = redeem(context(), [0; SECRET_BYTES]).await.unwrap();
+            assert_eq!(outcome, Redeemed::WrongSecret);
+            let answer = pair(State(context()), Bytes::from_static(b"{}")).await;
+            assert_eq!(answer.status(), StatusCode::BAD_REQUEST);
+            let closed = context();
+            closed.closed.cancel();
+            let outcome = redeem(closed, secret_of(&code)).await.unwrap();
+            assert_eq!(outcome, Redeemed::Abandoned);
+            idle(&pairing, addr(), pin);
+        }
+        assert_eq!(counted("no request before the deadline", "count=1"), 1);
+        assert_eq!(counted("wrong secret", "count=1"), 1);
+        assert_eq!(lines("pairing request refused: not a secret"), 1);
+        assert_eq!(lines("its connection closed first"), 1);
+        clock.advance(SUMMARY_INTERVAL);
+        redeem(context(), [0; SECRET_BYTES]).await.unwrap();
+        idle(&pairing, addr(), pin);
+        assert_eq!(lines("wrong secret"), 2);
+        assert_eq!(counted("no request before the deadline", "count=3"), 1);
+        assert_eq!(counted("wrong secret", "count=3"), 1);
+        // Still answered every time: the limit is the log's only.
+        assert!(pairing.is_open());
+        assert_eq!(
+            redeem(context(), secret_of(&code)).await.unwrap(),
+            Redeemed::Enrolled
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                redeem(context(), secret_of(&code)).await.unwrap(),
+                Redeemed::NoCode
+            );
+        }
+        assert_eq!(lines("no code open"), 1);
+        assert_eq!(lines("control client enrolled by pairing"), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

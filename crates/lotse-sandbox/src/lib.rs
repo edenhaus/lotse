@@ -10,6 +10,7 @@
 //! Standards: landlock(7), seccomp(2), prctl(2), setresuid(2), setrlimit(2).
 
 use std::fmt;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -115,8 +116,21 @@ impl FromStr for Mode {
     }
 }
 
+/// The directory the supervisor writes at runtime, as the caller opened
+/// and checked it. Its Landlock rule is made from `fd`, never from `path`:
+/// a rule names the inode (landlock(7)), and looking the path up again
+/// could find another directory than the one checked, should someone who
+/// may rename in a parent have swapped it meanwhile.
+#[derive(Debug)]
+pub struct StateDir {
+    /// What the directory was opened as, for the notes and the logs only.
+    pub path: PathBuf,
+    /// The directory, open; close-on-exec, so no child inherits it.
+    pub fd: OwnedFd,
+}
+
 /// Which process kind is being sandboxed, with what that kind still needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Profile {
     /// The supervisor: reads `/etc/resolv.conf`, `/etc/hosts` and `/proc`,
     /// re-executes its own binary, spawns processes, opens sockets, and
@@ -127,7 +141,7 @@ pub enum Profile {
         binary: PathBuf,
         /// The directory the supervisor writes at runtime (the control TLS
         /// listener's enrolled clients), if it has one.
-        state_dir: Option<PathBuf>,
+        state_dir: Option<StateDir>,
     },
     /// A worker: no filesystem, TCP only to its camera's ports, no
     /// subprocesses, threads only.

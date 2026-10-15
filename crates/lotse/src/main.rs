@@ -20,7 +20,7 @@ use lotse_core::clock::SystemClock;
 use lotse_core::registry::Registries;
 use lotse_core::runner::RunnerConfig;
 use lotse_core::track::TrackLimits;
-use lotse_sandbox::{Profile, SandboxConfig, SandboxReport};
+use lotse_sandbox::{Profile, SandboxConfig, SandboxReport, StateDir};
 use lotse_supervisor::worker::WorkerConfig;
 use lotse_supervisor::{Environment, Identity};
 
@@ -185,11 +185,26 @@ fn serve(args: &ServeArgs, matches: &ArgMatches) -> anyhow::Result<()> {
 
     let listeners = lotse_supervisor::bind(&settings.supervisor).context("sockets")?;
     let binary = std::env::current_exe().context("own executable path")?;
+    // The rule is made from the descriptor the directory was checked and
+    // locked through, not its path, which could name another by now. The
+    // copy is close-on-exec (`F_DUPFD_CLOEXEC`) and closed with the profile.
+    let state_dir = listeners
+        .api
+        .state_dir()
+        .map(|(path, fd)| {
+            fd.try_clone_to_owned().map(|fd| StateDir {
+                path: path.to_path_buf(),
+                fd,
+            })
+        })
+        .transpose()
+        .context("state directory")?;
     let profile = Profile::Supervisor {
         binary: binary.clone(),
-        state_dir: listeners.api.state_dir().map(std::path::Path::to_path_buf),
+        state_dir,
     };
     let report = lotse_sandbox::apply(&profile, &settings.sandbox).context("sandbox")?;
+    drop(profile);
 
     let limits = &settings.supervisor.limits;
     let environment = Environment {

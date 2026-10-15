@@ -143,7 +143,13 @@ fn start(name: &str, clients: Vec<Fingerprint>) -> Running {
 /// A server in directories an earlier one used.
 fn start_in(dir: PathBuf, data: PathBuf, clients: Vec<Fingerprint>) -> Running {
     let server = Server::bind(config(&dir, &data, clients)).unwrap();
-    assert_eq!(server.state_dir(), Some(data.join("clients").as_path()));
+    let (state_dir, fd) = server.state_dir().unwrap();
+    assert_eq!(state_dir, data.join("clients"));
+    // A copy shares the store's lock (flock(2)): this one is closed at once.
+    let opened = std::fs::File::from(fd.try_clone_to_owned().unwrap());
+    let checked = std::fs::metadata(state_dir).unwrap().ino();
+    assert_eq!(opened.metadata().unwrap().ino(), checked);
+    drop(opened);
     let addr = server.tls_local_addr().unwrap();
     let server_pin = ServerIdentity::load(&data, uid_of(&dir)).unwrap().pin();
     let shutdown = CancellationToken::new();

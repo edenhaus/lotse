@@ -65,7 +65,7 @@ use tokio_util::sync::CancellationToken;
 use crate::clients::ClientStore;
 use crate::identity::ServerIdentity;
 use crate::listener::{BindError, PeerInfo, accept_retrying};
-use crate::pairing::{self, CODE_LIFETIME, PairContext, Pairing};
+use crate::pairing::{self, CODE_LIFETIME, PairContext, Pairing, Unpaired};
 use crate::{UPGRADE_TIMEOUT, upgrade_slot};
 
 /// From accept to the end of the TLS handshake: 3 s. A TLS 1.3 handshake
@@ -565,7 +565,9 @@ async fn handshake(tcp: TcpStream, addr: SocketAddr, ticket: Ticket, h: Handshak
             if !h.store.allows(&pin) {
                 // In only because a code is open: it may pair and do
                 // nothing else, within the budget its ticket holds.
-                tracing::info!(%addr, client_pin = %pin, "pairing connection opened");
+                if let Some(count) = h.pairing.unpaired(Unpaired::Opened) {
+                    tracing::info!(%addr, client_pin = %pin, count, "pairing connection opened");
+                }
                 let context =
                     PairContext::new(Arc::clone(&h.pairing), Arc::clone(&h.store), pin, addr);
                 pairing::serve(stream, context, h.clock, h.shutdown).await;
