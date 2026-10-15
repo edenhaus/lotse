@@ -1,7 +1,8 @@
 //! How a retina error becomes a [`SourceError`]: the RTSP status and
 //! method stay in the message, the kind follows what went wrong. The
-//! attempt scrubs its error of the source URL's path and query
-//! ([`SourceError::scrubbed`]), which retina may echo.
+//! message is scrubbed of the source URL's path and query, which retina
+//! may echo, before it is cut: a path cut partway through no longer
+//! matches the scrub.
 //!
 //! The camera's own text, which retina's messages quote (a header, an
 //! SDP line), reaches the log and the API's error only through
@@ -11,6 +12,7 @@
 //! RFC 2326 §7.1.1: 401 and 403 are the credential failures.
 
 use lotse_core::source::SourceError;
+use lotse_core::source_url::SourceUrl;
 
 /// The most bytes of a camera's text an error message or a log line
 /// carries: a header value or a reason is a sentence, and a camera's
@@ -23,17 +25,20 @@ pub(crate) fn camera_text(text: &str) -> String {
     lotse_core::text::plain(text, CAMERA_TEXT_BYTES)
 }
 
-/// Classifies a retina error. retina keeps its variants private, so the
-/// status code (public) and the message text (stable prefixes per
-/// variant) decide.
-pub fn classify(error: &retina::Error) -> SourceError {
-    classify_text(&error.to_string(), error.status_code())
+/// Classifies a retina error of the session for `url`. retina keeps its
+/// variants private, so the status code (public) and the message text
+/// (stable prefixes per variant) decide.
+pub fn classify(error: &retina::Error, url: &SourceUrl) -> SourceError {
+    classify_text(&error.to_string(), error.status_code(), url)
 }
 
 /// [`classify`] on a retina error's `text` and RTSP `status`: its first
-/// line, as [`camera_text`], is the message.
-fn classify_text(text: &str, status: Option<u16>) -> SourceError {
-    let message = camera_text(first_line(text));
+/// line, scrubbed of `url` ([`RedactedUrl::scrub`]), then as
+/// [`camera_text`], is the message.
+///
+/// [`RedactedUrl::scrub`]: lotse_core::secret::RedactedUrl::scrub
+fn classify_text(text: &str, status: Option<u16>, url: &SourceUrl) -> SourceError {
+    let message = camera_text(&url.redacted().scrub(first_line(text)));
     if let Some(status) = status {
         return match status {
             401 | 403 => SourceError::AuthFailed(message),
@@ -68,9 +73,12 @@ mod tests {
         reason = "test code"
     )]
 
-    use lotse_core::source_url::SourceUrl;
-
     use super::*;
+
+    /// A source URL with nothing to scrub.
+    fn cam() -> SourceUrl {
+        SourceUrl::parse("rtsp://cam/").unwrap()
+    }
 
     /// retina names the URL it was given in an `InvalidArgument`; the
     /// relay URL it is given carries the source URL's path and query,
@@ -91,7 +99,7 @@ mod tests {
             "retina echoes: {err}"
         );
         assert_eq!(
-            classify(&err).scrubbed(&url),
+            classify(&err, &url),
             SourceError::Protocol(
                 "Invalid argument: Bad URL rtspx://cam/****?**** only scheme rtsp supported".into()
             )
@@ -113,32 +121,45 @@ mod tests {
     fn a_camera_s_text_in_retina_s_error_reaches_the_message_capped_on_one_line() {
         let quoted = format!("{:?}", format!("x\r\n{}", "y".repeat(64 * 1024)));
         let text = format!("Unparseable Session header {quoted}\n\nconn: 127.0.0.1:1");
-        let err = classify_text(&text, None);
+        let err = classify_text(&text, None, &cam());
         assert!(
             matches!(&err, SourceError::Protocol(m) if m.len() == CAMERA_TEXT_BYTES
                 && m.starts_with(r#"Unparseable Session header "x\r\nyyy"#)),
             "{err:?}"
         );
         assert_eq!(
-            classify_text("401\u{1b}[2J\nmore", Some(401)),
+            classify_text("401\u{1b}[2J\nmore", Some(401), &cam()),
             SourceError::AuthFailed("401\u{fffd}[2J".into())
         );
         assert!(matches!(
-            classify_text("Unable to connect\r to x", None),
+            classify_text("Unable to connect\r to x", None, &cam()),
             SourceError::Unreachable(m) if m == "Unable to connect  to x"
         ));
         assert!(matches!(
-            classify_text("Timeout", None),
+            classify_text("Timeout", None, &cam()),
             SourceError::Timeout(_)
         ));
         assert!(matches!(
-            classify_text("Error receiving UDP packet", None),
+            classify_text("Error receiving UDP packet", None, &cam()),
             SourceError::Ended(_)
         ));
         assert!(matches!(
-            classify_text("x", Some(404)),
+            classify_text("x", Some(404), &cam()),
             SourceError::Protocol(_)
         ));
+    }
+
+    /// A camera that echoes the path without a scheme, where the message
+    /// is cut: scrubbed after the cut, the path's first bytes would show.
+    #[test]
+    fn a_path_echoed_where_the_message_is_cut_is_scrubbed_before_the_cut() {
+        let url = SourceUrl::parse("rtsp://cam/camkey7f3a/live?token=tok9d2e").unwrap();
+        let lead = "x".repeat(CAMERA_TEXT_BYTES - 18);
+        let text = format!("Bad request {lead} /camkey7f3a/live?token=tok9d2e");
+        assert_eq!(
+            classify_text(&text, Some(400), &url),
+            SourceError::Protocol(format!("Bad request {lead} /****"))
+        );
     }
 
     #[test]

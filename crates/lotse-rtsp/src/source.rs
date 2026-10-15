@@ -523,15 +523,16 @@ impl Carried {
 }
 
 /// Runs one RTSP request under the read deadline and cancellation; a
-/// retina error is classified.
+/// retina error is classified, scrubbed of `url`.
 async fn bounded<T>(
     ctx: &SourceCtx,
+    url: &SourceUrl,
     deadline: Duration,
     what: &str,
     future: impl Future<Output = Result<T, retina::Error>>,
 ) -> Result<T, SourceError> {
     within(ctx, deadline, what, async {
-        future.await.map_err(|err| classify(&err))
+        future.await.map_err(|err| classify(&err, url))
     })
     .await
 }
@@ -585,6 +586,7 @@ async fn connect(
     tracing::info!(host = %ctx.peer.host, addrs = ?ctx.peer.addrs, "rtsp: describing");
     let mut session = bounded(
         ctx,
+        url,
         deadline,
         "DESCRIBE",
         Session::describe(target, session_options),
@@ -609,7 +611,7 @@ async fn connect(
         );
         let udp = options.transport == MediaTransport::Udp;
         within(ctx, deadline, "SETUP", async {
-            setup.await.map_err(|err| setup_error(&err, udp))
+            setup.await.map_err(|err| setup_error(&err, url, udp))
         })
         .await?;
     }
@@ -640,7 +642,7 @@ async fn connect(
             .initial_seq(InitialSequenceNumberPolicy::IgnoreSuspiciousValues)
             .initial_timestamp(InitialTimestampPolicy::Ignore),
     );
-    let playing = bounded(ctx, deadline, "PLAY", play).await?;
+    let playing = bounded(ctx, url, deadline, "PLAY", play).await?;
     Ok(Connected { playing, carried })
 }
 
@@ -650,8 +652,8 @@ const UNSUPPORTED_TRANSPORT: u16 = 461;
 /// A failed `SETUP` as a source error: a camera that refuses RTP over UDP
 /// says how to repair it; nothing falls back to TCP on its own, because
 /// the transport is part of the stream's options and its connection key.
-fn setup_error(error: &retina::Error, udp: bool) -> SourceError {
-    match classify(error) {
+fn setup_error(error: &retina::Error, url: &SourceUrl, udp: bool) -> SourceError {
+    match classify(error, url) {
         SourceError::Protocol(message)
             if udp && error.status_code() == Some(UNSUPPORTED_TRANSPORT) =>
         {
@@ -774,11 +776,11 @@ async fn run(
 ) -> SourceExit {
     let group = Arc::new(SessionGroup::default());
     let exit = match connect(target, &url, &options, &mut ctx, &group, &rates).await {
-        Ok(connected) => play(connected, &options, &ctx).await,
+        Ok(connected) => play(connected, &url, &options, &ctx).await,
         Err(err) => err,
     };
-    // retina's messages may echo a URL built from the source URL's path
-    // and query (a control URL it cannot join to its base).
+    // `classify` scrubbed retina's errors; the attempt's others (TLS, the
+    // relay) are scrubbed here too, should one echo the URL.
     let exit = exit.scrubbed(&url);
     tear_down(&group, &ctx, &exit).await;
     SourceExit::Ended(exit)
@@ -798,7 +800,12 @@ async fn tear_down(group: &SessionGroup, ctx: &SourceCtx, exit: &SourceError) {
 
 /// Plays a connected session until the camera or core ends it: why it
 /// ended, with the session dropped, which starts its `TEARDOWN`.
-async fn play(mut connected: Connected, options: &RtspOptions, ctx: &SourceCtx) -> SourceError {
+async fn play(
+    mut connected: Connected,
+    url: &SourceUrl,
+    options: &RtspOptions,
+    ctx: &SourceCtx,
+) -> SourceError {
     // Over TCP the session is live once PLAY is answered. Over UDP it is
     // live once the first RTP datagram arrived: a camera whose datagrams
     // never reach the daemon ends the attempt with why, not a stall.
@@ -820,7 +827,7 @@ async fn play(mut connected: Connected, options: &RtspOptions, ctx: &SourceCtx) 
         };
         match item {
             None => break SourceError::Ended("the camera closed the session".into()),
-            Some(Err(err)) => break classify(&err),
+            Some(Err(err)) => break classify(&err, url),
             Some(Ok(PacketItem::Rtp(packet))) => {
                 if !live {
                     live = true;
