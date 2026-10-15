@@ -415,8 +415,11 @@ async fn serve<H: Handler>(
         () = deadline => {
             // RFC 6455 §7.1.1: the server may drop the connection rather
             // than wait; aborting the writer drops the sink and, with the
-            // stream below, the socket.
+            // stream below, the socket. Awaited, as `abort` only asks: the
+            // connection's state, and with it its hold on serving, goes
+            // only once the sink is gone.
             writer.abort();
+            let _aborted = (&mut writer).await;
             let timeout_ms = CLOSE_TIMEOUT.as_millis();
             tracing::warn!(
                 closed_by,
@@ -931,13 +934,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            matches!(
-                next_frame(&mut ws).await,
-                tokio_tungstenite::tungstenite::Message::Text(_)
-            ),
-            "hello"
-        );
+        let hello = next_frame(&mut ws).await;
+        assert!(hello.is_text(), "{hello:?}");
         ws
     }
 
