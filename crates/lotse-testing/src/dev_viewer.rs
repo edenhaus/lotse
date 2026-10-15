@@ -864,7 +864,7 @@ mod tests {
         let between = &play[put..offer];
         assert!(!between.contains("await"), "{between}");
         assert!(!page.contains(r#"type: "stream/get""#), "no polling");
-        assert!(!page.contains("setTimeout(resolve"), "no waiting");
+        assert!(!play.contains("setTimeout("), "no waiting: {play}");
         // A talk-back request the daemon cannot meet fails the session; the
         // page says why and does not retry without talk-back.
         let closed = page
@@ -913,6 +913,68 @@ mod tests {
             .and_then(|rest| rest.split("\n}\n").next())
             .expect("teardown()");
         assert!(teardown.contains("releaseMic();"), "{teardown}");
+    }
+
+    /// Talk's start and stop are serialized per Play: a stale Play's
+    /// failure never touches a later one's controls, and Talk stays
+    /// disabled from a stop until the worker applied its release.
+    #[test]
+    fn talk_controls_follow_only_the_current_play_and_wait_for_the_release() {
+        let page = PAGE;
+        let start = page
+            .split("async function startTalking()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("startTalking()");
+        // A stale Play's failure leaves the controls alone: each failure
+        // returns for it before touching them, and Talk comes back only
+        // for the current one.
+        for failed in start.split("} catch (err) {").skip(1) {
+            let handler = failed.split("return;\n  }").next().unwrap();
+            let stale = handler
+                .find("if (mine !== attempt) return;")
+                .expect(handler);
+            for touch in ["log(", "$(\"talk\")", "releaseMic()"] {
+                assert!(
+                    handler.find(touch).is_none_or(|at| at > stale),
+                    "{touch} before the stale check: {handler}"
+                );
+            }
+            assert!(
+                handler.contains("$(\"talk\").disabled = false;"),
+                "{handler}"
+            );
+        }
+        let stop = page
+            .split("async function stopTalking()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("stopTalking()");
+        // Talk stays disabled from the stop until the worker applied the
+        // release, which session/get shows once the supervisor heard of
+        // it: the command's result only says it is queued.
+        let disabled = stop.find("$(\"talk\").disabled = true;").expect(stop);
+        let release = stop.find("backchannel/release").expect(stop);
+        let applied = stop
+            .find("await releaseApplied(session, mine)")
+            .expect(stop);
+        let enabled = stop
+            .find("if (mine === attempt) $(\"talk\").disabled = false;")
+            .expect(stop);
+        assert!(
+            disabled < release && release < applied && applied < enabled,
+            "{stop}"
+        );
+        let polls = page
+            .split("async function releaseApplied(session, mine)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("releaseApplied()");
+        assert!(
+            polls.contains(r#"call({ type: "session/get", session_id: session })"#),
+            "{polls}"
+        );
+        assert!(polls.contains("!got.result.backchannel.talker"), "{polls}");
     }
 
     type Connected = Result<
