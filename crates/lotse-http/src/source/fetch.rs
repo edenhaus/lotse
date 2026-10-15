@@ -266,7 +266,9 @@ impl<C: Connect> Follower<C> {
     /// Fetches one segment, and its init segment when the `EXT-X-MAP`
     /// changed. The init segment's first bytes tell MPEG-TS tables (RFC
     /// 8216 §3.2) from a movie box (§3.3); a segment without one must be
-    /// MPEG-TS (§3.2).
+    /// MPEG-TS (§3.2). With the tables in the map, a segment of whole
+    /// transport packets is MPEG-TS however few: one AAC frame fits in
+    /// one packet.
     async fn segment(&mut self, fetch: Fetch) -> Result<Segment, SourceError> {
         let format = match &fetch.segment.map {
             Some(map) => {
@@ -293,7 +295,7 @@ impl<C: Connect> Follower<C> {
                     fetch.sequence, self.what
                 )));
             }
-            Format::Ts { init: Some(_) } if !is_mpegts(&data) => {
+            Format::Ts { init: Some(_) } if !is_mpegts(&data) && !is_mpegts_packets(&data) => {
                 return Err(SourceError::Protocol(format!(
                     "segment {} of the {} playlist is not MPEG-TS, which its EXT-X-MAP is (RFC 8216 §3.2)",
                     fetch.sequence, self.what

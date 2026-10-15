@@ -752,6 +752,40 @@ async fn rfc8216_3_2_ts_segments_take_their_tables_from_their_ext_x_map() {
     rig.stop().await;
 }
 
+/// With its tables in the `EXT-X-MAP`, a segment of one or two transport
+/// packets is MPEG-TS (RFC 8216 §3.2), however short: a single AAC frame
+/// fits in one packet.
+#[tokio::test(flavor = "current_thread")]
+async fn rfc8216_3_2_mapped_ts_segments_of_one_or_two_packets_are_read() {
+    let rig = Rig::new().await;
+    let (tables, live_0) = split_tables(LIVE_0);
+    let (_, live_1) = split_tables(LIVE_1);
+    let (one, rest) = live_1.split_at(188);
+    let (two, rest) = rest.split_at(2 * 188);
+    rig.body("/s/tables.ts", MP2T, tables);
+    for (name, body) in [("0", &live_0[..]), ("1", one), ("2", two), ("3", rest)] {
+        rig.body(&format!("/s/{name}.m2t"), MP2T, body.to_vec());
+    }
+    rig.playlist(
+        "/s/index.m3u8",
+        &media_playlist(
+            "#EXT-X-MAP:URI=\"tables.ts\"\n",
+            &["0.m2t", "1.m2t", "2.m2t", "3.m2t"],
+            true,
+        ),
+    );
+    let harness = rig.start("/s/index.m3u8");
+    let set = Arc::clone(&harness.tracks);
+    let err = rig.exit(harness).await;
+    assert_ended_with(&err, "EXT-X-ENDLIST");
+    let (video, audio) = tracks(&set);
+    assert_eq!(rig.seen("/s/3.m2t"), 1);
+    assert_eq!(video.stats().frames, 20);
+    assert_eq!(video.stats().keyframes, 2);
+    assert!(audio.stats().frames >= 90, "{:?}", audio.stats());
+    rig.stop().await;
+}
+
 /// Without its tables, a segment is read against no program; a segment
 /// of another format than its map is refused.
 #[tokio::test(flavor = "current_thread")]
