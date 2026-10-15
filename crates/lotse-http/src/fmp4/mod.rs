@@ -51,9 +51,11 @@
 //! start at the same instant as tracks of one stream do. A new init
 //! segment is a new reader and a new [`Layout`].
 //!
-//! Bounds: a movie fragment declaring more than [`MAX_SAMPLES`] samples is
-//! refused before mp4-atom reads it (each declared sample may become an
-//! entry it allocates); a sample larger than `max_frame_bytes`, empty,
+//! Bounds: a media segment whose movie fragments declare more than
+//! [`MAX_SAMPLES`] samples in all is refused before mp4-atom reads any of
+//! them (each declared sample may become an entry it allocates and a
+//! unit, and an empty one is read without costing media data); a sample
+//! larger than `max_frame_bytes`, empty,
 //! outside every media data box (a segment cut short ends its last one)
 //! or whose NAL units run past its end is dropped and counted; a segment
 //! whose samples cover more bytes than its media data boxes hold is
@@ -81,9 +83,11 @@ use mp4_atom::{
 use crate::media::{Layout, LayoutTrack, TS_CLOCK_RATE, Unit};
 use crate::ts::clamp;
 
-/// The most samples one movie fragment may declare: over an hour of
-/// 30 fps video with AAC at 48 kHz in a single fragment, where HLS
+/// The most samples one media segment may declare, over all its movie
+/// fragments: over an hour of 30 fps video with AAC at 48 kHz, where HLS
 /// segments last seconds (RFC 8216 §4.3.3.1, `EXT-X-TARGETDURATION`).
+/// Counted over the whole segment, as each sample may become a [`Unit`]
+/// and many fragments of one-byte samples would otherwise make millions.
 pub const MAX_SAMPLES: u64 = 1 << 18;
 
 /// The movie box (ISO/IEC 14496-12 §8.2.1).
@@ -160,10 +164,11 @@ pub enum Fmp4Error {
         /// Its `track_ID`.
         track: u32,
     },
-    /// A movie fragment declares more samples than [`MAX_SAMPLES`].
-    #[error("a movie fragment declares {count} samples, more than {MAX_SAMPLES}")]
+    /// A media segment's movie fragments declare more samples than
+    /// [`MAX_SAMPLES`] in all.
+    #[error("a media segment declares {count} samples, more than {MAX_SAMPLES}")]
     TooManySamples {
-        /// The samples its runs declare.
+        /// The samples the runs of all its movie fragments declare.
         count: u64,
     },
     /// The samples of a media segment cover more bytes than its media
@@ -644,11 +649,16 @@ impl Reader {
         };
         let mut units = Vec::new();
         let mut stats = self.stats;
-        for fragment in placed.iter().filter(|placed| placed.kind == MOOF) {
-            let count = declared_samples(fragment.body).map_err(box_error("movie fragment"))?;
-            if count > MAX_SAMPLES {
-                return Err(Fmp4Error::TooManySamples { count });
-            }
+        let fragments: Vec<_> = placed.iter().filter(|placed| placed.kind == MOOF).collect();
+        let mut count = 0_u64;
+        for fragment in &fragments {
+            let declared = declared_samples(fragment.body).map_err(box_error("movie fragment"))?;
+            count = count.saturating_add(declared);
+        }
+        if count > MAX_SAMPLES {
+            return Err(Fmp4Error::TooManySamples { count });
+        }
+        for fragment in fragments {
             let mut bytes = segment.get(fragment.start..).unwrap_or_default();
             let moof = Moof::decode(&mut bytes).map_err(box_error("movie fragment"))?;
             self.fragment(&moof, fragment.start, &mut media, &mut units, &mut stats)?;

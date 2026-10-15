@@ -498,7 +498,7 @@ fn iso14496_12_8_8_8_a_huge_sample_count_is_refused_before_mp4_atom_reads_it() {
     assert_eq!(err, Fmp4Error::TooManySamples { count: declared });
     assert_eq!(
         err.to_string(),
-        format!("a movie fragment declares {declared} samples, more than 262144")
+        format!("a media segment declares {declared} samples, more than 262144")
     );
     // Exactly the limit is read, and mp4-atom finds the run short.
     let at_limit = u32::try_from(MAX_SAMPLES - 48).unwrap();
@@ -513,6 +513,24 @@ fn iso14496_12_8_8_8_a_huge_sample_count_is_refused_before_mp4_atom_reads_it() {
             }
         ),
         "{err:?}"
+    );
+}
+
+/// Each sample may become a unit, so the bound holds for the whole
+/// segment: movie fragments each under it are refused together, before
+/// mp4-atom reads the first.
+#[test]
+fn iso14496_12_8_8_8_the_sample_bound_holds_over_all_the_movie_fragments() {
+    let count = trun(H264_AAC_0, 0) + 4;
+    let half = u32::try_from(MAX_SAMPLES / 2 + 1 - 48).unwrap();
+    let fragment = patched(H264_AAC_0, count, &half.to_be_bytes());
+    let segment = [&fragment[..], &fragment[..]].concat();
+    let err = segment_error(H264_AAC_INIT, &segment);
+    assert_eq!(
+        err,
+        Fmp4Error::TooManySamples {
+            count: MAX_SAMPLES + 2
+        }
     );
 }
 
