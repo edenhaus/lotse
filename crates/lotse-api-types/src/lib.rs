@@ -11,6 +11,7 @@
 //! Standards: JSON Schema 2020-12, RFC 3339, ULID, Semantic Versioning
 //! 2.0.0.
 
+pub mod clients;
 pub mod command;
 pub mod error;
 pub mod frame;

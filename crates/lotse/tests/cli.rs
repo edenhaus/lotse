@@ -383,3 +383,92 @@ fn pair_without_a_control_tls_listener_fails() {
     let (exit, _rest) = daemon.terminate();
     assert_eq!(exit, Some(0));
 }
+
+#[test]
+fn ctl_clients_lists_the_pins_and_removes_an_enrolled_one_for_good() {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+
+    let dir = socket_dir("clients");
+    let socket = dir.join("lotse.sock");
+    let socket = socket.to_str().expect("utf-8 path");
+    let data = dir.join("data");
+    let mut private = std::fs::DirBuilder::new();
+    private.mode(0o700);
+    private.create(&data).unwrap();
+    private.create(data.join("clients")).unwrap();
+    let pins = data.join("clients").join("pins");
+    let fixed = "ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad";
+    let enrolled = ["11"; 32].join(":");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&pins)
+        .unwrap();
+    writeln!(file, "{enrolled}").unwrap();
+    drop(file);
+    // Owned by the uid the daemon runs as: root drops to nobody.
+    let meta = std::fs::metadata(&data).unwrap();
+    let owner = if meta.uid() == 0 {
+        (65534, 65534)
+    } else {
+        (meta.uid(), meta.gid())
+    };
+    for path in [data.join("clients"), pins.clone()] {
+        std::os::unix::fs::chown(path, Some(owner.0), Some(owner.1)).unwrap();
+    }
+    let mut daemon = Daemon::start(
+        &[
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "off",
+            "--socket",
+            socket,
+            "--sandbox",
+            "off",
+            "--control-listen",
+            "127.0.0.1:0",
+            "--data-dir",
+            data.to_str().expect("utf-8 path"),
+        ],
+        &[("LOTSE_CONTROL_CLIENTS", fixed)],
+    );
+    daemon.wait_for("\"event\":\"ready\"");
+    let ctl = |args: &[&str]| {
+        lotse()
+            .args(["ctl", "--socket", socket, "--compact", "clients"])
+            .args(args)
+            .output()
+            .expect("runs")
+    };
+    let printed = |output: &std::process::Output| -> serde_json::Value {
+        serde_json::from_slice(&output.stdout).expect("JSON on stdout")
+    };
+
+    let output = ctl(&["list"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        printed(&output),
+        serde_json::json!({ "clients": [
+            { "pin": enrolled, "fixed": false, "connected": false },
+            { "pin": fixed, "fixed": true, "connected": false },
+        ] })
+    );
+    let output = ctl(&["remove", fixed]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(printed(&output)["error"]["code"], "not_permitted");
+    let output = ctl(&["remove", &"11".repeat(32)]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(printed(&output), serde_json::json!({}));
+    daemon.wait_for("control client removed");
+    let output = ctl(&["list"]);
+    assert_eq!(
+        printed(&output)["clients"],
+        serde_json::json!([{ "pin": fixed, "fixed": true, "connected": false }])
+    );
+    let (exit, rest) = daemon.terminate();
+    assert_eq!(exit, Some(0), "clean exit\n{}", rest.join("\n"));
+    assert_eq!(std::fs::read_to_string(&pins).unwrap(), "");
+}

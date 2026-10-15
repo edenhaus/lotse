@@ -41,6 +41,8 @@ use lotse_core::task::{BoxFuture, spawn_named};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 
 mod clients;
 mod connection;
@@ -130,14 +132,17 @@ pub enum Outcome {
     Subscribed(mpsc::Receiver<Event>),
 }
 
-/// What the supervisor implements. `ping`, `schema`, `unsubscribe` and
-/// `pairing/create` are answered by the server itself; everything else
-/// goes here.
+/// What the supervisor implements. `ping`, `schema`, `unsubscribe`,
+/// `pairing/create`, `clients/list` and `clients/remove` are answered by
+/// the server itself; everything else goes here.
 pub trait Handler: Send + Sync + 'static {
     /// The `hello` frame's content.
     fn hello(&self) -> Hello;
 
-    /// Handles one command of `connection`. Never waits on a camera.
+    /// Handles one command of `connection`. Never waits on a camera. The
+    /// future is dropped at an await point when the connection's client is
+    /// removed or the daemon shuts down before it ends, so what it changes
+    /// it changes between two awaits, never across one.
     fn handle(
         &self,
         connection: ConnectionId,
@@ -196,6 +201,15 @@ struct AppState<H> {
     /// The TLS listener's pairing, for `pairing/create`; `None` without a
     /// listener.
     pairing: Option<Arc<pairing::Pairing>>,
+    /// The TLS listener's clients, for `clients/list` and `clients/remove`
+    /// and to close a removed client's connections; `None` without a
+    /// listener.
+    clients: Option<Arc<clients::ClientStore>>,
+    /// Held by everything that serves a connection, and by the commands
+    /// about the TLS listener's clients still at the disk: [`Server::serve`]
+    /// returns once the last is dropped, so nothing it began, the client
+    /// store's lock least of all, outlives it.
+    serving: TaskTrackerToken,
 }
 
 impl<H> Clone for AppState<H> {
@@ -208,6 +222,8 @@ impl<H> Clone for AppState<H> {
             shutdown: self.shutdown.clone(),
             clock: Arc::clone(&self.clock),
             pairing: self.pairing.clone(),
+            clients: self.clients.clone(),
+            serving: self.serving.clone(),
         }
     }
 }
@@ -267,7 +283,10 @@ impl Server {
     /// Serves until `shutdown` is cancelled: then no new connections, the
     /// ones not yet upgraded (or still in their TLS handshake) are closed,
     /// every upgraded one gets `shutdown` and a `1001` close, and the call
-    /// returns. `clock` times the handshake, upgrade and close deadlines.
+    /// returns once each has closed, within [`CLOSE_TIMEOUT`], and no
+    /// command about the TLS listener's clients is still at the disk: the
+    /// data directory can be bound again at once. `clock` times the
+    /// handshake, upgrade and close deadlines.
     pub async fn serve<H: Handler>(
         self,
         handler: Arc<H>,
@@ -281,7 +300,7 @@ impl Server {
         // Each queued connection holds one of `pending`'s permits, so the
         // queue never fills and a handshake task never waits to send.
         let (admitted, mut authenticated) = mpsc::channel(usize::from(MAX_PENDING_UPGRADES));
-        let (tls, pairing) = match self.tls {
+        let (tls, pairing, clients) = match self.tls {
             Some(bound) => {
                 let pairing = bound.pairing(Arc::clone(&clock));
                 let config = bound
@@ -290,6 +309,7 @@ impl Server {
                 let listener = tokio::net::TcpListener::from_std(bound.listener)
                     .map_err(ServeError::Register)?;
                 tls::announce_first_code(&pairing, &bound.store, &clock, &shutdown);
+                let clients = Arc::clone(&bound.store);
                 let accepting = spawn_named(
                     "api.tls_accept",
                     tls::accept_loop(
@@ -306,10 +326,11 @@ impl Server {
                         },
                     ),
                 );
-                (Some(accepting), Some(pairing))
+                (Some(accepting), Some(pairing), Some(clients))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
+        let serving = TaskTracker::new();
         let state = AppState {
             handler,
             config: self.config,
@@ -318,6 +339,8 @@ impl Server {
             shutdown: shutdown.clone(),
             clock: Arc::clone(&clock),
             pairing,
+            clients,
+            serving: serving.token(),
         };
         let app = Router::new()
             .route(lotse_api_types::WS_PATH, get(connection::upgrade::<H>))
@@ -353,11 +376,18 @@ impl Server {
             while authenticated.recv().await.is_some() {}
         }
         drop(authenticated);
-        let _drained = admission
+        let drained = admission
             .pending
             .acquire_many(u32::from(MAX_PENDING_UPGRADES))
             .await;
+        drop(drained);
         tracing::info!("control API stopped accepting");
+        // The router holds the state, and with it a token, as does every
+        // upgraded connection until it has closed.
+        drop(admission);
+        serving.close();
+        serving.wait().await;
+        tracing::info!("control API stopped: every connection closed");
         Ok(())
     }
 }
@@ -482,7 +512,7 @@ mod tests {
     use super::*;
 
     /// A handler that keeps every default.
-    struct Minimal;
+    pub(crate) struct Minimal;
 
     impl Handler for Minimal {
         fn hello(&self) -> Hello {
@@ -540,7 +570,7 @@ mod tests {
 
     /// What every connection shares, with `max_connections` and the
     /// shutdown begun or not.
-    fn state(max_connections: u32, shutting_down: bool) -> AppState<Minimal> {
+    pub(crate) fn state(max_connections: u32, shutting_down: bool) -> AppState<Minimal> {
         let shutdown = CancellationToken::new();
         if shutting_down {
             shutdown.cancel();
@@ -560,6 +590,8 @@ mod tests {
             shutdown,
             clock: Arc::new(lotse_core::clock::FakeClock::default()),
             pairing: None,
+            clients: None,
+            serving: TaskTracker::new().token(),
         }
     }
 

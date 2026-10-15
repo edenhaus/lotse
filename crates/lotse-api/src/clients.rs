@@ -19,18 +19,32 @@
 //! the new list is the one in force, even if the directory sync after it
 //! fails. Pins are public; the file is private so nobody else can read who
 //! is enrolled.
+//!
+//! The store also knows which control connections each pin has open, so
+//! removing an enrolled pin closes them at once; its next handshake is
+//! refused because sessions are never resumed. A connection registers
+//! itself and checks its pin under the connections' lock, and a removal
+//! changes the pins before it looks for connections under that lock: a
+//! connection that authenticated just before its pin was removed is closed
+//! either way. A removal holds the lock that orders changes until its
+//! connections are closed, so a new enrollment of the same pin waits and
+//! its fresh connection is never closed by the removal before it.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError, RwLock};
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
 
+use lotse_api_types::clients::{ClientList, ControlClient};
 use lotse_core::fingerprint::Fingerprint;
 use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
+use tokio_util::sync::CancellationToken;
+
+use crate::ConnectionId;
 
 /// The enrolled clients' directory in the data directory.
 pub(crate) const CLIENTS_DIR: &str = "clients";
@@ -100,6 +114,22 @@ fn fsync_dir(dir: &OwnedFd) -> io::Result<()> {
     Ok(rustix::fs::fsync(dir)?)
 }
 
+/// What [`ClientStore::remove`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Removal {
+    /// The pin was enrolled; it is not any more, and this many of its
+    /// connections were told to close.
+    Removed {
+        /// The connections closed.
+        closed: usize,
+    },
+    /// The pin was not enrolled: nothing to do.
+    Unknown,
+    /// The pin is the configuration's, which only the configuration
+    /// changes.
+    Fixed,
+}
+
 /// Who may connect: the fixed pins and the enrolled ones.
 #[derive(Debug)]
 pub(crate) struct ClientStore {
@@ -120,6 +150,9 @@ pub(crate) struct ClientStore {
     /// Syncs [`CLIENTS_DIR`] after the rename: [`fsync_dir`], or a test's
     /// fault.
     sync_dir: SyncDir,
+    /// The open control connections over the TLS listener: each one's pin
+    /// and the token that closes it.
+    connections: Mutex<HashMap<ConnectionId, (Fingerprint, CancellationToken)>>,
 }
 
 impl ClientStore {
@@ -184,6 +217,7 @@ impl ClientStore {
             dir,
             dir_fd,
             sync_dir: fsync_dir,
+            connections: Mutex::default(),
         })
     }
 
@@ -256,6 +290,102 @@ impl ClientStore {
                 "enrolled clients changed, but syncing their directory failed: a crash may undo the change"
             );
         }
+    }
+
+    /// The open connections; a poisoned lock is still usable, the map
+    /// holds no invariant a panicking holder could have broken halfway.
+    fn connections(
+        &self,
+    ) -> MutexGuard<'_, HashMap<ConnectionId, (Fingerprint, CancellationToken)>> {
+        self.connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Registers connection `id`, authenticated with `pin`, and returns the
+    /// token cancelled when `pin` is removed: already cancelled when it was
+    /// removed after the handshake.
+    pub(crate) fn attach(&self, id: ConnectionId, pin: Fingerprint) -> CancellationToken {
+        let token = CancellationToken::new();
+        let mut open = self.connections();
+        open.insert(id, (pin, token.clone()));
+        if !self.allows(&pin) {
+            token.cancel();
+        }
+        drop(open);
+        token
+    }
+
+    /// Forgets connection `id`, which closed.
+    pub(crate) fn detach(&self, id: ConnectionId) {
+        self.connections().remove(&id);
+    }
+
+    /// Every allowed pin, ordered, whether it is fixed and whether it has a
+    /// connection open.
+    pub(crate) fn list(&self) -> ClientList {
+        let connected: HashSet<Fingerprint> =
+            self.connections().values().map(|(pin, _)| *pin).collect();
+        let mut pins: BTreeMap<Fingerprint, bool> = self
+            .enrolled
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|pin| (*pin, false))
+            .collect();
+        pins.extend(self.fixed.iter().map(|pin| (*pin, true)));
+        let clients = pins
+            .into_iter()
+            .map(|(pin, fixed)| ControlClient {
+                pin: pin.to_string(),
+                fixed,
+                connected: connected.contains(&pin),
+            })
+            .collect();
+        ClientList { clients }
+    }
+
+    /// Removes the enrolled `pin`, as connection `by` asked: the file first,
+    /// then the set, then every connection it has open is told to close,
+    /// then the directory is synced. All of it holds `writing`, so a new
+    /// enrollment of `pin` waits until its old connections are closed and
+    /// never has one of its own closed by this removal; closing before the
+    /// sync keeps a slow disk from keeping a removed client connected. `by`
+    /// itself is left open, counted among the closed, for it to close once
+    /// it has answered: a client removing itself gets the result first,
+    /// while any other connection of `pin` closes without waiting for
+    /// whatever it is answering. A fixed pin stays. Blocking: run it off
+    /// the runtime's threads.
+    pub(crate) fn remove(&self, pin: Fingerprint, by: ConnectionId) -> io::Result<Removal> {
+        if self.fixed.contains(&pin) {
+            return Ok(Removal::Fixed);
+        }
+        let writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = self
+            .enrolled
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if !next.remove(&pin) {
+            return Ok(Removal::Unknown);
+        }
+        write_pins(&self.dir_fd, &next)?;
+        *self
+            .enrolled
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = next;
+        let mut closed: usize = 0;
+        for (id, (open, token)) in self.connections().iter() {
+            if *open == pin {
+                if *id != by {
+                    token.cancel();
+                }
+                closed = closed.saturating_add(1);
+            }
+        }
+        self.sync_after_rename(pin, "removed");
+        drop(writing);
+        Ok(Removal::Removed { closed })
     }
 }
 
@@ -622,6 +752,77 @@ mod tests {
     }
 
     #[test]
+    fn removing_an_enrolled_pin_persists_and_closes_its_connections_and_no_other() {
+        let dir = data_dir("remove");
+        let fixed = Fingerprint::of(b"fixed");
+        let store = open(&dir, &[fixed], runtime()).unwrap();
+        let (gone, kept) = (Fingerprint::of(b"gone"), Fingerprint::of(b"kept"));
+        store.enroll(gone).unwrap();
+        store.enroll(kept).unwrap();
+        let first = store.attach(ConnectionId(1), gone);
+        let second = store.attach(ConnectionId(2), gone);
+        let other = store.attach(ConnectionId(3), kept);
+        let closed = store.attach(ConnectionId(4), fixed);
+        store.detach(ConnectionId(4));
+        let listed = store.list().clients;
+        let mut expected = vec![
+            ControlClient {
+                pin: fixed.to_string(),
+                fixed: true,
+                connected: false,
+            },
+            ControlClient {
+                pin: gone.to_string(),
+                fixed: false,
+                connected: true,
+            },
+            ControlClient {
+                pin: kept.to_string(),
+                fixed: false,
+                connected: true,
+            },
+        ];
+        expected.sort_by_key(|client| Fingerprint::parse(&client.pin).unwrap());
+        assert_eq!(listed, expected);
+
+        assert_eq!(
+            store.remove(fixed, ConnectionId(9)).unwrap(),
+            Removal::Fixed
+        );
+        assert!(store.allows(&fixed));
+        assert_eq!(
+            store
+                .remove(Fingerprint::of(b"unknown"), ConnectionId(9))
+                .unwrap(),
+            Removal::Unknown
+        );
+        // The second asked: it closes itself once it has answered.
+        assert_eq!(
+            store.remove(gone, ConnectionId(2)).unwrap(),
+            Removal::Removed { closed: 2 }
+        );
+        assert!(first.is_cancelled() && !second.is_cancelled());
+        assert!(!other.is_cancelled() && !closed.is_cancelled());
+        assert!(!store.allows(&gone));
+        assert_eq!(
+            store.remove(gone, ConnectionId(9)).unwrap(),
+            Removal::Unknown,
+            "idempotent"
+        );
+        let file = dir.join(CLIENTS_DIR).join(PINS_FILE);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{kept}\n"));
+        // A connection of a pin removed since its handshake closes at once.
+        assert!(store.attach(ConnectionId(5), gone).is_cancelled());
+        assert!(!store.attach(ConnectionId(6), fixed).is_cancelled());
+
+        drop(store);
+        let again = open(&dir, &[], runtime()).unwrap();
+        assert!(!again.allows(&gone), "removed for good");
+        assert!(again.allows(&kept));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_failed_sync_after_the_rename_keeps_the_enrollment_and_says_so() {
         let (logs, _guard) = crate::pairing::test_support::capture();
         let dir = data_dir("sync-fails");
@@ -635,6 +836,12 @@ mod tests {
         assert_eq!(std::fs::read_to_string(file).unwrap(), format!("{pin}\n"));
         assert!(logs.text().contains("a crash may undo the change"));
         assert!(logs.text().contains("change=\"enrolled\""));
+        assert_eq!(
+            store.remove(pin, ConnectionId(9)).unwrap(),
+            Removal::Removed { closed: 0 }
+        );
+        assert!(!store.allows(&pin));
+        assert!(logs.text().contains("change=\"removed\""));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -660,6 +867,61 @@ mod tests {
             SYNCING.wait();
             writer.join().unwrap().unwrap();
         });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Both sides of each sync held open by
+    /// `a_reenrollment_waits_for_the_removal_to_close_its_connections`.
+    static REMOVING: std::sync::Barrier = std::sync::Barrier::new(2);
+
+    #[test]
+    fn a_reenrollment_waits_for_the_removal_to_close_its_connections() {
+        let dir = data_dir("reenroll");
+        let store = open(&dir, &[], runtime()).unwrap();
+        let pin = Fingerprint::of(b"pin");
+        store.enroll(pin).unwrap();
+        let old = store.attach(ConnectionId(1), pin);
+        let store = store.with_sync_dir(|_| {
+            REMOVING.wait();
+            REMOVING.wait();
+            Ok(())
+        });
+        std::thread::scope(|scope| {
+            let removal = scope.spawn(|| store.remove(pin, ConnectionId(9)));
+            REMOVING.wait();
+            // Syncing: the connection is already closed, and the next
+            // change has to wait for the removal to end.
+            assert!(old.is_cancelled());
+            assert!(!store.allows(&pin));
+            assert!(store.writing.try_lock().is_err());
+            let enrollment = scope.spawn(|| store.enroll(pin));
+            REMOVING.wait();
+            assert_eq!(
+                removal.join().unwrap().unwrap(),
+                Removal::Removed { closed: 1 }
+            );
+            REMOVING.wait();
+            REMOVING.wait();
+            enrollment.join().unwrap().unwrap();
+        });
+        assert!(store.allows(&pin));
+        assert!(!store.attach(ConnectionId(2), pin).is_cancelled());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_removal_keeps_the_pin_and_its_connection() {
+        let dir = data_dir("remove-fails");
+        let store = open(&dir, &[], runtime()).unwrap();
+        let pin = Fingerprint::of(b"pin");
+        store.enroll(pin).unwrap();
+        let token = store.attach(ConnectionId(1), pin);
+        std::fs::DirBuilder::new()
+            .create(dir.join(CLIENTS_DIR).join(PARTIAL_FILE))
+            .unwrap();
+        assert!(store.remove(pin, ConnectionId(9)).is_err());
+        assert!(store.allows(&pin));
+        assert!(!token.is_cancelled());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
