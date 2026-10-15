@@ -16,6 +16,7 @@ pub mod error;
 pub mod frame;
 pub mod info;
 pub mod limits;
+pub mod pairing;
 pub mod schema;
 pub mod session;
 pub mod stream;

@@ -180,6 +180,28 @@
         },
         {
           "additionalProperties": false,
+          "description": "`pairing/create`: a one-time pairing code for the control TLS\nlistener, replacing any open one; only on the Unix socket.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "pairing/create",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "title": "PairingCreateCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "`stream/put`: the idempotent upsert of a stream's desired state.",
           "properties": {
             "audio": {
@@ -750,6 +772,11 @@
           "type": "string"
         },
         {
+          "const": "not_permitted",
+          "description": "The command is not allowed on this connection (`pairing/create`\nover the TLS listener).",
+          "type": "string"
+        },
+        {
           "const": "internal_error",
           "description": "An invariant failed; a bug, always logged with context.",
           "type": "string"
@@ -1284,6 +1311,27 @@
           "type": "string"
         }
       ]
+    },
+    "PairingCreateResult": {
+      "additionalProperties": false,
+      "description": "What `pairing/create` answers.",
+      "properties": {
+        "code": {
+          "description": "The code to paste into the client, `LOTSE1-<server pin>-<secret>`:\nthe SHA-256 of the daemon's certificate and a 128-bit secret, each\nas lowercase hex. A secret: show it to the user, never log it.",
+          "type": "string"
+        },
+        "expires_in_ms": {
+          "description": "How long the code stays valid, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "code",
+        "expires_in_ms"
+      ],
+      "type": "object"
     },
     "Pong": {
       "description": "The answer to `ping`, sent instead of a `result`.",
@@ -2064,6 +2112,36 @@
       ],
       "type": "object"
     },
+    "Success_for_PairingCreateResult": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/PairingCreateResult",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
     "Success_for_Session": {
       "description": "A successful `result`: exactly one per command.",
       "properties": {
@@ -2484,6 +2562,9 @@
     },
     "metrics/get": {
       "$ref": "#/$defs/Success_for_Metrics"
+    },
+    "pairing/create": {
+      "$ref": "#/$defs/Success_for_PairingCreateResult"
     },
     "ping": {
       "$ref": "#/$defs/Pong"

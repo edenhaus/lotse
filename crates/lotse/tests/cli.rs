@@ -300,3 +300,86 @@ fn the_control_tls_listener_starts_with_its_identity_and_identity_prints_its_pin
         bound["server_pin"].as_str().unwrap()
     );
 }
+
+#[test]
+fn without_a_client_the_daemon_logs_a_first_code_and_pair_prints_a_new_one() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let dir = socket_dir("pair");
+    let socket = dir.join("lotse.sock");
+    let socket = socket.to_str().expect("utf-8 path");
+    let data = dir.join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data)
+        .unwrap();
+    let data = data.to_str().expect("utf-8 path");
+    let mut daemon = Daemon::start(
+        &[
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "off",
+            "--socket",
+            socket,
+            "--sandbox",
+            "off",
+            "--control-listen",
+            "127.0.0.1:0",
+            "--data-dir",
+            data,
+        ],
+        &[],
+    );
+    let bound = json(&daemon.wait_for("control TLS listener bound"));
+    let pin = bound["server_pin"].as_str().unwrap().replace(':', "");
+    let first = json(&daemon.wait_for("pairing code for the first client"));
+    let first = first["code"].as_str().unwrap().to_owned();
+    assert!(first.starts_with(&format!("LOTSE1-{pin}-")), "{first}");
+
+    let output = lotse()
+        .args(["pair", "--socket", socket])
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "{output:?}");
+    let code = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    assert!(code.starts_with(&format!("LOTSE1-{pin}-")), "{code}");
+    assert_ne!(code, first, "a new code replaces the first");
+    daemon.wait_for("pairing code issued");
+    let (exit, rest) = daemon.terminate();
+    assert_eq!(exit, Some(0), "clean exit\n{}", rest.join("\n"));
+    assert!(
+        rest.iter().all(|line| !line.contains(&code)),
+        "the issued code is never logged"
+    );
+}
+
+#[test]
+fn pair_without_a_control_tls_listener_fails() {
+    let dir = socket_dir("pair-off");
+    let socket = dir.join("lotse.sock");
+    let socket = socket.to_str().expect("utf-8 path");
+    let mut daemon = Daemon::start(
+        &[
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "off",
+            "--socket",
+            socket,
+            "--sandbox",
+            "off",
+        ],
+        &[],
+    );
+    daemon.wait_for("\"event\":\"ready\"");
+    let output = lotse()
+        .args(["pair", "--socket", socket])
+        .output()
+        .expect("runs");
+    assert_eq!(output.status.code(), Some(1));
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(printed.contains("invalid_request"), "{printed}");
+    let (exit, _rest) = daemon.terminate();
+    assert_eq!(exit, Some(0));
+}

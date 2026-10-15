@@ -13,7 +13,7 @@ use lotse_core::fingerprint::Fingerprint;
 use lotse_sandbox::Mode;
 
 use crate::config::{LogFormat, TcpListen};
-use crate::ctl::CtlArgs;
+use crate::ctl::{CtlArgs, PairArgs};
 
 /// The one binary.
 #[derive(Debug, Parser)]
@@ -41,6 +41,9 @@ pub(crate) enum Command {
     /// Print the pin of the control TLS listener's certificate, the SHA-256
     /// clients check, from the data directory.
     Identity(IdentityArgs),
+    /// Print a one-time code that pairs a client with the control TLS
+    /// listener, asking the daemon over its control socket.
+    Pair(PairArgs),
 }
 
 /// `lotse identity`.

@@ -62,6 +62,11 @@ exclude_re = [
     # dropping them changes nothing a test can see. Column 60 drops `O_EXCL` and
     # `O_NOFOLLOW`, column 79 `O_NOFOLLOW` and `O_CLOEXEC`.
     "identity.rs:\\d+:(60|79): replace \\| with & in write_new$",
+    # A non-blocking `flock` on a directory the daemon just opened fails only with
+    # `EWOULDBLOCK` in a test: any other error is refused either way, as in use or as I/O.
+    "clients.rs:.*replace match guard err == Errno::WOULDBLOCK with true in ClientStore::open$",
+    # A directory sync shows only after a crash: skipping it changes nothing a test can see.
+    "clients.rs:.*replace fsync_dir -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
 ]

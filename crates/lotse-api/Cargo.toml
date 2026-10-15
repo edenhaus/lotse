@@ -20,10 +20,11 @@ rcgen = { workspace = true } # the TLS listener's self-signed server certificate
 rustls = { workspace = true } # the TLS listener: TLS 1.3, the client-pin verifier
 serde = { workspace = true }
 serde_json = { workspace = true }
+subtle = { workspace = true } # the pairing secret compared in constant time
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "macros"] } # the Unix and TLS listeners, channels
 tokio-rustls = { workspace = true } # the TLS listener's handshake on a tokio stream
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] } # shutdown tokens; `rt`: the pairing redemptions a closed connection still waits for
 tracing = { workspace = true }
 rustix = { workspace = true, features = ["process", "fs"] } # umask around the bind (`fs` for the mode type)
 lotse-api-types = { workspace = true }
