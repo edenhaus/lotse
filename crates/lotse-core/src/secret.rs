@@ -99,23 +99,48 @@ impl<'a> RedactedUrl<'a> {
     /// verbatim occurrence of this URL's path (unless empty or `/`) and
     /// query (unless empty) replaced by `****`: for messages of third-party
     /// libraries, which may echo the URL, or a URL built from it, that they
-    /// were given.
+    /// were given. Where the two overlap (a query that repeats the path,
+    /// `?path=/live`), the one that starts first, then the longer, is
+    /// replaced whole, so neither survives the other's replacement.
     #[must_use]
     pub fn scrub(&self, text: &str) -> String {
-        let mut scrubbed = redact_embedded_urls(text);
-        let path = self.url.path();
-        if !path.is_empty() && path != "/" {
-            scrubbed = scrubbed.replace(path, REDACTED_PATH);
-        }
-        if let Some(query) = self.url.query().filter(|query| !query.is_empty()) {
-            scrubbed = scrubbed.replace(query, REDACTED);
-        }
-        scrubbed
+        let scrubbed = redact_embedded_urls(text);
+        let path = Some(self.url.path())
+            .filter(|path| !path.is_empty() && *path != "/")
+            .map(|path| (path, REDACTED_PATH));
+        let query = self
+            .url
+            .query()
+            .filter(|query| !query.is_empty())
+            .map(|query| (query, REDACTED));
+        let needles: Vec<(&str, &str)> = path.into_iter().chain(query).collect();
+        replace_each(&scrubbed, &needles)
     }
 }
 
 /// What a path other than empty or `/` prints as.
 const REDACTED_PATH: &str = "/****";
+
+/// `text` with each occurrence of the first of every `(needle,
+/// replacement)` pair replaced, scanning once from the left: at each
+/// position the earliest match wins, among matches at the same position
+/// the longest, then the first listed, and the scan goes on after it.
+fn replace_each(text: &str, needles: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((at, needle, replacement)) = needles
+        .iter()
+        .filter_map(|&(needle, replacement)| Some((rest.find(needle)?, needle, replacement)))
+        .min_by_key(|&(at, needle, _)| (at, std::cmp::Reverse(needle.len())))
+    {
+        let (before, from_match) = rest.split_at_checked(at).unwrap_or((rest, ""));
+        out.push_str(before);
+        out.push_str(replacement);
+        rest = from_match.get(needle.len()..).unwrap_or_default();
+    }
+    out.push_str(rest);
+    out
+}
 
 impl fmt::Display for RedactedUrl<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -311,6 +336,44 @@ mod tests {
         ] {
             assert_eq!(shown.scrub(text), scrubbed, "{text}");
         }
+    }
+
+    /// A query that repeats the path, or a path that contains the query:
+    /// replacing one must not hide the other from its replacement.
+    #[test]
+    fn scrub_redacts_a_path_and_a_query_that_overlap_whole() {
+        for (input, text, scrubbed) in [
+            (
+                "rtsp://cam/live?path=/live&token=tok9d2e",
+                "Bad request /live?path=/live&token=tok9d2e",
+                "Bad request /****?****",
+            ),
+            (
+                "rtsp://cam/live?path=/live&token=tok9d2e",
+                "query path=/live&token=tok9d2e then path /live",
+                "query **** then path /****",
+            ),
+            ("rtsp://cam/xa=by?a=b", "got /xa=by?a=b", "got /****?****"),
+            ("rtsp://cam/k?/k", "x /k y", "x /**** y"),
+            ("rtsp://cam/k?/k", "x /k/k y", "x /****/**** y"),
+        ] {
+            let url = Url::parse(input).unwrap();
+            assert_eq!(
+                RedactedUrl::new(&url).scrub(text),
+                scrubbed,
+                "{input}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_each_takes_the_earliest_then_the_longest_match() {
+        assert_eq!(replace_each("", &[("a", "1")]), "");
+        assert_eq!(replace_each("abc", &[]), "abc");
+        assert_eq!(
+            replace_each("ab abc bc", &[("bc", "2"), ("abc", "3"), ("ab", "1")]),
+            "1 3 2"
+        );
     }
 
     #[test]
