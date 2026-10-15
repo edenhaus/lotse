@@ -1065,7 +1065,11 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
         );
         printed.push(format!("{described:?} {} {source:?}", described.url));
         let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
-        assert_eq!(harness.wait_ready().await, plays, "{password}");
+        assert_eq!(
+            harness.wait_ready().await,
+            plays,
+            "plays with the right password only"
+        );
         harness.cancel();
         let exit = harness.finish().await;
         printed.push(format!("{exit:?}"));
@@ -1078,8 +1082,11 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
     assert!(logs.contains("rtsp: describing"), "{logs}");
     let printed = printed.join("\n");
     assert!(printed.contains("AuthFailed"), "{printed}");
-    for secret in SECRETS {
-        assert!(!logs.contains(secret), "{secret} logged:\n{logs}");
-        assert!(!printed.contains(secret), "{secret} printed:\n{printed}");
+    for (index, secret) in SECRETS.iter().enumerate() {
+        assert!(!logs.contains(secret), "SECRETS[{index}] logged:\n{logs}");
+        assert!(
+            !printed.contains(secret),
+            "SECRETS[{index}] printed:\n{printed}"
+        );
     }
 }

@@ -134,7 +134,7 @@ async fn stream(
             discontinuity: false,
             ends: false,
         };
-        tx.send(Ok(segment)).await.map_err(|_| cancelled())?;
+        tx.send(Ok(segment)).await.ok().ok_or_else(cancelled)?;
         piece = body
             .chunk()
             .await?
@@ -185,7 +185,7 @@ impl<C: Connect> Follower<C> {
             }
             for fetch in update.segments {
                 let segment = self.segment(fetch).await?;
-                tx.send(Ok(segment)).await.map_err(|_| cancelled())?;
+                tx.send(Ok(segment)).await.ok().ok_or_else(cancelled)?;
             }
             let after = update.reload_after.ok_or_else(|| {
                 SourceError::Ended(format!(

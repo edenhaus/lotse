@@ -444,9 +444,15 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
     let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     assert!(logged.contains("http: following a redirect"), "{logged}");
     assert!(logged.contains("segment fetched"), "{logged}");
-    for secret in SECRETS {
-        assert!(!logged.contains(secret), "{secret} logged:\n{logged}");
-        assert!(!printed.contains(secret), "{secret} printed:\n{printed}");
+    for (index, secret) in SECRETS.iter().enumerate() {
+        assert!(
+            !logged.contains(secret),
+            "SECRETS[{index}] logged:\n{logged}"
+        );
+        assert!(
+            !printed.contains(secret),
+            "SECRETS[{index}] printed:\n{printed}"
+        );
     }
     rig.stop().await;
 }

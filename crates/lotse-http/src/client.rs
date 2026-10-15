@@ -60,12 +60,6 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use url::{Origin, Url};
 
-/// Why a challenge the origin sent cannot be answered with the URL's
-/// credentials. http-auth's own error quotes the value it could not write,
-/// so it is not passed on; in practice it fails only when one Digest nonce
-/// was used 2^32 times (RFC 7616 §3.4 `nc`).
-const UNANSWERABLE: &str = "the url's credentials cannot answer the server's challenge";
-
 /// The `User-Agent` of every request (RFC 9110 §10.1.5), as the RTSP
 /// source announces itself.
 pub const DAEMON_USER_AGENT: &str = concat!("lotse/", env!("CARGO_PKG_VERSION"));
@@ -267,11 +261,17 @@ impl<C: Connect> Client<C> {
 
     /// The `Authorization` field for a GET of `uri` (the origin-form
     /// target), once the origin challenged: RFC 7617 §2 or RFC 7616 §3.4.
-    fn authorization(&mut self, uri: &str) -> Result<Option<String>, SourceError> {
+    ///
+    /// None for a challenge http-auth cannot answer, which in practice is
+    /// one Digest nonce used 2^32 times (RFC 7616 §3.4 `nc`): the server's
+    /// 401 to the request without it brings a fresh challenge. http-auth's
+    /// error quotes the value it could not write, the URI among them, so
+    /// it is dropped.
+    fn authorization(&mut self, uri: &str) -> Option<String> {
         let (Some(challenge), Some(credentials)) =
             (self.challenge.as_mut(), self.credentials.as_ref())
         else {
-            return Ok(None);
+            return None;
         };
         challenge
             .respond(&PasswordParams {
@@ -283,8 +283,7 @@ impl<C: Connect> Client<C> {
                 method: "GET",
                 body: Some(&[]),
             })
-            .map(Some)
-            .map_err(|_| SourceError::AuthFailed(UNANSWERABLE.to_owned()))
+            .ok()
     }
 
     /// A GET of `target`: origin-form (RFC 9112 §3.2.1), `Host` (RFC 9112
@@ -301,7 +300,7 @@ impl<C: Connect> Client<C> {
         let mut request = Request::get(uri.as_str())
             .header(HOST, host)
             .header(USER_AGENT, DAEMON_USER_AGENT);
-        if let Some(authorization) = self.authorization(&uri)? {
+        if let Some(authorization) = self.authorization(&uri) {
             request = request.header(AUTHORIZATION, authorization);
         }
         request
@@ -330,7 +329,7 @@ impl<C: Connect> Client<C> {
         let answer = self
             .exchange(&mut sender, request)
             .await?
-            .map_err(|err| hyper_error(&err))?;
+            .map_err(hyper_error)?;
         self.sender = Some(sender);
         Ok(answer)
     }
@@ -360,10 +359,9 @@ impl<C: Connect> Client<C> {
         for &addr in &self.peer.addrs {
             let connected = tokio::select! {
                 io = self.connector.connect(addr, &self.peer.host) => io,
-                () = self.clock.sleep(self.timeout) => Err(SourceError::Unreachable(format!(
-                    "connecting to {addr} took longer than {} ms",
-                    self.timeout.as_millis()
-                ))),
+                // One line: `connect` has a copy per connector, and the copy
+                // the tests connect with never times out.
+                () = self.clock.sleep(self.timeout) => Err(connect_timed_out(addr, self.timeout)),
             };
             match connected {
                 Ok(io) => return self.handshake(io, addr).await,
@@ -385,11 +383,11 @@ impl<C: Connect> Client<C> {
     ) -> Result<SendRequest<Empty<Bytes>>, SourceError> {
         let (sender, connection) = http1::handshake(TokioIo::new(io))
             .await
-            .map_err(|err| hyper_error(&err))?;
+            .map_err(hyper_error)?;
         let cancel = self.cancel.clone();
         let _driver = spawn_named("http.connection", async move {
             let ended = tokio::select! {
-                result = connection => result.err().map(|err| err.to_string()),
+                result = connection => result.err().as_ref().map(ToString::to_string),
                 () = cancel.cancelled() => Some("cancelled".to_owned()),
             };
             tracing::debug!(%addr, error = ?ended, "http: connection closed");
@@ -476,7 +474,7 @@ impl Body {
         let mut whole = BytesMut::new();
         while let Some(frame) = next_frame(&mut body, &*self.clock, self.timeout).await? {
             let frame = frame.map_err(|err| match err.downcast::<hyper::Error>() {
-                Ok(err) => hyper_error(&err),
+                Ok(err) => hyper_error(*err),
                 Err(_) => SourceError::Protocol(format!("the body is larger than {limit} bytes")),
             })?;
             whole.extend_from_slice(&frame.into_data().unwrap_or_default());
@@ -491,7 +489,7 @@ impl Body {
             .await?
             .transpose()
             .map(|frame| frame.map(|frame| frame.into_data().unwrap_or_default()))
-            .map_err(|err| hyper_error(&err))
+            .map_err(hyper_error)
     }
 }
 
@@ -540,12 +538,24 @@ fn status_error(status: StatusCode) -> SourceError {
 
 /// A hyper error typed: an answer that is not HTTP/1.1 is a protocol
 /// error, anything else a lost connection.
-fn hyper_error(err: &hyper::Error) -> SourceError {
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a fn item for `map_err`: a closure that never runs is a line the coverage gate counts as missed"
+)]
+fn hyper_error(err: hyper::Error) -> SourceError {
     if err.is_parse() {
         SourceError::Protocol(format!("the answer is not HTTP/1.1: {err}"))
     } else {
         SourceError::Unreachable(format!("the connection failed: {err}"))
     }
+}
+
+/// A connect to `addr` that did not complete within `timeout`: unreachable.
+fn connect_timed_out(addr: SocketAddr, timeout: Duration) -> SourceError {
+    SourceError::Unreachable(format!(
+        "connecting to {addr} took longer than {} ms",
+        timeout.as_millis()
+    ))
 }
 
 /// The timeout error for `what` ("no answer") within `timeout`.
@@ -781,12 +791,9 @@ mod tests {
             .into_body();
         assert_eq!(&body.bytes(16).await.unwrap()[..], b"next");
         assert_eq!(s.fake.connections(), 2);
-        assert!(logs.text().contains("the kept-alive connection is gone"));
-        assert!(
-            logs.text().contains("error=None"),
-            "a clean close: {}",
-            logs.text()
-        );
+        let text = logs.text();
+        assert!(text.contains("the kept-alive connection is gone"));
+        assert!(text.contains("error=None"), "a clean close: {text}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1287,6 +1294,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn the_addresses_are_tried_in_order_until_one_connects() {
+        let logs = Captured::default();
+        let _logs = logs.install();
         let s = setup("").await;
         s.fake.set("/a", Reply::body("video/mp2t", "a"));
         let closed = {
@@ -1304,6 +1313,11 @@ mod tests {
         );
         assert!(client.get(&url(&s.fake, "/a")).await.is_ok());
         assert_eq!(s.fake.connections(), 1);
+        let text = logs.text();
+        assert!(
+            text.contains(&format!("http: connect failed addr={closed}")),
+            "{text}"
+        );
 
         let mut client = client_to(&s.fake, "", &s.clock, &s.cancel, vec![closed]);
         let err = client.get(&url(&s.fake, "/a")).await.unwrap_err();

@@ -294,13 +294,14 @@ pub fn parse(bytes: &[u8], base: &Url) -> Result<Playlist, PlaylistError> {
     if !bytes.starts_with(b"#EXTM3U") {
         return Err(PlaylistError::MissingHeader);
     }
-    let (rest, playlist) =
-        m3u8_rs::parse_playlist(bytes).map_err(|_| PlaylistError::Malformed { offset: 0 })?;
-    if !rest.is_empty() {
+    // A playlist m3u8-rs refuses leaves all of it unread: offset 0.
+    let parsed = m3u8_rs::parse_playlist(bytes).ok();
+    let unread = parsed.as_ref().map_or(bytes.len(), |(rest, _)| rest.len());
+    let Some((_, playlist)) = parsed.filter(|_| unread == 0) else {
         return Err(PlaylistError::Malformed {
-            offset: bytes.len().saturating_sub(rest.len()),
+            offset: bytes.len().saturating_sub(unread),
         });
-    }
+    };
     match playlist {
         m3u8_rs::Playlist::MasterPlaylist(playlist) => {
             multivariant(playlist, base).map(Playlist::Multivariant)
