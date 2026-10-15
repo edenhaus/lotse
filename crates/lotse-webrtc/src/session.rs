@@ -492,17 +492,26 @@ fn engine_family(codec: EngineCodec) -> Option<CodecFamily> {
 
 /// How the session receives talk-back on the m-line `mid` the plan
 /// negotiated it on: by the payload types the engine settled on with the
-/// offer (str0m takes the offer's numbers), every talk-back codec among
-/// them, since the browser may send any codec the m-line lists.
+/// offer (str0m takes the offer's numbers), every codec among them that
+/// reaches the camera ([`AudioPlan::takes`]), since the browser may send
+/// any codec the m-line lists (RFC 3264 §7). The stream audio's codec, on
+/// a `sendrecv` m-line that carries it too, is refused when it does not
+/// reach the camera: such a packet never claims the backchannel.
 /// `codec` is the one the answer named first; the plan negotiates
 /// talk-back codecs only, so it is always one, and `None` never comes.
-fn talkback_rx(rtc: &Rtc, mid: &str, codec: CodecFamily) -> Option<TalkbackRx> {
+fn talkback_rx(
+    rtc: &Rtc,
+    plan: &AudioPlan<'_>,
+    mid: &str,
+    codec: CodecFamily,
+) -> Option<TalkbackRx> {
     let negotiated = UplinkCodec::of(codec)?;
     let params = rtc
         .codec_config()
         .params()
         .iter()
-        .filter_map(|params| Some((*params.pt(), engine_family(params.spec().codec)?)));
+        .filter_map(|params| Some((*params.pt(), engine_family(params.spec().codec)?)))
+        .filter(|(_, family)| plan.takes(*family));
     Some(TalkbackRx {
         mid: Mid::from(mid),
         depacketizer: Depacketizer::new(params),
@@ -758,7 +767,7 @@ impl Session {
         }
         log_talkback(&plan, request.backchannel.as_ref());
         let talkback = match plan.talkback {
-            Talkback::Negotiated { mid, codec, .. } => talkback_rx(&rtc, mid, codec),
+            Talkback::Negotiated { mid, codec, .. } => talkback_rx(&rtc, &plan, mid, codec),
             Talkback::Off(_) | Talkback::NotRequested => None,
         };
 

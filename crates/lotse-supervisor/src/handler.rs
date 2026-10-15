@@ -966,11 +966,14 @@ impl Supervisor {
     }
 
     /// `backchannel/release`: frees the camera's backchannel from its
-    /// talker, on each of the stream's sources whose protocol can carry
-    /// audio back. Non-blocking: the worker releases it, and a
+    /// talker, or only from `session_id` when given, on each of the
+    /// stream's sources whose protocol can carry audio back. Non-blocking:
+    /// the worker decides against its claims and releases it, and a
     /// `talker_changed` with `released` follows on `stream/subscribe`.
-    /// Releasing a free backchannel succeeds.
-    fn backchannel_release(&self, stream_id: &str) -> Outcome {
+    /// Releasing a free backchannel, or one another session holds, succeeds
+    /// and changes nothing; the result names the talker as last heard
+    /// either way.
+    fn backchannel_release(&self, stream_id: &str, session_id: Option<&str>) -> Outcome {
         let state = self.shared.lock();
         let Some(stream) = state.streams.get(stream_id) else {
             return Outcome::Error(
@@ -1007,7 +1010,9 @@ impl Supervisor {
             }
             if connection
                 .commands
-                .try_send(DriverCommand::ReleaseBackchannel)
+                .try_send(DriverCommand::ReleaseBackchannel {
+                    session_id: session_id.map(str::to_owned),
+                })
                 .is_err()
             {
                 return Outcome::Error(
@@ -1020,6 +1025,7 @@ impl Supervisor {
         tracing::info!(
             event = "backchannel_release",
             stream.id = stream_id,
+            session.id = session_id,
             talker = ?talker,
             "backchannel release requested"
         );
@@ -1055,7 +1061,9 @@ impl Supervisor {
             Command::SessionAdopt(adopt) => {
                 self.session_adopt(connection, adopt.id, &adopt.session_id)
             }
-            Command::BackchannelRelease(release) => self.backchannel_release(&release.stream_id),
+            Command::BackchannelRelease(release) => {
+                self.backchannel_release(&release.stream_id, release.session_id.as_deref())
+            }
             Command::Ping(_) | Command::Schema(_) | Command::Unsubscribe(_) => {
                 tracing::error!(
                     command = command.name(),
@@ -1625,8 +1633,9 @@ mod tests {
     }
 
     /// `backchannel/release` frees the camera's
-    /// backchannel through the stream's connection, says who held it, and
-    /// is refused for an unknown stream and a protocol without one.
+    /// backchannel through the stream's connection, unconditionally or for
+    /// one session, says who held it, and is refused for an unknown stream
+    /// and a protocol without one.
     #[tokio::test]
     async fn backchannel_release_reaches_the_connection_and_says_who_held_it() {
         let dir = private_dir("release");
@@ -1677,7 +1686,7 @@ mod tests {
         );
         assert!(matches!(
             sent.try_recv(),
-            Ok(DriverCommand::ReleaseBackchannel)
+            Ok(DriverCommand::ReleaseBackchannel { session_id: None })
         ));
         let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
         assert!(
@@ -1703,7 +1712,20 @@ mod tests {
         );
         assert!(matches!(
             sent.try_recv(),
-            Ok(DriverCommand::ReleaseBackchannel)
+            Ok(DriverCommand::ReleaseBackchannel { session_id: None })
+        ));
+        // A release for one session takes it to the worker, which decides
+        // against its claims; the result names the talker as last heard,
+        // whichever session the release names.
+        let mut conditional = release(7, "front");
+        conditional["session_id"] = json!("s2");
+        assert_eq!(
+            result(call_on(&s, 1, &conditional).await),
+            json!({ "talker": "s1" })
+        );
+        assert!(matches!(
+            sent.try_recv(),
+            Ok(DriverCommand::ReleaseBackchannel { session_id: Some(session) }) if session == "s2"
         ));
         s.shutdown().await;
     }

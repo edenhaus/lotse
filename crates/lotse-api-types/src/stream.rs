@@ -377,7 +377,10 @@ pub struct BackchannelReleaseResult {
     /// The session that held the backchannel when the command arrived, as
     /// the worker last reported it; null when it was free. A
     /// `talker_changed` with `released` follows on `stream/subscribe` when
-    /// one was released.
+    /// one was released. A release conditional on a `session_id` reports
+    /// the talker the same way, whichever session it is: the worker frees
+    /// the backchannel only if that session still holds it when the
+    /// release arrives, so the `talker_changed` is what tells.
     pub talker: Option<String>,
 }
 

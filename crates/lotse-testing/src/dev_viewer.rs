@@ -896,18 +896,16 @@ mod tests {
             .and_then(|rest| rest.split("\n}\n").next())
             .expect("stopTalking()");
         assert!(stop.contains("transceiver.sender.replaceTrack(null)"));
-        // The backchannel is released only when this session holds it, so
-        // stopping never takes it from another viewer.
-        let check = stop
-            .find("!got.result.backchannel.talker) return;")
-            .expect("checks the talker");
+        // The backchannel is released only from this session, decided in
+        // the worker in one step, so stopping never takes it from another
+        // viewer: no separate check of the talker races a claim.
         assert!(
-            check
-                < stop
-                    .find(r#"call({ type: "backchannel/release", stream_id: streamId })"#)
-                    .expect("releases"),
+            stop.contains(
+                r#"call({ type: "backchannel/release", stream_id: streamId, session_id: session })"#
+            ),
             "{stop}"
         );
+        assert!(!stop.contains("session/get"), "{stop}");
         // Teardown stops the microphone.
         let teardown = page
             .split("function teardown(quiet)")

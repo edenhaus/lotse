@@ -136,7 +136,10 @@ pub(crate) enum DriverCommand {
         channel: u16,
     },
     /// Free the backchannel from its talker (`backchannel/release`).
-    ReleaseBackchannel,
+    ReleaseBackchannel {
+        /// Only if this session holds it, which the worker decides.
+        session_id: Option<String>,
+    },
     /// An ICE-TCP connection the acceptor verified for one of the
     /// worker's sessions.
     IceTcp {
@@ -164,7 +167,7 @@ impl DriverCommand {
             Self::IceTcp { .. }
             | Self::SwitchSource(_)
             | Self::Backchannel(_)
-            | Self::ReleaseBackchannel => None,
+            | Self::ReleaseBackchannel { .. } => None,
         }
     }
 }
@@ -1184,8 +1187,11 @@ impl Driver {
                 tracing::debug!(%peer, "ice-tcp connection without a worker; closed");
             }
             // Without a worker no session talks.
-            DriverCommand::ReleaseBackchannel => {
-                tracing::debug!("backchannel release without a worker; nothing held");
+            DriverCommand::ReleaseBackchannel { session_id } => {
+                tracing::debug!(
+                    session.id = ?session_id,
+                    "backchannel release without a worker; nothing held"
+                );
             }
             command => self.queued.push(command),
         }
@@ -1264,7 +1270,9 @@ impl Driver {
                     .ice_tcp(stream, &local_ufrag, peer, first_frame)
                     .await
             }
-            DriverCommand::ReleaseBackchannel => worker.release_backchannel().await,
+            DriverCommand::ReleaseBackchannel { session_id } => {
+                worker.release_backchannel(session_id).await
+            }
         };
         if let Err(err) = sent {
             // The exit follows and closes the sessions.
@@ -1521,7 +1529,10 @@ mod tests {
             message: String::new(),
         });
         // Without a worker nobody talks: a release is not kept.
-        driver.queue(DriverCommand::ReleaseBackchannel);
+        driver.queue(DriverCommand::ReleaseBackchannel { session_id: None });
+        driver.queue(DriverCommand::ReleaseBackchannel {
+            session_id: Some("b".into()),
+        });
         let left: Vec<Option<&str>> = driver
             .queued
             .iter()
@@ -1615,7 +1626,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// `backchannel/release` reaches the worker as its own message.
+    /// `backchannel/release` reaches the worker as its own message, with
+    /// the session it is conditional on.
     #[tokio::test]
     async fn a_release_reaches_the_worker() {
         let dir = private_dir("driver-release");
@@ -1635,14 +1647,32 @@ mod tests {
             &mut worker,
             &shared,
             &commands,
-            DriverCommand::ReleaseBackchannel,
+            DriverCommand::ReleaseBackchannel { session_id: None },
         )
         .await;
-        let expected = lotse_ipc::encode(&lotse_ipc::ToWorker::ReleaseBackchannel).unwrap();
+        // A release for one session takes the session along.
+        Driver::send(
+            &mut worker,
+            &shared,
+            &commands,
+            DriverCommand::ReleaseBackchannel {
+                session_id: Some("s1".into()),
+            },
+        )
+        .await;
+        // Each on the wire as its frame: the length, u32 little-endian,
+        // then the message.
+        let mut expected = Vec::new();
+        for session_id in [None, Some("s1".to_owned())] {
+            let message =
+                lotse_ipc::encode(&lotse_ipc::ToWorker::ReleaseBackchannel { session_id }).unwrap();
+            expected.extend(u32::try_from(message.len()).unwrap().to_le_bytes());
+            expected.extend(message);
+        }
         let mut received = Vec::new();
         for _ in 0..500 {
             received = std::fs::read(&out).unwrap_or_default();
-            if !received.is_empty() {
+            if received.ends_with(&expected) {
                 break;
             }
             SystemClock.sleep(Duration::from_millis(10)).await;
@@ -1705,13 +1735,15 @@ mod tests {
                 peer: "192.0.2.1:1".parse().unwrap(),
                 first_frame: vec![],
             },
-            DriverCommand::ReleaseBackchannel,
+            DriverCommand::ReleaseBackchannel {
+                session_id: Some("live".into()),
+            },
         ] {
             assert_eq!(
                 command.session_id().is_none(),
                 matches!(
                     command,
-                    DriverCommand::IceTcp { .. } | DriverCommand::ReleaseBackchannel
+                    DriverCommand::IceTcp { .. } | DriverCommand::ReleaseBackchannel { .. }
                 )
             );
             Driver::send(&mut worker, &shared, &commands, command).await;

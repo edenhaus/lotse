@@ -460,7 +460,9 @@ impl Serving<'_> {
                     manager.close(&session_id, sessions::close_code(&code), message);
                 }
             }
-            ToWorker::ReleaseBackchannel => self.release_backchannel(),
+            ToWorker::ReleaseBackchannel { session_id } => {
+                self.release_backchannel(session_id.as_deref());
+            }
             ToWorker::Shutdown { deadline_ms } => {
                 return self.on_shutdown(deadline_ms).await.map(Some);
             }
@@ -601,15 +603,16 @@ impl Serving<'_> {
         Ok(())
     }
 
-    /// Frees the backchannel from its talker (`backchannel/release`); the
-    /// arbiter logs it and reports the change.
-    fn release_backchannel(&self) {
+    /// Frees the backchannel from its talker, or only from `only`
+    /// (`backchannel/release`); the arbiter decides, logs it and reports
+    /// the change.
+    fn release_backchannel(&self, only: Option<&str>) {
         if let Some(arbiter) = self
             .running
             .as_ref()
             .and_then(|source| source.backchannel.as_ref())
         {
-            let _held = arbiter.release();
+            let _held = arbiter.release(only);
         } else {
             tracing::debug!("backchannel release without a backchannel; ignored");
         }
@@ -1827,10 +1830,27 @@ mod tests {
         seen.extend(messages_until(&mut h, |seen| closed(seen, "a")).await);
         talk("b", 5);
         assert_eq!(samples(within(camera.wait_for(3)).await), [1, 4, 5]);
+        // A release for a, which no longer holds it, frees nothing of b's:
+        // b's next packet reaches the camera without a new claim.
+        h.tx.send_msg(
+            &ToWorker::ReleaseBackchannel {
+                session_id: Some("a".into()),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        talk("b", 6);
+        assert_eq!(samples(within(camera.wait_for(4)).await), [1, 4, 5, 6]);
         // The client frees the channel from b (`backchannel/release`).
-        h.tx.send_msg(&ToWorker::ReleaseBackchannel, &[])
-            .await
-            .unwrap();
+        h.tx.send_msg(
+            &ToWorker::ReleaseBackchannel {
+                session_id: Some("b".into()),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
         let released = |seen: &[ToSupervisor]| {
             seen.iter().any(|message| {
                 matches!(message, ToSupervisor::Talker(change) if change.reason == "released")
@@ -1880,14 +1900,14 @@ mod tests {
     async fn a_release_without_a_backchannel_is_ignored() {
         let mut h = start_with_settings(echo_registries(), quiet_settings());
         h.next().await;
-        h.tx.send_msg(&ToWorker::ReleaseBackchannel, &[])
+        h.tx.send_msg(&ToWorker::ReleaseBackchannel { session_id: None }, &[])
             .await
             .unwrap();
         h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "{}")), &[])
             .await
             .unwrap();
         until_live(&mut h).await;
-        h.tx.send_msg(&ToWorker::ReleaseBackchannel, &[])
+        h.tx.send_msg(&ToWorker::ReleaseBackchannel { session_id: None }, &[])
             .await
             .unwrap();
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])

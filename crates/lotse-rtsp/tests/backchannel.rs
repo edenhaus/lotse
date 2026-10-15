@@ -395,11 +395,11 @@ async fn onvif_5_3_1_a_stream_that_does_not_opt_in_sends_no_require() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc8866_6_7_a_backchannel_retina_sends_on_no_stream_of_plays_without_it() {
+async fn rfc8866_6_7_an_audio_media_without_a_direction_takes_the_sessions_sendonly() {
     // The session's `a=sendonly` makes the camera's own audio, which
     // states no direction, the first `sendonly` audio media (RFC 8866
-    // §6.7); retina reads the media's own attribute only and sends on the
-    // PCMA backchannel, whose payload type is another.
+    // §6.7): the backchannel, for lotse and retina alike, and no track;
+    // the backchannel media after it is never set up.
     let mut config = config(Some(CameraAudio::Pcmu), BackchannelCodec::Pcma, |_| {});
     config.sdp_session_lines = "a=sendonly\r\n".into();
     config.video_fmtp = "\r\na=sendrecv".into();
@@ -409,8 +409,29 @@ async fn rfc8866_6_7_a_backchannel_retina_sends_on_no_stream_of_plays_without_it
     assert!(harness.wait_ready().await, "plays");
     assert_eq!(count(&cam.stats().backchannel_describes), 1);
     assert_eq!(count(&cam.stats().backchannel_setups), 0, "never set up");
+    let handle = harness.backchannel.current().expect("the camera's audio");
+    assert_eq!(handle.codec, Codec::Pcmu);
+    assert_eq!(harness.tracks.tracks().len(), 1, "video only");
+    let _exit = finish(harness).await;
+    cam.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc8866_6_15_a_backchannel_retina_cannot_parse_plays_without_it() {
+    // A valueless `a=fmtp` breaks RFC 8866 §6.15's grammar: retina drops
+    // the media, so no stream it sends on has the backchannel's payload
+    // type, while the offer, which reads no `a=fmtp`, still finds it.
+    let cam = camera(config(None, BackchannelCodec::Pcmu, |backchannel| {
+        backchannel.attributes = "a=fmtp\r\n".into();
+    }))
+    .await;
+    let source = source(&cam, &serde_json::Value::Null);
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(harness.wait_ready().await, "plays");
+    assert_eq!(count(&cam.stats().backchannel_describes), 1);
+    assert_eq!(count(&cam.stats().backchannel_setups), 0, "never set up");
     assert!(harness.backchannel.current().is_none());
-    assert_eq!(harness.tracks.tracks().len(), 2, "the camera's audio stays");
+    assert_eq!(harness.tracks.tracks().len(), 1, "video only");
     let _exit = finish(harness).await;
     cam.stop().await;
 }

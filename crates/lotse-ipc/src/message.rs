@@ -111,7 +111,11 @@ pub enum ToWorker {
     },
     /// Free the connection's backchannel from its talker
     /// (`backchannel/release`); a `Talker` report follows when one held it.
-    ReleaseBackchannel,
+    ReleaseBackchannel {
+        /// Free it only if this session holds it, decided in the worker
+        /// against the claims; any talker when `None`.
+        session_id: Option<String>,
+    },
 }
 
 /// A session to open: the browser's offer, the ICE credentials the
@@ -612,10 +616,16 @@ mod tests {
                 message
             );
         }
-        let release = ToWorker::ReleaseBackchannel;
-        assert_eq!(
-            decode::<ToWorker>(&encode(&release).unwrap()).unwrap(),
-            release
-        );
+        for release in [
+            ToWorker::ReleaseBackchannel { session_id: None },
+            ToWorker::ReleaseBackchannel {
+                session_id: Some("s1".into()),
+            },
+        ] {
+            assert_eq!(
+                decode::<ToWorker>(&encode(&release).unwrap()).unwrap(),
+                release
+            );
+        }
     }
 }

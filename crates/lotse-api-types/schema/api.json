@@ -42,7 +42,7 @@
       "description": "`backchannel/release`'s result.",
       "properties": {
         "talker": {
-          "description": "The session that held the backchannel when the command arrived, as\nthe worker last reported it; null when it was free. A\n`talker_changed` with `released` follows on `stream/subscribe` when\none was released.",
+          "description": "The session that held the backchannel when the command arrived, as\nthe worker last reported it; null when it was free. A\n`talker_changed` with `released` follows on `stream/subscribe` when\none was released. A release conditional on a `session_id` reports\nthe talker the same way, whichever session it is: the worker frees\nthe backchannel only if that session still holds it when the\nrelease arrives, so the `talker_changed` is what tells.",
           "type": [
             "string",
             "null"
@@ -608,13 +608,21 @@
         },
         {
           "additionalProperties": false,
-          "description": "`backchannel/release`: frees the camera's backchannel from its\ntalker.",
+          "description": "`backchannel/release`: frees the camera's backchannel from its\ntalker, or only from the session given.",
           "properties": {
             "id": {
               "description": "The command id.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "session_id": {
+              "description": "Free it only if this session holds it when the worker handles the\nrelease, checked atomically against a claim, so a viewer that\nstops talking never frees the backchannel another session claimed\nin the meantime; a release that finds another talker, or none,\nchanges nothing. Absent, it is freed from whichever session holds\nit.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "stream_id": {
               "description": "The stream whose camera's backchannel to free.",

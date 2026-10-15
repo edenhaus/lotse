@@ -1532,7 +1532,8 @@ async fn source_where(api: &mut Api, peers: &mut [&mut ApiPeer], want: &Value) -
 /// talk-back; neither holds the backchannel until it sends; the first
 /// sender claims it, the second gets exactly one `backchannel_busy` and its
 /// packets are dropped; the holder going silent keeps it; closing the
-/// holder's session frees it, and so does `backchannel/release`. Each
+/// holder's session frees it, and so does `backchannel/release`, unless
+/// it names a session that no longer holds it. Each
 /// change is a `talker_changed`, and `session/get` and `stream/get` say
 /// who holds it; `stream/get`'s source says the camera's codec and whether
 /// the backchannel is in use.
@@ -1695,6 +1696,15 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         api.talker_changes()[4],
         ("b".to_owned(), "claimed".to_owned(), json!("b"))
     );
+    // A release for a session that no longer holds it, as a viewer that
+    // stops talking sends, frees nothing of b's.
+    let stale = api
+        .call(&json!({ "id": 8, "type": "backchannel/release", "stream_id": "door", "session_id": "a" }))
+        .await;
+    assert_eq!(stale, json!({ "talker": "b" }));
+    pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(300)).await;
+    assert_eq!(api.talker_changes().len(), 5, "{:?}", api.stream_seen);
+    assert_eq!(api.stream().await["backchannel"]["talker"], "b");
     // Exactly one busy warning in all of it, to the second sender.
     assert_eq!(a.warnings("backchannel_busy"), 0);
     assert_eq!(b.warnings("backchannel_busy"), 1, "{:?}", b.seen);

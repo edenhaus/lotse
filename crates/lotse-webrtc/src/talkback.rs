@@ -2,13 +2,18 @@
 //! in, [`UplinkPacket`]s out.
 //!
 //! It takes the packet by its payload type, not by the codec the answer
-//! named first: the browser sends the first codec of the answer's list
-//! (RFC 3264 §6.1), but the talk-back m-line lists the stream audio's too
-//! (str0m's one codec list), and a browser may switch to any listed codec
-//! without renegotiating (RFC 3264 §5.1). A payload type of no talk-back
-//! codec (G.722, video, an unknown one) is refused, and so is a payload
-//! that is not one packet of its codec: an Opus packet that breaks RFC
-//! 6716 §3.4, an empty G.711 one (RFC 3551 §4.5.14: one octet per sample).
+//! named first: the browser sends the first codec of the answer's list,
+//! but may switch to any other the answer lists without renegotiating
+//! (RFC 3264 §7). The talk-back m-line lists only codecs that reach the
+//! camera (Opus and both laws may all reach a G.711 backchannel), but a
+//! `sendrecv` one that also carries the downlink lists the stream
+//! audio's too. The
+//! session hands the depacketizer the payload types of the codecs that
+//! reach the camera only, so a payload type of any other codec (the
+//! stream audio's when it does not, G.722, video, an unknown one) is
+//! refused, and so is a payload that is not one packet of its codec: an
+//! Opus packet that breaks RFC 6716 §3.4, an empty G.711 one (RFC 3551
+//! §4.5.14: one octet per sample).
 //! The packet is not decoded here; the reverse chain decodes it in the
 //! camera's sandboxed worker.
 //!

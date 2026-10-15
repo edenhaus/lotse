@@ -359,6 +359,8 @@ pub struct CameraBackchannel {
     pub payload_type: Option<u8>,
     /// Its `a=ptime` in milliseconds (RFC 8866 §6.4); none when `None`.
     pub ptime: Option<u32>,
+    /// More attribute lines, each ending in CRLF, after its `a=rtpmap`.
+    pub attributes: String,
     /// How a `DESCRIBE` with `Require` is answered.
     pub require: RequireAnswer,
     /// Record only RTP of this payload type and refuse the rest, as a
@@ -395,8 +397,9 @@ impl CameraBackchannel {
             .map(|ms| format!("a=ptime:{ms}\r\n"))
             .unwrap_or_default();
         format!(
-            "m=audio 0 RTP/AVP {pt}\r\na=rtpmap:{pt} {}\r\n{ptime}a=sendonly\r\na=control:{base}{BACKCHANNEL_CONTROL}\r\n",
-            self.codec.rtpmap()
+            "m=audio 0 RTP/AVP {pt}\r\na=rtpmap:{pt} {}\r\n{}{ptime}a=sendonly\r\na=control:{base}{BACKCHANNEL_CONTROL}\r\n",
+            self.codec.rtpmap(),
+            self.attributes
         )
     }
 }
@@ -2144,10 +2147,11 @@ mod tests {
         let custom = CameraBackchannel {
             payload_type: Some(96),
             ptime: Some(40),
+            attributes: "a=fmtp:96 x=1\r\n".into(),
             ..CameraBackchannel::new(BackchannelCodec::Pcma)
         };
         assert!(custom.sdp(base).starts_with(
-            "m=audio 0 RTP/AVP 96\r\na=rtpmap:96 PCMA/8000\r\na=ptime:40\r\na=sendonly\r\n"
+            "m=audio 0 RTP/AVP 96\r\na=rtpmap:96 PCMA/8000\r\na=fmtp:96 x=1\r\na=ptime:40\r\na=sendonly\r\n"
         ));
         // The whole SDP: the backchannel last, only when asked and offered.
         let config = CameraConfig {

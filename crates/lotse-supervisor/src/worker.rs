@@ -581,11 +581,14 @@ impl Worker {
         self.control.send_msg(&message, &[]).await
     }
 
-    /// Frees the connection's backchannel from its talker
-    /// (`backchannel/release`).
-    pub async fn release_backchannel(&mut self) -> Result<(), IpcError> {
+    /// Frees the connection's backchannel from its talker, or only from
+    /// `session_id` when given (`backchannel/release`).
+    pub async fn release_backchannel(
+        &mut self,
+        session_id: Option<String>,
+    ) -> Result<(), IpcError> {
         self.control
-            .send_msg(&ToWorker::ReleaseBackchannel, &[])
+            .send_msg(&ToWorker::ReleaseBackchannel { session_id }, &[])
             .await
     }
 

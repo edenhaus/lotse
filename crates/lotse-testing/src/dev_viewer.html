@@ -692,7 +692,16 @@ async function startTalking() {
   const track = stream.getAudioTracks()[0];
   // Unplugged, or the permission taken back.
   track.addEventListener("ended", () => { if (mic === stream) stopTalking(); });
-  await transceiver.sender.replaceTrack(track);
+  try {
+    await transceiver.sender.replaceTrack(track);
+  } catch (err) {
+    // A track the m-line cannot take without renegotiating, say: the
+    // microphone goes, and Talk comes back for this attempt only.
+    log(`microphone not sent: ${err.name}: ${err.message}`, "bad");
+    if (mic === stream) releaseMic();
+    $("talk").disabled = mine !== attempt;
+    return;
+  }
   if (mine !== attempt) return;
   $("talk").textContent = "Stop talking";
   $("talk").disabled = false;
@@ -709,7 +718,9 @@ function releaseMic() {
 // Takes the microphone off the m-line, which ends the uplink, and frees
 // the camera's backchannel if this session holds it: the talker keeps it
 // until its session closes or backchannel/release, so without the release
-// no other viewer could talk while this one plays.
+// no other viewer could talk while this one plays. The release names this
+// session, and the worker frees the backchannel only if it holds it then,
+// so stopping never takes it from a viewer that claimed it meanwhile.
 async function stopTalking() {
   const mine = attempt;
   const transceiver = talkTransceiver;
@@ -720,10 +731,12 @@ async function stopTalking() {
   await transceiver.sender.replaceTrack(null);
   if (mine !== attempt) return;
   log("talking stopped");
-  const got = await call({ type: "session/get", session_id: session });
-  if (mine !== attempt || !got.success || !got.result.backchannel.talker) return;
-  const released = await call({ type: "backchannel/release", stream_id: streamId });
-  if (released.success) log(`backchannel released from ${released.result.talker ?? "nobody"}`);
+  const released = await call({ type: "backchannel/release", stream_id: streamId, session_id: session });
+  if (mine !== attempt || !released.success) return;
+  // The talker as the daemon last heard of it: this session's means it
+  // was freed, another's or none that there was nothing of this one's.
+  const { talker } = released.result;
+  log(talker === session ? "backchannel released" : `backchannel not ours to release: held by ${talker ?? "nobody"}`);
 }
 
 // The talk-back counters of session/get, which the worker pushes once per

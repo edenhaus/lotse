@@ -15,7 +15,9 @@
 //! - **Hold.** The talker keeps the channel, silent or muted, until its
 //!   session closes ([`ChangeReason::SessionClosed`]; a deleted stream
 //!   closes its sessions) or the client releases it ([`Arbiter::release`],
-//!   [`ChangeReason::Released`]). There is no timeout.
+//!   [`ChangeReason::Released`]): from whoever holds it, or only from the
+//!   session the release names, decided against the claims under one
+//!   lock. There is no timeout.
 //! - **Reconnect.** The talker keeps the slot while the source withdraws
 //!   its backchannel and offers it again; packets that arrive meanwhile
 //!   are dropped, not buffered, and the route to the device is rebuilt on
@@ -276,11 +278,34 @@ impl Arbiter {
         self.events.subscribe()
     }
 
-    /// Frees the channel, whoever holds it (`backchannel/release`): its
-    /// route stops at once, and the next session to send claims it, the
-    /// released one included. Returns the session that held it.
-    pub(crate) fn release(&self) -> Option<String> {
-        let talker = self.lock().talker.take()?;
+    /// Frees the channel (`backchannel/release`) from whoever holds it,
+    /// or, given `only`, only if that session holds it: decided under the
+    /// lock a claim takes, so a release that names a session that already
+    /// let go never frees the channel a later claim took. Its route stops
+    /// at once, and the next session to send claims it, the released one
+    /// included. Returns the session that held it when it was freed.
+    pub(crate) fn release(&self, only: Option<&str>) -> Option<String> {
+        let mut state = self.lock();
+        let freed = state
+            .talker
+            .take_if(|talker| only.is_none_or(|session| talker.session == session));
+        let kept = state.talker.as_ref().map(|talker| talker.session.clone());
+        drop(state);
+        let Some(talker) = freed else {
+            if let Some(talker) = kept {
+                tracing::info!(
+                    session = only,
+                    talker,
+                    "talk-back: release for a session that does not hold the backchannel; the talker keeps it"
+                );
+            } else {
+                tracing::debug!(
+                    session = only,
+                    "talk-back: release with the backchannel free; nothing to do"
+                );
+            }
+            return None;
+        };
         let (session, reason) = (talker.session.as_str(), ChangeReason::Released.code());
         tracing::info!(
             session,
@@ -994,7 +1019,7 @@ mod tests {
         let (arbiter, slot) = arbiter(Some(Arc::new(Factory(Arc::clone(&uplink)))));
         let mut device = pcmu(&slot);
         let mut events = arbiter.subscribe();
-        assert_eq!(arbiter.release(), None, "nobody holds it");
+        assert_eq!(arbiter.release(None), None, "nobody holds it");
         no_change(&mut events);
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
@@ -1006,7 +1031,7 @@ mod tests {
             "through the chain"
         );
 
-        assert_eq!(arbiter.release().as_deref(), Some("a"));
+        assert_eq!(arbiter.release(None).as_deref(), Some("a"));
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("a", ChangeReason::Released));
         assert!(
@@ -1031,7 +1056,7 @@ mod tests {
         no_change(&mut events);
         assert!(talk(&mut d, 0), "b still holds it");
         // The released talker claims again when nobody else did.
-        assert_eq!(arbiter.release().as_deref(), Some("b"));
+        assert_eq!(arbiter.release(None).as_deref(), Some("b"));
         assert!(!talk(&mut b, 1));
         assert_eq!(change(&mut events).1, ChangeReason::Released);
         let (session, reason) = change(&mut events);
@@ -1048,13 +1073,91 @@ mod tests {
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
         assert!(!talk(&mut a, 0));
-        assert_eq!(arbiter.release().as_deref(), Some("a"));
+        assert_eq!(arbiter.release(None).as_deref(), Some("a"));
         assert!(!talk(&mut b, 0));
         let _claimed_released_claimed = (0..3).map(|_| change(&mut events)).count();
         drop(a);
         no_change(&mut events);
         let mut c = Talkback::new(Arc::clone(&arbiter), "c".into(), Arc::default());
         assert!(talk(&mut c, 0), "b still holds it");
+    }
+
+    /// A release that names a session frees the channel only from that
+    /// session: from the holder it frees it as an unconditional one does,
+    /// from anyone else, or with nobody holding it, it changes nothing.
+    #[tokio::test]
+    async fn a_release_for_a_session_frees_the_channel_only_from_that_session() {
+        let (arbiter, slot) = arbiter(None);
+        let mut device = pcmu(&slot);
+        let mut events = arbiter.subscribe();
+        assert_eq!(arbiter.release(Some("a")), None, "nobody holds it");
+        no_change(&mut events);
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
+        assert!(!talk(&mut a, 0));
+        assert_eq!(change(&mut events).1, ChangeReason::Claimed);
+        assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 0);
+
+        // Another session's release leaves a the talker, its route up.
+        assert_eq!(arbiter.release(Some("b")), None);
+        no_change(&mut events);
+        assert!(talk(&mut b, 0), "a still holds it");
+        assert!(!talk(&mut a, 1));
+        assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 1);
+
+        // The holder's own release frees it for the next sender.
+        assert_eq!(arbiter.release(Some("a")).as_deref(), Some("a"));
+        let (session, reason) = change(&mut events);
+        assert_eq!((session.as_str(), reason), ("a", ChangeReason::Released));
+        assert!(!talk(&mut b, 1));
+        let (session, reason) = change(&mut events);
+        assert_eq!((session.as_str(), reason), ("b", ChangeReason::Claimed));
+    }
+
+    /// The interleaving a client checking the talker before an
+    /// unconditional release would lose: a's talker spell ends, b claims,
+    /// and only then does a's release arrive. Named for a, it frees
+    /// nothing of b's.
+    #[tokio::test]
+    async fn a_stale_release_for_the_previous_talker_never_evicts_the_next_one() {
+        let (arbiter, slot) = arbiter(None);
+        let mut device = pcmu(&slot);
+        let mut events = arbiter.subscribe();
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
+        assert!(!talk(&mut a, 0));
+        assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 0);
+        // Another client releases a, and b claims the free channel.
+        assert_eq!(arbiter.release(None).as_deref(), Some("a"));
+        assert!(!talk(&mut b, 0));
+        assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 0);
+        let changes: Vec<(String, ChangeReason)> = (0..3).map(|_| change(&mut events)).collect();
+        assert_eq!(
+            changes,
+            [
+                ("a".to_owned(), ChangeReason::Claimed),
+                ("a".to_owned(), ChangeReason::Released),
+                ("b".to_owned(), ChangeReason::Claimed),
+            ]
+        );
+        // a stops talking: its release, named for a, arrives late.
+        assert_eq!(arbiter.release(Some("a")), None);
+        no_change(&mut events);
+        assert!(talk(&mut a, 1), "b still holds it");
+        assert_eq!(load(&a.stats.packets_dropped_busy), 1);
+        assert!(!talk(&mut b, 1));
+        assert_eq!(
+            within(device.recv()).await.unwrap().rtp.seq,
+            1,
+            "b's route is up"
+        );
+        assert!(device.try_recv().is_err(), "nothing of a's");
+        drop(b);
+        let (session, reason) = change(&mut events);
+        assert_eq!(
+            (session.as_str(), reason),
+            ("b", ChangeReason::SessionClosed)
+        );
     }
 
     /// A source reconnect.

@@ -2372,7 +2372,7 @@ impl Pair {
 /// on either offer shape, is handed on as uplink packets with the header
 /// fields as sent, taken by payload type: the backchannel's PCMA the
 /// answer names first, and the stream's PCMU that the m-line lists too
-/// (RFC 3264 §6.1, §5.1: the browser may send any listed codec).
+/// (RFC 3264 §7: the browser may send any listed codec).
 #[test]
 fn rfc3264_6_1_talk_back_rtp_is_handed_on_by_payload_type_in_any_listed_codec() {
     use lotse_testing::viewer::TalkbackOffer;
@@ -2479,6 +2479,94 @@ fn rfc3264_6_1_rtp_that_is_no_talk_back_is_refused_and_counted() {
     assert_eq!(pair.uplink[0].packet.rtp.seq, 101, "the PCMA one");
     let stats = pair.session.stats();
     assert_eq!((stats.uplink_packets, stats.uplink_refused), (1, 1));
+}
+
+/// The answer's talk-back m-line lists only codecs that reach the camera,
+/// though the viewer offers Opus, G.722, PCMU and PCMA on it and the engine
+/// answers every m-line from one codec list: without stream audio no
+/// G.722, and with PCMU down and an Opus backchannel no PCMU on a
+/// dedicated m-line. A `sendrecv` m-line that carries the stream's PCMU
+/// too lists it after Opus, the codec the browser sends (RFC 3264 §7);
+/// a packet in a codec that does not reach the camera is refused there,
+/// never handed on, or dropped by the engine already when no m-line
+/// negotiated it (G.722 beside stream audio).
+#[test]
+fn rfc3264_7_the_talk_back_m_line_lists_only_codecs_that_reach_the_camera() {
+    use lotse_testing::viewer::TalkbackOffer;
+
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let opus = Codec::Opus { channels: 2 };
+    let all = &["PCMU/8000", "opus/48000/2", "PCMA/8000"][..];
+    for (shape, audio, backchannel, expected, taken, refused) in [
+        (
+            TalkbackOffer::Dedicated,
+            None,
+            Codec::Pcmu,
+            all,
+            &[UplinkCodec::Pcmu, UplinkCodec::Opus][..],
+            1,
+        ),
+        (
+            TalkbackOffer::Dedicated,
+            Some(Codec::Pcmu),
+            opus.clone(),
+            &["opus/48000/2"],
+            &[UplinkCodec::Opus],
+            1,
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            None,
+            Codec::Pcmu,
+            all,
+            &[UplinkCodec::Pcmu, UplinkCodec::Opus],
+            1,
+        ),
+        (
+            TalkbackOffer::SendRecv,
+            Some(Codec::Pcmu),
+            opus,
+            &["opus/48000/2", "PCMU/8000"],
+            &[UplinkCodec::Opus],
+            1,
+        ),
+    ] {
+        let what = format!("{shape:?}, {audio:?} down, {backchannel:?} up");
+        let viewer =
+            Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, shape).expect("a viewer");
+        let mut request = request(viewer.offer(), h264(None));
+        request.audio = audio.map(Arc::new);
+        request.backchannel = Some(backchannel);
+        let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+        let sections = audio_sections(&answer);
+        let up = sections.last().unwrap();
+        let encodings: Vec<&str> = payload_types(up)
+            .iter()
+            .map(|pt| {
+                up.iter()
+                    .find_map(|line| line.strip_prefix(&format!("a=rtpmap:{pt} ")))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(encodings, expected, "{what}: {answer}");
+        assert_eq!(pair.session.talkback(), Some(taken[0]), "{what}");
+
+        // PCMU, G.722 and Opus on the talk-back m-line, whatever it lists.
+        pair.connect(&answer);
+        talk(
+            &mut pair,
+            &[(0, &[0xff; 160]), (9, &[0x55; 160]), (111, &[0xf8, 1, 2])],
+        );
+        let got: Vec<UplinkCodec> = pair.uplink.iter().map(|up| up.codec).collect();
+        assert_eq!(got, taken, "{what}");
+        let stats = pair.session.stats();
+        assert_eq!(
+            (stats.uplink_packets, stats.uplink_refused),
+            (taken.len() as u64, refused),
+            "{what}"
+        );
+    }
 }
 
 #[test]
