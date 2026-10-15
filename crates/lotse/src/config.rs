@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use clap::ArgMatches;
 use clap::parser::ValueSource;
+use lotse_core::fingerprint::Fingerprint;
 use lotse_sandbox::{Mode, SandboxConfig};
-use lotse_supervisor::{DEFAULT_CONNECT_CONCURRENCY, Limits, SHUTDOWN_BUDGET};
+use lotse_supervisor::{ControlTls, DEFAULT_CONNECT_CONCURRENCY, Limits, SHUTDOWN_BUDGET};
 use serde::Deserialize;
 
 use crate::cli::ServeArgs;
@@ -217,6 +218,11 @@ pub(crate) enum ConfigError {
         "the control socket path is required: --socket, LOTSE_SOCKET, or `socket` in the config file"
     )]
     MissingSocket,
+    /// A control TLS listener without a data directory for its identity.
+    #[error(
+        "the control TLS listener keeps its identity in the data directory: --data-dir, LOTSE_DATA_DIR, or `data_dir` in the config file"
+    )]
+    MissingDataDir,
     /// The config file could not be read.
     #[error("config file {path}: {source}")]
     Read {
@@ -249,6 +255,11 @@ struct FileConfig {
     group: Option<u32>,
     /// `allow_uid`.
     allow_uid: Option<u32>,
+    /// `data_dir`.
+    data_dir: Option<PathBuf>,
+    /// `[control]`.
+    #[serde(default)]
+    control: ControlFile,
     /// `sandbox`.
     sandbox: Option<Mode>,
     /// `[webrtc]`.
@@ -266,6 +277,16 @@ struct FileConfig {
     /// `[log]`.
     #[serde(default)]
     log: LogFile,
+}
+
+/// `[control]` in the file.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlFile {
+    /// `control.listen`.
+    listen: Option<SocketAddr>,
+    /// `control.clients`.
+    clients: Option<Vec<Fingerprint>>,
 }
 
 /// `[webrtc]` in the file.
@@ -463,6 +484,46 @@ impl Resolver<'_> {
         }
     }
 
+    /// The control TLS listener, from `control.listen`, `control.clients`
+    /// and `data_dir`: none without a listen address, and an error without
+    /// a data directory for its identity. An empty allowlist is refused
+    /// when the listener binds.
+    fn control(
+        &mut self,
+        args: &ServeArgs,
+        data_dir: Option<PathBuf>,
+        file: ControlFile,
+        state_owner: (u32, u32),
+    ) -> Result<Option<ControlTls>, ConfigError> {
+        let data_dir = self.pick_required(
+            "data_dir",
+            "data_dir",
+            args.data_dir.clone().map(DisplayPath),
+            data_dir.map(DisplayPath),
+        );
+        let Some(listen) = self.pick_required(
+            "control.listen",
+            "control_listen",
+            args.control_listen,
+            file.listen,
+        ) else {
+            return Ok(None);
+        };
+        let clients = self.pick(
+            "control.clients",
+            "control_clients",
+            args.control_clients.clone().map(Pins),
+            file.clients.map(Pins),
+            Pins(Vec::new()),
+        );
+        Ok(Some(ControlTls {
+            listen,
+            clients: clients.0,
+            data_dir: data_dir.ok_or(ConfigError::MissingDataDir)?.0,
+            state_owner,
+        }))
+    }
+
     /// The `[log]` group. A valid `RUST_LOG` beats every other source of
     /// `log.level`; an invalid one is ignored and reported.
     fn log(&mut self, args: &ServeArgs, file: LogFile) -> LogSettings {
@@ -495,6 +556,22 @@ impl Resolver<'_> {
             level,
             ignored_rust_log,
         }
+    }
+}
+
+/// Client pins, printed comma-separated for the provenance log; they are
+/// public.
+struct Pins(Vec<Fingerprint>);
+
+impl fmt::Display for Pins {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, pin) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{pin}")?;
+        }
+        Ok(())
     }
 }
 
@@ -555,6 +632,9 @@ pub(crate) fn load(
         file.allow_uid,
         starting_uid,
     );
+    let own_gid = rustix::process::getgid().as_raw();
+    let state_owner = state_owner(starting_uid, (uid, gid), own_gid);
+    let control_tls = r.control(args, file.data_dir, file.control, state_owner)?;
     let mode = r.pick("sandbox", "sandbox", args.sandbox, file.sandbox, Mode::On);
     let udp_listen = r.pick(
         "webrtc.udp_listen",
@@ -599,6 +679,7 @@ pub(crate) fn load(
             socket,
             owner_uid: starting_uid,
             allow_uid,
+            control_tls,
             udp_listen,
             tcp_listen: tcp_listen.address(),
             limits,
@@ -608,6 +689,16 @@ pub(crate) fn load(
         },
     };
     Ok((settings, r.provenance))
+}
+
+/// Who owns what the daemon writes at runtime: the ids it drops to
+/// (`drop_to`) when started as root, else its own.
+const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u32, u32) {
+    if starting_uid == 0 {
+        drop_to
+    } else {
+        (starting_uid, own_gid)
+    }
 }
 
 /// The default of `webrtc.udp_listen` and `webrtc.tcp_listen`: dual-stack,
@@ -723,6 +814,126 @@ mod tests {
         let err = resolve(&["lotse", "serve"]).unwrap_err();
         assert!(matches!(err, ConfigError::MissingSocket), "{err}");
         assert!(err.to_string().contains("--socket"));
+    }
+
+    /// SHA-256("abc") as a pin, run together and in pairs.
+    const PIN_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const PIN_ABC_PAIRS: &str = "ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad";
+
+    #[test]
+    fn the_control_listener_is_off_unless_an_address_is_given() {
+        let (settings, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/z.sock",
+            "--data-dir",
+            "/data",
+        ])
+        .unwrap();
+        assert_eq!(settings.supervisor.control_tls, None);
+        assert_eq!(
+            source_of(&provenance, "data_dir"),
+            ("/data".into(), Source::Flag)
+        );
+        assert!(provenance.iter().all(|p| p.name != "control.clients"));
+    }
+
+    #[test]
+    fn the_control_listener_takes_its_address_pins_and_data_dir_from_flags() {
+        let (settings, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/z.sock",
+            "--control-listen",
+            "127.0.0.1:18557",
+            "--control-clients",
+            &format!("{PIN_ABC},{}", PIN_ABC_PAIRS.to_uppercase()),
+            "--data-dir",
+            "/data",
+        ])
+        .unwrap();
+        let control = settings.supervisor.control_tls.unwrap();
+        assert_eq!(control.listen, "127.0.0.1:18557".parse().unwrap());
+        assert_eq!(control.clients, [Fingerprint::of(b"abc"); 2]);
+        assert_eq!(control.data_dir, PathBuf::from("/data"));
+        assert_eq!(
+            source_of(&provenance, "control.clients"),
+            (format!("{PIN_ABC_PAIRS},{PIN_ABC_PAIRS}"), Source::Flag)
+        );
+        assert_eq!(
+            source_of(&provenance, "control.listen"),
+            ("127.0.0.1:18557".into(), Source::Flag)
+        );
+    }
+
+    #[test]
+    fn runtime_state_belongs_to_the_ids_the_daemon_runs_as() {
+        assert_eq!(state_owner(0, (65534, 65533), 0), (65534, 65533));
+        assert_eq!(state_owner(1000, (65534, 65533), 100), (1000, 100));
+    }
+
+    #[test]
+    fn the_control_listener_reads_the_file_and_needs_a_data_dir() {
+        let dir = std::env::temp_dir().join(format!("lotse-config-control-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lotse.toml");
+        std::fs::write(
+            &path,
+            format!("data_dir = \"/data\"\n[control]\nlisten = \"[::]:18557\"\nclients = [\"{PIN_ABC}\"]\n"),
+        )
+        .unwrap();
+        let config = path.to_str().unwrap();
+        let (settings, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/z.sock",
+            "--config",
+            config,
+        ])
+        .unwrap();
+        let control = settings.supervisor.control_tls.unwrap();
+        assert_eq!(control.listen, "[::]:18557".parse().unwrap());
+        assert_eq!(control.clients, [Fingerprint::of(b"abc")]);
+        assert_eq!(
+            source_of(&provenance, "control.clients"),
+            (PIN_ABC_PAIRS.into(), Source::File)
+        );
+
+        // Without pins the listener is configured, and refused when it binds.
+        let (settings, _) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/z.sock",
+            "--control-listen",
+            "[::]:18557",
+            "--data-dir",
+            "/data",
+        ])
+        .unwrap();
+        assert!(settings.supervisor.control_tls.unwrap().clients.is_empty());
+
+        let err = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/z.sock",
+            "--control-listen",
+            "[::]:18557",
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::MissingDataDir), "{err}");
+        assert!(err.to_string().contains("--data-dir"), "{err}");
+        assert!(
+            Cli::command()
+                .try_get_matches_from(["lotse", "serve", "--control-clients", "ab"])
+                .is_err(),
+            "a pin that does not parse is a usage error"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

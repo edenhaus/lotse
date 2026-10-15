@@ -2,12 +2,12 @@
 //!
 //! Speaks the WebSocket API like any other client: connect, `hello`, one
 //! command, its `result`, and for a subscription the events after it.
-//! Results and events are printed as JSON on stdout, the one place in the
-//! binary that writes there; a failed result prints its `error` and exits 1.
+//! Results and events are printed as JSON on stdout, which only this and
+//! `lotse identity` write to; a failed result prints its `error` and exits 1.
 
 #![expect(
     clippy::print_stdout,
-    reason = "`lotse ctl` output is the one stdout writer in the binary (Cargo.toml lints)"
+    reason = "`lotse ctl` output is one of the binary's two stdout writers, with `lotse identity` (Cargo.toml lints)"
 )]
 
 use std::io::Read;
@@ -54,6 +54,12 @@ pub(crate) enum CtlCommand {
         /// What to do.
         #[command(subcommand)]
         command: StreamCommand,
+    },
+    /// The control TLS listener's clients.
+    Clients {
+        /// What to do.
+        #[command(subcommand)]
+        command: ClientsCommand,
     },
     /// Send one command as written and print every frame up to its result;
     /// `id` is filled in when missing.
@@ -119,14 +125,63 @@ pub(crate) enum StreamCommand {
     },
 }
 
-/// Runs the command on a small runtime of its own; the exit code is 0 for
-/// a successful result, 1 for a failed one.
-pub(crate) fn run(args: &CtlArgs) -> anyhow::Result<ExitCode> {
+/// `lotse ctl clients ...`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ClientsCommand {
+    /// Every client certificate pin the TLS listener lets in, fixed by the
+    /// configuration or enrolled by pairing.
+    List,
+    /// Remove an enrolled client and close its connections; succeeds when
+    /// it is not enrolled.
+    Remove {
+        /// The client certificate's SHA-256, 64 hex digits, optionally with
+        /// a colon between each pair.
+        pin: String,
+    },
+}
+
+/// `lotse pair`.
+#[derive(Debug, Args)]
+pub(crate) struct PairArgs {
+    /// The daemon's control socket.
+    #[arg(long, env = "LOTSE_SOCKET", value_name = "PATH")]
+    pub(crate) socket: PathBuf,
+}
+
+/// `future` on a small runtime of its own.
+fn on_runtime<T>(future: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("runtime")?;
-    runtime.block_on(async {
+    runtime.block_on(future)
+}
+
+/// Asks the daemon for a pairing code (`pairing/create`) and prints the
+/// code alone, to be copied into the client; a refusal prints the error
+/// and exits 1.
+pub(crate) fn pair(args: &PairArgs) -> anyhow::Result<ExitCode> {
+    on_runtime(async {
+        let mut client = Client::connect(&args.socket).await?;
+        let frame = client.call(json!({ "type": "pairing/create" })).await?;
+        let code = frame
+            .get("result")
+            .and_then(|result| result.get("code"))
+            .and_then(Value::as_str);
+        Ok(match code {
+            Some(code) => {
+                println!("{code}");
+                ExitCode::SUCCESS
+            }
+            None => report(&frame, false),
+        })
+    })
+}
+
+/// Runs the command on a small runtime of its own; the exit code is 0 for
+/// a successful result, 1 for a failed one.
+pub(crate) fn run(args: &CtlArgs) -> anyhow::Result<ExitCode> {
+    on_runtime(async {
         let mut client = Client::connect(&args.socket).await?;
         match &args.command {
             CtlCommand::Raw { json } => {
@@ -153,6 +208,10 @@ fn command_of(command: &CtlCommand, stdin: impl Read) -> anyhow::Result<Value> {
         CtlCommand::Info => json!({ "type": "info" }),
         CtlCommand::Metrics => json!({ "type": "metrics/get" }),
         CtlCommand::Schema => json!({ "type": "schema" }),
+        CtlCommand::Clients { command } => match command {
+            ClientsCommand::List => json!({ "type": "clients/list" }),
+            ClientsCommand::Remove { pin } => json!({ "type": "clients/remove", "pin": pin }),
+        },
         CtlCommand::Stream { command } => match command {
             StreamCommand::List => json!({ "type": "stream/list" }),
             StreamCommand::Get { stream_id } => {
@@ -475,6 +534,19 @@ mod tests {
         assert_eq!(
             command_of(&CtlCommand::Schema, b"".as_slice()).unwrap(),
             json!({ "type": "schema" })
+        );
+        let clients = |command| CtlCommand::Clients { command };
+        assert_eq!(
+            command_of(&clients(ClientsCommand::List), b"".as_slice()).unwrap(),
+            json!({ "type": "clients/list" })
+        );
+        assert_eq!(
+            command_of(
+                &clients(ClientsCommand::Remove { pin: "ab".into() }),
+                b"".as_slice()
+            )
+            .unwrap(),
+            json!({ "type": "clients/remove", "pin": "ab" })
         );
         let stream = |command| CtlCommand::Stream { command };
         assert_eq!(

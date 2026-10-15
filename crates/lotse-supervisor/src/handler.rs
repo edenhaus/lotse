@@ -1064,7 +1064,12 @@ impl Supervisor {
             Command::BackchannelRelease(release) => {
                 self.backchannel_release(&release.stream_id, release.session_id.as_deref())
             }
-            Command::Ping(_) | Command::Schema(_) | Command::Unsubscribe(_) => {
+            Command::Ping(_)
+            | Command::Schema(_)
+            | Command::Unsubscribe(_)
+            | Command::PairingCreate(_)
+            | Command::ClientsList(_)
+            | Command::ClientsRemove(_) => {
                 tracing::error!(
                     command = command.name(),
                     "the server answers this command itself"
@@ -1522,8 +1527,23 @@ mod tests {
         let _logs = captured.install();
         let err = error(call(&s, r#"{"id":3,"type":"ping"}"#).await);
         assert_eq!(err.code, ErrorCode::InternalError);
+        let err = error(call(&s, r#"{"id":4,"type":"pairing/create"}"#).await);
+        assert_eq!(err.code, ErrorCode::InternalError);
+        let err = error(call(&s, r#"{"id":5,"type":"clients/list"}"#).await);
+        assert_eq!(err.code, ErrorCode::InternalError);
+        let err = error(call(&s, r#"{"id":6,"type":"clients/remove","pin":"00"}"#).await);
+        assert_eq!(err.code, ErrorCode::InternalError);
         let logged = captured.lines("the server answers this command itself");
         assert!(logged[0].contains("command=\"ping\""), "{logged:?}");
+        assert!(
+            logged[1].contains("command=\"pairing/create\""),
+            "{logged:?}"
+        );
+        assert!(logged[2].contains("command=\"clients/list\""), "{logged:?}");
+        assert!(
+            logged[3].contains("command=\"clients/remove\""),
+            "{logged:?}"
+        );
     }
 
     #[tokio::test]

@@ -1250,6 +1250,7 @@ impl Api {
             socket: PathBuf::from("/nonexistent/lotse.sock"),
             owner_uid: 0,
             allow_uid: 0,
+            control_tls: None,
             udp_listen: bound.local,
             tcp_listen: None,
             limits: Limits {

@@ -10,9 +10,11 @@ use schemars::generate::{SchemaGenerator, SchemaSettings};
 use serde_json::{Map, Value, json};
 
 use crate::API_VERSION;
+use crate::clients::ClientList;
 use crate::command::Command;
 use crate::frame::{Empty, EventFrame, Failure, Hello, Pong, Shutdown, Success};
 use crate::info::{InfoResult, Metrics};
+use crate::pairing::PairingCreateResult;
 use crate::session::{Session, SessionEvent, SessionList};
 use crate::stream::{BackchannelReleaseResult, Stream, StreamEvent, StreamList, StreamPutResult};
 
@@ -41,6 +43,14 @@ pub fn bundle() -> Value {
     );
     results.insert("schema".into(), reference::<Success<Value>>(&mut generator));
     results.insert(
+        "pairing/create".into(),
+        reference::<Success<PairingCreateResult>>(&mut generator),
+    );
+    results.insert(
+        "clients/list".into(),
+        reference::<Success<ClientList>>(&mut generator),
+    );
+    results.insert(
         "stream/put".into(),
         reference::<Success<StreamPutResult>>(&mut generator),
     );
@@ -53,6 +63,7 @@ pub fn bundle() -> Value {
         reference::<Success<StreamList>>(&mut generator),
     );
     for name in [
+        "clients/remove",
         "stream/delete",
         "stream/subscribe",
         "unsubscribe",

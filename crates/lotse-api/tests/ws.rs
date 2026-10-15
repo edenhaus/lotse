@@ -131,9 +131,15 @@ impl Handler for FakeHandler {
             | Command::SessionClose(_)
             | Command::SessionAdopt(_)
             | Command::BackchannelRelease(_) => Outcome::Result(json!({})),
-            Command::Ping(_) | Command::Schema(_) | Command::Unsubscribe(_) => Outcome::Error(
-                ApiError::new(ErrorCode::InternalError, "the server answers these itself"),
-            ),
+            Command::Ping(_)
+            | Command::Schema(_)
+            | Command::Unsubscribe(_)
+            | Command::PairingCreate(_)
+            | Command::ClientsList(_)
+            | Command::ClientsRemove(_) => Outcome::Error(ApiError::new(
+                ErrorCode::InternalError,
+                "the server answers these itself",
+            )),
         }
     }
 
@@ -192,8 +198,13 @@ fn start_limited(
         allow_uid: uid,
         max_connections,
         max_subscriptions,
+        tls: None,
     })
     .unwrap();
+    assert!(
+        server.state_dir().is_none(),
+        "no TLS listener writes nothing"
+    );
     let handler = Arc::new(handler);
     let shutdown = CancellationToken::new();
     let clock = Arc::new(FakeClock::default());
@@ -250,7 +261,7 @@ async fn recv<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     ws: &mut WebSocketStream<S>,
 ) -> Value {
     loop {
-        match ws.next().await {
+        match within_5_s(ws.next()).await {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(text.as_str()).unwrap(),
             Some(Ok(Message::Close(frame))) => {
                 let code = frame.map_or(1005, |f| u16::from(f.code));
@@ -734,6 +745,26 @@ async fn rfc6455_s7_1_1_a_peer_that_never_reads_is_dropped_at_the_close_deadline
 }
 
 #[tokio::test]
+async fn a_frame_that_is_not_a_command_is_answered_and_logged_at_debug() {
+    let (logs, _guard) = capture(tracing::Level::DEBUG);
+    let running = start("not-a-command", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    ws.send(Message::Text(r#"{"id":1,"type":"made/up"}"#.into()))
+        .await
+        .unwrap();
+    let answer = recv(&mut ws).await;
+    assert_eq!(answer["error"]["code"], "unknown_command", "{answer}");
+    assert!(
+        logs.text()
+            .contains("command rejected id=Some(1) code=\"unknown_command\""),
+        "{}",
+        logs.text()
+    );
+    running.finish().await;
+}
+
+#[tokio::test]
 async fn a_peer_gone_while_a_frame_is_written_ends_the_writer() {
     let (logs, _guard) = capture(tracing::Level::DEBUG);
     let flood = Arc::new(Notify::new());
@@ -787,6 +818,26 @@ async fn rfc6455_s5_5_pings_change_nothing_and_a_close_frame_ends_the_connection
         }
     })
     .await;
+    running.finish().await;
+}
+
+#[tokio::test]
+async fn the_tls_listener_commands_without_one_are_invalid_requests() {
+    let running = start("pairing-off", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    let pin = "ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad";
+    for (id, command) in [
+        (1, json!({ "id": 1, "type": "pairing/create" })),
+        (2, json!({ "id": 2, "type": "clients/list" })),
+        (3, json!({ "id": 3, "type": "clients/remove", "pin": pin })),
+    ] {
+        send(&mut ws, command).await;
+        let answer = recv(&mut ws).await;
+        assert_eq!(answer["id"], id, "{answer}");
+        assert_eq!(answer["success"], false, "{answer}");
+        assert_eq!(answer["error"]["code"], "invalid_request");
+    }
     running.finish().await;
 }
 

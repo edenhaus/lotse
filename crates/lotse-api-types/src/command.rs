@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorCode};
 use crate::limits::{
-    ID_PATTERN, MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_SDP_CHARS, MAX_SOURCES,
-    MAX_TEXT_CHARS, MAX_URL_CHARS,
+    ID_PATTERN, MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_SDP_CHARS,
+    MAX_SOURCES, MAX_TEXT_CHARS, MAX_URL_CHARS,
 };
 use crate::session::IceServer;
 use crate::stream::{AudioMode, Orientation, SourceSpec};
@@ -45,6 +45,34 @@ pub struct MetricsGet {
 pub struct Schema {
     /// The command id.
     pub id: u64,
+}
+
+/// `pairing/create`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PairingCreate {
+    /// The command id.
+    pub id: u64,
+}
+
+/// `clients/list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClientsList {
+    /// The command id.
+    pub id: u64,
+}
+
+/// `clients/remove`; idempotent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClientsRemove {
+    /// The command id.
+    pub id: u64,
+    /// The client certificate's SHA-256, 64 hex digits, optionally with a
+    /// colon between each pair.
+    #[schemars(length(max = MAX_PIN_CHARS))]
+    pub pin: String,
 }
 
 /// `stream/put`: the idempotent upsert of a stream's desired state.
@@ -245,6 +273,22 @@ pub enum Command {
     #[serde(rename = "schema")]
     #[schemars(title = "SchemaCommand")]
     Schema(Schema),
+    /// `pairing/create`: a one-time pairing code for the control TLS
+    /// listener, replacing any open one; only on the Unix socket.
+    #[serde(rename = "pairing/create")]
+    #[schemars(title = "PairingCreateCommand")]
+    PairingCreate(PairingCreate),
+    /// `clients/list`: every client the control TLS listener lets in, fixed
+    /// by the configuration or enrolled by pairing.
+    #[serde(rename = "clients/list")]
+    #[schemars(title = "ClientsListCommand")]
+    ClientsList(ClientsList),
+    /// `clients/remove`: removes an enrolled client and closes its control
+    /// connections; idempotent. Over the TLS listener a client may remove
+    /// only itself; a fixed pin cannot be removed.
+    #[serde(rename = "clients/remove")]
+    #[schemars(title = "ClientsRemoveCommand")]
+    ClientsRemove(ClientsRemove),
     /// `stream/put`: the idempotent upsert of a stream's desired state.
     #[serde(rename = "stream/put")]
     #[schemars(title = "StreamPutCommand")]
@@ -310,6 +354,9 @@ impl Command {
         "info",
         "metrics/get",
         "schema",
+        "pairing/create",
+        "clients/list",
+        "clients/remove",
         "stream/put",
         "stream/get",
         "stream/list",
@@ -332,6 +379,9 @@ impl Command {
             Self::Info(c) => c.id,
             Self::MetricsGet(c) => c.id,
             Self::Schema(c) => c.id,
+            Self::PairingCreate(c) => c.id,
+            Self::ClientsList(c) => c.id,
+            Self::ClientsRemove(c) => c.id,
             Self::StreamPut(c) => c.id,
             Self::StreamGet(c) => c.id,
             Self::StreamList(c) => c.id,
@@ -353,6 +403,9 @@ impl Command {
             Self::Info(_) => "info",
             Self::MetricsGet(_) => "metrics/get",
             Self::Schema(_) => "schema",
+            Self::PairingCreate(_) => "pairing/create",
+            Self::ClientsList(_) => "clients/list",
+            Self::ClientsRemove(_) => "clients/remove",
             Self::StreamPut(_) => "stream/put",
             Self::StreamGet(_) => "stream/get",
             Self::StreamList(_) => "stream/list",
@@ -560,10 +613,13 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
         Command::StreamSubscribe(subscribe) => {
             cap_stream_id(subscribe.stream_id.as_deref().unwrap_or_default())?;
         }
+        Command::ClientsRemove(remove) => cap_chars("pin", &remove.pin, MAX_PIN_CHARS)?,
         Command::Ping(_)
         | Command::Info(_)
         | Command::MetricsGet(_)
         | Command::Schema(_)
+        | Command::PairingCreate(_)
+        | Command::ClientsList(_)
         | Command::StreamList(_)
         | Command::Unsubscribe(_)
         | Command::SessionList(_) => {}
@@ -640,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn every_command_parses_from_the_contract_shape() {
+    fn stream_put_parses_from_the_contract_shape() {
         let put = parse_command(
             r#"{ "id": 3, "type": "stream/put", "stream_id": "front",
                  "sources": [ { "url": "rtsp://user:pass@192.168.1.10:554/h264",
@@ -656,7 +712,10 @@ mod tests {
         );
         assert_eq!(put.sources[0].options["transport"], "tcp");
         assert_eq!(put.orientation, Orientation::RotateLeft);
+    }
 
+    #[test]
+    fn every_command_parses_from_the_contract_shape() {
         let cases = [
             (r#"{"id":1,"type":"ping"}"#, "ping"),
             (r#"{"id":2,"type":"info"}"#, "info"),
@@ -705,11 +764,15 @@ mod tests {
                 r#"{"id":17,"type":"backchannel/release","stream_id":"front"}"#,
                 "backchannel/release",
             ),
+            (r#"{"id":18,"type":"pairing/create"}"#, "pairing/create"),
+            (r#"{"id":19,"type":"clients/list"}"#, "clients/list"),
+            (
+                r#"{"id":20,"type":"clients/remove","pin":"00"}"#,
+                "clients/remove",
+            ),
         ];
         for (index, (text, name)) in cases.iter().enumerate() {
-            let command = parse_command(text);
-            assert!(command.is_ok(), "{text}: {command:?}");
-            let command = command.unwrap();
+            let_assert!(Ok(command) = parse_command(text), "{text}");
             assert_eq!(command.name(), *name);
             assert_eq!(command.id(), u64::try_from(index).unwrap() + 1);
             // Commands serialize back into the same shape, for `lotse ctl`.
@@ -804,7 +867,9 @@ mod tests {
         let offer = |sdp: usize, servers: Vec<serde_json::Value>| json!({ "id": 1, "type": "webrtc/offer", "stream_id": "a", "sdp": text(sdp), "ice_servers": servers });
         let candidate = |session: usize, candidate: usize, mid: usize| json!({ "id": 1, "type": "webrtc/candidate", "session_id": text(session), "candidate": text(candidate), "sdp_mid": text(mid) });
         let at_cap = server(MAX_ICE_URLS, MAX_TEXT_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS);
+        let remove = |pin: usize| json!({ "id": 1, "type": "clients/remove", "pin": text(pin) });
         let accepted = [
+            remove(MAX_PIN_CHARS),
             put(MAX_SOURCES, MAX_URL_CHARS),
             offer(MAX_SDP_CHARS, vec![at_cap.clone(); MAX_ICE_SERVERS]),
             candidate(MAX_ID_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS),
@@ -813,6 +878,7 @@ mod tests {
             assert!(limited(frame).is_ok(), "{}", frame["type"]);
         }
         let refused = [
+            (remove(MAX_PIN_CHARS + 1), "pin"),
             (put(MAX_SOURCES + 1, 10), "sources"),
             (put(1, MAX_URL_CHARS + 1), "sources[].url"),
             (offer(MAX_SDP_CHARS + 1, vec![]), "sdp"),

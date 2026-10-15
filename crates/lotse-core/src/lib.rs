@@ -17,6 +17,7 @@ pub mod clock_map;
 pub mod codec;
 pub mod connection;
 pub mod discontinuity;
+pub mod fingerprint;
 pub mod id;
 pub mod ingest;
 pub mod lateness;

@@ -35,6 +35,10 @@ pub enum ErrorCode {
     SourceInUse,
     /// The command arrived during graceful shutdown.
     ShuttingDown,
+    /// The command is not allowed on this connection (`pairing/create`
+    /// over the TLS listener, `clients/remove` of another client over it),
+    /// or not for this target (`clients/remove` of a fixed pin).
+    NotPermitted,
     /// An invariant failed; a bug, always logged with context.
     InternalError,
     /// Connecting to the source failed.
@@ -103,6 +107,7 @@ impl ErrorCode {
             Self::SchemeUnsupported => "scheme_unsupported",
             Self::SourceInUse => "source_in_use",
             Self::ShuttingDown => "shutting_down",
+            Self::NotPermitted => "not_permitted",
             Self::InternalError => "internal_error",
             Self::SourceUnreachable => "source_unreachable",
             Self::SourceAuthFailed => "source_auth_failed",
@@ -230,6 +235,7 @@ mod tests {
             ErrorCode::SnapshotTimeout,
             ErrorCode::SnapshotBusy,
             ErrorCode::FrameOverBrowserLimit,
+            ErrorCode::NotPermitted,
         ];
         for code in all {
             let json = serde_json::to_value(code).unwrap();

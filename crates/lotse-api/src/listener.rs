@@ -1,28 +1,57 @@
 //! The listener: the private Unix socket with its directory, umask and
-//! peer-credential checks.
+//! peer-credential checks, and the accept loop's retry both listeners share.
 //!
 //! Implements unix(7) `SO_PEERCRED` (through tokio's `peer_cred`, which is
 //! `getpeereid(2)` on macOS): the peer's uid is read and checked at accept,
 //! and a peer that is not allowed is closed before a byte of its request
 //! is read. An allowed peer's credentials are carried as its [`PeerInfo`].
 
+use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::Path;
 use std::sync::Arc;
 
 use lotse_core::backoff::AcceptBackoff;
 use lotse_core::clock::Clock;
+use lotse_core::fingerprint::Fingerprint;
 use rustix::fs::Mode;
 use tokio::net::{UnixListener, UnixStream};
 
-/// What the listener learned about an allowed peer at accept.
+use crate::clients::ClientsError;
+use crate::identity::IdentityError;
+
+/// Who an authenticated peer is, as its listener learned it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeerInfo {
-    /// The peer's uid, one of the allowed ones.
-    pub uid: u32,
-    /// The peer's pid, where the platform reports it.
-    pub pid: Option<i32>,
+pub enum PeerInfo {
+    /// A peer on the Unix socket, by its credentials, checked at accept.
+    Unix {
+        /// The peer's uid, one of the allowed ones.
+        uid: u32,
+        /// The peer's pid, where the platform reports it.
+        pid: Option<i32>,
+    },
+    /// A peer on the TLS listener, by its certificate.
+    Tls {
+        /// The pin of the certificate it authenticated with.
+        pin: Fingerprint,
+        /// Its address.
+        addr: SocketAddr,
+    },
+}
+
+impl fmt::Display for PeerInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unix {
+                uid,
+                pid: Some(pid),
+            } => write!(f, "uid {uid} pid {pid}"),
+            Self::Unix { uid, pid: None } => write!(f, "uid {uid}"),
+            Self::Tls { pin, addr } => write!(f, "client {pin} at {addr}"),
+        }
+    }
 }
 
 /// Why a listener could not be bound.
@@ -73,6 +102,59 @@ pub enum BindError {
         #[source]
         source: io::Error,
     },
+    /// The TLS listener's server identity.
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
+    /// The TLS listener's enrolled clients.
+    #[error(transparent)]
+    Clients(#[from] ClientsError),
+    /// The TLS configuration could not be built.
+    #[error("control TLS configuration: {0}")]
+    Tls(#[source] rustls::Error),
+    /// The TLS listener could not be bound.
+    #[error("control TLS listener {addr}: {source}")]
+    TlsListen {
+        /// The address asked for.
+        addr: SocketAddr,
+        /// The error.
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Runs `accept` until it succeeds. A failure is logged with `listener`
+/// and retried after a pause on `clock`, the [`AcceptBackoff`] schedule,
+/// reset by the next success, so a full descriptor table cannot spin the
+/// loop.
+pub(crate) async fn accept_retrying<T, F, Fut>(
+    backoff: &mut AcceptBackoff,
+    clock: &dyn Clock,
+    listener: &'static str,
+    mut accept: F,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+{
+    loop {
+        match accept().await {
+            Ok(accepted) => {
+                backoff.reset();
+                return accepted;
+            }
+            Err(err) => {
+                let pause = backoff.next_delay();
+                let backoff_ms = pause.as_millis();
+                tracing::warn!(
+                    listener,
+                    error = %err,
+                    backoff_ms,
+                    "accept on a control listener failed; retrying after a pause"
+                );
+                clock.sleep(pause).await;
+            }
+        }
+    }
 }
 
 /// Binds the Unix socket after checking its directory, with umask 0177 so
@@ -167,34 +249,20 @@ impl CheckedUnix {
     /// [`AcceptBackoff`] schedule, reset by the next success.
     pub(crate) async fn accept(&mut self) -> (UnixStream, PeerInfo) {
         loop {
-            let accepted = self.inner.accept().await.and_then(|(stream, _addr)| {
-                let cred = stream.peer_cred()?;
-                Ok((stream, cred))
-            });
-            match accepted {
-                Ok((stream, cred)) => {
-                    self.backoff.reset();
-                    let peer = PeerInfo {
-                        uid: cred.uid(),
-                        pid: cred.pid(),
-                    };
-                    if !self.allowed.contains(&peer.uid) {
-                        tracing::warn!(uid = peer.uid, pid = ?peer.pid, "control connection refused: peer uid not allowed");
-                        continue;
-                    }
-                    return (stream, peer);
-                }
-                Err(err) => {
-                    let pause = self.backoff.next_delay();
-                    let backoff_ms = pause.as_millis();
-                    tracing::warn!(
-                        error = %err,
-                        backoff_ms,
-                        "accept on the control socket failed; retrying after a pause"
-                    );
-                    self.clock.sleep(pause).await;
-                }
+            let inner = &self.inner;
+            let (stream, cred) =
+                accept_retrying(&mut self.backoff, &*self.clock, "unix", || async {
+                    let (stream, _addr) = inner.accept().await?;
+                    let cred = stream.peer_cred()?;
+                    Ok((stream, cred))
+                })
+                .await;
+            let (uid, pid) = (cred.uid(), cred.pid());
+            if !self.allowed.contains(&uid) {
+                tracing::warn!(uid, pid = ?pid, "control connection refused: peer uid not allowed");
+                continue;
             }
+            return (stream, PeerInfo::Unix { uid, pid });
         }
     }
 }
@@ -290,10 +358,16 @@ mod tests {
             accepted = listener.accept() => accepted,
             closed = client.read(&mut byte) => panic!("refused: {closed:?}"),
         };
-        assert_eq!(peer.uid, uid);
         // Linux reports the pid (`SO_PEERCRED`).
-        let pid = peer.pid.map(|pid| u32::try_from(pid).unwrap());
-        assert_eq!(pid, Some(std::process::id()));
+        let pid = i32::try_from(std::process::id()).unwrap();
+        assert_eq!(
+            peer,
+            PeerInfo::Unix {
+                uid,
+                pid: Some(pid)
+            }
+        );
+        assert_eq!(peer.to_string(), format!("uid {uid} pid {pid}"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -317,7 +391,7 @@ mod tests {
         fn pauses(&self) -> Vec<u64> {
             let logs = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
             logs.lines()
-                .filter(|line| line.contains("accept on the control socket failed"))
+                .filter(|line| line.contains("accept on a control listener failed"))
                 .map(|line| {
                     let (_, after) = line.split_once("backoff_ms=").unwrap();
                     after.split_whitespace().next().unwrap().parse().unwrap()
@@ -404,7 +478,7 @@ mod tests {
         setrlimit(Resource::Nofile, limit).unwrap();
         clock.advance(Duration::from_millis(last));
         let (_stream, peer) = drive(&mut accept, 50).await.expect("accepted");
-        assert_eq!(peer.uid, uid);
+        assert!(matches!(peer, PeerInfo::Unix { uid: got, .. } if got == uid));
         drop(accept);
 
         // A success resets the pause.
@@ -421,6 +495,17 @@ mod tests {
         drop(accept);
         assert_eq!(queued.len(), 14, "the clients stayed connected until here");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_peer_shows_who_it_is() {
+        assert_eq!(PeerInfo::Unix { uid: 7, pid: None }.to_string(), "uid 7");
+        let pin = Fingerprint::of(b"abc");
+        let addr = "192.0.2.1:18557".parse().unwrap();
+        assert_eq!(
+            PeerInfo::Tls { pin, addr }.to_string(),
+            format!("client {pin} at 192.0.2.1:18557")
+        );
     }
 
     #[test]
