@@ -864,10 +864,11 @@ mod tests {
                 .write_all(b"HTTP/1.0 404 Not Found\r\n\r\n{}")
                 .await
                 .unwrap();
-            api.local_addr().unwrap().port()
+            Ok(api.local_addr().unwrap().port())
         };
-        let (camera, api) = tokio::join!(start, serve);
-        let camera = camera.unwrap();
+        // A failed start (the API's port taken before the stand-in bound
+        // it) ends the test instead of leaving the stand-in waiting.
+        let (camera, api) = tokio::try_join!(start, serve).unwrap();
         assert_eq!(camera.ports().api, api);
         assert_eq!(starts, 2);
         camera.stop();
