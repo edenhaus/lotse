@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use lotse_api::{ConnectionId, Event, EventClass};
 use lotse_api_types::session::{Session, SessionEvent};
@@ -42,6 +42,7 @@ use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
 use lotse_ipc::SessionEvent as WorkerSessionEvent;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::OwnedPermit;
 use tokio::task::AbortHandle;
 
 use crate::net::turn_client::Lease;
@@ -82,18 +83,24 @@ pub(crate) const MAX_REPORT_TEXT_BYTES: usize = 16 * 1024;
 /// seen through it, which the demux caps at 8 addresses.
 pub(crate) const MAX_RELAY_CHANNELS: usize = 16;
 
-/// A session without an answer this long after its offer closes with
-/// `source_not_live`: the source declared no tracks.
-pub(crate) const SOURCE_NOT_LIVE_AFTER: Duration = Duration::from_secs(10);
-
 /// The `closed` codes of the API; anything else a worker reports is an
-/// `internal_error`.
-const CLOSED_CODES: [&str; 12] = [
+/// `internal_error`. The `source_*` codes and `worker_crashed` are the
+/// connection's own errors
+/// ([`ConnectionError::code`](lotse_core::connection::ConnectionError::code)),
+/// which close a session still waiting for its answer when its connection
+/// fails; `source_not_live` is a worker that runs no source when the
+/// offer reaches it.
+const CLOSED_CODES: [&str; 17] = [
     "peer_closed",
     "session_closed",
     "stream_deleted",
     "stream_changed",
     "worker_crashed",
+    "source_unreachable",
+    "source_auth_failed",
+    "source_timeout",
+    "source_protocol_error",
+    "source_ended",
     "source_not_live",
     "ice_failed",
     "invalid_sdp",
@@ -240,10 +247,13 @@ pub(crate) struct SessionEntry {
     channel_requests: Vec<ChannelRequest>,
     /// When the offer arrived.
     since: SystemTime,
-    /// Its one-shot timers (`source_not_live`, the gather deadline, grace),
-    /// aborted when the entry is dropped: no timer task outlives its
-    /// session.
+    /// Its one-shot timers (the gather deadline, grace), aborted when the
+    /// entry is dropped: no timer task outlives its session.
     timers: Vec<AbortHandle>,
+    /// The slot in its driver's queue reserved for its close at the
+    /// offer, behind the offer: a full queue never drops the close, which
+    /// the worker's session waits for without a deadline of its own.
+    pub(crate) close_slot: Option<OwnedPermit<crate::driver::DriverCommand>>,
 }
 
 impl Drop for SessionEntry {
@@ -297,6 +307,7 @@ impl SessionEntry {
             channel_requests: Vec::new(),
             since,
             timers: Vec::new(),
+            close_slot: None,
         }
     }
 
@@ -1047,6 +1058,30 @@ mod tests {
             lines[0].contains(r#"stream.id=front code="av_sync_lost""#),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn every_connection_error_is_a_closed_code() {
+        use lotse_core::connection::ConnectionError;
+        use lotse_core::source::SourceError;
+        let errors = [
+            ConnectionError::WorkerCrashed,
+            ConnectionError::Source(SourceError::Unreachable("x".into())),
+            ConnectionError::Source(SourceError::AuthFailed("x".into())),
+            ConnectionError::Source(SourceError::Timeout("x".into())),
+            ConnectionError::Source(SourceError::Protocol("x".into())),
+            ConnectionError::Source(SourceError::Ended("x".into())),
+        ];
+        for error in errors {
+            assert!(CLOSED_CODES.contains(&error.code()), "{}", error.code());
+            assert_eq!(
+                closed_event(error.code(), "m"),
+                SessionEvent::Closed {
+                    code: error.code().into(),
+                    message: "m".into()
+                }
+            );
+        }
     }
 
     #[test]

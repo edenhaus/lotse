@@ -36,6 +36,12 @@ pub(crate) const MAX_STUN_SERVERS: usize = 4;
 /// TURN servers asked per session; each is one shared allocation.
 pub(crate) const MAX_TURN_SERVERS: usize = 4;
 
+/// Warnings an offer's `ice_servers` yield; the rest are logged. The
+/// session's queue must hold them with its `session` event before them
+/// and a `closed` event after, so an offer closed at once never loses
+/// its close.
+pub(crate) const MAX_WARNINGS: usize = 4;
+
 /// The default port of a `stun:` and a `turn:` URI (RFC 7064 §3.1, RFC
 /// 7065 §3.1, RFC 8489 §18.6).
 const STUN_PORT: u16 = 3478;
@@ -75,7 +81,7 @@ pub(crate) struct TurnServer {
 /// What `ice_servers` asks of a session.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct IcePlan {
-    /// Warnings for entries not supported yet.
+    /// Warnings for entries not supported yet, at most [`MAX_WARNINGS`].
     pub(crate) warnings: Vec<SessionEvent>,
     /// The STUN servers to gather from, at most [`MAX_STUN_SERVERS`].
     pub(crate) stun: Vec<StunServer>,
@@ -85,13 +91,14 @@ pub(crate) struct IcePlan {
 
 /// Checks `ice_servers`: only `stun:`, `turn:` and `turns:` URIs (RFC 7064,
 /// RFC 7065). `turns:` is not supported until M6 and yields a
-/// `turn_unsupported` warning. A `turn:` entry without a username and
-/// credential is skipped: TURN asks for the long-term credential (RFC 8656
-/// §5), and browsers refuse such an entry (W3C WebRTC 1.0 §4.2.1). A
-/// `turn:` over TCP is skipped when the list names its host and port over
-/// UDP too: both relay over UDP to the peer (§7.1), so the UDP allocation
-/// is enough, and what a session sends through a TCP one passes through
-/// the supervisor, which owns the connection.
+/// `turn_unsupported` warning, the first [`MAX_WARNINGS`] of them. A
+/// `turn:` entry without a username and credential is skipped: TURN asks
+/// for the long-term credential (RFC 8656 §5), and browsers refuse such an
+/// entry (W3C WebRTC 1.0 §4.2.1). A `turn:` over TCP is skipped when the
+/// list names its host and port over UDP too: both relay over UDP to the
+/// peer (§7.1), so the UDP allocation is enough, and what a session sends
+/// through a TCP one passes through the supervisor, which owns the
+/// connection.
 pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
     let mut plan = IcePlan::default();
     for (entry, url) in servers
@@ -134,10 +141,15 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                     plan.turn.push(turn);
                 }
             }
-            "turns" => plan.warnings.push(SessionEvent::Warning {
-                code: "turn_unsupported".to_owned(),
-                message: format!("{url} ignored: TURN over TLS is not supported yet"),
-            }),
+            "turns" if plan.warnings.len() < MAX_WARNINGS => {
+                plan.warnings.push(SessionEvent::Warning {
+                    code: "turn_unsupported".to_owned(),
+                    message: format!("{url} ignored: TURN over TLS is not supported yet"),
+                });
+            }
+            "turns" => {
+                tracing::debug!(url, "turns: server beyond the warning limit ignored");
+            }
             _ => {
                 return Err(ApiError::new(
                     ErrorCode::InvalidRequest,
@@ -388,6 +400,20 @@ mod tests {
             ]
         );
         assert_eq!(plan.warnings.len(), 1);
+        let many: Vec<String> = (0..6).map(|n| format!("turns:t{n}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let warnings = super::plan(&servers(&many)).unwrap().warnings;
+        assert_eq!(warnings.len(), MAX_WARNINGS);
+        assert_eq!(
+            warnings[MAX_WARNINGS - 1],
+            SessionEvent::Warning {
+                code: "turn_unsupported".into(),
+                message: format!(
+                    "turns:t{} ignored: TURN over TLS is not supported yet",
+                    MAX_WARNINGS - 1
+                ),
+            }
+        );
         let many: Vec<String> = (0..6).map(|n| format!("stun:s{n}")).collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         assert_eq!(

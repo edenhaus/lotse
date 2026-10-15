@@ -11,7 +11,14 @@
 # The target runs as `cargo fuzz run` would run it (cargo-fuzz 0.13.2, src/project.rs): its corpus
 # in fuzz/corpus/<target>/, a failing input written to fuzz/artifacts/<target>/, and
 # `detect_odr_violation=0` added to ASAN_OPTIONS. `cargo fuzz run <target> <input>` reproduces a
-# failing input.
+# failing input. A run without a finding then minimizes the corpus as `cargo fuzz cmin` does
+# (src/project.rs, `exec_cmin`): libFuzzer's `-merge=1` into an empty directory keeps a small set
+# of the corpus's inputs that covers all the corpus covers, and that set replaces the corpus (a
+# merge that outlasts the fuzzing's own duration is given up, and the corpus stays as is). So a
+# corpus that carries over between runs stays bounded by the target's coverage instead of growing
+# by every run's finds. A run with a finding exits with it and keeps its corpus as is: the failing
+# input is in fuzz/artifacts/, never in the corpus. To start from CI's corpora:
+# `git clone https://github.com/edenhaus/lotse-fuzz-corpus fuzz/corpus`.
 #
 # libFuzzer's options (https://llvm.org/docs/LibFuzzer.html#options), each limit a finding when
 # crossed (a `timeout-*` or `oom-*` artifact):
@@ -30,6 +37,7 @@
 # every target's input format reaches its paths within it.
 set -eu
 
+deadline=
 target=${1:?usage: scripts/fuzz.sh <target> [secs]}
 secs=${2:-60}
 
@@ -42,11 +50,38 @@ fi
 ASAN_OPTIONS="quarantine_size_mb=64${ASAN_OPTIONS:+:$ASAN_OPTIONS}:detect_odr_violation=0"
 export ASAN_OPTIONS
 
-mkdir -p "fuzz/corpus/$target" "fuzz/artifacts/$target"
-exec "$FUZZ_BIN_DIR/$target" \
-  -artifact_prefix="fuzz/artifacts/$target/" \
-  -max_total_time="$secs" \
-  -timeout=10 \
-  -malloc_limit_mb=64 \
-  -rss_limit_mb=1024 \
-  "fuzz/corpus/$target"
+# The target under the limits above, with the options and directories given; with `deadline`
+# set, under GNU timeout for that many seconds, which ends libFuzzer's merge subprocesses with it
+# and sends SIGKILL 10 s later.
+fuzz() {
+  ${deadline:+timeout --kill-after=10 "$deadline"} "$FUZZ_BIN_DIR/$target" \
+    -artifact_prefix="fuzz/artifacts/$target/" \
+    -timeout=10 \
+    -malloc_limit_mb=64 \
+    -rss_limit_mb=1024 \
+    "$@"
+}
+
+corpus=fuzz/corpus/$target
+mkdir -p "$corpus" "fuzz/artifacts/$target"
+fuzz -max_total_time="$secs" "$corpus"
+
+# The merge gets as long as the fuzzing had: a corpus too large or slow to merge in time stays as
+# fuzzed, and the run is still one without a finding.
+rm -rf "$corpus.cmin" "$corpus.old"
+mkdir "$corpus.cmin"
+deadline=$secs
+status=0
+fuzz -merge=1 "$corpus.cmin" "$corpus" || status=$?
+case $status in
+  0)
+    mv "$corpus" "$corpus.old"
+    mv "$corpus.cmin" "$corpus"
+    rm -rf "$corpus.old"
+    ;;
+  124 | 137)
+    echo "fuzz.sh: $target: the merge outlasted ${secs} s, the corpus stays as fuzzed" >&2
+    rm -rf "$corpus.cmin"
+    ;;
+  *) exit "$status" ;;
+esac
