@@ -516,6 +516,43 @@ fn iso14496_12_8_8_8_a_huge_sample_count_is_refused_before_mp4_atom_reads_it() {
     );
 }
 
+/// Runs pointing at the same bytes would copy them once per run: a
+/// segment of a few kilobytes could become gigabytes of units. The
+/// samples of a segment may cover its media data once.
+#[test]
+fn iso14496_12_8_8_8_samples_that_cover_more_than_the_media_data_overlap_and_are_refused() {
+    // The video run a second time, at the same data offset.
+    let segment = reencoded(H264_AAC_0, |moof, _| {
+        let run = moof.traf[0].trun[0].clone();
+        moof.traf[0].trun.push(run);
+    });
+    let (_, body) = locate(&segment, &[(b"mdat", 0)]);
+    let media = segment.len() - body;
+    let err = segment_error(H264_AAC_INIT, &segment);
+    assert_eq!(err, Fmp4Error::OverlappingSamples { media });
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the samples of a media segment cover more than its {media} bytes of media data: they overlap"
+        )
+    );
+    // The fixture's own samples cover its media data exactly: read whole,
+    // and with its first video sample one byte longer (every sample still
+    // inside the mdat, the video's last byte covered twice) refused.
+    let (reader, _) = read(H264_AAC_INIT, &[H264_AAC_0], MAX);
+    assert_eq!(reader.stats().samples, 58);
+    let segment = reencoded(H264_AAC_0, |moof, _| {
+        let run = &mut moof.traf[0].trun[0];
+        if let Some(size) = run.entries.first_mut().unwrap().size.as_mut() {
+            *size += 1;
+        }
+    });
+    assert!(matches!(
+        segment_error(H264_AAC_INIT, &segment),
+        Fmp4Error::OverlappingSamples { .. }
+    ));
+}
+
 #[test]
 fn iso14496_12_8_1_1_samples_past_a_truncated_mdat_are_dropped() {
     let (_, whole) = read(H264_AAC_INIT, &[H264_AAC_0], MAX);

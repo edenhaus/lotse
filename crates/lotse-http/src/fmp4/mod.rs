@@ -55,7 +55,11 @@
 //! refused before mp4-atom reads it (each declared sample may become an
 //! entry it allocates); a sample larger than `max_frame_bytes`, empty,
 //! outside every media data box (a segment cut short ends its last one)
-//! or whose NAL units run past its end is dropped and counted. Pure: no
+//! or whose NAL units run past its end is dropped and counted; a segment
+//! whose samples cover more bytes than its media data boxes hold is
+//! refused, because they overlap (runs pointing at the same bytes would
+//! have each copied again), so a segment's units hold at most its media
+//! data, each NAL unit's length prefix replaced by a start code. Pure: no
 //! I/O, no clock, no logging (mp4-atom's own `tracing` warnings name
 //! boxes it does not know).
 
@@ -162,6 +166,16 @@ pub enum Fmp4Error {
         /// The samples its runs declare.
         count: u64,
     },
+    /// The samples of a media segment cover more bytes than its media
+    /// data boxes hold: their runs overlap (ISO/IEC 14496-12 §8.8.8 lays
+    /// a run's samples out one after the other).
+    #[error(
+        "the samples of a media segment cover more than its {media} bytes of media data: they overlap"
+    )]
+    OverlappingSamples {
+        /// The bytes its media data boxes hold.
+        media: usize,
+    },
 }
 
 /// A box an mp4-atom error came from.
@@ -229,13 +243,42 @@ pub struct Reader {
     stats: Fmp4Stats,
 }
 
-/// A media segment's bytes and where its media data boxes hold them.
-#[derive(Debug, Clone, Copy)]
+/// A media segment's bytes, where its media data boxes hold them, and how
+/// much of them its samples may still cover.
+#[derive(Debug)]
 struct Media<'a> {
     /// The segment.
     bytes: &'a [u8],
     /// The body of each media data box, cut short where the segment ends.
     data: &'a [Range<usize>],
+    /// The media data not yet covered by a sample.
+    budget: Budget,
+}
+
+/// How many bytes of a media segment's media data its samples may still
+/// cover: samples that do not overlap cover at most the media data once.
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    /// The bytes the segment's media data boxes hold.
+    media: usize,
+    /// Those not yet covered by a sample.
+    left: usize,
+}
+
+impl Budget {
+    /// Covers `size` bytes with a sample.
+    ///
+    /// # Errors
+    ///
+    /// [`Fmp4Error::OverlappingSamples`] when the samples now cover more
+    /// than the media data.
+    fn cover(&mut self, size: usize) -> Result<(), Fmp4Error> {
+        self.left = self
+            .left
+            .checked_sub(size)
+            .ok_or(Fmp4Error::OverlappingSamples { media: self.media })?;
+        Ok(())
+    }
 }
 
 /// A box of a byte sequence, as its header places it.
@@ -580,8 +623,9 @@ impl Reader {
     /// # Errors
     ///
     /// [`Fmp4Error::Box`] when mp4-atom cannot read a movie fragment
-    /// (cut short included), [`Fmp4Error::TooManySamples`] and
-    /// [`Fmp4Error::NoDecodeTime`]; nothing is appended then.
+    /// (cut short included), [`Fmp4Error::TooManySamples`],
+    /// [`Fmp4Error::NoDecodeTime`] and [`Fmp4Error::OverlappingSamples`];
+    /// nothing is appended then.
     pub fn read_segment(&mut self, segment: &[u8], out: &mut Vec<Unit>) -> Result<(), Fmp4Error> {
         let placed = boxes(segment).map_err(box_error("media segment"))?;
         let data: Vec<Range<usize>> = placed
@@ -589,6 +633,15 @@ impl Reader {
             .filter(|placed| placed.kind == MDAT)
             .map(|mdat| mdat.body_start..mdat.body_start.saturating_add(mdat.body.len()))
             .collect();
+        let media = data
+            .iter()
+            .map(|mdat| mdat.end.saturating_sub(mdat.start))
+            .fold(0_usize, usize::saturating_add);
+        let mut media = Media {
+            bytes: segment,
+            data: &data,
+            budget: Budget { media, left: media },
+        };
         let mut units = Vec::new();
         let mut stats = self.stats;
         for fragment in placed.iter().filter(|placed| placed.kind == MOOF) {
@@ -598,11 +651,7 @@ impl Reader {
             }
             let mut bytes = segment.get(fragment.start..).unwrap_or_default();
             let moof = Moof::decode(&mut bytes).map_err(box_error("movie fragment"))?;
-            let media = Media {
-                bytes: segment,
-                data: &data,
-            };
-            self.fragment(&moof, fragment.start, media, &mut units, &mut stats)?;
+            self.fragment(&moof, fragment.start, &mut media, &mut units, &mut stats)?;
         }
         units.sort_by_key(|unit| unit.decode_time);
         stats.segments = stats.segments.saturating_add(1);
@@ -612,12 +661,12 @@ impl Reader {
     }
 
     /// The units of one movie fragment that begins at `moof_start` in
-    /// `media`.
+    /// `media`, its samples covered out of `media`'s budget.
     fn fragment(
         &self,
         moof: &Moof,
         moof_start: usize,
-        media: Media<'_>,
+        media: &mut Media<'_>,
         units: &mut Vec<Unit>,
         stats: &mut Fmp4Stats,
     ) -> Result<(), Fmp4Error> {
@@ -660,7 +709,7 @@ impl Reader {
                     };
                     let presentation =
                         decode_ticks.saturating_add(i128::from(entry.cts.unwrap_or(0)));
-                    if let Some(payload) = self.payload(track, media, start..position, stats) {
+                    if let Some(payload) = self.payload(track, media, start..position, stats)? {
                         stats.samples = stats.samples.saturating_add(1);
                         units.push(Unit {
                             track: index,
@@ -684,46 +733,54 @@ impl Reader {
         Ok(())
     }
 
-    /// The payload of `track`'s sample at `range` of `media`, or `None`
-    /// when it is dropped (counted in `stats`) or the track is not read.
+    /// The payload of `track`'s sample at `range` of `media`, covered out
+    /// of `media`'s budget before it is copied, or `None` when it is
+    /// dropped (counted in `stats`) or the track is not read.
+    ///
+    /// # Errors
+    ///
+    /// [`Fmp4Error::OverlappingSamples`] when the sample does not fit the
+    /// budget.
     fn payload(
         &self,
         track: &Track,
-        media: Media<'_>,
+        media: &mut Media<'_>,
         range: Range<usize>,
         stats: &mut Fmp4Stats,
-    ) -> Option<Bytes> {
+    ) -> Result<Option<Bytes>, Fmp4Error> {
         let length_size = match track.content {
-            Content::Unsupported => return None,
+            Content::Unsupported => return Ok(None),
             Content::Video { length_size } => Some(length_size),
             Content::Audio => None,
         };
         let size = range.end.saturating_sub(range.start);
         if size == 0 {
             stats.dropped_empty = stats.dropped_empty.saturating_add(1);
-            return None;
+            return Ok(None);
         }
         if size > self.max_frame_bytes {
             stats.dropped_oversize = stats.dropped_oversize.saturating_add(1);
-            return None;
+            return Ok(None);
         }
         let inside = media
             .data
             .iter()
             .any(|mdat| mdat.start <= range.start && range.end <= mdat.end);
-        let Some(sample) = media.bytes.get(range).filter(|_| inside) else {
+        let bytes = media.bytes;
+        let Some(sample) = bytes.get(range).filter(|_| inside) else {
             stats.dropped_outside = stats.dropped_outside.saturating_add(1);
-            return None;
+            return Ok(None);
         };
+        media.budget.cover(sample.len())?;
         let Some(length_size) = length_size else {
-            return Some(Bytes::copy_from_slice(sample));
+            return Ok(Some(Bytes::copy_from_slice(sample)));
         };
         let mut annex_b = Vec::with_capacity(sample.len());
         if length_prefixed_to_annex_b(sample, length_size, &mut annex_b).is_err() {
             stats.dropped_malformed = stats.dropped_malformed.saturating_add(1);
-            return None;
+            return Ok(None);
         }
-        Some(Bytes::from(annex_b))
+        Ok(Some(Bytes::from(annex_b)))
     }
 }
 
