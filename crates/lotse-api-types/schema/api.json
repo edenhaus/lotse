@@ -2114,7 +2114,7 @@
           "type": "object"
         },
         {
-          "description": "The talker of the stream's backchannel changed. Sent to the\nsubscribers of every stream on the source connection, never\ncoalesced or shed.",
+          "description": "The talker of the stream's backchannel changed. Sent to the\nsubscribers of every stream on the source connection, never\ncoalesced or shed: a client too slow to take one is disconnected\n(close code 1008) and reads the talker again from `stream/get`. A\nburst of changes faster than the daemon passes them on may reach\nthe subscribers as fewer, the last one naming the talker there is\nthen.",
           "properties": {
             "reason": {
               "$ref": "#/$defs/TalkerReason",

@@ -44,14 +44,14 @@ use lotse_ipc::{
     Channel, Decoded, IpcError, Sender, SessionEvent, SessionSpec, SourceSpec, SourceState,
     ToSupervisor, ToWorker, TrackInfo, TrackStats, WorkerStats,
 };
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::derived::DerivedTracks;
 use crate::sessions::{ConnectionMedia, SessionManager};
-use crate::talkback::{Arbiter, TalkerChanged};
+use crate::talkback::{Arbiter, TalkerChanged, TalkerFeed};
 
 /// How often the worker pushes its counters.
 pub const STATS_INTERVAL: Duration = Duration::from_secs(1);
@@ -178,7 +178,7 @@ struct Running {
     /// without one, whose slot no session reads.
     backchannel: Option<Arc<Arbiter>>,
     /// The arbiter's talker changes, for the supervisor.
-    talker: Option<broadcast::Receiver<TalkerChanged>>,
+    talker: Option<TalkerFeed>,
 }
 
 /// One source runner's handles.
@@ -583,7 +583,7 @@ impl Serving<'_> {
                     self.registries.uplink.clone(),
                     Arc::clone(&self.clock),
                 ));
-                running.talker = Some(arbiter.subscribe());
+                running.talker = Some(TalkerFeed::new(&arbiter));
                 running.backchannel = Some(arbiter);
             }
             (None, None) => {}
@@ -777,7 +777,7 @@ fn start_source(
             Arc::clone(clock),
         ))
     });
-    let talker = backchannel.as_ref().map(|arbiter| arbiter.subscribe());
+    let talker = backchannel.as_ref().map(TalkerFeed::new);
     Ok(Running {
         cancel: runner.cancel,
         tracks,
@@ -1017,9 +1017,9 @@ async fn watch_running(running: &mut Option<Running>) -> Option<RunningWake> {
 
 /// The next change of the connection's talker; never without a
 /// backchannel.
-async fn talker_changed(talker: Option<&mut broadcast::Receiver<TalkerChanged>>) -> TalkerChanged {
+async fn talker_changed(talker: Option<&mut TalkerFeed>) -> TalkerChanged {
     if let Some(talker) = talker
-        && let Some(change) = talkback::next_change(talker).await
+        && let Some(change) = talker.next().await
     {
         return change;
     }

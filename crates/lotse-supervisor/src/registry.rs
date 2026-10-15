@@ -48,8 +48,15 @@ use crate::worker::WorkerManager;
 
 /// Events a subscription may hold before the server's forwarder drains
 /// them. Stream-state events coalesce in the server's outbox anyway, so a
-/// full queue drops the event rather than blocking the control plane.
+/// full queue drops one rather than blocking the control plane. A
+/// talker change is never dropped: one that finds the queue full ends the
+/// subscription with [`EventClass::Overflowed`] in a slot kept free for
+/// it, on top of these, and the server disconnects the client as when its
+/// own outbound queue overflows.
 pub(crate) const SUBSCRIPTION_QUEUE: usize = 256;
+
+/// The slot of a subscription's queue kept for [`EventClass::Overflowed`].
+const OVERFLOW_SLOT: usize = 1;
 
 /// Binds the channel `request` names, then hands its number to the
 /// session's worker through the driver's `commands`; a refusal is logged,
@@ -452,11 +459,11 @@ impl State {
 
     /// Opens a subscription and queues the current state of every matching
     /// stream as its first events. The queue holds the whole snapshot on
-    /// top of [`SUBSCRIPTION_QUEUE`], so no stream's first event is lost
-    /// however many streams `max_streams` allows, and live events still
-    /// find the usual room. Subscriptions whose receiver is gone
-    /// (unsubscribed) are forgotten first, so the list holds only open
-    /// ones even when no event ever reaches their stream.
+    /// top of [`SUBSCRIPTION_QUEUE`] and the overflow slot, so no stream's
+    /// first event is lost however many streams `max_streams` allows, and
+    /// live events still find the usual room. Subscriptions whose receiver
+    /// is gone (unsubscribed) are forgotten first, so the list holds only
+    /// open ones even when no event ever reaches their stream.
     pub(crate) fn subscribe(
         &mut self,
         connection: ConnectionId,
@@ -474,7 +481,11 @@ impl State {
             })
             .map(|(id, entry)| self.stream_event(id, entry))
             .collect();
-        let (events, rx) = mpsc::channel(SUBSCRIPTION_QUEUE.saturating_add(snapshot.len()));
+        let (events, rx) = mpsc::channel(
+            SUBSCRIPTION_QUEUE
+                .saturating_add(OVERFLOW_SLOT)
+                .saturating_add(snapshot.len()),
+        );
         for event in snapshot {
             let _queued = events.try_send(event);
         }
@@ -968,7 +979,7 @@ impl State {
         for stream_id in streams {
             let event = Event {
                 // A talker change is never coalesced with the stream's
-                // state, nor shed.
+                // state, nor shed: a subscription without room for it ends.
                 class: EventClass::Signaling,
                 payload: serde_json::to_value(StreamEvent::TalkerChanged {
                     stream_id: stream_id.clone(),
@@ -996,8 +1007,13 @@ impl State {
         }
     }
 
-    /// Queues `event` on every subscription matching `stream_id`; a closed
-    /// subscription is forgotten, a full one drops the event.
+    /// Queues `event` on every subscription matching `stream_id`, leaving
+    /// the overflow slot free; a closed subscription is forgotten. A full
+    /// one drops a stream-state event, and is ended by a signaling one (a
+    /// talker change), which must not be dropped: it gets
+    /// [`EventClass::Overflowed`] in the slot kept for it, after which the
+    /// server disconnects the client, which resubscribes and reads the
+    /// state again rather than keep a talker that let go.
     fn fan_out(&mut self, stream_id: &str, event: &Event) {
         self.subscribers.retain(|subscriber| {
             if subscriber
@@ -1007,17 +1023,29 @@ impl State {
             {
                 return true;
             }
-            match subscriber.events.try_send(event.clone()) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::debug!(
-                        stream.id = stream_id,
-                        "subscription queue full; event dropped"
-                    );
-                    true
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            if subscriber.events.capacity() > OVERFLOW_SLOT {
+                return !matches!(
+                    subscriber.events.try_send(event.clone()),
+                    Err(mpsc::error::TrySendError::Closed(_))
+                );
             }
+            if event.class != EventClass::Signaling {
+                tracing::debug!(
+                    stream.id = stream_id,
+                    "subscription queue full; event dropped"
+                );
+                return true;
+            }
+            tracing::warn!(
+                stream.id = stream_id,
+                control.connection = subscriber.connection.0,
+                "subscription queue full for an event that is never dropped; ending the subscription, and the client is disconnected"
+            );
+            let _ended = subscriber.events.try_send(Event {
+                class: EventClass::Overflowed,
+                payload: serde_json::Value::Null,
+            });
+            false
         });
     }
 
@@ -1493,9 +1521,16 @@ mod tests {
         }
         let mut all = state.subscribe(ConnectionId(1), None);
         let mut one = state.subscribe(ConnectionId(1), Some("s0256".into()));
-        // The snapshot is queued and the usual room is still free.
-        assert_eq!(state.subscribers[0].events.capacity(), SUBSCRIPTION_QUEUE);
-        assert_eq!(state.subscribers[1].events.capacity(), SUBSCRIPTION_QUEUE);
+        // The snapshot is queued and the usual room is still free, with
+        // the overflow slot.
+        assert_eq!(
+            state.subscribers[0].events.capacity(),
+            SUBSCRIPTION_QUEUE + OVERFLOW_SLOT
+        );
+        assert_eq!(
+            state.subscribers[1].events.capacity(),
+            SUBSCRIPTION_QUEUE + OVERFLOW_SLOT
+        );
         let mut ids = Vec::new();
         while let Ok(event) = all.try_recv() {
             ids.push(event.payload["stream_id"].clone());
@@ -2071,6 +2106,90 @@ mod tests {
             "the snapshot and a full queue"
         );
         assert_eq!(captured.lines("subscription queue full").len(), 1);
+    }
+
+    /// A talker change is never dropped: a subscription whose queue has
+    /// no room for it ends with the overflow marker, after what it holds,
+    /// so the server disconnects the client instead of leaving it with a
+    /// talker that let go; one with room gets the change.
+    #[test]
+    fn a_full_subscription_ends_with_the_overflow_marker_on_a_talker_change() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let mut state = State::default();
+        let (demand, _demand) = watch::channel(0);
+        let (commands, _commands) = mpsc::channel(1);
+        state.connections.insert(
+            "c1".into(),
+            ConnectionEntry {
+                port: None,
+                loopback_relay: false,
+                backchannel: false,
+                key: ConnectionKey {
+                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    options: serde_json::Value::Null,
+                },
+                demand,
+                snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
+                switches: 0,
+                streams: ["front".to_owned()].into(),
+                commands,
+                talker: Talker::default(),
+            },
+        );
+        state.streams.insert("front".into(), stream_on_c1(false));
+        state
+            .sessions
+            .insert("s1".into(), session_on_c1(1, "front"));
+        let mut full = state.subscribe(ConnectionId(1), Some("front".into()));
+        for _ in 0..=SUBSCRIPTION_QUEUE {
+            state.notify_stream("front");
+        }
+        assert_eq!(
+            captured
+                .lines("subscription queue full; event dropped")
+                .len(),
+            1
+        );
+        let mut roomy = state.subscribe(ConnectionId(2), Some("front".into()));
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_280_801);
+        assert!(
+            state
+                .talker_changed("c1", "s1", TalkerReason::Claimed, at)
+                .is_some()
+        );
+        assert_eq!(state.subscribers.len(), 1, "the full one ended");
+        assert_eq!(state.subscribers[0].connection, ConnectionId(2));
+
+        let mut queued = Vec::new();
+        while let Ok(event) = full.try_recv() {
+            queued.push(event.class);
+        }
+        assert_eq!(queued.len(), 1 + SUBSCRIPTION_QUEUE + 1);
+        assert!(
+            queued[..=SUBSCRIPTION_QUEUE]
+                .iter()
+                .all(|class| matches!(class, EventClass::StreamState { .. })),
+            "what it held goes out first"
+        );
+        assert_eq!(queued.last(), Some(&EventClass::Overflowed));
+        assert_eq!(
+            full.try_recv().unwrap_err(),
+            mpsc::error::TryRecvError::Disconnected
+        );
+        assert_eq!(
+            captured
+                .lines("subscription queue full for an event that is never dropped")
+                .len(),
+            1
+        );
+
+        let _snapshot = roomy.try_recv().unwrap();
+        let change = roomy.try_recv().unwrap();
+        assert_eq!(
+            (change.class, change.payload["type"].as_str()),
+            (EventClass::Signaling, Some("talker_changed"))
+        );
     }
 
     #[test]

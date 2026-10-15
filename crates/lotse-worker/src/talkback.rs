@@ -31,10 +31,13 @@
 //! device's own codec otherwise (Opus to an Opus device). A forwarder task
 //! puts each packet into the handle's sender without waiting; a full or
 //! closed queue drops it. Every change of the talker is logged and sent as
-//! a [`TalkerChanged`] event.
+//! a [`TalkerChanged`] event, under the lock that decided it, so the events
+//! come in the order of the changes; the supervisor gets them through a
+//! [`TalkerFeed`], which resynchronizes from the arbiter when it falls
+//! behind.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lotse_core::clock::Clock;
@@ -55,7 +58,8 @@ use tokio::task::JoinHandle;
 pub(crate) const BACKCHANNEL_BUSY: &str = "backchannel_busy";
 
 /// How many talker changes a slow subscriber may fall behind by. Changes
-/// come at human pace; one that lags skips the oldest.
+/// come at human pace; one that lags skips the oldest, and a
+/// [`TalkerFeed`] then resynchronizes from the arbiter's talker.
 const EVENT_CAPACITY: usize = 16;
 
 /// Why the talker changed: the `reason` of the talker-changed event.
@@ -87,6 +91,10 @@ pub(crate) struct TalkerChanged {
     /// [`ChangeReason::Claimed`], the one that let go otherwise (the
     /// channel is free then).
     pub(crate) session: String,
+    /// Its claim: the new one, or the one that ended. A session that
+    /// claims again gets another, so it tells two spells of one session
+    /// apart.
+    pub(crate) claim: u64,
     /// Why.
     pub(crate) reason: ChangeReason,
     /// When, on the wall clock: a claim's is the talker's `since`.
@@ -148,23 +156,61 @@ pub(crate) fn talker_change(change: TalkerChanged) -> TalkerChange {
     }
 }
 
-/// The next talker change on `events`. A receiver that fell behind skips
-/// the oldest changes, logged, and goes on with the ones kept: each says
-/// who holds the channel after it, so the last one is the state. `None`
-/// once the arbiter is gone.
-pub(crate) async fn next_change(
-    events: &mut broadcast::Receiver<TalkerChanged>,
-) -> Option<TalkerChanged> {
-    loop {
-        match events.recv().await {
-            Ok(change) => return Some(change),
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(
-                    skipped,
-                    "talk-back: talker changes skipped for the supervisor; the latest follow"
-                );
-            }
-            Err(broadcast::error::RecvError::Closed) => return None,
+/// The talker changes of one arbiter as the supervisor gets them: each
+/// one in order while the receiver keeps up. Once it falls behind, the
+/// changes it skipped and the ones still queued give way to the one change
+/// from the talker the supervisor was last told of to the arbiter's talker
+/// now ([`Arbiter::resync`]), so the supervisor never keeps a talker that
+/// let go, nor misses one that holds the channel.
+#[derive(Debug)]
+pub(crate) struct TalkerFeed {
+    /// The arbiter, for a resynchronization; not kept alive by the feed,
+    /// which ends with it.
+    arbiter: Weak<Arbiter>,
+    /// Its changes.
+    events: broadcast::Receiver<TalkerChanged>,
+    /// The claim the supervisor was last told of, while it holds; `None`
+    /// once told the channel is free.
+    told: Option<TalkerChanged>,
+}
+
+impl TalkerFeed {
+    /// The changes of `arbiter` from now on.
+    pub(crate) fn new(arbiter: &Arc<Arbiter>) -> Self {
+        Self {
+            arbiter: Arc::downgrade(arbiter),
+            events: arbiter.subscribe(),
+            told: None,
+        }
+    }
+
+    /// The next change for the supervisor; `None` once the arbiter is gone.
+    pub(crate) async fn next(&mut self) -> Option<TalkerChanged> {
+        loop {
+            let change = match self.events.recv().await {
+                Ok(change) => change,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let arbiter = self.arbiter.upgrade()?;
+                    let Some(change) = arbiter.resync(&mut self.events, self.told.as_ref()) else {
+                        tracing::warn!(
+                            skipped,
+                            "talk-back: talker changes skipped for the supervisor; it holds the talker there is now"
+                        );
+                        continue;
+                    };
+                    let (session, reason) = (change.session.as_str(), change.reason.code());
+                    tracing::warn!(
+                        skipped,
+                        session,
+                        reason,
+                        "talk-back: talker changes skipped for the supervisor; resynchronized from the arbiter's talker"
+                    );
+                    change
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            };
+            self.told = (change.reason == ChangeReason::Claimed).then(|| change.clone());
+            return Some(change);
         }
     }
 }
@@ -196,6 +242,10 @@ struct State {
     /// The id the next claim gets, so a session that lost the channel
     /// never takes a later claim for its own.
     next_claim: u64,
+    /// The last change, recorded and sent under the lock with the change
+    /// itself, so it always describes how the talker came to be what it
+    /// is: the talker's claim, or the release that freed the channel.
+    last: Option<TalkerChanged>,
 }
 
 /// The session holding the channel.
@@ -304,9 +354,46 @@ impl Arbiter {
         *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = slot;
     }
 
-    /// The talker changes from now on, for `stream/subscribe`.
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<TalkerChanged> {
+    /// The talker changes from now on, for the supervisor
+    /// ([`TalkerFeed`]).
+    fn subscribe(&self) -> broadcast::Receiver<TalkerChanged> {
         self.events.subscribe()
+    }
+
+    /// The change that brings a supervisor told of `told` (the claim it
+    /// holds, `None` when it was told the channel is free) to the talker
+    /// now, after its `events` fell behind; `None` when it holds that
+    /// talker already. Decided under the lock every change is sent under,
+    /// so the changes still queued on `events`, which are older, are
+    /// dropped, and every one after is newer. With a talker, it is that
+    /// talker's claim. With the channel free, it is a release of the
+    /// talker the supervisor holds, at the time and for the reason the
+    /// channel was freed: the session that let go last may be one whose
+    /// claim the supervisor never heard of.
+    fn resync(
+        &self,
+        events: &mut broadcast::Receiver<TalkerChanged>,
+        told: Option<&TalkerChanged>,
+    ) -> Option<TalkerChanged> {
+        let state = self.lock();
+        while !matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed)
+        ) {}
+        let now = state.talker.as_ref().map(|talker| talker.claim);
+        let last = state.last.clone();
+        drop(state);
+        if now == told.map(|told| told.claim) {
+            return None;
+        }
+        if now.is_some() {
+            return last;
+        }
+        told.zip(last).map(|(told, last)| TalkerChanged {
+            session: told.session.clone(),
+            claim: told.claim,
+            ..last
+        })
     }
 
     /// Frees the channel (`backchannel/release`) from whoever holds it,
@@ -316,12 +403,21 @@ impl Arbiter {
     /// at once, and the next session to send claims it, the released one
     /// included. Returns the session that held it when it was freed.
     pub(crate) fn release(&self, only: Option<&str>) -> Option<String> {
-        let mut state = self.lock();
+        let mut guard = self.lock();
+        let state = &mut *guard;
         let freed = state
             .talker
             .take_if(|talker| only.is_none_or(|session| talker.session == session));
+        if let Some(talker) = &freed {
+            self.emit(
+                &mut state.last,
+                &talker.session,
+                talker.claim,
+                ChangeReason::Released,
+            );
+        }
         let kept = state.talker.as_ref().map(|talker| talker.session.clone());
-        drop(state);
+        drop(guard);
         let Some(talker) = freed else {
             if let Some(talker) = kept {
                 tracing::info!(
@@ -343,30 +439,26 @@ impl Arbiter {
             reason,
             "talk-back: backchannel released; the next session to send claims it"
         );
-        self.emit(&talker.session, ChangeReason::Released);
         Some(talker.session)
     }
 
     /// The session holding `claim` closed: the channel is free if it still
     /// held it.
     fn session_closed(&self, session: &str, claim: u64) {
-        let talker = {
-            let mut state = self.lock();
-            if state.talker.as_ref().is_some_and(|t| t.claim == claim) {
-                state.talker.take()
-            } else {
-                None
-            }
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        // Its route stops on return, outside the lock.
+        let Some(_freed) = state.talker.take_if(|talker| talker.claim == claim) else {
+            return;
         };
-        if talker.is_some() {
-            let reason = ChangeReason::SessionClosed.code();
-            tracing::info!(
-                session,
-                reason,
-                "talk-back: the talker's session closed; backchannel free"
-            );
-            self.emit(session, ChangeReason::SessionClosed);
-        }
+        self.emit(&mut state.last, session, claim, ChangeReason::SessionClosed);
+        drop(guard);
+        let reason = ChangeReason::SessionClosed.code();
+        tracing::info!(
+            session,
+            reason,
+            "talk-back: the talker's session closed; backchannel free"
+        );
     }
 
     /// Decides one packet of `session`'s uplink `track` in `codec`:
@@ -383,15 +475,18 @@ impl Arbiter {
     ) -> Verdict {
         let offered = self.offered();
         let mut guard = self.lock();
-        let state = &mut *guard;
-        if let Some(talker) = &state.talker
+        let State {
+            talker,
+            next_claim,
+            last,
+        } = &mut *guard;
+        if let Some(talker) = talker
             && Some(talker.claim) != *claim
         {
             *claim = None;
             return Verdict::Busy(talker.session.clone());
         }
-        let next_claim = &mut state.next_claim;
-        let talker = state.talker.get_or_insert_with(|| {
+        let talker = talker.get_or_insert_with(|| {
             let id = *next_claim;
             *next_claim = id.wrapping_add(1);
             *claim = Some(id);
@@ -401,7 +496,7 @@ impl Arbiter {
                 reason,
                 "talk-back: backchannel claimed; this session is the talker"
             );
-            self.emit(session, ChangeReason::Claimed);
+            self.emit(last, session, id, ChangeReason::Claimed);
             Talker {
                 session: session.to_owned(),
                 claim: id,
@@ -519,13 +614,24 @@ impl Arbiter {
         }
     }
 
-    /// Sends a talker change to the subscribers; with none it goes nowhere.
-    fn emit(&self, session: &str, reason: ChangeReason) {
-        let _subscribers = self.events.send(TalkerChanged {
+    /// Records `session`'s change of `claim` as the `last` of the state,
+    /// whose lock the caller holds, and sends it to the subscribers; with
+    /// none it goes nowhere.
+    fn emit(
+        &self,
+        last: &mut Option<TalkerChanged>,
+        session: &str,
+        claim: u64,
+        reason: ChangeReason,
+    ) {
+        let change = TalkerChanged {
             session: session.to_owned(),
+            claim,
             reason,
             at: self.clock.wall_now(),
-        });
+        };
+        *last = Some(change.clone());
+        let _subscribers = self.events.send(change);
     }
 
     /// The state, even after a panic elsewhere (which aborts the process
@@ -1455,6 +1561,7 @@ mod tests {
         ] {
             let change = talker_change(TalkerChanged {
                 session: "a".into(),
+                claim: 7,
                 reason,
                 at,
             });
@@ -1469,29 +1576,170 @@ mod tests {
         }
         let before = talker_change(TalkerChanged {
             session: "a".into(),
+            claim: 7,
             reason: ChangeReason::Claimed,
             at: UNIX_EPOCH - Duration::from_secs(1),
         });
         assert_eq!(before.at_ms, 0);
     }
 
-    /// A supervisor link that fell behind goes on with the latest changes,
-    /// and ends with the arbiter.
+    /// Whether `future` still waits after one poll.
+    async fn waits(future: impl Future) -> bool {
+        tokio::select! {
+            biased;
+            _ = future => false,
+            () = std::future::ready(()) => true,
+        }
+    }
+
+    /// A feed that keeps up passes every change on in order, and ends
+    /// with the arbiter.
     #[tokio::test]
-    async fn a_lagging_receiver_skips_to_the_latest_changes_and_ends_with_the_arbiter() {
+    async fn a_feed_passes_every_change_on_in_order_and_ends_with_the_arbiter() {
         let (arbiter, _slot) = arbiter(None);
-        let mut events = arbiter.subscribe();
-        for round in 0..=EVENT_CAPACITY {
-            arbiter.emit(&format!("s{round}"), ChangeReason::Claimed);
-        }
-        let first = within(next_change(&mut events)).await.unwrap();
-        assert_eq!(first.session, "s1", "the oldest change was skipped");
-        let mut last = first;
-        while let Ok(change) = events.try_recv() {
-            last = change;
-        }
-        assert_eq!(last.session, format!("s{EVENT_CAPACITY}"));
+        let mut feed = TalkerFeed::new(&arbiter);
+        assert!(waits(feed.next()).await, "nothing changed yet");
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        assert!(!talk(&mut a, 0));
+        assert_eq!(arbiter.release(None), Some("a".into()));
+        assert!(!talk(&mut a, 1), "a claims again");
+        let changes: Vec<(String, u64, ChangeReason)> = [
+            within(feed.next()).await.unwrap(),
+            within(feed.next()).await.unwrap(),
+            within(feed.next()).await.unwrap(),
+        ]
+        .into_iter()
+        .map(|change| (change.session, change.claim, change.reason))
+        .collect();
+        assert_eq!(
+            changes,
+            [
+                ("a".into(), 0, ChangeReason::Claimed),
+                ("a".into(), 0, ChangeReason::Released),
+                ("a".into(), 1, ChangeReason::Claimed),
+            ],
+            "a second claim is another"
+        );
+        drop(a);
+        assert_eq!(
+            within(feed.next()).await.unwrap().reason,
+            ChangeReason::SessionClosed
+        );
         drop(arbiter);
-        assert_eq!(within(next_change(&mut events)).await, None);
+        assert_eq!(within(feed.next()).await, None);
+    }
+
+    /// The talker the supervisor holds lets go, and others claim and let
+    /// go more often than the feed holds: once it fell behind, the feed
+    /// tells the supervisor the talker it holds let go, at the time the
+    /// channel was freed, and nothing older after that.
+    #[tokio::test]
+    async fn a_feed_that_fell_behind_releases_the_talker_the_supervisor_holds() {
+        let (arbiter, _slot) = arbiter(None);
+        let mut feed = TalkerFeed::new(&arbiter);
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
+        assert!(!talk(&mut a, 0));
+        let told = within(feed.next()).await.unwrap();
+        assert_eq!(
+            (told.session.as_str(), told.reason),
+            ("a", ChangeReason::Claimed)
+        );
+        assert_eq!(arbiter.release(None), Some("a".into()));
+        for seq in 0..u16::try_from(EVENT_CAPACITY).unwrap() {
+            assert!(!talk(&mut b, seq));
+            assert_eq!(arbiter.release(Some("b")), Some("b".into()));
+        }
+        let release = arbiter.lock().last.clone().unwrap();
+        assert_eq!(
+            (release.session.as_str(), release.reason),
+            ("b", ChangeReason::Released)
+        );
+        let resynced = within(feed.next()).await.unwrap();
+        assert_eq!(
+            resynced,
+            TalkerChanged {
+                session: "a".into(),
+                claim: told.claim,
+                reason: ChangeReason::Released,
+                at: release.at,
+            }
+        );
+        assert!(waits(feed.next()).await, "nothing older follows");
+        // In order again from here.
+        assert!(!talk(&mut b, 99));
+        let claimed = within(feed.next()).await.unwrap();
+        assert_eq!(
+            (claimed.session.as_str(), claimed.reason),
+            ("b", ChangeReason::Claimed)
+        );
+    }
+
+    /// Others claim and let go more often than the feed holds, and one
+    /// holds the channel now: the feed tells the supervisor that claim,
+    /// as the claim was made, and goes on from there.
+    #[tokio::test]
+    async fn a_feed_that_fell_behind_tells_the_claim_of_the_talker_there_is_now() {
+        let (arbiter, _slot) = arbiter(None);
+        let mut feed = TalkerFeed::new(&arbiter);
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
+        assert!(!talk(&mut a, 0));
+        let told = within(feed.next()).await.unwrap();
+        assert_eq!(told.reason, ChangeReason::Claimed);
+        for seq in 1..=u16::try_from(EVENT_CAPACITY).unwrap() {
+            assert_eq!(arbiter.release(None), Some("a".into()));
+            assert!(!talk(&mut a, seq), "a claims again: another claim");
+        }
+        assert_eq!(arbiter.release(None), Some("a".into()));
+        assert!(!talk(&mut b, 0));
+        let claim = arbiter.lock().last.clone().unwrap();
+        let resynced = within(feed.next()).await.unwrap();
+        assert_eq!(resynced, claim);
+        assert_eq!(
+            (resynced.session.as_str(), resynced.reason),
+            ("b", ChangeReason::Claimed)
+        );
+        assert!(waits(feed.next()).await, "nothing older follows");
+        drop(b);
+        let closed = within(feed.next()).await.unwrap();
+        assert_eq!(
+            (closed.session.as_str(), closed.claim, closed.reason),
+            ("b", claim.claim, ChangeReason::SessionClosed)
+        );
+        // The same session again, after the feed fell behind: its new
+        // claim is news to the supervisor.
+        assert!(!talk(&mut a, 99));
+        let again = within(feed.next()).await.unwrap();
+        for seq in 100..100 + u16::try_from(EVENT_CAPACITY).unwrap() {
+            assert_eq!(arbiter.release(None), Some("a".into()));
+            assert!(!talk(&mut a, seq));
+        }
+        let resynced = within(feed.next()).await.unwrap();
+        assert_eq!(resynced.session, "a");
+        assert_ne!(resynced.claim, again.claim);
+        assert_eq!(resynced, arbiter.lock().last.clone().unwrap());
+    }
+
+    /// A feed that fell behind while the supervisor already holds the
+    /// talker there is now tells nothing; once the arbiter is gone it
+    /// ends, behind or not.
+    #[tokio::test]
+    async fn a_feed_that_fell_behind_to_where_the_supervisor_is_tells_nothing() {
+        let (arbiter, _slot) = arbiter(None);
+        let mut feed = TalkerFeed::new(&arbiter);
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        for seq in 0..u16::try_from(EVENT_CAPACITY).unwrap() {
+            assert!(!talk(&mut a, seq));
+            assert_eq!(arbiter.release(None), Some("a".into()));
+        }
+        assert!(waits(feed.next()).await, "free, as the supervisor was told");
+        for seq in 0..u16::try_from(EVENT_CAPACITY).unwrap() {
+            assert!(!talk(&mut a, seq));
+            assert_eq!(arbiter.release(None), Some("a".into()));
+        }
+        drop(a);
+        drop(arbiter);
+        assert_eq!(within(feed.next()).await, None);
     }
 }

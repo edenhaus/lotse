@@ -109,6 +109,12 @@ pub enum EventClass {
     },
     /// Dropped first: `state` diagnostics.
     Diagnostic,
+    /// Not an event but the handler's last word on a subscription whose
+    /// own queue had no room for a [`EventClass::Signaling`] one: the
+    /// client would miss it, so the connection is closed as when its
+    /// outbound queue overflows (`1008`). Its payload is ignored, and
+    /// nothing after it is sent.
+    Overflowed,
 }
 
 /// One event of a subscription, as the handler produces it.

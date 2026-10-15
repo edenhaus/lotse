@@ -40,12 +40,15 @@ pub(crate) enum Class {
     Diagnostic,
 }
 
-impl From<EventClass> for Class {
-    fn from(class: EventClass) -> Self {
+impl Class {
+    /// How an event of `class` is shed; `None` for the handler's
+    /// [`EventClass::Overflowed`], which is no frame.
+    pub(crate) fn of(class: EventClass) -> Option<Self> {
         match class {
-            EventClass::Signaling => Self::Signaling,
-            EventClass::StreamState { stream_id } => Self::StreamState(stream_id),
-            EventClass::Diagnostic => Self::Diagnostic,
+            EventClass::Signaling => Some(Self::Signaling),
+            EventClass::StreamState { stream_id } => Some(Self::StreamState(stream_id)),
+            EventClass::Diagnostic => Some(Self::Diagnostic),
+            EventClass::Overflowed => None,
         }
     }
 }
@@ -148,10 +151,8 @@ impl Outbox {
                     return Ok(());
                 }
                 Class::Signaling | Class::StreamState(_) => {
-                    state.overflowed = true;
                     drop(state);
-                    self.overflow.notify_one();
-                    return Err(Overflow);
+                    return Err(self.overflow());
                 }
             }
         }
@@ -160,6 +161,17 @@ impl Outbox {
         drop(state);
         self.wake.notify_one();
         Ok(())
+    }
+
+    /// Marks the queue overflowed and wakes the connection, which closes:
+    /// a non-droppable item did not fit, here or on its way here.
+    pub(crate) fn overflow(&self) -> Overflow {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .overflowed = true;
+        self.overflow.notify_one();
+        Overflow
     }
 
     /// Queues a close frame and accepts nothing more.
@@ -301,13 +313,23 @@ mod tests {
         tokio::task::yield_now().await;
         outbox.push(Class::Signaling, "hi".into()).unwrap();
         assert!(matches!(waiter.await.unwrap(), Some(Outgoing::Text { text, .. }) if text == "hi"));
-        assert_eq!(Class::from(EventClass::Diagnostic), Class::Diagnostic);
+        assert_eq!(Class::of(EventClass::Diagnostic), Some(Class::Diagnostic));
         assert_eq!(
-            Class::from(EventClass::StreamState {
+            Class::of(EventClass::StreamState {
                 stream_id: "s".into()
             }),
-            Class::StreamState("s".into())
+            Some(Class::StreamState("s".into()))
         );
-        assert_eq!(Class::from(EventClass::Signaling), Class::Signaling);
+        assert_eq!(Class::of(EventClass::Signaling), Some(Class::Signaling));
+        assert_eq!(Class::of(EventClass::Overflowed), None, "no frame");
+    }
+
+    #[tokio::test]
+    async fn an_overflow_from_upstream_closes_the_connection_as_its_own_does() {
+        let outbox = Outbox::new(100);
+        outbox.push(Class::Signaling, text(1)).unwrap();
+        assert_eq!(outbox.overflow(), Overflow);
+        outbox.overflowed().await;
+        assert_eq!(outbox.stats().bytes, 1, "what was queued stays");
     }
 }

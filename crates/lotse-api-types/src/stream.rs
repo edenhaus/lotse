@@ -421,7 +421,11 @@ pub enum StreamEvent {
     },
     /// The talker of the stream's backchannel changed. Sent to the
     /// subscribers of every stream on the source connection, never
-    /// coalesced or shed.
+    /// coalesced or shed: a client too slow to take one is disconnected
+    /// (close code 1008) and reads the talker again from `stream/get`. A
+    /// burst of changes faster than the daemon passes them on may reach
+    /// the subscribers as fewer, the last one naming the talker there is
+    /// then.
     #[schemars(title = "StreamEventTalkerChanged")]
     TalkerChanged {
         /// The stream.
