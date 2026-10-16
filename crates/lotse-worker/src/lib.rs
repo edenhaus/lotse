@@ -33,7 +33,9 @@ use lotse_core::backoff::ReconnectBackoff;
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::registry::Registries;
-use lotse_core::runner::{ConnectGate, RunnerConfig, RunnerEvent, SourceRunner};
+use lotse_core::runner::{
+    ConnectGate, ProbeAsk, ProbeGate, RunnerConfig, RunnerEvent, SourceRunner,
+};
 use lotse_core::session::SessionLimits;
 use lotse_core::source::{BackchannelSlot, ResolvedPeer, TrackSet};
 use lotse_core::source_url::SourceUrl;
@@ -234,6 +236,7 @@ pub async fn serve(
     let (runner_tx, runner_rx) = mpsc::channel::<RunnerEvent>(64);
     let (standby_tx, standby_rx) = mpsc::channel::<RunnerEvent>(64);
     let (session_tx, mut session_rx) = mpsc::channel::<(String, SessionEvent)>(256);
+    let (probes, mut probe_asks) = ProbeGate::closed();
     let mut serving = Serving {
         tx,
         registries,
@@ -248,6 +251,7 @@ pub async fn serve(
         standby: None,
         sessions: None,
         lost_hand_offs: Throttle::default(),
+        probes,
     };
     let fds: Vec<BorrowedFd<'_>> = memory.iter().map(AsFd::as_fd).collect();
     serving
@@ -270,15 +274,7 @@ pub async fn serve(
                 None => return serving.on_supervisor_gone().await,
                 Some(decoded) => {
                     if let Some(reason) = serving.on_decoded(decoded).await? {
-                        // The last events of the sessions and the runner,
-                        // `Stopped` included, are still queued.
-                        while let Ok((session_id, event)) = session_rx.try_recv() {
-                            serving.tx.send_msg(&ToSupervisor::Session { session_id, event }, &[]).await?;
-                        }
-                        while let Ok(event) = serving.runner_rx.try_recv() {
-                            report(&mut serving.tx, event, None).await?;
-                        }
-                        return Ok(reason);
+                        return serving.flush(reason, &mut session_rx).await;
                     }
                 }
             },
@@ -290,6 +286,10 @@ pub async fn serve(
             }
             Some((session_id, event)) = session_rx.recv() => {
                 serving.tx.send_msg(&ToSupervisor::Session { session_id, event }, &[]).await?;
+            }
+            // `serving` holds the gate's sender, so the asks never end.
+            Some(ask) = probe_asks.recv() => {
+                serving.tx.send_msg(&probe_message(ask), &[]).await?;
             }
             Some(wake) = watch_running(&mut serving.running) => {
                 match wake {
@@ -341,9 +341,39 @@ struct Serving<'a> {
     /// The log line for hand-offs whose connection the kernel discarded,
     /// rate-limited: a flood of them must not flood the log.
     lost_hand_offs: Throttle,
+    /// Where the sources' probes of the device's backchannel wait for
+    /// the supervisor's connect permits: one gate for the worker, shared
+    /// by the running source and the standby.
+    probes: ProbeGate,
+}
+
+/// The message that passes a probe's `ask` on to the supervisor.
+const fn probe_message(ask: ProbeAsk) -> ToSupervisor {
+    match ask {
+        ProbeAsk::Connecting => ToSupervisor::ProbeConnecting,
+        ProbeAsk::Ended => ToSupervisor::ProbeEnded,
+    }
 }
 
 impl Serving<'_> {
+    /// The worker is done for `reason`: the last events of the sessions
+    /// and the runner, `Stopped` included, still queued, go out first.
+    async fn flush(
+        &mut self,
+        reason: ExitReason,
+        session_rx: &mut mpsc::Receiver<(String, SessionEvent)>,
+    ) -> Result<ExitReason, Error> {
+        while let Ok((session_id, event)) = session_rx.try_recv() {
+            self.tx
+                .send_msg(&ToSupervisor::Session { session_id, event }, &[])
+                .await?;
+        }
+        while let Ok(event) = self.runner_rx.try_recv() {
+            report(&mut self.tx, event, None).await?;
+        }
+        Ok(reason)
+    }
+
     /// One received message. A hand-off whose connection the kernel
     /// discarded, because this process had no free descriptor for it,
     /// costs that connection alone: the browser sees it close and tries
@@ -382,12 +412,14 @@ impl Serving<'_> {
                     &self.registries,
                     &self.clock,
                     self.settings,
+                    &self.probes,
                     self.runner_tx.clone(),
                 )?);
             }
             ToWorker::ConnectGranted => self.on_connect_granted(),
             ToWorker::SwitchSource(spec) => self.on_switch_source(&spec, false).await?,
             ToWorker::RestartSource(spec) => self.on_switch_source(&spec, true).await?,
+            ToWorker::ProbeConnectGranted => self.probes.grant(),
             ToWorker::SwitchConnectGranted => {
                 if let Some(standby) = &self.standby {
                     standby.runner.gate.grant();
@@ -545,6 +577,7 @@ impl Serving<'_> {
             &self.registries,
             &self.clock,
             self.settings,
+            &self.probes,
             self.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -781,12 +814,13 @@ async fn refuse_renegotiation(tx: &mut Sender, session_id: String) -> Result<(),
 }
 
 /// Validates `spec` against the registry and starts its runner on a new
-/// track set.
+/// track set, its probes waiting at `probes`.
 fn start_source(
     spec: &SourceSpec,
     registries: &Registries,
     clock: &Arc<dyn Clock>,
     settings: &Settings,
+    probes: &ProbeGate,
     events: mpsc::Sender<RunnerEvent>,
 ) -> Result<Running, Error> {
     let native = TrackSet::new(settings.limits, clock.now());
@@ -795,6 +829,7 @@ fn start_source(
         registries,
         clock,
         settings,
+        probes,
         events,
         Arc::clone(&native),
         "source",
@@ -828,7 +863,8 @@ fn start_source(
 }
 
 /// Validates `spec` against the registry and starts its runner on
-/// `native`, reporting to `events`; `role` names it in the log.
+/// `native`, reporting to `events`, its probes waiting at `probes`;
+/// `role` names it in the log.
 #[expect(
     clippy::too_many_arguments,
     reason = "wires one runner into the worker's shared parts; called from two places"
@@ -838,6 +874,7 @@ fn start_runner(
     registries: &Registries,
     clock: &Arc<dyn Clock>,
     settings: &Settings,
+    probes: &ProbeGate,
     events: mpsc::Sender<RunnerEvent>,
     native: Arc<TrackSet>,
     role: &'static str,
@@ -869,7 +906,7 @@ fn start_runner(
     let backchannel = factory
         .capabilities()
         .backchannel
-        .then(BackchannelSlot::default);
+        .then(|| BackchannelSlot::gated(probes.clone()));
     let capable = backchannel.is_some();
     tracing::info!(
         connection = %spec.connection_id,
@@ -1299,6 +1336,12 @@ mod tests {
             ) {
                 self.tx
                     .send_msg(&ToWorker::SwitchConnectGranted, &[])
+                    .await
+                    .unwrap();
+            }
+            if message == ToSupervisor::ProbeConnecting {
+                self.tx
+                    .send_msg(&ToWorker::ProbeConnectGranted, &[])
                     .await
                     .unwrap();
             }
@@ -3867,6 +3910,7 @@ mod tests {
             standby: None,
             sessions: None,
             lost_hand_offs: Throttle::default(),
+            probes: ProbeGate::default(),
         };
         (serving, ours.split().1)
     }
@@ -3890,6 +3934,7 @@ mod tests {
             &serving.registries,
             &serving.clock,
             &settings,
+            &serving.probes,
             serving.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",

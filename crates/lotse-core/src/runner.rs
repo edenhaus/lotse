@@ -118,6 +118,94 @@ impl ConnectGate {
     }
 }
 
+/// What a [`ProbeGate`] asks of the supervisor's connect gate, through
+/// the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeAsk {
+    /// A probe waits for a permit.
+    Connecting,
+    /// The probe is over: its permit, or its wait for one, ends.
+    Ended,
+}
+
+/// Where a probe waits for the supervisor's permission
+/// (`sources.connect_concurrency`), as a connection attempt waits at its
+/// [`ConnectGate`]: a connection a source opens beside its attempt to ask
+/// the device about its backchannel (RTSP: a `DESCRIBE` with `Require`).
+/// The probe asks ([`ProbeAsk::Connecting`]), waits for the grant, and
+/// gives the permit back when its [`ProbePermit`] drops. One gate per
+/// worker, shared by its running and standby sources; the default gate
+/// lets every probe through and asks nothing, for a source outside a
+/// worker.
+#[derive(Debug, Clone)]
+pub struct ProbeGate {
+    /// Where the asks go; `None` for a gate that never waits.
+    asks: Option<mpsc::UnboundedSender<ProbeAsk>>,
+    /// The grants.
+    grants: ConnectGate,
+}
+
+impl Default for ProbeGate {
+    fn default() -> Self {
+        Self {
+            asks: None,
+            grants: ConnectGate { grants: None },
+        }
+    }
+}
+
+impl ProbeGate {
+    /// A gate whose probes wait for a grant, and the asks it sends, for
+    /// the worker to pass on.
+    pub fn closed() -> (Self, mpsc::UnboundedReceiver<ProbeAsk>) {
+        let (asks, rx) = mpsc::unbounded_channel();
+        let gate = Self {
+            asks: Some(asks),
+            grants: ConnectGate::closed(),
+        };
+        (gate, rx)
+    }
+
+    /// Lets the waiting probe, or the next one, through.
+    pub fn grant(&self) {
+        self.grants.grant();
+    }
+
+    /// Asks for a permit and waits for the grant. The permit is given back
+    /// when the returned [`ProbePermit`] drops, and so is the ask when
+    /// the wait is dropped before the grant.
+    pub async fn permit(&self) -> ProbePermit {
+        let permit = ProbePermit {
+            asks: self.asks.clone(),
+        };
+        permit.ask(ProbeAsk::Connecting);
+        self.grants.granted().await;
+        permit
+    }
+}
+
+/// A probe's connect permit: given back when dropped.
+#[derive(Debug)]
+pub struct ProbePermit {
+    /// Where the end goes; `None` for a gate that never waits.
+    asks: Option<mpsc::UnboundedSender<ProbeAsk>>,
+}
+
+impl ProbePermit {
+    /// Sends `ask`; a worker that is gone takes nothing.
+    fn ask(&self, ask: ProbeAsk) {
+        if let Some(asks) = &self.asks {
+            let _sent = asks.send(ask);
+        }
+    }
+}
+
+impl Drop for ProbePermit {
+    fn drop(&mut self) {
+        self.ask(ProbeAsk::Ended);
+    }
+}
+
 /// What the runner reports; the worker forwards it to the supervisor,
 /// whose machine maps it to the connection state.
 #[derive(Debug, Clone, PartialEq, Eq)]

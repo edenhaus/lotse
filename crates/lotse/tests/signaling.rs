@@ -425,13 +425,23 @@ async fn stream_where(s: &Supervisor, stream_id: &str, done: impl Fn(&Value) -> 
     );
 }
 
+/// The sessions `cam` played the stream in: those that set up its video.
+fn viewing_sessions(cam: &FakeCamera) -> Vec<lotse_testing::fake_camera::ConnectionLog> {
+    cam.stats()
+        .connection_log()
+        .into_iter()
+        .filter(|log| log.setups.iter().any(|setup| setup == "track0"))
+        .collect()
+}
+
 /// Talk-back is opt-in (ONVIF Streaming Specification §5.3.1): a stream
 /// without `backchannel` describes its camera without the `Require`
 /// header, and no backchannel is offered. Put again with `backchannel:
 /// true`, the same stream keeps its connection, which restarts its source
-/// once: exactly one more `DESCRIBE`, carrying `Require`, the old session
-/// torn down before the new one plays, so the camera never serves two at
-/// once, and the backchannel is offered from then on.
+/// once, the old session torn down before the new one plays, so the
+/// camera never serves two at once; the restarted session's `DESCRIBE`
+/// carries no `Require` either, and the probe on a connection of its own
+/// does, after which the backchannel is offered, nothing set up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onvif_5_3_1_opting_in_restarts_the_connection_once_with_the_require_header() {
     let cam = FakeCamera::start(
@@ -473,14 +483,20 @@ async fn onvif_5_3_1_opting_in_restarts_the_connection_once_with_the_require_hea
     assert_eq!(door["sources"][0]["backchannel"]["state"], "available");
     assert_eq!(door["sources"][0]["connection"]["id"], "c1");
     assert_eq!(door["state"], "live");
-    assert_eq!(Stats::get(&stats.describes), 2, "exactly one reconnect");
+    let viewing = viewing_sessions(&cam);
+    assert_eq!(viewing.len(), 2, "exactly one reconnect");
+    assert!(
+        viewing.iter().all(|log| log.describes == [false]),
+        "no Require on a viewing DESCRIBE: {viewing:?}"
+    );
+    assert_eq!(Stats::get(&stats.describes), 3, "and the probe's");
     assert_eq!(
         Stats::get(&stats.backchannel_describes),
         1,
-        "its DESCRIBE carries Require"
+        "the probe's DESCRIBE carries Require"
     );
     assert_eq!(Stats::get(&stats.require_rejected), 0);
-    assert_eq!(Stats::get(&stats.backchannel_setups), 1);
+    assert_eq!(Stats::get(&stats.backchannel_setups), 0, "nothing set up");
     assert_eq!(Stats::get(&stats.teardowns), 1, "the old session");
     assert_eq!(
         Stats::get(&stats.max_playing),
@@ -490,7 +506,7 @@ async fn onvif_5_3_1_opting_in_restarts_the_connection_once_with_the_require_hea
     // The same put again changes nothing.
     result(call(&s, 1, &put(3, json!({ "backchannel": true }))).await);
     clock().sleep(Duration::from_millis(500)).await;
-    assert_eq!(Stats::get(&stats.describes), 2);
+    assert_eq!(Stats::get(&stats.describes), 3);
 
     s.shutdown().await;
     demux.stop();
@@ -616,7 +632,7 @@ async fn onvif_5_3_1_an_offer_right_after_the_opt_in_negotiates_talk_back_from_t
         talker.viewer.talkback_direction(),
         Some(lotse_testing::viewer::Direction::SendOnly)
     );
-    assert_eq!(Stats::get(&cam.stats().describes), 2, "restarted once");
+    assert_eq!(viewing_sessions(&cam).len(), 2, "restarted once");
     // The session that played before was not held, nor closed.
     let packets = before.viewer.packets().len();
     drive(
@@ -712,7 +728,7 @@ async fn onvif_5_3_1_a_talk_back_request_on_an_opted_in_stream_is_met_or_fails_w
     result(call(&s, 1, &put(4, "plain", &plain, opted_in)).await);
     let mut late = Talker::offer(&s, "plain", "p2", TalkbackOffer::Dedicated).await;
     assert_eq!(late.settle().await, unavailable, "{:?}", late.seen);
-    assert_eq!(Stats::get(&plain.stats().describes), 2, "restarted once");
+    assert_eq!(viewing_sessions(&plain).len(), 2, "restarted once");
 
     s.shutdown().await;
     demux.stop();

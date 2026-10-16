@@ -56,12 +56,12 @@
       "oneOf": [
         {
           "const": "available",
-          "description": "Nobody talks: the next offer that asks for talk-back claims it.",
+          "description": "Nobody talks and no camera session of it is open: the next offer\nthat asks for talk-back claims it.",
           "type": "string"
         },
         {
           "const": "in_use",
-          "description": "A session holds it, the stream's `backchannel.talker`.",
+          "description": "A session holds it, the stream's `backchannel.talker`: the\ncamera's backchannel session for it is opening or open.",
           "type": "string"
         }
       ]
@@ -1969,7 +1969,7 @@
             }
           ],
           "default": null,
-          "description": "The camera's backchannel, which the connection offers while live:\nwhat a microphone button is gated on. Null when it offers none (the\ncamera has none or refused it, or no stream on the connection opted\nin: an RTSP source's `backchannel` option, off by default, which\nrestarts a connection running without it once), and while the\nconnection is not live."
+          "description": "The camera's backchannel, as the connection's probe found it, while\nthe connection is live: what a microphone button is gated on. The\nprobe asks the camera on a connection of its own each time the\nconnection connects; nothing is opened until a talker claims it.\nNull when the probe found none (the camera has none, refused the\nquestion or could not be asked), when no stream on the connection\nopted in (an RTSP source's `backchannel` option, off by default,\nwhich restarts a connection running without it once), and while\nthe connection is not live."
         },
         "connection": {
           "$ref": "#/$defs/ConnectionInfo",
@@ -2849,6 +2849,11 @@
           "const": "renegotiated",
           "description": "The talker's re-offer (`webrtc/renegotiate`) dropped talk-back;\nthe backchannel is free.",
           "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "The camera refused the talker's backchannel session, the session\ndid not open in time, or its connection was lost while the talker\nheld it: the backchannel is free, and the talker's session got a\n`backchannel_declined` warning with reason `refused`.",
+          "type": "string"
         }
       ]
     },
@@ -3048,7 +3053,7 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "api": "0.2.0",
+  "api": "0.2.1",
   "command": {
     "$ref": "#/$defs/Command"
   },

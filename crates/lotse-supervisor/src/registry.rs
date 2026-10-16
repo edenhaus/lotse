@@ -949,9 +949,10 @@ impl State {
             TalkerReason::Claimed => sessions
                 .get(session_id)
                 .is_some_and(|session| session.connection == id),
-            TalkerReason::SessionClosed | TalkerReason::Released | TalkerReason::Renegotiated => {
-                entry.talker.session.as_deref() == Some(session_id)
-            }
+            TalkerReason::SessionClosed
+            | TalkerReason::Released
+            | TalkerReason::Renegotiated
+            | TalkerReason::Refused => entry.talker.session.as_deref() == Some(session_id),
         };
         let reason_name = reason.as_str();
         if !applies {
@@ -1836,6 +1837,27 @@ mod tests {
             (&event["talker"], &event["reason"]),
             (&serde_json::Value::Null, &serde_json::json!("renegotiated"))
         );
+        // The camera refuses s1's backchannel session: free again, from
+        // s1 only.
+        assert!(
+            state
+                .talker_changed("c1", "s1", TalkerReason::Claimed, later)
+                .is_some()
+        );
+        let _claimed = front.try_recv().unwrap();
+        assert_eq!(
+            state.talker_changed("c1", "s2", TalkerReason::Refused, later),
+            None
+        );
+        assert_eq!(
+            state.talker_changed("c1", "s1", TalkerReason::Refused, later),
+            Some(Talker {
+                session: None,
+                since: Some(later),
+            })
+        );
+        let event = front.try_recv().unwrap().payload;
+        assert_eq!(event["reason"], "refused");
     }
 
     #[test]

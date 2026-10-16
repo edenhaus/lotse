@@ -1,122 +1,113 @@
-//! The backchannel's place in the RTSP session: whether a connection
-//! attempt asks for it, what a camera's refusal of the `Require` header
-//! means for this attempt and the next ones, which media of the
-//! `DESCRIBE` answer is the backchannel and in which format, what a
-//! refused `SETUP` of it means, and the handle a playing session offers
-//! on the connection's [`BackchannelSlot`].
+//! The backchannel's decisions, apart from the connections they run on:
+//! whether a connection attempt probes the camera, what a probe's `551`
+//! means for the next attempts, which media of the `DESCRIBE` answer is
+//! the backchannel and in which format, and what a camera's refusal of the
+//! backchannel's session says.
 //!
-//! [`crate::RtspSource`] calls each piece in its attempts: retina asks for
-//! the backchannel, sets it up and sends on it.
+//! The probe and the backchannel's own sessions call each piece: retina
+//! asks for the backchannel, sets it up and sends on it.
 //!
 //! Implements ONVIF Streaming Specification §5.3.1 (the `Require` tag on
 //! `DESCRIBE`) and §5.3.2 (a server without the backchannel answers `551
 //! Option not supported`, RFC 2326 §11.3.13; the backchannel media are
-//! `a=sendonly`, and the client chooses which one it uses); RFC 8866 §5.14
-//! (the first payload type of an `m=` line) and §6.7 (the direction
+//! `a=sendonly`, and the client chooses which one it uses); RFC 2326
+//! §11.3.11 (`461 Unsupported Transport`), with ONVIF Streaming
+//! Specification §5.1.1.3 (a device *should* take RTP over RTSP over TCP
+//! interleaved, the one transport lotse sends the backchannel on); RFC 8866
+//! §5.14 (the first payload type of an `m=` line) and §6.7 (the direction
 //! attribute, at media level, else at session level, else `sendrecv`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lotse_core::media::MediaPacket;
-use lotse_core::source::{BackchannelHandle, BackchannelSlot};
-use tokio::sync::mpsc;
+use lotse_core::source::{BackchannelRefused, SourceError};
 
-use super::{BackchannelFormat, BackchannelPacket, Initial, Packetizer, backchannel_format};
+use super::{BackchannelFormat, backchannel_format};
 
 /// The option tag of the ONVIF backchannel, which a client sends in a
 /// `Require` header (RFC 2326 §12.32) to ask for it: ONVIF Streaming
-/// Specification §5.3.1. retina adds it to the `DESCRIBE` and to the
-/// backchannel's `SETUP`, by which the UDP relay knows that `SETUP`.
+/// Specification §5.3.1. retina adds it to the `DESCRIBE`, the `SETUP`,
+/// the `PLAY` and the `TEARDOWN` of a session that asks for the
+/// backchannel, by which the UDP relay knows the backchannel's `SETUP`.
 pub const REQUIRE_TAG: &str = "www.onvif.org/ver20/backchannel";
 
 /// RFC 2326 §11.3.13: `551 Option not supported`, the answer ONVIF
 /// Streaming Specification §5.3.2 gives a server without the backchannel.
 pub const OPTION_NOT_SUPPORTED: u16 = 551;
 
-/// How many packets the backchannel's queue holds: 160 ms of 20 ms
+/// RFC 2326 §11.3.11: `461 Unsupported Transport`.
+pub const UNSUPPORTED_TRANSPORT: u16 = 461;
+
+/// How many packets a backchannel session's queue holds: 160 ms of 20 ms
 /// frames. The talker's forwarder never waits on it and drops when it is
 /// full, so it bounds the latency a slow send path can add.
 pub const QUEUE: usize = 8;
 
-/// The ONVIF backchannel's `Require` header across one source's connection
-/// attempts: whether the next `DESCRIBE` carries it, and what a refusal
-/// means. Kept by the source, so the memory outlives each attempt: once a
-/// camera refused the header and played without it, later attempts leave
-/// it out and spend no `DESCRIBE` on the refusal. Clones share the memory.
+/// What a source's probes of the camera's backchannel learned across its
+/// connection attempts: once the camera answered a probe with `551 Option
+/// not supported`, it has no backchannel (ONVIF Streaming Specification
+/// §5.3.2), and later attempts do not ask again. Any other failure proves
+/// nothing, and the next attempt asks again. Clones share the memory.
 #[derive(Debug, Clone, Default)]
-pub struct Require {
-    /// Set once a `DESCRIBE` retried without the header was answered.
-    refused: Arc<AtomicBool>,
+pub struct Probed {
+    /// Set once a probe was answered with `551`.
+    unsupported: Arc<AtomicBool>,
 }
 
-impl Require {
-    /// Whether the next `DESCRIBE` carries `Require:
-    /// www.onvif.org/ver20/backchannel` (ONVIF Streaming Specification
-    /// §5.3.1): the source protocol can send on a backchannel (`capable`,
-    /// the factory's `capabilities().backchannel`), the stream asks for one
-    /// (`wanted`, its `backchannel` option), and the camera has not refused
-    /// the header before.
-    pub fn send(&self, capable: bool, wanted: bool) -> bool {
+impl Probed {
+    /// Whether this attempt probes the camera's backchannel with a
+    /// `DESCRIBE` carrying `Require: www.onvif.org/ver20/backchannel`
+    /// (ONVIF Streaming Specification §5.3.1): the source protocol can send
+    /// on a backchannel (`capable`, the factory's
+    /// `capabilities().backchannel`), the stream asks for one (`wanted`,
+    /// its `backchannel` option), and the camera has not answered a probe
+    /// with `551` before.
+    pub fn asks(&self, capable: bool, wanted: bool) -> bool {
         if !(capable && wanted) {
             return false;
         }
-        let refused = self.refused.load(Ordering::Relaxed);
-        if refused {
-            tracing::debug!(
-                "rtsp: DESCRIBE without the backchannel's Require header; the camera refused it before"
-            );
+        let unsupported = self.unsupported.load(Ordering::Relaxed);
+        if unsupported {
+            tracing::debug!("rtsp: no backchannel probe; the camera answered one with 551 before");
         }
-        !refused
+        !unsupported
     }
 
-    /// Whether a failed `DESCRIBE` is retried without the header, on a
-    /// fresh connection: it carried the header (`sent`) and the camera
-    /// answered `551 Option not supported`, after which "the client can
-    /// then try to establish an RTSP connection without backchannel" (ONVIF
-    /// Streaming Specification §5.3.2). Anything else, or a status without
-    /// the header sent, is the attempt's error as it is.
-    pub fn retry_without(sent: bool, status: Option<u16>) -> bool {
-        let retry = sent && status == Some(OPTION_NOT_SUPPORTED);
-        if retry {
+    /// Whether a probe's failure with `status` proves the camera has no
+    /// backchannel: `551 Option not supported` (ONVIF Streaming
+    /// Specification §5.3.2), remembered for the source's later attempts.
+    /// Anything else proves nothing.
+    pub fn refused_with(&self, status: Option<u16>) -> bool {
+        let unsupported = status == Some(OPTION_NOT_SUPPORTED);
+        if unsupported && !self.unsupported.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 status,
-                "rtsp: the camera refused the backchannel's Require header; describing again without it"
+                "rtsp: the camera answered the backchannel probe with 551 Option not supported; it has no backchannel, and the source does not ask again"
             );
         }
-        retry
-    }
-
-    /// The `DESCRIBE` retried without the header was answered, so the
-    /// header was what the camera refused: later attempts leave it out,
-    /// and the connection plays without a backchannel. A retry that fails
-    /// as well proves nothing, and remembers nothing.
-    pub fn refused(&self) {
-        if !self.refused.swap(true, Ordering::Relaxed) {
-            tracing::info!(
-                "rtsp: the camera plays without the backchannel's Require header; talk-back is off for this connection"
-            );
-        }
+        unsupported
     }
 }
 
-/// Whether the `SETUP` of the backchannel failing with `status` leaves the
-/// attempt to play without it: any RTSP status does, since the
-/// backchannel is optional, the media streams are already set up, and a
-/// refused `SETUP` leaves retina's session usable without that stream.
-/// Without a status the connection failed, and the attempt ends with that
-/// error.
-pub fn play_without(status: Option<u16>) -> bool {
-    match status {
-        Some(status) => {
-            tracing::info!(
-                status,
-                "rtsp: the camera refused the backchannel's SETUP; playing without it"
-            );
-            true
-        }
-        None => false,
-    }
+/// Why the camera refused a request of the backchannel's (its `status`,
+/// when it answered one) or its connection failed (`error`): the refusal
+/// a declined talk-back reports. A `461 Unsupported Transport` is named as
+/// such: lotse sends the backchannel TCP interleaved only, which ONVIF
+/// Streaming Specification §5.1.1.3 has a device only *should* take.
+pub fn refusal(status: Option<u16>, error: &SourceError) -> BackchannelRefused {
+    let message = if status == Some(UNSUPPORTED_TRANSPORT) {
+        tracing::warn!(
+            status,
+            error = %error,
+            "rtsp: unsupported transport: the camera refuses the backchannel over TCP interleaved, the only transport lotse sends it on"
+        );
+        format!(
+            "{error}: unsupported transport: the camera does not take the backchannel over TCP interleaved (ONVIF Streaming Specification §5.1.1.3 has a device only should)"
+        )
+    } else {
+        error.to_string()
+    };
+    BackchannelRefused { status, message }
 }
 
 /// The camera's backchannel in its `DESCRIBE` answer.
@@ -192,71 +183,6 @@ pub fn offer(sdp: &[u8]) -> Option<Offer> {
     offer
 }
 
-/// One playing session's backchannel: the handle offered on the
-/// connection's slot, the queue it fills, and the session's one
-/// [`Packetizer`]. Built once the backchannel is set up and the session
-/// plays (one per `SETUP`, so a reconnect starts a fresh RTP stream);
-/// dropping it withdraws the handle, which the talker's claim outlives.
-#[derive(Debug)]
-pub struct Backchannel {
-    /// The slot the handle is offered on.
-    slot: BackchannelSlot,
-    /// The format the camera takes.
-    format: BackchannelFormat,
-    /// Stamps every packet for the camera.
-    packetizer: Packetizer,
-    /// The queue's receiving end; the handle's sender fills it.
-    uplink: mpsc::Receiver<MediaPacket>,
-}
-
-impl Backchannel {
-    /// Offers on `slot` a handle in the camera's `format`: its codec, the
-    /// frame its `a=ptime` asks for (else
-    /// [`BackchannelHandle::DEFAULT_FRAME`]), and a queue of [`QUEUE`]
-    /// packets, stamped from `initial` on.
-    pub fn offer(slot: BackchannelSlot, format: BackchannelFormat, initial: Initial) -> Self {
-        let (sender, uplink) = mpsc::channel(QUEUE);
-        let frame = format.ptime.unwrap_or(BackchannelHandle::DEFAULT_FRAME);
-        tracing::info!(
-            codec = format.codec.name(),
-            payload_type = format.payload_type,
-            frame_ms = frame.as_millis(),
-            "rtsp: backchannel offered"
-        );
-        slot.offer(BackchannelHandle {
-            codec: format.codec.clone(),
-            frame,
-            sender,
-        });
-        Self {
-            slot,
-            packetizer: Packetizer::new(&format, initial),
-            format,
-            uplink,
-        }
-    }
-
-    /// The format the camera takes.
-    pub const fn format(&self) -> &BackchannelFormat {
-        &self.format
-    }
-
-    /// The next packet for the camera, stamped. Pending until the talker
-    /// sends one; `None` only once the handle left the slot (withdrawn or
-    /// replaced) and every sender is gone.
-    pub async fn next(&mut self) -> Option<BackchannelPacket> {
-        let packet = self.uplink.recv().await?;
-        Some(self.packetizer.packetize(&packet))
-    }
-}
-
-impl Drop for Backchannel {
-    fn drop(&mut self) {
-        self.slot.withdraw();
-        tracing::info!("rtsp: backchannel withdrawn");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -267,9 +193,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use lotse_core::clock::{Clock as _, SystemClock};
     use lotse_core::codec::Codec;
-    use lotse_core::media::RtpHeaderFields;
     use lotse_testing::CameraConfig;
     use lotse_testing::fake_camera::{BackchannelCodec, CameraAudio, CameraBackchannel};
 
@@ -295,50 +219,62 @@ mod tests {
         }
     }
 
-    const INITIAL: Initial = Initial {
-        ssrc: 0x0102_0304,
-        seq: 100,
-        ts: 5_000,
-    };
-
     #[test]
-    fn onvif_5_3_1_require_is_sent_only_when_capable_wanted_and_not_refused() {
-        let require = Require::default();
-        assert!(require.send(true, true));
-        assert!(!require.send(false, true), "the protocol cannot send");
-        assert!(
-            !require.send(true, false),
-            "the stream's backchannel option"
-        );
-        assert!(!require.send(false, false));
-        let shared = require.clone();
-        shared.refused();
-        assert!(!require.send(true, true), "clones share the memory");
-        assert!(!require.send(false, true));
+    fn onvif_5_3_1_a_probe_asks_only_when_capable_wanted_and_never_answered_551() {
+        let probed = Probed::default();
+        assert!(probed.asks(true, true));
+        assert!(!probed.asks(false, true), "the protocol cannot send");
+        assert!(!probed.asks(true, false), "the stream's backchannel option");
+        assert!(!probed.asks(false, false));
+        let shared = probed.clone();
+        assert!(shared.refused_with(Some(OPTION_NOT_SUPPORTED)));
+        assert!(!probed.asks(true, true), "clones share the memory");
         // Remembering twice changes nothing.
-        require.refused();
-        assert!(!shared.send(true, true));
+        assert!(probed.refused_with(Some(OPTION_NOT_SUPPORTED)));
+        assert!(!shared.asks(true, true));
+        assert_eq!(OPTION_NOT_SUPPORTED, 551, "RFC 2326 §11.3.13");
     }
 
     #[test]
-    fn onvif_5_3_2_a_551_to_the_require_header_is_retried_without_it() {
-        assert!(Require::retry_without(true, Some(OPTION_NOT_SUPPORTED)));
-        assert!(
-            !Require::retry_without(false, Some(OPTION_NOT_SUPPORTED)),
-            "a 551 without the header is the camera's own error"
-        );
+    fn onvif_5_3_2_only_a_551_proves_the_camera_has_no_backchannel() {
         for status in [
+            None,
             Some(400),
             Some(401),
             Some(404),
-            Some(454),
+            Some(453),
             Some(461),
             Some(500),
-            None,
         ] {
-            assert!(!Require::retry_without(true, status), "{status:?}");
+            let probed = Probed::default();
+            assert!(!probed.refused_with(status), "{status:?}");
+            assert!(probed.asks(true, true), "{status:?}: asked again");
         }
-        assert_eq!(OPTION_NOT_SUPPORTED, 551, "RFC 2326 §11.3.13");
+    }
+
+    #[test]
+    fn rfc2326_11_3_11_a_461_is_named_unsupported_transport_and_other_refusals_say_what_failed() {
+        let error = SourceError::Protocol("SETUP: 461 Unsupported Transport".into());
+        let refused = refusal(Some(UNSUPPORTED_TRANSPORT), &error);
+        assert_eq!(refused.status, Some(461));
+        assert!(
+            refused
+                .message
+                .starts_with(&format!("{error}: unsupported transport: ")),
+            "{refused:?}"
+        );
+        assert!(refused.message.contains("§5.1.1.3"), "{refused:?}");
+        let busy = SourceError::Protocol("SETUP: 453 Not Enough Bandwidth".into());
+        assert_eq!(
+            refusal(Some(453), &busy),
+            BackchannelRefused {
+                status: Some(453),
+                message: busy.to_string(),
+            }
+        );
+        let gone = SourceError::Unreachable("Unable to connect".into());
+        assert_eq!(refusal(None, &gone).status, None);
+        assert_eq!(UNSUPPORTED_TRANSPORT, 461, "RFC 2326 §11.3.11");
     }
 
     /// A log sink the test reads back.
@@ -373,12 +309,11 @@ mod tests {
 
     #[test]
     fn every_decision_is_logged_with_its_reason() {
-        let require = Require::default();
+        let probed = Probed::default();
         let log = logged(|| {
-            assert!(Require::retry_without(true, Some(OPTION_NOT_SUPPORTED)));
-            require.refused();
-            assert!(!require.send(true, true));
-            assert!(play_without(Some(453)));
+            assert!(probed.refused_with(Some(OPTION_NOT_SUPPORTED)));
+            assert!(!probed.asks(true, true));
+            let _named = refusal(Some(461), &SourceError::Protocol("461".into()));
             let answer = sdp(&[
                 "m=video 0 RTP/AVP 96",
                 "m=audio 0 RTP/AVP 0",
@@ -387,35 +322,18 @@ mod tests {
             ]);
             assert!(offer(&answer).is_some());
             assert!(offer(&sdp(&["m=video 0 RTP/AVP 96"])).is_none());
-            let slot = BackchannelSlot::default();
-            drop(Backchannel::offer(slot, pcmu(0), INITIAL));
         });
         for line in [
-            "rtsp: the camera refused the backchannel's Require header; describing again without it status=551",
-            "rtsp: DESCRIBE without the backchannel's Require header; the camera refused it before",
-            "rtsp: the camera refused the backchannel's SETUP; playing without it status=453",
+            "rtsp: the camera answered the backchannel probe with 551 Option not supported; it has no backchannel, and the source does not ask again status=551",
+            "rtsp: no backchannel probe; the camera answered one with 551 before",
+            "rtsp: unsupported transport: the camera refuses the backchannel over TCP interleaved",
             "rtsp: the camera offers a backchannel media=1 codec=\"pcmu\" payload_type=0 ptime_ms=30",
             "rtsp: the camera offers no backchannel the talk-back chain can feed",
-            "rtsp: backchannel offered codec=\"pcmu\" payload_type=0 frame_ms=20",
-            "rtsp: backchannel withdrawn",
         ] {
             assert!(log.contains(line), "{line} in {log}");
         }
-        assert_eq!(
-            log.matches("talk-back is off for this connection").count(),
-            1,
-            "remembered once: {log}"
-        );
-        let again = logged(|| require.refused());
-        assert!(!again.contains("talk-back is off"), "{again}");
-    }
-
-    #[test]
-    fn a_refused_backchannel_setup_plays_without_it_and_a_lost_connection_ends() {
-        for status in [400, 453, 455, 461, 551] {
-            assert!(play_without(Some(status)), "{status}");
-        }
-        assert!(!play_without(None));
+        let again = logged(|| assert!(probed.refused_with(Some(551))));
+        assert!(!again.contains("551 Option not supported"), "once: {again}");
     }
 
     #[test]
@@ -554,92 +472,5 @@ mod tests {
         assert_eq!(offered.format.codec, Codec::Pcma);
         assert_eq!(offered.format.ptime, Some(Duration::from_millis(30)));
         assert_eq!(offer(config.sdp(base, false).as_bytes()), None);
-    }
-
-    fn uplink(arrival: std::time::Instant, ts: u32, marker: bool) -> MediaPacket {
-        MediaPacket {
-            arrival,
-            rtp: RtpHeaderFields {
-                pt: 0,
-                seq: 1,
-                ts,
-                marker,
-                ssrc: 7,
-            },
-            frame_start: true,
-            keyframe_start: false,
-            epoch: 0,
-            lateness: Duration::ZERO,
-            payload: Arc::from(&[0x55_u8; 160][..]),
-        }
-    }
-
-    #[tokio::test]
-    async fn the_handle_names_the_cameras_codec_and_ptime_and_its_packets_come_out_stamped() {
-        let slot = BackchannelSlot::default();
-        let format = BackchannelFormat {
-            ptime: Some(Duration::from_millis(40)),
-            ..pcmu(97)
-        };
-        let mut backchannel = Backchannel::offer(slot.clone(), format.clone(), INITIAL);
-        assert_eq!(backchannel.format(), &format);
-        let handle = slot.current().unwrap();
-        assert_eq!(handle.codec, Codec::Pcmu);
-        assert_eq!(handle.frame, Duration::from_millis(40));
-        assert_eq!(handle.sender.max_capacity(), QUEUE);
-        let now = SystemClock.now();
-        handle.sender.try_send(uplink(now, 0, true)).unwrap();
-        handle.sender.try_send(uplink(now, 320, false)).unwrap();
-        let first = backchannel.next().await.unwrap();
-        assert_eq!(
-            first.rtp,
-            RtpHeaderFields {
-                pt: 97,
-                seq: 100,
-                ts: 5_000,
-                marker: true,
-                ssrc: 0x0102_0304,
-            }
-        );
-        assert_eq!(&first.payload[..], &[0x55_u8; 160][..]);
-        let second = backchannel.next().await.unwrap();
-        assert_eq!(
-            (second.rtp.seq, second.rtp.ts, second.rtp.marker),
-            (101, 5_320, false)
-        );
-    }
-
-    #[tokio::test]
-    async fn without_ptime_the_frame_is_20_ms_and_the_queue_drops_when_full() {
-        let slot = BackchannelSlot::default();
-        let _backchannel = Backchannel::offer(slot.clone(), pcmu(0), INITIAL);
-        let handle = slot.current().unwrap();
-        assert_eq!(handle.frame, BackchannelHandle::DEFAULT_FRAME);
-        let now = SystemClock.now();
-        let mut ts = 0;
-        for _ in 0..QUEUE {
-            handle.sender.try_send(uplink(now, ts, false)).unwrap();
-            ts += 160;
-        }
-        assert!(handle.sender.try_send(uplink(now, 0, false)).is_err());
-    }
-
-    #[tokio::test]
-    async fn dropping_the_backchannel_withdraws_the_handle_and_a_new_one_restarts_the_stream() {
-        let slot = BackchannelSlot::default();
-        let first = Backchannel::offer(slot.clone(), pcmu(0), INITIAL);
-        let old = slot.current().unwrap();
-        drop(first);
-        assert!(slot.current().is_none(), "withdrawn with the session");
-        let mut second = Backchannel::offer(slot.clone(), pcmu(0), Initial { seq: 9, ..INITIAL });
-        let new = slot.current().unwrap();
-        assert!(!new.sender.same_channel(&old.sender), "a fresh queue");
-        assert!(old.sender.is_closed(), "nothing reads the old queue");
-        new.sender
-            .try_send(uplink(SystemClock.now(), 0, false))
-            .unwrap();
-        let packet = second.next().await.unwrap();
-        assert_eq!(packet.rtp.seq, 9, "a fresh packetizer");
-        assert!(packet.rtp.marker, "the new stream's first packet");
     }
 }
