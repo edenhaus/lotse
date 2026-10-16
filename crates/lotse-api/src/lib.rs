@@ -107,7 +107,9 @@ pub enum EventClass {
         /// The stream the event is about.
         stream_id: String,
     },
-    /// Dropped first: `state` diagnostics.
+    /// A subscription's state report, a session's `state`: coalesced per
+    /// subscription (the latest wins), and dropped first, when it would
+    /// take the outbound queue past half its budget.
     Diagnostic,
     /// Not an event but the handler's last word on a subscription whose
     /// own queue had no room for a [`EventClass::Signaling`] one: the

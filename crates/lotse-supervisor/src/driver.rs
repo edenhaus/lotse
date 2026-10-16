@@ -49,6 +49,7 @@ use lotse_core::connection::{
 };
 use lotse_core::source::SourceError;
 use lotse_core::task::{BoxFuture, spawn_named};
+use lotse_core::throttle::Throttle;
 use lotse_ipc::{SessionSpec, SourceSpec};
 use tokio::sync::{mpsc, watch};
 
@@ -468,6 +469,10 @@ pub(crate) struct Driver {
     resolve_backoff: ReconnectBackoff,
     /// What the registry sees.
     snapshot: ConnectionSnapshot,
+    /// Rate-limits the line of a declaration that changed the tracks: a
+    /// worker can declare as fast as it likes, a repeated one is no change
+    /// and logs nothing.
+    track_lines: Throttle,
     /// The state and error last published, to detect a change.
     published: (ConnectionState, Option<ConnectionError>),
     /// Whether the worker's source asks for the camera's backchannel: the
@@ -519,6 +524,7 @@ impl Driver {
             switch_connect,
             resolve_backoff: ReconnectBackoff::new(0),
             snapshot,
+            track_lines: Throttle::default(),
             published: (ConnectionState::Idle, None),
             running_backchannel: false,
             restart: false,
@@ -837,8 +843,12 @@ impl Driver {
                 self.on_standby_event(event);
             }
             WorkerEvent::Tracks(tracks) => {
-                tracing::info!(tracks = tracks.len(), "tracks declared");
-                self.snapshot.tracks = tracks;
+                if tracks != self.snapshot.tracks {
+                    if let Some(count) = self.track_lines.hit(self.shared.clock.now()) {
+                        tracing::info!(tracks = tracks.len(), count, "tracks declared");
+                    }
+                    self.snapshot.tracks = tracks;
+                }
             }
             WorkerEvent::Stats(stats) => self.snapshot.stats = Some(stats),
             WorkerEvent::Session { session_id, event } => {
@@ -1569,7 +1579,7 @@ mod tests {
                 "c1".into(),
                 "ulivesession".into(),
                 (ConnectionId(1), 1, events),
-                UNIX_EPOCH,
+                Arc::new(SystemClock),
             ),
         );
         let mut gone = spec("gonesession");
@@ -1707,7 +1717,7 @@ mod tests {
                 "c1".into(),
                 "ulive".into(),
                 (ConnectionId(1), 1, events),
-                UNIX_EPOCH,
+                Arc::new(SystemClock),
             ),
         );
         Driver::send(
@@ -1806,7 +1816,7 @@ mod tests {
                     "c1".into(),
                     "us1".into(),
                     (ConnectionId(1), 1, events),
-                    UNIX_EPOCH,
+                    Arc::new(SystemClock),
                 ),
             );
         }
@@ -2277,7 +2287,7 @@ mod tests {
                         "c1".into(),
                         format!("u{id}"),
                         (ConnectionId(1), 1, events),
-                        UNIX_EPOCH,
+                        Arc::new(SystemClock),
                     ),
                 );
                 rx
@@ -2934,6 +2944,53 @@ mod tests {
         assert!(shared.tracker.is_empty(), "nothing to stop");
     }
 
+    /// Regression for SUP-30: every `Tracks` message was an `info` line,
+    /// so a worker repeating its declaration, or flipping between two,
+    /// grew the log at its own rate.
+    #[tokio::test]
+    async fn a_worker_s_repeated_declaration_logs_nothing_and_a_changed_one_once_per_interval() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (_demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let track = |id: &str| lotse_ipc::TrackInfo {
+            id: id.into(),
+            kind: "video".into(),
+            codec: "h264".into(),
+            clock_rate: 90_000,
+            sync: "arrival".into(),
+            derived_from: None,
+            audio_delay_ms: None,
+        };
+        for _ in 0..100 {
+            driver.on_worker_event(WorkerEvent::Tracks(vec![track("v0")]));
+        }
+        assert_eq!(captured.lines("tracks declared").len(), 1);
+        for _ in 0..50 {
+            driver.on_worker_event(WorkerEvent::Tracks(vec![track("v1"), track("a1")]));
+            driver.on_worker_event(WorkerEvent::Tracks(vec![track("v0")]));
+        }
+        driver.on_worker_event(WorkerEvent::Tracks(vec![track("v1"), track("a1")]));
+        assert_eq!(
+            driver.snapshot.tracks,
+            [track("v1"), track("a1")],
+            "every change is kept"
+        );
+        assert_eq!(
+            captured.lines("tracks declared").len(),
+            1,
+            "within the interval"
+        );
+        clock.advance(lotse_core::throttle::SUMMARY_INTERVAL);
+        driver.on_worker_event(WorkerEvent::Tracks(vec![track("v0")]));
+        let lines = captured.lines("tracks declared");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("tracks=1 count=102"), "{lines:?}");
+        drop(driver);
+    }
+
     #[tokio::test]
     async fn a_worker_that_cannot_start_counts_as_a_crash() {
         let clock = Arc::new(FakeClock::from_system());
@@ -3013,7 +3070,7 @@ mod tests {
                 "c1".into(),
                 "us1".into(),
                 (ConnectionId(1), 1, events),
-                UNIX_EPOCH,
+                Arc::new(SystemClock),
             ),
         );
         rx

@@ -15,7 +15,9 @@
 //! end-of-candidates (RFC 8838 §13), one warning per code, messages cut to
 //! [`MAX_MESSAGE_BYTES`], and [`MAX_REPORT_TEXT_BYTES`] of text besides
 //! the answer over the session's life. A report over the budget closes the
-//! session; a repeated warning is dropped.
+//! session; a repeated warning is dropped. A state goes on only when it
+//! changed, and the outbox keeps the latest one per session, so a worker
+//! repeating or flipping its state adds at most one frame to the queue.
 //!
 //! A session holds a lease on the TURN allocation behind each of its relay
 //! candidates, and the channels its worker asked for on them, at most
@@ -24,7 +26,8 @@
 //!
 //! What a worker reports is logged within bounds too: a dropped warning
 //! and a refused channel once per session, each (ICE, DTLS) state pair
-//! at most once per [`SUMMARY_INTERVAL`](lotse_core::throttle::SUMMARY_INTERVAL).
+//! and the events a full subscription drops at most once per
+//! [`SUMMARY_INTERVAL`](lotse_core::throttle::SUMMARY_INTERVAL).
 //!
 //! Also the identifiers the supervisor chooses: the session's ULID when the
 //! client passes none, and the ICE credentials the demux verifies (RFC 8839 §5.4).
@@ -38,6 +41,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use lotse_api::{ConnectionId, Event, EventClass};
 use lotse_api_types::session::{Session, SessionBackchannel, SessionEvent};
 use lotse_api_types::time::rfc3339;
+use lotse_core::clock::Clock;
 use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
 use lotse_ipc::SessionEvent as WorkerSessionEvent;
@@ -53,7 +57,8 @@ use crate::worker_text::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES};
 /// the control connection is not being read.
 pub(crate) const SESSION_QUEUE: usize = 128;
 
-/// Events kept for an orphaned session.
+/// Events kept for an orphaned session: its signaling only, since the
+/// adopter's `state` snapshot stands for every state it missed.
 pub(crate) const ORPHAN_BUFFER: usize = 64;
 
 /// Browser candidates accepted before the answer.
@@ -202,7 +207,7 @@ pub(crate) struct SessionEntry {
     pub(crate) ufrag: String,
     /// The subscription, while a control connection owns it.
     owner: Option<Owner>,
-    /// Events kept while orphaned, oldest first.
+    /// Signaling kept while orphaned, oldest first.
     buffer: VecDeque<Event>,
     /// Counts orphanings, so a grace timer only expires its own.
     orphan_epoch: u64,
@@ -250,6 +255,11 @@ pub(crate) struct SessionEntry {
     /// pair is logged when first reached. At most one entry per pair of
     /// known names.
     state_lines: HashMap<(&'static str, &'static str), Throttle>,
+    /// Rate-limits the line of the events a full subscription drops, which
+    /// a worker can cause as fast as it reports.
+    full_lines: Throttle,
+    /// The injected clock, which [`Self::full_lines`] reads.
+    clock: Arc<dyn Clock>,
     /// Channels the worker asked for that are still to bind.
     channel_requests: Vec<ChannelRequest>,
     /// When the offer arrived.
@@ -272,14 +282,15 @@ impl Drop for SessionEntry {
 }
 
 impl SessionEntry {
-    /// A session owned by `connection`'s subscription `subscription`.
+    /// A session owned by `connection`'s subscription `subscription`,
+    /// opened now on `clock`.
     pub(crate) fn new(
         serial: u64,
         stream_id: String,
         connection: String,
         ufrag: String,
         owner: (ConnectionId, u64, mpsc::Sender<Event>),
-        since: SystemTime,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         let (connection_id, subscription, events) = owner;
         Self {
@@ -312,8 +323,10 @@ impl SessionEntry {
             channels: HashSet::new(),
             channels_refused: 0,
             state_lines: HashMap::new(),
+            full_lines: Throttle::default(),
             channel_requests: Vec::new(),
-            since,
+            since: clock.wall_now(),
+            clock,
             timers: Vec::new(),
             close_slot: None,
         }
@@ -359,13 +372,24 @@ impl SessionEntry {
     /// Hands an event to the owner, or buffers it while orphaned (the
     /// oldest goes when the buffer is full). A full subscription queue
     /// drops the event: the control connection is not being read and is
-    /// about to be disconnected for it.
+    /// about to be disconnected for it; the drops are logged at most once
+    /// per [`SUMMARY_INTERVAL`](lotse_core::throttle::SUMMARY_INTERVAL).
+    /// An orphan keeps no `state` diagnostic: the adopter's snapshot
+    /// carries the latest, so a worker flapping its state cannot push the
+    /// buffered signaling out.
     pub(crate) fn deliver(&mut self, session_id: &str, event: Event) {
         if let Some(owner) = &self.owner {
             match owner.events.try_send(event) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(event)) => {
-                    tracing::warn!(session.id = session_id, event = ?event.payload.get("type"), "session subscription full; event dropped");
+                    if let Some(count) = self.full_lines.hit(self.clock.now()) {
+                        tracing::warn!(
+                            session.id = session_id,
+                            event = ?event.payload.get("type"),
+                            count,
+                            "session subscription full; event dropped"
+                        );
+                    }
                 }
                 // The forwarder ended; the connection's close orphans the
                 // session next.
@@ -373,6 +397,11 @@ impl SessionEntry {
                     tracing::debug!(session.id = session_id, event = ?event.payload.get("type"), "session subscription gone; event dropped");
                 }
             }
+        } else if event.class == EventClass::Diagnostic {
+            tracing::trace!(
+                session.id = session_id,
+                "orphaned; the state is left to the adopter's snapshot"
+            );
         } else {
             if self.buffer.len() >= ORPHAN_BUFFER {
                 let _oldest = self.buffer.pop_front();
@@ -596,11 +625,17 @@ impl SessionEntry {
                 Ok(Vec::new())
             }
             WorkerSessionEvent::State { ice, dtls } => {
+                let before = (self.ice, self.dtls);
                 if let Some(ice) = known(&ICE_STATES, &ice) {
                     self.ice = ice;
                 }
                 if let Some(dtls) = known(&DTLS_STATES, &dtls) {
                     self.dtls = dtls;
+                }
+                // The API sends `state` when ICE or DTLS changed: a
+                // repeated one is no event, so it costs the queue nothing.
+                if (self.ice, self.dtls) == before {
+                    return Ok(Vec::new());
                 }
                 Ok(vec![SessionEvent::State {
                     ice: self.ice.to_owned(),
@@ -719,7 +754,8 @@ fn closed_event(code: &str, message: &str) -> SessionEvent {
 }
 
 /// A session event as the server queues it: `state` is a diagnostic the
-/// outbox may shed, everything else is signaling and never dropped.
+/// outbox coalesces per subscription, and so per session, and may shed;
+/// everything else is signaling and never dropped.
 pub(crate) fn api_event(event: &SessionEvent) -> Event {
     let class = match event {
         SessionEvent::State { .. } => EventClass::Diagnostic,
@@ -793,7 +829,8 @@ mod tests {
         reason = "test code"
     )]
 
-    use lotse_core::clock::{Clock as _, SystemClock};
+    use lotse_core::clock::{FakeClock, SystemClock};
+    use lotse_core::throttle::SUMMARY_INTERVAL;
     use serde_json::json;
 
     use super::*;
@@ -811,13 +848,20 @@ mod tests {
     }
 
     fn entry(events: mpsc::Sender<Event>) -> SessionEntry {
+        entry_on(
+            events,
+            Arc::new(FakeClock::new(SystemClock.now(), UNIX_EPOCH)),
+        )
+    }
+
+    fn entry_on(events: mpsc::Sender<Event>, clock: Arc<dyn Clock>) -> SessionEntry {
         SessionEntry::new(
             1,
             "front".into(),
             "c1".into(),
             "ufrag".into(),
             (ConnectionId(1), 7, events),
-            UNIX_EPOCH,
+            clock,
         )
     }
 
@@ -1356,6 +1400,43 @@ mod tests {
         assert_eq!(session.channels_refused, 6);
     }
 
+    /// Regression for SUP-30: a worker repeating a state, or naming only
+    /// unknown ones, made one `state` event per report, which filled the
+    /// client's queue with diagnostics until its next signaling frame
+    /// overflowed it. The API sends `state` when ICE or DTLS changed.
+    #[test]
+    fn a_worker_repeating_its_state_reports_no_event() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut session = entry(tx);
+        let state = |ice: &str, dtls: &str| WorkerSessionEvent::State {
+            ice: ice.into(),
+            dtls: dtls.into(),
+        };
+        assert_eq!(
+            session.applied(state("new", "new")),
+            vec![],
+            "the state a session starts in is no change"
+        );
+        assert_eq!(
+            session.applied(state("checking", "new")),
+            vec![SessionEvent::State {
+                ice: "checking".into(),
+                dtls: "new".into()
+            }]
+        );
+        for _ in 0..1_000 {
+            assert_eq!(session.applied(state("checking", "new")), vec![]);
+            assert_eq!(session.applied(state("made-up", "bogus")), vec![]);
+        }
+        assert_eq!(
+            session.applied(state("checking", "connecting")),
+            vec![SessionEvent::State {
+                ice: "checking".into(),
+                dtls: "connecting".into()
+            }]
+        );
+    }
+
     #[test]
     fn state_is_a_diagnostic_and_the_rest_is_signaling() {
         let state = api_event(&SessionEvent::State {
@@ -1421,6 +1502,58 @@ mod tests {
         assert_eq!(adopted.recv().await.unwrap().payload["sdp"], "live");
         // A second orphaning moves the epoch, so the first timer is stale.
         assert!(session.orphan() > epoch);
+    }
+
+    /// Regression for SUP-30: an orphan buffered a worker's `state` events
+    /// with its signaling, so a worker flapping its state pushed the
+    /// buffered answer out before the client could adopt the session.
+    #[tokio::test]
+    async fn an_orphan_keeps_its_signaling_and_leaves_the_state_to_the_adopter_s_snapshot() {
+        let (tx, _first) = mpsc::channel(8);
+        let mut session = entry(tx);
+        let _epoch = session.orphan();
+        session.deliver("s1", api_event(&SessionEvent::Answer { sdp: "a".into() }));
+        for ice in ICE_STATES.iter().cycle().take(ORPHAN_BUFFER * 4) {
+            session.deliver(
+                "s1",
+                api_event(&SessionEvent::State {
+                    ice: (*ice).to_owned(),
+                    dtls: "connected".into(),
+                }),
+            );
+        }
+        let mut adopted = session.adopt(ConnectionId(2), 3);
+        assert_eq!(adopted.recv().await.unwrap().payload["type"], "state");
+        assert_eq!(
+            adopted.recv().await.unwrap().payload,
+            json!({ "type": "answer", "sdp": "a" })
+        );
+        assert!(adopted.try_recv().is_err(), "no state was buffered");
+    }
+
+    /// Regression for SUP-30: every event a full subscription dropped was
+    /// a `warn` line, so a worker reporting faster than the client reads
+    /// grew the log at its own rate.
+    #[tokio::test]
+    async fn a_full_subscription_logs_its_drops_once_per_interval() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let clock = Arc::new(FakeClock::from_system());
+        let (tx, _rx) = mpsc::channel(1);
+        let mut session = entry_on(tx, clock.clone());
+        let answer = |sdp: &str| api_event(&SessionEvent::Answer { sdp: sdp.into() });
+        session.deliver("s1", answer("queued"));
+        for _ in 0..3 {
+            session.deliver("s1", answer("dropped"));
+        }
+        let lines = captured.lines("session subscription full");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("count=1"), "{lines:?}");
+        clock.advance(SUMMARY_INTERVAL);
+        session.deliver("s1", answer("dropped"));
+        let lines = captured.lines("session subscription full");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("count=3"), "{lines:?}");
     }
 
     #[tokio::test]

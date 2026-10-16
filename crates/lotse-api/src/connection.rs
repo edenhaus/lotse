@@ -677,7 +677,7 @@ async fn forward(id: u64, mut events: mpsc::Receiver<Event>, outbox: Arc<Outbox>
 /// outbox: the client is disconnected rather than left with a hole in
 /// events it is promised.
 fn deliver(outbox: &Outbox, id: u64, event: Event) -> Result<(), Overflow> {
-    let Some(class) = Class::of(event.class) else {
+    let Some(class) = Class::of(event.class, id) else {
         tracing::warn!(
             subscription = id,
             "subscription queue overflowed with an event that is never dropped"

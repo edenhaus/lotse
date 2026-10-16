@@ -1,7 +1,16 @@
 //! The bounded outbound queue of one connection, with its shedding rules:
 //! stream-state events are coalesced (latest per stream), diagnostics are
-//! dropped when the queue is under pressure, and results and signaling are
-//! never dropped, so a client that still fills the budget is disconnected.
+//! coalesced (latest per subscription) and dropped when they would take
+//! the queue past half its budget, and results and signaling are never
+//! dropped, so a client that still fills the budget is disconnected.
+//! Diagnostics alone never take more than that half, so they cannot be
+//! what disconnects a client.
+//!
+//! A coalesced frame's replacement goes to the back of the queue, not
+//! into the old one's place: every frame the client reads is still in the
+//! order it was pushed, relative to its subscription's signaling too (a
+//! session's `state` never moves ahead of the answer or candidate it
+//! followed), and only the superseded frames are missing.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, PoisonError};
@@ -36,18 +45,24 @@ pub(crate) enum Class {
     Signaling,
     /// Coalesced per stream.
     StreamState(String),
-    /// Dropped under pressure.
-    Diagnostic,
+    /// Coalesced per subscription, its command id, which a connection
+    /// never reuses: a subscription's queued diagnostic is replaced by its
+    /// newer one, so each holds at most one and a flood of them takes a
+    /// frame's worth of the queue. Dropped when it would take the queue
+    /// past half its budget; as one per subscription is small, that is a
+    /// queue mostly full of signaling, about to be disconnected.
+    Diagnostic(u64),
 }
 
 impl Class {
-    /// How an event of `class` is shed; `None` for the handler's
-    /// [`EventClass::Overflowed`], which is no frame.
-    pub(crate) fn of(class: EventClass) -> Option<Self> {
+    /// How an event of `class` of subscription `subscription` is shed;
+    /// `None` for the handler's [`EventClass::Overflowed`], which is no
+    /// frame.
+    pub(crate) fn of(class: EventClass, subscription: u64) -> Option<Self> {
         match class {
             EventClass::Signaling => Some(Self::Signaling),
             EventClass::StreamState { stream_id } => Some(Self::StreamState(stream_id)),
-            EventClass::Diagnostic => Some(Self::Diagnostic),
+            EventClass::Diagnostic => Some(Self::Diagnostic(subscription)),
             EventClass::Overflowed => None,
         }
     }
@@ -62,13 +77,20 @@ struct State {
     bytes: usize,
     /// The byte budget.
     budget: usize,
+    /// The bytes a diagnostic may fill the queue to: half the budget, so
+    /// the diagnostics in it never take more than that half and signaling
+    /// always has the rest. A source of diagnostics that outpaces the
+    /// client's reader, a worker repeating its session's state for one,
+    /// cannot leave the next signaling frame without room and have the
+    /// client disconnected for it.
+    diagnostic_budget: usize,
     /// No more items will be accepted.
     closed: bool,
     /// A non-droppable item did not fit.
     overflowed: bool,
     /// Diagnostics dropped.
     dropped: u64,
-    /// Stream-state events replaced by a newer one.
+    /// Stream-state and diagnostic events replaced by a newer one.
     coalesced: u64,
 }
 
@@ -77,7 +99,7 @@ struct State {
 pub(crate) struct OutboxStats {
     /// Diagnostics dropped.
     pub(crate) dropped: u64,
-    /// Stream-state events coalesced.
+    /// Stream-state and diagnostic events replaced by a newer one.
     pub(crate) coalesced: u64,
     /// Bytes queued now.
     pub(crate) bytes: usize,
@@ -108,6 +130,7 @@ impl Outbox {
                 queue: VecDeque::new(),
                 bytes: 0,
                 budget,
+                diagnostic_budget: budget / 2,
                 closed: false,
                 overflowed: false,
                 dropped: 0,
@@ -124,14 +147,14 @@ impl Outbox {
         if state.closed {
             return Ok(());
         }
-        if let Class::StreamState(stream_id) = &class {
+        if class != Class::Signaling {
             let before = state.queue.len();
             let mut freed: usize = 0;
             state.queue.retain(|item| match item {
                 Outgoing::Text {
-                    class: Class::StreamState(queued),
+                    class: queued,
                     text,
-                } if queued == stream_id => {
+                } if *queued == class => {
                     freed = freed.saturating_add(text.len());
                     false
                 }
@@ -144,17 +167,13 @@ impl Outbox {
                 .saturating_add(u64::try_from(removed).unwrap_or(u64::MAX));
         }
         let after = state.bytes.saturating_add(text.len());
+        if matches!(class, Class::Diagnostic(_)) && after > state.diagnostic_budget {
+            state.dropped = state.dropped.saturating_add(1);
+            return Ok(());
+        }
         if after > state.budget {
-            match class {
-                Class::Diagnostic => {
-                    state.dropped = state.dropped.saturating_add(1);
-                    return Ok(());
-                }
-                Class::Signaling | Class::StreamState(_) => {
-                    drop(state);
-                    return Err(self.overflow());
-                }
-            }
+            drop(state);
+            return Err(self.overflow());
         }
         state.bytes = after;
         state.queue.push_back(Outgoing::Text { class, text });
@@ -248,7 +267,7 @@ mod tests {
     async fn pops_in_order_and_ends_after_close() {
         let outbox = Outbox::new(100);
         outbox.push(Class::Signaling, "a".into()).unwrap();
-        outbox.push(Class::Diagnostic, "b".into()).unwrap();
+        outbox.push(Class::Diagnostic(1), "b".into()).unwrap();
         outbox.close(1001, "going away");
         outbox.push(Class::Signaling, "late".into()).unwrap();
         assert!(matches!(outbox.pop().await, Some(Outgoing::Text { text, .. }) if text == "a"));
@@ -289,10 +308,11 @@ mod tests {
     #[tokio::test]
     async fn diagnostics_are_dropped_under_pressure_but_signaling_overflows() {
         let outbox = Outbox::new(10);
-        outbox.push(Class::Signaling, text(8)).unwrap();
-        outbox.push(Class::Diagnostic, text(5)).unwrap();
-        assert_eq!(outbox.stats().dropped, 1);
-        outbox.push(Class::Diagnostic, text(2)).unwrap();
+        outbox.push(Class::Diagnostic(1), text(3)).unwrap();
+        outbox.push(Class::Signaling, text(2)).unwrap();
+        outbox.push(Class::Diagnostic(2), text(1)).unwrap();
+        assert_eq!(outbox.stats().dropped, 1, "over half the budget");
+        outbox.push(Class::Signaling, text(5)).unwrap();
         assert_eq!(outbox.stats().bytes, 10);
         assert_eq!(outbox.push(Class::Signaling, text(1)), Err(Overflow));
         outbox.overflowed().await;
@@ -301,6 +321,76 @@ mod tests {
             Err(Overflow)
         );
         assert_eq!(Overflow.to_string(), "outbound queue overflowed");
+    }
+
+    /// Regression for SUP-30: diagnostics were dropped only once the queue
+    /// held the whole budget, so a flood of them left the next signaling
+    /// frame no room and the client was disconnected for it.
+    #[tokio::test]
+    async fn diagnostics_leave_half_the_budget_to_signaling() {
+        let outbox = Outbox::new(10);
+        for subscription in 0..5 {
+            outbox
+                .push(Class::Diagnostic(subscription), text(1))
+                .unwrap();
+        }
+        assert_eq!(
+            outbox.stats(),
+            OutboxStats {
+                dropped: 0,
+                coalesced: 0,
+                bytes: 5
+            }
+        );
+        for subscription in 5..105 {
+            outbox
+                .push(Class::Diagnostic(subscription), text(1))
+                .unwrap();
+        }
+        assert_eq!(outbox.stats().dropped, 100);
+        outbox.push(Class::Signaling, text(5)).unwrap();
+        assert_eq!(outbox.stats().bytes, 10, "the whole budget");
+    }
+
+    /// Regression for SUP-30: a worker flipping its session between two
+    /// states made each report a change and took the diagnostics' half of
+    /// the queue, so another session's `state` was dropped, and with
+    /// repeats suppressed its last transition never came again.
+    #[tokio::test]
+    async fn a_flapping_session_s_state_is_coalesced_and_another_session_s_still_goes_out() {
+        let outbox = Outbox::new(1000);
+        outbox.push(Class::Signaling, "answer-a".into()).unwrap();
+        for n in 0..10_000 {
+            outbox
+                .push(Class::Diagnostic(1), format!("state-a-{}", n % 2))
+                .unwrap();
+            if n == 5_000 {
+                outbox.push(Class::Diagnostic(2), "state-b".into()).unwrap();
+            }
+        }
+        outbox.push(Class::Signaling, "candidate-a".into()).unwrap();
+        outbox
+            .push(Class::Diagnostic(1), "state-a-last".into())
+            .unwrap();
+        assert_eq!(
+            outbox.stats(),
+            OutboxStats {
+                dropped: 0,
+                coalesced: 10_000,
+                bytes: 8 + 7 + 11 + 12
+            }
+        );
+        outbox.close(1000, "done");
+        let mut texts = Vec::new();
+        while let Some(Outgoing::Text { text, .. }) = outbox.pop().await {
+            texts.push(text);
+        }
+        // One state per session, the latest; it follows the candidate it
+        // was pushed after.
+        assert_eq!(
+            texts,
+            ["answer-a", "state-b", "candidate-a", "state-a-last"]
+        );
     }
 
     #[tokio::test]
@@ -313,15 +403,21 @@ mod tests {
         tokio::task::yield_now().await;
         outbox.push(Class::Signaling, "hi".into()).unwrap();
         assert!(matches!(waiter.await.unwrap(), Some(Outgoing::Text { text, .. }) if text == "hi"));
-        assert_eq!(Class::of(EventClass::Diagnostic), Some(Class::Diagnostic));
         assert_eq!(
-            Class::of(EventClass::StreamState {
-                stream_id: "s".into()
-            }),
+            Class::of(EventClass::Diagnostic, 7),
+            Some(Class::Diagnostic(7))
+        );
+        assert_eq!(
+            Class::of(
+                EventClass::StreamState {
+                    stream_id: "s".into()
+                },
+                7
+            ),
             Some(Class::StreamState("s".into()))
         );
-        assert_eq!(Class::of(EventClass::Signaling), Some(Class::Signaling));
-        assert_eq!(Class::of(EventClass::Overflowed), None, "no frame");
+        assert_eq!(Class::of(EventClass::Signaling, 7), Some(Class::Signaling));
+        assert_eq!(Class::of(EventClass::Overflowed, 7), None, "no frame");
     }
 
     #[tokio::test]

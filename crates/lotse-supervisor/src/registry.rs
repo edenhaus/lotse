@@ -1493,7 +1493,7 @@ mod tests {
             "c1".into(),
             format!("u{serial}"),
             (ConnectionId(1), serial, events),
-            SystemTime::UNIX_EPOCH,
+            Arc::new(lotse_core::clock::SystemClock),
         )
     }
 
@@ -1758,7 +1758,7 @@ mod tests {
             "c2".into(),
             "u3".into(),
             (ConnectionId(1), 3, events),
-            SystemTime::UNIX_EPOCH,
+            Arc::new(lotse_core::clock::SystemClock),
         );
         assert!(!state.session_dto("s3", &orphan).backchannel.talker);
 
