@@ -101,8 +101,7 @@ pub struct SessionRequest {
     /// The connection's backchannel, when its source protocol can carry
     /// audio back (`SourceCapabilities::backchannel`, the feature's gate)
     /// and the source offers one now. `None` answers talk-back
-    /// `inactive`, or refuses a talk-back request when
-    /// [`Self::talkback_required`]. What the camera offers, whoever
+    /// `inactive` (or not received). What the camera offers, whoever
     /// holds it: [`Self::claim`] says whether this session does.
     pub backchannel: Option<TalkbackTarget>,
     /// Whether the session holds the backchannel for the offer: the
@@ -117,12 +116,6 @@ pub struct SessionRequest {
     /// anchor that puts the session's capture times, which are monotonic,
     /// on the wall clock a receiver compares them with (`abs-capture-time`).
     pub wall: SystemTime,
-    /// The stream asked for the camera's backchannel (its source's
-    /// `backchannel` option): an offer that requests talk-back the session
-    /// cannot receive is refused ([`SessionOpenError::BackchannelUnavailable`])
-    /// instead of answered without it. Without it such an offer is answered
-    /// as the backchannel allows, talk-back `inactive` or not received.
-    pub talkback_required: bool,
 }
 
 /// Whether a session holds the stream's backchannel for an offer: the
@@ -171,11 +164,6 @@ pub enum SessionOpenError {
     /// The output kind does not open sessions.
     #[error("{0} outputs do not open sessions")]
     NotASession(&'static str),
-    /// The offer requests talk-back on a stream that asked for the
-    /// camera's backchannel ([`SessionRequest::talkback_required`]), and
-    /// the session cannot receive it, for this reason.
-    #[error("two-way audio unavailable: {0}")]
-    BackchannelUnavailable(String),
 }
 
 impl SessionOpenError {
@@ -186,7 +174,6 @@ impl SessionOpenError {
             Self::NoVideoTrack => "no_video_track",
             Self::VideoCodecUnsupported(_) => "video_codec_unsupported",
             Self::NotASession(_) => "internal_error",
-            Self::BackchannelUnavailable(_) => "backchannel_unavailable",
         }
     }
 }
@@ -561,13 +548,6 @@ mod tests {
             "video_codec_unsupported"
         );
         assert_eq!(SessionOpenError::NotASession("x").code(), "internal_error");
-        let unavailable =
-            SessionOpenError::BackchannelUnavailable("the camera offers no backchannel".into());
-        assert_eq!(unavailable.code(), "backchannel_unavailable");
-        assert_eq!(
-            unavailable.to_string(),
-            "two-way audio unavailable: the camera offers no backchannel"
-        );
         assert_eq!(
             RenegotiateError::InvalidSdp("x".into()).code(),
             "invalid_sdp"

@@ -424,24 +424,35 @@ impl BackchannelSession {
     }
 }
 
-/// What a slot holds: the backchannel the last probe found, and whether a
-/// probe runs now.
+/// What a slot holds: the backchannel the last probe found, whether a
+/// probe runs now, and whether the connection asks for the backchannel.
 #[derive(Debug, Clone, Default)]
 struct Probed {
-    /// The backchannel found, until a probe finds none.
+    /// The backchannel found, until a probe finds none or the connection
+    /// stops asking.
     offer: Option<BackchannelOffer>,
-    /// A probe runs: a claim waits for its result ([`BackchannelSlot::settled`]).
+    /// A probe runs, or is due: a claim waits for its result
+    /// ([`BackchannelSlot::settled`]).
     probing: bool,
+    /// Whether the connection asks for the backchannel, once it said
+    /// ([`BackchannelSlot::ask`]); `None` until then, when the source's own
+    /// option decides.
+    asked: Option<bool>,
+    /// How many times the connection's ask changed, so the source sees
+    /// every change, one that a later one undid included.
+    changes: u64,
 }
 
 /// The slot a source fills when its probe found the device's backchannel,
 /// and where the probe waits for a connect permit. Shared with the
-/// connection, which arbitrates the talker and opens the backchannel for
-/// it. An offer stands until a probe finds none: a reconnect of the
-/// source keeps it, and the next probe replaces it.
+/// connection, which arbitrates the talker, opens the backchannel for it,
+/// and turns the probe on and off as its streams opt in and out
+/// ([`BackchannelSlot::ask`]). An offer stands until a probe finds none or
+/// the connection stops asking: a reconnect of the source keeps it, and
+/// the next probe replaces it.
 #[derive(Debug, Clone, Default)]
 pub struct BackchannelSlot {
-    /// What the probes found.
+    /// What the probes found, and what the connection asks.
     probed: Arc<watch::Sender<Probed>>,
     /// Where a probe waits for a connect permit; [`ProbeGate::default`]
     /// lets every probe through, for a source outside a worker.
@@ -462,16 +473,56 @@ impl BackchannelSlot {
         &self.probes
     }
 
+    /// The connection asks for the device's backchannel from now on
+    /// (`asked`: a stream on it opted in), or no longer (the last one
+    /// opted out), without restarting the source, which follows it
+    /// ([`BackchannelSlot::asks`]). Asked now, a probe is due: a claim
+    /// waits for it from now on ([`BackchannelSlot::settled`]), whether the
+    /// source probes at once or at its next connect. Not asked any more,
+    /// what was offered is withdrawn, and a probe still running offers
+    /// nothing. Returns whether it changed: a slot that never was told
+    /// changes either way, as the source's own option decided so far.
+    pub fn ask(&self, asked: bool) -> bool {
+        self.probed.send_if_modified(|probed| {
+            if probed.asked == Some(asked) {
+                return false;
+            }
+            probed.asked = Some(asked);
+            probed.changes = probed.changes.wrapping_add(1);
+            probed.probing = asked;
+            if !asked {
+                probed.offer = None;
+            }
+            true
+        })
+    }
+
+    /// Follows whether the connection asks for the device's backchannel,
+    /// for the source's probe: its changes from now on.
+    pub fn asks(&self) -> Asks {
+        let probed = self.probed.subscribe();
+        let seen = probed.borrow().changes;
+        Asks { probed, seen }
+    }
+
     /// A probe started: claims wait for its result.
     pub fn probing(&self) {
         self.probed.send_modify(|probed| probed.probing = true);
     }
 
-    /// The probe found `offer`: offered (or replaced).
+    /// The probe found `offer`: offered (or replaced), unless the
+    /// connection stopped asking for the backchannel meanwhile
+    /// ([`BackchannelSlot::ask`]), whose result it then is not.
     pub fn offer(&self, offer: BackchannelOffer) {
         self.probed.send_modify(|probed| {
-            probed.offer = Some(offer);
             probed.probing = false;
+            if probed.asked == Some(false) {
+                tracing::debug!(
+                    "backchannel offer dropped: the connection no longer asks for the backchannel"
+                );
+            } else {
+                probed.offer = Some(offer);
+            }
         });
     }
 
@@ -484,7 +535,8 @@ impl BackchannelSlot {
     }
 
     /// The probe ended without a result (the source's attempt ended
-    /// first): what was offered before stands.
+    /// first), or a probe due will not run: what was offered before
+    /// stands.
     pub fn abandon_probe(&self) {
         self.probed.send_modify(|probed| probed.probing = false);
     }
@@ -494,7 +546,7 @@ impl BackchannelSlot {
         self.probed.borrow().offer.clone()
     }
 
-    /// Whether a probe runs now.
+    /// Whether a probe runs now, or is due.
     pub fn is_probing(&self) -> bool {
         self.probed.borrow().probing
     }
@@ -506,6 +558,42 @@ impl BackchannelSlot {
         // The slot holds the sender, so the wait never fails.
         let settled = probed.wait_for(|probed| !probed.probing).await;
         settled.ok().and_then(|probed| probed.offer.clone())
+    }
+}
+
+/// Whether the connection asks for the device's backchannel, as its slot
+/// says ([`BackchannelSlot::ask`]): what a source's probe follows.
+#[derive(Debug)]
+pub struct Asks {
+    /// The slot's state.
+    probed: watch::Receiver<Probed>,
+    /// The changes of the connection's ask seen so far.
+    seen: u64,
+}
+
+impl Asks {
+    /// Whether the connection asks now: `None` until it first said, when
+    /// the source's own option decides.
+    pub fn now(&self) -> Option<bool> {
+        self.probed.borrow().asked
+    }
+
+    /// Waits for the next change of the connection's ask: whether it asks
+    /// then. Every change counts, an opt-in that follows an opt-out the
+    /// source had no time to see included: each asks for a probe.
+    pub async fn next(&mut self) -> bool {
+        let seen = self.seen;
+        // The slot's clones hold the sender, the source's own among them:
+        // the wait ends only with a change.
+        let (now_seen, asked) = self
+            .probed
+            .wait_for(|probed| probed.changes != seen)
+            .await
+            .map_or((seen, false), |probed| {
+                (probed.changes, probed.asked == Some(true))
+            });
+        self.seen = now_seen;
+        asked
     }
 }
 
@@ -1263,6 +1351,49 @@ mod tests {
         let mut never = slot.current().unwrap().opener.open();
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(never.as_mut().poll(&mut cx).is_pending(), "a test opener");
+    }
+
+    /// The connection turns the probe on and off: an opt-in makes a probe
+    /// due, which a claim waits for; an opt-out withdraws the offer, a
+    /// probe's result after it is dropped, and the source sees every
+    /// change, an undone one included.
+    #[tokio::test]
+    async fn a_connection_turns_its_slot_s_probe_on_and_off() {
+        let slot = BackchannelSlot::default();
+        let mut asks = slot.asks();
+        assert_eq!(asks.now(), None, "the source's option decides");
+        // Never told: an offer stands, and either word is a change.
+        slot.offer(pcmu());
+        assert!(slot.current().is_some());
+        assert!(slot.ask(true));
+        assert!(!slot.ask(true), "no change");
+        assert_eq!(asks.now(), Some(true));
+        assert!(bounded(asks.next()).await, "opted in");
+        assert!(slot.is_probing(), "a probe is due");
+        let waiting = slot.clone();
+        let settled =
+            crate::task::spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for it");
+        slot.offer(pcmu());
+        assert!(bounded(settled).await.unwrap().is_some());
+        // Opted out: withdrawn, nothing due, and a late result dropped.
+        assert!(slot.ask(false));
+        assert!(!bounded(asks.next()).await, "opted out");
+        assert!(slot.current().is_none() && !slot.is_probing());
+        slot.probing();
+        slot.offer(pcmu());
+        assert!(slot.current().is_none() && !slot.is_probing(), "dropped");
+        // In and out again before the source looks: both seen as one
+        // change, whose word is the last.
+        assert!(slot.ask(true) && slot.ask(false));
+        assert!(!bounded(asks.next()).await);
+        assert!(slot.ask(true));
+        assert!(bounded(asks.next()).await);
+        // Without a change, the source waits.
+        let mut next = Box::pin(asks.next());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(next.as_mut().poll(&mut cx).is_pending());
     }
 
     /// `future`'s output, or a failed test after five seconds.

@@ -27,9 +27,9 @@
 //! www.onvif.org/ver20/backchannel` (RFC 2326 §12.32): a PCMU, PCMA (RFC
 //! 3551 §4.5.14) or Opus (RFC 7587 §7) `a=sendonly` media with a chosen
 //! payload type and `a=ptime` (RFC 8866 §6.4, §6.6), set up interleaved on
-//! its own channel pair, in the session that plays the stream or in a
-//! session of its own on another connection beside it (RFC 2326 §10.4:
-//! the client chooses which media it sets up), whose RTP after `PLAY` it
+//! its own channel pair in a session of its own on another connection
+//! beside the one that plays the stream (RFC 2326 §10.4: the client
+//! chooses which media it sets up), whose RTP after `PLAY` it
 //! parses (RFC 3550 §5.1) and records ([`Stats::backchannel`]), RTCP on the
 //! odd channel counted. Every connection is logged
 //! ([`Stats::connection_log`]): its `DESCRIBE`s and whether they asked for
@@ -373,9 +373,8 @@ pub enum BackchannelSetup {
 /// The ONVIF backchannel the camera offers (ONVIF Streaming Specification
 /// §5.3): with `Require: www.onvif.org/ver20/backchannel` on `DESCRIBE`,
 /// an `a=sendonly` audio media after the others, set up TCP interleaved on
-/// its own channel pair, in the session of the media streams or alone in a
-/// session of its own; a `SETUP` of it over UDP gets `461`, as lotse sets
-/// it up interleaved only.
+/// its own channel pair alone in a session of its own; a `SETUP` of it
+/// over UDP gets `461`, as lotse sets it up interleaved only.
 /// After `PLAY` the RTP that arrives on its channel is recorded
 /// ([`Stats::backchannel`]) and RTCP on the next channel counted.
 #[derive(Debug, Clone, Default)]
@@ -2616,7 +2615,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn onvif_5_3_the_backchannel_is_set_up_on_its_own_channels_and_records_rtp_after_play() {
+    async fn onvif_5_3_the_backchannel_is_set_up_alone_on_its_own_channels_and_records_rtp_after_play()
+     {
         let clock = clock();
         let camera = FakeCamera::start(
             with_backchannel(CameraBackchannel::new(BackchannelCodec::Pcma)),
@@ -2630,21 +2630,12 @@ mod tests {
         client
             .request("DESCRIBE", &url, &[REQUIRE_BACKCHANNEL])
             .await;
-        let video = client
-            .request(
-                "SETUP",
-                &format!("{}track0", base(&camera)),
-                &["Transport: RTP/AVP/TCP;unicast;interleaved=0-1"],
-            )
-            .await;
-        assert_eq!(video.status(), StatusCode::Ok);
         let setup = client
             .request(
                 "SETUP",
                 &back,
                 &[
                     "Transport: RTP/AVP/TCP;unicast;interleaved=4-5",
-                    "Session: 12345678",
                     REQUIRE_BACKCHANNEL,
                 ],
             )
@@ -2680,14 +2671,16 @@ mod tests {
         client.send(5, &[0x80, 201, 0, 1, 0, 0, 0, 0x77]).await;
         client.send(5, &[1, 2, 3]).await;
         client.send(4, &[0x80, 8, 0]).await;
-        // A client's report on the video's RTCP channel is not the backchannel's.
+        // A report on another channel is not the backchannel's.
         client.send(1, &[0x80, 201, 0, 1, 0, 0, 0, 0x77]).await;
         let stats = camera.stats();
         assert!(eventually(&clock, || Stats::get(&stats.backchannel_refused) == 3).await);
         assert_eq!(Stats::get(&stats.backchannel_packets), 2);
         assert_eq!(Stats::get(&stats.backchannel_rtcp), 1);
         assert_eq!(Stats::get(&stats.backchannel_setups), 1);
-        assert_eq!(Stats::get(&stats.setups), 2);
+        assert_eq!(Stats::get(&stats.setups), 1);
+        assert_eq!(Stats::get(&stats.backchannel_playing), 1);
+        assert_eq!(Stats::get(&stats.playing), 0, "no stream played");
         let received = stats.backchannel();
         assert_eq!(received.len(), 2);
         let first = &received[0];
@@ -2709,8 +2702,9 @@ mod tests {
         assert_eq!(received[1].payload, vec![0x55; 160]);
         assert!(first.arrival >= before);
         assert!(received[1].arrival >= first.arrival);
-        // The video kept flowing to the client meanwhile.
-        assert!(eventually(&clock, || Stats::get(&stats.packets) > 0).await);
+        // Nothing of the stream's goes out on a session without it.
+        assert_eq!(Stats::get(&stats.packets), 0);
+        assert!(stats.connection_log()[0].backchannel_only());
         let teardown = client
             .request(
                 "TEARDOWN",
@@ -2719,6 +2713,7 @@ mod tests {
             )
             .await;
         assert_eq!(teardown.status(), StatusCode::Ok);
+        assert_eq!(stats.connection_log()[0].teardown, Some(true));
         camera.stop().await;
     }
 

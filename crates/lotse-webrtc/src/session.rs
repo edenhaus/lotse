@@ -710,9 +710,8 @@ struct Prepared<'a> {
     offered: Vec<String>,
 }
 
-/// Plans `request.offer`: refuses a talk-back request a stream that asks
-/// for the backchannel cannot meet ([`require_talkback`]) and an offer
-/// the engine must not see ([`check_payload_types`]).
+/// Plans `request.offer`, and refuses an offer the engine must not see
+/// ([`check_payload_types`]).
 fn prepare(request: &SessionRequest) -> Result<Prepared<'_>, SessionOpenError> {
     // The audio m-lines: the stream's audio down on the first the
     // browser receives on, when it lists its codec; talk-back up on
@@ -731,7 +730,6 @@ fn prepare(request: &SessionRequest) -> Result<Prepared<'_>, SessionOpenError> {
         request.claim,
         &order,
     );
-    require_talkback(request, &plan)?;
     let directed = plan.engine_offer(&request.offer);
     // The offer's candidates pass the same policy as trickled ones,
     // after the answer; str0m would add every one it parses.
@@ -768,33 +766,6 @@ fn push_opening_events(pending: &mut VecDeque<SessionOutput>, candidates: Vec<St
         ice: "new",
         dtls: "new",
     }));
-}
-
-/// Refuses a talk-back request `plan` cannot meet on a stream that asked
-/// for the camera's backchannel (`request.talkback_required`): such a
-/// stream never plays one without talk-back. One another session holds
-/// the backchannel against ([`Talkback::Busy`]) is not refused: the
-/// stream can carry talk-back, this session gets it when the other lets
-/// go.
-fn require_talkback(
-    request: &SessionRequest,
-    plan: &AudioPlan<'_>,
-) -> Result<(), SessionOpenError> {
-    match plan.talkback {
-        Talkback::Off(reason) if request.talkback_required => {
-            let backchannel = request
-                .backchannel
-                .as_ref()
-                .map(|backchannel| backchannel.codec.name());
-            tracing::info!(
-                reason,
-                backchannel,
-                "talk-back unavailable; session refused"
-            );
-            Err(SessionOpenError::BackchannelUnavailable(reason.to_owned()))
-        }
-        _ => Ok(()),
-    }
 }
 
 /// Logs what the answer did with talk-back: the m-line and codec it is
@@ -1749,7 +1720,6 @@ mod tests {
                 orientation: Orientation::default(),
                 limits: SessionLimits::default(),
                 wall: std::time::SystemTime::UNIX_EPOCH,
-                talkback_required: false,
             };
             let video = VideoPlan::for_codec(&request.video).unwrap();
             let mut rtc = build_config(&request, &video, codecs).build(now);
@@ -1815,7 +1785,6 @@ mod tests {
             orientation: Orientation::default(),
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
-            talkback_required: false,
         };
         let panicked = std::panic::catch_unwind(|| {
             let video = VideoPlan::for_codec(&request.video).unwrap();

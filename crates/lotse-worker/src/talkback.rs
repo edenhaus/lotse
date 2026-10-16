@@ -29,10 +29,12 @@
 //! - **Hold.** The talker keeps the channel, silent or muted, until its
 //!   session closes ([`ChangeReason::SessionClosed`]; a deleted stream
 //!   closes its sessions), its re-offer drops talk-back
-//!   ([`Talkback::let_go`], [`ChangeReason::Renegotiated`]) or the client
+//!   ([`Talkback::let_go`], [`ChangeReason::Renegotiated`]), the client
 //!   releases it ([`Arbiter::release`], [`ChangeReason::Released`]): from
 //!   whoever holds it, or only from the session the release names,
-//!   decided against the claims under one lock. There is no timeout.
+//!   decided against the claims under one lock; or no stream on the
+//!   connection asks for the backchannel any more ([`Arbiter::ask`],
+//!   [`ChangeReason::OptedOut`]). There is no timeout.
 //!   Every release closes the device's backchannel session. Free, the
 //!   channel goes to the next offer that asks, from any session, the one
 //!   that let go included.
@@ -44,6 +46,10 @@
 //!   counted.
 //! - **Reconnect.** The talker's backchannel session is its own: a
 //!   reconnect of the source that plays the stream leaves it open.
+//! - **Opt-in and opt-out.** A stream that opts in has the source probe
+//!   the device without restarting it, and an offer meanwhile waits for
+//!   the probe; the last opt-out withdraws the offer and frees the channel
+//!   from its talker ([`Arbiter::ask`]).
 //!
 //! The talker's route to the device starts on its uplink track before its
 //! first packet is published, so nothing is missed: the reverse
@@ -98,6 +104,8 @@ pub(crate) enum ChangeReason {
     /// The device refused the talker's backchannel session, it did not
     /// open in time, or it ended on the device's side while held.
     Refused,
+    /// No stream on the connection asks for the backchannel any more.
+    OptedOut,
 }
 
 impl ChangeReason {
@@ -109,6 +117,7 @@ impl ChangeReason {
             Self::Released => "released",
             Self::Renegotiated => "renegotiated",
             Self::Refused => "refused",
+            Self::OptedOut => "opted_out",
         }
     }
 }
@@ -711,37 +720,71 @@ impl Arbiter {
     /// released session's included. Returns the session that held it when
     /// it was freed.
     pub(crate) fn release(&self, only: Option<&str>) -> Option<String> {
+        self.free(only, ChangeReason::Released)
+    }
+
+    /// The connection asks for the device's backchannel from now on
+    /// (`asks`: a stream on it opted in), or no longer, as its slot then
+    /// says ([`BackchannelSlot::ask`]); the running source follows without
+    /// restarting. An opt-in has it probe the device, and an offer that
+    /// asks for talk-back waits for the probe ([`Arbiter::settled`]). An
+    /// opt-out withdraws the offer and frees the channel from its talker
+    /// ([`ChangeReason::OptedOut`]), whose backchannel session closes.
+    pub(crate) fn ask(&self, asks: bool) {
+        if !self.slot().ask(asks) {
+            tracing::debug!(
+                asks,
+                "talk-back: the connection's ask for the backchannel is unchanged"
+            );
+            return;
+        }
+        if asks {
+            tracing::info!(
+                reason = "a stream on the connection opted in",
+                "talk-back: the source probes the camera's backchannel; offers that ask for talk-back wait for it"
+            );
+        } else {
+            tracing::info!(
+                reason = "no stream on the connection asks for the backchannel any more",
+                "talk-back: backchannel withdrawn; its talker, if any, is released"
+            );
+            let _freed = self.free(None, ChangeReason::OptedOut);
+        }
+    }
+
+    /// Frees the channel for `reason` from whoever holds it, or, given
+    /// `only`, only if that session holds it ([`Arbiter::release`]).
+    /// Returns the session that held it when it was freed.
+    fn free(&self, only: Option<&str>, reason: ChangeReason) -> Option<String> {
         let mut guard = self.lock();
         let state = &mut *guard;
         let freed = state
             .talker
             .take_if(|talker| only.is_none_or(|session| talker.session == session));
         if let Some(talker) = &freed {
-            self.emit(
-                &mut state.last,
-                &talker.session,
-                talker.claim,
-                ChangeReason::Released,
-            );
+            self.emit(&mut state.last, &talker.session, talker.claim, reason);
         }
         let kept = state.talker.as_ref().map(|talker| talker.session.clone());
         drop(guard);
+        let reason = reason.code();
         let Some(talker) = freed else {
             if let Some(talker) = kept {
                 tracing::info!(
                     session = only,
                     talker,
+                    reason,
                     "talk-back: release for a session that does not hold the backchannel; the talker keeps it"
                 );
             } else {
                 tracing::debug!(
                     session = only,
+                    reason,
                     "talk-back: release with the backchannel free; nothing to do"
                 );
             }
             return None;
         };
-        let (session, reason) = (talker.session.as_str(), ChangeReason::Released.code());
+        let session = talker.session.as_str();
         tracing::info!(
             session,
             reason,
@@ -1591,6 +1634,42 @@ mod tests {
         assert_eq!(ChangeReason::Released.code(), "released");
         assert_eq!(ChangeReason::Renegotiated.code(), "renegotiated");
         assert_eq!(ChangeReason::Refused.code(), "refused");
+        assert_eq!(ChangeReason::OptedOut.code(), "opted_out");
+    }
+
+    /// The connection's opt-out withdraws the offer and frees the channel
+    /// from its talker (`opted_out`), closing its device session; its
+    /// opt-in makes a probe due, which an offer waits for; an unchanged
+    /// ask changes nothing.
+    #[tokio::test]
+    async fn an_opt_out_frees_the_talker_and_an_opt_in_has_offers_wait_for_the_probe() {
+        let (arbiter, slot) = arbiter(None);
+        let mut device = pcmu(&slot);
+        let mut events = arbiter.subscribe();
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        claims(&mut a).await;
+        assert_eq!(change(&mut events).1, ChangeReason::Claimed);
+        arbiter.ask(false);
+        let (session, reason) = change(&mut events);
+        assert_eq!((session.as_str(), reason), ("a", ChangeReason::OptedOut));
+        assert!(!holds(&a));
+        assert!(device.session().close.is_cancelled(), "its session closed");
+        assert!(arbiter.offered().is_none() && !arbiter.probing());
+        arbiter.ask(false);
+        no_change(&mut events);
+        // Opted in again: a probe is due, which an offer waits for.
+        arbiter.ask(true);
+        assert!(arbiter.probing());
+        let waiting = Arc::clone(&arbiter);
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "waits for the probe");
+        let _found = pcmu(&slot);
+        within(settled).await.unwrap();
+        assert!(arbiter.offered().is_some());
+        // Out again with nobody talking: nothing to free.
+        arbiter.ask(false);
+        no_change(&mut events);
     }
 
     #[test]

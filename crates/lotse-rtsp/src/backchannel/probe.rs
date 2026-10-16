@@ -1,7 +1,8 @@
 //! The probe of the camera's backchannel: once the stream's session plays,
-//! a stream that opted in has the camera asked, on a connection of its
-//! own, whether it has a backchannel, and the answer offered on the
-//! connection's slot, where a talker's claim finds it.
+//! a connection that asks for it (a stream on it opted in) has the camera
+//! asked, on a connection of its own, whether it has a backchannel, and
+//! the answer offered on the connection's slot, where a talker's claim
+//! finds it.
 //!
 //! One `DESCRIBE` with `Require: www.onvif.org/ver20/backchannel` (ONVIF
 //! Streaming Specification §5.3.1), then the connection closes: a
@@ -13,12 +14,20 @@
 //! attempt, and the next one asks again, as every connect does: a
 //! rebooted camera may answer differently. The probe waits for a connect
 //! permit (`sources.connect_concurrency`) like any connection attempt.
+//!
+//! The connection turns the probe on and off as its streams opt in and out
+//! ([`BackchannelSlot::ask`]), without the session that plays the stream
+//! noticing: an opt-in while it plays probes at once, one while it is down
+//! at its next connect; an opt-out drops what the probe found, and a probe
+//! still running offers nothing.
 
 use std::future::Future;
 use std::sync::Arc;
 
 use futures_util::FutureExt as _;
-use lotse_core::source::{BackchannelOffer, BackchannelRefused, BackchannelSlot, SourceError};
+use lotse_core::source::{
+    Asks, BackchannelOffer, BackchannelRefused, BackchannelSlot, SourceError,
+};
 use retina::client::{Session, SessionGroup};
 use tokio_util::sync::CancellationToken;
 
@@ -74,33 +83,89 @@ impl Drop for Probing {
     }
 }
 
-/// The probe of `camera`'s backchannel for a connection attempt that
-/// plays now, unless the stream asks for none or the camera answered
-/// `551` before (`probed`): `slot` is marked probed at once, before the
+/// The probes of `camera`'s backchannel for a connection attempt that
+/// plays now. When the connection asks for the backchannel (as `slot`
+/// says, else as the stream's option does) and the camera did not answer
+/// `551` before (`probed`), `slot` is marked probed at once, before the
 /// attempt reports its tracks ready, so a claim that comes with the first
-/// session waits for the probe; the future probes and offers what it
-/// found on `slot`. The attempt runs it as a task it aborts when it ends.
+/// session waits for the probe. The future probes, offers what it found
+/// on `slot`, and then follows the connection's opt-ins and opt-outs
+/// ([`follow`]). The attempt runs it as a task it aborts when it ends.
 pub(crate) fn start(
     camera: Camera,
     slot: BackchannelSlot,
     probed: Probed,
-) -> Option<impl Future<Output = ()> + Send + 'static> {
-    if !probed.asks(BACKCHANNEL, camera.options.backchannel) {
-        return None;
+) -> impl Future<Output = ()> + Send + 'static {
+    let asks = slot.asks();
+    let wanted = asks.now().unwrap_or(camera.options.backchannel);
+    let first = due(wanted, &slot, &probed);
+    follow(camera, slot, probed, asks, first)
+}
+
+/// The probe `wanted` makes due on `slot`, marked there, unless the camera
+/// answered `551` before (`probed`): then a probe an opt-in marked due
+/// will not run, and `slot` settles at once.
+fn due(wanted: bool, slot: &BackchannelSlot, probed: &Probed) -> Option<Probing> {
+    if probed.asks(BACKCHANNEL, wanted) {
+        Some(Probing::start(slot.clone()))
+    } else {
+        slot.abandon_probe();
+        None
     }
-    let probing = Probing::start(slot);
-    Some(run(camera, probing, probed))
+}
+
+/// Runs `first`, the probe due when the attempt played, then follows the
+/// connection's ask (`asks`) until the attempt ends: an opt-in probes
+/// again, an opt-out drops a probe still running, whose result the slot
+/// would drop anyway ([`BackchannelSlot::offer`]).
+async fn follow(
+    camera: Camera,
+    slot: BackchannelSlot,
+    probed: Probed,
+    mut asks: Asks,
+    first: Option<Probing>,
+) {
+    let mut probing = first;
+    loop {
+        let asked = match probing.take() {
+            Some(probe) => {
+                tokio::select! {
+                    () = run(&camera, probe, &probed) => asks.next().await,
+                    asked = asks.next() => {
+                        tracing::info!(
+                            asked,
+                            "rtsp: the connection's ask for the backchannel changed while it was probed; that probe is dropped"
+                        );
+                        asked
+                    }
+                }
+            }
+            None => asks.next().await,
+        };
+        if asked {
+            tracing::info!(
+                reason = "a stream on the connection opted in",
+                "rtsp: probing the camera's backchannel now; the viewing session plays on"
+            );
+        } else {
+            tracing::info!(
+                reason = "no stream on the connection asks for the backchannel any more",
+                "rtsp: no backchannel probe; what the last one found is dropped"
+            );
+        }
+        probing = due(asked, &slot, &probed);
+    }
 }
 
 /// Runs the probe [`start`] marked on its slot.
-async fn run(camera: Camera, probing: Probing, probed: Probed) {
+async fn run(camera: &Camera, probing: Probing, probed: &Probed) {
     tracing::info!(
         "rtsp: probing the camera's backchannel on a connection of its own; waiting for a connect permit"
     );
     let permit = probing.slot.probes().permit().await;
     tracing::info!("rtsp: connect permit for the backchannel probe granted");
     // Aborted with its attempt: nothing else cancels it.
-    let described = Box::pin(describe(&camera, &CancellationToken::new())).await;
+    let described = Box::pin(describe(camera, &CancellationToken::new())).await;
     drop(permit);
     match described {
         Ok(Some(format)) => {
@@ -115,7 +180,7 @@ async fn run(camera: Camera, probing: Probing, probed: Probed) {
             probing.found(BackchannelOffer {
                 codec,
                 frame,
-                opener: Arc::new(Opener::new(camera)),
+                opener: Arc::new(Opener::new(camera.clone())),
             });
         }
         Ok(None) => {
@@ -242,11 +307,11 @@ mod tests {
                 .contains("probe DESCRIBE: no answer within 200 ms"),
             "{refused:?}"
         );
-        // A probe that does not ask leaves the slot alone.
+        // A connection that does not ask leaves the slot unmarked.
         let slot = BackchannelSlot::default();
         let mut quiet = camera_at(silent.addr(), 200);
         quiet.options.backchannel = false;
-        assert!(start(quiet, slot.clone(), Probed::default()).is_none());
+        drop(start(quiet, slot.clone(), Probed::default()));
         assert!(!slot.is_probing());
         // One dropped before it settled abandons, and the slot waits no
         // more.

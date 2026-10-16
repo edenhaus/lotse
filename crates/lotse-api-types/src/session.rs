@@ -114,25 +114,14 @@ pub enum SessionEvent {
     /// after a delay, and the session waits for the retry; only a retry
     /// that fails closes it. While a `stream/put` switches the stream to
     /// another source, the old source's failures do not count. An answered
-    /// session rides every reconnect instead.
-    ///
-    /// `backchannel_unavailable`: the offer requests two-way audio (an
-    /// audio m-line the browser offers `sendonly` or `sendrecv`) on a
-    /// stream that opted in to the camera's backchannel (an RTSP source's
-    /// `backchannel` option), and the session cannot have it: the camera
-    /// offers no backchannel, setting it up failed, it takes a codec
-    /// talk-back cannot feed, or the talk-back m-line lists neither its
-    /// codec nor Opus (nor, for a G.711 backchannel, the other G.711
-    /// law, which talk-back converts). The message says which. Such a
-    /// session is never played without talk-back; on a stream that did
-    /// not opt in, the request is answered without it instead (the
-    /// dedicated m-line `inactive`, a `sendrecv` one send-only).
+    /// session rides every reconnect instead. A talk-back request the
+    /// stream cannot serve never closes a session: its answer declines
+    /// it (`backchannel_declined`).
     #[schemars(title = "SessionEventClosed")]
     Closed {
-        /// The stable code (`peer_closed`, `session_closed`,
-        /// `backchannel_unavailable`, ...). Before the answer, a failed
-        /// source closes the session with its error's code, the one
-        /// `stream/get` reports as `last_error`:
+        /// The stable code (`peer_closed`, `session_closed`, ...). Before
+        /// the answer, a failed source closes the session with its error's
+        /// code, the one `stream/get` reports as `last_error`:
         /// `source_unreachable`, `source_auth_failed`, `source_timeout`,
         /// `source_protocol_error`, `source_ended` or `worker_crashed`.
         code: String,
@@ -148,9 +137,9 @@ pub enum SessionEvent {
 #[serde(rename_all = "snake_case")]
 pub enum DeclineReason {
     /// The stream has no backchannel the session can feed: its source
-    /// protocol cannot carry audio back, the camera offers none, or it
-    /// takes a codec talk-back cannot produce from what the offer lists.
-    /// The message says which.
+    /// protocol cannot carry audio back, no stream on its connection opted
+    /// in to it, the camera offers none, or it takes a codec talk-back
+    /// cannot produce from what the offer lists. The message says which.
     Unsupported,
     /// Another session holds the backchannel; `backchannel/release`, its
     /// re-offer dropping talk-back, or its close frees it.

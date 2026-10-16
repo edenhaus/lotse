@@ -494,12 +494,12 @@ impl Worker {
             .await
     }
 
-    /// Tells the worker to stop its source, then connect `spec` as its
-    /// standby, which takes the tracks over at its first keyframe: one
-    /// camera session at a time.
-    pub async fn restart_source(&mut self, spec: &SourceSpec) -> Result<(), IpcError> {
+    /// Tells the worker whether its connection asks for the camera's
+    /// backchannel from now on (`asks`): its sources turn their probe on
+    /// or off, and nothing restarts.
+    pub async fn backchannel(&mut self, asks: bool) -> Result<(), IpcError> {
         self.control
-            .send_msg(&ToWorker::RestartSource(spec.clone()), &[])
+            .send_msg(&ToWorker::Backchannel { asks }, &[])
             .await
     }
 
@@ -1134,15 +1134,15 @@ mod tests {
             peer_addrs: vec![],
         };
         worker.run_source(&spec).await.unwrap();
-        worker.restart_source(&spec).await.unwrap();
+        worker.backchannel(true).await.unwrap();
         worker.grant_switch_connect().await.unwrap();
         worker.grant_probe_connect().await.unwrap();
         assert_eq!(
             received(&dir, 5).await,
             [
                 ToWorker::Sockets,
-                ToWorker::RunSource(spec.clone()),
-                ToWorker::RestartSource(spec),
+                ToWorker::RunSource(spec),
+                ToWorker::Backchannel { asks: true },
                 ToWorker::SwitchConnectGranted,
                 ToWorker::ProbeConnectGranted
             ],

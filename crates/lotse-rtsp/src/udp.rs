@@ -42,13 +42,6 @@
 //!   was counted as loss when the later packet passed. A larger step back
 //!   is a new sequence, passed for retina to judge as over TCP.
 //!
-//! The ONVIF backchannel's `SETUP` (ONVIF Streaming Specification
-//! §5.3.2), the one retina sends with `Require:
-//! www.onvif.org/ver20/backchannel`, passes on unchanged: retina sends on
-//! it TCP interleaved only, so its media and RTCP take the camera's
-//! connection both ways, as on a TCP stream, and the camera's answer and
-//! interleaved frames on its channels reach retina as they are.
-//!
 //! The pairs listen on the wildcard address of the camera's family, so the
 //! kernel answers on whichever interface the camera reaches; the address
 //! check above, not the bind, says who may send. retina keeps the control
@@ -80,7 +73,6 @@ use retina::rtsp::msg::{Headers, Message, Response};
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
-use crate::backchannel::session::REQUIRE_TAG;
 use crate::error::camera_text;
 use crate::framer::{Framed, Framer};
 use crate::rtcp::{HEAD, ReceiverReports, Report};
@@ -252,16 +244,6 @@ fn interleaved_channel(transport: &str) -> u8 {
         .and_then(|range| range.split('-').next())
         .and_then(|first| first.trim().parse().ok())
         .unwrap_or_default()
-}
-
-/// Whether retina's `SETUP` with `headers` sets up the ONVIF backchannel:
-/// it carries the backchannel's option tag in `Require` (RFC 2326 §12.32,
-/// ONVIF Streaming Specification §5.3.1), which retina sends on that
-/// `SETUP` only.
-fn sets_up_backchannel(headers: &Headers) -> bool {
-    headers
-        .get("Require")
-        .is_some_and(|tags| tags.split(',').any(|tag| tag.trim() == REQUIRE_TAG))
 }
 
 /// What a camera's `SETUP` answer says about the way its media takes
@@ -639,8 +621,8 @@ impl UdpRelay {
 
     /// Takes bytes retina wrote and appends to `out` what goes to the
     /// camera: its requests as they are, a `SETUP` asking for UDP instead
-    /// of its interleaved channels, except the backchannel's, which stays
-    /// TCP interleaved.
+    /// of its interleaved channels. The ONVIF backchannel never comes
+    /// here: its sessions take a relay of their own in TCP mode.
     pub(crate) fn retina_wrote(
         &mut self,
         bytes: &[u8],
@@ -656,21 +638,13 @@ impl UdpRelay {
                 body_len,
             } = framed;
             match head {
-                Message::Request(request)
-                    if &*request.method == "SETUP" && !sets_up_backchannel(&request.headers) =>
-                {
+                Message::Request(request) if &*request.method == "SETUP" => {
                     self.ask_udp(&request.headers, &raw, body_len, out)?;
                 }
                 Message::Request(request) => {
                     match &*request.method {
                         "PLAY" => self.play = cseq(&request.headers),
                         "TEARDOWN" => self.teardown = true,
-                        "SETUP" => tracing::debug!(
-                            channel = interleaved_channel(
-                                request.headers.get("Transport").map_or("", |value| value)
-                            ),
-                            "rtsp udp: the backchannel's SETUP stays TCP interleaved (ONVIF Streaming Specification §5.3.2)"
-                        ),
                         _ => {}
                     }
                     out.extend_from_slice(&raw);
@@ -1404,57 +1378,6 @@ mod tests {
         assert_eq!((&buf[..len], from.port()), (&HOLE_PUNCH_RTP[..], port));
         assert_eq!(relay.pairs.len(), 1);
         assert!(relay.carries(3) && relay.carries(2) && !relay.carries(4));
-    }
-
-    /// retina's `SETUP` of a backchannel, on channels 4 and 5, with
-    /// `require` as its `Require` header.
-    fn backchannel_setup(require: &str) -> Vec<u8> {
-        format!(
-            "SETUP rtsp://127.0.0.1:41000/stream/backchannel RTSP/1.0\r\nCSeq: 4\r\n\
-             Require: {require}\r\nTransport: RTP/AVP/TCP;unicast;interleaved=4-5\r\n\
-             Session: 1\r\n\r\n"
-        )
-        .into_bytes()
-    }
-
-    #[tokio::test]
-    async fn onvif_5_3_2_the_backchannels_setup_and_its_frames_pass_the_udp_relay_unchanged() {
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (mut relay, _ingest) = set_up(&server);
-        let mut out = Vec::new();
-        // ONVIF Streaming Specification §5.3.1: the option tag, alone or
-        // in a list (RFC 2326 §12.32), marks the backchannel's SETUP.
-        for require in [REQUIRE_TAG, "play.basic, www.onvif.org/ver20/backchannel"] {
-            let setup = backchannel_setup(require);
-            out.clear();
-            relay.retina_wrote(&setup, &mut out).unwrap();
-            assert_eq!(out, setup, "{require}");
-            assert!(relay.setup.is_none(), "no pair bound for {require}");
-        }
-        out.clear();
-        let answered: &[u8] = b"RTSP/1.0 200 OK\r\nCSeq: 4\r\nSession: 1\r\n\
-            Transport: RTP/AVP/TCP;unicast;interleaved=4-5\r\n\r\n";
-        relay.camera_sent(answered, &mut out).unwrap();
-        assert_eq!(out, answered, "the answer reaches retina as it is");
-        assert_eq!(relay.pairs.len(), 1, "the video's pair only");
-        assert!(!relay.carries(4) && !relay.carries(5));
-        // retina's RTP on the backchannel goes to the camera, and the
-        // camera's RTCP on its odd channel to retina (RFC 2326 §10.12).
-        let mut frame = b"$\x04\x00\x0d".to_vec();
-        frame.extend_from_slice(&rtp(1, 5));
-        out.clear();
-        relay.retina_wrote(&frame, &mut out).unwrap();
-        assert_eq!(out, frame);
-        let report: &[u8] = b"$\x05\x00\x08\x80\xc9\x00\x01\x00\x00\x00\x01";
-        out.clear();
-        relay.camera_sent(report, &mut out).unwrap();
-        assert_eq!(out, report);
-        // Another option tag is no backchannel: that SETUP asks for UDP.
-        out.clear();
-        relay
-            .retina_wrote(&backchannel_setup("play.basic"), &mut out)
-            .unwrap();
-        assert!(String::from_utf8_lossy(&out).contains("client_port="));
     }
 
     #[tokio::test]

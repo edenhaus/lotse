@@ -437,13 +437,13 @@ fn viewing_sessions(cam: &FakeCamera) -> Vec<lotse_testing::fake_camera::Connect
 /// Talk-back is opt-in (ONVIF Streaming Specification §5.3.1): a stream
 /// without `backchannel` describes its camera without the `Require`
 /// header, and no backchannel is offered. Put again with `backchannel:
-/// true`, the same stream keeps its connection, which restarts its source
-/// once, the old session torn down before the new one plays, so the
-/// camera never serves two at once; the restarted session's `DESCRIBE`
-/// carries no `Require` either, and the probe on a connection of its own
-/// does, after which the backchannel is offered, nothing set up.
+/// true`, the same stream keeps its connection and its viewing session,
+/// which is neither torn down nor described again: the probe on a
+/// connection of its own asks with `Require`, after which the backchannel
+/// is offered, nothing set up. Put without it again, the offer is gone,
+/// still without a reconnect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onvif_5_3_1_opting_in_restarts_the_connection_once_with_the_require_header() {
+async fn onvif_5_3_1_opting_in_probes_beside_the_viewing_session_without_restarting_it() {
     let cam = FakeCamera::start(
         CameraConfig {
             backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
@@ -484,12 +484,10 @@ async fn onvif_5_3_1_opting_in_restarts_the_connection_once_with_the_require_hea
     assert_eq!(door["sources"][0]["connection"]["id"], "c1");
     assert_eq!(door["state"], "live");
     let viewing = viewing_sessions(&cam);
-    assert_eq!(viewing.len(), 2, "exactly one reconnect");
-    assert!(
-        viewing.iter().all(|log| log.describes == [false]),
-        "no Require on a viewing DESCRIBE: {viewing:?}"
-    );
-    assert_eq!(Stats::get(&stats.describes), 3, "and the probe's");
+    assert_eq!(viewing.len(), 1, "no reconnect");
+    assert_eq!(viewing[0].describes, [false], "no Require on it");
+    assert!(viewing[0].played && !viewing[0].closed);
+    assert_eq!(Stats::get(&stats.describes), 2, "and the probe's");
     assert_eq!(
         Stats::get(&stats.backchannel_describes),
         1,
@@ -497,16 +495,21 @@ async fn onvif_5_3_1_opting_in_restarts_the_connection_once_with_the_require_hea
     );
     assert_eq!(Stats::get(&stats.require_rejected), 0);
     assert_eq!(Stats::get(&stats.backchannel_setups), 0, "nothing set up");
-    assert_eq!(Stats::get(&stats.teardowns), 1, "the old session");
-    assert_eq!(
-        Stats::get(&stats.max_playing),
-        1,
-        "one camera session at a time"
-    );
+    assert_eq!(Stats::get(&stats.teardowns), 0, "nothing torn down");
+    assert_eq!(Stats::get(&stats.max_playing), 1);
     // The same put again changes nothing.
     result(call(&s, 1, &put(3, json!({ "backchannel": true }))).await);
     clock().sleep(Duration::from_millis(500)).await;
-    assert_eq!(Stats::get(&stats.describes), 3);
+    assert_eq!(Stats::get(&stats.describes), 2);
+    // Opted out: the offer is gone, the viewing session plays on.
+    result(call(&s, 1, &put(4, json!({}))).await);
+    let door = stream_where(&s, "door", |door| {
+        door["sources"][0]["backchannel"].is_null()
+    })
+    .await;
+    assert_eq!(door["state"], "live");
+    assert_eq!(viewing_sessions(&cam).len(), 1, "no reconnect");
+    assert_eq!(Stats::get(&stats.describes), 2, "no probe");
 
     s.shutdown().await;
     demux.stop();
@@ -588,14 +591,14 @@ async fn session_backchannel(s: &Supervisor, session_id: &str) -> Value {
 
 /// A client opts a stream in to the camera's backchannel while its
 /// connection plays without it, and offers talk-back right after the put's
-/// result, as a client does: the offer waits for the connection's restart
-/// (ONVIF Streaming Specification §5.3.1) and its answer negotiates
-/// talk-back in the camera's codec from the restarted source, rather than
-/// opening on the source without the backchannel. A session already
-/// playing is not held and keeps playing.
+/// result, as a client does: the offer waits for the probe the opt-in
+/// started (ONVIF Streaming Specification §5.3.1) and its answer
+/// negotiates talk-back in the camera's codec, rather than being declined
+/// on the backchannel not found yet. The connection is not restarted, and
+/// a session already playing is not held and keeps playing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onvif_5_3_1_an_offer_right_after_the_opt_in_negotiates_talk_back_from_the_restarted_source()
- {
+async fn onvif_5_3_1_an_offer_right_after_the_opt_in_waits_for_the_probe_and_negotiates_talk_back()
+{
     let cam = FakeCamera::start(
         CameraConfig {
             fps: 30,
@@ -632,7 +635,7 @@ async fn onvif_5_3_1_an_offer_right_after_the_opt_in_negotiates_talk_back_from_t
         talker.viewer.talkback_direction(),
         Some(lotse_testing::viewer::Direction::SendOnly)
     );
-    assert_eq!(viewing_sessions(&cam).len(), 2, "restarted once");
+    assert_eq!(viewing_sessions(&cam).len(), 1, "not restarted");
     // The session that played before was not held, nor closed.
     let packets = before.viewer.packets().len();
     drive(
@@ -658,18 +661,36 @@ async fn onvif_5_3_1_an_offer_right_after_the_opt_in_negotiates_talk_back_from_t
     cam.stop().await;
 }
 
-/// The talk-back request of a stream that opted in is met from the live
-/// source's backchannel or fails with `backchannel_unavailable`, never
-/// played without it; one of a stream that did not opt in plays without.
-/// A cold start decides once the source is live, as the camera offers its
-/// backchannel then: a camera with one negotiates, a camera without one
-/// (which ignores the `Require` tag, ONVIF Streaming Specification §5.3.1)
-/// fails it, with a `sendonly` and a `sendrecv` request alike
-/// (RFC 8866 §6.7); so does an opt-in that restarts a live connection to a
-/// camera without one.
+/// Drives `talker` until the warning that declines its talk-back came:
+/// one `backchannel_declined`, `unsupported`, and no `closed`.
+async fn declined(talker: &mut Talker, what: &str) {
+    let is_declined = |e: &Value| e["type"] == "warning" && e["code"] == "backchannel_declined";
+    drive(
+        &mut talker.viewer,
+        &talker.socket,
+        &mut talker.events,
+        &mut talker.seen,
+        relay_signaling,
+        |seen, _| seen.iter().any(is_declined),
+    )
+    .await;
+    let warnings: Vec<&Value> = talker.seen.iter().filter(|e| is_declined(e)).collect();
+    assert_eq!(warnings.len(), 1, "{what}: {:?}", talker.seen);
+    assert_eq!(warnings[0]["reason"], "unsupported", "{what}");
+    assert!(talker.seen.iter().all(|e| e["type"] != "closed"), "{what}");
+}
+
+/// A talk-back request is met from the backchannel the connection's probe
+/// found, or declined in the answer (`backchannel_declined`,
+/// `unsupported`) while the session plays, whether the stream opted in or
+/// not: never closed for it. A cold start decides once the probe is over:
+/// a camera with a backchannel negotiates, a camera without one (which
+/// ignores the `Require` tag, ONVIF Streaming Specification §5.3.1) is
+/// declined, with a `sendonly` and a `sendrecv` request alike (RFC 8866
+/// §6.7); so is one after an opt-in on a live connection to a camera
+/// without one, which is not restarted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onvif_5_3_1_a_talk_back_request_on_an_opted_in_stream_is_met_or_fails_with_backchannel_unavailable()
- {
+async fn onvif_5_3_1_a_talk_back_request_the_stream_cannot_serve_is_declined_never_closed() {
     let config = |backchannel: bool| CameraConfig {
         fps: 30,
         gop: 10,
@@ -699,10 +720,6 @@ async fn onvif_5_3_1_a_talk_back_request_on_an_opted_in_stream_is_met_or_fails_w
     result(call(&s, 1, &put(1, "talking", &talking, opted_in.clone())).await);
     result(call(&s, 1, &put(2, "mute", &mute, opted_in.clone())).await);
     result(call(&s, 1, &put(3, "plain", &plain, json!({}))).await);
-    let unavailable = Some((
-        "backchannel_unavailable".to_owned(),
-        "two-way audio unavailable: the camera offers no backchannel".to_owned(),
-    ));
 
     let mut talker = Talker::offer(&s, "talking", "t1", TalkbackOffer::Dedicated).await;
     assert_eq!(talker.settle().await, None, "{:?}", talker.seen);
@@ -710,11 +727,9 @@ async fn onvif_5_3_1_a_talk_back_request_on_an_opted_in_stream_is_met_or_fails_w
     for shape in [TalkbackOffer::Dedicated, TalkbackOffer::SendRecv] {
         let id = format!("m-{shape:?}");
         let mut talker = Talker::offer(&s, "mute", &id, shape).await;
-        assert_eq!(talker.settle().await, unavailable, "{shape:?}");
-        assert!(
-            talker.seen.iter().all(|e| e["type"] != "answer"),
-            "{shape:?}"
-        );
+        assert_eq!(talker.settle().await, None, "{shape:?}: {:?}", talker.seen);
+        assert_eq!(session_backchannel(&s, &id).await["negotiated"], false);
+        declined(&mut talker, &id).await;
     }
     // Not opted in: answered without talk-back, the m-line `inactive`.
     let mut talker = Talker::offer(&s, "plain", "p1", TalkbackOffer::Dedicated).await;
@@ -724,11 +739,14 @@ async fn onvif_5_3_1_a_talk_back_request_on_an_opted_in_stream_is_met_or_fails_w
         talker.viewer.talkback_direction(),
         Some(lotse_testing::viewer::Direction::Inactive)
     );
-    // Opted in while live: the restarted source has no backchannel either.
+    declined(&mut talker, "p1").await;
+    // Opted in while live: the probe finds none either, and the
+    // connection is not restarted.
     result(call(&s, 1, &put(4, "plain", &plain, opted_in)).await);
     let mut late = Talker::offer(&s, "plain", "p2", TalkbackOffer::Dedicated).await;
-    assert_eq!(late.settle().await, unavailable, "{:?}", late.seen);
-    assert_eq!(viewing_sessions(&plain).len(), 2, "restarted once");
+    assert_eq!(late.settle().await, None, "{:?}", late.seen);
+    declined(&mut late, "p2").await;
+    assert_eq!(viewing_sessions(&plain).len(), 1, "not restarted");
 
     s.shutdown().await;
     demux.stop();

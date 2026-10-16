@@ -417,8 +417,8 @@ impl Serving<'_> {
                 )?);
             }
             ToWorker::ConnectGranted => self.on_connect_granted(),
-            ToWorker::SwitchSource(spec) => self.on_switch_source(&spec, false).await?,
-            ToWorker::RestartSource(spec) => self.on_switch_source(&spec, true).await?,
+            ToWorker::SwitchSource(spec) => self.on_switch_source(&spec).await?,
+            ToWorker::Backchannel { asks } => self.on_backchannel(asks),
             ToWorker::ProbeConnectGranted => self.probes.grant(),
             ToWorker::SwitchConnectGranted => {
                 if let Some(standby) = &self.standby {
@@ -552,24 +552,15 @@ impl Serving<'_> {
 
     /// `SwitchSource`: connects `spec` as the standby of the running
     /// source, replacing a standby still on its way; a standby before any
-    /// source is a protocol error. `RestartSource` (`restart`) stops the
-    /// running source's runner first, so the camera sees its teardown
-    /// before the standby connects: one camera session at a time, a gap
-    /// for the viewers until the standby's first keyframe. The tracks, the
-    /// sessions and the backchannel's arbiter stay, and the switch goes
-    /// on as for any standby.
-    async fn on_switch_source(&mut self, spec: &SourceSpec, restart: bool) -> Result<(), Error> {
-        let Some(running) = self.running.as_mut() else {
+    /// source is a protocol error.
+    async fn on_switch_source(&mut self, spec: &SourceSpec) -> Result<(), Error> {
+        let Some(running) = self.running.as_ref() else {
             return Err(Error::SwitchWithoutSource);
         };
         if let Some(replaced) = self.standby.take() {
             tracing::info!("standby source replaced before it took over");
             replaced.staging.disarm();
             stop_runner(replaced.runner, &self.clock).await;
-        }
-        if restart {
-            tracing::info!("source restart: the running source stops before the new one connects");
-            stop_task(&running.cancel, &mut running.task, &self.clock).await;
         }
         let staging = TrackSet::staging(running.tracks.tracks());
         let runner = start_runner(
@@ -652,6 +643,35 @@ impl Serving<'_> {
             .send_msg(&ToSupervisor::Tracks(running.reported.clone()), &[])
             .await?;
         Ok(())
+    }
+
+    /// `Backchannel`: the connection asks for the camera's backchannel from
+    /// now on (`asks`), or no longer. The running source's arbiter turns
+    /// its probe on or off, and frees the backchannel from its talker on an
+    /// opt-out ([`Arbiter::ask`]); a standby's slot follows too, so the
+    /// source it becomes asks as the connection does. Nothing restarts.
+    fn on_backchannel(&self, asks: bool) {
+        if let Some(slot) = self
+            .standby
+            .as_ref()
+            .and_then(|standby| standby.runner.backchannel.as_ref())
+        {
+            let changed = slot.ask(asks);
+            tracing::debug!(
+                asks,
+                changed,
+                "the standby source follows the connection's backchannel ask"
+            );
+        }
+        if let Some(arbiter) = self
+            .running
+            .as_ref()
+            .and_then(|source| source.backchannel.as_ref())
+        {
+            arbiter.ask(asks);
+        } else {
+            tracing::debug!(asks, "backchannel ask without a backchannel; ignored");
+        }
     }
 
     /// Frees the backchannel from its talker, or only from `only`
@@ -952,20 +972,9 @@ fn start_runner(
 /// depends on it any more.
 async fn stop_runner(runner: Runner, clock: &Arc<dyn Clock>) {
     let mut task = runner.task;
-    stop_task(&runner.cancel, &mut task, clock).await;
-}
-
-/// Cancels a runner's `task` and waits for it, aborting it after
-/// [`SWITCH_STOP_GRACE`]. A task that is already finished, as the one a
-/// restart stopped, is not waited for again: polling a `JoinHandle` after
-/// it returned panics.
-async fn stop_task(cancel: &CancellationToken, task: &mut JoinHandle<()>, clock: &Arc<dyn Clock>) {
-    cancel.cancel();
-    if task.is_finished() {
-        return;
-    }
+    runner.cancel.cancel();
     tokio::select! {
-        _ = &mut *task => {}
+        _ = &mut task => {}
         () = clock.sleep(SWITCH_STOP_GRACE) => {
             tracing::warn!(
                 grace_ms = SWITCH_STOP_GRACE.as_millis(),
@@ -1006,14 +1015,10 @@ async fn stop_source(
         return Ok(());
     };
     source.cancel.cancel();
-    let task = source.task;
-    // A restart may have stopped it already ([`stop_task`]).
-    if !task.is_finished() {
-        tokio::select! {
-            _ = task => {}
-            () = clock.sleep(deadline) => {
-                return Err(Error::ShutdownTimeout(u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX)));
-            }
+    tokio::select! {
+        _ = source.task => {}
+        () = clock.sleep(deadline) => {
+            return Err(Error::ShutdownTimeout(u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX)));
         }
     }
     let derived = source
@@ -1246,7 +1251,6 @@ mod tests {
             tcp_candidates: vec![],
             audio: false,
             orientation: 1,
-            talkback_required: false,
         }
     }
 
@@ -1463,61 +1467,116 @@ mod tests {
         assert!(matches!(h.worker.await, Ok(Ok(ExitReason::Shutdown))));
     }
 
+    /// ONVIF Streaming Specification §5.3.1: the connection's opt-out
+    /// reaches the running source's arbiter, which withdraws the offer and
+    /// frees the talker (`opted_out`), and the standby's slot, without a
+    /// restart; on a protocol without a backchannel it is ignored.
     #[tokio::test]
-    async fn a_restart_source_stops_the_running_source_then_switches_like_a_standby() {
-        let mut h = start_with_settings(registries(), quiet_settings());
+    async fn an_opt_out_frees_the_talker_and_withdraws_the_backchannel_without_a_restart() {
+        let (logs, _guard) = Logs::capture();
+        let mut h = start_with_settings(echo_registries_with_backchannel(), quiet_settings());
+        h.next().await;
+        let shared = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (_datagrams, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
         h.tx.send_msg(
-            &ToWorker::RunSource(spec("fake://cam/", r#"{"keyframes_every_ms": 10}"#)),
+            &ToWorker::Sockets,
+            &[OwnedFd::from(shared).as_fd(), theirs.as_fd()],
+        )
+        .await
+        .unwrap();
+        h.tx.send_msg(
+            &ToWorker::RunSource(spec("talk://cam/", r#"{"backchannel": "pcmu"}"#)),
             &[],
         )
         .await
         .unwrap();
         until_live(&mut h).await;
-        // The running source stops before its replacement connects: its
-        // `Stopped` is reported as the source's, which a plain switch
-        // never does, and the replacement goes live as a standby.
+        let talking = SessionSpec {
+            offer: "v=0 talk".into(),
+            ..session_spec("a")
+        };
+        h.tx.send_msg(&ToWorker::OpenSession(talking), &[])
+            .await
+            .unwrap();
+        let answer =
+            session_event_where(&mut h, |e| matches!(e, SessionEvent::Answer { .. })).await;
+        let_assert!(
+            SessionEvent::Answer {
+                talkback: Some(_),
+                ..
+            } = answer
+        );
+        // A standby on its way follows the word too.
         h.tx.send_msg(
-            &ToWorker::RestartSource(spec(
-                "fake://cam/",
-                r#"{"keyframes_every_ms": 10, "talk": true}"#,
+            &ToWorker::SwitchSource(spec(
+                "talk://cam/",
+                r#"{"backchannel": "pcmu", "video": true}"#,
             )),
             &[],
         )
         .await
         .unwrap();
-        let stopped = ToSupervisor::SourceState(SourceState::Stopped);
-        let live = ToSupervisor::SwitchState(SourceState::Live);
-        let seen = messages_until_still(&mut h, |seen| {
-            seen.contains(&stopped) && seen.contains(&live)
+        h.tx.send_msg(&ToWorker::Backchannel { asks: false }, &[])
+            .await
+            .unwrap();
+        let seen = messages_until(&mut h, |seen| {
+            seen.iter().any(|message| {
+                matches!(message, ToSupervisor::Talker(change) if change.reason == "opted_out" && change.session_id == "a")
+            }) && seen.iter().any(|message| {
+                matches!(message, ToSupervisor::Stats(stats) if stats.backchannel.is_none())
+            })
         })
         .await;
         assert!(
             seen.iter()
-                .any(|m| matches!(m, ToSupervisor::SwitchState(SourceState::Connecting { .. }))),
-            "{seen:?}"
+                .all(|m| !matches!(m, ToSupervisor::SourceState(_))),
+            "no restart: {seen:?}"
         );
-        // Its first keyframe takes the tracks over; the stopped source,
-        // already waited for, is not waited for again.
-        h.clock.advance(Duration::from_millis(10));
-        assert_eq!(h.next().await, ToSupervisor::Switched);
-        let_assert!(ToSupervisor::Tracks(tracks) = h.next().await);
-        assert_eq!(tracks.len(), 1);
-        // A restart whose replacement never goes live leaves no source
-        // running: the shutdown does not wait for the stopped one again.
-        h.tx.send_msg(
-            &ToWorker::RestartSource(spec("fake://cam/", r#"{"ready_after_ms": 60000}"#)),
-            &[],
-        )
-        .await
-        .unwrap();
-        next_where(&mut h, &|m| {
-            *m == ToSupervisor::SourceState(SourceState::Stopped)
-        })
-        .await;
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "the standby source follows the connection's backchannel ask"
+            ),
+            1
+        );
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1000 }, &[])
             .await
             .unwrap();
         assert!(matches!(h.worker.await, Ok(Ok(ExitReason::Shutdown))));
+        // A protocol without a backchannel has nothing to turn on.
+        let mut h = start();
+        h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "{}")), &[])
+            .await
+            .unwrap();
+        h.tx.send_msg(&ToWorker::Backchannel { asks: true }, &[])
+            .await
+            .unwrap();
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1000 }, &[])
+            .await
+            .unwrap();
+        assert!(matches!(h.worker.await, Ok(Ok(ExitReason::Shutdown))));
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "backchannel ask without a backchannel; ignored"
+            ),
+            1
+        );
+    }
+
+    /// The fake source behind `talk://`, whose protocol has a backchannel,
+    /// and the echoing session output.
+    fn echo_registries_with_backchannel() -> Arc<Registries> {
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::with_backchannel(&["talk"])))
+            .unwrap();
+        registries
+            .outputs
+            .register(Arc::new(EchoSessionFactory))
+            .unwrap();
+        Arc::new(registries)
     }
 
     #[tokio::test]
@@ -4111,7 +4170,7 @@ mod tests {
             .await
             .unwrap();
         // The standby heard its cancel after the worker began to wait.
-        cancelled.notified().await;
+        within(cancelled.notified()).await;
         assert_eq!(
             logs.count(
                 Level::WARN,
@@ -4146,7 +4205,7 @@ mod tests {
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 100 }, &[])
             .await
             .unwrap();
-        cancelled.notified().await;
+        within(cancelled.notified()).await;
         h.clock.advance(Duration::from_millis(99));
         tokio::task::yield_now().await;
         assert!(!h.worker.is_finished());
@@ -4155,7 +4214,7 @@ mod tests {
         assert!(matches!(err, Error::ShutdownTimeout(100)), "{err}");
         // Let go at last, the source returns to its runner.
         released.notify_one();
-        cancelled.notified().await;
+        within(cancelled.notified()).await;
         assert!(!Stubborn::default().capabilities().backchannel);
         // What a runner reads of its source, never of this one.
         let source = Stubborn::default()

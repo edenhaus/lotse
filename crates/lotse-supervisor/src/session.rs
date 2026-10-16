@@ -101,7 +101,7 @@ pub(crate) const MAX_RELAY_CHANNELS: usize = 16;
 /// which close a session still waiting for its answer when its connection
 /// fails; `source_not_live` is a worker that runs no source when the
 /// offer reaches it.
-const CLOSED_CODES: [&str; 18] = [
+const CLOSED_CODES: [&str; 17] = [
     "peer_closed",
     "session_closed",
     "stream_deleted",
@@ -117,7 +117,6 @@ const CLOSED_CODES: [&str; 18] = [
     "invalid_sdp",
     "no_video_track",
     "video_codec_unsupported",
-    "backchannel_unavailable",
     "shutting_down",
     "internal_error",
 ];
@@ -1046,14 +1045,15 @@ mod tests {
         assert_eq!(distinct.len(), 62);
     }
 
-    /// A talk-back request the stream's backchannel cannot meet closes
-    /// with its own code.
+    /// A talk-back request never closes a session: its answer declines
+    /// it. The code that once did is no longer known, so a worker that
+    /// reported it would be an internal error.
     #[test]
-    fn backchannel_unavailable_is_a_closed_code() {
+    fn backchannel_unavailable_is_no_closed_code() {
         assert_eq!(
             closed_event("backchannel_unavailable", "m"),
             SessionEvent::Closed {
-                code: "backchannel_unavailable".into(),
+                code: "internal_error".into(),
                 message: "m".into()
             }
         );

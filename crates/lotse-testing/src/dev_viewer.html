@@ -494,17 +494,16 @@ async function onSessionEvent(event) {
       break;
     case "warning":
       log(`warning ${event.code}: ${event.message}`, "bad");
+      if (event.code === "backchannel_declined") {
+        // The answer declined talk-back and the session plays on; the
+        // next press of Talk is another try.
+        $("s-talk").textContent = `declined (${event.reason}): ${event.message}`;
+        $("s-talk").className = "bad";
+      }
       break;
     case "closed":
       log(`closed: ${event.code}: ${event.message}`, event.code === "session_closed" ? undefined : "bad");
       $("s-state").textContent = `closed (${event.code})`;
-      if (event.code === "backchannel_unavailable") {
-        // The stream opted in, so the daemon never plays a talk-back
-        // request without talk-back; nor does the page retry without.
-        $("s-talk").textContent = `unavailable: ${event.message}`;
-        $("s-talk").className = "bad";
-        log(`two-way audio unavailable, the session failed: ${event.message}; turn two-way audio off to play without it`, "bad");
-      }
       offerId = undefined; // the subscription ended with this event
       teardown(true);
       break;
@@ -572,12 +571,11 @@ async function play() {
     // Talk-back goes up on a dedicated send-only m-line, which the daemon
     // answers recvonly in the backchannel's codec, else for a G.711 camera
     // the other G.711 law (converted), else Opus (RFC 3264 §6.1)
-    // from the backchannel the live source offers: the stream opted in, so
-    // without one the session closes with backchannel_unavailable rather
-    // than playing without talk-back. An offer right after a put that
-    // opted in a live connection waits in the daemon for its restart to
-    // ask for the backchannel. It carries no track until Talk, so nothing
-    // is sent and nothing claims the backchannel before then.
+    // from the backchannel the connection's probe found; without one the
+    // answer declines it (backchannel_declined) and the session plays on.
+    // An offer right after a put that opted in waits in the daemon for that
+    // probe. It carries no track until Talk, so nothing is sent before
+    // then.
     if (!features.includes("two_way_audio")) log("the daemon announces no two_way_audio: talk-back will not be negotiated", "bad");
     if (navigator.mediaDevices?.getUserMedia) {
       talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });

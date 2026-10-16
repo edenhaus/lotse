@@ -202,8 +202,8 @@ pub struct SourceInfo {
     /// Null when the probe found none (the camera has none, refused the
     /// question or could not be asked), when no stream on the connection
     /// opted in (an RTSP source's `backchannel` option, off by default,
-    /// which restarts a connection running without it once), and while
-    /// the connection is not live.
+    /// which turns the probe on and off without restarting the
+    /// connection), and while the connection is not live.
     #[serde(default)]
     pub backchannel: Option<SourceBackchannel>,
     /// Protocol-specific detail, documented by the scheme's options schema.
@@ -370,6 +370,11 @@ pub enum TalkerReason {
     /// held it: the backchannel is free, and the talker's session got a
     /// `backchannel_declined` warning with reason `refused`.
     Refused,
+    /// No stream on the talker's connection asks for the camera's
+    /// backchannel any more (the last one that did was put without the
+    /// RTSP option `backchannel`): the camera's backchannel session is
+    /// closed and the backchannel is no longer offered.
+    OptedOut,
 }
 
 impl TalkerReason {
@@ -381,6 +386,7 @@ impl TalkerReason {
             Self::Released => "released",
             Self::Renegotiated => "renegotiated",
             Self::Refused => "refused",
+            Self::OptedOut => "opted_out",
         }
     }
 
@@ -392,6 +398,7 @@ impl TalkerReason {
             Self::Released,
             Self::Renegotiated,
             Self::Refused,
+            Self::OptedOut,
         ]
         .into_iter()
         .find(|reason| reason.as_str() == name)
@@ -680,6 +687,7 @@ mod tests {
             (TalkerReason::Released, "released"),
             (TalkerReason::Renegotiated, "renegotiated"),
             (TalkerReason::Refused, "refused"),
+            (TalkerReason::OptedOut, "opted_out"),
         ] {
             assert_eq!(reason.as_str(), name);
             assert_eq!(serde_json::to_value(reason).unwrap(), name);

@@ -851,8 +851,8 @@ mod tests {
       talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });"#
         ));
         // The offer goes out right after the put's result, talk-back or
-        // not: the daemon holds it while the connection restarts to ask for
-        // the backchannel, so the page neither waits nor polls.
+        // not: the daemon has it wait for the probe of the backchannel the
+        // put opted in to, so the page neither waits nor polls.
         let play = page
             .split("async function play()")
             .nth(1)
@@ -865,19 +865,25 @@ mod tests {
         assert!(!between.contains("await"), "{between}");
         assert!(!page.contains(r#"type: "stream/get""#), "no polling");
         assert!(!play.contains("setTimeout("), "no waiting: {play}");
-        // A talk-back request the daemon cannot meet fails the session; the
-        // page says why and does not retry without talk-back.
-        let closed = page
-            .split(r#"case "closed":"#)
+        // A talk-back request the daemon cannot meet is declined in the
+        // answer and the session plays on; the page says why and retries
+        // nothing itself.
+        let warning = page
+            .split(r#"case "warning":"#)
             .nth(1)
             .and_then(|rest| rest.split("break;").next())
-            .expect("the closed event");
+            .expect("the warning event");
         assert!(
-            closed.contains(r#"if (event.code === "backchannel_unavailable") {"#),
-            "{closed}"
+            warning.contains(r#"if (event.code === "backchannel_declined") {"#),
+            "{warning}"
         );
-        assert!(closed.contains("${event.message}"), "{closed}");
-        assert!(!closed.contains("play()"), "no retry: {closed}");
+        assert!(warning.contains("${event.reason}"), "{warning}");
+        assert!(warning.contains("${event.message}"), "{warning}");
+        assert!(!warning.contains("play()"), "no retry: {warning}");
+        assert!(
+            !page.contains("backchannel_unavailable"),
+            "a code that is gone"
+        );
         // Talk is usable only when the answer took the m-line.
         assert!(page.contains(r#"talkTransceiver.currentDirection === "sendonly""#));
         // The microphone is asked for on Talk, not on Play, and leaves the
