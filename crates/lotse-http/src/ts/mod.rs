@@ -304,8 +304,9 @@ struct Audio {
     splitter: AdtsSplitter,
     /// The configuration.
     config: AudioConfig,
-    /// What timestamps count from; `None` before the first PTS and after
-    /// a configuration change.
+    /// What timestamps count from; `None` before the first PTS, after a
+    /// configuration change and after a continuity error, which loses an
+    /// unknown number of frames.
     anchor: Option<Anchor>,
     /// The last PES packet's PTS and the sequence of the frame it times
     /// (ISO/IEC 13818-1 §2.4.3.7: the first frame that begins in the
@@ -776,15 +777,22 @@ impl Ctx {
         value
     }
 
-    /// Drops the PES packet open on track `index`, its rest lost.
+    /// Drops the PES packet open on track `index`, its rest lost. An AAC
+    /// track also drops the frame begun in an earlier packet, the PTS
+    /// kept for it and what timestamps counted from: the bytes after the
+    /// loss do not continue that frame, and the frame count no longer
+    /// follows the time. The next PTS times its frames again.
     fn cut(&mut self, index: usize) {
-        if self
-            .tracks
-            .get_mut(index)
-            .and_then(|track| track.pes.take())
-            .is_some()
-        {
+        let Some(track) = self.tracks.get_mut(index) else {
+            return;
+        };
+        if track.pes.take().is_some() {
             self.stats.dropped_incomplete = self.stats.dropped_incomplete.saturating_add(1);
+        }
+        if let Content::Audio(audio) = &mut track.content {
+            audio.splitter.discontinuity();
+            audio.pending = None;
+            audio.anchor = None;
         }
     }
 

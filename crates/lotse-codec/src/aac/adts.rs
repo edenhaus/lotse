@@ -18,6 +18,9 @@
 //!
 //! The bytes may come in any pieces: a frame split across pushes is held
 //! until its last byte arrives (at most one frame, 8191 bytes, plus one).
+//! When bytes were lost between pushes, [`AdtsSplitter::discontinuity`]
+//! drops what is held, so a frame's start is never joined to bytes that
+//! do not continue it.
 //! Bytes that do not begin a header are skipped and counted until a
 //! syncword with layer `00` (§6.2.1) and a readable header follow; a header
 //! found that way is believed only once the next one's syncword follows
@@ -110,6 +113,8 @@ pub struct AdtsStats {
     pub dropped_empty: u64,
     /// Bytes skipped looking for a header.
     pub skipped_bytes: u64,
+    /// Bytes of a frame not complete yet, dropped at a discontinuity.
+    pub discarded_bytes: u64,
     /// Headers announcing another config than the frame before.
     pub config_changes: u64,
 }
@@ -200,6 +205,7 @@ impl AdtsSplitter {
                 dropped_blocks: 0,
                 dropped_empty: 0,
                 skipped_bytes: 0,
+                discarded_bytes: 0,
                 config_changes: 0,
             },
         }
@@ -265,6 +271,18 @@ impl AdtsSplitter {
         buffer.drain(..position.min(buffer.len()));
         self.pending = buffer;
         first
+    }
+
+    /// Bytes were lost before the next push: drops the frame or header
+    /// begun and not complete, counted, and believes the next header
+    /// only once the syncword after it confirms it, as the next bytes
+    /// may begin anywhere in a frame. The sequence goes on from the
+    /// frames that came: how many were lost is unknown.
+    pub fn discontinuity(&mut self) {
+        let held = u64::try_from(self.pending.len()).unwrap_or(u64::MAX);
+        self.stats.discarded_bytes = self.stats.discarded_bytes.saturating_add(held);
+        self.pending.clear();
+        self.synced = false;
     }
 
     /// Takes one complete frame: its config, its sequence, and the frame
@@ -475,6 +493,32 @@ mod tests {
         assert_eq!(payloads(&out), vec![&b"real"[..], b"next"]);
         assert_eq!(sequences(&out), vec![0, 1]);
         assert_eq!(splitter.stats().skipped_bytes, bad.len() as u64);
+    }
+
+    #[test]
+    fn iso13818_7_6_2_1_a_discontinuity_drops_the_frame_begun_and_resyncs() {
+        let (a, b, c) = (lc(b"aaaa"), lc(b"bbbbbb"), lc(b"cc"));
+        let mut splitter = AdtsSplitter::new(LIMIT);
+        let mut data = a.clone();
+        data.extend_from_slice(&b[..3]);
+        let (_, out) = push(&mut splitter, &data);
+        assert_eq!(payloads(&out), vec![&b"aaaa"[..]]);
+        splitter.discontinuity();
+        assert_eq!(splitter.buffered(), 0);
+        assert_eq!(splitter.stats().discarded_bytes, 3);
+        // Out of sync, a whole frame alone waits for the syncword after
+        // it, which confirms it.
+        assert_eq!(push(&mut splitter, &c), (None, Vec::new()));
+        assert_eq!(splitter.buffered(), c.len());
+        let (first, out) = push(&mut splitter, &a);
+        assert_eq!(first, Some(2));
+        assert_eq!(payloads(&out), vec![&b"cc"[..], b"aaaa"]);
+        // B never ended: C follows the first A.
+        assert_eq!(sequences(&out), vec![1, 2]);
+        // Nothing held, nothing dropped.
+        splitter.discontinuity();
+        assert_eq!(splitter.stats().discarded_bytes, 3);
+        assert_eq!(splitter.stats().skipped_bytes, 0);
     }
 
     #[test]

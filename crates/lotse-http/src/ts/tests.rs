@@ -676,6 +676,56 @@ fn iso13818_1_2_4_3_7_a_pts_waits_only_while_its_frame_has_not_come() {
     assert_eq!(ctx.stats.dropped_untimed, 1);
 }
 
+/// A continuity error (ISO/IEC 13818-1 §2.4.3.3) loses the rest of a
+/// frame begun in an earlier PES packet: the packet after the loss is not
+/// joined to it, the PTS kept for it is gone, and so is what the
+/// timestamps counted from, as frames were lost with it; the next PTS
+/// times the frames again.
+#[test]
+fn iso13818_1_2_4_3_3_a_continuity_error_drops_the_adts_frame_begun_before_it() {
+    let frame = |n: usize| adts_frame(SINE_48K_MONO, n);
+    let raw = |n: usize| {
+        let mut out = Vec::new();
+        AdtsSplitter::new(MAX).push(frame(n), &mut out);
+        out[0].payload.clone()
+    };
+    // Frame 1 begins in a packet with its PTS; the packet with its rest
+    // is cut short by the loss.
+    let lost = |ctx: &mut Ctx| {
+        feed(ctx, frame(0), Some(0));
+        feed(ctx, &frame(1)[..8], Some(1_920));
+        ctx.tracks[0].pes = Some(Pes {
+            timing: None,
+            data: frame(1)[8..12].to_vec(),
+        });
+        ctx.cut(0);
+        assert_eq!(ctx.stats.dropped_incomplete, 1);
+    };
+    // The next packet's PTS (frame 3's, 3 072 samples) times frame 2,
+    // the first that begins in it: a new count, no restart.
+    let mut ctx = audio_ctx(false);
+    lost(&mut ctx);
+    let mut next = frame(2).to_vec();
+    next.extend_from_slice(frame(3));
+    feed(&mut ctx, &next, Some(3 * 1_920));
+    assert_eq!(timestamps(&ctx.events), [0, 3_072, 4_096]);
+    let payloads: Vec<_> = units(&ctx.events, 0)
+        .iter()
+        .map(|unit| unit.payload.clone())
+        .collect();
+    assert_eq!(payloads, [raw(0), raw(2), raw(3)]);
+    assert_eq!(ctx.stats.audio_reanchors, 0);
+    // Without a PTS after the loss, nothing times the frames.
+    let mut ctx = audio_ctx(false);
+    lost(&mut ctx);
+    feed(&mut ctx, &next, None);
+    assert_eq!(timestamps(&ctx.events), [0]);
+    assert_eq!(ctx.stats.dropped_untimed, 2);
+    feed(&mut ctx, frame(4), Some(4 * 1_920));
+    assert_eq!(timestamps(&ctx.events), [0, 4_096]);
+    assert_eq!(ctx.stats.audio_reanchors, 0);
+}
+
 #[test]
 fn iso13818_7_6_2_a_configuration_change_before_the_layout_only_updates_it() {
     // Two AAC tracks; the first changes its configuration while the
