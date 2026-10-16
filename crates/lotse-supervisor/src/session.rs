@@ -430,10 +430,18 @@ impl SessionEntry {
         subscription: u64,
     ) -> mpsc::Receiver<Event> {
         let (events, rx) = mpsc::channel(SESSION_QUEUE.saturating_add(ORPHAN_BUFFER));
-        let snapshot = api_event(&SessionEvent::State {
-            ice: self.ice.to_owned(),
-            dtls: self.dtls.to_owned(),
-        });
+        // The snapshot is the first event of `session/adopt` (the API's
+        // contract), so it is signaling: as a diagnostic, a live state
+        // still queued with it would replace it at the back of the
+        // outbox, behind the buffered events, and it could be dropped.
+        // The states after it are diagnostics again.
+        let snapshot = Event {
+            class: EventClass::Signaling,
+            ..api_event(&SessionEvent::State {
+                ice: self.ice.to_owned(),
+                dtls: self.dtls.to_owned(),
+            })
+        };
         let _queued = events.try_send(snapshot);
         for event in self.buffer.drain(..) {
             let _queued = events.try_send(event);
@@ -754,8 +762,9 @@ fn closed_event(code: &str, message: &str) -> SessionEvent {
 }
 
 /// A session event as the server queues it: `state` is a diagnostic the
-/// outbox coalesces per subscription, and so per session, and may shed;
-/// everything else is signaling and never dropped.
+/// outbox coalesces per subscription, and so per session, and may shed
+/// (but for the snapshot [`SessionEntry::adopt`] starts with); everything
+/// else is signaling and never dropped.
 pub(crate) fn api_event(event: &SessionEvent) -> Event {
     let class = match event {
         SessionEvent::State { .. } => EventClass::Diagnostic,
@@ -1529,6 +1538,47 @@ mod tests {
             json!({ "type": "answer", "sdp": "a" })
         );
         assert!(adopted.try_recv().is_err(), "no state was buffered");
+    }
+
+    /// Regression for SUP-30: the adoption's `state` snapshot was a
+    /// diagnostic, so the outbox, which keeps one diagnostic per
+    /// subscription, let a live state replace it behind the buffered
+    /// events, and the adopter's first event was not the snapshot.
+    #[tokio::test]
+    async fn the_adoption_snapshot_is_signaling_and_the_live_states_after_it_diagnostics() {
+        let (tx, _first) = mpsc::channel(8);
+        let mut session = entry(tx);
+        let _epoch = session.orphan();
+        session.deliver("s1", api_event(&SessionEvent::Answer { sdp: "a".into() }));
+        let mut adopted = session.adopt(ConnectionId(2), 3);
+        let report = WorkerSessionEvent::State {
+            ice: "connected".into(),
+            dtls: "new".into(),
+        };
+        for event in session.applied(report) {
+            session.deliver("s1", api_event(&event));
+        }
+        let mut got = Vec::new();
+        while let Ok(event) = adopted.try_recv() {
+            got.push((event.class, event.payload));
+        }
+        assert_eq!(
+            got,
+            [
+                (
+                    EventClass::Signaling,
+                    json!({ "type": "state", "ice": "new", "dtls": "new" })
+                ),
+                (
+                    EventClass::Signaling,
+                    json!({ "type": "answer", "sdp": "a" })
+                ),
+                (
+                    EventClass::Diagnostic,
+                    json!({ "type": "state", "ice": "connected", "dtls": "new" })
+                ),
+            ]
+        );
     }
 
     /// Regression for SUP-30: every event a full subscription dropped was

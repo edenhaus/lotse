@@ -393,6 +393,25 @@ mod tests {
         );
     }
 
+    /// Regression for SUP-30: a session's adoption starts with a `state`
+    /// snapshot, which is signaling so that the live state after it,
+    /// coalesced per subscription, cannot replace it behind the buffered
+    /// events: both go out, in order.
+    #[tokio::test]
+    async fn a_signaling_state_is_kept_ahead_of_its_subscription_s_diagnostic() {
+        let outbox = Outbox::new(1000);
+        outbox.push(Class::Signaling, "snapshot".into()).unwrap();
+        outbox.push(Class::Signaling, "buffered".into()).unwrap();
+        outbox.push(Class::Diagnostic(3), "live-1".into()).unwrap();
+        outbox.push(Class::Diagnostic(3), "live-2".into()).unwrap();
+        outbox.close(1000, "done");
+        let mut texts = Vec::new();
+        while let Some(Outgoing::Text { text, .. }) = outbox.pop().await {
+            texts.push(text);
+        }
+        assert_eq!(texts, ["snapshot", "buffered", "live-2"]);
+    }
+
     #[tokio::test]
     async fn the_writer_wakes_when_an_item_arrives() {
         let outbox = std::sync::Arc::new(Outbox::new(100));

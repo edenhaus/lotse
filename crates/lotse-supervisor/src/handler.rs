@@ -2765,16 +2765,15 @@ mod tests {
             // not. Now the first is the one change, the session lives.
             (6, "states", &state, &json!("state"), 64),
         ];
-        for (id, session_id, flood, last_event, most) in floods {
-            let mut events =
-                subscription(call_on(&s, 1, &offer(id, "front", Some(session_id))).await);
+        for (id, name, flood, last_event, most) in floods {
+            let mut events = subscription(call_on(&s, 1, &offer(id, "front", Some(name))).await);
             next(&mut events).await;
-            let connection = s.shared.lock().sessions[session_id].connection.clone();
+            let connection = s.shared.lock().sessions[name].connection.clone();
             let report = |event| {
                 let now = s.shared.clock.now();
                 s.shared
                     .lock()
-                    .session_report(&connection, session_id, event, now);
+                    .session_report(&connection, name, event, now);
             };
             report(answer());
             let mut bytes = 0;
@@ -2786,20 +2785,20 @@ mod tests {
             }
             assert!(
                 bytes < share,
-                "{session_id}: {bytes} bytes queued for one session"
+                "{name}: {bytes} bytes queued for one session"
             );
+            let after = bytes - answered;
             assert!(
-                bytes - answered <= most,
-                "{session_id}: {} bytes queued after the answer",
-                bytes - answered
+                after <= most,
+                "{name}: {after} bytes queued after the answer"
             );
             if last_event.is_object() {
-                assert_eq!(last.as_ref(), Some(last_event), "{session_id}");
-                assert!(events.recv().await.is_none(), "{session_id}: ended");
+                assert_eq!(last.as_ref(), Some(last_event), "{name}");
+                assert!(events.recv().await.is_none(), "{name}: ended");
             } else {
-                assert_eq!(&last.unwrap()["type"], last_event, "{session_id}");
+                assert_eq!(&last.unwrap()["type"], last_event, "{name}");
                 let _event = s.shared.lock().close_session(
-                    session_id,
+                    name,
                     "session_closed",
                     "test",
                     CloseBy::Supervisor,
