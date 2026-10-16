@@ -165,7 +165,8 @@ struct Follower<C: Connect> {
     clock: Arc<dyn Clock>,
     /// Which segments each load adds.
     tracker: Tracker,
-    /// The last `EXT-X-MAP` fetched: its URL and the init segment.
+    /// The last `EXT-X-MAP` fetched: its URL and the init segment; `None`
+    /// again after a restart ([`Event::Restart`]).
     map: Option<(Url, Bytes)>,
 }
 
@@ -188,6 +189,11 @@ impl<C: Connect> Follower<C> {
             };
             let update = self.tracker.update(&playlist);
             self.log(update.event);
+            if update.event == Some(Event::Restart) {
+                // A restarted stream may have written a new init segment
+                // under the same URI: fetched again, not reused.
+                self.map = None;
+            }
             if !update.segments.is_empty() {
                 grew_at = loaded_at;
             } else if !playlist.end_list {

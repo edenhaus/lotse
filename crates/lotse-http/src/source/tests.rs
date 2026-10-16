@@ -828,6 +828,37 @@ async fn rfc8216_6_3_2_a_playlist_whose_media_sequence_went_back_restarts_in_an_
     rig.stop().await;
 }
 
+/// A restart (RFC 8216 §6.3.2: the media sequence went back) fetches the
+/// `EXT-X-MAP` again, as the restarted stream may have written another
+/// init segment under the same URI: here one that is none, so reading it
+/// ends the attempt where the old one would have played on.
+#[tokio::test(flavor = "current_thread")]
+async fn rfc8216_6_3_2_a_restart_fetches_the_init_segment_again() {
+    let rig = Rig::new().await;
+    let playlist = "/r/index.m3u8";
+    rig.body("/r/init.mp4", MP4, H264_AAC_INIT);
+    rig.body("/r/0.m4s", MP4, H264_AAC_0);
+    rig.body("/r/1.m4s", MP4, H264_AAC_1);
+    let map = "#EXT-X-MAP:URI=\"init.mp4\"\n";
+    let first = format!("#EXT-X-MEDIA-SEQUENCE:10\n{map}");
+    rig.playlist(
+        playlist,
+        &media_playlist(&first, &["0.m4s", "1.m4s"], false),
+    );
+    let harness = rig.start(playlist);
+    rig.wait("both segments", || rig.seen("/r/1.m4s") == 1)
+        .await;
+    assert_eq!(rig.seen("/r/init.mp4"), 1);
+    rig.body("/r/init.mp4", MP4, &b"not an init segment"[..]);
+    let restarted = format!("#EXT-X-MEDIA-SEQUENCE:0\n{map}");
+    rig.playlist(playlist, &media_playlist(&restarted, &["0.m4s"], true));
+    let err = rig.exit(harness).await;
+    assert_eq!(rig.seen("/r/init.mp4"), 2);
+    assert_protocol(&err, "fmp4: ");
+    assert_eq!(rig.logs.lines("the playlist restarted").len(), 1);
+    rig.stop().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn rfc8216_4_3_2_3_a_discontinuity_starts_an_epoch_with_a_fresh_demultiplexer() {
     let rig = Rig::new().await;
