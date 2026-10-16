@@ -42,11 +42,11 @@ use lotse_core::codec::CodecFamily;
 use lotse_core::media::MediaPacket;
 use lotse_core::negotiate::NegotiationError;
 use lotse_core::orientation::Orientation;
-use lotse_core::output::OutputFactory;
+use lotse_core::output::{OutputFactory, TalkbackRequest};
 use lotse_core::registry::Registries;
 use lotse_core::session::{
     IceCredentials, SessionEngine, SessionEvent, SessionLimits, SessionOutput, SessionRequest,
-    Transport, apply_audio_event, apply_track_event,
+    TalkbackClaim, TalkbackTarget, Transport, apply_audio_event, apply_track_event,
 };
 use lotse_core::skew::AV_SYNC_LOST;
 use lotse_core::task::spawn_named;
@@ -60,7 +60,7 @@ use crate::derived::{DerivedTracks, Lease, PickedTrack};
 use crate::ice_tcp::Links;
 use crate::relay::{Egress, Relays};
 use crate::sendmsg;
-use crate::talkback::{self, Arbiter, BACKCHANNEL_BUSY, Talkback, TalkbackStats};
+use crate::talkback::{self, Arbiter, Talkback, TalkbackStats};
 
 /// The bounded inbound queue per session:
 /// uplink only, so small.
@@ -94,6 +94,8 @@ type CloseRequest = Option<(&'static str, String)>;
 enum Control {
     /// A trickled remote candidate; empty is end-of-candidates.
     Candidate(String),
+    /// A re-offer from the browser (`webrtc/renegotiate`).
+    Renegotiate(String),
     /// The stream's orientation changed.
     Orientation(Orientation),
     /// A relay candidate the supervisor allocated for this session.
@@ -384,6 +386,29 @@ impl SessionManager {
     /// A trickled candidate for a session.
     pub(crate) fn candidate(&self, session_id: &str, candidate: String) {
         self.send(session_id, Control::Candidate(candidate));
+    }
+
+    /// A re-offer for a session, which answers it with a `Renegotiated`
+    /// or `RenegotiateRefused` report; one for no session, or one whose
+    /// queue is full, is refused here, so the supervisor's command never
+    /// waits for an answer that cannot come.
+    pub(crate) async fn renegotiate(&self, session_id: &str, sdp: String) {
+        let queued = self
+            .sessions
+            .get(session_id)
+            .is_some_and(|handle| handle.control.try_send(Control::Renegotiate(sdp)).is_ok());
+        if queued {
+            return;
+        }
+        tracing::debug!(
+            session = session_id,
+            "re-offer refused: no such session, or its queue is full"
+        );
+        let event = IpcEvent::RenegotiateRefused {
+            code: "internal_error".to_owned(),
+            message: "the session is gone or busy".to_owned(),
+        };
+        let _sent = self.events.send((session_id.to_owned(), event)).await;
     }
 
     /// A relay candidate for a session.
@@ -719,30 +744,52 @@ async fn wait_ready(
         return None;
     }
     loop {
-        tokio::select! {
+        // Whether a re-offer arrived, refused after the select: the
+        // close's guard must not live across an await.
+        let reoffer = tokio::select! {
             // The session holds the track set, so its sender outlives this
             // wait and `changed` never fails.
             Ok(()) = ready.changed() => {
                 if *ready.borrow_and_update() {
                     return None;
                 }
+                false
             }
             // A manager that is gone ends the control queue too.
             Ok(request) = close.wait_for(Option::is_some) => return request.clone(),
             message = control.recv() => match message {
-                Some(Control::Candidate(_)) => {}
-                Some(Control::Orientation(orientation)) => ctx.spec.orientation = orientation.code(),
-                Some(Control::Relay { relayed, server, local, tcp }) => relays.push(PendingRelay { relayed, server, local, tcp }),
+                Some(Control::Candidate(_)) => false,
+                // The supervisor refuses one before the answer; a race
+                // with the answer is refused here.
+                Some(Control::Renegotiate(_)) => true,
+                Some(Control::Orientation(orientation)) => {
+                    ctx.spec.orientation = orientation.code();
+                    false
+                }
+                Some(Control::Relay { relayed, server, local, tcp }) => {
+                    relays.push(PendingRelay { relayed, server, local, tcp });
+                    false
+                }
                 // No relay candidate yet, so no channel on one.
                 Some(Control::Channel { relayed, peer, .. }) => {
                     tracing::debug!(%relayed, %peer, "relay channel before the answer; ignored");
+                    false
                 }
                 // No answer yet, so no browser knows a TCP candidate.
                 Some(Control::Tcp { peer, .. }) => {
                     tracing::debug!(%peer, "ice-tcp connection before the answer; closed");
+                    false
                 }
                 None => return Some(("shutting_down", "the worker is stopping".to_owned())),
             },
+        };
+        if reoffer {
+            tracing::debug!("re-offer before the answer; refused");
+            ctx.emit(IpcEvent::RenegotiateRefused {
+                code: "internal_error".to_owned(),
+                message: "the session has no answer yet".to_owned(),
+            })
+            .await;
         }
     }
 }
@@ -808,6 +855,118 @@ struct Opened {
     /// ([`talkback`]), when it has one; dropped with the session, which
     /// frees the channel if the session held it.
     talkback: Option<Talkback>,
+}
+
+/// Why an offer's talk-back was declined: the `backchannel_declined`
+/// warning the session gets after the answer to that offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Decline {
+    /// The session cannot receive talk-back on this stream, and why
+    /// ([`TalkbackRequest::Unsupported`]).
+    Unsupported(String),
+    /// This session holds the backchannel.
+    Busy(String),
+}
+
+impl Decline {
+    /// The warning's `reason`.
+    const fn reason(&self) -> &'static str {
+        match self {
+            Self::Unsupported(_) => "unsupported",
+            Self::Busy(_) => "busy",
+        }
+    }
+
+    /// The warning, for the supervisor.
+    fn event(&self) -> IpcEvent {
+        let message = match self {
+            Self::Unsupported(reason) => format!("talk-back declined: {reason}"),
+            Self::Busy(holder) => {
+                format!("talk-back declined: session {holder} holds the camera's backchannel")
+            }
+        };
+        IpcEvent::TalkbackDeclined {
+            reason: self.reason().to_owned(),
+            status: None,
+            message,
+        }
+    }
+}
+
+/// The arbitration of an offer's talk-back, before the engine answers
+/// it: what the engine negotiates with, and what follows the answer.
+#[derive(Debug)]
+struct Arbitration {
+    /// The backchannel the camera offers now, whoever holds it.
+    backchannel: Option<TalkbackTarget>,
+    /// Whether the session holds it for this offer.
+    claim: TalkbackClaim,
+    /// The decline to report after the answer, if any.
+    decline: Option<Decline>,
+    /// The offer claimed the backchannel, which the session did not hold
+    /// before: an engine that refuses the offer lets go again.
+    claimed: bool,
+    /// The offer drops talk-back the session held: it lets go once the
+    /// engine took the offer, since the engine needs no claim to answer
+    /// without talk-back.
+    drops: bool,
+}
+
+/// Arbitrates `offer`'s talk-back for the session, through `talkback`
+/// when its connection has a backchannel: an offer that asks for
+/// talk-back the backchannel takes ([`OutputFactory::talkback_request`])
+/// claims it, first offer wins, and is declined `busy` when another
+/// session holds it; one that asks for talk-back the stream cannot carry
+/// is declined `unsupported`; one that asks for none lets go of a
+/// backchannel the session held. Decided before the engine sees the
+/// offer, so the answer carries the outcome.
+fn arbitrate(ctx: &SessionCtx, talkback: Option<&mut Talkback>, offer: &str) -> Arbitration {
+    let mut arbitration = Arbitration {
+        backchannel: None,
+        claim: TalkbackClaim::Granted,
+        decline: None,
+        claimed: false,
+        drops: false,
+    };
+    let Some(talkback) = talkback else {
+        if let TalkbackRequest::Unsupported(reason) = ctx.factory.talkback_request(offer, None) {
+            arbitration.decline = Some(Decline::Unsupported(reason));
+        }
+        return arbitration;
+    };
+    arbitration.backchannel = talkback.target();
+    match ctx
+        .factory
+        .talkback_request(offer, arbitration.backchannel.as_ref())
+    {
+        TalkbackRequest::NotRequested => arbitration.drops = talkback.holds(),
+        TalkbackRequest::Unsupported(reason) => {
+            arbitration.drops = talkback.holds();
+            arbitration.decline = Some(Decline::Unsupported(reason));
+        }
+        TalkbackRequest::Negotiable => {
+            let held = talkback.holds();
+            match talkback.claim() {
+                Ok(()) => arbitration.claimed = !held,
+                Err(holder) => {
+                    arbitration.claim = TalkbackClaim::Busy;
+                    arbitration.decline = Some(Decline::Busy(holder));
+                }
+            }
+        }
+    }
+    let (claim, decline) = (
+        arbitration.claim,
+        arbitration.decline.as_ref().map(Decline::reason),
+    );
+    tracing::debug!(
+        ?claim,
+        decline,
+        claimed = arbitration.claimed,
+        drops = arbitration.drops,
+        "talk-back arbitrated for the offer"
+    );
+    arbitration
 }
 
 /// What a session takes from the connection it opens on.
@@ -918,6 +1077,16 @@ async fn open_session(
         track: audio.track,
         lease: audio.lease,
     });
+    // The offer claims the backchannel before the engine answers; a
+    // session that never opens lets go as it is dropped.
+    let mut talkback = ctx.backchannel.as_ref().map(|arbiter| {
+        Talkback::new(
+            Arc::clone(arbiter),
+            ctx.spec.session_id.clone(),
+            Arc::clone(&ctx.talkback),
+        )
+    });
+    let arbitration = arbitrate(ctx, talkback.as_mut(), &ctx.spec.offer);
     // The monotonic and the wall clock read together: the session's anchor
     // for the capture times it sends.
     let now = ctx.clock.now();
@@ -931,12 +1100,10 @@ async fn open_session(
         tcp_candidates: ctx.spec.tcp_candidates.clone(),
         video: video.codec(),
         audio: audio.as_ref().map(|audio| audio.track.codec()),
-        // What the source offers now, behind its protocol's gate; never
-        // who talks.
-        backchannel: ctx
-            .backchannel
-            .as_ref()
-            .and_then(|arbiter| arbiter.target()),
+        // What the source offers now, behind its protocol's gate, and
+        // whether this session holds it.
+        backchannel: arbitration.backchannel,
+        claim: arbitration.claim,
         orientation: Orientation::from_code(ctx.spec.orientation).unwrap_or_default(),
         limits: ctx.limits,
         wall: ctx.clock.wall_now(),
@@ -949,15 +1116,18 @@ async fn open_session(
             return None;
         }
     };
-    let talkback = engine.talkback();
+    let negotiated = engine.talkback();
     ctx.talkback
         .negotiated
-        .store(talkback.is_some(), Ordering::Relaxed);
+        .store(negotiated.is_some(), Ordering::Relaxed);
     ctx.emit(IpcEvent::Answer {
         sdp: answer,
-        talkback: talkback.map(|codec| codec.name().to_owned()),
+        talkback: negotiated.map(|codec| codec.name().to_owned()),
     })
     .await;
+    if let Some(decline) = &arbitration.decline {
+        ctx.emit(decline.event()).await;
+    }
     let mut opened = Opened {
         engine,
         family: video.codec().family(),
@@ -967,18 +1137,61 @@ async fn open_session(
         _video_lease: picked.video.lease,
         relays: Relays::default(),
         uplink: Vec::new(),
-        talkback: ctx.backchannel.as_ref().map(|arbiter| {
-            Talkback::new(
-                Arc::clone(arbiter),
-                ctx.spec.session_id.clone(),
-                Arc::clone(&ctx.talkback),
-            )
-        }),
+        talkback,
     };
     for relay in relays {
         add_relay(ctx, &mut opened, relay).await;
     }
     Some(opened)
+}
+
+/// A re-offer: arbitrates its talk-back ([`arbitrate`]), has the engine
+/// answer it and reports the answer (`Renegotiated`) and the decline, if
+/// any; a refused re-offer is reported (`RenegotiateRefused`) and leaves
+/// the session as it was, a backchannel it claimed let go again.
+async fn renegotiate(ctx: &SessionCtx, opened: &mut Opened, sdp: &str) {
+    let arbitration = arbitrate(ctx, opened.talkback.as_mut(), sdp);
+    let now = ctx.clock.now();
+    match opened
+        .engine
+        .renegotiate(now, sdp, arbitration.backchannel.clone(), arbitration.claim)
+    {
+        Ok(answer) => {
+            if arbitration.drops
+                && let Some(talkback) = opened.talkback.as_mut()
+            {
+                talkback.let_go();
+            }
+            let negotiated = opened.engine.talkback();
+            ctx.talkback
+                .negotiated
+                .store(negotiated.is_some(), Ordering::Relaxed);
+            let talkback = negotiated.map(lotse_core::uplink::UplinkCodec::name);
+            tracing::info!(talkback, "re-offer answered");
+            ctx.emit(IpcEvent::Renegotiated {
+                sdp: answer,
+                talkback: talkback.map(str::to_owned),
+            })
+            .await;
+            if let Some(decline) = &arbitration.decline {
+                ctx.emit(decline.event()).await;
+            }
+        }
+        Err(err) => {
+            if arbitration.claimed
+                && let Some(talkback) = opened.talkback.as_mut()
+            {
+                talkback.let_go();
+            }
+            let code = err.code();
+            tracing::info!(code, error = %err, "re-offer refused");
+            ctx.emit(IpcEvent::RenegotiateRefused {
+                code: code.to_owned(),
+                message: err.to_string(),
+            })
+            .await;
+        }
+    }
 }
 
 /// Gives the engine a relay candidate and reports its line, or that it
@@ -1070,13 +1283,7 @@ async fn drain(
                 ctx.talkback
                     .packets_received
                     .store(opened.engine.stats().uplink_packets, Ordering::Relaxed);
-                if talkback::receive(opened.talkback.as_mut(), packet) {
-                    ctx.emit(IpcEvent::Warning {
-                        code: BACKCHANNEL_BUSY.to_owned(),
-                        message: "another session holds the camera's backchannel; this session's talk-back is dropped".to_owned(),
-                    })
-                    .await;
-                }
+                talkback::receive(opened.talkback.as_mut(), packet);
             }
             SessionOutput::Timeout(at) => return Some(at),
         }
@@ -1182,6 +1389,7 @@ async fn run_session(
                 let now = ctx.clock.now();
                 match message {
                     Some(Control::Candidate(candidate)) => opened.engine.add_remote_candidate(now, &candidate),
+                    Some(Control::Renegotiate(sdp)) => renegotiate(&ctx, &mut opened, &sdp).await,
                     Some(Control::Orientation(orientation)) => opened.engine.set_orientation(orientation),
                     Some(Control::Relay { relayed, server, local, tcp }) => add_relay(&ctx, &mut opened, PendingRelay { relayed, server, local, tcp }).await,
                     Some(Control::Channel { relayed, peer, channel }) => {
@@ -1223,8 +1431,9 @@ mod tests {
     use std::pin::{Pin, pin};
     use std::task::Poll;
 
-    use lotse_core::clock::FakeClock;
+    use lotse_core::clock::{FakeClock, SystemClock};
     use lotse_core::codec::{Codec, Kind};
+    use lotse_core::let_assert;
     use lotse_core::media::RtpHeaderFields;
     use lotse_core::output::{OutputShape, TrackRequest};
     use lotse_core::session::{SessionOpenError, SessionStats};
@@ -1233,6 +1442,7 @@ mod tests {
     use tracing::Level;
 
     use super::*;
+    use crate::talkback::TalkerFeed;
     use crate::test_logs::Logs;
 
     const HOUR: Duration = Duration::from_secs(3600);
@@ -1262,14 +1472,32 @@ mod tests {
         }
     }
 
+    /// Whether an offer of the scripted output negotiates talk-back: it
+    /// asks (`talk` in the offer) for talk-back the camera's backchannel
+    /// takes (not `unsupported`), and the session holds the backchannel.
+    fn scripted_talkback(
+        offer: &str,
+        backchannel: Option<&TalkbackTarget>,
+        claim: TalkbackClaim,
+    ) -> Option<lotse_core::uplink::UplinkCodec> {
+        (offer.contains("talk")
+            && !offer.contains("unsupported")
+            && claim == TalkbackClaim::Granted
+            && backchannel.is_some())
+        .then_some(lotse_core::uplink::UplinkCodec::Pcmu)
+    }
+
     /// An engine that records its calls in its script and returns the
     /// script's outputs, then a timeout an hour after it opened or last
     /// timed out. It takes every relay candidate and video change, and
-    /// closes when asked.
+    /// closes when asked. It negotiates talk-back as [`scripted_talkback`]
+    /// says, for the offer and every re-offer, and refuses a re-offer
+    /// containing `refuse`.
     #[derive(Debug)]
     struct Scripted {
         script: Arc<Script>,
         idle: Instant,
+        talkback: Option<lotse_core::uplink::UplinkCodec>,
     }
 
     impl SessionEngine for Scripted {
@@ -1347,12 +1575,31 @@ mod tests {
         }
 
         fn talkback(&self) -> Option<lotse_core::uplink::UplinkCodec> {
-            None
+            self.talkback
+        }
+
+        fn renegotiate(
+            &mut self,
+            _now: Instant,
+            offer: &str,
+            backchannel: Option<TalkbackTarget>,
+            claim: TalkbackClaim,
+        ) -> Result<String, lotse_core::session::RenegotiateError> {
+            self.script
+                .call(&format!("renegotiate {offer} claim={claim:?}"));
+            if offer.contains("refuse") {
+                return Err(lotse_core::session::RenegotiateError::InvalidSdp(
+                    "refused by the script".into(),
+                ));
+            }
+            self.talkback = scripted_talkback(offer, backchannel.as_ref(), claim);
+            Ok(format!("answer to {offer}"))
         }
     }
 
     /// The `webrtc` output of [`Scripted`] engines: H.264 video, and PCMU
-    /// audio when asked.
+    /// audio when asked. An offer with `talk` asks for talk-back, which a
+    /// camera's backchannel takes unless the offer says `unsupported`.
     #[derive(Debug, Default)]
     struct ScriptedOutput(Arc<Script>);
 
@@ -1390,14 +1637,38 @@ mod tests {
                 .call(&format!("open audio={}", request.audio.is_some()));
             self.0
                 .call(&format!("open orientation={}", request.orientation.name()));
+            self.0.call(&format!(
+                "open backchannel={} claim={:?}",
+                request.backchannel.is_some(),
+                request.claim
+            ));
             if self.0.refuse {
                 return Err(SessionOpenError::InvalidSdp("refused by the script".into()));
             }
             let engine = Scripted {
                 script: Arc::clone(&self.0),
                 idle: now + HOUR,
+                talkback: scripted_talkback(
+                    &request.offer,
+                    request.backchannel.as_ref(),
+                    request.claim,
+                ),
             };
             Ok((Box::new(engine), "answer".into()))
+        }
+
+        fn talkback_request(
+            &self,
+            offer: &str,
+            backchannel: Option<&TalkbackTarget>,
+        ) -> TalkbackRequest {
+            if !offer.contains("talk") {
+                TalkbackRequest::NotRequested
+            } else if backchannel.is_none() || offer.contains("unsupported") {
+                TalkbackRequest::Unsupported("the script says no".into())
+            } else {
+                TalkbackRequest::Negotiable
+            }
         }
     }
 
@@ -1464,6 +1735,10 @@ mod tests {
     fn tcp_pair() -> (std::net::TcpStream, OwnedFd, SocketAddr) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let browser = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // A close that never comes fails the test's read instead of hanging it.
+        browser
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let (ours, peer) = listener.accept().unwrap();
         (browser, OwnedFd::from(ours), peer)
     }
@@ -1496,6 +1771,8 @@ mod tests {
         control: mpsc::Sender<Control>,
         close: watch::Sender<CloseRequest>,
         inbound: mpsc::Sender<Inbound>,
+        /// Its talk-back counters, as the manager would report them.
+        talkback: Arc<TalkbackStats>,
     }
 
     impl Rig {
@@ -1517,6 +1794,20 @@ mod tests {
     /// Session `s` on the connection [`connection`] makes, and its task's
     /// future, not yet polled.
     fn session(script: Script, audio: bool, ready: bool) -> (Rig, impl Future<Output = ()> + Send) {
+        session_on("s", script, audio, ready, "v=0", None)
+    }
+
+    /// Session `id` offering `offer` on the connection [`connection`]
+    /// makes, with the arbiter of its backchannel when it has one, and
+    /// its task's future, not yet polled.
+    fn session_on(
+        id: &str,
+        script: Script,
+        audio: bool,
+        ready: bool,
+        offer: &str,
+        backchannel: Option<Arc<Arbiter>>,
+    ) -> (Rig, impl Future<Output = ()> + Send) {
         let clock = Arc::new(FakeClock::default());
         let publisher = connection(&clock, audio, ready);
         let script = Arc::new(script);
@@ -1525,13 +1816,17 @@ mod tests {
         let (close, close_rx) = watch::channel(None);
         let (inbound, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
         let (uplink, _supervisor) = UnixDatagram::pair().unwrap();
+        let talkback = Arc::new(TalkbackStats::default());
         let ctx = SessionCtx {
-            spec: spec("s", audio),
+            spec: SessionSpec {
+                offer: offer.into(),
+                ..spec(id, audio)
+            },
             inbound: inbound.clone(),
             tracks: DerivedTracks::new(Arc::clone(publisher.tracks()), Vec::new(), clock.clone()),
             mapper: Arc::new(ClockMapper::new()),
-            backchannel: None,
-            talkback: Arc::default(),
+            backchannel,
+            talkback: Arc::clone(&talkback),
             factory: Arc::new(ScriptedOutput(Arc::clone(&script))),
             limits: SessionLimits::default(),
             udp: Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
@@ -1549,8 +1844,276 @@ mod tests {
             control,
             close,
             inbound,
+            talkback,
         };
         (rig, run_session(ctx, inbound_rx, control_rx, close_rx))
+    }
+
+    /// An arbiter of a connection whose source offers a PCMU backchannel,
+    /// and the feed of its talker changes.
+    fn arbiter() -> (Arc<Arbiter>, TalkerFeed) {
+        let slot = lotse_core::source::BackchannelSlot::default();
+        let (sender, _device) = mpsc::channel(8);
+        slot.offer(lotse_core::source::BackchannelHandle {
+            codec: Codec::Pcmu,
+            frame: lotse_core::source::BackchannelHandle::DEFAULT_FRAME,
+            sender,
+        });
+        let arbiter = Arc::new(Arbiter::new(slot, None, Arc::new(FakeClock::default())));
+        let feed = TalkerFeed::new(&arbiter);
+        (arbiter, feed)
+    }
+
+    /// The next talker change of `feed`, which must be there already.
+    async fn change(feed: &mut TalkerFeed) -> (String, &'static str) {
+        let next = feed.next();
+        let mut next = pin!(next);
+        let_assert!(Poll::Ready(Some(changed)) = poll_once(&mut next).await);
+        (changed.session, changed.reason.code())
+    }
+
+    /// A re-offer, as the manager hands it to the session.
+    fn reoffer(sdp: &str) -> Control {
+        Control::Renegotiate(sdp.into())
+    }
+
+    /// A talk-back packet the engine hands on.
+    fn uplink(now: Instant) -> SessionOutput {
+        SessionOutput::Uplink(lotse_core::uplink::UplinkPacket {
+            codec: lotse_core::uplink::UplinkCodec::Pcmu,
+            packet: packet(now),
+        })
+    }
+
+    /// The offer claims the backchannel before the engine answers, and
+    /// the answer says so; a second session's offer is declined `busy`
+    /// after its answer, one the stream cannot serve `unsupported`; a
+    /// re-offer that drops talk-back lets go, one that asks for it claims
+    /// or is declined, and one the engine refuses, after claiming, lets
+    /// go again; a packet of a session that does not hold the backchannel
+    /// is dropped and counted.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "two sessions' offers and re-offers")]
+    async fn an_offer_claims_the_backchannel_and_re_offers_claim_or_let_go() {
+        let (arbiter, mut feed) = arbiter();
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = pin!(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("open backchannel=true claim=Granted"));
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Answer {
+                sdp: "answer".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        assert!(a.talkback.negotiated.load(Ordering::Relaxed));
+
+        // b asks too: declined, after its answer.
+        let (mut b, task) = session_on(
+            "b",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut b_task = pin!(task);
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert!(b.script.called("open backchannel=true claim=Busy"));
+        assert_eq!(
+            b.events(),
+            [
+                IpcEvent::Answer {
+                    sdp: "answer".into(),
+                    talkback: None,
+                },
+                IpcEvent::TalkbackDeclined {
+                    reason: "busy".into(),
+                    status: None,
+                    message: "talk-back declined: session a holds the camera's backchannel".into(),
+                },
+            ]
+        );
+        assert!(!b.talkback.negotiated.load(Ordering::Relaxed));
+        // b's packets go nowhere, and are counted.
+        b.script.then(uplink(b.clock.now()));
+        b.control(Control::Candidate("candidate:x".into()));
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert_eq!(b.talkback.packets_dropped_busy.load(Ordering::Relaxed), 1);
+
+        // Talk-back the stream cannot serve: declined `unsupported`, with
+        // and without a backchannel on the connection.
+        for (what, backchannel) in [
+            ("v=0 talk unsupported", Some(Arc::clone(&arbiter))),
+            ("v=0 talk", None),
+        ] {
+            let (mut c, task) = session_on("c", Script::default(), false, true, what, backchannel);
+            let mut c_task = pin!(task);
+            assert!(poll_once(&mut c_task).await.is_pending());
+            assert_eq!(
+                c.events(),
+                [
+                    IpcEvent::Answer {
+                        sdp: "answer".into(),
+                        talkback: None,
+                    },
+                    IpcEvent::TalkbackDeclined {
+                        reason: "unsupported".into(),
+                        status: None,
+                        message: "talk-back declined: the script says no".into(),
+                    },
+                ],
+                "{what}"
+            );
+        }
+        // An offer that asks for none is answered without a word.
+        let (mut d, task) = session_on(
+            "d",
+            Script::default(),
+            false,
+            true,
+            "v=0",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut d_task = pin!(task);
+        assert!(poll_once(&mut d_task).await.is_pending());
+        assert_eq!(d.events().len(), 1);
+
+        // a's re-offer drops talk-back: let go, and b's re-offer claims.
+        a.control(reoffer("v=0"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("renegotiate v=0 claim=Granted"));
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Renegotiated {
+                sdp: "answer to v=0".into(),
+                talkback: None,
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "renegotiated"));
+        assert!(!a.talkback.negotiated.load(Ordering::Relaxed));
+        b.control(reoffer("v=0 talk"));
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert!(b.script.called("renegotiate v=0 talk claim=Granted"));
+        assert_eq!(
+            b.events(),
+            [IpcEvent::Renegotiated {
+                sdp: "answer to v=0 talk".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("b".into(), "claimed"));
+        assert!(b.talkback.negotiated.load(Ordering::Relaxed));
+        // a asks again while b holds it: declined, after the answer.
+        a.control(reoffer("v=0 talk"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("renegotiate v=0 talk claim=Busy"));
+        assert_eq!(
+            a.events(),
+            [
+                IpcEvent::Renegotiated {
+                    sdp: "answer to v=0 talk".into(),
+                    talkback: None,
+                },
+                IpcEvent::TalkbackDeclined {
+                    reason: "busy".into(),
+                    status: None,
+                    message: "talk-back declined: session b holds the camera's backchannel".into(),
+                },
+            ]
+        );
+        // A re-offer the engine refuses leaves the holder holding.
+        b.control(reoffer("v=0 talk refuse"));
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert_eq!(
+            b.events(),
+            [IpcEvent::RenegotiateRefused {
+                code: "invalid_sdp".into(),
+                message: "invalid re-offer: refused by the script".into(),
+            }]
+        );
+        assert!(b.talkback.negotiated.load(Ordering::Relaxed));
+        // b lets go; a's refused re-offer claimed first, and lets go again.
+        b.control(reoffer("v=0"));
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert_eq!(change(&mut feed).await, ("b".into(), "renegotiated"));
+        a.control(reoffer("v=0 talk refuse"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(
+            a.events(),
+            [IpcEvent::RenegotiateRefused {
+                code: "invalid_sdp".into(),
+                message: "invalid re-offer: refused by the script".into(),
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        assert_eq!(change(&mut feed).await, ("a".into(), "renegotiated"));
+        // A session closing lets go of what it holds.
+        a.control(reoffer("v=0 talk"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        request_close(&a.close, "session_closed", "bye".into());
+        assert!(poll_once(&mut a_task).await.is_ready());
+        assert_eq!(change(&mut feed).await, ("a".into(), "session_closed"));
+    }
+
+    /// A re-offer before the answer is refused, and so is one for a
+    /// session the manager does not hold or whose queue is full.
+    #[tokio::test]
+    async fn a_re_offer_before_the_answer_or_for_no_session_is_refused() {
+        let (mut rig, session) = session(Script::default(), false, false);
+        let mut session = pin!(session);
+        assert!(poll_once(&mut session).await.is_pending());
+        rig.control(reoffer("v=0 talk"));
+        assert!(poll_once(&mut session).await.is_pending());
+        assert_eq!(
+            rig.events(),
+            [IpcEvent::RenegotiateRefused {
+                code: "internal_error".into(),
+                message: "the session has no answer yet".into(),
+            }]
+        );
+        assert!(rig.script.calls.lock().unwrap().is_empty(), "never opened");
+
+        let mut m = managed();
+        m.manager.renegotiate("ghost", "v=0".into()).await;
+        assert_eq!(
+            m.next().await,
+            (
+                "ghost".to_owned(),
+                IpcEvent::RenegotiateRefused {
+                    code: "internal_error".into(),
+                    message: "the session is gone or busy".into(),
+                }
+            )
+        );
+        m.open("a").await;
+        // Its task has not run, so nothing reads the queue.
+        while m.manager.sessions["a"]
+            .control
+            .try_send(Control::Candidate(String::new()))
+            .is_ok()
+        {}
+        m.manager.renegotiate("a", "v=0".into()).await;
+        assert_eq!(
+            m.next().await,
+            (
+                "a".to_owned(),
+                IpcEvent::RenegotiateRefused {
+                    code: "internal_error".into(),
+                    message: "the session is gone or busy".into(),
+                }
+            )
+        );
     }
 
     fn closed(code: &str, message: &str) -> IpcEvent {
@@ -1828,8 +2391,10 @@ mod tests {
         let engine = Scripted {
             script: Arc::default(),
             idle: rig.clock.now(),
+            talkback: None,
         };
         assert_eq!(engine.stats(), SessionStats::default());
+        assert_eq!(engine.talkback(), None);
     }
 
     /// A manager on fresh sockets with the scripted output, and what a
@@ -1893,6 +2458,16 @@ mod tests {
                 .await;
         }
 
+        /// The manager's next event, or a failed test after five seconds
+        /// of real time: an answer that never comes fails instead of
+        /// hanging.
+        async fn next(&mut self) -> (String, IpcEvent) {
+            tokio::select! {
+                event = self.events.recv() => event.unwrap(),
+                () = SystemClock.sleep(Duration::from_secs(5)) => panic!("no event within 5 s"),
+            }
+        }
+
         /// Sends a datagram-channel frame for `ufrag` as the supervisor's
         /// demux does.
         fn route(&self, ufrag: &str) {
@@ -1908,13 +2483,44 @@ mod tests {
         }
     }
 
+    /// The talk-back counters for the supervisor's stats: one entry per
+    /// session whose answer negotiated talk-back, in the order of their
+    /// ids whatever the order they opened in.
+    #[tokio::test]
+    async fn talk_back_counters_are_reported_per_negotiated_session_in_id_order() {
+        let mut m = managed();
+        for id in ["b", "a", "c"] {
+            m.open(id).await;
+        }
+        assert!(m.manager.talkback().is_empty(), "none negotiated");
+        for id in ["b", "a"] {
+            let stats = &m.manager.sessions[id].talkback;
+            stats.negotiated.store(true, Ordering::Relaxed);
+        }
+        let b = &m.manager.sessions["b"].talkback;
+        b.packets_received.store(2, Ordering::Relaxed);
+        assert_eq!(
+            m.manager.talkback(),
+            [
+                ("a".to_owned(), lotse_ipc::TalkbackStats::default()),
+                (
+                    "b".to_owned(),
+                    lotse_ipc::TalkbackStats {
+                        packets_received: 2,
+                        ..lotse_ipc::TalkbackStats::default()
+                    }
+                ),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn a_session_id_already_open_is_refused() {
         let mut m = managed();
         m.open("a").await;
         m.open("a").await;
         assert_eq!(
-            m.events.recv().await.unwrap(),
+            m.next().await,
             (
                 "a".into(),
                 closed("internal_error", "session id already open in this worker")
@@ -1952,7 +2558,7 @@ mod tests {
         m.manager.close("a", "session_closed", "bye".into());
         m.manager.close("a", "shutting_down", "later".into());
         assert_eq!(
-            m.events.recv().await.unwrap(),
+            m.next().await,
             ("a".to_owned(), closed("session_closed", "bye"))
         );
         m.manager.close("nobody", "session_closed", String::new());
@@ -2037,7 +2643,7 @@ mod tests {
             None,
             OwnedFd::from(datagrams),
             256,
-            Arc::new(lotse_core::clock::SystemClock),
+            Arc::new(SystemClock),
             events,
         )
         .unwrap();
@@ -2078,7 +2684,7 @@ mod tests {
             Some(at),
             OwnedFd::from(datagrams),
             256,
-            Arc::new(lotse_core::clock::SystemClock),
+            Arc::new(SystemClock),
             events,
         )
         .unwrap();
@@ -2113,7 +2719,7 @@ mod tests {
             Some(taken),
             OwnedFd::from(datagrams),
             256,
-            Arc::new(lotse_core::clock::SystemClock),
+            Arc::new(SystemClock),
             events,
         )
         .unwrap_err();

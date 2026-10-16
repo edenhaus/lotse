@@ -15,14 +15,16 @@ use std::time::{Duration, Instant};
 
 use lotse_api::{ConnectionId, Event, Handler, Outcome};
 use lotse_api_types::API_VERSION;
-use lotse_api_types::command::{Command, StreamPut, WebrtcCandidate, WebrtcOffer};
+use lotse_api_types::command::{
+    Command, StreamPut, WebrtcCandidate, WebrtcOffer, WebrtcRenegotiate,
+};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Hello, HelloTag};
 use lotse_api_types::info::{
     BuildInfo, Codecs, DemuxMetrics, InfoResult, Limits, Metrics, ProcessMetrics, SandboxInfo,
     SupervisorMetrics,
 };
-use lotse_api_types::session::{SessionEvent, SessionList};
+use lotse_api_types::session::{SessionEvent, SessionList, WebrtcRenegotiateResult};
 use lotse_api_types::stream::{AudioMode, BackchannelReleaseResult, StreamList, StreamPutResult};
 use lotse_core::clock::Clock;
 use lotse_core::codec::CodecFamily;
@@ -32,7 +34,7 @@ use lotse_core::registry::Registries;
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_ipc::SessionSpec;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 
@@ -78,6 +80,10 @@ const AUDIO_CODECS: [CodecFamily; 5] = [
 
 /// Extra time the shutdown waits for drivers past the workers' budget.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
+/// How long `webrtc/renegotiate` waits for the worker's answer: a worker
+/// answers a re-offer in milliseconds, so this only bounds a stuck one.
+const RENEGOTIATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What `hello` and `info` say about this build and process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -908,6 +914,103 @@ impl Supervisor {
         Outcome::Result(serde_json::Value::Object(serde_json::Map::new()))
     }
 
+    /// `webrtc/renegotiate`: passed on to the session's worker, whose
+    /// answer or refusal is the result; waited for up to
+    /// [`RENEGOTIATE_TIMEOUT`] on the daemon's clock. Like
+    /// `webrtc/candidate`, only the connection that owns the session may
+    /// send one, and only once the session is answered; the worker
+    /// answers the re-offers of a session one at a time.
+    async fn webrtc_renegotiate(
+        &self,
+        connection: ConnectionId,
+        command: WebrtcRenegotiate,
+    ) -> Outcome {
+        let session_id = command.session_id;
+        let (reply, waiting) = oneshot::channel();
+        {
+            let mut state = self.shared.lock();
+            let Some(session) = state.sessions.get_mut(&session_id) else {
+                return Outcome::Error(session_not_found(&session_id));
+            };
+            if !session.owned_by_connection(connection) {
+                drop(state);
+                tracing::debug!(
+                    session.id = %session_id,
+                    control.connection = connection.0,
+                    "re-offer refused: not the session's owner"
+                );
+                return Outcome::Error(
+                    ApiError::new(
+                        ErrorCode::SessionNotFound,
+                        "the session is not this connection's",
+                    )
+                    .with_detail("session_id", session_id.as_str()),
+                );
+            }
+            if let Err(error) = session.renegotiate(reply) {
+                return Outcome::Error(error.with_detail("session_id", session_id.as_str()));
+            }
+            let connection = session.connection.clone();
+            let queued = state.connections.get(&connection).is_some_and(|entry| {
+                entry
+                    .commands
+                    .try_send(DriverCommand::Renegotiate {
+                        session_id: session_id.clone(),
+                        sdp: command.sdp,
+                    })
+                    .is_ok()
+            });
+            if !queued {
+                if let Some(session) = state.sessions.get_mut(&session_id) {
+                    session.renegotiation_abandoned();
+                }
+                return Outcome::Error(
+                    ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
+                        .with_detail("limit", "connection_queue"),
+                );
+            }
+            drop(state);
+        }
+        tracing::info!(
+            event = "session_renegotiate",
+            session.id = %session_id,
+            "re-offer handed to the worker"
+        );
+        let answer = tokio::select! {
+            answer = waiting => answer,
+            () = self.shared.clock.sleep(RENEGOTIATE_TIMEOUT) => {
+                if let Some(session) = self.shared.lock().sessions.get_mut(&session_id) {
+                    session.renegotiation_abandoned();
+                }
+                tracing::warn!(session.id = %session_id, "re-offer not answered by the worker in time");
+                return Outcome::Error(
+                    ApiError::new(ErrorCode::InternalError, "the worker did not answer the re-offer")
+                        .with_detail("session_id", session_id.as_str()),
+                );
+            }
+        };
+        match answer {
+            Ok(Ok(sdp)) => {
+                tracing::info!(
+                    event = "session_renegotiated",
+                    session.id = %session_id,
+                    "re-offer answered"
+                );
+                Outcome::Result(
+                    serde_json::to_value(WebrtcRenegotiateResult { sdp }).unwrap_or_default(),
+                )
+            }
+            Ok(Err(error)) => {
+                let code = error.code.as_str();
+                tracing::info!(session.id = %session_id, code, detail = ?error.message, "re-offer refused by the worker");
+                Outcome::Error(error.with_detail("session_id", session_id.as_str()))
+            }
+            // The session closed while the re-offer waited: its entry, and
+            // the answer's way back, went with it.
+            Err(_closed) => Outcome::Error(session_not_found(&session_id)),
+        }
+    }
+
     /// `session/get`.
     fn session_get(&self, session_id: &str) -> Outcome {
         let state = self.shared.lock();
@@ -1055,6 +1158,9 @@ impl Supervisor {
                 Err(error) => Outcome::Error(error),
             },
             Command::WebrtcCandidate(candidate) => self.webrtc_candidate(connection, &candidate),
+            Command::WebrtcRenegotiate(renegotiate) => {
+                self.webrtc_renegotiate(connection, renegotiate).await
+            }
             Command::SessionGet(get) => self.session_get(&get.session_id),
             Command::SessionList(_) => self.session_list(),
             Command::SessionClose(close) => self.session_close(&close.session_id),
@@ -1424,6 +1530,14 @@ mod tests {
         tokio::select! {
             event = rx.recv() => event.expect("an event").payload,
             () = SystemClock.sleep(Duration::from_secs(10)) => panic!("no event in 10 s"),
+        }
+    }
+    /// `future`'s output, or a failed test after five seconds of real
+    /// time: a command whose answer never comes fails instead of hanging.
+    async fn within<T>(future: impl Future<Output = T>) -> T {
+        tokio::select! {
+            output = future => output,
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("nothing within 5 s"),
         }
     }
 
@@ -2577,6 +2691,180 @@ mod tests {
         let front = result(call(&s, r#"{"id":103,"type":"stream/get","stream_id":"front"}"#).await);
         assert_eq!(front["sessions"], json!([]));
         s.shutdown().await;
+    }
+
+    fn renegotiate(id: u64, session_id: &str) -> Value {
+        json!({ "id": id, "type": "webrtc/renegotiate", "session_id": session_id, "sdp": "v=0\r\n" })
+    }
+
+    /// Yields until the session `session_id` of `s` has a re-offer
+    /// waiting for its worker, which the worker then answers.
+    async fn until_waiting(s: &Supervisor, session_id: &str) {
+        let mut yields = 0;
+        while !s.shared.lock().sessions[session_id].renegotiating() {
+            assert!(yields < 10_000, "no re-offer waiting");
+            yields += 1;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// `webrtc/renegotiate` is for the session's owner, after the answer:
+    /// the worker's answer is its result, a refusal its error, and a
+    /// session that closes meanwhile, or a worker that never answers, end
+    /// the wait too.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "every end of a re-offer")]
+    async fn a_re_offer_is_answered_by_the_worker_or_refused() {
+        let dir = private_dir("renegotiate");
+        let clock = Arc::new(FakeClock::default());
+        let s = Arc::new(with_webrtc(&blocking_worker(&dir), clock.clone()));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        next(&mut events).await;
+        let err = error(call_on(&s, 1, &renegotiate(3, "ghost")).await);
+        assert_eq!(err.code, ErrorCode::SessionNotFound);
+        let err = error(call_on(&s, 2, &renegotiate(3, "s1")).await);
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (
+                ErrorCode::SessionNotFound,
+                "the session is not this connection's"
+            )
+        );
+        let err = error(within(call_on(&s, 1, &renegotiate(4, "s1"))).await);
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (ErrorCode::InvalidRequest, "the session has no answer yet")
+        );
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0\r\n".into(),
+                talkback: None,
+            },
+        );
+        next(&mut events).await;
+
+        // The worker answers: the answer is the result, and `session/get`
+        // reports the talk-back it negotiated.
+        let waiting = {
+            let s = Arc::clone(&s);
+            spawn_named("test.renegotiate", async move {
+                call_on(&s, 1, &renegotiate(5, "s1")).await
+            })
+        };
+        until_waiting(&s, "s1").await;
+        let err = error(within(call_on(&s, 1, &renegotiate(6, "s1"))).await);
+        assert_eq!(err.code, ErrorCode::InvalidRequest, "one at a time");
+        report(
+            &s,
+            "s1",
+            Report::Renegotiated {
+                sdp: "v=0\r\na=mid:0\r\n".into(),
+                talkback: Some("pcmu".into()),
+            },
+        );
+        assert_eq!(
+            result(within(waiting).await.unwrap()),
+            json!({ "sdp": "v=0\r\na=mid:0\r\n" })
+        );
+        let got = result(call(&s, r#"{"id":7,"type":"session/get","session_id":"s1"}"#).await);
+        assert_eq!(got["backchannel"]["codec"], "pcmu");
+        // The decline that follows reaches the subscription as a warning.
+        report(
+            &s,
+            "s1",
+            Report::TalkbackDeclined {
+                reason: "busy".into(),
+                status: None,
+                message: "s2 holds it".into(),
+            },
+        );
+        assert_eq!(
+            next(&mut events).await,
+            json!({ "type": "warning", "code": "backchannel_declined", "message": "s2 holds it",
+                    "reason": "busy" })
+        );
+
+        // The worker refuses: the error is the result.
+        let waiting = {
+            let s = Arc::clone(&s);
+            spawn_named("test.renegotiate", async move {
+                call_on(&s, 1, &renegotiate(8, "s1")).await
+            })
+        };
+        until_waiting(&s, "s1").await;
+        report(
+            &s,
+            "s1",
+            Report::RenegotiateRefused {
+                code: "no_video_track".into(),
+                message: "no video".into(),
+            },
+        );
+        let err = error(within(waiting).await.unwrap());
+        assert_eq!(
+            (err.code, err.message.as_str(), &err.details["session_id"]),
+            (ErrorCode::NoVideoTrack, "no video", &json!("s1"))
+        );
+
+        // The worker never answers: the daemon's clock bounds the wait.
+        let waiting = {
+            let s = Arc::clone(&s);
+            spawn_named("test.renegotiate", async move {
+                call_on(&s, 1, &renegotiate(9, "s1")).await
+            })
+        };
+        until_waiting(&s, "s1").await;
+        clock.advance(RENEGOTIATE_TIMEOUT);
+        let err = error(within(waiting).await.unwrap());
+        assert_eq!(err.code, ErrorCode::InternalError);
+        assert!(!s.shared.lock().sessions["s1"].renegotiating());
+
+        // The session closes while the re-offer waits.
+        let waiting = {
+            let s = Arc::clone(&s);
+            spawn_named("test.renegotiate", async move {
+                call_on(&s, 1, &renegotiate(10, "s1")).await
+            })
+        };
+        until_waiting(&s, "s1").await;
+        result(
+            call_on(
+                &s,
+                1,
+                &json!({ "id": 11, "type": "session/close", "session_id": "s1" }),
+            )
+            .await,
+        );
+        let err = error(within(waiting).await.unwrap());
+        assert_eq!(err.code, ErrorCode::SessionNotFound);
+
+        // A full driver queue refuses the re-offer, and holds no slot.
+        let _s2 = subscription(call_on(&s, 1, &offer(12, "front", Some("s2"))).await);
+        report(
+            &s,
+            "s2",
+            Report::Answer {
+                sdp: "v=0\r\n".into(),
+                talkback: None,
+            },
+        );
+        let (full, _rx) = mpsc::channel(1);
+        full.try_send(DriverCommand::Candidate {
+            session_id: "x".into(),
+            candidate: String::new(),
+        })
+        .unwrap();
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = full;
+        let err = error(within(call_on(&s, 1, &renegotiate(13, "s2"))).await);
+        assert_eq!(
+            (err.code, &err.details["limit"]),
+            (ErrorCode::LimitReached, &json!("connection_queue"))
+        );
+        assert!(!s.shared.lock().sessions["s2"].renegotiating());
+        Arc::try_unwrap(s).unwrap().shutdown().await;
     }
 
     /// A session timer's task that leaves the maps as they are.

@@ -56,7 +56,7 @@
       "oneOf": [
         {
           "const": "available",
-          "description": "Nobody talks: the next session to send claims it.",
+          "description": "Nobody talks: the next offer that asks for talk-back claims it.",
           "type": "string"
         },
         {
@@ -590,6 +590,40 @@
         },
         {
           "additionalProperties": false,
+          "description": "`webrtc/renegotiate`: a re-offer for an answered session, taken\nonly from the connection that owns it; the result carries the\nanswer.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sdp": {
+              "description": "The browser's SDP re-offer.",
+              "maxLength": 65536,
+              "type": "string"
+            },
+            "session_id": {
+              "description": "The session.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "webrtc/renegotiate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "session_id",
+            "sdp"
+          ],
+          "title": "WebrtcRenegotiateCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "`session/get`: one session's state.",
           "properties": {
             "id": {
@@ -778,6 +812,26 @@
       ],
       "type": "object"
     },
+    "DeclineReason": {
+      "description": "Why an offer's talk-back was declined: the `reason` of a\n`backchannel_declined` warning.",
+      "oneOf": [
+        {
+          "const": "unsupported",
+          "description": "The stream has no backchannel the session can feed: its source\nprotocol cannot carry audio back, the camera offers none, or it\ntakes a codec talk-back cannot produce from what the offer lists.\nThe message says which.",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "Another session holds the backchannel; `backchannel/release`, its\nre-offer dropping talk-back, or its close frees it.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "The camera refused the backchannel for this session; `status`\ncarries its status code when it gave one.",
+          "type": "string"
+        }
+      ]
+    },
     "DemuxMetrics": {
       "description": "The supervisor's demux counters: what the receive thread did with each\ndatagram on the shared UDP socket.",
       "properties": {
@@ -890,7 +944,7 @@
         },
         {
           "const": "session_not_found",
-          "description": "No such session, or its grace expired; for `webrtc/candidate`, also\na session this connection does not own.",
+          "description": "No such session, or its grace expired; for `webrtc/candidate` and\n`webrtc/renegotiate`, also a session this connection does not own.",
           "type": "string"
         },
         {
@@ -984,11 +1038,6 @@
           "type": "string"
         },
         {
-          "const": "backchannel_busy",
-          "description": "Another session holds the backchannel.",
-          "type": "string"
-        },
-        {
           "const": "backchannel_unsupported",
           "description": "`backchannel/release` on a stream whose source protocol cannot\ncarry audio back.",
           "type": "string"
@@ -1025,12 +1074,12 @@
         },
         {
           "const": "invalid_sdp",
-          "description": "The offer could not be parsed.",
+          "description": "The offer could not be parsed, or a re-offer changes the video\nm-line a session keeps.",
           "type": "string"
         },
         {
           "const": "no_video_track",
-          "description": "The stream has no video track.",
+          "description": "The stream has no video track, or the offer no video m-line.",
           "type": "string"
         },
         {
@@ -1659,7 +1708,7 @@
         },
         "packets_dropped_busy": {
           "default": 0,
-          "description": "Of those, the ones dropped because another session held the\nbackchannel.",
+          "description": "Of those, the ones dropped because the session did not hold the\nbackchannel: its offer was declined, or it was released since.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1673,7 +1722,7 @@
         },
         "talker": {
           "default": false,
-          "description": "The session holds the camera's backchannel now: it sent first and\nkeeps it until it closes or `backchannel/release`.",
+          "description": "The session holds the camera's backchannel now: its offer claimed\nit, and it keeps it until it closes, re-offers without talk-back\nor `backchannel/release`.",
           "type": "boolean"
         }
       },
@@ -1780,7 +1829,7 @@
           "type": "object"
         },
         {
-          "description": "Non-fatal (`audio_codec_unsupported`, `turn_unsupported`,\n`h264_profile_mismatch`, ...).",
+          "description": "Non-fatal (`audio_codec_unsupported`, `turn_unsupported`,\n`h264_profile_mismatch`, `backchannel_declined`, ...). Each code\ncomes at most once per session, but `backchannel_declined`, which\ncomes once per offer (`webrtc/offer` or `webrtc/renegotiate`) that\nasked for talk-back the session did not get: the talk-back m-line\nwas answered `inactive` (or `sendonly` when it carries the\nstream's audio too, RFC 3264 §6.1), and `reason` says why.",
           "properties": {
             "code": {
               "description": "The stable code.",
@@ -1789,6 +1838,27 @@
             "message": {
               "description": "For humans.",
               "type": "string"
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeclineReason"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Why, for `backchannel_declined`; absent for every other code."
+            },
+            "status": {
+              "description": "The camera's status code for `refused`, when it gave one\n(an RTSP status, 453 Not Enough Bandwidth or 503 Service\nUnavailable when a camera's one backchannel is taken by\nanother client); absent otherwise.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "type": {
               "const": "warning",
@@ -2039,7 +2109,7 @@
       "properties": {
         "since": {
           "default": null,
-          "description": "When `talker` last changed, RFC 3339; null while nobody has talked\nsince the connection's worker started.",
+          "description": "When `talker` last changed, RFC 3339; null while no offer has\nclaimed it since the connection's worker started.",
           "type": [
             "string",
             "null"
@@ -2667,6 +2737,36 @@
       ],
       "type": "object"
     },
+    "Success_for_WebrtcRenegotiateResult": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/WebrtcRenegotiateResult",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
     "SupervisorMetrics": {
       "description": "The supervisor process.",
       "properties": {
@@ -2732,7 +2832,7 @@
       "oneOf": [
         {
           "const": "claimed",
-          "description": "A session sent the first talk-back packet while nobody held the\nbackchannel, and holds it now.",
+          "description": "A session's offer (`webrtc/offer` or `webrtc/renegotiate`) asked\nfor talk-back while nobody held the backchannel; it holds it now.",
           "type": "string"
         },
         {
@@ -2742,7 +2842,12 @@
         },
         {
           "const": "released",
-          "description": "`backchannel/release` freed it; the next session to send claims it.",
+          "description": "`backchannel/release` freed it; the next offer that asks for\ntalk-back claims it.",
+          "type": "string"
+        },
+        {
+          "const": "renegotiated",
+          "description": "The talker's re-offer (`webrtc/renegotiate`) dropped talk-back;\nthe backchannel is free.",
           "type": "string"
         }
       ]
@@ -2802,6 +2907,19 @@
         "sync",
         "frames",
         "bytes"
+      ],
+      "type": "object"
+    },
+    "WebrtcRenegotiateResult": {
+      "description": "`webrtc/renegotiate`'s result.",
+      "properties": {
+        "sdp": {
+          "description": "The SDP answer to the re-offer.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sdp"
       ],
       "type": "object"
     },
@@ -2930,7 +3048,7 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "api": "0.1.1",
+  "api": "0.2.0",
   "command": {
     "$ref": "#/$defs/Command"
   },
@@ -3011,6 +3129,9 @@
     },
     "webrtc/offer": {
       "$ref": "#/$defs/Success_for_Empty"
+    },
+    "webrtc/renegotiate": {
+      "$ref": "#/$defs/Success_for_WebrtcRenegotiateResult"
     }
   },
   "shutdown": {

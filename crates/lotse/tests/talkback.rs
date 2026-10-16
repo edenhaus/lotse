@@ -72,7 +72,7 @@ use lotse_testing::fake_camera::{
 };
 #[cfg(feature = "source-rtsp")]
 use lotse_testing::viewer::capture_seconds;
-use lotse_testing::viewer::{Outgoing, TalkbackOffer, Viewer, with_audio_codecs};
+use lotse_testing::viewer::{Outgoing, Reoffer, TalkbackOffer, Viewer, with_audio_codecs};
 #[cfg(feature = "source-rtsp")]
 use lotse_testing::{CameraConfig, FakeCamera};
 use serde_json::{Value, json};
@@ -279,6 +279,24 @@ impl Peer {
             || viewer.offer().to_owned(),
             |codecs| with_audio_codecs(viewer.offer(), codecs),
         );
+        Self {
+            viewer,
+            socket,
+            offer,
+            pt: None,
+            mic: None,
+            out: Vec::new(),
+        }
+    }
+
+    /// A viewer receiving audio and video without offering talk-back,
+    /// which a re-offer may add later.
+    async fn new_silent() -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("viewer socket");
+        lotse_webrtc::install_crypto_provider();
+        let viewer =
+            Viewer::new_with_audio(socket.local_addr().unwrap(), clock().now()).expect("a viewer");
+        let offer = viewer.offer().to_owned();
         Self {
             viewer,
             socket,
@@ -576,6 +594,21 @@ impl InProcess {
             .unwrap();
     }
 
+    /// A re-offer for session `id`, whose answer [`Self::pump`] applies
+    /// to its peer.
+    async fn renegotiate(&mut self, id: &str, sdp: &str) {
+        self.tx
+            .send_msg(
+                &ToWorker::Renegotiate {
+                    session_id: id.into(),
+                    sdp: sdp.into(),
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+
     /// Polls the worker and `peers` (session `i` is `peers[i]`'s, named by
     /// its index) until `done`; twenty seconds without fail the test.
     async fn pump(&mut self, peers: &mut [&mut Peer], done: impl Fn(&Self, &[&mut Peer]) -> bool) {
@@ -618,6 +651,7 @@ impl InProcess {
                             SessionEvent::Candidate { candidate, .. } => {
                                 peer.on_candidate(candidate);
                             }
+                            SessionEvent::Renegotiated { sdp, .. } => peer.on_answer(sdp),
                             _ => {}
                         }
                         self.events.push((session_id, event));
@@ -1086,6 +1120,78 @@ async fn onvif_5_3_a_pcmu_tone_through_the_rtsp_source_reaches_the_camera_within
     camera.stop().await;
 }
 
+/// A viewer playing the camera re-offers talk-back (`webrtc/renegotiate`
+/// through the worker): the re-offer claims the backchannel, its answer
+/// takes the dedicated m-line in the camera's PCMU, and the browser's
+/// packets reach the camera through the RTSP source as frames in its
+/// payload type (ONVIF Streaming Specification §5.3), as they do for an
+/// offer that asked from the start; a re-offer that drops talk-back lets
+/// go, and nothing more reaches the camera.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_a_re_offer_adds_talk_back_whose_tone_reaches_the_camera() {
+    let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
+    let mut worker = InProcess::rtsp(&camera).await;
+    let mut peer = Peer::new_silent().await;
+    worker.open("0", &peer.offer).await;
+    worker
+        .pump(&mut [&mut peer], |_, peers| peers[0].viewer.is_connected())
+        .await;
+    assert_eq!(peer.viewer.talkback_direction(), None);
+    assert!(worker.talkers.is_empty());
+    let reoffer = peer
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    worker.renegotiate("0", &reoffer).await;
+    let renegotiated = |events: &[(String, SessionEvent)]| {
+        events.iter().any(|(_, event)| {
+            matches!(event, SessionEvent::Renegotiated { talkback: Some(codec), .. } if codec == "pcmu")
+        })
+    };
+    worker
+        .pump(&mut [&mut peer], |w, _| renegotiated(&w.events))
+        .await;
+    assert_eq!(peer.pt, Some(0), "the camera's PCMU");
+    assert_eq!(
+        peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::SendOnly)
+    );
+    peer.talk(Mic::pcmu());
+    worker
+        .pump(&mut [&mut peer], |_, peers| peers[0].sent() >= 25)
+        .await;
+    let mic = peer.mute();
+    let frames = camera_frames(&mut worker, &mut peer, &camera, 25).await;
+    check_frames(&frames[..25], 0, FRAME, &mic);
+    // Dropped: let go, and what the browser sends after it goes nowhere.
+    let reoffer = peer.viewer.reoffer(Reoffer::Drop).expect("a re-offer");
+    let answered = worker.events.len();
+    worker.renegotiate("0", &reoffer).await;
+    worker
+        .pump(&mut [&mut peer], |w, _| {
+            w.events[answered..].iter().any(|(_, event)| {
+                matches!(event, SessionEvent::Renegotiated { talkback: None, .. })
+            })
+        })
+        .await;
+    let taken = Stats::get(&camera.stats().backchannel_packets);
+    peer.talk(mic);
+    let quiet = clock().now() + Duration::from_millis(500);
+    worker
+        .pump(&mut [&mut peer], |_, _| clock().now() >= quiet)
+        .await;
+    assert_eq!(Stats::get(&camera.stats().backchannel_packets), taken);
+    let changes: Vec<(&str, &str)> = worker
+        .talkers
+        .iter()
+        .map(|change| (change.session_id.as_str(), change.reason.as_str()))
+        .collect();
+    assert_eq!(changes, [("0", "claimed"), ("0", "renegotiated")]);
+    worker.stop().await;
+    camera.stop().await;
+}
+
 /// RFC 8866 §6.4: a camera whose backchannel asks for `a=ptime:40` takes
 /// 40 ms frames of 320 samples, each as the browser's second 20 ms packet
 /// for it arrives, the tone in them.
@@ -1117,8 +1223,8 @@ async fn rfc8866_6_4_a_cameras_ptime_of_40_ms_frames_the_tone_in_40_ms_packets()
 
 /// A reconnect under a talker: the camera drops the connection, the
 /// source withdraws the handle and offers it again after the new `SETUP`,
-/// and the talker keeps the channel (one claim, never released, no
-/// `backchannel_busy`); the camera takes a fresh RTP stream (RFC 3550
+/// and the talker keeps the channel (one claim, never released, nothing
+/// declined); the camera takes a fresh RTP stream (RFC 3550
 /// §5.1, §8.1: another SSRC), whose first packet starts a talkspurt
 /// (RFC 3551 §4.1).
 #[cfg(feature = "source-rtsp")]
@@ -1169,10 +1275,10 @@ async fn rfc3550_8_1_a_reconnect_offers_the_backchannel_again_and_the_talker_kee
         "the claim outlives the reconnect"
     );
     assert!(
-        !worker.events.iter().any(|(_, event)| matches!(
-            event,
-            SessionEvent::Warning { code, .. } if code == "backchannel_busy"
-        )),
+        !worker
+            .events
+            .iter()
+            .any(|(_, event)| matches!(event, SessionEvent::TalkbackDeclined { .. })),
         "{:?}",
         worker.events
     );
@@ -1434,6 +1540,37 @@ impl ApiPeer {
         }
     }
 
+    /// A viewer that offers no talk-back, through `webrtc/offer`.
+    async fn offer_silent(api: &Api, id: &'static str) -> Self {
+        let peer = Peer::new_silent().await;
+        let events = subscription(
+            call(
+                &api.supervisor,
+                &json!({ "id": 4, "type": "webrtc/offer", "stream_id": "door",
+                         "session_id": id, "sdp": peer.offer }),
+            )
+            .await,
+        );
+        Self {
+            id,
+            peer,
+            events,
+            seen: Vec::new(),
+        }
+    }
+
+    /// A re-offer of `what` through `webrtc/renegotiate`, its answer
+    /// applied: the command's result.
+    async fn renegotiate(&mut self, api: &Api, what: Reoffer) -> Value {
+        let sdp = self.peer.viewer.reoffer(what).expect("a re-offer");
+        let result = api
+            .call(&json!({ "id": 20, "type": "webrtc/renegotiate", "session_id": self.id, "sdp": sdp }))
+            .await;
+        self.peer
+            .on_answer(result["sdp"].as_str().expect("the answer"));
+        result
+    }
+
     /// Its `warning` events with `code`.
     fn warnings(&self, code: &str) -> usize {
         self.seen
@@ -1529,15 +1666,18 @@ async fn source_where(api: &mut Api, peers: &mut [&mut ApiPeer], want: &Value) -
     }
 }
 
-/// Talker arbitration through the control API: two viewers negotiate
-/// talk-back; neither holds the backchannel until it sends; the first
-/// sender claims it, the second gets exactly one `backchannel_busy` and its
-/// packets are dropped; the holder going silent keeps it; closing the
-/// holder's session frees it, and so does `backchannel/release`, unless
-/// it names a session that no longer holds it. Each
-/// change is a `talker_changed`, and `session/get` and `stream/get` say
-/// who holds it; `stream/get`'s source says the camera's codec and whether
-/// the backchannel is in use.
+/// Talker arbitration through the control API: two viewers offer
+/// talk-back; the first offer claims the backchannel and is answered
+/// `recvonly`, the second is declined `busy`, answered `inactive` with
+/// one `backchannel_declined`; the holder going silent keeps it; closing
+/// the holder's session frees it for the next re-offer
+/// (`webrtc/renegotiate`), and so does `backchannel/release`, unless it
+/// names a session that no longer holds it; a re-offer that drops
+/// talk-back lets go. Each change is a `talker_changed`, and
+/// `session/get` and `stream/get` say who holds it; `stream/get`'s source
+/// says the camera's codec and whether the backchannel is in use. A
+/// re-offer is taken from the session's owner only, for an answered
+/// session only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api() {
     let mut api = Api::start(&json!({ "backchannel": "pcmu" })).await;
@@ -1547,41 +1687,31 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         peers.iter().all(|p| p.peer.viewer.is_connected())
     })
     .await;
-    // Both answered recvonly in the camera's PCMU; nobody talks yet.
-    for peer in [&a, &b] {
-        assert_eq!(
-            peer.peer.viewer.talkback_direction(),
-            Some(lotse_testing::viewer::Direction::SendOnly)
-        );
-        assert_eq!(peer.peer.pt, Some(0));
-        let backchannel = api.session(peer.id).await["backchannel"].clone();
-        assert_eq!(
-            backchannel,
-            json!({ "negotiated": true, "talker": false, "codec": "pcmu", "packets_received": 0,
-                    "packets_dropped_busy": 0, "bytes_sent": 0 }),
-            "{}",
-            peer.id
-        );
-    }
+    // a's offer claimed it: answered recvonly in the camera's PCMU; b's
+    // was declined: answered inactive, and told why.
     assert_eq!(
-        api.stream().await["backchannel"],
-        json!({ "talker": null, "since": null })
+        a.peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::SendOnly)
     );
-    source_where(
-        &mut api,
-        &mut [&mut a, &mut b],
-        &json!({ "codec": "pcmu", "state": "available" }),
-    )
-    .await;
-    pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(300)).await;
-    assert!(api.talker_changes().is_empty(), "{:?}", api.stream_seen);
-
-    // a sends first and claims it.
-    a.peer.talk(Mic::pcmu());
-    pump(&mut api, &mut [&mut a, &mut b], |api, _| {
-        !api.talker_changes().is_empty()
+    assert_eq!(a.peer.pt, Some(0));
+    assert_eq!(
+        b.peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::Inactive)
+    );
+    pump(&mut api, &mut [&mut a, &mut b], |api, peers| {
+        peers[1].warnings("backchannel_declined") > 0 && !api.talker_changes().is_empty()
     })
     .await;
+    let declined = b
+        .seen
+        .iter()
+        .find(|event| event["code"] == "backchannel_declined")
+        .unwrap();
+    assert_eq!(declined["reason"], "busy");
+    assert_eq!(
+        declined["message"],
+        "talk-back declined: session a holds the camera's backchannel"
+    );
     assert_eq!(
         api.talker_changes(),
         [("a".to_owned(), "claimed".to_owned(), json!("a"))]
@@ -1596,6 +1726,16 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         api.stream().await["backchannel"],
         json!({ "talker": "a", "since": claim["since"] })
     );
+    assert_eq!(
+        api.session("a").await["backchannel"],
+        json!({ "negotiated": true, "talker": true, "codec": "pcmu", "packets_received": 0,
+                "packets_dropped_busy": 0, "bytes_sent": 0 })
+    );
+    assert_eq!(
+        api.session("b").await["backchannel"],
+        json!({ "negotiated": false, "talker": false, "codec": null, "packets_received": 0,
+                "packets_dropped_busy": 0, "bytes_sent": 0 })
+    );
     let stream = source_where(
         &mut api,
         &mut [&mut a, &mut b],
@@ -1604,51 +1744,47 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
     .await;
     assert_eq!(stream["sources"][0]["state"], "live");
 
-    // b sends while a holds it: one warning, every packet dropped. The
-    // counters are read once b paused and its packets are through: the
-    // worker pushes them once a second, and two counters read while
-    // packets arrive may be a packet apart.
-    b.peer.talk(Mic::pcmu());
-    pump(&mut api, &mut [&mut a, &mut b], |_, peers| {
-        peers[1].warnings("backchannel_busy") > 0
+    // a talks, then goes silent: it still holds the backchannel, and a
+    // re-offer of b's that asks again is declined again, once more.
+    a.peer.talk(Mic::pcmu());
+    let holder = session_where(&mut api, &mut [&mut a, &mut b], "a", |bc| {
+        bc["bytes_sent"].as_u64().unwrap() > 0
     })
     .await;
-    pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(500)).await;
-    let mut b_mic = b.peer.mute();
-    let b_sent = u64::from(b_mic.index);
-    let refused = |bc: &Value| {
-        bc["packets_received"].as_u64() == Some(b_sent)
-            && bc["packets_dropped_busy"] == bc["packets_received"]
-    };
-    let busy = session_where(&mut api, &mut [&mut a, &mut b], "b", refused).await;
-    assert_eq!(busy["talker"], false);
-    assert_eq!(busy["bytes_sent"], 0, "none of b's reached the camera");
-    let holder = api.session("a").await["backchannel"].clone();
     assert_eq!(holder["talker"], true);
     assert_eq!(holder["packets_dropped_busy"], 0);
-    assert!(holder["bytes_sent"].as_u64().unwrap() > 0, "{holder}");
-
-    // a goes silent: it still holds the backchannel, b is still refused,
-    // and b hears about it only the once.
     a.peer.mute();
-    b.peer.talk(b_mic);
-    pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_secs(1)).await;
+    pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(300)).await;
     assert_eq!(api.talker_changes().len(), 1, "{:?}", api.stream_seen);
+    let answer = b
+        .renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .await;
+    assert!(answer["sdp"].as_str().unwrap().starts_with("v=0"));
+    assert_eq!(
+        b.peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::Inactive)
+    );
+    pump(&mut api, &mut [&mut a, &mut b], |_, peers| {
+        peers[1].warnings("backchannel_declined") == 2
+    })
+    .await;
     assert_eq!(api.stream().await["backchannel"]["talker"], "a");
-    b_mic = b.peer.mute();
-    let b_sent = u64::from(b_mic.index);
-    let refused = |bc: &Value| {
-        bc["packets_received"].as_u64() == Some(b_sent)
-            && bc["packets_dropped_busy"] == bc["packets_received"]
-    };
-    let busy = session_where(&mut api, &mut [&mut a, &mut b], "b", refused).await;
-    assert_eq!(busy["bytes_sent"], 0);
-    assert_eq!(b.warnings("backchannel_busy"), 1, "{:?}", b.seen);
-    b.peer.talk(b_mic);
 
-    // Closing a's session frees it; b's next packet claims it.
+    // Closing a's session frees it; b's next re-offer claims it, and
+    // b's packets reach the camera.
     api.call(&json!({ "id": 6, "type": "session/close", "session_id": "a" }))
         .await;
+    pump(&mut api, &mut [&mut a, &mut b], |api, _| {
+        api.talker_changes().len() >= 2
+    })
+    .await;
+    b.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .await;
+    assert_eq!(
+        b.peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::SendOnly)
+    );
+    assert_eq!(b.peer.pt, Some(0));
     pump(&mut api, &mut [&mut a, &mut b], |api, _| {
         api.talker_changes().len() >= 3
     })
@@ -1661,16 +1797,20 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
             ("b".to_owned(), "claimed".to_owned(), json!("b")),
         ]
     );
+    b.peer.talk(Mic::pcmu());
     let talking = session_where(&mut api, &mut [&mut a, &mut b], "b", |bc| {
         bc["bytes_sent"].as_u64().unwrap() > 0
     })
     .await;
-    assert_eq!(talking["talker"], true);
+    assert_eq!(
+        (&talking["negotiated"], &talking["talker"]),
+        (&json!(true), &json!(true))
+    );
 
-    // b goes silent and the client releases the backchannel: free, and it stays
-    // free until someone sends. The release waits until b's last packets
-    // are through, or one still on its way would claim it back.
-    let b_mic = b.peer.mute();
+    // The client releases the backchannel: free, and it stays free until
+    // an offer asks; what b still sends meanwhile is dropped and counted.
+    // The release waits until b's last packets are through.
+    let mut b_mic = b.peer.mute();
     pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(300)).await;
     let released = api
         .call(&json!({ "id": 7, "type": "backchannel/release", "stream_id": "door" }))
@@ -1684,11 +1824,25 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         api.talker_changes()[3],
         ("b".to_owned(), "released".to_owned(), Value::Null)
     );
-    pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(300)).await;
-    assert_eq!(api.stream().await["backchannel"]["talker"], Value::Null);
-    assert_eq!(api.session("b").await["backchannel"]["talker"], false);
-    // The released talker may claim it again by sending.
+    let sent_before = u64::from(b_mic.index);
     b.peer.talk(b_mic);
+    pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(500)).await;
+    b_mic = b.peer.mute();
+    let dropped = u64::from(b_mic.index) - sent_before;
+    assert!(dropped > 0);
+    let refused = |bc: &Value| {
+        bc["packets_received"].as_u64() == Some(u64::from(b_mic.index))
+            && bc["packets_dropped_busy"].as_u64() == Some(dropped)
+    };
+    let idle = session_where(&mut api, &mut [&mut a, &mut b], "b", refused).await;
+    assert_eq!(idle["talker"], false);
+    assert_eq!(api.stream().await["backchannel"]["talker"], Value::Null);
+    assert_eq!(api.talker_changes().len(), 4, "{:?}", api.stream_seen);
+    // The released session's next re-offer claims again, and its packets
+    // flow again.
+    let bytes_before = idle["bytes_sent"].as_u64().unwrap();
+    b.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .await;
     pump(&mut api, &mut [&mut a, &mut b], |api, _| {
         api.talker_changes().len() >= 5
     })
@@ -1697,6 +1851,11 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         api.talker_changes()[4],
         ("b".to_owned(), "claimed".to_owned(), json!("b"))
     );
+    b.peer.talk(b_mic);
+    session_where(&mut api, &mut [&mut a, &mut b], "b", |bc| {
+        bc["bytes_sent"].as_u64().unwrap() > bytes_before
+    })
+    .await;
     // A release for a session that no longer holds it, as a viewer that
     // stops talking sends, frees nothing of b's.
     let stale = api
@@ -1706,9 +1865,70 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
     pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(300)).await;
     assert_eq!(api.talker_changes().len(), 5, "{:?}", api.stream_seen);
     assert_eq!(api.stream().await["backchannel"]["talker"], "b");
-    // Exactly one busy warning in all of it, to the second sender.
-    assert_eq!(a.warnings("backchannel_busy"), 0);
-    assert_eq!(b.warnings("backchannel_busy"), 1, "{:?}", b.seen);
+    // b's re-offer drops talk-back: let go, and a viewer that never
+    // offered talk-back takes it with its re-offer.
+    b.peer.mute();
+    b.renegotiate(&api, Reoffer::Drop).await;
+    pump(&mut api, &mut [&mut a, &mut b], |api, _| {
+        api.talker_changes().len() >= 6
+    })
+    .await;
+    assert_eq!(
+        api.talker_changes()[5],
+        ("b".to_owned(), "renegotiated".to_owned(), Value::Null)
+    );
+    assert_eq!(api.session("b").await["backchannel"]["negotiated"], false);
+    let mut c = ApiPeer::offer_silent(&api, "c").await;
+    pump(&mut api, &mut [&mut a, &mut b, &mut c], |_, peers| {
+        peers[2].peer.viewer.is_connected()
+    })
+    .await;
+    assert_eq!(c.peer.viewer.talkback_direction(), None);
+    c.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .await;
+    assert_eq!(
+        c.peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::SendOnly)
+    );
+    pump(&mut api, &mut [&mut a, &mut b, &mut c], |api, _| {
+        api.talker_changes().len() >= 7
+    })
+    .await;
+    assert_eq!(
+        api.talker_changes()[6],
+        ("c".to_owned(), "claimed".to_owned(), json!("c"))
+    );
+    c.peer.talk(Mic::pcmu());
+    session_where(&mut api, &mut [&mut a, &mut b, &mut c], "c", |bc| {
+        bc["bytes_sent"].as_u64().unwrap() > 0
+    })
+    .await;
+    // A re-offer is the owner's, for an answered session: another
+    // connection's, or one for no session, is `session_not_found`.
+    let sdp = c.peer.viewer.offer().to_owned();
+    for (connection, session) in [(2, "c"), (1, "ghost")] {
+        let command = parse_command(
+            &json!({ "id": 30, "type": "webrtc/renegotiate", "session_id": session, "sdp": sdp })
+                .to_string(),
+        )
+        .unwrap();
+        let outcome = api
+            .supervisor
+            .handle(ConnectionId(connection), command)
+            .await;
+        let Outcome::Error(err) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(
+            err.code.as_str(),
+            "session_not_found",
+            "{connection} {session}"
+        );
+    }
+    // Exactly two declines in all of it, both to b, one per offer.
+    assert_eq!(a.warnings("backchannel_declined"), 0);
+    assert_eq!(b.warnings("backchannel_declined"), 2, "{:?}", b.seen);
+    assert_eq!(c.warnings("backchannel_declined"), 0);
     api.stop().await;
 }
 

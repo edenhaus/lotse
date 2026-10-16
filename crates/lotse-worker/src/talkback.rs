@@ -7,24 +7,31 @@
 //! so it arbitrates: one [`Arbiter`] per connection whose source protocol
 //! can carry audio back, and one [`Talkback`] per session on it.
 //!
-//! - **Claim.** The first uplink packet a session sends while nobody holds
-//!   the channel makes it the talker ([`ChangeReason::Claimed`]).
-//! - **Busy.** A packet from another session while one holds it is
-//!   dropped and counted, and its session gets one `backchannel_busy`
-//!   warning per spell of being refused.
+//! - **Claim.** An offer that asks for talk-back the backchannel takes
+//!   (`webrtc/offer` or `webrtc/renegotiate`, judged by the output's
+//!   `talkback_request`) claims the channel for its session while nobody
+//!   holds it ([`Talkback::claim`], [`ChangeReason::Claimed`]), before the
+//!   engine answers, so the answer carries the outcome; first offer wins.
+//! - **Declined.** An offer while another session holds it is answered
+//!   without talk-back, and the session is told once per offer
+//!   (`backchannel_declined`, `busy`). A packet from a session that does
+//!   not hold the channel, declined or released, is dropped and counted.
 //! - **Hold.** The talker keeps the channel, silent or muted, until its
 //!   session closes ([`ChangeReason::SessionClosed`]; a deleted stream
-//!   closes its sessions) or the client releases it ([`Arbiter::release`],
-//!   [`ChangeReason::Released`]): from whoever holds it, or only from the
-//!   session the release names, decided against the claims under one
-//!   lock. There is no timeout.
+//!   closes its sessions), its re-offer drops talk-back
+//!   ([`Talkback::let_go`], [`ChangeReason::Renegotiated`]) or the client
+//!   releases it ([`Arbiter::release`], [`ChangeReason::Released`]): from
+//!   whoever holds it, or only from the session the release names,
+//!   decided against the claims under one lock. There is no timeout.
+//!   Free, the channel goes to the next offer that asks, from any
+//!   session, the one that let go included.
 //! - **Reconnect.** The talker keeps the slot while the source withdraws
 //!   its backchannel and offers it again; packets that arrive meanwhile
 //!   are dropped, not buffered, and the route to the device is rebuilt on
 //!   the new handle.
 //!
-//! The talker's route to the device starts on its uplink track before the
-//! packet that claimed it is published, so nothing is missed: the reverse
+//! The talker's route to the device starts on its uplink track before its
+//! first packet is published, so nothing is missed: the reverse
 //! chain (the binary's [`UplinkFactory`] transcoder, framed as the
 //! [`BackchannelHandle`] asks) when it converts the uplink to the device's
 //! codec (any G.711 device), or the track's live path as it is for the
@@ -53,10 +60,6 @@ use lotse_ipc::TalkerChange;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-/// The warning code a session gets when it sends while another holds the
-/// backchannel.
-pub(crate) const BACKCHANNEL_BUSY: &str = "backchannel_busy";
-
 /// How many talker changes a slow subscriber may fall behind by. Changes
 /// come at human pace; one that lags skips the oldest, and a
 /// [`TalkerFeed`] then resynchronizes from the arbiter's talker.
@@ -65,12 +68,15 @@ const EVENT_CAPACITY: usize = 16;
 /// Why the talker changed: the `reason` of the talker-changed event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChangeReason {
-    /// A session sent the first packet while nobody held the channel.
+    /// A session's offer asked for talk-back while nobody held the
+    /// channel.
     Claimed,
     /// The talker's session closed.
     SessionClosed,
     /// The client released the channel (`backchannel/release`).
     Released,
+    /// The talker's re-offer dropped talk-back (`webrtc/renegotiate`).
+    Renegotiated,
 }
 
 impl ChangeReason {
@@ -80,6 +86,7 @@ impl ChangeReason {
             Self::Claimed => "claimed",
             Self::SessionClosed => "session_closed",
             Self::Released => "released",
+            Self::Renegotiated => "renegotiated",
         }
     }
 }
@@ -112,7 +119,8 @@ pub(crate) struct TalkbackStats {
     /// Talk-back packets the engine took (`SessionStats::uplink_packets`,
     /// `session/get`'s `packets_received`).
     pub(crate) packets_received: AtomicU64,
-    /// Packets dropped because another session held the channel
+    /// Packets dropped because the session did not hold the channel: its
+    /// offer was declined, or it let go or was released since
     /// (`session/get`'s `packets_dropped_busy`).
     pub(crate) packets_dropped_busy: AtomicU64,
     /// Packets of the talker dropped on the way: the backchannel
@@ -270,8 +278,9 @@ enum Verdict {
     /// The sender is the talker, but nothing takes its codec to the
     /// device's.
     Unroutable,
-    /// Another session, this one, holds the channel.
-    Busy(String),
+    /// The sender does not hold the channel: this session does, or
+    /// nobody (the sender's offer was declined, or it let go since).
+    NotTalker(Option<String>),
 }
 
 /// Where a session's talk-back stands after its last packet; changes are
@@ -286,8 +295,8 @@ enum Flow {
     Withdrawn,
     /// It is the talker, and its codec has no route.
     Unroutable,
-    /// Another session holds the channel.
-    Busy,
+    /// It does not hold the channel.
+    Refused,
 }
 
 impl Arbiter {
@@ -396,12 +405,52 @@ impl Arbiter {
         })
     }
 
+    /// Claims the channel for `session`'s offer: `Ok` when it holds the
+    /// channel now, with `claim` its claim (a new one, or the one it held
+    /// already); `Err` with the holder's session id when another session
+    /// holds it. Decided under the lock a release takes.
+    pub(crate) fn claim(&self, session: &str, claim: &mut Option<u64>) -> Result<(), String> {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        if let Some(talker) = &state.talker {
+            if Some(talker.claim) == *claim {
+                return Ok(());
+            }
+            *claim = None;
+            return Err(talker.session.clone());
+        }
+        let id = state.next_claim;
+        state.next_claim = id.wrapping_add(1);
+        *claim = Some(id);
+        self.emit(&mut state.last, session, id, ChangeReason::Claimed);
+        state.talker = Some(Talker {
+            session: session.to_owned(),
+            claim: id,
+            route: None,
+        });
+        drop(guard);
+        let reason = ChangeReason::Claimed.code();
+        tracing::info!(
+            session,
+            claim = id,
+            reason,
+            "talk-back: backchannel claimed by the offer; this session is the talker"
+        );
+        Ok(())
+    }
+
+    /// Whether `claim` holds the channel now.
+    fn holds(&self, claim: Option<u64>) -> bool {
+        claim.is_some() && self.lock().talker.as_ref().map(|talker| talker.claim) == claim
+    }
+
     /// Frees the channel (`backchannel/release`) from whoever holds it,
     /// or, given `only`, only if that session holds it: decided under the
     /// lock a claim takes, so a release that names a session that already
     /// let go never frees the channel a later claim took. Its route stops
-    /// at once, and the next session to send claims it, the released one
-    /// included. Returns the session that held it when it was freed.
+    /// at once, and the next offer that asks for talk-back claims it, the
+    /// released session's included. Returns the session that held it when
+    /// it was freed.
     pub(crate) fn release(&self, only: Option<&str>) -> Option<String> {
         let mut guard = self.lock();
         let state = &mut *guard;
@@ -437,37 +486,38 @@ impl Arbiter {
         tracing::info!(
             session,
             reason,
-            "talk-back: backchannel released; the next session to send claims it"
+            "talk-back: backchannel released; the next offer that asks for talk-back claims it"
         );
         Some(talker.session)
     }
 
-    /// The session holding `claim` closed: the channel is free if it still
-    /// held it.
-    fn session_closed(&self, session: &str, claim: u64) {
+    /// `session` let go of the channel for `reason`: its session closed,
+    /// or its re-offer dropped talk-back. The channel is free if `claim`
+    /// still held it; nothing changes otherwise.
+    fn let_go(&self, session: &str, claim: u64, reason: ChangeReason) {
         let mut guard = self.lock();
         let state = &mut *guard;
         // Its route stops on return, outside the lock.
         let Some(_freed) = state.talker.take_if(|talker| talker.claim == claim) else {
             return;
         };
-        self.emit(&mut state.last, session, claim, ChangeReason::SessionClosed);
+        self.emit(&mut state.last, session, claim, reason);
         drop(guard);
-        let reason = ChangeReason::SessionClosed.code();
+        let reason = reason.code();
         tracing::info!(
             session,
             reason,
-            "talk-back: the talker's session closed; backchannel free"
+            "talk-back: the talker let go; backchannel free"
         );
     }
 
-    /// Decides one packet of `session`'s uplink `track` in `codec`:
-    /// claims the channel if it is free, answers busy if another holds it,
-    /// and for the talker makes sure its route serves the track and the
-    /// backchannel offered now. `claim` is the session's, updated here.
+    /// Decides one packet of a session's uplink `track` in `codec`:
+    /// refuses it unless the session holds the channel, and for the
+    /// talker makes sure its route serves the track and the backchannel
+    /// offered now. `claim` is the session's, cleared here once it no
+    /// longer holds the channel.
     fn decide(
         &self,
-        session: &str,
         claim: &mut Option<u64>,
         track: &Arc<Track>,
         codec: UplinkCodec,
@@ -475,34 +525,15 @@ impl Arbiter {
     ) -> Verdict {
         let offered = self.offered();
         let mut guard = self.lock();
-        let State {
-            talker,
-            next_claim,
-            last,
-        } = &mut *guard;
-        if let Some(talker) = talker
-            && Some(talker.claim) != *claim
-        {
+        let holder = guard.talker.as_ref().map(|talker| talker.session.clone());
+        let Some(talker) = guard
+            .talker
+            .as_mut()
+            .filter(|talker| claim.is_some() && Some(talker.claim) == *claim)
+        else {
             *claim = None;
-            return Verdict::Busy(talker.session.clone());
-        }
-        let talker = talker.get_or_insert_with(|| {
-            let id = *next_claim;
-            *next_claim = id.wrapping_add(1);
-            *claim = Some(id);
-            let reason = ChangeReason::Claimed.code();
-            tracing::info!(
-                session,
-                reason,
-                "talk-back: backchannel claimed; this session is the talker"
-            );
-            self.emit(last, session, id, ChangeReason::Claimed);
-            Talker {
-                session: session.to_owned(),
-                claim: id,
-                route: None,
-            }
-        });
+            return Verdict::NotTalker(holder);
+        };
         let Some(handle) = offered else {
             // The source is reconnecting: nothing is buffered for it, and
             // the old handle's route goes.
@@ -731,8 +762,10 @@ async fn forward(
 }
 
 /// One session's talk-back: its uplink track, its claim on the
-/// connection's backchannel, its counters. Dropped with the session, which
-/// frees the channel if it held it.
+/// connection's backchannel, its counters. The claim is made for an
+/// offer ([`Talkback::claim`]) and let go for a re-offer
+/// ([`Talkback::let_go`]); dropped with the session, which frees the
+/// channel if it held it.
 #[derive(Debug)]
 pub(crate) struct Talkback {
     /// The connection's arbiter.
@@ -764,11 +797,38 @@ impl Talkback {
         }
     }
 
+    /// Claims the connection's backchannel for the session's offer
+    /// ([`Arbiter::claim`]): `Ok` when the session holds it now, `Err`
+    /// with the holder's session id when another session does.
+    pub(crate) fn claim(&mut self) -> Result<(), String> {
+        self.arbiter.claim(&self.session, &mut self.claim)
+    }
+
+    /// Whether the session holds the backchannel now.
+    pub(crate) fn holds(&self) -> bool {
+        self.arbiter.holds(self.claim)
+    }
+
+    /// The backchannel the connection's source offers now, with the
+    /// uplink codecs that reach it ([`Arbiter::target`]).
+    pub(crate) fn target(&self) -> Option<TalkbackTarget> {
+        self.arbiter.target()
+    }
+
+    /// The session's re-offer dropped talk-back: lets go of the
+    /// backchannel if the session holds it ([`ChangeReason::Renegotiated`]).
+    pub(crate) fn let_go(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            self.arbiter
+                .let_go(&self.session, claim, ChangeReason::Renegotiated);
+        }
+    }
+
     /// Takes one uplink packet: opens a track for the first one or one in
     /// another codec, has the arbiter decide, and publishes it if the
-    /// session is the talker with a way to the device. `true` when the
-    /// session is to get its `backchannel_busy` warning now.
-    pub(crate) fn receive(&mut self, packet: UplinkPacket) -> bool {
+    /// session is the talker with a way to the device; a packet of a
+    /// session that does not hold the backchannel is dropped and counted.
+    pub(crate) fn receive(&mut self, packet: UplinkPacket) {
         let UplinkPacket { codec, packet } = packet;
         let track = match self.track.take() {
             Some(track) if track.codec() == codec => track,
@@ -784,41 +844,34 @@ impl Talkback {
             }
         };
         let track = self.track.insert(track);
-        let verdict = self.arbiter.decide(
-            &self.session,
-            &mut self.claim,
-            track.track(),
-            codec,
-            &self.stats,
-        );
-        let warn = change(&mut self.flow, &verdict);
+        let verdict = self
+            .arbiter
+            .decide(&mut self.claim, track.track(), codec, &self.stats);
+        change(&mut self.flow, &verdict);
         match verdict {
             Verdict::Send => track.publish(packet),
-            Verdict::Busy(_) => TalkbackStats::count(&self.stats.packets_dropped_busy),
+            Verdict::NotTalker(_) => TalkbackStats::count(&self.stats.packets_dropped_busy),
             Verdict::Withdrawn | Verdict::Unroutable => {
                 TalkbackStats::count(&self.stats.packets_dropped);
             }
         }
-        warn
     }
 }
 
 /// Moves a session's talk-back from `current` to where `verdict` puts
-/// it, logging a change;
-/// `true` when it starts being refused.
-fn change(current: &mut Flow, verdict: &Verdict) -> bool {
+/// it, logging a change.
+fn change(current: &mut Flow, verdict: &Verdict) {
     let flow = match verdict {
         Verdict::Send => Flow::Talking,
         Verdict::Withdrawn => Flow::Withdrawn,
         Verdict::Unroutable => Flow::Unroutable,
-        Verdict::Busy(_) => Flow::Busy,
+        Verdict::NotTalker(_) => Flow::Refused,
     };
     if flow == *current {
-        return false;
+        return;
     }
     let from = std::mem::replace(current, flow);
     log_change(from, verdict);
-    flow == Flow::Busy
 }
 
 /// Logs a session's talk-back moving `from` where `verdict` puts it:
@@ -835,10 +888,9 @@ fn log_change(from: Flow, verdict: &Verdict) {
         Verdict::Unroutable => {
             tracing::debug!("talk-back: no route to the backchannel; packets are dropped");
         }
-        Verdict::Busy(holder) => tracing::info!(
-            holder = %holder,
-            code = BACKCHANNEL_BUSY,
-            "talk-back refused: another session holds the backchannel; packets are dropped"
+        Verdict::NotTalker(holder) => tracing::info!(
+            holder,
+            "talk-back refused: the session does not hold the backchannel; packets are dropped"
         ),
     }
 }
@@ -846,7 +898,8 @@ fn log_change(from: Flow, verdict: &Verdict) {
 impl Drop for Talkback {
     fn drop(&mut self) {
         if let Some(claim) = self.claim {
-            self.arbiter.session_closed(&self.session, claim);
+            self.arbiter
+                .let_go(&self.session, claim, ChangeReason::SessionClosed);
         }
         self.log_end();
     }
@@ -875,18 +928,16 @@ impl Talkback {
 /// Takes one uplink packet for a session's `talkback`. A session on a
 /// connection without a backchannel has none and its packet is dropped:
 /// its talk-back m-line was answered `inactive`, so a browser sends there
-/// only against the answer. `true` when the session is to get its
-/// `backchannel_busy` warning now.
-pub(crate) fn receive(talkback: Option<&mut Talkback>, packet: UplinkPacket) -> bool {
+/// only against the answer.
+pub(crate) fn receive(talkback: Option<&mut Talkback>, packet: UplinkPacket) {
     if let Some(talkback) = talkback {
-        talkback.receive(packet)
+        talkback.receive(packet);
     } else {
         let codec = packet.codec.name();
         tracing::trace!(
             codec,
             "talk-back packet dropped: the connection has no backchannel"
         );
-        false
     }
 }
 
@@ -1044,8 +1095,13 @@ mod tests {
         }
     }
 
-    fn talk(talkback: &mut Talkback, seq: u16) -> bool {
-        talkback.receive(packet(UplinkCodec::Pcmu, 1, seq, &[0xff, 0xfe]))
+    fn talk(talkback: &mut Talkback, seq: u16) {
+        talkback.receive(packet(UplinkCodec::Pcmu, 1, seq, &[0xff, 0xfe]));
+    }
+
+    /// The session's offer claims the channel, which must be free.
+    fn claims(talkback: &mut Talkback) {
+        talkback.claim().expect("the channel is free");
     }
 
     async fn within<T>(future: impl Future<Output = T>) -> T {
@@ -1083,62 +1139,79 @@ mod tests {
         assert_eq!(ChangeReason::Claimed.code(), "claimed");
         assert_eq!(ChangeReason::SessionClosed.code(), "session_closed");
         assert_eq!(ChangeReason::Released.code(), "released");
-        assert_eq!(BACKCHANNEL_BUSY, "backchannel_busy");
+        assert_eq!(ChangeReason::Renegotiated.code(), "renegotiated");
     }
 
     #[test]
     fn without_a_backchannel_talk_back_goes_nowhere() {
-        assert!(!receive(None, packet(UplinkCodec::Opus, 1, 0, &[1])));
+        receive(None, packet(UplinkCodec::Opus, 1, 0, &[1]));
     }
 
-    /// Claim and hold.
+    /// Claim and hold: the first offer claims, a second is declined with
+    /// the holder's name and its packets go nowhere, and the holder keeps
+    /// the channel, silent or not, until its session closes; then the
+    /// next offer claims it.
     #[tokio::test]
-    async fn the_first_sender_claims_a_second_is_busy_once_and_the_holder_keeps_it_until_it_closes()
-    {
+    async fn the_first_offer_claims_a_second_is_declined_and_the_holder_keeps_it_until_it_closes() {
         let (arbiter, slot) = arbiter(None);
         let mut device = pcmu(&slot);
         let mut events = arbiter.subscribe();
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
-        // Neither holds the channel before it sends.
+        // Nobody holds the channel before an offer claims it: a packet
+        // from either is refused and counted.
+        assert!(!a.holds() && !b.holds());
+        talk(&mut a, 0);
+        assert_eq!(load(&a.stats.packets_dropped_busy), 1);
         no_change(&mut events);
 
-        assert!(!talk(&mut a, 0), "the first sender is not refused");
+        claims(&mut a);
+        assert!(a.holds());
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("a", ChangeReason::Claimed));
+        // Claiming again is the same claim: no change.
+        claims(&mut a);
+        no_change(&mut events);
+        talk(&mut a, 0);
         let first = within(device.recv()).await.unwrap();
         assert_eq!((first.rtp.seq, &first.payload[..]), (0, &[0xff, 0xfe][..]));
         eventually("a's bytes counted", || load(&a.stats.bytes_sent) == 2).await;
         assert_eq!(load(&a.stats.packets_sent), 1);
 
-        // The second sender: one warning, its packets dropped and counted.
-        let warnings: Vec<bool> = (0..3).map(|seq| talk(&mut b, seq)).collect();
-        assert_eq!(warnings, [true, false, false]);
+        // The second offer is declined with the holder's name; its
+        // packets are dropped and counted.
+        assert_eq!(b.claim(), Err("a".to_owned()));
+        assert!(!b.holds());
+        for seq in 0..3 {
+            talk(&mut b, seq);
+        }
         assert_eq!(load(&b.stats.packets_dropped_busy), 3);
         no_change(&mut events);
         // The holder sends on, and only its packets reach the device.
-        assert!(!talk(&mut a, 1));
+        talk(&mut a, 1);
         assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 1);
         // Silent, the holder keeps it: no timeout frees it.
         SystemClock.sleep(Duration::from_millis(20)).await;
-        assert!(!talk(&mut b, 3), "still refused, not warned again");
+        assert_eq!(b.claim(), Err("a".to_owned()), "still held");
+        talk(&mut b, 3);
         assert_eq!(load(&b.stats.packets_dropped_busy), 4);
         assert!(device.try_recv().is_err(), "nothing of b's");
 
         // The holder's session closes: the channel is free, and the next
-        // sender claims it.
+        // offer claims it.
         drop(a);
         let (session, reason) = change(&mut events);
         assert_eq!(
             (session.as_str(), reason),
             ("a", ChangeReason::SessionClosed)
         );
-        assert!(!talk(&mut b, 4));
+        claims(&mut b);
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("b", ChangeReason::Claimed));
+        talk(&mut b, 4);
         assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 4);
         let mut c = Talkback::new(Arc::clone(&arbiter), "c".into(), Arc::default());
-        assert!(talk(&mut c, 0), "a new busy sender is warned");
+        assert_eq!(c.claim(), Err("b".to_owned()));
         drop(c);
         no_change(&mut events);
         drop(b);
@@ -1149,9 +1222,56 @@ mod tests {
         );
     }
 
+    /// A re-offer that drops talk-back lets go: the channel is free for
+    /// the next offer, from any session, the one that let go included,
+    /// and a packet the session still sends is refused meanwhile.
+    #[tokio::test]
+    async fn a_re_offer_that_drops_talk_back_lets_go_and_the_next_offer_claims() {
+        let (arbiter, slot) = arbiter(None);
+        let mut device = pcmu(&slot);
+        let mut events = arbiter.subscribe();
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
+        // Letting go without a claim changes nothing.
+        a.let_go();
+        no_change(&mut events);
+        claims(&mut a);
+        talk(&mut a, 0);
+        assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 0);
+        assert_eq!(change(&mut events).1, ChangeReason::Claimed);
+
+        a.let_go();
+        assert!(!a.holds());
+        let (session, reason) = change(&mut events);
+        assert_eq!(
+            (session.as_str(), reason),
+            ("a", ChangeReason::Renegotiated)
+        );
+        talk(&mut a, 1);
+        assert_eq!(load(&a.stats.packets_dropped_busy), 1);
+        assert!(device.try_recv().is_err(), "the route stopped");
+        // The same session's next offer claims again: another claim.
+        claims(&mut a);
+        let (session, reason) = change(&mut events);
+        assert_eq!((session.as_str(), reason), ("a", ChangeReason::Claimed));
+        talk(&mut a, 2);
+        assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 2);
+        // Or another session's, once a let go.
+        a.let_go();
+        assert_eq!(change(&mut events).1, ChangeReason::Renegotiated);
+        claims(&mut b);
+        assert_eq!(change(&mut events).0, "b");
+        // a's stale claim is gone: letting go again, or closing, frees
+        // nothing of b's.
+        a.let_go();
+        drop(a);
+        no_change(&mut events);
+        assert!(b.holds());
+    }
+
     /// Hold, until `backchannel/release`.
     #[tokio::test]
-    async fn a_release_frees_the_channel_for_the_next_sender_and_stops_the_talkers_route() {
+    async fn a_release_frees_the_channel_for_the_next_offer_and_stops_the_talkers_route() {
         let uplink = Arc::new(FakeUplink::default());
         let (arbiter, slot) = arbiter(Some(Arc::new(Factory(Arc::clone(&uplink)))));
         let mut device = pcmu(&slot);
@@ -1160,8 +1280,9 @@ mod tests {
         no_change(&mut events);
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
-        assert!(!talk(&mut a, 0));
+        claims(&mut a);
         assert_eq!(change(&mut events).1, ChangeReason::Claimed);
+        talk(&mut a, 0);
         assert_eq!(
             within(device.recv()).await.unwrap().rtp.ssrc,
             9,
@@ -1169,6 +1290,7 @@ mod tests {
         );
 
         assert_eq!(arbiter.release(None).as_deref(), Some("a"));
+        assert!(!a.holds());
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("a", ChangeReason::Released));
         assert!(
@@ -1176,32 +1298,31 @@ mod tests {
             "a's chain stopped at once"
         );
         assert!(uplink.outputs.lock().unwrap()[0].is_closed());
-        // The next sender claims it; the released one, now refused, is
-        // warned when it sends again.
-        assert!(!talk(&mut b, 0));
+        // The next offer claims it; the released session, now refused,
+        // loses what it still sends.
+        claims(&mut b);
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("b", ChangeReason::Claimed));
-        assert!(talk(&mut a, 1));
+        talk(&mut a, 1);
         assert_eq!(load(&a.stats.packets_dropped_busy), 1);
         // A stale claim frees nothing: a's session closing leaves b the
         // talker.
         let mut c = Talkback::new(Arc::clone(&arbiter), "c".into(), Arc::default());
-        assert!(talk(&mut c, 0));
+        assert_eq!(c.claim(), Err("b".to_owned()));
         drop(c);
-        let mut d = Talkback::new(Arc::clone(&arbiter), "d".into(), Arc::default());
         drop(a);
         no_change(&mut events);
-        assert!(talk(&mut d, 0), "b still holds it");
+        assert!(b.holds());
         // The released talker claims again when nobody else did.
         assert_eq!(arbiter.release(None).as_deref(), Some("b"));
-        assert!(!talk(&mut b, 1));
         assert_eq!(change(&mut events).1, ChangeReason::Released);
+        claims(&mut b);
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("b", ChangeReason::Claimed));
     }
 
     /// A stale claim is not taken for a later one: a released talker that
-    /// did not send since cannot free the next talker's channel.
+    /// did not claim since cannot free the next talker's channel.
     #[tokio::test]
     async fn a_released_talker_closing_frees_nothing_of_the_next_talkers() {
         let (arbiter, slot) = arbiter(None);
@@ -1209,14 +1330,14 @@ mod tests {
         let mut events = arbiter.subscribe();
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
-        assert!(!talk(&mut a, 0));
+        claims(&mut a);
         assert_eq!(arbiter.release(None).as_deref(), Some("a"));
-        assert!(!talk(&mut b, 0));
+        claims(&mut b);
         let _claimed_released_claimed = (0..3).map(|_| change(&mut events)).count();
         drop(a);
         no_change(&mut events);
         let mut c = Talkback::new(Arc::clone(&arbiter), "c".into(), Arc::default());
-        assert!(talk(&mut c, 0), "b still holds it");
+        assert_eq!(c.claim(), Err("b".to_owned()), "b still holds it");
     }
 
     /// A release that names a session frees the channel only from that
@@ -1231,22 +1352,23 @@ mod tests {
         no_change(&mut events);
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
-        assert!(!talk(&mut a, 0));
+        claims(&mut a);
         assert_eq!(change(&mut events).1, ChangeReason::Claimed);
+        talk(&mut a, 0);
         assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 0);
 
         // Another session's release leaves a the talker, its route up.
         assert_eq!(arbiter.release(Some("b")), None);
         no_change(&mut events);
-        assert!(talk(&mut b, 0), "a still holds it");
-        assert!(!talk(&mut a, 1));
+        assert_eq!(b.claim(), Err("a".to_owned()), "a still holds it");
+        talk(&mut a, 1);
         assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 1);
 
-        // The holder's own release frees it for the next sender.
+        // The holder's own release frees it for the next offer.
         assert_eq!(arbiter.release(Some("a")).as_deref(), Some("a"));
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("a", ChangeReason::Released));
-        assert!(!talk(&mut b, 1));
+        claims(&mut b);
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("b", ChangeReason::Claimed));
     }
@@ -1262,11 +1384,14 @@ mod tests {
         let mut events = arbiter.subscribe();
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
-        assert!(!talk(&mut a, 0));
+        claims(&mut a);
+        talk(&mut a, 0);
         assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 0);
-        // Another client releases a, and b claims the free channel.
+        // Another client releases a, and b's offer claims the free
+        // channel.
         assert_eq!(arbiter.release(None).as_deref(), Some("a"));
-        assert!(!talk(&mut b, 0));
+        claims(&mut b);
+        talk(&mut b, 0);
         assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 0);
         let changes: Vec<(String, ChangeReason)> = (0..3).map(|_| change(&mut events)).collect();
         assert_eq!(
@@ -1280,9 +1405,9 @@ mod tests {
         // a stops talking: its release, named for a, arrives late.
         assert_eq!(arbiter.release(Some("a")), None);
         no_change(&mut events);
-        assert!(talk(&mut a, 1), "b still holds it");
-        assert_eq!(load(&a.stats.packets_dropped_busy), 1);
-        assert!(!talk(&mut b, 1));
+        talk(&mut a, 1);
+        assert_eq!(load(&a.stats.packets_dropped_busy), 1, "b still holds it");
+        talk(&mut b, 1);
         assert_eq!(
             within(device.recv()).await.unwrap().rtp.seq,
             1,
@@ -1305,19 +1430,24 @@ mod tests {
         let mut events = arbiter.subscribe();
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
-        assert!(!talk(&mut a, 0));
+        claims(&mut a);
+        talk(&mut a, 0);
         assert_eq!(within(before.recv()).await.unwrap().rtp.seq, 0);
 
         slot.withdraw();
-        assert!(!talk(&mut a, 1));
-        assert!(!talk(&mut a, 2));
+        talk(&mut a, 1);
+        talk(&mut a, 2);
         assert_eq!(load(&a.stats.packets_dropped), 2);
         // Nothing went to the old backchannel, and its route let go of it.
         assert!(within(before.recv()).await.is_none());
-        assert!(talk(&mut b, 0), "the talker still holds the slot");
+        assert_eq!(
+            b.claim(),
+            Err("a".to_owned()),
+            "the talker still holds the slot"
+        );
 
         let mut after = pcmu(&slot);
-        assert!(!talk(&mut a, 3));
+        talk(&mut a, 3);
         let resumed = within(after.recv()).await.unwrap();
         assert_eq!(
             resumed.rtp.seq, 3,
@@ -1326,7 +1456,7 @@ mod tests {
         // Offered again without a withdrawal (another handle): the route
         // follows it.
         let mut replaced = pcmu(&slot);
-        assert!(!talk(&mut a, 4));
+        talk(&mut a, 4);
         assert_eq!(within(replaced.recv()).await.unwrap().rtp.seq, 4);
         assert!(within(after.recv()).await.is_none(), "the old route let go");
         let (session, reason) = change(&mut events);
@@ -1344,7 +1474,8 @@ mod tests {
         let forty = Duration::from_millis(40);
         let mut device = offer(&slot, Codec::Pcma, forty, 64);
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
-        assert!(!a.receive(packet(UplinkCodec::Opus, 1, 0, &[1, 2, 3])));
+        claims(&mut a);
+        a.receive(packet(UplinkCodec::Opus, 1, 0, &[1, 2, 3]));
         let out = within(device.recv()).await.unwrap();
         assert_eq!((out.rtp.ssrc, &out.payload[..]), (9, &[1, 2, 3][..]));
         eventually("bytes after the chain", || load(&a.stats.bytes_sent) == 3).await;
@@ -1352,7 +1483,7 @@ mod tests {
         assert_eq!(*uplink.outputs.lock().unwrap()[0].codec(), Codec::Pcma);
 
         // Another codec: a new track, and the chain restarts on it.
-        assert!(!a.receive(packet(UplinkCodec::Pcmu, 1, 1, &[4])));
+        a.receive(packet(UplinkCodec::Pcmu, 1, 1, &[4]));
         assert_eq!(&within(device.recv()).await.unwrap().payload[..], &[4]);
         assert!(uplink.stops.lock().unwrap()[0].is_cancelled());
         assert!(!uplink.stops.lock().unwrap()[1].is_cancelled());
@@ -1360,7 +1491,7 @@ mod tests {
         // The same codec on another frame or another law: new chains.
         let sixty = Duration::from_millis(60);
         let mut device = offer(&slot, Codec::Pcma, sixty, 64);
-        assert!(!a.receive(packet(UplinkCodec::Pcmu, 1, 2, &[5])));
+        a.receive(packet(UplinkCodec::Pcmu, 1, 2, &[5]));
         assert_eq!(&within(device.recv()).await.unwrap().payload[..], &[5]);
         let (sender, _) = mpsc::channel(1);
         slot.offer(BackchannelHandle {
@@ -1371,8 +1502,8 @@ mod tests {
         // Same sender, same codec, same frame: one more chain only for the
         // law, none for an unchanged offer.
         let mut device = offer(&slot, Codec::Pcmu, sixty, 64);
-        assert!(!a.receive(packet(UplinkCodec::Pcmu, 1, 3, &[6])));
-        assert!(!a.receive(packet(UplinkCodec::Pcmu, 1, 4, &[7])));
+        a.receive(packet(UplinkCodec::Pcmu, 1, 3, &[6]));
+        a.receive(packet(UplinkCodec::Pcmu, 1, 4, &[7]));
         assert_eq!(&within(device.recv()).await.unwrap().payload[..], &[6]);
         assert_eq!(&within(device.recv()).await.unwrap().payload[..], &[7]);
         assert_eq!(*uplink.frames.lock().unwrap(), [forty, forty, sixty, sixty]);
@@ -1411,10 +1542,11 @@ mod tests {
             64,
         );
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
-        assert!(!a.receive(packet(UplinkCodec::Opus, 7, 0, &[9, 9])));
+        claims(&mut a);
+        a.receive(packet(UplinkCodec::Opus, 7, 0, &[9, 9]));
         // A new SSRC starts an epoch on the track; the forwarder skips the
         // event and forwards the packet.
-        assert!(!a.receive(packet(UplinkCodec::Opus, 8, 1, &[8])));
+        a.receive(packet(UplinkCodec::Opus, 8, 1, &[8]));
         let first = within(device.recv()).await.unwrap();
         let second = within(device.recv()).await.unwrap();
         assert_eq!((first.rtp.ssrc, &first.payload[..]), (7, &[9, 9][..]));
@@ -1444,13 +1576,14 @@ mod tests {
             let (arbiter, slot) = arbiter(uplink);
             let mut device = pcmu(&slot);
             let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+            claims(&mut a);
             let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
             for seq in 0..2 {
-                assert!(!a.receive(packet(UplinkCodec::Opus, 1, seq, &[1])));
+                a.receive(packet(UplinkCodec::Opus, 1, seq, &[1]));
             }
             assert_eq!(load(&a.stats.packets_dropped), 2);
-            assert!(talk(&mut b, 0), "a holds it all the same");
-            assert!(!talk(&mut a, 2));
+            assert_eq!(b.claim(), Err("a".to_owned()), "a holds it all the same");
+            talk(&mut a, 2);
             if forwards_g711 {
                 // The device's own codec is forwarded as received.
                 assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 2);
@@ -1522,8 +1655,9 @@ mod tests {
         let (arbiter, slot) = arbiter(None);
         let _device = offer(&slot, Codec::Pcmu, BackchannelHandle::DEFAULT_FRAME, 1);
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        claims(&mut a);
         for seq in 0..3 {
-            assert!(!talk(&mut a, seq));
+            talk(&mut a, seq);
         }
         eventually("two dropped", || load(&a.stats.packets_dropped) == 2).await;
         assert_eq!(load(&a.stats.packets_sent), 1);
@@ -1558,6 +1692,7 @@ mod tests {
             (ChangeReason::Claimed, "claimed"),
             (ChangeReason::SessionClosed, "session_closed"),
             (ChangeReason::Released, "released"),
+            (ChangeReason::Renegotiated, "renegotiated"),
         ] {
             let change = talker_change(TalkerChanged {
                 session: "a".into(),
@@ -1600,9 +1735,9 @@ mod tests {
         let mut feed = TalkerFeed::new(&arbiter);
         assert!(waits(feed.next()).await, "nothing changed yet");
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
-        assert!(!talk(&mut a, 0));
+        claims(&mut a);
         assert_eq!(arbiter.release(None), Some("a".into()));
-        assert!(!talk(&mut a, 1), "a claims again");
+        claims(&mut a);
         let changes: Vec<(String, u64, ChangeReason)> = [
             within(feed.next()).await.unwrap(),
             within(feed.next()).await.unwrap(),
@@ -1639,15 +1774,15 @@ mod tests {
         let mut feed = TalkerFeed::new(&arbiter);
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
-        assert!(!talk(&mut a, 0));
+        claims(&mut a);
         let told = within(feed.next()).await.unwrap();
         assert_eq!(
             (told.session.as_str(), told.reason),
             ("a", ChangeReason::Claimed)
         );
         assert_eq!(arbiter.release(None), Some("a".into()));
-        for seq in 0..u16::try_from(EVENT_CAPACITY).unwrap() {
-            assert!(!talk(&mut b, seq));
+        for _ in 0..u16::try_from(EVENT_CAPACITY).unwrap() {
+            claims(&mut b);
             assert_eq!(arbiter.release(Some("b")), Some("b".into()));
         }
         let release = arbiter.lock().last.clone().unwrap();
@@ -1667,7 +1802,7 @@ mod tests {
         );
         assert!(waits(feed.next()).await, "nothing older follows");
         // In order again from here.
-        assert!(!talk(&mut b, 99));
+        claims(&mut b);
         let claimed = within(feed.next()).await.unwrap();
         assert_eq!(
             (claimed.session.as_str(), claimed.reason),
@@ -1684,15 +1819,15 @@ mod tests {
         let mut feed = TalkerFeed::new(&arbiter);
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
-        assert!(!talk(&mut a, 0));
+        claims(&mut a);
         let told = within(feed.next()).await.unwrap();
         assert_eq!(told.reason, ChangeReason::Claimed);
-        for seq in 1..=u16::try_from(EVENT_CAPACITY).unwrap() {
+        for _ in 1..=u16::try_from(EVENT_CAPACITY).unwrap() {
             assert_eq!(arbiter.release(None), Some("a".into()));
-            assert!(!talk(&mut a, seq), "a claims again: another claim");
+            claims(&mut a);
         }
         assert_eq!(arbiter.release(None), Some("a".into()));
-        assert!(!talk(&mut b, 0));
+        claims(&mut b);
         let claim = arbiter.lock().last.clone().unwrap();
         let resynced = within(feed.next()).await.unwrap();
         assert_eq!(resynced, claim);
@@ -1709,11 +1844,11 @@ mod tests {
         );
         // The same session again, after the feed fell behind: its new
         // claim is news to the supervisor.
-        assert!(!talk(&mut a, 99));
+        claims(&mut a);
         let again = within(feed.next()).await.unwrap();
-        for seq in 100..100 + u16::try_from(EVENT_CAPACITY).unwrap() {
+        for _ in 100..100 + u16::try_from(EVENT_CAPACITY).unwrap() {
             assert_eq!(arbiter.release(None), Some("a".into()));
-            assert!(!talk(&mut a, seq));
+            claims(&mut a);
         }
         let resynced = within(feed.next()).await.unwrap();
         assert_eq!(resynced.session, "a");
@@ -1729,13 +1864,13 @@ mod tests {
         let (arbiter, _slot) = arbiter(None);
         let mut feed = TalkerFeed::new(&arbiter);
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
-        for seq in 0..u16::try_from(EVENT_CAPACITY).unwrap() {
-            assert!(!talk(&mut a, seq));
+        for _ in 0..u16::try_from(EVENT_CAPACITY).unwrap() {
+            claims(&mut a);
             assert_eq!(arbiter.release(None), Some("a".into()));
         }
         assert!(waits(feed.next()).await, "free, as the supervisor was told");
-        for seq in 0..u16::try_from(EVENT_CAPACITY).unwrap() {
-            assert!(!talk(&mut a, seq));
+        for _ in 0..u16::try_from(EVENT_CAPACITY).unwrap() {
+            claims(&mut a);
             assert_eq!(arbiter.release(None), Some("a".into()));
         }
         drop(a);

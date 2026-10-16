@@ -55,6 +55,12 @@ exclude_re = [
     "talkback.rs:.*in Talkback::log_end$",
     "talkback.rs:.*replace Talkback::log_end with \\(\\)",
     "replace == with != in TalkbackRx::take",
+    # Only moves the talk-back flow state that `log_change` and `log_end` log; the
+    # verdicts and counters themselves are asserted by the arbitration tests.
+    "talkback.rs:.*replace change with \\(\\)",
+    "talkback.rs:.*replace == with != in change$",
+    # Only picks whether the one-per-session warning for dropped declines is logged.
+    "replace == with != in SessionEntry::declined",
     # G.711's sign (0x80), segment (0x70) and step (0x0f) bits are disjoint, so `|` and `^`
     # produce the same code.
     "g711.rs:.*replace \\| with \\^ in (mu|a)_encode$",

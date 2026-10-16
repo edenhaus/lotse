@@ -93,6 +93,13 @@ pub(crate) enum DriverCommand {
         /// The candidate; empty is end-of-candidates.
         candidate: String,
     },
+    /// A re-offer from the browser (`webrtc/renegotiate`).
+    Renegotiate {
+        /// The session.
+        session_id: String,
+        /// The SDP re-offer.
+        sdp: String,
+    },
     /// The session's stream changed its orientation to this number.
     Orientation {
         /// The session.
@@ -161,6 +168,7 @@ impl DriverCommand {
         match self {
             Self::OpenSession(spec) => Some(&spec.session_id),
             Self::Candidate { session_id, .. }
+            | Self::Renegotiate { session_id, .. }
             | Self::Orientation { session_id, .. }
             | Self::CloseSession { session_id, .. }
             | Self::RelayCandidate { session_id, .. }
@@ -1238,6 +1246,9 @@ impl Driver {
                 session_id,
                 candidate,
             } => worker.candidate(&session_id, &candidate).await,
+            DriverCommand::Renegotiate { session_id, sdp } => {
+                worker.renegotiate(&session_id, &sdp).await
+            }
             DriverCommand::Orientation {
                 session_id,
                 orientation,
@@ -1530,6 +1541,10 @@ mod tests {
         );
         driver.queue(DriverCommand::OpenSession(spec("a")));
         driver.queue(candidate("a"));
+        driver.queue(DriverCommand::Renegotiate {
+            session_id: "a".into(),
+            sdp: "v=0".into(),
+        });
         driver.queue(DriverCommand::OpenSession(spec("b")));
         driver.queue(DriverCommand::IceTcp {
             stream: fd(),
@@ -1674,22 +1689,42 @@ mod tests {
             },
         )
         .await;
+        // A re-offer reaches the worker as its own message too.
+        Driver::send(
+            &mut worker,
+            &shared,
+            &commands,
+            DriverCommand::Renegotiate {
+                session_id: "s1".into(),
+                sdp: "v=0".into(),
+            },
+        )
+        .await;
         // Each on the wire as its frame: the length, u32 little-endian,
         // then the message.
         let mut expected = Vec::new();
-        for session_id in [None, Some("s1".to_owned())] {
-            let message =
-                lotse_ipc::encode(&lotse_ipc::ToWorker::ReleaseBackchannel { session_id }).unwrap();
+        let messages = [
+            lotse_ipc::ToWorker::ReleaseBackchannel { session_id: None },
+            lotse_ipc::ToWorker::ReleaseBackchannel {
+                session_id: Some("s1".into()),
+            },
+            lotse_ipc::ToWorker::Renegotiate {
+                session_id: "s1".into(),
+                sdp: "v=0".into(),
+            },
+        ];
+        for message in &messages {
+            let message = lotse_ipc::encode(message).unwrap();
             expected.extend(u32::try_from(message.len()).unwrap().to_le_bytes());
             expected.extend(message);
         }
+        // Polled until the file ends with them, at most 500 times.
         let mut received = Vec::new();
-        for _ in 0..500 {
-            received = std::fs::read(&out).unwrap_or_default();
-            if received.ends_with(&expected) {
-                break;
-            }
+        let mut polls = 0;
+        while !received.ends_with(&expected) && polls < 500 {
+            polls += 1;
             SystemClock.sleep(Duration::from_millis(10)).await;
+            received = std::fs::read(&out).unwrap_or_default();
         }
         assert!(received.ends_with(&expected), "{received:?}");
         let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;

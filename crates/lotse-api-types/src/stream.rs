@@ -226,7 +226,7 @@ pub struct SourceBackchannel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BackchannelState {
-    /// Nobody talks: the next session to send claims it.
+    /// Nobody talks: the next offer that asks for talk-back claims it.
     Available,
     /// A session holds it, the stream's `backchannel.talker`.
     InUse,
@@ -339,8 +339,8 @@ pub struct StreamBackchannel {
     /// The session holding the backchannel, or null when it is free.
     #[serde(default)]
     pub talker: Option<String>,
-    /// When `talker` last changed, RFC 3339; null while nobody has talked
-    /// since the connection's worker started.
+    /// When `talker` last changed, RFC 3339; null while no offer has
+    /// claimed it since the connection's worker started.
     #[serde(default)]
     pub since: Option<String>,
 }
@@ -349,13 +349,17 @@ pub struct StreamBackchannel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TalkerReason {
-    /// A session sent the first talk-back packet while nobody held the
-    /// backchannel, and holds it now.
+    /// A session's offer (`webrtc/offer` or `webrtc/renegotiate`) asked
+    /// for talk-back while nobody held the backchannel; it holds it now.
     Claimed,
     /// The talker's session closed; the backchannel is free.
     SessionClosed,
-    /// `backchannel/release` freed it; the next session to send claims it.
+    /// `backchannel/release` freed it; the next offer that asks for
+    /// talk-back claims it.
     Released,
+    /// The talker's re-offer (`webrtc/renegotiate`) dropped talk-back;
+    /// the backchannel is free.
+    Renegotiated,
 }
 
 impl TalkerReason {
@@ -365,14 +369,20 @@ impl TalkerReason {
             Self::Claimed => "claimed",
             Self::SessionClosed => "session_closed",
             Self::Released => "released",
+            Self::Renegotiated => "renegotiated",
         }
     }
 
     /// The reason for its API name.
     pub fn parse(name: &str) -> Option<Self> {
-        [Self::Claimed, Self::SessionClosed, Self::Released]
-            .into_iter()
-            .find(|reason| reason.as_str() == name)
+        [
+            Self::Claimed,
+            Self::SessionClosed,
+            Self::Released,
+            Self::Renegotiated,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str() == name)
     }
 }
 
@@ -656,6 +666,7 @@ mod tests {
             (TalkerReason::Claimed, "claimed"),
             (TalkerReason::SessionClosed, "session_closed"),
             (TalkerReason::Released, "released"),
+            (TalkerReason::Renegotiated, "renegotiated"),
         ] {
             assert_eq!(reason.as_str(), name);
             assert_eq!(serde_json::to_value(reason).unwrap(), name);

@@ -15,7 +15,7 @@ use crate::command::Command;
 use crate::frame::{Empty, EventFrame, Failure, Hello, Pong, Shutdown, Success};
 use crate::info::{InfoResult, Metrics};
 use crate::pairing::PairingCreateResult;
-use crate::session::{Session, SessionEvent, SessionList};
+use crate::session::{Session, SessionEvent, SessionList, WebrtcRenegotiateResult};
 use crate::stream::{BackchannelReleaseResult, Stream, StreamEvent, StreamList, StreamPutResult};
 
 /// The committed bundle, byte for byte.
@@ -74,6 +74,10 @@ pub fn bundle() -> Value {
     ] {
         results.insert(name.into(), reference::<Success<Empty>>(&mut generator));
     }
+    results.insert(
+        "webrtc/renegotiate".into(),
+        reference::<Success<WebrtcRenegotiateResult>>(&mut generator),
+    );
     results.insert(
         "session/get".into(),
         reference::<Success<Session>>(&mut generator),

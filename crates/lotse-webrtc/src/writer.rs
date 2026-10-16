@@ -538,6 +538,11 @@ impl AudioWriter {
         }
     }
 
+    /// The media's mid: the downlink m-line the writer sends on.
+    pub(crate) const fn mid(&self) -> Mid {
+        self.mid
+    }
+
     /// The writer, its packets carrying their capture time as `capture_time`
     /// decides.
     pub(crate) fn with_capture_time(mut self, capture_time: Option<CaptureTimeSender>) -> Self {

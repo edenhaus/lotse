@@ -668,10 +668,11 @@ function answeredTalkback() {
   log(negotiated ? "talk-back negotiated" : "talk-back not negotiated: the answer's m-line is inactive", negotiated ? "good" : "bad");
 }
 
-// Puts the microphone on the talk-back m-line. Its first packet claims the
-// camera's backchannel if nobody holds it; else the daemon drops it and
-// warns backchannel_busy. The browser asks for the microphone on this
-// click, not on Play's.
+// Puts the microphone on the talk-back m-line, which the offer claimed the
+// camera's backchannel for (the answer took it recvonly); an offer while
+// another session holds it gets the m-line inactive and a
+// backchannel_declined warning. The browser asks for the microphone on
+// this click, not on Play's.
 async function startTalking() {
   const mine = attempt;
   const transceiver = talkTransceiver;
