@@ -1,0 +1,42 @@
+[package]
+name = "lotse-http"
+description = "HTTP source: HLS playlists and segments, raw MPEG-TS over HTTP."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bytes = { workspace = true } # the payloads of demultiplexed units; the bodies of fetched playlists and segments
+http-auth = { workspace = true } # Basic and Digest answers to a server's challenge (RFC 7617, RFC 7616)
+http-body-util = { workspace = true } # the empty GET body, frame-by-frame body reads and the `Limited` cap of a whole body
+hyper = { workspace = true, features = ["client"] } # the HTTP/1.1 connections to the source (`client::conn::http1`)
+hyper-util = { workspace = true } # `TokioIo` between the connection's tokio stream and hyper
+lotse-codec = { workspace = true } # ADTS splitting of AAC from MPEG-TS
+lotse-core = { workspace = true } # the codecs and kinds of a demultiplexed program's tracks, and the tracks it is published on
+lotse-tls = { workspace = true } # `https`: the certificate check and the TLS stream to the server; the `tls_fingerprint` option
+m3u8-rs = { workspace = true }
+mp4-atom = { workspace = true }
+mpeg2ts-reader = { workspace = true }
+serde = { workspace = true } # the typed source options
+serde_json = { workspace = true } # the untyped options `stream/put` carries, and their redacted form
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "macros"] } # the TCP connections to the source; deadlines raced against requests and reads
+tokio-util = { workspace = true } # the cancellation token that ends a connection's task
+tracing = { workspace = true } # the declared tracks, new epochs and losses of the published program
+url = { workspace = true } # playlist URIs resolved against the playlist's own URL and checked for its origin
+
+[dev-dependencies]
+lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock` drives the connect, answer and body deadlines
+lotse-testing = { workspace = true } # the scripted HTTP server the client fetches from
+tokio = { workspace = true, features = ["io-util"] } # the hand-made non-HTTP answer and the stream that never connects
+lotse-codec = { workspace = true, features = ["test-util"] } # the recorded ADTS of the AAC tests
+tracing-subscriber = { workspace = true } # captures the publisher's log lines
+
+[lints]
+workspace = true

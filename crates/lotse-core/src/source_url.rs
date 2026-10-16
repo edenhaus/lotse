@@ -12,7 +12,7 @@ use std::str::FromStr;
 use percent_encoding::percent_decode_str;
 use url::Url;
 
-use crate::secret::{REDACTED, Secret};
+use crate::secret::{REDACTED, RedactedUrl, Secret};
 
 /// The userinfo of a source URL. `Debug` prints `Credentials(****)`, and the
 /// password is a [`Secret`] on its own, so neither reaches a log line.
@@ -67,7 +67,9 @@ pub enum SourceUrlError {
 /// scheme, host (lowercased), port as written, path, query and credentials.
 /// Streams whose URLs are equal share one `SourceConnection`; a different
 /// port spelling, path or password is a different connection.
-/// `Display` and `Debug` print the redacted form, `rtsp://****@host:554/path`.
+/// `Display` and `Debug` print the [`RedactedUrl`] form, the origin only
+/// (`rtsp://****@host:554/****?****`): a path or query can carry a secret
+/// as well as the userinfo can.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SourceUrl {
     /// The URL without its userinfo, as a protocol client needs it.
@@ -127,19 +129,17 @@ impl SourceUrl {
         self.url.port()
     }
 
-    /// The path, possibly empty.
-    pub fn path(&self) -> &str {
-        self.url.path()
-    }
-
-    /// The query without its `?`, when present.
-    pub fn query(&self) -> Option<&str> {
-        self.url.query()
-    }
-
-    /// The URL with the userinfo removed, for the protocol client.
-    pub fn url(&self) -> &Url {
+    /// The URL with the userinfo removed, path and query included, for the
+    /// protocol client only. The name is deliberately loud, as
+    /// [`Secret::expose_secret`]'s is: what it returns must not be printed
+    /// (print [`SourceUrl::redacted`]).
+    pub const fn expose_url(&self) -> &Url {
         &self.url
+    }
+
+    /// The printable form, `****@` included when the URL had a userinfo.
+    pub fn redacted(&self) -> RedactedUrl<'_> {
+        RedactedUrl::with_userinfo(&self.url, self.credentials.is_some())
     }
 
     /// The credentials, when the URL had any.
@@ -166,19 +166,7 @@ impl FromStr for SourceUrl {
 
 impl fmt::Display for SourceUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}://", self.scheme())?;
-        if self.credentials.is_some() {
-            write!(f, "{REDACTED}@")?;
-        }
-        f.write_str(self.host())?;
-        if let Some(port) = self.port() {
-            write!(f, ":{port}")?;
-        }
-        f.write_str(self.path())?;
-        if let Some(query) = self.query() {
-            write!(f, "?{query}")?;
-        }
-        Ok(())
+        fmt::Display::fmt(&self.redacted(), f)
     }
 }
 
@@ -204,32 +192,36 @@ mod tests {
         assert_eq!(url.scheme(), "rtsp");
         assert_eq!(url.host(), "192.168.1.10");
         assert_eq!(url.port(), Some(554));
-        assert_eq!(url.path(), "/h264");
-        assert_eq!(url.query(), Some("ch=1"));
+        assert_eq!(url.expose_url().path(), "/h264");
+        assert_eq!(url.expose_url().query(), Some("ch=1"));
         let credentials = url.credentials().unwrap();
         assert_eq!(credentials.username(), "admin");
         assert_eq!(credentials.password().unwrap().expose_secret(), "hunter2");
     }
 
     #[test]
-    fn display_and_debug_redact_the_userinfo() {
+    fn display_and_debug_redact_the_userinfo_path_and_query() {
         let url = SourceUrl::parse("rtsp://admin:hunter2@Cam.local:554/h264?x=1").unwrap();
-        assert_eq!(url.to_string(), "rtsp://****@cam.local:554/h264?x=1");
+        assert_eq!(url.to_string(), "rtsp://****@cam.local:554/****?****");
+        assert_eq!(url.redacted().to_string(), url.to_string());
         assert_eq!(
             format!("{url:?}"),
-            "SourceUrl(\"rtsp://****@cam.local:554/h264?x=1\")"
+            "SourceUrl(\"rtsp://****@cam.local:554/****?****\")"
         );
         assert_eq!(
             format!("{:?}", url.credentials().unwrap()),
             "Credentials(****)"
         );
-        assert!(!format!("{url}{url:?}").contains("hunter2"));
+        let printed = format!("{url}{url:?}");
+        for secret in ["hunter2", "admin", "h264", "x=1"] {
+            assert!(!printed.contains(secret), "{secret} in {printed}");
+        }
     }
 
     #[test]
     fn url_without_credentials_keeps_everything_else() {
         let url = SourceUrl::parse("rtsps://admin:hunter2@cam.local:322/main?a=b").unwrap();
-        assert_eq!(url.url().as_str(), "rtsps://cam.local:322/main?a=b");
+        assert_eq!(url.expose_url().as_str(), "rtsps://cam.local:322/main?a=b");
     }
 
     #[test]
@@ -237,7 +229,7 @@ mod tests {
         let url = SourceUrl::parse("rtsp://cam.local/main").unwrap();
         assert!(url.credentials().is_none());
         assert_eq!(url.port(), None);
-        assert_eq!(url.to_string(), "rtsp://cam.local/main");
+        assert_eq!(url.to_string(), "rtsp://cam.local/****");
     }
 
     #[test]
@@ -269,7 +261,41 @@ mod tests {
     fn keeps_ipv6_literals_bracketed() {
         let url = SourceUrl::parse("rtsp://[FE80::1]:554/main").unwrap();
         assert_eq!(url.host(), "[fe80::1]");
-        assert_eq!(url.to_string(), "rtsp://[fe80::1]:554/main");
+        assert_eq!(url.to_string(), "rtsp://[fe80::1]:554/****");
+    }
+
+    #[test]
+    fn rfc3986_3_every_component_past_the_origin_is_redacted() {
+        for (input, shown) in [
+            ("rtsp://cam.local", "rtsp://cam.local"),
+            ("rtsp://cam.local/", "rtsp://cam.local/"),
+            ("rtsp://u:p@cam.local", "rtsp://****@cam.local"),
+            ("rtsp://u@cam.local:8554/", "rtsp://****@cam.local:8554/"),
+            ("rtsp://cam.local?token=t", "rtsp://cam.local?****"),
+            ("http://cam.local/?token=t", "http://cam.local/?****"),
+            ("http://cam.local/?", "http://cam.local/?****"),
+            (
+                "https://cam.local:8443/key/live/files/high/index.m3u8?session=s",
+                "https://cam.local:8443/****?****",
+            ),
+            (
+                "https://cam.local:443/key/index.m3u8",
+                "https://cam.local/****",
+            ),
+            ("http://cam.local", "http://cam.local/"),
+            (
+                "rtsp://:p@[FE80::1]:554/main?a=b",
+                "rtsp://****@[fe80::1]:554/****?****",
+            ),
+        ] {
+            let url = SourceUrl::parse(input).unwrap();
+            assert_eq!(url.to_string(), shown, "{input}");
+            assert_eq!(
+                format!("{url:?}"),
+                format!("SourceUrl({shown:?})"),
+                "{input}"
+            );
+        }
     }
 
     #[test]

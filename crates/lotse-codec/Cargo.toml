@@ -16,6 +16,7 @@ categories.workspace = true
 test-util = []
 
 [dependencies]
+adts-reader = { workspace = true }
 bytes = { workspace = true }
 h264-reader = { workspace = true }
 opus = { workspace = true }

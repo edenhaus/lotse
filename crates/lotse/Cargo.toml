@@ -17,8 +17,9 @@ categories.workspace = true
 # --each-feature` keeps every combination building. A feature gains its `dep:` the moment the
 # factory registration exists.
 [features]
-default = ["source-rtsp", "output-webrtc"]
+default = ["source-rtsp", "source-http", "output-webrtc"]
 source-rtsp = ["dep:lotse-rtsp"] # the RTSP source factory
+source-http = ["dep:lotse-http"] # the HTTP source factory: HLS and MPEG-TS over `http` and `https`
 output-webrtc = ["dep:lotse-webrtc"] # the WebRTC session output factory
 source-fake = ["lotse-core/test-util"] # the `fake://` source of lotse-core's fakes, for tests and development only
 
@@ -38,6 +39,7 @@ tracing-subscriber = { workspace = true }
 lotse-api-types = { workspace = true }
 lotse-codec = { workspace = true } # the AAC-LC → Opus transcoder, registered in every build
 lotse-core = { workspace = true }
+lotse-http = { workspace = true, optional = true }
 lotse-rtsp = { workspace = true, optional = true }
 lotse-sandbox = { workspace = true }
 lotse-supervisor = { workspace = true }

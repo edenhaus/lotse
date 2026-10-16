@@ -11,7 +11,7 @@
 //! through `lotse-codec`,
 //! RFC 3551 §6 (the
 //! static audio payload types), RFC 7587 (Opus), RFC 3640 (AAC), and
-//! RFC 7826 §19.2 for `rtsps` (the TLS stream in [`crate::tls`]), and
+//! RFC 7826 §19.2 for `rtsps` (the TLS stream from `lotse_tls`), and
 //! RFC 2326 §12.39 with RFC 3550 §11 for RTP over UDP ([`crate::udp`]). Every
 //! connection reaches retina through [`crate::relay`], and retina reads at
 //! most [`MAX_MESSAGE`] bytes of each RTSP message. The camera host is
@@ -56,6 +56,7 @@ use lotse_core::source_url::SourceUrl;
 use lotse_core::task::BoxFuture;
 use lotse_core::throttle::Throttle;
 use lotse_core::track::Track;
+use lotse_tls::TlsTarget;
 use retina::client::{
     Credentials, Described, InitialSequenceNumberPolicy, InitialTimestampPolicy, PacketItem,
     PlayOptions, Playing, Session, SessionGroup, SessionOptions, SetupOptions, Stream,
@@ -73,7 +74,6 @@ use crate::options::{RtspOptions, Transport as MediaTransport};
 use crate::relay;
 use crate::relay::{First, Media};
 use crate::rtcp::{ReceiverReports, Seed, SetupRates};
-use crate::tls::{self, TlsTarget};
 use crate::udp::UdpRelay;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -171,7 +171,9 @@ impl Source for RtspSource {
                     Some(tls) => {
                         tracing::info!(host = %ctx.peer.host, %addr, "rtsps: connecting");
                         // The TLS stream makes the attempt large: on the heap.
-                        let handshake = || async move { tls::connect(addr, tls).await };
+                        let handshake = || async move {
+                            lotse_tls::connect(relay::tcp(addr).await?, tls, &[]).await
+                        };
                         Box::pin(attempt.run(&mut ctx, "TLS handshake", handshake)).await
                     }
                 };
@@ -545,15 +547,16 @@ impl Carried {
 }
 
 /// Runs one RTSP request under the read deadline and cancellation; a
-/// retina error is classified.
+/// retina error is classified, scrubbed of `url`.
 async fn bounded<T>(
     ctx: &SourceCtx,
+    url: &SourceUrl,
     deadline: Duration,
     what: &str,
     future: impl Future<Output = Result<T, retina::Error>>,
 ) -> Result<T, SourceError> {
     within(ctx, deadline, what, async {
-        future.await.map_err(|err| classify(&err))
+        future.await.map_err(|err| classify(&err, url))
     })
     .await
 }
@@ -634,7 +637,7 @@ async fn connect(
         Err(err) if Require::retry_without(requested, err.status_code()) => {
             return Err(AttemptEnd::RetryWithoutRequire);
         }
-        Err(err) => return Err(classify(&err).into()),
+        Err(err) => return Err(classify(&err, &ask.url).into()),
     };
     if ask.without {
         ask.require.refused();
@@ -664,12 +667,12 @@ async fn connect(
         );
         let udp = options.transport == MediaTransport::Udp;
         within(ctx, deadline, "SETUP", async {
-            setup.await.map_err(|err| setup_error(&err, udp))
+            setup.await.map_err(|err| setup_error(&err, &ask.url, udp))
         })
         .await?;
     }
     let backchannel = match backchannel {
-        Some((index, offer)) => set_up_backchannel(&mut session, index, ctx, deadline)
+        Some((index, offer)) => set_up_backchannel(&mut session, index, &ask.url, ctx, deadline)
             .await?
             .then_some((index, offer)),
         None => None,
@@ -701,7 +704,7 @@ async fn connect(
             .initial_seq(InitialSequenceNumberPolicy::IgnoreSuspiciousValues)
             .initial_timestamp(InitialTimestampPolicy::Ignore),
     );
-    let playing = bounded(ctx, deadline, "PLAY", play).await?;
+    let playing = bounded(ctx, &ask.url, deadline, "PLAY", play).await?;
     let backchannel = backchannel.map(|(index, offer)| {
         let offered = Backchannel::offer(ctx.backchannel.clone(), offer.format, FROM_ZERO);
         (index, offered)
@@ -744,6 +747,7 @@ fn find_backchannel(session: &Session<Described>) -> Option<(usize, Offer)> {
 async fn set_up_backchannel(
     session: &mut Session<Described>,
     index: usize,
+    url: &SourceUrl,
     ctx: &SourceCtx,
     deadline: Duration,
 ) -> Result<bool, SourceError> {
@@ -756,7 +760,7 @@ async fn set_up_backchannel(
         match setup.await {
             Ok(()) => Ok(true),
             Err(err) if play_without(err.status_code()) => Ok(false),
-            Err(err) => Err(classify(&err)),
+            Err(err) => Err(classify(&err, url)),
         }
     })
     .await
@@ -768,8 +772,8 @@ const UNSUPPORTED_TRANSPORT: u16 = 461;
 /// A failed `SETUP` as a source error: a camera that refuses RTP over UDP
 /// says how to repair it; nothing falls back to TCP on its own, because
 /// the transport is part of the stream's options and its connection key.
-fn setup_error(error: &retina::Error, udp: bool) -> SourceError {
-    match classify(error) {
+fn setup_error(error: &retina::Error, url: &SourceUrl, udp: bool) -> SourceError {
+    match classify(error, url) {
         SourceError::Protocol(message)
             if udp && error.status_code() == Some(UNSUPPORTED_TRANSPORT) =>
         {
@@ -957,11 +961,14 @@ async fn run(
 ) -> AttemptEnd {
     let group = Arc::new(SessionGroup::default());
     let exit = match connect(target, ask, ctx, &group, &rates).await {
-        Ok(connected) => play(connected, &ask.options, ctx).await,
+        Ok(connected) => play(connected, &ask.url, &ask.options, ctx).await,
         Err(AttemptEnd::Exit(err)) => err,
         // Refused at `DESCRIBE`: no session to tear down.
         Err(retry) => return retry,
     };
+    // `classify` scrubbed retina's errors; the attempt's others (TLS, the
+    // relay) are scrubbed here too, should one echo the URL.
+    let exit = exit.scrubbed(&ask.url);
     tear_down(&group, ctx, &exit).await;
     AttemptEnd::Exit(exit)
 }
@@ -983,14 +990,19 @@ async fn tear_down(group: &SessionGroup, ctx: &SourceCtx, exit: &SourceError) {
 /// backchannel withdrawn. The session's packets come from one half of it,
 /// the backchannel's go out through the other, forwarded beside the loop
 /// and never dropped between its turns, so no packet in flight is lost.
-async fn play(connected: Connected, options: &RtspOptions, ctx: &SourceCtx) -> SourceError {
+async fn play(
+    connected: Connected,
+    url: &SourceUrl,
+    options: &RtspOptions,
+    ctx: &SourceCtx,
+) -> SourceError {
     let Connected {
         playing,
         mut carried,
         backchannel,
     } = connected;
     let (sink, mut packets) = playing.split();
-    let forward = forward(sink, backchannel);
+    let forward = forward(sink, backchannel, url);
     tokio::pin!(forward);
     // Over TCP the session is live once PLAY is answered. Over UDP it is
     // live once the first RTP datagram arrived: a camera whose datagrams
@@ -1014,7 +1026,7 @@ async fn play(connected: Connected, options: &RtspOptions, ctx: &SourceCtx) -> S
         };
         match item {
             None => break SourceError::Ended("the camera closed the session".into()),
-            Some(Err(err)) => break classify(&err),
+            Some(Err(err)) => break classify(&err, url),
             Some(Ok(PacketItem::Rtp(packet))) => {
                 if !live {
                     live = true;
@@ -1057,6 +1069,7 @@ async fn play(connected: Connected, options: &RtspOptions, ctx: &SourceCtx) -> S
 async fn forward(
     mut sink: SplitSink<Session<Playing>, SendingPacket>,
     backchannel: Option<(usize, Backchannel)>,
+    url: &SourceUrl,
 ) -> SourceError {
     if let Some((index, mut backchannel)) = backchannel {
         while let Some(BackchannelPacket { rtp, payload }) = backchannel.next().await {
@@ -1064,7 +1077,7 @@ async fn forward(
                 .mark(rtp.marker)
                 .payload_type(rtp.pt);
             if let Err(err) = sink.send(packet).await {
-                let error = classify(&err);
+                let error = classify(&err, url);
                 tracing::warn!(error = %error, "rtsp: the backchannel's packet was not sent; the attempt ends");
                 return error;
             }
