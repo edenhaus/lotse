@@ -20,6 +20,9 @@ name: CI
 # main's; the tools come from mise's cache, the browser test's Python packages from uv's, prek's
 # hooks from prek's. The fuzz corpora are no cache: the Fuzz jobs read them from a repository of
 # their own, and on main the Fuzz corpus job pushes what they found.
+#
+# The run's verdict is its last job, All required jobs pass, the one check of this workflow the
+# ruleset requires: it needs every other job and fails when one of them failed or was cancelled.
 
 on:
   push:
@@ -577,8 +580,9 @@ jobs:
 
   # The corpora of a run on main pushed to the corpus repository, the only write to it: each
   # target's directory replaced by the one its Fuzz job minimized, so inputs that no longer add
-  # coverage go. It runs no code of this repository. The deploy key (write access to the corpus
-  # repository only) is a secret of the fuzz-corpus environment, which only main may use.
+  # coverage go. It runs no code of this repository. It pushes with a token of the lotse-bot app,
+  # whose private key is a secret of the lotse-bot environment, which only main may use; the token
+  # reaches the corpus repository only and lasts an hour.
   #
   # Runs on main overlap (each has a concurrency group of its own), so another run may have pushed
   # since this one's Fuzz jobs read the corpus. The replacement is therefore committed on the commit
@@ -591,21 +595,26 @@ jobs:
     needs: [fuzz-build, fuzz]
     if: ${{ !cancelled() && needs.fuzz.result != 'skipped' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    environment: fuzz-corpus
+    environment: lotse-bot
     permissions: {}
     concurrency:
       group: fuzz-corpus
       cancel-in-progress: false
     steps:
-      # GitHub's host key is pinned by actions/checkout (src/git-auth-helper.ts, v7.0.1, the same
-      # as `gh api meta` on 2026-10-14), and ssh-strict keeps it checked. The key stays for the
-      # push below.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          client-id: ${{ vars.LOTSE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.LOTSE_BOT_PRIVATE_KEY }}
+          repositories: lotse-fuzz-corpus
+          permission-contents: write # the push below
+      # The token stays for the push below.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.FUZZ_CORPUS_REPO }}
           ref: ${{ needs.fuzz-build.outputs.corpus }}
           path: corpus
-          ssh-key: ${{ secrets.FUZZ_CORPUS_DEPLOY_KEY }}
+          token: ${{ steps.app.outputs.token }}
           persist-credentials: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -888,12 +897,15 @@ jobs:
 
   # A change to the API schema on main asks lotse-clients to sync it: its sync-schema.yml opens or
   # updates a PR with the schema and the regenerated models, whose CI runs the contract tests
-  # against this commit.
+  # against this commit. The lotse-bot app's private key is a secret of the lotse-bot environment,
+  # which only main may use.
   clients:
     name: Ask lotse-clients to sync the schema
     needs: changes
     if: github.event_name == 'push' && needs.changes.outputs.schema == 'true'
     runs-on: ubuntu-latest
+    environment: lotse-bot
+    permissions: {}
     # The newest schema is the one to sync; lotse-clients' run supersedes an older one anyway.
     concurrency:
       group: clients
@@ -912,3 +924,58 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           SHA: ${{ github.sha }}
         run: gh api repos/edenhaus/lotse-clients/dispatches -f event_type=lotse-schema -f "client_payload[sha]=$SHA"
+
+  # The run's one verdict, on a PR, on main, nightly and by hand, and the one check of this
+  # workflow the ruleset requires: it needs every other job and fails when one of them failed or
+  # was cancelled, so a new job gates by being added to its needs, never to the ruleset. A required
+  # check that is skipped counts as passed, so it runs also after a failure. A cancelled run needs
+  # no verdict: its jobs that had not started, this one included, end cancelled, not skipped
+  # (observed on run 38882406218, 2026-10-16), which the ruleset does not count as passed. A job
+  # skipped by its own condition (another event, no fuzz target changed, no mutant, no dependency
+  # changed) passes; one skipped because a job it needs did not pass fails through that job. Fuzz
+  # corpus, Release notes and clients have concurrency groups of their own, in which a newer run's
+  # job cancels this run's: their cancellation is no failure, a newer run does their work.
+  all-green:
+    name: All required jobs pass
+    if: ${{ !cancelled() }}
+    needs:
+      - changes
+      - check
+      - build
+      - coverage-build
+      - tests
+      - interop
+      - turn
+      - sandbox
+      - mutants-plan
+      - mutants-cache
+      - mutants
+      - fuzz-build
+      - fuzz
+      - fuzz-corpus
+      - release-build
+      - codeql
+      - dependency-review
+      - audit
+      - browser
+      - compare
+      - load
+      - soak
+      - release-notes
+      - clients
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check the needed jobs' results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "- `\(.key)`: \(.value.result)"' <<<"$NEEDS" | tee -a "$GITHUB_STEP_SUMMARY"
+          failed=$(jq -r '[to_entries[]
+            | select(.value.result == "failure"
+              or (.value.result == "cancelled" and (.key | IN("fuzz-corpus", "release-notes", "clients") | not)))
+            | .key] | join(" ")' <<<"$NEEDS")
+          if [ -n "$failed" ]; then
+            echo "::error::Failed or cancelled: $failed"
+            exit 1
+          fi
