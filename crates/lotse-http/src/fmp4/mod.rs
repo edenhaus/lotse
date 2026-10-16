@@ -254,7 +254,9 @@ pub struct Reader {
 struct Media<'a> {
     /// The segment.
     bytes: &'a [u8],
-    /// The body of each media data box, cut short where the segment ends.
+    /// The body of each media data box, cut short where the segment ends:
+    /// in order and disjoint, as top-level boxes follow one another
+    /// (ISO/IEC 14496-12 §4.2).
     data: &'a [Range<usize>],
     /// The media data not yet covered by a sample.
     budget: Budget,
@@ -772,10 +774,7 @@ impl Reader {
             stats.dropped_oversize = stats.dropped_oversize.saturating_add(1);
             return Ok(None);
         }
-        let inside = media
-            .data
-            .iter()
-            .any(|mdat| mdat.start <= range.start && range.end <= mdat.end);
+        let inside = inside(media.data, &range);
         let bytes = media.bytes;
         let Some(sample) = bytes.get(range).filter(|_| inside) else {
             stats.dropped_outside = stats.dropped_outside.saturating_add(1);
@@ -792,6 +791,18 @@ impl Reader {
         }
         Ok(Some(Bytes::from(annex_b)))
     }
+}
+
+/// Whether `range` lies inside one of `data`, the bodies of a segment's
+/// media data boxes in order and disjoint: inside the last that starts at
+/// or before it, found by binary search, so a sample costs the log of the
+/// boxes, however many empty ones a segment holds.
+fn inside(data: &[Range<usize>], range: &Range<usize>) -> bool {
+    let after = data.partition_point(|mdat| mdat.start <= range.start);
+    after
+        .checked_sub(1)
+        .and_then(|last| data.get(last))
+        .is_some_and(|mdat| range.end <= mdat.end)
 }
 
 #[cfg(test)]

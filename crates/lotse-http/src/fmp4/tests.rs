@@ -603,6 +603,46 @@ fn iso14496_12_8_8_8_samples_outside_the_mdat_are_dropped() {
     assert_eq!(units.len(), 54);
 }
 
+/// A sample lies inside the media data box that holds it (ISO/IEC
+/// 14496-12 §4.2, §8.1.1), whatever boxes come before it.
+#[test]
+fn iso14496_12_4_2_a_sample_is_inside_one_media_data_box_or_none() {
+    let data = [10..20, 28..28, 36..50];
+    for (range, expected) in [
+        (10..20, true),
+        (12..15, true),
+        (36..50, true),
+        (0..5, false),
+        (9..12, false),
+        (15..21, false),
+        (20..21, false),
+        (29..36, false),
+        (40..51, false),
+        (60..61, false),
+    ] {
+        assert_eq!(inside(&data, &range), expected, "{range:?}");
+    }
+    assert!(!inside(&[], &(0..1)));
+}
+
+/// Half a million empty media data boxes before the one with the samples
+/// (a segment under 5 MiB): a box is found by binary search, so the
+/// 131 072 one-byte samples take milliseconds where a scan of every box
+/// for each would take over 68 billion steps and outlast the test's
+/// three minutes (`.config/nextest.toml`).
+#[test]
+fn iso14496_12_4_2_many_media_data_boxes_cost_each_sample_a_logarithm() {
+    const EMPTY: usize = 1 << 19;
+    const SAMPLES: usize = 1 << 17;
+    let mut data: Vec<Range<usize>> = (0..EMPTY).map(|box_| 8 * box_ + 8..8 * box_ + 8).collect();
+    let start = 8 * EMPTY + 8;
+    data.push(start..start + SAMPLES);
+    let found = (0..SAMPLES)
+        .filter(|&sample| inside(&data, &(start + sample..start + sample + 1)))
+        .count();
+    assert_eq!(found, SAMPLES);
+}
+
 #[test]
 fn samples_over_the_frame_limit_empty_or_with_a_unit_past_their_end_are_dropped() {
     // Over the limit: the keyframe (3206 bytes) only.
