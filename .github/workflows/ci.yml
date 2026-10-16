@@ -928,15 +928,16 @@ jobs:
   # The run's one verdict, on a PR, on main, nightly and by hand, and the one check of this
   # workflow the ruleset requires: it needs every other job and fails when one of them failed or
   # was cancelled, so a new job gates by being added to its needs, never to the ruleset. A required
-  # check that is skipped counts as passed, so it runs always, also after a failure or a
-  # cancellation. A job skipped by its own condition (another event, no fuzz target changed, no
-  # mutant, no dependency changed) passes; one skipped because a job it needs did not pass fails
-  # through that job. Fuzz corpus, Release notes and clients have concurrency groups of their own,
-  # in which a newer run's job cancels this run's: their cancellation is no failure, a newer run
-  # does their work.
+  # check that is skipped counts as passed, so it runs also after a failure. A cancelled run needs
+  # no verdict: its jobs that had not started, this one included, end cancelled, not skipped
+  # (observed on run 38882406218, 2026-10-16), which the ruleset does not count as passed. A job
+  # skipped by its own condition (another event, no fuzz target changed, no mutant, no dependency
+  # changed) passes; one skipped because a job it needs did not pass fails through that job. Fuzz
+  # corpus, Release notes and clients have concurrency groups of their own, in which a newer run's
+  # job cancels this run's: their cancellation is no failure, a newer run does their work.
   all-green:
     name: All required jobs pass
-    if: always()
+    if: ${{ !cancelled() }}
     needs:
       - changes
       - check
