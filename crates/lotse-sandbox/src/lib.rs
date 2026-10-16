@@ -52,13 +52,32 @@ pub const WORKER_MAX_FILES: u64 = 256;
 /// about a seventieth of a core it shares with any other busy process
 /// of the host. The kernel clamps the result at 19 (setpriority(2)).
 ///
-/// A bound only per thread: a worker that starts N spinning threads still
-/// takes about N/9 of the supervisor's share, and sibling workers, at the
-/// same nice, share the CPU with them evenly. Thread count and CPU time are
-/// not bounded otherwise. Nice values count only within one autogroup
-/// (sched(7), "The autogroup feature"), and a worker stays in the
-/// supervisor's session, which spawns it without `setsid(2)`.
+/// A bound only per thread: a supervisor thread on a core with N spinning
+/// worker threads gets 1024/(1024 + 110·N) of it (the weights of nice 0
+/// and nice 10, kernel/sched/core.c `sched_prio_to_weight`), half of it at
+/// about N = 9, and sibling workers, at the same nice, share the CPU with
+/// them evenly. Thread count and CPU time are not bounded otherwise.
+///
+/// Nice values count only among the threads of one task group: one
+/// autogroup (sched(7), "The autogroup feature"; a worker stays in the
+/// supervisor's session, which spawns it without `setsid(2)`) and one
+/// cgroup. So where the daemon runs inside its client's container, workers
+/// under load yield about 9:1 to the client's threads too. A worker that
+/// cannot set its nice value does not start (`setpriority` refused by a
+/// container's seccomp profile; Docker's default profile allows it), and
+/// its `RLIMIT_NICE` is 0 ([`WORKER_MAX_NICE_RLIMIT`]) so it cannot lower
+/// the value again.
 pub const WORKER_NICE_INCREMENT: i32 = 10;
+
+/// `RLIMIT_NICE` for a worker, soft and hard: 0, so no nice value below
+/// the one it has is within its reach. An unprivileged process may lower
+/// its nice value only as far as its `RLIMIT_NICE` soft limit allows
+/// (setpriority(2), since Linux 2.6.12), whose ceiling is `20 - rlim_cur`
+/// (getrlimit(2), `RLIMIT_NICE`): nice 20, beyond the range, at 0. An
+/// inherited limit above 0 (`docker run --ulimit nice=20:20`, say) would
+/// let the dropped uid undo [`WORKER_NICE_INCREMENT`] wherever the seccomp
+/// layer is unavailable. Lowering a hard limit needs no privilege.
+pub const WORKER_MAX_NICE_RLIMIT: u64 = 0;
 
 /// The descriptor number a worker keeps the shared WebRTC UDP socket at,
 /// the highest [`WORKER_MAX_FILES`] leaves it. Every worker sends on one
@@ -231,7 +250,7 @@ pub fn apply(profile: &Profile, config: &SandboxConfig) -> Result<SandboxReport,
         Mode::Off => {
             let (uid, gid) = platform::drop_privileges(config)?;
             tracing::warn!(
-                "sandbox is off: no rlimits, no_new_privs, Landlock or seccomp, only the privilege drop; use only for debugging"
+                "sandbox is off: no rlimits, lower worker priority, no_new_privs, Landlock or seccomp, only the privilege drop; use only for debugging"
             );
             SandboxReport::off(uid, gid)
         }

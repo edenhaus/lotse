@@ -24,7 +24,7 @@ use rustix::process::{DumpableBehavior, Gid, Resource, Rlimit, Signal, Uid};
 use crate::report::{LandlockReport, LayerStatus};
 use crate::{
     DECODER_ADDRESS_SPACE, DECODER_CPU_SECONDS, Mode, Profile, SandboxConfig, SandboxError,
-    SandboxReport, WORKER_MAX_FILES, WORKER_NICE_INCREMENT, seccomp,
+    SandboxReport, WORKER_MAX_FILES, WORKER_MAX_NICE_RLIMIT, WORKER_NICE_INCREMENT, seccomp,
 };
 
 /// The highest Landlock ABI this crate asks for. Filesystem rules need
@@ -177,6 +177,8 @@ fn apply_rlimits(profile: &Profile, config: &SandboxConfig) -> Result<(), Sandbo
                 .map_err(step("RLIMIT_NOFILE"))?;
             rustix::process::setrlimit(Resource::As, hard(config.worker_address_space))
                 .map_err(step("RLIMIT_AS"))?;
+            rustix::process::setrlimit(Resource::Nice, hard(WORKER_MAX_NICE_RLIMIT))
+                .map_err(step("RLIMIT_NICE"))?;
         }
         Profile::Decoder => {
             rustix::process::setrlimit(Resource::As, hard(DECODER_ADDRESS_SPACE))
@@ -204,14 +206,16 @@ fn apply_rlimits(profile: &Profile, config: &SandboxConfig) -> Result<(), Sandbo
 /// the supervisor's nice value, and a hook that runs between `fork` and
 /// `execve` needs `unsafe`.
 ///
-/// After the privilege drop: a higher nice value needs no privilege, and
-/// nothing the worker keeps lets it raise its priority again, neither the
-/// dropped uid (`RLIMIT_NICE`, setrlimit(2)) nor the worker's seccomp
-/// allowlist, which has no call that changes a priority or a scheduling
-/// policy. The read
-/// (getpriority(2)) and the write both run under the supervisor's inherited
-/// filter, which allows them on the calling thread only. A failure of
-/// either is fatal, as a refused rlimit is.
+/// After the privilege drop and the rlimits: a higher nice value needs no
+/// privilege, and nothing the worker keeps lets it raise its priority
+/// again, neither the dropped uid with its `RLIMIT_NICE` of 0
+/// ([`WORKER_MAX_NICE_RLIMIT`], set by [`apply_rlimits`] whatever limit it
+/// inherited) nor the worker's seccomp allowlist, which has no call that
+/// changes a priority or a scheduling policy. The read (getpriority(2))
+/// and the write both run under the supervisor's inherited filter, which
+/// allows them on the calling thread only. A failure of either is fatal,
+/// as a refused rlimit is: a container whose seccomp profile refuses
+/// `setpriority` starts no worker (Docker's default profile allows it).
 ///
 /// No `SCHED_BATCH` (sched(7)): it changes only how the scheduler treats a
 /// thread that wakes up, not its CPU share, so it does nothing against a
@@ -685,6 +689,42 @@ mod tests {
             "setpriority failed: Operation not permitted (os error 1)"
         );
         assert_eq!(own_nice(), before);
+    }
+
+    #[test]
+    fn setrlimit2_a_worker_gets_its_limits_and_cannot_raise_its_priority_again() {
+        in_child("linux::tests::setrlimit2_worker_limits_child");
+    }
+
+    /// The child: the worker's limits, set and read back, over whatever
+    /// `RLIMIT_NICE` it inherited (`docker run --ulimit nice=20:20` lets an
+    /// unprivileged process lower its nice value to 0); then its lower
+    /// priority, which it cannot undo unless it holds `CAP_SYS_NICE`, as
+    /// root does outside a container (setpriority(2): `EACCES`; Docker's
+    /// default capability set has no `CAP_SYS_NICE`).
+    #[test]
+    fn setrlimit2_worker_limits_child() {
+        if !is_child() {
+            return;
+        }
+        let worker = Profile::Worker {
+            connect_ports: vec![554],
+        };
+        apply_rlimits(&worker, &SandboxConfig::default()).unwrap();
+        let nice = Some(WORKER_MAX_NICE_RLIMIT);
+        assert_eq!(limits(Resource::Nice), (nice, nice));
+        assert_eq!(nice, Some(0));
+        let files = Some(WORKER_MAX_FILES);
+        assert_eq!(limits(Resource::Nofile), (files, files));
+        let address_space = Some(crate::DEFAULT_WORKER_ADDRESS_SPACE);
+        assert_eq!(limits(Resource::As), (address_space, address_space));
+        apply_priority(&worker).unwrap();
+        let lowered = own_nice();
+        let raised = rustix::process::setpriority_process(None, lowered - 1);
+        let effective = rustix::thread::capabilities(None).unwrap().effective;
+        let privileged = effective.contains(rustix::thread::CapabilitySet::SYS_NICE);
+        assert_eq!(raised.err(), (!privileged).then_some(Errno::ACCESS));
+        println!("{CHILD_DONE}");
     }
 
     #[test]

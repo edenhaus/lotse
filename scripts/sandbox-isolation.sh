@@ -89,7 +89,9 @@ workers_niced() {
     want="$lowered"
     if [ "$pid" = "$DAEMON" ]; then want="$own"; else workers=$((workers + 1)); fi
     for stat in "/proc/$pid/task/"*/stat; do
-      nice="$(sed 's/.*) //' "$stat" | cut -d ' ' -f 17)"
+      # A thread that exits after the glob (a runtime's idle blocking thread) leaves no stat.
+      nice="$(sed 's/.*) //' "$stat" 2>/dev/null | cut -d ' ' -f 17)"
+      [ -n "$nice" ] || continue
       [ "$nice" = "$want" ] || fail "$stat: nice $nice, expected $want"
     done
   done

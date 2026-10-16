@@ -235,7 +235,8 @@ fn supervisor_probe_child() {
 /// limits), then try the act the variable names: lower the parent's
 /// limits, make itself dumpable again, clear its parent-death signal, ask
 /// for its parent's pid, create a memory file, resize a file or raise its
-/// scheduling priority again.
+/// scheduling priority again. An act after [`WITHOUT_SECCOMP`] is tried
+/// with the seccomp layer unavailable.
 #[test]
 #[expect(
     clippy::disallowed_methods,
@@ -248,6 +249,14 @@ fn escape_probe_child() {
     // Learnt before the sandbox, as a compromised worker could learn it by
     // trying pids in turn.
     let parent = rustix::process::getppid().expect("a parent");
+    let act = act.to_str().expect("act is UTF-8");
+    let act = match act.strip_prefix(WITHOUT_SECCOMP) {
+        Some(act) => {
+            refuse_seccomp();
+            act
+        }
+        None => act,
+    };
     let profile = Profile::Worker {
         connect_ports: vec![554],
     };
@@ -266,7 +275,8 @@ fn escape_probe_child() {
     println!("thread_name:{named:?}");
     let files = rustix::process::getrlimit(Resource::Nofile).current;
     println!("nofile:{files:?}");
-    let act = act.to_str().expect("act is UTF-8");
+    let nice = rustix::process::getrlimit(Resource::Nice);
+    println!("nice_limit:{:?}", (nice.current, nice.maximum));
     match act {
         "prlimit_parent" => {
             // Zero core size: harmless to the test harness should the call
@@ -298,9 +308,11 @@ fn escape_probe_child() {
             println!("ftruncate:{resized:?}");
         }
         "setpriority" => {
-            // Back to nice 0: refused (`EACCES`) without `CAP_SYS_NICE`
-            // should the call get through (setpriority(2)).
-            let raised = rustix::process::setpriority_process(None, 0);
+            // Back to nice 0: should the call get through, refused
+            // (`EACCES`) for want of `CAP_SYS_NICE` and of an `RLIMIT_NICE`
+            // above 0 (setpriority(2)).
+            let raised = rustix::process::setpriority_process(None, 0)
+                .map_err(|errno| std::io::Error::from(errno).kind());
             println!("setpriority:{raised:?}");
         }
         _ => {
@@ -612,13 +624,51 @@ fn a_worker_and_every_thread_it_starts_run_at_a_lower_priority() {
     assert_eq!(nices, [expected, expected], "{context}");
 }
 
+/// The prefix of an escape probe act that the child tries with the seccomp
+/// layer unavailable, as under a container profile that refuses
+/// seccomp(2): the worker profile applies in `on` mode and reports it.
+const WITHOUT_SECCOMP: &str = "without-seccomp:";
+
+/// A filter on the calling thread that answers seccomp(2) with `EPERM`,
+/// so the worker profile installs no filter of its own (seccomp(2): a
+/// filter applies to the calling thread, without
+/// `SECCOMP_FILTER_FLAG_TSYNC`).
+fn refuse_seccomp() {
+    let arch = seccompiler::TargetArch::try_from(std::env::consts::ARCH).expect("an arch");
+    let rules = std::collections::BTreeMap::from([(libc::SYS_seccomp, Vec::new())]);
+    let eperm = u32::try_from(libc::EPERM).expect("EPERM");
+    let refuse: seccompiler::BpfProgram = seccompiler::SeccompFilter::new(
+        rules,
+        seccompiler::SeccompAction::Allow,
+        seccompiler::SeccompAction::Errno(eperm),
+        arch,
+    )
+    .and_then(TryInto::try_into)
+    .expect("the filter builds");
+    seccompiler::apply_filter(&refuse).expect("the filter installs");
+}
+
 /// Regression for SBX-25: a worker could undo its lower priority. Under
-/// its allowlist `setpriority` ends it with `SIGSYS`; without it, the
-/// dropped uid cannot lower its nice value anyway (setpriority(2),
-/// `RLIMIT_NICE`).
+/// its allowlist `setpriority` ends it with `SIGSYS`. Without the seccomp
+/// layer, which `on` mode only reports, the dropped uid is refused all the
+/// same: its `RLIMIT_NICE` is 0 whatever it inherited (setpriority(2),
+/// getrlimit(2)), which `--ulimit nice=20:20` under Docker exercises.
 #[test]
 fn a_worker_cannot_raise_its_priority_again() {
     assert_escape_is_killed("setpriority", false);
+    let act = format!("{WITHOUT_SECCOMP}setpriority");
+    let (report, stdout, stderr, status) = run_probe("escape_probe_child", ESCAPE_PROBE, &act);
+    let context = format!("{status}\nstdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(report.seccomp, LayerStatus::Unavailable, "{context}");
+    assert!(
+        stdout.contains("nice_limit:(Some(0), Some(0))"),
+        "{context}"
+    );
+    assert!(
+        stdout.contains("setpriority:Err(PermissionDenied)"),
+        "{context}"
+    );
+    assert!(status.success(), "{context}");
 }
 
 /// Runs the escape probe child with `act` and checks that the worker's
@@ -632,6 +682,10 @@ fn assert_escape_is_killed(act: &str, profiler_needs_it: bool) {
         "{context}"
     );
     assert!(stdout.contains("nofile:Some(256)"), "{context}");
+    assert!(
+        stdout.contains("nice_limit:(Some(0), Some(0))"),
+        "{context}"
+    );
     if report.seccomp == LayerStatus::Enforced && !profiler_needs_it {
         assert!(!stdout.contains(&format!("{act}:")), "{context}");
         assert_eq!(status.signal(), Some(SIGSYS), "{context}");
