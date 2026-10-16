@@ -20,6 +20,9 @@ name: CI
 # main's; the tools come from mise's cache, the browser test's Python packages from uv's, prek's
 # hooks from prek's. The fuzz corpora are no cache: the Fuzz jobs read them from a repository of
 # their own, and on main the Fuzz corpus job pushes what they found.
+#
+# The run's verdict is its last job, All required jobs pass, the one check of this workflow the
+# ruleset requires: it needs every other job and fails when one of them failed or was cancelled.
 
 on:
   push:
@@ -921,3 +924,58 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           SHA: ${{ github.sha }}
         run: gh api repos/edenhaus/lotse-clients/dispatches -f event_type=lotse-schema -f "client_payload[sha]=$SHA"
+
+  # The run's one verdict, on a PR, on main, nightly and by hand, and the one check of this
+  # workflow the ruleset requires: it needs every other job and fails when one of them failed or
+  # was cancelled, so a new job gates by being added to its needs, never to the ruleset. A required
+  # check that is skipped counts as passed, so it runs also after a failure. A cancelled run needs
+  # no verdict: its jobs that had not started, this one included, end cancelled, not skipped
+  # (observed on run 38882406218, 2026-10-16), which the ruleset does not count as passed. A job
+  # skipped by its own condition (another event, no fuzz target changed, no mutant, no dependency
+  # changed) passes; one skipped because a job it needs did not pass fails through that job. Fuzz
+  # corpus, Release notes and clients have concurrency groups of their own, in which a newer run's
+  # job cancels this run's: their cancellation is no failure, a newer run does their work.
+  all-green:
+    name: All required jobs pass
+    if: ${{ !cancelled() }}
+    needs:
+      - changes
+      - check
+      - build
+      - coverage-build
+      - tests
+      - interop
+      - turn
+      - sandbox
+      - mutants-plan
+      - mutants-cache
+      - mutants
+      - fuzz-build
+      - fuzz
+      - fuzz-corpus
+      - release-build
+      - codeql
+      - dependency-review
+      - audit
+      - browser
+      - compare
+      - load
+      - soak
+      - release-notes
+      - clients
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check the needed jobs' results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "- `\(.key)`: \(.value.result)"' <<<"$NEEDS" | tee -a "$GITHUB_STEP_SUMMARY"
+          failed=$(jq -r '[to_entries[]
+            | select(.value.result == "failure"
+              or (.value.result == "cancelled" and (.key | IN("fuzz-corpus", "release-notes", "clients") | not)))
+            | .key] | join(" ")' <<<"$NEEDS")
+          if [ -n "$failed" ]; then
+            echo "::error::Failed or cancelled: $failed"
+            exit 1
+          fi
