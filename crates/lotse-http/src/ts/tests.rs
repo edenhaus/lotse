@@ -649,6 +649,24 @@ fn iso13818_1_2_4_3_7_a_frame_split_across_pes_packets_keeps_the_pts_of_the_one_
     assert_eq!(ctx.stats.dropped_untimed, 0);
 }
 
+/// A frame that begins with the last byte of a PES packet, its
+/// syncword's first, keeps that packet's PTS (ISO/IEC 13818-1 §2.4.3.7):
+/// before any anchor, or as a restart after one.
+#[test]
+fn iso13818_1_2_4_3_7_a_frame_begun_by_a_packets_last_byte_keeps_its_pts() {
+    let frame = |n: usize| adts_frame(SINE_48K_MONO, n);
+    let mut ctx = audio_ctx(false);
+    feed(&mut ctx, &frame(0)[..1], Some(0));
+    feed(&mut ctx, &frame(0)[1..], None);
+    assert_eq!(timestamps(&ctx.events), [0]);
+    assert_eq!(ctx.stats.dropped_untimed, 0);
+    // 5 000 ticks are 2 666 samples, more than half a frame from 1 024.
+    feed(&mut ctx, &frame(1)[..1], Some(5_000));
+    feed(&mut ctx, &frame(1)[1..], None);
+    assert_eq!(timestamps(&ctx.events), [0, 2_666]);
+    assert_eq!(ctx.stats.audio_reanchors, 1);
+}
+
 /// A PES packet's PTS waits (ISO/IEC 13818-1 §2.4.3.7) only while the
 /// frame it times has not come: past the last frame its packet ends, it
 /// times that frame in the packet that ends it; once the frame came, it

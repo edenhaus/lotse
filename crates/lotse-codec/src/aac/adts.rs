@@ -167,6 +167,10 @@ fn starts_with_sync(bytes: &[u8]) -> Option<bool> {
 /// followed by the next syncword.
 fn step(rest: &[u8], synced: bool) -> Step<'_> {
     match starts_with_sync(rest) {
+        // The syncword's first byte alone, in sync: a frame that begins
+        // here, so the PTS of the bytes it ends is its own (ISO/IEC
+        // 13818-1 §2.4.3.7).
+        None if synced && !rest.is_empty() => return Step::Begins,
         None => return Step::Wait,
         Some(false) => return Step::Skip,
         Some(true) => {}
@@ -429,15 +433,16 @@ mod tests {
         for size in [1, 2, 7, 9, 100, 188] {
             let mut splitter = AdtsSplitter::new(LIMIT);
             let mut out = Vec::new();
+            let mut named = Vec::new();
             for chunk in SINE_48K_MONO.chunks(size) {
-                let first = splitter.push(chunk, &mut out);
-                if size == 1 {
-                    // No frame begins and ends in one byte.
-                    assert_eq!(first, None);
-                }
+                named.extend(splitter.push(chunk, &mut out));
                 assert!(splitter.buffered() <= MAX_ADTS_FRAME + 1);
             }
             assert_eq!(out, whole, "pieces of {size}");
+            if size == 1 {
+                // Each frame is named once, by its syncword's first byte.
+                assert_eq!(named, sequences(&whole), "pieces of {size}");
+            }
             assert_eq!(splitter.buffered(), 0);
         }
     }
@@ -466,7 +471,7 @@ mod tests {
         assert_eq!((first, sequences(&out)), (None, vec![3]));
         // Begun with its syncword alone, or with a header short of its
         // last byte: named as well.
-        for cut in [2, 6] {
+        for cut in [1, 2, 6] {
             let mut splitter = AdtsSplitter::new(LIMIT);
             assert_eq!(push(&mut splitter, &a[..cut]), (Some(0), Vec::new()));
             let (first, out) = push(&mut splitter, &a[cut..]);
@@ -735,12 +740,18 @@ mod tests {
         assert_eq!(starts_with_sync(&[0xff, 0xf9]), Some(true));
         assert_eq!(starts_with_sync(&[0xfe, 0xf1]), Some(false));
         assert_eq!(starts_with_sync(&[0xff, 0xe1]), Some(false));
+        // In sync, a lone first byte begins a frame; no byte begins none.
+        assert_eq!(push(&mut splitter, &[]), (None, Vec::new()));
+        let mut synced = AdtsSplitter::new(LIMIT);
+        assert_eq!(push(&mut synced, &[0xff]), (Some(0), Vec::new()));
+        assert_eq!(synced.buffered(), 1);
+        // Out of sync, it waits for what follows.
         push(&mut splitter, &[0x12]);
         assert_eq!(
             (splitter.stats().skipped_bytes, splitter.buffered()),
             (1, 0)
         );
-        push(&mut splitter, &[0xff]);
+        assert_eq!(push(&mut splitter, &[0xff]), (None, Vec::new()));
         assert_eq!(
             (splitter.stats().skipped_bytes, splitter.buffered()),
             (1, 1)
