@@ -419,14 +419,23 @@ impl From<Event> for Item {
 /// starts another timeline (a timestamp reset) and stays behind them.
 const REORDER_TICKS: i64 = 90_000;
 
+/// The most queued units one unit moves ahead of: more than the
+/// [`REORDER_TICKS`] of a program holds (120 video frames a second and
+/// 47 AAC frames at 48 kHz are 167), so only decoding times that run
+/// backwards, which no stream's do (ISO/IEC 13818-1 §2.4.3.7), reach
+/// it, and the work of a segment stays linear in its units.
+const REORDER_UNITS: usize = 256;
+
 /// Queues `item` behind the items of `queue`, a unit ahead of the units of
-/// its timeline it is decoded before (within [`REORDER_TICKS`]): never
-/// ahead of a layout or an epoch, nor of a unit with the same decoding
-/// time, which keep their order.
+/// its timeline it is decoded before (within [`REORDER_TICKS`], and of
+/// [`REORDER_UNITS`] of them at most): never ahead of a layout or an
+/// epoch, nor of a unit with the same decoding time, which keep their
+/// order.
 fn enqueue(queue: &mut VecDeque<Item>, item: Item) {
     let mut at = queue.len();
     if let Item::Unit(unit) = &item {
-        while let Some(before) = at.checked_sub(1) {
+        let farthest = at.saturating_sub(REORDER_UNITS);
+        while let Some(before) = at.checked_sub(1).filter(|&before| before >= farthest) {
             let Some(Item::Unit(queued)) = queue.get(before) else {
                 break;
             };

@@ -366,6 +366,17 @@ fn iso13818_1_2_4_2_6_units_queue_in_decoding_order_within_one_second() {
     // A unit more than a second before the last is another timeline.
     enqueue(&mut queue, unit(1, -1));
     assert_eq!(queue.back().map(Item::order), Some(Some(-1)));
+    // Decoding times that run backwards: each unit moves ahead of
+    // `REORDER_UNITS` units at most, so a segment's work stays linear.
+    let mut queue = VecDeque::new();
+    for back in 0..3 * REORDER_UNITS {
+        let decode_time = -i64::try_from(back).unwrap();
+        enqueue(&mut queue, unit(0, decode_time));
+        let at = queue
+            .iter()
+            .position(|item| item.order() == Some(decode_time));
+        assert_eq!(at, Some(back.saturating_sub(REORDER_UNITS)), "{back}");
+    }
     // Nothing moves ahead of a layout or an epoch.
     for barrier in [
         Item::Layout(Layout {
@@ -495,7 +506,15 @@ fn rfc8216_4_3_3_3_streams_at_the_discontinuity_take_it_together() {
         stream_with(Some(2), Some(9), vec![unit_at(10)]),
         stream_with(Some(0), Some(500_000), vec![unit_at(500_000)]),
     ];
+    let logs = Captured::default();
+    let _logging = logs.install();
     join(&mut streams, 0, 1);
+    let lagging = logs.lines("left its timeline without the discontinuity");
+    assert_eq!(lagging.len(), 1, "{lagging:?}");
+    assert!(
+        lagging[0].contains("WARN") && lagging[0].contains("lagging=1"),
+        "{lagging:?}"
+    );
     let state = |stream: &Stream| (stream.timeline, stream.released, queued(&stream.queue));
     assert_eq!(state(&streams[0]), (Some(1), None, vec![('v', 0)]));
     assert_eq!(state(&streams[1]), (Some(1), None, vec![('v', 0)]));
@@ -504,6 +523,9 @@ fn rfc8216_4_3_3_3_streams_at_the_discontinuity_take_it_together() {
         state(&streams[3]),
         (Some(0), Some(500_000), vec![('v', 500_000)])
     );
+    // No other stream behind: nothing to log.
+    join(&mut streams[2..3], 0, 3);
+    assert_eq!(logs.lines("without the discontinuity").len(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
