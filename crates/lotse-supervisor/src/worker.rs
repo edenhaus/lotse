@@ -8,7 +8,9 @@
 //! and never used as a path or a command, and what is kept is bounded
 //! here: at most 32 tracks and track counters with short names, error
 //! text cut and on one line. The frame cap alone would let a
-//! worker hand the API a quarter MiB per `stream/get`.
+//! worker hand the API a quarter MiB per `stream/get`. A trim is logged
+//! once per worker, so a worker repeating an over-long message cannot
+//! flood the log either.
 
 use std::io;
 use std::net::UdpSocket;
@@ -252,18 +254,30 @@ impl WorkerManager {
     }
 }
 
+/// Which kinds of trim of one worker's messages were logged: each once,
+/// since a worker repeating an over-long message would otherwise write a
+/// line per message.
+#[derive(Debug, Default)]
+struct Trims {
+    /// A declaration of tracks was trimmed ([`declared`]).
+    tracks: bool,
+    /// A report of track counters was trimmed ([`counted`]).
+    stats: bool,
+}
+
 /// Reads the worker's messages and relays them as events until the
 /// channel ends.
 async fn relay(mut rx: Receiver, events: mpsc::Sender<WorkerEvent>) {
     // Only the first message may hand over a descriptor: it is sent before
     // the worker reads anything from the network ([`ToSupervisor::Ready`]).
     let mut first = true;
+    let mut trims = Trims::default();
     loop {
         let event = match rx.recv_msg::<ToSupervisor>().await {
             Ok(Some((message, fds))) => {
                 let memory = fds.into_iter().next().filter(|_| first);
                 first = false;
-                map_message(message, memory)
+                map_message(message, memory, &mut trims)
             }
             Ok(None) => WorkerEvent::ChannelClosed,
             Err(err) => WorkerEvent::ChannelError(err.to_string()),
@@ -279,8 +293,9 @@ async fn relay(mut rx: Receiver, events: mpsc::Sender<WorkerEvent>) {
 }
 
 /// A worker message as a trusted event; `memory` is the descriptor that
-/// came with it, kept only for `Ready` and closed otherwise.
-fn map_message(message: ToSupervisor, memory: Option<OwnedFd>) -> WorkerEvent {
+/// came with it, kept only for `Ready` and closed otherwise, and `trims`
+/// what the worker's earlier messages logged.
+fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims) -> WorkerEvent {
     match message {
         ToSupervisor::Ready { pid } => WorkerEvent::Ready {
             pid,
@@ -319,8 +334,8 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>) -> WorkerEvent {
             SourceState::Stopped => WorkerEvent::StandbyStopped,
         },
         ToSupervisor::Switched => WorkerEvent::Switched,
-        ToSupervisor::Tracks(tracks) => WorkerEvent::Tracks(declared(tracks)),
-        ToSupervisor::Stats(stats) => WorkerEvent::Stats(counted(stats)),
+        ToSupervisor::Tracks(tracks) => WorkerEvent::Tracks(declared(tracks, &mut trims.tracks)),
+        ToSupervisor::Stats(stats) => WorkerEvent::Stats(counted(stats, &mut trims.stats)),
         ToSupervisor::Session { session_id, event } => WorkerEvent::Session { session_id, event },
         ToSupervisor::Talker(change) => match TalkerReason::parse(&change.reason) {
             Some(reason) => WorkerEvent::Talker {
@@ -339,8 +354,9 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>) -> WorkerEvent {
 }
 
 /// The tracks of a worker's declaration the supervisor keeps: the first
-/// [`MAX_TRACKS`] whose names fit [`MAX_NAME_BYTES`].
-fn declared(tracks: Vec<TrackInfo>) -> Vec<TrackInfo> {
+/// [`MAX_TRACKS`] whose names fit [`MAX_NAME_BYTES`]. A trim is logged
+/// unless `logged` says one was already, and sets it.
+fn declared(tracks: Vec<TrackInfo>, logged: &mut bool) -> Vec<TrackInfo> {
     let declared = tracks.len();
     let kept: Vec<TrackInfo> = tracks
         .into_iter()
@@ -352,29 +368,30 @@ fn declared(tracks: Vec<TrackInfo>) -> Vec<TrackInfo> {
         })
         .take(MAX_TRACKS)
         .collect();
-    if kept.len() < declared {
+    if kept.len() < declared && !std::mem::replace(logged, true) {
         tracing::warn!(
             declared,
             kept = kept.len(),
             limit = MAX_TRACKS,
-            "a worker declared too many tracks or over-long names; the rest dropped"
+            "a worker declared too many tracks or over-long names; the rest dropped, and later ones without a log"
         );
     }
     kept
 }
 
 /// A worker's counters with at most [`MAX_TRACKS`] tracks whose ids fit
-/// [`MAX_NAME_BYTES`].
-fn counted(mut stats: WorkerStats) -> WorkerStats {
+/// [`MAX_NAME_BYTES`]. A trim is logged unless `logged` says one was
+/// already, and sets it.
+fn counted(mut stats: WorkerStats, logged: &mut bool) -> WorkerStats {
     let reported = stats.tracks.len();
     stats.tracks.retain(|(id, _)| id.len() <= MAX_NAME_BYTES);
     stats.tracks.truncate(MAX_TRACKS);
-    if stats.tracks.len() < reported {
+    if stats.tracks.len() < reported && !std::mem::replace(logged, true) {
         tracing::warn!(
             reported,
             kept = stats.tracks.len(),
             limit = MAX_TRACKS,
-            "a worker counted too many tracks or over-long ids; the rest dropped"
+            "a worker counted too many tracks or over-long ids; the rest dropped, and later ones without a log"
         );
     }
     stats
@@ -689,21 +706,21 @@ mod tests {
     #[test]
     fn messages_map_onto_trusted_events() {
         assert_eq!(
-            map_message(ToSupervisor::Ready { pid: 4 }, None),
+            mapped(ToSupervisor::Ready { pid: 4 }, None),
             WorkerEvent::Ready {
                 pid: 4,
                 memory: None
             }
         );
         assert_eq!(
-            map_message(
+            mapped(
                 ToSupervisor::SourceState(SourceState::Connecting { attempt: 3 }),
                 None
             ),
             WorkerEvent::Report(WorkerReport::Connecting)
         );
         assert_eq!(
-            map_message(ToSupervisor::SourceState(SourceState::Live), None),
+            mapped(ToSupervisor::SourceState(SourceState::Live), None),
             WorkerEvent::Report(WorkerReport::Live)
         );
     }
@@ -738,20 +755,17 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                map_message(ToSupervisor::SwitchState(state), None),
+                mapped(ToSupervisor::SwitchState(state), None),
                 WorkerEvent::SwitchReport(report)
             );
         }
         assert_eq!(
-            map_message(ToSupervisor::SwitchState(SourceState::Stopped), None),
+            mapped(ToSupervisor::SwitchState(SourceState::Stopped), None),
             WorkerEvent::StandbyStopped
         );
+        assert_eq!(mapped(ToSupervisor::Switched, None), WorkerEvent::Switched);
         assert_eq!(
-            map_message(ToSupervisor::Switched, None),
-            WorkerEvent::Switched
-        );
-        assert_eq!(
-            map_message(
+            mapped(
                 ToSupervisor::SourceState(SourceState::Reconnecting {
                     code: "source_timeout".into(),
                     message: "stall".into()
@@ -763,7 +777,7 @@ mod tests {
             )))
         );
         assert_eq!(
-            map_message(
+            mapped(
                 ToSupervisor::SourceState(SourceState::Backoff {
                     code: "made_up".into(),
                     message: "x".into(),
@@ -777,15 +791,15 @@ mod tests {
             })
         );
         assert_eq!(
-            map_message(ToSupervisor::SourceState(SourceState::Stopped), None),
+            mapped(ToSupervisor::SourceState(SourceState::Stopped), None),
             WorkerEvent::SourceStopped
         );
         assert_eq!(
-            map_message(ToSupervisor::Tracks(vec![]), None),
+            mapped(ToSupervisor::Tracks(vec![]), None),
             WorkerEvent::Tracks(vec![])
         );
         assert_eq!(
-            map_message(ToSupervisor::Stats(WorkerStats::default()), None),
+            mapped(ToSupervisor::Stats(WorkerStats::default()), None),
             WorkerEvent::Stats(WorkerStats::default())
         );
         for (code, expect) in [
@@ -801,7 +815,7 @@ mod tests {
     #[test]
     fn talker_changes_map_onto_talker_events_and_an_unknown_reason_fails_the_channel() {
         assert_eq!(
-            map_message(
+            mapped(
                 ToSupervisor::Talker(TalkerChange {
                     session_id: "s1".into(),
                     reason: "released".into(),
@@ -816,7 +830,7 @@ mod tests {
             }
         );
         assert_eq!(
-            map_message(
+            mapped(
                 ToSupervisor::Talker(TalkerChange {
                     session_id: "s1".into(),
                     reason: "stolen".into(),
@@ -826,6 +840,11 @@ mod tests {
             ),
             WorkerEvent::ChannelError("talker change with an unknown reason \"stolen\"".into())
         );
+    }
+
+    /// [`map_message`] as a worker's first message of its kind maps.
+    fn mapped(message: ToSupervisor, memory: Option<OwnedFd>) -> WorkerEvent {
+        map_message(message, memory, &mut Trims::default())
     }
 
     fn track(id: &str) -> TrackInfo {
@@ -856,11 +875,11 @@ mod tests {
         let captured = Captured::default();
         let _logs = captured.install();
         assert_eq!(
-            map_message(ToSupervisor::Tracks(tracks.clone()), None),
+            mapped(ToSupervisor::Tracks(tracks.clone()), None),
             WorkerEvent::Tracks(tracks[5..5 + MAX_TRACKS].to_vec())
         );
         let few = vec![track("v0"), track("a0")];
-        assert_eq!(declared(few.clone()), few);
+        assert_eq!(declared(few.clone(), &mut false), few);
         let lines = captured.lines("declared too many tracks");
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
@@ -891,16 +910,48 @@ mod tests {
         reported[0] = &long;
         reported[1] = &named;
         assert_eq!(
-            map_message(ToSupervisor::Stats(stats(&reported)), None),
+            mapped(ToSupervisor::Stats(stats(&reported)), None),
             WorkerEvent::Stats(stats(&reported[1..=MAX_TRACKS]))
         );
-        assert_eq!(counted(stats(&["v0"])), stats(&["v0"]));
+        assert_eq!(counted(stats(&["v0"]), &mut false), stats(&["v0"]));
         let lines = captured.lines("counted too many tracks");
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines[0].contains("reported=40 kept=32 limit=32"),
             "{lines:?}"
         );
+    }
+
+    /// Regression for SUP-30: every trimmed declaration or counter report
+    /// was a `warn` line, so a worker repeating one grew the log at its
+    /// own rate.
+    #[test]
+    fn a_worker_s_repeated_trims_are_logged_once() {
+        let tracks: Vec<TrackInfo> = (0..=MAX_TRACKS).map(|n| track(&n.to_string())).collect();
+        let counters = lotse_ipc::TrackStats {
+            packets: 1,
+            packet_bytes: 2,
+            frames: 3,
+            frame_bytes: 4,
+            keyframes: 5,
+            frames_dropped_oversize: 6,
+            frames_over_browser_limit: 7,
+        };
+        let stats = WorkerStats {
+            tracks: (0..=MAX_TRACKS)
+                .map(|n| (n.to_string(), counters))
+                .collect(),
+            ..WorkerStats::default()
+        };
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let mut trims = Trims::default();
+        for _ in 0..100 {
+            let _tracks = map_message(ToSupervisor::Tracks(tracks.clone()), None, &mut trims);
+            let _stats = map_message(ToSupervisor::Stats(stats.clone()), None, &mut trims);
+        }
+        assert_eq!(captured.lines("declared too many tracks").len(), 1);
+        assert_eq!(captured.lines("counted too many tracks").len(), 1);
     }
 
     #[test]
@@ -957,7 +1008,7 @@ mod tests {
             talkback: None,
         };
         assert_eq!(
-            map_message(
+            mapped(
                 ToSupervisor::Session {
                     session_id: "s1".into(),
                     event: event.clone(),

@@ -735,7 +735,7 @@ impl Supervisor {
             connection_id.clone(),
             ice_ufrag,
             (connection, offer.id, events),
-            self.shared.clock.wall_now(),
+            Arc::clone(&self.shared.clock),
         );
         entry.close_slot = close_slot;
         entry.deliver(
@@ -2701,8 +2701,10 @@ mod tests {
         s.shutdown().await;
     }
 
-    /// An offer id, a session id, its flood, and the `closed` it ends with.
-    type Flood<'a> = (u64, &'a str, &'a dyn Fn() -> Report, Option<&'a Value>);
+    /// An offer id, a session id, its flood, the `closed` it ends with or
+    /// the type of its last event while it lives, and the most bytes the
+    /// flood may queue after the answer.
+    type Flood<'a> = (u64, &'a str, &'a dyn Fn() -> Report, &'a Value, usize);
 
     /// The bytes of `rx`'s queued events as the server frames them, and
     /// the last one.
@@ -2747,43 +2749,56 @@ mod tests {
             code: "av_sync_lost".into(),
             message: "m".repeat(200 * 1024),
         };
+        let state = || Report::State {
+            ice: "connected".into(),
+            dtls: "connected".into(),
+        };
         let refused = json!({ "type": "closed", "code": "internal_error",
                               "message": "the worker reported more than its session allows" });
-        let floods: [Flood<'_>; 3] = [
-            (3, "answers", &answer, Some(&refused)),
-            (4, "candidates", &candidate, Some(&refused)),
+        let share = lotse_api::OUTBOUND_BUDGET_BYTES / 8;
+        let floods: [Flood<'_>; 4] = [
+            (3, "answers", &answer, &refused, share),
+            (4, "candidates", &candidate, &refused, share),
             // One warning per code: the rest are dropped, the session lives.
-            (5, "warnings", &warning, None),
+            (5, "warnings", &warning, &json!("warning"), share),
+            // Regression for SUP-30: one `state` per report, changed or
+            // not. Now the first is the one change, the session lives.
+            (6, "states", &state, &json!("state"), 64),
         ];
-        for (id, session_id, flood, closed) in floods {
-            let mut events =
-                subscription(call_on(&s, 1, &offer(id, "front", Some(session_id))).await);
+        for (id, name, flood, last_event, most) in floods {
+            let mut events = subscription(call_on(&s, 1, &offer(id, "front", Some(name))).await);
             next(&mut events).await;
-            let connection = s.shared.lock().sessions[session_id].connection.clone();
+            let connection = s.shared.lock().sessions[name].connection.clone();
             let report = |event| {
                 let now = s.shared.clock.now();
                 s.shared
                     .lock()
-                    .session_report(&connection, session_id, event, now);
+                    .session_report(&connection, name, event, now);
             };
             report(answer());
             let mut bytes = 0;
             let mut last = drain(&mut events, &mut bytes);
+            let answered = bytes;
             for _ in 0..2_000 {
                 report(flood());
                 last = drain(&mut events, &mut bytes).or(last);
             }
             assert!(
-                bytes < lotse_api::OUTBOUND_BUDGET_BYTES / 8,
-                "{session_id}: {bytes} bytes queued for one session"
+                bytes < share,
+                "{name}: {bytes} bytes queued for one session"
             );
-            if let Some(closed) = closed {
-                assert_eq!(last.as_ref(), Some(closed), "{session_id}");
-                assert!(events.recv().await.is_none(), "{session_id}: ended");
+            let after = bytes - answered;
+            assert!(
+                after <= most,
+                "{name}: {after} bytes queued after the answer"
+            );
+            if last_event.is_object() {
+                assert_eq!(last.as_ref(), Some(last_event), "{name}");
+                assert!(events.recv().await.is_none(), "{name}: ended");
             } else {
-                assert_eq!(last.unwrap()["type"], "warning", "{session_id}");
+                assert_eq!(&last.unwrap()["type"], last_event, "{name}");
                 let _event = s.shared.lock().close_session(
-                    session_id,
+                    name,
                     "session_closed",
                     "test",
                     CloseBy::Supervisor,
@@ -2876,7 +2891,7 @@ mod tests {
             lines[3].contains(r#"ice="connected" dtls="connected" count=50"#),
             "{lines:?}"
         );
-        // Every report still reaches the client.
+        // Every change still reaches the client.
         let mut states = 0;
         while let Ok(event) = events.try_recv() {
             states += usize::from(event.payload["type"] == "state");
