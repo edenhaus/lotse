@@ -1368,6 +1368,50 @@ async fn a_refused_content_type_is_named_on_one_line_of_at_most_200_bytes() {
     rig.stop().await;
 }
 
+/// A refused answer's `Content-Type` that echoes the URL asked for, or the
+/// one redirected to, is quoted without its path and query, even where
+/// the 200-byte cut falls inside the path.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_content_type_is_quoted_without_the_urls_path_and_query() {
+    let rig = Rig::new().await;
+    let html = &b"<html></html>"[..];
+    rig.body(
+        "/camkey7f3a/live?token=tok9d2e",
+        "text/html; name=\"/camkey7f3a/live?token=tok9d2e\"",
+        html,
+    );
+    let echoed = rig.exit(rig.start("/camkey7f3a/live?token=tok9d2e")).await;
+    assert_protocol(&echoed, "Content-Type text/html; name=\"/****?****\"");
+    // The cut at 200 bytes falls inside the echoed path.
+    let pad = "x".repeat(180);
+    rig.body(
+        "/camkey7f3a/cut",
+        &format!("text/html; q={pad} /camkey7f3a/cut"),
+        html,
+    );
+    let cut = rig.exit(rig.start("/camkey7f3a/cut")).await;
+    assert_protocol(&cut, &format!("Content-Type text/html; q={pad} /****"));
+    // Redirected: the target's path and query, which the source URL does
+    // not have, go too.
+    rig.server.set(
+        "/start",
+        Reply::Redirect {
+            status: 302,
+            location: "/camkey7f3a/live?token=tok9d2e".into(),
+        },
+    );
+    let redirected = rig.exit(rig.start("/start")).await;
+    assert_protocol(&redirected, "Content-Type text/html; name=\"/****?****\"");
+    for err in [echoed, cut, redirected] {
+        let text = err.to_string();
+        assert!(
+            !text.contains("camkey") && !text.contains("tok9d2e"),
+            "{text}"
+        );
+    }
+    rig.stop().await;
+}
+
 /// `bytes` without the `nth` transport packet of `pid` that does not start
 /// a PES packet.
 fn drop_packet(bytes: &[u8], pid: u16, nth: usize) -> Vec<u8> {

@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use lotse_core::secret::RedactedUrl;
 use lotse_core::source::{Source, SourceCtx, SourceDescriptor, SourceError, SourceExit};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::BoxFuture;
@@ -237,7 +238,7 @@ fn is_mpegts_packets(bytes: &[u8]) -> bool {
 /// Tells what the first answer is, reading as much of its body as that
 /// takes: a playlist whole (at most [`hls::MAX_PLAYLIST_BYTES`]), MPEG-TS
 /// only its first [`SNIFF_BYTES`].
-async fn sniff(response: Response) -> Result<Sniffed, SourceError> {
+async fn sniff(response: Response, source: &SourceUrl) -> Result<Sniffed, SourceError> {
     let content_type = response.content_type().map(str::to_owned);
     let essence = content_type
         .as_deref()
@@ -276,6 +277,10 @@ async fn sniff(response: Response) -> Result<Sniffed, SourceError> {
     let labelled = content_type.map_or_else(
         || "no Content-Type".to_owned(),
         |value| {
+            // A server may echo the URL asked for, or the one it redirected
+            // to, in any header: their paths and queries go before the
+            // value is cut, so no part of either is left at the cut.
+            let value = RedactedUrl::new(&base).scrub(&source.redacted().scrub(&value));
             format!(
                 "Content-Type {}",
                 lotse_core::text::plain(&value, SERVER_TEXT_BYTES)
@@ -311,7 +316,7 @@ async fn attempt<C: Connect + Clone + 'static>(
     let mut first = client(connector.clone());
     tracing::info!(host = %ctx.peer.host, scheme = url.scheme(), "http: fetching the source");
     let sniffed = cancellable(&ctx.cancel, async {
-        sniff(first.get(url.expose_url()).await?).await
+        sniff(first.get(url.expose_url()).await?, &url).await
     })
     .await?;
     let feeds = match sniffed {
