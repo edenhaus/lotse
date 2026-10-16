@@ -377,8 +377,12 @@ async fn attempt<C: Connect + Clone + 'static>(
 enum Item {
     /// The stream's tracks from here on.
     Layout(Layout),
-    /// A new timeline starts here.
-    Epoch,
+    /// A new timeline starts here: an HLS discontinuity, which every
+    /// rendition has where its matching content does, so the one epoch
+    /// it starts waits for each stream to reach it (`Some`, the
+    /// discontinuity sequence number of the timeline it starts, RFC 8216
+    /// §4.3.3.3), or this stream's own gap or restart (`None`).
+    Epoch(Option<u64>),
     /// A unit, indexing the stream's own layout.
     Unit(Unit),
 }
@@ -388,7 +392,7 @@ impl Item {
     /// once (`None` sorts first), units by decoding time.
     const fn order(&self) -> Option<i64> {
         match self {
-            Self::Layout(_) | Self::Epoch => None,
+            Self::Layout(_) | Self::Epoch(_) => None,
             Self::Unit(unit) => Some(unit.decode_time),
         }
     }
@@ -459,6 +463,14 @@ struct Stream {
     layout: Option<Layout>,
     /// Why its feed ended, once it has: it has no segment left.
     ended: Option<SourceError>,
+    /// The discontinuity sequence number of the last segment read.
+    read_sequence: Option<u64>,
+    /// The discontinuity sequence number of the timeline the merge plays
+    /// of it: its first segment's, then that of each discontinuity
+    /// taken; `None` without one (a raw MPEG-TS body).
+    timeline: Option<u64>,
+    /// The decoding time of its last unit released on this timeline.
+    released: Option<i64>,
 }
 
 impl Stream {
@@ -471,12 +483,41 @@ impl Stream {
             fmp4: None,
             layout: None,
             ended: None,
+            read_sequence: None,
+            timeline: None,
+            released: None,
         }
     }
 
     /// Whether the merge has to wait for its next segment.
     fn starved(&self) -> bool {
         self.queue.is_empty() && self.ended.is_none()
+    }
+
+    /// Whether the merge has to take items of this stream before the
+    /// discontinuity that starts timeline `next`: it plays an earlier
+    /// one, and its head is not the epoch of `next` or of a later one.
+    /// Units count only while they belong to the timeline that ends
+    /// there: decoded within [`REORDER_TICKS`] of `ended`, the last
+    /// decoding time released on it by the stream that reached the
+    /// discontinuity, as matching content of the renditions ends
+    /// together (RFC 8216 §4.3.3.3); further away, before (timestamps
+    /// that restarted) or after (that ran on), they show a stream that
+    /// left that timeline without the discontinuity.
+    fn behind(&self, next: u64, ended: Option<i64>) -> bool {
+        if self.timeline.is_some_and(|timeline| timeline >= next) {
+            return false;
+        }
+        match self.queue.front() {
+            // Ended and played out: a stream that waits for a segment
+            // is fed before the merge takes anything.
+            None => false,
+            Some(Item::Epoch(Some(sequence))) => *sequence < next,
+            Some(Item::Epoch(None) | Item::Layout(_)) => true,
+            Some(Item::Unit(unit)) => ended.is_none_or(|ended| {
+                unit.decode_time.abs_diff(ended) <= REORDER_TICKS.unsigned_abs()
+            }),
+        }
     }
 
     /// Takes the feed's next segment into the queue: the continuity errors
@@ -514,10 +555,18 @@ impl Stream {
     /// Reads `segment` into the queue, after an epoch and with fresh
     /// readers when it starts a new timeline.
     fn read(&mut self, segment: Segment, max_frame_bytes: usize) -> Result<u64, SourceError> {
+        let sequence = segment.discontinuity_sequence;
+        // A discontinuity sequence number of its own makes it one every
+        // rendition shares; the same one, a gap or restart of this stream.
+        let shared = sequence.filter(|&next| self.read_sequence.is_some_and(|last| last != next));
+        self.read_sequence = sequence.or(self.read_sequence);
+        if self.timeline.is_none() {
+            self.timeline = sequence;
+        }
         if segment.discontinuity {
             self.ts = None;
             self.fmp4 = None;
-            self.queue.push_back(Item::Epoch);
+            self.queue.push_back(Item::Epoch(shared));
         }
         let mut events = Vec::new();
         let mut lost = 0;
@@ -642,12 +691,25 @@ impl Program {
                     }
                     self.declare()?;
                 }
-                Item::Epoch => {
+                Item::Epoch(shared) => {
+                    let reason = match shared {
+                        Some(next) => {
+                            join(&mut self.streams, index, next);
+                            "an HLS discontinuity"
+                        }
+                        None => "an HLS gap or restart",
+                    };
+                    if let Some(stream) = self.streams.get_mut(index) {
+                        stream.released = None;
+                    }
                     if let Some(publisher) = self.publisher.as_mut() {
-                        publisher.new_epoch("an HLS discontinuity, gap or restart");
+                        publisher.new_epoch(reason);
                     }
                 }
                 Item::Unit(mut unit) => {
+                    if let Some(stream) = self.streams.get_mut(index) {
+                        stream.released = Some(unit.decode_time);
+                    }
                     unit.track = unit.track.saturating_add(self.offset(index));
                     self.release(unit).await?;
                 }
@@ -655,15 +717,9 @@ impl Program {
         }
     }
 
-    /// The next item of the merge and the stream it is from: a layout or
-    /// an epoch at a stream's head first, else the unit due first.
+    /// The next item of the merge and the stream it is from ([`next`]).
     fn take(&mut self) -> Option<(usize, Item)> {
-        let (_, index) = self
-            .streams
-            .iter()
-            .enumerate()
-            .filter_map(|(index, stream)| Some((stream.queue.front()?.order(), index)))
-            .min()?;
+        let index = next(&self.streams)?;
         Some((index, self.streams.get_mut(index)?.queue.pop_front()?))
     }
 
@@ -752,5 +808,61 @@ impl Program {
         }
         publisher.publish(unit, self.ctx.time.now());
         Ok(())
+    }
+}
+
+/// The stream whose head the merge of `streams` takes next: a layout or
+/// an epoch first, else the unit due first; but an HLS discontinuity only
+/// once no other stream is [`Stream::behind`] it, measured from where its
+/// own stream's old timeline ended, so the old timeline's units of every
+/// stream come before the one new epoch. One stream at least can always
+/// go: one waits only for a stream whose head is no discontinuity, or an
+/// earlier one, which waits for nothing later.
+fn next(streams: &[Stream]) -> Option<usize> {
+    let waits = |index: usize, item: &Item| match item {
+        Item::Epoch(Some(sequence)) => {
+            let ended = streams.get(index).and_then(|stream| stream.released);
+            streams
+                .iter()
+                .enumerate()
+                .any(|(other, stream)| other != index && stream.behind(*sequence, ended))
+        }
+        Item::Epoch(None) | Item::Layout(_) | Item::Unit(_) => false,
+    };
+    streams
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stream)| Some((index, stream.queue.front()?)))
+        .filter(|&(index, item)| !waits(index, item))
+        .map(|(index, item)| (item.order(), index))
+        .min()
+        .map(|(_, index)| index)
+}
+
+/// Stream `index` took the discontinuity that starts timeline `next`:
+/// so do the streams whose head is its epoch, which goes with it; a
+/// stream still behind it is logged, as the timeline starts without
+/// it, and one past it keeps its own.
+fn join(streams: &mut [Stream], index: usize, next: u64) {
+    let mut lagging = 0_usize;
+    for (other, stream) in streams.iter_mut().enumerate() {
+        let joins = other == index
+            || matches!(stream.queue.front(), Some(Item::Epoch(Some(sequence))) if *sequence == next);
+        if joins {
+            if other != index {
+                stream.queue.pop_front();
+            }
+            stream.timeline = Some(next);
+            stream.released = None;
+        } else if stream.behind(next, None) {
+            lagging = lagging.saturating_add(1);
+        }
+    }
+    if lagging > 0 {
+        tracing::warn!(
+            discontinuity_sequence = next,
+            lagging,
+            "http: a rendition left its timeline without the discontinuity; the new timeline starts without it"
+        );
     }
 }

@@ -70,6 +70,10 @@ pub(super) struct Segment {
     pub(super) format: Format,
     /// Whether a new timeline starts with them ([`Fetch::discontinuity`]).
     pub(super) discontinuity: bool,
+    /// The segment's discontinuity sequence number (RFC 8216 §4.3.3.3,
+    /// [`Fetch::discontinuity_sequence`]): what its timeline is called in
+    /// every rendition; `None` for a piece of a raw MPEG-TS body.
+    pub(super) discontinuity_sequence: Option<u64>,
     /// Whether they end a segment, so the reader's open units end too: an
     /// HLS segment, not a piece of a raw body.
     pub(super) ends: bool,
@@ -137,6 +141,7 @@ async fn stream(
             data: piece,
             format: Format::Ts { init: None },
             discontinuity: false,
+            discontinuity_sequence: None,
             ends: false,
         };
         tx.send(Ok(segment)).await.ok().ok_or_else(cancelled)?;
@@ -315,6 +320,7 @@ impl<C: Connect> Follower<C> {
             data,
             format,
             discontinuity: fetch.discontinuity,
+            discontinuity_sequence: Some(fetch.discontinuity_sequence),
             ends: true,
         })
     }

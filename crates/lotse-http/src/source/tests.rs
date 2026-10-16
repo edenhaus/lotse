@@ -15,7 +15,7 @@ use lotse_core::codec::CodecFamily;
 use lotse_core::media::MediaFrame;
 use lotse_core::source::{ResolvedPeer, Source, SourceError, SourceExit, TrackSet};
 use lotse_core::source_url::SourceUrl;
-use lotse_core::track::{FrameSubscription, Track};
+use lotse_core::track::{FrameSubscription, SubscriptionError, Track};
 use lotse_core::{Codec, Kind};
 use lotse_testing::Harness;
 use lotse_testing::fake_camera::CameraTls;
@@ -338,7 +338,7 @@ fn queued(queue: &VecDeque<Item>) -> Vec<(char, i64)> {
         .map(|item| match item {
             Item::Unit(unit) => (if unit.track == 0 { 'v' } else { 'a' }, unit.decode_time),
             Item::Layout(_) => ('l', 0),
-            Item::Epoch => ('e', 0),
+            Item::Epoch(_) => ('e', 0),
         })
         .collect()
 }
@@ -372,13 +372,138 @@ fn iso13818_1_2_4_2_6_units_queue_in_decoding_order_within_one_second() {
             program_number: 1,
             tracks: Vec::new(),
         }),
-        Item::Epoch,
+        Item::Epoch(None),
     ] {
         let mut queue = VecDeque::from([unit(0, 9_000)]);
         enqueue(&mut queue, barrier);
         enqueue(&mut queue, unit(1, 0));
         assert_eq!(queued(&queue)[2], ('a', 0));
     }
+}
+
+/// A stream on timeline `timeline` whose last unit released was decoded at
+/// `released`, `items` queued.
+fn stream_with(timeline: Option<u64>, released: Option<i64>, items: Vec<Item>) -> Stream {
+    let (_tx, feed) = tokio::sync::mpsc::channel(1);
+    let mut stream = Stream::new(feed);
+    stream.timeline = timeline;
+    stream.released = released;
+    stream.queue = items.into();
+    stream
+}
+
+fn unit_at(decode_time: i64) -> Item {
+    Item::Unit(Unit {
+        track: 0,
+        decode_time,
+        ts: decode_time,
+        payload: Bytes::new(),
+    })
+}
+
+/// The discontinuity that starts timeline 1 (RFC 8216 §4.3.3.3) waits at
+/// the head of the stream that reached it, its old timeline ended at
+/// 80 000, while the other stream's head still belongs to that timeline.
+#[test]
+fn rfc8216_4_3_3_3_a_discontinuity_waits_for_every_stream_to_reach_it() {
+    let pick = |other: Stream| {
+        let streams = [
+            stream_with(
+                Some(0),
+                Some(80_000),
+                vec![Item::Epoch(Some(1)), unit_at(0)],
+            ),
+            other,
+        ];
+        next(&streams)
+    };
+    let layout = || {
+        Item::Layout(Layout {
+            program_number: 1,
+            tracks: Vec::new(),
+        })
+    };
+    // Still on the old timeline: the other stream goes first.
+    assert_eq!(
+        pick(stream_with(Some(0), None, vec![unit_at(85_000)])),
+        Some(1)
+    );
+    assert_eq!(
+        pick(stream_with(Some(0), None, vec![unit_at(-10_000)])),
+        Some(1)
+    );
+    assert_eq!(
+        pick(stream_with(Some(0), None, vec![Item::Epoch(None)])),
+        Some(1)
+    );
+    assert_eq!(pick(stream_with(Some(0), None, vec![layout()])), Some(1));
+    assert_eq!(
+        pick(stream_with(Some(0), None, vec![Item::Epoch(Some(0))])),
+        Some(1)
+    );
+    // Left the old timeline without the discontinuity, its units over a
+    // second past its end or before it: no wait.
+    assert_eq!(
+        pick(stream_with(Some(0), None, vec![unit_at(170_001)])),
+        Some(0)
+    );
+    assert_eq!(
+        pick(stream_with(Some(0), None, vec![unit_at(-10_001)])),
+        Some(0)
+    );
+    // At the discontinuity, past it, or ended and played out: no wait.
+    assert_eq!(
+        pick(stream_with(Some(0), None, vec![Item::Epoch(Some(1))])),
+        Some(0)
+    );
+    assert_eq!(
+        pick(stream_with(Some(0), None, vec![Item::Epoch(Some(2))])),
+        Some(0)
+    );
+    assert_eq!(
+        pick(stream_with(Some(1), None, vec![unit_at(85_000)])),
+        Some(0)
+    );
+    assert_eq!(pick(stream_with(Some(0), None, Vec::new())), Some(0));
+    // Before any unit of the old timeline, every unit is on it.
+    let streams = [
+        stream_with(Some(0), None, vec![Item::Epoch(Some(1))]),
+        stream_with(Some(0), None, vec![unit_at(i64::MAX)]),
+    ];
+    assert_eq!(next(&streams), Some(1));
+    // A gap or restart of one stream waits for nothing.
+    let streams = [
+        stream_with(Some(0), Some(0), vec![Item::Epoch(None)]),
+        stream_with(Some(0), None, vec![unit_at(0)]),
+    ];
+    assert_eq!(next(&streams), Some(0));
+    assert_eq!(next(&[]), None);
+}
+
+/// The stream that takes the discontinuity of timeline 1 takes the other
+/// streams' epoch of it along, so it starts one epoch; a stream past it
+/// keeps its timeline, one that left the old one without it is counted.
+#[test]
+fn rfc8216_4_3_3_3_streams_at_the_discontinuity_take_it_together() {
+    let mut streams = [
+        stream_with(Some(0), Some(80_000), vec![unit_at(0)]),
+        stream_with(
+            Some(0),
+            Some(80_000),
+            vec![Item::Epoch(Some(1)), unit_at(0)],
+        ),
+        stream_with(Some(2), Some(9), vec![unit_at(10)]),
+        stream_with(Some(0), Some(500_000), vec![unit_at(500_000)]),
+    ];
+    join(&mut streams, 0, 1);
+    let state = |stream: &Stream| (stream.timeline, stream.released, queued(&stream.queue));
+    assert_eq!(state(&streams[0]), (Some(1), None, vec![('v', 0)]));
+    assert_eq!(state(&streams[1]), (Some(1), None, vec![('v', 0)]));
+    assert_eq!(state(&streams[2]), (Some(2), Some(9), vec![('v', 10)]));
+    assert_eq!(
+        state(&streams[3]),
+        (Some(0), Some(500_000), vec![('v', 500_000)])
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -983,6 +1108,69 @@ async fn rfc8216_4_3_4_1_a_separate_audio_rendition_plays_with_the_variant_on_on
     let last_video = video_frames.iter().map(|f| f.arrival).max().unwrap();
     let first_audio = audio_frames.iter().map(|f| f.arrival).min().unwrap();
     assert!(first_audio < last_video, "{first_audio:?} {last_video:?}");
+    rig.stop().await;
+}
+
+/// A discontinuity both renditions have, their timestamps starting over
+/// there (RFC 8216 §4.3.3.3): the variant's old timeline and the audio's
+/// play out before the one epoch both start together, so no unit of the
+/// old timeline follows one of the new.
+#[tokio::test(flavor = "current_thread")]
+async fn rfc8216_4_3_3_3_a_discontinuity_of_both_renditions_starts_one_epoch_after_both() {
+    let rig = Rig::new().await;
+    rig.body("/m/video.mp4", MP4, SPLIT_VIDEO_INIT);
+    rig.body("/m/video.m4s", MP4, SPLIT_VIDEO_0);
+    rig.body("/m/audio.mp4", MP4, SPLIT_AUDIO_INIT);
+    rig.body("/m/audio.m4s", MP4, SPLIT_AUDIO_0);
+    rig.playlist("/m/index.m3u8", MULTIVARIANT);
+    for (name, init) in [("video", "video.mp4"), ("audio", "audio.mp4")] {
+        rig.playlist(
+            &format!("/m/{name}.m3u8"),
+            &media_playlist(
+                &format!("#EXT-X-MAP:URI=\"{init}\"\n"),
+                &[
+                    &format!("{name}.m4s"),
+                    "#EXT-X-DISCONTINUITY",
+                    &format!("{name}.m4s"),
+                ],
+                true,
+            ),
+        );
+    }
+    let mut harness = rig.start("/m/index.m3u8");
+    assert!(harness.wait_ready_within().await);
+    let (video, audio) = tracks(&harness.tracks);
+    let mut video_frames = video.subscribe_frames();
+    let mut audio_frames = audio.subscribe_frames();
+    let err = rig.exit(harness).await;
+    assert_ended_with(&err, "EXT-X-ENDLIST");
+    assert_eq!((video.epoch(), audio.epoch()), (1, 1));
+    assert_eq!(video.stats().frames, 20);
+    assert_eq!(audio.stats().frames, 94);
+    // The last 64 frames of each track are kept (`DEFAULT_FRAME_CAPACITY`):
+    // every video frame, the audio's of the new timeline and the end of
+    // the old one's.
+    let kept = |sub: &mut FrameSubscription| {
+        let mut kept = Vec::new();
+        loop {
+            match sub.try_recv() {
+                Ok(Some(frame)) => kept.push(frame),
+                Ok(None) => return kept,
+                Err(err) => assert!(matches!(err, SubscriptionError::Lagged(_)), "{err:?}"),
+            }
+        }
+    };
+    let (video_frames, audio_frames) = (kept(&mut video_frames), kept(&mut audio_frames));
+    let new = |frames: &[Arc<MediaFrame>]| frames.iter().filter(|frame| frame.epoch == 1).count();
+    assert_eq!((new(&video_frames), new(&audio_frames)), (10, 47));
+    let mut all: Vec<(std::time::Instant, u32)> = video_frames
+        .iter()
+        .chain(&audio_frames)
+        .map(|frame| (frame.arrival, frame.epoch))
+        .collect();
+    all.sort();
+    let epochs: Vec<u32> = all.iter().map(|&(_, epoch)| epoch).collect();
+    assert!(epochs.is_sorted(), "{epochs:?}");
     rig.stop().await;
 }
 
