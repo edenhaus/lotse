@@ -17,13 +17,16 @@
     reason = "test code; the helpers outside #[test] functions panic on harness failures"
 )]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::connection::WorkerReport;
+use lotse_core::task::spawn_named;
 use lotse_supervisor::net::demux::{Demux, DemuxStats, WorkerSink};
 use lotse_supervisor::net::udp::bind_udp;
 use lotse_supervisor::worker::{
@@ -35,6 +38,7 @@ use lotse_testing::libwebrtc::H265Receiver;
 use lotse_testing::viewer::{Direction, Outgoing, Viewer, capture_seconds, with_video_codecs};
 use lotse_testing::{CameraConfig, FakeCamera};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 const UFRAG: &str = "lotseufrag";
 const PASS: &str = "lotsepassword0123456789ab";
@@ -111,6 +115,52 @@ async fn send_all(socket: &UdpSocket, out: &mut Vec<Outgoing>) {
             .send_to(&datagram.payload, datagram.destination)
             .await
             .expect("viewer send");
+    }
+}
+
+/// A task reading the viewer's datagrams off its socket as they come, so
+/// the kernel's receive buffer drains while the viewer decrypts: a
+/// keyframe sent as one burst of thousands of packets overflows the
+/// buffer (about 170 datagrams at Linux's default `rmem_default`) of a
+/// viewer that reads only between packets, as under coverage and a
+/// loaded CI runner (observed 2026-10-16).
+struct Reader {
+    /// The task, on a copy of the socket's descriptor.
+    task: tokio::task::JoinHandle<()>,
+    /// The datagrams read and their sources.
+    datagrams: mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
+}
+
+impl Reader {
+    fn start(socket: &UdpSocket) -> Self {
+        let fd = socket.as_fd().try_clone_to_owned().expect("socket copy");
+        let copy = UdpSocket::from_std(std::net::UdpSocket::from(fd)).expect("socket copy");
+        let (tx, datagrams) = mpsc::unbounded_channel();
+        let task = spawn_named("viewer-reader", async move {
+            let mut buf = vec![0_u8; 2_000];
+            loop {
+                let (len, source) = copy.recv_from(&mut buf).await.expect("viewer recv");
+                if tx.send((buf[..len].to_vec(), source)).is_err() {
+                    return;
+                }
+            }
+        });
+        Self { task, datagrams }
+    }
+
+    /// Stops the task and hands back what it read and the viewer has
+    /// not taken: `recv_from` is cancel safe, so no datagram is lost to
+    /// the reads after it.
+    async fn stop(mut self) -> Vec<(Vec<u8>, SocketAddr)> {
+        self.task.abort();
+        if let Err(error) = self.task.await {
+            assert!(error.is_cancelled(), "viewer reader: {error}");
+        }
+        let mut rest = Vec::new();
+        while let Ok(datagram) = self.datagrams.try_recv() {
+            rest.push(datagram);
+        }
+        rest
     }
 }
 
@@ -441,7 +491,7 @@ async fn drive(
 ) {
     let viewer_addr = socket.local_addr().unwrap();
     let mut out = Vec::new();
-    let mut buf = vec![0_u8; 2_000];
+    let mut reader = Reader::start(socket);
     let mut deadline = clock().sleep(Duration::from_secs(20));
     while !done(viewer, reports) {
         let next_timeout = viewer
@@ -472,9 +522,8 @@ async fn drive(
                 WorkerEvent::Exited(status) => panic!("worker exited: {status:?}"),
                 _ => {}
             },
-            received = socket.recv_from(&mut buf) => {
-                let (len, source) = received.expect("viewer recv");
-                viewer.receive(clock().now(), source, &buf[..len], &mut out);
+            Some((datagram, source)) = reader.datagrams.recv() => {
+                viewer.receive(clock().now(), source, &datagram, &mut out);
                 send_all(socket, &mut out).await;
             }
             () = clock().sleep(next_timeout) => {
@@ -484,6 +533,10 @@ async fn drive(
             () = &mut deadline => panic!("not reached in time; {} packets, events {events:?}, reports {reports:?}", viewer.packets().len()),
         }
     }
+    for (datagram, source) in reader.stop().await {
+        viewer.receive(clock().now(), source, &datagram, &mut out);
+    }
+    send_all(socket, &mut out).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1632,23 +1685,10 @@ async fn libwebrtc_max_frame_packets_a_larger_keyframe_is_sent_whole_with_a_warn
     // a frame's packets at once, so loopback drops part of such a burst
     // and which packets arrive varies (the session tests of `lotse-webrtc`
     // count every one); the span shows the frame went past the limit.
-    let large = |v: &Viewer| {
-        let mut frames = std::collections::BTreeMap::new();
-        for p in v.packets() {
-            let seq = p.header.sequence_number;
-            let span = frames.entry(p.header.timestamp).or_insert((seq, seq));
-            if seq.wrapping_sub(span.1) < 1 << 15 {
-                span.1 = seq;
-            }
-            if span.0.wrapping_sub(seq) < 1 << 15 {
-                span.0 = seq;
-            }
-        }
-        frames
-            .into_iter()
-            .map(|(ts, (first, last))| (ts, usize::from(last.wrapping_sub(first)) + 1))
-            .find(|&(_, span)| span > 2_049)
-    };
+    // Each check reads only the packets that came since the last: one
+    // over every packet, after every datagram, kept the viewer from its
+    // socket for a third of the run.
+    let (mut spans, mut ends, mut read) = (BTreeMap::new(), BTreeSet::new(), 0);
     drive(
         &mut door,
         &socket,
@@ -1656,17 +1696,29 @@ async fn libwebrtc_max_frame_packets_a_larger_keyframe_is_sent_whole_with_a_warn
         &mut events,
         &mut reports,
         |v, _| {
-            large(v).is_some_and(|(ts, _)| {
-                v.packets()
-                    .iter()
-                    .filter(|p| {
-                        p.header.marker
-                            && p.header.timestamp.wrapping_sub(ts) < 1 << 31
-                            && p.header.timestamp != ts
-                    })
-                    .count()
-                    >= 3
-            })
+            for p in &v.packets()[read..] {
+                let seq = p.header.sequence_number;
+                let span = spans.entry(p.header.timestamp).or_insert((seq, seq));
+                if seq.wrapping_sub(span.1) < 1 << 15 {
+                    span.1 = seq;
+                }
+                if span.0.wrapping_sub(seq) < 1 << 15 {
+                    span.0 = seq;
+                }
+                if p.header.marker {
+                    ends.insert(p.header.timestamp);
+                }
+            }
+            read = v.packets().len();
+            spans
+                .iter()
+                .find(|&(_, &(first, last))| usize::from(last.wrapping_sub(first)) + 1 > 2_049)
+                .is_some_and(|(&ts, _)| {
+                    ends.iter()
+                        .filter(|&&end| end.wrapping_sub(ts) < 1 << 31 && end != ts)
+                        .count()
+                        >= 3
+                })
         },
     )
     .await;
