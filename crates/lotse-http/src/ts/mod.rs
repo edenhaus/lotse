@@ -783,16 +783,15 @@ impl Ctx {
     /// loss do not continue that frame, and the frame count no longer
     /// follows the time. The next PTS times its frames again.
     fn cut(&mut self, index: usize) {
-        let Some(track) = self.tracks.get_mut(index) else {
-            return;
-        };
-        if track.pes.take().is_some() {
-            self.stats.dropped_incomplete = self.stats.dropped_incomplete.saturating_add(1);
-        }
-        if let Content::Audio(audio) = &mut track.content {
-            audio.splitter.discontinuity();
-            audio.pending = None;
-            audio.anchor = None;
+        if let Some(track) = self.tracks.get_mut(index) {
+            if track.pes.take().is_some() {
+                self.stats.dropped_incomplete = self.stats.dropped_incomplete.saturating_add(1);
+            }
+            if let Content::Audio(audio) = &mut track.content {
+                audio.splitter.discontinuity();
+                audio.pending = None;
+                audio.anchor = None;
+            }
         }
     }
 
