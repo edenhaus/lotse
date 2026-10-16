@@ -172,8 +172,8 @@ fn supervisor_probe_child() {
 /// The escape probe child: learn the parent's pid, sandbox itself as a
 /// worker, do what its runtime still does (name a thread, read its own
 /// limits), then try the act the variable names: lower the parent's
-/// limits, make itself dumpable again, clear its parent-death signal, or
-/// ask for its parent's pid.
+/// limits, make itself dumpable again, clear its parent-death signal, ask
+/// for its parent's pid, create a memory file or resize a file.
 #[test]
 #[expect(
     clippy::disallowed_methods,
@@ -223,6 +223,17 @@ fn escape_probe_child() {
         "pdeathsig" => {
             let cleared = rustix::process::set_parent_process_death_signal(None);
             println!("pdeathsig:{cleared:?}");
+        }
+        "memfd" => {
+            let created =
+                rustix::fs::memfd_create("lotse-probe", rustix::fs::MemfdFlags::CLOEXEC).map(drop);
+            println!("memfd:{created:?}");
+        }
+        "ftruncate" => {
+            // stdout is the harness's pipe: the call fails with `EINVAL`
+            // should it get through.
+            let resized = rustix::fs::ftruncate(std::io::stdout(), 0);
+            println!("ftruncate:{resized:?}");
         }
         _ => {
             assert_eq!(act, "getppid", "unknown act");
@@ -465,20 +476,38 @@ fn a_worker_cannot_read_files_or_spawn_processes() {
 #[test]
 fn a_worker_cannot_reach_the_supervisor_or_undo_its_sandbox() {
     for act in ["prlimit_parent", "dumpable", "pdeathsig", "getppid"] {
-        let (report, stdout, stderr, status) = run_probe("escape_probe_child", ESCAPE_PROBE, act);
-        let context = format!("act {act}\nstdout: {stdout}\nstderr: {stderr}");
-        assert!(
-            stdout.contains("thread_name:Ok(Ok(\"lotse-probe\"))"),
-            "{context}"
-        );
-        assert!(stdout.contains("nofile:Some(256)"), "{context}");
         let profiler_needs_it = act == "pdeathsig" && cfg!(coverage);
-        if report.seccomp == LayerStatus::Enforced && !profiler_needs_it {
-            assert!(!stdout.contains(&format!("{act}:")), "{context}");
-            assert_eq!(status.signal(), Some(SIGSYS), "{context}");
-        } else {
-            assert!(stdout.contains(&format!("{act}:")), "{context}");
-        }
+        assert_escape_is_killed(act, profiler_needs_it);
+    }
+}
+
+/// Regression for SBX-20: a worker could create a memfd and fill it with
+/// shmem pages that `RLIMIT_AS` does not count (`memfd_create(2)`), until
+/// the host ran out of memory. Under the worker's allowlist creating or
+/// resizing one ends the worker with `SIGSYS`.
+#[test]
+fn a_worker_cannot_fill_memory_outside_its_address_space() {
+    for act in ["memfd", "ftruncate"] {
+        assert_escape_is_killed(act, false);
+    }
+}
+
+/// Runs the escape probe child with `act` and checks that the worker's
+/// runtime still works and that the act ends it with `SIGSYS` where
+/// seccomp is enforced, unless the coverage `profiler_needs_it`.
+fn assert_escape_is_killed(act: &str, profiler_needs_it: bool) {
+    let (report, stdout, stderr, status) = run_probe("escape_probe_child", ESCAPE_PROBE, act);
+    let context = format!("act {act}\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("thread_name:Ok(Ok(\"lotse-probe\"))"),
+        "{context}"
+    );
+    assert!(stdout.contains("nofile:Some(256)"), "{context}");
+    if report.seccomp == LayerStatus::Enforced && !profiler_needs_it {
+        assert!(!stdout.contains(&format!("{act}:")), "{context}");
+        assert_eq!(status.signal(), Some(SIGSYS), "{context}");
+    } else {
+        assert!(stdout.contains(&format!("{act}:")), "{context}");
     }
 }
 

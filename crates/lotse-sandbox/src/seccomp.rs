@@ -158,7 +158,6 @@ fn allowlist(
         Profile::Worker { .. } => {
             allow(&mut rules, COMMON);
             allow(&mut rules, ARCH_SPECIFIC);
-            allow(&mut rules, WORKER);
             rules.extend(descriptor_rules()?);
             rules.insert(libc::SYS_socket, inet_only()?);
             rules.insert(libc::SYS_clone, threads_only()?);
@@ -504,10 +503,6 @@ const SUPERVISOR: &[i64] = &[
     libc::SYS_unlinkat,
 ];
 
-/// What a worker does beyond the common set (`socket`, `clone`, `tgkill`,
-/// `prlimit64` and `prctl` are added with conditions).
-const WORKER: &[i64] = &[libc::SYS_memfd_create, libc::SYS_ftruncate];
-
 /// A decoder: read its input, write its output, memory, and exit
 /// (`tgkill` is added with a condition).
 const DECODER: &[i64] = &[
@@ -662,6 +657,19 @@ mod tests {
             libc::SYS_clone,
             [arg(libc::SIGCHLD), 0, 0, 0, 0, 0]
         ));
+    }
+
+    /// Regression for SBX-20: a worker allowed `memfd_create` could fill
+    /// shmem pages that `RLIMIT_AS` does not count (`memfd_create(2)`: the
+    /// file lives in memory, and only a mapping of it takes address space)
+    /// until the host ran out of memory, and nothing it runs calls either
+    /// syscall. The supervisor keeps both for the keyframe hand-over.
+    #[test]
+    fn a_worker_cannot_create_or_resize_a_memory_file() {
+        for call in [libc::SYS_memfd_create, libc::SYS_ftruncate] {
+            assert!(!allows(&worker(), call, [0; 6]), "{call}");
+            assert!(allows(&supervisor(), call, [0; 6]), "{call}");
+        }
     }
 
     /// Regression for SBX-3: one uid for every process, so an
@@ -924,7 +932,6 @@ mod tests {
         for call in DESCRIPTOR_CALLS.iter().chain(ARCH_DESCRIPTOR_CALLS) {
             assert!(!COMMON.contains(call), "{call}");
             assert!(!ARCH_SPECIFIC.contains(call), "{call}");
-            assert!(!WORKER.contains(call), "{call}");
         }
     }
 
@@ -1063,7 +1070,7 @@ mod tests {
         ] {
             assert!(!COMMON.contains(&denied));
             assert!(!SUPERVISOR.contains(&denied));
-            assert!(!WORKER.contains(&denied));
+            assert!(!allows(&worker(), denied, [0; 6]));
             assert!(!DECODER.contains(&denied));
         }
         for writing in [
@@ -1077,11 +1084,10 @@ mod tests {
                 !COMMON.contains(&writing),
                 "only the supervisor writes files"
             );
-            assert!(!WORKER.contains(&writing));
+            assert!(!allows(&worker(), writing, [0; 6]));
             assert!(!DECODER.contains(&writing));
         }
         assert!(!COMMON.contains(&libc::SYS_execve));
-        assert!(!WORKER.contains(&libc::SYS_execve));
         for sandboxing in [
             libc::SYS_seccomp,
             libc::SYS_landlock_create_ruleset,
@@ -1092,7 +1098,7 @@ mod tests {
                 !COMMON.contains(&sandboxing),
                 "only the supervisor's children sandbox themselves"
             );
-            assert!(!WORKER.contains(&sandboxing));
+            assert!(!allows(&worker(), sandboxing, [0; 6]));
         }
         assert!(!COMMON.contains(&libc::SYS_socket), "socket is per profile");
         for reaching in [
@@ -1105,7 +1111,6 @@ mod tests {
                 !COMMON.contains(&reaching),
                 "conditional outside the supervisor"
             );
-            assert!(!WORKER.contains(&reaching));
             assert!(!DECODER.contains(&reaching));
         }
         assert!(!COMMON.contains(&libc::SYS_clone), "clone is per profile");
