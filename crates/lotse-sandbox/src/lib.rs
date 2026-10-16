@@ -1,5 +1,6 @@
-//! Privilege drop, `no_new_privs`, `dumpable`, rlimits, and the Landlock and
-//! seccomp profiles for each process kind (supervisor, worker, decoder).
+//! Privilege drop, `no_new_privs`, `dumpable`, rlimits, a worker's lower
+//! scheduling priority, and the Landlock and seccomp profiles for each
+//! process kind (supervisor, worker, decoder).
 //!
 //! Applied by the binary in the main thread before any runtime starts, and
 //! reports which layers are enforced for `info.sandbox`. Linux-only: on
@@ -7,7 +8,8 @@
 //! tests. Depends on nothing in the workspace: it runs before anything else
 //! exists in the process.
 //!
-//! Standards: landlock(7), seccomp(2), prctl(2), setresuid(2), setrlimit(2).
+//! Standards: landlock(7), seccomp(2), prctl(2), setresuid(2), setrlimit(2),
+//! setpriority(2) and sched(7).
 
 use std::fmt;
 use std::os::fd::OwnedFd;
@@ -39,6 +41,24 @@ pub const DEFAULT_WORKER_ADDRESS_SPACE: u64 = 1 << 30;
 
 /// `RLIMIT_NOFILE` for a worker.
 pub const WORKER_MAX_FILES: u64 = 256;
+
+/// How many nice units a worker adds to the nice value it inherits from
+/// the supervisor (setpriority(2)), so the supervisor and its control plane
+/// outrank a worker that spins: each unit makes the scheduler favor the
+/// higher-priority thread by a factor of about 1.25 (sched(7), "The nice
+/// value"), so 10 units give a supervisor thread about nine times the CPU
+/// share of a worker thread competing with it. It is nice(1)'s default
+/// adjustment. Not 19: a worker carries live video, and at 19 it would get
+/// about a seventieth of a core it shares with any other busy process
+/// of the host. The kernel clamps the result at 19 (setpriority(2)).
+///
+/// A bound only per thread: a worker that starts N spinning threads still
+/// takes about N/9 of the supervisor's share, and sibling workers, at the
+/// same nice, share the CPU with them evenly. Thread count and CPU time are
+/// not bounded otherwise. Nice values count only within one autogroup
+/// (sched(7), "The autogroup feature"), and a worker stays in the
+/// supervisor's session, which spawns it without `setsid(2)`.
+pub const WORKER_NICE_INCREMENT: i32 = 10;
 
 /// The descriptor number a worker keeps the shared WebRTC UDP socket at,
 /// the highest [`WORKER_MAX_FILES`] leaves it. Every worker sends on one
@@ -75,7 +95,8 @@ pub enum Mode {
     /// Refuse to start if any layer is unavailable.
     Require,
     /// Debugging only; warns on every start. Only the privilege drop
-    /// applies: no rlimits, `dumpable`, `no_new_privs`, Landlock or seccomp.
+    /// applies: no rlimits, lower priority, `dumpable`, `no_new_privs`,
+    /// Landlock or seccomp.
     /// The drop is not a sandbox layer, so no mode lets a process started as
     /// root keep root.
     Off,
@@ -193,7 +214,8 @@ impl Default for SandboxConfig {
 /// before any other thread exists: the privilege drop is per thread at the
 /// syscall level and seccomp applies to the calling thread.
 ///
-/// The order is privileges, rlimits, `dumpable`, the parent-death signal
+/// The order is privileges, rlimits, a worker's scheduling priority
+/// ([`WORKER_NICE_INCREMENT`]), `dumpable`, the parent-death signal
 /// (workers and decoders), `no_new_privs`, Landlock, seccomp. In `on` mode
 /// a layer the kernel lacks is reported, in `require` mode it is an error,
 /// and `off` applies the privilege drop alone: started as root, every mode

@@ -1,10 +1,12 @@
-//! The Linux implementation: privilege drop, rlimits, `dumpable`, the
-//! parent-death signal, `no_new_privs` and Landlock, then the seccomp
-//! allowlist from [`crate::seccomp`].
+//! The Linux implementation: privilege drop, rlimits, a worker's
+//! scheduling priority, `dumpable`, the parent-death signal,
+//! `no_new_privs` and Landlock, then the seccomp allowlist from
+//! [`crate::seccomp`].
 //!
 //! Implements setresuid(2)/setgroups(2) for the drop, setrlimit(2),
-//! prctl(2) `PR_SET_DUMPABLE`, `PR_SET_PDEATHSIG` and `PR_SET_NO_NEW_PRIVS`,
-//! and landlock(7) filesystem rules (ABI 1) and TCP rules (ABI 4). Every
+//! setpriority(2) for a worker's nice value (sched(7)), prctl(2)
+//! `PR_SET_DUMPABLE`, `PR_SET_PDEATHSIG` and `PR_SET_NO_NEW_PRIVS`, and
+//! landlock(7) filesystem rules (ABI 1) and TCP rules (ABI 4). Every
 //! Landlock ruleset is best effort: the kernel's ABI is probed first, and
 //! what it lacks is reported rather than fatal unless the mode is `require`.
 
@@ -22,7 +24,7 @@ use rustix::process::{DumpableBehavior, Gid, Resource, Rlimit, Signal, Uid};
 use crate::report::{LandlockReport, LayerStatus};
 use crate::{
     DECODER_ADDRESS_SPACE, DECODER_CPU_SECONDS, Mode, Profile, SandboxConfig, SandboxError,
-    SandboxReport, WORKER_MAX_FILES, seccomp,
+    SandboxReport, WORKER_MAX_FILES, WORKER_NICE_INCREMENT, seccomp,
 };
 
 /// The highest Landlock ABI this crate asks for. Filesystem rules need
@@ -39,6 +41,7 @@ pub(crate) fn apply(
     let rules = open_rules(profile);
     let (uid, gid) = drop_privileges(config)?;
     apply_rlimits(profile, config)?;
+    apply_priority(profile)?;
     rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable)
         .map_err(step("PR_SET_DUMPABLE"))?;
     if !matches!(profile, Profile::Supervisor { .. }) {
@@ -181,6 +184,49 @@ fn apply_rlimits(profile: &Profile, config: &SandboxConfig) -> Result<(), Sandbo
             rustix::process::setrlimit(Resource::Cpu, hard(DECODER_CPU_SECONDS))
                 .map_err(step("RLIMIT_CPU"))?;
         }
+    }
+    Ok(())
+}
+
+/// Lowers a worker's scheduling priority by [`WORKER_NICE_INCREMENT`] nice
+/// units from the one it inherited, and logs the nice value it now runs at;
+/// the other profiles keep theirs.
+///
+/// The nice value is per thread on Linux: setpriority(2) with
+/// `PRIO_PROCESS` and `who` 0 changes the calling thread only (BUGS: "the
+/// nice value is a per-thread attribute"), and a thread starts with the
+/// nice value of the thread that created it (setpriority(2) NOTES for
+/// fork(2); the kernel's `sched_fork` copies it for a thread too). So the
+/// worker sets it itself, here, in the main thread before any other thread
+/// exists, as every step of [`crate::apply`] requires, and every thread of
+/// its runtime inherits it. The supervisor setting it on the child's pid
+/// after the spawn would race the child's runtime threads, which would keep
+/// the supervisor's nice value, and a hook that runs between `fork` and
+/// `execve` needs `unsafe`.
+///
+/// After the privilege drop: a higher nice value needs no privilege, and
+/// nothing the worker keeps lets it raise its priority again, neither the
+/// dropped uid (`RLIMIT_NICE`, setrlimit(2)) nor the worker's seccomp
+/// allowlist, which has no call that changes a priority or a scheduling
+/// policy. The read
+/// (getpriority(2)) and the write both run under the supervisor's inherited
+/// filter, which allows them on the calling thread only. A failure of
+/// either is fatal, as a refused rlimit is.
+///
+/// No `SCHED_BATCH` (sched(7)): it changes only how the scheduler treats a
+/// thread that wakes up, not its CPU share, so it does nothing against a
+/// spinning thread and delays the media path's wakeups; rustix has no
+/// `sched_setscheduler(2)` either, and `unsafe` is not allowed.
+fn apply_priority(profile: &Profile) -> Result<(), SandboxError> {
+    if let Profile::Worker { .. } = profile {
+        // getpriority(2) then setpriority(2) on the calling thread, clamped
+        // to the kernel's range.
+        let nice = rustix::process::nice(WORKER_NICE_INCREMENT).map_err(step("setpriority"))?;
+        tracing::info!(
+            nice,
+            increment = WORKER_NICE_INCREMENT,
+            "worker scheduling priority lowered"
+        );
     }
     Ok(())
 }
@@ -443,6 +489,8 @@ mod tests {
     use std::path::PathBuf;
     use std::process::{Command, Output};
 
+    use tracing_subscriber::fmt::MakeWriter as _;
+
     use super::*;
     use crate::StateDir;
 
@@ -556,6 +604,87 @@ mod tests {
         assert_eq!(limits(Resource::Cpu), (cpu, cpu));
         assert_eq!(limits(Resource::Core), (Some(0), Some(0)));
         println!("{CHILD_DONE}");
+    }
+
+    /// The calling thread's nice value (getpriority(2): on Linux,
+    /// `PRIO_PROCESS` with `who` 0 is the calling thread).
+    fn own_nice() -> i32 {
+        rustix::process::getpriority_process(None).unwrap()
+    }
+
+    /// The log lines of
+    /// [`setpriority2_a_worker_lowers_its_priority_and_its_later_threads_inherit_it`].
+    static PRIORITY_LOGS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    /// Regression for SBX-25: a worker's threads ran at the supervisor's
+    /// nice value, so one that spun took the supervisor's CPU share. The
+    /// nice value is per thread, so this changes this test's thread only
+    /// and ends with it.
+    #[test]
+    fn setpriority2_a_worker_lowers_its_priority_and_its_later_threads_inherit_it() {
+        let before = own_nice();
+        let supervisor = Profile::Supervisor {
+            binary: "/lotse".into(),
+            state_dir: None,
+        };
+        apply_priority(&supervisor).unwrap();
+        apply_priority(&Profile::Decoder).unwrap();
+        assert_eq!(own_nice(), before, "only a worker lowers its priority");
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| PRIORITY_LOGS.make_writer())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let worker = Profile::Worker {
+            connect_ports: vec![554],
+        };
+        tracing::subscriber::with_default(subscriber, || apply_priority(&worker)).unwrap();
+        // setpriority(2): the kernel clamps the value at 19.
+        let lowered = (before + WORKER_NICE_INCREMENT).min(19);
+        assert_eq!(own_nice(), lowered);
+        let started = std::thread::spawn(own_nice).join().unwrap();
+        assert_eq!(started, lowered, "a thread started afterwards inherits it");
+        let logs = String::from_utf8(PRIORITY_LOGS.lock().unwrap().clone()).unwrap();
+        let line = format!("worker scheduling priority lowered nice={lowered} increment=10");
+        assert!(logs.contains(&line), "{logs}");
+    }
+
+    /// As a container's own seccomp profile can, a filter on this test's
+    /// thread answers setpriority(2) with `EPERM` (seccomp(2): a filter
+    /// applies to the calling thread only, without
+    /// `SECCOMP_FILTER_FLAG_TSYNC`): the worker does not run on at the
+    /// priority it inherited.
+    #[test]
+    fn setpriority2_a_priority_the_kernel_refuses_is_a_setpriority_step_error() {
+        let arch = seccompiler::TargetArch::try_from(std::env::consts::ARCH).unwrap();
+        let rules = std::collections::BTreeMap::from([(libc::SYS_setpriority, Vec::new())]);
+        let eperm = u32::try_from(libc::EPERM).unwrap();
+        let refuse: seccompiler::BpfProgram = seccompiler::SeccompFilter::new(
+            rules,
+            seccompiler::SeccompAction::Allow,
+            seccompiler::SeccompAction::Errno(eperm),
+            arch,
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        seccompiler::apply_filter(&refuse).unwrap();
+        let before = own_nice();
+        let worker = Profile::Worker {
+            connect_ports: vec![554],
+        };
+        let err = apply_priority(&worker).unwrap_err();
+        assert!(
+            matches!(&err, SandboxError::Step { step: "setpriority", source }
+                if source.raw_os_error() == Some(libc::EPERM)),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "setpriority failed: Operation not permitted (os error 1)"
+        );
+        assert_eq!(own_nice(), before);
     }
 
     #[test]

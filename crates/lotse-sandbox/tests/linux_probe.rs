@@ -12,7 +12,7 @@
     reason = "test code; the helper outside #[test] functions panics on harness failures"
 )]
 
-use std::io::{IoSlice, IoSliceMut};
+use std::io::{BufRead as _, BufReader, IoSlice, IoSliceMut, Read as _};
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
@@ -42,6 +42,9 @@ const ESCAPE_PROBE: &str = "LOTSE_SANDBOX_ESCAPE_PROBE";
 /// The variable that turns this binary into the shared-socket probe child;
 /// its value names the one call on the shared socket, tried last.
 const SHARED_PROBE: &str = "LOTSE_SANDBOX_SHARED_PROBE";
+
+/// The variable that turns this binary into the priority probe child.
+const NICE_PROBE: &str = "LOTSE_SANDBOX_NICE_PROBE";
 
 /// `SIGSYS`, without pulling libc into the test.
 const SIGSYS: i32 = 31;
@@ -73,6 +76,64 @@ fn probe_child() {
     // Under the allowlist `execve` kills the process before anything prints.
     let spawned = Command::new("/bin/true").status().map(|s| s.success());
     println!("spawn:{spawned:?}");
+}
+
+/// The priority probe child: sandbox itself as a worker, start a thread,
+/// print its own thread's and the new thread's ids, and keep both alive
+/// until its stdin closes, so the parent reads each one's nice value from
+/// `/proc`, which the worker's Landlock domain keeps from it.
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the probe child reads the variable that marks it"
+)]
+fn nice_probe_child() {
+    if std::env::var_os(NICE_PROBE).is_none() {
+        return;
+    }
+    let profile = Profile::Worker {
+        connect_ports: vec![554],
+    };
+    let report =
+        lotse_sandbox::apply(&profile, &SandboxConfig::default()).expect("worker profile applies");
+    println!(
+        "{}",
+        serde_json::to_string(&report).expect("report serializes")
+    );
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let started = std::thread::spawn(move || {
+        tid_tx
+            .send(rustix::thread::gettid().as_raw_nonzero())
+            .expect("tid sent");
+        // Until the main thread hangs up.
+        let _closed = done_rx.recv();
+    });
+    let thread = tid_rx.recv().expect("the thread's tid");
+    println!(
+        "tids:{} {thread}",
+        rustix::thread::gettid().as_raw_nonzero()
+    );
+    let mut rest = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut rest)
+        .expect("stdin until it closes");
+    drop(done_tx);
+    started.join().expect("thread joins");
+}
+
+/// The nice value of thread `tid` of process `pid`: field 19 of its
+/// `stat` (proc(5), `/proc/pid/stat`), counted after the closing
+/// parenthesis of the `comm` field, which may hold spaces.
+fn nice_of(pid: u32, tid: &str) -> i32 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).expect("stat");
+    let (_, fields) = stat.rsplit_once(')').expect("comm ends");
+    fields
+        .split_whitespace()
+        .nth(19 - 3)
+        .expect("field 19")
+        .parse()
+        .expect("a nice value")
 }
 
 /// Where the supervisor probe child moves the state directory it opened,
@@ -173,7 +234,8 @@ fn supervisor_probe_child() {
 /// worker, do what its runtime still does (name a thread, read its own
 /// limits), then try the act the variable names: lower the parent's
 /// limits, make itself dumpable again, clear its parent-death signal, ask
-/// for its parent's pid, create a memory file or resize a file.
+/// for its parent's pid, create a memory file, resize a file or raise its
+/// scheduling priority again.
 #[test]
 #[expect(
     clippy::disallowed_methods,
@@ -234,6 +296,12 @@ fn escape_probe_child() {
             // should it get through.
             let resized = rustix::fs::ftruncate(std::io::stdout(), 0);
             println!("ftruncate:{resized:?}");
+        }
+        "setpriority" => {
+            // Back to nice 0: refused (`EACCES`) without `CAP_SYS_NICE`
+            // should the call get through (setpriority(2)).
+            let raised = rustix::process::setpriority_process(None, 0);
+            println!("setpriority:{raised:?}");
         }
         _ => {
             assert_eq!(act, "getppid", "unknown act");
@@ -490,6 +558,67 @@ fn a_worker_cannot_fill_memory_outside_its_address_space() {
     for act in ["memfd", "ftruncate"] {
         assert_escape_is_killed(act, false);
     }
+}
+
+/// Regression for SBX-25: a worker's threads ran at the supervisor's nice
+/// value, so one that spun took the supervisor's CPU share (sched(7)). A
+/// worker runs at [`lotse_sandbox::WORKER_NICE_INCREMENT`] above the nice
+/// value it inherits, clamped at 19 (setpriority(2)), on the thread that
+/// sandboxed itself and on a thread it starts afterwards; the nice value is
+/// per thread on Linux, so both are read.
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "spawns this test binary as the probe child"
+)]
+fn a_worker_and_every_thread_it_starts_run_at_a_lower_priority() {
+    let inherited = rustix::process::getpriority_process(None).expect("own nice value");
+    let expected = (inherited + lotse_sandbox::WORKER_NICE_INCREMENT).min(19);
+    let mut child = Command::new(std::env::current_exe().expect("own path"))
+        .args(["--exact", "nice_probe_child", "--nocapture"])
+        .env(NICE_PROBE, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("child runs");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut lines = String::new();
+    let tids = loop {
+        let mut line = String::new();
+        let read = stdout.read_line(&mut line).expect("child output");
+        assert_ne!(read, 0, "no tids in child output\nstdout: {lines}");
+        if let Some(tids) = line.strip_prefix("tids:") {
+            break tids
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+        }
+        lines.push_str(&line);
+    };
+    let nices: Vec<i32> = tids.iter().map(|tid| nice_of(child.id(), tid)).collect();
+    drop(child.stdin.take());
+    stdout.read_to_string(&mut lines).expect("child output");
+    let output = child.wait_with_output().expect("child exits");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!("stdout: {lines}\nstderr: {stderr}");
+    assert!(output.status.success(), "{}\n{context}", output.status);
+    let report_line = lines
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .unwrap_or_else(|| panic!("no report\n{context}"));
+    let report: SandboxReport = serde_json::from_str(report_line).expect("report parses");
+    assert_eq!(report.mode, Mode::On);
+    assert_eq!(nices, [expected, expected], "{context}");
+}
+
+/// Regression for SBX-25: a worker could undo its lower priority. Under
+/// its allowlist `setpriority` ends it with `SIGSYS`; without it, the
+/// dropped uid cannot lower its nice value anyway (setpriority(2),
+/// `RLIMIT_NICE`).
+#[test]
+fn a_worker_cannot_raise_its_priority_again() {
+    assert_escape_is_killed("setpriority", false);
 }
 
 /// Runs the escape probe child with `act` and checks that the worker's
