@@ -107,6 +107,27 @@ impl<'a> RedactedUrl<'a> {
     /// query (a host a short query repeats) has it replaced too.
     #[must_use]
     pub fn scrub(&self, text: &str) -> String {
+        Self::scrub_all(&[*self], text)
+    }
+
+    /// `text` scrubbed of every one of `urls` at once, as
+    /// [`RedactedUrl::scrub`] scrubs it of one: all their paths and
+    /// queries are found in `text` as it is, so where one URL's overlaps
+    /// another's (a source URL's query that a redirect target repeats in
+    /// its own), none hides the other. Scrubbing one URL after the other
+    /// would leave the rest of a longer one the first had cut into.
+    #[must_use]
+    pub fn scrub_all(urls: &[Self], text: &str) -> String {
+        let needles: Vec<(&str, &str)> = urls.iter().flat_map(RedactedUrl::needles).collect();
+        let mut cuts = embedded_urls(text);
+        cuts.extend(occurrences(text, &needles));
+        let scrubbed = apply(text, cuts);
+        apply(&scrubbed, occurrences(&scrubbed, &needles))
+    }
+
+    /// What [`RedactedUrl::scrub`] replaces of this URL, with what: its
+    /// path unless empty or `/`, its query unless empty.
+    fn needles(&self) -> impl Iterator<Item = (&'a str, &'static str)> {
         let path = Some(self.url.path())
             .filter(|path| !path.is_empty() && *path != "/")
             .map(|path| (path, REDACTED_PATH));
@@ -115,11 +136,7 @@ impl<'a> RedactedUrl<'a> {
             .query()
             .filter(|query| !query.is_empty())
             .map(|query| (query, REDACTED));
-        let needles: Vec<(&str, &str)> = path.into_iter().chain(query).collect();
-        let mut cuts = embedded_urls(text);
-        cuts.extend(occurrences(text, &needles));
-        let scrubbed = apply(text, cuts);
-        apply(&scrubbed, occurrences(&scrubbed, &needles))
+        path.into_iter().chain(query)
     }
 }
 
@@ -434,6 +451,36 @@ mod tests {
                 "{input}: {text}"
             );
         }
+    }
+
+    /// A source URL and the URL it redirected to, scrubbed together:
+    /// the source's query inside the target's, or the source's path inside
+    /// the target's query, does not leave the rest of the target's.
+    #[test]
+    fn scrub_all_redacts_urls_whose_parts_overlap_together() {
+        let target = "text/html; name=\"/protected?session=old&token=tok9d2e\"";
+        for (source, redirect, text, scrubbed) in [
+            (
+                "rtsp://cam/entry?session=old",
+                "rtsp://cam/protected?session=old&token=tok9d2e",
+                target,
+                "text/html; name=\"/****?****\"",
+            ),
+            (
+                "rtsp://cam/entry",
+                "rtsp://cam/protected?next=/entry&token=tok9d2e",
+                "got ?next=/entry&token=tok9d2e",
+                "got ?****",
+            ),
+        ] {
+            let (source, redirect) = (Url::parse(source).unwrap(), Url::parse(redirect).unwrap());
+            let urls = [RedactedUrl::new(&source), RedactedUrl::new(&redirect)];
+            assert_eq!(RedactedUrl::scrub_all(&urls, text), scrubbed, "{text}");
+            // One after the other, the first cuts into the second.
+            let chained = urls[1].scrub(&urls[0].scrub(text));
+            assert!(chained.contains("tok9d2e"), "{chained}");
+        }
+        assert_eq!(RedactedUrl::scrub_all(&[], "a /b ?c"), "a /b ?c");
     }
 
     #[test]

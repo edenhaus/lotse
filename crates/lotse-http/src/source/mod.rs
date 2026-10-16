@@ -278,9 +278,11 @@ async fn sniff(response: Response, source: &SourceUrl) -> Result<Sniffed, Source
         || "no Content-Type".to_owned(),
         |value| {
             // A server may echo the URL asked for, or the one it redirected
-            // to, in any header: their paths and queries go before the
-            // value is cut, so no part of either is left at the cut.
-            let value = RedactedUrl::new(&base).scrub(&source.redacted().scrub(&value));
+            // to, in any header: their paths and queries go together, as
+            // one may overlap the other, and before the value is cut, so
+            // no part of either is left at the cut.
+            let value =
+                RedactedUrl::scrub_all(&[source.redacted(), RedactedUrl::new(&base)], &value);
             format!(
                 "Content-Type {}",
                 lotse_core::text::plain(&value, SERVER_TEXT_BYTES)

@@ -1402,7 +1402,34 @@ async fn a_refused_content_type_is_quoted_without_the_urls_path_and_query() {
     );
     let redirected = rig.exit(rig.start("/start")).await;
     assert_protocol(&redirected, "Content-Type text/html; name=\"/****?****\"");
-    for err in [echoed, cut, redirected] {
+    // Redirected where the source URL's query, or its path, is part of
+    // the target's query: both URLs are scrubbed together.
+    let mut overlapping = Vec::new();
+    for (source, target, location) in [
+        (
+            "/entry?session=old",
+            "/protected?session=old&token=tok9d2e",
+            "/protected?session=old&token=tok9d2e",
+        ),
+        (
+            "/entry",
+            "/protected?next=/entry&token=tok9d2e",
+            "/protected?next=/entry&token=tok9d2e",
+        ),
+    ] {
+        rig.body(target, &format!("text/html; name=\"{target}\""), html);
+        rig.server.set(
+            source,
+            Reply::Redirect {
+                status: 302,
+                location: location.into(),
+            },
+        );
+        let err = rig.exit(rig.start(source)).await;
+        assert_protocol(&err, "Content-Type text/html; name=\"/****?****\"");
+        overlapping.push(err);
+    }
+    for err in [echoed, cut, redirected].into_iter().chain(overlapping) {
         let text = err.to_string();
         assert!(
             !text.contains("camkey") && !text.contains("tok9d2e"),
