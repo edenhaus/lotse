@@ -90,6 +90,11 @@ const STREAM_ADTS: u8 = 0x0f;
 /// default `max_delay` of 0.7 s).
 pub const HOLD_TICKS: u64 = 2 * TS_CLOCK_RATE as u64;
 
+/// What a unit held for the layout costs besides its payload: the unit
+/// itself, so that units with little or no payload are bounded in number
+/// too.
+pub const HELD_UNIT_BYTES: usize = size_of::<Unit>();
+
 /// The span of PTS and DTS: 33 bits (ISO/IEC 13818-1 §2.4.3.7).
 const TIMESTAMP_WRAP: i64 = 1 << 33;
 
@@ -123,6 +128,8 @@ pub struct DemuxStats {
     pub dropped_untimed: u64,
     /// PES packets dropped unfinished, their rest lost.
     pub dropped_incomplete: u64,
+    /// Video PES packets dropped without payload: no access unit.
+    pub dropped_empty: u64,
     /// Times the AAC timestamps restarted from a PES PTS that the frame
     /// count did not reach.
     pub audio_reanchors: u64,
@@ -198,8 +205,9 @@ impl Demuxer {
     }
 
     /// Bytes held: a partial packet, open PES packets, units waiting for
-    /// the layout. Each is bounded: fewer than three packets,
-    /// `max_frame_bytes` per stream, `max_frame_bytes` plus one unit.
+    /// the layout, each with its own size ([`HELD_UNIT_BYTES`]). Each is
+    /// bounded: fewer than three packets, `max_frame_bytes` per stream,
+    /// `max_frame_bytes` plus one unit.
     #[must_use]
     pub fn buffered(&self) -> usize {
         let open: usize = self
@@ -582,7 +590,7 @@ struct Ctx {
     ready: bool,
     /// Units waiting for the layout.
     held: Vec<Unit>,
-    /// Their payload bytes.
+    /// Their payload bytes and [`HELD_UNIT_BYTES`] for each.
     held_bytes: usize,
     /// The last extended timestamp, which the next one is extended near.
     last_time: Option<i64>,
@@ -744,7 +752,10 @@ impl Ctx {
             .held
             .first()
             .map_or(0, |first| first.decode_time.abs_diff(unit.decode_time));
-        self.held_bytes = self.held_bytes.saturating_add(unit.payload.len());
+        self.held_bytes = self
+            .held_bytes
+            .saturating_add(unit.payload.len())
+            .saturating_add(HELD_UNIT_BYTES);
         self.held.push(unit);
         if span > HOLD_TICKS || self.held_bytes > self.max_frame_bytes {
             for track in &mut self.tracks {
@@ -869,6 +880,10 @@ impl Ctx {
                 .filter(|&(sequence, _)| last.is_none_or(|last| last < sequence));
             steps
         } else {
+            if pes.data.is_empty() {
+                self.stats.dropped_empty = self.stats.dropped_empty.saturating_add(1);
+                return;
+            }
             let Some(timing) = pes.timing else {
                 self.stats.dropped_untimed = self.stats.dropped_untimed.saturating_add(1);
                 return;

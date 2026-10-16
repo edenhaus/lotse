@@ -814,15 +814,44 @@ fn iso13818_1_2_4_4_8_units_are_held_at_most_two_seconds_or_max_frame_bytes() {
     ctx.emit(unit(0, 10));
     ctx.emit(unit(-(HOLD_TICKS as i64) - 1, 10));
     assert_eq!(layouts(&ctx.events).len(), 1);
-    // By bytes: up to the limit they wait.
+    // By bytes, each unit's own included: up to the limit they wait.
     let mut ctx = audio_ctx(false);
-    ctx.max_frame_bytes = 100;
+    ctx.max_frame_bytes = 100 + 2 * HELD_UNIT_BYTES;
     ctx.emit(unit(0, 60));
     ctx.emit(unit(0, 40));
     assert!(ctx.events.is_empty());
-    assert_eq!(ctx.held_bytes, 100);
-    ctx.emit(unit(0, 1));
+    assert_eq!(ctx.held_bytes, 100 + 2 * HELD_UNIT_BYTES);
+    ctx.emit(unit(0, 0));
     assert_eq!(layouts(&ctx.events).len(), 1);
+    // Units of one time without payload are bounded in number.
+    let mut ctx = audio_ctx(false);
+    ctx.max_frame_bytes = 10 * HELD_UNIT_BYTES;
+    for _ in 0..10 {
+        ctx.emit(unit(0, 0));
+    }
+    assert!(ctx.events.is_empty());
+    ctx.emit(unit(0, 0));
+    assert_eq!(layouts(&ctx.events).len(), 1);
+}
+
+/// A video PES packet without payload carries no access unit (ISO/IEC
+/// 13818-1 §2.4.3.7): dropped, so none is held for a layout that waits
+/// for a silent AAC track, however many come with one timestamp.
+#[test]
+fn iso13818_1_2_4_3_7_an_empty_video_pes_is_dropped() {
+    let mut ctx = audio_ctx(false);
+    ctx.tracks.push(Track::new(VIDEO_PID, 0x1b, MAX).unwrap());
+    for _ in 0..3 {
+        ctx.tracks[1].pes = Some(Pes {
+            timing: Some(Timing { pts: 0, dts: 0 }),
+            data: Vec::new(),
+        });
+        ctx.finish(1);
+    }
+    assert!(ctx.held.is_empty());
+    assert_eq!(ctx.held_bytes, 0);
+    assert_eq!(ctx.stats.dropped_empty, 3);
+    assert_eq!(ctx.stats.dropped_untimed, 0);
 }
 
 #[test]
