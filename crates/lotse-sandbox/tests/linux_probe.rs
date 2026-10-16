@@ -651,8 +651,10 @@ fn refuse_seccomp() {
 /// Regression for SBX-25: a worker could undo its lower priority. Under
 /// its allowlist `setpriority` ends it with `SIGSYS`. Without the seccomp
 /// layer, which `on` mode only reports, the dropped uid is refused all the
-/// same: its `RLIMIT_NICE` is 0 whatever it inherited (setpriority(2),
-/// getrlimit(2)), which `--ulimit nice=20:20` under Docker exercises.
+/// same: its `RLIMIT_NICE` is 0 (setpriority(2), getrlimit(2)). At the
+/// default limit of 0 this holds without the pin as well; CI's Sandbox
+/// isolation job starts its container with `--ulimit nice=20:20` and checks
+/// that the pin took the raised limit away (`scripts/sandbox-isolation.sh`).
 #[test]
 fn a_worker_cannot_raise_its_priority_again() {
     assert_escape_is_killed("setpriority", false);

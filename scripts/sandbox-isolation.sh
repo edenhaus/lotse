@@ -6,12 +6,14 @@
 # root-owned 0700 directory, drops to 65534 and applies its sandbox; workers apply
 # theirs. Checks, through `lotse ctl`, that `info.sandbox` reports every layer, that a
 # sandboxed worker on the fake source goes live with every thread at a lower scheduling
-# priority than the supervisor's, that a crashing worker is restarted without touching
-# the other stream, and that the daemon stops cleanly on SIGTERM.
+# priority than the supervisor's and an `RLIMIT_NICE` pinned to 0, that a crashing worker is
+# restarted without touching the other stream, and that the daemon stops cleanly on SIGTERM.
 # First, as root with `--sandbox off`, which must still drop the supervisor and its
 # workers to 65534: no mode parses camera bytes as root.
 #
-# Needs a `lotse` built with `--features source-fake`, at $LOTSE (default /lotse).
+# Needs a `lotse` built with `--features source-fake`, at $LOTSE (default /lotse), and a
+# container started with `--ulimit nice=20:20`: a raised `RLIMIT_NICE` would let a worker undo
+# its lower priority, so the check proves the worker pins it to 0.
 set -eu
 
 LOTSE="${LOTSE:-/lotse}"
@@ -73,30 +75,49 @@ all_unprivileged() {
 
 nice_increment=10 # lotse_sandbox::WORKER_NICE_INCREMENT
 
+# `nice_limit <pid>`: the soft and hard `RLIMIT_NICE` of <pid>, as "<soft> <hard>" (proc(5)).
+nice_limit() {
+  grep '^Max nice priority' "/proc/$1/limits" | tr -s ' ' | cut -d ' ' -f 4,5
+}
+
 # `workers_niced`: every thread of every worker runs at the supervisor's nice value plus
 # $nice_increment (at most 19), and the supervisor's at the one it started with: a worker lowers
-# its priority before it starts a thread, and the nice value is per thread (setpriority(2)).
+# its priority before it starts a thread, and the nice value is per thread (setpriority(2)). Each
+# worker's `RLIMIT_NICE` is 0, so it cannot lower its nice value again, while the supervisor keeps
+# the raised limit the container started it with, so the pin had a limit to undo.
 workers_niced() {
   name="$(basename "$LOTSE" | cut -c 1-15)"
   own="$(sed 's/.*) //' "/proc/$DAEMON/stat" | cut -d ' ' -f 17)" # field 19, after `comm`
   lowered=$((own + nice_increment))
   [ "$lowered" -le 19 ] || lowered=19
+  limit="$(nice_limit "$DAEMON")"
+  [ "$limit" = "20 20" ] ||
+    fail "the supervisor's RLIMIT_NICE is '$limit', not 20 20: start the container with --ulimit nice=20:20"
   workers=0
   for status in /proc/[0-9]*/status; do
     grep -q "^Name:[[:space:]]*$name\$" "$status" 2>/dev/null || continue
     pid="${status#/proc/}"
     pid="${pid%/status}"
     want="$lowered"
-    if [ "$pid" = "$DAEMON" ]; then want="$own"; else workers=$((workers + 1)); fi
+    if [ "$pid" = "$DAEMON" ]; then
+      want="$own"
+    else
+      workers=$((workers + 1))
+      limit="$(nice_limit "$pid")"
+      [ "$limit" = "0 0" ] || fail "worker $pid: RLIMIT_NICE '$limit', expected 0 0"
+    fi
+    threads=0
     for stat in "/proc/$pid/task/"*/stat; do
       # A thread that exits after the glob (a runtime's idle blocking thread) leaves no stat.
       nice="$(sed 's/.*) //' "$stat" 2>/dev/null | cut -d ' ' -f 17)"
       [ -n "$nice" ] || continue
       [ "$nice" = "$want" ] || fail "$stat: nice $nice, expected $want"
+      threads=$((threads + 1))
     done
+    [ "$threads" -ge 1 ] || fail "process $pid: no thread's nice value could be read"
   done
   [ "$workers" -ge 1 ] || fail "no worker to check the nice value of"
-  echo "$workers workers at nice $lowered, the supervisor at nice $own"
+  echo "$workers workers at nice $lowered with RLIMIT_NICE 0 0, the supervisor at nice $own with 20 20"
 }
 
 mkdir -m 0700 -p "$DIR"
