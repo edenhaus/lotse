@@ -99,12 +99,14 @@ impl<'a> RedactedUrl<'a> {
     /// verbatim occurrence of this URL's path (unless empty or `/`) and
     /// query (unless empty) replaced by `****`: for messages of third-party
     /// libraries, which may echo the URL, or a URL built from it, that they
-    /// were given. Where the two overlap (a query that repeats the path,
-    /// `?path=/live`), the one that starts first, then the longer, is
-    /// replaced whole, so neither survives the other's replacement.
+    /// were given. All of them are found in `text` as it is, before any is
+    /// replaced, so none hides another: where they overlap (a query that
+    /// repeats the path, `?path=/live`, or holds a URL, `?next=http://…`),
+    /// the one that starts first, then the longer, is printed for all of
+    /// them together. A printed origin that still shows the path or the
+    /// query (a host a short query repeats) has it replaced too.
     #[must_use]
     pub fn scrub(&self, text: &str) -> String {
-        let scrubbed = redact_embedded_urls(text);
         let path = Some(self.url.path())
             .filter(|path| !path.is_empty() && *path != "/")
             .map(|path| (path, REDACTED_PATH));
@@ -114,31 +116,59 @@ impl<'a> RedactedUrl<'a> {
             .filter(|query| !query.is_empty())
             .map(|query| (query, REDACTED));
         let needles: Vec<(&str, &str)> = path.into_iter().chain(query).collect();
-        replace_each(&scrubbed, &needles)
+        let mut cuts = embedded_urls(text);
+        cuts.extend(occurrences(text, &needles));
+        let scrubbed = apply(text, cuts);
+        apply(&scrubbed, occurrences(&scrubbed, &needles))
     }
 }
 
 /// What a path other than empty or `/` prints as.
 const REDACTED_PATH: &str = "/****";
 
-/// `text` with each occurrence of the first of every `(needle,
-/// replacement)` pair replaced, scanning once from the left: at each
-/// position the earliest match wins, among matches at the same position
-/// the longest, then the first listed, and the scan goes on after it.
-fn replace_each(text: &str, needles: &[(&str, &str)]) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some((at, needle, replacement)) = needles
+/// A byte range of a text and what it prints as instead.
+#[derive(Debug)]
+struct Cut {
+    /// Its first byte.
+    start: usize,
+    /// Past its last byte.
+    end: usize,
+    /// What it prints as.
+    replacement: String,
+}
+
+/// The occurrences in `text` of the first of every `(needle,
+/// replacement)` pair, each to print as the second.
+fn occurrences(text: &str, needles: &[(&str, &str)]) -> Vec<Cut> {
+    needles
         .iter()
-        .filter_map(|&(needle, replacement)| Some((rest.find(needle)?, needle, replacement)))
-        .min_by_key(|&(at, needle, _)| (at, std::cmp::Reverse(needle.len())))
-    {
-        let (before, from_match) = rest.split_at_checked(at).unwrap_or((rest, ""));
-        out.push_str(before);
-        out.push_str(replacement);
-        rest = from_match.get(needle.len()..).unwrap_or_default();
+        .flat_map(|&(needle, replacement)| {
+            text.match_indices(needle).map(move |(start, _)| Cut {
+                start,
+                end: start.saturating_add(needle.len()),
+                replacement: replacement.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// `text` with `cuts` printed as their replacements. Cuts that overlap
+/// print as one: the one that starts first, among those the longest, then
+/// the first listed, and nothing more up to the end of the last of them.
+fn apply(text: &str, mut cuts: Vec<Cut>) -> String {
+    cuts.sort_by_key(|cut| (cut.start, std::cmp::Reverse(cut.end)));
+    let mut out = String::with_capacity(text.len());
+    let mut position = 0;
+    for cut in cuts {
+        if cut.start < position {
+            position = position.max(cut.end);
+            continue;
+        }
+        out.push_str(text.get(position..cut.start).unwrap_or_default());
+        out.push_str(&cut.replacement);
+        position = cut.end;
     }
-    out.push_str(rest);
+    out.push_str(text.get(position..).unwrap_or_default());
     out
 }
 
@@ -186,41 +216,43 @@ const fn ends_embedded_url(c: char) -> bool {
 /// What follows the scheme of a URL with an authority (RFC 3986 §3).
 const SEPARATOR: &str = "://";
 
-/// `text` with every `scheme://…` in it replaced by its [`RedactedUrl`]
-/// form, or by `scheme://****` when it does not parse. The URL runs from
-/// its scheme (RFC 3986 §3.1) to the next white space, quote or angle
+/// Every `scheme://…` in `text`, to print as its [`RedactedUrl`] form, or
+/// as `scheme://****` when it does not parse. The URL runs from its
+/// scheme (RFC 3986 §3.1) to the next white space, quote or angle
 /// bracket, or the end.
-fn redact_embedded_urls(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(SEPARATOR) {
-        let (before, from_separator) = rest.split_at_checked(at).unwrap_or((rest, ""));
-        let scheme_start = before
-            .char_indices()
+fn embedded_urls(text: &str) -> Vec<Cut> {
+    let mut cuts = Vec::new();
+    let mut searched = 0;
+    while let Some(found) = text.get(searched..).and_then(|rest| rest.find(SEPARATOR)) {
+        let at = searched.saturating_add(found);
+        let scheme_len: usize = text
+            .get(searched..at)
+            .unwrap_or_default()
+            .chars()
             .rev()
-            .take_while(|&(_, c)| is_scheme_char(c))
-            .last()
-            .map_or(before.len(), |(index, _)| index);
-        let (prose, scheme) = before
-            .split_at_checked(scheme_start)
-            .unwrap_or((before, ""));
-        let past = from_separator.get(SEPARATOR.len()..).unwrap_or_default();
-        let end = past.find(ends_embedded_url).unwrap_or(past.len());
-        let (tail, after) = past.split_at_checked(end).unwrap_or((past, ""));
-        out.push_str(prose);
-        if let Ok(url) = Url::parse(&format!("{scheme}{SEPARATOR}{tail}")) {
-            out.push_str(&RedactedUrl::new(&url).to_string());
-        } else {
+            .take_while(|&c| is_scheme_char(c))
+            .map(char::len_utf8)
+            .sum();
+        let start = at.saturating_sub(scheme_len);
+        let scheme = text.get(start..at).unwrap_or_default();
+        let past = at.saturating_add(SEPARATOR.len());
+        let rest = text.get(past..).unwrap_or_default();
+        let end = past.saturating_add(rest.find(ends_embedded_url).unwrap_or(rest.len()));
+        let tail = text.get(past..end).unwrap_or_default();
+        let replacement = Url::parse(&format!("{scheme}{SEPARATOR}{tail}")).map_or_else(
             // Not a URL after all (no scheme, or one that does not parse):
             // what follows `://` is redacted anyway.
-            out.push_str(scheme);
-            out.push_str(SEPARATOR);
-            out.push_str(REDACTED);
-        }
-        rest = after;
+            |_| format!("{scheme}{SEPARATOR}{REDACTED}"),
+            |url| RedactedUrl::new(&url).to_string(),
+        );
+        cuts.push(Cut {
+            start,
+            end,
+            replacement,
+        });
+        searched = end;
     }
-    out.push_str(rest);
-    out
+    cuts
 }
 
 #[cfg(test)]
@@ -366,14 +398,57 @@ mod tests {
         }
     }
 
+    /// A query that holds a URL, or a URL that runs past the query: each
+    /// is found before the other is replaced, so the query's token does
+    /// not survive the URL's redaction, nor the URL's tail the query's.
     #[test]
-    fn replace_each_takes_the_earliest_then_the_longest_match() {
-        assert_eq!(replace_each("", &[("a", "1")]), "");
-        assert_eq!(replace_each("abc", &[]), "abc");
+    fn scrub_redacts_a_query_and_a_url_inside_it_together() {
+        for (input, text, scrubbed) in [
+            (
+                "rtsp://cam/live?token=tok9d2e&next=http://cdn.invalid/x",
+                "Url { query: Some(\"token=tok9d2e&next=http://cdn.invalid/x\") }",
+                "Url { query: Some(\"****\") }",
+            ),
+            (
+                "rtsp://cam/live?token=tok9d2e&next=http://cdn.invalid/x",
+                "got token=tok9d2e&next=http://cdn.invalid/x/more end",
+                "got **** end",
+            ),
+            // A query short enough to change `://` hides nothing less.
+            (
+                "rtsp://cam/live?p",
+                "at http://cdn/x",
+                "at htt****://cdn/****",
+            ),
+            // An origin printed with what the query repeats.
+            (
+                "rtsp://cam/live?cam",
+                "at rtsp://cam/x",
+                "at rtsp://****/****",
+            ),
+        ] {
+            let url = Url::parse(input).unwrap();
+            assert_eq!(
+                RedactedUrl::new(&url).scrub(text),
+                scrubbed,
+                "{input}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn cuts_take_the_earliest_then_the_longest_match() {
+        let cut = |text: &str, needles: &[(&str, &str)]| apply(text, occurrences(text, needles));
+        assert_eq!(cut("", &[("a", "1")]), "");
+        assert_eq!(cut("abc", &[]), "abc");
         assert_eq!(
-            replace_each("ab abc bc", &[("bc", "2"), ("abc", "3"), ("ab", "1")]),
+            cut("ab abc bc", &[("bc", "2"), ("abc", "3"), ("ab", "1")]),
             "1 3 2"
         );
+        // Equal cuts print as the first listed.
+        assert_eq!(cut("ab", &[("ab", "1"), ("ab", "2")]), "1");
+        // One that starts inside another and runs past it is hidden whole.
+        assert_eq!(cut("abcd", &[("abc", "1"), ("bcd", "2")]), "1");
     }
 
     #[test]
