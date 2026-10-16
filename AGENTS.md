@@ -44,9 +44,9 @@ job writes (a token of the lotse-bot app, whose key is in the `lotse-bot` enviro
 cache, saved by every run and restored from the PR's own (GitHub scopes
 them to it) or else from `main`'s; only the Mutants jobs save none and
 restore the one the Mutants cache job builds on `main`. A new job goes
-into `ci.yml`, and a job a PR runs into the needs of its last job, All
-required jobs pass, the one check of it the ruleset requires; workflow
-and job names start with a capital letter.
+into `ci.yml` and into the needs of its last job, All required jobs pass,
+the run's one verdict and the one check of it the ruleset requires;
+workflow and job names start with a capital letter.
 
 | Command | What it does |
 |---|---|

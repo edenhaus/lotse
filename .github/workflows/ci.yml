@@ -21,8 +21,8 @@ name: CI
 # hooks from prek's. The fuzz corpora are no cache: the Fuzz jobs read them from a repository of
 # their own, and on main the Fuzz corpus job pushes what they found.
 #
-# The ruleset requires one check of this workflow, All required jobs pass, the last job: it needs
-# every job a PR runs and fails when one of them failed or was cancelled.
+# The run's verdict is its last job, All required jobs pass, the one check of this workflow the
+# ruleset requires: it needs every other job and fails when one of them failed or was cancelled.
 
 on:
   push:
@@ -925,12 +925,15 @@ jobs:
           SHA: ${{ github.sha }}
         run: gh api repos/edenhaus/lotse-clients/dispatches -f event_type=lotse-schema -f "client_payload[sha]=$SHA"
 
-  # The one check of this workflow the ruleset requires: it fails when a job a PR runs failed or
+  # The run's one verdict, on a PR, on main, nightly and by hand, and the one check of this
+  # workflow the ruleset requires: it needs every other job and fails when one of them failed or
   # was cancelled, so a new job gates by being added to its needs, never to the ruleset. A required
   # check that is skipped counts as passed, so it runs always, also after a failure or a
-  # cancellation. A job skipped by its own condition (no fuzz target changed, no mutant, no
-  # dependency changed) passes; one skipped because a job it needs did not pass fails through that
-  # job. The nightly and main-only jobs gate no PR and are not needed.
+  # cancellation. A job skipped by its own condition (another event, no fuzz target changed, no
+  # mutant, no dependency changed) passes; one skipped because a job it needs did not pass fails
+  # through that job. Fuzz corpus, Release notes and clients have concurrency groups of their own,
+  # in which a newer run's job cancels this run's: their cancellation is no failure, a newer run
+  # does their work.
   all-green:
     name: All required jobs pass
     if: always()
@@ -944,13 +947,21 @@ jobs:
       - turn
       - sandbox
       - mutants-plan
+      - mutants-cache
       - mutants
       - fuzz-build
       - fuzz
+      - fuzz-corpus
       - release-build
       - codeql
       - dependency-review
       - audit
+      - browser
+      - compare
+      - load
+      - soak
+      - release-notes
+      - clients
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -958,8 +969,12 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
-          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
-          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<<"$NEEDS" >/dev/null; then
-            echo "::error::A required job failed or was cancelled"
+          jq -r 'to_entries[] | "- `\(.key)`: \(.value.result)"' <<<"$NEEDS" | tee -a "$GITHUB_STEP_SUMMARY"
+          failed=$(jq -r '[to_entries[]
+            | select(.value.result == "failure"
+              or (.value.result == "cancelled" and (.key | IN("fuzz-corpus", "release-notes", "clients") | not)))
+            | .key] | join(" ")' <<<"$NEEDS")
+          if [ -n "$failed" ]; then
+            echo "::error::Failed or cancelled: $failed"
             exit 1
           fi
