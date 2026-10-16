@@ -347,9 +347,10 @@ jobs:
             [ -e "$root/bin/$applet" ] || ln -s busybox "$root/bin/$applet"
           done
           tar -C "$root" -c . | docker import - lotse-sandbox-check
+      # A raised RLIMIT_NICE, which the workers must pin to 0 (the check reads both limits).
       - name: Run the check in a container
         run: |
-          docker run --rm \
+          docker run --rm --ulimit nice=20:20 \
             --volume "$PWD/$BIN:/lotse:ro" \
             --volume "$PWD/scripts/sandbox-isolation.sh:/check.sh:ro" \
             lotse-sandbox-check /bin/sh /check.sh

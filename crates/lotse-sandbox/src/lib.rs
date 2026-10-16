@@ -1,5 +1,6 @@
-//! Privilege drop, `no_new_privs`, `dumpable`, rlimits, and the Landlock and
-//! seccomp profiles for each process kind (supervisor, worker, decoder).
+//! Privilege drop, `no_new_privs`, `dumpable`, rlimits, a worker's lower
+//! scheduling priority, and the Landlock and seccomp profiles for each
+//! process kind (supervisor, worker, decoder).
 //!
 //! Applied by the binary in the main thread before any runtime starts, and
 //! reports which layers are enforced for `info.sandbox`. Linux-only: on
@@ -7,7 +8,8 @@
 //! tests. Depends on nothing in the workspace: it runs before anything else
 //! exists in the process.
 //!
-//! Standards: landlock(7), seccomp(2), prctl(2), setresuid(2), setrlimit(2).
+//! Standards: landlock(7), seccomp(2), prctl(2), setresuid(2), setrlimit(2),
+//! setpriority(2) and sched(7).
 
 use std::fmt;
 use std::os::fd::OwnedFd;
@@ -39,6 +41,43 @@ pub const DEFAULT_WORKER_ADDRESS_SPACE: u64 = 1 << 30;
 
 /// `RLIMIT_NOFILE` for a worker.
 pub const WORKER_MAX_FILES: u64 = 256;
+
+/// How many nice units a worker adds to the nice value it inherits from
+/// the supervisor (setpriority(2)), so the supervisor and its control plane
+/// outrank a worker that spins: each unit makes the scheduler favor the
+/// higher-priority thread by a factor of about 1.25 (sched(7), "The nice
+/// value"), so 10 units give a supervisor thread about nine times the CPU
+/// share of a worker thread competing with it. It is nice(1)'s default
+/// adjustment. Not 19: a worker carries live video, and at 19 it would get
+/// about a seventieth of a core it shares with any other busy process
+/// of the host. The kernel clamps the result at 19 (setpriority(2)).
+///
+/// A bound only per thread: a supervisor thread on a core with N spinning
+/// worker threads gets 1024/(1024 + 110·N) of it (the weights of nice 0
+/// and nice 10, kernel/sched/core.c `sched_prio_to_weight`), half of it at
+/// about N = 9, and sibling workers, at the same nice, share the CPU with
+/// them evenly. Thread count and CPU time are not bounded otherwise.
+///
+/// Nice values count only among the threads of one task group: one
+/// autogroup (sched(7), "The autogroup feature"; a worker stays in the
+/// supervisor's session, which spawns it without `setsid(2)`) and one
+/// cgroup. So where the daemon runs inside its client's container, workers
+/// under load yield about 9:1 to the client's threads too. A worker that
+/// cannot set its nice value does not start (`setpriority` refused by a
+/// container's seccomp profile; Docker's default profile allows it), and
+/// its `RLIMIT_NICE` is 0 ([`WORKER_MAX_NICE_RLIMIT`]) so it cannot lower
+/// the value again.
+pub const WORKER_NICE_INCREMENT: i32 = 10;
+
+/// `RLIMIT_NICE` for a worker, soft and hard: 0, so no nice value below
+/// the one it has is within its reach. An unprivileged process may lower
+/// its nice value only as far as its `RLIMIT_NICE` soft limit allows
+/// (setpriority(2), since Linux 2.6.12), whose ceiling is `20 - rlim_cur`
+/// (getrlimit(2), `RLIMIT_NICE`): nice 20, beyond the range, at 0. An
+/// inherited limit above 0 (`docker run --ulimit nice=20:20`, say) would
+/// let the dropped uid undo [`WORKER_NICE_INCREMENT`] wherever the seccomp
+/// layer is unavailable. Lowering a hard limit needs no privilege.
+pub const WORKER_MAX_NICE_RLIMIT: u64 = 0;
 
 /// The descriptor number a worker keeps the shared WebRTC UDP socket at,
 /// the highest [`WORKER_MAX_FILES`] leaves it. Every worker sends on one
@@ -75,7 +114,8 @@ pub enum Mode {
     /// Refuse to start if any layer is unavailable.
     Require,
     /// Debugging only; warns on every start. Only the privilege drop
-    /// applies: no rlimits, `dumpable`, `no_new_privs`, Landlock or seccomp.
+    /// applies: no rlimits, lower priority, `dumpable`, `no_new_privs`,
+    /// Landlock or seccomp.
     /// The drop is not a sandbox layer, so no mode lets a process started as
     /// root keep root.
     Off,
@@ -193,7 +233,8 @@ impl Default for SandboxConfig {
 /// before any other thread exists: the privilege drop is per thread at the
 /// syscall level and seccomp applies to the calling thread.
 ///
-/// The order is privileges, rlimits, `dumpable`, the parent-death signal
+/// The order is privileges, rlimits, a worker's scheduling priority
+/// ([`WORKER_NICE_INCREMENT`]), `dumpable`, the parent-death signal
 /// (workers and decoders), `no_new_privs`, Landlock, seccomp. In `on` mode
 /// a layer the kernel lacks is reported, in `require` mode it is an error,
 /// and `off` applies the privilege drop alone: started as root, every mode
@@ -209,7 +250,7 @@ pub fn apply(profile: &Profile, config: &SandboxConfig) -> Result<SandboxReport,
         Mode::Off => {
             let (uid, gid) = platform::drop_privileges(config)?;
             tracing::warn!(
-                "sandbox is off: no rlimits, no_new_privs, Landlock or seccomp, only the privilege drop; use only for debugging"
+                "sandbox is off: no rlimits, lower worker priority, no_new_privs, Landlock or seccomp, only the privilege drop; use only for debugging"
             );
             SandboxReport::off(uid, gid)
         }

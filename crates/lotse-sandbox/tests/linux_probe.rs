@@ -12,7 +12,7 @@
     reason = "test code; the helper outside #[test] functions panics on harness failures"
 )]
 
-use std::io::{IoSlice, IoSliceMut};
+use std::io::{BufRead as _, BufReader, IoSlice, IoSliceMut, Read as _};
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
@@ -42,6 +42,9 @@ const ESCAPE_PROBE: &str = "LOTSE_SANDBOX_ESCAPE_PROBE";
 /// The variable that turns this binary into the shared-socket probe child;
 /// its value names the one call on the shared socket, tried last.
 const SHARED_PROBE: &str = "LOTSE_SANDBOX_SHARED_PROBE";
+
+/// The variable that turns this binary into the priority probe child.
+const NICE_PROBE: &str = "LOTSE_SANDBOX_NICE_PROBE";
 
 /// `SIGSYS`, without pulling libc into the test.
 const SIGSYS: i32 = 31;
@@ -73,6 +76,64 @@ fn probe_child() {
     // Under the allowlist `execve` kills the process before anything prints.
     let spawned = Command::new("/bin/true").status().map(|s| s.success());
     println!("spawn:{spawned:?}");
+}
+
+/// The priority probe child: sandbox itself as a worker, start a thread,
+/// print its own thread's and the new thread's ids, and keep both alive
+/// until its stdin closes, so the parent reads each one's nice value from
+/// `/proc`, which the worker's Landlock domain keeps from it.
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the probe child reads the variable that marks it"
+)]
+fn nice_probe_child() {
+    if std::env::var_os(NICE_PROBE).is_none() {
+        return;
+    }
+    let profile = Profile::Worker {
+        connect_ports: vec![554],
+    };
+    let report =
+        lotse_sandbox::apply(&profile, &SandboxConfig::default()).expect("worker profile applies");
+    println!(
+        "{}",
+        serde_json::to_string(&report).expect("report serializes")
+    );
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let started = std::thread::spawn(move || {
+        tid_tx
+            .send(rustix::thread::gettid().as_raw_nonzero())
+            .expect("tid sent");
+        // Until the main thread hangs up.
+        let _closed = done_rx.recv();
+    });
+    let thread = tid_rx.recv().expect("the thread's tid");
+    println!(
+        "tids:{} {thread}",
+        rustix::thread::gettid().as_raw_nonzero()
+    );
+    let mut rest = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut rest)
+        .expect("stdin until it closes");
+    drop(done_tx);
+    started.join().expect("thread joins");
+}
+
+/// The nice value of thread `tid` of process `pid`: field 19 of its
+/// `stat` (proc(5), `/proc/pid/stat`), counted after the closing
+/// parenthesis of the `comm` field, which may hold spaces.
+fn nice_of(pid: u32, tid: &str) -> i32 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).expect("stat");
+    let (_, fields) = stat.rsplit_once(')').expect("comm ends");
+    fields
+        .split_whitespace()
+        .nth(19 - 3)
+        .expect("field 19")
+        .parse()
+        .expect("a nice value")
 }
 
 /// Where the supervisor probe child moves the state directory it opened,
@@ -173,7 +234,9 @@ fn supervisor_probe_child() {
 /// worker, do what its runtime still does (name a thread, read its own
 /// limits), then try the act the variable names: lower the parent's
 /// limits, make itself dumpable again, clear its parent-death signal, ask
-/// for its parent's pid, create a memory file or resize a file.
+/// for its parent's pid, create a memory file, resize a file or raise its
+/// scheduling priority again. An act after [`WITHOUT_SECCOMP`] is tried
+/// with the seccomp layer unavailable.
 #[test]
 #[expect(
     clippy::disallowed_methods,
@@ -186,6 +249,14 @@ fn escape_probe_child() {
     // Learnt before the sandbox, as a compromised worker could learn it by
     // trying pids in turn.
     let parent = rustix::process::getppid().expect("a parent");
+    let act = act.to_str().expect("act is UTF-8");
+    let act = match act.strip_prefix(WITHOUT_SECCOMP) {
+        Some(act) => {
+            refuse_seccomp();
+            act
+        }
+        None => act,
+    };
     let profile = Profile::Worker {
         connect_ports: vec![554],
     };
@@ -204,7 +275,8 @@ fn escape_probe_child() {
     println!("thread_name:{named:?}");
     let files = rustix::process::getrlimit(Resource::Nofile).current;
     println!("nofile:{files:?}");
-    let act = act.to_str().expect("act is UTF-8");
+    let nice = rustix::process::getrlimit(Resource::Nice);
+    println!("nice_limit:{:?}", (nice.current, nice.maximum));
     match act {
         "prlimit_parent" => {
             // Zero core size: harmless to the test harness should the call
@@ -234,6 +306,14 @@ fn escape_probe_child() {
             // should it get through.
             let resized = rustix::fs::ftruncate(std::io::stdout(), 0);
             println!("ftruncate:{resized:?}");
+        }
+        "setpriority" => {
+            // Back to nice 0: should the call get through, refused
+            // (`EACCES`) for want of `CAP_SYS_NICE` and of an `RLIMIT_NICE`
+            // above 0 (setpriority(2)).
+            let raised = rustix::process::setpriority_process(None, 0)
+                .map_err(|errno| std::io::Error::from(errno).kind());
+            println!("setpriority:{raised:?}");
         }
         _ => {
             assert_eq!(act, "getppid", "unknown act");
@@ -492,6 +572,107 @@ fn a_worker_cannot_fill_memory_outside_its_address_space() {
     }
 }
 
+/// Regression for SBX-25: a worker's threads ran at the supervisor's nice
+/// value, so one that spun took the supervisor's CPU share (sched(7)). A
+/// worker runs at [`lotse_sandbox::WORKER_NICE_INCREMENT`] above the nice
+/// value it inherits, clamped at 19 (setpriority(2)), on the thread that
+/// sandboxed itself and on a thread it starts afterwards; the nice value is
+/// per thread on Linux, so both are read.
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "spawns this test binary as the probe child"
+)]
+fn a_worker_and_every_thread_it_starts_run_at_a_lower_priority() {
+    let inherited = rustix::process::getpriority_process(None).expect("own nice value");
+    let expected = (inherited + lotse_sandbox::WORKER_NICE_INCREMENT).min(19);
+    let mut child = Command::new(std::env::current_exe().expect("own path"))
+        .args(["--exact", "nice_probe_child", "--nocapture"])
+        .env(NICE_PROBE, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("child runs");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut lines = String::new();
+    let tids = loop {
+        let mut line = String::new();
+        let read = stdout.read_line(&mut line).expect("child output");
+        assert_ne!(read, 0, "no tids in child output\nstdout: {lines}");
+        if let Some(tids) = line.strip_prefix("tids:") {
+            break tids
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+        }
+        lines.push_str(&line);
+    };
+    let nices: Vec<i32> = tids.iter().map(|tid| nice_of(child.id(), tid)).collect();
+    drop(child.stdin.take());
+    stdout.read_to_string(&mut lines).expect("child output");
+    let output = child.wait_with_output().expect("child exits");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!("stdout: {lines}\nstderr: {stderr}");
+    assert!(output.status.success(), "{}\n{context}", output.status);
+    let report_line = lines
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .unwrap_or_else(|| panic!("no report\n{context}"));
+    let report: SandboxReport = serde_json::from_str(report_line).expect("report parses");
+    assert_eq!(report.mode, Mode::On);
+    assert_eq!(nices, [expected, expected], "{context}");
+}
+
+/// The prefix of an escape probe act that the child tries with the seccomp
+/// layer unavailable, as under a container profile that refuses
+/// seccomp(2): the worker profile applies in `on` mode and reports it.
+const WITHOUT_SECCOMP: &str = "without-seccomp:";
+
+/// A filter on the calling thread that answers seccomp(2) with `EPERM`,
+/// so the worker profile installs no filter of its own (seccomp(2): a
+/// filter applies to the calling thread, without
+/// `SECCOMP_FILTER_FLAG_TSYNC`).
+fn refuse_seccomp() {
+    let arch = seccompiler::TargetArch::try_from(std::env::consts::ARCH).expect("an arch");
+    let rules = std::collections::BTreeMap::from([(libc::SYS_seccomp, Vec::new())]);
+    let eperm = u32::try_from(libc::EPERM).expect("EPERM");
+    let refuse: seccompiler::BpfProgram = seccompiler::SeccompFilter::new(
+        rules,
+        seccompiler::SeccompAction::Allow,
+        seccompiler::SeccompAction::Errno(eperm),
+        arch,
+    )
+    .and_then(TryInto::try_into)
+    .expect("the filter builds");
+    seccompiler::apply_filter(&refuse).expect("the filter installs");
+}
+
+/// Regression for SBX-25: a worker could undo its lower priority. Under
+/// its allowlist `setpriority` ends it with `SIGSYS`. Without the seccomp
+/// layer, which `on` mode only reports, the dropped uid is refused all the
+/// same: its `RLIMIT_NICE` is 0 (setpriority(2), getrlimit(2)). At the
+/// default limit of 0 this holds without the pin as well; CI's Sandbox
+/// isolation job starts its container with `--ulimit nice=20:20` and checks
+/// that the pin took the raised limit away (`scripts/sandbox-isolation.sh`).
+#[test]
+fn a_worker_cannot_raise_its_priority_again() {
+    assert_escape_is_killed("setpriority", false);
+    let act = format!("{WITHOUT_SECCOMP}setpriority");
+    let (report, stdout, stderr, status) = run_probe("escape_probe_child", ESCAPE_PROBE, &act);
+    let context = format!("{status}\nstdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(report.seccomp, LayerStatus::Unavailable, "{context}");
+    assert!(
+        stdout.contains("nice_limit:(Some(0), Some(0))"),
+        "{context}"
+    );
+    assert!(
+        stdout.contains("setpriority:Err(PermissionDenied)"),
+        "{context}"
+    );
+    assert!(status.success(), "{context}");
+}
+
 /// Runs the escape probe child with `act` and checks that the worker's
 /// runtime still works and that the act ends it with `SIGSYS` where
 /// seccomp is enforced, unless the coverage `profiler_needs_it`.
@@ -503,6 +684,10 @@ fn assert_escape_is_killed(act: &str, profiler_needs_it: bool) {
         "{context}"
     );
     assert!(stdout.contains("nofile:Some(256)"), "{context}");
+    assert!(
+        stdout.contains("nice_limit:(Some(0), Some(0))"),
+        "{context}"
+    );
     if report.seccomp == LayerStatus::Enforced && !profiler_needs_it {
         assert!(!stdout.contains(&format!("{act}:")), "{context}");
         assert_eq!(status.signal(), Some(SIGSYS), "{context}");

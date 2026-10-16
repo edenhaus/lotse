@@ -12,6 +12,14 @@
 //! `prctl` and `prlimit64` under its inherited filter while they sandbox
 //! themselves, and it signals its children with `kill` anyway.
 //!
+//! A worker lowers its scheduling priority before its allowlist, and the
+//! allowlist then has no call that changes a nice value, a scheduling
+//! policy or its parameters (`setpriority`, `sched_setscheduler`,
+//! `sched_setparam`, `sched_setattr`), so a compromised worker cannot
+//! outrank the supervisor again. The supervisor's filter, which the worker
+//! runs under until then, allows `getpriority` and `setpriority` on the
+//! calling thread only.
+//!
 //! Every worker also holds the shared WebRTC UDP socket, one open file
 //! description with the supervisor, which receives every viewer's datagrams
 //! on it. A worker's filter lets it send on that socket and nothing else:
@@ -154,6 +162,9 @@ fn allowlist(
             allow(&mut rules, ARCH_SPECIFIC);
             allow(&mut rules, ARCH_DESCRIPTOR_CALLS);
             allow(&mut rules, SUPERVISOR);
+            for number in [libc::SYS_getpriority, libc::SYS_setpriority] {
+                rules.insert(number, own_thread_priority()?);
+            }
         }
         Profile::Worker { .. } => {
             allow(&mut rules, COMMON);
@@ -226,6 +237,24 @@ fn read_own_limits() -> Result<Vec<SeccompRule>, BackendError> {
     let caller = equals(0, SeccompCmpArgLen::Dword, 0)?;
     let no_new_limit = equals(2, SeccompCmpArgLen::Qword, 0)?;
     Ok(vec![SeccompRule::new(vec![caller, no_new_limit])?])
+}
+
+/// `PRIO_PROCESS` (linux/resource.h): `who` names a process, which on Linux
+/// is one thread (setpriority(2), BUGS).
+const PRIO_PROCESS: u64 = 0;
+
+/// `getpriority(PRIO_PROCESS, 0)` and `setpriority(PRIO_PROCESS, 0, ..)`:
+/// the calling thread's own nice value (setpriority(2): `who` 0 is the
+/// caller). A worker lowers its priority under this filter, inherited
+/// from the supervisor, before its own allowlist, which has neither call;
+/// the supervisor calls neither itself. No process may change another's, a
+/// process group's or a user's (`PRIO_PGRP`, `PRIO_USER`). `which` and
+/// `who` are `int`s, so the kernel reads the arguments' low 32 bits and so
+/// do the comparisons.
+fn own_thread_priority() -> Result<Vec<SeccompRule>, BackendError> {
+    let process = equals(0, SeccompCmpArgLen::Dword, PRIO_PROCESS)?;
+    let caller = equals(1, SeccompCmpArgLen::Dword, 0)?;
+    Ok(vec![SeccompRule::new(vec![process, caller])?])
 }
 
 /// `prctl(option, ..)` with `option` `PR_SET_NAME` or `PR_GET_NAME`: the
@@ -477,8 +506,10 @@ const ARCH_SPECIFIC: &[i64] = &[];
 /// directory's descriptor), where Landlock confines writes. Its children inherit this filter, so it
 /// also allows what they need to sandbox themselves: `prlimit64` and
 /// `prctl` for their limits and flags, the Landlock calls and `seccomp`,
-/// which can only add restrictions to the caller. `tgkill` and `getppid`
-/// are unconditional here only: it may signal any process with `kill`.
+/// which can only add restrictions to the caller, and, with a condition
+/// ([`own_thread_priority`]), `getpriority` and `setpriority` for a
+/// worker's nice value. `tgkill` and `getppid` are unconditional here
+/// only: it may signal any process with `kill`.
 const SUPERVISOR: &[i64] = &[
     libc::SYS_getppid,
     libc::SYS_prctl,
@@ -669,6 +700,57 @@ mod tests {
         for call in [libc::SYS_memfd_create, libc::SYS_ftruncate] {
             assert!(!allows(&worker(), call, [0; 6]), "{call}");
             assert!(allows(&supervisor(), call, [0; 6]), "{call}");
+        }
+    }
+
+    /// `PRIO_PGRP` (linux/resource.h): `who` names a process group.
+    const PRIO_PGRP: u64 = 1;
+
+    /// `PRIO_USER` (linux/resource.h): `who` names a user.
+    const PRIO_USER: u64 = 2;
+
+    /// Regression for SBX-25: a worker lowers its priority before its
+    /// allowlist so a spinning one cannot take the supervisor's CPU share
+    /// (setpriority(2), sched(7)); nothing in the allowlist lets it raise
+    /// it again, by nice value or by scheduling policy. The supervisor's
+    /// filter, which the worker sets it under, allows the calling thread's
+    /// own nice value only.
+    #[test]
+    fn setpriority2_a_worker_cannot_raise_its_scheduling_priority_again() {
+        let scheduling = [
+            libc::SYS_setpriority,
+            libc::SYS_getpriority,
+            libc::SYS_sched_setscheduler,
+            libc::SYS_sched_setparam,
+            libc::SYS_sched_setattr,
+        ];
+        let own = [PRIO_PROCESS, 0, 0, 0, 0, 0];
+        for call in scheduling {
+            for profile in [worker(), Profile::Decoder] {
+                assert!(!allows(&profile, call, own), "{} {call}", profile.name());
+            }
+            assert!(!COMMON.contains(&call), "{call}");
+            assert!(!SUPERVISOR.contains(&call), "{call}: conditional");
+        }
+        for call in [libc::SYS_getpriority, libc::SYS_setpriority] {
+            assert!(allows(&supervisor(), call, own), "{call}");
+            // The kernel reads `int`s: high bits do not make another one.
+            let high = [PRIO_PROCESS | 1 << 32, 1 << 32, 0, 0, 0, 0];
+            assert!(allows(&supervisor(), call, high), "{call}");
+            for other in [
+                [PRIO_PROCESS, arg(OTHER), 0, 0, 0, 0],
+                [PRIO_PGRP, 0, 0, 0, 0, 0],
+                [PRIO_USER, 0, 0, 0, 0, 0],
+            ] {
+                assert!(!allows(&supervisor(), call, other), "{call} {other:?}");
+            }
+        }
+        for call in [
+            libc::SYS_sched_setscheduler,
+            libc::SYS_sched_setparam,
+            libc::SYS_sched_setattr,
+        ] {
+            assert!(!allows(&supervisor(), call, [0; 6]), "{call}");
         }
     }
 
