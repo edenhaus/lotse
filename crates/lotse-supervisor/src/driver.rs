@@ -2388,12 +2388,12 @@ mod tests {
         // The old retry's wait is gone: past it, the wake is the new
         // source's lookup, not the old one's retry.
         clock.advance(Duration::from_secs(120));
-        match next_wake(&mut driver).await {
-            Wake::Resolved(Ok(addrs)) => {
-                assert_eq!(addrs, ["127.0.0.2:7".parse::<SocketAddr>().unwrap()]);
-            }
-            _ => panic!("the new source's lookup should finish first"),
-        }
+        let new_source: SocketAddr = "127.0.0.2:7".parse().unwrap();
+        let wake = next_wake(&mut driver).await;
+        assert!(
+            matches!(&wake, Wake::Resolved(Ok(addrs)) if addrs == &[new_source]),
+            "the new source's lookup finishes first"
+        );
         drop((driver, demand_tx));
     }
 
