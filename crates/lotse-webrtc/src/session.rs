@@ -189,8 +189,9 @@ fn video_mid(sdp: &str) -> Option<&str> {
 
 /// What a re-offer must keep of the video m-line a session plays on: its
 /// mid, its direction and the codec of the payload type the answer
-/// chose. A session answers one video m-line with one payload type and
-/// one packetizer, chosen from the offer ([`VideoPlan`]), and plays on;
+/// chose, and the m-line itself, which it must not stop. A session
+/// answers one video m-line with one payload type and one packetizer,
+/// chosen from the offer ([`VideoPlan`]), and plays on;
 /// a re-offer that changes that would need the video negotiated again
 /// on a live engine, which the session does not do, so it is refused and
 /// the session goes on as it was (RFC 8829 §5.2.2 lets a subsequent
@@ -236,16 +237,22 @@ impl VideoShape {
     }
 
     /// Whether the re-offer `offer` keeps the video m-line as this: what
-    /// it changes otherwise, or that it has none.
+    /// it changes otherwise, or that it has none. One that stops the
+    /// m-line ([`Sdp::stopped`]: a zero port, not bundled) changes its
+    /// port: the engine would stop the video the session plays on
+    /// (str0m 0.24 marks such an m-line stopped and `inactive`).
     fn check(&self, offer: &str) -> Result<(), RenegotiateError> {
         let shape = Self::of(offer, self.pt).ok_or(RenegotiateError::NoVideoTrack)?;
-        let listed = Sdp::parse(offer)
+        let sdp = Sdp::parse(offer);
+        let section = sdp
             .media()
             .iter()
-            .find(|section| section.mid() == Some(self.mid.as_str()))
-            .is_some_and(|section| section.formats().any(|pt| pt == self.pt));
+            .find(|section| section.mid() == Some(self.mid.as_str()));
+        let listed = section.is_some_and(|section| section.formats().any(|pt| pt == self.pt));
         let changed = if shape.mid != self.mid {
             "its mid"
+        } else if section.is_some_and(|section| sdp.stopped(section)) {
+            "its port"
         } else if shape.direction != self.direction {
             "its direction"
         } else if !listed || shape.codec != self.codec {
@@ -1983,8 +1990,24 @@ mod tests {
                 .replace("a=rtpmap:98 VP8/90000\r\n", "")
         );
         assert_eq!(shape.check(&talking), Ok(()));
+        // A zero port on a `bundle-only` m-line in the BUNDLE group only
+        // bundles it (RFC 9143 §6).
+        let bundle_only = format!(
+            "v=0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=recvonly\r\n{}",
+            video
+                .replace("m=video 9 ", "m=video 0 ")
+                .replace("a=mid:1\r\n", "a=mid:1\r\na=bundle-only\r\n")
+        );
+        assert_eq!(shape.check(&bundle_only), Ok(()));
         for (changed, what) in [
             (offer.replace("a=mid:1", "a=mid:v"), "its mid"),
+            // Stopped (RFC 3264 §8.2, RFC 8829 §5.2.2): a zero port out of
+            // any BUNDLE group, mid, direction and codecs kept.
+            (offer.replace("m=video 9 ", "m=video 0 "), "its port"),
+            (
+                bundle_only.replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0"),
+                "its port",
+            ),
             (
                 offer.replace("a=mid:1\r\na=recvonly", "a=mid:1\r\na=sendrecv"),
                 "its direction",

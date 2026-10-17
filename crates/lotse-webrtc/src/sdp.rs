@@ -67,6 +67,29 @@ impl<'a> Sdp<'a> {
         self.media.iter().find(|section| section.is(kind))
     }
 
+    /// Whether `section` is stopped: its port is zero (RFC 3264 §8.2: the
+    /// stream is disabled; RFC 8829 §5.2.2: the m-line of a stopped
+    /// transceiver), unless it is a `bundle-only` one (RFC 9143 §6) that
+    /// a BUNDLE group lists (RFC 9143 §5), whose zero port only says it
+    /// shares the group's transport. The port is the `m=` line's second
+    /// field, without a `/<number of ports>` (RFC 8866 §5.14).
+    pub(crate) fn stopped(&self, section: &Section<'_>) -> bool {
+        let zero = section
+            .m_line
+            .split(' ')
+            .nth(1)
+            .and_then(|port| port.split('/').next())
+            == Some("0");
+        let bundled = section.lines.contains(&"a=bundle-only")
+            && section.mid().is_some_and(|mid| {
+                self.session
+                    .iter()
+                    .filter_map(|line| line.strip_prefix("a=group:BUNDLE "))
+                    .any(|mids| mids.split_whitespace().any(|listed| listed == mid))
+            });
+        zero && !bundled
+    }
+
     /// Whether one `a=group:BUNDLE` line (RFC 9143 §5) lists both mids.
     fn bundled(&self, a: Option<&str>, b: Option<&str>) -> bool {
         let (Some(a), Some(b)) = (a, b) else {
@@ -412,6 +435,31 @@ mod tests {
         assert!(!sdp.bundled(Some("a"), Some("c")), "two groups");
         assert!(!sdp.bundled(Some("a"), None));
         assert!(!sdp.bundled(None, Some("a")));
+    }
+
+    #[test]
+    fn rfc3264_8_2_a_zero_port_stops_an_m_line_unless_bundle_only_in_a_bundle_rfc9143_6() {
+        let stopped = |sdp: &str| {
+            let sdp = Sdp::parse(sdp);
+            sdp.stopped(&sdp.media()[0])
+        };
+        assert!(!stopped(
+            "a=group:BUNDLE v\r\nm=video 9 x 96\r\na=mid:v\r\n"
+        ));
+        // Stopped: out of the BUNDLE group (RFC 8829 §5.2.2), or in it
+        // without `bundle-only`, or `bundle-only` outside it.
+        assert!(stopped("a=group:BUNDLE a\r\nm=video 0 x 96\r\na=mid:v\r\n"));
+        assert!(stopped("a=group:BUNDLE v\r\nm=video 0 x 96\r\na=mid:v\r\n"));
+        assert!(stopped(
+            "a=group:BUNDLE a\r\nm=video 0 x 96\r\na=mid:v\r\na=bundle-only\r\n"
+        ));
+        assert!(stopped("m=video 0/2 x 96\r\na=bundle-only\r\n"), "no mid");
+        // Bundled only: in the group, on its transport.
+        assert!(!stopped(
+            "a=group:BUNDLE a v\r\nm=video 0 x 96\r\na=mid:v\r\na=bundle-only\r\n"
+        ));
+        assert!(!stopped("m=video 10 x 96\r\n"));
+        assert!(!stopped("m=video\r\n"), "no port at all");
     }
 
     #[test]

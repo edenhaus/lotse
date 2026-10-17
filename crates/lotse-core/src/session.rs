@@ -200,7 +200,7 @@ pub enum RenegotiateError {
     #[error("invalid re-offer: {0}")]
     InvalidSdp(String),
     /// The re-offer changes the video m-line the session plays on: its
-    /// mid, direction or codecs.
+    /// mid, direction or codecs, or stops it (its port).
     #[error("the re-offer changes the video m-line: {0}")]
     VideoChanged(String),
     /// The re-offer has no video m-line.

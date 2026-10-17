@@ -3095,6 +3095,61 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
     );
 }
 
+/// A re-offer that stops the video m-line, its mid, direction and codecs
+/// kept but its port zero and its mid out of the BUNDLE group (RFC 3264
+/// §8.2; RFC 8829 §5.2.2, a stopped transceiver), is refused before the
+/// engine sees it, which would stop the video the session plays on
+/// (str0m 0.24 marks the m-line stopped and `inactive`): the video plays
+/// on.
+#[test]
+fn rfc3264_8_2_a_re_offer_that_stops_the_video_m_line_is_refused_and_video_plays_on() {
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
+    pair.connect(&answer);
+    let mut normalizer = normalizer();
+    let mut seq = 1000;
+    let mut play = |pair: &mut Pair, ts: u32, keyframe: bool, what: &str| {
+        let before = pair.viewer.packets().len();
+        for packet in packets(&mut normalizer, &mut seq, ts, keyframe, 1_500, pair.now) {
+            pair.session.write_video(pair.now, &packet, pair.now);
+        }
+        pair.drain();
+        pair.run_until(|p| p.viewer.packets().len() > before, 500, what);
+    };
+    play(&mut pair, 90_000, true, "video before");
+    let reoffer = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let mid = pair.viewer.mid().to_string();
+    let bundle = reoffer
+        .lines()
+        .find(|line| line.starts_with("a=group:BUNDLE "))
+        .expect("a BUNDLE group");
+    let unbundled = bundle
+        .split(' ')
+        .filter(|token| *token != mid)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_ne!(unbundled, bundle, "{reoffer}");
+    let stopped = reoffer
+        .replacen("m=video 9 ", "m=video 0 ", 1)
+        .replacen(bundle, &unbundled, 1);
+    assert!(stopped.contains("m=video 0 "), "{stopped}");
+    assert!(!stopped.contains("a=bundle-only"), "{stopped}");
+    assert_eq!(
+        pair.session.renegotiate(
+            pair.now,
+            &stopped,
+            Some(chained(Codec::Pcmu)),
+            TalkbackClaim::Granted
+        ),
+        Err(RenegotiateError::VideoChanged("its port".to_owned()))
+    );
+    assert_eq!(pair.session.state(), State::Connected);
+    play(&mut pair, 93_000, false, "video after the refused re-offer");
+    pair.play_audio(0, 5, "audio too");
+}
+
 /// A re-offer that turns the downlink m-line off stops the stream's
 /// audio, with the warning an offer without one gets; one that turns it
 /// back on sends it again, on a new writer.
