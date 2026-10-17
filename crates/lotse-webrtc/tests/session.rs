@@ -2825,6 +2825,20 @@ fn rfc3264_6_1_a_declined_re_offer_is_answered_inactive_or_sendonly() {
                 claim,
             )
             .expect("answered");
+        // It asks for talk-back on the downlink m-line alone: the
+        // dedicated one is offered `inactive`, so the decline is the
+        // shared m-line's, and the dedicated one stays `inactive`.
+        let offered = audio_sections(pair.viewer.offer());
+        assert!(offered[0].contains(&"a=sendrecv"), "{what}: {offered:?}");
+        assert!(
+            offered.last().unwrap().contains(&"a=inactive"),
+            "{what}: {offered:?}"
+        );
+        assert_eq!(
+            talkback_answered(&answer).0,
+            "a=inactive",
+            "{what}: {answer}"
+        );
         let down = &audio_sections(&answer)[0];
         assert!(down.contains(&"a=sendonly"), "{what}: {answer}");
         assert!(down.contains(&"a=rtpmap:0 PCMU/8000"), "{what}: {answer}");
@@ -2893,6 +2907,72 @@ fn rfc8829_5_3_1_a_re_offer_shares_the_downlink_m_line_for_talk_back() {
     assert_eq!(pair.session.talkback(), None);
     assert_eq!(pair.viewer.audio_direction(), Some(Direction::RecvOnly));
     pair.play_audio(10, 15, "after");
+}
+
+/// Talk-back moved between a dedicated m-line and the downlink one by
+/// re-offers (RFC 8829 §5.2.2): turning the downlink m-line `sendrecv`
+/// sets the dedicated one `inactive`, so the shared m-line is the one
+/// that asks for talk-back and takes it (answered `sendrecv`, the
+/// dedicated one `inactive`); asking on the dedicated m-line again sets
+/// the downlink one back to `recvonly`, answered `sendonly`, and talk-back
+/// comes up the dedicated one. The uplink follows each move.
+#[test]
+fn rfc8829_5_2_2_a_re_offer_moves_talk_back_between_the_dedicated_and_the_downlink_m_line() {
+    let target = Some(chained(Codec::Pcma));
+    let (mut pair, answer) = Pair::with_audio_on(h264(None), Arc::new(Codec::Pcmu), target.clone());
+    pair.connect(&answer);
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            target.clone(),
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    assert_eq!(talkback_answered(&answer).0, "a=recvonly", "{answer}");
+    talk(&mut pair, &[(8, &[0xd5; 160])]);
+    assert_eq!(pair.uplink.len(), 1);
+
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::SendRecv),
+            target.clone(),
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    let offered = audio_sections(pair.viewer.offer());
+    assert_eq!(offered.len(), 2, "no m-line added: {offered:?}");
+    assert!(offered[0].contains(&"a=sendrecv"), "{offered:?}");
+    assert!(offered[1].contains(&"a=inactive"), "{offered:?}");
+    let answered = audio_sections(&answer);
+    assert!(answered[0].contains(&"a=sendrecv"), "{answer}");
+    assert_eq!(first_encoding(&answered[0]), "PCMA/8000", "{answer}");
+    assert!(answered[1].contains(&"a=inactive"), "{answer}");
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcma));
+    assert_eq!(pair.viewer.talkback_direction(), Some(Direction::SendRecv));
+    talk(&mut pair, &[(8, &[0xd5; 160])]);
+    assert_eq!(pair.uplink.len(), 2, "taken on the shared m-line");
+    pair.play_audio(0, 5, "audio on the shared m-line");
+
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            target,
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    let offered = audio_sections(pair.viewer.offer());
+    assert_eq!(offered.len(), 2, "the dedicated m-line again: {offered:?}");
+    assert!(offered[0].contains(&"a=recvonly"), "{offered:?}");
+    assert!(offered[1].contains(&"a=sendonly"), "{offered:?}");
+    let answered = audio_sections(&answer);
+    assert!(answered[0].contains(&"a=sendonly"), "{answer}");
+    assert_eq!(talkback_answered(&answer).0, "a=recvonly", "{answer}");
+    assert_eq!(pair.viewer.audio_direction(), Some(Direction::RecvOnly));
+    assert_eq!(pair.viewer.talkback_direction(), Some(Direction::SendOnly));
+    talk(&mut pair, &[(8, &[0xd5; 160])]);
+    assert_eq!(pair.uplink.len(), 3, "taken on the dedicated m-line");
+    pair.play_audio(5, 10, "audio after moving back");
+    assert_eq!(pair.session.stats().uplink_refused, 0);
 }
 
 /// A re-offer may change the audio m-lines only: one that changes the
