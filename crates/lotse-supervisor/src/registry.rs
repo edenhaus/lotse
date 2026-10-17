@@ -342,13 +342,16 @@ impl State {
 
     /// Re-keys connection `id` to `key` and tells its driver to switch its
     /// worker to `spec`: the stream's sessions stay, and the tracks switch
-    /// at the new source's first keyframe.
+    /// at the new source's first keyframe. Whether the connection asks for
+    /// the camera's backchannel is left as it was: the switch keeps the
+    /// running source's talker, so a put that also changed the ask is
+    /// [`State::follow_backchannel`]'s, which tells the running worker
+    /// (an opt-out frees the talker) after the switch.
     pub(crate) fn switch_connection(&mut self, id: &str, key: ConnectionKey, spec: DriverSpec) {
         let Some(entry) = self.connections.get_mut(id) else {
             return;
         };
         entry.key = key;
-        entry.backchannel = spec.backchannel;
         if entry
             .commands
             .try_send(DriverCommand::SwitchSource(spec))
@@ -2069,11 +2072,20 @@ mod tests {
         assert_eq!(captured.lines("driver queue full").len(), 1);
         let_assert!(Ok(DriverCommand::Backchannel(sent)) = rx.try_recv());
         assert!(sent.backchannel);
-        // A connection gone has nothing to follow; a switch carries its
-        // source's ask.
+        // A connection gone has nothing to follow.
         state.follow_backchannel("gone", "front");
         assert!(rx.try_recv().is_err());
+        // A switch to a source that no longer asks leaves the ask as it
+        // was, so following it after the put still tells the running
+        // worker, which frees the talker the switch keeps.
+        state.streams.insert("twin".into(), on_c1(false));
         state.switch_connection("c1", key, spec_on("c1", false));
+        assert!(asks(&state), "the switch leaves the ask");
+        let_assert!(Ok(DriverCommand::SwitchSource(switched)) = rx.try_recv());
+        assert!(!switched.backchannel);
+        state.follow_backchannel("c1", "twin");
+        let_assert!(Ok(DriverCommand::Backchannel(sent)) = rx.try_recv());
+        assert!(!sent.backchannel);
         assert!(!asks(&state));
     }
 

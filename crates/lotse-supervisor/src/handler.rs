@@ -2322,6 +2322,42 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// ONVIF Streaming Specification §5.3.1: a put that switches the
+    /// source in place (another connection option) and opts in to the
+    /// backchannel, or out of it, tells the worker both: the switch, and
+    /// the ask, so its running source probes, or frees the talker the
+    /// switch would keep, without a restart.
+    #[tokio::test]
+    async fn a_put_that_switches_the_source_and_opts_in_or_out_tells_the_worker_both_onvif_5_3_1() {
+        let dir = private_dir("backchannel-switch");
+        let s = with_webrtc(&recording_worker(&dir), Arc::new(SystemClock));
+        result(call(&s, &put_options(&json!({}))).await);
+        let mut s1 = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        assert_eq!(next(&mut s1).await["type"], "session");
+        let first = worker_pid(&s).await;
+        wait_received(&dir, first, b"fake://127.0.0.1:1/").await;
+        let asks = |s: &Supervisor| s.shared.lock().connections["c1"].backchannel;
+        let told =
+            |asks: bool| lotse_ipc::encode(&lotse_ipc::ToWorker::Backchannel { asks }).unwrap();
+        for (options, ask) in [
+            (json!({ "talk": true, "ready_after_ms": 1000 }), true),
+            (json!({ "ready_after_ms": 2000 }), false),
+        ] {
+            let put = result(call(&s, &put_options(&options)).await);
+            assert_eq!(put["created"], false);
+            assert_eq!(front_connection(&s).await, "c1");
+            assert_eq!(asks(&s), ask);
+            wait_received(&dir, first, &told(ask)).await;
+            let switched = format!(r#""ready_after_ms":{}"#, options["ready_after_ms"]);
+            wait_received(&dir, first, switched.as_bytes()).await;
+            assert_eq!(worker_pid(&s).await, first, "the same worker");
+            assert!(s.shared.lock().sessions.contains_key("s1"));
+        }
+        assert_eq!(s.shared.lock().connections.len(), 1);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn relay_candidates_and_channels_reach_the_worker_process() {
         let dir = private_dir("relay-ipc");
