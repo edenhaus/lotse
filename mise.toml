@@ -240,5 +240,9 @@ cargo about generate --locked --fail --config .cargo/about.toml --manifest-path 
 """
 
 [tasks.image]
-description = "The scratch image from the static binaries: `load [arch]` into the local Docker as lotse:dev, or `push <repository> <version>` (release.yml); see scripts/image.sh"
-run = "scripts/image.sh"
+description = "The release image of the host's arch (Dockerfile), into the local Docker as lotse:dev (Linux only, as release-build)"
+run = """
+mise run release-build "$(uname -m)"
+install -D target/$(uname -m)-unknown-linux-musl/release/lotse target/image/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/lotse
+docker build --tag lotse:dev .
+"""

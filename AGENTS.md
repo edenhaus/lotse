@@ -72,7 +72,7 @@ workflow and job names start with a capital letter.
 | `mise run set-version <version>` | the workspace version and its lockfile entries; only a release build sets it, from the tag (the repository keeps `0.0.0-dev`) |
 | `mise run release-build [x86_64\|aarch64]` | static musl binary (Linux only); zig links every musl build (`.cargo/config.toml`) |
 | `mise run sbom` / `mise run licenses` | a release's CycloneDX SBOMs and `THIRD_PARTY_LICENSES.md`, in `target/dist/` |
-| `mise run image load [arch]` | the scratch release image from the static binary, into the local Docker as `lotse:dev` |
+| `mise run image` | `release-build` for the host's arch, then the release image from it (`Dockerfile`, which takes `target/image/<docker arch>/lotse`), into the local Docker as `lotse:dev` (Linux only) |
 
 ## Layout
 

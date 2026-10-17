@@ -20,7 +20,7 @@ use crate::ctl::{CtlArgs, PairArgs};
 #[command(
     name = "lotse",
     version,
-    about = "Media daemon: RTSP cameras in, WebRTC to browsers out."
+    about = "Memory-safe media daemon for IP cameras."
 )]
 pub(crate) struct Cli {
     /// What to run.

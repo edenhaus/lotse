@@ -102,11 +102,10 @@ jobs:
         with:
           pattern: lotse-*
           path: artifacts
-      - name: Put the binaries where scripts/image.sh takes them
+      - name: Put the binaries where the Dockerfile takes them
         run: |
-          for arch in x86_64 aarch64; do
-            install -D -m 0755 "artifacts/lotse-$arch/lotse" "target/$arch-unknown-linux-musl/release/lotse"
-          done
+          install -D artifacts/lotse-x86_64/lotse target/image/amd64/lotse
+          install -D artifacts/lotse-aarch64/lotse target/image/arm64/lotse
       # ghcr.io takes lowercase names only. The owner is not written down: the repository may
       # move to another organization.
       - name: Image name
@@ -120,16 +119,36 @@ jobs:
           ACTOR: ${{ github.actor }}
           TOKEN: ${{ github.token }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      # The same binaries give the same image.
+      - name: Image timestamp
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      # mirror.gcr.io: Docker Hub's anonymous pull limit. No cache-binary: this workflow restores
+      # no cache.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+          cache-binary: false
+      # No `latest`: consumers pin by digest. No SBOM or provenance: attested below, and the
+      # SBOMs are the binaries'.
       - name: Build and push
         id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         env:
-          IMAGE: ${{ steps.name.outputs.image }}
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          scripts/image.sh push "$IMAGE" "$VERSION"
-          digest="$(cat target/dist/image-digest)"
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          echo "Image: \`$IMAGE:$VERSION@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          sbom: false
+          tags: ${{ steps.name.outputs.image }}:${{ needs.version.outputs.version }}
+          outputs: type=image,push=true,oci-mediatypes=true,rewrite-timestamp=true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+          annotations: |
+            index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            index:org.opencontainers.image.description=Memory-safe media daemon for IP cameras.
+            index:org.opencontainers.image.licenses=MIT OR Apache-2.0
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.name.outputs.image }}
@@ -196,10 +215,20 @@ jobs:
 
           ## Container image
 
-          `$IMAGE:$VERSION@$DIGEST` (linux/amd64, linux/arm64): `/lotse` and nothing else.
+          `$IMAGE:$VERSION@$DIGEST` (linux/amd64, linux/arm64): `/lotse` and the directories it needs.
+          Take the binary into an image of your own:
 
           ```dockerfile
           COPY --from=$IMAGE:$VERSION@$DIGEST /lotse /bin/lotse
+          ```
+
+          Or run it with its control API over mutual TLS, and pair a client with the code it logs:
+
+          ```sh
+          docker run -d --name lotse --network host -v lotse-data:/data \
+            -e LOTSE_CONTROL_LISTEN='[::]:18557' $IMAGE:$VERSION@$DIGEST
+          docker logs lotse              # the first client's pairing code
+          docker exec lotse /lotse pair  # another one-time code
           ```
 
           ## Verify
