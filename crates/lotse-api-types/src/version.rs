@@ -11,18 +11,26 @@
 //! client: before that no client exists to be incompatible with, so an
 //! API change does not bump it.
 
-/// The API version in `hello.api` and the schema bundle's `api`.
-pub const API_VERSION: &str = "0.1.0";
+/// Defines [`API_VERSION`], [`CURRENT`] and [`WS_PATH`] from one
+/// `major, minor, patch`, so the three cannot disagree.
+macro_rules! api_version {
+    ($major:literal, $minor:literal, $patch:literal) => {
+        /// The API version in `hello.api` and the schema bundle's `api`.
+        pub const API_VERSION: &str = concat!($major, ".", $minor, ".", $patch);
 
-/// [`API_VERSION`], parsed; a test keeps the two equal.
-pub const CURRENT: ApiVersion = ApiVersion {
-    major: 0,
-    minor: 1,
-    patch: 0,
-};
+        /// [`API_VERSION`] as numbers, for [`ApiVersion::accepts`].
+        pub const CURRENT: ApiVersion = ApiVersion {
+            major: $major,
+            minor: $minor,
+            patch: $patch,
+        };
 
-/// The WebSocket path: `/v<major>/ws`; a test keeps it on [`CURRENT`]'s major.
-pub const WS_PATH: &str = "/v0/ws";
+        /// The WebSocket path: `/v<major>/ws`.
+        pub const WS_PATH: &str = concat!("/v", $major, "/ws");
+    };
+}
+
+api_version!(0, 1, 0);
 
 /// A `MAJOR.MINOR.PATCH` version (Semantic Versioning 2.0.0 §2, without pre-release or
 /// build metadata, which the API version never carries).
@@ -96,11 +104,11 @@ mod tests {
     }
 
     #[test]
-    fn the_constants_agree_and_stay_below_1_0() {
+    fn the_constants_render_the_version() {
+        assert_eq!(API_VERSION, "0.1.0");
+        assert_eq!(CURRENT, v(0, 1, 0));
+        assert_eq!(WS_PATH, "/v0/ws");
         assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
-        assert_eq!(CURRENT.to_string(), API_VERSION);
-        assert_eq!(WS_PATH, format!("/v{}/ws", CURRENT.major));
-        assert_eq!(CURRENT, v(0, 1, 0), "unstable until lotse 1.0");
     }
 
     #[test]
