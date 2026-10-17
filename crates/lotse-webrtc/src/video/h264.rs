@@ -243,6 +243,7 @@ mod tests {
             }),
             audio: None,
             backchannel: None,
+            claim: lotse_core::session::TalkbackClaim::Granted,
             orientation: lotse_core::Orientation::default(),
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,

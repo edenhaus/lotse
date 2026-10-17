@@ -500,13 +500,20 @@ mod tests {
     #[test]
     fn hello_is_accepted_only_at_a_compatible_api_version() {
         let hello = |api: Value| json!({ "type": "hello", "api": api, "version": "0.0.0" });
+        let current = lotse_api_types::version::CURRENT;
         assert!(check_hello(&hello(json!(API_VERSION))).is_ok());
         assert!(
-            check_hello(&hello(json!("0.1.7"))).is_ok(),
+            check_hello(&hello(json!(format!(
+                "{}.{}.{}",
+                current.major,
+                current.minor,
+                current.patch + 7
+            ))))
+            .is_ok(),
             "a later patch only adds"
         );
         for api in [
-            json!("0.2.0"),
+            json!(format!("{}.{}.0", current.major, current.minor + 1)),
             json!("1.1.0"),
             json!("0.1"),
             json!(1),

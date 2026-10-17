@@ -1,7 +1,10 @@
 //! `sdp_offer`: an offer from outside never panics the session's answer
 //! path, for an H.264 or an H.265 stream (Main or High tier). The payload
 //! type check refuses what would panic str0m, the engine answers the rest
-//! or returns an error, and a refused offer never reaches it.
+//! or returns an error, and a refused offer never reaches it. A session
+//! that answered then takes a re-offer (`webrtc/renegotiate`, RFC 8829
+//! §5.3), with or without the camera's backchannel and with the claim
+//! granted or busy, which it answers or refuses without panicking.
 //! Run with `cargo +nightly fuzz run sdp_offer` from the repository root.
 
 #![no_main]
@@ -12,7 +15,11 @@ use std::time::{Instant, SystemTime};
 use libfuzzer_sys::fuzz_target;
 use lotse_core::Orientation;
 use lotse_core::codec::Codec;
-use lotse_core::session::{IceCredentials, SessionLimits, SessionOpenError, SessionRequest};
+use lotse_core::session::{
+    IceCredentials, SessionEngine, SessionLimits, SessionOpenError, SessionRequest, TalkbackClaim,
+    TalkbackTarget,
+};
+use lotse_core::uplink::UplinkCodec;
 use lotse_webrtc::Session;
 use lotse_webrtc::sdp::check_payload_types;
 
@@ -63,6 +70,31 @@ a=fmtp:118 level-id=153;profile-id=2;tier-flag=1;tx-mode=SRST\r\n\
 a=rtpmap:119 rtx/90000\r\n\
 a=fmtp:119 apt=118\r\n";
 
+/// Separates the offer's bytes from the re-offer's: 0xFF never occurs in
+/// UTF-8, so an SDP has no use for it.
+const SEPARATOR: u8 = 0xFF;
+
+/// The offer `pick` and `rest` describe: `rest` as the whole offer, or
+/// lines to insert into [`BASE`] before the line its first byte picks.
+fn offer_of(pick: u8, rest: &[u8]) -> Option<String> {
+    if pick & 4 == 0 {
+        return Some(String::from_utf8_lossy(rest).into_owned());
+    }
+    let (&at, lines) = rest.split_first()?;
+    let base: Vec<&str> = BASE.lines().collect();
+    let at = usize::from(at) % base.len();
+    let mut offer = String::new();
+    for (index, line) in base.iter().enumerate() {
+        if index == at {
+            offer.push_str(&String::from_utf8_lossy(lines));
+            offer.push_str("\r\n");
+        }
+        offer.push_str(line);
+        offer.push_str("\r\n");
+    }
+    Some(offer)
+}
+
 fuzz_target!(|data: &[u8]| {
     // Byte 0 picks the stream's audio (none: every audio codec enabled;
     // Opus; PCMU), its video (H.264, or H.265 under Main and Main 10, RFC
@@ -70,27 +102,27 @@ fuzz_target!(|data: &[u8]| {
     // whether the rest is the whole offer or lines to insert into BASE
     // before the line byte 1 picks; its top three bits pick the stream's
     // orientation, which the answer marks when the offer negotiates CVO.
+    // What follows a SEPARATOR describes the re-offer the same way, its
+    // first byte picking the backchannel (bit 0: a PCMU camera's, else
+    // none) and the claim (bit 1: busy, else granted); without one, the
+    // re-offer is the offer with its first m-line turned `sendrecv`, as a
+    // microphone press on the downlink audio m-line sends.
     let Some((&pick, rest)) = data.split_first() else {
         return;
     };
-    let offer = if pick & 4 == 0 {
-        String::from_utf8_lossy(rest).into_owned()
-    } else {
-        let Some((&at, lines)) = rest.split_first() else {
-            return;
-        };
-        let base: Vec<&str> = BASE.lines().collect();
-        let at = usize::from(at) % base.len();
-        let mut offer = String::new();
-        for (index, line) in base.iter().enumerate() {
-            if index == at {
-                offer.push_str(&String::from_utf8_lossy(lines));
-                offer.push_str("\r\n");
-            }
-            offer.push_str(line);
-            offer.push_str("\r\n");
+    let (first, second) = match rest.iter().position(|&byte| byte == SEPARATOR) {
+        Some(at) => {
+            let (first, tail) = rest.split_at(at);
+            (first, tail.split_first().map(|(_, second)| second))
         }
-        offer
+        None => (rest, None),
+    };
+    let Some(offer) = offer_of(pick, first) else {
+        return;
+    };
+    let (talk, reoffer) = match second.and_then(|second| second.split_first()) {
+        Some((&talk, reoffer)) => (talk, offer_of(pick, reoffer)),
+        None => (0, Some(offer.replacen("a=recvonly", "a=sendrecv", 1))),
     };
     let audio = match pick & 3 {
         0 => None,
@@ -122,6 +154,7 @@ fuzz_target!(|data: &[u8]| {
         }),
         audio,
         backchannel: None,
+        claim: lotse_core::session::TalkbackClaim::Granted,
         orientation: Orientation::ALL[usize::from(pick >> 5)],
         limits: SessionLimits::default(),
         wall: SystemTime::UNIX_EPOCH,
@@ -133,5 +166,22 @@ fuzz_target!(|data: &[u8]| {
             matches!(answered, Err(SessionOpenError::InvalidSdp(_))),
             "a refused offer is invalid_sdp"
         );
+    }
+    let (Ok((mut session, _)), Some(reoffer)) = (answered, reoffer) else {
+        return;
+    };
+    let backchannel = (talk & 1 != 0).then(|| TalkbackTarget {
+        codec: Codec::Pcmu,
+        takes: UplinkCodec::ALL.to_vec(),
+    });
+    let claim = if talk & 2 == 0 {
+        TalkbackClaim::Granted
+    } else {
+        TalkbackClaim::Busy
+    };
+    // Answered or refused, the session goes on and takes the next one:
+    // the same SDP again, as a browser repeating its offer sends it.
+    for _ in 0..2 {
+        let _answer = session.renegotiate(Instant::now(), &reoffer, backchannel.clone(), claim);
     }
 });

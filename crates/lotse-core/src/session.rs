@@ -102,9 +102,12 @@ pub struct SessionRequest {
     /// audio back (`SourceCapabilities::backchannel`, the feature's gate)
     /// and the source offers one now. `None` answers talk-back
     /// `inactive`, or refuses a talk-back request when
-    /// [`Self::talkback_required`]. Never whether another session talks:
-    /// the answer stays a function of the offer and this.
+    /// [`Self::talkback_required`]. What the camera offers, whoever
+    /// holds it: [`Self::claim`] says whether this session does.
     pub backchannel: Option<TalkbackTarget>,
+    /// Whether the session holds the backchannel for the offer: the
+    /// worker's arbitration, decided before the engine sees the offer.
+    pub claim: TalkbackClaim,
     /// How the stream's picture is turned for display: the stream's
     /// `orientation`, which an output marks when the viewer can apply it.
     pub orientation: Orientation,
@@ -120,6 +123,23 @@ pub struct SessionRequest {
     /// instead of answered without it. Without it such an offer is answered
     /// as the backchannel allows, talk-back `inactive` or not received.
     pub talkback_required: bool,
+}
+
+/// Whether a session holds the stream's backchannel for an offer: the
+/// worker's arbitration of it ([`crate::output::TalkbackRequest`]), one
+/// talker per stream, decided before the engine answers so the answer
+/// carries the outcome (RFC 8829 §5.3.1, RFC 3264 §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TalkbackClaim {
+    /// The session holds the backchannel, or the offer asks for no
+    /// talk-back and needs none: talk-back is negotiated as the offer
+    /// and [`SessionRequest::backchannel`] allow.
+    Granted,
+    /// Another session holds it: the talk-back m-line is answered
+    /// without talk-back (`inactive`, or `sendonly` when it carries the
+    /// stream's audio too), whatever the offer and the backchannel allow,
+    /// and the session plays on.
+    Busy,
 }
 
 /// The backchannel a session negotiates talk-back with: the codec the
@@ -167,6 +187,33 @@ impl SessionOpenError {
             Self::VideoCodecUnsupported(_) => "video_codec_unsupported",
             Self::NotASession(_) => "internal_error",
             Self::BackchannelUnavailable(_) => "backchannel_unavailable",
+        }
+    }
+}
+
+/// Why a re-offer ([`SessionEngine::renegotiate`]) was not applied; the
+/// session goes on as it was. Each maps to a `webrtc/renegotiate` error
+/// code.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RenegotiateError {
+    /// The re-offer is not an SDP the engine accepts.
+    #[error("invalid re-offer: {0}")]
+    InvalidSdp(String),
+    /// The re-offer changes the video m-line the session plays on: its
+    /// mid, direction or codecs, or stops it (its port).
+    #[error("the re-offer changes the video m-line: {0}")]
+    VideoChanged(String),
+    /// The re-offer has no video m-line.
+    #[error("the re-offer has no video m-line")]
+    NoVideoTrack,
+}
+
+impl RenegotiateError {
+    /// The error code.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidSdp(_) | Self::VideoChanged(_) => "invalid_sdp",
+            Self::NoVideoTrack => "no_video_track",
         }
     }
 }
@@ -277,7 +324,8 @@ pub struct SessionStats {
     pub uplink_packets: u64,
     /// RTP the viewer sent that is no talk-back packet: on another m-line
     /// than talk-back's, in a payload type of no talk-back codec, or a
-    /// payload that is not one packet of its codec. Dropped.
+    /// payload that is not one packet of its codec, or any RTP while the
+    /// answer negotiated no talk-back. Dropped.
     pub uplink_refused: u64,
 }
 
@@ -353,6 +401,21 @@ pub trait SessionEngine: fmt::Debug + Send {
     /// The talk-back codec the answer negotiated, which the browser sends
     /// (`session/get`'s `backchannel.codec`); `None` when talk-back is off.
     fn talkback(&self) -> Option<UplinkCodec>;
+
+    /// A re-offer (`webrtc/renegotiate`): the answer to it, or why it was
+    /// not applied, the session then going on as it was. Only the audio
+    /// m-lines may change; talk-back is negotiated again from them, with
+    /// `backchannel` what the camera offers now and `claim` whether the
+    /// session holds it for this re-offer
+    /// ([`SessionRequest::backchannel`], [`SessionRequest::claim`]);
+    /// the video m-line must be the one the session opened with.
+    fn renegotiate(
+        &mut self,
+        now: Instant,
+        offer: &str,
+        backchannel: Option<TalkbackTarget>,
+        claim: TalkbackClaim,
+    ) -> Result<String, RenegotiateError>;
 }
 
 /// What a session does with one event of its video subscription, or with
@@ -505,6 +568,19 @@ mod tests {
             unavailable.to_string(),
             "two-way audio unavailable: the camera offers no backchannel"
         );
+        assert_eq!(
+            RenegotiateError::InvalidSdp("x".into()).code(),
+            "invalid_sdp"
+        );
+        assert_eq!(
+            RenegotiateError::VideoChanged("mid".into()).code(),
+            "invalid_sdp"
+        );
+        assert_eq!(
+            RenegotiateError::VideoChanged("mid".into()).to_string(),
+            "the re-offer changes the video m-line: mid"
+        );
+        assert_eq!(RenegotiateError::NoVideoTrack.code(), "no_video_track");
         assert_eq!(
             SessionLimits::default().max_packet_age,
             Duration::from_millis(150)

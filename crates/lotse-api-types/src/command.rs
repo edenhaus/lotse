@@ -210,6 +210,30 @@ pub struct WebrtcCandidate {
     pub sdp_mline_index: Option<u32>,
 }
 
+/// `webrtc/renegotiate`: a re-offer for an answered session, taken only
+/// from the connection that owns it, answered in the result. Only the
+/// audio m-lines may change: one offered `sendonly`, or the downlink one
+/// offered `sendrecv`, asks for talk-back, and the answer says whether
+/// the session got the camera's backchannel (`recvonly` or `sendrecv`)
+/// or not (`inactive` or `sendonly`, RFC 3264 §6.1, with a
+/// `backchannel_declined` warning on the session's subscription saying
+/// why); one offered `inactive` or `recvonly`, or removed (port 0), lets
+/// the backchannel go. A re-offer that changes the video m-line (its
+/// mid, codecs or direction) fails with `invalid_sdp`, one without a
+/// video m-line with `no_video_track`; the session goes on as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebrtcRenegotiate {
+    /// The command id.
+    pub id: u64,
+    /// The session.
+    #[schemars(regex(pattern = ID_PATTERN))]
+    pub session_id: String,
+    /// The browser's SDP re-offer.
+    #[schemars(length(max = MAX_SDP_CHARS))]
+    pub sdp: String,
+}
+
 /// `session/get`, `session/close` and `session/adopt`: one session by id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -230,8 +254,8 @@ pub struct SessionListCommand {
 }
 
 /// `backchannel/release`: frees the camera's backchannel from whichever
-/// session holds it, or only from `session_id`, so the next session to
-/// send claims it.
+/// session holds it, or only from `session_id`, so the next offer that
+/// asks for talk-back claims it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BackchannelRelease {
@@ -324,6 +348,12 @@ pub enum Command {
     #[serde(rename = "webrtc/candidate")]
     #[schemars(title = "WebrtcCandidateCommand")]
     WebrtcCandidate(WebrtcCandidate),
+    /// `webrtc/renegotiate`: a re-offer for an answered session, taken
+    /// only from the connection that owns it; the result carries the
+    /// answer.
+    #[serde(rename = "webrtc/renegotiate")]
+    #[schemars(title = "WebrtcRenegotiateCommand")]
+    WebrtcRenegotiate(WebrtcRenegotiate),
     /// `session/get`: one session's state.
     #[serde(rename = "session/get")]
     #[schemars(title = "SessionGetCommand")]
@@ -365,6 +395,7 @@ impl Command {
         "unsubscribe",
         "webrtc/offer",
         "webrtc/candidate",
+        "webrtc/renegotiate",
         "session/get",
         "session/list",
         "session/close",
@@ -390,6 +421,7 @@ impl Command {
             Self::Unsubscribe(c) => c.id,
             Self::WebrtcOffer(c) => c.id,
             Self::WebrtcCandidate(c) => c.id,
+            Self::WebrtcRenegotiate(c) => c.id,
             Self::SessionGet(c) | Self::SessionClose(c) | Self::SessionAdopt(c) => c.id,
             Self::SessionList(c) => c.id,
             Self::BackchannelRelease(c) => c.id,
@@ -414,6 +446,7 @@ impl Command {
             Self::Unsubscribe(_) => "unsubscribe",
             Self::WebrtcOffer(_) => "webrtc/offer",
             Self::WebrtcCandidate(_) => "webrtc/candidate",
+            Self::WebrtcRenegotiate(_) => "webrtc/renegotiate",
             Self::SessionGet(_) => "session/get",
             Self::SessionList(_) => "session/list",
             Self::SessionClose(_) => "session/close",
@@ -596,6 +629,10 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             let mid = candidate.sdp_mid.as_deref().unwrap_or_default();
             cap_chars("sdp_mid", mid, MAX_TEXT_CHARS)?;
         }
+        Command::WebrtcRenegotiate(renegotiate) => {
+            cap_chars("session_id", &renegotiate.session_id, MAX_ID_CHARS)?;
+            cap_chars("sdp", &renegotiate.sdp, MAX_SDP_CHARS)?;
+        }
         Command::SessionGet(session)
         | Command::SessionClose(session)
         | Command::SessionAdopt(session) => {
@@ -748,26 +785,30 @@ mod tests {
                 "webrtc/candidate",
             ),
             (
-                r#"{"id":13,"type":"session/get","session_id":"s"}"#,
+                r#"{"id":13,"type":"webrtc/renegotiate","session_id":"01J8ZK","sdp":"v=0"}"#,
+                "webrtc/renegotiate",
+            ),
+            (
+                r#"{"id":14,"type":"session/get","session_id":"s"}"#,
                 "session/get",
             ),
-            (r#"{"id":14,"type":"session/list"}"#, "session/list"),
+            (r#"{"id":15,"type":"session/list"}"#, "session/list"),
             (
-                r#"{"id":15,"type":"session/close","session_id":"s"}"#,
+                r#"{"id":16,"type":"session/close","session_id":"s"}"#,
                 "session/close",
             ),
             (
-                r#"{"id":16,"type":"session/adopt","session_id":"s"}"#,
+                r#"{"id":17,"type":"session/adopt","session_id":"s"}"#,
                 "session/adopt",
             ),
             (
-                r#"{"id":17,"type":"backchannel/release","stream_id":"front"}"#,
+                r#"{"id":18,"type":"backchannel/release","stream_id":"front"}"#,
                 "backchannel/release",
             ),
-            (r#"{"id":18,"type":"pairing/create"}"#, "pairing/create"),
-            (r#"{"id":19,"type":"clients/list"}"#, "clients/list"),
+            (r#"{"id":19,"type":"pairing/create"}"#, "pairing/create"),
+            (r#"{"id":20,"type":"clients/list"}"#, "clients/list"),
             (
-                r#"{"id":20,"type":"clients/remove","pin":"00"}"#,
+                r#"{"id":21,"type":"clients/remove","pin":"00"}"#,
                 "clients/remove",
             ),
         ];
@@ -806,6 +847,34 @@ mod tests {
             .unwrap()
         );
         assert_eq!((candidate.sdp_mid, candidate.sdp_mline_index), (None, None));
+    }
+
+    #[test]
+    fn a_renegotiation_names_its_session_and_carries_the_re_offer() {
+        let_assert!(
+            Command::WebrtcRenegotiate(renegotiate) = parse_command(
+                r#"{"id":1,"type":"webrtc/renegotiate","session_id":"s1","sdp":"v=0\r\n"}"#
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            (
+                renegotiate.id,
+                renegotiate.session_id.as_str(),
+                renegotiate.sdp.as_str()
+            ),
+            (1, "s1", "v=0\r\n")
+        );
+        // Every field is required: a re-offer is for one session.
+        for frame in [
+            r#"{"id":2,"type":"webrtc/renegotiate","sdp":"v=0"}"#,
+            r#"{"id":3,"type":"webrtc/renegotiate","session_id":"s1"}"#,
+            r#"{"id":4,"type":"webrtc/renegotiate","session_id":"s1","sdp":"v=0","stream_id":"x"}"#,
+        ] {
+            let err = parse_command(frame).unwrap_err();
+            assert_eq!(err.error.code, ErrorCode::InvalidRequest, "{frame}");
+            assert_eq!(err.error.details["type"], "webrtc/renegotiate");
+        }
     }
 
     #[test]
@@ -866,6 +935,7 @@ mod tests {
         let server = |urls: usize, url: usize, username: usize, credential: usize| json!({ "urls": vec![text(url); urls], "username": text(username), "credential": text(credential) });
         let offer = |sdp: usize, servers: Vec<serde_json::Value>| json!({ "id": 1, "type": "webrtc/offer", "stream_id": "a", "sdp": text(sdp), "ice_servers": servers });
         let candidate = |session: usize, candidate: usize, mid: usize| json!({ "id": 1, "type": "webrtc/candidate", "session_id": text(session), "candidate": text(candidate), "sdp_mid": text(mid) });
+        let renegotiate = |session: usize, sdp: usize| json!({ "id": 1, "type": "webrtc/renegotiate", "session_id": text(session), "sdp": text(sdp) });
         let at_cap = server(MAX_ICE_URLS, MAX_TEXT_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS);
         let remove = |pin: usize| json!({ "id": 1, "type": "clients/remove", "pin": text(pin) });
         let accepted = [
@@ -873,6 +943,7 @@ mod tests {
             put(MAX_SOURCES, MAX_URL_CHARS),
             offer(MAX_SDP_CHARS, vec![at_cap.clone(); MAX_ICE_SERVERS]),
             candidate(MAX_ID_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS),
+            renegotiate(MAX_ID_CHARS, MAX_SDP_CHARS),
         ];
         for frame in &accepted {
             assert!(limited(frame).is_ok(), "{}", frame["type"]);
@@ -902,6 +973,8 @@ mod tests {
             (candidate(MAX_ID_CHARS + 1, 1, 1), "session_id"),
             (candidate(1, MAX_TEXT_CHARS + 1, 1), "candidate"),
             (candidate(1, 1, MAX_TEXT_CHARS + 1), "sdp_mid"),
+            (renegotiate(MAX_ID_CHARS + 1, 1), "session_id"),
+            (renegotiate(1, MAX_SDP_CHARS + 1), "sdp"),
         ];
         for (frame, field) in &refused {
             let (named, message) = limited(frame).unwrap_err();

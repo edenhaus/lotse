@@ -183,18 +183,12 @@ impl VideoWriter {
         playout_delay: bool,
         orientation: Option<VideoOrientation>,
     ) -> Self {
-        let (min, max) = limits.playout_delay_ms;
-        let hundredths = |ms: u16| EngineTime::new(u64::from(ms) / 10, Frequency::HUNDREDTHS);
-        Self {
+        let mut writer = Self {
             pt,
             mid,
             packetize,
             limits,
-            ext_vals: ExtensionValues {
-                play_delay_min: playout_delay.then(|| hundredths(min)),
-                play_delay_max: playout_delay.then(|| hundredths(max)),
-                ..ExtensionValues::default()
-            },
+            ext_vals: ExtensionValues::default(),
             orientation,
             capture_time: None,
             seq: 0,
@@ -206,7 +200,20 @@ impl VideoWriter {
             frame_bytes: 0,
             over_limit: None,
             stats: SessionStats::default(),
-        }
+        };
+        writer.set_playout_delay(playout_delay);
+        writer
+    }
+
+    /// Whether the packets from the next one written on carry the
+    /// `limits.playout_delay_ms` extension: a re-offer that adds or drops
+    /// the stream's audio changes it on the live writer, whose sequence
+    /// numbers and timestamps run on.
+    pub(crate) fn set_playout_delay(&mut self, playout_delay: bool) {
+        let (min, max) = self.limits.playout_delay_ms;
+        let hundredths = |ms: u16| EngineTime::new(u64::from(ms) / 10, Frequency::HUNDREDTHS);
+        self.ext_vals.play_delay_min = playout_delay.then(|| hundredths(min));
+        self.ext_vals.play_delay_max = playout_delay.then(|| hundredths(max));
     }
 
     /// The CVO value the last packet of each frame carries from the next
@@ -538,6 +545,11 @@ impl AudioWriter {
         }
     }
 
+    /// The media's mid: the downlink m-line the writer sends on.
+    pub(crate) const fn mid(&self) -> Mid {
+        self.mid
+    }
+
     /// The writer, its packets carrying their capture time as `capture_time`
     /// decides.
     pub(crate) fn with_capture_time(mut self, capture_time: Option<CaptureTimeSender>) -> Self {
@@ -724,5 +736,35 @@ mod tests {
         let mut audio = AudioWriter::new(Pt::from(0), Mid::from("a"), 8_000, limits);
         let later = now + limits.max_packet_age + Duration::from_millis(1);
         assert!(!audio.write(&mut rtc, later, &packet, later));
+    }
+
+    /// `playout-delay` carries its bounds in units of 10 ms (the
+    /// extension's granularity), and the writer carries them or none as
+    /// it is told, at the start and afterwards.
+    #[test]
+    fn playout_delay_carries_the_configured_bounds_in_10_ms_units_while_on() {
+        let limits = SessionLimits {
+            playout_delay_ms: (100, 250),
+            ..SessionLimits::default()
+        };
+        let bounds =
+            |video: &VideoWriter| (video.ext_vals.play_delay_min, video.ext_vals.play_delay_max);
+        let on = (
+            Some(EngineTime::new(10, Frequency::HUNDREDTHS)),
+            Some(EngineTime::new(25, Frequency::HUNDREDTHS)),
+        );
+        let mut video = VideoWriter::new(
+            Pt::from(96),
+            Mid::from("v"),
+            lotse_codec::h264::packetize,
+            limits,
+            true,
+            None,
+        );
+        assert_eq!(bounds(&video), on);
+        video.set_playout_delay(false);
+        assert_eq!(bounds(&video), (None, None));
+        video.set_playout_delay(true);
+        assert_eq!(bounds(&video), on);
     }
 }

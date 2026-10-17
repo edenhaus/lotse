@@ -126,6 +126,7 @@ impl Handler for FakeHandler {
             Command::MetricsGet(_) => Outcome::Result(json!({ "pad": "x".repeat(2 << 20) })),
             Command::StreamDelete(_)
             | Command::WebrtcCandidate(_)
+            | Command::WebrtcRenegotiate(_)
             | Command::SessionGet(_)
             | Command::SessionList(_)
             | Command::SessionClose(_)

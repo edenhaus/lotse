@@ -13,10 +13,10 @@ use crate::clock::Clock;
 use crate::codec::{Codec, CodecFamily, Kind};
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
 use crate::orientation::Orientation;
-use crate::output::{OutputFactory, OutputShape, TrackRequest};
+use crate::output::{OutputFactory, OutputShape, TalkbackRequest, TrackRequest};
 use crate::session::{
-    SessionEngine, SessionEvent, SessionOpenError, SessionOutput, SessionRequest, SessionStats,
-    Transport,
+    RenegotiateError, SessionEngine, SessionEvent, SessionOpenError, SessionOutput, SessionRequest,
+    SessionStats, TalkbackClaim, TalkbackTarget, Transport,
 };
 use crate::source::{
     BackchannelHandle, Direction, Source, SourceCapabilities, SourceConfigError, SourceCtx,
@@ -768,14 +768,38 @@ impl OutputFactory for FakeOutputFactory {
 /// output does; an offer of `"refuse"` is refused as invalid SDP. The
 /// answer is [`ECHO_ANSWER`], followed by ` audio=<codec>` with audio,
 /// ` backchannel=<codec>` with a backchannel and ` orientation=<name>` for
-/// a turned stream. Its engine reports talk-back negotiated in the
-/// backchannel's codec when that is one a viewer can send and that reaches
-/// the backchannel.
+/// a turned stream. An offer containing `talk` asks for talk-back
+/// ([`OutputFactory::talkback_request`]), which the backchannel takes
+/// when its codec is one a viewer can send and that reaches it; its
+/// engine then reports talk-back negotiated in that codec when the
+/// session holds the backchannel ([`TalkbackClaim::Granted`]). A re-offer
+/// is answered [`ECHO_RENEGOTIATED`] the same way, but `refuse` is
+/// invalid SDP and `no video` has no video m-line.
 #[derive(Debug)]
 pub struct EchoSessionFactory;
 
 /// The answer [`EchoSessionFactory`] gives.
 pub const ECHO_ANSWER: &str = "v=0 echo";
+
+/// The answer [`EchoEngine`] gives a re-offer.
+pub const ECHO_RENEGOTIATED: &str = "v=0 echo renegotiated";
+
+/// The talk-back codec the echo negotiates for `offer` with
+/// `backchannel` under `claim`: the backchannel's own codec, when the
+/// offer asks for talk-back and the session holds the backchannel.
+fn echo_talkback(
+    offer: &str,
+    backchannel: Option<&TalkbackTarget>,
+    claim: TalkbackClaim,
+) -> Option<UplinkCodec> {
+    if !offer.contains("talk") || claim != TalkbackClaim::Granted {
+        return None;
+    }
+    backchannel.and_then(|backchannel| {
+        UplinkCodec::of(backchannel.codec.family())
+            .filter(|codec| backchannel.takes.contains(codec))
+    })
+}
 
 impl OutputFactory for EchoSessionFactory {
     fn kind(&self) -> &'static str {
@@ -828,14 +852,30 @@ impl OutputFactory for EchoSessionFactory {
             .chain(orientation)
             .collect::<Vec<_>>()
             .join(" ");
-        let talkback = request.backchannel.as_ref().and_then(|backchannel| {
-            UplinkCodec::of(backchannel.codec.family())
-                .filter(|codec| backchannel.takes.contains(codec))
-        });
+        let talkback = echo_talkback(&request.offer, request.backchannel.as_ref(), request.claim);
         Ok((
             Box::new(EchoEngine::new(now).with_talkback(talkback)),
             answer,
         ))
+    }
+
+    fn talkback_request(
+        &self,
+        offer: &str,
+        backchannel: Option<&TalkbackTarget>,
+    ) -> TalkbackRequest {
+        if !offer.contains("talk") {
+            return TalkbackRequest::NotRequested;
+        }
+        match echo_talkback(offer, backchannel, TalkbackClaim::Granted) {
+            Some(_) => TalkbackRequest::Negotiable,
+            None if backchannel.is_none() => {
+                TalkbackRequest::Unsupported("the camera offers no backchannel".to_owned())
+            }
+            None => TalkbackRequest::Unsupported(
+                "the backchannel takes a codec talk-back cannot feed".to_owned(),
+            ),
+        }
     }
 }
 
@@ -1049,6 +1089,31 @@ impl SessionEngine for EchoEngine {
     fn talkback(&self) -> Option<UplinkCodec> {
         self.talkback
     }
+
+    /// Answers [`ECHO_RENEGOTIATED`] with ` backchannel=<codec>` when
+    /// talk-back is negotiated now, which [`SessionEngine::talkback`]
+    /// reports from then on; `refuse` is invalid SDP, `no video` has no
+    /// video m-line.
+    fn renegotiate(
+        &mut self,
+        now: Instant,
+        offer: &str,
+        backchannel: Option<TalkbackTarget>,
+        claim: TalkbackClaim,
+    ) -> Result<String, RenegotiateError> {
+        self.idle = now.checked_add(Duration::from_secs(3600)).unwrap_or(now);
+        if offer == "refuse" {
+            return Err(RenegotiateError::InvalidSdp("refused by the echo".into()));
+        }
+        if offer == "no video" {
+            return Err(RenegotiateError::NoVideoTrack);
+        }
+        self.talkback = echo_talkback(offer, backchannel.as_ref(), claim);
+        Ok(match self.talkback {
+            Some(codec) => format!("{ECHO_RENEGOTIATED} backchannel={}", codec.name()),
+            None => ECHO_RENEGOTIATED.to_owned(),
+        })
+    }
 }
 
 /// A transcoder from one family to another that never processes a frame.
@@ -1127,7 +1192,7 @@ mod tests {
 
     use super::*;
     use crate::clock::SystemClock;
-    use crate::session::TalkbackTarget;
+
     use crate::source::{BackchannelSlot, ClockInput, ResolvedPeer, TrackSet};
     use crate::track::{TrackId, TrackLimits};
 
@@ -1873,7 +1938,7 @@ mod tests {
     fn the_echo_names_audio_the_backchannel_and_a_turn_in_its_answer_and_reports_turns() {
         let now = SystemClock.now();
         let turned = SessionRequest {
-            offer: "v=0".into(),
+            offer: "v=0 talk".into(),
             ice: crate::session::IceCredentials {
                 ufrag: "u".into(),
                 pass: "p".into(),
@@ -1886,6 +1951,7 @@ mod tests {
                 codec: Codec::Pcma,
                 takes: vec![UplinkCodec::Pcma],
             }),
+            claim: TalkbackClaim::Granted,
             orientation: Orientation::Rotate180,
             limits: crate::session::SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
@@ -1920,10 +1986,94 @@ mod tests {
         assert_eq!(engine.talkback(), None);
         let without = SessionRequest {
             backchannel: None,
-            ..turned
+            ..turned.clone()
         };
         let (engine, _answer) = EchoSessionFactory.open_session(without, now).unwrap();
         assert_eq!(engine.talkback(), None);
+        // Nor for an offer that asks for none, or a session another
+        // holds the backchannel against.
+        let silent = SessionRequest {
+            offer: "v=0".into(),
+            ..turned.clone()
+        };
+        let (engine, _answer) = EchoSessionFactory.open_session(silent, now).unwrap();
+        assert_eq!(engine.talkback(), None);
+        let busy = SessionRequest {
+            claim: TalkbackClaim::Busy,
+            ..turned.clone()
+        };
+        let (engine, _answer) = EchoSessionFactory.open_session(busy, now).unwrap();
+        assert_eq!(engine.talkback(), None);
+        // What an offer asks for, as the worker arbitrates it.
+        let target = turned.backchannel.as_ref();
+        assert_eq!(
+            EchoSessionFactory.talkback_request("v=0", target),
+            TalkbackRequest::NotRequested
+        );
+        assert_eq!(
+            EchoSessionFactory.talkback_request("v=0 talk", target),
+            TalkbackRequest::Negotiable
+        );
+        assert_eq!(
+            EchoSessionFactory.talkback_request("v=0 talk", None),
+            TalkbackRequest::Unsupported("the camera offers no backchannel".into())
+        );
+        let unroutable = TalkbackTarget {
+            codec: Codec::Pcma,
+            takes: vec![UplinkCodec::Opus],
+        };
+        assert_eq!(
+            EchoSessionFactory.talkback_request("v=0 talk", Some(&unroutable)),
+            TalkbackRequest::Unsupported(
+                "the backchannel takes a codec talk-back cannot feed".into()
+            )
+        );
+    }
+
+    #[test]
+    fn the_echo_engine_answers_a_re_offer_and_negotiates_talk_back_from_it() {
+        let now = SystemClock.now();
+        let mut engine = EchoEngine::new(now);
+        let target = TalkbackTarget {
+            codec: Codec::Pcmu,
+            takes: vec![UplinkCodec::Pcmu],
+        };
+        assert_eq!(
+            engine.renegotiate(
+                now,
+                "v=0 talk",
+                Some(target.clone()),
+                TalkbackClaim::Granted
+            ),
+            Ok(format!("{ECHO_RENEGOTIATED} backchannel=pcmu"))
+        );
+        assert_eq!(engine.talkback(), Some(UplinkCodec::Pcmu));
+        assert_eq!(
+            engine.renegotiate(now, "v=0", Some(target.clone()), TalkbackClaim::Granted),
+            Ok(ECHO_RENEGOTIATED.to_owned())
+        );
+        assert_eq!(engine.talkback(), None);
+        assert_eq!(
+            engine.renegotiate(now, "v=0 talk", Some(target), TalkbackClaim::Busy),
+            Ok(ECHO_RENEGOTIATED.to_owned())
+        );
+        assert_eq!(
+            engine.renegotiate(now, "refuse", None, TalkbackClaim::Granted),
+            Err(RenegotiateError::InvalidSdp("refused by the echo".into()))
+        );
+        assert_eq!(
+            engine.renegotiate(now, "no video", None, TalkbackClaim::Granted),
+            Err(RenegotiateError::NoVideoTrack)
+        );
+        let later = now + Duration::from_secs(7200);
+        engine
+            .renegotiate(later, "v=0", None, TalkbackClaim::Granted)
+            .unwrap();
+        assert_eq!(
+            engine.poll(),
+            SessionOutput::Timeout(later + Duration::from_secs(3600)),
+            "idle from the re-offer on"
+        );
     }
 
     #[test]
@@ -1941,6 +2091,7 @@ mod tests {
             video: Arc::new(Codec::Pcmu),
             audio: None,
             backchannel: None,
+            claim: TalkbackClaim::Granted,
             orientation: Orientation::default(),
             limits: crate::session::SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,

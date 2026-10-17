@@ -33,8 +33,12 @@ mod writer;
 use std::time::{Duration, Instant};
 
 use lotse_core::codec::{CodecFamily, Kind};
-use lotse_core::output::{Delivery, JoinPolicy, OutputFactory, OutputShape, TrackRequest};
-use lotse_core::session::{SessionEngine, SessionOpenError, SessionRequest};
+use lotse_core::output::{
+    Delivery, JoinPolicy, OutputFactory, OutputShape, TalkbackRequest, TrackRequest,
+};
+use lotse_core::session::{
+    SessionEngine, SessionOpenError, SessionRequest, TalkbackClaim, TalkbackTarget,
+};
 use lotse_core::track::Unit;
 use str0m::rtp::{Extension, ExtensionMap};
 use str0m::{IceCreds, Rtc, RtcConfig};
@@ -144,6 +148,30 @@ impl OutputFactory for WebRtcFactory {
         let (session, answer) = Session::answer(&request, now)?;
         Ok((Box::new(session), answer))
     }
+
+    /// What the audio plan of `offer` would make of `backchannel` for a
+    /// session that holds it (`AudioPlan`): talk-back is
+    /// negotiable when the plan receives it, requested in vain when the
+    /// plan says why not.
+    fn talkback_request(
+        &self,
+        offer: &str,
+        backchannel: Option<&TalkbackTarget>,
+    ) -> TalkbackRequest {
+        let order = audio::engine_codecs(
+            backchannel.map(|backchannel| backchannel.codec.family()),
+            None,
+        );
+        match audio::AudioPlan::new(offer, None, backchannel, TalkbackClaim::Granted, &order)
+            .talkback
+        {
+            audio::Talkback::NotRequested => TalkbackRequest::NotRequested,
+            audio::Talkback::Negotiated { .. } | audio::Talkback::Busy => {
+                TalkbackRequest::Negotiable
+            }
+            audio::Talkback::Off(reason) => TalkbackRequest::Unsupported(reason.to_owned()),
+        }
+    }
 }
 
 /// The pacer's target delay budget; exported for the settings until the
@@ -172,5 +200,64 @@ mod tests {
         assert!(!both[1].required);
         assert_eq!(both[1].accept[0], CodecFamily::Opus);
         assert_eq!(MAX_PACER_DELAY, Duration::from_millis(50));
+    }
+
+    /// What an offer asks of the backchannel, as the worker arbitrates
+    /// it before the answer: a `sendonly` audio m-line in a codec that
+    /// reaches the backchannel is negotiable, one the backchannel cannot
+    /// take is requested in vain with the plan's reason, and an offer
+    /// without one, or with it stopped, asks for nothing.
+    #[test]
+    fn rfc8866_6_7_the_factory_reads_what_an_offer_asks_of_the_backchannel() {
+        use lotse_core::codec::Codec;
+        use lotse_core::uplink::UplinkCodec;
+
+        let factory = WebRtcFactory;
+        let talking = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=recvonly\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:1\r\na=sendonly\r\na=rtpmap:0 PCMU/8000\r\n";
+        let silent = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=recvonly\r\n";
+        let pcmu = TalkbackTarget {
+            codec: Codec::Pcmu,
+            takes: vec![UplinkCodec::Pcmu],
+        };
+        let opus = TalkbackTarget {
+            codec: Codec::Opus { channels: 2 },
+            takes: vec![UplinkCodec::Opus],
+        };
+        assert_eq!(
+            factory.talkback_request(talking, Some(&pcmu)),
+            TalkbackRequest::Negotiable
+        );
+        assert_eq!(
+            factory.talkback_request(talking, Some(&opus)),
+            TalkbackRequest::Unsupported(
+                "the talk-back m-line lists no codec that reaches the backchannel".into()
+            )
+        );
+        assert_eq!(
+            factory.talkback_request(talking, None),
+            TalkbackRequest::Unsupported("the camera offers no backchannel".into())
+        );
+        assert_eq!(
+            factory.talkback_request(silent, Some(&pcmu)),
+            TalkbackRequest::NotRequested
+        );
+        // Only in two-channel PCMU, which the engine does not carry
+        // (`audio::engine_channels`): requested in vain, so the worker
+        // neither claims the backchannel for it nor keeps it.
+        let stereo = talking.replace("PCMU/8000", "PCMU/8000/2");
+        assert_eq!(
+            factory.talkback_request(&stereo, Some(&pcmu)),
+            TalkbackRequest::Unsupported(
+                "the talk-back m-line lists no codec that reaches the backchannel".into()
+            )
+        );
+        // Stopped with port 0 (RFC 3264 §8.2), its `a=sendonly` kept: it
+        // asks for nothing, so a session that held the backchannel lets
+        // go.
+        let stopped = talking.replace("m=audio 9 ", "m=audio 0 ");
+        assert_eq!(
+            factory.talkback_request(&stopped, Some(&pcmu)),
+            TalkbackRequest::NotRequested
+        );
     }
 }

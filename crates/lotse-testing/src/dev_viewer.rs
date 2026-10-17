@@ -831,8 +831,8 @@ mod tests {
 
     /// Talk-back (2026-10-11): the opt-in puts the RTSP option
     /// `backchannel`, the offer carries a send-only audio m-line, which the
-    /// daemon answers recvonly (RFC 3264 §6.1), and the microphone goes on
-    /// it only while Talk is on, so nothing claims the backchannel before.
+    /// daemon answers recvonly (RFC 3264 §6.1) when the offer claims the
+    /// backchannel, and the microphone goes on it only while Talk is on.
     #[test]
     fn rfc3264_s6_1_talk_back_offers_a_sendonly_m_line_and_sends_only_while_talking() {
         let page = PAGE;
@@ -878,7 +878,7 @@ mod tests {
         );
         assert!(closed.contains("${event.message}"), "{closed}");
         assert!(!closed.contains("play()"), "no retry: {closed}");
-        // Talk is usable only when the answer took the m-line.
+        // The answer took the m-line when the browser's side is sendonly.
         assert!(page.contains(r#"talkTransceiver.currentDirection === "sendonly""#));
         // The microphone is asked for on Talk, not on Play, and leaves the
         // sender when talking stops.
@@ -896,16 +896,6 @@ mod tests {
             .and_then(|rest| rest.split("\n}\n").next())
             .expect("stopTalking()");
         assert!(stop.contains("transceiver.sender.replaceTrack(null)"));
-        // The backchannel is released only from this session, decided in
-        // the worker in one step, so stopping never takes it from another
-        // viewer: no separate check of the talker races a claim.
-        assert!(
-            stop.contains(
-                r#"call({ type: "backchannel/release", stream_id: streamId, session_id: session })"#
-            ),
-            "{stop}"
-        );
-        assert!(!stop.contains("session/get"), "{stop}");
         // Teardown stops the microphone.
         let teardown = page
             .split("function teardown(quiet)")
@@ -917,9 +907,9 @@ mod tests {
 
     /// Talk's start and stop are serialized per Play: a stale Play's
     /// failure never touches a later one's controls, and Talk stays
-    /// disabled from a stop until the worker applied its release.
+    /// disabled from a press until the re-offer it makes is answered.
     #[test]
-    fn talk_controls_follow_only_the_current_play_and_wait_for_the_release() {
+    fn talk_controls_follow_only_the_current_play_and_wait_for_the_re_offer() {
         let page = PAGE;
         let start = page
             .split("async function startTalking()")
@@ -945,36 +935,164 @@ mod tests {
                 "{handler}"
             );
         }
+        // A failed claim stops the microphone and leaves the controls to
+        // a later Play the same way.
+        let declined = start
+            .split("if (mine !== attempt || claimed !== true) {")
+            .nth(1)
+            .and_then(|rest| rest.split("return;\n  }").next())
+            .expect(start);
+        let stopped = declined
+            .find("for (const track of stream.getTracks()) track.stop();")
+            .expect(declined);
+        let stale = declined
+            .find("if (mine !== attempt) return;")
+            .expect(declined);
+        assert!(stopped < stale, "{declined}");
+        for touch in ["log(", "$(\"talk\")", "$(\"s-talk\")"] {
+            assert!(
+                declined.find(touch).is_some_and(|at| at > stale),
+                "{touch} after the stale check: {declined}"
+            );
+        }
         let stop = page
             .split("async function stopTalking()")
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
             .expect("stopTalking()");
-        // Talk stays disabled from the stop until the worker applied the
-        // release, which session/get shows once the supervisor heard of
-        // it: the command's result only says it is queued.
+        // Talk stays disabled from the stop until the re-offer dropping
+        // talk-back is answered: the browser takes one offer at a time.
         let disabled = stop.find("$(\"talk\").disabled = true;").expect(stop);
-        let release = stop.find("backchannel/release").expect(stop);
-        let applied = stop
-            .find("await releaseApplied(session, mine)")
+        let reoffer = stop
+            .find(r#"await renegotiate("inactive", mine)"#)
             .expect(stop);
-        let enabled = stop
-            .find("if (mine === attempt) $(\"talk\").disabled = false;")
-            .expect(stop);
+        let stale = reoffer
+            + stop[reoffer..]
+                .find("if (mine !== attempt) return;")
+                .expect(stop);
+        let enabled = stop.rfind("$(\"talk\").disabled = false;").expect(stop);
         assert!(
-            disabled < release && release < applied && applied < enabled,
+            disabled < reoffer && reoffer < stale && stale < enabled,
             "{stop}"
         );
-        let polls = page
-            .split("async function releaseApplied(session, mine)")
+    }
+
+    /// Talk-back comes and goes by re-offer (`webrtc/renegotiate`, RFC
+    /// 8829 §5.2.2): every Talk re-offers the m-line `sendonly`, Stop
+    /// talking re-offers it `inactive`, which lets the backchannel go;
+    /// nothing releases it by command. A declined claim (answered
+    /// `inactive`) leaves the microphone off and Talk usable to ask again;
+    /// a refused re-offer is rolled back.
+    #[test]
+    fn rfc8829_s5_2_2_talk_and_stop_re_offer_talk_back() {
+        let page = PAGE;
+        assert!(!page.contains("backchannel/release"), "no release command");
+        let renegotiate = page
+            .split("async function renegotiate(direction, mine)")
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
-            .expect("releaseApplied()");
+            .expect("renegotiate()");
+        let set = renegotiate
+            .find("transceiver.direction = direction;")
+            .expect(renegotiate);
+        let offer = renegotiate
+            .find("await peer.createOffer()")
+            .expect(renegotiate);
+        let local = renegotiate
+            .find("await peer.setLocalDescription(offer)")
+            .expect(renegotiate);
+        let posted = renegotiate
+            .find(r#"call({ type: "webrtc/renegotiate", session_id: session, sdp: sent(offer.sdp) })"#)
+            .expect(renegotiate);
+        let remote = renegotiate
+            .find(
+                r#"await peer.setRemoteDescription({ type: "answer", sdp: answered.result.sdp })"#,
+            )
+            .expect(renegotiate);
         assert!(
-            polls.contains(r#"call({ type: "session/get", session_id: session })"#),
-            "{polls}"
+            set < offer && offer < local && local < posted && posted < remote,
+            "{renegotiate}"
         );
-        assert!(polls.contains("!got.result.backchannel.talker"), "{polls}");
+        // Refused: rolled back, the transceiver as it was.
+        let refused = renegotiate
+            .split("if (!answered.success) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }").next())
+            .expect(renegotiate);
+        assert!(
+            refused.contains(r#"await peer.setLocalDescription({ type: "rollback" });"#)
+                && refused.contains("transceiver.direction = before;")
+                && refused.contains("return undefined;"),
+            "{refused}"
+        );
+        // Whether the answer gave the session the backchannel.
+        assert!(
+            renegotiate.contains(r#"return transceiver.currentDirection === "sendonly";"#),
+            "{renegotiate}"
+        );
+        // The re-offer leaves out what Play's offer left out.
+        assert!(page.contains("const sdp = sent(offer.sdp);"));
+
+        let start = page
+            .split("async function startTalking()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("startTalking()");
+        // Talk claims by re-offer before the microphone goes on the
+        // m-line, on every press: an m-line answered recvonly says the
+        // session held the backchannel then, and another client's
+        // `backchannel/release` frees it without a re-offer, after which
+        // the worker drops the session's packets. A regression: Talk once
+        // skipped the re-offer while the m-line was negotiated `sendonly`.
+        let mic = start
+            .find("navigator.mediaDevices.getUserMedia({ audio: true })")
+            .expect(start);
+        let claim = start
+            .find(r#"await renegotiate("sendonly", mine)"#)
+            .expect(start);
+        let on = start
+            .find("await transceiver.sender.replaceTrack(track)")
+            .expect(start);
+        assert!(mic < claim && claim < on, "{start}");
+        assert!(!start.contains("currentDirection"), "{start}");
+        assert!(
+            start.contains("\n  try {\n    claimed = await renegotiate(\"sendonly\", mine);"),
+            "the re-offer is unconditional: {start}"
+        );
+        let declined = &start[claim..on];
+        assert!(declined.contains("claimed !== true"), "{declined}");
+        assert!(
+            declined.contains(r#"$("talk").disabled = false;"#),
+            "Talk asks again: {declined}"
+        );
+        // Stop talking drops talk-back only while it holds it.
+        let stop = page
+            .split("async function stopTalking()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("stopTalking()");
+        let held = stop
+            .find(r#"if (transceiver.currentDirection === "sendonly") {"#)
+            .expect(stop);
+        let off = stop
+            .find("await transceiver.sender.replaceTrack(null)")
+            .expect(stop);
+        let drop = stop
+            .find(r#"await renegotiate("inactive", mine)"#)
+            .expect(stop);
+        assert!(off < held && held < drop, "{stop}");
+        // A declined offer still leaves Talk usable, to ask again.
+        let answered = page
+            .split("function answeredTalkback()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("answeredTalkback()");
+        assert!(
+            answered.contains(r#"$("talk").disabled = false;"#),
+            "{answered}"
+        );
+        // The warning says why a claim was declined.
+        assert!(page.contains("event.reason ? ` (${event.reason}"));
     }
 
     type Connected = Result<
