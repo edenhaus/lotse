@@ -106,21 +106,26 @@ pub(crate) fn start(
 ) -> impl Future<Output = ()> + Send + 'static {
     let asks = slot.asks();
     let wanted = asks.now().unwrap_or(camera.options.backchannel);
-    let first = due(wanted, &slot, &probed);
+    let first = due(wanted, &slot, &probed, &asks);
     follow(camera, slot, probed, asks, first)
 }
 
 /// The probe `wanted` makes due on `slot`, marked there, unless the camera
-/// answered `551` before (`probed`): then a probe an opt-in marked due
-/// will not run, and `slot` settles at once, marked only to be abandoned,
-/// so the probes marked before no longer settle it either.
-fn due(wanted: bool, slot: &BackchannelSlot, probed: &Probed) -> Option<Probing> {
+/// answered `551` before (`probed`): then the probe an opt-in made due
+/// will not run, and `slot` stops awaiting it, but only while the ask is
+/// the one `asks` saw last ([`BackchannelSlot::forgo_probe`]): a newer
+/// one's probe stays due until this source sees that ask. Not wanted,
+/// `slot` stays as it is: the opt-out already ended what it had due
+/// ([`BackchannelSlot::ask`]), and a stale one must not end the probe a
+/// newer opt-in made due.
+fn due(wanted: bool, slot: &BackchannelSlot, probed: &Probed, asks: &Asks) -> Option<Probing> {
     if probed.asks(BACKCHANNEL, wanted) {
-        Some(Probing::start(slot.clone()))
-    } else {
-        slot.abandon_probe(slot.probing());
-        None
+        return Some(Probing::start(slot.clone()));
     }
+    if wanted {
+        slot.forgo_probe(asks);
+    }
+    None
 }
 
 /// Runs `first`, the probe due when the attempt played, then follows the
@@ -162,7 +167,7 @@ async fn follow(
                 "rtsp: no backchannel probe; what the last one found is dropped"
             );
         }
-        probing = due(asked, &slot, &probed);
+        probing = due(asked, &slot, &probed, &asks);
     }
 }
 
@@ -428,5 +433,57 @@ mod tests {
             () = SystemClock.sleep(Duration::from_secs(5)) => panic!("still waiting"),
         };
         assert!(settled.is_none(), "nothing was offered");
+    }
+
+    /// The source took an opt-out, and an opt-in came before it decided on
+    /// that opt-out: the stale opt-out leaves the slot alone, so a claim
+    /// waits for the probe the opt-in made due rather than being declined
+    /// at once, and the source probes once it sees the opt-in. With the
+    /// camera's `551` remembered, the probe due ends only for the ask the
+    /// source saw: a newer one's stays due until the source sees it.
+    #[tokio::test]
+    async fn a_stale_ask_leaves_the_probe_a_newer_opt_in_made_due() {
+        let slot = BackchannelSlot::default();
+        let mut asks = slot.asks();
+        let probed = Probed::default();
+        // Not asked by the connection or the stream's option: a probe
+        // marked by another stays as it is.
+        let other = slot.probing();
+        assert!(due(false, &slot, &probed, &asks).is_none());
+        assert!(slot.awaits_probe(), "untouched");
+        slot.abandon_probe(other);
+        // Out, taken by the source; in before it decided.
+        assert!(slot.ask(false));
+        assert!(!bounded(asks.next()).await);
+        assert!(slot.ask(true));
+        assert!(due(false, &slot, &probed, &asks).is_none());
+        assert!(slot.awaits_probe(), "the opt-in's probe stays due");
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for it");
+        assert!(bounded(asks.next()).await);
+        let probe = due(true, &slot, &probed, &asks).expect("probes the opt-in");
+        probe.none();
+        assert!(bounded(settled).await.unwrap().is_none(), "found none");
+        // The camera answered 551: in, taken by the source; out and in
+        // before it decided.
+        assert!(probed.refused_with(Some(551)));
+        assert!(slot.ask(false) && slot.ask(true));
+        assert!(bounded(asks.next()).await);
+        assert!(slot.ask(false) && slot.ask(true));
+        assert!(due(true, &slot, &probed, &asks).is_none());
+        assert!(slot.awaits_probe(), "the newer opt-in's probe stays due");
+        assert!(bounded(asks.next()).await);
+        assert!(due(true, &slot, &probed, &asks).is_none());
+        assert!(!slot.is_probing(), "settled once the source saw it");
+    }
+
+    /// `future`'s output, or a failed test after five seconds.
+    async fn bounded<T>(future: impl Future<Output = T>) -> T {
+        tokio::select! {
+            output = future => output,
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("nothing within 5 s"),
+        }
     }
 }

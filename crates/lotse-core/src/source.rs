@@ -707,9 +707,9 @@ impl BackchannelSlot {
     }
 
     /// The probe marked `mark` ended without a result (the source's
-    /// attempt ended first), or the probe due will not run (marked only
-    /// to end it): what was offered before stands. Once a later probe
-    /// marked the slot, nothing changes: claims still wait for that one.
+    /// attempt ended first): what was offered before stands. Once a later
+    /// probe marked the slot, nothing changes: claims still wait for that
+    /// one.
     pub fn abandon_probe(&self, mark: ProbeMark) {
         let abandoned = self.probed.send_if_modified(|probed| {
             let runs = probed.runs(mark);
@@ -722,6 +722,33 @@ impl BackchannelSlot {
             tracing::debug!(
                 probe = mark.0,
                 "backchannel: a probe ended that no longer runs on the slot, a later probe marked it or it settled; the slot stays as it is"
+            );
+        }
+    }
+
+    /// The probe the connection's ask made due will not run, as the
+    /// source knows the device has no backchannel: claims no longer wait
+    /// for it, and what was offered before stands. Only while the ask is
+    /// the one `asks` saw last: once it changed since, a newer ask made a
+    /// probe of its own due, which the source sees next and decides on,
+    /// and claims wait for that decision. The check and the end are one
+    /// step, so an ask that comes meanwhile is never undone.
+    pub fn forgo_probe(&self, asks: &Asks) {
+        let seen = asks.seen;
+        let forgone = self.probed.send_if_modified(|probed| {
+            let current = probed.changes == seen;
+            if current {
+                probed.probing = false;
+            }
+            current
+        });
+        if forgone {
+            tracing::debug!(
+                "backchannel: the probe due will not run, the device has no backchannel; claims no longer wait for it"
+            );
+        } else {
+            tracing::debug!(
+                "backchannel: the probe due will not run, but the connection's ask changed since; the slot waits for the source to decide on the newer one"
             );
         }
     }
@@ -1667,6 +1694,48 @@ mod tests {
         assert!(!slot.is_probing());
         assert!(slot.current().is_none());
         assert_eq!(logs.count(Level::DEBUG, DISCARDED), 2);
+    }
+
+    /// A probe due that will not run (the device has no backchannel) ends
+    /// the wait for it, the offer standing, only while the connection's
+    /// ask is the one the source saw: a newer ask's probe stays due, and a
+    /// claim waits, until the source sees that ask and decides on it.
+    #[tokio::test]
+    async fn a_probe_forgone_ends_only_the_ask_the_source_saw() {
+        const FORGONE: &str = "backchannel: the probe due will not run, the device has no backchannel; claims no longer wait for it";
+        const CHANGED: &str = "backchannel: the probe due will not run, but the connection's ask changed since; the slot waits for the source to decide on the newer one";
+        use tracing::Level;
+        let (logs, _guard) = Logs::capture();
+        let slot = BackchannelSlot::default();
+        let mut asks = slot.asks();
+        slot.offer(pcmu());
+        assert!(slot.ask(true));
+        assert!(bounded(asks.next()).await);
+        assert!(slot.is_probing());
+        slot.forgo_probe(&asks);
+        assert!(!slot.is_probing());
+        assert_eq!(
+            slot.current().unwrap().codec,
+            Codec::Pcmu,
+            "the offer stands"
+        );
+        assert_eq!(logs.count(Level::DEBUG, FORGONE), 1);
+        // Out and in again before the source decided: the newer opt-in's
+        // probe stays due.
+        assert!(slot.ask(false) && slot.ask(true));
+        slot.forgo_probe(&asks);
+        assert!(slot.awaits_probe(), "the newer opt-in's probe is due");
+        assert_eq!(logs.count(Level::DEBUG, CHANGED), 1);
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for it");
+        // The source saw it: forgone too.
+        assert!(bounded(asks.next()).await);
+        slot.forgo_probe(&asks);
+        assert!(bounded(settled).await.unwrap().is_none(), "nothing offered");
+        assert_eq!(logs.count(Level::DEBUG, FORGONE), 2);
+        assert_eq!(logs.count(Level::DEBUG, CHANGED), 1);
     }
 
     /// `future`'s output, or a failed test after five seconds.
