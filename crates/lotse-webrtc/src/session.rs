@@ -566,7 +566,12 @@ fn audio_engine_codec(family: CodecFamily) -> Option<EngineCodec> {
 }
 
 /// The mid of the downlink m-line `downlink`, when the engine has it as
-/// an audio m-line it did not reject.
+/// an audio m-line it did not reject. The plan reads the offer alone,
+/// so the engine may have answered its downlink with port zero
+/// (RFC 3264 §6): str0m 0.24.0 keeps an m-line stopped once a re-offer
+/// stopped it, also when a later re-offer offers it again under its mid
+/// with a port (`Media::disabled`, read 2026-10-17), and keeps the
+/// m-line's send stream, which would send on.
 fn audio_mid(rtc: &Rtc, downlink: Option<&str>) -> Option<Mid> {
     downlink.map(Mid::from).filter(|mid| {
         rtc.media(*mid)
@@ -1057,7 +1062,8 @@ impl Session {
     /// downlink writer stays when the stream's audio still goes down the
     /// same m-line, is parked for another, whose own writer is taken up
     /// again or made anew ([`Session::downlink_writer`]), or pauses while
-    /// no m-line carries the stream's audio; talk-back is
+    /// no m-line the engine took carries the stream's audio
+    /// ([`audio_mid`]); talk-back is
     /// received as the new plan says, or not at all. Nothing changes
     /// until the engine took the re-offer: a refused one leaves the
     /// session as it was. The video writer keeps its sequence numbers
@@ -1107,8 +1113,8 @@ impl Session {
             .stream_audio
             .clone()
             .filter(|codec| plan.send == Some(codec.family()));
-        let on_writer =
-            |audio: &AudioWriter| plan.downlink == Some(audio.mid().to_string().as_str());
+        let downlink = audio_mid(&self.rtc, plan.downlink);
+        let on_writer = |audio: &AudioWriter| downlink == Some(audio.mid());
         if let Some(codec) = send.as_deref()
             && !self.audio.as_ref().is_some_and(on_writer)
             && let Some((audio, audio_ssrc)) = self.downlink_writer(plan.downlink, codec)

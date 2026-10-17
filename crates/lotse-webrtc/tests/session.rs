@@ -3528,6 +3528,98 @@ fn rfc3550_5_1_audio_moved_off_an_m_line_and_back_runs_its_sequence_numbers_on()
     );
 }
 
+/// `offer` with its first audio m-line stopped (RFC 3264 §8.2): port 0,
+/// its mid out of the BUNDLE group, as `RTCRtpTransceiver.stop()` offers
+/// it (RFC 8829 §5.2.2).
+fn first_audio_stopped(offer: &str) -> String {
+    let audio = section(offer, "audio");
+    let mid = audio
+        .iter()
+        .find_map(|line| line.strip_prefix("a=mid:"))
+        .expect("a mid");
+    let group = offer
+        .lines()
+        .find(|line| line.starts_with("a=group:BUNDLE "))
+        .expect("a BUNDLE group");
+    let unbundled = group
+        .split(' ')
+        .filter(|listed| *listed != mid)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_ne!(unbundled, group);
+    let stopped = offer
+        .replacen(
+            audio[0],
+            &audio[0].replacen("m=audio 9 ", "m=audio 0 ", 1),
+            1,
+        )
+        .replacen(group, &unbundled, 1);
+    assert_ne!(stopped, offer);
+    stopped
+}
+
+/// A re-offer that offers the downlink m-line A again under its mid, with
+/// a port, after an earlier one stopped it (RFC 3264 §8.2), is answered
+/// with port zero there (RFC 3264 §6): str0m 0.24.0 keeps the m-line
+/// stopped (`Media::disabled`, read 2026-10-17). So no stream audio goes
+/// down A, whether the writer stayed on A while it was stopped or the
+/// audio moved to B and A's writer was parked: the packets are dropped,
+/// none is sent on A's SSRC, where the engine kept the send stream.
+#[test]
+fn rfc3264_6_a_stopped_downlink_m_line_offered_again_carries_no_stream_audio() {
+    for (what, moved_to_b) in [("writer kept on A", false), ("writer moved to B", true)] {
+        let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
+        pair.connect(&answer);
+        pair.play_audio(0, 5, what);
+        let [a] = audio_ssrcs(&pair)[..] else {
+            panic!("{what}: one audio SSRC: {:?}", audio_ssrcs(&pair));
+        };
+        // A `recvonly`, B (the dedicated m-line) `sendonly`: without a
+        // backchannel the stream's audio goes down A.
+        let reoffer = pair
+            .viewer
+            .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+            .expect("a re-offer");
+        // A stopped; B `sendrecv` takes the stream's audio, else none does.
+        let stopped = first_audio_stopped(&reoffer);
+        let stopped = if moved_to_b {
+            stopped.replacen("a=sendonly", "a=sendrecv", 1)
+        } else {
+            stopped
+        };
+        let answer = pair
+            .session
+            .renegotiate(pair.now, &stopped, None, TalkbackClaim::Granted)
+            .expect("answered");
+        let sections = audio_sections(&answer);
+        assert!(sections[0][0].starts_with("m=audio 0 "), "{what}: {answer}");
+        let sent = pair.session.stats().audio_packets;
+        write_five(&mut pair, 5);
+        let expected = if moved_to_b { sent + 5 } else { sent };
+        assert_eq!(pair.session.stats().audio_packets, expected, "{what}");
+
+        // A offered again as at first, `recvonly` with its port and in the
+        // group: answered with port zero, and no audio goes down it.
+        assert!(section(&reoffer, "audio")[0].starts_with("m=audio 9 "));
+        let answer = pair
+            .session
+            .renegotiate(pair.now, &reoffer, None, TalkbackClaim::Granted)
+            .expect("answered");
+        let sections = audio_sections(&answer);
+        assert!(sections[0][0].starts_with("m=audio 0 "), "{what}: {answer}");
+        let before = pair.session.stats();
+        write_five(&mut pair, 10);
+        let after = pair.session.stats();
+        assert_eq!(after.audio_packets, before.audio_packets, "{what}");
+        assert_eq!(after.audio_dropped, before.audio_dropped + 5, "{what}");
+        assert_eq!(
+            audio_seqs(&pair, a),
+            [0, 1, 2, 3, 4],
+            "{what}: nothing on A"
+        );
+    }
+}
+
 /// A re-offer whose downlink m-line lists codecs the stream's audio is not
 /// among stops the audio, although the writer the first answer made still
 /// sits on that m-line (RFC 3264 §6.1: an answer uses only the formats
