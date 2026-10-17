@@ -529,7 +529,26 @@ struct Probed {
     /// A probe runs: with nothing offered before it, a claim waits for
     /// its result ([`BackchannelSlot::awaits_probe`]).
     probing: bool,
+    /// The mark of the last probe started ([`BackchannelSlot::probing`]):
+    /// only that probe settles or abandons the slot.
+    latest: u64,
 }
+
+impl Probed {
+    /// Whether the probe marked `mark` is the one that runs now: the last
+    /// started, not settled or abandoned yet.
+    const fn runs(&self, mark: ProbeMark) -> bool {
+        self.probing && self.latest == mark.0
+    }
+}
+
+/// A probe's mark on its slot ([`BackchannelSlot::probing`]), with which
+/// it settles or abandons the slot: once a later probe has marked it, an
+/// earlier one's result or end changes nothing. A probe a connection
+/// attempt aborts ends when its task is next polled, which may be after
+/// the next attempt's probe started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeMark(u64);
 
 /// The slot a source fills when its probe found the device's backchannel,
 /// and where the probe waits for a connect permit. Shared with the
@@ -576,9 +595,37 @@ impl BackchannelSlot {
     }
 
     /// A probe started: claims wait for its result unless an offer
-    /// stands ([`BackchannelSlot::awaits_probe`]).
-    pub fn probing(&self) {
-        self.probed.send_modify(|probed| probed.probing = true);
+    /// stands ([`BackchannelSlot::awaits_probe`]). Its mark settles or
+    /// abandons it; any earlier probe's no longer does.
+    pub fn probing(&self) -> ProbeMark {
+        let mut mark = ProbeMark(0);
+        self.probed.send_modify(|probed| {
+            probed.latest = probed.latest.wrapping_add(1);
+            probed.probing = true;
+            mark = ProbeMark(probed.latest);
+        });
+        mark
+    }
+
+    /// The probe marked `mark` found `offer` (`Some`, offered or
+    /// replaced) or none (`None`, withdrawn), unless a later probe marked
+    /// the slot since: its result is discarded then, the later probe's
+    /// stands.
+    pub fn settle(&self, mark: ProbeMark, offer: Option<BackchannelOffer>) {
+        let settled = self.probed.send_if_modified(|probed| {
+            if !probed.runs(mark) {
+                return false;
+            }
+            probed.offer = offer;
+            probed.probing = false;
+            true
+        });
+        if !settled {
+            tracing::debug!(
+                probe = mark.0,
+                "backchannel: a probe's result came when it no longer runs on the slot, a later probe marked it or it ended; discarded"
+            );
+        }
     }
 
     /// The probe found `offer`: offered (or replaced).
@@ -597,10 +644,24 @@ impl BackchannelSlot {
         });
     }
 
-    /// The probe ended without a result (the source's attempt ended
-    /// first): what was offered before stands.
-    pub fn abandon_probe(&self) {
-        self.probed.send_modify(|probed| probed.probing = false);
+    /// The probe marked `mark` ended without a result (the source's
+    /// attempt ended first): what was offered before stands. Once a later
+    /// probe marked the slot, nothing changes: claims still wait for that
+    /// one.
+    pub fn abandon_probe(&self, mark: ProbeMark) {
+        let abandoned = self.probed.send_if_modified(|probed| {
+            let runs = probed.runs(mark);
+            if runs {
+                probed.probing = false;
+            }
+            runs
+        });
+        if !abandoned {
+            tracing::debug!(
+                probe = mark.0,
+                "backchannel: a probe ended that no longer runs on the slot, a later probe marked it or it settled; the slot stays as it is"
+            );
+        }
     }
 
     /// The offered backchannel, if any.
@@ -1386,12 +1447,68 @@ mod tests {
         assert!(slot.awaits_probe());
         // A probe abandoned leaves the offer as it was.
         slot.offer(pcmu());
-        slot.probing();
-        slot.abandon_probe();
+        let mark = slot.probing();
+        slot.abandon_probe(mark);
         assert_eq!(bounded(slot.settled()).await.unwrap().codec, Codec::Pcmu);
         let mut never = slot.current().unwrap().opener.open();
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(never.as_mut().poll(&mut cx).is_pending(), "a test opener");
+    }
+
+    /// A probe whose aborted task ends only after the next attempt's
+    /// probe marked the slot neither abandons nor settles it: a claim
+    /// still waits for the later probe, whose result alone settles it.
+    #[tokio::test]
+    async fn a_probe_ending_after_a_later_one_marked_the_slot_leaves_it_to_that_one() {
+        const ABANDONED: &str = "backchannel: a probe ended that no longer runs on the slot, a later probe marked it or it settled; the slot stays as it is";
+        const DISCARDED: &str = "backchannel: a probe's result came when it no longer runs on the slot, a later probe marked it or it ended; discarded";
+        use tracing::Level;
+        let (logs, _guard) = Logs::capture();
+        let slot = BackchannelSlot::default();
+        let earlier = slot.probing();
+        let later = slot.probing();
+        assert_ne!(earlier, later);
+        slot.abandon_probe(earlier);
+        assert!(slot.awaits_probe(), "the later probe still runs");
+        assert_eq!(logs.count(Level::DEBUG, ABANDONED), 1);
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "waits for the later probe");
+        slot.settle(earlier, Some(pcmu()));
+        assert!(slot.awaits_probe(), "the earlier result is discarded");
+        assert!(slot.current().is_none());
+        assert_eq!(logs.count(Level::DEBUG, DISCARDED), 1);
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "still waits for the later probe");
+        slot.settle(later, Some(pcmu()));
+        assert_eq!(bounded(settled).await.unwrap().unwrap().codec, Codec::Pcmu);
+        assert_eq!(
+            logs.count(Level::DEBUG, DISCARDED),
+            1,
+            "the later one settled"
+        );
+        // The probe that runs abandons quietly, and its mark is spent:
+        // neither an abandon nor a result of it changes the slot again.
+        let last = slot.probing();
+        slot.abandon_probe(last);
+        assert!(!slot.is_probing());
+        assert_eq!(logs.count(Level::DEBUG, ABANDONED), 1, "the probe that ran");
+        slot.abandon_probe(last);
+        assert_eq!(logs.count(Level::DEBUG, ABANDONED), 2);
+        slot.settle(last, None);
+        assert_eq!(
+            slot.current().unwrap().codec,
+            Codec::Pcmu,
+            "the offer stands"
+        );
+        assert_eq!(logs.count(Level::DEBUG, DISCARDED), 2);
+        // The probe that runs settles: none found withdraws the offer.
+        let next = slot.probing();
+        slot.settle(next, None);
+        assert!(!slot.is_probing());
+        assert!(slot.current().is_none());
+        assert_eq!(logs.count(Level::DEBUG, DISCARDED), 2);
     }
 
     /// `future`'s output, or a failed test after five seconds.

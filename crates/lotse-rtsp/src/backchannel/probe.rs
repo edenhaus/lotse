@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use futures_util::FutureExt as _;
 use lotse_core::runner::PROBE_TIMEOUT;
-use lotse_core::source::{BackchannelOffer, BackchannelRefused, BackchannelSlot, SourceError};
+use lotse_core::source::{
+    BackchannelOffer, BackchannelRefused, BackchannelSlot, ProbeMark, SourceError,
+};
 use retina::client::{Session, SessionGroup};
 use tokio_util::sync::CancellationToken;
 
@@ -36,10 +38,13 @@ use crate::source::within_on;
 
 /// A probe under way on a slot: claims wait for it until it settles the
 /// slot, and one dropped first (its attempt ended) leaves what the slot
-/// offered before.
+/// offered before. Both by its mark, so a probe whose aborted task ends
+/// after the next attempt's probe started leaves that one's alone.
 struct Probing {
     /// The slot.
     slot: BackchannelSlot,
+    /// The probe's mark on the slot.
+    mark: ProbeMark,
     /// The probe offered or withdrew.
     settled: bool,
 }
@@ -47,22 +52,23 @@ struct Probing {
 impl Probing {
     /// Marks `slot` as probed now.
     fn start(slot: BackchannelSlot) -> Self {
-        slot.probing();
+        let mark = slot.probing();
         Self {
             slot,
+            mark,
             settled: false,
         }
     }
 
     /// The probe found `offer`.
     fn found(mut self, offer: BackchannelOffer) {
-        self.slot.offer(offer);
+        self.slot.settle(self.mark, Some(offer));
         self.settled = true;
     }
 
     /// The probe found none.
     fn none(mut self) {
-        self.slot.withdraw();
+        self.slot.settle(self.mark, None);
         self.settled = true;
     }
 }
@@ -70,7 +76,7 @@ impl Probing {
 impl Drop for Probing {
     fn drop(&mut self) {
         if !self.settled {
-            self.slot.abandon_probe();
+            self.slot.abandon_probe(self.mark);
             tracing::debug!(
                 "rtsp: backchannel probe abandoned with its attempt; the offer stays as it was"
             );
@@ -333,5 +339,30 @@ mod tests {
         drop(probe);
         assert!(!slot.is_probing());
         silent.stop().await;
+    }
+
+    /// The probe of an attempt that ended is aborted, and its task may be
+    /// dropped only after the next attempt's probe marked the slot: then
+    /// the slot still awaits the next probe, and a claim waits for it
+    /// rather than declining at once.
+    #[tokio::test]
+    async fn a_probe_dropped_after_its_replacement_started_leaves_it_awaited() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 9));
+        let slot = BackchannelSlot::default();
+        let earlier = start(camera_at(addr, 200), slot.clone(), Probed::default());
+        let later = start(camera_at(addr, 200), slot.clone(), Probed::default());
+        drop(earlier);
+        assert!(slot.awaits_probe(), "the replacement still runs");
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for the replacement");
+        drop(later);
+        assert!(!slot.is_probing());
+        let settled = tokio::select! {
+            settled = settled => settled.unwrap(),
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("still waiting"),
+        };
+        assert!(settled.is_none(), "nothing was offered");
     }
 }

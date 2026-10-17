@@ -20,8 +20,8 @@ use crate::session::{
 };
 use crate::source::{
     BackchannelOffer, BackchannelOpener, BackchannelRefused, BackchannelSession, BackchannelSlot,
-    Direction, Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor,
-    SourceError, SourceExit, SourceFactory,
+    Direction, ProbeMark, Source, SourceCapabilities, SourceConfigError, SourceCtx,
+    SourceDescriptor, SourceError, SourceExit, SourceFactory,
 };
 use crate::source_url::SourceUrl;
 use crate::task::BoxFuture;
@@ -613,8 +613,8 @@ impl Source for FakeSource {
             // Marked before the tracks are ready, so a claim that comes
             // with the first session waits for the probe.
             let probe = backchannel.map(|offer| {
-                ctx.backchannel.probing();
-                fake_probe(ctx.backchannel.clone(), offer, ctx.cancel.clone())
+                let mark = ctx.backchannel.probing();
+                fake_probe(ctx.backchannel.clone(), mark, offer, ctx.cancel.clone())
             });
             let probe = async move {
                 if let Some(probe) = probe {
@@ -693,23 +693,24 @@ impl Source for FakeSource {
     }
 }
 
-/// A fake source's probe of its backchannel, which `slot` is marked for:
-/// under a connect permit of the slot's gate, as a protocol's source
-/// probes the device, it offers `offer`; a cancel while it waits for the
-/// permit abandons it, and the offer stays as it was.
+/// A fake source's probe of its backchannel, which `slot` is marked for
+/// with `mark`: under a connect permit of the slot's gate, as a
+/// protocol's source probes the device, it offers `offer`; a cancel while
+/// it waits for the permit abandons it, and the offer stays as it was.
 async fn fake_probe(
     slot: BackchannelSlot,
+    mark: ProbeMark,
     offer: BackchannelOffer,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     let permit = tokio::select! {
         permit = slot.probes().permit() => permit,
         () = cancel.cancelled() => {
-            slot.abandon_probe();
+            slot.abandon_probe(mark);
             return;
         }
     };
-    slot.offer(offer);
+    slot.settle(mark, Some(offer));
     drop(permit);
 }
 
