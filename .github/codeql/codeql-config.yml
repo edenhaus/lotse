@@ -1,0 +1,22 @@
+# The CodeQL configuration of ci.yml's CodeQL jobs: test code stays out of code scanning, so
+# its findings (fixed keys, unchecked results, fake secrets the tests need on purpose) do not
+# bury the production code's. Rust is extracted without a build (`build-mode: none`), so
+# `paths-ignore` removes these files from the database. Inline `#[cfg(test)] mod tests`
+# blocks inside production files cannot be excluded by path and stay analyzed.
+name: lotse CodeQL configuration
+
+paths-ignore:
+  # Integration tests, their shared helpers and fixtures.
+  - crates/*/tests/**
+  # Unit test modules split into their own file, each declared under `#[cfg(test)]`.
+  - crates/*/src/**/tests.rs
+  # The log capture of the unit tests, declared under `#[cfg(test)]`.
+  - crates/*/src/test_logs.rs
+  # Recorded media of the unit tests: lotse-http's under `#[cfg(test)]`; lotse-codec's under
+  # its `test-util` feature, which only dev-dependencies and lotse-testing enable.
+  - crates/lotse-http/src/*/test_data.rs
+  - crates/lotse-codec/src/aac/test_data.rs
+  # The fakes and harnesses crate: a dev-dependency only, never a dependency of a shipped crate.
+  - crates/lotse-testing/**
+  # The fuzz targets, a workspace of their own that ships nothing.
+  - fuzz/**
