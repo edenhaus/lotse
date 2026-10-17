@@ -184,6 +184,21 @@ fn without_formats(m_line: &str, pts: &[u8]) -> String {
     head.into_iter().chain(kept).collect::<Vec<_>>().join(" ")
 }
 
+/// `m_line` with its port field (RFC 8866 §5.14: `m=<media>
+/// <port>[/<number of ports>] <proto> <fmt> ...`) written `0`, the one
+/// form of port zero str0m 0.24.0 reads as a disabled m-line (its
+/// `media_parser` in `sdp/parser.rs`, read 2026-10-17). A number of
+/// ports goes with it: str0m reads `0/2` as a live port, and a stopped
+/// m-line uses no port it could count (RFC 3264 §8.2).
+fn with_port_zero(m_line: &str) -> String {
+    m_line
+        .split(' ')
+        .enumerate()
+        .map(|(field, value)| if field == 1 { "0" } else { value })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The payload types of `section` whose codec the engine carries and
 /// `dropped` says to leave out. A format is read by its `a=rtpmap`, else
 /// as a static payload type (RFC 3551 §6, Table 4), the way str0m reads
@@ -496,6 +511,13 @@ impl<'a> AudioPlan<'a> {
     /// only the offer narrows one m-line. An answer lists formats of the
     /// offer (RFC 3264 §6.1), and the browser may send any it lists
     /// (RFC 3264 §7).
+    ///
+    /// A stopped audio m-line ([`Sdp::stopped`]: a zero port, not a
+    /// bundled `bundle-only` one, whose port stays as offered) has its
+    /// port written `0` ([`with_port_zero`]): str0m reads a zero-padded
+    /// port, or one with a number of ports, as live and would answer it
+    /// with a nonzero one, where RFC 3264 §6 answers a zero port with
+    /// zero.
     pub(crate) fn engine_offer(&self, offer: &str) -> String {
         let sdp = Sdp::parse(offer);
         let mut out = String::with_capacity(offer.len().saturating_add(64));
@@ -513,7 +535,12 @@ impl<'a> AudioPlan<'a> {
                 .then(|| self.answer(section.mid()).reversed())
                 .filter(|wanted| *wanted != offered);
             let dropped = self.unroutable(section);
-            push(&without_formats(section.m_line(), &dropped));
+            let m_line = without_formats(section.m_line(), &dropped);
+            if section.is("audio") && sdp.stopped(section) {
+                push(&with_port_zero(&m_line));
+            } else {
+                push(&m_line);
+            }
             for line in section.lines() {
                 if (rewrite.is_none() || Direction::parse(line).is_none())
                     && !describes(line, &dropped)
@@ -914,6 +941,65 @@ mod tests {
         );
         let plan = plan_for(&bundle_only, Some(&opus), Some(&pcmu));
         assert_eq!(plan.talkback, negotiated("2", CodecFamily::Pcmu, true));
+    }
+
+    /// The engine is offered a stopped audio m-line (RFC 3264 §8.2) with
+    /// the port `0`, the one form str0m reads as port zero, so it answers
+    /// it with zero (RFC 3264 §6): a zero-padded port (RFC 8866 §9,
+    /// `1*DIGIT`) and a number of ports (RFC 8866 §5.14) go. A live
+    /// m-line, a `bundle-only` one the group lists (RFC 9143 §6) and a
+    /// stopped m-line of another kind keep their port as offered.
+    #[test]
+    fn rfc3264_6_a_stopped_audio_m_line_is_offered_to_the_engine_with_port_zero() {
+        let opus = Codec::Opus { channels: 2 };
+        let pcmu = reaching(&Codec::Pcmu);
+        let dedicated = "m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2";
+        for port in ["0", "00", "000/2", "0/2"] {
+            let stopped = DEDICATED
+                .replace(
+                    dedicated,
+                    &format!("m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2"),
+                )
+                .replace("a=group:BUNDLE 0 1 2", "a=group:BUNDLE 0 1");
+            let plan = plan_for(&stopped, Some(&opus), Some(&pcmu));
+            let engine = plan.engine_offer(&stopped);
+            let rewritten = Sdp::parse(&engine);
+            assert_eq!(
+                with_mid(&rewritten, "2").m_line(),
+                "m=audio 0 UDP/TLS/RTP/SAVPF 111 0 8",
+                "{port}: {engine}"
+            );
+            assert_eq!(
+                with_mid(&rewritten, "0").m_line(),
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8",
+                "{port}: {engine}"
+            );
+
+            // Bundle-only and listed in the group: not stopped.
+            let bundle_only = DEDICATED.replace(
+                dedicated,
+                &format!("m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2\r\na=bundle-only"),
+            );
+            let plan = plan_for(&bundle_only, Some(&opus), Some(&pcmu));
+            let engine = plan.engine_offer(&bundle_only);
+            assert_eq!(
+                with_mid(&Sdp::parse(&engine), "2").m_line(),
+                format!("m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8"),
+                "{port}: {engine}"
+            );
+
+            // A stopped video m-line is no audio plan's to rewrite.
+            let video = DEDICATED
+                .replace("m=video 9 ", &format!("m=video {port} "))
+                .replace("a=group:BUNDLE 0 1 2", "a=group:BUNDLE 0 2");
+            let plan = plan_for(&video, Some(&opus), Some(&pcmu));
+            let engine = plan.engine_offer(&video);
+            assert_eq!(
+                with_mid(&Sdp::parse(&engine), "1").m_line(),
+                format!("m=video {port} UDP/TLS/RTP/SAVPF 96"),
+                "{port}: {engine}"
+            );
+        }
     }
 
     /// The engine's order was fixed for the backchannel the session

@@ -2779,6 +2779,99 @@ fn rfc8829_5_3_2_a_re_offer_adds_and_drops_dedicated_talk_back() {
     assert_eq!((stats.uplink_packets, stats.uplink_refused), (3, 1));
 }
 
+/// An offer whose audio m-line is stopped (RFC 3264 §8.2: a zero port,
+/// out of the BUNDLE group) is answered with port zero there (RFC 3264
+/// §6), whatever form its zero takes: zero-padded (RFC 8866 §9,
+/// `1*DIGIT`) or with a number of ports (RFC 8866 §5.14), which the
+/// engine alone would read as a live port. The video m-line stays live.
+#[test]
+fn rfc3264_6_an_offer_that_stops_its_audio_m_line_is_answered_with_port_zero() {
+    for port in ["0", "00", "000/2", "0/2"] {
+        let now = SystemClock.now();
+        lotse_webrtc::install_crypto_provider();
+        let viewer = Viewer::new_with_audio(BROWSER.parse().unwrap(), now).expect("a viewer");
+        let offer = viewer.offer().to_owned();
+        let audio = section(&offer, "audio");
+        let mid = audio
+            .iter()
+            .find_map(|line| line.strip_prefix("a=mid:"))
+            .expect("a mid");
+        let group = offer
+            .lines()
+            .find(|line| line.starts_with("a=group:BUNDLE "))
+            .expect("a BUNDLE group");
+        let unbundled = group
+            .split(' ')
+            .filter(|listed| *listed != mid)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_ne!(unbundled, group);
+        let stopped = offer
+            .replacen(
+                audio[0],
+                &audio[0].replacen("m=audio 9 ", &format!("m=audio {port} "), 1),
+                1,
+            )
+            .replacen(group, &unbundled, 1);
+        assert!(stopped.contains(&format!("m=audio {port} ")), "{stopped}");
+        let mut request = request(&stopped, h264(None));
+        request.audio = Some(Arc::new(Codec::Pcmu));
+        let (_, answer) = Session::answer(&request, now).expect("answered");
+        assert!(
+            section(&answer, "audio")[0].starts_with("m=audio 0 "),
+            "{port}: {answer}"
+        );
+        assert!(
+            section(&answer, "video")[0].starts_with("m=video 9 "),
+            "{port}: {answer}"
+        );
+    }
+}
+
+/// A re-offer that stops the talk-back m-line (RFC 3264 §8.2) is answered
+/// with port zero there (RFC 3264 §6), whatever form its zero takes:
+/// zero-padded (RFC 8866 §9, `1*DIGIT`) or with a number of ports (RFC
+/// 8866 §5.14), which the engine alone would read as a live port.
+/// Talk-back stops, and the downlink audio plays on.
+#[test]
+fn rfc3264_6_a_re_offer_that_stops_talk_back_with_a_padded_port_is_answered_with_port_zero() {
+    for port in ["00", "000/2", "0/2"] {
+        let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
+        pair.connect(&answer);
+        pair.renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            Some(chained(Codec::Pcma)),
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+        assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcma), "{port}");
+        let offer = pair.viewer.reoffer(Reoffer::Stop).expect("a re-offer");
+        let (head, stopped) = offer.split_once("m=audio 0 ").expect("a stopped m-line");
+        assert!(!stopped.contains("m="), "the last m-line: {offer}");
+        let padded = format!("{head}m=audio {port} {stopped}");
+        let answer = pair
+            .session
+            .renegotiate(
+                pair.now,
+                &padded,
+                Some(chained(Codec::Pcma)),
+                TalkbackClaim::Granted,
+            )
+            .expect("answered");
+        assert!(
+            audio_sections(&answer).last().unwrap()[0].starts_with("m=audio 0 "),
+            "{port}: {answer}"
+        );
+        assert_eq!(pair.session.talkback(), None, "{port}");
+        pair.viewer
+            .accept_answer(&answer, &mut pair.to_daemon)
+            .expect("the answer applies");
+        pair.drain();
+        assert_eq!(pair.viewer.talkback_direction(), None, "{port}: rejected");
+        pair.play_audio(0, 5, &format!("audio after stopping with port {port}"));
+    }
+}
+
 /// A re-offer the backchannel cannot serve is answered without talk-back
 /// (RFC 3264 §6.1): `inactive` for a dedicated m-line, `sendonly` for the
 /// downlink one offered `sendrecv`, which keeps the stream's audio; while

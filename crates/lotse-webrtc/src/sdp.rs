@@ -83,7 +83,8 @@ impl<'a> Sdp<'a> {
     /// zero. lotse goes by the value, so the engine never acts on such an
     /// m-line: a re-offer that stops the video one is refused before it,
     /// and a stopped audio one is planned and answered `inactive`
-    /// ([`crate::audio::AudioPlan::new`]).
+    /// ([`crate::audio::AudioPlan::new`]), its port written `0` in the
+    /// offer the engine answers ([`crate::audio::AudioPlan::engine_offer`]).
     pub(crate) fn stopped(&self, section: &Section<'_>) -> bool {
         let zero = section
             .m_line
