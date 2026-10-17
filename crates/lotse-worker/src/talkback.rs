@@ -2337,11 +2337,21 @@ mod tests {
 
     /// The source probes with nothing offered: a claim's arbitration
     /// waits for the probe, at most the limit; with an offer a reconnect
-    /// kept, it does not wait.
+    /// kept, it does not wait, and says so. Without a probe it neither
+    /// waits nor says anything.
     #[tokio::test]
     async fn the_arbiter_waits_for_the_probe_at_most_the_limit() {
+        let (logs, _guard) = Logs::capture();
+        let kept = || {
+            logs.lines(
+                Level::DEBUG,
+                "talk-back: the source probes the camera again; a claim takes the backchannel offered before without waiting for it",
+            )
+            .len()
+        };
         let (arbiter, slot, clock) = arbiter_on(None);
         assert!(!arbiter.awaits_probe());
+        assert_eq!(kept(), 0, "no probe runs");
         assert_eq!(within(arbiter.settled()).await, BACKCHANNEL_OPEN_LIMIT);
         slot.probing();
         assert!(arbiter.awaits_probe());
@@ -2358,6 +2368,7 @@ mod tests {
         // A reconnect's probe with the offer kept: no wait.
         slot.probing();
         assert!(!arbiter.awaits_probe(), "the offer stands");
+        assert_eq!(kept(), 1, "the kept offer is claimed at once");
         // A probe that never ends: the limit, and nothing left.
         slot.withdraw();
         slot.probing();
@@ -2367,6 +2378,7 @@ mod tests {
         clock.advance(BACKCHANNEL_OPEN_LIMIT);
         assert_eq!(within(settled).await.unwrap(), Duration::ZERO);
         assert!(arbiter.awaits_probe(), "still probing");
+        assert_eq!(kept(), 1, "nothing kept while the probe is awaited");
         // A session that opens at once still wins over a limit used up.
         let _second = pcmu(&slot);
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
