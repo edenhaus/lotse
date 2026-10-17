@@ -13,9 +13,12 @@
 //! the ports listed at startup, so the worker binds the listener before its
 //! sandbox and passes it to the factory (`--loopback-relay`); without one,
 //! the relay binds an ephemeral port per attempt (tests, `--sandbox off`).
-//! A pre-bound listener is shared by every attempt of the worker's one
-//! connection: connections left in its backlog by an earlier attempt are
-//! dropped before retina connects, and each attempt accepts exactly one.
+//! A pre-bound listener is shared by every connection of the worker: the
+//! attempts of its source, the probes of the camera's backchannel and the
+//! talkers' backchannel sessions, which run beside each other. One at a
+//! time takes it from binding to accepting ([`Listener`]): connections
+//! left in its backlog by an earlier one are dropped before retina
+//! connects, and each accepts exactly one, its own.
 //!
 //! With `transport: "udp"` the relay also carries the media's UDP side:
 //! [`crate::udp`] translates the `SETUP` exchange, frames every message
@@ -48,7 +51,7 @@ use lotse_core::task::BoxFuture;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 
 use crate::framer::Framer;
 use crate::rtcp::ReceiverReports;
@@ -70,15 +73,57 @@ pub(crate) async fn tcp(addr: SocketAddr) -> Result<TcpStream, SourceError> {
     stream.map_err(|err| SourceError::Unreachable(format!("Unable to connect to {addr}: {err}")))
 }
 
-/// The relay's listener for one attempt and its address: a clone of the
-/// pre-bound one with its stale backlog dropped, or a fresh ephemeral port.
-pub(crate) async fn listen(
-    pre_bound: Option<&StdListener>,
-) -> Result<(TcpListener, SocketAddr), SourceError> {
+/// Where the relays of a worker's connections listen: the pre-bound
+/// listener, if any, and the turn that gives it to one connection at a
+/// time from [`listen`] until retina's connection is accepted, so no
+/// connection drops another's from the backlog or accepts it. Clones
+/// share both.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Listener {
+    /// The pre-bound listener; `None` binds an ephemeral port each time.
+    pre_bound: Option<Arc<StdListener>>,
+    /// The turn.
+    turn: Arc<AsyncMutex<()>>,
+}
+
+impl Listener {
+    /// The listener of a worker that bound `pre_bound`, or of one that
+    /// binds a port per connection.
+    pub(crate) fn new(pre_bound: Option<Arc<StdListener>>) -> Self {
+        Self {
+            pre_bound,
+            turn: Arc::default(),
+        }
+    }
+}
+
+/// One connection's relay listener, its turn held until retina's
+/// connection is accepted ([`Listener`]).
+#[derive(Debug)]
+pub(crate) struct Listening {
+    /// The listener.
+    listener: TcpListener,
+    /// The turn.
+    turn: OwnedMutexGuard<()>,
+}
+
+/// The relay's listener for one connection and its address, once it is
+/// this connection's turn: a clone of the pre-bound one with its stale
+/// backlog dropped, or a fresh ephemeral port.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the turn is held until retina's connection is accepted: it moves into the `Listening`"
+)]
+pub(crate) async fn listen(listener: &Listener) -> Result<(Listening, SocketAddr), SourceError> {
+    let turn = Arc::clone(&listener.turn).lock_owned().await;
     let failed = |err: io::Error| SourceError::Unreachable(format!("rtsp relay: {err}"));
-    let listener = bind(pre_bound).await.map_err(failed)?;
-    let local = listener.local_addr().map_err(failed)?;
-    Ok((listener, local))
+    let bound = bind(listener.pre_bound.as_deref()).await.map_err(failed)?;
+    let local = bound.local_addr().map_err(failed)?;
+    let listening = Listening {
+        listener: bound,
+        turn,
+    };
+    Ok((listening, local))
 }
 
 /// [`listen`] before its error is typed.
@@ -176,7 +221,7 @@ pub(crate) struct Orphan {
 /// stays pending once the copy is over, and the source, which keeps
 /// polling the session, notices the closed relay as an ended connection.
 pub(crate) async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
-    listener: TcpListener,
+    listener: Listening,
     camera: S,
     media: Media,
 ) -> RelayEnd {
@@ -215,6 +260,16 @@ pub(crate) enum First<R, S> {
     Relay(R),
     /// The session, with its exit.
     Session(S),
+}
+
+impl<S> First<RelayEnd, S> {
+    /// The session's output, or why the relay ended first.
+    pub(crate) fn session(self) -> Result<S, SourceError> {
+        match self {
+            Self::Session(out) => Ok(out),
+            Self::Relay(ended) => Err(ended.error),
+        }
+    }
 }
 
 /// Runs the relay's `pump` beside the `session` it carries, in the
@@ -318,7 +373,8 @@ fn ack_now(from: &OwnedReadHalf) {
 #[cfg(not(target_os = "linux"))]
 const fn ack_now(_from: &OwnedReadHalf) {}
 
-/// Accepts retina's one connection, the listener closed behind it, with
+/// Accepts retina's one connection, the listener closed behind it and
+/// the turn passed on ([`Listener`]), with
 /// Nagle's algorithm off (`TCP_NODELAY`): the relay passes on what the
 /// camera sent as it arrives and must not hold it. With Nagle (RFC 1122
 /// §4.2.3.4) a small write waits while an earlier one is unacknowledged,
@@ -327,8 +383,11 @@ const fn ack_now(_from: &OwnedReadHalf) {}
 /// first Sender Report among them, waited 39 ms for the ACK of the
 /// answer (Linux 7.0, 2026-10-09), which put the clock map's offset as
 /// far ahead of every later arrival for seconds.
-async fn accept(listener: TcpListener) -> io::Result<TcpStream> {
-    let (plain, _) = listener.accept().await?;
+async fn accept(listening: Listening) -> io::Result<TcpStream> {
+    let Listening { listener, turn } = listening;
+    let accepted = listener.accept().await;
+    drop(turn);
+    let (plain, _) = accepted?;
     plain.set_nodelay(true)?;
     Ok(plain)
 }
@@ -337,7 +396,7 @@ async fn accept(listener: TcpListener) -> io::Result<TcpStream> {
 /// go on whole, with the receiver reports due between them; the camera's
 /// side goes on as it arrives, read along by the tap.
 async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
-    listener: TcpListener,
+    listener: Listening,
     camera: S,
     reports: ReceiverReports,
     clock: Arc<dyn Clock>,
@@ -538,7 +597,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UdpPump<S> {
 /// session is not over, retina's side and the translation are kept for
 /// the `TEARDOWN` ([`teardown`]).
 async fn relay_udp<S: AsyncRead + AsyncWrite + Unpin>(
-    listener: TcpListener,
+    listener: Listening,
     camera: S,
     udp: UdpRelay,
 ) -> Result<(u64, u64), Ended> {
@@ -614,6 +673,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_first_to_end_is_the_session_s_output_or_the_relay_s_error() {
+        assert_eq!(First::<RelayEnd, u8>::Session(7).session(), Ok(7));
+        let ended = RelayEnd {
+            error: SourceError::Protocol("refused".into()),
+            orphan: None,
+        };
+        assert_eq!(
+            First::<RelayEnd, u8>::Relay(ended).session(),
+            Err(SourceError::Protocol("refused".into()))
+        );
+    }
+
+    #[test]
     fn the_relay_url_keeps_path_and_query_and_drops_the_credentials() {
         let url = SourceUrl::parse("rtsps://admin:secret@camera.local/h264?x=1").unwrap();
         let target = relay_url(&url, "127.0.0.1:41000".parse().unwrap());
@@ -625,14 +697,23 @@ mod tests {
         let pre_bound = StdListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = pre_bound.local_addr().unwrap();
         let _stale = std::net::TcpStream::connect(addr).unwrap();
-        let (listener, local) = listen(Some(&pre_bound)).await.unwrap();
+        let shared = Listener::new(Some(Arc::new(pre_bound)));
+        let (listener, local) = listen(&shared).await.unwrap();
         assert_eq!(local, addr);
+        // Another connection waits for its turn until this one accepted.
+        let next = shared.clone();
+        let waiting = spawn_named("test.listen", async move {
+            listen(&next).await.map(|(_, local)| local)
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "not its turn");
         // The stale connection is gone: the next accept is the new one.
         let fresh = TcpStream::connect(addr).await.unwrap();
-        let (_accepted, peer) = listener.accept().await.unwrap();
-        assert_eq!(peer, fresh.local_addr().unwrap());
+        let accepted = accept(listener).await.unwrap();
+        assert_eq!(accepted.peer_addr().unwrap(), fresh.local_addr().unwrap());
+        assert_eq!(waiting.await.unwrap().unwrap(), addr, "its turn now");
         // Without one, every attempt binds its own port.
-        let (_own, own) = listen(None).await.unwrap();
+        let (_own, own) = listen(&Listener::default()).await.unwrap();
         assert_ne!(own, addr);
         assert!(own.ip().is_loopback());
     }
@@ -652,7 +733,7 @@ mod tests {
         // With Nagle on, the first frames after PLAY waited for retina's
         // delayed ACK (39 ms on Linux 7.0) and the clock map took the late
         // first Sender Report for the camera's transit.
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let _retina = TcpStream::connect(local).await.unwrap();
         let accepted = accept(listener).await.unwrap();
         assert!(accepted.nodelay().unwrap());
@@ -709,7 +790,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_pump_copies_both_ways_and_outlives_the_close() {
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (camera, mut far) = tokio::io::duplex(1024);
         let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
         let mut plain = TcpStream::connect(local).await.unwrap();
@@ -751,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_camera_ends_the_copy_and_retina_sees_the_close() {
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let camera = tokio::io::join(Broken, tokio::io::sink());
         let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
         let mut plain = TcpStream::connect(local).await.unwrap();
@@ -766,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_relay_whose_listener_fails_stays_for_the_session_to_decide() {
-        let (listener, _local) = listen(None).await.unwrap();
+        let (listener, _local) = listen(&Listener::default()).await.unwrap();
         // A listener that never sees retina: the attempt's deadline ends it.
         let (camera, _far) = tokio::io::duplex(16);
         let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
@@ -792,7 +873,7 @@ mod tests {
         use lotse_core::clock::SystemClock;
         use tokio::net::UdpSocket;
 
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (camera, mut far) = tokio::io::duplex(4096);
         let udp = UdpRelay::new(
             Ipv4Addr::LOCALHOST.into(),
@@ -858,7 +939,7 @@ mod tests {
     async fn over_udp_a_camera_the_relay_refuses_ends_the_pump_with_why() {
         use lotse_core::clock::SystemClock;
 
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (camera, mut far) = tokio::io::duplex(1024);
         let udp = UdpRelay::new(
             Ipv4Addr::LOCALHOST.into(),
@@ -896,7 +977,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_udp_a_failing_or_closing_camera_ends_the_pump_with_retinas_side_kept() {
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let camera = tokio::io::join(Broken, tokio::io::sink());
         let relay = spawn_named(
             "test.pump",
@@ -910,7 +991,7 @@ mod tests {
         );
         assert!(end.orphan.is_some());
 
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (camera, far) = tokio::io::duplex(64);
         let relay = spawn_named(
             "test.pump",
@@ -936,7 +1017,7 @@ mod tests {
     #[tokio::test]
     async fn rfc2326_10_7_over_udp_the_camera_may_close_or_fail_once_retina_sent_its_teardown() {
         for fails in [false, true] {
-            let (listener, local) = listen(None).await.unwrap();
+            let (listener, local) = listen(&Listener::default()).await.unwrap();
             let (ours, mut far) = tokio::io::duplex(1024);
             let relay = if fails {
                 spawn_named(
@@ -980,7 +1061,7 @@ mod tests {
         let (writes, gone) = tokio::io::duplex(64);
         drop(gone);
         let unwritable = tokio::io::join(reads, writes);
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let relay = spawn_named(
             "test.pump",
             pump(listener, unwritable, Media::Udp(Box::new(udp_relay()))),
@@ -1001,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn over_udp_retina_writing_what_no_parser_reads_ends_the_pump_with_nothing_to_tear_down()
     {
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (camera, _far) = tokio::io::duplex(64);
         let relay = spawn_named(
             "test.pump",
@@ -1019,7 +1100,7 @@ mod tests {
 
     /// The orphan of a UDP relay whose camera closed, and retina's end.
     async fn orphaned_relay() -> (Box<Orphan>, TcpStream) {
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (camera, far) = tokio::io::duplex(64);
         let relay = spawn_named(
             "test.pump",
@@ -1149,7 +1230,7 @@ mod tests {
 
         let clock = Arc::new(FakeClock::from_system());
         let (reports, time) = reports_on(&clock);
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (camera, mut far) = tokio::io::duplex(4096);
         let relay = spawn_named(
             "test.pump",
@@ -1190,7 +1271,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_tcp_retina_writing_what_no_parser_reads_ends_the_pump() {
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (camera, _far) = tokio::io::duplex(64);
         let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
         let mut plain = TcpStream::connect(local).await.unwrap();
@@ -1211,7 +1292,7 @@ mod tests {
         let clock = Arc::new(FakeClock::from_system());
         let (reports, time) = reports_on(&clock);
         let udp = UdpRelay::new(Ipv4Addr::LOCALHOST.into(), Arc::default(), time, reports);
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (camera, mut far) = tokio::io::duplex(4096);
         let relay = spawn_named(
             "test.pump",
@@ -1274,7 +1355,9 @@ mod tests {
 
         // Its address is no IP address: the listener has none to give.
         let not_tcp = StdListener::from(OwnedFd::from(UnixDatagram::unbound().unwrap()));
-        let err = listen(Some(&not_tcp)).await.unwrap_err();
+        let err = listen(&Listener::new(Some(Arc::new(not_tcp))))
+            .await
+            .unwrap_err();
         assert!(
             matches!(&err, SourceError::Unreachable(message) if message.starts_with("rtsp relay: ")),
             "{err:?}"
@@ -1283,7 +1366,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reset_from_retina_ends_the_copy_and_the_relay_stays_for_the_session() {
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (camera, mut far) = tokio::io::duplex(1024);
         let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
         let mut plain = TcpStream::connect(local).await.unwrap();
@@ -1350,7 +1433,7 @@ mod tests {
         let clock = Arc::new(FakeClock::from_system());
         let (reports, time) = reports_on(&clock);
         let udp = UdpRelay::new(Ipv4Addr::LOCALHOST.into(), Arc::default(), time, reports);
-        let (listener, local) = listen(None).await.unwrap();
+        let (listener, local) = listen(&Listener::default()).await.unwrap();
         let (reads, mut camera_says) = tokio::io::duplex(4096);
         let (writes, mut camera_hears) = tokio::io::duplex(4096);
         let relay = spawn_named(
@@ -1419,7 +1502,7 @@ mod tests {
             .build()
             .unwrap();
         let end = runtime.block_on(async move {
-            let (listener, local) = listen(None).await.unwrap();
+            let (listener, local) = listen(&Listener::default()).await.unwrap();
             let (camera, _far) = tokio::io::duplex(64);
             let relay = spawn_named(
                 "test.pump",

@@ -49,7 +49,8 @@ use lotse_core::session::{
     TalkbackClaim, TalkbackTarget, Transport, apply_audio_event, apply_track_event,
 };
 use lotse_core::skew::AV_SYNC_LOST;
-use lotse_core::task::spawn_named;
+use lotse_core::source::{BACKCHANNEL_OPEN_LIMIT, BackchannelRefused};
+use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
 use lotse_ipc::{SessionEvent as IpcEvent, SessionSpec, datagram};
 use tokio::net::UnixDatagram;
@@ -60,7 +61,7 @@ use crate::derived::{DerivedTracks, Lease, PickedTrack};
 use crate::ice_tcp::Links;
 use crate::relay::{Egress, Relays};
 use crate::sendmsg;
-use crate::talkback::{self, Arbiter, Talkback, TalkbackStats};
+use crate::talkback::{self, Arbiter, Claim, ClaimError, Claimant, Talkback, TalkbackStats};
 
 /// The bounded inbound queue per session:
 /// uplink only, so small.
@@ -856,6 +857,9 @@ enum Decline {
     Unsupported(String),
     /// This session holds the backchannel.
     Busy(String),
+    /// The camera's backchannel session did not open for the claim, or
+    /// was lost while the session held it, and why.
+    Refused(BackchannelRefused),
 }
 
 impl Decline {
@@ -864,20 +868,26 @@ impl Decline {
         match self {
             Self::Unsupported(_) => "unsupported",
             Self::Busy(_) => "busy",
+            Self::Refused(_) => "refused",
         }
     }
 
     /// The warning, for the supervisor.
     fn event(&self) -> IpcEvent {
-        let message = match self {
-            Self::Unsupported(reason) => format!("talk-back declined: {reason}"),
-            Self::Busy(holder) => {
-                format!("talk-back declined: session {holder} holds the camera's backchannel")
-            }
+        let (message, status) = match self {
+            Self::Unsupported(reason) => (format!("talk-back declined: {reason}"), None),
+            Self::Busy(holder) => (
+                format!("talk-back declined: session {holder} holds the camera's backchannel"),
+                None,
+            ),
+            Self::Refused(why) => (
+                format!("talk-back declined: the camera's backchannel session: {why}"),
+                why.status,
+            ),
         };
         IpcEvent::TalkbackDeclined {
             reason: self.reason().to_owned(),
-            status: None,
+            status,
             message,
         }
     }
@@ -887,14 +897,20 @@ impl Decline {
 /// it: what the engine negotiates with, and what follows the answer.
 #[derive(Debug)]
 struct Arbitration {
-    /// The backchannel the camera offers now, whoever holds it.
+    /// The backchannel the session negotiates with: the one it has open
+    /// while it holds it, the one the camera offers now otherwise,
+    /// whoever holds that.
     backchannel: Option<TalkbackTarget>,
     /// Whether the session holds it for this offer.
     claim: TalkbackClaim,
     /// The decline to report after the answer, if any.
     decline: Option<Decline>,
+    /// The claim the offer made, its backchannel session open, for the
+    /// session to adopt ([`Talkback::adopt`]); dropped unadopted, it lets
+    /// go.
+    granted: Option<Claim>,
     /// The offer claimed the backchannel, which the session did not hold
-    /// before, as the claim itself decided ([`Talkback::claim`]): an
+    /// before, as the claim itself decided ([`Claimant::claim`]): an
     /// engine that refuses the offer lets go again.
     claimed: bool,
     /// The offer drops talk-back the session held: it lets go once the
@@ -903,62 +919,163 @@ struct Arbitration {
     drops: bool,
 }
 
+impl Arbitration {
+    /// The arbitration of an offer that asks for nothing, with
+    /// `backchannel` offered.
+    const fn new(backchannel: Option<TalkbackTarget>) -> Self {
+        Self {
+            backchannel,
+            claim: TalkbackClaim::Granted,
+            decline: None,
+            granted: None,
+            claimed: false,
+            drops: false,
+        }
+    }
+
+    /// Logs the outcome: log-only.
+    fn log(&self) {
+        let (claim, decline) = (self.claim, self.decline.as_ref().map(Decline::reason));
+        tracing::debug!(
+            ?claim,
+            decline,
+            claimed = self.claimed,
+            drops = self.drops,
+            "talk-back arbitrated for the offer"
+        );
+    }
+}
+
+/// An offer's arbitration: decided at once, or a claim that opens the
+/// camera's backchannel session (or waits for the source's probe first),
+/// which the answer waits for.
+enum Arbitrating {
+    /// Decided.
+    Decided(Arbitration),
+    /// Decided once the future resolves.
+    Claiming(BoxFuture<'static, Arbitration>),
+}
+
+/// What an offer asks for on the backchannel offered now: the
+/// arbitration so far, and whether a claim must still be made.
+struct Assessed {
+    /// The arbitration without the claim.
+    arbitration: Arbitration,
+    /// The offer asks for talk-back the backchannel takes, and the session
+    /// does not hold it.
+    claims: bool,
+}
+
 /// Arbitrates `offer`'s talk-back for the session, through `talkback`
 /// when its connection has a backchannel: an offer that asks for
 /// talk-back the backchannel takes ([`OutputFactory::talkback_request`])
 /// claims it, first offer wins, and is declined `busy` when another
-/// session holds it; one that asks for talk-back the stream cannot carry
+/// session holds it, `refused` when the camera's backchannel session does
+/// not open for it; one that asks for talk-back the stream cannot carry
 /// is declined `unsupported`; one that asks for none lets go of a
 /// backchannel the session held. Decided before the engine sees the
-/// offer, so the answer carries the outcome.
-fn arbitrate(ctx: &SessionCtx, talkback: Option<&mut Talkback>, offer: &str) -> Arbitration {
-    let mut arbitration = Arbitration {
-        backchannel: None,
-        claim: TalkbackClaim::Granted,
-        decline: None,
-        claimed: false,
-        drops: false,
-    };
+/// offer, so the answer carries the outcome: a claim, which opens the
+/// camera's backchannel session, and an offer that asks for talk-back
+/// while the source probes the camera with nothing offered before, are
+/// decided by the future [`Arbitrating::Claiming`] holds.
+fn arbitrate(ctx: &SessionCtx, talkback: Option<&Talkback>, offer: &str) -> Arbitrating {
     let Some(talkback) = talkback else {
+        let mut arbitration = Arbitration::new(None);
         if let TalkbackRequest::Unsupported(reason) = ctx.factory.talkback_request(offer, None) {
             arbitration.decline = Some(Decline::Unsupported(reason));
         }
-        return arbitration;
+        return Arbitrating::Decided(arbitration);
     };
-    arbitration.backchannel = talkback.target();
-    match ctx
-        .factory
-        .talkback_request(offer, arbitration.backchannel.as_ref())
-    {
-        TalkbackRequest::NotRequested => arbitration.drops = talkback.holds(),
-        TalkbackRequest::Unsupported(reason) => {
-            arbitration.drops = talkback.holds();
-            arbitration.decline = Some(Decline::Unsupported(reason));
+    let claimant = talkback.claimant();
+    let factory = Arc::clone(&ctx.factory);
+    // The probe's result decides an offer that asks for talk-back, unless
+    // an offer from before stands.
+    let probing = claimant.arbiter().awaits_probe()
+        && !matches!(
+            factory.talkback_request(offer, None),
+            TalkbackRequest::NotRequested
+        );
+    let assessed = assess(factory.as_ref(), &claimant, offer);
+    if !probing && !assessed.claims {
+        return Arbitrating::Decided(assessed.arbitration);
+    }
+    let offer = offer.to_owned();
+    Arbitrating::Claiming(Box::pin(async move {
+        // One limit for the probe's wait and the claim's.
+        let (assessed, limit) = if probing {
+            tracing::info!("talk-back: the offer waits for the probe of the camera's backchannel");
+            let left = claimant.arbiter().settled().await;
+            (assess(factory.as_ref(), &claimant, &offer), left)
+        } else {
+            (assessed, BACKCHANNEL_OPEN_LIMIT)
+        };
+        if assessed.claims {
+            claim(assessed.arbitration, claimant, limit).await
+        } else {
+            assessed.arbitration
         }
-        TalkbackRequest::Negotiable => {
-            // Whether the claim is new comes from the claim itself, under
-            // the arbiter's lock: a release just before makes it new.
-            match talkback.claim() {
-                Ok(claimed) => arbitration.claimed = claimed,
-                Err(holder) => {
-                    arbitration.claim = TalkbackClaim::Busy;
-                    arbitration.decline = Some(Decline::Busy(holder));
-                }
-            }
+    }))
+}
+
+/// What `offer` asks of `claimant`'s backchannel ([`arbitrate`]): the
+/// one it has open while it holds it, the one offered now otherwise
+/// ([`Claimant::target`]).
+fn assess(factory: &dyn OutputFactory, claimant: &Claimant, offer: &str) -> Assessed {
+    let (backchannel, holds) = claimant.target();
+    let request = factory.talkback_request(offer, backchannel.as_ref());
+    let mut arbitration = Arbitration::new(backchannel);
+    let claims = match request {
+        TalkbackRequest::NotRequested => {
+            arbitration.drops = holds;
+            false
+        }
+        TalkbackRequest::Unsupported(reason) => {
+            arbitration.drops = holds;
+            arbitration.decline = Some(Decline::Unsupported(reason));
+            false
+        }
+        TalkbackRequest::Negotiable => !holds,
+    };
+    Assessed {
+        arbitration,
+        claims,
+    }
+}
+
+/// Claims the backchannel for `arbitration`'s offer through `claimant`,
+/// which opens the camera's backchannel session within `limit`: granted,
+/// or declined `busy` or `refused`. The claim carries the backchannel the
+/// answer is negotiated with, so it opens that one or none: a probe that
+/// replaced the offer since with another codec declines it `refused`
+/// ([`Claimant::claim`]).
+async fn claim(mut arbitration: Arbitration, claimant: Claimant, limit: Duration) -> Arbitration {
+    let negotiated = arbitration.backchannel.clone();
+    match claimant.claim(negotiated, limit).await {
+        Ok(granted) => {
+            arbitration.claimed = granted.is_some();
+            arbitration.granted = granted;
+        }
+        Err(ClaimError::Busy(holder)) => {
+            arbitration.claim = TalkbackClaim::Busy;
+            arbitration.decline = Some(Decline::Busy(holder));
+        }
+        Err(ClaimError::Refused(why)) => {
+            arbitration.claim = TalkbackClaim::Busy;
+            arbitration.decline = Some(Decline::Refused(why));
         }
     }
-    let (claim, decline) = (
-        arbitration.claim,
-        arbitration.decline.as_ref().map(Decline::reason),
-    );
-    tracing::debug!(
-        ?claim,
-        decline,
-        claimed = arbitration.claimed,
-        drops = arbitration.drops,
-        "talk-back arbitrated for the offer"
-    );
     arbitration
+}
+
+/// The close a session waits for: the first one asked, or the worker's
+/// stop once the manager is gone.
+async fn closed(close: &mut watch::Receiver<CloseRequest>) -> (&'static str, String) {
+    let request = close
+        .wait_for(Option::is_some)
+        .await
+        .ok()
+        .and_then(|request| request.clone());
+    request.unwrap_or_else(|| ("shutting_down", "the worker is stopping".to_owned()))
 }
 
 /// What a session takes from the connection it opens on.
@@ -1027,6 +1144,32 @@ async fn next_audio(audio: &mut Option<AudioSubscription>) -> Option<TrackEvent>
     }
 }
 
+/// The arbitration of the session's offer ([`arbitrate`]), a claim it
+/// granted adopted by `talkback`. A claim holds it until the camera's
+/// backchannel session is open; a close meanwhile ends the session, and
+/// the claim with it: `None`, reported already.
+async fn arbitrate_offer(
+    ctx: &SessionCtx,
+    talkback: Option<&mut Talkback>,
+    close: &mut watch::Receiver<CloseRequest>,
+) -> Option<Arbitration> {
+    let mut arbitration = match arbitrate(ctx, talkback.as_deref(), &ctx.spec.offer) {
+        Arbitrating::Decided(arbitration) => arbitration,
+        Arbitrating::Claiming(claiming) => tokio::select! {
+            arbitration = claiming => arbitration,
+            (code, message) = closed(close) => {
+                ctx.finish(code, message).await;
+                return None;
+            }
+        },
+    };
+    arbitration.log();
+    if let (Some(talkback), Some(claim)) = (talkback, arbitration.granted.take()) {
+        talkback.adopt(claim);
+    }
+    Some(arbitration)
+}
+
 /// Waits for the tracks, negotiates, opens the engine and reports the
 /// answer; `None` when the session ended before that (reported already).
 async fn open_session(
@@ -1078,7 +1221,7 @@ async fn open_session(
             Arc::clone(&ctx.talkback),
         )
     });
-    let arbitration = arbitrate(ctx, talkback.as_mut(), &ctx.spec.offer);
+    let arbitration = arbitrate_offer(ctx, talkback.as_mut(), close).await?;
     // The monotonic and the wall clock read together: the session's anchor
     // for the capture times it sends.
     let now = ctx.clock.now();
@@ -1092,8 +1235,9 @@ async fn open_session(
         tcp_candidates: ctx.spec.tcp_candidates.clone(),
         video: video.codec(),
         audio: audio.as_ref().map(|audio| audio.track.codec()),
-        // What the source offers now, behind its protocol's gate, and
-        // whether this session holds it.
+        // What the source offers now, behind its protocol's gate (a new
+        // session holds no backchannel session yet), and whether this
+        // session holds it.
         backchannel: arbitration.backchannel,
         claim: arbitration.claim,
         orientation: Orientation::from_code(ctx.spec.orientation).unwrap_or_default(),
@@ -1137,12 +1281,72 @@ async fn open_session(
     Some(opened)
 }
 
-/// A re-offer: arbitrates its talk-back ([`arbitrate`]), has the engine
+/// A re-offer whose answer waits for its claim: the camera's backchannel
+/// session opening, or the source's probe.
+struct PendingOffer {
+    /// The re-offer.
+    sdp: String,
+    /// Its arbitration.
+    arbitration: BoxFuture<'static, Arbitration>,
+}
+
+/// A re-offer: arbitrates its talk-back ([`arbitrate`]) and answers it
+/// ([`answer`]), or, when its claim opens the camera's backchannel
+/// session, holds it in `pending` until the arbitration is decided, while
+/// the session plays on. A re-offer while one is held is refused.
+async fn renegotiate(
+    ctx: &SessionCtx,
+    opened: &mut Opened,
+    pending: &mut Option<PendingOffer>,
+    sdp: String,
+) {
+    if pending.is_some() {
+        tracing::info!("re-offer while another is held; refused");
+        ctx.emit(IpcEvent::RenegotiateRefused {
+            code: "internal_error".to_owned(),
+            message: "a re-offer of the session is still being answered".to_owned(),
+        })
+        .await;
+        return;
+    }
+    match arbitrate(ctx, opened.talkback.as_ref(), &sdp) {
+        Arbitrating::Decided(arbitration) => answer(ctx, opened, &sdp, arbitration).await,
+        Arbitrating::Claiming(arbitration) => {
+            tracing::info!("re-offer held until its talk-back claim is decided");
+            *pending = Some(PendingOffer { sdp, arbitration });
+        }
+    }
+}
+
+/// The next held re-offer's decided arbitration, taken out of `pending`;
+/// never without one.
+async fn next_arbitration(pending: &mut Option<PendingOffer>) -> (String, Arbitration) {
+    let Some(offer) = pending.as_mut() else {
+        return std::future::pending().await;
+    };
+    let arbitration = offer.arbitration.as_mut().await;
+    let sdp = pending.take().map(|offer| offer.sdp).unwrap_or_default();
+    (sdp, arbitration)
+}
+
+/// The next loss of the session's backchannel session the arbiter
+/// reports; never without talk-back.
+async fn next_loss(talkback: Option<&mut Talkback>) -> Option<BackchannelRefused> {
+    match talkback {
+        Some(talkback) => talkback.lost().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Answers a re-offer once its talk-back is arbitrated: has the engine
 /// answer it and reports the answer (`Renegotiated`) and the decline, if
 /// any; a refused re-offer is reported (`RenegotiateRefused`) and leaves
 /// the session as it was, a backchannel it claimed let go again.
-async fn renegotiate(ctx: &SessionCtx, opened: &mut Opened, sdp: &str) {
-    let arbitration = arbitrate(ctx, opened.talkback.as_mut(), sdp);
+async fn answer(ctx: &SessionCtx, opened: &mut Opened, sdp: &str, mut arbitration: Arbitration) {
+    arbitration.log();
+    if let (Some(talkback), Some(claim)) = (opened.talkback.as_mut(), arbitration.granted.take()) {
+        talkback.adopt(claim);
+    }
     let now = ctx.clock.now();
     match opened
         .engine
@@ -1333,6 +1537,7 @@ async fn run_session(
     };
     let local = ctx.udp.local_addr().ok();
     let mut links = Links::new(Arc::clone(&ctx.clock));
+    let mut pending = None;
     loop {
         // Drain after every input (the engine's contract).
         let Some(at) = drain(&ctx, &mut opened, local, &links).await else {
@@ -1383,7 +1588,7 @@ async fn run_session(
                 let now = ctx.clock.now();
                 match message {
                     Some(Control::Candidate(candidate)) => opened.engine.add_remote_candidate(now, &candidate),
-                    Some(Control::Renegotiate(sdp)) => renegotiate(&ctx, &mut opened, &sdp).await,
+                    Some(Control::Renegotiate(sdp)) => renegotiate(&ctx, &mut opened, &mut pending, sdp).await,
                     Some(Control::Orientation(orientation)) => opened.engine.set_orientation(orientation),
                     Some(Control::Relay { relayed, server, local, tcp }) => add_relay(&ctx, &mut opened, PendingRelay { relayed, server, local, tcp }).await,
                     Some(Control::Channel { relayed, peer, channel }) => {
@@ -1400,6 +1605,12 @@ async fn run_session(
                     }
                     None => opened.engine.close(now, "shutting_down", "the worker is stopping".to_owned()),
                 }
+            }
+            (sdp, arbitration) = next_arbitration(&mut pending) => {
+                answer(&ctx, &mut opened, &sdp, arbitration).await;
+            }
+            Some(why) = next_loss(opened.talkback.as_mut()) => {
+                ctx.emit(Decline::Refused(why).event()).await;
             }
             Ok(()) = close.changed() => {
                 let request = close.borrow_and_update().clone();
@@ -1466,19 +1677,56 @@ mod tests {
         }
     }
 
-    /// Whether an offer of the scripted output negotiates talk-back: it
-    /// asks (`talk` in the offer) for talk-back the camera's backchannel
-    /// takes (not `unsupported`), and the session holds the backchannel.
+    /// The codec an offer of the scripted output sends talk-back in to
+    /// `backchannel`, as the engine picks one a route reaches: of the
+    /// uplink codecs the offer names (`opus`, `pcmu`, `pcma`), in its
+    /// order, PCMU when it names none, the first the backchannel takes.
+    fn scripted_codec(
+        offer: &str,
+        backchannel: &TalkbackTarget,
+    ) -> Option<lotse_core::uplink::UplinkCodec> {
+        let mut named: Vec<_> = lotse_core::uplink::UplinkCodec::ALL
+            .into_iter()
+            .filter_map(|codec| Some((offer.find(codec.name())?, codec)))
+            .collect();
+        named.sort_unstable_by_key(|(at, _)| *at);
+        let mut named: Vec<_> = named.into_iter().map(|(_, codec)| codec).collect();
+        if named.is_empty() {
+            named.push(lotse_core::uplink::UplinkCodec::Pcmu);
+        }
+        named
+            .into_iter()
+            .find(|codec| backchannel.takes.contains(codec))
+    }
+
+    /// The backchannel an engine call negotiates with, for the script:
+    /// its codec and the uplink codecs that reach it.
+    fn target_name(backchannel: Option<&TalkbackTarget>) -> String {
+        backchannel.map_or_else(
+            || "nothing".to_owned(),
+            |target| {
+                let takes: Vec<_> = target.takes.iter().map(|codec| codec.name()).collect();
+                format!("{} taking {}", target.codec.name(), takes.join(" "))
+            },
+        )
+    }
+
+    /// Whether an offer of the scripted output negotiates talk-back, and
+    /// in which codec: it asks (`talk` in the offer) for talk-back the
+    /// camera's backchannel takes (not `unsupported`, in a codec it
+    /// takes, [`scripted_codec`]), and the session holds the backchannel.
     fn scripted_talkback(
         offer: &str,
         backchannel: Option<&TalkbackTarget>,
         claim: TalkbackClaim,
     ) -> Option<lotse_core::uplink::UplinkCodec> {
-        (offer.contains("talk")
-            && !offer.contains("unsupported")
-            && claim == TalkbackClaim::Granted
-            && backchannel.is_some())
-        .then_some(lotse_core::uplink::UplinkCodec::Pcmu)
+        if !offer.contains("talk")
+            || offer.contains("unsupported")
+            || claim != TalkbackClaim::Granted
+        {
+            return None;
+        }
+        scripted_codec(offer, backchannel?)
     }
 
     /// An engine that records its calls in its script and returns the
@@ -1581,6 +1829,10 @@ mod tests {
         ) -> Result<String, lotse_core::session::RenegotiateError> {
             self.script
                 .call(&format!("renegotiate {offer} claim={claim:?}"));
+            self.script.call(&format!(
+                "renegotiate with {}",
+                target_name(backchannel.as_ref())
+            ));
             if offer.contains("refuse") {
                 return Err(lotse_core::session::RenegotiateError::InvalidSdp(
                     "refused by the script".into(),
@@ -1593,7 +1845,8 @@ mod tests {
 
     /// The `webrtc` output of [`Scripted`] engines: H.264 video, and PCMU
     /// audio when asked. An offer with `talk` asks for talk-back, which a
-    /// camera's backchannel takes unless the offer says `unsupported`.
+    /// camera's backchannel takes unless the offer says `unsupported` or
+    /// names no codec it takes ([`scripted_codec`]).
     #[derive(Debug, Default)]
     struct ScriptedOutput(Arc<Script>);
 
@@ -1636,6 +1889,10 @@ mod tests {
                 request.backchannel.is_some(),
                 request.claim
             ));
+            self.0.call(&format!(
+                "open with {}",
+                target_name(request.backchannel.as_ref())
+            ));
             if self.0.refuse {
                 return Err(SessionOpenError::InvalidSdp("refused by the script".into()));
             }
@@ -1658,7 +1915,10 @@ mod tests {
         ) -> TalkbackRequest {
             if !offer.contains("talk") {
                 TalkbackRequest::NotRequested
-            } else if backchannel.is_none() || offer.contains("unsupported") {
+            } else if offer.contains("unsupported")
+                || backchannel
+                    .is_none_or(|backchannel| scripted_codec(offer, backchannel).is_none())
+            {
                 TalkbackRequest::Unsupported("the script says no".into())
             } else {
                 TalkbackRequest::Negotiable
@@ -1843,19 +2103,81 @@ mod tests {
         (rig, run_session(ctx, inbound_rx, control_rx, close_rx))
     }
 
+    /// The camera's backchannel for the session tests: each open answers
+    /// at once with a session, or with the next refusal scripted, or once
+    /// `hold` is notified when it is set. The sessions' losses are kept
+    /// for the tests to report, and what each takes for them to read.
+    #[derive(Debug, Default)]
+    struct TestCamera {
+        refusals: Mutex<VecDeque<BackchannelRefused>>,
+        hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        losses: Mutex<Vec<tokio::sync::oneshot::Sender<BackchannelRefused>>>,
+        closes: Mutex<Vec<tokio_util::sync::CancellationToken>>,
+        /// The codec its sessions open in; PCMU unless set.
+        codec: Mutex<Option<Codec>>,
+        /// What each session took, in the order they opened.
+        devices: Mutex<Vec<mpsc::Receiver<MediaPacket>>>,
+    }
+
+    impl lotse_core::source::BackchannelOpener for TestCamera {
+        fn open(
+            &self,
+        ) -> BoxFuture<'static, Result<lotse_core::source::BackchannelSession, BackchannelRefused>>
+        {
+            let refusal = self.refusals.lock().unwrap().pop_front();
+            let hold = self.hold.lock().unwrap().clone();
+            let (sender, device) = mpsc::channel(8);
+            let (on_loss, lost) = tokio::sync::oneshot::channel();
+            let close = tokio_util::sync::CancellationToken::new();
+            self.losses.lock().unwrap().push(on_loss);
+            self.closes.lock().unwrap().push(close.clone());
+            self.devices.lock().unwrap().push(device);
+            let codec = self.codec.lock().unwrap().clone();
+            let session = lotse_core::source::BackchannelSession::new(
+                codec.unwrap_or(Codec::Pcmu),
+                lotse_core::source::BackchannelOffer::DEFAULT_FRAME,
+                sender,
+                lost,
+                close,
+            );
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    hold.notified().await;
+                }
+                refusal.map_or(Ok(session), Err)
+            })
+        }
+    }
+
     /// An arbiter of a connection whose source offers a PCMU backchannel,
     /// and the feed of its talker changes.
     fn arbiter() -> (Arc<Arbiter>, TalkerFeed) {
-        let slot = lotse_core::source::BackchannelSlot::default();
-        let (sender, _device) = mpsc::channel(8);
-        slot.offer(lotse_core::source::BackchannelHandle {
-            codec: Codec::Pcmu,
-            frame: lotse_core::source::BackchannelHandle::DEFAULT_FRAME,
-            sender,
-        });
-        let arbiter = Arc::new(Arbiter::new(slot, None, Arc::new(FakeClock::default())));
-        let feed = TalkerFeed::new(&arbiter);
+        let (arbiter, feed, _camera, _slot) = arbiter_with();
         (arbiter, feed)
+    }
+
+    /// [`arbiter`], with the camera's backchannel and the slot.
+    fn arbiter_with() -> (
+        Arc<Arbiter>,
+        TalkerFeed,
+        Arc<TestCamera>,
+        lotse_core::source::BackchannelSlot,
+    ) {
+        let slot = lotse_core::source::BackchannelSlot::default();
+        let camera = Arc::new(TestCamera::default());
+        let opener: Arc<dyn lotse_core::source::BackchannelOpener> = camera.clone();
+        slot.offer(lotse_core::source::BackchannelOffer {
+            codec: Codec::Pcmu,
+            frame: lotse_core::source::BackchannelOffer::DEFAULT_FRAME,
+            opener,
+        });
+        let arbiter = Arc::new(Arbiter::new(
+            slot.clone(),
+            None,
+            Arc::new(FakeClock::default()),
+        ));
+        let feed = TalkerFeed::new(&arbiter);
+        (arbiter, feed, camera, slot)
     }
 
     /// The next talker change of `feed`, which must be there already.
@@ -1873,8 +2195,13 @@ mod tests {
 
     /// A talk-back packet the engine hands on.
     fn uplink(now: Instant) -> SessionOutput {
+        uplink_in(lotse_core::uplink::UplinkCodec::Pcmu, now)
+    }
+
+    /// A talk-back packet in `codec` the engine hands on.
+    fn uplink_in(codec: lotse_core::uplink::UplinkCodec, now: Instant) -> SessionOutput {
         SessionOutput::Uplink(lotse_core::uplink::UplinkPacket {
-            codec: lotse_core::uplink::UplinkCodec::Pcmu,
+            codec,
             packet: packet(now),
         })
     }
@@ -2061,6 +2388,536 @@ mod tests {
         request_close(&a.close, "session_closed", "bye".into());
         assert!(poll_once(&mut a_task).await.is_ready());
         assert_eq!(change(&mut feed).await, ("a".into(), "session_closed"));
+    }
+
+    /// ONVIF Streaming Specification §5.3: the camera takes no data before
+    /// its backchannel session's `PLAY` is answered, so the answer to the
+    /// offer that claims it waits until the session is open; a close
+    /// meanwhile ends the session and lets go of the claim.
+    #[tokio::test]
+    async fn onvif_5_3_the_answer_to_a_claiming_offer_waits_for_the_backchannel_session() {
+        let (arbiter, mut feed, camera, _slot) = arbiter_with();
+        let go = Arc::new(tokio::sync::Notify::new());
+        *camera.hold.lock().unwrap() = Some(Arc::clone(&go));
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = Box::pin(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(
+            a.events().is_empty(),
+            "no answer before the session is open"
+        );
+        assert!(a.script.calls.lock().unwrap().is_empty(), "not opened yet");
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        go.notify_one();
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("open backchannel=true claim=Granted"));
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Answer {
+                sdp: "answer".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+
+        // b's answer waits too, and b closes meanwhile: it lets go.
+        drop(a_task);
+        assert_eq!(change(&mut feed).await, ("a".into(), "session_closed"));
+        let (mut b, task) = session_on(
+            "b",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut b_task = pin!(task);
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert_eq!(change(&mut feed).await, ("b".into(), "claimed"));
+        request_close(&b.close, "session_closed", "bye".into());
+        assert!(poll_once(&mut b_task).await.is_ready());
+        assert_eq!(b.events(), [closed("session_closed", "bye")]);
+        assert_eq!(change(&mut feed).await, ("b".into(), "session_closed"));
+        // c's answer waits, and its manager goes meanwhile: the worker is
+        // stopping.
+        let (mut c, task) = session_on(
+            "c",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut c_task = pin!(task);
+        assert!(poll_once(&mut c_task).await.is_pending());
+        assert_eq!(change(&mut feed).await, ("c".into(), "claimed"));
+        c.close = watch::channel(None).0;
+        assert!(poll_once(&mut c_task).await.is_ready());
+        assert_eq!(
+            c.events(),
+            [closed("shutting_down", "the worker is stopping")]
+        );
+        assert_eq!(change(&mut feed).await, ("c".into(), "session_closed"));
+        assert!(
+            camera
+                .closes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(tokio_util::sync::CancellationToken::is_cancelled),
+            "every session closed"
+        );
+    }
+
+    /// The camera refuses the backchannel session: the answer declines
+    /// talk-back with `refused` and the camera's status, and no claim is
+    /// kept; the next offer opens one.
+    #[tokio::test]
+    async fn rfc2326_11_3_3_a_refused_backchannel_session_declines_with_its_status() {
+        let (arbiter, mut feed, camera, _slot) = arbiter_with();
+        camera
+            .refusals
+            .lock()
+            .unwrap()
+            .push_back(BackchannelRefused {
+                status: Some(453),
+                message: "SETUP: 453 Not Enough Bandwidth".into(),
+            });
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = pin!(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("open backchannel=true claim=Busy"));
+        assert_eq!(
+            a.events(),
+            [
+                IpcEvent::Answer {
+                    sdp: "answer".into(),
+                    talkback: None,
+                },
+                IpcEvent::TalkbackDeclined {
+                    reason: "refused".into(),
+                    status: Some(453),
+                    message: "talk-back declined: the camera's backchannel session: SETUP: 453 Not Enough Bandwidth".into(),
+                },
+            ]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        assert_eq!(change(&mut feed).await, ("a".into(), "refused"));
+        // The user's next press: a re-offer, which opens one.
+        a.control(reoffer("v=0 talk"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Renegotiated {
+                sdp: "answer to v=0 talk".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+    }
+
+    /// A re-offer that claims waits for the backchannel session while the
+    /// session plays on; another re-offer meanwhile is refused.
+    #[tokio::test]
+    async fn a_held_re_offer_leaves_the_session_playing_and_refuses_another() {
+        let (arbiter, mut feed, camera, _slot) = arbiter_with();
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = pin!(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(a.events().len(), 1, "the answer");
+        let go = Arc::new(tokio::sync::Notify::new());
+        *camera.hold.lock().unwrap() = Some(Arc::clone(&go));
+        a.control(reoffer("v=0 talk"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.events().is_empty(), "held");
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        // The session plays on meanwhile.
+        a.control(Control::Candidate("candidate:x".into()));
+        a.control(reoffer("v=0 talk again"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("candidate candidate:x"));
+        assert_eq!(
+            a.events(),
+            [IpcEvent::RenegotiateRefused {
+                code: "internal_error".into(),
+                message: "a re-offer of the session is still being answered".into(),
+            }]
+        );
+        go.notify_one();
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("renegotiate v=0 talk claim=Granted"));
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Renegotiated {
+                sdp: "answer to v=0 talk".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+    }
+
+    /// The camera's backchannel session is lost while the session talks:
+    /// one `refused` warning with why, and the claim released.
+    #[tokio::test]
+    async fn a_lost_backchannel_session_warns_the_talker_once() {
+        let (arbiter, mut feed, camera, _slot) = arbiter_with();
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = pin!(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(a.events().len(), 1, "the answer");
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        let on_loss = camera.losses.lock().unwrap().pop().unwrap();
+        on_loss
+            .send(BackchannelRefused {
+                status: Some(454),
+                message: "GET_PARAMETER: 454 Session Not Found".into(),
+            })
+            .unwrap();
+        // The arbiter's watch runs on the runtime: step the session until
+        // the warning is out.
+        let mut events = Vec::new();
+        for _ in 0..10_000 {
+            assert!(poll_once(&mut a_task).await.is_pending());
+            events = a.events();
+            if !events.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            events,
+            [IpcEvent::TalkbackDeclined {
+                reason: "refused".into(),
+                status: Some(454),
+                message: "talk-back declined: the camera's backchannel session: GET_PARAMETER: 454 Session Not Found".into(),
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "refused"));
+    }
+
+    /// While the source probes the camera with nothing offered, an offer
+    /// that asks for talk-back waits for the probe; one that asks for none
+    /// does not.
+    #[tokio::test]
+    async fn an_offer_that_asks_for_talk_back_waits_for_the_probe() {
+        let (arbiter, mut feed, camera, slot) = arbiter_with();
+        slot.withdraw();
+        slot.probing();
+        let (mut d, task) = session_on(
+            "d",
+            Script::default(),
+            false,
+            true,
+            "v=0",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut d_task = pin!(task);
+        assert!(poll_once(&mut d_task).await.is_pending());
+        assert_eq!(d.events().len(), 1, "answered at once");
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = pin!(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.events().is_empty(), "waits for the probe");
+        slot.withdraw();
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(
+            a.events(),
+            [
+                IpcEvent::Answer {
+                    sdp: "answer".into(),
+                    talkback: None,
+                },
+                IpcEvent::TalkbackDeclined {
+                    reason: "unsupported".into(),
+                    status: None,
+                    message: "talk-back declined: the script says no".into(),
+                },
+            ]
+        );
+        let next = feed.next();
+        let mut next = pin!(next);
+        assert!(poll_once(&mut next).await.is_pending(), "nothing claimed");
+        // The next probe finds the backchannel: a's re-offer meanwhile
+        // waits for it, then claims and opens it.
+        slot.probing();
+        a.control(reoffer("v=0 talk"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.events().is_empty(), "waits for the probe");
+        let opener: Arc<dyn lotse_core::source::BackchannelOpener> = camera;
+        slot.offer(lotse_core::source::BackchannelOffer {
+            codec: Codec::Pcmu,
+            frame: lotse_core::source::BackchannelOffer::DEFAULT_FRAME,
+            opener,
+        });
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Renegotiated {
+                sdp: "answer to v=0 talk".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+    }
+
+    /// A reconnect's probe that waits for its connect permit does not hold
+    /// up a claim: the offer kept from before is claimed and opened at
+    /// once, the probe still running.
+    #[tokio::test]
+    async fn an_offer_claims_the_backchannel_a_reconnect_kept_while_its_probe_runs() {
+        let (logs, _guard) = Logs::capture();
+        let (arbiter, mut feed, _camera, slot) = arbiter_with();
+        slot.probing();
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = pin!(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Answer {
+                sdp: "answer".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        assert!(slot.is_probing(), "the probe still runs");
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "talk-back: the source probes the camera again; a claim takes the backchannel offered before without waiting for it"
+            ),
+            1
+        );
+    }
+
+    /// A probe again that finds another codec than the talker's open
+    /// backchannel session leaves that session open, and the talker's
+    /// re-offers negotiate with it: Opus, which reaches it, though the
+    /// camera now offers PCMU, which would reach nothing; a re-offer that
+    /// can send it nothing is declined and lets go. Another session
+    /// negotiates with what the camera offers now, and claims and opens
+    /// that once the channel is free.
+    #[tokio::test]
+    async fn a_talkers_re_offer_negotiates_with_its_open_session_not_a_new_probes_codec() {
+        let (arbiter, mut feed, camera, slot) = arbiter_with();
+        let opener: Arc<dyn lotse_core::source::BackchannelOpener> = camera.clone();
+        let offer = |codec: Codec| lotse_core::source::BackchannelOffer {
+            codec,
+            frame: lotse_core::source::BackchannelOffer::DEFAULT_FRAME,
+            opener: Arc::clone(&opener),
+        };
+        let opus = Codec::Opus { channels: 2 };
+        *camera.codec.lock().unwrap() = Some(opus.clone());
+        slot.offer(offer(opus));
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk opus pcmu",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = pin!(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("open with opus taking opus"));
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Answer {
+                sdp: "answer".into(),
+                talkback: Some("opus".into()),
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+
+        // The probe again finds PCMU; a's Opus session stays open, and its
+        // re-offer that prefers PCMU negotiates Opus all the same.
+        *camera.codec.lock().unwrap() = None;
+        slot.offer(offer(Codec::Pcmu));
+        a.control(reoffer("v=0 talk pcmu opus"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("renegotiate with opus taking opus"));
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Renegotiated {
+                sdp: "answer to v=0 talk pcmu opus".into(),
+                talkback: Some("opus".into()),
+            }]
+        );
+        // Its Opus reaches its session; the forwarder runs on the runtime.
+        a.script.then(uplink_in(
+            lotse_core::uplink::UplinkCodec::Opus,
+            a.clock.now(),
+        ));
+        a.control(Control::Candidate("candidate:x".into()));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        until(&|| a.talkback.packets_sent.load(Ordering::Relaxed) == 1).await;
+        assert!(camera.devices.lock().unwrap()[0].try_recv().is_ok());
+        assert_eq!(a.talkback.packets_dropped.load(Ordering::Relaxed), 0);
+
+        // b negotiates with the offer of now, which a holds.
+        let (mut b, task) = session_on(
+            "b",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk pcmu",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut b_task = pin!(task);
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert!(b.script.called("open with pcmu taking pcmu"));
+        assert!(b.script.called("open backchannel=true claim=Busy"));
+        assert_eq!(b.events().len(), 2, "the answer and the decline");
+
+        // a's re-offer that names PCMU alone cannot reach its session:
+        // declined, and a lets go.
+        a.control(reoffer("v=0 talk pcmu"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(
+            a.events(),
+            [
+                IpcEvent::Renegotiated {
+                    sdp: "answer to v=0 talk pcmu".into(),
+                    talkback: None,
+                },
+                IpcEvent::TalkbackDeclined {
+                    reason: "unsupported".into(),
+                    status: None,
+                    message: "talk-back declined: the script says no".into(),
+                },
+            ]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "renegotiated"));
+        // b's re-offer claims and opens the PCMU session.
+        b.control(reoffer("v=0 talk pcmu"));
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert!(b.script.called("renegotiate with pcmu taking pcmu"));
+        assert_eq!(
+            b.events(),
+            [IpcEvent::Renegotiated {
+                sdp: "answer to v=0 talk pcmu".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("b".into(), "claimed"));
+        assert_eq!(camera.devices.lock().unwrap().len(), 2, "b's opened");
+    }
+
+    /// A probe that replaces the offer between an offer's assessment and
+    /// its claim: the claim opens the backchannel the answer is
+    /// negotiated with, or none. Opus in place of the negotiated PCMU
+    /// declines the offer `refused`, nothing opened and nothing claimed,
+    /// so its answer goes out without talk-back rather than with PCMU an
+    /// Opus session would drop; PCMU found again is opened, and the
+    /// answer's PCMU reaches it.
+    #[tokio::test]
+    async fn a_claim_declines_a_backchannel_replaced_since_its_offer_was_assessed() {
+        let (arbiter, mut feed, camera, slot) = arbiter_with();
+        let opener: Arc<dyn lotse_core::source::BackchannelOpener> = camera.clone();
+        let offer = |codec: Codec| lotse_core::source::BackchannelOffer {
+            codec,
+            frame: lotse_core::source::BackchannelOffer::DEFAULT_FRAME,
+            opener: Arc::clone(&opener),
+        };
+        let stats = Arc::new(TalkbackStats::default());
+        let mut talkback = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::clone(&stats));
+        let output = ScriptedOutput::default();
+        let assessed = assess(&output, &talkback.claimant(), "v=0 talk pcmu");
+        assert!(assessed.claims);
+        assert_eq!(
+            target_name(assessed.arbitration.backchannel.as_ref()),
+            "pcmu taking pcmu"
+        );
+        // The probe again finds Opus before the claim.
+        let opus = Codec::Opus { channels: 2 };
+        *camera.codec.lock().unwrap() = Some(opus.clone());
+        slot.offer(offer(opus));
+        let declined = claim(
+            assessed.arbitration,
+            talkback.claimant(),
+            BACKCHANNEL_OPEN_LIMIT,
+        )
+        .await;
+        assert_eq!(declined.claim, TalkbackClaim::Busy);
+        assert_eq!(
+            declined.decline,
+            Some(Decline::Refused(BackchannelRefused {
+                status: None,
+                message: "the camera's backchannel changed to opus while the offer was negotiated"
+                    .into(),
+            }))
+        );
+        assert!(declined.granted.is_none() && !declined.claimed);
+        assert!(camera.devices.lock().unwrap().is_empty(), "nothing opened");
+        {
+            let next = feed.next();
+            let mut next = pin!(next);
+            assert!(poll_once(&mut next).await.is_pending(), "nothing claimed");
+        }
+
+        // It finds PCMU again, after the next offer's assessment: the same
+        // backchannel, opened.
+        *camera.codec.lock().unwrap() = None;
+        slot.offer(offer(Codec::Pcmu));
+        let assessed = assess(&output, &talkback.claimant(), "v=0 talk pcmu");
+        slot.offer(offer(Codec::Pcmu));
+        let mut granted = claim(
+            assessed.arbitration,
+            talkback.claimant(),
+            BACKCHANNEL_OPEN_LIMIT,
+        )
+        .await;
+        assert_eq!(
+            (granted.claim, granted.decline.is_none(), granted.claimed),
+            (TalkbackClaim::Granted, true, true)
+        );
+        talkback.adopt(granted.granted.take().unwrap());
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        talkback.receive(lotse_core::uplink::UplinkPacket {
+            codec: lotse_core::uplink::UplinkCodec::Pcmu,
+            packet: packet(SystemClock.now()),
+        });
+        until(&|| stats.packets_sent.load(Ordering::Relaxed) == 1).await;
+        assert!(camera.devices.lock().unwrap()[0].try_recv().is_ok());
+        assert_eq!(stats.packets_dropped.load(Ordering::Relaxed), 0);
     }
 
     /// A re-offer before the answer is refused; the manager hands one on

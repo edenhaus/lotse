@@ -33,9 +33,11 @@ use lotse_core::backoff::ReconnectBackoff;
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::registry::Registries;
-use lotse_core::runner::{ConnectGate, RunnerConfig, RunnerEvent, SourceRunner};
+use lotse_core::runner::{
+    ConnectGate, ProbeAsk, ProbeGate, RunnerConfig, RunnerEvent, SourceRunner,
+};
 use lotse_core::session::SessionLimits;
-use lotse_core::source::{BackchannelSlot, ResolvedPeer, TrackSet};
+use lotse_core::source::{BackchannelSlot, BackchannelTasks, ResolvedPeer, TrackSet};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
@@ -234,6 +236,7 @@ pub async fn serve(
     let (runner_tx, runner_rx) = mpsc::channel::<RunnerEvent>(64);
     let (standby_tx, standby_rx) = mpsc::channel::<RunnerEvent>(64);
     let (session_tx, mut session_rx) = mpsc::channel::<(String, SessionEvent)>(256);
+    let (probes, mut probe_asks) = ProbeGate::closed();
     let mut serving = Serving {
         tx,
         registries,
@@ -248,6 +251,8 @@ pub async fn serve(
         standby: None,
         sessions: None,
         lost_hand_offs: Throttle::default(),
+        probes,
+        backchannels: BackchannelTasks::default(),
     };
     let fds: Vec<BorrowedFd<'_>> = memory.iter().map(AsFd::as_fd).collect();
     serving
@@ -270,15 +275,7 @@ pub async fn serve(
                 None => return serving.on_supervisor_gone().await,
                 Some(decoded) => {
                     if let Some(reason) = serving.on_decoded(decoded).await? {
-                        // The last events of the sessions and the runner,
-                        // `Stopped` included, are still queued.
-                        while let Ok((session_id, event)) = session_rx.try_recv() {
-                            serving.tx.send_msg(&ToSupervisor::Session { session_id, event }, &[]).await?;
-                        }
-                        while let Ok(event) = serving.runner_rx.try_recv() {
-                            report(&mut serving.tx, event, None).await?;
-                        }
-                        return Ok(reason);
+                        return serving.flush(reason, &mut session_rx).await;
                     }
                 }
             },
@@ -290,6 +287,10 @@ pub async fn serve(
             }
             Some((session_id, event)) = session_rx.recv() => {
                 serving.tx.send_msg(&ToSupervisor::Session { session_id, event }, &[]).await?;
+            }
+            // `serving` holds the gate's sender, so the asks never end.
+            Some(ask) = probe_asks.recv() => {
+                serving.tx.send_msg(&probe_message(ask), &[]).await?;
             }
             Some(wake) = watch_running(&mut serving.running) => {
                 match wake {
@@ -341,9 +342,43 @@ struct Serving<'a> {
     /// The log line for hand-offs whose connection the kernel discarded,
     /// rate-limited: a flood of them must not flood the log.
     lost_hand_offs: Throttle,
+    /// Where the sources' probes of the device's backchannel wait for
+    /// the supervisor's connect permits: one gate for the worker, shared
+    /// by the running source and the standby.
+    probes: ProbeGate,
+    /// The tasks of the backchannel sessions the sources opened, which
+    /// the shutdown waits for ([`close_backchannels`]): one tracker for
+    /// the worker, shared by every source's slot.
+    backchannels: BackchannelTasks,
+}
+
+/// The message that passes a probe's `ask` on to the supervisor.
+const fn probe_message(ask: ProbeAsk) -> ToSupervisor {
+    match ask {
+        ProbeAsk::Connecting(probe) => ToSupervisor::ProbeConnecting { probe },
+        ProbeAsk::Ended(probe) => ToSupervisor::ProbeEnded { probe },
+    }
 }
 
 impl Serving<'_> {
+    /// The worker is done for `reason`: the last events of the sessions
+    /// and the runner, `Stopped` included, still queued, go out first.
+    async fn flush(
+        &mut self,
+        reason: ExitReason,
+        session_rx: &mut mpsc::Receiver<(String, SessionEvent)>,
+    ) -> Result<ExitReason, Error> {
+        while let Ok((session_id, event)) = session_rx.try_recv() {
+            self.tx
+                .send_msg(&ToSupervisor::Session { session_id, event }, &[])
+                .await?;
+        }
+        while let Ok(event) = self.runner_rx.try_recv() {
+            report(&mut self.tx, event, None).await?;
+        }
+        Ok(reason)
+    }
+
     /// One received message. A hand-off whose connection the kernel
     /// discarded, because this process had no free descriptor for it,
     /// costs that connection alone: the browser sees it close and tries
@@ -366,6 +401,20 @@ impl Serving<'_> {
         self.on_message(decoded.message, decoded.fds).await
     }
 
+    /// The supervisor's grant for the probe `probe`: lets it through, or
+    /// is discarded when that probe is over, its end on the way to the
+    /// supervisor as the grant came.
+    fn on_probe_granted(&self, probe: u64) {
+        if self.probes.grant(probe) {
+            tracing::debug!(probe, "backchannel probe granted its connect permit");
+        } else {
+            tracing::debug!(
+                probe,
+                "connect grant for a backchannel probe that is over; discarded"
+            );
+        }
+    }
+
     /// One control message; `Some` once the worker is done.
     async fn on_message(
         &mut self,
@@ -382,12 +431,15 @@ impl Serving<'_> {
                     &self.registries,
                     &self.clock,
                     self.settings,
+                    &self.probes,
+                    &self.backchannels,
                     self.runner_tx.clone(),
                 )?);
             }
             ToWorker::ConnectGranted => self.on_connect_granted(),
             ToWorker::SwitchSource(spec) => self.on_switch_source(&spec, false).await?,
             ToWorker::RestartSource(spec) => self.on_switch_source(&spec, true).await?,
+            ToWorker::ProbeConnectGranted { probe } => self.on_probe_granted(probe),
             ToWorker::SwitchConnectGranted => {
                 if let Some(standby) = &self.standby {
                     standby.runner.gate.grant();
@@ -510,6 +562,7 @@ impl Serving<'_> {
             Duration::from_millis(u64::from(deadline_ms)),
         )
         .await?;
+        close_backchannels(&self.backchannels, &self.clock).await;
         Ok(ExitReason::Shutdown)
     }
 
@@ -520,6 +573,7 @@ impl Serving<'_> {
         self.sessions.take();
         stop_standby(self.standby.take(), &self.clock).await;
         stop_source(self.running.take(), &self.clock, Duration::from_secs(1)).await?;
+        close_backchannels(&self.backchannels, &self.clock).await;
         Ok(ExitReason::SupervisorGone)
     }
 
@@ -550,6 +604,8 @@ impl Serving<'_> {
             &self.registries,
             &self.clock,
             self.settings,
+            &self.probes,
+            &self.backchannels,
             self.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -791,12 +847,19 @@ async fn refuse_renegotiation(
 }
 
 /// Validates `spec` against the registry and starts its runner on a new
-/// track set.
+/// track set, its probes waiting at `probes`, its backchannel sessions'
+/// tasks tracked in `backchannels`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "wires the source into the worker's shared parts, as start_runner does"
+)]
 fn start_source(
     spec: &SourceSpec,
     registries: &Registries,
     clock: &Arc<dyn Clock>,
     settings: &Settings,
+    probes: &ProbeGate,
+    backchannels: &BackchannelTasks,
     events: mpsc::Sender<RunnerEvent>,
 ) -> Result<Running, Error> {
     let native = TrackSet::new(settings.limits, clock.now());
@@ -805,6 +868,8 @@ fn start_source(
         registries,
         clock,
         settings,
+        probes,
+        backchannels,
         events,
         Arc::clone(&native),
         "source",
@@ -838,7 +903,9 @@ fn start_source(
 }
 
 /// Validates `spec` against the registry and starts its runner on
-/// `native`, reporting to `events`; `role` names it in the log.
+/// `native`, reporting to `events`, its probes waiting at `probes`, its
+/// backchannel sessions' tasks tracked in `backchannels`; `role` names it
+/// in the log.
 #[expect(
     clippy::too_many_arguments,
     reason = "wires one runner into the worker's shared parts; called from two places"
@@ -848,6 +915,8 @@ fn start_runner(
     registries: &Registries,
     clock: &Arc<dyn Clock>,
     settings: &Settings,
+    probes: &ProbeGate,
+    backchannels: &BackchannelTasks,
     events: mpsc::Sender<RunnerEvent>,
     native: Arc<TrackSet>,
     role: &'static str,
@@ -879,7 +948,7 @@ fn start_runner(
     let backchannel = factory
         .capabilities()
         .backchannel
-        .then(BackchannelSlot::default);
+        .then(|| BackchannelSlot::gated(probes.clone()).tracked(backchannels.clone()));
     let capable = backchannel.is_some();
     tracing::info!(
         connection = %spec.connection_id,
@@ -999,6 +1068,29 @@ async fn stop_source(
     }
     tracing::info!("source stopped");
     Ok(())
+}
+
+/// How long the shutdown waits, once the sessions closed and the sources
+/// stopped, for the backchannel sessions they opened to close on the
+/// device. A session's task ends within its source's teardown budget once
+/// its talker let go (RTSP: 100 ms for the answer to its `TEARDOWN`, RFC
+/// 2326 §10.7, RFC 7826 §13.4); this bounds one that does not.
+const BACKCHANNEL_CLOSE_GRACE: Duration = Duration::from_millis(500);
+
+/// Waits, at most [`BACKCHANNEL_CLOSE_GRACE`] on `clock`, for the tasks of
+/// the backchannel sessions in `tasks`, whose talkers all let go by now:
+/// each session's close then reached its device before the worker exits
+/// and its runtime drops whatever still runs.
+async fn close_backchannels(tasks: &BackchannelTasks, clock: &Arc<dyn Clock>) {
+    let open = tasks.running();
+    tokio::select! {
+        () = tasks.ended() => tracing::info!(open, "backchannel sessions closed"),
+        () = clock.sleep(BACKCHANNEL_CLOSE_GRACE) => tracing::warn!(
+            left = tasks.running(),
+            grace_ms = BACKCHANNEL_CLOSE_GRACE.as_millis(),
+            "backchannel sessions still closing after the grace; the worker exits without them"
+        ),
+    }
 }
 
 /// Forwards a runner event to the supervisor; `Live` also restarts derived
@@ -1239,6 +1331,9 @@ mod tests {
         rx: Receiver,
         clock: Arc<FakeClock>,
         worker: JoinHandle<Result<ExitReason, Error>>,
+        /// Backchannel probes wait for a connect permit that never comes,
+        /// as behind a busy `sources.connect_concurrency`.
+        hold_probes: bool,
     }
 
     fn start() -> Harness {
@@ -1277,6 +1372,7 @@ mod tests {
             rx,
             clock,
             worker,
+            hold_probes: false,
         }
     }
 
@@ -1284,7 +1380,8 @@ mod tests {
         /// The worker's next message; a worker that goes quiet for ten
         /// seconds of real time fails the test instead of hanging it.
         /// Grants every announced connection attempt at once, as the
-        /// supervisor does with a permit free.
+        /// supervisor does with a permit free; a probe's only unless
+        /// `hold_probes`.
         async fn next(&mut self) -> ToSupervisor {
             let message = tokio::select! {
                 message = self.rx.recv_msg::<ToSupervisor>() => message.unwrap().unwrap().0,
@@ -1309,6 +1406,14 @@ mod tests {
             ) {
                 self.tx
                     .send_msg(&ToWorker::SwitchConnectGranted, &[])
+                    .await
+                    .unwrap();
+            }
+            if let ToSupervisor::ProbeConnecting { probe } = message
+                && !self.hold_probes
+            {
+                self.tx
+                    .send_msg(&ToWorker::ProbeConnectGranted { probe }, &[])
                     .await
                     .unwrap();
             }
@@ -1751,7 +1856,12 @@ mod tests {
                 .await
                 .unwrap();
             until_live(&mut h).await;
-            let stats = stats_where(&mut h, &mut || {}, &|_| true).await;
+            // The probe asks for its permit once the source is live, and
+            // offers what it found once granted.
+            let stats = stats_where(&mut h, &mut || {}, &|stats| {
+                stats.backchannel.as_deref() == before
+            })
+            .await;
             assert_eq!(stats.backchannel.as_deref(), before, "{running}");
             // The standby offers PCMA; its keyframe a second after it went
             // live switches, and the counters follow its backchannel.
@@ -1777,6 +1887,89 @@ mod tests {
                 .unwrap();
             assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
         }
+    }
+
+    /// A viewing reconnect keeps the backchannel offered, and its probe
+    /// waits for a connect permit the supervisor does not grant (a busy
+    /// `sources.connect_concurrency`): an offer that asks for talk-back
+    /// meanwhile claims the kept backchannel and is answered at once,
+    /// with no time passing, rather than waiting for the probe and
+    /// leaving the open none of its limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_offer_during_a_reconnects_probe_claims_the_backchannel_kept_at_once() {
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::with_backchannel(&["fake"])))
+            .unwrap();
+        registries
+            .outputs
+            .register(Arc::new(EchoSessionFactory))
+            .unwrap();
+        let mut h = start_with_settings(Arc::new(registries), settings());
+        h.next().await;
+        let shared = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (_datagrams, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
+        h.tx.send_msg(
+            &ToWorker::Sockets,
+            &[OwnedFd::from(shared).as_fd(), theirs.as_fd()],
+        )
+        .await
+        .unwrap();
+        // Its video is silent: the watchdog reconnects it once live.
+        h.tx.send_msg(
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"backchannel": "pcmu"}"#)),
+            &[],
+        )
+        .await
+        .unwrap();
+        // The first probe is granted and offers PCMU before it ends, all
+        // with the fake clock standing still: moved meanwhile, it could
+        // stall the source first, whose one `Reconnecting` (the next
+        // attempts before a stable stream are `Connecting` after a
+        // backoff) the test would then miss.
+        messages_until_still(&mut h, |seen| {
+            seen.contains(&ToSupervisor::SourceState(SourceState::Live))
+                && seen
+                    .iter()
+                    .any(|m| matches!(m, ToSupervisor::ProbeEnded { .. }))
+        })
+        .await;
+        // The reconnect's probe asks and is never granted. The clock moves
+        // only until the stall reconnects: the reconnect goes live and its
+        // probe asks with no time passing, and a clock that moved on would
+        // stall it again before the offer came, which then waits for the
+        // tracks with the clock standing still.
+        h.hold_probes = true;
+        messages_until(&mut h, |seen| {
+            seen.iter()
+                .any(|m| matches!(source_state(m), Some(SourceState::Reconnecting { .. })))
+        })
+        .await;
+        messages_until_still(&mut h, |seen| {
+            seen.iter()
+                .any(|m| matches!(m, ToSupervisor::ProbeConnecting { .. }))
+        })
+        .await;
+        let talking = SessionSpec {
+            offer: "v=0 talk".into(),
+            ..session_spec("talk")
+        };
+        h.tx.send_msg(&ToWorker::OpenSession(talking), &[])
+            .await
+            .unwrap();
+        let seen = messages_until_still(&mut h, |seen| !answers(seen).is_empty()).await;
+        assert_eq!(
+            answers(&seen),
+            [&SessionEvent::Answer {
+                sdp: format!("{ECHO_ANSWER} backchannel=pcmu"),
+                talkback: Some("pcmu".to_owned()),
+            }]
+        );
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
     }
 
     /// Claim and hold through the worker: the first offer that asks for
@@ -3947,8 +4140,69 @@ mod tests {
             standby: None,
             sessions: None,
             lost_hand_offs: Throttle::default(),
+            probes: ProbeGate::default(),
+            backchannels: BackchannelTasks::default(),
         };
         (serving, ours.split().1)
+    }
+
+    /// The supervisor's probe grant lets through the probe it names; one
+    /// for a probe that is over, sent before that probe's end reached the
+    /// supervisor, is logged and discarded, and lets no other probe
+    /// through.
+    #[tokio::test]
+    async fn a_probe_grant_lets_its_probe_through_and_a_stale_one_is_discarded() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, _rx) = serving(&settings);
+        let (gate, mut asks) = ProbeGate::closed();
+        serving.probes = gate.clone();
+        let mut probe = Box::pin(gate.permit());
+        tokio::select! {
+            biased;
+            _permit = &mut probe => panic!("through without a grant"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Connecting(1)));
+        let stale = ToWorker::ProbeConnectGranted { probe: 7 };
+        assert!(
+            serving
+                .on_message(stale, Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "connect grant for a backchannel probe that is over; discarded"
+            ),
+            1
+        );
+        tokio::select! {
+            biased;
+            _permit = &mut probe => panic!("through on another probe's grant"),
+            () = std::future::ready(()) => {}
+        }
+        let granted = ToWorker::ProbeConnectGranted { probe: 1 };
+        assert!(
+            serving
+                .on_message(granted, Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let permit = tokio::select! {
+            biased;
+            permit = &mut probe => permit,
+            () = std::future::ready(()) => panic!("not through on its grant"),
+        };
+        drop(permit);
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Ended(1)));
+        assert_eq!(
+            logs.count(Level::DEBUG, "backchannel probe granted its connect permit"),
+            1
+        );
     }
 
     /// The tracks switching with no standby to take them, or no source
@@ -3970,6 +4224,8 @@ mod tests {
             &serving.registries,
             &serving.clock,
             &settings,
+            &serving.probes,
+            &serving.backchannels,
             serving.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -4203,6 +4459,114 @@ mod tests {
             (source.describe().protocol, source.connection_options()),
             ("stubborn", serde_json::Value::Null)
         );
+    }
+
+    /// The shutdown, and the supervisor going away, wait for the tasks of
+    /// the backchannel sessions the sources opened to end, each session
+    /// closed on its device by then (RFC 2326 §10.7), instead of the
+    /// runtime dropping them halfway once the worker returns.
+    #[tokio::test]
+    async fn rfc2326_10_7_the_shutdown_waits_for_the_backchannel_sessions_to_close() {
+        for gone in [false, true] {
+            let (logs, _guard) = Logs::capture();
+            let settings = settings();
+            let (mut serving, _rx) = serving(&settings);
+            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&closed);
+            let close = CancellationToken::new();
+            let _session = serving
+                .backchannels
+                .spawn("test.backchannel", &close, async move {
+                    for _ in 0..10 {
+                        tokio::task::yield_now().await;
+                    }
+                    flag.store(true, Ordering::Relaxed);
+                });
+            let reason = if gone {
+                serving.on_supervisor_gone().await
+            } else {
+                serving.on_shutdown(1_000).await
+            };
+            assert!(reason.is_ok(), "{reason:?}");
+            assert!(closed.load(Ordering::Relaxed), "gone: {gone}");
+            assert_eq!(
+                logs.lines(Level::INFO, "backchannel sessions closed")[0].fields,
+                " open=1",
+                "gone: {gone}"
+            );
+        }
+    }
+
+    /// A backchannel session whose task does not end within the grace is
+    /// left behind with a warning: the shutdown goes on.
+    #[tokio::test]
+    async fn a_backchannel_session_still_closing_after_the_grace_is_left_with_a_warning() {
+        let (logs, _guard) = Logs::capture();
+        let fake = Arc::new(FakeClock::default());
+        let clock: Arc<dyn Clock> = fake.clone();
+        let tasks = BackchannelTasks::default();
+        let _stuck = tasks.spawn(
+            "test.stuck",
+            &CancellationToken::new(),
+            std::future::pending(),
+        );
+        let closing = spawn_named("test.close", async move {
+            close_backchannels(&tasks, &clock).await;
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        fake.advance(
+            BACKCHANNEL_CLOSE_GRACE
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+        );
+        tokio::task::yield_now().await;
+        assert!(!closing.is_finished(), "waits for the grace");
+        fake.advance(Duration::from_millis(1));
+        closing.await.unwrap();
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "backchannel sessions still closing after the grace; the worker exits without them"
+            )[0]
+            .fields,
+            " left=1 grace_ms=500"
+        );
+    }
+
+    /// Every runner's backchannel slot tracks its sessions' tasks in the
+    /// worker's tracker, the one the shutdown waits for.
+    #[tokio::test]
+    async fn a_runners_backchannel_sessions_are_tracked_by_the_worker() {
+        let settings = settings();
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::with_backchannel(&["fake"])))
+            .unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::default());
+        let tasks = BackchannelTasks::default();
+        let runner = start_runner(
+            &spec("fake://cam/", "null"),
+            &registries,
+            &clock,
+            &settings,
+            &ProbeGate::default(),
+            &tasks,
+            mpsc::channel(1).0,
+            TrackSet::new(TrackLimits::default(), clock.now()),
+            "source",
+        )
+        .unwrap();
+        let slot = runner.backchannel.clone().unwrap();
+        let _session = slot.tasks().spawn(
+            "test.session",
+            &CancellationToken::new(),
+            std::future::pending(),
+        );
+        assert_eq!(tasks.running(), 1);
+        stop_runner(runner, &clock).await;
     }
 
     #[test]

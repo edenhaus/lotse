@@ -15,7 +15,9 @@
 //! the RTSP source against the fake camera, whose ONVIF backchannel
 //! (ONVIF Streaming Specification §5.3) records what arrives: the tone,
 //! its `a=ptime` framing, a reconnect under a talker, and the downlink's
-//! A/V sync while talking.
+//! A/V sync while talking; one goes through the control API to a real
+//! worker process running the RTSP source, whose backchannel session is
+//! torn down before the process exits at the daemon's shutdown.
 //! Needs the `source-fake` feature (on with `--all-features`) and
 //! `output-webrtc` (a default); the RTSP tests `source-rtsp` (a default)
 //! too.
@@ -68,7 +70,8 @@ use lotse_supervisor::worker::WorkerConfig;
 use lotse_supervisor::{Environment, FrontDoor, Identity, Limits, Settings, Supervisor};
 #[cfg(feature = "source-rtsp")]
 use lotse_testing::fake_camera::{
-    BackchannelCodec, BackchannelRtp, CameraAudio, CameraBackchannel, Stats,
+    BackchannelCodec, BackchannelRtp, BackchannelSetup, CameraAudio, CameraBackchannel,
+    ConnectionLog, Stats,
 };
 #[cfg(feature = "source-rtsp")]
 use lotse_testing::viewer::capture_seconds;
@@ -629,6 +632,12 @@ impl InProcess {
                             .await
                             .unwrap();
                     }
+                    ToSupervisor::ProbeConnecting { probe } => {
+                        self.tx
+                            .send_msg(&ToWorker::ProbeConnectGranted { probe }, &[])
+                            .await
+                            .unwrap();
+                    }
                     ToSupervisor::SourceState(SourceState::Live) => self.live = true,
                     ToSupervisor::Talker(change) => self.talkers.push(change),
                     ToSupervisor::Session { session_id, event } => {
@@ -664,6 +673,31 @@ impl InProcess {
             }
             clock().sleep(Duration::from_millis(1)).await;
         }
+    }
+
+    /// Closes session `id`, as the supervisor does for its client.
+    #[cfg(feature = "source-rtsp")]
+    async fn close(&mut self, id: &str) {
+        self.tx
+            .send_msg(
+                &ToWorker::CloseSession {
+                    session_id: id.into(),
+                    code: "session_closed".into(),
+                    message: "bye".into(),
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Frees the backchannel from its talker (`backchannel/release`).
+    #[cfg(feature = "source-rtsp")]
+    async fn release(&mut self) {
+        self.tx
+            .send_msg(&ToWorker::ReleaseBackchannel { session_id: None }, &[])
+            .await
+            .unwrap();
     }
 
     async fn stop(mut self) {
@@ -1050,6 +1084,7 @@ async fn rtsp_camera(
             ptime: Some(ptime),
             ..CameraBackchannel::new(codec)
         }),
+        keep_open_on_teardown: true,
         ..CameraConfig::default()
     };
     FakeCamera::start(config, clock())
@@ -1149,9 +1184,21 @@ async fn onvif_5_3_a_re_offer_adds_talk_back_whose_tone_reaches_the_camera() {
             matches!(event, SessionEvent::Renegotiated { talkback: Some(codec), .. } if codec == "pcmu")
         })
     };
+    // ONVIF Streaming Specification §5.3: the answer waits for the
+    // backchannel session's `PLAY`, on a connection of its own.
     worker
-        .pump(&mut [&mut peer], |w, _| renegotiated(&w.events))
+        .pump(&mut [&mut peer], |w, _| {
+            let answered = renegotiated(&w.events);
+            assert!(
+                !answered || backchannel_session(&camera).is_some_and(|log| log.played),
+                "answered before the backchannel session played"
+            );
+            answered
+        })
         .await;
+    let log = backchannel_session(&camera).unwrap();
+    assert_eq!(log.describes, [true]);
+    assert_eq!(log.setups, ["backchannel"]);
     assert_eq!(peer.pt, Some(0), "the camera's PCMU");
     assert_eq!(
         peer.viewer.talkback_direction(),
@@ -1188,6 +1235,11 @@ async fn onvif_5_3_a_re_offer_adds_talk_back_whose_tone_reaches_the_camera() {
         .map(|change| (change.session_id.as_str(), change.reason.as_str()))
         .collect();
     assert_eq!(changes, [("0", "claimed"), ("0", "renegotiated")]);
+    // The release tore the session down with `Require` and closed its
+    // connection.
+    let log = backchannel_session(&camera).unwrap();
+    assert_eq!(log.teardown, Some(true));
+    assert!(log.closed_by_client, "{log:?}");
     worker.stop().await;
     camera.stop().await;
 }
@@ -1221,59 +1273,74 @@ async fn rfc8866_6_4_a_cameras_ptime_of_40_ms_frames_the_tone_in_40_ms_packets()
     camera.stop().await;
 }
 
-/// A reconnect under a talker: the camera drops the connection, the
-/// source withdraws the handle and offers it again after the new `SETUP`,
-/// and the talker keeps the channel (one claim, never released, nothing
-/// declined); the camera takes a fresh RTP stream (RFC 3550
-/// §5.1, §8.1: another SSRC), whose first packet starts a talkspurt
-/// (RFC 3551 §4.1).
+/// The connection log of `camera`'s last backchannel session, if any.
+#[cfg(feature = "source-rtsp")]
+fn backchannel_session(camera: &FakeCamera) -> Option<ConnectionLog> {
+    camera
+        .stats()
+        .connection_log()
+        .into_iter()
+        .rev()
+        .find(ConnectionLog::backchannel_only)
+}
+
+/// The talker changes of `worker` so far, as `(session, reason)`.
+#[cfg(feature = "source-rtsp")]
+fn changes(worker: &InProcess) -> Vec<(String, String)> {
+    worker
+        .talkers
+        .iter()
+        .map(|change| (change.session_id.clone(), change.reason.clone()))
+        .collect()
+}
+
+/// A viewing reconnect under a talker: the camera drops the viewing
+/// session's connection, the source reconnects and probes again, and the
+/// talker's backchannel session, a connection of its own, carries on: one
+/// RTP stream (RFC 3550 §5.1), one claim, nothing declined.
 #[cfg(feature = "source-rtsp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc3550_8_1_a_reconnect_offers_the_backchannel_again_and_the_talker_keeps_it() {
+async fn onvif_5_3_a_viewing_reconnect_leaves_the_talkers_backchannel_session_alone() {
     let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
     let mut worker = InProcess::rtsp(&camera).await;
     let mut peer = talking(&mut worker, false, Mic::pcmu()).await;
     let before = camera_frames(&mut worker, &mut peer, &camera, 25)
         .await
         .len();
-    camera.drop_connections();
+    camera.hang_up_where(|log| !log.backchannel_only());
     worker
         .pump(&mut [&mut peer], |_, _| {
-            let stats = camera.stats();
-            Stats::get(&stats.backchannel_setups) == 2
-                && Stats::get(&stats.backchannel_packets) >= before as u64 + 25
+            let log = camera.stats().connection_log();
+            // The viewing session's again, and the probe's again.
+            log.iter()
+                .filter(|log| log.setups.contains(&"track0".to_owned()))
+                .count()
+                == 2
+                && log
+                    .iter()
+                    .filter(|log| log.describes == [true] && log.setups.is_empty())
+                    .count()
+                    == 2
+                && Stats::get(&camera.stats().backchannel_packets) >= before as u64 + 25
         })
         .await;
     let _mic = peer.mute();
     let recorded = camera.stats().backchannel();
-    let split = recorded
-        .iter()
-        .position(|packet| packet.ssrc != recorded[0].ssrc)
-        .expect("a second RTP stream");
-    let (old, new) = recorded.split_at(split);
     assert!(
-        new.iter().all(|packet| packet.ssrc == new[0].ssrc),
-        "one stream per SETUP"
+        recorded
+            .iter()
+            .all(|packet| packet.ssrc == recorded[0].ssrc),
+        "one RTP stream"
     );
-    for stream in [old, new] {
-        assert!(stream[0].marker, "a stream starts a talkspurt");
-        for pair in stream.windows(2) {
-            assert_eq!(
-                pair[1].sequence_number,
-                pair[0].sequence_number.wrapping_add(1)
-            );
-        }
+    for pair in recorded.windows(2) {
+        assert_eq!(
+            pair[1].sequence_number,
+            pair[0].sequence_number.wrapping_add(1)
+        );
     }
-    let changes: Vec<(&str, &str)> = worker
-        .talkers
-        .iter()
-        .map(|change| (change.session_id.as_str(), change.reason.as_str()))
-        .collect();
-    assert_eq!(
-        changes,
-        [("0", "claimed")],
-        "the claim outlives the reconnect"
-    );
+    assert_eq!(Stats::get(&camera.stats().backchannel_setups), 1);
+    assert!(!backchannel_session(&camera).unwrap().closed);
+    assert_eq!(changes(&worker), [("0".into(), "claimed".into())]);
     assert!(
         !worker
             .events
@@ -1282,8 +1349,202 @@ async fn rfc3550_8_1_a_reconnect_offers_the_backchannel_again_and_the_talker_kee
         "{:?}",
         worker.events
     );
-    assert_eq!(Stats::get(&camera.stats().connections), 2);
     worker.stop().await;
+    camera.stop().await;
+}
+
+/// RFC 2326 §11.3.3: the camera refuses the backchannel session with
+/// `453` (another app holds its one backchannel): the answer declines
+/// talk-back, the session gets one `refused` warning with the status, and
+/// the claim is not kept; once the camera's backchannel is free, the
+/// user's next re-offer claims it and its tone reaches the camera.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_11_3_3_a_refused_backchannel_session_declines_and_the_next_re_offer_claims() {
+    let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
+    camera.set_backchannel_setup(BackchannelSetup::Refuse(453));
+    let mut worker = InProcess::rtsp(&camera).await;
+    let mut peer = Peer::new_silent().await;
+    worker.open("0", &peer.offer).await;
+    worker
+        .pump(&mut [&mut peer], |_, peers| peers[0].viewer.is_connected())
+        .await;
+    let reoffer = peer
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    worker.renegotiate("0", &reoffer).await;
+    let declined = |w: &InProcess| {
+        w.events.iter().any(|(_, event)| {
+            matches!(event, SessionEvent::TalkbackDeclined { reason, status: Some(453), .. } if reason == "refused")
+        })
+    };
+    worker.pump(&mut [&mut peer], |w, _| declined(w)).await;
+    assert!(
+        worker
+            .events
+            .iter()
+            .any(|(_, event)| matches!(event, SessionEvent::Renegotiated { talkback: None, .. }))
+    );
+    assert_eq!(
+        peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::Inactive),
+        "declined per RFC 3264 §6.1, not port 0"
+    );
+    assert_eq!(
+        changes(&worker),
+        [
+            ("0".into(), "claimed".into()),
+            ("0".into(), "refused".into())
+        ]
+    );
+    // The camera's backchannel is free again: the next press claims it.
+    camera.set_backchannel_setup(BackchannelSetup::Accept);
+    let reoffer = peer
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let answered = worker.events.len();
+    worker.renegotiate("0", &reoffer).await;
+    worker
+        .pump(&mut [&mut peer], |w, _| {
+            w.events[answered..].iter().any(|(_, event)| {
+                matches!(
+                    event,
+                    SessionEvent::Renegotiated {
+                        talkback: Some(_),
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    peer.talk(Mic::pcmu());
+    let frames = camera_frames(&mut worker, &mut peer, &camera, 10).await;
+    assert!(frames.len() >= 10);
+    assert_eq!(changes(&worker).len(), 3, "claimed again");
+    worker.stop().await;
+    camera.stop().await;
+}
+
+/// The backchannel session's connection drops while the viewer talks:
+/// the claim is released (`talker_changed` `refused`) and the session gets
+/// one `refused` warning; what it sends meanwhile is dropped, and its
+/// m-line stays as answered.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_a_lost_backchannel_connection_releases_the_talker_with_one_warning() {
+    let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
+    let mut worker = InProcess::rtsp(&camera).await;
+    let mut peer = talking(&mut worker, false, Mic::pcmu()).await;
+    camera_frames(&mut worker, &mut peer, &camera, 10).await;
+    camera.hang_up_backchannel();
+    let warned = |w: &InProcess| {
+        w.events
+            .iter()
+            .filter(|(_, event)| {
+                matches!(event, SessionEvent::TalkbackDeclined { reason, .. } if reason == "refused")
+            })
+            .count()
+    };
+    worker.pump(&mut [&mut peer], |w, _| warned(w) == 1).await;
+    let quiet = clock().now() + Duration::from_millis(300);
+    worker
+        .pump(&mut [&mut peer], |_, _| clock().now() >= quiet)
+        .await;
+    assert_eq!(warned(&worker), 1, "once");
+    assert_eq!(
+        changes(&worker),
+        [
+            ("0".into(), "claimed".into()),
+            ("0".into(), "refused".into())
+        ]
+    );
+    assert_eq!(
+        Stats::get(&camera.stats().backchannel_setups),
+        1,
+        "nothing opened again"
+    );
+    worker.stop().await;
+    camera.stop().await;
+}
+
+/// The release closes the backchannel session, whatever releases it: the
+/// talker's session closing, `backchannel/release`, and the stream's
+/// deletion, which stops the worker. Each time the camera sees its
+/// `TEARDOWN` with `Require`, and the connection is closed.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_every_release_tears_the_backchannel_session_down_and_closes_it() {
+    for release in ["session_closed", "released", "stream_deleted"] {
+        let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
+        let mut worker = InProcess::rtsp(&camera).await;
+        let mut peer = talking(&mut worker, false, Mic::pcmu()).await;
+        camera_frames(&mut worker, &mut peer, &camera, 5).await;
+        match release {
+            "session_closed" => worker.close("0").await,
+            "released" => worker.release().await,
+            _ => {}
+        }
+        let running = if release == "stream_deleted" {
+            worker.stop().await;
+            None
+        } else {
+            let reason = release;
+            worker
+                .pump(&mut [&mut peer], |w, _| {
+                    w.talkers.iter().any(|change| change.reason == reason)
+                })
+                .await;
+            Some(worker)
+        };
+        let deadline = clock().now() + Duration::from_secs(5);
+        while !backchannel_session(&camera).unwrap().closed {
+            assert!(clock().now() < deadline, "{release}: never closed");
+            clock().sleep(Duration::from_millis(5)).await;
+        }
+        let log = backchannel_session(&camera).unwrap();
+        assert_eq!(log.teardown, Some(true), "{release}: TEARDOWN with Require");
+        assert!(log.closed_by_client, "{release}: {log:?}");
+        if let Some(worker) = running {
+            worker.stop().await;
+        }
+        camera.stop().await;
+    }
+}
+
+/// The daemon stops while a viewer holds the camera's backchannel, through
+/// a real `lotse worker` process: before the process exits, its
+/// backchannel session is torn down (RFC 2326 §10.7), the camera sees the
+/// `TEARDOWN` with `Require` (ONVIF Streaming Specification §5.3), and the
+/// connection is closed; the worker's runtime does not drop the session's
+/// task halfway at its exit.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_7_a_worker_process_tears_the_backchannel_session_down_before_it_exits() {
+    let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
+    let mut api = Api::start_with(
+        Arc::new(lotse_rtsp::RtspFactory::default()),
+        &camera.url(),
+        &json!({ "backchannel": true }),
+    )
+    .await;
+    let mut a = ApiPeer::offer(&api, "a").await;
+    pump(&mut api, &mut [&mut a], |_, _| {
+        backchannel_session(&camera).is_some_and(|log| log.played)
+    })
+    .await;
+    api.stop().await;
+    // The worker is gone: what it sent before its exit is all the camera
+    // reads before the connection's end.
+    let deadline = clock().now() + Duration::from_secs(5);
+    while !backchannel_session(&camera).unwrap().closed {
+        assert!(clock().now() < deadline, "never closed");
+        clock().sleep(Duration::from_millis(5)).await;
+    }
+    let log = backchannel_session(&camera).unwrap();
+    assert_eq!(log.teardown, Some(true), "TEARDOWN with Require: {log:?}");
+    assert!(log.closed_by_client, "{log:?}");
     camera.stop().await;
 }
 
@@ -1344,6 +1605,14 @@ struct Api {
 
 impl Api {
     async fn start(options: &Value) -> Self {
+        let factory = Arc::new(FakeSourceFactory::with_backchannel(&["fake"]));
+        Self::start_with(factory, "fake://127.0.0.1/", options).await
+    }
+
+    /// The supervisor and its demux, with stream `door` on `url` and
+    /// `options`, its scheme validated by `factory` (the worker process
+    /// registers the binary's own).
+    async fn start_with(factory: Arc<dyn SourceFactory>, url: &str, options: &Value) -> Self {
         let bound = bind_udp("127.0.0.1:0".parse().unwrap()).expect("the shared socket");
         let demux = Demux::start(
             Arc::clone(&bound.socket),
@@ -1377,10 +1646,7 @@ impl Api {
             .outputs
             .register(Arc::new(lotse_webrtc::WebRtcFactory))
             .unwrap();
-        registries
-            .sources
-            .register(Arc::new(FakeSourceFactory::with_backchannel(&["fake"])))
-            .unwrap();
+        registries.sources.register(factory).unwrap();
         registries.uplink = Some(Arc::new(ToG711Factory::new(clock())));
         let environment = Environment {
             registries,
@@ -1437,7 +1703,7 @@ impl Api {
             call(
                 &supervisor,
                 &json!({ "id": 2, "type": "stream/put", "stream_id": "door",
-                         "sources": [{ "url": "fake://127.0.0.1/", "options": options }] }),
+                         "sources": [{ "url": url, "options": options }] }),
             )
             .await,
         );

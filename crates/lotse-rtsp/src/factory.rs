@@ -9,6 +9,7 @@ use lotse_core::source_url::SourceUrl;
 use lotse_tls::{TlsTarget, Trust};
 
 use crate::options::{RtspOptions, Transport};
+use crate::relay::Listener;
 use crate::source::RtspSource;
 
 /// The protocol name reported for every scheme of this factory.
@@ -25,25 +26,26 @@ pub const DEFAULT_TLS_PORT: u16 = 322;
 /// Whether the RTSP source can send on the camera's ONVIF backchannel, as
 /// [`SourceFactory::capabilities`] declares it: the worker offers talk-back
 /// on this protocol's streams, and the daemon announces `two_way_audio`,
-/// only when it is `true`. It is: the source requests, sets up, offers and
-/// drains the backchannel ([`crate::backchannel::session`]) through
-/// retina's send path.
+/// only when it is `true`. It is: the source probes the backchannel and
+/// offers it, and a talker's claim opens it in a session of its own whose
+/// packets go out through retina's send path ([`crate::backchannel`]).
 pub const BACKCHANNEL: bool = true;
 
 /// The factory, with the loopback listener a sandboxed worker bound for
-/// the `rtsps` relay before its sandbox, if any.
+/// the relay before its sandbox, if any.
 #[derive(Debug, Default)]
 pub struct RtspFactory {
-    /// The pre-bound relay listener; `None` binds one per attempt.
-    relay: Option<Arc<TcpListener>>,
+    /// Where the relays of its sources' connections listen: the pre-bound
+    /// listener, or one bound per connection.
+    relay: Listener,
 }
 
 impl RtspFactory {
-    /// A factory whose `rtsps` sources relay through `relay` when given
+    /// A factory whose sources relay through `relay` when given
     /// ([`SourceFactory::loopback_relay`]).
     pub fn new(relay: Option<TcpListener>) -> Self {
         Self {
-            relay: relay.map(Arc::new),
+            relay: Listener::new(relay.map(Arc::new)),
         }
     }
 }

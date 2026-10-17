@@ -52,6 +52,14 @@ pub enum ToWorker {
     RestartSource(SourceSpec),
     /// The grant for the standby's last announced attempt.
     SwitchConnectGranted,
+    /// The grant for the probe the worker announced (`ProbeConnecting`):
+    /// it may connect now, under a `sources.connect_concurrency` permit
+    /// the supervisor holds until its `ProbeEnded`. A worker whose probe
+    /// with that id is over discards it.
+    ProbeConnectGranted {
+        /// The id of the probe, as its `ProbeConnecting` named it.
+        probe: u64,
+    },
     /// Open a viewer session on this connection's tracks.
     OpenSession(SessionSpec),
     /// A trickle candidate from the browser; empty means end of candidates.
@@ -327,16 +335,31 @@ pub enum ToSupervisor {
     },
     /// The talker of the connection's backchannel changed.
     Talker(TalkerChange),
+    /// A source of the worker probes the device's backchannel on a
+    /// connection of its own and waits for a connect permit, as an
+    /// attempt does; the `ProbeConnectGranted` naming it lets it go. The
+    /// worker runs one probe at a time: its `ProbeEnded` comes before the
+    /// next one's `ProbeConnecting`.
+    ProbeConnecting {
+        /// The probe's id, unique within the worker.
+        probe: u64,
+    },
+    /// The probe is over: its permit, or its wait for one, ends.
+    ProbeEnded {
+        /// The probe's id, as its `ProbeConnecting` named it.
+        probe: u64,
+    },
 }
 
 /// A change of the connection's talker: the session it concerns, the new
 /// talker after `claimed`, the one that let go after `session_closed`,
-/// `released` or `renegotiated`, when the channel is free.
+/// `released`, `renegotiated` or `refused`, when the channel is free.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TalkerChange {
     /// The session.
     pub session_id: String,
-    /// `claimed`, `session_closed`, `released` or `renegotiated`.
+    /// `claimed`, `session_closed`, `released`, `renegotiated` or
+    /// `refused`.
     pub reason: String,
     /// When, in milliseconds since the Unix epoch.
     pub at_ms: u64,
@@ -596,6 +619,7 @@ mod tests {
         for message in [
             ToWorker::Shutdown { deadline_ms: 2_000 },
             ToWorker::ConnectGranted,
+            ToWorker::ProbeConnectGranted { probe: 7 },
             ToWorker::RelayCandidate {
                 session_id: "s1".into(),
                 relayed: "203.0.113.1:49153".parse().unwrap(),
@@ -641,6 +665,8 @@ mod tests {
                 reason: "claimed".into(),
                 at_ms: 1_791_280_800_000,
             }),
+            ToSupervisor::ProbeConnecting { probe: 7 },
+            ToSupervisor::ProbeEnded { probe: 7 },
             ToSupervisor::Session {
                 session_id: "s1".into(),
                 event: SessionEvent::Answer {

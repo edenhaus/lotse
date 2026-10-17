@@ -114,10 +114,14 @@ pub struct RtspOptions {
     /// `tcp` (default) or `udp`.
     pub transport: Transport,
     /// Ask the camera for its ONVIF backchannel, two-way audio's path to
-    /// its speaker: the `DESCRIBE` carries `Require:
-    /// www.onvif.org/ver20/backchannel` (ONVIF Streaming Specification
-    /// §5.3.1) and the backchannel is set up when offered. Off by default:
-    /// the client knows which cameras talk back and opts a stream in, so a
+    /// its speaker. Once the stream's session plays, a `DESCRIBE` with
+    /// `Require: www.onvif.org/ver20/backchannel` (ONVIF Streaming
+    /// Specification §5.3.1) on a connection of its own asks whether the
+    /// camera has one, on every connect; a talker's claim opens it in a
+    /// session of its own and its release closes it, so the camera's
+    /// backchannel is free whenever nobody talks, and the session that
+    /// plays the stream never carries the header. Off by default: the
+    /// client knows which cameras talk back and opts a stream in, so a
     /// camera without one never sees the header. Not part of the
     /// connection key ([`Self::connection_key`]): the connection a stream
     /// shares asks iff one of its streams does, an opt-in restarts a

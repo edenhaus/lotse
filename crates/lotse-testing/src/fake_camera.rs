@@ -27,12 +27,25 @@
 //! www.onvif.org/ver20/backchannel` (RFC 2326 §12.32): a PCMU, PCMA (RFC
 //! 3551 §4.5.14) or Opus (RFC 7587 §7) `a=sendonly` media with a chosen
 //! payload type and `a=ptime` (RFC 8866 §6.4, §6.6), set up interleaved on
-//! its own channel pair in the same session, whose RTP after `PLAY` it
+//! its own channel pair, in the session that plays the stream or in a
+//! session of its own on another connection beside it (RFC 2326 §10.4:
+//! the client chooses which media it sets up), whose RTP after `PLAY` it
 //! parses (RFC 3550 §5.1) and records ([`Stats::backchannel`]), RTCP on the
-//! odd channel counted. Other modes: the `Require` tag refused with `551`
-//! (RFC 2326 §11.3.13, ONVIF Streaming Specification §5.3.2), only the
-//! offered payload type taken (§5.3.2), and the backchannel's `SETUP`
-//! refused with `453` (RFC 2326 §11.3.3) or hung up on.
+//! odd channel counted. Every connection is logged
+//! ([`Stats::connection_log`]): its `DESCRIBE`s and whether they asked for
+//! the backchannel, its `SETUP`s, its `PLAY`, its `TEARDOWN` and whether
+//! that carried `Require`, the backchannel RTP it took, and its close.
+//! Other modes: the `Require` tag refused with `551` (RFC 2326 §11.3.13,
+//! ONVIF Streaming Specification §5.3.2) or never answered, only the
+//! offered payload type taken (§5.3.2), and the backchannel's `SETUP` or
+//! `PLAY` refused with a given status (RFC 2326 §11.3.3's `453`, say),
+//! hung up on or never answered, its `TEARDOWN` left unanswered, or the
+//! backchannel missing from a `DESCRIBE`'s answer, each one switchable
+//! while the camera runs ([`FakeCamera::set_backchannel_setup`]); one
+//! backchannel only, a `SETUP` of it refused `453` while another session
+//! holds it ([`CameraBackchannel::single`]); and the connections of the
+//! backchannel's sessions hung up on alone
+//! ([`FakeCamera::hang_up_backchannel`]).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -328,27 +341,56 @@ pub enum RequireAnswer {
     /// §11.3.13, §12.40), as ONVIF Streaming Specification §5.3.2 has a
     /// server without the backchannel answer.
     OptionNotSupported,
+    /// Refused with this status, as a camera failing for another reason.
+    Status(u16),
+    /// Never answered, the connection kept open and nothing on it
+    /// answered after: a client's deadline ends the wait.
+    Silent,
 }
 
-/// How the camera answers the `SETUP` of its backchannel.
+/// How the camera answers the requests of its backchannel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BackchannelSetup {
-    /// Set up, TCP interleaved.
+    /// Set up, TCP interleaved, and played.
     #[default]
     Accept,
-    /// `453 Not Enough Bandwidth` (RFC 2326 §11.3.3), as a camera whose one
-    /// backchannel another client holds may answer; the media streams
-    /// play on.
-    Busy,
-    /// No answer: the camera closes the connection.
+    /// Its `SETUP` refused with this status: `453 Not Enough Bandwidth`
+    /// (RFC 2326 §11.3.3), say, as a camera whose one backchannel another
+    /// client holds may answer.
+    Refuse(u16),
+    /// The `PLAY` of a session whose only stream is the backchannel
+    /// refused with this status.
+    RefusePlay(u16),
+    /// A `DESCRIBE` with `Require` answered without the backchannel media.
+    NoMedia,
+    /// A `DESCRIBE` with `Require` refused with this status.
+    RefuseDescribe(u16),
+    /// No answer to its `SETUP`: the camera closes the connection.
     HangUp,
+    /// No answer to its `SETUP`, the connection kept open: a client's
+    /// deadline ends the wait.
+    Silent,
+    /// The `PLAY` of a session whose only stream is the backchannel
+    /// answered, then bytes that are no RTSP.
+    Unreadable,
+    /// Set up and played as [`Self::Accept`], then the connection is read
+    /// no more, as a camera that stopped taking data: what the client
+    /// sends piles up in the TCP buffers until its writes wait.
+    Deaf,
+    /// Set up and played as [`Self::Accept`]; its `TEARDOWN` goes
+    /// unanswered, and a camera with one backchannel
+    /// ([`CameraBackchannel::single`]) holds it until the connection
+    /// closes, as one slow to leave two-way mode: a client's deadline for
+    /// the answer ends the wait.
+    Lingering,
 }
 
 /// The ONVIF backchannel the camera offers (ONVIF Streaming Specification
 /// §5.3): with `Require: www.onvif.org/ver20/backchannel` on `DESCRIBE`,
 /// an `a=sendonly` audio media after the others, set up TCP interleaved on
-/// its own channel pair in the same session; a `SETUP` of it over UDP gets
-/// `461`, as lotse sets it up interleaved only.
+/// its own channel pair, in the session of the media streams or alone in a
+/// session of its own; a `SETUP` of it over UDP gets `461`, as lotse sets
+/// it up interleaved only.
 /// After `PLAY` the RTP that arrives on its channel is recorded
 /// ([`Stats::backchannel`]) and RTCP on the next channel counted.
 #[derive(Debug, Clone, Default)]
@@ -370,6 +412,12 @@ pub struct CameraBackchannel {
     pub accept_only: Option<u8>,
     /// How its `SETUP` is answered.
     pub setup: BackchannelSetup,
+    /// The camera has one backchannel: a `SETUP` of it while another
+    /// session holds it is refused `453 Not Enough Bandwidth` (RFC 2326
+    /// §11.3.3) and counted ([`Stats::backchannel_busy`]). A session holds
+    /// it from its `SETUP`, answered or not, until its `TEARDOWN` is
+    /// answered or its connection closes.
+    pub single: bool,
 }
 
 impl CameraBackchannel {
@@ -425,12 +473,14 @@ pub struct BackchannelRtp {
     pub payload: Vec<u8>,
     /// When the camera read it, on the camera's clock.
     pub arrival: Instant,
+    /// The connection it came on, numbered from 0 in accept order.
+    pub connection: usize,
 }
 
 impl BackchannelRtp {
     /// Parses an RTP packet (RFC 3550 §5.1, §5.3.1): version 2, its CSRC
     /// list, header extension and padding skipped; `None` if malformed.
-    fn parse(packet: &[u8], arrival: Instant) -> Option<Self> {
+    fn parse(packet: &[u8], arrival: Instant, connection: usize) -> Option<Self> {
         let (header, rest) = packet.split_at_checked(12)?;
         let word =
             |at: usize| -> Option<[u8; 4]> { header.get(at..at.checked_add(4)?)?.try_into().ok() };
@@ -459,6 +509,7 @@ impl BackchannelRtp {
             ssrc: u32::from_be_bytes(word(8)?),
             payload: rest.to_vec(),
             arrival,
+            connection,
         })
     }
 }
@@ -655,6 +706,9 @@ pub struct CameraConfig {
     /// Offer an ONVIF backchannel to a `DESCRIBE` that asks for one; a
     /// `Require` tag is ignored without, as many cameras do.
     pub backchannel: Option<CameraBackchannel>,
+    /// Keep a connection open after answering its `TEARDOWN`, so that its
+    /// close is the client's ([`ConnectionLog::closed_by_client`]).
+    pub keep_open_on_teardown: bool,
 }
 
 /// How the camera answers `PLAY`; every other request is answered as
@@ -745,6 +799,7 @@ impl Default for CameraConfig {
             play: PlayAnswer::Play,
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             backchannel: None,
+            keep_open_on_teardown: false,
         }
     }
 }
@@ -801,8 +856,53 @@ pub struct Stats {
     /// Packets on the backchannel's channels refused: RTP before `PLAY`,
     /// malformed, or of a payload type the camera does not take.
     pub backchannel_refused: AtomicU64,
+    /// Sessions whose only stream is the backchannel playing now.
+    pub backchannel_playing: AtomicU64,
+    /// The most of those that played at once.
+    pub max_backchannel_playing: AtomicU64,
+    /// Backchannel `SETUP`s refused `453` because another session held
+    /// the camera's one backchannel ([`CameraBackchannel::single`]).
+    pub backchannel_busy: AtomicU64,
+    /// The connection whose session holds the camera's one backchannel.
+    backchannel_holder: Mutex<Option<usize>>,
     /// The RTP recorded from the backchannel, in arrival order.
     received: Mutex<Vec<BackchannelRtp>>,
+    /// What each connection did, in accept order.
+    connections_seen: Mutex<Vec<ConnectionLog>>,
+    /// Each connection's hang-up, in accept order.
+    hangups: Mutex<Vec<CancellationToken>>,
+    /// How the backchannel's requests are answered from now on, in place
+    /// of the configuration's ([`FakeCamera::set_backchannel_setup`]).
+    setup_now: Mutex<Option<BackchannelSetup>>,
+}
+
+/// What one connection did, for assertions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectionLog {
+    /// Its `DESCRIBE`s, in order: whether each asked for the backchannel
+    /// with `Require` (ONVIF Streaming Specification §5.3.1).
+    pub describes: Vec<bool>,
+    /// The last segment of each `SETUP`'s control URL it answered:
+    /// `track0`, `track1`, `backchannel`.
+    pub setups: Vec<String>,
+    /// Its `PLAY` was answered.
+    pub played: bool,
+    /// Its `TEARDOWN`, once one came: whether it carried `Require`.
+    pub teardown: Option<bool>,
+    /// The backchannel RTP it took.
+    pub backchannel_packets: u64,
+    /// It ended.
+    pub closed: bool,
+    /// It ended because the client closed it (or failed it), not the
+    /// camera.
+    pub closed_by_client: bool,
+}
+
+impl ConnectionLog {
+    /// A session whose only stream is the backchannel: set up alone.
+    pub fn backchannel_only(&self) -> bool {
+        self.setups.iter().all(|setup| setup == BACKCHANNEL_CONTROL) && !self.setups.is_empty()
+    }
 }
 
 /// One RTCP compound packet the client sent the camera.
@@ -847,6 +947,40 @@ impl Stats {
             .clone()
     }
 
+    /// What every connection did so far, in accept order.
+    pub fn connection_log(&self) -> Vec<ConnectionLog> {
+        self.connections_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Changes the log of connection `index`.
+    fn log(&self, index: usize, change: impl FnOnce(&mut ConnectionLog)) {
+        if let Some(log) = self
+            .connections_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(index)
+        {
+            change(log);
+        }
+    }
+
+    /// A new connection, hung up on by `hangup`: its index.
+    fn open(&self, hangup: CancellationToken) -> usize {
+        let mut logs = self
+            .connections_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        logs.push(ConnectionLog::default());
+        self.hangups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(hangup);
+        logs.len().saturating_sub(1)
+    }
+
     /// Records one RTCP packet from the client.
     fn record_rtcp(&self, rtcp: ClientRtcp) {
         self.rtcp
@@ -858,6 +992,9 @@ impl Stats {
     /// Records one backchannel packet.
     fn record(&self, packet: BackchannelRtp) {
         Self::bump(&self.backchannel_packets);
+        self.log(packet.connection, |log| {
+            log.backchannel_packets = log.backchannel_packets.saturating_add(1);
+        });
         self.received
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -940,6 +1077,40 @@ impl FakeCamera {
     /// What it saw so far.
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// Answers the backchannel's requests as `setup` says from now on, in
+    /// place of the configuration's: a camera whose backchannel another
+    /// client takes, or frees.
+    pub fn set_backchannel_setup(&self, setup: BackchannelSetup) {
+        *self
+            .stats
+            .setup_now
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(setup);
+    }
+
+    /// Hangs up the connections of the sessions whose only stream is the
+    /// backchannel, as a camera that drops them does, and leaves the
+    /// others alone.
+    pub fn hang_up_backchannel(&self) {
+        self.hang_up_where(ConnectionLog::backchannel_only);
+    }
+
+    /// Hangs up the open connections whose log `which` picks, and leaves
+    /// the others alone.
+    pub fn hang_up_where(&self, which: impl Fn(&ConnectionLog) -> bool) {
+        let logs = self.stats.connection_log();
+        let hangups = self
+            .stats
+            .hangups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (log, hangup) in logs.iter().zip(hangups.iter()) {
+            if which(log) && !log.closed {
+                hangup.cancel();
+            }
+        }
     }
 
     /// Hangs up every open connection, as a camera that reboots or drops
@@ -1064,7 +1235,9 @@ impl CameraConfig {
 enum Answering {
     /// It does.
     Yes,
-    /// It hung at `PLAY` ([`PlayAnswer::Never`]) and answers nothing.
+    /// It hung at `PLAY` ([`PlayAnswer::Never`]), at the `SETUP` of the
+    /// backchannel ([`BackchannelSetup::Silent`]) or at a `DESCRIBE` with
+    /// `Require` ([`RequireAnswer::Silent`]) and answers nothing.
     Hung,
     /// It closes the connection instead of the next answer
     /// ([`BackchannelSetup::HangUp`]).
@@ -1104,6 +1277,22 @@ struct Connection {
     /// The interleaved RTP channel of the backchannel, once set up; RTCP
     /// on the next one.
     backchannel_channel: Option<u8>,
+    /// Its number, in accept order.
+    index: usize,
+    /// What its `SETUP`s set up.
+    set_up: SetUp,
+    /// The client closed it.
+    client_closed: bool,
+}
+
+/// What a connection's `SETUP`s set up.
+#[derive(Debug, Clone, Copy, Default)]
+struct SetUp {
+    /// The video stream: frames go out once playing.
+    video: bool,
+    /// A media stream (the video or the audio): a session without one
+    /// plays the backchannel alone.
+    media: bool,
 }
 
 /// The camera's UDP side of one connection: its port pair, the client's
@@ -1263,8 +1452,11 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     cancel: CancellationToken,
     clock: Arc<dyn Clock>,
 ) {
+    let cancel = cancel.child_token();
+    let index = stats.open(cancel.clone());
     if config.silent {
         cancel.cancelled().await;
+        stats.log(index, |log| log.closed = true);
         return;
     }
     let mut connection = Connection {
@@ -1283,6 +1475,9 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         answering: Answering::Yes,
         backchannel_offered: false,
         backchannel_channel: None,
+        index,
+        set_up: SetUp::default(),
+        client_closed: false,
     };
     let frame_interval = Duration::from_secs(1)
         .checked_div(connection.config.fps.max(1))
@@ -1310,9 +1505,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     None => std::future::pending().await,
                 }
             } => {}
-            read = stream.read(&mut read_buf) => {
+            read = stream.read(&mut read_buf), if !connection.deaf() => {
                 let n = match read {
-                    Ok(0) | Err(_) => return,
+                    Ok(0) | Err(_) => {
+                        connection.client_closed = true;
+                        return;
+                    }
                     Ok(n) => n,
                 };
                 inbound.extend_from_slice(read_buf.get(..n).unwrap_or(&[]));
@@ -1320,10 +1518,14 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     return;
                 }
             }
-            () = &mut tick, if connection.playing => {
+            // A session that set up a media stream ticks: the video's
+            // frames when it set up the video, the audio due when the
+            // audio; one that plays the backchannel alone gets nothing.
+            () = &mut tick, if connection.playing && connection.set_up.media => {
                 next_frame_at = next_frame_at.and_then(|at| at.checked_add(frame_interval));
                 let spacing = connection.config.packet_spacing;
-                for (index, (channel, packet)) in connection.next_frame(&clock).into_iter().enumerate() {
+                let frame = if connection.set_up.video { connection.next_frame(&clock) } else { Vec::new() };
+                for (index, (channel, packet)) in frame.into_iter().enumerate() {
                     if index > 0 && !spacing.is_zero() {
                         clock.sleep(spacing).await;
                     }
@@ -1348,21 +1550,46 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// A connection that ends, however, plays no more.
+/// A connection that ends, however, plays no more, and is logged closed.
 impl Drop for Connection {
     fn drop(&mut self) {
         self.set_playing(false);
+        self.release_backchannel();
+        let client = self.client_closed;
+        self.stats.log(self.index, |log| {
+            log.closed = true;
+            log.closed_by_client = client;
+        });
     }
 }
 
 impl Connection {
     /// Marks the connection playing or not, keeping [`Stats::playing`] and
-    /// [`Stats::max_playing`].
+    /// [`Stats::max_playing`], or for a session that plays the backchannel
+    /// alone [`Stats::backchannel_playing`] and
+    /// [`Stats::max_backchannel_playing`].
     fn set_playing(&mut self, playing: bool) {
         if self.playing == playing {
             return;
         }
         self.playing = playing;
+        if !self.set_up.media {
+            if playing {
+                let now = self
+                    .stats
+                    .backchannel_playing
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                self.stats
+                    .max_backchannel_playing
+                    .fetch_max(now, Ordering::Relaxed);
+            } else {
+                self.stats
+                    .backchannel_playing
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+            return;
+        }
         if playing {
             let now = self
                 .stats
@@ -1396,7 +1623,11 @@ impl Connection {
             let request = match message {
                 Message::Request(request) => request,
                 Message::Data(data) => {
-                    self.receive(data.channel_id(), data.as_slice(), arrival);
+                    if let Some(report) = self.receive(data.channel_id(), data.as_slice(), arrival)
+                        && stream.write_all(&report).await.is_err()
+                    {
+                        return false;
+                    }
                     continue;
                 }
                 Message::Response(_) => continue,
@@ -1486,7 +1717,12 @@ impl Connection {
         if response.write(&mut bytes).is_err() {
             return (None, true);
         }
-        if *request.method() == Method::Play {
+        if *request.method() == Method::Play
+            && !self.set_up.media
+            && self.backchannel_setup() == Some(BackchannelSetup::Unreadable)
+        {
+            bytes.extend_from_slice(UNREADABLE);
+        } else if *request.method() == Method::Play {
             match self.config.play {
                 PlayAnswer::Never => self.answering = Answering::Hung,
                 PlayAnswer::Unreadable => bytes.extend_from_slice(UNREADABLE),
@@ -1542,14 +1778,78 @@ impl Connection {
             }
             Method::Teardown => {
                 Stats::bump(&self.stats.teardowns);
+                let require = asks_backchannel(request);
+                self.stats
+                    .log(self.index, |log| log.teardown = Some(require));
                 self.set_playing(false);
-                (reply(&cseq, StatusCode::Ok).build(Vec::new()), true)
+                if self.backchannel_channel.is_some()
+                    && self.backchannel_setup() == Some(BackchannelSetup::Lingering)
+                {
+                    self.answering = Answering::Hung;
+                } else {
+                    self.release_backchannel();
+                }
+                (
+                    reply(&cseq, StatusCode::Ok).build(Vec::new()),
+                    !self.config.keep_open_on_teardown,
+                )
             }
             _ => (
                 reply(&cseq, StatusCode::MethodNotAllowed).build(Vec::new()),
                 false,
             ),
         }
+    }
+
+    /// How the backchannel's requests are answered now: as last set
+    /// ([`FakeCamera::set_backchannel_setup`]), else as configured.
+    fn backchannel_setup(&self) -> Option<BackchannelSetup> {
+        let now = *self
+            .stats
+            .setup_now
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        now.or_else(|| self.config.backchannel.as_ref().map(|b| b.setup))
+    }
+
+    /// Takes the camera's one backchannel for this connection's session
+    /// ([`CameraBackchannel::single`]): `false` while another one holds
+    /// it; always `true` for a camera without that limit.
+    fn hold_backchannel(&self) -> bool {
+        if !self.config.backchannel.as_ref().is_some_and(|b| b.single) {
+            return true;
+        }
+        let mut holder = self
+            .stats
+            .backchannel_holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if holder.is_some_and(|holder| holder != self.index) {
+            return false;
+        }
+        *holder = Some(self.index);
+        true
+    }
+
+    /// Frees the camera's one backchannel if this connection's session
+    /// holds it.
+    fn release_backchannel(&self) {
+        let mut holder = self
+            .stats
+            .backchannel_holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *holder == Some(self.index) {
+            *holder = None;
+        }
+    }
+
+    /// The connection reads no more: its backchannel plays and the camera
+    /// stopped taking data ([`BackchannelSetup::Deaf`]).
+    fn deaf(&self) -> bool {
+        self.playing
+            && self.backchannel_channel.is_some()
+            && self.backchannel_setup() == Some(BackchannelSetup::Deaf)
     }
 
     /// Whether the request carries the configured Basic credentials
@@ -1571,18 +1871,28 @@ impl Connection {
     /// carries its `Require` tag and the camera offers one (ONVIF Streaming
     /// Specification §5.3.1, §5.3.2), or its refusal with `551` (§5.3.2).
     fn describe(&mut self, request: &Request<Vec<u8>>, cseq: &str) -> Response<Vec<u8>> {
-        let asked = request.header(&REQUIRE).is_some_and(|tags| {
-            tags.as_str()
-                .split(',')
-                .any(|tag| tag.trim() == BACKCHANNEL_REQUIRE)
-        });
+        let asked = asks_backchannel(request);
+        self.stats.log(self.index, |log| log.describes.push(asked));
+        if asked && let Some(BackchannelSetup::RefuseDescribe(status)) = self.backchannel_setup() {
+            return reply(cseq, status_code(status)).build(Vec::new());
+        }
         let offered = match self.config.backchannel.as_ref().map(|b| b.require) {
-            Some(RequireAnswer::Honor) => asked,
+            Some(RequireAnswer::Honor) => {
+                asked && self.backchannel_setup() != Some(BackchannelSetup::NoMedia)
+            }
             Some(RequireAnswer::OptionNotSupported) if asked => {
                 Stats::bump(&self.stats.require_rejected);
                 return reply(cseq, StatusCode::OptionNotSupported)
                     .header(UNSUPPORTED, BACKCHANNEL_REQUIRE)
                     .build(Vec::new());
+            }
+            Some(RequireAnswer::Status(status)) if asked => {
+                Stats::bump(&self.stats.require_rejected);
+                return reply(cseq, status_code(status)).build(Vec::new());
+            }
+            Some(RequireAnswer::Silent) if asked => {
+                self.answering = Answering::Hung;
+                return reply(cseq, StatusCode::Ok).build(Vec::new());
             }
             _ => false,
         };
@@ -1601,8 +1911,11 @@ impl Connection {
     /// odd channel is the client's RTCP, recorded; after `PLAY`, RTP on the
     /// backchannel's channel is recorded and RTCP on the next one counted,
     /// anything else on them refused. Frames on other channels are
-    /// otherwise ignored.
-    fn receive(&self, channel: u8, packet: &[u8], arrival: Instant) {
+    /// otherwise ignored. The first backchannel RTP a session takes, and
+    /// every 25th after it, is answered with a Receiver Report on its RTCP
+    /// channel (RFC 3550 §6.4.2), as a camera that receives reports: the
+    /// interleaved bytes to send back.
+    fn receive(&self, channel: u8, packet: &[u8], arrival: Instant) -> Option<Vec<u8>> {
         if channel & 1 == 1 {
             self.stats.record_rtcp(ClientRtcp {
                 at: arrival,
@@ -1611,26 +1924,39 @@ impl Connection {
                 packet: packet.to_vec(),
             });
         }
-        let Some(rtp_channel) = self.backchannel_channel else {
-            return;
-        };
+        let rtp_channel = self.backchannel_channel?;
         if channel == rtp_channel.wrapping_add(1) {
             if is_rtcp(packet) {
                 Stats::bump(&self.stats.backchannel_rtcp);
             } else {
                 Stats::bump(&self.stats.backchannel_refused);
             }
-            return;
+            return None;
         }
         if channel != rtp_channel {
-            return;
+            return None;
         }
         let accept_only = self.config.backchannel.as_ref().and_then(|b| b.accept_only);
-        match BackchannelRtp::parse(packet, arrival) {
+        match BackchannelRtp::parse(packet, arrival, self.index) {
             Some(rtp) if self.playing && accept_only.is_none_or(|pt| pt == rtp.payload_type) => {
+                let taken = self
+                    .stats
+                    .connection_log()
+                    .get(self.index)
+                    .map_or(0, |log| log.backchannel_packets);
                 self.stats.record(rtp);
+                // V=2, no reception report blocks, PT 201, one word after
+                // the header: the camera's SSRC (RFC 3550 §6.4.2).
+                let mut report = vec![0x80, 201, 0, 1];
+                report.extend_from_slice(&AUDIO_SSRC.to_be_bytes());
+                taken
+                    .is_multiple_of(25)
+                    .then(|| interleave(rtp_channel.wrapping_add(1), &report))
             }
-            _ => Stats::bump(&self.stats.backchannel_refused),
+            _ => {
+                Stats::bump(&self.stats.backchannel_refused);
+                None
+            }
         }
     }
 
@@ -1650,11 +1976,16 @@ impl Connection {
         {
             return reply(cseq, StatusCode::UnsupportedTransport).build(Vec::new());
         }
-        match self.config.backchannel.as_ref().map(|b| b.setup) {
-            Some(BackchannelSetup::Busy) if backchannel => {
-                return reply(cseq, StatusCode::NotEnoughBandwidth).build(Vec::new());
+        if backchannel && !self.hold_backchannel() {
+            Stats::bump(&self.stats.backchannel_busy);
+            return reply(cseq, status_code(453)).build(Vec::new());
+        }
+        match self.backchannel_setup() {
+            Some(BackchannelSetup::Refuse(status)) if backchannel => {
+                return reply(cseq, status_code(status)).build(Vec::new());
             }
             Some(BackchannelSetup::HangUp) if backchannel => self.answering = Answering::HangUp,
+            Some(BackchannelSetup::Silent) if backchannel => self.answering = Answering::Hung,
             _ => {}
         }
         if transport.contains("client_port=") && self.config.udp.service != UdpService::Refuse {
@@ -1664,6 +1995,13 @@ impl Connection {
             return reply(cseq, StatusCode::UnsupportedTransport).build(Vec::new());
         }
         Stats::bump(&self.stats.setups);
+        let control = request
+            .request_uri()
+            .and_then(|uri| uri.as_str().rsplit('/').next().map(str::to_owned))
+            .unwrap_or_default();
+        self.set_up.media |= !backchannel;
+        self.set_up.video |= control == "track0";
+        self.stats.log(self.index, |log| log.setups.push(control));
         let session = "12345678".to_owned();
         self.session = Some(session.clone());
         // The channels the client asked for (RFC 2326 §12.39), the video's
@@ -1730,6 +2068,11 @@ impl Connection {
         let audio = request
             .request_uri()
             .is_some_and(|uri| uri.as_str().ends_with("track1"));
+        self.set_up.media = true;
+        self.set_up.video |= !audio;
+        let control = if audio { "track1" } else { "track0" };
+        self.stats
+            .log(self.index, |log| log.setups.push(control.to_owned()));
         let channel = if audio {
             self.audio_channel = Some(2);
             2
@@ -1774,11 +2117,17 @@ impl Connection {
             return reply(cseq, StatusCode::SessionNotFound).build(Vec::new());
         };
         Stats::bump(&self.stats.plays);
+        if !self.set_up.media
+            && let Some(BackchannelSetup::RefusePlay(status)) = self.backchannel_setup()
+        {
+            return reply(cseq, status_code(status)).build(Vec::new());
+        }
         if matches!(self.config.play, PlayAnswer::Refuse | PlayAnswer::Never) {
             // `respond` leaves it unanswered for `PlayAnswer::Never`.
             return reply(cseq, StatusCode::ServiceUnavailable).build(Vec::new());
         }
         self.set_playing(true);
+        self.stats.log(self.index, |log| log.played = true);
         let rtptime = |ts: u32| {
             if self.config.omit_rtptime {
                 String::new()
@@ -1850,6 +2199,22 @@ impl Connection {
 /// What [`PlayAnswer::Unreadable`] writes after its answer: no RTSP message
 /// starts with these bytes, and nothing frames them as interleaved data.
 const UNREADABLE: &[u8] = b"\xff\xfe not RTSP\r\n\r\n";
+
+/// Whether `request` asks for the backchannel: `Require:
+/// www.onvif.org/ver20/backchannel` (ONVIF Streaming Specification
+/// §5.3.1).
+fn asks_backchannel(request: &Request<Vec<u8>>) -> bool {
+    request.header(&REQUIRE).is_some_and(|tags| {
+        tags.as_str()
+            .split(',')
+            .any(|tag| tag.trim() == BACKCHANNEL_REQUIRE)
+    })
+}
+
+/// The status code numbered `status`.
+fn status_code(status: u16) -> StatusCode {
+    StatusCode::from(status)
+}
 
 /// A response builder echoing the request's `CSeq`.
 fn reply(cseq: &str, status: StatusCode) -> rtsp_types::ResponseBuilder {
@@ -2136,6 +2501,27 @@ mod tests {
             }
         }
 
+        /// The next interleaved frame from the camera (RFC 2326 §10.12):
+        /// its channel and its packet.
+        async fn frame(&mut self) -> (u8, Vec<u8>) {
+            let deadline = self.clock.sleep(Duration::from_secs(5));
+            tokio::pin!(deadline);
+            loop {
+                if let Ok((message, consumed)) = Message::<Vec<u8>>::parse(&self.inbound) {
+                    self.inbound.drain(..consumed);
+                    if let Message::Data(data) = message {
+                        return (data.channel_id(), data.as_slice().to_vec());
+                    }
+                    continue;
+                }
+                let mut buf = [0_u8; 4096];
+                tokio::select! {
+                    read = self.stream.read(&mut buf) => self.inbound.extend_from_slice(&buf[..read.unwrap()]),
+                    () = &mut deadline => panic!("no interleaved frame"),
+                }
+            }
+        }
+
         async fn send(&mut self, channel: u8, packet: &[u8]) {
             self.stream
                 .write_all(&interleave(channel, packet))
@@ -2226,7 +2612,8 @@ mod tests {
     #[test]
     fn rfc3550_5_1_backchannel_rtp_is_parsed_past_csrcs_extension_and_padding() {
         let at = clock().now();
-        let plain = BackchannelRtp::parse(&rtp_of(8, 0xabcd, 7, 160, true, &[1, 2]), at).unwrap();
+        let plain =
+            BackchannelRtp::parse(&rtp_of(8, 0xabcd, 7, 160, true, &[1, 2]), at, 3).unwrap();
         assert_eq!(
             plain,
             BackchannelRtp {
@@ -2237,9 +2624,10 @@ mod tests {
                 ssrc: 0xabcd,
                 payload: vec![1, 2],
                 arrival: at,
+                connection: 3,
             }
         );
-        let unmarked = BackchannelRtp::parse(&rtp_of(0, 1, 1, 1, false, &[]), at).unwrap();
+        let unmarked = BackchannelRtp::parse(&rtp_of(0, 1, 1, 1, false, &[]), at, 3).unwrap();
         assert!(!unmarked.marker);
         assert!(unmarked.payload.is_empty());
         // Two CSRCs, a one-word extension and three bytes of padding
@@ -2250,28 +2638,28 @@ mod tests {
         full.extend_from_slice(&[0xbe, 0xde, 0, 1, 9, 9, 9, 9]);
         full.extend_from_slice(&[5, 6, 0, 0, 3]);
         assert_eq!(
-            BackchannelRtp::parse(&full, at).unwrap().payload,
+            BackchannelRtp::parse(&full, at, 3).unwrap().payload,
             vec![5, 6]
         );
         let mut version1 = rtp_of(0, 1, 2, 3, false, &[1]);
         version1[0] = 0x40;
-        assert_eq!(BackchannelRtp::parse(&version1, at), None);
-        assert_eq!(BackchannelRtp::parse(&[0x80; 11], at), None);
+        assert_eq!(BackchannelRtp::parse(&version1, at, 3), None);
+        assert_eq!(BackchannelRtp::parse(&[0x80; 11], at, 3), None);
         let mut short_csrc = rtp_of(0, 1, 2, 3, false, &[1]);
         short_csrc[0] = 0x82;
-        assert_eq!(BackchannelRtp::parse(&short_csrc, at), None);
+        assert_eq!(BackchannelRtp::parse(&short_csrc, at, 3), None);
         let mut short_extension = rtp_of(0, 1, 2, 3, false, &[0xbe, 0xde, 0, 2, 0, 0, 0, 0]);
         short_extension[0] = 0x90;
-        assert_eq!(BackchannelRtp::parse(&short_extension, at), None);
+        assert_eq!(BackchannelRtp::parse(&short_extension, at, 3), None);
         let mut no_extension_header = rtp_of(0, 1, 2, 3, false, &[0xbe, 0xde]);
         no_extension_header[0] = 0x90;
-        assert_eq!(BackchannelRtp::parse(&no_extension_header, at), None);
+        assert_eq!(BackchannelRtp::parse(&no_extension_header, at, 3), None);
         let mut overpadded = rtp_of(0, 1, 2, 3, false, &[1, 9]);
         overpadded[0] = 0xa0;
-        assert_eq!(BackchannelRtp::parse(&overpadded, at), None);
+        assert_eq!(BackchannelRtp::parse(&overpadded, at, 3), None);
         let mut padding_only = rtp_of(0, 1, 2, 3, false, &[]);
         padding_only[0] = 0xa0;
-        assert_eq!(BackchannelRtp::parse(&padding_only, at), None);
+        assert_eq!(BackchannelRtp::parse(&padding_only, at, 3), None);
         // RTCP: version 2, SR to APP (RFC 3550 §12.1).
         assert!(is_rtcp(&[0x81, 201, 0, 1]));
         assert!(is_rtcp(&[0x80, 200, 0, 6, 0]));
@@ -2557,6 +2945,111 @@ mod tests {
         assert_eq!(playing(stats), (1, 2));
         drop(clients);
         assert!(eventually(&clock, || playing(stats) == (0, 2)).await);
+        camera.stop().await;
+    }
+
+    /// A client that sets up the audio alone (RFC 2326 §10.4: the client
+    /// chooses which media it sets up) gets the audio's RTP and Sender
+    /// Reports after `PLAY`, and no video.
+    #[tokio::test]
+    async fn rfc2326_10_4_a_session_that_sets_up_the_audio_alone_gets_audio_and_no_video() {
+        let camera = FakeCamera::start(
+            CameraConfig {
+                audio: Some(CameraAudio::Pcmu),
+                ..CameraConfig::default()
+            },
+            clock(),
+        )
+        .await
+        .unwrap();
+        let mut client = Client::connect(&camera).await;
+        client.request("DESCRIBE", &camera.url(), &[]).await;
+        let setup = client
+            .request(
+                "SETUP",
+                &format!("{}track1", base(&camera)),
+                &["Transport: RTP/AVP/TCP;unicast;interleaved=2-3"],
+            )
+            .await;
+        assert_eq!(setup.status(), StatusCode::Ok);
+        let play = client
+            .request("PLAY", &camera.url(), &["Session: 12345678"])
+            .await;
+        assert_eq!(play.status(), StatusCode::Ok);
+        let mut channels = Vec::new();
+        let mut audio = 0;
+        while audio < 3 {
+            let (channel, packet) = client.frame().await;
+            if channel == 2 {
+                assert_eq!(packet[1] & 0x7f, CameraAudio::Pcmu.payload_type());
+                audio += 1;
+            }
+            channels.push(channel);
+        }
+        assert!(
+            channels.iter().all(|channel| [2, 3].contains(channel)),
+            "{channels:?}"
+        );
+        assert!(channels.contains(&3), "a Sender Report: {channels:?}");
+        assert_eq!(Stats::get(&camera.stats().packets), 0, "no video");
+        camera.stop().await;
+    }
+
+    /// A camera with one backchannel refuses a `SETUP` of it with `453`
+    /// (RFC 2326 §11.3.3) while another session holds it: from that
+    /// session's `SETUP` until its `TEARDOWN` is answered, or, when the
+    /// camera leaves it unanswered, until its connection closes.
+    #[tokio::test]
+    async fn rfc2326_11_3_3_a_camera_with_one_backchannel_refuses_a_second_setup_with_453() {
+        let clock = clock();
+        let camera = FakeCamera::start(
+            with_backchannel(CameraBackchannel {
+                single: true,
+                ..CameraBackchannel::new(BackchannelCodec::Pcmu)
+            }),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
+        let back = format!("{}{BACKCHANNEL_CONTROL}", base(&camera));
+        let transport = "Transport: RTP/AVP/TCP;unicast;interleaved=2-3";
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let mut client = Client::connect(&camera).await;
+            client
+                .request("DESCRIBE", &camera.url(), &[REQUIRE_BACKCHANNEL])
+                .await;
+            clients.push(client);
+        }
+        let stats = camera.stats();
+        let first = clients[0].request("SETUP", &back, &[transport]).await;
+        assert_eq!(first.status(), StatusCode::Ok);
+        let again = clients[0].request("SETUP", &back, &[transport]).await;
+        assert_eq!(again.status(), StatusCode::Ok, "its own session's");
+        let busy = clients[1].request("SETUP", &back, &[transport]).await;
+        assert_eq!(busy.status(), status_code(453));
+        assert_eq!(Stats::get(&stats.backchannel_busy), 1);
+        let teardown = clients[0]
+            .request("TEARDOWN", &camera.url(), &["Session: 12345678"])
+            .await;
+        assert_eq!(teardown.status(), StatusCode::Ok);
+        let second = clients[1].request("SETUP", &back, &[transport]).await;
+        assert_eq!(second.status(), StatusCode::Ok, "freed by the TEARDOWN");
+        // A TEARDOWN left unanswered: held until the connection closes.
+        camera.set_backchannel_setup(BackchannelSetup::Lingering);
+        clients[1]
+            .stream
+            .write_all(b"TEARDOWN rtsp://camera/ RTSP/1.0\r\nCSeq: 9\r\nSession: 12345678\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(eventually(&clock, || stats.connection_log()[1].teardown.is_some()).await);
+        let lingering = clients[2].request("SETUP", &back, &[transport]).await;
+        assert_eq!(lingering.status(), status_code(453));
+        assert_eq!(Stats::get(&stats.backchannel_busy), 2);
+        drop(clients.remove(1));
+        assert!(eventually(&clock, || stats.connection_log()[1].closed).await);
+        let freed = clients[1].request("SETUP", &back, &[transport]).await;
+        assert_eq!(freed.status(), StatusCode::Ok, "freed by the close");
         camera.stop().await;
     }
 

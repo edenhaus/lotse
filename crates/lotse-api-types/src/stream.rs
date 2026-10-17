@@ -195,12 +195,15 @@ pub struct SourceInfo {
     pub state: StreamState,
     /// Reconnects so far.
     pub reconnects: u32,
-    /// The camera's backchannel, which the connection offers while live:
-    /// what a microphone button is gated on. Null when it offers none (the
-    /// camera has none or refused it, or no stream on the connection opted
-    /// in: an RTSP source's `backchannel` option, off by default, which
-    /// restarts a connection running without it once), and while the
-    /// connection is not live.
+    /// The camera's backchannel, as the connection's probe found it, while
+    /// the connection is live: what a microphone button is gated on. The
+    /// probe asks the camera on a connection of its own each time the
+    /// connection connects; nothing is opened until a talker claims it.
+    /// Null when the probe found none (the camera has none, refused the
+    /// question or could not be asked), when no stream on the connection
+    /// opted in (an RTSP source's `backchannel` option, off by default,
+    /// which restarts a connection running without it once), and while
+    /// the connection is not live.
     #[serde(default)]
     pub backchannel: Option<SourceBackchannel>,
     /// Protocol-specific detail, documented by the scheme's options schema.
@@ -226,9 +229,11 @@ pub struct SourceBackchannel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BackchannelState {
-    /// Nobody talks: the next offer that asks for talk-back claims it.
+    /// Nobody talks and no camera session of it is open: the next offer
+    /// that asks for talk-back claims it.
     Available,
-    /// A session holds it, the stream's `backchannel.talker`.
+    /// A session holds it, the stream's `backchannel.talker`: the
+    /// camera's backchannel session for it is opening or open.
     InUse,
 }
 
@@ -360,6 +365,11 @@ pub enum TalkerReason {
     /// The talker's re-offer (`webrtc/renegotiate`) dropped talk-back;
     /// the backchannel is free.
     Renegotiated,
+    /// The camera refused the talker's backchannel session, the session
+    /// did not open in time, or its connection was lost while the talker
+    /// held it: the backchannel is free, and the talker's session got a
+    /// `backchannel_declined` warning with reason `refused`.
+    Refused,
 }
 
 impl TalkerReason {
@@ -370,6 +380,7 @@ impl TalkerReason {
             Self::SessionClosed => "session_closed",
             Self::Released => "released",
             Self::Renegotiated => "renegotiated",
+            Self::Refused => "refused",
         }
     }
 
@@ -380,6 +391,7 @@ impl TalkerReason {
             Self::SessionClosed,
             Self::Released,
             Self::Renegotiated,
+            Self::Refused,
         ]
         .into_iter()
         .find(|reason| reason.as_str() == name)
@@ -667,6 +679,7 @@ mod tests {
             (TalkerReason::SessionClosed, "session_closed"),
             (TalkerReason::Released, "released"),
             (TalkerReason::Renegotiated, "renegotiated"),
+            (TalkerReason::Refused, "refused"),
         ] {
             assert_eq!(reason.as_str(), name);
             assert_eq!(serde_json::to_value(reason).unwrap(), name);

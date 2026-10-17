@@ -13,16 +13,17 @@
 //! and the Sender Reports into the clock mapper. Once the camera hangs up
 //! the attempt ends with a typed error.
 //!
-//! The source opts in, so the `DESCRIBE` asks for the ONVIF backchannel
-//! (ONVIF Streaming Specification §5.3.1), and a fuzzed `a=sendonly`
-//! audio media takes the backchannel's path (§5.3.2): retina's stream
+//! The source opts in, so once its session plays it probes the camera's
+//! ONVIF backchannel (ONVIF Streaming Specification §5.3.1) with a
+//! `DESCRIBE` carrying `Require` on a connection of its own, which the
+//! camera answers from the same script, and a fuzzed `a=sendonly` audio
+//! media takes the backchannel's path (§5.3.2): retina's stream
 //! direction, our reading of its format and `a=ptime` from the raw SDP
-//! (RFC 8866 §5.14, §6.4, §6.6, §6.7) and its matching stream, its
-//! `SETUP` last with the fuzzed answer, and once offered one packet
-//! through retina's send path. A
-//! `551` or `400` to `DESCRIBE` (a whole-response section) describes again
-//! without the header, on a second connection the camera plays the same
-//! script to.
+//! (RFC 8866 §5.14, §6.4, §6.6, §6.7) and its matching stream; once
+//! offered, a talker's claim opens it in a session of its own on a third
+//! connection, its `SETUP` alone with the fuzzed answer, its `PLAY`, and
+//! one packet through retina's send path. The camera serves the
+//! connections side by side.
 //! Run with `mise run fuzz rtsp_session`, which passes libFuzzer's time and
 //! memory limits (`scripts/fuzz.sh`).
 //!
@@ -181,14 +182,21 @@ async fn request(socket: &mut TcpStream, buf: &mut Vec<u8>) -> Option<(String, S
     }
 }
 
-/// Plays `script` to every connection on `listener`, one at a time: the
-/// source's retry of a refused `Require` header comes on a second one.
+/// Plays `script` to every connection on `listener`, side by side: the
+/// backchannel's probe and its session come on connections of their own
+/// while the stream's plays.
 async fn camera(listener: TcpListener, base: String, script: Script<'_>) {
+    let mut plays: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>> = Vec::new();
     loop {
-        let Ok((socket, _)) = listener.accept().await else {
+        let accepted = std::future::poll_fn(|cx| {
+            plays.retain_mut(|play| play.as_mut().poll(cx).is_pending());
+            listener.poll_accept(cx)
+        })
+        .await;
+        let Ok((socket, _)) = accepted else {
             return;
         };
-        play(socket, &base, &script).await;
+        plays.push(Box::pin(play(socket, &base, &script)));
     }
 }
 
@@ -273,13 +281,16 @@ async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
     while matches!(socket.read(&mut sink).await, Ok(n) if n > 0) {}
 }
 
-/// The talker's half: once the source offers a backchannel on `slot`, one
-/// 20 ms PCMU packet into it, for retina to send on what the fuzzed SDP
-/// and `SETUP` answer made of it.
+/// The talker's half: once the source offers a backchannel on `slot`, a
+/// claim opens it and puts one 20 ms PCMU packet into it, for retina to
+/// send on what the fuzzed SDP and `SETUP` answer made of it.
 async fn talk(slot: BackchannelSlot) {
     loop {
-        if let Some(handle) = slot.current() {
-            let _ = handle.sender.try_send(MediaPacket {
+        if let Some(offer) = slot.current() {
+            let Ok(session) = offer.opener.open().await else {
+                break;
+            };
+            let _ = session.sender.try_send(MediaPacket {
                 arrival: std::time::Instant::now(),
                 rtp: RtpHeaderFields {
                     pt: 0,
@@ -294,7 +305,8 @@ async fn talk(slot: BackchannelSlot) {
                 lateness: Duration::ZERO,
                 payload: Arc::from(&[0xff_u8; 160][..]),
             });
-            break;
+            // Held while the source runs.
+            std::future::pending::<()>().await;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }

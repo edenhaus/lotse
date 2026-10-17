@@ -9,11 +9,13 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, watch};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::task::TaskTracker;
 
 use crate::clock::Clock;
 use crate::clock_map::ClockMapper;
@@ -21,8 +23,9 @@ use crate::codec::{Codec, Kind};
 use crate::ingest::{IngestCounters, IngestStats};
 use crate::media::MediaPacket;
 use crate::negotiate::TrackInfo;
+use crate::runner::ProbeGate;
 use crate::source_url::SourceUrl;
-use crate::task::BoxFuture;
+use crate::task::{BoxFuture, spawn_named};
 use crate::track::{Feeds, Track, TrackId, TrackLimits};
 
 /// How a source protocol obtains media.
@@ -156,8 +159,9 @@ pub trait Source: fmt::Debug + Send + Sync {
 
     /// Whether the source asks the device for its backchannel, two-way
     /// audio's path to the camera's speaker (RTSP `backchannel`, ONVIF
-    /// Streaming Specification §5.3.1): only when its stream opted in, as
-    /// the client knows which cameras talk back. Left out of
+    /// Streaming Specification §5.3.1, which the RTSP source probes on a
+    /// connection of its own): only when its stream opted in, as the
+    /// client knows which cameras talk back. Left out of
     /// [`Self::connection_options`], so streams sharing a connection may
     /// differ here: the supervisor has the connection ask iff one of its
     /// sources does. `false` for a protocol without a backchannel.
@@ -327,53 +331,367 @@ impl ClockInput {
     }
 }
 
-/// A source's reverse audio path into the device, offered when the protocol
-/// has one (RTSP with the ONVIF backchannel). Packets sent here reach the
-/// device; the codec and the frame duration are what it accepts.
+/// The longest a claim of the device's backchannel waits for its session
+/// to open, the answer to the claiming offer held meanwhile: under the
+/// 10 s the control API gives a re-offer's answer, so a camera that never
+/// answers is declined in that answer, not timed out as a failed
+/// re-offer. A source bounds its handshake by the lesser of this and its
+/// own connect timeout; the worker bounds the wait by this.
+pub const BACKCHANNEL_OPEN_LIMIT: Duration = Duration::from_secs(8);
+
+/// Why the device's backchannel session could not be opened, or ended
+/// while a talker held it: the device's status when it answered with one
+/// (RTSP's on `DESCRIBE`, `SETUP` or `PLAY`), else `None` (a connection
+/// that failed or closed, a timeout), and what happened, for humans.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct BackchannelRefused {
+    /// The device's status code, when it refused with one.
+    pub status: Option<u16>,
+    /// What happened.
+    pub message: String,
+}
+
+/// Opens the device's backchannel in a session of its own (RTSP: ONVIF
+/// Streaming Specification §5.3), for the talker that claimed it.
+/// Offered by a source whose probe found a backchannel
+/// ([`BackchannelOffer`]); one opener serves every claim of the offer.
+pub trait BackchannelOpener: fmt::Debug + Send + Sync {
+    /// Opens the session: resolves once the device takes packets (RTSP:
+    /// `PLAY` answered), or with why not. Dropping the future before it
+    /// resolves abandons the handshake and closes what it opened.
+    fn open(&self) -> BoxFuture<'static, Result<BackchannelSession, BackchannelRefused>>;
+}
+
+/// A device's backchannel as a source's probe found it: the codec the
+/// device takes, the audio one packet carries, and the way to open it. No
+/// session is open while it is offered; a claim opens one
+/// ([`BackchannelOpener::open`]).
 #[derive(Debug, Clone)]
-pub struct BackchannelHandle {
+pub struct BackchannelOffer {
     /// The codec the device accepts.
     pub codec: Codec,
     /// The audio one packet carries, as the device asks for it (RTSP: the
     /// backchannel media's `a=ptime`, RFC 8866 §6.4), else
-    /// [`BackchannelHandle::DEFAULT_FRAME`]. The talk-back transcoder
+    /// [`BackchannelOffer::DEFAULT_FRAME`]. The talk-back transcoder
     /// frames G.711 to it; a forwarded packet keeps the sender's.
     pub frame: Duration,
-    /// Where uplink packets go. Never waited on: a full queue drops.
-    pub sender: mpsc::Sender<MediaPacket>,
+    /// Opens the device's backchannel session.
+    pub opener: Arc<dyn BackchannelOpener>,
 }
 
-impl BackchannelHandle {
+impl BackchannelOffer {
     /// 20 ms, RFC 3551 §4.5's default packetization interval: the frame
     /// of a device that names none.
     pub const DEFAULT_FRAME: Duration = Duration::from_millis(20);
 }
 
-/// The slot a source fills when it offers a backchannel. Shared with the
-/// connection, which arbitrates the talker.
+/// One open session of the device's backchannel, held by its talker:
+/// packets sent here reach the device in its codec and frame. Dropping it
+/// closes the session (RTSP: `TEARDOWN`, then the connection closes).
+#[derive(Debug)]
+pub struct BackchannelSession {
+    /// The codec the device takes on this session.
+    pub codec: Codec,
+    /// The audio one packet carries.
+    pub frame: Duration,
+    /// Where uplink packets go. Never waited on: a full queue drops.
+    pub sender: mpsc::Sender<MediaPacket>,
+    /// Resolves with why, should the session end on the device's side (a
+    /// lost connection, a refused keepalive) while it is held; never
+    /// once the holder dropped it.
+    pub lost: oneshot::Receiver<BackchannelRefused>,
+    /// Ends the session when dropped.
+    _close: DropGuard,
+}
+
+impl BackchannelSession {
+    /// A session in `codec` and `frame` fed through `sender`, which
+    /// reports its loss on `lost` and ends once `close` is cancelled: when
+    /// the session is dropped.
+    pub fn new(
+        codec: Codec,
+        frame: Duration,
+        sender: mpsc::Sender<MediaPacket>,
+        lost: oneshot::Receiver<BackchannelRefused>,
+        close: CancellationToken,
+    ) -> Self {
+        Self {
+            codec,
+            frame,
+            sender,
+            lost,
+            _close: close.drop_guard(),
+        }
+    }
+}
+
+/// The tasks of the backchannel sessions opened from a worker's offers,
+/// tracked so that the worker's shutdown waits for each to close its
+/// session on the device (RTSP: its `TEARDOWN`, RFC 2326 §10.7, RFC 7826
+/// §13.4) instead of its runtime dropping them halfway. Clones track
+/// together; a default one tracks on its own, for a slot outside a
+/// worker. A source spawns its session's task here
+/// ([`BackchannelTasks::spawn`]), the claim's drop closes the session, and
+/// the task ends once the device's side is closed.
+///
+/// The tasks run one at a time, each once the one spawned before it
+/// ended: a device takes one backchannel session at a time (a camera with
+/// one backchannel refuses a second `SETUP` of it, `453 Not Enough
+/// Bandwidth`, RFC 2326 §11.3.3), so the session a claim opens right
+/// after a release waits for the released one's bounded close to reach
+/// the device instead of racing it. A worker runs one connection, so the
+/// order holds across its sources.
+#[derive(Debug, Clone, Default)]
+pub struct BackchannelTasks {
+    /// The tasks, until each ends.
+    tracker: TaskTracker,
+    /// Held by the task whose session runs; the next one waits for it.
+    turn: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl BackchannelTasks {
+    /// Spawns `future`, one backchannel session's task, under `name`,
+    /// tracked until it ends. It runs once every task spawned before it
+    /// ended; cancelled meanwhile (the claim gave up or was released),
+    /// `close` ends the task without running it.
+    pub fn spawn<F>(
+        &self,
+        name: &'static str,
+        close: &CancellationToken,
+        future: F,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let task = in_turn(Arc::clone(&self.turn), close.clone(), Box::pin(future));
+        spawn_named(name, self.tracker.track_future(task))
+    }
+
+    /// How many of the tracked tasks still run, waiting ones included.
+    pub fn running(&self) -> usize {
+        self.tracker.len()
+    }
+
+    /// Resolves once every tracked task ended, a task spawned meanwhile
+    /// included. The caller bounds the wait.
+    pub async fn ended(&self) {
+        self.tracker.close();
+        self.tracker.wait().await;
+    }
+}
+
+/// Runs `session`, one backchannel session's task, once it has the
+/// `turn` ([`take_turn`]), holding it until it ends; never, when `close`
+/// is cancelled first.
+async fn in_turn(
+    turn: Arc<tokio::sync::Mutex<()>>,
+    close: CancellationToken,
+    session: BoxFuture<'static, ()>,
+) {
+    if let Some(held) = take_turn(turn, close).await {
+        session.await;
+        drop(held);
+    }
+}
+
+/// The turn of one backchannel session's task ([`BackchannelTasks::spawn`]):
+/// at once when no other task holds it, else once the one that does
+/// ended; `None` when `close` is cancelled first, the session closed
+/// before it opened.
+async fn take_turn(
+    turn: Arc<tokio::sync::Mutex<()>>,
+    close: CancellationToken,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    if let Ok(held) = Arc::clone(&turn).try_lock_owned() {
+        return Some(held);
+    }
+    tracing::info!(
+        "backchannel: the previous session still closes on the device; this one opens once it is closed"
+    );
+    tokio::select! {
+        held = turn.lock_owned() => Some(held),
+        () = close.cancelled() => {
+            tracing::info!(
+                "backchannel: the session was closed while it waited for the previous one; never opened"
+            );
+            None
+        }
+    }
+}
+
+/// What a slot holds: the backchannel the last probe found, and whether a
+/// probe runs now.
+#[derive(Debug, Clone, Default)]
+struct Probed {
+    /// The backchannel found, until a probe finds none.
+    offer: Option<BackchannelOffer>,
+    /// A probe runs: with nothing offered before it, a claim waits for
+    /// its result ([`BackchannelSlot::awaits_probe`]).
+    probing: bool,
+    /// The mark of the last probe started ([`BackchannelSlot::probing`]):
+    /// only that probe settles or abandons the slot.
+    latest: u64,
+}
+
+impl Probed {
+    /// Whether the probe marked `mark` is the one that runs now: the last
+    /// started, not settled or abandoned yet.
+    const fn runs(&self, mark: ProbeMark) -> bool {
+        self.probing && self.latest == mark.0
+    }
+}
+
+/// A probe's mark on its slot ([`BackchannelSlot::probing`]), with which
+/// it settles or abandons the slot: once a later probe has marked it, an
+/// earlier one's result or end changes nothing. A probe a connection
+/// attempt aborts ends when its task is next polled, which may be after
+/// the next attempt's probe started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeMark(u64);
+
+/// The slot a source fills when its probe found the device's backchannel,
+/// and where the probe waits for a connect permit. Shared with the
+/// connection, which arbitrates the talker and opens the backchannel for
+/// it. An offer stands until a probe finds none: a reconnect of the
+/// source keeps it, and the next probe replaces it.
 #[derive(Debug, Clone, Default)]
 pub struct BackchannelSlot {
-    /// The offered handle, if any.
-    handle: Arc<Mutex<Option<BackchannelHandle>>>,
+    /// What the probes found.
+    probed: Arc<watch::Sender<Probed>>,
+    /// Where a probe waits for a connect permit; [`ProbeGate::default`]
+    /// lets every probe through, for a source outside a worker.
+    probes: ProbeGate,
+    /// Where the tasks of the sessions opened from its offers are
+    /// tracked: the worker's, or one of its own.
+    tasks: BackchannelTasks,
 }
 
 impl BackchannelSlot {
-    /// Offers (or replaces) the backchannel.
-    pub fn offer(&self, handle: BackchannelHandle) {
-        *self.handle.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
+    /// A slot whose probes wait at `probes` for their connect permit.
+    pub fn gated(probes: ProbeGate) -> Self {
+        Self {
+            probed: Arc::default(),
+            probes,
+            tasks: BackchannelTasks::default(),
+        }
     }
 
-    /// Withdraws the backchannel, for a reconnect.
+    /// This slot, the tasks of the sessions opened from its offers
+    /// tracked in `tasks`: the worker's, which its shutdown waits for.
+    #[must_use]
+    pub fn tracked(self, tasks: BackchannelTasks) -> Self {
+        Self { tasks, ..self }
+    }
+
+    /// Where the source's probe waits for its connect permit.
+    pub const fn probes(&self) -> &ProbeGate {
+        &self.probes
+    }
+
+    /// Where the opener of an offer spawns its sessions' tasks.
+    pub const fn tasks(&self) -> &BackchannelTasks {
+        &self.tasks
+    }
+
+    /// A probe started: claims wait for its result unless an offer
+    /// stands ([`BackchannelSlot::awaits_probe`]). Its mark settles or
+    /// abandons it; any earlier probe's no longer does.
+    pub fn probing(&self) -> ProbeMark {
+        let mut mark = ProbeMark(0);
+        self.probed.send_modify(|probed| {
+            probed.latest = probed.latest.wrapping_add(1);
+            probed.probing = true;
+            mark = ProbeMark(probed.latest);
+        });
+        mark
+    }
+
+    /// The probe marked `mark` found `offer` (`Some`, offered or
+    /// replaced) or none (`None`, withdrawn), unless a later probe marked
+    /// the slot since: its result is discarded then, the later probe's
+    /// stands.
+    pub fn settle(&self, mark: ProbeMark, offer: Option<BackchannelOffer>) {
+        let settled = self.probed.send_if_modified(|probed| {
+            if !probed.runs(mark) {
+                return false;
+            }
+            probed.offer = offer;
+            probed.probing = false;
+            true
+        });
+        if !settled {
+            tracing::debug!(
+                probe = mark.0,
+                "backchannel: a probe's result came when it no longer runs on the slot, a later probe marked it or it ended; discarded"
+            );
+        }
+    }
+
+    /// The probe found `offer`: offered (or replaced).
+    pub fn offer(&self, offer: BackchannelOffer) {
+        self.probed.send_modify(|probed| {
+            probed.offer = Some(offer);
+            probed.probing = false;
+        });
+    }
+
+    /// The probe found none, or failed: withdrawn.
     pub fn withdraw(&self) {
-        *self.handle.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.probed.send_modify(|probed| {
+            probed.offer = None;
+            probed.probing = false;
+        });
+    }
+
+    /// The probe marked `mark` ended without a result (the source's
+    /// attempt ended first): what was offered before stands. Once a later
+    /// probe marked the slot, nothing changes: claims still wait for that
+    /// one.
+    pub fn abandon_probe(&self, mark: ProbeMark) {
+        let abandoned = self.probed.send_if_modified(|probed| {
+            let runs = probed.runs(mark);
+            if runs {
+                probed.probing = false;
+            }
+            runs
+        });
+        if !abandoned {
+            tracing::debug!(
+                probe = mark.0,
+                "backchannel: a probe ended that no longer runs on the slot, a later probe marked it or it settled; the slot stays as it is"
+            );
+        }
     }
 
     /// The offered backchannel, if any.
-    pub fn current(&self) -> Option<BackchannelHandle> {
-        self.handle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    pub fn current(&self) -> Option<BackchannelOffer> {
+        self.probed.borrow().offer.clone()
+    }
+
+    /// Whether a probe runs now.
+    pub fn is_probing(&self) -> bool {
+        self.probed.borrow().probing
+    }
+
+    /// Whether a claim waits for the probe ([`BackchannelSlot::settled`]):
+    /// one runs, and nothing was offered before it. An offer a reconnect
+    /// kept is claimed at once while the new attempt's probe runs, which
+    /// may wait for its connect permit a long time
+    /// (`sources.connect_concurrency`): the claim's open asks the device
+    /// again anyway.
+    pub fn awaits_probe(&self) -> bool {
+        let probed = self.probed.borrow();
+        probed.probing && probed.offer.is_none()
+    }
+
+    /// The offered backchannel once no probe runs: at once without one,
+    /// else when it found one, none, or ended without a result.
+    pub async fn settled(&self) -> Option<BackchannelOffer> {
+        let mut probed = self.probed.subscribe();
+        // The slot holds the sender, so the wait never fails.
+        let settled = probed.wait_for(|probed| !probed.probing).await;
+        settled.ok().and_then(|probed| probed.offer.clone())
     }
 }
 
@@ -656,7 +974,9 @@ pub struct SourceCtx {
     pub clock: ClockInput,
     /// The time source, for deadlines and arrival stamps.
     pub time: Arc<dyn Clock>,
-    /// Offers a reverse audio path, if the protocol has one.
+    /// Where the source offers the device's backchannel its probe found,
+    /// if the protocol has one, and where the probe waits for its connect
+    /// permit.
     pub backchannel: BackchannelSlot,
     /// Cancelled when core wants the connection to end; honor within 100 ms.
     pub cancel: CancellationToken,
@@ -1075,20 +1395,244 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn backchannel_slot_is_offered_read_and_withdrawn() {
+    /// An opener whose session never opens.
+    #[derive(Debug)]
+    struct Pending;
+
+    impl BackchannelOpener for Pending {
+        fn open(&self) -> BoxFuture<'static, Result<BackchannelSession, BackchannelRefused>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn pcmu() -> BackchannelOffer {
+        BackchannelOffer {
+            codec: Codec::Pcmu,
+            frame: BackchannelOffer::DEFAULT_FRAME,
+            opener: Arc::new(Pending),
+        }
+    }
+
+    #[tokio::test]
+    async fn backchannel_slot_is_probed_offered_read_and_withdrawn() {
         let slot = BackchannelSlot::default();
         assert!(slot.current().is_none());
-        let (sender, _rx) = mpsc::channel(1);
-        slot.offer(BackchannelHandle {
-            codec: Codec::Pcmu,
-            frame: BackchannelHandle::DEFAULT_FRAME,
-            sender,
-        });
+        assert!(
+            bounded(slot.settled()).await.is_none(),
+            "no probe: settled at once"
+        );
+        slot.offer(pcmu());
         assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
-        assert_eq!(BackchannelHandle::DEFAULT_FRAME, Duration::from_millis(20));
+        assert_eq!(BackchannelOffer::DEFAULT_FRAME, Duration::from_millis(20));
+        // A probe keeps what was offered readable, and a claim takes it
+        // without waiting for the probe's result.
+        assert!(!slot.is_probing());
+        slot.probing();
+        assert!(slot.is_probing());
+        assert!(!slot.awaits_probe(), "an offer stands");
+        assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "waits for the probe");
         slot.withdraw();
+        assert!(
+            bounded(settled).await.unwrap().is_none(),
+            "the probe found none"
+        );
         assert!(slot.current().is_none());
+        // With nothing offered, a claim waits for the probe.
+        assert!(!slot.awaits_probe(), "no probe");
+        slot.probing();
+        assert!(slot.awaits_probe());
+        // A probe abandoned leaves the offer as it was.
+        slot.offer(pcmu());
+        let mark = slot.probing();
+        slot.abandon_probe(mark);
+        assert_eq!(bounded(slot.settled()).await.unwrap().codec, Codec::Pcmu);
+        let mut never = slot.current().unwrap().opener.open();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(never.as_mut().poll(&mut cx).is_pending(), "a test opener");
+    }
+
+    /// A probe whose aborted task ends only after the next attempt's
+    /// probe marked the slot neither abandons nor settles it: a claim
+    /// still waits for the later probe, whose result alone settles it.
+    #[tokio::test]
+    async fn a_probe_ending_after_a_later_one_marked_the_slot_leaves_it_to_that_one() {
+        const ABANDONED: &str = "backchannel: a probe ended that no longer runs on the slot, a later probe marked it or it settled; the slot stays as it is";
+        const DISCARDED: &str = "backchannel: a probe's result came when it no longer runs on the slot, a later probe marked it or it ended; discarded";
+        use tracing::Level;
+        let (logs, _guard) = Logs::capture();
+        let slot = BackchannelSlot::default();
+        let earlier = slot.probing();
+        let later = slot.probing();
+        assert_ne!(earlier, later);
+        slot.abandon_probe(earlier);
+        assert!(slot.awaits_probe(), "the later probe still runs");
+        assert_eq!(logs.count(Level::DEBUG, ABANDONED), 1);
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "waits for the later probe");
+        slot.settle(earlier, Some(pcmu()));
+        assert!(slot.awaits_probe(), "the earlier result is discarded");
+        assert!(slot.current().is_none());
+        assert_eq!(logs.count(Level::DEBUG, DISCARDED), 1);
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "still waits for the later probe");
+        slot.settle(later, Some(pcmu()));
+        assert_eq!(bounded(settled).await.unwrap().unwrap().codec, Codec::Pcmu);
+        assert_eq!(
+            logs.count(Level::DEBUG, DISCARDED),
+            1,
+            "the later one settled"
+        );
+        // The probe that runs abandons quietly, and its mark is spent:
+        // neither an abandon nor a result of it changes the slot again.
+        let last = slot.probing();
+        slot.abandon_probe(last);
+        assert!(!slot.is_probing());
+        assert_eq!(logs.count(Level::DEBUG, ABANDONED), 1, "the probe that ran");
+        slot.abandon_probe(last);
+        assert_eq!(logs.count(Level::DEBUG, ABANDONED), 2);
+        slot.settle(last, None);
+        assert_eq!(
+            slot.current().unwrap().codec,
+            Codec::Pcmu,
+            "the offer stands"
+        );
+        assert_eq!(logs.count(Level::DEBUG, DISCARDED), 2);
+        // The probe that runs settles: none found withdraws the offer.
+        let next = slot.probing();
+        slot.settle(next, None);
+        assert!(!slot.is_probing());
+        assert!(slot.current().is_none());
+        assert_eq!(logs.count(Level::DEBUG, DISCARDED), 2);
+    }
+
+    /// `future`'s output, or a failed test after five seconds.
+    async fn bounded<T>(future: impl Future<Output = T>) -> T {
+        tokio::select! {
+            output = future => output,
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("nothing within 5 s"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slot_s_probes_wait_at_its_gate() {
+        let (gate, mut asks) = ProbeGate::closed();
+        let slot = BackchannelSlot::gated(gate);
+        let probes = slot.probes().clone();
+        let permit = spawn_named("test.permit", async move { probes.permit().await });
+        assert_eq!(
+            bounded(asks.recv()).await,
+            Some(crate::runner::ProbeAsk::Connecting(1))
+        );
+        assert!(slot.probes().grant(1));
+        drop(bounded(permit).await.unwrap());
+        assert_eq!(
+            bounded(asks.recv()).await,
+            Some(crate::runner::ProbeAsk::Ended(1))
+        );
+        // The default slot's probes never wait.
+        drop(bounded(BackchannelSlot::default().probes().permit()).await);
+    }
+
+    /// A slot's tasks are the ones it was given: a task spawned there
+    /// counts until it ends, and the wait for them resolves only then, a
+    /// task spawned during the wait included.
+    #[tokio::test]
+    async fn a_slot_tracks_its_sessions_tasks_where_it_was_told() {
+        let tasks = BackchannelTasks::default();
+        let slot = BackchannelSlot::default().tracked(tasks.clone());
+        assert_eq!(BackchannelSlot::default().tasks().running(), 0);
+        let (end, ended) = oneshot::channel::<()>();
+        let task = slot
+            .tasks()
+            .spawn("test.session", &CancellationToken::new(), async move {
+                let _ended = ended.await;
+            });
+        assert_eq!(tasks.running(), 1, "tracked by the tasks it was given");
+        let waiting = tasks.clone();
+        let wait = spawn_named("test.wait", async move { waiting.ended().await });
+        let (more, later) = oneshot::channel::<()>();
+        let _late = slot
+            .tasks()
+            .spawn("test.late", &CancellationToken::new(), async move {
+                let _later = later.await;
+            });
+        drop(end);
+        bounded(task).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished(), "a task spawned during the wait counts");
+        assert_eq!(tasks.running(), 1);
+        drop(more);
+        bounded(wait).await.unwrap();
+        assert_eq!(tasks.running(), 0);
+    }
+
+    /// A device takes one backchannel session at a time (a camera with
+    /// one answers a second `SETUP` `453`, RFC 2326 §11.3.3): a session's
+    /// task runs once the one spawned before it ended, and one closed
+    /// while it waits ends without running.
+    #[tokio::test]
+    async fn rfc2326_11_3_3_backchannel_session_tasks_run_one_at_a_time() {
+        let tasks = BackchannelTasks::default();
+        let (end, ended) = oneshot::channel::<()>();
+        let (ran, mut runs) = mpsc::unbounded_channel();
+        let first_ran = ran.clone();
+        let first = tasks.spawn("test.first", &CancellationToken::new(), async move {
+            first_ran.send(1).unwrap();
+            let _ended = ended.await;
+        });
+        assert_eq!(bounded(runs.recv()).await, Some(1));
+        let close = CancellationToken::new();
+        // Run, it would never end.
+        let closed = tasks.spawn("test.closed", &close, std::future::pending());
+        let second = tasks.spawn("test.second", &CancellationToken::new(), async move {
+            ran.send(2).unwrap();
+        });
+        tokio::task::yield_now().await;
+        assert!(runs.try_recv().is_err(), "both wait for the first");
+        assert_eq!(tasks.running(), 3, "waiting ones count");
+        close.cancel();
+        bounded(closed).await.unwrap();
+        assert!(runs.try_recv().is_err(), "the second still waits");
+        drop(end);
+        bounded(first).await.unwrap();
+        bounded(second).await.unwrap();
+        assert_eq!(runs.try_recv(), Ok(2));
+        assert_eq!(tasks.running(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_backchannel_session_closes_it() {
+        let close = CancellationToken::new();
+        let (sender, _uplink) = mpsc::channel(1);
+        let (on_loss, lost) = oneshot::channel();
+        let session = BackchannelSession::new(
+            Codec::Pcma,
+            Duration::from_millis(40),
+            sender,
+            lost,
+            close.clone(),
+        );
+        assert_eq!(
+            (session.codec.clone(), session.frame),
+            (Codec::Pcma, Duration::from_millis(40))
+        );
+        assert!(!close.is_cancelled());
+        let refused = BackchannelRefused {
+            status: Some(453),
+            message: "453 Not Enough Bandwidth".into(),
+        };
+        assert_eq!(refused.to_string(), "453 Not Enough Bandwidth");
+        on_loss.send(refused.clone()).unwrap();
+        let mut session = session;
+        assert_eq!((&mut session.lost).await.unwrap(), refused);
+        drop(session);
+        assert!(close.is_cancelled(), "closed with the session");
     }
 
     #[test]
