@@ -1331,6 +1331,9 @@ mod tests {
         rx: Receiver,
         clock: Arc<FakeClock>,
         worker: JoinHandle<Result<ExitReason, Error>>,
+        /// Backchannel probes wait for a connect permit that never comes,
+        /// as behind a busy `sources.connect_concurrency`.
+        hold_probes: bool,
     }
 
     fn start() -> Harness {
@@ -1369,6 +1372,7 @@ mod tests {
             rx,
             clock,
             worker,
+            hold_probes: false,
         }
     }
 
@@ -1376,7 +1380,8 @@ mod tests {
         /// The worker's next message; a worker that goes quiet for ten
         /// seconds of real time fails the test instead of hanging it.
         /// Grants every announced connection attempt at once, as the
-        /// supervisor does with a permit free.
+        /// supervisor does with a permit free; a probe's only unless
+        /// `hold_probes`.
         async fn next(&mut self) -> ToSupervisor {
             let message = tokio::select! {
                 message = self.rx.recv_msg::<ToSupervisor>() => message.unwrap().unwrap().0,
@@ -1404,7 +1409,9 @@ mod tests {
                     .await
                     .unwrap();
             }
-            if let ToSupervisor::ProbeConnecting { probe } = message {
+            if let ToSupervisor::ProbeConnecting { probe } = message
+                && !self.hold_probes
+            {
                 self.tx
                     .send_msg(&ToWorker::ProbeConnectGranted { probe }, &[])
                     .await
@@ -1880,6 +1887,80 @@ mod tests {
                 .unwrap();
             assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
         }
+    }
+
+    /// A viewing reconnect keeps the backchannel offered, and its probe
+    /// waits for a connect permit the supervisor does not grant (a busy
+    /// `sources.connect_concurrency`): an offer that asks for talk-back
+    /// meanwhile claims the kept backchannel and is answered at once,
+    /// with no time passing, rather than waiting for the probe and
+    /// leaving the open none of its limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_offer_during_a_reconnects_probe_claims_the_backchannel_kept_at_once() {
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::with_backchannel(&["fake"])))
+            .unwrap();
+        registries
+            .outputs
+            .register(Arc::new(EchoSessionFactory))
+            .unwrap();
+        let mut h = start_with_settings(Arc::new(registries), settings());
+        h.next().await;
+        let shared = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (_datagrams, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
+        h.tx.send_msg(
+            &ToWorker::Sockets,
+            &[OwnedFd::from(shared).as_fd(), theirs.as_fd()],
+        )
+        .await
+        .unwrap();
+        // Its video is silent: the watchdog reconnects it once live.
+        h.tx.send_msg(
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"backchannel": "pcmu"}"#)),
+            &[],
+        )
+        .await
+        .unwrap();
+        until_live(&mut h).await;
+        // The first probe is granted and offers PCMU.
+        stats_where(&mut h, &mut || {}, &|stats| {
+            stats.backchannel.as_deref() == Some("pcmu")
+        })
+        .await;
+        // The reconnect's probe asks and is never granted.
+        h.hold_probes = true;
+        messages_until(&mut h, |seen| {
+            let reconnected = seen
+                .iter()
+                .position(|m| matches!(source_state(m), Some(SourceState::Reconnecting { .. })));
+            reconnected.is_some_and(|at| {
+                seen[at..]
+                    .iter()
+                    .any(|m| matches!(m, ToSupervisor::ProbeConnecting { .. }))
+            })
+        })
+        .await;
+        let talking = SessionSpec {
+            offer: "v=0 talk".into(),
+            ..session_spec("talk")
+        };
+        h.tx.send_msg(&ToWorker::OpenSession(talking), &[])
+            .await
+            .unwrap();
+        let seen = messages_until_still(&mut h, |seen| !answers(seen).is_empty()).await;
+        assert_eq!(
+            answers(&seen),
+            [&SessionEvent::Answer {
+                sdp: format!("{ECHO_ANSWER} backchannel=pcmu"),
+                talkback: Some("pcmu".to_owned()),
+            }]
+        );
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
     }
 
     /// Claim and hold through the worker: the first offer that asks for

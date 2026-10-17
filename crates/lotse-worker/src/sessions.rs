@@ -974,8 +974,8 @@ struct Assessed {
 /// backchannel the session held. Decided before the engine sees the
 /// offer, so the answer carries the outcome: a claim, which opens the
 /// camera's backchannel session, and an offer that asks for talk-back
-/// while the source probes the camera, are decided by the future
-/// [`Arbitrating::Claiming`] holds.
+/// while the source probes the camera with nothing offered before, are
+/// decided by the future [`Arbitrating::Claiming`] holds.
 fn arbitrate(ctx: &SessionCtx, talkback: Option<&Talkback>, offer: &str) -> Arbitrating {
     let Some(talkback) = talkback else {
         let mut arbitration = Arbitration::new(None);
@@ -986,8 +986,9 @@ fn arbitrate(ctx: &SessionCtx, talkback: Option<&Talkback>, offer: &str) -> Arbi
     };
     let claimant = talkback.claimant();
     let factory = Arc::clone(&ctx.factory);
-    // The probe's result decides an offer that asks for talk-back.
-    let probing = claimant.arbiter().probing()
+    // The probe's result decides an offer that asks for talk-back, unless
+    // an offer from before stands.
+    let probing = claimant.arbiter().awaits_probe()
         && !matches!(
             factory.talkback_request(offer, None),
             TalkbackRequest::NotRequested
@@ -2552,11 +2553,13 @@ mod tests {
         assert_eq!(change(&mut feed).await, ("a".into(), "refused"));
     }
 
-    /// While the source probes the camera, an offer that asks for
-    /// talk-back waits for the probe; one that asks for none does not.
+    /// While the source probes the camera with nothing offered, an offer
+    /// that asks for talk-back waits for the probe; one that asks for none
+    /// does not.
     #[tokio::test]
     async fn an_offer_that_asks_for_talk_back_waits_for_the_probe() {
         let (arbiter, mut feed, camera, slot) = arbiter_with();
+        slot.withdraw();
         slot.probing();
         let (mut d, task) = session_on(
             "d",
@@ -2618,6 +2621,42 @@ mod tests {
                 sdp: "answer to v=0 talk".into(),
                 talkback: Some("pcmu".into()),
             }]
+        );
+    }
+
+    /// A reconnect's probe that waits for its connect permit does not hold
+    /// up a claim: the offer kept from before is claimed and opened at
+    /// once, the probe still running.
+    #[tokio::test]
+    async fn an_offer_claims_the_backchannel_a_reconnect_kept_while_its_probe_runs() {
+        let (logs, _guard) = Logs::capture();
+        let (arbiter, mut feed, _camera, slot) = arbiter_with();
+        slot.probing();
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = pin!(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Answer {
+                sdp: "answer".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        assert!(slot.is_probing(), "the probe still runs");
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "talk-back: the source probes the camera again; a claim takes the backchannel offered before without waiting for it"
+            ),
+            1
         );
     }
 

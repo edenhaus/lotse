@@ -395,10 +395,20 @@ impl Arbiter {
             .clone()
     }
 
-    /// Whether the running source probes the device now: a claim waits
-    /// for the probe ([`Arbiter::settled`]).
-    pub(crate) fn probing(&self) -> bool {
-        self.slot().is_probing()
+    /// Whether a claim waits for the running source's probe of the device
+    /// ([`Arbiter::settled`]): it probes, and nothing was offered before.
+    /// An offer a reconnect kept is claimed at once, so the claim's open
+    /// has the whole [`BACKCHANNEL_OPEN_LIMIT`] even while the new probe
+    /// waits for a connect permit.
+    pub(crate) fn awaits_probe(&self) -> bool {
+        let slot = self.slot();
+        let awaits = slot.awaits_probe();
+        if !awaits && slot.is_probing() {
+            tracing::debug!(
+                "talk-back: the source probes the camera again; a claim takes the backchannel offered before without waiting for it"
+            );
+        }
+        awaits
     }
 
     /// Waits until the running source's probe is over, at most
@@ -2126,15 +2136,16 @@ mod tests {
         assert!(waits(a.lost()).await);
     }
 
-    /// The source probes: a claim's arbitration waits for the probe, at
-    /// most the limit.
+    /// The source probes with nothing offered: a claim's arbitration
+    /// waits for the probe, at most the limit; with an offer a reconnect
+    /// kept, it does not wait.
     #[tokio::test]
     async fn the_arbiter_waits_for_the_probe_at_most_the_limit() {
         let (arbiter, slot, clock) = arbiter_on(None);
-        assert!(!arbiter.probing());
+        assert!(!arbiter.awaits_probe());
         assert_eq!(within(arbiter.settled()).await, BACKCHANNEL_OPEN_LIMIT);
         slot.probing();
-        assert!(arbiter.probing());
+        assert!(arbiter.awaits_probe());
         let waiting = Arc::clone(&arbiter);
         let settled = spawn_named("test.settled", async move { waiting.settled().await });
         SystemClock.sleep(Duration::from_millis(5)).await;
@@ -2145,14 +2156,18 @@ mod tests {
         let _device = pcmu(&slot);
         assert_eq!(within(settled).await.unwrap(), Duration::from_secs(5));
         assert!(arbiter.offered().is_some());
+        // A reconnect's probe with the offer kept: no wait.
+        slot.probing();
+        assert!(!arbiter.awaits_probe(), "the offer stands");
         // A probe that never ends: the limit, and nothing left.
+        slot.withdraw();
         slot.probing();
         let waiting = Arc::clone(&arbiter);
         let settled = spawn_named("test.settled", async move { waiting.settled().await });
         SystemClock.sleep(Duration::from_millis(5)).await;
         clock.advance(BACKCHANNEL_OPEN_LIMIT);
         assert_eq!(within(settled).await.unwrap(), Duration::ZERO);
-        assert!(arbiter.probing(), "still probing");
+        assert!(arbiter.awaits_probe(), "still probing");
         // A session that opens at once still wins over a limit used up.
         let _second = pcmu(&slot);
         let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());

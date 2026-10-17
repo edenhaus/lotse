@@ -466,7 +466,8 @@ impl BackchannelTasks {
 struct Probed {
     /// The backchannel found, until a probe finds none.
     offer: Option<BackchannelOffer>,
-    /// A probe runs: a claim waits for its result ([`BackchannelSlot::settled`]).
+    /// A probe runs: with nothing offered before it, a claim waits for
+    /// its result ([`BackchannelSlot::awaits_probe`]).
     probing: bool,
 }
 
@@ -514,7 +515,8 @@ impl BackchannelSlot {
         &self.tasks
     }
 
-    /// A probe started: claims wait for its result.
+    /// A probe started: claims wait for its result unless an offer
+    /// stands ([`BackchannelSlot::awaits_probe`]).
     pub fn probing(&self) {
         self.probed.send_modify(|probed| probed.probing = true);
     }
@@ -549,6 +551,17 @@ impl BackchannelSlot {
     /// Whether a probe runs now.
     pub fn is_probing(&self) -> bool {
         self.probed.borrow().probing
+    }
+
+    /// Whether a claim waits for the probe ([`BackchannelSlot::settled`]):
+    /// one runs, and nothing was offered before it. An offer a reconnect
+    /// kept is claimed at once while the new attempt's probe runs, which
+    /// may wait for its connect permit a long time
+    /// (`sources.connect_concurrency`): the claim's open asks the device
+    /// again anyway.
+    pub fn awaits_probe(&self) -> bool {
+        let probed = self.probed.borrow();
+        probed.probing && probed.offer.is_none()
     }
 
     /// The offered backchannel once no probe runs: at once without one,
@@ -1290,11 +1303,12 @@ mod tests {
         slot.offer(pcmu());
         assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
         assert_eq!(BackchannelOffer::DEFAULT_FRAME, Duration::from_millis(20));
-        // A probe keeps what was offered readable, and a claim waits for
-        // its result.
+        // A probe keeps what was offered readable, and a claim takes it
+        // without waiting for the probe's result.
         assert!(!slot.is_probing());
         slot.probing();
         assert!(slot.is_probing());
+        assert!(!slot.awaits_probe(), "an offer stands");
         assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
         let waiting = slot.clone();
         let settled = spawn_named("test.settled", async move { waiting.settled().await });
@@ -1306,6 +1320,10 @@ mod tests {
             "the probe found none"
         );
         assert!(slot.current().is_none());
+        // With nothing offered, a claim waits for the probe.
+        assert!(!slot.awaits_probe(), "no probe");
+        slot.probing();
+        assert!(slot.awaits_probe());
         // A probe abandoned leaves the offer as it was.
         slot.offer(pcmu());
         slot.probing();
