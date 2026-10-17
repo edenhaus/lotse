@@ -44,7 +44,10 @@
 //!   until it re-offers, and what it sends meanwhile is dropped and
 //!   counted.
 //! - **Reconnect.** The talker's backchannel session is its own: a
-//!   reconnect of the source that plays the stream leaves it open.
+//!   reconnect of the source that plays the stream leaves it open, and
+//!   the talker's re-offers negotiate with it ([`Arbiter::target`]),
+//!   whatever the reconnect's probe offers since; the next claim opens
+//!   what that probe offers.
 //!
 //! The talker's route to the device starts on its uplink track before its
 //! first packet is published, so nothing is missed: the reverse
@@ -436,19 +439,50 @@ impl Arbiter {
         BACKCHANNEL_OPEN_LIMIT.saturating_sub(waited)
     }
 
-    /// The backchannel the running source offers now, with the uplink
-    /// codecs that reach it, for a session to negotiate talk-back with:
-    /// each one [`Arbiter::reaches`] routes to its codec.
-    pub(crate) fn target(&self) -> Option<TalkbackTarget> {
-        let offer = self.offered()?;
+    /// The backchannel a session whose claim is `held` negotiates talk-back
+    /// with, with the uplink codecs that reach it (each one
+    /// [`Arbiter::reaches`] routes to its codec), and whether `held` holds
+    /// the channel now, decided under one lock. The talker negotiates with
+    /// the device's backchannel session it has open, in the codec and
+    /// frame its route converts to ([`Arbiter::route`]), which a probe
+    /// again or a switch to another source leaves open whatever it offers
+    /// now: an answer in a codec only the new offer takes would be routed
+    /// nowhere. Any other session negotiates with the backchannel the
+    /// running source offers now, which its claim opens.
+    pub(crate) fn target(&self, held: Option<u64>) -> (Option<TalkbackTarget>, bool) {
+        let offered = self.offered();
+        let guard = self.lock();
+        let talker = guard
+            .talker
+            .as_ref()
+            .filter(|talker| Some(talker.claim) == held);
+        let holds = talker.is_some();
+        // A session adopts its claim once the session opened, so the
+        // talker it names has one.
+        let open = talker
+            .and_then(|talker| talker.open.as_ref())
+            .map(|open| (open.codec.clone(), open.frame));
+        drop(guard);
+        if let Some((codec, _frame)) = &open {
+            let (open, offered) = (
+                codec.name(),
+                offered.as_ref().map(|offer| offer.codec.name()),
+            );
+            tracing::debug!(
+                open,
+                offered,
+                "talk-back: the talker negotiates with its open backchannel session, not with what the source offers now"
+            );
+        }
+        let Some((codec, frame)) = open.or_else(|| offered.map(|offer| (offer.codec, offer.frame)))
+        else {
+            return (None, holds);
+        };
         let takes = UplinkCodec::ALL
             .into_iter()
-            .filter(|from| self.reaches(*from, &offer.codec, offer.frame))
+            .filter(|from| self.reaches(*from, &codec, frame))
             .collect();
-        Some(TalkbackTarget {
-            codec: offer.codec,
-            takes,
-        })
+        (Some(TalkbackTarget { codec, takes }), holds)
     }
 
     /// Whether [`Arbiter::route`] finds a path for an uplink in `from` to
@@ -742,11 +776,6 @@ impl Arbiter {
             error = %why,
             "talk-back: the camera's backchannel session was lost while the talker held it; backchannel free, its packets are dropped until it offers again"
         );
-    }
-
-    /// Whether `claim` holds the channel now.
-    fn holds(&self, claim: Option<u64>) -> bool {
-        claim.is_some() && self.lock().talker.as_ref().map(|talker| talker.claim) == claim
     }
 
     /// Frees the channel (`backchannel/release`) from whoever holds it,
@@ -1097,9 +1126,11 @@ impl Claimant {
         &self.arbiter
     }
 
-    /// Whether the session holds the backchannel now.
-    pub(crate) fn holds(&self) -> bool {
-        self.arbiter.holds(self.held)
+    /// The backchannel the session negotiates talk-back with, and whether
+    /// it holds it now ([`Arbiter::target`]): its own open one while it
+    /// holds the channel, the one offered now otherwise.
+    pub(crate) fn target(&self) -> (Option<TalkbackTarget>, bool) {
+        self.arbiter.target(self.held)
     }
 
     /// Claims the backchannel for the offer and opens the device's
@@ -1598,7 +1629,7 @@ mod tests {
     }
 
     fn holds(talkback: &Talkback) -> bool {
-        talkback.claimant().holds()
+        talkback.claimant().target().1
     }
 
     fn busy(holder: &str) -> Result<(), ClaimError> {
@@ -2353,6 +2384,63 @@ mod tests {
         assert!(uplink.stops.lock().unwrap().is_empty(), "no chain");
     }
 
+    /// The talker negotiates with the backchannel session it has open, not
+    /// with what a probe since offers: holding an Opus session while the
+    /// camera now offers PCMU, it negotiates Opus alone (no chain produces
+    /// Opus), which reaches its session, never PCMU, which would reach
+    /// nothing. Any other session negotiates with what is offered now,
+    /// and the next claim opens that.
+    #[tokio::test]
+    async fn the_talker_negotiates_with_its_open_session_and_others_with_the_offer_of_now() {
+        let (logs, _guard) = Logs::capture();
+        let uplink: Arc<dyn UplinkFactory> = Arc::new(Factory(Arc::default()));
+        let (arbiter, slot) = arbiter(Some(uplink));
+        let opus = Codec::Opus { channels: 2 };
+        let mut opus_device = offer(&slot, opus.clone(), Duration::from_millis(20), 64);
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
+        claims(&mut a).await;
+        // The probe again finds PCMU.
+        let mut pcmu_device = pcmu(&slot);
+        let opus_only = TalkbackTarget {
+            codec: opus,
+            takes: vec![UplinkCodec::Opus],
+        };
+        assert_eq!(a.claimant().target(), (Some(opus_only), true));
+        assert_eq!(
+            logs.lines(
+                Level::DEBUG,
+                "talk-back: the talker negotiates with its open backchannel session, not with what the source offers now"
+            )
+            .iter()
+            .map(|line| line.fields.as_str())
+            .collect::<Vec<_>>(),
+            [" open=\"opus\" offered=\"pcmu\""]
+        );
+        // What it negotiates reaches its session, as received.
+        a.receive(packet(UplinkCodec::Opus, 7, 0, &[9, 9]));
+        let sent = within(opus_device.recv()).await.unwrap();
+        assert_eq!(&sent.payload[..], &[9, 9][..]);
+        assert_eq!(load(&a.stats.packets_dropped), 0);
+        // PCMU, which the new offer takes, has no way to the Opus session.
+        a.receive(packet(UplinkCodec::Pcmu, 7, 1, &[1]));
+        assert_eq!(load(&a.stats.packets_dropped), 1);
+        // b, and a session with no claim, get the offer of now.
+        let now = TalkbackTarget {
+            codec: Codec::Pcmu,
+            takes: vec![UplinkCodec::Opus, UplinkCodec::Pcmu, UplinkCodec::Pcma],
+        };
+        assert_eq!(b.claimant().target(), (Some(now.clone()), false));
+        assert_eq!(arbiter.target(None), (Some(now), false));
+        // Released, a's next claim opens the PCMU session.
+        arbiter.release(None);
+        assert!(!holds(&a));
+        claims(&mut a).await;
+        talk(&mut a, 2);
+        assert!(within(pcmu_device.recv()).await.is_some());
+        assert_eq!(opus_device.opens(), 1);
+    }
+
     /// No route: no factory for a conversion, or a chain that does not
     /// start. The talker keeps the channel; its packets are dropped.
     #[tokio::test]
@@ -2416,9 +2504,13 @@ mod tests {
         ] {
             let what = format!("{device:?}, chain: {}", uplink.is_some());
             let (arbiter, slot) = arbiter(uplink);
-            assert_eq!(arbiter.target(), None, "{what}: nothing offered");
+            assert_eq!(
+                arbiter.target(None),
+                (None, false),
+                "{what}: nothing offered"
+            );
             let _device = offer(&slot, device.clone(), BackchannelOffer::DEFAULT_FRAME, 1);
-            let target = arbiter.target().unwrap();
+            let target = arbiter.target(None).0.unwrap();
             assert_eq!(target.codec, device, "{what}");
             assert_eq!(target.takes, takes, "{what}");
             // The route agrees, codec by codec.
