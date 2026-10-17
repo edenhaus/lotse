@@ -68,12 +68,6 @@ impl ApiVersion {
     }
 }
 
-impl std::fmt::Display for ApiVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
-
 /// One numeric identifier: ASCII digits, no leading zero unless it is `0`.
 fn number(part: &str) -> Option<u64> {
     let digits = !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
