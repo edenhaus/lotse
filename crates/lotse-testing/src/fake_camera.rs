@@ -1494,10 +1494,14 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     return;
                 }
             }
-            () = &mut tick, if connection.playing && connection.set_up.video => {
+            // A session that set up a media stream ticks: the video's
+            // frames when it set up the video, the audio due when the
+            // audio; one that plays the backchannel alone gets nothing.
+            () = &mut tick, if connection.playing && connection.set_up.media => {
                 next_frame_at = next_frame_at.and_then(|at| at.checked_add(frame_interval));
                 let spacing = connection.config.packet_spacing;
-                for (index, (channel, packet)) in connection.next_frame(&clock).into_iter().enumerate() {
+                let frame = if connection.set_up.video { connection.next_frame(&clock) } else { Vec::new() };
+                for (index, (channel, packet)) in frame.into_iter().enumerate() {
                     if index > 0 && !spacing.is_zero() {
                         clock.sleep(spacing).await;
                     }
@@ -2425,6 +2429,27 @@ mod tests {
             }
         }
 
+        /// The next interleaved frame from the camera (RFC 2326 §10.12):
+        /// its channel and its packet.
+        async fn frame(&mut self) -> (u8, Vec<u8>) {
+            let deadline = self.clock.sleep(Duration::from_secs(5));
+            tokio::pin!(deadline);
+            loop {
+                if let Ok((message, consumed)) = Message::<Vec<u8>>::parse(&self.inbound) {
+                    self.inbound.drain(..consumed);
+                    if let Message::Data(data) = message {
+                        return (data.channel_id(), data.as_slice().to_vec());
+                    }
+                    continue;
+                }
+                let mut buf = [0_u8; 4096];
+                tokio::select! {
+                    read = self.stream.read(&mut buf) => self.inbound.extend_from_slice(&buf[..read.unwrap()]),
+                    () = &mut deadline => panic!("no interleaved frame"),
+                }
+            }
+        }
+
         async fn send(&mut self, channel: u8, packet: &[u8]) {
             self.stream
                 .write_all(&interleave(channel, packet))
@@ -2848,6 +2873,53 @@ mod tests {
         assert_eq!(playing(stats), (1, 2));
         drop(clients);
         assert!(eventually(&clock, || playing(stats) == (0, 2)).await);
+        camera.stop().await;
+    }
+
+    /// A client that sets up the audio alone (RFC 2326 §10.4: the client
+    /// chooses which media it sets up) gets the audio's RTP and Sender
+    /// Reports after `PLAY`, and no video.
+    #[tokio::test]
+    async fn rfc2326_10_4_a_session_that_sets_up_the_audio_alone_gets_audio_and_no_video() {
+        let camera = FakeCamera::start(
+            CameraConfig {
+                audio: Some(CameraAudio::Pcmu),
+                ..CameraConfig::default()
+            },
+            clock(),
+        )
+        .await
+        .unwrap();
+        let mut client = Client::connect(&camera).await;
+        client.request("DESCRIBE", &camera.url(), &[]).await;
+        let setup = client
+            .request(
+                "SETUP",
+                &format!("{}track1", base(&camera)),
+                &["Transport: RTP/AVP/TCP;unicast;interleaved=2-3"],
+            )
+            .await;
+        assert_eq!(setup.status(), StatusCode::Ok);
+        let play = client
+            .request("PLAY", &camera.url(), &["Session: 12345678"])
+            .await;
+        assert_eq!(play.status(), StatusCode::Ok);
+        let mut channels = Vec::new();
+        let mut audio = 0;
+        while audio < 3 {
+            let (channel, packet) = client.frame().await;
+            if channel == 2 {
+                assert_eq!(packet[1] & 0x7f, CameraAudio::Pcmu.payload_type());
+                audio += 1;
+            }
+            channels.push(channel);
+        }
+        assert!(
+            channels.iter().all(|channel| [2, 3].contains(channel)),
+            "{channels:?}"
+        );
+        assert!(channels.contains(&3), "a Sender Report: {channels:?}");
+        assert_eq!(Stats::get(&camera.stats().packets), 0, "no video");
         camera.stop().await;
     }
 
