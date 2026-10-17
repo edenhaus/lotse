@@ -59,6 +59,12 @@ exclude_re = [
     # verdicts and counters themselves are asserted by the arbitration tests.
     "talkback.rs:.*replace change with \\(\\)",
     "talkback.rs:.*replace == with != in change$",
+    # Only logs a talk-back arbitration's outcome; the outcome itself (the claim, the decline,
+    # what the answer carries) is asserted by the session tests.
+    "sessions.rs:.*replace Arbitration::log with \\(\\)",
+    # Only picks whether a failed backchannel probe that proves nothing is logged as a warning;
+    # what it remembers (`Probed::refused_with`) and the slot it settles are asserted alike.
+    "backchannel/probe.rs:.*delete ! in run$",
     # Only picks whether the one-per-session warning for dropped declines is logged.
     "replace == with != in SessionEntry::declined",
     # G.711's sign (0x80), segment (0x70) and step (0x0f) bits are disjoint, so `|` and `^`

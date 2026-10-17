@@ -35,11 +35,22 @@ pub struct Harness {
 impl Harness {
     /// Starts `source` against `peer`.
     pub fn start(source: &dyn Source, peer: ResolvedPeer, clock: Arc<dyn Clock>) -> Self {
+        Self::start_with(source, peer, clock, BackchannelSlot::default())
+    }
+
+    /// Starts `source` against `peer`, offering its backchannel on
+    /// `backchannel`: one shared with an earlier attempt, as a reconnect
+    /// shares its connection's, or one whose probes wait at a gate.
+    pub fn start_with(
+        source: &dyn Source,
+        peer: ResolvedPeer,
+        clock: Arc<dyn Clock>,
+        backchannel: BackchannelSlot,
+    ) -> Self {
         let tracks = TrackSet::new(TrackLimits::default(), clock.now());
         let mapper = Arc::new(ClockMapper::new());
         let (clock_input, reports) = ClockInput::channel(Arc::clone(&mapper));
         let cancel = CancellationToken::new();
-        let backchannel = BackchannelSlot::default();
         let ctx = SourceCtx {
             peer,
             tracks: tracks.publisher(),

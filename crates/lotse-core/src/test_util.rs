@@ -19,7 +19,8 @@ use crate::session::{
     SessionStats, TalkbackClaim, TalkbackTarget, Transport,
 };
 use crate::source::{
-    BackchannelHandle, Direction, Source, SourceCapabilities, SourceConfigError, SourceCtx,
+    BackchannelOffer, BackchannelOpener, BackchannelRefused, BackchannelSession, BackchannelSlot,
+    Direction, ProbeMark, Source, SourceCapabilities, SourceConfigError, SourceCtx,
     SourceDescriptor, SourceError, SourceExit, SourceFactory,
 };
 use crate::source_url::SourceUrl;
@@ -63,8 +64,9 @@ macro_rules! let_assert {
 /// `{"audio": "aac_drifting"}` for that and Sender Reports whose audio
 /// clock runs 2 % fast, so the skew watchdog withdraws its audio, or
 /// `{"backchannel": "pcmu" | "pcma" | "opus"}` to offer a backchannel
-/// taking that codec in 20 ms frames while it runs (whose packets go into
-/// the factory's [`BackchannelCapture`], if it has one, else nowhere),
+/// taking that codec in 20 ms frames once it runs, each claim opening a
+/// session of it at once (whose packets go into the factory's
+/// [`BackchannelCapture`], if it has one, else nowhere),
 /// `{"video": true}` to publish 30 fps H.264 on the video track
 /// ([`video_packet`]), or both of the last two together, the doorbell a
 /// talk-back test watches while it talks; anything else is rejected, so
@@ -131,12 +133,25 @@ impl FakeSourceFactory {
 }
 
 /// What the backchannels of a capturing [`FakeSourceFactory`] received, in
-/// order, across runs: the packets as the worker sent them to the device,
-/// each with when it arrived.
+/// order, across runs and sessions: the packets as the worker sent them
+/// to the device, each with when it arrived, and how many backchannel
+/// sessions were opened and closed.
 #[derive(Debug, Clone)]
 pub struct BackchannelCapture {
     /// The packets; a waiter sees each one arrive.
     packets: Arc<tokio::sync::watch::Sender<Vec<Captured>>>,
+    /// The sessions opened and closed so far.
+    sessions: Arc<tokio::sync::watch::Sender<FakeSessions>>,
+}
+
+/// How many backchannel sessions a [`BackchannelCapture`]'s fake device
+/// opened and closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FakeSessions {
+    /// Opened for a claim.
+    pub opened: u64,
+    /// Closed by their holder.
+    pub closed: u64,
 }
 
 /// One packet a [`BackchannelCapture`] took.
@@ -153,6 +168,7 @@ impl Default for BackchannelCapture {
     fn default() -> Self {
         Self {
             packets: Arc::new(tokio::sync::watch::Sender::new(Vec::new())),
+            sessions: Arc::new(tokio::sync::watch::Sender::new(FakeSessions::default())),
         }
     }
 }
@@ -191,51 +207,88 @@ impl BackchannelCapture {
         self.packets
             .send_modify(|packets| packets.push(Captured { at, packet }));
     }
+
+    /// The sessions opened and closed so far.
+    pub fn sessions(&self) -> FakeSessions {
+        *self.sessions.borrow()
+    }
+
+    /// Waits until the sessions opened and closed are `want`.
+    pub async fn wait_sessions(&self, want: FakeSessions) {
+        let mut sessions = self.sessions.subscribe();
+        // The capture holds the sender, so the wait never fails.
+        let _reached = sessions.wait_for(|sessions| *sessions == want).await;
+    }
 }
 
-/// Runs `live` to its end, taking what the backchannel receives
-/// meanwhile into `capture` if there is one, stamped on `time`.
-async fn drain_while(
-    live: impl Future<Output = SourceExit>,
-    mut uplink: Option<tokio::sync::mpsc::Receiver<MediaPacket>>,
+/// The fake device's backchannel: every claim opens a session at once,
+/// taking `codec` in 20 ms frames, whose packets go into `capture` if
+/// there is one, stamped on `time`.
+#[derive(Debug)]
+struct FakeOpener {
+    /// The codec it takes.
+    codec: Codec,
+    /// Where its packets go.
+    capture: Option<BackchannelCapture>,
+    /// The clock that stamps them.
+    time: Arc<dyn Clock>,
+}
+
+impl BackchannelOpener for FakeOpener {
+    fn open(&self) -> BoxFuture<'static, Result<BackchannelSession, BackchannelRefused>> {
+        let (sender, uplink) = tokio::sync::mpsc::channel(8);
+        let (on_loss, lost) = tokio::sync::oneshot::channel();
+        let close = tokio_util::sync::CancellationToken::new();
+        let session = BackchannelSession::new(
+            self.codec.clone(),
+            BackchannelOffer::DEFAULT_FRAME,
+            sender,
+            lost,
+            close.clone(),
+        );
+        if let Some(capture) = &self.capture {
+            capture.sessions.send_modify(|sessions| {
+                sessions.opened = sessions.opened.saturating_add(1);
+            });
+        }
+        let drain = drain(
+            uplink,
+            self.capture.clone(),
+            Arc::clone(&self.time),
+            (close, on_loss),
+        );
+        let _drain = crate::task::spawn_named("fake_source.backchannel", drain);
+        Box::pin(std::future::ready(Ok(session)))
+    }
+}
+
+/// One fake backchannel session until its holder closes it: what arrives
+/// on `uplink` goes into `capture` if there is one, stamped on `time`.
+/// Its loss is never reported, so the sender is kept until the close.
+async fn drain(
+    mut uplink: tokio::sync::mpsc::Receiver<MediaPacket>,
     capture: Option<BackchannelCapture>,
     time: Arc<dyn Clock>,
-) -> SourceExit {
-    let mut live = std::pin::pin!(live);
+    (close, _on_loss): (
+        tokio_util::sync::CancellationToken,
+        tokio::sync::oneshot::Sender<BackchannelRefused>,
+    ),
+) {
     loop {
         tokio::select! {
-            exit = &mut live => return exit,
-            Some(packet) = next_uplink(&mut uplink) => {
+            Some(packet) = uplink.recv() => {
                 if let Some(capture) = &capture {
                     capture.push(time.now(), packet);
                 }
             }
+            () = close.cancelled() => break,
         }
     }
-}
-
-/// The next packet a fake backchannel receives; never without one.
-async fn next_uplink(
-    uplink: &mut Option<tokio::sync::mpsc::Receiver<MediaPacket>>,
-) -> Option<MediaPacket> {
-    match uplink {
-        Some(uplink) => uplink.recv().await,
-        None => std::future::pending().await,
+    if let Some(capture) = &capture {
+        capture.sessions.send_modify(|sessions| {
+            sessions.closed = sessions.closed.saturating_add(1);
+        });
     }
-}
-
-/// A fake backchannel taking `codec` in 20 ms frames: the handle a source
-/// offers, and the receiving end it drains.
-fn fake_handle(codec: Codec) -> (BackchannelHandle, tokio::sync::mpsc::Receiver<MediaPacket>) {
-    let (sender, uplink) = tokio::sync::mpsc::channel(8);
-    (
-        BackchannelHandle {
-            codec,
-            frame: BackchannelHandle::DEFAULT_FRAME,
-            sender,
-        },
-        uplink,
-    )
 }
 
 /// The `backchannel` and `video` options of a fake source, when `options`
@@ -463,10 +516,14 @@ pub fn fake_aac() -> Codec {
 /// publishes a frame of it every 64 ms, stamped with its capture time on
 /// the 64 ms grid from the moment it went live; drifting, it also sends
 /// Sender Reports every second from a second after it went live, whose
-/// audio clock runs 2 % fast. With a backchannel it offers one in the slot
-/// before it goes live (20 ms frames), takes what arrives on it into its
-/// capture, if any, stamped with its arrival on the injected clock, and
-/// withdraws it when its run ends. With video it publishes a
+/// audio clock runs 2 % fast. With a backchannel it marks the slot probed
+/// before its tracks are ready, then probes beside its run, as the RTSP
+/// source does: under a permit of the slot's gate, which it asks for only
+/// once its tracks are ready, so a probe never waits for the permit its
+/// own attempt holds until it is live. It offers the backchannel in the
+/// slot once granted (20 ms frames), whose sessions take what arrives on
+/// them into its capture, if any, stamped with its arrival on the injected
+/// clock; the offer stands when its run ends. With video it publishes a
 /// [`video_packet`] every [`VIDEO_FRAME`] on the injected clock while it
 /// runs.
 #[derive(Debug)]
@@ -525,12 +582,15 @@ impl Source for FakeSource {
         let audio = self.audio;
         let keyframes_every = self.keyframes_every;
         let publishes_video = self.video;
-        // The channel lives as long as the run: a worker's sender fails
-        // once the run is over, as a camera session's would.
-        let (backchannel, uplink) = self.backchannel.clone().map(fake_handle).unzip();
-        let capture = self.capture.clone();
-        let slot = ctx.backchannel.clone();
-        let time = Arc::clone(&ctx.time);
+        let backchannel = self.backchannel.clone().map(|codec| BackchannelOffer {
+            codec: codec.clone(),
+            frame: BackchannelOffer::DEFAULT_FRAME,
+            opener: Arc::new(FakeOpener {
+                codec,
+                capture: self.capture.clone(),
+                time: Arc::clone(&ctx.time),
+            }),
+        });
         let ready_after = ctx.time.sleep(self.ready_after);
         let live = async move {
             // The ingest contract holds while waiting to go live too: a
@@ -550,78 +610,108 @@ impl Source for FakeSource {
                 },
                 90_000,
             );
-            if let Some(handle) = backchannel {
-                ctx.backchannel.offer(handle);
-            }
-            let (codec, clock_rate, step) = match audio {
-                FakeAudio::None => {
-                    ctx.tracks.ready();
-                    if crash {
-                        tracing::error!("fake source: crashing the process as requested");
-                        abort();
-                    }
-                    if publishes_video {
-                        return fake_video(&video, &*ctx.time, &ctx.cancel).await;
-                    }
-                    return video_only(&ctx, &video, keyframes_every).await;
-                }
-                FakeAudio::Pcmu => (Codec::Pcmu, 8_000, Duration::from_millis(20)),
-                FakeAudio::Aac | FakeAudio::AacDrifting => {
-                    (fake_aac(), 16_000, Duration::from_millis(64))
+            // Marked before the tracks are ready, so a claim that comes
+            // with the first session waits for the probe.
+            let probe = backchannel.map(|offer| {
+                let mark = ctx.backchannel.probing();
+                fake_probe(ctx.backchannel.clone(), mark, offer, ctx.cancel.clone())
+            });
+            let probe = async move {
+                if let Some(probe) = probe {
+                    probe.await;
                 }
             };
-            let track = ctx.tracks.declare(Kind::Audio, codec, clock_rate);
-            ctx.tracks.ready();
-            let start = ctx.time.now();
-            let (mut index, mut seq) = (0_u32, 0_u16);
-            // A camera's first report follows its first packets (RFC 3550
-            // §6.2), so the tracks are announced before it maps them.
-            let mut next_report = DRIFTING_REPORT_INTERVAL;
-            loop {
-                let now = ctx.time.now();
-                let elapsed = now.saturating_duration_since(start);
-                if audio == FakeAudio::AacDrifting && elapsed >= next_report {
-                    drifting_reports(&ctx.clock, &video, &track, elapsed, now);
-                    next_report = next_report.saturating_add(DRIFTING_REPORT_INTERVAL);
-                }
-                if audio == FakeAudio::Pcmu {
-                    track.publish_packet(pcmu_packet(ctx.time.now(), seq));
-                } else {
-                    // Captured on the frame grid, as a camera with Sender
-                    // Reports maps them, however late the task wakes.
-                    let wallclock = step
-                        .checked_mul(index)
-                        .and_then(|since| start.checked_add(since))
-                        .unwrap_or(start);
-                    track.publish_frame(MediaFrame {
-                        ts: MediaTime::from_ticks(i64::from(index).saturating_mul(1024)),
-                        wallclock,
-                        arrival: now,
-                        keyframe: true,
-                        discontinuity: false,
-                        epoch: 0,
-                        // One `ID_END`: a silent AAC frame.
-                        payload: bytes::Bytes::from_static(&[0xe0]),
-                    });
-                }
-                index = index.wrapping_add(1);
-                seq = seq.wrapping_add(1);
-                tokio::select! {
-                    () = ctx.time.sleep(step) => {}
-                    () = ctx.cancel.cancelled() => {
-                        return SourceExit::Ended(SourceError::Ended("cancelled".into()));
+            let run = async move {
+                let (codec, clock_rate, step) = match audio {
+                    FakeAudio::None => {
+                        ctx.tracks.ready();
+                        if crash {
+                            tracing::error!("fake source: crashing the process as requested");
+                            abort();
+                        }
+                        if publishes_video {
+                            return fake_video(&video, &*ctx.time, &ctx.cancel).await;
+                        }
+                        return video_only(&ctx, &video, keyframes_every).await;
+                    }
+                    FakeAudio::Pcmu => (Codec::Pcmu, 8_000, Duration::from_millis(20)),
+                    FakeAudio::Aac | FakeAudio::AacDrifting => {
+                        (fake_aac(), 16_000, Duration::from_millis(64))
+                    }
+                };
+                let track = ctx.tracks.declare(Kind::Audio, codec, clock_rate);
+                ctx.tracks.ready();
+                let start = ctx.time.now();
+                let (mut index, mut seq) = (0_u32, 0_u16);
+                // A camera's first report follows its first packets (RFC 3550
+                // §6.2), so the tracks are announced before it maps them.
+                let mut next_report = DRIFTING_REPORT_INTERVAL;
+                loop {
+                    let now = ctx.time.now();
+                    let elapsed = now.saturating_duration_since(start);
+                    if audio == FakeAudio::AacDrifting && elapsed >= next_report {
+                        drifting_reports(&ctx.clock, &video, &track, elapsed, now);
+                        next_report = next_report.saturating_add(DRIFTING_REPORT_INTERVAL);
+                    }
+                    if audio == FakeAudio::Pcmu {
+                        track.publish_packet(pcmu_packet(ctx.time.now(), seq));
+                    } else {
+                        // Captured on the frame grid, as a camera with Sender
+                        // Reports maps them, however late the task wakes.
+                        let wallclock = step
+                            .checked_mul(index)
+                            .and_then(|since| start.checked_add(since))
+                            .unwrap_or(start);
+                        track.publish_frame(MediaFrame {
+                            ts: MediaTime::from_ticks(i64::from(index).saturating_mul(1024)),
+                            wallclock,
+                            arrival: now,
+                            keyframe: true,
+                            discontinuity: false,
+                            epoch: 0,
+                            // One `ID_END`: a silent AAC frame.
+                            payload: bytes::Bytes::from_static(&[0xe0]),
+                        });
+                    }
+                    index = index.wrapping_add(1);
+                    seq = seq.wrapping_add(1);
+                    tokio::select! {
+                        () = ctx.time.sleep(step) => {}
+                        () = ctx.cancel.cancelled() => {
+                            return SourceExit::Ended(SourceError::Ended("cancelled".into()));
+                        }
                     }
                 }
-            }
+            };
+            // The run goes first: its tracks are ready before the probe
+            // asks for its permit.
+            tokio::join!(biased; run, probe).0
         };
-        Box::pin(async move {
-            let exit = drain_while(live, uplink, capture, time).await;
-            // Gone with the run, as a source's backchannel is for the
-            // reconnect.
-            slot.withdraw();
-            exit
-        })
+        // The offer stands after the run, as a probe's does across a
+        // reconnect.
+        Box::pin(live)
     }
+}
+
+/// A fake source's probe of its backchannel, which `slot` is marked for
+/// with `mark`: under a connect permit of the slot's gate, as a
+/// protocol's source probes the device, it offers `offer`; a cancel while
+/// it waits for the permit abandons it, and the offer stays as it was.
+async fn fake_probe(
+    slot: BackchannelSlot,
+    mark: ProbeMark,
+    offer: BackchannelOffer,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let permit = tokio::select! {
+        permit = slot.probes().permit() => permit,
+        () = cancel.cancelled() => {
+            slot.abandon_probe(mark);
+            return;
+        }
+    };
+    slot.settle(mark, Some(offer));
+    drop(permit);
 }
 
 /// The run of a fake source without audio once it is live: until
@@ -1374,15 +1464,19 @@ mod tests {
             let mut ready = set.ready();
             let run = crate::task::spawn_named("test.fake_source", run);
             assert!(ready.changed().await.is_ok());
-            // Offered before it went live, video only, and open.
-            let handle = slot.current().expect("offered");
-            assert_eq!(handle.codec, codec);
-            assert_eq!(handle.frame, BackchannelHandle::DEFAULT_FRAME);
+            // Offered before it went live, video only.
+            let offer = slot.current().expect("offered");
+            assert_eq!(offer.codec, codec);
+            assert_eq!(offer.frame, BackchannelOffer::DEFAULT_FRAME);
             assert_eq!(set.tracks().len(), 1);
+            // A claim opens a session at once, in the offer's codec.
+            let session = offer.opener.open().await.unwrap();
+            assert_eq!(session.codec, codec);
+            assert_eq!(session.frame, BackchannelOffer::DEFAULT_FRAME);
             let before = capture.packets().len();
             for seq in 0..3 {
                 assert!(
-                    handle
+                    session
                         .sender
                         .try_send(pcmu_packet(SystemClock.now(), seq))
                         .is_ok()
@@ -1396,12 +1490,13 @@ mod tests {
                 let seqs: Vec<u16> = captured.iter().map(|packet| packet.rtp.seq).collect();
                 assert_eq!(seqs, [0, 1, 2], "in order");
                 assert_eq!(capture.packets().len(), 3, "kept");
+                assert_eq!(capture.sessions().opened, 1);
             } else {
                 // Taken off the channel all the same, so it never fills.
                 for _ in 0..20 {
                     tokio::task::yield_now().await;
                 }
-                assert_eq!(handle.sender.capacity(), 8);
+                assert_eq!(session.sender.capacity(), 8);
                 assert_eq!(capture.packets().len(), before, "nowhere to put them");
             }
             cancel.cancel();
@@ -1409,8 +1504,20 @@ mod tests {
                 run.await.unwrap(),
                 SourceExit::Ended(SourceError::Ended(_))
             ));
-            assert!(slot.current().is_none(), "withdrawn with the run");
-            assert!(handle.sender.is_closed());
+            assert!(slot.current().is_some(), "the offer stands after the run");
+            // The session is its holder's: open until dropped.
+            assert!(!session.sender.is_closed());
+            let sender = session.sender.clone();
+            drop(session);
+            if name == "pcma" {
+                let both = FakeSessions {
+                    opened: 1,
+                    closed: 1,
+                };
+                within(capture.wait_sessions(both)).await;
+                assert_eq!(capture.sessions(), both, "closed by its holder");
+            }
+            within(sender.closed()).await;
         }
     }
 
@@ -1485,8 +1592,14 @@ mod tests {
                 if index % 30 == 0 { 5 } else { 1 }
             );
         }
-        let handle = slot.current().expect("offered");
-        assert!(handle.sender.try_send(pcmu_packet(clock.now(), 7)).is_ok());
+        let session = slot
+            .current()
+            .expect("offered")
+            .opener
+            .open()
+            .await
+            .unwrap();
+        assert!(session.sender.try_send(pcmu_packet(clock.now(), 7)).is_ok());
         let captured = within(async {
             loop {
                 if let Some(first) = capture.captured().first().cloned() {
@@ -1504,7 +1617,7 @@ mod tests {
             packets.1.await.unwrap(),
             SourceExit::Ended(SourceError::Ended(_))
         ));
-        assert!(slot.current().is_none());
+        drop(session);
     }
 
     /// The ingest contract: a source honors `cancel` within 100 ms in every
@@ -1541,6 +1654,64 @@ mod tests {
             SourceExit::Ended(SourceError::Ended(_))
         ));
         assert!(set.tracks().is_empty(), "cancelled before it declared any");
+    }
+
+    /// A fake source with a backchannel marks its slot probed before its
+    /// tracks are ready and probes beside its run under a permit of the
+    /// slot's gate, which it asks for once they are: its readiness never
+    /// waits for that permit, which with one connect permit its own
+    /// attempt holds until it is live. A cancel while the probe waits
+    /// abandons it.
+    #[tokio::test]
+    async fn a_fake_source_probes_its_backchannel_under_a_permit_once_ready() {
+        use crate::runner::{ProbeAsk, ProbeGate};
+
+        let url = SourceUrl::parse("fake://cam/").unwrap();
+        let source = FakeSourceFactory::with_backchannel(&["fake"])
+            .validate(&url, &serde_json::json!({"backchannel": "pcmu"}))
+            .unwrap();
+        for granted in [true, false] {
+            let (gate, mut asks) = ProbeGate::closed();
+            let slot = BackchannelSlot::gated(gate.clone());
+            let set = TrackSet::new(TrackLimits::default(), SystemClock.now());
+            let (input, _reports) =
+                ClockInput::channel(Arc::new(crate::clock_map::ClockMapper::new()));
+            let cancel = CancellationToken::new();
+            let run = source.run(SourceCtx {
+                peer: ResolvedPeer {
+                    host: "cam".into(),
+                    addrs: vec![],
+                },
+                tracks: set.publisher(),
+                clock: input,
+                time: Arc::new(SystemClock),
+                backchannel: slot.clone(),
+                cancel: cancel.clone(),
+            });
+            let mut ready = set.ready();
+            let run = crate::task::spawn_named("test.fake_source", run);
+            assert!(
+                within(ready.wait_for(|ready| *ready)).await.is_ok(),
+                "ready without the probe's permit"
+            );
+            assert!(slot.is_probing(), "marked before the tracks were ready");
+            assert_eq!(within(asks.recv()).await, Some(ProbeAsk::Connecting(1)));
+            if granted {
+                assert!(gate.grant(1));
+                assert_eq!(within(asks.recv()).await, Some(ProbeAsk::Ended(1)));
+                assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
+            }
+            cancel.cancel();
+            assert!(matches!(
+                within(run).await.unwrap(),
+                SourceExit::Ended(SourceError::Ended(_))
+            ));
+            assert!(!slot.is_probing(), "{granted}");
+            assert_eq!(slot.current().is_some(), granted);
+            if !granted {
+                assert_eq!(within(asks.recv()).await, Some(ProbeAsk::Ended(1)));
+            }
+        }
     }
 
     /// `future`'s output, or a failed test after five seconds of real time.

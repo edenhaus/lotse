@@ -1,19 +1,23 @@
-//! The backchannel's RTP side: the format a camera takes on its ONVIF
-//! backchannel media, read from its SDP, and the packetizer that stamps the
+//! The camera's ONVIF backchannel (ONVIF Streaming Specification §5.3):
+//! the format it takes, read from its SDP; the packetizer that stamps the
 //! talk-back chain's packets with the camera's payload type and the
-//! session's own sequence numbers, timestamps and SSRC.
+//! session's own sequence numbers, timestamps and SSRC; and the
+//! connections of its own the backchannel lives on, apart from the
+//! session that plays the stream.
 //!
-//! Both halves are pure: [`backchannel_format`] reads one SDP media
-//! description, and a [`Packetizer`] turns the packets the backchannel
-//! handle receives (the talk-back transcoder's G.711 frames, or a browser's
-//! Opus packets forwarded as they are) into [`BackchannelPacket`]s, the RTP
-//! header fields and the payload, without a wire format: whatever sends them
-//! on the RTSP session's interleaved channel serializes them. [`session`]
-//! holds what surrounds them in the RTSP session: the `Require` header and
-//! its refusal, the backchannel media of the `DESCRIBE` answer, and the
-//! handle offered while the session plays; the RTSP source hands retina
-//! the stamped packets, and retina serializes them on the backchannel's
-//! interleaved channel with its own SSRC and sequence numbers.
+//! [`backchannel_format`] reads one SDP media description, and a
+//! [`Packetizer`] turns the packets a talker's backchannel session receives
+//! (the talk-back transcoder's G.711 frames, or a browser's Opus packets
+//! forwarded as they are) into [`BackchannelPacket`]s, the RTP header
+//! fields and the payload, without a wire format: retina serializes them
+//! on the backchannel's interleaved channel with its own SSRC and sequence
+//! numbers. [`session`] holds the decisions: the `Require` header, which
+//! media of a `DESCRIBE` answer is the backchannel, what a probe's `551`
+//! means for the source, and what a refusal says. The crate's `probe`
+//! module asks the camera, once the stream's session plays, on a
+//! connection of its own; its `open` module opens the backchannel in a
+//! session of its own when a talker claims it and closes it at the
+//! release; its `camera` module is how both reach the camera.
 //!
 //! Implements RFC 8866 §5.14 (the `m=` format list, in order of preference),
 //! §6.4 (`a=ptime`) and §6.6 (`a=rtpmap`), with encoding names compared
@@ -25,6 +29,9 @@
 //! the first packet of a talkspurt); ONVIF Streaming Specification §5.3 (the
 //! backchannel media whose format this is).
 
+pub(crate) mod camera;
+pub(crate) mod open;
+pub(crate) mod probe;
 pub mod session;
 
 use std::sync::Arc;

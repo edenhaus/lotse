@@ -20,7 +20,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sdp-types = { workspace = true } # the camera's backchannel media: payload type and `a=ptime`
 socket2 = { workspace = true } # `TCP_QUICKACK` on the relay's side of retina's connection, whose Nagle would hold the backchannel's packets
-tokio = { workspace = true, features = ["macros", "net", "io-util", "sync"] } # `select!` over packets and cancellation; the `rtsps` relay's sockets and copy loop; `sync`: the TCP relay's wake-up when a receiver report is first scheduled, and the backchannel's queue
+tokio = { workspace = true, features = ["macros", "net", "io-util", "sync"] } # `select!` over packets and cancellation; the `rtsps` relay's sockets and copy loop; `sync`: the TCP relay's wake-up when a receiver report is first scheduled, the relay listener's turn, and the backchannel's queue
+tokio-util = { workspace = true } # the backchannel session's close: dropping the talker's session cancels its task
 tracing = { workspace = true }
 url = { workspace = true } # the URL retina connects to, host replaced by the resolved address
 lotse-codec = { workspace = true }
@@ -31,7 +32,6 @@ lotse-tls = { workspace = true } # `rtsps`: the certificate check and the TLS st
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] } # the end-to-end tests against the fake camera
 lotse-core = { workspace = true, features = ["test-util"] } # the fake clock
 lotse-testing = { workspace = true } # the fake camera and the source harness
-tokio-util = { workspace = true } # cancels the runner in the reconnect row
 tracing-subscriber = { workspace = true } # captures the `insecure_tls` and `frame_over_browser_limit` warnings; runs the UDP tests at `trace`
 
 [lints]

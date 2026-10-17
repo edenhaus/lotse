@@ -79,7 +79,7 @@ pub trait Transcoder: fmt::Debug + Send + Sync {
 /// negotiation never offers a viewer a talk-back conversion.
 pub trait UplinkFactory: fmt::Debug + Send + Sync {
     /// The transcoder producing packets of `frame`
-    /// ([`BackchannelHandle::frame`](crate::source::BackchannelHandle::frame));
+    /// ([`BackchannelOffer::frame`](crate::source::BackchannelOffer::frame));
     /// one outside the range it frames is clamped into it.
     fn transcoder(&self, frame: Duration) -> Arc<dyn Transcoder>;
 }
