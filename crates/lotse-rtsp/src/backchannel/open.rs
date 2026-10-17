@@ -29,9 +29,9 @@ use lotse_core::codec::Codec;
 use lotse_core::media::MediaPacket;
 use lotse_core::source::{
     BACKCHANNEL_OPEN_LIMIT, BackchannelOffer, BackchannelOpener, BackchannelRefused,
-    BackchannelSession, SourceError,
+    BackchannelSession, BackchannelTasks, SourceError,
 };
-use lotse_core::task::{BoxFuture, spawn_named};
+use lotse_core::task::BoxFuture;
 use retina::client::{
     Playing, Session, SessionGroup, SetupOptions, TcpTransportOptions, Transport,
 };
@@ -67,12 +67,17 @@ type Opened = (Codec, Duration, mpsc::Sender<MediaPacket>);
 pub(crate) struct Opener {
     /// The camera.
     camera: Camera,
+    /// Where each session's task is tracked: the worker's shutdown waits
+    /// for it, so the session's `TEARDOWN` (RFC 2326 §10.7) goes out
+    /// before the worker exits.
+    tasks: BackchannelTasks,
 }
 
 impl Opener {
-    /// An opener for `camera`'s backchannel.
-    pub(crate) const fn new(camera: Camera) -> Self {
-        Self { camera }
+    /// An opener for `camera`'s backchannel, its sessions' tasks tracked
+    /// in `tasks`.
+    pub(crate) const fn new(camera: Camera, tasks: BackchannelTasks) -> Self {
+        Self { camera, tasks }
     }
 }
 
@@ -81,7 +86,9 @@ impl BackchannelOpener for Opener {
         let close = CancellationToken::new();
         let (opened, open) = oneshot::channel();
         let (on_loss, lost) = oneshot::channel();
-        let _session = spawn_named(
+        // Tracked, not joined: the claim's drop closes it, and the
+        // worker's shutdown waits for the task to end.
+        let _session = self.tasks.spawn(
             "rtsp.backchannel",
             run(self.camera.clone(), close.clone(), opened, on_loss),
         );
@@ -324,6 +331,7 @@ mod tests {
 
     use lotse_core::clock::{Clock as _, SystemClock};
     use lotse_core::source_url::SourceUrl;
+    use lotse_core::task::spawn_named;
     use lotse_testing::fake_camera::{
         BackchannelCodec, BackchannelSetup, CameraBackchannel, ConnectionLog,
     };
@@ -402,6 +410,37 @@ mod tests {
         assert!(log.played, "{log:?}");
         assert_eq!(log.teardown, Some(true), "{log:?}");
         assert!(log.closed_by_client, "{log:?}");
+        cam.stop().await;
+    }
+
+    /// The tasks an opener's sessions run on are tracked where it was
+    /// told, and end only once the session's `TEARDOWN` (RFC 2326 §10.7)
+    /// was answered: once the wait for them is over at a worker's
+    /// shutdown, the camera has seen it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc2326_10_7_a_tracked_session_task_ends_once_its_teardown_is_answered() {
+        let cam = FakeCamera::start(
+            CameraConfig {
+                backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+                keep_open_on_teardown: true,
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let tasks = BackchannelTasks::default();
+        let opener = Opener::new(camera_at(&cam), tasks.clone());
+        let session = opener.open().await.unwrap();
+        assert_eq!(session.codec, Codec::Pcmu);
+        assert_eq!(tasks.running(), 1);
+        drop(session);
+        tokio::select! {
+            () = tasks.ended() => {}
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the session's task never ended"),
+        }
+        let log = cam.stats().connection_log();
+        assert_eq!(log[0].teardown, Some(true), "{log:?}");
         cam.stop().await;
     }
 

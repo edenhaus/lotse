@@ -13,7 +13,9 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::task::TaskTracker;
 
 use crate::clock::Clock;
 use crate::clock_map::ClockMapper;
@@ -23,7 +25,7 @@ use crate::media::MediaPacket;
 use crate::negotiate::TrackInfo;
 use crate::runner::ProbeGate;
 use crate::source_url::SourceUrl;
-use crate::task::BoxFuture;
+use crate::task::{BoxFuture, spawn_named};
 use crate::track::{Feeds, Track, TrackId, TrackLimits};
 
 /// How a source protocol obtains media.
@@ -424,6 +426,40 @@ impl BackchannelSession {
     }
 }
 
+/// The tasks of the backchannel sessions opened from a worker's offers,
+/// tracked so that the worker's shutdown waits for each to close its
+/// session on the device (RTSP: its `TEARDOWN`, RFC 2326 §10.7, RFC 7826
+/// §13.4) instead of its runtime dropping them halfway. Clones track
+/// together; a default one tracks on its own, for a slot outside a
+/// worker. A source spawns its session's task here
+/// ([`BackchannelTasks::spawn`]), the claim's drop closes the session, and
+/// the task ends once the device's side is closed.
+#[derive(Debug, Clone, Default)]
+pub struct BackchannelTasks(TaskTracker);
+
+impl BackchannelTasks {
+    /// Spawns `future`, one backchannel session's task, under `name`,
+    /// tracked until it ends.
+    pub fn spawn<F>(&self, name: &'static str, future: F) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        spawn_named(name, self.0.track_future(future))
+    }
+
+    /// How many of the tracked tasks still run.
+    pub fn running(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Resolves once every tracked task ended, a task spawned meanwhile
+    /// included. The caller bounds the wait.
+    pub async fn ended(&self) {
+        self.0.close();
+        self.0.wait().await;
+    }
+}
+
 /// What a slot holds: the backchannel the last probe found, and whether a
 /// probe runs now.
 #[derive(Debug, Clone, Default)]
@@ -446,6 +482,9 @@ pub struct BackchannelSlot {
     /// Where a probe waits for a connect permit; [`ProbeGate::default`]
     /// lets every probe through, for a source outside a worker.
     probes: ProbeGate,
+    /// Where the tasks of the sessions opened from its offers are
+    /// tracked: the worker's, or one of its own.
+    tasks: BackchannelTasks,
 }
 
 impl BackchannelSlot {
@@ -454,12 +493,25 @@ impl BackchannelSlot {
         Self {
             probed: Arc::default(),
             probes,
+            tasks: BackchannelTasks::default(),
         }
+    }
+
+    /// This slot, the tasks of the sessions opened from its offers
+    /// tracked in `tasks`: the worker's, which its shutdown waits for.
+    #[must_use]
+    pub fn tracked(self, tasks: BackchannelTasks) -> Self {
+        Self { tasks, ..self }
     }
 
     /// Where the source's probe waits for its connect permit.
     pub const fn probes(&self) -> &ProbeGate {
         &self.probes
+    }
+
+    /// Where the opener of an offer spawns its sessions' tasks.
+    pub const fn tasks(&self) -> &BackchannelTasks {
+        &self.tasks
     }
 
     /// A probe started: claims wait for its result.
@@ -1245,8 +1297,7 @@ mod tests {
         assert!(slot.is_probing());
         assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
         let waiting = slot.clone();
-        let settled =
-            crate::task::spawn_named("test.settled", async move { waiting.settled().await });
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
         tokio::task::yield_now().await;
         assert!(!settled.is_finished(), "waits for the probe");
         slot.withdraw();
@@ -1278,7 +1329,7 @@ mod tests {
         let (gate, mut asks) = ProbeGate::closed();
         let slot = BackchannelSlot::gated(gate);
         let probes = slot.probes().clone();
-        let permit = crate::task::spawn_named("test.permit", async move { probes.permit().await });
+        let permit = spawn_named("test.permit", async move { probes.permit().await });
         assert_eq!(
             bounded(asks.recv()).await,
             Some(crate::runner::ProbeAsk::Connecting(1))
@@ -1291,6 +1342,35 @@ mod tests {
         );
         // The default slot's probes never wait.
         drop(bounded(BackchannelSlot::default().probes().permit()).await);
+    }
+
+    /// A slot's tasks are the ones it was given: a task spawned there
+    /// counts until it ends, and the wait for them resolves only then, a
+    /// task spawned during the wait included.
+    #[tokio::test]
+    async fn a_slot_tracks_its_sessions_tasks_where_it_was_told() {
+        let tasks = BackchannelTasks::default();
+        let slot = BackchannelSlot::default().tracked(tasks.clone());
+        assert_eq!(BackchannelSlot::default().tasks().running(), 0);
+        let (end, ended) = oneshot::channel::<()>();
+        let task = slot.tasks().spawn("test.session", async move {
+            let _ended = ended.await;
+        });
+        assert_eq!(tasks.running(), 1, "tracked by the tasks it was given");
+        let waiting = tasks.clone();
+        let wait = spawn_named("test.wait", async move { waiting.ended().await });
+        let (more, later) = oneshot::channel::<()>();
+        let _late = slot.tasks().spawn("test.late", async move {
+            let _later = later.await;
+        });
+        drop(end);
+        bounded(task).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished(), "a task spawned during the wait counts");
+        assert_eq!(tasks.running(), 1);
+        drop(more);
+        bounded(wait).await.unwrap();
+        assert_eq!(tasks.running(), 0);
     }
 
     #[tokio::test]

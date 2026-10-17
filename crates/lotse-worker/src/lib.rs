@@ -37,7 +37,7 @@ use lotse_core::runner::{
     ConnectGate, ProbeAsk, ProbeGate, RunnerConfig, RunnerEvent, SourceRunner,
 };
 use lotse_core::session::SessionLimits;
-use lotse_core::source::{BackchannelSlot, ResolvedPeer, TrackSet};
+use lotse_core::source::{BackchannelSlot, BackchannelTasks, ResolvedPeer, TrackSet};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
@@ -252,6 +252,7 @@ pub async fn serve(
         sessions: None,
         lost_hand_offs: Throttle::default(),
         probes,
+        backchannels: BackchannelTasks::default(),
     };
     let fds: Vec<BorrowedFd<'_>> = memory.iter().map(AsFd::as_fd).collect();
     serving
@@ -345,6 +346,10 @@ struct Serving<'a> {
     /// the supervisor's connect permits: one gate for the worker, shared
     /// by the running source and the standby.
     probes: ProbeGate,
+    /// The tasks of the backchannel sessions the sources opened, which
+    /// the shutdown waits for ([`close_backchannels`]): one tracker for
+    /// the worker, shared by every source's slot.
+    backchannels: BackchannelTasks,
 }
 
 /// The message that passes a probe's `ask` on to the supervisor.
@@ -427,6 +432,7 @@ impl Serving<'_> {
                     &self.clock,
                     self.settings,
                     &self.probes,
+                    &self.backchannels,
                     self.runner_tx.clone(),
                 )?);
             }
@@ -556,6 +562,7 @@ impl Serving<'_> {
             Duration::from_millis(u64::from(deadline_ms)),
         )
         .await?;
+        close_backchannels(&self.backchannels, &self.clock).await;
         Ok(ExitReason::Shutdown)
     }
 
@@ -566,6 +573,7 @@ impl Serving<'_> {
         self.sessions.take();
         stop_standby(self.standby.take(), &self.clock).await;
         stop_source(self.running.take(), &self.clock, Duration::from_secs(1)).await?;
+        close_backchannels(&self.backchannels, &self.clock).await;
         Ok(ExitReason::SupervisorGone)
     }
 
@@ -597,6 +605,7 @@ impl Serving<'_> {
             &self.clock,
             self.settings,
             &self.probes,
+            &self.backchannels,
             self.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -838,13 +847,19 @@ async fn refuse_renegotiation(
 }
 
 /// Validates `spec` against the registry and starts its runner on a new
-/// track set, its probes waiting at `probes`.
+/// track set, its probes waiting at `probes`, its backchannel sessions'
+/// tasks tracked in `backchannels`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "wires the source into the worker's shared parts, as start_runner does"
+)]
 fn start_source(
     spec: &SourceSpec,
     registries: &Registries,
     clock: &Arc<dyn Clock>,
     settings: &Settings,
     probes: &ProbeGate,
+    backchannels: &BackchannelTasks,
     events: mpsc::Sender<RunnerEvent>,
 ) -> Result<Running, Error> {
     let native = TrackSet::new(settings.limits, clock.now());
@@ -854,6 +869,7 @@ fn start_source(
         clock,
         settings,
         probes,
+        backchannels,
         events,
         Arc::clone(&native),
         "source",
@@ -887,8 +903,9 @@ fn start_source(
 }
 
 /// Validates `spec` against the registry and starts its runner on
-/// `native`, reporting to `events`, its probes waiting at `probes`;
-/// `role` names it in the log.
+/// `native`, reporting to `events`, its probes waiting at `probes`, its
+/// backchannel sessions' tasks tracked in `backchannels`; `role` names it
+/// in the log.
 #[expect(
     clippy::too_many_arguments,
     reason = "wires one runner into the worker's shared parts; called from two places"
@@ -899,6 +916,7 @@ fn start_runner(
     clock: &Arc<dyn Clock>,
     settings: &Settings,
     probes: &ProbeGate,
+    backchannels: &BackchannelTasks,
     events: mpsc::Sender<RunnerEvent>,
     native: Arc<TrackSet>,
     role: &'static str,
@@ -930,7 +948,7 @@ fn start_runner(
     let backchannel = factory
         .capabilities()
         .backchannel
-        .then(|| BackchannelSlot::gated(probes.clone()));
+        .then(|| BackchannelSlot::gated(probes.clone()).tracked(backchannels.clone()));
     let capable = backchannel.is_some();
     tracing::info!(
         connection = %spec.connection_id,
@@ -1050,6 +1068,29 @@ async fn stop_source(
     }
     tracing::info!("source stopped");
     Ok(())
+}
+
+/// How long the shutdown waits, once the sessions closed and the sources
+/// stopped, for the backchannel sessions they opened to close on the
+/// device. A session's task ends within its source's teardown budget once
+/// its talker let go (RTSP: 100 ms for the answer to its `TEARDOWN`, RFC
+/// 2326 §10.7, RFC 7826 §13.4); this bounds one that does not.
+const BACKCHANNEL_CLOSE_GRACE: Duration = Duration::from_millis(500);
+
+/// Waits, at most [`BACKCHANNEL_CLOSE_GRACE`] on `clock`, for the tasks of
+/// the backchannel sessions in `tasks`, whose talkers all let go by now:
+/// each session's close then reached its device before the worker exits
+/// and its runtime drops whatever still runs.
+async fn close_backchannels(tasks: &BackchannelTasks, clock: &Arc<dyn Clock>) {
+    let open = tasks.running();
+    tokio::select! {
+        () = tasks.ended() => tracing::info!(open, "backchannel sessions closed"),
+        () = clock.sleep(BACKCHANNEL_CLOSE_GRACE) => tracing::warn!(
+            left = tasks.running(),
+            grace_ms = BACKCHANNEL_CLOSE_GRACE.as_millis(),
+            "backchannel sessions still closing after the grace; the worker exits without them"
+        ),
+    }
 }
 
 /// Forwards a runner event to the supervisor; `Live` also restarts derived
@@ -4010,6 +4051,7 @@ mod tests {
             sessions: None,
             lost_hand_offs: Throttle::default(),
             probes: ProbeGate::default(),
+            backchannels: BackchannelTasks::default(),
         };
         (serving, ours.split().1)
     }
@@ -4093,6 +4135,7 @@ mod tests {
             &serving.clock,
             &settings,
             &serving.probes,
+            &serving.backchannels,
             serving.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -4326,6 +4369,103 @@ mod tests {
             (source.describe().protocol, source.connection_options()),
             ("stubborn", serde_json::Value::Null)
         );
+    }
+
+    /// The shutdown, and the supervisor going away, wait for the tasks of
+    /// the backchannel sessions the sources opened to end, each session
+    /// closed on its device by then (RFC 2326 §10.7), instead of the
+    /// runtime dropping them halfway once the worker returns.
+    #[tokio::test]
+    async fn rfc2326_10_7_the_shutdown_waits_for_the_backchannel_sessions_to_close() {
+        for gone in [false, true] {
+            let (logs, _guard) = Logs::capture();
+            let settings = settings();
+            let (mut serving, _rx) = serving(&settings);
+            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&closed);
+            let _session = serving.backchannels.spawn("test.backchannel", async move {
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                flag.store(true, Ordering::Relaxed);
+            });
+            let reason = if gone {
+                serving.on_supervisor_gone().await
+            } else {
+                serving.on_shutdown(1_000).await
+            };
+            assert!(reason.is_ok(), "{reason:?}");
+            assert!(closed.load(Ordering::Relaxed), "gone: {gone}");
+            assert_eq!(
+                logs.lines(Level::INFO, "backchannel sessions closed")[0].fields,
+                " open=1",
+                "gone: {gone}"
+            );
+        }
+    }
+
+    /// A backchannel session whose task does not end within the grace is
+    /// left behind with a warning: the shutdown goes on.
+    #[tokio::test]
+    async fn a_backchannel_session_still_closing_after_the_grace_is_left_with_a_warning() {
+        let (logs, _guard) = Logs::capture();
+        let fake = Arc::new(FakeClock::default());
+        let clock: Arc<dyn Clock> = fake.clone();
+        let tasks = BackchannelTasks::default();
+        let _stuck = tasks.spawn("test.stuck", std::future::pending());
+        let closing = spawn_named("test.close", async move {
+            close_backchannels(&tasks, &clock).await;
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        fake.advance(
+            BACKCHANNEL_CLOSE_GRACE
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+        );
+        tokio::task::yield_now().await;
+        assert!(!closing.is_finished(), "waits for the grace");
+        fake.advance(Duration::from_millis(1));
+        closing.await.unwrap();
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "backchannel sessions still closing after the grace; the worker exits without them"
+            )[0]
+            .fields,
+            " left=1 grace_ms=500"
+        );
+    }
+
+    /// Every runner's backchannel slot tracks its sessions' tasks in the
+    /// worker's tracker, the one the shutdown waits for.
+    #[tokio::test]
+    async fn a_runners_backchannel_sessions_are_tracked_by_the_worker() {
+        let settings = settings();
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::with_backchannel(&["fake"])))
+            .unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::default());
+        let tasks = BackchannelTasks::default();
+        let runner = start_runner(
+            &spec("fake://cam/", "null"),
+            &registries,
+            &clock,
+            &settings,
+            &ProbeGate::default(),
+            &tasks,
+            mpsc::channel(1).0,
+            TrackSet::new(TrackLimits::default(), clock.now()),
+            "source",
+        )
+        .unwrap();
+        let slot = runner.backchannel.clone().unwrap();
+        let _session = slot.tasks().spawn("test.session", std::future::pending());
+        assert_eq!(tasks.running(), 1);
+        stop_runner(runner, &clock).await;
     }
 
     #[test]

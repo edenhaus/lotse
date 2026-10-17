@@ -106,6 +106,7 @@ async fn run(camera: Camera, probing: Probing, probed: Probed) {
         Ok(Some(format)) => {
             let frame = format.ptime.unwrap_or(BackchannelOffer::DEFAULT_FRAME);
             let codec = format.codec.clone();
+            let tasks = probing.slot.tasks().clone();
             tracing::info!(
                 codec = codec.name(),
                 payload_type = format.payload_type,
@@ -115,7 +116,7 @@ async fn run(camera: Camera, probing: Probing, probed: Probed) {
             probing.found(BackchannelOffer {
                 codec,
                 frame,
-                opener: Arc::new(Opener::new(camera)),
+                opener: Arc::new(Opener::new(camera, tasks)),
             });
         }
         Ok(None) => {

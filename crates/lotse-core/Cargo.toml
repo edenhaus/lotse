@@ -25,7 +25,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true } # the SHA-256 of a certificate pin (`fingerprint`)
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros", "time"] } # channels for the fan-out; `select!`; the runtime timer behind `SystemClock::sleep`
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] } # the backchannel session's close token; `rt`: the tracker of the backchannel sessions' tasks the worker's shutdown waits for
 tracing = { workspace = true }
 url = { workspace = true }
 

@@ -15,7 +15,9 @@
 //! the RTSP source against the fake camera, whose ONVIF backchannel
 //! (ONVIF Streaming Specification §5.3) records what arrives: the tone,
 //! its `a=ptime` framing, a reconnect under a talker, and the downlink's
-//! A/V sync while talking.
+//! A/V sync while talking; one goes through the control API to a real
+//! worker process running the RTSP source, whose backchannel session is
+//! torn down before the process exits at the daemon's shutdown.
 //! Needs the `source-fake` feature (on with `--all-features`) and
 //! `output-webrtc` (a default); the RTSP tests `source-rtsp` (a default)
 //! too.
@@ -1511,6 +1513,41 @@ async fn onvif_5_3_every_release_tears_the_backchannel_session_down_and_closes_i
     }
 }
 
+/// The daemon stops while a viewer holds the camera's backchannel, through
+/// a real `lotse worker` process: before the process exits, its
+/// backchannel session is torn down (RFC 2326 §10.7), the camera sees the
+/// `TEARDOWN` with `Require` (ONVIF Streaming Specification §5.3), and the
+/// connection is closed; the worker's runtime does not drop the session's
+/// task halfway at its exit.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_7_a_worker_process_tears_the_backchannel_session_down_before_it_exits() {
+    let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
+    let mut api = Api::start_with(
+        Arc::new(lotse_rtsp::RtspFactory::default()),
+        &camera.url(),
+        &json!({ "backchannel": true }),
+    )
+    .await;
+    let mut a = ApiPeer::offer(&api, "a").await;
+    pump(&mut api, &mut [&mut a], |_, _| {
+        backchannel_session(&camera).is_some_and(|log| log.played)
+    })
+    .await;
+    api.stop().await;
+    // The worker is gone: what it sent before its exit is all the camera
+    // reads before the connection's end.
+    let deadline = clock().now() + Duration::from_secs(5);
+    while !backchannel_session(&camera).unwrap().closed {
+        assert!(clock().now() < deadline, "never closed");
+        clock().sleep(Duration::from_millis(5)).await;
+    }
+    let log = backchannel_session(&camera).unwrap();
+    assert_eq!(log.teardown, Some(true), "TEARDOWN with Require: {log:?}");
+    assert!(log.closed_by_client, "{log:?}");
+    camera.stop().await;
+}
+
 /// Downlink A/V sync with talk-back active, which needs audio, video and
 /// a backchannel on one source: while the viewer talks, the daemon's
 /// Sender Reports (RFC 3550 §6.4.1) still put the camera's audio within
@@ -1568,6 +1605,14 @@ struct Api {
 
 impl Api {
     async fn start(options: &Value) -> Self {
+        let factory = Arc::new(FakeSourceFactory::with_backchannel(&["fake"]));
+        Self::start_with(factory, "fake://127.0.0.1/", options).await
+    }
+
+    /// The supervisor and its demux, with stream `door` on `url` and
+    /// `options`, its scheme validated by `factory` (the worker process
+    /// registers the binary's own).
+    async fn start_with(factory: Arc<dyn SourceFactory>, url: &str, options: &Value) -> Self {
         let bound = bind_udp("127.0.0.1:0".parse().unwrap()).expect("the shared socket");
         let demux = Demux::start(
             Arc::clone(&bound.socket),
@@ -1601,10 +1646,7 @@ impl Api {
             .outputs
             .register(Arc::new(lotse_webrtc::WebRtcFactory))
             .unwrap();
-        registries
-            .sources
-            .register(Arc::new(FakeSourceFactory::with_backchannel(&["fake"])))
-            .unwrap();
+        registries.sources.register(factory).unwrap();
         registries.uplink = Some(Arc::new(ToG711Factory::new(clock())));
         let environment = Environment {
             registries,
@@ -1661,7 +1703,7 @@ impl Api {
             call(
                 &supervisor,
                 &json!({ "id": 2, "type": "stream/put", "stream_id": "door",
-                         "sources": [{ "url": "fake://127.0.0.1/", "options": options }] }),
+                         "sources": [{ "url": url, "options": options }] }),
             )
             .await,
         );
