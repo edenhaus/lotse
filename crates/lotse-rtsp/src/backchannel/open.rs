@@ -19,19 +19,25 @@
 //! `TEARDOWN` with `Require`, and the connection closes, as a camera may
 //! stay in two-way mode until it does. Should the camera end the session
 //! first (its connection lost, a request refused), the loss is reported
-//! with why; nothing is opened again until the next claim.
+//! with why; nothing is opened again until the next claim. A session
+//! opens only once the one before it closed on the camera, its bounded
+//! `TEARDOWN` included ([`BackchannelTasks::spawn`]): a camera with one
+//! backchannel refuses a `SETUP` of it while another session holds it
+//! (`453 Not Enough Bandwidth`, RFC 2326 §11.3.3), so the claim that
+//! follows a release waits for that close rather than race it.
 
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::stream::SplitSink;
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
 use lotse_core::codec::Codec;
 use lotse_core::media::MediaPacket;
 use lotse_core::source::{
     BACKCHANNEL_OPEN_LIMIT, BackchannelOffer, BackchannelOpener, BackchannelRefused,
-    BackchannelSession, SourceError,
+    BackchannelSession, BackchannelTasks, SourceError,
 };
-use lotse_core::task::{BoxFuture, spawn_named};
+use lotse_core::task::BoxFuture;
 use retina::client::{
     Playing, Session, SessionGroup, SetupOptions, TcpTransportOptions, Transport,
 };
@@ -67,12 +73,24 @@ type Opened = (Codec, Duration, mpsc::Sender<MediaPacket>);
 pub(crate) struct Opener {
     /// The camera.
     camera: Camera,
+    /// The codec the probe found, which the claim's answer is negotiated
+    /// for: a session whose `DESCRIBE` offers another is refused.
+    codec: Codec,
+    /// Where each session's task is tracked: the worker's shutdown waits
+    /// for it, so the session's `TEARDOWN` (RFC 2326 §10.7) goes out
+    /// before the worker exits.
+    tasks: BackchannelTasks,
 }
 
 impl Opener {
-    /// An opener for `camera`'s backchannel.
-    pub(crate) const fn new(camera: Camera) -> Self {
-        Self { camera }
+    /// An opener for `camera`'s backchannel in `codec`, as its probe
+    /// found it, its sessions' tasks tracked in `tasks`.
+    pub(crate) const fn new(camera: Camera, codec: Codec, tasks: BackchannelTasks) -> Self {
+        Self {
+            camera,
+            codec,
+            tasks,
+        }
     }
 }
 
@@ -81,9 +99,19 @@ impl BackchannelOpener for Opener {
         let close = CancellationToken::new();
         let (opened, open) = oneshot::channel();
         let (on_loss, lost) = oneshot::channel();
-        let _session = spawn_named(
+        // Tracked, not joined: the claim's drop closes it, and the
+        // worker's shutdown waits for the task to end. It starts once the
+        // session before it closed on the camera.
+        let _session = self.tasks.spawn(
             "rtsp.backchannel",
-            run(self.camera.clone(), close.clone(), opened, on_loss),
+            &close,
+            run(
+                self.camera.clone(),
+                self.codec.clone(),
+                close.clone(),
+                opened,
+                on_loss,
+            ),
         );
         // Dropped before the session opens, the claim abandons it.
         let guard = close.drop_guard();
@@ -104,12 +132,13 @@ impl BackchannelOpener for Opener {
     }
 }
 
-/// One backchannel session, from its connection until it is closed
-/// (`close`, cancelled when its holder drops it or its claim gives up) or
-/// lost: the session or why it did not open goes to `opened`, and why it
-/// ended on the camera's side after that to `on_loss`.
+/// One backchannel session in `codec`, from its connection until it is
+/// closed (`close`, cancelled when its holder drops it or its claim gives
+/// up) or lost: the session or why it did not open goes to `opened`, and
+/// why it ended on the camera's side after that to `on_loss`.
 pub(crate) async fn run(
     camera: Camera,
+    codec: Codec,
     close: CancellationToken,
     opened: oneshot::Sender<Result<Opened, BackchannelRefused>>,
     on_loss: oneshot::Sender<BackchannelRefused>,
@@ -119,7 +148,7 @@ pub(crate) async fn run(
         "rtsp: opening the camera's backchannel in a session of its own; its connection bypasses sources.connect_concurrency, as a talker waits for it"
     );
     let mut opened = Some(opened);
-    let Some(why) = Box::pin(session(&camera, &close, &mut opened)).await else {
+    let Some(why) = Box::pin(session(&camera, &codec, &close, &mut opened)).await else {
         tracing::info!("rtsp: backchannel session closed: TEARDOWN sent and its connection closed");
         return;
     };
@@ -146,11 +175,12 @@ fn hold(camera: &Camera) -> Duration {
     camera.deadline().min(BACKCHANNEL_OPEN_LIMIT)
 }
 
-/// Connects, opens the session and forwards until it is closed (`None`)
-/// or fails: why, sent by [`run`] to `opened` while it is still there,
-/// else reported as the session's loss.
+/// Connects, opens the session in `codec` and forwards until it is closed
+/// (`None`) or fails: why, sent by [`run`] to `opened` while it is still
+/// there, else reported as the session's loss.
 async fn session(
     camera: &Camera,
+    codec: &Codec,
     close: &CancellationToken,
     opened: &mut Option<oneshot::Sender<Result<Opened, BackchannelRefused>>>,
 ) -> Option<BackchannelRefused> {
@@ -162,23 +192,24 @@ async fn session(
         Err(err) => return Some(unanswered(err)),
     };
     let left = hold.saturating_sub(camera.time.now().saturating_duration_since(start));
-    let talk = talk(camera, target, left, close, opened);
+    let talk = talk(camera, codec, target, left, close, opened);
     let relayed = Box::pin(camera.relayed(stream, listening, talk)).await;
     relayed.map_err(unanswered).unwrap_or_else(Some)
 }
 
-/// retina's side of the session: the handshake within `left`, the
-/// session handed to `opened`, the talker's packets forwarded until the
-/// close or the loss, and the `TEARDOWN` awaited within its budget.
+/// retina's side of the session: the handshake in `codec` within `left`,
+/// the session handed to `opened`, the talker's packets forwarded until
+/// the close or the loss, and the `TEARDOWN` awaited within its budget.
 async fn talk(
     camera: &Camera,
+    codec: &Codec,
     target: url::Url,
     left: Duration,
     close: &CancellationToken,
     opened: &mut Option<oneshot::Sender<Result<Opened, BackchannelRefused>>>,
 ) -> Option<BackchannelRefused> {
     let group = std::sync::Arc::new(SessionGroup::default());
-    let handshake = handshake(camera, target, &group).map(Ok::<_, SourceError>);
+    let handshake = handshake(camera, codec, target, &group).map(Ok::<_, SourceError>);
     let shaken = within_on(&*camera.time, close, left, "backchannel session", handshake).await;
     let shaken = match shaken {
         Ok(shaken) => shaken,
@@ -215,9 +246,13 @@ async fn talk(
 /// `DESCRIBE` with `Require`, `SETUP` of the backchannel media alone, TCP
 /// interleaved, and `PLAY` with `Require`: the playing session, the index
 /// of the retina stream it sends on and the camera's format, or why not,
-/// with the camera's status when it refused.
+/// with the camera's status when it refused. A `DESCRIBE` whose answer
+/// offers the backchannel in another codec than `codec`, the probe's, is
+/// refused before the `SETUP`: the claim's answer is negotiated for the
+/// probe's codec, and the talker's uplink would reach no other.
 async fn handshake(
     camera: &Camera,
+    codec: &Codec,
     target: url::Url,
     group: &std::sync::Arc<SessionGroup>,
 ) -> Result<(Session<Playing>, usize, BackchannelFormat), BackchannelRefused> {
@@ -234,6 +269,7 @@ async fn handshake(
                 .to_owned(),
         });
     };
+    as_probed(codec, &offer.format.codec)?;
     tracing::info!(
         index,
         "rtsp: backchannel session: SETUP of the backchannel alone, TCP interleaved"
@@ -251,10 +287,34 @@ async fn handshake(
     Ok((playing, index, offer.format))
 }
 
+/// Whether a session's `DESCRIBE` offers the backchannel in `described`,
+/// the codec its probe found (`probed`), which the claim's answer is
+/// negotiated for; else why the session is refused before its `SETUP`.
+fn as_probed(probed: &Codec, described: &Codec) -> Result<(), BackchannelRefused> {
+    if described == probed {
+        return Ok(());
+    }
+    let (probed, described) = (probed.name(), described.name());
+    tracing::info!(
+        probed,
+        described,
+        "rtsp: backchannel session: the camera's answer offers another codec than its probe found, which the answer is negotiated for; refused before SETUP"
+    );
+    Err(BackchannelRefused {
+        status: None,
+        message: format!(
+            "the camera's backchannel takes {described} now, not the {probed} its probe found and talk-back was negotiated for; the next probe, at the stream's reconnect, offers what it takes"
+        ),
+    })
+}
+
 /// Sends the talker's packets from `uplink` on retina's stream `index`,
 /// stamped for the camera's `format` (RFC 3550 §5.1; retina sets the SSRC
 /// and the sequence numbers), and keeps reading the session, which keeps
 /// it alive and notices its loss: `None` once closed, else why it ended.
+/// A send waits while the camera takes no data (its TCP buffers full);
+/// the close ends that wait too, so a release always reaches the
+/// session's bounded `TEARDOWN` ([`tear_down`]).
 async fn forward(
     playing: Session<Playing>,
     index: usize,
@@ -272,7 +332,8 @@ async fn forward(
                 let sending = SendingPacket::new(index, rtp.ts, Bytes::from_owner(payload))
                     .mark(rtp.marker)
                     .payload_type(rtp.pt);
-                if let Err(err) = sink.send(sending).await {
+                // Closed while the send waits: `None`, as for any close.
+                if let Err(err) = send(&mut sink, sending, close).await? {
                     return Some(refusal(err.status_code(), &classify(&err, &camera.url)));
                 }
             }
@@ -283,6 +344,26 @@ async fn forward(
                 ended => return Some(lost(ended.and_then(Result::err).as_ref(), camera)),
             },
             () = close.cancelled() => return None,
+        }
+    }
+}
+
+/// Sends `sending` on `sink`, retina's way to the camera: the send's
+/// result, or `None` once `close` is cancelled while the send waits for
+/// the camera to take data (its TCP buffers full), so a release still
+/// reaches the session's bounded `TEARDOWN` ([`tear_down`]).
+async fn send(
+    sink: &mut SplitSink<Session<Playing>, SendingPacket>,
+    sending: SendingPacket,
+    close: &CancellationToken,
+) -> Option<Result<(), retina::Error>> {
+    tokio::select! {
+        sent = sink.send(sending) => Some(sent),
+        () = close.cancelled() => {
+            tracing::info!(
+                "rtsp: backchannel session closed while a packet waited for the camera to take data"
+            );
+            None
         }
     }
 }
@@ -308,10 +389,14 @@ mod tests {
     )]
 
     use std::sync::Arc;
+    use std::time::Instant;
 
     use lotse_core::clock::{Clock as _, SystemClock};
     use lotse_core::source_url::SourceUrl;
-    use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel};
+    use lotse_core::task::spawn_named;
+    use lotse_testing::fake_camera::{
+        BackchannelCodec, BackchannelSetup, CameraBackchannel, ConnectionLog, Stats,
+    };
     use lotse_testing::{CameraConfig, FakeCamera};
 
     use super::*;
@@ -377,31 +462,254 @@ mod tests {
         let close = CancellationToken::new();
         let session = spawn_named(
             "test.backchannel",
-            run(camera_at(&cam), close.clone(), opened, on_loss),
+            run(camera_at(&cam), Codec::Pcmu, close.clone(), opened, on_loss),
         );
         let deadline = SystemClock.now() + Duration::from_secs(5);
-        while !cam
-            .stats()
-            .connection_log()
-            .first()
-            .is_some_and(|log| log.played)
-        {
-            assert!(SystemClock.now() < deadline, "never played");
-            SystemClock.sleep(Duration::from_millis(5)).await;
-        }
+        first_logged(&cam, deadline, |log| log.played).await;
         close.cancel();
         session.await.unwrap();
+        let log = first_logged(&cam, deadline, |log| log.closed).await;
+        assert!(log.played, "{log:?}");
+        assert_eq!(log.teardown, Some(true), "{log:?}");
+        assert!(log.closed_by_client, "{log:?}");
+        cam.stop().await;
+    }
+
+    /// The tasks an opener's sessions run on are tracked where it was
+    /// told, and end only once the session's `TEARDOWN` (RFC 2326 §10.7)
+    /// was answered: once the wait for them is over at a worker's
+    /// shutdown, the camera has seen it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc2326_10_7_a_tracked_session_task_ends_once_its_teardown_is_answered() {
+        let cam = FakeCamera::start(
+            CameraConfig {
+                backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+                keep_open_on_teardown: true,
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let tasks = BackchannelTasks::default();
+        let opener = Opener::new(camera_at(&cam), Codec::Pcmu, tasks.clone());
+        let session = opener.open().await.unwrap();
+        assert_eq!(session.codec, Codec::Pcmu);
+        assert_eq!(tasks.running(), 1);
+        drop(session);
+        tokio::select! {
+            () = tasks.ended() => {}
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the session's task never ended"),
+        }
+        let log = cam.stats().connection_log();
+        assert_eq!(log[0].teardown, Some(true), "{log:?}");
+        cam.stop().await;
+    }
+
+    /// The probe found PCMU, which the claim's answer is negotiated for,
+    /// and the camera's answer to the session's own `DESCRIBE` offers
+    /// Opus now: the session is refused before its `SETUP`, so the camera
+    /// never plays a backchannel the talker's uplink cannot reach, and
+    /// the claim is declined with why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn onvif_5_3_2_a_session_whose_describe_changed_the_probes_codec_is_refused_before_setup()
+    {
+        let cam = FakeCamera::start(
+            CameraConfig {
+                backchannel: Some(CameraBackchannel::new(BackchannelCodec::Opus)),
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let tasks = BackchannelTasks::default();
+        let opener = Opener::new(camera_at(&cam), Codec::Pcmu, tasks.clone());
+        let refused = opener.open().await.unwrap_err();
+        assert_eq!(
+            refused,
+            BackchannelRefused {
+                status: None,
+                message: "the camera's backchannel takes opus now, not the pcmu its probe found and talk-back was negotiated for; the next probe, at the stream's reconnect, offers what it takes".into(),
+            }
+        );
+        let deadline = SystemClock.now() + Duration::from_secs(5);
+        let log = first_logged(&cam, deadline, |log| log.closed).await;
+        assert_eq!(log.describes, [true], "{log:?}");
+        assert!(log.setups.is_empty(), "no SETUP: {log:?}");
+        assert!(!log.played, "{log:?}");
+        tokio::select! {
+            () = tasks.ended() => {}
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the session's task never ended"),
+        }
+        cam.stop().await;
+    }
+
+    /// A camera with one PCMU backchannel ([`CameraBackchannel::single`])
+    /// that answers its requests as `setup` says.
+    async fn one_backchannel(setup: BackchannelSetup) -> FakeCamera {
+        let backchannel = CameraBackchannel {
+            setup,
+            single: true,
+            ..CameraBackchannel::new(BackchannelCodec::Pcmu)
+        };
+        let config = CameraConfig {
+            backchannel: Some(backchannel),
+            ..CameraConfig::default()
+        };
+        FakeCamera::start(config, Arc::new(SystemClock))
+            .await
+            .unwrap()
+    }
+
+    /// A camera with one backchannel holds it for the released session
+    /// until that session's connection closes, its `TEARDOWN` left
+    /// unanswered: the session a claim opens right after the release
+    /// waits for that close, the end of the `TEARDOWN`'s budget (RFC 2326
+    /// §10.7), rather than race it into a `453` (RFC 2326 §11.3.3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc2326_11_3_3_a_session_opened_after_a_release_while_playing_waits_for_its_close() {
+        let cam = one_backchannel(BackchannelSetup::Lingering).await;
+        let tasks = BackchannelTasks::default();
+        let opener = Opener::new(camera_at(&cam), Codec::Pcmu, tasks.clone());
+        let first = opener.open().await.unwrap();
+        drop(first);
+        let second = opener.open().await.unwrap();
+        assert_eq!(second.codec, Codec::Pcmu);
+        let stats = cam.stats();
+        assert_eq!(Stats::get(&stats.backchannel_busy), 0, "never refused");
+        let log = stats.connection_log();
+        assert_eq!(log[0].teardown, Some(true), "{log:?}");
+        assert!(log[0].closed_by_client, "{log:?}");
+        assert!(log[1].played, "{log:?}");
+        drop(second);
+        tokio::select! {
+            () = tasks.ended() => {}
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the sessions' tasks never ended"),
+        }
+        cam.stop().await;
+    }
+
+    /// A claim released while its session opens drops the open: the
+    /// handshake is abandoned, its `SETUP` taken by the camera and never
+    /// answered ending with its connection, and the session the next
+    /// claim opens gets the camera's one backchannel (RFC 2326 §11.3.3)
+    /// once the abandoned one closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc2326_11_3_3_a_session_opened_after_a_release_while_opening_gets_the_backchannel() {
+        let cam = one_backchannel(BackchannelSetup::Silent).await;
+        let tasks = BackchannelTasks::default();
+        let opener = Opener::new(camera_at(&cam), Codec::Pcmu, tasks.clone());
+        let opening = opener.open();
+        let deadline = SystemClock.now() + Duration::from_secs(5);
+        first_logged(&cam, deadline, |log| !log.setups.is_empty()).await;
+        drop(opening);
+        cam.set_backchannel_setup(BackchannelSetup::Accept);
+        let session = opener.open().await.unwrap();
+        let stats = cam.stats();
+        assert_eq!(Stats::get(&stats.backchannel_busy), 0, "never refused");
+        let log = stats.connection_log();
+        assert!(!log[0].played, "{log:?}");
+        assert!(log[0].closed_by_client, "{log:?}");
+        assert!(log[1].played, "{log:?}");
+        drop(session);
+        tokio::select! {
+            () = tasks.ended() => {}
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the sessions' tasks never ended"),
+        }
+        cam.stop().await;
+    }
+
+    /// A camera that stops taking data once its backchannel plays: the
+    /// talker's packets fill the TCP buffers until retina's send waits,
+    /// and the release still ends the session within the teardown budget
+    /// (RFC 2326 §10.7), its connection closed, rather than leaving the
+    /// task waiting with the camera's connection open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc2326_10_7_a_release_while_a_send_waits_on_a_camera_taking_no_data_ends_the_session()
+    {
+        let cam = FakeCamera::start(
+            CameraConfig {
+                backchannel: Some(CameraBackchannel {
+                    setup: BackchannelSetup::Deaf,
+                    ..CameraBackchannel::new(BackchannelCodec::Pcmu)
+                }),
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let (opened, open) = oneshot::channel();
+        let (on_loss, _lost) = oneshot::channel();
+        let close = CancellationToken::new();
+        let mut session = spawn_named(
+            "test.backchannel",
+            run(camera_at(&cam), Codec::Pcmu, close.clone(), opened, on_loss),
+        );
+        let (_codec, _frame, sender) = open.await.unwrap().unwrap();
+        // Packets as large as interleaved data carries (RFC 2326 §10.12)
+        // until the queue stays full: the forwarding waits in its send.
+        let deadline = SystemClock.now() + Duration::from_secs(20);
+        let mut full_since = None;
+        for ts in 0_u32.. {
+            assert!(SystemClock.now() < deadline, "the send never waited");
+            if sender.try_send(large(ts)).is_ok() {
+                full_since = None;
+                continue;
+            }
+            let since = *full_since.get_or_insert_with(|| SystemClock.now());
+            if SystemClock.now().duration_since(since) >= Duration::from_millis(300) {
+                break;
+            }
+            SystemClock.sleep(Duration::from_millis(10)).await;
+        }
+        close.cancel();
+        tokio::select! {
+            ended = &mut session => ended.unwrap(),
+            () = SystemClock.sleep(Duration::from_secs(2)) => panic!("the send outlived the release"),
+        }
+        let log = cam.stats().connection_log();
+        assert!(log[0].played, "{log:?}");
+        assert_eq!(log[0].teardown, None, "the camera read nothing more");
+        cam.stop().await;
+    }
+
+    /// A PCMU packet whose payload is as large as one interleaved frame
+    /// carries after its RTP header.
+    fn large(ts: u32) -> MediaPacket {
+        MediaPacket {
+            arrival: SystemClock.now(),
+            rtp: lotse_core::media::RtpHeaderFields {
+                pt: 0,
+                seq: 0,
+                ts: ts.wrapping_mul(160),
+                marker: false,
+                ssrc: 1,
+            },
+            frame_start: true,
+            keyframe_start: false,
+            epoch: 0,
+            lateness: Duration::ZERO,
+            payload: Arc::from(vec![0xff_u8; 60_000]),
+        }
+    }
+
+    /// What `cam` logged of its first connection once `done` holds for
+    /// it, before `deadline`: one wait for every step of a test, so its
+    /// polling runs whichever step has to wait.
+    async fn first_logged(
+        cam: &FakeCamera,
+        deadline: Instant,
+        done: impl Fn(&ConnectionLog) -> bool,
+    ) -> ConnectionLog {
         loop {
             let log = cam.stats().connection_log();
-            if log.first().is_some_and(|log| log.closed) {
-                assert!(log[0].played, "{log:?}");
-                assert_eq!(log[0].teardown, Some(true), "{log:?}");
-                assert!(log[0].closed_by_client, "{log:?}");
-                break;
+            if let Some(first) = log.first().filter(|first| done(first)) {
+                return first.clone();
             }
             assert!(SystemClock.now() < deadline, "{log:?}");
             SystemClock.sleep(Duration::from_millis(5)).await;
         }
-        cam.stop().await;
     }
 }

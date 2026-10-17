@@ -2,9 +2,9 @@
 //! with `preload` starts a `lotse worker` running the fake source, the
 //! stream goes live with its tracks, losing demand lingers then stops the
 //! worker, a crashing worker is restarted with backoff, connection
-//! attempts take turns under `sources.connect_concurrency`, and shutdown
-//! stops everything within the budget. Needs the `source-fake` feature (on with
-//! `--all-features`).
+//! attempts take turns under `sources.connect_concurrency`, a backchannel
+//! probe among them, and shutdown stops everything within the budget.
+//! Needs the `source-fake` feature (on with `--all-features`).
 
 #![cfg(feature = "source-fake")]
 #![allow(
@@ -307,5 +307,51 @@ async fn with_one_connect_permit_two_preloaded_cameras_connect_one_at_a_time() {
         apart >= Duration::from_millis(300),
         "the second connected while the first held the permit: {apart:?}"
     );
+    s.shutdown().await;
+}
+
+/// With one connect permit, a camera whose source probes its backchannel
+/// goes live at once and then offers it: the probe asks for its permit
+/// only once the tracks are ready, so it never waits for the permit its
+/// own attempt holds until it is live, and gets that one then. A probe
+/// that waited first would keep the attempt from going live until its
+/// 30 s ready timeout.
+#[tokio::test]
+async fn with_one_connect_permit_a_camera_that_probes_its_backchannel_goes_live() {
+    let s = supervisor_with(NonZeroUsize::MIN);
+    let mut events = subscription(call(&s, json!({ "id": 1, "type": "stream/subscribe" })).await);
+    result(call(&s, put("door", &json!({ "backchannel": "pcmu" }), true)).await);
+    let live = async {
+        loop {
+            let (state, error) = next_state(&mut events).await;
+            assert_eq!(error, None, "no attempt failed");
+            if state == "live" {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        () = live => {}
+        () = SystemClock.sleep(Duration::from_secs(10)) => panic!("not live within 10 s"),
+    }
+    let offered = async {
+        loop {
+            let door = result(
+                call(
+                    &s,
+                    json!({ "id": 2, "type": "stream/get", "stream_id": "door" }),
+                )
+                .await,
+            );
+            if door["sources"][0]["backchannel"]["codec"] == "pcmu" {
+                break;
+            }
+            SystemClock.sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        () = offered => {}
+        () = SystemClock.sleep(Duration::from_secs(10)) => panic!("the probe's offer never came"),
+    }
     s.shutdown().await;
 }

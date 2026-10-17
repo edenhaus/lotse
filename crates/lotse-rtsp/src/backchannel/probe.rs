@@ -13,7 +13,10 @@
 //! source ([`Probed`]); any other failure means none for this connection
 //! attempt, and the next one asks again, as every connect does: a
 //! rebooted camera may answer differently. The probe waits for a connect
-//! permit (`sources.connect_concurrency`) like any connection attempt.
+//! permit (`sources.connect_concurrency`) like any connection attempt,
+//! and ends within [`PROBE_TIMEOUT`] of its grant, connection and answer
+//! included, whatever the source's `timeout_ms`: no probe holds a permit
+//! past the lease the supervisor keeps on it.
 //!
 //! The connection turns the probe on and off as its streams opt in and out
 //! ([`BackchannelSlot::ask`]), without the session that plays the stream
@@ -25,8 +28,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use futures_util::FutureExt as _;
+use lotse_core::runner::PROBE_TIMEOUT;
 use lotse_core::source::{
-    Asks, BackchannelOffer, BackchannelRefused, BackchannelSlot, SourceError,
+    Asks, BackchannelOffer, BackchannelRefused, BackchannelSlot, ProbeMark, SourceError,
 };
 use retina::client::{Session, SessionGroup};
 use tokio_util::sync::CancellationToken;
@@ -41,10 +45,13 @@ use crate::source::within_on;
 
 /// A probe under way on a slot: claims wait for it until it settles the
 /// slot, and one dropped first (its attempt ended) leaves what the slot
-/// offered before.
+/// offered before. Both by its mark, so a probe whose aborted task ends
+/// after the next attempt's probe started leaves that one's alone.
 struct Probing {
     /// The slot.
     slot: BackchannelSlot,
+    /// The probe's mark on the slot.
+    mark: ProbeMark,
     /// The probe offered or withdrew.
     settled: bool,
 }
@@ -52,22 +59,23 @@ struct Probing {
 impl Probing {
     /// Marks `slot` as probed now.
     fn start(slot: BackchannelSlot) -> Self {
-        slot.probing();
+        let mark = slot.probing();
         Self {
             slot,
+            mark,
             settled: false,
         }
     }
 
     /// The probe found `offer`.
     fn found(mut self, offer: BackchannelOffer) {
-        self.slot.offer(offer);
+        self.slot.settle(self.mark, Some(offer));
         self.settled = true;
     }
 
     /// The probe found none.
     fn none(mut self) {
-        self.slot.withdraw();
+        self.slot.settle(self.mark, None);
         self.settled = true;
     }
 }
@@ -75,7 +83,7 @@ impl Probing {
 impl Drop for Probing {
     fn drop(&mut self) {
         if !self.settled {
-            self.slot.abandon_probe();
+            self.slot.abandon_probe(self.mark);
             tracing::debug!(
                 "rtsp: backchannel probe abandoned with its attempt; the offer stays as it was"
             );
@@ -104,12 +112,13 @@ pub(crate) fn start(
 
 /// The probe `wanted` makes due on `slot`, marked there, unless the camera
 /// answered `551` before (`probed`): then a probe an opt-in marked due
-/// will not run, and `slot` settles at once.
+/// will not run, and `slot` settles at once, marked only to be abandoned,
+/// so the probes marked before no longer settle it either.
 fn due(wanted: bool, slot: &BackchannelSlot, probed: &Probed) -> Option<Probing> {
     if probed.asks(BACKCHANNEL, wanted) {
         Some(Probing::start(slot.clone()))
     } else {
-        slot.abandon_probe();
+        slot.abandon_probe(slot.probing());
         None
     }
 }
@@ -117,7 +126,7 @@ fn due(wanted: bool, slot: &BackchannelSlot, probed: &Probed) -> Option<Probing>
 /// Runs `first`, the probe due when the attempt played, then follows the
 /// connection's ask (`asks`) until the attempt ends: an opt-in probes
 /// again, an opt-out drops a probe still running, whose result the slot
-/// would drop anyway ([`BackchannelSlot::offer`]).
+/// would drop anyway ([`BackchannelSlot::settle`]).
 async fn follow(
     camera: Camera,
     slot: BackchannelSlot,
@@ -171,6 +180,7 @@ async fn run(camera: &Camera, probing: Probing, probed: &Probed) {
         Ok(Some(format)) => {
             let frame = format.ptime.unwrap_or(BackchannelOffer::DEFAULT_FRAME);
             let codec = format.codec.clone();
+            let tasks = probing.slot.tasks().clone();
             tracing::info!(
                 codec = codec.name(),
                 payload_type = format.payload_type,
@@ -180,7 +190,7 @@ async fn run(camera: &Camera, probing: Probing, probed: &Probed) {
             probing.found(BackchannelOffer {
                 codec,
                 frame,
-                opener: Arc::new(Opener::new(camera.clone())),
+                opener: Arc::new(Opener::new(camera.clone(), format.codec, tasks)),
             });
         }
         Ok(None) => {
@@ -212,11 +222,29 @@ pub(crate) fn unanswered(error: SourceError) -> BackchannelRefused {
     refusal(None, &error)
 }
 
-/// One `DESCRIBE` with `Require` on a connection of its own: the
-/// backchannel's format, `None` when the answer has none the talk-back
-/// chain can feed, or why it failed, with the camera's status when it
-/// answered one.
+/// One `DESCRIBE` with `Require` on a connection of its own, all of it
+/// within [`PROBE_TIMEOUT`], however long the source's `timeout_ms` lets
+/// each step take: the backchannel's format, `None` when the answer has
+/// none the talk-back chain can feed, or why it failed, with the camera's
+/// status when it answered one.
 async fn describe(
+    camera: &Camera,
+    cancel: &CancellationToken,
+) -> Result<Option<BackchannelFormat>, BackchannelRefused> {
+    let probe = ask(camera, cancel).map(Ok::<_, SourceError>);
+    within_on(
+        &*camera.time,
+        cancel,
+        PROBE_TIMEOUT,
+        "backchannel probe",
+        probe,
+    )
+    .await
+    .map_err(unanswered)?
+}
+
+/// [`describe`]'s steps, each within the source's `timeout_ms`.
+async fn ask(
     camera: &Camera,
     cancel: &CancellationToken,
 ) -> Result<Option<BackchannelFormat>, BackchannelRefused> {
@@ -253,8 +281,11 @@ mod tests {
         reason = "test code"
     )]
 
-    use lotse_core::clock::SystemClock;
+    use lotse_core::clock::{Clock, FakeClock, SystemClock};
     use lotse_core::source_url::SourceUrl;
+    use std::time::Duration;
+
+    use lotse_core::task::spawn_named;
     use lotse_testing::{CameraConfig, FakeCamera};
 
     use super::*;
@@ -262,6 +293,10 @@ mod tests {
     use crate::relay::Listener;
 
     fn camera_at(addr: std::net::SocketAddr, timeout_ms: u64) -> Camera {
+        timed(addr, timeout_ms, Arc::new(SystemClock))
+    }
+
+    fn timed(addr: std::net::SocketAddr, timeout_ms: u64, time: Arc<dyn Clock>) -> Camera {
         Camera {
             url: SourceUrl::parse(&format!("rtsp://{addr}/stream")).unwrap(),
             options: RtspOptions {
@@ -272,8 +307,52 @@ mod tests {
             tls: None,
             relay: Listener::default(),
             addr,
-            time: Arc::new(SystemClock),
+            time,
         }
+    }
+
+    /// The whole probe, connection and `DESCRIBE`, ends within
+    /// `PROBE_TIMEOUT`, however long the source's `timeout_ms` lets each
+    /// step wait: it gives its connect permit back in time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_probe_ends_within_the_probe_timeout_whatever_the_read_deadline() {
+        let silent = FakeCamera::start(
+            CameraConfig {
+                silent: true,
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let time = Arc::new(FakeClock::from_system());
+        let camera = timed(silent.addr(), 60_000, time.clone());
+        let probe = spawn_named("test.probe", async move {
+            describe(&camera, &CancellationToken::new()).await
+        });
+        // Connected, so the probe's deadline runs.
+        let mut waited = 0;
+        while silent.stats().connection_log().is_empty() && waited < 500 {
+            SystemClock.sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert_eq!(silent.stats().connection_log().len(), 1, "connected");
+        time.advance(PROBE_TIMEOUT.checked_sub(Duration::from_millis(1)).unwrap());
+        SystemClock.sleep(Duration::from_millis(100)).await;
+        assert!(!probe.is_finished(), "not over yet");
+        time.advance(Duration::from_millis(1));
+        let refused = tokio::select! {
+            done = probe => done.unwrap().unwrap_err(),
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("outlived its timeout"),
+        };
+        assert_eq!(refused.status, None);
+        assert!(
+            refused
+                .message
+                .contains("backchannel probe: no answer within 30000 ms"),
+            "{refused:?}"
+        );
+        silent.stop().await;
     }
 
     /// A probe that cannot reach the camera, or that the camera never
@@ -324,5 +403,30 @@ mod tests {
         drop(probe);
         assert!(!slot.is_probing());
         silent.stop().await;
+    }
+
+    /// The probe of an attempt that ended is aborted, and its task may be
+    /// dropped only after the next attempt's probe marked the slot: then
+    /// the slot still awaits the next probe, and a claim waits for it
+    /// rather than declining at once.
+    #[tokio::test]
+    async fn a_probe_dropped_after_its_replacement_started_leaves_it_awaited() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 9));
+        let slot = BackchannelSlot::default();
+        let earlier = start(camera_at(addr, 200), slot.clone(), Probed::default());
+        let later = start(camera_at(addr, 200), slot.clone(), Probed::default());
+        drop(earlier);
+        assert!(slot.awaits_probe(), "the replacement still runs");
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for the replacement");
+        drop(later);
+        assert!(!slot.is_probing());
+        let settled = tokio::select! {
+            settled = settled => settled.unwrap(),
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("still waiting"),
+        };
+        assert!(settled.is_none(), "nothing was offered");
     }
 }

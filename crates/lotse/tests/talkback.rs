@@ -15,8 +15,11 @@
 //! the RTSP source against the fake camera, whose ONVIF backchannel
 //! (ONVIF Streaming Specification §5.3) records what arrives: the tone,
 //! its `a=ptime` framing, a reconnect under a talker, and the downlink's
-//! A/V sync while talking; and through the control API, a stream opting
-//! in and out while a viewer plays the camera.
+//! A/V sync while talking; one goes through the control API to a real
+//! worker process running the RTSP source, whose backchannel session is
+//! torn down before the process exits at the daemon's shutdown; and
+//! through the control API, a stream opting in and out while a viewer
+//! plays the camera.
 //! Needs the `source-fake` feature (on with `--all-features`) and
 //! `output-webrtc` (a default); the RTSP tests `source-rtsp` (a default)
 //! too.
@@ -630,9 +633,9 @@ impl InProcess {
                             .await
                             .unwrap();
                     }
-                    ToSupervisor::ProbeConnecting => {
+                    ToSupervisor::ProbeConnecting { probe } => {
                         self.tx
-                            .send_msg(&ToWorker::ProbeConnectGranted, &[])
+                            .send_msg(&ToWorker::ProbeConnectGranted { probe }, &[])
                             .await
                             .unwrap();
                     }
@@ -1511,6 +1514,41 @@ async fn onvif_5_3_every_release_tears_the_backchannel_session_down_and_closes_i
     }
 }
 
+/// The daemon stops while a viewer holds the camera's backchannel, through
+/// a real `lotse worker` process: before the process exits, its
+/// backchannel session is torn down (RFC 2326 §10.7), the camera sees the
+/// `TEARDOWN` with `Require` (ONVIF Streaming Specification §5.3), and the
+/// connection is closed; the worker's runtime does not drop the session's
+/// task halfway at its exit.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_7_a_worker_process_tears_the_backchannel_session_down_before_it_exits() {
+    let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
+    let mut api = Api::start_with(
+        Arc::new(lotse_rtsp::RtspFactory::default()),
+        &camera.url(),
+        &json!({ "backchannel": true }),
+    )
+    .await;
+    let mut a = ApiPeer::offer(&api, "a").await;
+    pump(&mut api, &mut [&mut a], |_, _| {
+        backchannel_session(&camera).is_some_and(|log| log.played)
+    })
+    .await;
+    api.stop().await;
+    // The worker is gone: what it sent before its exit is all the camera
+    // reads before the connection's end.
+    let deadline = clock().now() + Duration::from_secs(5);
+    while !backchannel_session(&camera).unwrap().closed {
+        assert!(clock().now() < deadline, "never closed");
+        clock().sleep(Duration::from_millis(5)).await;
+    }
+    let log = backchannel_session(&camera).unwrap();
+    assert_eq!(log.teardown, Some(true), "TEARDOWN with Require: {log:?}");
+    assert!(log.closed_by_client, "{log:?}");
+    camera.stop().await;
+}
+
 /// Downlink A/V sync with talk-back active, which needs audio, video and
 /// a backchannel on one source: while the viewer talks, the daemon's
 /// Sender Reports (RFC 3550 §6.4.1) still put the camera's audio within
@@ -1568,12 +1606,14 @@ struct Api {
 
 impl Api {
     async fn start(options: &Value) -> Self {
-        Self::start_on("fake://127.0.0.1/", options).await
+        let factory = Arc::new(FakeSourceFactory::with_backchannel(&["fake"]));
+        Self::start_with(factory, "fake://127.0.0.1/", options).await
     }
 
-    /// The supervisor with stream `door` on `url` with `options`: the fake
-    /// source, or with `source-rtsp` an RTSP camera.
-    async fn start_on(url: &str, options: &Value) -> Self {
+    /// The supervisor and its demux, with stream `door` on `url` and
+    /// `options`, its scheme validated by `factory` (the worker process
+    /// registers the binary's own).
+    async fn start_with(factory: Arc<dyn SourceFactory>, url: &str, options: &Value) -> Self {
         let bound = bind_udp("127.0.0.1:0".parse().unwrap()).expect("the shared socket");
         let demux = Demux::start(
             Arc::clone(&bound.socket),
@@ -1607,15 +1647,7 @@ impl Api {
             .outputs
             .register(Arc::new(lotse_webrtc::WebRtcFactory))
             .unwrap();
-        registries
-            .sources
-            .register(Arc::new(FakeSourceFactory::with_backchannel(&["fake"])))
-            .unwrap();
-        #[cfg(feature = "source-rtsp")]
-        registries
-            .sources
-            .register(Arc::new(lotse_rtsp::RtspFactory::default()))
-            .unwrap();
+        registries.sources.register(factory).unwrap();
         registries.uplink = Some(Arc::new(ToG711Factory::new(clock())));
         let environment = Environment {
             registries,
@@ -1758,26 +1790,17 @@ struct ApiPeer {
 
 impl ApiPeer {
     async fn offer(api: &Api, id: &'static str) -> Self {
-        let peer = Peer::new(None).await;
-        let events = subscription(
-            call(
-                &api.supervisor,
-                &json!({ "id": 4, "type": "webrtc/offer", "stream_id": "door",
-                         "session_id": id, "sdp": peer.offer }),
-            )
-            .await,
-        );
-        Self {
-            id,
-            peer,
-            events,
-            seen: Vec::new(),
-        }
+        Self::open(api, id, Box::new(Peer::new(None).await)).await
     }
 
     /// A viewer that offers no talk-back, through `webrtc/offer`.
     async fn offer_silent(api: &Api, id: &'static str) -> Self {
-        let peer = Peer::new_silent().await;
+        Self::open(api, id, Box::new(Peer::new_silent().await)).await
+    }
+
+    /// `peer`'s offer as it sends it, through `webrtc/offer`; boxed, so
+    /// the future holds no viewer.
+    async fn open(api: &Api, id: &'static str, peer: Box<Peer>) -> Self {
         let events = subscription(
             call(
                 &api.supervisor,
@@ -1788,7 +1811,7 @@ impl ApiPeer {
         );
         Self {
             id,
-            peer,
+            peer: *peer,
             events,
             seen: Vec::new(),
         }
@@ -2101,8 +2124,15 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
     assert_eq!(api.talker_changes().len(), 5, "{:?}", api.stream_seen);
     assert_eq!(api.stream().await["backchannel"]["talker"], "b");
     // b's re-offer drops talk-back: let go, and a viewer that never
-    // offered talk-back takes it with its re-offer.
-    b.peer.mute();
+    // offered talk-back takes it with its re-offer. What b counted, once
+    // its last packets are through, stays in `session/get` after the
+    // stats pushes that follow: the counters never go back.
+    let b_mic = b.peer.mute();
+    pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(300)).await;
+    let counted = session_where(&mut api, &mut [&mut a, &mut b], "b", |bc| {
+        bc["packets_received"].as_u64() == Some(u64::from(b_mic.index))
+    })
+    .await;
     b.renegotiate(&api, Reoffer::Drop).await;
     pump(&mut api, &mut [&mut a, &mut b], |api, _| {
         api.talker_changes().len() >= 6
@@ -2112,7 +2142,20 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         api.talker_changes()[5],
         ("b".to_owned(), "renegotiated".to_owned(), Value::Null)
     );
-    assert_eq!(api.session("b").await["backchannel"]["negotiated"], false);
+    pump_for(
+        &mut api,
+        &mut [&mut a, &mut b],
+        lotse_worker::STATS_INTERVAL * 3,
+    )
+    .await;
+    assert_eq!(
+        api.session("b").await["backchannel"],
+        json!({ "negotiated": false, "talker": false, "codec": null,
+                "packets_received": counted["packets_received"],
+                "packets_dropped_busy": counted["packets_dropped_busy"],
+                "bytes_sent": counted["bytes_sent"] })
+    );
+    assert!(counted["bytes_sent"].as_u64().unwrap() > 0, "{counted}");
     let mut c = ApiPeer::offer_silent(&api, "c").await;
     pump(&mut api, &mut [&mut a, &mut b, &mut c], |_, peers| {
         peers[2].peer.viewer.is_connected()
@@ -2164,6 +2207,160 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
     assert_eq!(a.warnings("backchannel_declined"), 0);
     assert_eq!(b.warnings("backchannel_declined"), 2, "{:?}", b.seen);
     assert_eq!(c.warnings("backchannel_declined"), 0);
+    api.stop().await;
+}
+
+/// A talker whose re-offer stops its talk-back m-line, port 0 and out of
+/// the BUNDLE group, but keeps the m-line's `a=sendonly` and codecs, asks
+/// for no talk-back: the stream is disabled (RFC 3264 §8.2) whatever
+/// direction the m-line names. The m-line is answered with port 0, the
+/// talker lets go, and another viewer's re-offer claims the backchannel
+/// without a `busy` decline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3264_8_2_a_re_offer_that_stops_talk_back_with_its_direction_kept_frees_the_backchannel()
+{
+    let mut api = Api::start(&json!({ "backchannel": "pcmu" })).await;
+    let mut a = ApiPeer::offer(&api, "a").await;
+    let mut b = ApiPeer::offer_silent(&api, "b").await;
+    pump(&mut api, &mut [&mut a, &mut b], |api, peers| {
+        peers.iter().all(|p| p.peer.viewer.is_connected()) && !api.talker_changes().is_empty()
+    })
+    .await;
+    assert_eq!(
+        api.talker_changes(),
+        [("a".to_owned(), "claimed".to_owned(), json!("a"))]
+    );
+
+    // a stops its talk-back m-line, the stopped section keeping its
+    // `a=sendonly` where the viewer wrote `a=inactive`.
+    let offered = a.peer.viewer.reoffer(Reoffer::Stop).expect("a re-offer");
+    let (head, stopped) = offered.split_once("m=audio 0 ").expect("a stopped m-line");
+    assert!(!stopped.contains("m="), "the last m-line: {offered}");
+    assert!(stopped.contains("a=rtpmap:0 PCMU/8000"), "{offered}");
+    let sdp = format!(
+        "{head}m=audio 0 {}",
+        stopped.replacen("a=inactive", "a=sendonly", 1)
+    );
+    assert!(sdp.ends_with("\r\n") && sdp.contains("a=sendonly"), "{sdp}");
+    let result = api
+        .call(&json!({ "id": 20, "type": "webrtc/renegotiate", "session_id": "a", "sdp": sdp }))
+        .await;
+    let answer = result["sdp"].as_str().expect("the answer");
+    let (_, answered) = answer.rsplit_once("m=audio ").expect("an audio m-line");
+    assert!(answered.starts_with("0 "), "rejected: {answer}");
+    a.peer.on_answer(answer);
+    assert_eq!(a.peer.viewer.talkback_direction(), None, "rejected");
+    pump(&mut api, &mut [&mut a, &mut b], |api, _| {
+        api.talker_changes().len() >= 2
+    })
+    .await;
+    assert_eq!(
+        api.talker_changes()[1],
+        ("a".to_owned(), "renegotiated".to_owned(), Value::Null)
+    );
+    assert_eq!(api.stream().await["backchannel"]["talker"], Value::Null);
+    assert_eq!(api.session("a").await["backchannel"]["negotiated"], false);
+
+    // b asks for talk-back and claims it.
+    b.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .await;
+    assert_eq!(
+        b.peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::SendOnly)
+    );
+    pump(&mut api, &mut [&mut a, &mut b], |api, _| {
+        api.talker_changes().len() >= 3
+    })
+    .await;
+    assert_eq!(
+        api.talker_changes()[2],
+        ("b".to_owned(), "claimed".to_owned(), json!("b"))
+    );
+    assert_eq!(api.stream().await["backchannel"]["talker"], "b");
+    assert_eq!(b.warnings("backchannel_declined"), 0, "{:?}", b.seen);
+    api.stop().await;
+}
+
+/// `sdp` with its last audio m-line, the dedicated talk-back one after
+/// the video, offering two-channel PCMU, under a payload type no other
+/// m-line of the bundle uses (RFC 9143 §9.1.1), and G.722, which does
+/// not reach a G.711 backchannel: no codec talk-back can take, and one
+/// the engine answers the m-line `inactive` with. (Without one, str0m
+/// 0.24.0 rejects the m-line with an empty format list, which its own
+/// parser, the viewer's, refuses: RFC 8866 §5.14 wants a format.)
+fn two_channel_talkback(sdp: &str) -> String {
+    let at = sdp.rfind("m=audio ").expect("a talk-back m-line");
+    format!(
+        "{}{}",
+        &sdp[..at],
+        with_audio_codecs(
+            &sdp[at..],
+            "a=rtpmap:104 PCMU/8000/2\na=rtpmap:9 G722/8000\n"
+        )
+    )
+}
+
+/// Talk-back offered only in two-channel PCMU, which the engine does not
+/// carry (it carries G.711 mono, RFC 3551 §4.5.14), so it answers it no
+/// format (RFC 3264 §6): the offer is declined `unsupported` and does
+/// not claim the backchannel, which another viewer's offer then claims
+/// without a `busy` decline; and a talker's re-offer that asks for
+/// talk-back only in it lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3551_4_5_14_talk_back_only_in_two_channel_pcmu_neither_claims_nor_keeps_the_backchannel()
+ {
+    let mut api = Api::start(&json!({ "backchannel": "pcmu" })).await;
+    let mut stereo = Box::new(Peer::new(None).await);
+    stereo.offer = two_channel_talkback(&stereo.offer);
+    assert!(stereo.offer.contains("a=sendonly"), "{}", stereo.offer);
+    let mut a = ApiPeer::open(&api, "a", stereo).await;
+    let mut b = ApiPeer::offer(&api, "b").await;
+    pump(&mut api, &mut [&mut a, &mut b], |api, peers| {
+        peers.iter().all(|p| p.peer.viewer.is_connected())
+            && peers[0].warnings("backchannel_declined") > 0
+            && !api.talker_changes().is_empty()
+    })
+    .await;
+    let declined = a
+        .seen
+        .iter()
+        .find(|event| event["code"] == "backchannel_declined")
+        .unwrap();
+    assert_eq!(declined["reason"], "unsupported");
+    assert_eq!(
+        api.talker_changes(),
+        [("b".to_owned(), "claimed".to_owned(), json!("b"))]
+    );
+    assert_eq!(b.warnings("backchannel_declined"), 0, "{:?}", b.seen);
+    assert_eq!(api.session("a").await["backchannel"]["negotiated"], false);
+
+    // b re-offers its talk-back m-line `sendonly` in two-channel PCMU
+    // only: it lets go.
+    let dropped = b.peer.viewer.reoffer(Reoffer::Drop).expect("a re-offer");
+    let at = dropped.rfind("m=audio ").expect("the talk-back m-line");
+    let sdp = two_channel_talkback(&format!(
+        "{}{}",
+        &dropped[..at],
+        dropped[at..].replacen("a=inactive", "a=sendonly", 1)
+    ));
+    assert!(sdp[at..].contains("a=sendonly"), "{sdp}");
+    api.call(&json!({ "id": 20, "type": "webrtc/renegotiate", "session_id": "b", "sdp": sdp }))
+        .await;
+    pump(&mut api, &mut [&mut a, &mut b], |api, peers| {
+        api.talker_changes().len() >= 2 && peers[1].warnings("backchannel_declined") > 0
+    })
+    .await;
+    assert_eq!(
+        api.talker_changes()[1],
+        ("b".to_owned(), "renegotiated".to_owned(), Value::Null)
+    );
+    assert_eq!(api.stream().await["backchannel"]["talker"], Value::Null);
+    let declined = b
+        .seen
+        .iter()
+        .find(|event| event["code"] == "backchannel_declined")
+        .unwrap();
+    assert_eq!(declined["reason"], "unsupported");
     api.stop().await;
 }
 
@@ -2281,7 +2478,12 @@ async fn onvif_5_3_1_opting_in_and_out_leaves_the_video_alone_and_frees_the_talk
         json!({ "id": 2, "type": "stream/put", "stream_id": "door",
                 "sources": [{ "url": camera.url(), "options": options }] })
     };
-    let mut api = Api::start_on(&camera.url(), &json!({})).await;
+    let mut api = Api::start_with(
+        Arc::new(lotse_rtsp::RtspFactory::default()),
+        &camera.url(),
+        &json!({}),
+    )
+    .await;
     let mut v = ApiPeer::offer_silent(&api, "v").await;
     // Playing: past the first keyframe and a second of video.
     pump(&mut api, &mut [&mut v], |_, peers| {

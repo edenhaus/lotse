@@ -137,17 +137,46 @@ pub(crate) const fn clock_rate(family: CodecFamily) -> u32 {
     }
 }
 
+/// Whether an `a=rtpmap` encoding of `family` with the channel count
+/// `channels` (its encoding parameters, RFC 8866 §6.6; `None` when it
+/// has none) is the one the engine is configured with: str0m 0.24.0
+/// matches an offered format to its own only at the same channel count
+/// (`PayloadParams::match_score`, read 2026-10-17). It carries Opus at
+/// two channels, the only count RFC 7587 §7 allows (`opus/48000/2`), and
+/// G.711 and G.722 mono (RFC 3551 §4.5.14, §4.5.2, Table 4) at none
+/// (`enable_pcmu`, `enable_pcma`, `enable_g722`), which for G.722 it
+/// also reads from `/1` (`From<RtpMap> for CodecSpec`). So an offer's
+/// two-channel G.711 is no codec the engine carries, and the plan takes
+/// neither talk-back nor the downlink in it.
+///
+/// `SPEC-DEVIATION` (RFC 8866 §6.6: an audio encoding without encoding
+/// parameters has one channel, so `PCMU/8000/1` names the codec
+/// `PCMU/8000` does): a G.711 encoding that writes its one channel is
+/// not matched, since str0m 0.24.0 answers no format for it; the plan
+/// follows the engine, so it never counts on a codec the answer leaves
+/// out.
+const fn engine_channels(family: CodecFamily, channels: Option<u8>) -> bool {
+    match family {
+        CodecFamily::Opus => matches!(channels, Some(2)),
+        CodecFamily::G722 => matches!(channels, None | Some(1)),
+        _ => channels.is_none(),
+    }
+}
+
 /// The audio family the engine carries that an `a=rtpmap` encoding
 /// (`<name>/<clock>[/<channels>]`, RFC 8866 §6.6) names: its encoding
-/// name, case-insensitive (RFC 4855 §3), at its RTP clock rate; `None`
-/// for any other codec. The engine matches the rest.
+/// name, case-insensitive (RFC 4855 §3), at its RTP clock rate and with
+/// the channel count the engine carries it at ([`engine_channels`]);
+/// `None` for any other codec. The engine matches the rest.
 fn encoding_family(encoding: &str) -> Option<CodecFamily> {
     let mut parts = encoding.split('/');
     let name = parts.next()?;
     let clock = parts.next().and_then(|clock| clock.parse::<u32>().ok())?;
+    let channels = parts.next().map(str::parse::<u8>).transpose().ok()?;
     EVERY_CODEC.into_iter().find(|family| {
         encoding_name(*family).is_some_and(|known| known.eq_ignore_ascii_case(name))
             && clock_rate(*family) == clock
+            && engine_channels(*family, channels)
     })
 }
 
@@ -182,6 +211,21 @@ fn without_formats(m_line: &str, pts: &[u8]) -> String {
     let head: Vec<&str> = fields.by_ref().take(3).collect();
     let kept = fields.filter(|format| !format.parse::<u8>().is_ok_and(|pt| pts.contains(&pt)));
     head.into_iter().chain(kept).collect::<Vec<_>>().join(" ")
+}
+
+/// `m_line` with its port field (RFC 8866 §5.14: `m=<media>
+/// <port>[/<number of ports>] <proto> <fmt> ...`) written `0`, the one
+/// form of port zero str0m 0.24.0 reads as a disabled m-line (its
+/// `media_parser` in `sdp/parser.rs`, read 2026-10-17). A number of
+/// ports goes with it: str0m reads `0/2` as a live port, and a stopped
+/// m-line uses no port it could count (RFC 3264 §8.2).
+fn with_port_zero(m_line: &str) -> String {
+    m_line
+        .split(' ')
+        .enumerate()
+        .map(|(field, value)| if field == 1 { "0" } else { value })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The payload types of `section` whose codec the engine carries and
@@ -222,24 +266,32 @@ const fn other_law(family: CodecFamily) -> Option<CodecFamily> {
 
 /// The audio codecs the engine is configured with, in its order of
 /// preference, for a session whose stream's backchannel takes
-/// `backchannel` (`None` without one): the backchannel's codec, then for
-/// a G.711 one the other law, then Opus, then the rest of
-/// [`EVERY_CODEC`]. Fixed when the session opens: str0m answers every
-/// m-line, of the offer and of every re-offer, with this one list in
-/// this order, narrowed to what the m-line offers (there is no list per
-/// m-line, an upstream need), so [`AudioPlan::engine_offer`] narrows
-/// each m-line's formats, and the order puts the codec talk-back is
-/// received in first on the talk-back m-line, which the browser sends
-/// (RFC 3264 §7): the backchannel's own, else the other law, else Opus
-/// ([`AudioPlan::new`]). Every codec is enabled so a re-offer can add
-/// talk-back in any of them.
-pub(crate) fn engine_codecs(backchannel: Option<CodecFamily>) -> Vec<CodecFamily> {
-    let mut codecs = Vec::with_capacity(EVERY_CODEC.len());
-    for family in backchannel
+/// `backchannel` (`None` without one) and whose stream's audio is
+/// `stream` (`None` without any): with a backchannel, its codec, then
+/// for a G.711 one the other law, then Opus; then the stream audio's
+/// codec; then the rest of [`EVERY_CODEC`]. Fixed when the session
+/// opens: str0m answers every m-line, of the offer and of every
+/// re-offer, with this one list in this order, narrowed to what the
+/// m-line offers (there is no list per m-line, an upstream need), so
+/// [`AudioPlan::engine_offer`] narrows each m-line's formats, and the
+/// order puts the codec talk-back is received in first on the
+/// talk-back m-line, which the browser sends (RFC 3264 §7): the
+/// backchannel's own, else the other law, else Opus
+/// ([`AudioPlan::new`]). Without a backchannel the stream audio's codec
+/// comes first, so the downlink m-line names first the codec the session
+/// sends on it, the default format of the m-line (RFC 8866 §5.14: the
+/// first format listed SHOULD be the session's default). Every codec is
+/// enabled so a re-offer can add talk-back in any of them.
+pub(crate) fn engine_codecs(
+    backchannel: Option<CodecFamily>,
+    stream: Option<CodecFamily>,
+) -> Vec<CodecFamily> {
+    let talkback = backchannel
         .into_iter()
         .chain(backchannel.and_then(other_law))
-        .chain(EVERY_CODEC)
-    {
+        .chain(backchannel.map(|_| CodecFamily::Opus));
+    let mut codecs = Vec::with_capacity(EVERY_CODEC.len());
+    for family in talkback.chain(stream).chain(EVERY_CODEC) {
         if EVERY_CODEC.contains(&family) && !codecs.contains(&family) {
             codecs.push(family);
         }
@@ -280,8 +332,8 @@ pub(crate) enum Talkback<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AudioPlan<'a> {
     /// The m-line the stream's audio goes down on: the first audio m-line
-    /// with a mid that the browser receives on (`recvonly` or
-    /// `sendrecv`).
+    /// with a mid, not stopped ([`Sdp::stopped`]), that the browser
+    /// receives on (`recvonly` or `sendrecv`).
     pub(crate) downlink: Option<&'a str>,
     /// The stream audio's family, when the engine carries it and the
     /// downlink m-line lists it.
@@ -320,6 +372,11 @@ impl<'a> AudioPlan<'a> {
     /// that m-line, which the browser sends (RFC 3264 §6.1). Talk-back the
     /// backchannel would take is declined all the same while another
     /// session holds the backchannel ([`TalkbackClaim::Busy`]).
+    ///
+    /// A stopped m-line ([`Sdp::stopped`]: a zero port, not a bundled
+    /// `bundle-only` one) carries neither: its stream is disabled
+    /// (RFC 3264 §8.2), whatever direction it still names, so it neither
+    /// requests talk-back nor takes the stream's audio.
     pub(crate) fn new(
         offer: &'a str,
         audio: Option<&Codec>,
@@ -331,7 +388,7 @@ impl<'a> AudioPlan<'a> {
         let lines: Vec<(&Section<'a>, &'a str, Direction)> = sdp
             .media()
             .iter()
-            .filter(|section| section.is("audio"))
+            .filter(|section| section.is("audio") && !sdp.stopped(section))
             .filter_map(|section| Some((section, section.mid()?, Direction::of(section))))
             .collect();
         let downlink = lines.iter().find(|(_, _, offered)| offered.receives());
@@ -483,6 +540,13 @@ impl<'a> AudioPlan<'a> {
     /// only the offer narrows one m-line. An answer lists formats of the
     /// offer (RFC 3264 §6.1), and the browser may send any it lists
     /// (RFC 3264 §7).
+    ///
+    /// A stopped audio m-line ([`Sdp::stopped`]: a zero port, not a
+    /// bundled `bundle-only` one, whose port stays as offered) has its
+    /// port written `0` ([`with_port_zero`]): str0m reads a zero-padded
+    /// port, or one with a number of ports, as live and would answer it
+    /// with a nonzero one, where RFC 3264 §6 answers a zero port with
+    /// zero.
     pub(crate) fn engine_offer(&self, offer: &str) -> String {
         let sdp = Sdp::parse(offer);
         let mut out = String::with_capacity(offer.len().saturating_add(64));
@@ -500,7 +564,12 @@ impl<'a> AudioPlan<'a> {
                 .then(|| self.answer(section.mid()).reversed())
                 .filter(|wanted| *wanted != offered);
             let dropped = self.unroutable(section);
-            push(&without_formats(section.m_line(), &dropped));
+            let m_line = without_formats(section.m_line(), &dropped);
+            if section.is("audio") && sdp.stopped(section) {
+                push(&with_port_zero(&m_line));
+            } else {
+                push(&m_line);
+            }
             for line in section.lines() {
                 if (rewrite.is_none() || Direction::parse(line).is_none())
                     && !describes(line, &dropped)
@@ -589,7 +658,10 @@ mod tests {
         audio: Option<&Codec>,
         backchannel: Option<&TalkbackTarget>,
     ) -> AudioPlan<'a> {
-        let order = engine_codecs(backchannel.map(|backchannel| backchannel.codec.family()));
+        let order = engine_codecs(
+            backchannel.map(|backchannel| backchannel.codec.family()),
+            audio.map(Codec::family),
+        );
         AudioPlan::new(offer, audio, backchannel, TalkbackClaim::Granted, &order)
     }
 
@@ -645,6 +717,56 @@ mod tests {
         assert_eq!(clock_rate(CodecFamily::Opus), 48_000);
         assert_eq!(clock_rate(CodecFamily::G722), 8_000);
         assert_eq!(clock_rate(CodecFamily::Pcmu), 8_000);
+    }
+
+    /// An encoding names a codec the engine carries only at the channel
+    /// count the engine carries it at (str0m 0.24.0): Opus at two
+    /// (RFC 7587 §7), G.711 and G.722 mono (RFC 3551 §4.5.14, §4.5.2),
+    /// G.722 with or without its `/1`; G.711 only without it
+    /// (`SPEC-DEVIATION`, [`engine_channels`]). A count that is no number
+    /// names nothing.
+    #[test]
+    fn rfc7587_7_rfc3551_4_5_14_an_encoding_names_a_carried_codec_only_at_its_channel_count() {
+        use CodecFamily::{G722, Opus, Pcma, Pcmu};
+        for (encoding, family) in [
+            ("opus/48000/2", Some(Opus)),
+            ("opus/48000", None),
+            ("opus/48000/1", None),
+            ("PCMU/8000", Some(Pcmu)),
+            ("PCMU/8000/1", None),
+            ("PCMU/8000/2", None),
+            ("PCMA/8000", Some(Pcma)),
+            ("PCMA/8000/2", None),
+            ("G722/8000", Some(G722)),
+            ("G722/8000/1", Some(G722)),
+            ("G722/8000/2", None),
+            ("PCMU/8000/x", None),
+        ] {
+            assert_eq!(encoding_family(encoding), family, "{encoding}");
+        }
+    }
+
+    /// Talk-back offered only in a format the engine does not carry
+    /// (two-channel PCMU to a PCMU backchannel) is off, not negotiated:
+    /// the engine answers no format for it (RFC 3264 §6), so a plan that
+    /// took it would have the session hold the backchannel without
+    /// talk-back. A downlink m-line that offers the stream's PCMU only in
+    /// two channels carries no stream audio either.
+    #[test]
+    fn rfc3264_6_talk_back_in_a_format_the_engine_does_not_carry_is_off() {
+        let offer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\na=recvonly\r\na=rtpmap:0 PCMU/8000/2\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=recvonly\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:2\r\na=sendonly\r\na=rtpmap:0 PCMU/8000/2\r\n";
+        let pcmu = reaching(&Codec::Pcmu);
+        let plan = plan_for(offer, Some(&Codec::Pcmu), Some(&pcmu));
+        assert_eq!(
+            plan.talkback,
+            Talkback::Off("the talk-back m-line lists no codec that reaches the backchannel")
+        );
+        assert_eq!(plan.send, None);
+        // The same m-lines in the engine's mono PCMU: both carried.
+        let mono = offer.replace("PCMU/8000/2", "PCMU/8000");
+        let plan = plan_for(&mono, Some(&Codec::Pcmu), Some(&pcmu));
+        assert_eq!(plan.talkback, negotiated("2", CodecFamily::Pcmu, true));
+        assert_eq!(plan.send, Some(CodecFamily::Pcmu));
     }
 
     /// The fixture matrix: {dedicated talk-back m-line,
@@ -720,17 +842,51 @@ mod tests {
     }
 
     /// The engine's order: the backchannel's codec, its other law, Opus,
-    /// then the rest, every codec once; the rest alone without one.
+    /// then the stream audio's codec, then the rest, every codec once;
+    /// without a backchannel the stream audio's codec first.
     #[test]
     fn rfc3264_7_the_engine_prefers_the_backchannels_codec_then_the_other_law_then_opus() {
         use CodecFamily::{G722, Opus, Pcma, Pcmu};
-        assert_eq!(engine_codecs(None), EVERY_CODEC);
-        assert_eq!(engine_codecs(Some(Pcmu)), [Pcmu, Pcma, Opus, G722]);
-        assert_eq!(engine_codecs(Some(Pcma)), [Pcma, Pcmu, Opus, G722]);
-        assert_eq!(engine_codecs(Some(Opus)), [Opus, Pcmu, Pcma, G722]);
-        assert_eq!(engine_codecs(Some(G722)), [G722, Opus, Pcmu, Pcma]);
+        assert_eq!(engine_codecs(None, None), EVERY_CODEC);
+        assert_eq!(engine_codecs(Some(Pcmu), None), [Pcmu, Pcma, Opus, G722]);
+        assert_eq!(engine_codecs(Some(Pcma), None), [Pcma, Pcmu, Opus, G722]);
+        assert_eq!(engine_codecs(Some(Opus), None), [Opus, Pcmu, Pcma, G722]);
+        assert_eq!(engine_codecs(Some(G722), None), [G722, Opus, Pcmu, Pcma]);
         // A backchannel in a codec the engine does not carry changes nothing.
-        assert_eq!(engine_codecs(Some(CodecFamily::AacLc)), EVERY_CODEC);
+        assert_eq!(engine_codecs(Some(CodecFamily::AacLc), None), EVERY_CODEC);
+        // The stream audio's codec after the talk-back ones: Opus, the
+        // last of them, stays ahead of it.
+        assert_eq!(
+            engine_codecs(Some(Pcmu), Some(G722)),
+            [Pcmu, Pcma, Opus, G722]
+        );
+        assert_eq!(
+            engine_codecs(Some(Opus), Some(Pcma)),
+            [Opus, Pcma, Pcmu, G722]
+        );
+        assert_eq!(
+            engine_codecs(Some(Pcmu), Some(Opus)),
+            [Pcmu, Pcma, Opus, G722]
+        );
+    }
+
+    /// Without a backchannel the engine prefers the stream audio's codec,
+    /// so the downlink m-line names it first, the m-line's default format
+    /// (RFC 8866 §5.14), whatever the offer lists first; the rest follow
+    /// as offered, in the engine's order.
+    #[test]
+    fn rfc8866_5_14_the_downlink_m_line_names_the_stream_audios_codec_first() {
+        use CodecFamily::{G722, Opus, Pcma, Pcmu};
+        assert_eq!(engine_codecs(None, Some(Pcmu)), [Pcmu, Opus, Pcma, G722]);
+        assert_eq!(engine_codecs(None, Some(G722)), [G722, Opus, Pcmu, Pcma]);
+        // A stream codec the engine does not carry changes nothing.
+        assert_eq!(engine_codecs(None, Some(CodecFamily::AacLc)), EVERY_CODEC);
+        for codec in [Codec::Pcmu, Codec::Pcma, Codec::Opus { channels: 2 }] {
+            let plan = plan_for(DEDICATED, Some(&codec), None);
+            let answered = plan.answered(DEDICATED, "0");
+            assert_eq!(answered.first(), Some(&codec.family()), "{codec:?}");
+            assert_eq!(answered.len(), 3, "every codec offered: {answered:?}");
+        }
     }
 
     /// While another session holds the backchannel, talk-back the
@@ -742,7 +898,7 @@ mod tests {
     fn rfc3264_6_1_a_busy_backchannel_declines_talk_back_the_offer_asks_for() {
         let opus = Codec::Opus { channels: 2 };
         let pcmu = reaching(&Codec::Pcmu);
-        let order = engine_codecs(Some(CodecFamily::Pcmu));
+        let order = engine_codecs(Some(CodecFamily::Pcmu), Some(CodecFamily::Opus));
         let busy = AudioPlan::new(
             DEDICATED,
             Some(&opus),
@@ -795,6 +951,136 @@ mod tests {
         assert_eq!(silent.talkback, Talkback::NotRequested);
     }
 
+    /// A stopped audio m-line (a zero port, out of the BUNDLE group) is a
+    /// disabled stream (RFC 3264 §8.2) whatever direction it still names:
+    /// a talk-back m-line stopped with its `a=sendonly` kept requests no
+    /// talk-back, and is answered `inactive`, so the next m-line the
+    /// browser sends on takes it, a zero-padded port as a `0`; a stopped
+    /// downlink m-line carries no stream audio. A `bundle-only` m-line
+    /// the group lists keeps its zero port (RFC 9143 §6) and its
+    /// talk-back.
+    #[test]
+    fn rfc3264_8_2_a_stopped_audio_m_line_carries_neither_talk_back_nor_the_downlink() {
+        let opus = Codec::Opus { channels: 2 };
+        let pcmu = reaching(&Codec::Pcmu);
+        let dedicated = "m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2";
+        let stopped_talkback = DEDICATED
+            .replace(dedicated, "m=audio 0 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2")
+            .replace("a=group:BUNDLE 0 1 2", "a=group:BUNDLE 0 1");
+        assert!(stopped_talkback.contains("a=mid:2\r\na=sendonly"));
+        let plan = plan_for(&stopped_talkback, Some(&opus), Some(&pcmu));
+        assert_eq!(plan.talkback, Talkback::NotRequested);
+        assert_eq!(plan.answer(Some("2")), Direction::Inactive);
+        assert!(!plan.takes(CodecFamily::Pcmu));
+        assert_eq!(plan.downlink, Some("0"));
+        assert_eq!(plan.send, Some(CodecFamily::Opus));
+        let engine = plan.engine_offer(&stopped_talkback);
+        let rewritten = Sdp::parse(&engine);
+        assert!(
+            with_mid(&rewritten, "2").lines().contains(&"a=inactive"),
+            "{engine}"
+        );
+
+        // The downlink m-line turned `sendrecv` beside it takes talk-back.
+        let shared = stopped_talkback.replacen("a=recvonly", "a=sendrecv", 1);
+        let plan = plan_for(&shared, Some(&opus), Some(&pcmu));
+        assert_eq!(plan.talkback, negotiated("0", CodecFamily::Pcmu, false));
+        assert_eq!(plan.answer(Some("2")), Direction::Inactive);
+
+        // A stopped downlink m-line carries no stream audio.
+        let stopped_downlink = DEDICATED
+            .replacen(
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:0",
+                "m=audio 0 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:0",
+                1,
+            )
+            .replace("a=group:BUNDLE 0 1 2", "a=group:BUNDLE 1 2");
+        let plan = plan_for(&stopped_downlink, Some(&opus), Some(&pcmu));
+        assert_eq!(plan.downlink, None);
+        assert_eq!(plan.send, None);
+        assert_eq!(plan.answer(Some("0")), Direction::Inactive);
+        assert_eq!(plan.talkback, negotiated("2", CodecFamily::Pcmu, true));
+
+        // A zero-padded port is port zero (RFC 8866 §9, `1*DIGIT`).
+        for port in ["00", "000/2"] {
+            let padded = stopped_talkback.replace(
+                "m=audio 0 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2",
+                &format!("m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2"),
+            );
+            assert_ne!(padded, stopped_talkback);
+            let plan = plan_for(&padded, Some(&opus), Some(&pcmu));
+            assert_eq!(plan.talkback, Talkback::NotRequested, "{port}");
+            assert_eq!(plan.answer(Some("2")), Direction::Inactive, "{port}");
+        }
+
+        // Bundle-only and listed in the group: not stopped.
+        let bundle_only = DEDICATED.replace(
+            dedicated,
+            "m=audio 0 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2\r\na=bundle-only",
+        );
+        let plan = plan_for(&bundle_only, Some(&opus), Some(&pcmu));
+        assert_eq!(plan.talkback, negotiated("2", CodecFamily::Pcmu, true));
+    }
+
+    /// The engine is offered a stopped audio m-line (RFC 3264 §8.2) with
+    /// the port `0`, the one form str0m reads as port zero, so it answers
+    /// it with zero (RFC 3264 §6): a zero-padded port (RFC 8866 §9,
+    /// `1*DIGIT`) and a number of ports (RFC 8866 §5.14) go. A live
+    /// m-line, a `bundle-only` one the group lists (RFC 9143 §6) and a
+    /// stopped m-line of another kind keep their port as offered.
+    #[test]
+    fn rfc3264_6_a_stopped_audio_m_line_is_offered_to_the_engine_with_port_zero() {
+        let opus = Codec::Opus { channels: 2 };
+        let pcmu = reaching(&Codec::Pcmu);
+        let dedicated = "m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2";
+        for port in ["0", "00", "000/2", "0/2"] {
+            let stopped = DEDICATED
+                .replace(
+                    dedicated,
+                    &format!("m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2"),
+                )
+                .replace("a=group:BUNDLE 0 1 2", "a=group:BUNDLE 0 1");
+            let plan = plan_for(&stopped, Some(&opus), Some(&pcmu));
+            let engine = plan.engine_offer(&stopped);
+            let rewritten = Sdp::parse(&engine);
+            assert_eq!(
+                with_mid(&rewritten, "2").m_line(),
+                "m=audio 0 UDP/TLS/RTP/SAVPF 111 0 8",
+                "{port}: {engine}"
+            );
+            assert_eq!(
+                with_mid(&rewritten, "0").m_line(),
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8",
+                "{port}: {engine}"
+            );
+
+            // Bundle-only and listed in the group: not stopped.
+            let bundle_only = DEDICATED.replace(
+                dedicated,
+                &format!("m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2\r\na=bundle-only"),
+            );
+            let plan = plan_for(&bundle_only, Some(&opus), Some(&pcmu));
+            let engine = plan.engine_offer(&bundle_only);
+            assert_eq!(
+                with_mid(&Sdp::parse(&engine), "2").m_line(),
+                format!("m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8"),
+                "{port}: {engine}"
+            );
+
+            // A stopped video m-line is no audio plan's to rewrite.
+            let video = DEDICATED
+                .replace("m=video 9 ", &format!("m=video {port} "))
+                .replace("a=group:BUNDLE 0 1 2", "a=group:BUNDLE 0 2");
+            let plan = plan_for(&video, Some(&opus), Some(&pcmu));
+            let engine = plan.engine_offer(&video);
+            assert_eq!(
+                with_mid(&Sdp::parse(&engine), "1").m_line(),
+                format!("m=video {port} UDP/TLS/RTP/SAVPF 96"),
+                "{port}: {engine}"
+            );
+        }
+    }
+
     /// The engine's order was fixed for the backchannel the session
     /// opened with: on a re-offer that meets another, the talk-back
     /// m-line loses the codecs the engine would prefer to the one
@@ -803,7 +1089,7 @@ mod tests {
     #[test]
     fn rfc3264_7_a_re_offer_on_another_backchannel_keeps_the_talk_back_codec_first() {
         use CodecFamily::{Opus, Pcma, Pcmu};
-        let opened_with_opus = engine_codecs(Some(Opus));
+        let opened_with_opus = engine_codecs(Some(Opus), None);
         let offer = talking_in(&["opus", "PCMU", "PCMA", "G722"]);
         let plan = AudioPlan::new(
             &offer,
@@ -1189,10 +1475,11 @@ mod tests {
             // The downlink m-line is answered with what it offers (no
             // G.722 there) in the engine's order, the stream audio's
             // codec among them.
-            let offered_down: Vec<CodecFamily> = engine_codecs(Some(backchannel.family()))
-                .into_iter()
-                .filter(|family| *family != G722)
-                .collect();
+            let offered_down: Vec<CodecFamily> =
+                engine_codecs(Some(backchannel.family()), audio.map(Codec::family))
+                    .into_iter()
+                    .filter(|family| *family != G722)
+                    .collect();
             assert_eq!(plan.answered(&offer, "0"), offered_down, "{what}");
             // The engine is never offered a codec talk-back does not take
             // on that m-line, nor its attribute lines.
@@ -1343,7 +1630,7 @@ mod tests {
             assert!(engine.contains("a=rtpmap:9 G722/8000\r\n"), "{engine}");
             assert_eq!(
                 plan.answered(&offer, "2"),
-                engine_codecs(backchannel.map(Codec::family)),
+                engine_codecs(backchannel.map(Codec::family), Some(CodecFamily::Pcmu)),
                 "inactive, with every format of the offer"
             );
         }

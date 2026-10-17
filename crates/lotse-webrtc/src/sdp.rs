@@ -67,6 +67,41 @@ impl<'a> Sdp<'a> {
         self.media.iter().find(|section| section.is(kind))
     }
 
+    /// Whether `section` is stopped: its port is zero (RFC 3264 §8.2: the
+    /// stream is disabled; RFC 8829 §5.2.2: the m-line of a stopped
+    /// transceiver), unless it is a `bundle-only` one (RFC 9143 §6) that
+    /// a BUNDLE group lists (RFC 9143 §5), whose zero port only says it
+    /// shares the group's transport. The port is the `m=` line's second
+    /// field, without a `/<number of ports>` (RFC 8866 §5.14), and is
+    /// zero by its value ([`zero_port`]), so `00` and `000/2` stop an
+    /// m-line as `0` does.
+    ///
+    /// str0m 0.24.0 reads only a literal `0` as a disabled m-line (its
+    /// `media_parser` in `sdp/parser.rs`, read 2026-10-17): a zero-padded
+    /// port, or one with a number of ports, it would keep live and answer
+    /// with a nonzero one, where RFC 3264 §6 answers a zero port with
+    /// zero. lotse goes by the value, so the engine never acts on such an
+    /// m-line: a re-offer that stops the video one is refused before it,
+    /// and a stopped audio one is planned and answered `inactive`
+    /// ([`crate::audio::AudioPlan::new`]), its port written `0` in the
+    /// offer the engine answers ([`crate::audio::AudioPlan::engine_offer`]).
+    pub(crate) fn stopped(&self, section: &Section<'_>) -> bool {
+        let zero = section
+            .m_line
+            .split(' ')
+            .nth(1)
+            .and_then(|port| port.split('/').next())
+            .is_some_and(zero_port);
+        let bundled = section.lines.contains(&"a=bundle-only")
+            && section.mid().is_some_and(|mid| {
+                self.session
+                    .iter()
+                    .filter_map(|line| line.strip_prefix("a=group:BUNDLE "))
+                    .any(|mids| mids.split_whitespace().any(|listed| listed == mid))
+            });
+        zero && !bundled
+    }
+
     /// Whether one `a=group:BUNDLE` line (RFC 9143 §5) lists both mids.
     fn bundled(&self, a: Option<&str>, b: Option<&str>) -> bool {
         let (Some(a), Some(b)) = (a, b) else {
@@ -80,6 +115,20 @@ impl<'a> Sdp<'a> {
                     && mids.split_whitespace().any(|mid| mid == b)
             })
     }
+}
+
+/// Whether `port`, an `m=` line's port field without its
+/// `/<number of ports>`, is port zero. The grammar makes a port
+/// `1*DIGIT` (RFC 8866 §9), a decimal number whose leading zeros change
+/// nothing: it is zero when it is digits, at least one, all of them `0`.
+/// Checking the digits instead of parsing them keeps it total: no
+/// overflow on a long run of zeros, and no sign (`+0`, which
+/// `str::parse` takes) passes. A field that is no `1*DIGIT` (empty, a
+/// sign, a letter) is malformed and not zero, so the m-line is not
+/// stopped and is left to the engine, which reads it the same way; a
+/// nonzero port out of range (`70000`) is not zero either.
+fn zero_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|digit| digit == b'0')
 }
 
 impl<'a> Section<'a> {
@@ -412,6 +461,68 @@ mod tests {
         assert!(!sdp.bundled(Some("a"), Some("c")), "two groups");
         assert!(!sdp.bundled(Some("a"), None));
         assert!(!sdp.bundled(None, Some("a")));
+    }
+
+    #[test]
+    fn rfc3264_8_2_a_zero_port_stops_an_m_line_unless_bundle_only_in_a_bundle_rfc9143_6() {
+        let stopped = |sdp: &str| {
+            let sdp = Sdp::parse(sdp);
+            sdp.stopped(&sdp.media()[0])
+        };
+        assert!(!stopped(
+            "a=group:BUNDLE v\r\nm=video 9 x 96\r\na=mid:v\r\n"
+        ));
+        // Stopped: out of the BUNDLE group (RFC 8829 §5.2.2), or in it
+        // without `bundle-only`, or `bundle-only` outside it.
+        assert!(stopped("a=group:BUNDLE a\r\nm=video 0 x 96\r\na=mid:v\r\n"));
+        assert!(stopped("a=group:BUNDLE v\r\nm=video 0 x 96\r\na=mid:v\r\n"));
+        assert!(stopped(
+            "a=group:BUNDLE a\r\nm=video 0 x 96\r\na=mid:v\r\na=bundle-only\r\n"
+        ));
+        assert!(stopped("m=video 0/2 x 96\r\na=bundle-only\r\n"), "no mid");
+        // Bundled only: in the group, on its transport.
+        assert!(!stopped(
+            "a=group:BUNDLE a v\r\nm=video 0 x 96\r\na=mid:v\r\na=bundle-only\r\n"
+        ));
+        assert!(!stopped("m=video 10 x 96\r\n"));
+        assert!(!stopped("m=video\r\n"), "no port at all");
+    }
+
+    /// A port is `1*DIGIT` (RFC 8866 §9), zero by its value: leading
+    /// zeros, with or without a number of ports, stop the m-line as `0`
+    /// does, and the bundle-only exception (RFC 9143 §6) holds for them
+    /// too. A field that is no `1*DIGIT` is not zero.
+    #[test]
+    fn rfc8866_9_a_zero_padded_port_is_port_zero_and_stops_the_m_line() {
+        let stopped = |sdp: &str| {
+            let sdp = Sdp::parse(sdp);
+            sdp.stopped(&sdp.media()[0])
+        };
+        for port in ["00", "000/2", "0000000000000000000000000000"] {
+            assert!(stopped(&format!("m=video {port} x 96\r\n")), "{port}");
+            assert!(
+                stopped(&format!(
+                    "a=group:BUNDLE a\r\nm=video {port} x 96\r\na=mid:v\r\na=bundle-only\r\n"
+                )),
+                "{port}: bundle-only outside the group"
+            );
+            assert!(
+                !stopped(&format!(
+                    "a=group:BUNDLE a v\r\nm=video {port} x 96\r\na=mid:v\r\na=bundle-only\r\n"
+                )),
+                "{port}: bundle-only in the group"
+            );
+        }
+        for port in [
+            "01", "10/2", "007", "70000", "+0", "-0", "0x0", "x", "/2", "",
+        ] {
+            assert!(!stopped(&format!("m=video {port} x 96\r\n")), "{port}");
+        }
+        assert!(zero_port("0"));
+        assert!(zero_port("000"));
+        assert!(!zero_port(""));
+        assert!(!zero_port("+0"));
+        assert!(!zero_port("0 "));
     }
 
     #[test]

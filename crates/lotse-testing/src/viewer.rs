@@ -32,6 +32,11 @@ pub enum Reoffer {
     /// Talk-back as `TalkbackOffer` says: the dedicated m-line added
     /// after the video (`addTransceiver("audio", {direction: "sendonly"})`)
     /// or offered `sendonly` again, or the downlink one turned `sendrecv`.
+    /// The other one stops asking for it, as a browser sets that
+    /// transceiver's `direction`: the downlink m-line back to
+    /// `recvonly`, the dedicated one `inactive`. So the re-offer asks for
+    /// talk-back on one m-line, the one the viewer then sends on, which a
+    /// daemon preferring a `sendonly` m-line would otherwise not take.
     Talkback(TalkbackOffer),
     /// Talk-back dropped: the dedicated m-line `inactive`, or the
     /// downlink one back to `recvonly` (a transceiver's `direction` set).
@@ -98,6 +103,10 @@ pub struct Viewer {
     audio_mid: Option<Mid>,
     /// The mid talk-back is offered on, without it `None`.
     talkback_mid: Option<Mid>,
+    /// The dedicated talk-back m-line's mid, whether or not talk-back is
+    /// offered on it now; `None` before one is added and once it is
+    /// stopped, which it cannot come back from.
+    dedicated_mid: Option<Mid>,
     /// The payload types of the offer's audio m-line, empty without one.
     audio_pts: Vec<u8>,
     /// Audio RTP received, in arrival order.
@@ -269,6 +278,7 @@ impl Viewer {
             AudioOffer::Talkback(TalkbackOffer::SendRecv) => audio_mid,
             AudioOffer::Off | AudioOffer::Receive => None,
         };
+        let dedicated_mid = talkback_mid.filter(|mid| Some(*mid) != audio_mid);
         let (offer, pending) = api
             .apply()
             .ok_or_else(|| "the offer has no changes".to_owned())?;
@@ -284,6 +294,7 @@ impl Viewer {
             packets: Vec::new(),
             audio_mid,
             talkback_mid,
+            dedicated_mid,
             audio_pts,
             audio_packets: Vec::new(),
             ice_states: Vec::new(),
@@ -346,37 +357,45 @@ impl Viewer {
     /// re-offer offers the m-line as before: a browser's `createOffer`
     /// writes the transceiver's `direction` whatever the last answer
     /// made of it, which str0m needs a change for, so the direction is
-    /// toggled to get one.
+    /// toggled to get one. Switching talk-back between the dedicated and
+    /// the downlink m-line takes it off the other one
+    /// ([`Reoffer::Talkback`]).
     pub fn reoffer(&mut self, what: Reoffer) -> Result<String, String> {
         if self.pending.is_some() {
             return Err("the last offer has no answer yet".to_owned());
         }
         let mut api = self.rtc.sdp_api();
-        let talkback_mid = match what {
+        let (talkback_mid, dedicated_mid) = match what {
             Reoffer::Audio => {
                 if self.audio_mid.is_some() {
                     return Err("an audio m-line is offered already".to_owned());
                 }
                 self.audio_mid =
                     Some(api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None));
-                self.talkback_mid
+                (self.talkback_mid, self.dedicated_mid)
             }
             Reoffer::Talkback(TalkbackOffer::Dedicated) => {
-                let dedicated = self.talkback_mid.filter(|mid| Some(*mid) != self.audio_mid);
-                Some(match dedicated {
+                if let Some(shared) = self.audio_mid.filter(|mid| Some(*mid) == self.talkback_mid) {
+                    api.set_direction(shared, Direction::RecvOnly);
+                }
+                let mid = match self.dedicated_mid {
                     Some(mid) => {
                         api.set_direction(mid, Direction::Inactive);
                         api.set_direction(mid, Direction::SendOnly);
                         mid
                     }
                     None => api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None),
-                })
+                };
+                (Some(mid), Some(mid))
             }
             Reoffer::Talkback(TalkbackOffer::SendRecv) => {
                 let mid = self.audio_mid.ok_or("no audio m-line to send on")?;
+                if let Some(dedicated) = self.dedicated_mid {
+                    api.set_direction(dedicated, Direction::Inactive);
+                }
                 api.set_direction(mid, Direction::RecvOnly);
                 api.set_direction(mid, Direction::SendRecv);
-                Some(mid)
+                (Some(mid), self.dedicated_mid)
             }
             Reoffer::Drop | Reoffer::Stop => {
                 let mid = self.talkback_mid.ok_or("no talk-back offered")?;
@@ -385,13 +404,18 @@ impl Viewer {
                     _ if Some(mid) == self.audio_mid => api.set_direction(mid, Direction::RecvOnly),
                     _ => api.set_direction(mid, Direction::Inactive),
                 }
-                self.talkback_mid.filter(|_| what == Reoffer::Drop)
+                (
+                    self.talkback_mid.filter(|_| what == Reoffer::Drop),
+                    self.dedicated_mid
+                        .filter(|dedicated| what == Reoffer::Drop || *dedicated != mid),
+                )
             }
         };
         let (offer, pending) = api
             .apply()
             .ok_or_else(|| "the re-offer has no changes".to_owned())?;
         self.talkback_mid = talkback_mid;
+        self.dedicated_mid = dedicated_mid;
         self.pending = Some(pending);
         self.offer = offer.to_sdp_string();
         if what == Reoffer::Audio {
