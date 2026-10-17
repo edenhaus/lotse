@@ -255,6 +255,9 @@ async fn handshake(
 /// stamped for the camera's `format` (RFC 3550 §5.1; retina sets the SSRC
 /// and the sequence numbers), and keeps reading the session, which keeps
 /// it alive and notices its loss: `None` once closed, else why it ended.
+/// A send waits while the camera takes no data (its TCP buffers full);
+/// the close ends that wait too, so a release always reaches the
+/// session's bounded `TEARDOWN` ([`tear_down`]).
 async fn forward(
     playing: Session<Playing>,
     index: usize,
@@ -272,7 +275,16 @@ async fn forward(
                 let sending = SendingPacket::new(index, rtp.ts, Bytes::from_owner(payload))
                     .mark(rtp.marker)
                     .payload_type(rtp.pt);
-                if let Err(err) = sink.send(sending).await {
+                let sent = tokio::select! {
+                    sent = sink.send(sending) => sent,
+                    () = close.cancelled() => {
+                        tracing::info!(
+                            "rtsp: backchannel session closed while a packet waited for the camera to take data"
+                        );
+                        return None;
+                    }
+                };
+                if let Err(err) = sent {
                     return Some(refusal(err.status_code(), &classify(&err, &camera.url)));
                 }
             }
@@ -312,7 +324,9 @@ mod tests {
 
     use lotse_core::clock::{Clock as _, SystemClock};
     use lotse_core::source_url::SourceUrl;
-    use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel, ConnectionLog};
+    use lotse_testing::fake_camera::{
+        BackchannelCodec, BackchannelSetup, CameraBackchannel, ConnectionLog,
+    };
     use lotse_testing::{CameraConfig, FakeCamera};
 
     use super::*;
@@ -389,6 +403,83 @@ mod tests {
         assert_eq!(log.teardown, Some(true), "{log:?}");
         assert!(log.closed_by_client, "{log:?}");
         cam.stop().await;
+    }
+
+    /// A camera that stops taking data once its backchannel plays: the
+    /// talker's packets fill the TCP buffers until retina's send waits,
+    /// and the release still ends the session within the teardown budget
+    /// (RFC 2326 §10.7), its connection closed, rather than leaving the
+    /// task waiting with the camera's connection open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc2326_10_7_a_release_while_a_send_waits_on_a_camera_taking_no_data_ends_the_session()
+    {
+        let cam = FakeCamera::start(
+            CameraConfig {
+                backchannel: Some(CameraBackchannel {
+                    setup: BackchannelSetup::Deaf,
+                    ..CameraBackchannel::new(BackchannelCodec::Pcmu)
+                }),
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let (opened, open) = oneshot::channel();
+        let (on_loss, _lost) = oneshot::channel();
+        let close = CancellationToken::new();
+        let mut session = spawn_named(
+            "test.backchannel",
+            run(camera_at(&cam), close.clone(), opened, on_loss),
+        );
+        let (_codec, _frame, sender) = open.await.unwrap().unwrap();
+        // Packets as large as interleaved data carries (RFC 2326 §10.12)
+        // until the queue stays full: the forwarding waits in its send.
+        let deadline = SystemClock.now() + Duration::from_secs(20);
+        let mut full_since = None;
+        for ts in 0_u32.. {
+            assert!(SystemClock.now() < deadline, "the send never waited");
+            if sender.try_send(large(ts)).is_ok() {
+                full_since = None;
+                continue;
+            }
+            let since = *full_since.get_or_insert_with(|| SystemClock.now());
+            if SystemClock.now().duration_since(since) >= Duration::from_millis(300) {
+                break;
+            }
+            SystemClock.sleep(Duration::from_millis(10)).await;
+        }
+        close.cancel();
+        tokio::select! {
+            ended = &mut session => ended.unwrap(),
+            () = SystemClock.sleep(Duration::from_secs(2)) => {
+                panic!("the session still waits in its send after the release")
+            }
+        }
+        let log = cam.stats().connection_log();
+        assert!(log[0].played, "{log:?}");
+        assert_eq!(log[0].teardown, None, "the camera read nothing more");
+        cam.stop().await;
+    }
+
+    /// A PCMU packet whose payload is as large as one interleaved frame
+    /// carries after its RTP header.
+    fn large(ts: u32) -> MediaPacket {
+        MediaPacket {
+            arrival: SystemClock.now(),
+            rtp: lotse_core::media::RtpHeaderFields {
+                pt: 0,
+                seq: 0,
+                ts: ts.wrapping_mul(160),
+                marker: false,
+                ssrc: 1,
+            },
+            frame_start: true,
+            keyframe_start: false,
+            epoch: 0,
+            lateness: Duration::ZERO,
+            payload: Arc::from(vec![0xff_u8; 60_000]),
+        }
     }
 
     /// What `cam` logged of its first connection once `done` holds for

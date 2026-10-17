@@ -368,6 +368,10 @@ pub enum BackchannelSetup {
     /// The `PLAY` of a session whose only stream is the backchannel
     /// answered, then bytes that are no RTSP.
     Unreadable,
+    /// Set up and played as [`Self::Accept`], then the connection is read
+    /// no more, as a camera that stopped taking data: what the client
+    /// sends piles up in the TCP buffers until its writes wait.
+    Deaf,
 }
 
 /// The ONVIF backchannel the camera offers (ONVIF Streaming Specification
@@ -1477,7 +1481,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     None => std::future::pending().await,
                 }
             } => {}
-            read = stream.read(&mut read_buf) => {
+            read = stream.read(&mut read_buf), if !connection.deaf() => {
                 let n = match read {
                     Ok(0) | Err(_) => {
                         connection.client_closed = true;
@@ -1770,6 +1774,14 @@ impl Connection {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         now.or_else(|| self.config.backchannel.as_ref().map(|b| b.setup))
+    }
+
+    /// The connection reads no more: its backchannel plays and the camera
+    /// stopped taking data ([`BackchannelSetup::Deaf`]).
+    fn deaf(&self) -> bool {
+        self.playing
+            && self.backchannel_channel.is_some()
+            && self.backchannel_setup() == Some(BackchannelSetup::Deaf)
     }
 
     /// Whether the request carries the configured Basic credentials
