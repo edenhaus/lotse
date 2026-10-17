@@ -116,7 +116,7 @@ async fn run(camera: Camera, probing: Probing, probed: Probed) {
             probing.found(BackchannelOffer {
                 codec,
                 frame,
-                opener: Arc::new(Opener::new(camera, tasks)),
+                opener: Arc::new(Opener::new(camera, format.codec, tasks)),
             });
         }
         Ok(None) => {
