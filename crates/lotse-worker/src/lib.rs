@@ -1923,23 +1923,32 @@ mod tests {
         )
         .await
         .unwrap();
-        until_live(&mut h).await;
-        // The first probe is granted and offers PCMU.
-        stats_where(&mut h, &mut || {}, &|stats| {
-            stats.backchannel.as_deref() == Some("pcmu")
+        // The first probe is granted and offers PCMU before it ends, all
+        // with the fake clock standing still: moved meanwhile, it could
+        // stall the source first, whose one `Reconnecting` (the next
+        // attempts before a stable stream are `Connecting` after a
+        // backoff) the test would then miss.
+        messages_until_still(&mut h, |seen| {
+            seen.contains(&ToSupervisor::SourceState(SourceState::Live))
+                && seen
+                    .iter()
+                    .any(|m| matches!(m, ToSupervisor::ProbeEnded { .. }))
         })
         .await;
-        // The reconnect's probe asks and is never granted.
+        // The reconnect's probe asks and is never granted. The clock moves
+        // only until the stall reconnects: the reconnect goes live and its
+        // probe asks with no time passing, and a clock that moved on would
+        // stall it again before the offer came, which then waits for the
+        // tracks with the clock standing still.
         h.hold_probes = true;
         messages_until(&mut h, |seen| {
-            let reconnected = seen
-                .iter()
-                .position(|m| matches!(source_state(m), Some(SourceState::Reconnecting { .. })));
-            reconnected.is_some_and(|at| {
-                seen[at..]
-                    .iter()
-                    .any(|m| matches!(m, ToSupervisor::ProbeConnecting { .. }))
-            })
+            seen.iter()
+                .any(|m| matches!(source_state(m), Some(SourceState::Reconnecting { .. })))
+        })
+        .await;
+        messages_until_still(&mut h, |seen| {
+            seen.iter()
+                .any(|m| matches!(m, ToSupervisor::ProbeConnecting { .. }))
         })
         .await;
         let talking = SessionSpec {
