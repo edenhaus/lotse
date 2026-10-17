@@ -1597,8 +1597,10 @@ mod tests {
         rig.machine.handle_timeout(rig.now());
         let refresh = rig.next();
         let request = stun::parse(&refresh.bytes).unwrap();
+        // Signed as the user the rig already set up.
+        let user = rig.machine.credentials.username.clone();
         let answer = signed(
-            "alice",
+            &user,
             Builder::new(Class::Success, turn::METHOD_REFRESH, request.transaction_id)
                 .attribute(turn::ATTR_LIFETIME, &2_u32.to_be_bytes()),
         );
