@@ -40,8 +40,9 @@ is designed with.
   (libopus, mimalloc, OpenH264) only through existing safe wrappers.
   Pedantic Clippy. No panics on network input. Fuzzed parsers.
 - **Safe control plane.** Filesystem Unix socket in a private per-spawn
-  directory, peer-credential checks. No TCP control plane. No shell-outs.
-  Explicit resource limits.
+  directory, peer-credential checks. Over the network only when asked,
+  and then mutual TLS with pinned certificates, paired with a one-time
+  code. No shell-outs. Explicit resource limits.
 - **Fast.** One UDP socket for all viewers, zero-copy fan-out with `Bytes`,
   no per-packet allocation on the hot path, static musl binaries tuned per
   target.

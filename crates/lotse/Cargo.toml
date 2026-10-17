@@ -1,6 +1,6 @@
 [package]
 name = "lotse"
-description = "Media daemon: RTSP cameras to browsers over WebRTC."
+description = "Memory-safe media daemon for IP cameras."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
