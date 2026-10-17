@@ -6,14 +6,18 @@
 //! change and a patch bump an additive one; from 1.0 on, the major marks a
 //! breaking change and the minor an additive one. The WebSocket path
 //! carries the major version.
+//!
+//! The version stays at 0.1.0 until the first release of lotse or a
+//! client: before that no client exists to be incompatible with, so an
+//! API change does not bump it.
 
 /// The API version in `hello.api` and the schema bundle's `api`.
-pub const API_VERSION: &str = "0.3.0";
+pub const API_VERSION: &str = "0.1.0";
 
 /// [`API_VERSION`], parsed; a test keeps the two equal.
 pub const CURRENT: ApiVersion = ApiVersion {
     major: 0,
-    minor: 3,
+    minor: 1,
     patch: 0,
 };
 
@@ -96,18 +100,7 @@ mod tests {
         assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
         assert_eq!(CURRENT.to_string(), API_VERSION);
         assert_eq!(WS_PATH, format!("/v{}/ws", CURRENT.major));
-        // 0.1.1: two-way audio (`backchannel` in `session/get`, in
-        // `stream/get` and its `sources[]`, `talker_changed`,
-        // `backchannel/release`).
-        // 0.2.0: `webrtc/renegotiate`; the talk-back claim moves to the
-        // offer, `backchannel_declined` replaces `backchannel_busy`.
-        // 0.2.1: `talker_changed`'s `refused`, the camera's backchannel
-        // session refused, timed out or lost.
-        // 0.3.0: `closed`'s `backchannel_unavailable` goes, a talk-back
-        // request on an opted-in stream being declined in the answer like
-        // any other; `talker_changed`'s `opted_out`; opting in or out no
-        // longer restarts the connection.
-        assert_eq!(CURRENT, v(0, 3, 0), "unstable until lotse 1.0");
+        assert_eq!(CURRENT, v(0, 1, 0), "unstable until lotse 1.0");
     }
 
     #[test]
