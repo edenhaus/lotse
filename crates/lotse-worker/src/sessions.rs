@@ -1044,9 +1044,13 @@ fn assess(factory: &dyn OutputFactory, claimant: &Claimant, offer: &str) -> Asse
 
 /// Claims the backchannel for `arbitration`'s offer through `claimant`,
 /// which opens the camera's backchannel session within `limit`: granted,
-/// or declined `busy` or `refused`.
+/// or declined `busy` or `refused`. The claim carries the backchannel the
+/// answer is negotiated with, so it opens that one or none: a probe that
+/// replaced the offer since with another codec declines it `refused`
+/// ([`Claimant::claim`]).
 async fn claim(mut arbitration: Arbitration, claimant: Claimant, limit: Duration) -> Arbitration {
-    match claimant.claim(limit).await {
+    let negotiated = arbitration.backchannel.clone();
+    match claimant.claim(negotiated, limit).await {
         Ok(granted) => {
             arbitration.claimed = granted.is_some();
             arbitration.granted = granted;
@@ -2835,6 +2839,85 @@ mod tests {
         );
         assert_eq!(change(&mut feed).await, ("b".into(), "claimed"));
         assert_eq!(camera.devices.lock().unwrap().len(), 2, "b's opened");
+    }
+
+    /// A probe that replaces the offer between an offer's assessment and
+    /// its claim: the claim opens the backchannel the answer is
+    /// negotiated with, or none. Opus in place of the negotiated PCMU
+    /// declines the offer `refused`, nothing opened and nothing claimed,
+    /// so its answer goes out without talk-back rather than with PCMU an
+    /// Opus session would drop; PCMU found again is opened, and the
+    /// answer's PCMU reaches it.
+    #[tokio::test]
+    async fn a_claim_declines_a_backchannel_replaced_since_its_offer_was_assessed() {
+        let (arbiter, mut feed, camera, slot) = arbiter_with();
+        let opener: Arc<dyn lotse_core::source::BackchannelOpener> = camera.clone();
+        let offer = |codec: Codec| lotse_core::source::BackchannelOffer {
+            codec,
+            frame: lotse_core::source::BackchannelOffer::DEFAULT_FRAME,
+            opener: Arc::clone(&opener),
+        };
+        let stats = Arc::new(TalkbackStats::default());
+        let mut talkback = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::clone(&stats));
+        let output = ScriptedOutput::default();
+        let assessed = assess(&output, &talkback.claimant(), "v=0 talk pcmu");
+        assert!(assessed.claims);
+        assert_eq!(
+            target_name(assessed.arbitration.backchannel.as_ref()),
+            "pcmu taking pcmu"
+        );
+        // The probe again finds Opus before the claim.
+        let opus = Codec::Opus { channels: 2 };
+        *camera.codec.lock().unwrap() = Some(opus.clone());
+        slot.offer(offer(opus));
+        let declined = claim(
+            assessed.arbitration,
+            talkback.claimant(),
+            BACKCHANNEL_OPEN_LIMIT,
+        )
+        .await;
+        assert_eq!(declined.claim, TalkbackClaim::Busy);
+        assert_eq!(
+            declined.decline,
+            Some(Decline::Refused(BackchannelRefused {
+                status: None,
+                message: "the camera's backchannel changed to opus while the offer was negotiated"
+                    .into(),
+            }))
+        );
+        assert!(declined.granted.is_none() && !declined.claimed);
+        assert!(camera.devices.lock().unwrap().is_empty(), "nothing opened");
+        {
+            let next = feed.next();
+            let mut next = pin!(next);
+            assert!(poll_once(&mut next).await.is_pending(), "nothing claimed");
+        }
+
+        // It finds PCMU again, after the next offer's assessment: the same
+        // backchannel, opened.
+        *camera.codec.lock().unwrap() = None;
+        slot.offer(offer(Codec::Pcmu));
+        let assessed = assess(&output, &talkback.claimant(), "v=0 talk pcmu");
+        slot.offer(offer(Codec::Pcmu));
+        let mut granted = claim(
+            assessed.arbitration,
+            talkback.claimant(),
+            BACKCHANNEL_OPEN_LIMIT,
+        )
+        .await;
+        assert_eq!(
+            (granted.claim, granted.decline.is_none(), granted.claimed),
+            (TalkbackClaim::Granted, true, true)
+        );
+        talkback.adopt(granted.granted.take().unwrap());
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        talkback.receive(lotse_core::uplink::UplinkPacket {
+            codec: lotse_core::uplink::UplinkCodec::Pcmu,
+            packet: packet(SystemClock.now()),
+        });
+        until(&|| stats.packets_sent.load(Ordering::Relaxed) == 1).await;
+        assert!(camera.devices.lock().unwrap()[0].try_recv().is_ok());
+        assert_eq!(stats.packets_dropped.load(Ordering::Relaxed), 0);
     }
 
     /// A re-offer before the answer is refused; the manager hands one on
