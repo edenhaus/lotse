@@ -849,9 +849,10 @@ mod tests {
     /// disabled stream (RFC 3264 §8.2) whatever direction it still names:
     /// a talk-back m-line stopped with its `a=sendonly` kept requests no
     /// talk-back, and is answered `inactive`, so the next m-line the
-    /// browser sends on takes it; a stopped downlink m-line carries no
-    /// stream audio. A `bundle-only` m-line the group lists keeps its zero
-    /// port (RFC 9143 §6) and its talk-back.
+    /// browser sends on takes it, a zero-padded port as a `0`; a stopped
+    /// downlink m-line carries no stream audio. A `bundle-only` m-line
+    /// the group lists keeps its zero port (RFC 9143 §6) and its
+    /// talk-back.
     #[test]
     fn rfc3264_8_2_a_stopped_audio_m_line_carries_neither_talk_back_nor_the_downlink() {
         let opus = Codec::Opus { channels: 2 };
@@ -893,6 +894,18 @@ mod tests {
         assert_eq!(plan.send, None);
         assert_eq!(plan.answer(Some("0")), Direction::Inactive);
         assert_eq!(plan.talkback, negotiated("2", CodecFamily::Pcmu, true));
+
+        // A zero-padded port is port zero (RFC 8866 §9, `1*DIGIT`).
+        for port in ["00", "000/2"] {
+            let padded = stopped_talkback.replace(
+                "m=audio 0 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2",
+                &format!("m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2"),
+            );
+            assert_ne!(padded, stopped_talkback);
+            let plan = plan_for(&padded, Some(&opus), Some(&pcmu));
+            assert_eq!(plan.talkback, Talkback::NotRequested, "{port}");
+            assert_eq!(plan.answer(Some("2")), Direction::Inactive, "{port}");
+        }
 
         // Bundle-only and listed in the group: not stopped.
         let bundle_only = DEDICATED.replace(

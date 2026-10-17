@@ -3100,7 +3100,8 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
 /// §8.2; RFC 8829 §5.2.2, a stopped transceiver), is refused before the
 /// engine sees it, which would stop the video the session plays on
 /// (str0m 0.24 marks the m-line stopped and `inactive`): the video plays
-/// on.
+/// on. A zero-padded port is port zero (RFC 8866 §9, `1*DIGIT`) and is
+/// refused the same way, with or without a number of ports.
 #[test]
 fn rfc3264_8_2_a_re_offer_that_stops_the_video_m_line_is_refused_and_video_plays_on() {
     let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
@@ -3131,22 +3132,32 @@ fn rfc3264_8_2_a_re_offer_that_stops_the_video_m_line_is_refused_and_video_plays
         .collect::<Vec<_>>()
         .join(" ");
     assert_ne!(unbundled, bundle, "{reoffer}");
-    let stopped = reoffer
-        .replacen("m=video 9 ", "m=video 0 ", 1)
-        .replacen(bundle, &unbundled, 1);
-    assert!(stopped.contains("m=video 0 "), "{stopped}");
-    assert!(!stopped.contains("a=bundle-only"), "{stopped}");
-    assert_eq!(
-        pair.session.renegotiate(
-            pair.now,
-            &stopped,
-            Some(chained(Codec::Pcmu)),
-            TalkbackClaim::Granted
-        ),
-        Err(RenegotiateError::VideoChanged("its port".to_owned()))
-    );
-    assert_eq!(pair.session.state(), State::Connected);
-    play(&mut pair, 93_000, false, "video after the refused re-offer");
+    let mut ts = 90_000;
+    for port in ["0", "00", "000/2"] {
+        let stopped = reoffer
+            .replacen("m=video 9 ", &format!("m=video {port} "), 1)
+            .replacen(bundle, &unbundled, 1);
+        assert!(stopped.contains(&format!("m=video {port} ")), "{stopped}");
+        assert!(!stopped.contains("a=bundle-only"), "{stopped}");
+        assert_eq!(
+            pair.session.renegotiate(
+                pair.now,
+                &stopped,
+                Some(chained(Codec::Pcmu)),
+                TalkbackClaim::Granted
+            ),
+            Err(RenegotiateError::VideoChanged("its port".to_owned())),
+            "{port}"
+        );
+        assert_eq!(pair.session.state(), State::Connected, "{port}");
+        ts += 3_000;
+        play(
+            &mut pair,
+            ts,
+            false,
+            &format!("video after the refused re-offer with port {port}"),
+        );
+    }
     pair.play_audio(0, 5, "audio too");
 }
 

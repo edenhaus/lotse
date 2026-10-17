@@ -251,7 +251,9 @@ impl VideoShape {
     /// it changes otherwise, or that it has none. One that stops the
     /// m-line ([`Sdp::stopped`]: a zero port, not bundled) changes its
     /// port: the engine would stop the video the session plays on
-    /// (str0m 0.24 marks such an m-line stopped and `inactive`).
+    /// (str0m 0.24 marks such an m-line stopped and `inactive`), or, for
+    /// a zero-padded port it does not read as zero, keep it live against
+    /// the offer's stop (RFC 3264 §6, §8.2).
     fn check(&self, offer: &str) -> Result<(), RenegotiateError> {
         let shape = Self::of(offer, self.pt).ok_or(RenegotiateError::NoVideoTrack)?;
         let sdp = Sdp::parse(offer);
