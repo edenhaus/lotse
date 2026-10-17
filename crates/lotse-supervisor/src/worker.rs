@@ -1174,6 +1174,75 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// IPC-20: a worker starts with standard input, output and error and
+    /// nothing else. Standard input is its control channel (the worker's
+    /// `lotse_sandbox::WORKER_CONTROL_FD`), output is `/dev/null` and error
+    /// is the supervisor's; the datagram channel and the shared UDP socket
+    /// come later, by `SCM_RIGHTS` with [`ToWorker::Sockets`]. The stand-in
+    /// worker `exec`s `sleep`, which opens no descriptor, so what it holds
+    /// once it runs is exactly what crossed the `execve(2)`: none of the
+    /// supervisor's end of the control channel, the two ends of the
+    /// datagram socketpair or the shared socket, which the supervisor holds
+    /// meanwhile. The supervisor in turn keeps no copy of the worker's end.
+    #[tokio::test]
+    async fn a_spawned_worker_holds_only_its_stdio_and_control_socket() {
+        let dir = crate::test_support::private_dir("worker-descriptors");
+        let script = dir.join("worker.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mut config = crate::test_support::environment("/bin/sh").worker;
+        config.binary = script;
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let manager = WorkerManager::new(config, Some(udp));
+        let worker = manager.spawn(&[554], true).unwrap();
+        let proc = PathBuf::from(format!("/proc/{}", worker.pid()));
+        // The shell holds its script open until it `exec`s `sleep`: look
+        // every 10 ms for up to five seconds.
+        let mut ran_sleep = false;
+        let mut looks = 0;
+        while !ran_sleep && looks < 500 {
+            SystemClock.sleep(Duration::from_millis(10)).await;
+            looks += 1;
+            ran_sleep = std::fs::read_to_string(proc.join("comm")).unwrap_or_default() == "sleep\n";
+        }
+        assert!(ran_sleep, "the stand-in never ran `sleep`");
+        let held = descriptors(&proc);
+        let numbers: Vec<u32> = held.iter().map(|(fd, _)| *fd).collect();
+        assert_eq!(numbers, [0, 1, 2], "{held:?}");
+        assert!(held[0].1.starts_with("socket:["), "{held:?}");
+        assert_eq!(held[1].1, "/dev/null");
+        let ours = descriptors(std::path::Path::new("/proc/self"));
+        let stderr = ours.iter().find(|(fd, _)| *fd == 2).unwrap();
+        assert_eq!(held[2].1, stderr.1);
+        assert!(
+            ours.iter().all(|(_, target)| *target != held[0].1),
+            "the supervisor closed its copy of the worker's end: {ours:?}"
+        );
+        drop(worker);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The descriptors `proc` (a `/proc/<pid>` directory) holds, by number,
+    /// with what each names (`proc(5)` `/proc/pid/fd/`).
+    fn descriptors(proc: &std::path::Path) -> Vec<(u32, String)> {
+        let mut held: Vec<(u32, String)> = std::fs::read_dir(proc.join("fd"))
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                // A descriptor closed between the listing and this read
+                // (another test's, under `cargo test`) is skipped.
+                let target = std::fs::read_link(entry.path()).ok()?;
+                Some((
+                    entry.file_name().to_str().unwrap().parse().unwrap(),
+                    target.display().to_string(),
+                ))
+            })
+            .collect();
+        held.sort();
+        held
+    }
+
     #[tokio::test]
     async fn a_worker_reaped_elsewhere_is_a_channel_error_and_stops_without_a_status() {
         use rustix::process::{Pid, WaitOptions, waitpid};
