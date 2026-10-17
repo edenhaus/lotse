@@ -210,6 +210,7 @@ fn video_mid(sdp: &str) -> Option<&str> {
 /// A subsequent offer lists the codecs negotiated, not every one the
 /// first offered (RFC 8829 §5.2.2; str0m 0.24 and Chrome, observed
 /// 2026-10-16), so only the chosen payload type is held to, its
+/// encoding name as a media subtype's ([`rtpmap_encoding`]) and its
 /// `a=fmtp` parameters as a media type's ([`fmtp_parameters`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VideoShape {
@@ -219,9 +220,23 @@ struct VideoShape {
     direction: Direction,
     /// The payload type the answer chose.
     pt: u8,
-    /// Its `a=rtpmap` line and its `a=fmtp` line, the latter's
-    /// parameters in their canonical form ([`fmtp_parameters`]), sorted.
+    /// Its `a=rtpmap` line, its encoding in its canonical form
+    /// ([`rtpmap_encoding`]), and its `a=fmtp` line, its parameters in
+    /// their canonical form ([`fmtp_parameters`]), sorted.
     codec: Vec<String>,
+}
+
+/// An `a=rtpmap` encoding (`<encoding name>/<clock rate>[/<encoding
+/// parameters>]`, RFC 8866 §6.6) in a canonical form, so that two lines
+/// of the same codec compare equal: its encoding name in lower case. The
+/// encoding name is the payload format's media subtype, which compares
+/// case-insensitively (RFC 4855 §3), so `h264/90000` names the codec
+/// `H264/90000` does. The clock rate and the encoding parameters stay
+/// as they are.
+fn rtpmap_encoding(encoding: &str) -> String {
+    let at = encoding.find('/').unwrap_or(encoding.len());
+    let (name, rest) = encoding.split_at_checked(at).unwrap_or((encoding, ""));
+    format!("{}{rest}", name.to_ascii_lowercase())
 }
 
 /// The parameters of an `a=fmtp` line in a canonical form, so that two
@@ -263,9 +278,13 @@ impl VideoShape {
         let mut codec: Vec<String> = section
             .lines()
             .iter()
-            .filter_map(|line| match line.strip_prefix(fmtp.as_str()) {
-                Some(parameters) => Some(format!("{fmtp}{}", fmtp_parameters(parameters))),
-                None => line.starts_with(&rtpmap).then(|| (*line).to_owned()),
+            .filter_map(|line| {
+                if let Some(parameters) = line.strip_prefix(fmtp.as_str()) {
+                    Some(format!("{fmtp}{}", fmtp_parameters(parameters)))
+                } else {
+                    line.strip_prefix(rtpmap.as_str())
+                        .map(|encoding| format!("{rtpmap}{}", rtpmap_encoding(encoding)))
+                }
             })
             .collect();
         codec.sort_unstable();
@@ -2051,7 +2070,7 @@ mod tests {
                 pt: 96,
                 codec: vec![
                     "a=fmtp:96 profile-level-id=42e01f".into(),
-                    "a=rtpmap:96 H264/90000".into(),
+                    "a=rtpmap:96 h264/90000".into(),
                 ],
             }
         );
@@ -2131,7 +2150,7 @@ mod tests {
             shape.codec,
             [
                 "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
-                "a=rtpmap:96 H264/90000"
+                "a=rtpmap:96 h264/90000"
             ]
         );
         for same in [
@@ -2156,5 +2175,37 @@ mod tests {
         }
         // A parameter without a value has its name in lower case too.
         assert_eq!(fmtp_parameters("B=2; Flag"), "b=2;flag");
+    }
+
+    /// The chosen payload type's encoding name is a media subtype, which
+    /// compares case-insensitively: a re-offer that writes it in another
+    /// case keeps the video m-line (RFC 4855 §3); another clock rate or
+    /// another codec under the payload type changes its codecs.
+    #[test]
+    fn rfc4855_3_a_re_offer_may_recase_the_encoding_name() {
+        let offer = |rtpmap: &str| {
+            format!(
+                "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=recvonly\r\na=rtpmap:96 {rtpmap}\r\na=fmtp:96 packetization-mode=1\r\n"
+            )
+        };
+        let shape = VideoShape::of(&offer("h264/90000"), 96).unwrap();
+        assert_eq!(
+            shape.codec,
+            ["a=fmtp:96 packetization-mode=1", "a=rtpmap:96 h264/90000"]
+        );
+        for same in ["H264/90000", "h264/90000"] {
+            assert_eq!(shape.check(&offer(same)), Ok(()), "{same}");
+        }
+        for changed in ["H264/48000", "H265/90000"] {
+            assert_eq!(
+                shape.check(&offer(changed)),
+                Err(RenegotiateError::VideoChanged("its codecs".to_owned())),
+                "{changed}"
+            );
+        }
+        // Only the name is folded; an encoding without a clock rate is
+        // its name.
+        assert_eq!(rtpmap_encoding("Opus/48000/2"), "opus/48000/2");
+        assert_eq!(rtpmap_encoding("H264"), "h264");
     }
 }

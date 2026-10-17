@@ -3188,6 +3188,38 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
     );
 }
 
+/// A re-offer that writes the video's encoding name in another case
+/// (`h264/90000` for `H264/90000`) names the same codec, its media
+/// subtype compared case-insensitively (RFC 4855 §3): the session takes
+/// it, the engine with it, and plays on, talk-back added.
+#[test]
+fn rfc4855_3_a_re_offer_that_recases_the_video_encoding_name_is_taken() {
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
+    pair.connect(&answer);
+    let reoffer = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let recased = reoffer.replace(" H264/90000", " h264/90000");
+    assert_ne!(recased, reoffer, "{reoffer}");
+    let answer = pair
+        .session
+        .renegotiate(
+            pair.now,
+            &recased,
+            Some(chained(Codec::Pcmu)),
+            TalkbackClaim::Granted,
+        )
+        .expect("taken");
+    pair.viewer
+        .accept_answer(&answer, &mut pair.to_daemon)
+        .expect("the answer applies");
+    pair.drain();
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcmu));
+    assert_eq!(pair.session.state(), State::Connected);
+    pair.play_audio(0, 5, "playing after the re-offer");
+}
+
 /// A re-offer that stops the video m-line, its mid, direction and codecs
 /// kept but its port zero and its mid out of the BUNDLE group (RFC 3264
 /// §8.2; RFC 8829 §5.2.2, a stopped transceiver), is refused before the
