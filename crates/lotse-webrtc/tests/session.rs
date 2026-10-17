@@ -3542,6 +3542,124 @@ fn rfc8829_5_3_2_a_re_offer_adds_the_downlink_audio_m_line() {
     );
 }
 
+/// Writes one keyframe at `ts` and steps until the viewer got its last
+/// packet, the one with the marker bit (RFC 6184 §5.1); returns the
+/// packets received, and the ones received before.
+fn play_keyframe(
+    pair: &mut Pair,
+    normalizer: &mut PacketNormalizer,
+    seq: &mut u16,
+    ts: u32,
+) -> Vec<str0m::rtp::RtpPacket> {
+    let before = pair.viewer.packets().len();
+    for packet in packets(normalizer, seq, ts, true, 1_500, pair.now) {
+        pair.session.write_video(pair.now, &packet, pair.now);
+    }
+    pair.drain();
+    pair.run_until(
+        |p| {
+            p.viewer.packets()[before..]
+                .iter()
+                .any(|packet| packet.header.marker)
+        },
+        500,
+        "a frame",
+    );
+    pair.viewer.take_packets()
+}
+
+/// The video carries `playout-delay` 0/0 exactly while no audio goes
+/// down, as at the answer
+/// (`playout_delay_0_0_only_without_audio_so_the_browser_can_hold_video_for_lip_sync`):
+/// a re-offer that adds the downlink audio m-line takes it off the
+/// video, one that sets the downlink `inactive` puts it back, and one
+/// that takes the downlink back takes it off again, while the video's
+/// sequence numbers run on (RFC 3550 §5.1).
+#[test]
+fn rfc8829_5_3_2_playout_delay_0_0_follows_a_re_offer_that_adds_or_drops_the_audio() {
+    let zero = Some(str0m::media::MediaTime::new(
+        0,
+        str0m::media::Frequency::HUNDREDTHS,
+    ));
+    let delays = |packets: &[str0m::rtp::RtpPacket]| {
+        assert!(!packets.is_empty());
+        packets
+            .iter()
+            .map(|packet| {
+                (
+                    packet.header.ext_vals.play_delay_min,
+                    packet.header.ext_vals.play_delay_max,
+                )
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    let in_order = |packets: &[str0m::rtp::RtpPacket]| {
+        let seqs: Vec<u16> = packets.iter().map(|p| p.header.sequence_number).collect();
+        assert!(
+            seqs.windows(2).all(|w| w[1] == w[0].wrapping_add(1)),
+            "{seqs:?}"
+        );
+    };
+
+    // Added: a viewer that offered video alone re-offers audio.
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let mut request = request(viewer.offer(), h264(None));
+    request.audio = Some(Arc::new(Codec::Opus { channels: 2 }));
+    let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+    pair.connect(&answer);
+    let mut normalizer = normalizer();
+    let mut seq = 1000;
+    let mut received = play_keyframe(&mut pair, &mut normalizer, &mut seq, 90_000);
+    assert_eq!(delays(&received), [(zero, zero)]);
+    let before = received.len();
+    pair.renegotiate(Reoffer::Audio, None, TalkbackClaim::Granted)
+        .expect("answered");
+    received.extend(play_keyframe(&mut pair, &mut normalizer, &mut seq, 93_000));
+    assert_eq!(delays(&received[before..]), [(None, None)]);
+    in_order(&received);
+    pair.play_audio(0, 5, "audio down the added m-line");
+
+    // Dropped and taken back: the downlink set `inactive`, then
+    // `recvonly` again.
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
+    pair.connect(&answer);
+    let mut normalizer = crate::normalizer();
+    let mut seq = 1000;
+    let mut received = play_keyframe(&mut pair, &mut normalizer, &mut seq, 90_000);
+    assert_eq!(delays(&received), [(None, None)]);
+    for (step, (from, to, expected)) in [
+        ("a=recvonly", "a=inactive", (zero, zero)),
+        ("a=inactive", "a=recvonly", (None, None)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reoffer = pair
+            .viewer
+            .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+            .expect("a re-offer");
+        let changed = reoffer.replacen(from, to, 1);
+        assert_ne!(changed, reoffer);
+        let answer = pair
+            .session
+            .renegotiate(pair.now, &changed, None, TalkbackClaim::Granted)
+            .expect("answered");
+        pair.viewer
+            .accept_answer(&answer, &mut pair.to_daemon)
+            .expect("applies");
+        pair.drain();
+        let before = received.len();
+        let ts = 93_000 + 3_000 * u32::try_from(step).unwrap();
+        received.extend(play_keyframe(&mut pair, &mut normalizer, &mut seq, ts));
+        assert_eq!(delays(&received[before..]), [expected], "{to}");
+    }
+    in_order(&received);
+}
+
 /// An offer that asks for talk-back while another session holds the
 /// backchannel ([`TalkbackClaim::Busy`]) is answered without it, as one
 /// on a stream without a backchannel is, and opens all the same, on a

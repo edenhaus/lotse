@@ -1041,9 +1041,12 @@ impl Session {
     /// no m-line carries the stream's audio; talk-back is
     /// received as the new plan says, or not at all. Nothing changes
     /// until the engine took the re-offer: a refused one leaves the
-    /// session as it was. The re-offer's candidates are not added: the
-    /// browser trickled them, and the engine keeps its pairs (RFC 8829
-    /// §5.3.2: a subsequent answer keeps the transport).
+    /// session as it was. The video writer keeps its sequence numbers
+    /// and timestamps and carries `playout-delay` exactly while the
+    /// answer sends no audio, as the first answer's does. The re-offer's
+    /// candidates are not added: the browser trickled them, and the
+    /// engine keeps its pairs (RFC 8829 §5.3.2: a subsequent answer
+    /// keeps the transport).
     fn renegotiate_offer(
         &mut self,
         offer: &str,
@@ -1099,6 +1102,11 @@ impl Session {
             self.audio_ssrc = Some(audio_ssrc);
         }
         self.audio_on = send.is_some() && self.audio.as_ref().is_some_and(on_writer);
+        // The video follows the same `playout-delay` policy as at the
+        // answer: render-on-decode only while no audio goes down, so the
+        // browser may hold video for lip sync once a re-offer adds audio
+        // ([`Session::answer`]).
+        self.writer.set_playout_delay(!self.audio_on);
         if !self.audio_on {
             no_audio(
                 &self.rtc,
