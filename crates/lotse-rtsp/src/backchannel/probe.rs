@@ -57,14 +57,17 @@ struct Probing {
 }
 
 impl Probing {
-    /// Marks `slot` as probed now.
-    fn start(slot: BackchannelSlot) -> Self {
-        let mark = slot.probing();
-        Self {
-            slot,
+    /// Marks `slot` as probed now, for the ask `asks` saw last: `None`
+    /// once the connection's ask changed since, when the probe would be
+    /// for an ask that no longer stands and the slot stays as it is
+    /// ([`BackchannelSlot::probing_for`]).
+    fn start(slot: &BackchannelSlot, asks: &Asks) -> Option<Self> {
+        let mark = slot.probing_for(asks)?;
+        Some(Self {
+            slot: slot.clone(),
             mark,
             settled: false,
-        }
+        })
     }
 
     /// The probe found `offer`.
@@ -112,15 +115,17 @@ pub(crate) fn start(
 
 /// The probe `wanted` makes due on `slot`, marked there, unless the camera
 /// answered `551` before (`probed`): then the probe an opt-in made due
-/// will not run, and `slot` stops awaiting it, but only while the ask is
-/// the one `asks` saw last ([`BackchannelSlot::forgo_probe`]): a newer
-/// one's probe stays due until this source sees that ask. Not wanted,
-/// `slot` stays as it is: the opt-out already ended what it had due
+/// will not run, and `slot` stops awaiting it. Either only while the ask
+/// is the one `asks` saw last ([`BackchannelSlot::probing_for`],
+/// [`BackchannelSlot::forgo_probe`]): a newer one's probe stays due until
+/// this source sees that ask, and none starts for the stale one, whose end
+/// would end the wait the newer one began. Not wanted, `slot` stays as it
+/// is: the opt-out already ended what it had due
 /// ([`BackchannelSlot::ask`]), and a stale one must not end the probe a
 /// newer opt-in made due.
 fn due(wanted: bool, slot: &BackchannelSlot, probed: &Probed, asks: &Asks) -> Option<Probing> {
     if probed.asks(BACKCHANNEL, wanted) {
-        return Some(Probing::start(slot.clone()));
+        return Probing::start(slot, asks);
     }
     if wanted {
         slot.forgo_probe(asks);
@@ -477,6 +482,37 @@ mod tests {
         assert!(bounded(asks.next()).await);
         assert!(due(true, &slot, &probed, &asks).is_none());
         assert!(!slot.is_probing(), "settled once the source saw it");
+    }
+
+    /// The source took an opt-in, and an opt-out and another opt-in came
+    /// before it started the probe, the camera's `551` not remembered: the
+    /// stale opt-in starts no probe, so none of it is dropped once the
+    /// source sees the newer one, which would end the wait that one began.
+    /// A claim waits for the newer opt-in's probe rather than being
+    /// declined at once, and the source probes once it sees that ask.
+    #[tokio::test]
+    async fn a_stale_opt_in_starts_no_probe_and_leaves_the_newer_ones_due() {
+        let slot = BackchannelSlot::default();
+        let mut asks = slot.asks();
+        let probed = Probed::default();
+        assert!(slot.ask(true));
+        assert!(bounded(asks.next()).await);
+        assert!(slot.ask(false) && slot.ask(true));
+        assert!(
+            due(true, &slot, &probed, &asks).is_none(),
+            "the stale opt-in starts no probe"
+        );
+        assert!(slot.awaits_probe(), "the newer opt-in's probe stays due");
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for it");
+        assert!(bounded(asks.next()).await);
+        let probe = due(true, &slot, &probed, &asks).expect("probes the newer opt-in");
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim still waits for it");
+        probe.none();
+        assert!(bounded(settled).await.unwrap().is_none(), "found none");
     }
 
     /// `future`'s output, or a failed test after five seconds.

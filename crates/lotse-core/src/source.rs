@@ -670,6 +670,34 @@ impl BackchannelSlot {
         mark
     }
 
+    /// The probe the connection's ask made due starts, marked as
+    /// [`BackchannelSlot::probing`] marks one, but only while the ask is
+    /// the one `asks` saw last. Once it changed since, the probe would be
+    /// for an ask that no longer stands: `None`, and the slot stays as it
+    /// is, awaiting the probe a newer opt-in made due, which the source
+    /// sees next and starts, or settled by a newer opt-out. The check and
+    /// the mark are one step, so the stale probe never holds the mark, and
+    /// its end never ends the wait a newer ask began.
+    pub fn probing_for(&self, asks: &Asks) -> Option<ProbeMark> {
+        let seen = asks.seen;
+        let mut mark = None;
+        self.probed.send_if_modified(|probed| {
+            if probed.changes != seen {
+                return false;
+            }
+            probed.latest = probed.latest.wrapping_add(1);
+            probed.probing = true;
+            mark = Some(ProbeMark(probed.latest));
+            true
+        });
+        if mark.is_none() {
+            tracing::debug!(
+                "backchannel: the probe due is not started, the connection's ask changed since the source saw it; the slot waits for the source to decide on the newer one"
+            );
+        }
+        mark
+    }
+
     /// The probe marked `mark` found `offer` (`Some`, offered or
     /// replaced) or none (`None`, withdrawn), unless a later probe marked
     /// the slot since: its result is discarded then, the later probe's
@@ -1736,6 +1764,51 @@ mod tests {
         assert!(bounded(settled).await.unwrap().is_none(), "nothing offered");
         assert_eq!(logs.count(Level::DEBUG, FORGONE), 2);
         assert_eq!(logs.count(Level::DEBUG, CHANGED), 1);
+    }
+
+    /// A probe due starts, and takes the slot's mark, only while the
+    /// connection's ask is the one the source saw: a stale opt-in's probe
+    /// never marks the slot, so a claim keeps waiting for the probe a newer
+    /// opt-in made due, which starts once the source saw that ask, and a
+    /// newer opt-out leaves the slot settled.
+    #[tokio::test]
+    async fn a_probe_starts_only_for_the_ask_the_source_saw() {
+        const STALE: &str = "backchannel: the probe due is not started, the connection's ask changed since the source saw it; the slot waits for the source to decide on the newer one";
+        use tracing::Level;
+        let (logs, _guard) = Logs::capture();
+        let slot = BackchannelSlot::default();
+        let mut asks = slot.asks();
+        let first = slot.probing_for(&asks).expect("the ask the source saw");
+        assert!(slot.awaits_probe());
+        slot.settle(first, None);
+        assert!(!slot.is_probing());
+        // In, taken by the source; out and in again before it started the
+        // probe.
+        assert!(slot.ask(true));
+        assert!(bounded(asks.next()).await);
+        assert!(slot.ask(false) && slot.ask(true));
+        assert!(slot.probing_for(&asks).is_none(), "a stale opt-in");
+        assert_eq!(logs.count(Level::DEBUG, STALE), 1);
+        assert!(slot.awaits_probe(), "the newer opt-in's probe is due");
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for it");
+        // The source saw it: its probe starts, and settles the slot.
+        assert!(bounded(asks.next()).await);
+        let newer = slot.probing_for(&asks).expect("the newer opt-in");
+        slot.settle(newer, Some(pcmu()));
+        assert_eq!(bounded(settled).await.unwrap().unwrap().codec, Codec::Pcmu);
+        assert_eq!(logs.count(Level::DEBUG, STALE), 1);
+        // In, taken by the source; out before it started the probe: the
+        // stale opt-in's probe leaves the slot settled.
+        assert!(slot.ask(false) && slot.ask(true));
+        assert!(bounded(asks.next()).await);
+        assert!(slot.ask(false));
+        assert!(slot.probing_for(&asks).is_none(), "a stale opt-in");
+        assert!(!slot.is_probing(), "the opt-out settled it");
+        assert!(slot.current().is_none(), "and withdrew the offer");
+        assert_eq!(logs.count(Level::DEBUG, STALE), 2);
     }
 
     /// `future`'s output, or a failed test after five seconds.
