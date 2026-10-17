@@ -46,7 +46,10 @@ use crate::source::within_on;
 /// A probe under way on a slot: claims wait for it until it settles the
 /// slot, and one dropped first (its attempt ended) leaves what the slot
 /// offered before. Both by its mark, so a probe whose aborted task ends
-/// after the next attempt's probe started leaves that one's alone.
+/// after the next attempt's probe started leaves that one's alone; and an
+/// aborted attempt's follower that goes on after the next attempt started
+/// starts none ([`BackchannelSlot::asks`]), so it holds no mark newer
+/// than that one's.
 struct Probing {
     /// The slot.
     slot: BackchannelSlot,
@@ -59,8 +62,9 @@ struct Probing {
 impl Probing {
     /// Marks `slot` as probed now, for the ask `asks` saw last: `None`
     /// once the connection's ask changed since, when the probe would be
-    /// for an ask that no longer stands and the slot stays as it is
-    /// ([`BackchannelSlot::probing_for`]).
+    /// for an ask that no longer stands, or once a later connection
+    /// attempt started, when it would be an ended attempt's; the slot
+    /// stays as it is then ([`BackchannelSlot::probing_for`]).
     fn start(slot: &BackchannelSlot, asks: &Asks) -> Option<Self> {
         let mark = slot.probing_for(asks)?;
         Some(Self {
@@ -119,7 +123,10 @@ pub(crate) fn start(
 /// is the one `asks` saw last ([`BackchannelSlot::probing_for`],
 /// [`BackchannelSlot::forgo_probe`]): a newer one's probe stays due until
 /// this source sees that ask, and none starts for the stale one, whose end
-/// would end the wait the newer one began. Not wanted, `slot` stays as it
+/// would end the wait the newer one began. And either only while `asks`
+/// follows for the attempt that runs now: the follower of an attempt that
+/// ended may go on after the next one started, as its abort only asks,
+/// and the next attempt decides then. Not wanted, `slot` stays as it
 /// is: the opt-out already ended what it had due
 /// ([`BackchannelSlot::ask`]), and a stale one must not end the probe a
 /// newer opt-in made due.
@@ -438,6 +445,59 @@ mod tests {
             () = SystemClock.sleep(Duration::from_secs(5)) => panic!("still waiting"),
         };
         assert!(settled.is_none(), "nothing was offered");
+    }
+
+    /// The follower of an attempt that ended is aborted, but an abort only
+    /// asks: one that took the connection's opt-in may go on only after
+    /// the next attempt started and marked its probe (here: polled only
+    /// then). It starts no probe of its own then, so its end abandons
+    /// nothing and no result of it is offered: a claim waits for the next
+    /// attempt's probe, whose result alone settles the slot.
+    #[tokio::test]
+    async fn a_follower_going_on_after_the_next_attempt_marked_its_probe_leaves_it_awaited() {
+        use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel};
+
+        let fake = FakeCamera::start(
+            CameraConfig {
+                backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let slot = BackchannelSlot::default();
+        let probed = Probed::default();
+        // The ended attempt's follower, which probed nothing at first: the
+        // connection had not asked, and the stream's option does not.
+        let mut unasked = camera_at(fake.addr(), 1_000);
+        unasked.options.backchannel = false;
+        let mut ended = Box::pin(start(unasked, slot.clone(), probed.clone()));
+        assert!(!slot.is_probing());
+        // A stream opts in, and the next attempt starts and marks its
+        // probe before the ended attempt's follower takes the opt-in.
+        assert!(slot.ask(true));
+        let next = start(camera_at(fake.addr(), 1_000), slot.clone(), probed.clone());
+        assert!(slot.awaits_probe(), "the next attempt's probe is marked");
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(ended.as_mut().poll(&mut cx).is_pending());
+        drop(ended);
+        assert!(slot.awaits_probe(), "the next attempt's probe is awaited");
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for it");
+        let next = spawn_named("test.next", next);
+        let offered = bounded(settled).await.unwrap().expect("offered");
+        assert_eq!(offered.codec, lotse_core::codec::Codec::Pcmu);
+        assert!(!slot.is_probing());
+        assert_eq!(
+            fake.stats().connection_log().len(),
+            1,
+            "only the next attempt probed"
+        );
+        next.abort();
+        fake.stop().await;
     }
 
     /// The source took an opt-out, and an opt-in came before it decided on
