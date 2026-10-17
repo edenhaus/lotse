@@ -544,6 +544,20 @@ impl Worker {
             .await
     }
 
+    /// A re-offer for a session (`webrtc/renegotiate`); the worker
+    /// answers with a `Renegotiated` or `RenegotiateRefused` report.
+    pub async fn renegotiate(&mut self, session_id: &str, sdp: &str) -> Result<(), IpcError> {
+        self.control
+            .send_msg(
+                &ToWorker::Renegotiate {
+                    session_id: session_id.to_owned(),
+                    sdp: sdp.to_owned(),
+                },
+                &[],
+            )
+            .await
+    }
+
     /// Hands a session the relay candidate at `relayed`, on the
     /// allocation `server` serves, over TCP when `tcp`; `local` is the host
     /// address its traffic leaves from. The worker reports its line as

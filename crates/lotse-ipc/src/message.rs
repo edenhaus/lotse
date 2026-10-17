@@ -61,6 +61,14 @@ pub enum ToWorker {
         /// The `candidate:` line.
         candidate: String,
     },
+    /// A re-offer from the browser (`webrtc/renegotiate`); a
+    /// `Renegotiated` or `RenegotiateRefused` report answers it.
+    Renegotiate {
+        /// The session.
+        session_id: String,
+        /// The browser's SDP re-offer.
+        sdp: String,
+    },
     /// A relay candidate for a session: the address a TURN allocation
     /// relays from. What the session sends from it goes to the
     /// allocation's server as `ChannelData`: from the shared socket for a
@@ -110,7 +118,8 @@ pub enum ToWorker {
         message: String,
     },
     /// Free the connection's backchannel from its talker
-    /// (`backchannel/release`); a `Talker` report follows when one held it.
+    /// (`backchannel/release`); a `Talker` report follows when one held
+    /// it, and the next offer that asks for talk-back claims it.
     ReleaseBackchannel {
         /// Free it only if this session holds it, decided in the worker
         /// against the claims; any talker when `None`.
@@ -175,6 +184,33 @@ pub enum SessionEvent {
         /// The talk-back codec the answer negotiated (`opus`, `pcmu`,
         /// `pcma`); `None` when talk-back is off.
         talkback: Option<String>,
+    },
+    /// The answer to a re-offer (`Renegotiate`).
+    Renegotiated {
+        /// The SDP.
+        sdp: String,
+        /// The talk-back codec the answer negotiated (`opus`, `pcmu`,
+        /// `pcma`); `None` when talk-back is off now.
+        talkback: Option<String>,
+    },
+    /// A re-offer (`Renegotiate`) was not applied; the session goes on
+    /// as it was.
+    RenegotiateRefused {
+        /// The error code (`invalid_sdp`, `no_video_track`).
+        code: String,
+        /// For humans.
+        message: String,
+    },
+    /// The offer or re-offer asked for talk-back the session did not get:
+    /// its talk-back m-line was answered without it. One per offer, after
+    /// its `Answer` or `Renegotiated`.
+    TalkbackDeclined {
+        /// Why: `unsupported`, `busy` or `refused`.
+        reason: String,
+        /// The camera's status code, when it refused with one.
+        status: Option<u16>,
+        /// For humans.
+        message: String,
     },
     /// A local candidate; empty means end of candidates.
     Candidate {
@@ -294,13 +330,13 @@ pub enum ToSupervisor {
 }
 
 /// A change of the connection's talker: the session it concerns, the new
-/// talker after `claimed`, the one that let go after `session_closed` or
-/// `released`, when the channel is free.
+/// talker after `claimed`, the one that let go after `session_closed`,
+/// `released` or `renegotiated`, when the channel is free.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TalkerChange {
     /// The session.
     pub session_id: String,
-    /// `claimed`, `session_closed` or `released`.
+    /// `claimed`, `session_closed`, `released` or `renegotiated`.
     pub reason: String,
     /// When, in milliseconds since the Unix epoch.
     pub at_ms: u64,
@@ -311,7 +347,7 @@ pub struct TalkerChange {
 pub struct TalkbackStats {
     /// Talk-back packets the session received and took.
     pub packets_received: u64,
-    /// Those dropped because another session held the backchannel.
+    /// Those dropped because the session did not hold the backchannel.
     pub packets_dropped_busy: u64,
     /// Payload bytes handed to the backchannel.
     pub bytes_sent: u64,
@@ -612,12 +648,42 @@ mod tests {
                     talkback: Some("pcmu".into()),
                 },
             },
+            ToSupervisor::Session {
+                session_id: "s1".into(),
+                event: SessionEvent::Renegotiated {
+                    sdp: "v=0".into(),
+                    talkback: None,
+                },
+            },
+            ToSupervisor::Session {
+                session_id: "s1".into(),
+                event: SessionEvent::RenegotiateRefused {
+                    code: "invalid_sdp".into(),
+                    message: "no".into(),
+                },
+            },
+            ToSupervisor::Session {
+                session_id: "s1".into(),
+                event: SessionEvent::TalkbackDeclined {
+                    reason: "refused".into(),
+                    status: Some(503),
+                    message: "the camera refused".into(),
+                },
+            },
         ] {
             assert_eq!(
                 decode::<ToSupervisor>(&encode(&message).unwrap()).unwrap(),
                 message
             );
         }
+        let renegotiate = ToWorker::Renegotiate {
+            session_id: "s1".into(),
+            sdp: "v=0".into(),
+        };
+        assert_eq!(
+            decode::<ToWorker>(&encode(&renegotiate).unwrap()).unwrap(),
+            renegotiate
+        );
         for release in [
             ToWorker::ReleaseBackchannel { session_id: None },
             ToWorker::ReleaseBackchannel {

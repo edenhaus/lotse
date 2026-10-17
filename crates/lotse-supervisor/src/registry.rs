@@ -851,7 +851,7 @@ impl State {
                 SessionEvent::State { .. } => {}
                 // The worker's text under `detail`, Debug-escaped: a field
                 // named `message` is printed raw by the text format.
-                SessionEvent::Warning { code, message } => {
+                SessionEvent::Warning { code, message, .. } => {
                     tracing::info!(
                         event = "session_warning",
                         session.id = session_id,
@@ -949,7 +949,7 @@ impl State {
             TalkerReason::Claimed => sessions
                 .get(session_id)
                 .is_some_and(|session| session.connection == id),
-            TalkerReason::SessionClosed | TalkerReason::Released => {
+            TalkerReason::SessionClosed | TalkerReason::Released | TalkerReason::Renegotiated => {
                 entry.talker.session.as_deref() == Some(session_id)
             }
         };
@@ -1811,6 +1811,31 @@ mod tests {
         state.talker_gone("c1", gone);
         state.talker_gone("c9", gone);
         assert!(front.try_recv().is_err());
+        // s1 claims again and its re-offer drops talk-back: free again,
+        // from s1 only.
+        let later = gone + Duration::from_secs(1);
+        assert!(
+            state
+                .talker_changed("c1", "s1", TalkerReason::Claimed, later)
+                .is_some()
+        );
+        let _claimed = front.try_recv().unwrap();
+        assert_eq!(
+            state.talker_changed("c1", "s2", TalkerReason::Renegotiated, later),
+            None
+        );
+        assert_eq!(
+            state.talker_changed("c1", "s1", TalkerReason::Renegotiated, later),
+            Some(Talker {
+                session: None,
+                since: Some(later),
+            })
+        );
+        let event = front.try_recv().unwrap().payload;
+        assert_eq!(
+            (&event["talker"], &event["reason"]),
+            (&serde_json::Value::Null, &serde_json::json!("renegotiated"))
+        );
     }
 
     #[test]

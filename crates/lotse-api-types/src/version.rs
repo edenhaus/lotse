@@ -8,13 +8,13 @@
 //! carries the major version.
 
 /// The API version in `hello.api` and the schema bundle's `api`.
-pub const API_VERSION: &str = "0.1.1";
+pub const API_VERSION: &str = "0.2.0";
 
 /// [`API_VERSION`], parsed; a test keeps the two equal.
 pub const CURRENT: ApiVersion = ApiVersion {
     major: 0,
-    minor: 1,
-    patch: 1,
+    minor: 2,
+    patch: 0,
 };
 
 /// The WebSocket path: `/v<major>/ws`; a test keeps it on [`CURRENT`]'s major.
@@ -99,7 +99,9 @@ mod tests {
         // 0.1.1: two-way audio (`backchannel` in `session/get`, in
         // `stream/get` and its `sources[]`, `talker_changed`,
         // `backchannel/release`).
-        assert_eq!(CURRENT, v(0, 1, 1), "unstable until lotse 1.0");
+        // 0.2.0: `webrtc/renegotiate`; the talk-back claim moves to the
+        // offer, `backchannel_declined` replaces `backchannel_busy`.
+        assert_eq!(CURRENT, v(0, 2, 0), "unstable until lotse 1.0");
     }
 
     #[test]

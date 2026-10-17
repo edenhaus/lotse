@@ -145,6 +145,8 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                 plan.warnings.push(SessionEvent::Warning {
                     code: "turn_unsupported".to_owned(),
                     message: format!("{url} ignored: TURN over TLS is not supported yet"),
+                    reason: None,
+                    status: None,
                 });
             }
             "turns" => {
@@ -412,6 +414,8 @@ mod tests {
                     "turns:t{} ignored: TURN over TLS is not supported yet",
                     MAX_WARNINGS - 1
                 ),
+                reason: None,
+                status: None,
             }
         );
         let many: Vec<String> = (0..6).map(|n| format!("stun:s{n}")).collect();

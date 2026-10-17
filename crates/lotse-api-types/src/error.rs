@@ -19,8 +19,8 @@ pub enum ErrorCode {
     InvalidStreamId,
     /// No such stream.
     StreamNotFound,
-    /// No such session, or its grace expired; for `webrtc/candidate`, also
-    /// a session this connection does not own.
+    /// No such session, or its grace expired; for `webrtc/candidate` and
+    /// `webrtc/renegotiate`, also a session this connection does not own.
     SessionNotFound,
     /// The session id is already open.
     SessionIdInUse,
@@ -62,8 +62,6 @@ pub enum ErrorCode {
     /// A video frame needed more RTP packets than some libwebrtc receivers
     /// assemble; it was sent whole.
     FrameOverBrowserLimit,
-    /// Another session holds the backchannel.
-    BackchannelBusy,
     /// `backchannel/release` on a stream whose source protocol cannot
     /// carry audio back.
     BackchannelUnsupported,
@@ -79,9 +77,10 @@ pub enum ErrorCode {
     StreamChanged,
     /// ICE failed or stayed disconnected.
     IceFailed,
-    /// The offer could not be parsed.
+    /// The offer could not be parsed, or a re-offer changes the video
+    /// m-line a session keeps.
     InvalidSdp,
-    /// The stream has no video track.
+    /// The stream has no video track, or the offer no video m-line.
     NoVideoTrack,
     /// No video codec both sides can use.
     VideoCodecUnsupported,
@@ -119,7 +118,7 @@ impl ErrorCode {
             Self::TurnUnsupported => "turn_unsupported",
             Self::H264ProfileMismatch => "h264_profile_mismatch",
             Self::FrameOverBrowserLimit => "frame_over_browser_limit",
-            Self::BackchannelBusy => "backchannel_busy",
+
             Self::BackchannelUnsupported => "backchannel_unsupported",
             Self::AvSyncLost => "av_sync_lost",
             Self::PeerClosed => "peer_closed",
@@ -221,7 +220,6 @@ mod tests {
             ErrorCode::AudioCodecUnsupported,
             ErrorCode::TurnUnsupported,
             ErrorCode::H264ProfileMismatch,
-            ErrorCode::BackchannelBusy,
             ErrorCode::BackchannelUnsupported,
             ErrorCode::AvSyncLost,
             ErrorCode::PeerClosed,

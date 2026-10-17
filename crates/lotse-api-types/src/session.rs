@@ -84,13 +84,27 @@ pub enum SessionEvent {
         dtls: String,
     },
     /// Non-fatal (`audio_codec_unsupported`, `turn_unsupported`,
-    /// `h264_profile_mismatch`, ...).
+    /// `h264_profile_mismatch`, `backchannel_declined`, ...). Each code
+    /// comes at most once per session, but `backchannel_declined`, which
+    /// comes once per offer (`webrtc/offer` or `webrtc/renegotiate`) that
+    /// asked for talk-back the session did not get: the talk-back m-line
+    /// was answered `inactive` (or `sendonly` when it carries the
+    /// stream's audio too, RFC 3264 §6.1), and `reason` says why.
     #[schemars(title = "SessionEventWarning")]
     Warning {
         /// The stable code.
         code: String,
         /// For humans.
         message: String,
+        /// Why, for `backchannel_declined`; absent for every other code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<DeclineReason>,
+        /// The camera's status code for `refused`, when it gave one
+        /// (an RTSP status, 453 Not Enough Bandwidth or 503 Service
+        /// Unavailable when a camera's one backchannel is taken by
+        /// another client); absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
     },
     /// The last event; the subscription ends with it. A session still
     /// waiting for its answer has no deadline of its own: it waits while
@@ -128,6 +142,49 @@ pub enum SessionEvent {
     },
 }
 
+/// Why an offer's talk-back was declined: the `reason` of a
+/// `backchannel_declined` warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclineReason {
+    /// The stream has no backchannel the session can feed: its source
+    /// protocol cannot carry audio back, the camera offers none, or it
+    /// takes a codec talk-back cannot produce from what the offer lists.
+    /// The message says which.
+    Unsupported,
+    /// Another session holds the backchannel; `backchannel/release`, its
+    /// re-offer dropping talk-back, or its close frees it.
+    Busy,
+    /// The camera refused the backchannel for this session; `status`
+    /// carries its status code when it gave one.
+    Refused,
+}
+
+impl DeclineReason {
+    /// The API name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Busy => "busy",
+            Self::Refused => "refused",
+        }
+    }
+
+    /// The reason for its API name.
+    pub fn parse(name: &str) -> Option<Self> {
+        [Self::Unsupported, Self::Busy, Self::Refused]
+            .into_iter()
+            .find(|reason| reason.as_str() == name)
+    }
+}
+
+/// `webrtc/renegotiate`'s result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WebrtcRenegotiateResult {
+    /// The SDP answer to the re-offer.
+    pub sdp: String,
+}
+
 /// A session as `session/get` and `session/list` return it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Session {
@@ -146,23 +203,27 @@ pub struct Session {
     pub orphaned: bool,
     /// When the offer arrived, RFC 3339 UTC.
     pub since: String,
-    /// Talk-back towards the camera's backchannel; all zero and `false`
-    /// when the answer did not negotiate it.
+    /// Talk-back towards the camera's backchannel; `false` and null when
+    /// the last answer did not negotiate it, and the counters zero until
+    /// one of the session's answers does.
     #[serde(default)]
     pub backchannel: SessionBackchannel,
 }
 
 /// A session's talk-back, as `session/get` reports it.
 /// The counters are the worker's, pushed once per second, so they may lag
-/// by that much; `negotiated`, `codec` and `talker` are current.
+/// by that much; `negotiated`, `codec` and `talker` are current. They add
+/// up over the session's life and never go back: a re-offer that drops
+/// talk-back keeps them, and one that adds it again counts on.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SessionBackchannel {
     /// The answer accepted the browser's talk-back m-line (`recvonly`, or
     /// `sendrecv` on its downlink audio m-line).
     #[serde(default)]
     pub negotiated: bool,
-    /// The session holds the camera's backchannel now: it sent first and
-    /// keeps it until it closes or `backchannel/release`.
+    /// The session holds the camera's backchannel now: its offer claimed
+    /// it, and it keeps it until it closes, re-offers without talk-back
+    /// or `backchannel/release`.
     #[serde(default)]
     pub talker: bool,
     /// The talk-back codec the answer named first on that m-line, which the
@@ -172,8 +233,8 @@ pub struct SessionBackchannel {
     /// Talk-back RTP packets the session received and took.
     #[serde(default)]
     pub packets_received: u64,
-    /// Of those, the ones dropped because another session held the
-    /// backchannel.
+    /// Of those, the ones dropped because the session did not hold the
+    /// backchannel: its offer was declined, or it was released since.
     #[serde(default)]
     pub packets_dropped_busy: u64,
     /// Payload bytes handed to the camera's backchannel, after the reverse
@@ -243,8 +304,30 @@ mod tests {
                 SessionEvent::Warning {
                     code: "turn_unsupported".into(),
                     message: "m".into(),
+                    reason: None,
+                    status: None,
                 },
                 json!({ "type": "warning", "code": "turn_unsupported", "message": "m" }),
+            ),
+            (
+                SessionEvent::Warning {
+                    code: "backchannel_declined".into(),
+                    message: "m".into(),
+                    reason: Some(DeclineReason::Busy),
+                    status: None,
+                },
+                json!({ "type": "warning", "code": "backchannel_declined", "message": "m",
+                        "reason": "busy" }),
+            ),
+            (
+                SessionEvent::Warning {
+                    code: "backchannel_declined".into(),
+                    message: "m".into(),
+                    reason: Some(DeclineReason::Refused),
+                    status: Some(503),
+                },
+                json!({ "type": "warning", "code": "backchannel_declined", "message": "m",
+                        "reason": "refused", "status": 503 }),
             ),
             (
                 SessionEvent::Closed {
@@ -260,6 +343,27 @@ mod tests {
                 event
             );
         }
+    }
+
+    #[test]
+    fn decline_reasons_carry_the_api_names_and_the_result_the_answer() {
+        for (reason, name) in [
+            (DeclineReason::Unsupported, "unsupported"),
+            (DeclineReason::Busy, "busy"),
+            (DeclineReason::Refused, "refused"),
+        ] {
+            assert_eq!(reason.as_str(), name);
+            assert_eq!(serde_json::to_value(reason).unwrap(), name);
+            assert_eq!(DeclineReason::parse(name), Some(reason));
+        }
+        assert_eq!(DeclineReason::parse("tired"), None);
+        let result = WebrtcRenegotiateResult { sdp: "v=0".into() };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json, json!({ "sdp": "v=0" }));
+        assert_eq!(
+            serde_json::from_value::<WebrtcRenegotiateResult>(json).unwrap(),
+            result
+        );
     }
 
     #[test]

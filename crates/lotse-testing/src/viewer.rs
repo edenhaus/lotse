@@ -1,7 +1,8 @@
 //! A headless browser stand-in on str0m: offers `recvonly` video the way
 //! Chrome does (standard extensions plus `playout-delay`, and
 //! `abs-capture-time` as Chrome offers it to a page that asks), takes the
-//! daemon's answer, and collects the RTP it receives.
+//! daemon's answer, re-offers to add or drop talk-back
+//! ([`Viewer::reoffer`]), and collects the RTP it receives.
 //!
 //! Sans-IO like the session it talks to, so the same viewer runs in memory
 //! against a `Session` and over real UDP against a worker; the caller moves
@@ -20,6 +21,30 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 
 /// The direction [`Viewer::audio_direction`] reports.
 pub use str0m::media::Direction;
+
+/// How a viewer re-offers ([`Viewer::reoffer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reoffer {
+    /// A `recvonly` audio m-line added after the video
+    /// (`addTransceiver("audio", {direction: "recvonly"})`), for a viewer
+    /// that offered none: the stream's audio comes down it.
+    Audio,
+    /// Talk-back as `TalkbackOffer` says: the dedicated m-line added
+    /// after the video (`addTransceiver("audio", {direction: "sendonly"})`)
+    /// or offered `sendonly` again, or the downlink one turned `sendrecv`.
+    /// The other one stops asking for it, as a browser sets that
+    /// transceiver's `direction`: the downlink m-line back to
+    /// `recvonly`, the dedicated one `inactive`. So the re-offer asks for
+    /// talk-back on one m-line, the one the viewer then sends on, which a
+    /// daemon preferring a `sendonly` m-line would otherwise not take.
+    Talkback(TalkbackOffer),
+    /// Talk-back dropped: the dedicated m-line `inactive`, or the
+    /// downlink one back to `recvonly` (a transceiver's `direction` set).
+    Drop,
+    /// The talk-back m-line stopped (`RTCRtpTransceiver.stop()`): port 0,
+    /// out of the BUNDLE group (RFC 8829 §5.2.2).
+    Stop,
+}
 
 /// How a viewer offers talk-back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +103,10 @@ pub struct Viewer {
     audio_mid: Option<Mid>,
     /// The mid talk-back is offered on, without it `None`.
     talkback_mid: Option<Mid>,
+    /// The dedicated talk-back m-line's mid, whether or not talk-back is
+    /// offered on it now; `None` before one is added and once it is
+    /// stopped, which it cannot come back from.
+    dedicated_mid: Option<Mid>,
     /// The payload types of the offer's audio m-line, empty without one.
     audio_pts: Vec<u8>,
     /// Audio RTP received, in arrival order.
@@ -249,20 +278,12 @@ impl Viewer {
             AudioOffer::Talkback(TalkbackOffer::SendRecv) => audio_mid,
             AudioOffer::Off | AudioOffer::Receive => None,
         };
+        let dedicated_mid = talkback_mid.filter(|mid| Some(*mid) != audio_mid);
         let (offer, pending) = api
             .apply()
             .ok_or_else(|| "the offer has no changes".to_owned())?;
         let offer = offer.to_sdp_string();
-        let audio_pts = offer
-            .lines()
-            .find_map(|line| line.strip_prefix("m=audio "))
-            .map(|rest| {
-                rest.split(' ')
-                    .skip(2)
-                    .filter_map(|pt| pt.trim().parse().ok())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let audio_pts = audio_pts(&offer);
         Ok(Self {
             rtc,
             addr,
@@ -273,6 +294,7 @@ impl Viewer {
             packets: Vec::new(),
             audio_mid,
             talkback_mid,
+            dedicated_mid,
             audio_pts,
             audio_packets: Vec::new(),
             ice_states: Vec::new(),
@@ -324,6 +346,82 @@ impl Viewer {
             .and_then(|mid| self.rtc.media(mid))
             .filter(|media| !media.disabled())
             .map(str0m::media::Media::direction)
+    }
+
+    /// A re-offer, as a browser makes one after the answer: the SDP to
+    /// send as `webrtc/renegotiate`, which [`Viewer::accept_answer`] then
+    /// takes the answer to. `Err` when the engine has nothing to offer
+    /// (dropping talk-back that was never offered, the downlink turned
+    /// `sendrecv` without an audio m-line) or the answer to the last
+    /// offer is still due. Asking for talk-back again after a declined
+    /// re-offer offers the m-line as before: a browser's `createOffer`
+    /// writes the transceiver's `direction` whatever the last answer
+    /// made of it, which str0m needs a change for, so the direction is
+    /// toggled to get one. Switching talk-back between the dedicated and
+    /// the downlink m-line takes it off the other one
+    /// ([`Reoffer::Talkback`]).
+    pub fn reoffer(&mut self, what: Reoffer) -> Result<String, String> {
+        if self.pending.is_some() {
+            return Err("the last offer has no answer yet".to_owned());
+        }
+        let mut api = self.rtc.sdp_api();
+        let (talkback_mid, dedicated_mid) = match what {
+            Reoffer::Audio => {
+                if self.audio_mid.is_some() {
+                    return Err("an audio m-line is offered already".to_owned());
+                }
+                self.audio_mid =
+                    Some(api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None));
+                (self.talkback_mid, self.dedicated_mid)
+            }
+            Reoffer::Talkback(TalkbackOffer::Dedicated) => {
+                if let Some(shared) = self.audio_mid.filter(|mid| Some(*mid) == self.talkback_mid) {
+                    api.set_direction(shared, Direction::RecvOnly);
+                }
+                let mid = match self.dedicated_mid {
+                    Some(mid) => {
+                        api.set_direction(mid, Direction::Inactive);
+                        api.set_direction(mid, Direction::SendOnly);
+                        mid
+                    }
+                    None => api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None),
+                };
+                (Some(mid), Some(mid))
+            }
+            Reoffer::Talkback(TalkbackOffer::SendRecv) => {
+                let mid = self.audio_mid.ok_or("no audio m-line to send on")?;
+                if let Some(dedicated) = self.dedicated_mid {
+                    api.set_direction(dedicated, Direction::Inactive);
+                }
+                api.set_direction(mid, Direction::RecvOnly);
+                api.set_direction(mid, Direction::SendRecv);
+                (Some(mid), self.dedicated_mid)
+            }
+            Reoffer::Drop | Reoffer::Stop => {
+                let mid = self.talkback_mid.ok_or("no talk-back offered")?;
+                match what {
+                    Reoffer::Stop => api.stop_media(mid),
+                    _ if Some(mid) == self.audio_mid => api.set_direction(mid, Direction::RecvOnly),
+                    _ => api.set_direction(mid, Direction::Inactive),
+                }
+                (
+                    self.talkback_mid.filter(|_| what == Reoffer::Drop),
+                    self.dedicated_mid
+                        .filter(|dedicated| what == Reoffer::Drop || *dedicated != mid),
+                )
+            }
+        };
+        let (offer, pending) = api
+            .apply()
+            .ok_or_else(|| "the re-offer has no changes".to_owned())?;
+        self.talkback_mid = talkback_mid;
+        self.dedicated_mid = dedicated_mid;
+        self.pending = Some(pending);
+        self.offer = offer.to_sdp_string();
+        if what == Reoffer::Audio {
+            self.audio_pts = audio_pts(&self.offer);
+        }
+        Ok(self.offer.clone())
     }
 
     /// Applies the daemon's answer.
@@ -512,6 +610,21 @@ impl Viewer {
             }
         }
     }
+}
+
+/// The payload types of the first audio m-line of `offer`, empty without
+/// one.
+fn audio_pts(offer: &str) -> Vec<u8> {
+    offer
+        .lines()
+        .find_map(|line| line.strip_prefix("m=audio "))
+        .map(|rest| {
+            rest.split(' ')
+                .skip(2)
+                .filter_map(|pt| pt.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The capture time of a received `packet` by its stream's last Sender

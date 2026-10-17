@@ -385,13 +385,7 @@ impl Serving<'_> {
                     self.runner_tx.clone(),
                 )?);
             }
-            ToWorker::ConnectGranted => {
-                if let Some(source) = &self.running {
-                    source.gate.grant();
-                } else {
-                    tracing::debug!("connect grant without a source; ignored");
-                }
-            }
+            ToWorker::ConnectGranted => self.on_connect_granted(),
             ToWorker::SwitchSource(spec) => self.on_switch_source(&spec, false).await?,
             ToWorker::RestartSource(spec) => self.on_switch_source(&spec, true).await?,
             ToWorker::SwitchConnectGranted => {
@@ -421,6 +415,9 @@ impl Serving<'_> {
                 if let Some(manager) = &self.sessions {
                     manager.candidate(&session_id, candidate);
                 }
+            }
+            ToWorker::Renegotiate { session_id, sdp } => {
+                self.on_renegotiate(session_id, sdp).await?;
             }
             ToWorker::RelayCandidate {
                 session_id,
@@ -468,6 +465,32 @@ impl Serving<'_> {
             }
         }
         Ok(None)
+    }
+
+    /// `ConnectGranted`: the running source may connect now.
+    fn on_connect_granted(&self) {
+        if let Some(source) = &self.running {
+            source.gate.grant();
+        } else {
+            tracing::debug!("connect grant without a source; ignored");
+        }
+    }
+
+    /// `Renegotiate`: a re-offer for a session, which its session answers.
+    /// One without a manager, for no session or for one whose queue is
+    /// full is refused here, straight to the supervisor, never through
+    /// the session events this loop alone drains, so a full queue of them
+    /// cannot stall it; the supervisor's command never waits for an
+    /// answer that cannot come. The refusal may overtake that session's
+    /// queued events, which is harmless: the supervisor has one re-offer
+    /// out per session, and this refusal is its only answer.
+    async fn on_renegotiate(&mut self, session_id: String, sdp: String) -> Result<(), Error> {
+        let message = match &self.sessions {
+            Some(manager) if manager.renegotiate(&session_id, sdp) => return Ok(()),
+            Some(_) => "the session is gone or busy",
+            None => "the worker holds no sockets",
+        };
+        refuse_renegotiation(&mut self.tx, session_id, message).await
     }
 
     /// `Shutdown`: closes every session, stops the standby and the source
@@ -736,6 +759,28 @@ async fn refuse_session(
             session_id,
             event: SessionEvent::Closed {
                 code: code.to_owned(),
+                message: message.to_owned(),
+            },
+        },
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Refuses a re-offer for `session_id` that no session takes, saying why
+/// in `message`.
+async fn refuse_renegotiation(
+    tx: &mut Sender,
+    session_id: String,
+    message: &str,
+) -> Result<(), Error> {
+    tracing::debug!(session = %session_id, message, "re-offer refused by the worker");
+    tx.send_msg(
+        &ToSupervisor::Session {
+            session_id,
+            event: SessionEvent::RenegotiateRefused {
+                code: "internal_error".to_owned(),
                 message: message.to_owned(),
             },
         },
@@ -1453,7 +1498,7 @@ mod tests {
             .unwrap();
         assert!(matches!(h.next().await, ToSupervisor::Ready { .. }));
         assert!(matches!(
-            h.worker.await,
+            ended(h.worker).await,
             Ok(Err(Error::SwitchWithoutSource))
         ));
     }
@@ -1645,7 +1690,11 @@ mod tests {
                 .await
                 .unwrap();
             until_live(&mut h).await;
-            h.tx.send_msg(&ToWorker::OpenSession(session_spec("talk")), &[])
+            let talking = SessionSpec {
+                offer: "v=0 talk".into(),
+                ..session_spec("talk")
+            };
+            h.tx.send_msg(&ToWorker::OpenSession(talking), &[])
                 .await
                 .unwrap();
             let answer =
@@ -1730,13 +1779,16 @@ mod tests {
         }
     }
 
-    /// Claim and hold through the worker: the first session
-    /// to send talk-back reaches the camera, the second gets exactly one
-    /// `backchannel_busy` and its packets go nowhere, and closing the
-    /// holder's session hands the channel to the next sender.
+    /// Claim and hold through the worker: the first offer that asks for
+    /// talk-back claims the backchannel and its session's packets reach
+    /// the camera, the second is declined `busy` and its packets go
+    /// nowhere, closing the holder's session frees the channel for the
+    /// next re-offer, a re-offer that drops talk-back lets go, and a
+    /// re-offer the engine refuses, or for no session, is refused.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[expect(clippy::too_many_lines, reason = "two talkers' whole lives")]
-    async fn the_first_session_to_talk_holds_the_backchannel_and_a_second_gets_one_busy_warning() {
+    async fn the_first_offer_holds_the_backchannel_and_a_second_is_declined_until_a_re_offer_claims()
+     {
         let camera = BackchannelCapture::default();
         let mut registries = Registries::default();
         registries
@@ -1768,12 +1820,41 @@ mod tests {
         .await
         .unwrap();
         until_live(&mut h).await;
-        for id in ["a", "b"] {
-            h.tx.send_msg(&ToWorker::OpenSession(session_spec(id)), &[])
-                .await
-                .unwrap();
+        let talking = |id: &str| SessionSpec {
+            offer: "v=0 talk".into(),
+            ..session_spec(id)
+        };
+        // a's offer claims the backchannel; b's is declined.
+        h.tx.send_msg(&ToWorker::OpenSession(talking("a")), &[])
+            .await
+            .unwrap();
+        let answer =
             session_event_where(&mut h, |e| matches!(e, SessionEvent::Answer { .. })).await;
-        }
+        let_assert!(
+            SessionEvent::Answer {
+                talkback: Some(codec),
+                ..
+            } = answer
+        );
+        assert_eq!(codec, "pcmu");
+        h.tx.send_msg(&ToWorker::OpenSession(talking("b")), &[])
+            .await
+            .unwrap();
+        let answer =
+            session_event_where(&mut h, |e| matches!(e, SessionEvent::Answer { .. })).await;
+        let_assert!(SessionEvent::Answer { talkback: None, .. } = answer);
+        let declined = session_event_where(&mut h, |e| {
+            matches!(e, SessionEvent::TalkbackDeclined { .. })
+        })
+        .await;
+        assert_eq!(
+            declined,
+            SessionEvent::TalkbackDeclined {
+                reason: "busy".into(),
+                status: None,
+                message: "talk-back declined: session a holds the camera's backchannel".into(),
+            }
+        );
         let browser = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let datagrams = std::os::unix::net::UnixDatagram::from(datagrams);
         let talk = |session: &str, sample: u8| {
@@ -1790,33 +1871,34 @@ mod tests {
         let samples = |packets: Vec<lotse_core::media::MediaPacket>| -> Vec<u8> {
             packets.iter().map(|packet| packet.payload[0]).collect()
         };
+        let renegotiate = |session: &str, sdp: &str| ToWorker::Renegotiate {
+            session_id: session.into(),
+            sdp: sdp.into(),
+        };
 
         talk("a", 1);
         assert_eq!(samples(within(camera.wait_for(1)).await), [1]);
         talk("b", 2);
         talk("b", 3);
-        let busy = |e: &SessionEvent| matches!(e, SessionEvent::Warning { code, .. } if code == "backchannel_busy");
-        let mut seen = messages_until(&mut h, |seen| {
-            session_events(seen).any(|(session, event)| session == "b" && busy(event))
-        })
-        .await;
         talk("a", 4);
         assert_eq!(
             samples(within(camera.wait_for(2)).await),
             [1, 4],
             "nothing of b's"
         );
-        // `session/get`'s counters come with the stats, per session.
+        // `session/get`'s counters come with the stats, for the session
+        // whose answer negotiated talk-back.
         let counted = |seen: &[ToSupervisor]| {
             seen.iter().any(|message| {
                 matches!(message, ToSupervisor::Stats(stats) if stats.talkback == [
                     ("a".to_owned(), lotse_ipc::TalkbackStats { packets_received: 2, packets_dropped_busy: 0, bytes_sent: 2 }),
-                    ("b".to_owned(), lotse_ipc::TalkbackStats { packets_received: 2, packets_dropped_busy: 2, bytes_sent: 0 }),
                 ])
             })
         };
-        seen.extend(messages_until(&mut h, counted).await);
+        let mut seen = messages_until(&mut h, counted).await;
 
+        // The holder's session closes: b's re-offer claims the channel,
+        // and its packets reach the camera.
         h.tx.send_msg(
             &ToWorker::CloseSession {
                 session_id: "a".into(),
@@ -1828,10 +1910,23 @@ mod tests {
         .await
         .unwrap();
         seen.extend(messages_until(&mut h, |seen| closed(seen, "a")).await);
+        h.tx.send_msg(&renegotiate("b", "v=0 talk"), &[])
+            .await
+            .unwrap();
+        let answered = |seen: &[ToSupervisor]| {
+            session_events(seen).any(|(session, event)| {
+                session == "b"
+                    && *event
+                        == SessionEvent::Renegotiated {
+                            sdp: "v=0 echo renegotiated backchannel=pcmu".into(),
+                            talkback: Some("pcmu".into()),
+                        }
+            })
+        };
+        seen.extend(messages_until(&mut h, answered).await);
         talk("b", 5);
         assert_eq!(samples(within(camera.wait_for(3)).await), [1, 4, 5]);
-        // A release for a, which no longer holds it, frees nothing of b's:
-        // b's next packet reaches the camera without a new claim.
+        // A release for a, which no longer holds it, frees nothing of b's.
         h.tx.send_msg(
             &ToWorker::ReleaseBackchannel {
                 session_id: Some("a".into()),
@@ -1842,7 +1937,8 @@ mod tests {
         .unwrap();
         talk("b", 6);
         assert_eq!(samples(within(camera.wait_for(4)).await), [1, 4, 5, 6]);
-        // The client frees the channel from b (`backchannel/release`).
+        // The client frees the channel from b (`backchannel/release`): b's
+        // packets go nowhere until its next re-offer claims again.
         h.tx.send_msg(
             &ToWorker::ReleaseBackchannel {
                 session_id: Some("b".into()),
@@ -1857,8 +1953,93 @@ mod tests {
             })
         };
         seen.extend(messages_until(&mut h, released).await);
+        talk("b", 7);
+        // Dropped and counted before the next re-offer claims again.
+        let dropped = |seen: &[ToSupervisor]| {
+            seen.iter().any(|message| {
+                matches!(message, ToSupervisor::Stats(stats) if stats.talkback.iter().any(
+                    |(session, counters)| session == "b" && counters.packets_dropped_busy == 3
+                ))
+            })
+        };
+        seen.extend(messages_until(&mut h, dropped).await);
+        h.tx.send_msg(&renegotiate("b", "v=0 talk"), &[])
+            .await
+            .unwrap();
+        let claimed_again = |seen: &[ToSupervisor]| {
+            seen.iter().any(|message| {
+                matches!(message, ToSupervisor::Talker(change) if change.reason == "claimed")
+            })
+        };
+        seen.extend(messages_until(&mut h, claimed_again).await);
+        talk("b", 8);
+        assert_eq!(
+            samples(within(camera.wait_for(5)).await),
+            [1, 4, 5, 6, 8],
+            "nothing sent while released"
+        );
+        // A re-offer that drops talk-back lets go; one the engine refuses
+        // is refused; one for no session is refused too.
+        h.tx.send_msg(&renegotiate("b", "v=0"), &[]).await.unwrap();
+        // Answered without talk-back, b stays in the stats with all it
+        // counted: `session/get`'s counters never go back.
+        let let_go = |seen: &[ToSupervisor]| {
+            seen.iter().any(|message| {
+                matches!(message, ToSupervisor::Talker(change) if change.reason == "renegotiated")
+            }) && session_events(seen).any(|(session, event)| {
+                session == "b" && matches!(event, SessionEvent::Renegotiated { talkback: None, .. })
+            })
+        };
+        seen.extend(messages_until(&mut h, let_go).await);
+        let pushed = messages_until(&mut h, |seen| {
+            seen.iter()
+                .any(|message| matches!(message, ToSupervisor::Stats(_)))
+        })
+        .await;
+        let_assert!(Some(ToSupervisor::Stats(stats)) = pushed.last());
+        assert_eq!(
+            stats.talkback,
+            [(
+                "b".to_owned(),
+                lotse_ipc::TalkbackStats {
+                    packets_received: 6,
+                    packets_dropped_busy: 3,
+                    bytes_sent: 3,
+                }
+            )]
+        );
+        seen.extend(pushed);
+        h.tx.send_msg(&renegotiate("b", "refuse"), &[])
+            .await
+            .unwrap();
+        h.tx.send_msg(&renegotiate("zz", "v=0"), &[]).await.unwrap();
+        let refused = |seen: &[ToSupervisor]| {
+            session_events(seen)
+                .filter(|(_, event)| matches!(event, SessionEvent::RenegotiateRefused { .. }))
+                .count()
+                == 2
+        };
+        seen.extend(messages_until(&mut h, refused).await);
+        let mut refusals: Vec<(&str, &str, &str)> = session_events(&seen)
+            .filter_map(|(session, event)| match event {
+                SessionEvent::RenegotiateRefused { code, message } => {
+                    Some((session, code.as_str(), message.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        // The manager refuses the one for no session at once, before the
+        // session task answers the other.
+        refusals.sort_unstable();
+        assert_eq!(
+            refusals,
+            [
+                ("b", "invalid_sdp", "invalid re-offer: refused by the echo"),
+                ("zz", "internal_error", "the session is gone or busy"),
+            ]
+        );
 
-        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1000 }, &[])
             .await
             .unwrap();
         while let Some(Ok(Some((message, _)))) = tokio::select! {
@@ -1868,12 +2049,14 @@ mod tests {
             seen.push(message);
         }
         assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
-        let warnings: Vec<&str> = session_events(&seen)
-            .filter(|(_, event)| busy(event))
-            .map(|(session, _)| session)
-            .collect();
-        assert_eq!(warnings, ["b"], "exactly one, to the second sender");
-        // Every change of the talker reached the supervisor, in order.
+        // b's offer got the one decline, taken above; nothing after it.
+        assert!(
+            !session_events(&seen)
+                .any(|(_, event)| matches!(event, SessionEvent::TalkbackDeclined { .. })),
+            "{seen:?}"
+        );
+        // Every change of the talker reached the supervisor, in order;
+        // a's claim went by with the answers, before `seen` began.
         let changes: Vec<(&str, &str)> = seen
             .iter()
             .filter_map(|message| match message {
@@ -1886,11 +2069,91 @@ mod tests {
         assert_eq!(
             changes,
             [
-                ("a", "claimed"),
                 ("a", "session_closed"),
                 ("b", "claimed"),
-                ("b", "released")
+                ("b", "released"),
+                ("b", "claimed"),
+                ("b", "renegotiated"),
             ]
+        );
+    }
+
+    /// A re-offer before the worker has its sockets is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_re_offer_without_sessions_is_refused() {
+        let mut h = start_with_settings(echo_registries(), quiet_settings());
+        h.next().await;
+        h.tx.send_msg(
+            &ToWorker::Renegotiate {
+                session_id: "s".into(),
+                sdp: "v=0".into(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        let refused = session_event_where(&mut h, |e| {
+            matches!(e, SessionEvent::RenegotiateRefused { .. })
+        })
+        .await;
+        assert_eq!(
+            refused,
+            SessionEvent::RenegotiateRefused {
+                code: "internal_error".into(),
+                message: "the worker holds no sockets".into(),
+            }
+        );
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
+    /// A re-offer no session takes is refused straight to the supervisor,
+    /// never through the session events the serve loop alone drains: with
+    /// their queue full, the loop refuses it all the same instead of
+    /// waiting for room only it could make.
+    #[tokio::test]
+    async fn a_re_offer_for_no_session_is_refused_while_the_session_events_are_full() {
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let (events, _undrained) = mpsc::channel(1);
+        events
+            .try_send((
+                "s".to_owned(),
+                SessionEvent::Closed {
+                    code: "session_closed".into(),
+                    message: "closed".into(),
+                },
+            ))
+            .unwrap();
+        let (datagrams, _demux) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let manager = SessionManager::new(
+            OwnedFd::from(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()),
+            None,
+            OwnedFd::from(datagrams),
+            1,
+            Arc::clone(&serving.clock),
+            events,
+        )
+        .unwrap();
+        serving.sessions = Some(manager);
+        within(serving.on_renegotiate("ghost".into(), "v=0".into()))
+            .await
+            .unwrap();
+        let (message, _) = within(rx.recv_msg::<ToSupervisor>())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            message,
+            ToSupervisor::Session {
+                session_id: "ghost".into(),
+                event: SessionEvent::RenegotiateRefused {
+                    code: "internal_error".into(),
+                    message: "the session is gone or busy".into(),
+                },
+            }
         );
     }
 

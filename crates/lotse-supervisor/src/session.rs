@@ -12,12 +12,19 @@
 //! control connection's outbound queue, whose signaling is never shed, and
 //! have the client disconnected: one answer, at most
 //! [`MAX_WORKER_CANDIDATES`] candidate lines and none after its
-//! end-of-candidates (RFC 8838 §13), one warning per code, messages cut to
-//! [`MAX_MESSAGE_BYTES`], and [`MAX_REPORT_TEXT_BYTES`] of text besides
-//! the answer over the session's life. A report over the budget closes the
-//! session; a repeated warning is dropped. A state goes on only when it
-//! changed, and the outbox keeps the latest one per session, so a worker
-//! repeating or flipping its state adds at most one frame to the queue.
+//! end-of-candidates (RFC 8838 §13), one warning per code, one answer
+//! per re-offer handed to the worker (`webrtc/renegotiate`, answered
+//! through the entry's [`SessionEntry::renegotiate`]), and one
+//! `backchannel_declined` per offer or re-offer answered; the client
+//! asked for each of these last three, so they are bounded by its
+//! requests and not charged. Messages are cut to
+//! [`MAX_MESSAGE_BYTES`], and the rest of the worker's text, the
+//! candidates and warnings, to [`MAX_REPORT_TEXT_BYTES`] over the
+//! session's life. A report over the budget closes
+//! the session; a repeated warning is dropped. A state goes on only when
+//! it changed, and the outbox keeps the latest one per session, so a
+//! worker repeating or flipping its state adds at most one frame to the
+//! queue.
 //!
 //! A session holds a lease on the TURN allocation behind each of its relay
 //! candidates, and the channels its worker asked for on them, at most
@@ -39,14 +46,15 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use lotse_api::{ConnectionId, Event, EventClass};
-use lotse_api_types::session::{Session, SessionBackchannel, SessionEvent};
+use lotse_api_types::error::{ApiError, ErrorCode};
+use lotse_api_types::session::{DeclineReason, Session, SessionBackchannel, SessionEvent};
 use lotse_api_types::time::rfc3339;
 use lotse_core::clock::Clock;
 use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
 use lotse_ipc::SessionEvent as WorkerSessionEvent;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::OwnedPermit;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use crate::net::turn_client::Lease;
@@ -116,15 +124,26 @@ const CLOSED_CODES: [&str; 18] = [
     "internal_error",
 ];
 
-/// The `warning` codes of the API; a worker's other warnings are dropped.
-const WARNING_CODES: [&str; 7] = [
+/// The `warning` codes of the API a worker may report once per session;
+/// a worker's other warnings are dropped. `backchannel_declined` comes
+/// as its own report, once per offer.
+const WARNING_CODES: [&str; 6] = [
     "audio_codec_unsupported",
     "turn_unsupported",
-    "backchannel_busy",
     "av_sync_lost",
     "h264_profile_mismatch",
     "invalid_candidate",
     "frame_over_browser_limit",
+];
+
+/// The `warning` code of a declined talk-back request.
+const BACKCHANNEL_DECLINED: &str = "backchannel_declined";
+
+/// The error codes a worker may refuse a re-offer with; any other is an
+/// `internal_error`.
+const RENEGOTIATE_CODES: [(&str, ErrorCode); 2] = [
+    ("invalid_sdp", ErrorCode::InvalidSdp),
+    ("no_video_track", ErrorCode::NoVideoTrack),
 ];
 
 /// The talk-back codecs a worker may report negotiated;
@@ -235,6 +254,16 @@ pub(crate) struct SessionEntry {
     report_bytes: usize,
     /// The warning codes forwarded, each once.
     warned: Vec<&'static str>,
+    /// The `backchannel_declined` reports still allowed: one per offer,
+    /// or re-offer handed to the worker, answered, until it comes; a
+    /// report that answers no request allows none.
+    declines_due: u32,
+    /// The re-offer handed to the worker whose answer or refusal has not
+    /// come, with the way back to its `webrtc/renegotiate`. Held until
+    /// that report, even once the command gave up or lost its client
+    /// (the sender then closed), so a late report answers the re-offer
+    /// it belongs to and never the next one.
+    renegotiation: Option<oneshot::Sender<Result<String, ApiError>>>,
     /// Warnings dropped, repeated or unknown; only the first is logged,
     /// so a worker cannot flood the log either.
     warnings_dropped: u32,
@@ -316,6 +345,8 @@ impl SessionEntry {
             worker_candidates: 0,
             report_bytes: 0,
             warned: Vec::new(),
+            declines_due: 0,
+            renegotiation: None,
             warnings_dropped: 0,
             held: Vec::new(),
             mid: None,
@@ -460,6 +491,60 @@ impl SessionEntry {
         self.candidates_done
     }
 
+    /// Takes a `webrtc/renegotiate` for the session: `reply` gets the
+    /// worker's answer or refusal ([`WorkerSessionEvent::Renegotiated`],
+    /// [`WorkerSessionEvent::RenegotiateRefused`]). Refused before the
+    /// answer (a browser cannot re-offer before it has one) and while the
+    /// worker has not answered the last re-offer, even one whose command
+    /// gave up or lost its client: the reports carry no request of their
+    /// own, so only one re-offer may be out. The worker answers every
+    /// re-offer it is handed, and its sessions close when it exits, so
+    /// only a stuck worker keeps the next one out.
+    pub(crate) fn renegotiate(
+        &mut self,
+        reply: oneshot::Sender<Result<String, ApiError>>,
+    ) -> Result<(), ApiError> {
+        if !self.answered {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "the session has no answer yet",
+            ));
+        }
+        if self.renegotiation.is_some() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "a re-offer of the session is still being answered",
+            ));
+        }
+        self.renegotiation = Some(reply);
+        Ok(())
+    }
+
+    /// The re-offer [`Self::renegotiate`] took never reached the worker
+    /// (its connection's queue was full): no answer comes for it.
+    pub(crate) fn renegotiation_unsent(&mut self) {
+        self.renegotiation = None;
+    }
+
+    /// Whether a re-offer waits for the worker's answer, for tests.
+    #[cfg(test)]
+    pub(crate) const fn renegotiating(&self) -> bool {
+        self.renegotiation.is_some()
+    }
+
+    /// The re-offer a worker's answer or refusal answers: `None`, and the
+    /// report dropped, when none is out.
+    fn answered_renegotiation(&mut self) -> Option<oneshot::Sender<Result<String, ApiError>>> {
+        let waiting = self.renegotiation.take();
+        if waiting.is_none() {
+            tracing::debug!(
+                stream.id = %self.stream_id,
+                "a worker answered a re-offer it was not handed; dropped"
+            );
+        }
+        waiting
+    }
+
     /// A relay candidate went to the worker on `lease`: its gathering
     /// ends with the worker's report ([`WorkerSessionEvent::Relayed`]).
     pub(crate) fn relay_handed_over(&mut self, lease: Lease) {
@@ -590,6 +675,7 @@ impl SessionEntry {
                     return Err("a second answer");
                 }
                 self.answered = true;
+                self.declines_due = 1;
                 self.talkback = talkback.and_then(|codec| known(&TALKBACK_CODECS, &codec));
                 self.mid = sdp
                     .lines()
@@ -650,6 +736,39 @@ impl SessionEntry {
                     dtls: self.dtls.to_owned(),
                 }])
             }
+            // The client asked for each answer and refusal, so neither
+            // counts against the worker's text budget; the answer is
+            // bounded by `worker_text::check`, the message cut to size.
+            // One that answers no re-offer is dropped and changes nothing.
+            WorkerSessionEvent::Renegotiated { sdp, talkback } => {
+                if !self.answered {
+                    return Err("a re-offer answered before the offer");
+                }
+                let Some(waiting) = self.answered_renegotiation() else {
+                    return Ok(Vec::new());
+                };
+                self.declines_due = 1;
+                self.talkback = talkback.and_then(|codec| known(&TALKBACK_CODECS, &codec));
+                reply(waiting, Ok(sdp));
+                Ok(Vec::new())
+            }
+            WorkerSessionEvent::RenegotiateRefused { code, message } => {
+                let Some(waiting) = self.answered_renegotiation() else {
+                    return Ok(Vec::new());
+                };
+                let message = plain(&message, MAX_MESSAGE_BYTES);
+                let code = RENEGOTIATE_CODES
+                    .iter()
+                    .find(|(name, _)| *name == code)
+                    .map_or(ErrorCode::InternalError, |(_, code)| *code);
+                reply(waiting, Err(ApiError::new(code, message)));
+                Ok(Vec::new())
+            }
+            WorkerSessionEvent::TalkbackDeclined {
+                reason,
+                status,
+                message,
+            } => Ok(self.declined(&reason, status, &message)),
             WorkerSessionEvent::Warning { code, message } => self.warning(&code, &message),
             WorkerSessionEvent::Closed { code, message } => Ok(vec![closed_event(&code, &message)]),
         }
@@ -699,7 +818,38 @@ impl SessionEntry {
         Ok(vec![SessionEvent::Warning {
             code: code.to_owned(),
             message,
+            reason: None,
+            status: None,
         }])
+    }
+
+    /// A worker's `backchannel_declined`: one per offer, or re-offer
+    /// handed to the worker, answered, with a known `reason`, its message
+    /// made [`plain`]; a second one for the same offer, or one with an
+    /// unknown reason, is dropped like a repeated warning. Bounded by the
+    /// client's offers, so not charged: a client that keeps asking for
+    /// talk-back while it is declined does not use up the budget its
+    /// session's other reports need.
+    fn declined(&mut self, reason: &str, status: Option<u16>, message: &str) -> Vec<SessionEvent> {
+        let reason = DeclineReason::parse(reason).filter(|_| self.declines_due > 0);
+        let Some(reason) = reason else {
+            if self.warnings_dropped == 0 {
+                tracing::warn!(
+                    stream.id = %self.stream_id,
+                    "a worker declined talk-back twice for one offer or for an unknown reason; dropped, and later ones without a log"
+                );
+            }
+            self.warnings_dropped = self.warnings_dropped.saturating_add(1);
+            return Vec::new();
+        };
+        let message = plain(message, MAX_MESSAGE_BYTES);
+        self.declines_due = self.declines_due.saturating_sub(1);
+        vec![SessionEvent::Warning {
+            code: BACKCHANNEL_DECLINED.to_owned(),
+            message,
+            reason: Some(reason),
+            status,
+        }]
     }
 
     /// The session as `session/get` returns it, with whether it holds its
@@ -738,6 +888,15 @@ fn known(names: &[&'static str], value: &str) -> Option<&'static str> {
         tracing::debug!(value, "unknown name in a worker's session report");
     }
     found
+}
+
+/// Hands a re-offer's answer or refusal to its `webrtc/renegotiate`,
+/// which may have given up or lost its client meanwhile: then it goes
+/// nowhere.
+fn reply(waiting: oneshot::Sender<Result<String, ApiError>>, answer: Result<String, ApiError>) {
+    if waiting.send(answer).is_err() {
+        tracing::debug!("re-offer answered after its command gave up or lost its client; dropped");
+    }
 }
 
 /// A worker's `closed` event, its message made [`plain`]; an unknown code
@@ -958,17 +1117,19 @@ mod tests {
         assert_eq!(
             session.applied(WorkerSessionEvent::Warning {
                 code: "h264_profile_mismatch".into(),
-                message: "m".into()
+                message: "m".into(),
             }),
             vec![SessionEvent::Warning {
                 code: "h264_profile_mismatch".into(),
-                message: "m".into()
+                message: "m".into(),
+                reason: None,
+                status: None,
             }]
         );
         assert_eq!(
             session.applied(WorkerSessionEvent::Warning {
                 code: "rm -rf".into(),
-                message: "m".into()
+                message: "m".into(),
             }),
             vec![]
         );
@@ -1069,6 +1230,249 @@ mod tests {
         assert_eq!(session.mid.as_deref(), Some("0"), "nothing changed");
     }
 
+    /// A decline passes once per offer answered, with a known reason,
+    /// like a warning otherwise; a re-offer is answered to the command
+    /// waiting for it, and `session/get` follows its talk-back.
+    #[test]
+    fn a_decline_passes_once_per_offer_answered_and_a_re_offer_is_answered() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut session = entry(tx);
+        let declined = |reason: &str, status: Option<u16>| WorkerSessionEvent::TalkbackDeclined {
+            reason: reason.into(),
+            status,
+            message: "why".into(),
+        };
+        // Before the answer: no re-offer, and no decline either.
+        let (reply, _waiting) = oneshot::channel();
+        assert_eq!(
+            session.renegotiate(reply).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            session.apply(WorkerSessionEvent::Renegotiated {
+                sdp: "v=0".into(),
+                talkback: None,
+            }),
+            Err("a re-offer answered before the offer")
+        );
+        assert_eq!(session.applied(declined("busy", None)), vec![]);
+        assert_eq!(session.warnings_dropped, 1);
+        session.applied(WorkerSessionEvent::Answer {
+            sdp: "v=0".into(),
+            talkback: None,
+        });
+        // One decline per offer, with its reason; a second, or an unknown
+        // reason, is dropped like a repeated warning.
+        assert_eq!(
+            session.applied(declined("busy", None)),
+            vec![SessionEvent::Warning {
+                code: "backchannel_declined".into(),
+                message: "why".into(),
+                reason: Some(DeclineReason::Busy),
+                status: None,
+            }]
+        );
+        assert_eq!(session.applied(declined("busy", None)), vec![]);
+        assert_eq!(session.warnings_dropped, 2);
+        assert_eq!(session.report_bytes, 0, "a decline is not charged");
+
+        // An answer to a re-offer never handed to the worker is dropped:
+        // it changes the talk-back no more than it allows a decline.
+        assert_eq!(
+            session.applied(WorkerSessionEvent::Renegotiated {
+                sdp: "v=0".into(),
+                talkback: Some("opus".into()),
+            }),
+            vec![]
+        );
+        assert_eq!(session.talkback, None);
+        assert_eq!(session.applied(declined("busy", None)), vec![]);
+        assert_eq!(session.warnings_dropped, 3);
+
+        // A re-offer: answered to the command waiting, which `session/get`
+        // follows; the next decline passes again.
+        let (reply, mut waiting) = oneshot::channel();
+        session.renegotiate(reply).unwrap();
+        let (again, _again) = oneshot::channel();
+        assert_eq!(
+            session.renegotiate(again).unwrap_err().message,
+            "a re-offer of the session is still being answered"
+        );
+        assert_eq!(
+            session.applied(WorkerSessionEvent::Renegotiated {
+                sdp: "v=0\r\na=mid:0\r\n".into(),
+                talkback: Some("opus".into()),
+            }),
+            vec![]
+        );
+        assert_eq!(waiting.try_recv(), Ok(Ok("v=0\r\na=mid:0\r\n".into())));
+        let dto = session.dto("s1", true, lotse_ipc::TalkbackStats::default());
+        assert_eq!(dto.backchannel.codec.as_deref(), Some("opus"));
+        assert_eq!(
+            session.applied(declined("refused", Some(503))),
+            vec![SessionEvent::Warning {
+                code: "backchannel_declined".into(),
+                message: "why".into(),
+                reason: Some(DeclineReason::Refused),
+                status: Some(503),
+            }]
+        );
+        assert_eq!(session.applied(declined("tired", None)), vec![]);
+        assert_eq!(session.warnings_dropped, 4);
+    }
+
+    /// A re-offer refused by the worker fails the command under a known
+    /// code; a re-offer stays out until the worker answers it, even after
+    /// its command gave up or lost its client, so a late answer never
+    /// answers the next; one that never reached the worker is not in the
+    /// way; a report that answers no re-offer is dropped.
+    #[test]
+    fn a_re_offer_stays_out_until_the_worker_answers_it() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut session = entry(tx);
+        session.applied(WorkerSessionEvent::Answer {
+            sdp: "v=0".into(),
+            talkback: None,
+        });
+        // Refused under a known code, else as an internal error.
+        for (code, expected) in [
+            ("invalid_sdp", ErrorCode::InvalidSdp),
+            ("no_video_track", ErrorCode::NoVideoTrack),
+            ("made_up", ErrorCode::InternalError),
+        ] {
+            let (reply, mut waiting) = oneshot::channel();
+            session.renegotiate(reply).unwrap();
+            assert_eq!(
+                session.applied(WorkerSessionEvent::RenegotiateRefused {
+                    code: code.into(),
+                    message: "no\nway".into(),
+                }),
+                vec![]
+            );
+            let error = waiting.try_recv().unwrap().unwrap_err();
+            assert_eq!((error.code, error.message.as_str()), (expected, "no way"));
+        }
+        // A: its command gives up, or loses its client; B, the retry, is
+        // refused until A's answer comes, which goes nowhere.
+        for late in [
+            WorkerSessionEvent::Renegotiated {
+                sdp: "a".into(),
+                talkback: None,
+            },
+            WorkerSessionEvent::RenegotiateRefused {
+                code: "invalid_sdp".into(),
+                message: "a".into(),
+            },
+        ] {
+            let (reply, waiting) = oneshot::channel();
+            session.renegotiate(reply).unwrap();
+            drop(waiting);
+            let (reply, _b) = oneshot::channel();
+            assert_eq!(
+                session.renegotiate(reply).unwrap_err().message,
+                "a re-offer of the session is still being answered"
+            );
+            assert_eq!(session.applied(late), vec![]);
+            assert!(!session.renegotiating());
+            // B is answered with its own answer.
+            let (reply, mut b) = oneshot::channel();
+            session.renegotiate(reply).unwrap();
+            session.applied(WorkerSessionEvent::Renegotiated {
+                sdp: "b".into(),
+                talkback: None,
+            });
+            assert_eq!(b.try_recv(), Ok(Ok("b".into())));
+        }
+        // A refusal that answers no re-offer is dropped, and the next one
+        // still gets its own.
+        assert_eq!(
+            session.applied(WorkerSessionEvent::RenegotiateRefused {
+                code: "invalid_sdp".into(),
+                message: "none".into(),
+            }),
+            vec![]
+        );
+        // One that never reached the worker is not in the way.
+        let (reply, _waiting) = oneshot::channel();
+        session.renegotiate(reply).unwrap();
+        session.renegotiation_unsent();
+        assert!(!session.renegotiating());
+        let (reply, mut waiting) = oneshot::channel();
+        session.renegotiate(reply).unwrap();
+        session.applied(WorkerSessionEvent::Renegotiated {
+            sdp: "c".into(),
+            talkback: None,
+        });
+        assert_eq!(waiting.try_recv(), Ok(Ok("c".into())));
+    }
+
+    /// The client asks for each re-offer's answer, refusal and decline,
+    /// so none is charged against the worker's text budget: a session
+    /// whose budget is full keeps being re-offered and declined
+    /// talk-back, and its other text is still over the budget.
+    #[test]
+    fn re_offers_and_their_declines_are_free_of_the_text_budget() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut session = entry(tx);
+        let declined = WorkerSessionEvent::TalkbackDeclined {
+            reason: "busy".into(),
+            status: None,
+            message: "m".repeat(MAX_MESSAGE_BYTES * 2),
+        };
+        session.applied(WorkerSessionEvent::Answer {
+            sdp: "v=0".into(),
+            talkback: None,
+        });
+        assert_eq!(session.applied(declined.clone()).len(), 1);
+        session.applied(line(MAX_REPORT_TEXT_BYTES));
+        assert_eq!(session.report_bytes, MAX_REPORT_TEXT_BYTES);
+        // More declines than the budget has bytes for, cut to size each.
+        for _ in 0..=MAX_REPORT_TEXT_BYTES / MAX_MESSAGE_BYTES {
+            let (reply, mut waiting) = oneshot::channel();
+            session.renegotiate(reply).unwrap();
+            assert_eq!(
+                session.apply(WorkerSessionEvent::Renegotiated {
+                    sdp: "v=0".into(),
+                    talkback: None,
+                }),
+                Ok(vec![])
+            );
+            assert_eq!(waiting.try_recv(), Ok(Ok("v=0".into())));
+            let events = session
+                .apply(declined.clone())
+                .expect("a decline is not charged");
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [SessionEvent::Warning { message, .. }] if message.len() <= MAX_MESSAGE_BYTES
+                ),
+                "one warning, cut to size: {events:?}"
+            );
+            let (reply, mut waiting) = oneshot::channel();
+            session.renegotiate(reply).unwrap();
+            assert_eq!(
+                session.apply(WorkerSessionEvent::RenegotiateRefused {
+                    code: "invalid_sdp".into(),
+                    message: "no way".into(),
+                }),
+                Ok(vec![])
+            );
+            assert_eq!(
+                waiting.try_recv().unwrap().unwrap_err().code,
+                ErrorCode::InvalidSdp
+            );
+        }
+        assert_eq!(session.report_bytes, MAX_REPORT_TEXT_BYTES);
+        assert_eq!(
+            session.apply(WorkerSessionEvent::Warning {
+                code: "av_sync_lost".into(),
+                message: "x".into(),
+            }),
+            Err("more text than a session allows"),
+            "the worker's own text still is"
+        );
+    }
+
     fn line(n: usize) -> WorkerSessionEvent {
         WorkerSessionEvent::Candidate {
             candidate: "c".repeat(n),
@@ -1150,7 +1554,7 @@ mod tests {
         assert_eq!(
             full.apply(WorkerSessionEvent::Warning {
                 code: "av_sync_lost".into(),
-                message: "m".into()
+                message: "m".into(),
             }),
             Err("more text than a session allows")
         );
@@ -1173,6 +1577,8 @@ mod tests {
             vec![SessionEvent::Warning {
                 code: "av_sync_lost".into(),
                 message: format!("a b{}", "x".repeat(MAX_MESSAGE_BYTES - 3)),
+                reason: None,
+                status: None,
             }]
         );
         assert_eq!(session.report_bytes, MAX_MESSAGE_BYTES);
@@ -1193,6 +1599,8 @@ mod tests {
             vec![SessionEvent::Warning {
                 code: "invalid_candidate".into(),
                 message: "m".into(),
+                reason: None,
+                status: None,
             }],
             "another code passes"
         );
@@ -1486,6 +1894,8 @@ mod tests {
                 api_event(&SessionEvent::Warning {
                     code: "av_sync_lost".into(),
                     message: n.to_string(),
+                    reason: None,
+                    status: None,
                 }),
             );
         }

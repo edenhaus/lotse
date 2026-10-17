@@ -9,7 +9,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::codec::{CodecFamily, Kind};
-use crate::session::{SessionEngine, SessionOpenError, SessionRequest};
+use crate::session::{SessionEngine, SessionOpenError, SessionRequest, TalkbackTarget};
 use crate::track::{TrackSubscription, Unit};
 
 /// The shape of an output kind.
@@ -52,6 +52,36 @@ pub trait OutputFactory: fmt::Debug + Send + Sync {
         let _ = (request, now);
         Err(SessionOpenError::NotASession(self.kind()))
     }
+
+    /// What `offer` (an offer or a re-offer) asks of the stream's
+    /// backchannel, `backchannel` as the camera offers it now: the worker
+    /// claims the backchannel for a session whose offer could receive
+    /// talk-back before the engine answers it, so the answer carries the
+    /// claim's outcome. A kind without talk-back never asks for it.
+    fn talkback_request(
+        &self,
+        offer: &str,
+        backchannel: Option<&TalkbackTarget>,
+    ) -> TalkbackRequest {
+        let _ = (offer, backchannel);
+        TalkbackRequest::NotRequested
+    }
+}
+
+/// What an offer asks of the stream's backchannel
+/// ([`OutputFactory::talkback_request`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TalkbackRequest {
+    /// No talk-back: the offer has no m-line the viewer sends audio on.
+    NotRequested,
+    /// Talk-back the session could receive: the offer sends audio on an
+    /// m-line in a codec that reaches the backchannel, so the worker
+    /// claims it for the session.
+    Negotiable,
+    /// Talk-back the session cannot receive, and why: the camera offers
+    /// no backchannel, or the offer lists no codec that reaches it. The
+    /// m-line is answered without it, and nothing is claimed.
+    Unsupported(String),
 }
 
 /// One track a sink wants.
@@ -175,6 +205,7 @@ mod tests {
             video: std::sync::Arc::new(crate::codec::Codec::Pcmu),
             audio: None,
             backchannel: None,
+            claim: crate::session::TalkbackClaim::Granted,
             orientation: crate::Orientation::default(),
             limits: crate::session::SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
@@ -184,6 +215,15 @@ mod tests {
             .open_session(request, crate::clock::SystemClock.now())
             .err();
         assert_eq!(err, Some(SessionOpenError::NotASession("snapshot")));
+        let target = TalkbackTarget {
+            codec: crate::codec::Codec::Pcmu,
+            takes: vec![crate::uplink::UplinkCodec::Pcmu],
+        };
+        assert_eq!(
+            factory.talkback_request("a=sendonly", Some(&target)),
+            TalkbackRequest::NotRequested,
+            "a kind without talk-back asks for none"
+        );
     }
 
     #[test]

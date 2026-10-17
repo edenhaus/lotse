@@ -1,9 +1,20 @@
-//! One viewer session on str0m: the answer, the transports' input, the
-//! state machine and the events.
+//! One viewer session on str0m: the answer, the answers to the re-offers
+//! that add or drop talk-back, the transports' input, the state machine
+//! and the events.
+//!
+//! Talk-back is claimed by the offer: the worker arbitrates the
+//! connection's backchannel before the engine sees an offer or a
+//! re-offer ([`SessionRequest::claim`]), and the answer carries the
+//! outcome (RFC 8829 §5.3.1, RFC 3264 §6.1: the talk-back m-line is
+//! answered `recvonly` or `sendrecv` when the session holds the
+//! backchannel, `inactive` or `sendonly` when not). A re-offer
+//! ([`Session::renegotiate`]) may change the audio m-lines only; the
+//! video m-line is the one the session opened with (`VideoShape`).
 //!
 //! Sans-IO: the worker's session task owns it and drains [`Session::poll`]
 //! after every call. Standards: RFC 8829 §5.3 (the answer; §5.3.1 its
-//! directions), RFC 3264 §6 (rejected m-lines) and §6.1 (`inactive`
+//! directions; §5.3.2 the answers to re-offers, on the same transport),
+//! RFC 3264 §6 (rejected m-lines) and §6.1 (`inactive`
 //! m-lines), RFC 6184 §8.2.2 (H.264 negotiation), RFC 7798 §7.1 and
 //! §7.2.2 (H.265 `profile-id`, `tier-flag` and `level-id` in offer and
 //! answer), RFC 9143 §9.1.1 (one
@@ -23,6 +34,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lotse_codec::h264::LIBWEBRTC_MAX_FRAME_PACKETS;
@@ -30,20 +42,21 @@ use lotse_core::codec::{Codec, CodecFamily};
 use lotse_core::media::{MediaPacket, RtpHeaderFields};
 use lotse_core::orientation::Orientation;
 use lotse_core::session::{
-    SessionEngine, SessionEvent, SessionLimits, SessionOpenError, SessionOutput, SessionRequest,
-    SessionStats, TalkbackTarget, Transport,
+    RenegotiateError, SessionEngine, SessionEvent, SessionLimits, SessionOpenError, SessionOutput,
+    SessionRequest, SessionStats, TalkbackClaim, TalkbackTarget, Transport,
 };
 use lotse_core::throttle::Throttle;
 use lotse_core::track::GopSnapshot;
 use lotse_core::uplink::{UplinkCodec, UplinkPacket};
 use str0m::change::SdpOffer;
+use str0m::error::SdpError;
 use str0m::format::{Codec as EngineCodec, PayloadParams};
 use str0m::media::{Media, MediaKind, Mid};
 use str0m::net::{DatagramRecv, Protocol, Receive, TcpType, Transmit};
 use str0m::rtp::RtpPacket;
 use str0m::{Candidate, Event, IceConnectionState, IceCreds, Input, Output, Rtc, RtcConfig};
 
-use crate::audio::{self, AudioPlan, Talkback};
+use crate::audio::{self, AudioPlan, Direction, Talkback};
 use crate::capture_time::{CaptureTimeSender, WallAnchor};
 use crate::cvo::Cvo;
 use crate::sdp::{Sdp, Section, check_payload_types};
@@ -114,14 +127,30 @@ pub struct Session {
     /// The video the answer negotiated, which judges the stream's codec
     /// changes.
     video: NegotiatedVideo,
-    /// The audio writer, when the answer carries audio.
+    /// The audio writer, once an answer carried audio: kept across
+    /// re-offers, since the engine's send stream for the m-line keeps
+    /// its sequence numbers, and a writer made anew would restart them;
+    /// one that moves the downlink to another m-line parks it
+    /// ([`Session::parked`]).
     audio: Option<AudioWriter>,
+    /// Whether the last answer sends the stream's audio on the writer's
+    /// m-line; `false` while a re-offer has the downlink off.
+    audio_on: bool,
     /// A `frame_over_browser_limit` warning went out; it goes out once per
     /// session.
     warned_over_limit: bool,
     /// The SSRC of the audio send stream, when the answer carries audio:
     /// its RTP is marked for DSCP EF.
     audio_ssrc: Option<u32>,
+    /// The writers of the m-lines a re-offer moved the stream's audio off,
+    /// each with its SSRC, at most one per m-line: the engine keeps an
+    /// m-line's send stream and its SSRC, so a re-offer that moves the
+    /// audio back takes up that m-line's writer again
+    /// ([`Session::downlink_writer`]), its sequence numbers and timestamps
+    /// running on (RFC 3550 §5.1). A writer made anew would restart them
+    /// at zero, under the SSRC the browser has seen them on, and the
+    /// browser drops what it takes for replays (RFC 3711 §3.3.2).
+    parked: Vec<(AudioWriter, u32)>,
     /// Talk-back, when the answer receives it.
     talkback: Option<TalkbackRx>,
     /// Rate-limits the log line for RTP the viewer sent that is no
@@ -138,6 +167,18 @@ pub struct Session {
     /// The scopes of the session's own host candidates, which let a remote
     /// candidate of the same scope pair ([`refused_address`]).
     scopes: Vec<Scope>,
+    /// The stream's audio codec, which a re-offer's audio plan is made
+    /// with again.
+    stream_audio: Option<Arc<Codec>>,
+    /// The session's wall clock anchor, for the capture times of an audio
+    /// writer a re-offer makes.
+    anchor: WallAnchor,
+    /// The engine's audio codecs in its order ([`audio::engine_codecs`]),
+    /// fixed when the session opened.
+    order: Vec<CodecFamily>,
+    /// The video m-line the session opened with, which every re-offer
+    /// must keep.
+    video_shape: VideoShape,
 }
 
 impl fmt::Debug for Session {
@@ -157,6 +198,134 @@ fn video_mid(sdp: &str) -> Option<&str> {
     first_mid(sdp, "video")
 }
 
+/// What a re-offer must keep of the video m-line a session plays on: its
+/// mid, its direction and the codec of the payload type the answer
+/// chose, and the m-line itself, which it must not stop. A session
+/// answers one video m-line with one payload type and one packetizer,
+/// chosen from the offer ([`VideoPlan`]), and plays on;
+/// a re-offer that changes that would need the video negotiated again
+/// on a live engine, which the session does not do, so it is refused and
+/// the session goes on as it was (RFC 8829 §5.2.2 lets a subsequent
+/// offer change an m-line; the session takes that for the audio ones).
+/// A subsequent offer lists the codecs negotiated, not every one the
+/// first offered (RFC 8829 §5.2.2; str0m 0.24 and Chrome, observed
+/// 2026-10-16), so only the chosen payload type is held to, its
+/// encoding name as a media subtype's ([`rtpmap_encoding`]) and its
+/// `a=fmtp` parameters as a media type's ([`fmtp_parameters`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VideoShape {
+    /// The m-line's mid.
+    mid: String,
+    /// Its direction as the browser offers it.
+    direction: Direction,
+    /// The payload type the answer chose.
+    pt: u8,
+    /// Its `a=rtpmap` line, its encoding in its canonical form
+    /// ([`rtpmap_encoding`]), and its `a=fmtp` line, its parameters in
+    /// their canonical form ([`fmtp_parameters`]), sorted.
+    codec: Vec<String>,
+}
+
+/// An `a=rtpmap` encoding (`<encoding name>/<clock rate>[/<encoding
+/// parameters>]`, RFC 8866 §6.6) in a canonical form, so that two lines
+/// of the same codec compare equal: its encoding name in lower case. The
+/// encoding name is the payload format's media subtype, which compares
+/// case-insensitively (RFC 4855 §3), so `h264/90000` names the codec
+/// `H264/90000` does. The clock rate and the encoding parameters stay
+/// as they are.
+fn rtpmap_encoding(encoding: &str) -> String {
+    let at = encoding.find('/').unwrap_or(encoding.len());
+    let (name, rest) = encoding.split_at_checked(at).unwrap_or((encoding, ""));
+    format!("{}{rest}", name.to_ascii_lowercase())
+}
+
+/// The parameters of an `a=fmtp` line in a canonical form, so that two
+/// lines of the same configuration compare equal: each
+/// `parameter=value` pair trimmed of the whitespace around it, its name
+/// in lower case, the pairs sorted and joined by `;`. The H.264 and
+/// H.265 payload formats write their parameters into `a=fmtp` as a
+/// media type string, a `;`-separated list of `parameter=value` pairs
+/// (RFC 6184 §8.2.1, RFC 7798 §7.2.1, RFC 4855 §3), whose order is not
+/// significant and whose names are not case sensitive (RFC 2045 §5.1,
+/// RFC 6838 §4.3); RFC 7798 §7.2.1's own example writes a space after
+/// the `;`. Values stay as they are: they are case sensitive unless the
+/// format says otherwise (RFC 2045 §5.1).
+fn fmtp_parameters(parameters: &str) -> String {
+    let mut pairs: Vec<String> = parameters
+        .split(';')
+        .map(|pair| {
+            let pair = pair.trim();
+            let at = pair.find('=').unwrap_or(pair.len());
+            let (name, value) = pair.split_at_checked(at).unwrap_or((pair, ""));
+            format!("{}{value}", name.to_ascii_lowercase())
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs.join(";")
+}
+
+impl VideoShape {
+    /// The shape of the first video m-line with a mid in `offer`, for
+    /// the payload type `pt` the answer chose; `None` without one.
+    fn of(offer: &str, pt: u8) -> Option<Self> {
+        let sdp = Sdp::parse(offer);
+        let section = sdp
+            .media()
+            .iter()
+            .find(|section| section.is("video") && section.mid().is_some())?;
+        let rtpmap = format!("a=rtpmap:{pt} ");
+        let fmtp = format!("a=fmtp:{pt} ");
+        let mut codec: Vec<String> = section
+            .lines()
+            .iter()
+            .filter_map(|line| {
+                if let Some(parameters) = line.strip_prefix(fmtp.as_str()) {
+                    Some(format!("{fmtp}{}", fmtp_parameters(parameters)))
+                } else {
+                    line.strip_prefix(rtpmap.as_str())
+                        .map(|encoding| format!("{rtpmap}{}", rtpmap_encoding(encoding)))
+                }
+            })
+            .collect();
+        codec.sort_unstable();
+        Some(Self {
+            mid: section.mid()?.to_owned(),
+            direction: Direction::of(section),
+            pt,
+            codec,
+        })
+    }
+
+    /// Whether the re-offer `offer` keeps the video m-line as this: what
+    /// it changes otherwise, or that it has none. One that stops the
+    /// m-line ([`Sdp::stopped`]: a zero port, not bundled) changes its
+    /// port: the engine would stop the video the session plays on
+    /// (str0m 0.24 marks such an m-line stopped and `inactive`), or, for
+    /// a zero-padded port it does not read as zero, keep it live against
+    /// the offer's stop (RFC 3264 §6, §8.2).
+    fn check(&self, offer: &str) -> Result<(), RenegotiateError> {
+        let shape = Self::of(offer, self.pt).ok_or(RenegotiateError::NoVideoTrack)?;
+        let sdp = Sdp::parse(offer);
+        let section = sdp
+            .media()
+            .iter()
+            .find(|section| section.mid() == Some(self.mid.as_str()));
+        let listed = section.is_some_and(|section| section.formats().any(|pt| pt == self.pt));
+        let changed = if shape.mid != self.mid {
+            "its mid"
+        } else if section.is_some_and(|section| sdp.stopped(section)) {
+            "its port"
+        } else if shape.direction != self.direction {
+            "its direction"
+        } else if !listed || shape.codec != self.codec {
+            "its codecs"
+        } else {
+            return Ok(());
+        };
+        Err(RenegotiateError::VideoChanged(changed.to_owned()))
+    }
+}
+
 /// The `a=mid` of the first m-line of `kind` (`audio`, `video`) that has
 /// one.
 fn first_mid<'a>(sdp: &'a str, kind: &str) -> Option<&'a str> {
@@ -169,7 +338,7 @@ fn first_mid<'a>(sdp: &'a str, kind: &str) -> Option<&'a str> {
 
 /// The engine configuration of a session: the stream's video codec
 /// (the entries its [`VideoPlan`] lists), and the audio `codecs` in their
-/// order of preference ([`AudioPlan::codecs`]).
+/// order of preference ([`audio::engine_codecs`]).
 pub(crate) fn build_config(
     request: &SessionRequest,
     video: &VideoPlan,
@@ -396,6 +565,20 @@ fn audio_engine_codec(family: CodecFamily) -> Option<EngineCodec> {
     }
 }
 
+/// The mid of the downlink m-line `downlink`, when the engine has it as
+/// an audio m-line it did not reject. The plan reads the offer alone,
+/// so the engine may have answered its downlink with port zero
+/// (RFC 3264 §6): str0m 0.24.0 keeps an m-line stopped once a re-offer
+/// stopped it, also when a later re-offer offers it again under its mid
+/// with a port (`Media::disabled`, read 2026-10-17), and keeps the
+/// m-line's send stream, which would send on.
+fn audio_mid(rtc: &Rtc, downlink: Option<&str>) -> Option<Mid> {
+    downlink.map(Mid::from).filter(|mid| {
+        rtc.media(*mid)
+            .is_some_and(|media| media.kind() == MediaKind::Audio && !media.disabled())
+    })
+}
+
 /// The audio writer for `codec` and the SSRC it sends with: the downlink
 /// m-line `downlink`, if the engine accepted it with the codec's payload
 /// type. str0m keeps the send stream of an m-line it rejected for lack of
@@ -408,10 +591,7 @@ fn audio_writer(
     anchor: WallAnchor,
 ) -> Option<(AudioWriter, u32)> {
     let engine_codec = audio_engine_codec(codec.family())?;
-    let mid = downlink.map(Mid::from).filter(|mid| {
-        rtc.media(*mid)
-            .is_some_and(|media| media.kind() == MediaKind::Audio && !media.disabled())
-    })?;
+    let mid = audio_mid(rtc, downlink)?;
     let pt = rtc
         .codec_config()
         .params()
@@ -454,7 +634,7 @@ impl TalkbackRx {
         &mut self,
         mid: Option<Mid>,
         rtp: RtpHeaderFields,
-        payload: std::sync::Arc<[u8]>,
+        payload: Arc<[u8]>,
         arrival: Instant,
     ) -> Result<UplinkPacket, &'static str> {
         if mid != Some(self.mid) {
@@ -545,15 +725,15 @@ fn rejected(rtc: &Rtc, mid: &str) -> bool {
 }
 
 /// The session sends no audio: warns when the stream has audio
-/// (`audio_codec_unsupported`) and logs what the answer did with the
-/// offer's downlink audio m-line.
+/// (`audio_codec_unsupported`, `audio` its codec) and logs what the
+/// answer did with the offer's downlink audio m-line.
 fn no_audio(
     rtc: &Rtc,
-    request: &SessionRequest,
+    audio: Option<&Codec>,
     plan: &AudioPlan<'_>,
     pending: &mut VecDeque<SessionOutput>,
 ) {
-    if let Some(codec) = request.audio.as_deref() {
+    if let Some(codec) = audio {
         let message = if audio_engine_codec(codec.family()).is_some() {
             format!(
                 "the offer has no audio m-line that takes {}; video only",
@@ -570,7 +750,7 @@ fn no_audio(
             message,
         }));
     }
-    let reason = if request.audio.is_some() {
+    let reason = if audio.is_some() {
         "no audio codec in common"
     } else {
         "no stream audio requested"
@@ -592,6 +772,63 @@ fn no_audio(
             );
         }
     }
+}
+
+/// What an answer is made from, before the engine is built: the engine's
+/// audio codec order, the audio plan, the offer as the engine sees it
+/// ([`AudioPlan::engine_offer`] without its candidates) and those
+/// candidates, which reach the agent after the answer under the same
+/// policy as trickled ones.
+struct Prepared<'a> {
+    /// The engine's audio codecs in its order ([`audio::engine_codecs`]).
+    order: Vec<CodecFamily>,
+    /// The audio plan.
+    plan: AudioPlan<'a>,
+    /// The offer the engine answers.
+    rewritten: String,
+    /// The offer's `candidate` lines, without their `a=`.
+    offered: Vec<String>,
+}
+
+/// Plans `request.offer`: refuses a talk-back request a stream that asks
+/// for the backchannel cannot meet ([`require_talkback`]) and an offer
+/// the engine must not see ([`check_payload_types`]).
+fn prepare(request: &SessionRequest) -> Result<Prepared<'_>, SessionOpenError> {
+    // The audio m-lines: the stream's audio down on the first the
+    // browser receives on, when it lists its codec; talk-back up on
+    // the dedicated or `sendrecv` one when the stream has a
+    // backchannel the session holds; every other one `inactive`.
+    let order = audio::engine_codecs(
+        request
+            .backchannel
+            .as_ref()
+            .map(|backchannel| backchannel.codec.family()),
+        request.audio.as_deref().map(Codec::family),
+    );
+    let plan = AudioPlan::new(
+        &request.offer,
+        request.audio.as_deref(),
+        request.backchannel.as_ref(),
+        request.claim,
+        &order,
+    );
+    require_talkback(request, &plan)?;
+    let directed = plan.engine_offer(&request.offer);
+    // The offer's candidates pass the same policy as trickled ones,
+    // after the answer; str0m would add every one it parses.
+    let (rewritten, offered) = split_candidates(&directed);
+    // Before the engine sees it: str0m 0.24 panics on a payload type
+    // with two codec configurations, which would abort the worker.
+    check_payload_types(&rewritten).map_err(|reason| {
+        tracing::debug!(reason, "offer refused: payload types conflict");
+        SessionOpenError::InvalidSdp(reason)
+    })?;
+    Ok(Prepared {
+        order,
+        plan,
+        rewritten,
+        offered: offered.into_iter().map(str::to_owned).collect(),
+    })
 }
 
 /// Queues what a session reports as it opens: its host `candidates` on
@@ -616,7 +853,10 @@ fn push_opening_events(pending: &mut VecDeque<SessionOutput>, candidates: Vec<St
 
 /// Refuses a talk-back request `plan` cannot meet on a stream that asked
 /// for the camera's backchannel (`request.talkback_required`): such a
-/// stream never plays one without talk-back.
+/// stream never plays one without talk-back. One another session holds
+/// the backchannel against ([`Talkback::Busy`]) is not refused: the
+/// stream can carry talk-back, this session gets it when the other lets
+/// go.
 fn require_talkback(
     request: &SessionRequest,
     plan: &AudioPlan<'_>,
@@ -653,6 +893,9 @@ fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&TalkbackTarget>) {
             tracing::info!(mid, codec, backchannel, m_line, "talk-back negotiated");
         }
         Talkback::Off(reason) => tracing::info!(reason, "talk-back not negotiated"),
+        Talkback::Busy => {
+            tracing::info!("talk-back declined: another session holds the backchannel");
+        }
         Talkback::NotRequested => tracing::debug!("talk-back not requested"),
     }
 }
@@ -700,36 +943,22 @@ impl Session {
         now: Instant,
     ) -> Result<(Self, String), SessionOpenError> {
         install_crypto_provider();
-        // The audio m-lines: the stream's audio down on the first the
-        // browser receives on, when it lists its codec; talk-back up on
-        // the dedicated or `sendrecv` one when the stream has a
-        // backchannel; every other one `inactive`.
-        let plan = AudioPlan::new(
-            &request.offer,
-            request.audio.as_deref(),
-            request.backchannel.as_ref(),
-        );
-        require_talkback(request, &plan)?;
+        let Prepared {
+            order,
+            plan,
+            rewritten,
+            offered,
+        } = prepare(request)?;
         let send = request
             .audio
             .as_deref()
             .filter(|codec| plan.send == Some(codec.family()));
-        let directed = plan.engine_offer(&request.offer);
-        // The offer's candidates pass the same policy as trickled ones,
-        // after the answer; str0m would add every one it parses.
-        let (rewritten, offered) = split_candidates(&directed);
         let offer = SdpOffer::from_sdp_string(&rewritten)
             .map_err(|err| SessionOpenError::InvalidSdp(err.to_string()))?;
-        // Before the engine sees it: str0m 0.24 panics on a payload type
-        // with two codec configurations, which would abort the worker.
-        check_payload_types(&rewritten).map_err(|reason| {
-            tracing::debug!(reason, "offer refused: payload types conflict");
-            SessionOpenError::InvalidSdp(reason)
-        })?;
         let video = VideoPlan::for_codec(&request.video)?;
 
         let mut pending = VecDeque::new();
-        let mut rtc = build_config(request, &video, &plan.codecs()).build(now);
+        let mut rtc = build_config(request, &video, &order).build(now);
 
         let (candidates, scopes) = add_host_candidates(&mut rtc, request);
         let answer = rtc
@@ -748,6 +977,8 @@ impl Session {
             .ok_or(SessionOpenError::NoVideoTrack)?;
         let negotiated = video.negotiate(&rtc, &request.offer, &mut pending)?;
         let pt = negotiated.pt();
+        let video_shape =
+            VideoShape::of(&request.offer, *pt).ok_or(SessionOpenError::NoVideoTrack)?;
         let (cvo, orientation) = Cvo::negotiate(&rtc, mid, request.orientation);
         let anchor = WallAnchor::new(now, request.wall);
         let capture_time =
@@ -766,12 +997,12 @@ impl Session {
             .and_then(|codec| audio_writer(&mut rtc, plan.downlink, codec, request.limits, anchor))
             .unzip();
         if audio.is_none() {
-            no_audio(&rtc, request, &plan, &mut pending);
+            no_audio(&rtc, request.audio.as_deref(), &plan, &mut pending);
         }
         log_talkback(&plan, request.backchannel.as_ref());
         let talkback = match plan.talkback {
             Talkback::Negotiated { mid, codec, .. } => talkback_rx(&rtc, &plan, mid, codec),
-            Talkback::Off(_) | Talkback::NotRequested => None,
+            Talkback::Off(_) | Talkback::Busy | Talkback::NotRequested => None,
         };
 
         push_opening_events(&mut pending, candidates, mid);
@@ -797,9 +1028,11 @@ impl Session {
             .with_capture_time(capture_time),
             cvo,
             video: negotiated,
+            audio_on: audio.is_some(),
             audio,
             warned_over_limit: false,
             audio_ssrc,
+            parked: Vec::new(),
             talkback,
             refused: Throttle::default(),
             pending,
@@ -810,11 +1043,141 @@ impl Session {
             disconnect_deadline: None,
             now,
             scopes,
+            stream_audio: request.audio.clone(),
+            anchor,
+            order,
+            video_shape,
         };
-        for line in offered {
+        for line in &offered {
             session.add_remote(line);
         }
         Ok((session, one_sync_group(&answer.to_sdp_string())))
+    }
+
+    /// Answers the re-offer `offer` on the live engine
+    /// ([`SessionEngine::renegotiate`]): the audio m-lines are planned
+    /// again ([`AudioPlan`]) for the `backchannel` the camera offers now
+    /// and the worker's `claim` of it, the offer rewritten for the engine
+    /// as the first one was, and the writers follow the plan: the
+    /// downlink writer stays when the stream's audio still goes down the
+    /// same m-line, is parked for another, whose own writer is taken up
+    /// again or made anew ([`Session::downlink_writer`]), or pauses while
+    /// no m-line the engine took carries the stream's audio
+    /// ([`audio_mid`]); talk-back is
+    /// received as the new plan says, or not at all. Nothing changes
+    /// until the engine took the re-offer: a refused one leaves the
+    /// session as it was. The video writer keeps its sequence numbers
+    /// and timestamps and carries `playout-delay` exactly while the
+    /// answer sends no audio, as the first answer's does. The re-offer's
+    /// candidates are not added: the browser trickled them, and the
+    /// engine keeps its pairs (RFC 8829 §5.3.2: a subsequent answer
+    /// keeps the transport).
+    fn renegotiate_offer(
+        &mut self,
+        offer: &str,
+        backchannel: Option<&TalkbackTarget>,
+        claim: TalkbackClaim,
+    ) -> Result<String, RenegotiateError> {
+        if self.state == State::Closed {
+            return Err(RenegotiateError::InvalidSdp(
+                "the session is closed".to_owned(),
+            ));
+        }
+        // What is no SDP at all is refused as such, before the video
+        // m-line is looked for in it.
+        SdpOffer::from_sdp_string(offer).map_err(invalid_sdp)?;
+        self.video_shape.check(offer)?;
+        let plan = AudioPlan::new(
+            offer,
+            self.stream_audio.as_deref(),
+            backchannel,
+            claim,
+            &self.order,
+        );
+        let directed = plan.engine_offer(offer);
+        // The re-offer's candidates are ignored: the trickled ones reached
+        // the agent already. Counted on the answer's log line.
+        let (rewritten, offered) = split_candidates(&directed);
+        let candidates_ignored = offered.len();
+        let sdp = SdpOffer::from_sdp_string(&rewritten).map_err(invalid_sdp)?;
+        check_payload_types(&rewritten).map_err(|reason| {
+            tracing::debug!(reason, "re-offer refused: payload types conflict");
+            RenegotiateError::InvalidSdp(reason)
+        })?;
+        let answer = self
+            .rtc
+            .sdp_api()
+            .accept_offer(sdp)
+            .map_err(|err| RenegotiateError::InvalidSdp(err.to_string()))?;
+        let send = self
+            .stream_audio
+            .clone()
+            .filter(|codec| plan.send == Some(codec.family()));
+        let downlink = audio_mid(&self.rtc, plan.downlink);
+        let on_writer = |audio: &AudioWriter| downlink == Some(audio.mid());
+        if let Some(codec) = send.as_deref()
+            && !self.audio.as_ref().is_some_and(on_writer)
+            && let Some((audio, audio_ssrc)) = self.downlink_writer(plan.downlink, codec)
+        {
+            if let Some(previous) = self.audio.replace(audio)
+                && let Some(ssrc) = self.audio_ssrc
+            {
+                self.parked.push((previous, ssrc));
+            }
+            self.audio_ssrc = Some(audio_ssrc);
+        }
+        self.audio_on = send.is_some() && self.audio.as_ref().is_some_and(on_writer);
+        // The video follows the same `playout-delay` policy as at the
+        // answer: render-on-decode only while no audio goes down, so the
+        // browser may hold video for lip sync once a re-offer adds audio
+        // ([`Session::answer`]).
+        self.writer.set_playout_delay(!self.audio_on);
+        if !self.audio_on {
+            no_audio(
+                &self.rtc,
+                self.stream_audio.as_deref(),
+                &plan,
+                &mut self.pending,
+            );
+        }
+        log_talkback(&plan, backchannel);
+        self.talkback = match plan.talkback {
+            Talkback::Negotiated { mid, codec, .. } => talkback_rx(&self.rtc, &plan, mid, codec),
+            Talkback::Off(_) | Talkback::Busy | Talkback::NotRequested => None,
+        };
+        let talkback = self
+            .talkback
+            .as_ref()
+            .map(|talkback| talkback.negotiated.name());
+        tracing::info!(
+            audio = self.audio_on,
+            talkback,
+            candidates_ignored,
+            "session renegotiated"
+        );
+        Ok(one_sync_group(&answer.to_sdp_string()))
+    }
+
+    /// The writer for the stream's audio in `codec` on the downlink
+    /// m-line `downlink` of a re-offer, with its SSRC: the one parked on
+    /// that m-line ([`Session::parked`]), taken up again, else one made
+    /// for it ([`audio_writer`]); `None` when the engine has no such
+    /// m-line to send on.
+    fn downlink_writer(
+        &mut self,
+        downlink: Option<&str>,
+        codec: &Codec,
+    ) -> Option<(AudioWriter, u32)> {
+        let mid = audio_mid(&self.rtc, downlink)?;
+        let (resumed, parked): (Vec<_>, Vec<_>) = std::mem::take(&mut self.parked)
+            .into_iter()
+            .partition(|(writer, _)| writer.mid() == mid);
+        self.parked = parked;
+        if let Some((writer, ssrc)) = resumed.into_iter().next() {
+            tracing::info!(mid = %mid, ssrc, "stream audio back on an earlier m-line");
+            return Some((writer, ssrc));
+        }
+        audio_writer(&mut self.rtc, downlink, codec, self.limits, self.anchor)
     }
 
     /// Where the session is.
@@ -1029,6 +1392,16 @@ impl Session {
     }
 }
 
+/// A re-offer the SDP parser refuses, as [`RenegotiateError::InvalidSdp`]
+/// with the parser's reason.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "`Result::map_err` hands the error over by value; one function for both parses"
+)]
+fn invalid_sdp(err: SdpError) -> RenegotiateError {
+    RenegotiateError::InvalidSdp(err.to_string())
+}
+
 /// Adds the host candidates to `rtc` and returns their `candidate` lines:
 /// UDP first, then the passive ICE-TCP ones (RFC 6544 §4.5); the engine's
 /// priorities put UDP ahead either way. Also the scopes of those the
@@ -1186,7 +1559,10 @@ impl SessionEngine for Session {
         self.now = now;
         let stats = &mut self.writer.stats;
         let written = match self.audio.as_mut() {
-            Some(audio) if matches!(self.state, State::Connected | State::Disconnected) => {
+            Some(audio)
+                if self.audio_on
+                    && matches!(self.state, State::Connected | State::Disconnected) =>
+            {
                 audio.write(&mut self.rtc, now, packet, wallclock)
             }
             _ => false,
@@ -1262,6 +1638,17 @@ impl SessionEngine for Session {
 
     fn talkback(&self) -> Option<UplinkCodec> {
         self.talkback.as_ref().map(|talkback| talkback.negotiated)
+    }
+
+    fn renegotiate(
+        &mut self,
+        now: Instant,
+        offer: &str,
+        backchannel: Option<TalkbackTarget>,
+        claim: TalkbackClaim,
+    ) -> Result<String, RenegotiateError> {
+        self.now = now;
+        self.renegotiate_offer(offer, backchannel.as_ref(), claim)
     }
 }
 
@@ -1463,13 +1850,14 @@ mod tests {
                 },
                 candidates: vec![],
                 tcp_candidates: vec![],
-                video: std::sync::Arc::new(Codec::H264 {
+                video: Arc::new(Codec::H264 {
                     profile_level_id: None,
                     sps: None,
                     pps: None,
                 }),
                 audio: None,
                 backchannel: None,
+                claim: TalkbackClaim::Granted,
                 orientation: Orientation::default(),
                 limits: SessionLimits::default(),
                 wall: std::time::SystemTime::UNIX_EPOCH,
@@ -1528,13 +1916,14 @@ mod tests {
             },
             candidates: vec![],
             tcp_candidates: vec![],
-            video: std::sync::Arc::new(Codec::H264 {
+            video: Arc::new(Codec::H264 {
                 profile_level_id: None,
                 sps: None,
                 pps: None,
             }),
             audio: None,
             backchannel: None,
+            claim: TalkbackClaim::Granted,
             orientation: Orientation::default(),
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
@@ -1543,7 +1932,14 @@ mod tests {
         let panicked = std::panic::catch_unwind(|| {
             let video = VideoPlan::for_codec(&request.video).unwrap();
             let mut rtc = build_config(&request, &video, &audio::EVERY_CODEC).build(now);
-            let offer = AudioPlan::new(&offer, None, None).engine_offer(&offer);
+            let offer = AudioPlan::new(
+                &offer,
+                None,
+                None,
+                TalkbackClaim::Granted,
+                &audio::EVERY_CODEC,
+            )
+            .engine_offer(&offer);
             let offer = SdpOffer::from_sdp_string(&offer).unwrap();
             let _answer = rtc.sdp_api().accept_offer(offer);
         })
@@ -1611,7 +2007,7 @@ mod tests {
             marker: false,
             ssrc: 3,
         };
-        let payload = || std::sync::Arc::<[u8]>::from(&[0xf8_u8, 1][..]);
+        let payload = || Arc::<[u8]>::from(&[0xf8_u8, 1][..]);
         // Another m-line, or one the engine could not tell.
         for mid in [Some(Mid::from("0")), None] {
             assert_eq!(
@@ -1661,5 +2057,161 @@ mod tests {
             None
         );
         assert_eq!(video_mid("m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"), None);
+    }
+
+    /// A re-offer keeps the video m-line: the same mid, direction and
+    /// codecs, whatever its audio m-lines do; one that changes any of
+    /// them, or has none, is refused with what changed.
+    #[test]
+    fn rfc8829_5_2_2_a_re_offer_must_keep_the_video_m_line_as_offered() {
+        let video = "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98\r\na=mid:1\r\na=recvonly\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 profile-level-id=42e01f\r\na=rtpmap:97 rtx/90000\r\na=fmtp:97 apt=96\r\na=rtpmap:98 VP8/90000\r\n";
+        let offer =
+            format!("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=recvonly\r\n{video}");
+        let shape = VideoShape::of(&offer, 96).unwrap();
+        assert_eq!(
+            shape,
+            VideoShape {
+                mid: "1".into(),
+                direction: Direction::RecvOnly,
+                pt: 96,
+                codec: vec![
+                    "a=fmtp:96 profile-level-id=42e01f".into(),
+                    "a=rtpmap:96 h264/90000".into(),
+                ],
+            }
+        );
+        // The audio m-lines may change as they like; the video's lines
+        // may come in another order, a session attribute may change, and
+        // the codecs the answer did not choose may go (RFC 8829 §5.2.2).
+        let talking = format!(
+            "v=0\r\na=group:BUNDLE 0 1 2\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=inactive\r\n{}m=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:2\r\na=sendonly\r\n",
+            video
+                .replace(
+                    "a=rtpmap:96 H264/90000\r\na=fmtp:96 profile-level-id=42e01f\r\n",
+                    "a=fmtp:96 profile-level-id=42e01f\r\na=rtpmap:96 H264/90000\r\n"
+                )
+                .replace(" 98\r\n", "\r\n")
+                .replace("a=rtpmap:98 VP8/90000\r\n", "")
+        );
+        assert_eq!(shape.check(&talking), Ok(()));
+        // A zero port on a `bundle-only` m-line in the BUNDLE group only
+        // bundles it (RFC 9143 §6).
+        let bundle_only = format!(
+            "v=0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=recvonly\r\n{}",
+            video
+                .replace("m=video 9 ", "m=video 0 ")
+                .replace("a=mid:1\r\n", "a=mid:1\r\na=bundle-only\r\n")
+        );
+        assert_eq!(shape.check(&bundle_only), Ok(()));
+        for (changed, what) in [
+            (offer.replace("a=mid:1", "a=mid:v"), "its mid"),
+            // Stopped (RFC 3264 §8.2, RFC 8829 §5.2.2): a zero port out of
+            // any BUNDLE group, mid, direction and codecs kept.
+            (offer.replace("m=video 9 ", "m=video 0 "), "its port"),
+            (
+                bundle_only.replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0"),
+                "its port",
+            ),
+            (
+                offer.replace("a=mid:1\r\na=recvonly", "a=mid:1\r\na=sendrecv"),
+                "its direction",
+            ),
+            // The chosen payload type gone from the format list, or under
+            // another profile.
+            (offer.replace("96 97 98\r\n", "97 98\r\n"), "its codecs"),
+            (offer.replace("42e01f", "640028"), "its codecs"),
+        ] {
+            assert_eq!(
+                shape.check(&changed),
+                Err(RenegotiateError::VideoChanged(what.to_owned())),
+                "{changed}"
+            );
+        }
+        let audio_only = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=recvonly\r\n";
+        assert_eq!(shape.check(audio_only), Err(RenegotiateError::NoVideoTrack));
+        assert_eq!(VideoShape::of(audio_only, 96), None);
+        // A video m-line without a mid has no shape (RFC 8829 §5.2.1).
+        assert_eq!(
+            VideoShape::of("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n", 96),
+            None
+        );
+    }
+
+    /// The chosen payload type's `a=fmtp` parameters are a media type's:
+    /// a re-offer may list them in another order, with whitespace around
+    /// the `;` and with names in another case, and keeps the video
+    /// m-line (RFC 6838 §4.3, RFC 2045 §5.1, RFC 6184 §8.2.1); another
+    /// value, a value in another case among them, or another parameter
+    /// changes its codecs.
+    #[test]
+    fn rfc6838_4_3_a_re_offer_may_reorder_the_fmtp_parameters_and_recase_their_names() {
+        let offer = |fmtp: &str| {
+            format!(
+                "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=recvonly\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 {fmtp}\r\n"
+            )
+        };
+        let shape =
+            VideoShape::of(&offer("packetization-mode=1;profile-level-id=42e01f"), 96).unwrap();
+        assert_eq!(
+            shape.codec,
+            [
+                "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
+                "a=rtpmap:96 h264/90000"
+            ]
+        );
+        for same in [
+            "packetization-mode=1;profile-level-id=42e01f",
+            "profile-level-id=42e01f;packetization-mode=1",
+            "profile-level-id=42e01f; packetization-mode=1",
+            " Packetization-Mode=1 ;PROFILE-LEVEL-ID=42e01f",
+        ] {
+            assert_eq!(shape.check(&offer(same)), Ok(()), "{same}");
+        }
+        for changed in [
+            "profile-level-id=42e01f;packetization-mode=0",
+            "profile-level-id=42E01F;packetization-mode=1",
+            "profile-level-id=42e01f",
+            "profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1",
+        ] {
+            assert_eq!(
+                shape.check(&offer(changed)),
+                Err(RenegotiateError::VideoChanged("its codecs".to_owned())),
+                "{changed}"
+            );
+        }
+        // A parameter without a value has its name in lower case too.
+        assert_eq!(fmtp_parameters("B=2; Flag"), "b=2;flag");
+    }
+
+    /// The chosen payload type's encoding name is a media subtype, which
+    /// compares case-insensitively: a re-offer that writes it in another
+    /// case keeps the video m-line (RFC 4855 §3); another clock rate or
+    /// another codec under the payload type changes its codecs.
+    #[test]
+    fn rfc4855_3_a_re_offer_may_recase_the_encoding_name() {
+        let offer = |rtpmap: &str| {
+            format!(
+                "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=recvonly\r\na=rtpmap:96 {rtpmap}\r\na=fmtp:96 packetization-mode=1\r\n"
+            )
+        };
+        let shape = VideoShape::of(&offer("h264/90000"), 96).unwrap();
+        assert_eq!(
+            shape.codec,
+            ["a=fmtp:96 packetization-mode=1", "a=rtpmap:96 h264/90000"]
+        );
+        for same in ["H264/90000", "h264/90000"] {
+            assert_eq!(shape.check(&offer(same)), Ok(()), "{same}");
+        }
+        for changed in ["H264/48000", "H265/90000"] {
+            assert_eq!(
+                shape.check(&offer(changed)),
+                Err(RenegotiateError::VideoChanged("its codecs".to_owned())),
+                "{changed}"
+            );
+        }
+        // Only the name is folded; an encoding without a clock rate is
+        // its name.
+        assert_eq!(rtpmap_encoding("Opus/48000/2"), "opus/48000/2");
+        assert_eq!(rtpmap_encoding("H264"), "h264");
     }
 }

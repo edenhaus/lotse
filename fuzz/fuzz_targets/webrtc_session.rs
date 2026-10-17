@@ -217,6 +217,7 @@ fuzz_target!(|data: &[u8]| {
         }),
         audio: audio.then(|| Arc::new(Codec::Pcmu)),
         backchannel: None,
+        claim: lotse_core::session::TalkbackClaim::Granted,
         orientation: Orientation::ALL[usize::from((setup >> 1) & 7)],
         limits: SessionLimits::default(),
         wall: SystemTime::UNIX_EPOCH,
