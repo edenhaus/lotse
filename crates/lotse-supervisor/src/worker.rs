@@ -95,9 +95,12 @@ pub enum WorkerEvent {
         /// What happened.
         event: SessionEvent,
     },
-    /// A probe of the device's backchannel waits for a connect permit
-    /// (`true`), or is over (`false`).
-    Probe(bool),
+    /// The probe of the device's backchannel with this id waits for a
+    /// connect permit.
+    ProbeConnecting(u64),
+    /// The probe with this id is over: its permit, or its wait for one,
+    /// ends.
+    ProbeEnded(u64),
     /// The talker of the connection's backchannel changed.
     Talker {
         /// The session it concerns.
@@ -340,8 +343,8 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
         ToSupervisor::Tracks(tracks) => WorkerEvent::Tracks(declared(tracks, &mut trims.tracks)),
         ToSupervisor::Stats(stats) => WorkerEvent::Stats(counted(stats, &mut trims.stats)),
         ToSupervisor::Session { session_id, event } => WorkerEvent::Session { session_id, event },
-        ToSupervisor::ProbeConnecting => WorkerEvent::Probe(true),
-        ToSupervisor::ProbeEnded => WorkerEvent::Probe(false),
+        ToSupervisor::ProbeConnecting { probe } => WorkerEvent::ProbeConnecting(probe),
+        ToSupervisor::ProbeEnded { probe } => WorkerEvent::ProbeEnded(probe),
         ToSupervisor::Talker(change) => match TalkerReason::parse(&change.reason) {
             Some(reason) => WorkerEvent::Talker {
                 session_id: change.session_id,
@@ -510,10 +513,10 @@ impl Worker {
             .await
     }
 
-    /// Lets the probe the worker announced go ahead.
-    pub async fn grant_probe_connect(&mut self) -> Result<(), IpcError> {
+    /// Lets the probe `probe` the worker announced go ahead.
+    pub async fn grant_probe_connect(&mut self, probe: u64) -> Result<(), IpcError> {
         self.control
-            .send_msg(&ToWorker::ProbeConnectGranted, &[])
+            .send_msg(&ToWorker::ProbeConnectGranted { probe }, &[])
             .await
     }
 
@@ -829,12 +832,12 @@ mod tests {
             WorkerEvent::Stats(WorkerStats::default())
         );
         assert_eq!(
-            mapped(ToSupervisor::ProbeConnecting, None),
-            WorkerEvent::Probe(true)
+            mapped(ToSupervisor::ProbeConnecting { probe: 3 }, None),
+            WorkerEvent::ProbeConnecting(3)
         );
         assert_eq!(
-            mapped(ToSupervisor::ProbeEnded, None),
-            WorkerEvent::Probe(false)
+            mapped(ToSupervisor::ProbeEnded { probe: 3 }, None),
+            WorkerEvent::ProbeEnded(3)
         );
         for (code, expect) in [
             ("source_unreachable", SourceError::Unreachable("m".into())),
@@ -1136,7 +1139,7 @@ mod tests {
         worker.run_source(&spec).await.unwrap();
         worker.restart_source(&spec).await.unwrap();
         worker.grant_switch_connect().await.unwrap();
-        worker.grant_probe_connect().await.unwrap();
+        worker.grant_probe_connect(4).await.unwrap();
         assert_eq!(
             received(&dir, 5).await,
             [
@@ -1144,7 +1147,7 @@ mod tests {
                 ToWorker::RunSource(spec.clone()),
                 ToWorker::RestartSource(spec),
                 ToWorker::SwitchConnectGranted,
-                ToWorker::ProbeConnectGranted
+                ToWorker::ProbeConnectGranted { probe: 4 }
             ],
             "the sockets ride on the first message, once"
         );

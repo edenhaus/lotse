@@ -478,6 +478,10 @@ pub(crate) struct Driver {
     /// The place at the connect gate of the worker's probe of the
     /// camera's backchannel, a connection beside the source's own.
     probe_connect: ConnectSlot,
+    /// The id of the probe `probe_connect` is for: the one the worker
+    /// announced last, which its grant names. The worker runs one probe at
+    /// a time, so the end of any other is stale and releases nothing.
+    probe: u64,
     /// The retry schedule of the host lookup.
     resolve_backoff: ReconnectBackoff,
     /// What the registry sees.
@@ -537,6 +541,7 @@ impl Driver {
             connect,
             switch_connect,
             probe_connect,
+            probe: 0,
             resolve_backoff: ReconnectBackoff::new(0),
             snapshot,
             track_lines: Throttle::default(),
@@ -674,7 +679,7 @@ impl Driver {
             }
             Wake::ProbeConnect(SlotWake::Grant) => {
                 if let Some(worker) = self.worker.as_mut()
-                    && let Err(err) = worker.grant_probe_connect().await
+                    && let Err(err) = worker.grant_probe_connect(self.probe).await
                 {
                     // The exit follows and gives the permit back.
                     tracing::warn!(pid = worker.pid(), error = %err, "probe connect grant could not be sent to the worker");
@@ -877,11 +882,21 @@ impl Driver {
                 }
             }
             WorkerEvent::Stats(stats) => self.snapshot.stats = Some(stats),
-            WorkerEvent::Probe(true) => {
+            WorkerEvent::ProbeConnecting(probe) => {
+                self.probe = probe;
                 self.probe_connect
                     .request(&self.shared.connects, "backchannel probe");
             }
-            WorkerEvent::Probe(false) => self.probe_connect.release("backchannel probe over"),
+            WorkerEvent::ProbeEnded(probe) if probe == self.probe => {
+                self.probe_connect.release("backchannel probe over");
+            }
+            WorkerEvent::ProbeEnded(probe) => {
+                tracing::debug!(
+                    probe,
+                    current = self.probe,
+                    "end of a backchannel probe the probe permit is not for; ignored"
+                );
+            }
             WorkerEvent::Session { session_id, event } => {
                 let now = self.shared.clock.now();
                 self.shared.lock().session_report(
@@ -1992,7 +2007,7 @@ mod tests {
         step(driver).await;
         assert!(driver.worker.is_some(), "restarted");
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Connecting));
-        driver.on_worker_event(WorkerEvent::Probe(true));
+        driver.on_worker_event(WorkerEvent::ProbeConnecting(1));
         assert_eq!(in_flight(), 2);
         demand_tx.send_replace(0);
         step(driver).await;
@@ -2092,26 +2107,28 @@ mod tests {
         let wake = next_wake(&mut driver).await;
         assert!(matches!(wake, Wake::Connect(SlotWake::Grant)));
         driver.handle(wake).await;
-        driver.on_worker_event(WorkerEvent::Probe(true));
+        driver.on_worker_event(WorkerEvent::ProbeConnecting(1));
         assert_eq!(in_flight(), 2, "the attempt's and the probe's");
         let wake = next_wake(&mut driver).await;
         assert!(matches!(wake, Wake::ProbeConnect(SlotWake::Grant)));
         driver.handle(wake).await;
-        let messages = recorded(&out, &lotse_ipc::ToWorker::ProbeConnectGranted).await;
+        // The grant names the probe it is for.
+        let granted = lotse_ipc::ToWorker::ProbeConnectGranted { probe: 1 };
+        let messages = recorded(&out, &granted).await;
         assert_eq!(
             messages,
-            [
-                lotse_ipc::ToWorker::ConnectGranted,
-                lotse_ipc::ToWorker::ProbeConnectGranted
-            ]
+            [lotse_ipc::ToWorker::ConnectGranted, granted.clone()]
         );
-        driver.on_worker_event(WorkerEvent::Probe(false));
+        // The end of a probe the permit is not for releases nothing.
+        driver.on_worker_event(WorkerEvent::ProbeEnded(2));
+        assert_eq!(in_flight(), 2, "a stale end keeps the probe's permit");
+        driver.on_worker_event(WorkerEvent::ProbeEnded(1));
         assert_eq!(in_flight(), 1, "the probe gave its back");
         // A lease that runs out changes nothing more.
         driver
             .handle(Wake::ProbeConnect(SlotWake::LeaseExpired))
             .await;
-        driver.on_worker_event(WorkerEvent::Probe(true));
+        driver.on_worker_event(WorkerEvent::ProbeConnecting(2));
         assert_eq!(in_flight(), 2);
         let worker = driver.worker.take().unwrap();
         // Without a worker the grant goes nowhere.

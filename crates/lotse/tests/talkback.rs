@@ -630,9 +630,9 @@ impl InProcess {
                             .await
                             .unwrap();
                     }
-                    ToSupervisor::ProbeConnecting => {
+                    ToSupervisor::ProbeConnecting { probe } => {
                         self.tx
-                            .send_msg(&ToWorker::ProbeConnectGranted, &[])
+                            .send_msg(&ToWorker::ProbeConnectGranted { probe }, &[])
                             .await
                             .unwrap();
                     }

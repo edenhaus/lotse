@@ -1660,13 +1660,13 @@ mod tests {
                 cancel: cancel.clone(),
             });
             let run = crate::task::spawn_named("test.fake_source", run);
-            assert_eq!(within(asks.recv()).await, Some(ProbeAsk::Connecting));
+            assert_eq!(within(asks.recv()).await, Some(ProbeAsk::Connecting(1)));
             assert!(slot.is_probing());
             if granted {
-                gate.grant();
+                assert!(gate.grant(1));
                 let mut ready = set.ready();
                 assert!(within(ready.changed()).await.is_ok());
-                assert_eq!(within(asks.recv()).await, Some(ProbeAsk::Ended));
+                assert_eq!(within(asks.recv()).await, Some(ProbeAsk::Ended(1)));
                 assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
             }
             cancel.cancel();
@@ -1677,7 +1677,7 @@ mod tests {
             assert!(!slot.is_probing(), "{granted}");
             assert_eq!(slot.current().is_some(), granted);
             if !granted {
-                assert_eq!(within(asks.recv()).await, Some(ProbeAsk::Ended));
+                assert_eq!(within(asks.recv()).await, Some(ProbeAsk::Ended(1)));
             }
         }
     }

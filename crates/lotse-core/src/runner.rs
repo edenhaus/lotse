@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::backoff::ReconnectBackoff;
@@ -119,39 +119,58 @@ impl ConnectGate {
 }
 
 /// What a [`ProbeGate`] asks of the supervisor's connect gate, through
-/// the worker.
+/// the worker, for the probe the id names: the supervisor's grant names
+/// it again, so a grant that arrives after its probe was given up lets no
+/// other probe through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeAsk {
-    /// A probe waits for a permit.
-    Connecting,
+    /// The probe waits for a permit.
+    Connecting(u64),
     /// The probe is over: its permit, or its wait for one, ends.
-    Ended,
+    Ended(u64),
+}
+
+/// Where the probe whose turn it is stands at a [`ProbeGate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeTurn {
+    /// No probe waits for a grant or holds one.
+    Idle,
+    /// The probe with this id waits for its grant.
+    Waiting(u64),
+    /// The probe with this id was granted.
+    Granted(u64),
 }
 
 /// Where a probe waits for the supervisor's permission
 /// (`sources.connect_concurrency`), as a connection attempt waits at its
 /// [`ConnectGate`]: a connection a source opens beside its attempt to ask
 /// the device about its backchannel (RTSP: a `DESCRIBE` with `Require`).
-/// The probe asks ([`ProbeAsk::Connecting`]), waits for the grant, and
-/// gives the permit back when its [`ProbePermit`] drops. One gate per
-/// worker, shared by its running and standby sources; the default gate
-/// lets every probe through and asks nothing, for a source outside a
-/// worker.
-#[derive(Debug, Clone)]
+/// The probe asks ([`ProbeAsk::Connecting`]), waits for the grant that
+/// names it, and gives the permit back when its [`ProbePermit`] drops. One
+/// gate per worker, shared by its running and standby sources, which
+/// probe one at a time: a probe takes its turn before it asks and keeps
+/// it until its permit drops, so the supervisor sees at most one probe,
+/// whose end comes before the next one's ask, and every probe runs under
+/// a permit of its own. The default gate lets every probe through and
+/// asks nothing, for a source outside a worker.
+#[derive(Debug, Clone, Default)]
 pub struct ProbeGate {
-    /// Where the asks go; `None` for a gate that never waits.
-    asks: Option<mpsc::UnboundedSender<ProbeAsk>>,
-    /// The grants.
-    grants: ConnectGate,
+    /// The gate's shared state; `None` for a gate that never waits.
+    shared: Option<Arc<ProbeShared>>,
 }
 
-impl Default for ProbeGate {
-    fn default() -> Self {
-        Self {
-            asks: None,
-            grants: ConnectGate { grants: None },
-        }
-    }
+/// What the clones of a waiting [`ProbeGate`] share.
+#[derive(Debug)]
+struct ProbeShared {
+    /// Where the asks go.
+    asks: mpsc::UnboundedSender<ProbeAsk>,
+    /// The turn, held from a probe's ask until its permit drops; it holds
+    /// the id of the last probe that took it, so ids never repeat within
+    /// a gate (the first is 1).
+    turn: Arc<tokio::sync::Mutex<u64>>,
+    /// Where the probe whose turn it is stands; a grant moves it from
+    /// `Waiting` to `Granted` only for the id it names.
+    state: watch::Sender<ProbeTurn>,
 }
 
 impl ProbeGate {
@@ -160,42 +179,86 @@ impl ProbeGate {
     pub fn closed() -> (Self, mpsc::UnboundedReceiver<ProbeAsk>) {
         let (asks, rx) = mpsc::unbounded_channel();
         let gate = Self {
-            asks: Some(asks),
-            grants: ConnectGate::closed(),
+            shared: Some(Arc::new(ProbeShared {
+                asks,
+                turn: Arc::new(tokio::sync::Mutex::new(0)),
+                state: watch::Sender::new(ProbeTurn::Idle),
+            })),
         };
         (gate, rx)
     }
 
-    /// Lets the waiting probe, or the next one, through.
-    pub fn grant(&self) {
-        self.grants.grant();
+    /// The supervisor's grant for the probe `id`: lets it through if it
+    /// still waits. `false` for a grant no probe waits for, as when its
+    /// probe was given up while the grant was on its way: it is
+    /// discarded, and lets no later probe through.
+    pub fn grant(&self, id: u64) -> bool {
+        self.shared.as_ref().is_some_and(|shared| {
+            shared.state.send_if_modified(|turn| {
+                let waiting = *turn == ProbeTurn::Waiting(id);
+                if waiting {
+                    *turn = ProbeTurn::Granted(id);
+                }
+                waiting
+            })
+        })
     }
 
-    /// Asks for a permit and waits for the grant. The permit is given back
-    /// when the returned [`ProbePermit`] drops, and so is the ask when
-    /// the wait is dropped before the grant.
+    /// Takes the turn, asks for a permit and waits for its grant. The
+    /// permit and the turn are given back when the returned [`ProbePermit`]
+    /// drops, and so are the ask and the turn when the wait is dropped
+    /// before the grant.
     pub async fn permit(&self) -> ProbePermit {
+        let Some(shared) = &self.shared else {
+            return ProbePermit { held: None };
+        };
+        let mut turn = Arc::clone(&shared.turn).lock_owned().await;
+        let id = turn.wrapping_add(1);
+        *turn = id;
+        let mut state = shared.state.subscribe();
+        shared.state.send_replace(ProbeTurn::Waiting(id));
         let permit = ProbePermit {
-            asks: self.asks.clone(),
+            held: Some(HeldTurn {
+                shared: Arc::clone(shared),
+                id,
+                _turn: turn,
+            }),
         };
         permit.ask(ProbeAsk::Connecting);
-        self.grants.granted().await;
+        // `shared` keeps the sender, so the wait ends only at the grant.
+        let _granted = state
+            .wait_for(|turn| *turn == ProbeTurn::Granted(id))
+            .await
+            .is_ok();
         permit
     }
 }
 
-/// A probe's connect permit: given back when dropped.
+/// A probe's connect permit: given back when dropped, and its gate's turn
+/// with it.
 #[derive(Debug)]
 pub struct ProbePermit {
-    /// Where the end goes; `None` for a gate that never waits.
-    asks: Option<mpsc::UnboundedSender<ProbeAsk>>,
+    /// The turn it holds; `None` from a gate that never waits.
+    held: Option<HeldTurn>,
+}
+
+/// The turn a [`ProbePermit`] holds at its gate.
+#[derive(Debug)]
+struct HeldTurn {
+    /// The gate.
+    shared: Arc<ProbeShared>,
+    /// The probe's id.
+    id: u64,
+    /// The turn; the next probe takes it once this drops.
+    _turn: tokio::sync::OwnedMutexGuard<u64>,
 }
 
 impl ProbePermit {
-    /// Sends `ask`; a worker that is gone takes nothing.
-    fn ask(&self, ask: ProbeAsk) {
-        if let Some(asks) = &self.asks {
-            let _sent = asks.send(ask);
+    /// Sends the ask `kind` names for the probe; a worker that is gone
+    /// takes nothing.
+    fn ask(&self, kind: fn(u64) -> ProbeAsk) {
+        if let Some(held) = &self.held {
+            let _sent = held.shared.asks.send(kind(held.id));
         }
     }
 }
@@ -203,6 +266,11 @@ impl ProbePermit {
 impl Drop for ProbePermit {
     fn drop(&mut self) {
         self.ask(ProbeAsk::Ended);
+        // Before the turn goes, which happens as the fields drop: a grant
+        // still on its way finds no probe waiting for it.
+        if let Some(held) = &self.held {
+            held.shared.state.send_replace(ProbeTurn::Idle);
+        }
     }
 }
 
@@ -1427,6 +1495,89 @@ mod tests {
             1,
             "no second warning"
         );
+    }
+
+    /// `future`'s output if it is ready on one poll.
+    async fn poll_once<F: Future + Unpin>(future: &mut F) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            output = future => Some(output),
+            () = std::future::ready(()) => None,
+        }
+    }
+
+    /// The running source's and the standby's probes share the worker's
+    /// gate: the second asks only once the first's permit dropped, so the
+    /// supervisor sees one probe at a time, each under a permit of its own
+    /// that its own end gives back, and a grant lets through only the
+    /// probe it names.
+    #[tokio::test]
+    async fn overlapping_probes_of_the_running_source_and_the_standby_take_turns() {
+        let (gate, mut asks) = ProbeGate::closed();
+        let standby_gate = gate.clone();
+        let mut running = Box::pin(gate.permit());
+        let mut standby = Box::pin(standby_gate.permit());
+        assert!(poll_once(&mut running).await.is_none());
+        assert!(poll_once(&mut standby).await.is_none());
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Connecting(1)));
+        assert!(
+            asks.try_recv().is_err(),
+            "the standby's probe waits its turn"
+        );
+        assert!(!gate.grant(2), "no probe 2 waits");
+        assert!(poll_once(&mut standby).await.is_none());
+        assert!(standby_gate.grant(1));
+        let first = poll_once(&mut running).await.expect("probe 1 granted");
+        assert!(poll_once(&mut standby).await.is_none());
+        assert!(asks.try_recv().is_err(), "one probe at a time");
+        drop(first);
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Ended(1)));
+        assert!(poll_once(&mut standby).await.is_none());
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Connecting(2)));
+        assert!(
+            !gate.grant(1),
+            "probe 1's grant again lets probe 2 through no more"
+        );
+        assert!(poll_once(&mut standby).await.is_none());
+        assert!(gate.grant(2));
+        drop(poll_once(&mut standby).await.expect("probe 2 granted"));
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Ended(2)));
+        assert!(asks.try_recv().is_err());
+    }
+
+    /// A probe given up while its grant is on its way ends its ask; the
+    /// grant, arriving after that or while the next probe waits, is
+    /// discarded, and the next probe waits for a grant of its own.
+    #[tokio::test]
+    async fn a_grant_that_arrives_after_its_probe_was_given_up_lets_no_later_probe_through() {
+        let (gate, mut asks) = ProbeGate::closed();
+        let mut given_up = Box::pin(gate.permit());
+        assert!(poll_once(&mut given_up).await.is_none());
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Connecting(1)));
+        drop(given_up);
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Ended(1)));
+        assert!(!gate.grant(1), "no probe waits for it");
+        let mut next = Box::pin(gate.permit());
+        assert!(poll_once(&mut next).await.is_none());
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Connecting(2)));
+        assert!(!gate.grant(1), "the late grant again, while probe 2 waits");
+        assert!(
+            poll_once(&mut next).await.is_none(),
+            "waits for its own grant"
+        );
+        assert!(gate.grant(2));
+        drop(poll_once(&mut next).await.expect("probe 2 granted"));
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Ended(2)));
+    }
+
+    /// The default gate lets every probe through at once, asks nothing,
+    /// and has no probe for a grant.
+    #[tokio::test]
+    async fn the_default_probe_gate_never_waits() {
+        let gate = ProbeGate::default();
+        let mut permit = Box::pin(gate.permit());
+        drop(poll_once(&mut permit).await.expect("at once"));
+        assert!(!gate.grant(1));
     }
 
     #[test]

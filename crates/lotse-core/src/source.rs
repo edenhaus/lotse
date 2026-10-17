@@ -1281,13 +1281,13 @@ mod tests {
         let permit = crate::task::spawn_named("test.permit", async move { probes.permit().await });
         assert_eq!(
             bounded(asks.recv()).await,
-            Some(crate::runner::ProbeAsk::Connecting)
+            Some(crate::runner::ProbeAsk::Connecting(1))
         );
-        slot.probes().grant();
+        assert!(slot.probes().grant(1));
         drop(bounded(permit).await.unwrap());
         assert_eq!(
             bounded(asks.recv()).await,
-            Some(crate::runner::ProbeAsk::Ended)
+            Some(crate::runner::ProbeAsk::Ended(1))
         );
         // The default slot's probes never wait.
         drop(bounded(BackchannelSlot::default().probes().permit()).await);

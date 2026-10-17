@@ -350,8 +350,8 @@ struct Serving<'a> {
 /// The message that passes a probe's `ask` on to the supervisor.
 const fn probe_message(ask: ProbeAsk) -> ToSupervisor {
     match ask {
-        ProbeAsk::Connecting => ToSupervisor::ProbeConnecting,
-        ProbeAsk::Ended => ToSupervisor::ProbeEnded,
+        ProbeAsk::Connecting(probe) => ToSupervisor::ProbeConnecting { probe },
+        ProbeAsk::Ended(probe) => ToSupervisor::ProbeEnded { probe },
     }
 }
 
@@ -396,6 +396,20 @@ impl Serving<'_> {
         self.on_message(decoded.message, decoded.fds).await
     }
 
+    /// The supervisor's grant for the probe `probe`: lets it through, or
+    /// is discarded when that probe is over, its end on the way to the
+    /// supervisor as the grant came.
+    fn on_probe_granted(&self, probe: u64) {
+        if self.probes.grant(probe) {
+            tracing::debug!(probe, "backchannel probe granted its connect permit");
+        } else {
+            tracing::debug!(
+                probe,
+                "connect grant for a backchannel probe that is over; discarded"
+            );
+        }
+    }
+
     /// One control message; `Some` once the worker is done.
     async fn on_message(
         &mut self,
@@ -419,7 +433,7 @@ impl Serving<'_> {
             ToWorker::ConnectGranted => self.on_connect_granted(),
             ToWorker::SwitchSource(spec) => self.on_switch_source(&spec, false).await?,
             ToWorker::RestartSource(spec) => self.on_switch_source(&spec, true).await?,
-            ToWorker::ProbeConnectGranted => self.probes.grant(),
+            ToWorker::ProbeConnectGranted { probe } => self.on_probe_granted(probe),
             ToWorker::SwitchConnectGranted => {
                 if let Some(standby) = &self.standby {
                     standby.runner.gate.grant();
@@ -1349,9 +1363,9 @@ mod tests {
                     .await
                     .unwrap();
             }
-            if message == ToSupervisor::ProbeConnecting {
+            if let ToSupervisor::ProbeConnecting { probe } = message {
                 self.tx
-                    .send_msg(&ToWorker::ProbeConnectGranted, &[])
+                    .send_msg(&ToWorker::ProbeConnectGranted { probe }, &[])
                     .await
                     .unwrap();
             }
@@ -3993,6 +4007,65 @@ mod tests {
             probes: ProbeGate::default(),
         };
         (serving, ours.split().1)
+    }
+
+    /// The supervisor's probe grant lets through the probe it names; one
+    /// for a probe that is over, sent before that probe's end reached the
+    /// supervisor, is logged and discarded, and lets no other probe
+    /// through.
+    #[tokio::test]
+    async fn a_probe_grant_lets_its_probe_through_and_a_stale_one_is_discarded() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, _rx) = serving(&settings);
+        let (gate, mut asks) = ProbeGate::closed();
+        serving.probes = gate.clone();
+        let mut probe = Box::pin(gate.permit());
+        tokio::select! {
+            biased;
+            _permit = &mut probe => panic!("through without a grant"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Connecting(1)));
+        let stale = ToWorker::ProbeConnectGranted { probe: 7 };
+        assert!(
+            serving
+                .on_message(stale, Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "connect grant for a backchannel probe that is over; discarded"
+            ),
+            1
+        );
+        tokio::select! {
+            biased;
+            _permit = &mut probe => panic!("through on another probe's grant"),
+            () = std::future::ready(()) => {}
+        }
+        let granted = ToWorker::ProbeConnectGranted { probe: 1 };
+        assert!(
+            serving
+                .on_message(granted, Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let permit = tokio::select! {
+            biased;
+            permit = &mut probe => permit,
+            () = std::future::ready(()) => panic!("not through on its grant"),
+        };
+        drop(permit);
+        assert_eq!(asks.try_recv(), Ok(ProbeAsk::Ended(1)));
+        assert_eq!(
+            logs.count(Level::DEBUG, "backchannel probe granted its connect permit"),
+            1
+        );
     }
 
     /// The tracks switching with no standby to take them, or no source

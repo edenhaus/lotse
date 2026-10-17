@@ -676,19 +676,19 @@ async fn a_claim_bypasses_the_connect_gate_while_the_probe_waits_for_a_permit() 
     let slot = BackchannelSlot::gated(gate.clone());
     let mut first = Harness::start_with(source.as_ref(), peer(&cam), clock(), slot.clone());
     assert!(first.wait_ready().await, "ready");
-    assert_eq!(bounded(asks.recv()).await, Some(ProbeAsk::Connecting));
+    assert_eq!(bounded(asks.recv()).await, Some(ProbeAsk::Connecting(1)));
     clock().sleep(Duration::from_millis(100)).await;
     assert_eq!(log(&cam).len(), 1, "the probe waits for its permit");
     assert!(slot.is_probing());
-    gate.grant();
+    assert!(gate.grant(1));
     probed(&cam, 2, &slot).await;
-    assert_eq!(bounded(asks.recv()).await, Some(ProbeAsk::Ended));
+    assert_eq!(bounded(asks.recv()).await, Some(ProbeAsk::Ended(1)));
     finish(first).await;
     // A reconnect's probe waits again, with the gate busy; the offer the
     // last probe found stands meanwhile, and a claim opens it at once.
     let mut second = Harness::start_with(source.as_ref(), peer(&cam), clock(), slot.clone());
     assert!(second.wait_ready().await, "reconnected");
-    assert_eq!(bounded(asks.recv()).await, Some(ProbeAsk::Connecting));
+    assert_eq!(bounded(asks.recv()).await, Some(ProbeAsk::Connecting(2)));
     let offer = slot.current().expect("the last probe's offer");
     let session = tokio::select! {
         opened = offer.opener.open() => opened.unwrap(),
@@ -700,7 +700,7 @@ async fn a_claim_bypasses_the_connect_gate_while_the_probe_waits_for_a_permit() 
     // The attempt ends before the probe got its permit: it gives the ask
     // back and leaves the offer as it was.
     finish(second).await;
-    assert_eq!(bounded(asks.recv()).await, Some(ProbeAsk::Ended));
+    assert_eq!(bounded(asks.recv()).await, Some(ProbeAsk::Ended(2)));
     assert!(!slot.is_probing());
     assert!(slot.current().is_some());
     drop(session);
