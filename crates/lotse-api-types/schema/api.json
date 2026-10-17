@@ -1645,7 +1645,7 @@
             "packets_received": 0,
             "talker": false
           },
-          "description": "Talk-back towards the camera's backchannel; all zero and `false`\nwhen the answer did not negotiate it."
+          "description": "Talk-back towards the camera's backchannel; `false` and null when\nthe last answer did not negotiate it, and the counters zero until\none of the session's answers does."
         },
         "dtls": {
           "description": "The DTLS state, as the browser names it.",
@@ -1684,7 +1684,7 @@
       "type": "object"
     },
     "SessionBackchannel": {
-      "description": "A session's talk-back, as `session/get` reports it.\nThe counters are the worker's, pushed once per second, so they may lag\nby that much; `negotiated`, `codec` and `talker` are current.",
+      "description": "A session's talk-back, as `session/get` reports it.\nThe counters are the worker's, pushed once per second, so they may lag\nby that much; `negotiated`, `codec` and `talker` are current. They add\nup over the session's life and never go back: a re-offer that drops\ntalk-back keeps them, and one that adds it again counts on.",
       "properties": {
         "bytes_sent": {
           "default": 0,

@@ -248,8 +248,9 @@ impl SessionManager {
         self.sessions.len()
     }
 
-    /// The talk-back counters of every open session whose answer
-    /// negotiated talk-back, by session id.
+    /// The talk-back counters of every open session an answer of which
+    /// negotiated talk-back, its offer's or a re-offer's, by session id:
+    /// all it counted, also after a re-offer dropped talk-back.
     pub(crate) fn talkback(&mut self) -> Vec<(String, lotse_ipc::TalkbackStats)> {
         self.reap();
         let mut report: Vec<_> = self
@@ -1108,9 +1109,9 @@ async fn open_session(
         }
     };
     let negotiated = engine.talkback();
-    ctx.talkback
-        .negotiated
-        .store(negotiated.is_some(), Ordering::Relaxed);
+    if negotiated.is_some() {
+        ctx.talkback.ever_negotiated.store(true, Ordering::Relaxed);
+    }
     ctx.emit(IpcEvent::Answer {
         sdp: answer,
         talkback: negotiated.map(|codec| codec.name().to_owned()),
@@ -1153,10 +1154,12 @@ async fn renegotiate(ctx: &SessionCtx, opened: &mut Opened, sdp: &str) {
             {
                 talkback.let_go();
             }
+            // A session that drops talk-back stays reported, with what
+            // it counted so far.
             let negotiated = opened.engine.talkback();
-            ctx.talkback
-                .negotiated
-                .store(negotiated.is_some(), Ordering::Relaxed);
+            if negotiated.is_some() {
+                ctx.talkback.ever_negotiated.store(true, Ordering::Relaxed);
+            }
             let talkback = negotiated.map(lotse_core::uplink::UplinkCodec::name);
             tracing::info!(talkback, "re-offer answered");
             ctx.emit(IpcEvent::Renegotiated {
@@ -1906,7 +1909,7 @@ mod tests {
             }]
         );
         assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
-        assert!(a.talkback.negotiated.load(Ordering::Relaxed));
+        assert!(a.talkback.ever_negotiated.load(Ordering::Relaxed));
 
         // b asks too: declined, after its answer.
         let (mut b, task) = session_on(
@@ -1934,7 +1937,7 @@ mod tests {
                 },
             ]
         );
-        assert!(!b.talkback.negotiated.load(Ordering::Relaxed));
+        assert!(!b.talkback.ever_negotiated.load(Ordering::Relaxed));
         // b's packets go nowhere, and are counted.
         b.script.then(uplink(b.clock.now()));
         b.control(Control::Candidate("candidate:x".into()));
@@ -1991,7 +1994,10 @@ mod tests {
             }]
         );
         assert_eq!(change(&mut feed).await, ("a".into(), "renegotiated"));
-        assert!(!a.talkback.negotiated.load(Ordering::Relaxed));
+        assert!(
+            a.talkback.ever_negotiated.load(Ordering::Relaxed),
+            "still reported, with what it counted"
+        );
         b.control(reoffer("v=0 talk"));
         assert!(poll_once(&mut b_task).await.is_pending());
         assert!(b.script.called("renegotiate v=0 talk claim=Granted"));
@@ -2003,7 +2009,7 @@ mod tests {
             }]
         );
         assert_eq!(change(&mut feed).await, ("b".into(), "claimed"));
-        assert!(b.talkback.negotiated.load(Ordering::Relaxed));
+        assert!(b.talkback.ever_negotiated.load(Ordering::Relaxed));
         // a asks again while b holds it: declined, after the answer.
         a.control(reoffer("v=0 talk"));
         assert!(poll_once(&mut a_task).await.is_pending());
@@ -2032,7 +2038,7 @@ mod tests {
                 message: "invalid re-offer: refused by the script".into(),
             }]
         );
-        assert!(b.talkback.negotiated.load(Ordering::Relaxed));
+        assert!(b.talkback.ever_negotiated.load(Ordering::Relaxed));
         // b lets go; a's refused re-offer claimed first, and lets go again.
         b.control(reoffer("v=0"));
         assert!(poll_once(&mut b_task).await.is_pending());
@@ -2468,7 +2474,7 @@ mod tests {
         assert!(m.manager.talkback().is_empty(), "none negotiated");
         for id in ["b", "a"] {
             let stats = &m.manager.sessions[id].talkback;
-            stats.negotiated.store(true, Ordering::Relaxed);
+            stats.ever_negotiated.store(true, Ordering::Relaxed);
         }
         let b = &m.manager.sessions["b"].talkback;
         b.packets_received.store(2, Ordering::Relaxed);

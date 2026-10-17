@@ -1866,8 +1866,15 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
     assert_eq!(api.talker_changes().len(), 5, "{:?}", api.stream_seen);
     assert_eq!(api.stream().await["backchannel"]["talker"], "b");
     // b's re-offer drops talk-back: let go, and a viewer that never
-    // offered talk-back takes it with its re-offer.
-    b.peer.mute();
+    // offered talk-back takes it with its re-offer. What b counted, once
+    // its last packets are through, stays in `session/get` after the
+    // stats pushes that follow: the counters never go back.
+    let b_mic = b.peer.mute();
+    pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(300)).await;
+    let counted = session_where(&mut api, &mut [&mut a, &mut b], "b", |bc| {
+        bc["packets_received"].as_u64() == Some(u64::from(b_mic.index))
+    })
+    .await;
     b.renegotiate(&api, Reoffer::Drop).await;
     pump(&mut api, &mut [&mut a, &mut b], |api, _| {
         api.talker_changes().len() >= 6
@@ -1877,7 +1884,20 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         api.talker_changes()[5],
         ("b".to_owned(), "renegotiated".to_owned(), Value::Null)
     );
-    assert_eq!(api.session("b").await["backchannel"]["negotiated"], false);
+    pump_for(
+        &mut api,
+        &mut [&mut a, &mut b],
+        lotse_worker::STATS_INTERVAL * 3,
+    )
+    .await;
+    assert_eq!(
+        api.session("b").await["backchannel"],
+        json!({ "negotiated": false, "talker": false, "codec": null,
+                "packets_received": counted["packets_received"],
+                "packets_dropped_busy": counted["packets_dropped_busy"],
+                "bytes_sent": counted["bytes_sent"] })
+    );
+    assert!(counted["bytes_sent"].as_u64().unwrap() > 0, "{counted}");
     let mut c = ApiPeer::offer_silent(&api, "c").await;
     pump(&mut api, &mut [&mut a, &mut b, &mut c], |_, peers| {
         peers[2].peer.viewer.is_connected()

@@ -203,15 +203,18 @@ pub struct Session {
     pub orphaned: bool,
     /// When the offer arrived, RFC 3339 UTC.
     pub since: String,
-    /// Talk-back towards the camera's backchannel; all zero and `false`
-    /// when the answer did not negotiate it.
+    /// Talk-back towards the camera's backchannel; `false` and null when
+    /// the last answer did not negotiate it, and the counters zero until
+    /// one of the session's answers does.
     #[serde(default)]
     pub backchannel: SessionBackchannel,
 }
 
 /// A session's talk-back, as `session/get` reports it.
 /// The counters are the worker's, pushed once per second, so they may lag
-/// by that much; `negotiated`, `codec` and `talker` are current.
+/// by that much; `negotiated`, `codec` and `talker` are current. They add
+/// up over the session's life and never go back: a re-offer that drops
+/// talk-back keeps them, and one that adds it again counts on.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SessionBackchannel {
     /// The answer accepted the browser's talk-back m-line (`recvonly`, or

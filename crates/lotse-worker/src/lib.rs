@@ -1981,12 +1981,34 @@ mod tests {
         // A re-offer that drops talk-back lets go; one the engine refuses
         // is refused; one for no session is refused too.
         h.tx.send_msg(&renegotiate("b", "v=0"), &[]).await.unwrap();
+        // Answered without talk-back, b stays in the stats with all it
+        // counted: `session/get`'s counters never go back.
         let let_go = |seen: &[ToSupervisor]| {
             seen.iter().any(|message| {
                 matches!(message, ToSupervisor::Talker(change) if change.reason == "renegotiated")
+            }) && session_events(seen).any(|(session, event)| {
+                session == "b" && matches!(event, SessionEvent::Renegotiated { talkback: None, .. })
             })
         };
         seen.extend(messages_until(&mut h, let_go).await);
+        let pushed = messages_until(&mut h, |seen| {
+            seen.iter()
+                .any(|message| matches!(message, ToSupervisor::Stats(_)))
+        })
+        .await;
+        let_assert!(Some(ToSupervisor::Stats(stats)) = pushed.last());
+        assert_eq!(
+            stats.talkback,
+            [(
+                "b".to_owned(),
+                lotse_ipc::TalkbackStats {
+                    packets_received: 6,
+                    packets_dropped_busy: 3,
+                    bytes_sent: 3,
+                }
+            )]
+        );
+        seen.extend(pushed);
         h.tx.send_msg(&renegotiate("b", "refuse"), &[])
             .await
             .unwrap();
