@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::task::TaskTracker;
 
 use crate::connect::ConnectPermits;
-use crate::driver::{DriverCommand, DriverSpec};
+use crate::driver::{Demand, DriverCommand, DriverSpec};
 use crate::gather::Relayed;
 use crate::memory::MemoryProbe;
 use crate::millis;
@@ -248,7 +248,7 @@ pub(crate) struct ConnectionEntry {
     /// backchannel ([`State::follow_backchannel`]).
     pub(crate) backchannel: bool,
     /// The demand the driver follows; dropping it stops the driver.
-    pub(crate) demand: watch::Sender<u32>,
+    pub(crate) demand: watch::Sender<Demand>,
     /// What the driver last reported.
     pub(crate) snapshot: ConnectionSnapshot,
     /// The source switches queued for the driver: until its snapshot
@@ -453,9 +453,18 @@ impl State {
             .values()
             .filter(|session| session.connection == id)
             .count();
-        let demand = u32::try_from(preloads.saturating_add(viewers)).unwrap_or(u32::MAX);
+        let demand = Demand {
+            preloads: u32::try_from(preloads).unwrap_or(u32::MAX),
+            viewers: u32::try_from(viewers).unwrap_or(u32::MAX),
+        };
         if *entry.demand.borrow() != demand {
-            tracing::info!(connection.id = id, demand, "connection demand changed");
+            tracing::info!(
+                connection.id = id,
+                demand = demand.total(),
+                preloads = demand.preloads,
+                viewers = demand.viewers,
+                "connection demand changed"
+            );
             entry.demand.send_replace(demand);
         }
     }
@@ -1549,7 +1558,7 @@ mod tests {
     #[test]
     fn demand_counts_each_preloaded_stream_and_each_viewer_of_the_connection() {
         let mut state = State::default();
-        let (demand, rx) = watch::channel(0);
+        let (demand, rx) = watch::channel(Demand::default());
         let (commands, _commands) = mpsc::channel(1);
         state.connections.insert(
             "c1".into(),
@@ -1572,27 +1581,45 @@ mod tests {
         state.streams.insert("front".into(), stream_on_c1(true));
         state.streams.insert("twin".into(), stream_on_c1(false));
         state.refresh_connection("c1");
-        assert_eq!(*rx.borrow(), 1, "one preloaded stream, no viewers");
+        let demand = |preloads, viewers| Demand { preloads, viewers };
+        assert_eq!(
+            *rx.borrow(),
+            demand(1, 0),
+            "one preloaded stream, no viewers"
+        );
         state.sessions.insert("s1".into(), session_on_c1(1, "twin"));
         state.refresh_connection("c1");
-        assert_eq!(*rx.borrow(), 2, "plus a viewer of the other stream");
+        assert_eq!(
+            *rx.borrow(),
+            demand(1, 1),
+            "plus a viewer of the other stream"
+        );
         // Both streams preloaded: each counts, so turning one off later
         // leaves the connection wanted.
         state.streams.insert("twin".into(), stream_on_c1(true));
         state.refresh_connection("c1");
-        assert_eq!(*rx.borrow(), 3);
+        assert_eq!(*rx.borrow(), demand(2, 1));
+        assert_eq!(rx.borrow().total(), 3);
         state.streams.insert("front".into(), stream_on_c1(false));
         state.streams.insert("twin".into(), stream_on_c1(false));
         state.refresh_connection("c1");
-        assert_eq!(*rx.borrow(), 1, "the viewer alone keeps it wanted");
+        assert_eq!(
+            *rx.borrow(),
+            demand(0, 1),
+            "the viewer alone keeps it wanted"
+        );
         assert!(state.finish_session("s1").is_some());
-        assert_eq!(*rx.borrow(), 0, "no preload, no viewer: no demand");
+        assert_eq!(
+            *rx.borrow(),
+            demand(0, 0),
+            "no preload, no viewer: no demand"
+        );
         // A stream that left the connection no longer counts; with none
         // left the connection is released, which stops its driver.
         state.streams.insert("front".into(), stream_on_c1(true));
         state.streams.remove("twin");
         state.refresh_connection("c1");
-        assert_eq!(*rx.borrow(), 1);
+        assert_eq!(*rx.borrow(), demand(1, 0));
         assert_eq!(
             state.connections["c1"].streams,
             BTreeSet::from(["front".to_owned()])
@@ -1616,7 +1643,7 @@ mod tests {
     )]
     fn a_talker_change_reaches_every_stream_on_the_connection_and_its_sessions() {
         let mut state = State::default();
-        let (demand, _demand) = watch::channel(0);
+        let (demand, _demand) = watch::channel(Demand::default());
         let (commands, _commands) = mpsc::channel(1);
         state.connections.insert(
             "c1".into(),
@@ -1867,7 +1894,7 @@ mod tests {
     #[test]
     fn onvif_5_3_a_source_reports_the_backchannel_its_live_connection_offers() {
         let mut state = State::default();
-        let (demand, _demand) = watch::channel(0);
+        let (demand, _demand) = watch::channel(Demand::default());
         let (commands, _commands) = mpsc::channel(1);
         state.connections.insert(
             "c1".into(),
@@ -1929,7 +1956,7 @@ mod tests {
     /// command, and its session `s1` (serial 1), gathering `gathers`.
     fn relay_state(gathers: usize) -> (State, mpsc::Receiver<DriverCommand>) {
         let mut state = State::default();
-        let (demand, _demand) = watch::channel(0);
+        let (demand, _demand) = watch::channel(Demand::default());
         let (commands, rx) = mpsc::channel(1);
         state.connections.insert(
             "c1".into(),
@@ -1995,7 +2022,7 @@ mod tests {
         let captured = Captured::default();
         let _logs = captured.install();
         let mut state = State::default();
-        let (demand, _demand) = watch::channel(0);
+        let (demand, _demand) = watch::channel(Demand::default());
         let (commands, mut rx) = mpsc::channel(1);
         let key = ConnectionKey {
             url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
@@ -2179,7 +2206,7 @@ mod tests {
         let captured = Captured::default();
         let _logs = captured.install();
         let mut state = State::default();
-        let (demand, _demand) = watch::channel(0);
+        let (demand, _demand) = watch::channel(Demand::default());
         let (commands, _commands) = mpsc::channel(1);
         state.connections.insert(
             "c1".into(),
