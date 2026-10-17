@@ -308,10 +308,11 @@ mod tests {
     )]
 
     use std::sync::Arc;
+    use std::time::Instant;
 
     use lotse_core::clock::{Clock as _, SystemClock};
     use lotse_core::source_url::SourceUrl;
-    use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel};
+    use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel, ConnectionLog};
     use lotse_testing::{CameraConfig, FakeCamera};
 
     use super::*;
@@ -380,28 +381,31 @@ mod tests {
             run(camera_at(&cam), close.clone(), opened, on_loss),
         );
         let deadline = SystemClock.now() + Duration::from_secs(5);
-        while !cam
-            .stats()
-            .connection_log()
-            .first()
-            .is_some_and(|log| log.played)
-        {
-            assert!(SystemClock.now() < deadline, "never played");
-            SystemClock.sleep(Duration::from_millis(5)).await;
-        }
+        first_logged(&cam, deadline, |log| log.played).await;
         close.cancel();
         session.await.unwrap();
+        let log = first_logged(&cam, deadline, |log| log.closed).await;
+        assert!(log.played, "{log:?}");
+        assert_eq!(log.teardown, Some(true), "{log:?}");
+        assert!(log.closed_by_client, "{log:?}");
+        cam.stop().await;
+    }
+
+    /// What `cam` logged of its first connection once `done` holds for
+    /// it, before `deadline`: one wait for every step of a test, so its
+    /// polling runs whichever step has to wait.
+    async fn first_logged(
+        cam: &FakeCamera,
+        deadline: Instant,
+        done: impl Fn(&ConnectionLog) -> bool,
+    ) -> ConnectionLog {
         loop {
             let log = cam.stats().connection_log();
-            if log.first().is_some_and(|log| log.closed) {
-                assert!(log[0].played, "{log:?}");
-                assert_eq!(log[0].teardown, Some(true), "{log:?}");
-                assert!(log[0].closed_by_client, "{log:?}");
-                break;
+            if let Some(first) = log.first().filter(|first| done(first)) {
+                return first.clone();
             }
             assert!(SystemClock.now() < deadline, "{log:?}");
             SystemClock.sleep(Duration::from_millis(5)).await;
         }
-        cam.stop().await;
     }
 }
