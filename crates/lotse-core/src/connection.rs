@@ -33,6 +33,8 @@ pub enum ConnectionState {
     /// An attempt failed; the worker waits out the reconnect delay.
     Backoff,
     /// Demand dropped to zero; the linger timer runs before the worker stops.
+    /// The worker keeps reporting, and new demand resumes the state its
+    /// reports since leaving `Live` lead to.
     Draining,
     /// The worker crashed; the crash-backoff timer runs before a new one.
     Restarting,
@@ -163,6 +165,11 @@ pub struct ConnectionMachine {
     /// The `Backoff` under way follows a live source that dropped, not an
     /// attempt that failed: the source may well come back.
     dropped: bool,
+    /// While `Draining`, the state the worker's reports since leaving
+    /// `Live` lead to, which new demand resumes: `Live` until one says
+    /// otherwise, and only ever `Live`, `Connecting`, `Reconnecting` or
+    /// `Backoff`.
+    resume: ConnectionState,
     /// Worker crashes so far, for `stream/get`.
     crashes: u32,
 }
@@ -179,6 +186,7 @@ impl ConnectionMachine {
             worker_since: None,
             last_error: None,
             dropped: false,
+            resume: ConnectionState::Live,
             crashes: 0,
         }
     }
@@ -282,11 +290,12 @@ impl ConnectionMachine {
             ) => self.stop_worker(actions),
             (ConnectionState::Live, false) => {
                 actions.push(Action::StartLinger(self.config.linger));
+                self.resume = ConnectionState::Live;
                 self.state = ConnectionState::Draining;
             }
             (ConnectionState::Draining, true) => {
                 actions.push(Action::CancelLinger);
-                self.state = ConnectionState::Live;
+                self.state = self.resume;
             }
             (ConnectionState::Restarting, false) => {
                 actions.push(Action::CancelCrashBackoff);
@@ -304,9 +313,19 @@ impl ConnectionMachine {
         }
     }
 
-    /// The worker reported. Reports while no worker is wanted are stale.
+    /// The worker reported. Reports while no worker is wanted are stale;
+    /// while `Draining` they move the state new demand resumes, as they
+    /// would move the state with demand, so a drop or a failed retry during
+    /// the linger is not resumed as `Live`.
     fn on_report(&mut self, report: WorkerReport) {
         use ConnectionState as S;
+        if self.state == S::Draining {
+            self.state = self.resume;
+            self.on_report(report);
+            self.resume = self.state;
+            self.state = S::Draining;
+            return;
+        }
         match (self.state, report) {
             (S::Connecting | S::Reconnecting | S::Backoff, WorkerReport::Live) => {
                 self.last_error = None;
@@ -327,17 +346,9 @@ impl ConnectionMachine {
                 self.dropped = from == S::Live;
                 self.state = S::Backoff;
             }
-            (
-                S::Draining,
-                WorkerReport::Reconnecting(error) | WorkerReport::Backoff { error, .. },
-            ) => {
-                self.last_error = Some(ConnectionError::Source(error));
-            }
-            (S::Draining, WorkerReport::Live) => {
-                self.last_error = None;
-            }
-            (S::Idle | S::Restarting, _)
-            | (S::Connecting | S::Live | S::Draining, WorkerReport::Connecting)
+            // `Draining` is handled above, on the state it resumes.
+            (S::Idle | S::Restarting | S::Draining, _)
+            | (S::Connecting | S::Live, WorkerReport::Connecting)
             | (S::Live, WorkerReport::Live)
             | (S::Connecting | S::Backoff, WorkerReport::Reconnecting(_))
             | (S::Backoff, WorkerReport::Backoff { .. }) => {}
@@ -406,7 +417,7 @@ mod tests {
     )]
 
     use super::*;
-    use crate::clock::{Clock as _, SystemClock};
+    use crate::clock::{Clock as _, FakeClock, SystemClock};
 
     use ConnectionState as S;
 
@@ -627,6 +638,99 @@ mod tests {
             m.handle(Input::LingerExpired, now).is_empty(),
             "stale timer"
         );
+    }
+
+    #[test]
+    fn demand_during_the_linger_resumes_what_the_worker_last_reported() {
+        let clock = FakeClock::default();
+        let backoff = |error| {
+            Input::Report(WorkerReport::Backoff {
+                error,
+                retry_in: Duration::from_secs(1),
+            })
+        };
+        let draining = || {
+            let mut m = machine();
+            m.handle(Input::Demand(1), clock.now());
+            m.handle(Input::Report(WorkerReport::Live), clock.now());
+            m.handle(Input::Demand(0), clock.now());
+            assert_eq!(m.state(), S::Draining);
+            m
+        };
+
+        // The source dropped and is being retried at once: no failure yet.
+        let mut m = draining();
+        m.handle(
+            Input::Report(WorkerReport::Reconnecting(timeout())),
+            clock.now(),
+        );
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            m.handle(Input::Demand(1), clock.now()),
+            [Action::CancelLinger]
+        );
+        assert_eq!(m.state(), S::Reconnecting);
+        assert_eq!(m.failure(), None);
+        // The retry fails: the failure a waiting viewer closes with.
+        m.handle(backoff(SourceError::Ended("eof".into())), clock.now());
+        assert_eq!(m.state(), S::Backoff);
+        assert_eq!(m.failure().map(ConnectionError::code), Some("source_ended"));
+        // It recovers; the next linger starts from live again.
+        m.handle(Input::Report(WorkerReport::Connecting), clock.now());
+        m.handle(Input::Report(WorkerReport::Live), clock.now());
+        m.handle(Input::Demand(0), clock.now());
+        assert_eq!(
+            m.handle(Input::Demand(1), clock.now()),
+            [Action::CancelLinger]
+        );
+        assert_eq!(m.state(), S::Live);
+
+        // The retry already failed during the linger.
+        let mut m = draining();
+        m.handle(
+            Input::Report(WorkerReport::Reconnecting(timeout())),
+            clock.now(),
+        );
+        m.handle(backoff(SourceError::Ended("eof".into())), clock.now());
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            m.handle(Input::Demand(1), clock.now()),
+            [Action::CancelLinger]
+        );
+        assert_eq!(m.state(), S::Backoff);
+        assert_eq!(m.failure().map(ConnectionError::code), Some("source_ended"));
+
+        // The source dropped straight into a delay: a drop, no failure.
+        let mut m = draining();
+        m.handle(backoff(timeout()), clock.now());
+        m.handle(Input::Demand(1), clock.now());
+        assert_eq!(m.state(), S::Backoff);
+        assert_eq!(
+            m.last_error().map(ConnectionError::code),
+            Some("source_timeout")
+        );
+        assert_eq!(m.failure(), None, "a drop");
+        // Its retry is under way.
+        let mut m = draining();
+        m.handle(backoff(timeout()), clock.now());
+        m.handle(Input::Report(WorkerReport::Connecting), clock.now());
+        m.handle(Input::Demand(1), clock.now());
+        assert_eq!(m.state(), S::Connecting);
+        assert_eq!(m.failure(), None);
+
+        // The source came back during the linger: live again.
+        let mut m = draining();
+        m.handle(
+            Input::Report(WorkerReport::Reconnecting(timeout())),
+            clock.now(),
+        );
+        m.handle(Input::Report(WorkerReport::Live), clock.now());
+        assert_eq!(
+            m.handle(Input::Demand(1), clock.now()),
+            [Action::CancelLinger]
+        );
+        assert_eq!(m.state(), S::Live);
+        assert_eq!(m.last_error(), None);
     }
 
     #[test]
