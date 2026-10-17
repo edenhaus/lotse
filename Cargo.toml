@@ -66,7 +66,8 @@ toml = { version = "0.9", default-features = false, features = ["std", "parse", 
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
 # Ergonomic error context at the top level only: `anyhow` never leaves `main` (AGENTS.md).
 anyhow = { version = "1", default-features = false, features = ["std"] }
-# JSON Schema 2020-12 for every control API message, generated from the DTOs and committed.
+# JSON Schema 2020-12 for every control API message, generated from the DTOs and committed; behind
+# lotse-api-types' `schema` feature, so the daemon, which serves the committed bundle, links none of it.
 schemars = { version = "1", default-features = false, features = ["std", "derive"] }
 # The control API server: HTTP/1.1 with the WebSocket upgrade on the Unix socket; also the dev
 # viewer's pages and relay in `lotse-testing`.

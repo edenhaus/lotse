@@ -4,18 +4,20 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 
 /// One entry of `stream/put`'s `sources`.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SourceSpec {
     /// The source URL, credentials included; redacted everywhere it is
     /// reported.
-    #[schemars(length(max = crate::limits::MAX_URL_CHARS))]
+    #[cfg_attr(feature = "schema", schemars(length(max = crate::limits::MAX_URL_CHARS)))]
     pub url: String,
     /// Per-scheme options, typed by the scheme's factory; unknown fields
     /// there are rejected too.
@@ -56,7 +58,8 @@ fn redact_unparsed(url: &str) -> String {
 }
 
 /// `stream/put`'s `audio`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AudioMode {
     /// Audio when the source has it.
@@ -73,7 +76,8 @@ pub enum AudioMode {
 /// whose browser offered the video orientation extension carries it to
 /// the browser, which turns the picture; others get it as the camera
 /// sends it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Orientation {
     /// 1: as the camera sends it.
@@ -114,7 +118,8 @@ impl Orientation {
 }
 
 /// The connection state a stream shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StreamState {
     /// No demand, no worker.
@@ -149,7 +154,8 @@ impl StreamState {
 }
 
 /// The last error of a stream, or the connection it reads from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct LastError {
     /// The error.
     #[serde(flatten)]
@@ -159,7 +165,8 @@ pub struct LastError {
 }
 
 /// The worker running a connection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct WorkerInfo {
     /// Its process id.
     pub pid: u32,
@@ -173,7 +180,8 @@ pub struct WorkerInfo {
 
 /// The upstream connection behind a source: the stream's own, since a
 /// source URL belongs to one stream (`source_in_use`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct ConnectionInfo {
     /// The connection's id.
     pub id: String,
@@ -182,7 +190,8 @@ pub struct ConnectionInfo {
 }
 
 /// A source as `stream/get` reports it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct SourceInfo {
     /// The URL redacted to its origin, `scheme://[****@]host[:port]`, then
     /// `/****` when the path is anything but empty or `/` and `?****` when
@@ -216,7 +225,8 @@ pub struct SourceInfo {
 /// A source's backchannel as `stream/get` reports it: the camera's reverse
 /// audio path (an RTSP camera's ONVIF backchannel, ONVIF Streaming
 /// Specification §5.3), one per connection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct SourceBackchannel {
     /// The codec the camera takes (`pcmu`, `pcma`, `opus`); a viewer's
     /// talk-back in another codec is transcoded to it.
@@ -226,7 +236,8 @@ pub struct SourceBackchannel {
 }
 
 /// Whether a session holds a source's backchannel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BackchannelState {
     /// Nobody talks and no camera session of it is open: the next offer
@@ -238,7 +249,8 @@ pub enum BackchannelState {
 }
 
 /// A track as `stream/get` reports it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct TrackInfo {
     /// `v0`, `a0`, `a1`.
     pub id: String,
@@ -262,7 +274,7 @@ pub struct TrackInfo {
     /// six lowercase hex digits, as an SDP `fmtp` spells them (`42e01f`).
     /// Absent on other codecs, and until the camera sent its SPS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(pattern = r"^[0-9a-f]{6}$"))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = r"^[0-9a-f]{6}$")))]
     pub profile_level_id: Option<String>,
     /// A video track's picture width in pixels, cropping applied (ISO/IEC
     /// 14496-10 §7.4.2.1.1, ITU-T H.265 §7.4.3.2.1). Absent on audio and
@@ -291,7 +303,8 @@ pub struct TrackInfo {
 }
 
 /// A stream's counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct StreamStats {
     /// Frames dropped as oversize.
     #[serde(default)]
@@ -338,7 +351,8 @@ pub struct StreamStats {
 }
 
 /// A stream, as `stream/get` returns it and `stream/list` lists it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Stream {
     /// The id.
     pub stream_id: String,
@@ -366,7 +380,8 @@ pub struct Stream {
 /// The talker of a stream's backchannel, as `stream/get` reports it.
 /// A camera has one backchannel, held by its source connection, so streams
 /// that share the connection report the same talker.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct StreamBackchannel {
     /// The session holding the backchannel, or null when it is free.
     #[serde(default)]
@@ -378,7 +393,8 @@ pub struct StreamBackchannel {
 }
 
 /// Why a stream's talker changed: the `reason` of `talker_changed`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TalkerReason {
     /// A session's offer (`webrtc/offer` or `webrtc/renegotiate`) asked
@@ -433,7 +449,8 @@ impl TalkerReason {
 }
 
 /// `backchannel/release`'s result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct BackchannelReleaseResult {
     /// The session that held the backchannel when the command arrived, as
     /// the worker last reported it; null when it was free. A
@@ -446,14 +463,16 @@ pub struct BackchannelReleaseResult {
 }
 
 /// `stream/list`'s result.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct StreamList {
     /// Every stream by id.
     pub streams: BTreeMap<String, Stream>,
 }
 
 /// `stream/put`'s result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct StreamPutResult {
     /// The stream did not exist before.
     pub created: bool,
@@ -461,11 +480,12 @@ pub struct StreamPutResult {
 
 /// An event of `stream/subscribe`.
 /// Each variant's schema title names the Python client's class for it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     /// The stream's state, first as it is, then on every change.
-    #[schemars(title = "StreamEventStream")]
+    #[cfg_attr(feature = "schema", schemars(title = "StreamEventStream"))]
     Stream {
         /// The stream.
         stream_id: String,
@@ -475,7 +495,7 @@ pub enum StreamEvent {
         last_error: Option<LastError>,
     },
     /// The stream was deleted.
-    #[schemars(title = "StreamEventStreamRemoved")]
+    #[cfg_attr(feature = "schema", schemars(title = "StreamEventStreamRemoved"))]
     StreamRemoved {
         /// The stream.
         stream_id: String,
@@ -487,7 +507,7 @@ pub enum StreamEvent {
     /// burst of changes faster than the daemon passes them on may reach
     /// the subscribers as fewer, the last one naming the talker there is
     /// then.
-    #[schemars(title = "StreamEventTalkerChanged")]
+    #[cfg_attr(feature = "schema", schemars(title = "StreamEventTalkerChanged"))]
     TalkerChanged {
         /// The stream.
         stream_id: String,

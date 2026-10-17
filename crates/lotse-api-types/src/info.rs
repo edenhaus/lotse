@@ -2,13 +2,15 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::stream::StreamStats;
 
 /// How the daemon was built.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct BuildInfo {
     /// The target triple.
     pub target: String,
@@ -19,7 +21,8 @@ pub struct BuildInfo {
 }
 
 /// The codecs the daemon can carry.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Codecs {
     /// Video codec names.
     pub video: Vec<String>,
@@ -28,7 +31,8 @@ pub struct Codecs {
 }
 
 /// The limits in force.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Limits {
     /// Streams.
     pub max_streams: u32,
@@ -43,7 +47,8 @@ pub struct Limits {
 }
 
 /// The Landlock layers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct LandlockInfo {
     /// Filesystem rules: `enforced`, `unavailable` or `off`.
     pub fs: String,
@@ -55,7 +60,8 @@ pub struct LandlockInfo {
 
 /// The hardening layers of the supervisor, so a client can warn the user
 /// when one is missing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct SandboxInfo {
     /// `on`, `require` or `off`.
     pub mode: String,
@@ -75,7 +81,8 @@ pub struct SandboxInfo {
 }
 
 /// `info`'s result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct InfoResult {
     /// The daemon version.
     pub version: String,
@@ -99,7 +106,8 @@ pub struct InfoResult {
 /// Memory is read by the supervisor from the kernel, never reported by a
 /// worker; `None` where the platform has no `/proc` (macOS) or the process
 /// is gone.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct ProcessMetrics {
     /// The process id.
     pub pid: u32,
@@ -118,7 +126,8 @@ pub struct ProcessMetrics {
 
 /// The supervisor's demux counters: what the receive thread did with each
 /// datagram on the shared UDP socket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct DemuxMetrics {
     /// Datagrams read.
     pub received: u64,
@@ -144,7 +153,8 @@ pub struct DemuxMetrics {
 }
 
 /// The supervisor process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct SupervisorMetrics {
     /// Its process figures.
     #[serde(flatten)]
@@ -154,7 +164,8 @@ pub struct SupervisorMetrics {
 }
 
 /// One worker process: the one running a source connection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct WorkerMetrics {
     /// Its process figures; the uptime counts from this worker's start, a
     /// restart starts it again.
@@ -173,7 +184,8 @@ pub struct WorkerMetrics {
 }
 
 /// `metrics/get`'s result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Metrics {
     /// The supervisor.
     pub supervisor: SupervisorMetrics,

@@ -592,7 +592,7 @@ impl<H: Handler> Connection<H> {
             | Command::ClientsRemove(_)) => self.listener_command(command),
             Command::Schema(_) => self.send(
                 Class::Signaling,
-                &Success::new(id, lotse_api_types::schema::bundle()),
+                &Success::new(id, lotse_api_types::schema::committed()),
             ),
             Command::Unsubscribe(unsubscribe) => {
                 match self.subscriptions.remove(&unsubscribe.subscription) {
