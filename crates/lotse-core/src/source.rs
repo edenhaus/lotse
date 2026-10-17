@@ -520,18 +520,35 @@ async fn take_turn(
     }
 }
 
-/// What a slot holds: the backchannel the last probe found, and whether a
-/// probe runs now.
+/// What a slot holds: the backchannel the last probe found, whether a
+/// probe runs now, and whether the connection asks for the backchannel.
 #[derive(Debug, Clone, Default)]
 struct Probed {
-    /// The backchannel found, until a probe finds none.
+    /// The backchannel found, until a probe finds none or the connection
+    /// stops asking.
     offer: Option<BackchannelOffer>,
-    /// A probe runs: with nothing offered before it, a claim waits for
-    /// its result ([`BackchannelSlot::awaits_probe`]).
+    /// A probe runs, or is due: with nothing offered before it, a claim
+    /// waits for its result ([`BackchannelSlot::awaits_probe`]).
     probing: bool,
-    /// The mark of the last probe started ([`BackchannelSlot::probing`]):
-    /// only that probe settles or abandons the slot.
+    /// The mark of the last probe started ([`BackchannelSlot::probing`]),
+    /// or of the probe due once the connection asked
+    /// ([`BackchannelSlot::ask`]): only that probe settles or abandons the
+    /// slot.
     latest: u64,
+    /// Whether the connection asks for the backchannel, once it said
+    /// ([`BackchannelSlot::ask`]); `None` until then, when the source's own
+    /// option decides.
+    asked: Option<bool>,
+    /// How many times the connection's ask changed, so the source sees
+    /// every change, one that a later one undid included.
+    changes: u64,
+    /// The connection attempt whose probe follows the slot now, counted
+    /// by [`BackchannelSlot::asks`]: only it starts or forgoes the probe
+    /// due. An attempt's follower is aborted when the attempt ends, but an
+    /// abort only asks, so one that took an ask may go on deciding on it
+    /// after the next attempt started; counted here, its decision is
+    /// refused rather than undoing the next attempt's.
+    attempt: u64,
 }
 
 impl Probed {
@@ -540,24 +557,70 @@ impl Probed {
     const fn runs(&self, mark: ProbeMark) -> bool {
         self.probing && self.latest == mark.0
     }
+
+    /// Why the attempt `asks` follows for may no longer decide on the
+    /// probe due: a later attempt follows the slot now, or the
+    /// connection's ask changed since that attempt saw it. `None` while
+    /// its decision stands.
+    const fn stale(&self, asks: &Asks) -> Option<Stale> {
+        if self.attempt != asks.attempt {
+            return Some(Stale::Superseded);
+        }
+        if self.changes != asks.seen {
+            return Some(Stale::Changed);
+        }
+        None
+    }
+
+    /// Takes a probe's result, `found` (`Some`, offered or replaced) or
+    /// none (`None`, withdrawn): no probe runs after it. One found once the
+    /// connection stopped asking for the backchannel
+    /// ([`BackchannelSlot::ask`]) is dropped: the opt-out withdrew the
+    /// offer, and it is not the result of a probe the connection wants.
+    fn take(&mut self, found: Option<BackchannelOffer>) {
+        self.probing = false;
+        if self.asked == Some(false) && found.is_some() {
+            tracing::debug!(
+                "backchannel offer dropped: the connection no longer asks for the backchannel"
+            );
+            return;
+        }
+        self.offer = found;
+    }
+}
+
+/// Why a connection attempt may no longer decide on the probe its slot
+/// has due ([`Probed::stale`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stale {
+    /// A later connection attempt follows the slot now
+    /// ([`BackchannelSlot::asks`]): its decision stands.
+    Superseded,
+    /// The connection's ask changed since the attempt saw it: the newer
+    /// ask's decision, which the attempt sees next, stands.
+    Changed,
 }
 
 /// A probe's mark on its slot ([`BackchannelSlot::probing`]), with which
 /// it settles or abandons the slot: once a later probe has marked it, an
 /// earlier one's result or end changes nothing. A probe a connection
 /// attempt aborts ends when its task is next polled, which may be after
-/// the next attempt's probe started.
+/// the next attempt's probe started; and the attempt's follower, aborted
+/// as well, takes no mark once the next attempt started
+/// ([`BackchannelSlot::asks`]), so none it holds is newer than that one's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeMark(u64);
 
 /// The slot a source fills when its probe found the device's backchannel,
 /// and where the probe waits for a connect permit. Shared with the
-/// connection, which arbitrates the talker and opens the backchannel for
-/// it. An offer stands until a probe finds none: a reconnect of the
-/// source keeps it, and the next probe replaces it.
+/// connection, which arbitrates the talker, opens the backchannel for it,
+/// and turns the probe on and off as its streams opt in and out
+/// ([`BackchannelSlot::ask`]). An offer stands until a probe finds none or
+/// the connection stops asking: a reconnect of the source keeps it, and
+/// the next probe replaces it.
 #[derive(Debug, Clone, Default)]
 pub struct BackchannelSlot {
-    /// What the probes found.
+    /// What the probes found, and what the connection asks.
     probed: Arc<watch::Sender<Probed>>,
     /// Where a probe waits for a connect permit; [`ProbeGate::default`]
     /// lets every probe through, for a source outside a worker.
@@ -589,6 +652,61 @@ impl BackchannelSlot {
         &self.probes
     }
 
+    /// The connection asks for the device's backchannel from now on
+    /// (`asked`: a stream on it opted in), or no longer (the last one
+    /// opted out), without restarting the source, which follows it
+    /// ([`BackchannelSlot::asks`]). Asked now, a probe is due: unless an
+    /// offer stands, a claim waits for it from now on
+    /// ([`BackchannelSlot::awaits_probe`]), whether the source probes at
+    /// once or at its next connect. Not asked any more, what was offered
+    /// is withdrawn, and a probe still running offers nothing. Either way
+    /// the probes marked before no longer settle the slot. Returns whether
+    /// it changed: a slot that never was told changes either way, as the
+    /// source's own option decided so far.
+    pub fn ask(&self, asked: bool) -> bool {
+        self.probed.send_if_modified(|probed| {
+            if probed.asked == Some(asked) {
+                return false;
+            }
+            probed.asked = Some(asked);
+            probed.changes = probed.changes.wrapping_add(1);
+            probed.latest = probed.latest.wrapping_add(1);
+            probed.probing = asked;
+            if !asked {
+                probed.offer = None;
+            }
+            true
+        })
+    }
+
+    /// Follows whether the connection asks for the device's backchannel,
+    /// for the probe of a connection attempt that starts now: its changes
+    /// from now on. The attempt supersedes the one before: that one no
+    /// longer starts or forgoes a probe on the slot
+    /// ([`BackchannelSlot::probing_for`], [`BackchannelSlot::forgo_probe`]),
+    /// whatever it saw, so every mark it holds is older than any this one
+    /// takes, and its probe's end or result changes nothing once this one
+    /// marked the slot ([`BackchannelSlot::settle`]). Until then, a probe
+    /// it started still settles the slot, as nothing else would end the
+    /// wait that probe began.
+    pub fn asks(&self) -> Asks {
+        let mut taken = (0, 0);
+        self.probed.send_modify(|probed| {
+            probed.attempt = probed.attempt.wrapping_add(1);
+            taken = (probed.attempt, probed.changes);
+        });
+        let (attempt, seen) = taken;
+        tracing::debug!(
+            attempt,
+            "backchannel: a connection attempt follows the slot now; the attempts before it no longer start or forgo a probe"
+        );
+        Asks {
+            probed: self.probed.subscribe(),
+            seen,
+            attempt,
+        }
+    }
+
     /// Where the opener of an offer spawns its sessions' tasks.
     pub const fn tasks(&self) -> &BackchannelTasks {
         &self.tasks
@@ -607,17 +725,55 @@ impl BackchannelSlot {
         mark
     }
 
+    /// The probe the connection's ask made due starts, marked as
+    /// [`BackchannelSlot::probing`] marks one, but only while the ask is
+    /// the one `asks` saw last, and `asks` follows for the connection
+    /// attempt that runs now. Once the ask changed since, the probe would
+    /// be for an ask that no longer stands: `None`, and the slot stays as
+    /// it is, awaiting the probe a newer opt-in made due, which the source
+    /// sees next and starts, or settled by a newer opt-out. Once a later
+    /// attempt started ([`BackchannelSlot::asks`]), the probe would be an
+    /// ended attempt's: `None`, and the slot stays as the later attempt
+    /// left it. The check and the mark are one step, so the stale probe
+    /// never holds the mark, and its end never ends the wait a newer ask
+    /// or attempt began.
+    pub fn probing_for(&self, asks: &Asks) -> Option<ProbeMark> {
+        let mut stale = None;
+        let mut mark = None;
+        self.probed.send_if_modified(|probed| {
+            stale = probed.stale(asks);
+            if stale.is_some() {
+                return false;
+            }
+            probed.latest = probed.latest.wrapping_add(1);
+            probed.probing = true;
+            mark = Some(ProbeMark(probed.latest));
+            true
+        });
+        match stale {
+            None => {}
+            Some(Stale::Changed) => tracing::debug!(
+                "backchannel: the probe due is not started, the connection's ask changed since the source saw it; the slot waits for the source to decide on the newer one"
+            ),
+            Some(Stale::Superseded) => tracing::debug!(
+                attempt = asks.attempt,
+                "backchannel: the probe due is not started, its connection attempt ended and a later one follows the slot; that one's decision stands"
+            ),
+        }
+        mark
+    }
+
     /// The probe marked `mark` found `offer` (`Some`, offered or
     /// replaced) or none (`None`, withdrawn), unless a later probe marked
     /// the slot since: its result is discarded then, the later probe's
-    /// stands.
+    /// stands. One found once the connection stopped asking for the
+    /// backchannel ([`BackchannelSlot::ask`]) is dropped.
     pub fn settle(&self, mark: ProbeMark, offer: Option<BackchannelOffer>) {
         let settled = self.probed.send_if_modified(|probed| {
             if !probed.runs(mark) {
                 return false;
             }
-            probed.offer = offer;
-            probed.probing = false;
+            probed.take(offer);
             true
         });
         if !settled {
@@ -628,12 +784,11 @@ impl BackchannelSlot {
         }
     }
 
-    /// The probe found `offer`: offered (or replaced).
+    /// The probe found `offer`: offered (or replaced), unless the
+    /// connection stopped asking for the backchannel meanwhile
+    /// ([`BackchannelSlot::ask`]), whose result it then is not.
     pub fn offer(&self, offer: BackchannelOffer) {
-        self.probed.send_modify(|probed| {
-            probed.offer = Some(offer);
-            probed.probing = false;
-        });
+        self.probed.send_modify(|probed| probed.take(Some(offer)));
     }
 
     /// The probe found none, or failed: withdrawn.
@@ -664,12 +819,46 @@ impl BackchannelSlot {
         }
     }
 
+    /// The probe the connection's ask made due will not run, as the
+    /// source knows the device has no backchannel: claims no longer wait
+    /// for it, and what was offered before stands. Only while the ask is
+    /// the one `asks` saw last, and `asks` follows for the connection
+    /// attempt that runs now: once the ask changed since, a newer ask made
+    /// a probe of its own due, which the source sees next and decides on,
+    /// and claims wait for that decision; once a later attempt started
+    /// ([`BackchannelSlot::asks`]), that attempt decides, and its probe
+    /// may run. The check and the end are one step, so an ask or an
+    /// attempt that comes meanwhile is never undone.
+    pub fn forgo_probe(&self, asks: &Asks) {
+        let mut stale = None;
+        self.probed.send_if_modified(|probed| {
+            stale = probed.stale(asks);
+            if stale.is_some() {
+                return false;
+            }
+            probed.probing = false;
+            true
+        });
+        match stale {
+            None => tracing::debug!(
+                "backchannel: the probe due will not run, the device has no backchannel; claims no longer wait for it"
+            ),
+            Some(Stale::Changed) => tracing::debug!(
+                "backchannel: the probe due will not run, but the connection's ask changed since; the slot waits for the source to decide on the newer one"
+            ),
+            Some(Stale::Superseded) => tracing::debug!(
+                attempt = asks.attempt,
+                "backchannel: the probe due is not forgone, its connection attempt ended and a later one follows the slot; that one's decision stands"
+            ),
+        }
+    }
+
     /// The offered backchannel, if any.
     pub fn current(&self) -> Option<BackchannelOffer> {
         self.probed.borrow().offer.clone()
     }
 
-    /// Whether a probe runs now.
+    /// Whether a probe runs now, or is due.
     pub fn is_probing(&self) -> bool {
         self.probed.borrow().probing
     }
@@ -692,6 +881,45 @@ impl BackchannelSlot {
         // The slot holds the sender, so the wait never fails.
         let settled = probed.wait_for(|probed| !probed.probing).await;
         settled.ok().and_then(|probed| probed.offer.clone())
+    }
+}
+
+/// Whether the connection asks for the device's backchannel, as its slot
+/// says ([`BackchannelSlot::ask`]): what a source's probe follows.
+#[derive(Debug)]
+pub struct Asks {
+    /// The slot's state.
+    probed: watch::Receiver<Probed>,
+    /// The changes of the connection's ask seen so far.
+    seen: u64,
+    /// The connection attempt this follows for
+    /// ([`BackchannelSlot::asks`]).
+    attempt: u64,
+}
+
+impl Asks {
+    /// Whether the connection asks now: `None` until it first said, when
+    /// the source's own option decides.
+    pub fn now(&self) -> Option<bool> {
+        self.probed.borrow().asked
+    }
+
+    /// Waits for the next change of the connection's ask: whether it asks
+    /// then. Every change counts, an opt-in that follows an opt-out the
+    /// source had no time to see included: each asks for a probe.
+    pub async fn next(&mut self) -> bool {
+        let seen = self.seen;
+        // The slot's clones hold the sender, the source's own among them:
+        // the wait ends only with a change.
+        let (now_seen, asked) = self
+            .probed
+            .wait_for(|probed| probed.changes != seen)
+            .await
+            .map_or((seen, false), |probed| {
+                (probed.changes, probed.asked == Some(true))
+            });
+        self.seen = now_seen;
+        asked
     }
 }
 
@@ -1455,6 +1683,66 @@ mod tests {
         assert!(never.as_mut().poll(&mut cx).is_pending(), "a test opener");
     }
 
+    /// The connection turns the probe on and off: an opt-in makes a probe
+    /// due, which a claim waits for; an opt-out withdraws the offer, a
+    /// probe's result after it is dropped, and the source sees every
+    /// change, an undone one included.
+    #[tokio::test]
+    async fn a_connection_turns_its_slot_s_probe_on_and_off() {
+        let slot = BackchannelSlot::default();
+        let mut asks = slot.asks();
+        assert_eq!(asks.now(), None, "the source's option decides");
+        // Never told: an offer stands, and either word is a change.
+        slot.offer(pcmu());
+        assert!(slot.current().is_some());
+        let before = slot.probing();
+        assert!(slot.ask(true));
+        assert!(!slot.ask(true), "no change");
+        assert_eq!(asks.now(), Some(true));
+        assert!(bounded(asks.next()).await, "opted in");
+        assert!(slot.is_probing(), "a probe is due");
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for it");
+        // A probe marked before the opt-in settles nothing: the due one
+        // does.
+        slot.settle(before, None);
+        assert!(slot.is_probing() && slot.current().is_some());
+        let due = slot.probing();
+        slot.settle(due, Some(pcmu()));
+        assert!(bounded(settled).await.unwrap().is_some());
+        // Opted out: withdrawn, nothing due, and a late result dropped.
+        let running = slot.probing();
+        assert!(slot.ask(false));
+        assert!(!bounded(asks.next()).await, "opted out");
+        assert!(slot.current().is_none() && !slot.is_probing());
+        slot.settle(running, Some(pcmu()));
+        assert!(
+            slot.current().is_none(),
+            "the probe it stopped offers nothing"
+        );
+        let late = slot.probing();
+        slot.settle(late, Some(pcmu()));
+        assert!(slot.current().is_none() && !slot.is_probing(), "dropped");
+        slot.probing();
+        slot.offer(pcmu());
+        assert!(slot.current().is_none() && !slot.is_probing(), "dropped");
+        let none = slot.probing();
+        slot.settle(none, None);
+        assert!(slot.current().is_none() && !slot.is_probing());
+        // In and out again before the source looks: both seen as one
+        // change, whose word is the last.
+        assert!(slot.ask(true) && slot.ask(false));
+        assert!(!bounded(asks.next()).await);
+        assert!(slot.ask(true));
+        assert!(bounded(asks.next()).await);
+        // Without a change, the source waits.
+        let mut next = Box::pin(asks.next());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+    }
+
     /// A probe whose aborted task ends only after the next attempt's
     /// probe marked the slot neither abandons nor settles it: a claim
     /// still waits for the later probe, whose result alone settles it.
@@ -1509,6 +1797,130 @@ mod tests {
         assert!(!slot.is_probing());
         assert!(slot.current().is_none());
         assert_eq!(logs.count(Level::DEBUG, DISCARDED), 2);
+    }
+
+    /// A probe due that will not run (the device has no backchannel) ends
+    /// the wait for it, the offer standing, only while the connection's
+    /// ask is the one the source saw: a newer ask's probe stays due, and a
+    /// claim waits, until the source sees that ask and decides on it.
+    #[tokio::test]
+    async fn a_probe_forgone_ends_only_the_ask_the_source_saw() {
+        const FORGONE: &str = "backchannel: the probe due will not run, the device has no backchannel; claims no longer wait for it";
+        const CHANGED: &str = "backchannel: the probe due will not run, but the connection's ask changed since; the slot waits for the source to decide on the newer one";
+        use tracing::Level;
+        let (logs, _guard) = Logs::capture();
+        let slot = BackchannelSlot::default();
+        let mut asks = slot.asks();
+        slot.offer(pcmu());
+        assert!(slot.ask(true));
+        assert!(bounded(asks.next()).await);
+        assert!(slot.is_probing());
+        slot.forgo_probe(&asks);
+        assert!(!slot.is_probing());
+        assert_eq!(
+            slot.current().unwrap().codec,
+            Codec::Pcmu,
+            "the offer stands"
+        );
+        assert_eq!(logs.count(Level::DEBUG, FORGONE), 1);
+        // Out and in again before the source decided: the newer opt-in's
+        // probe stays due.
+        assert!(slot.ask(false) && slot.ask(true));
+        slot.forgo_probe(&asks);
+        assert!(slot.awaits_probe(), "the newer opt-in's probe is due");
+        assert_eq!(logs.count(Level::DEBUG, CHANGED), 1);
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for it");
+        // The source saw it: forgone too.
+        assert!(bounded(asks.next()).await);
+        slot.forgo_probe(&asks);
+        assert!(bounded(settled).await.unwrap().is_none(), "nothing offered");
+        assert_eq!(logs.count(Level::DEBUG, FORGONE), 2);
+        assert_eq!(logs.count(Level::DEBUG, CHANGED), 1);
+    }
+
+    /// A probe due starts, and takes the slot's mark, only while the
+    /// connection's ask is the one the source saw: a stale opt-in's probe
+    /// never marks the slot, so a claim keeps waiting for the probe a newer
+    /// opt-in made due, which starts once the source saw that ask, and a
+    /// newer opt-out leaves the slot settled.
+    #[tokio::test]
+    async fn a_probe_starts_only_for_the_ask_the_source_saw() {
+        const STALE: &str = "backchannel: the probe due is not started, the connection's ask changed since the source saw it; the slot waits for the source to decide on the newer one";
+        use tracing::Level;
+        let (logs, _guard) = Logs::capture();
+        let slot = BackchannelSlot::default();
+        let mut asks = slot.asks();
+        let first = slot.probing_for(&asks).expect("the ask the source saw");
+        assert!(slot.awaits_probe());
+        slot.settle(first, None);
+        assert!(!slot.is_probing());
+        // In, taken by the source; out and in again before it started the
+        // probe.
+        assert!(slot.ask(true));
+        assert!(bounded(asks.next()).await);
+        assert!(slot.ask(false) && slot.ask(true));
+        assert!(slot.probing_for(&asks).is_none(), "a stale opt-in");
+        assert_eq!(logs.count(Level::DEBUG, STALE), 1);
+        assert!(slot.awaits_probe(), "the newer opt-in's probe is due");
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for it");
+        // The source saw it: its probe starts, and settles the slot.
+        assert!(bounded(asks.next()).await);
+        let newer = slot.probing_for(&asks).expect("the newer opt-in");
+        slot.settle(newer, Some(pcmu()));
+        assert_eq!(bounded(settled).await.unwrap().unwrap().codec, Codec::Pcmu);
+        assert_eq!(logs.count(Level::DEBUG, STALE), 1);
+        // In, taken by the source; out before it started the probe: the
+        // stale opt-in's probe leaves the slot settled.
+        assert!(slot.ask(false) && slot.ask(true));
+        assert!(bounded(asks.next()).await);
+        assert!(slot.ask(false));
+        assert!(slot.probing_for(&asks).is_none(), "a stale opt-in");
+        assert!(!slot.is_probing(), "the opt-out settled it");
+        assert!(slot.current().is_none(), "and withdrew the offer");
+        assert_eq!(logs.count(Level::DEBUG, STALE), 2);
+    }
+
+    /// A connection attempt's follower is aborted when the attempt ends,
+    /// but an abort only asks: one that took the connection's opt-in may
+    /// go on after the next attempt started and marked its probe.
+    /// Superseded, it neither starts a probe nor forgoes the one due,
+    /// whatever ask it saw: the next attempt's probe stays awaited, and
+    /// its result alone settles the slot.
+    #[tokio::test]
+    async fn a_superseded_attempt_neither_starts_nor_forgoes_a_probe() {
+        const NOT_STARTED: &str = "backchannel: the probe due is not started, its connection attempt ended and a later one follows the slot; that one's decision stands";
+        const NOT_FORGONE: &str = "backchannel: the probe due is not forgone, its connection attempt ended and a later one follows the slot; that one's decision stands";
+        use tracing::Level;
+        let (logs, _guard) = Logs::capture();
+        let slot = BackchannelSlot::default();
+        let mut ended = slot.asks();
+        assert!(slot.ask(true));
+        assert!(bounded(ended.next()).await, "the ended attempt took it");
+        let mut next = slot.asks();
+        let mark = slot.probing_for(&next).expect("the next attempt probes");
+        assert!(slot.probing_for(&ended).is_none(), "superseded");
+        assert_eq!(logs.count(Level::DEBUG, NOT_STARTED), 1);
+        slot.forgo_probe(&ended);
+        assert_eq!(logs.count(Level::DEBUG, NOT_FORGONE), 1);
+        assert!(slot.awaits_probe(), "the next attempt's probe is awaited");
+        let waiting = slot.clone();
+        let settled = spawn_named("test.settled", async move { waiting.settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "a claim waits for it");
+        slot.settle(mark, Some(pcmu()));
+        assert_eq!(bounded(settled).await.unwrap().unwrap().codec, Codec::Pcmu);
+        // The next attempt decides on its own: the device has none.
+        assert!(slot.ask(false) && slot.ask(true));
+        assert!(bounded(next.next()).await);
+        slot.forgo_probe(&next);
+        assert!(!slot.is_probing(), "forgone by the attempt that runs");
+        assert_eq!(logs.count(Level::DEBUG, NOT_FORGONE), 1);
     }
 
     /// `future`'s output, or a failed test after five seconds.

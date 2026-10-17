@@ -45,11 +45,15 @@ pub enum ToWorker {
     /// switch to it at its first keyframe, and the old source stops. A
     /// standby still connecting is replaced.
     SwitchSource(SourceSpec),
-    /// Stop the running source, then connect this one as its standby, as
-    /// `SwitchSource` does: the camera holds one session at a time, and
-    /// the viewers see a gap instead. A connection whose streams now ask
-    /// for the camera's backchannel restarts its source this way once.
-    RestartSource(SourceSpec),
+    /// The connection asks for the camera's backchannel from now on (a
+    /// stream on it opted in), or no longer (the last one opted out): the
+    /// running source and the standby probe it, at once while they play,
+    /// or stop and drop what they found, which frees it from its talker.
+    /// Nothing restarts.
+    Backchannel {
+        /// Whether the connection asks.
+        asks: bool,
+    },
     /// The grant for the standby's last announced attempt.
     SwitchConnectGranted,
     /// The grant for the probe the worker announced (`ProbeConnecting`):
@@ -159,10 +163,6 @@ pub struct SessionSpec {
     /// The stream's orientation by its number, 1 (none) to 8
     /// (`lotse_core::Orientation::code`).
     pub orientation: u8,
-    /// The stream asked for the camera's backchannel: a talk-back request
-    /// the session cannot meet refuses it with `backchannel_unavailable`
-    /// (`lotse_core::session::SessionRequest::talkback_required`).
-    pub talkback_required: bool,
 }
 
 impl fmt::Debug for SessionSpec {
@@ -177,7 +177,6 @@ impl fmt::Debug for SessionSpec {
             .field("tcp_candidates", &self.tcp_candidates)
             .field("audio", &self.audio)
             .field("orientation", &self.orientation)
-            .field("talkback_required", &self.talkback_required)
             .finish()
     }
 }
@@ -353,13 +352,13 @@ pub enum ToSupervisor {
 
 /// A change of the connection's talker: the session it concerns, the new
 /// talker after `claimed`, the one that let go after `session_closed`,
-/// `released`, `renegotiated` or `refused`, when the channel is free.
+/// `released`, `renegotiated`, `refused` or `opted_out`, when the channel is free.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TalkerChange {
     /// The session.
     pub session_id: String,
-    /// `claimed`, `session_closed`, `released`, `renegotiated` or
-    /// `refused`.
+    /// `claimed`, `session_closed`, `released`, `renegotiated`,
+    /// `refused` or `opted_out`.
     pub reason: String,
     /// When, in milliseconds since the Unix epoch.
     pub at_ms: u64,
@@ -504,7 +503,6 @@ mod tests {
             tcp_candidates: vec!["192.0.2.1:18557".parse().unwrap()],
             audio: true,
             orientation: 6,
-            talkback_required: false,
         };
         let text = format!("{spec:?}");
         assert!(!text.contains("hunter2"), "{text}");
@@ -702,15 +700,13 @@ mod tests {
                 message
             );
         }
-        let renegotiate = ToWorker::Renegotiate {
-            session_id: "s1".into(),
-            sdp: "v=0".into(),
-        };
-        assert_eq!(
-            decode::<ToWorker>(&encode(&renegotiate).unwrap()).unwrap(),
-            renegotiate
-        );
         for release in [
+            ToWorker::Renegotiate {
+                session_id: "s1".into(),
+                sdp: "v=0".into(),
+            },
+            ToWorker::Backchannel { asks: true },
+            ToWorker::Backchannel { asks: false },
             ToWorker::ReleaseBackchannel { session_id: None },
             ToWorker::ReleaseBackchannel {
                 session_id: Some("s1".into()),

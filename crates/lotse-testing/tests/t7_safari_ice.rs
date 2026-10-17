@@ -307,7 +307,6 @@ impl Safari {
             orientation: lotse_core::Orientation::default(),
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
-            talkback_required: false,
         };
         let (session, answer) = Session::answer(&request, now).expect("an answer");
         let mut safari = Self {

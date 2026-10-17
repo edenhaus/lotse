@@ -9,9 +9,11 @@
 //! `TEARDOWN` with `Require` and closes the connection; a refusal, a
 //! hang-up, a camera that never answers and a lost connection each say
 //! why; a reconnect of the viewing session leaves the backchannel's
-//! alone; and the probe waits for a connect permit while a claim's
+//! alone; the probe waits for a connect permit while a claim's
 //! connection does not, and gives it back within its timeout however
-//! long the camera leaves it unanswered.
+//! long the camera leaves it unanswered; and the connection turns the
+//! probe on and off as its streams opt in and out, without the viewing
+//! session noticing.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -368,6 +370,13 @@ async fn onvif_5_3_2_a_551_to_the_probe_is_remembered_and_another_failure_asked_
             clock().sleep(Duration::from_millis(200)).await;
             assert_eq!(log(&cam).len(), 3, "{answer:?}: not asked again");
             assert_eq!(count(&cam.stats().require_rejected), 1, "{answer:?}");
+            // Nor after an opt-in: the probe it made due settles at once.
+            assert!(slot.ask(false) && slot.ask(true));
+            assert!(
+                eventually(50, || !slot.is_probing()).await,
+                "{answer:?}: settled"
+            );
+            assert_eq!(log(&cam).len(), 3, "{answer:?}: not asked");
         }
         finish(second).await;
         cam.stop().await;
@@ -392,6 +401,66 @@ async fn onvif_5_3_2_a_reconnect_whose_probe_finds_none_withdraws_the_offer() {
     probed(&cam, 4, &slot).await;
     assert!(slot.current().is_none(), "withdrawn");
     finish(second).await;
+    cam.stop().await;
+}
+
+/// ONVIF Streaming Specification §5.3.1: the connection turns the probe on
+/// and off while the viewing session plays, which never notices: an opt-in
+/// probes at once on a connection of its own and offers what it found, an
+/// opt-out withdraws it, and opted in again it probes again. An opt-out
+/// while a probe waits for its permit drops that probe, and an opt-in
+/// while the viewing session is down probes at its next connect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_1_the_connection_turns_the_probe_on_and_off_beside_the_viewing_session() {
+    let cam = camera(config(None, BackchannelCodec::Pcmu, |_| {})).await;
+    let source = as_given(&cam, &json!({}));
+    let (gate, mut permits) = ProbeGate::closed();
+    let slot = BackchannelSlot::gated(gate);
+    let mut harness = Harness::start_with(source.as_ref(), peer(&cam), clock(), slot.clone());
+    assert!(harness.wait_ready().await, "ready");
+    clock().sleep(Duration::from_millis(100)).await;
+    assert_eq!(log(&cam).len(), 1, "not opted in: no probe");
+    // Opted in: a probe is due at once, and waits for its permit.
+    assert!(slot.ask(true));
+    assert!(slot.is_probing());
+    assert_eq!(bounded(permits.recv()).await, Some(ProbeAsk::Connecting(1)));
+    // Opted out while it waits: dropped, its wait over, nothing asked.
+    assert!(slot.ask(false));
+    assert_eq!(bounded(permits.recv()).await, Some(ProbeAsk::Ended(1)));
+    assert!(!slot.is_probing());
+    // In again: it probes and offers what it found.
+    assert!(slot.ask(true));
+    assert_eq!(bounded(permits.recv()).await, Some(ProbeAsk::Connecting(2)));
+    assert!(slot.probes().grant(2));
+    probed(&cam, 2, &slot).await;
+    assert_eq!(offered(&slot).await.codec, Codec::Pcmu);
+    assert_eq!(bounded(permits.recv()).await, Some(ProbeAsk::Ended(2)));
+    // Out: withdrawn at once.
+    assert!(slot.ask(false));
+    assert!(slot.current().is_none());
+    clock().sleep(Duration::from_millis(100)).await;
+    let logs = log(&cam);
+    assert_eq!(logs.len(), 2, "one probe: {logs:?}");
+    assert_eq!(
+        logs[0].describes,
+        [false],
+        "described once, without Require"
+    );
+    assert!(logs[0].played && !logs[0].closed, "plays on");
+    assert_eq!(count(&cam.stats().teardowns), 0, "nothing torn down");
+    finish(harness).await;
+    // Opted in while the viewing session is down: due now, probed once the
+    // next attempt plays.
+    assert!(slot.ask(true));
+    assert!(slot.is_probing());
+    let mut next = Harness::start_with(source.as_ref(), peer(&cam), clock(), slot.clone());
+    assert!(next.wait_ready().await, "reconnected");
+    assert_eq!(bounded(permits.recv()).await, Some(ProbeAsk::Connecting(3)));
+    assert!(slot.probes().grant(3));
+    probed(&cam, 4, &slot).await;
+    assert_eq!(offered(&slot).await.codec, Codec::Pcmu);
+    assert_eq!(log(&cam)[3].describes, [true]);
+    finish(next).await;
     cam.stop().await;
 }
 

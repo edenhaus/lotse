@@ -851,8 +851,8 @@ mod tests {
       talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });"#
         ));
         // The offer goes out right after the put's result, talk-back or
-        // not: the daemon holds it while the connection restarts to ask for
-        // the backchannel, so the page neither waits nor polls.
+        // not: the daemon has it wait for the probe of the backchannel the
+        // put opted in to, so the page neither waits nor polls.
         let play = page
             .split("async function play()")
             .nth(1)
@@ -865,19 +865,25 @@ mod tests {
         assert!(!between.contains("await"), "{between}");
         assert!(!page.contains(r#"type: "stream/get""#), "no polling");
         assert!(!play.contains("setTimeout("), "no waiting: {play}");
-        // A talk-back request the daemon cannot meet fails the session; the
-        // page says why and does not retry without talk-back.
-        let closed = page
-            .split(r#"case "closed":"#)
+        // A talk-back request the daemon cannot meet is declined in the
+        // answer and the session plays on; the page says why and retries
+        // nothing itself.
+        let warning = page
+            .split(r#"case "warning":"#)
             .nth(1)
             .and_then(|rest| rest.split("break;").next())
-            .expect("the closed event");
+            .expect("the warning event");
         assert!(
-            closed.contains(r#"if (event.code === "backchannel_unavailable") {"#),
-            "{closed}"
+            warning.contains(r#"if (event.code === "backchannel_declined") {"#),
+            "{warning}"
         );
-        assert!(closed.contains("${event.message}"), "{closed}");
-        assert!(!closed.contains("play()"), "no retry: {closed}");
+        assert!(warning.contains("${event.reason}"), "{warning}");
+        assert!(warning.contains("${event.message}"), "{warning}");
+        assert!(!warning.contains("play()"), "no retry: {warning}");
+        assert!(
+            !page.contains("backchannel_unavailable"),
+            "a code that is gone"
+        );
         // The answer took the m-line when the browser's side is sendonly.
         assert!(page.contains(r#"talkTransceiver.currentDirection === "sendonly""#));
         // The microphone is asked for on Talk, not on Play, and leaves the
@@ -1093,6 +1099,74 @@ mod tests {
         );
         // The warning says why a claim was declined.
         assert!(page.contains("event.reason ? ` (${event.reason}"));
+    }
+
+    /// A decline's reason belongs to its own negotiation, Play's offer or
+    /// a Talk or Stop re-offer (RFC 8829 §5.2.2): the page keeps the
+    /// `backchannel_declined` warning's reason, shows it once the answer
+    /// is applied, which can be after the warning arrived, as events are
+    /// not awaited one after the other, and starts every negotiation
+    /// without the last one's. A regression: the status once fell back to
+    /// a generic decline as soon as the answer was applied.
+    #[test]
+    fn rfc8829_s5_2_2_a_decline_reason_stays_with_its_own_negotiation() {
+        let page = PAGE;
+        let body = |head: &str| {
+            page.split(head)
+                .nth(1)
+                .and_then(|rest| rest.split("\n}\n").next())
+                .expect(head)
+        };
+        // The warning keeps its reason, then shows it.
+        let warning = page
+            .split(r#"case "warning":"#)
+            .nth(1)
+            .and_then(|rest| rest.split("break;").next())
+            .expect("the warning event");
+        let kept = warning
+            .find("declinedWhy = `declined (${event.reason}): ${event.message}`;")
+            .expect(warning);
+        let shown = warning
+            .find(r#"$("s-talk").textContent = declinedStatus();"#)
+            .expect(warning);
+        assert!(kept < shown, "{warning}");
+        // The status falls back to a pointer only without a reason.
+        assert!(page.contains(
+            r#"const declinedStatus = () => `${declinedWhy ?? "declined (the warning says why)"}; Talk asks again`;"#
+        ));
+        assert_eq!(
+            page.matches("the warning says why").count(),
+            1,
+            "one fallback"
+        );
+        // Both paths that render after an answer use it.
+        assert!(
+            body("function answeredTalkback()").contains(
+                r#"$("s-talk").textContent = negotiated ? "negotiated; press Talk" : declinedStatus();"#
+            ),
+            "Play's answer"
+        );
+        assert!(
+            body("async function startTalking()")
+                .contains(r#"$("s-talk").textContent = claimed === false ? declinedStatus() :"#),
+            "Talk's re-offer"
+        );
+        // Every negotiation starts without the last one's reason, before
+        // its offer, so an earlier reason cannot outlive it.
+        let play = body("async function play()");
+        let cleared = play.find("declinedWhy = undefined;").expect(play);
+        let offer = play.find("await peer.createOffer()").expect(play);
+        assert!(cleared < offer, "{play}");
+        let renegotiate = body("async function renegotiate(direction, mine)");
+        let cleared = renegotiate
+            .find("declinedWhy = undefined;")
+            .expect(renegotiate);
+        let offer = renegotiate
+            .find("await peer.createOffer()")
+            .expect(renegotiate);
+        assert!(cleared < offer, "{renegotiate}");
+        // Set nowhere else: the warning, Play and the re-offers.
+        assert_eq!(page.matches("declinedWhy = ").count(), 3, "{page}");
     }
 
     type Connected = Result<

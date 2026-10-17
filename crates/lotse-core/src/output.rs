@@ -209,7 +209,6 @@ mod tests {
             orientation: crate::Orientation::default(),
             limits: crate::session::SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
-            talkback_required: false,
         };
         let err = factory
             .open_session(request, crate::clock::SystemClock.now())

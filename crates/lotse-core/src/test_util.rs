@@ -2126,7 +2126,6 @@ mod tests {
             orientation: Orientation::Rotate180,
             limits: crate::session::SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
-            talkback_required: false,
         };
         let (mut engine, answer) = EchoSessionFactory
             .open_session(turned.clone(), now)
@@ -2266,7 +2265,6 @@ mod tests {
             orientation: Orientation::default(),
             limits: crate::session::SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
-            talkback_required: false,
         };
         let factory = EchoSessionFactory;
         assert_eq!(

@@ -8,13 +8,13 @@
 //! carries the major version.
 
 /// The API version in `hello.api` and the schema bundle's `api`.
-pub const API_VERSION: &str = "0.2.1";
+pub const API_VERSION: &str = "0.3.0";
 
 /// [`API_VERSION`], parsed; a test keeps the two equal.
 pub const CURRENT: ApiVersion = ApiVersion {
     major: 0,
-    minor: 2,
-    patch: 1,
+    minor: 3,
+    patch: 0,
 };
 
 /// The WebSocket path: `/v<major>/ws`; a test keeps it on [`CURRENT`]'s major.
@@ -103,7 +103,11 @@ mod tests {
         // offer, `backchannel_declined` replaces `backchannel_busy`.
         // 0.2.1: `talker_changed`'s `refused`, the camera's backchannel
         // session refused, timed out or lost.
-        assert_eq!(CURRENT, v(0, 2, 1), "unstable until lotse 1.0");
+        // 0.3.0: `closed`'s `backchannel_unavailable` goes, a talk-back
+        // request on an opted-in stream being declined in the answer like
+        // any other; `talker_changed`'s `opted_out`; opting in or out no
+        // longer restarts the connection.
+        assert_eq!(CURRENT, v(0, 3, 0), "unstable until lotse 1.0");
     }
 
     #[test]

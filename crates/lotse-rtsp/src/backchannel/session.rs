@@ -24,13 +24,6 @@ use lotse_core::source::{BackchannelRefused, SourceError};
 
 use super::{BackchannelFormat, backchannel_format};
 
-/// The option tag of the ONVIF backchannel, which a client sends in a
-/// `Require` header (RFC 2326 §12.32) to ask for it: ONVIF Streaming
-/// Specification §5.3.1. retina adds it to the `DESCRIBE`, the `SETUP`,
-/// the `PLAY` and the `TEARDOWN` of a session that asks for the
-/// backchannel, by which the UDP relay knows the backchannel's `SETUP`.
-pub const REQUIRE_TAG: &str = "www.onvif.org/ver20/backchannel";
-
 /// RFC 2326 §11.3.13: `551 Option not supported`, the answer ONVIF
 /// Streaming Specification §5.3.2 gives a server without the backchannel.
 pub const OPTION_NOT_SUPPORTED: u16 = 551;
@@ -55,13 +48,13 @@ pub struct Probed {
 }
 
 impl Probed {
-    /// Whether this attempt probes the camera's backchannel with a
-    /// `DESCRIBE` carrying `Require: www.onvif.org/ver20/backchannel`
-    /// (ONVIF Streaming Specification §5.3.1): the source protocol can send
-    /// on a backchannel (`capable`, the factory's
-    /// `capabilities().backchannel`), the stream asks for one (`wanted`,
-    /// its `backchannel` option), and the camera has not answered a probe
-    /// with `551` before.
+    /// Whether the camera's backchannel is probed now with a `DESCRIBE`
+    /// carrying `Require: www.onvif.org/ver20/backchannel` (ONVIF
+    /// Streaming Specification §5.3.1): the source protocol can send on a
+    /// backchannel (`capable`, the factory's
+    /// `capabilities().backchannel`), the connection asks for one
+    /// (`wanted`: a stream on it opted in with its `backchannel` option),
+    /// and the camera has not answered a probe with `551` before.
     pub fn asks(&self, capable: bool, wanted: bool) -> bool {
         if !(capable && wanted) {
             return false;
