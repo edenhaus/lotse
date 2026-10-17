@@ -2075,12 +2075,13 @@ fn rfc3264_6_an_audio_m_line_without_a_known_codec_is_still_rejected() {
 }
 
 /// Each audio codec the session carries is answered `sendonly` on the
-/// downlink m-line, listed among every codec the browser offered that
-/// the engine carries (RFC 3264 §6.1: the answer lists formats of the
-/// offer; a re-offer may then turn the m-line `sendrecv` in any of them),
-/// and the session sends it.
+/// downlink m-line, listed first, as its default format (RFC 8866
+/// §5.14), among every codec the browser offered that the engine carries
+/// (RFC 3264 §6.1: the answer lists formats of the offer; a re-offer may
+/// then turn the m-line `sendrecv` in any of them), and the session sends
+/// it.
 #[test]
-fn rfc8829_5_3_1_each_carried_audio_codec_is_answered_sendonly_among_the_codecs_offered() {
+fn rfc8866_5_14_each_carried_audio_codec_is_answered_sendonly_first_among_those_offered() {
     let now = SystemClock.now();
     for (codec, encoding) in [
         (Codec::Opus { channels: 2 }, "opus/48000/2"),
@@ -2097,9 +2098,10 @@ fn rfc8829_5_3_1_each_carried_audio_codec_is_answered_sendonly_among_the_codecs_
         assert!(audio.contains(&"a=sendonly"), "{answer}");
         let pts = payload_types(&audio);
         assert_eq!(pts.len(), 4, "every codec offered: {answer}");
+        // The codec the session sends first, the m-line's default format
+        // (RFC 8866 §5.14), wherever the offer lists it.
         assert!(
-            pts.iter()
-                .any(|pt| audio.contains(&format!("a=rtpmap:{pt} {encoding}").as_str())),
+            audio.contains(&format!("a=rtpmap:{} {encoding}", pts[0]).as_str()),
             "{answer}"
         );
         assert!(warnings(&mut session).is_empty(), "{answer}");
@@ -2805,9 +2807,11 @@ fn rfc3264_6_1_a_declined_re_offer_is_answered_inactive_or_sendonly() {
             "{what}: {answer}"
         );
         let up = audio_sections(&answer).pop().unwrap();
+        // The session opened without a backchannel: the stream's PCMU
+        // first, then the rest.
         assert_eq!(
             payload_types(&up),
-            ["111", "0", "8", "9"],
+            ["0", "111", "8", "9"],
             "{what}: as offered, in the engine's order"
         );
         assert_eq!(pair.session.talkback(), None, "{what}");

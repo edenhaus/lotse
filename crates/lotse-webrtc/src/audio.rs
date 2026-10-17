@@ -222,24 +222,32 @@ const fn other_law(family: CodecFamily) -> Option<CodecFamily> {
 
 /// The audio codecs the engine is configured with, in its order of
 /// preference, for a session whose stream's backchannel takes
-/// `backchannel` (`None` without one): the backchannel's codec, then for
-/// a G.711 one the other law, then Opus, then the rest of
-/// [`EVERY_CODEC`]. Fixed when the session opens: str0m answers every
-/// m-line, of the offer and of every re-offer, with this one list in
-/// this order, narrowed to what the m-line offers (there is no list per
-/// m-line, an upstream need), so [`AudioPlan::engine_offer`] narrows
-/// each m-line's formats, and the order puts the codec talk-back is
-/// received in first on the talk-back m-line, which the browser sends
-/// (RFC 3264 §7): the backchannel's own, else the other law, else Opus
-/// ([`AudioPlan::new`]). Every codec is enabled so a re-offer can add
-/// talk-back in any of them.
-pub(crate) fn engine_codecs(backchannel: Option<CodecFamily>) -> Vec<CodecFamily> {
-    let mut codecs = Vec::with_capacity(EVERY_CODEC.len());
-    for family in backchannel
+/// `backchannel` (`None` without one) and whose stream's audio is
+/// `stream` (`None` without any): with a backchannel, its codec, then
+/// for a G.711 one the other law, then Opus; then the stream audio's
+/// codec; then the rest of [`EVERY_CODEC`]. Fixed when the session
+/// opens: str0m answers every m-line, of the offer and of every
+/// re-offer, with this one list in this order, narrowed to what the
+/// m-line offers (there is no list per m-line, an upstream need), so
+/// [`AudioPlan::engine_offer`] narrows each m-line's formats, and the
+/// order puts the codec talk-back is received in first on the
+/// talk-back m-line, which the browser sends (RFC 3264 §7): the
+/// backchannel's own, else the other law, else Opus
+/// ([`AudioPlan::new`]). Without a backchannel the stream audio's codec
+/// comes first, so the downlink m-line names first the codec the session
+/// sends on it, the default format of the m-line (RFC 8866 §5.14: the
+/// first format listed SHOULD be the session's default). Every codec is
+/// enabled so a re-offer can add talk-back in any of them.
+pub(crate) fn engine_codecs(
+    backchannel: Option<CodecFamily>,
+    stream: Option<CodecFamily>,
+) -> Vec<CodecFamily> {
+    let talkback = backchannel
         .into_iter()
         .chain(backchannel.and_then(other_law))
-        .chain(EVERY_CODEC)
-    {
+        .chain(backchannel.map(|_| CodecFamily::Opus));
+    let mut codecs = Vec::with_capacity(EVERY_CODEC.len());
+    for family in talkback.chain(stream).chain(EVERY_CODEC) {
         if EVERY_CODEC.contains(&family) && !codecs.contains(&family) {
             codecs.push(family);
         }
@@ -589,7 +597,10 @@ mod tests {
         audio: Option<&Codec>,
         backchannel: Option<&TalkbackTarget>,
     ) -> AudioPlan<'a> {
-        let order = engine_codecs(backchannel.map(|backchannel| backchannel.codec.family()));
+        let order = engine_codecs(
+            backchannel.map(|backchannel| backchannel.codec.family()),
+            audio.map(Codec::family),
+        );
         AudioPlan::new(offer, audio, backchannel, TalkbackClaim::Granted, &order)
     }
 
@@ -720,17 +731,51 @@ mod tests {
     }
 
     /// The engine's order: the backchannel's codec, its other law, Opus,
-    /// then the rest, every codec once; the rest alone without one.
+    /// then the stream audio's codec, then the rest, every codec once;
+    /// without a backchannel the stream audio's codec first.
     #[test]
     fn rfc3264_7_the_engine_prefers_the_backchannels_codec_then_the_other_law_then_opus() {
         use CodecFamily::{G722, Opus, Pcma, Pcmu};
-        assert_eq!(engine_codecs(None), EVERY_CODEC);
-        assert_eq!(engine_codecs(Some(Pcmu)), [Pcmu, Pcma, Opus, G722]);
-        assert_eq!(engine_codecs(Some(Pcma)), [Pcma, Pcmu, Opus, G722]);
-        assert_eq!(engine_codecs(Some(Opus)), [Opus, Pcmu, Pcma, G722]);
-        assert_eq!(engine_codecs(Some(G722)), [G722, Opus, Pcmu, Pcma]);
+        assert_eq!(engine_codecs(None, None), EVERY_CODEC);
+        assert_eq!(engine_codecs(Some(Pcmu), None), [Pcmu, Pcma, Opus, G722]);
+        assert_eq!(engine_codecs(Some(Pcma), None), [Pcma, Pcmu, Opus, G722]);
+        assert_eq!(engine_codecs(Some(Opus), None), [Opus, Pcmu, Pcma, G722]);
+        assert_eq!(engine_codecs(Some(G722), None), [G722, Opus, Pcmu, Pcma]);
         // A backchannel in a codec the engine does not carry changes nothing.
-        assert_eq!(engine_codecs(Some(CodecFamily::AacLc)), EVERY_CODEC);
+        assert_eq!(engine_codecs(Some(CodecFamily::AacLc), None), EVERY_CODEC);
+        // The stream audio's codec after the talk-back ones: Opus, the
+        // last of them, stays ahead of it.
+        assert_eq!(
+            engine_codecs(Some(Pcmu), Some(G722)),
+            [Pcmu, Pcma, Opus, G722]
+        );
+        assert_eq!(
+            engine_codecs(Some(Opus), Some(Pcma)),
+            [Opus, Pcma, Pcmu, G722]
+        );
+        assert_eq!(
+            engine_codecs(Some(Pcmu), Some(Opus)),
+            [Pcmu, Pcma, Opus, G722]
+        );
+    }
+
+    /// Without a backchannel the engine prefers the stream audio's codec,
+    /// so the downlink m-line names it first, the m-line's default format
+    /// (RFC 8866 §5.14), whatever the offer lists first; the rest follow
+    /// as offered, in the engine's order.
+    #[test]
+    fn rfc8866_5_14_the_downlink_m_line_names_the_stream_audios_codec_first() {
+        use CodecFamily::{G722, Opus, Pcma, Pcmu};
+        assert_eq!(engine_codecs(None, Some(Pcmu)), [Pcmu, Opus, Pcma, G722]);
+        assert_eq!(engine_codecs(None, Some(G722)), [G722, Opus, Pcmu, Pcma]);
+        // A stream codec the engine does not carry changes nothing.
+        assert_eq!(engine_codecs(None, Some(CodecFamily::AacLc)), EVERY_CODEC);
+        for codec in [Codec::Pcmu, Codec::Pcma, Codec::Opus { channels: 2 }] {
+            let plan = plan_for(DEDICATED, Some(&codec), None);
+            let answered = plan.answered(DEDICATED, "0");
+            assert_eq!(answered.first(), Some(&codec.family()), "{codec:?}");
+            assert_eq!(answered.len(), 3, "every codec offered: {answered:?}");
+        }
     }
 
     /// While another session holds the backchannel, talk-back the
@@ -742,7 +787,7 @@ mod tests {
     fn rfc3264_6_1_a_busy_backchannel_declines_talk_back_the_offer_asks_for() {
         let opus = Codec::Opus { channels: 2 };
         let pcmu = reaching(&Codec::Pcmu);
-        let order = engine_codecs(Some(CodecFamily::Pcmu));
+        let order = engine_codecs(Some(CodecFamily::Pcmu), Some(CodecFamily::Opus));
         let busy = AudioPlan::new(
             DEDICATED,
             Some(&opus),
@@ -803,7 +848,7 @@ mod tests {
     #[test]
     fn rfc3264_7_a_re_offer_on_another_backchannel_keeps_the_talk_back_codec_first() {
         use CodecFamily::{Opus, Pcma, Pcmu};
-        let opened_with_opus = engine_codecs(Some(Opus));
+        let opened_with_opus = engine_codecs(Some(Opus), None);
         let offer = talking_in(&["opus", "PCMU", "PCMA", "G722"]);
         let plan = AudioPlan::new(
             &offer,
@@ -1189,10 +1234,11 @@ mod tests {
             // The downlink m-line is answered with what it offers (no
             // G.722 there) in the engine's order, the stream audio's
             // codec among them.
-            let offered_down: Vec<CodecFamily> = engine_codecs(Some(backchannel.family()))
-                .into_iter()
-                .filter(|family| *family != G722)
-                .collect();
+            let offered_down: Vec<CodecFamily> =
+                engine_codecs(Some(backchannel.family()), audio.map(Codec::family))
+                    .into_iter()
+                    .filter(|family| *family != G722)
+                    .collect();
             assert_eq!(plan.answered(&offer, "0"), offered_down, "{what}");
             // The engine is never offered a codec talk-back does not take
             // on that m-line, nor its attribute lines.
@@ -1343,7 +1389,7 @@ mod tests {
             assert!(engine.contains("a=rtpmap:9 G722/8000\r\n"), "{engine}");
             assert_eq!(
                 plan.answered(&offer, "2"),
-                engine_codecs(backchannel.map(Codec::family)),
+                engine_codecs(backchannel.map(Codec::family), Some(CodecFamily::Pcmu)),
                 "inactive, with every format of the offer"
             );
         }

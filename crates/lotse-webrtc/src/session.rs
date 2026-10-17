@@ -723,6 +723,7 @@ fn prepare(request: &SessionRequest) -> Result<Prepared<'_>, SessionOpenError> {
             .backchannel
             .as_ref()
             .map(|backchannel| backchannel.codec.family()),
+        request.audio.as_deref().map(Codec::family),
     );
     let plan = AudioPlan::new(
         &request.offer,

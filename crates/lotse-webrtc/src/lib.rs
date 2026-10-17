@@ -158,7 +158,10 @@ impl OutputFactory for WebRtcFactory {
         offer: &str,
         backchannel: Option<&TalkbackTarget>,
     ) -> TalkbackRequest {
-        let order = audio::engine_codecs(backchannel.map(|backchannel| backchannel.codec.family()));
+        let order = audio::engine_codecs(
+            backchannel.map(|backchannel| backchannel.codec.family()),
+            None,
+        );
         match audio::AudioPlan::new(offer, None, backchannel, TalkbackClaim::Granted, &order)
             .talkback
         {
