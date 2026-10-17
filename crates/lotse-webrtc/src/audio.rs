@@ -288,8 +288,8 @@ pub(crate) enum Talkback<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AudioPlan<'a> {
     /// The m-line the stream's audio goes down on: the first audio m-line
-    /// with a mid that the browser receives on (`recvonly` or
-    /// `sendrecv`).
+    /// with a mid, not stopped ([`Sdp::stopped`]), that the browser
+    /// receives on (`recvonly` or `sendrecv`).
     pub(crate) downlink: Option<&'a str>,
     /// The stream audio's family, when the engine carries it and the
     /// downlink m-line lists it.
@@ -328,6 +328,11 @@ impl<'a> AudioPlan<'a> {
     /// that m-line, which the browser sends (RFC 3264 §6.1). Talk-back the
     /// backchannel would take is declined all the same while another
     /// session holds the backchannel ([`TalkbackClaim::Busy`]).
+    ///
+    /// A stopped m-line ([`Sdp::stopped`]: a zero port, not a bundled
+    /// `bundle-only` one) carries neither: its stream is disabled
+    /// (RFC 3264 §8.2), whatever direction it still names, so it neither
+    /// requests talk-back nor takes the stream's audio.
     pub(crate) fn new(
         offer: &'a str,
         audio: Option<&Codec>,
@@ -339,7 +344,7 @@ impl<'a> AudioPlan<'a> {
         let lines: Vec<(&Section<'a>, &'a str, Direction)> = sdp
             .media()
             .iter()
-            .filter(|section| section.is("audio"))
+            .filter(|section| section.is("audio") && !sdp.stopped(section))
             .filter_map(|section| Some((section, section.mid()?, Direction::of(section))))
             .collect();
         let downlink = lines.iter().find(|(_, _, offered)| offered.receives());
@@ -838,6 +843,64 @@ mod tests {
             &order,
         );
         assert_eq!(silent.talkback, Talkback::NotRequested);
+    }
+
+    /// A stopped audio m-line (a zero port, out of the BUNDLE group) is a
+    /// disabled stream (RFC 3264 §8.2) whatever direction it still names:
+    /// a talk-back m-line stopped with its `a=sendonly` kept requests no
+    /// talk-back, and is answered `inactive`, so the next m-line the
+    /// browser sends on takes it; a stopped downlink m-line carries no
+    /// stream audio. A `bundle-only` m-line the group lists keeps its zero
+    /// port (RFC 9143 §6) and its talk-back.
+    #[test]
+    fn rfc3264_8_2_a_stopped_audio_m_line_carries_neither_talk_back_nor_the_downlink() {
+        let opus = Codec::Opus { channels: 2 };
+        let pcmu = reaching(&Codec::Pcmu);
+        let dedicated = "m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2";
+        let stopped_talkback = DEDICATED
+            .replace(dedicated, "m=audio 0 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2")
+            .replace("a=group:BUNDLE 0 1 2", "a=group:BUNDLE 0 1");
+        assert!(stopped_talkback.contains("a=mid:2\r\na=sendonly"));
+        let plan = plan_for(&stopped_talkback, Some(&opus), Some(&pcmu));
+        assert_eq!(plan.talkback, Talkback::NotRequested);
+        assert_eq!(plan.answer(Some("2")), Direction::Inactive);
+        assert!(!plan.takes(CodecFamily::Pcmu));
+        assert_eq!(plan.downlink, Some("0"));
+        assert_eq!(plan.send, Some(CodecFamily::Opus));
+        let engine = plan.engine_offer(&stopped_talkback);
+        let rewritten = Sdp::parse(&engine);
+        assert!(
+            with_mid(&rewritten, "2").lines().contains(&"a=inactive"),
+            "{engine}"
+        );
+
+        // The downlink m-line turned `sendrecv` beside it takes talk-back.
+        let shared = stopped_talkback.replacen("a=recvonly", "a=sendrecv", 1);
+        let plan = plan_for(&shared, Some(&opus), Some(&pcmu));
+        assert_eq!(plan.talkback, negotiated("0", CodecFamily::Pcmu, false));
+        assert_eq!(plan.answer(Some("2")), Direction::Inactive);
+
+        // A stopped downlink m-line carries no stream audio.
+        let stopped_downlink = DEDICATED
+            .replacen(
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:0",
+                "m=audio 0 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:0",
+                1,
+            )
+            .replace("a=group:BUNDLE 0 1 2", "a=group:BUNDLE 1 2");
+        let plan = plan_for(&stopped_downlink, Some(&opus), Some(&pcmu));
+        assert_eq!(plan.downlink, None);
+        assert_eq!(plan.send, None);
+        assert_eq!(plan.answer(Some("0")), Direction::Inactive);
+        assert_eq!(plan.talkback, negotiated("2", CodecFamily::Pcmu, true));
+
+        // Bundle-only and listed in the group: not stopped.
+        let bundle_only = DEDICATED.replace(
+            dedicated,
+            "m=audio 0 UDP/TLS/RTP/SAVPF 111 0 8\r\na=mid:2\r\na=bundle-only",
+        );
+        let plan = plan_for(&bundle_only, Some(&opus), Some(&pcmu));
+        assert_eq!(plan.talkback, negotiated("2", CodecFamily::Pcmu, true));
     }
 
     /// The engine's order was fixed for the backchannel the session

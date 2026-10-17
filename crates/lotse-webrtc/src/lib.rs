@@ -206,7 +206,7 @@ mod tests {
     /// it before the answer: a `sendonly` audio m-line in a codec that
     /// reaches the backchannel is negotiable, one the backchannel cannot
     /// take is requested in vain with the plan's reason, and an offer
-    /// without one asks for nothing.
+    /// without one, or with it stopped, asks for nothing.
     #[test]
     fn rfc8866_6_7_the_factory_reads_what_an_offer_asks_of_the_backchannel() {
         use lotse_core::codec::Codec;
@@ -239,6 +239,14 @@ mod tests {
         );
         assert_eq!(
             factory.talkback_request(silent, Some(&pcmu)),
+            TalkbackRequest::NotRequested
+        );
+        // Stopped with port 0 (RFC 3264 §8.2), its `a=sendonly` kept: it
+        // asks for nothing, so a session that held the backchannel lets
+        // go.
+        let stopped = talking.replace("m=audio 9 ", "m=audio 0 ");
+        assert_eq!(
+            factory.talkback_request(&stopped, Some(&pcmu)),
             TalkbackRequest::NotRequested
         );
     }

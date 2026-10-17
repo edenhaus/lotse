@@ -1932,6 +1932,77 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
     api.stop().await;
 }
 
+/// A talker whose re-offer stops its talk-back m-line, port 0 and out of
+/// the BUNDLE group, but keeps the m-line's `a=sendonly` and codecs, asks
+/// for no talk-back: the stream is disabled (RFC 3264 §8.2) whatever
+/// direction the m-line names. The m-line is answered with port 0, the
+/// talker lets go, and another viewer's re-offer claims the backchannel
+/// without a `busy` decline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3264_8_2_a_re_offer_that_stops_talk_back_with_its_direction_kept_frees_the_backchannel()
+{
+    let mut api = Api::start(&json!({ "backchannel": "pcmu" })).await;
+    let mut a = ApiPeer::offer(&api, "a").await;
+    let mut b = ApiPeer::offer_silent(&api, "b").await;
+    pump(&mut api, &mut [&mut a, &mut b], |api, peers| {
+        peers.iter().all(|p| p.peer.viewer.is_connected()) && !api.talker_changes().is_empty()
+    })
+    .await;
+    assert_eq!(
+        api.talker_changes(),
+        [("a".to_owned(), "claimed".to_owned(), json!("a"))]
+    );
+
+    // a stops its talk-back m-line, the stopped section keeping its
+    // `a=sendonly` where the viewer wrote `a=inactive`.
+    let offered = a.peer.viewer.reoffer(Reoffer::Stop).expect("a re-offer");
+    let (head, stopped) = offered.split_once("m=audio 0 ").expect("a stopped m-line");
+    assert!(!stopped.contains("m="), "the last m-line: {offered}");
+    assert!(stopped.contains("a=rtpmap:0 PCMU/8000"), "{offered}");
+    let sdp = format!(
+        "{head}m=audio 0 {}",
+        stopped.replacen("a=inactive", "a=sendonly", 1)
+    );
+    assert!(sdp.ends_with("\r\n") && sdp.contains("a=sendonly"), "{sdp}");
+    let result = api
+        .call(&json!({ "id": 20, "type": "webrtc/renegotiate", "session_id": "a", "sdp": sdp }))
+        .await;
+    let answer = result["sdp"].as_str().expect("the answer");
+    let (_, answered) = answer.rsplit_once("m=audio ").expect("an audio m-line");
+    assert!(answered.starts_with("0 "), "rejected: {answer}");
+    a.peer.on_answer(answer);
+    assert_eq!(a.peer.viewer.talkback_direction(), None, "rejected");
+    pump(&mut api, &mut [&mut a, &mut b], |api, _| {
+        api.talker_changes().len() >= 2
+    })
+    .await;
+    assert_eq!(
+        api.talker_changes()[1],
+        ("a".to_owned(), "renegotiated".to_owned(), Value::Null)
+    );
+    assert_eq!(api.stream().await["backchannel"]["talker"], Value::Null);
+    assert_eq!(api.session("a").await["backchannel"]["negotiated"], false);
+
+    // b asks for talk-back and claims it.
+    b.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .await;
+    assert_eq!(
+        b.peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::SendOnly)
+    );
+    pump(&mut api, &mut [&mut a, &mut b], |api, _| {
+        api.talker_changes().len() >= 3
+    })
+    .await;
+    assert_eq!(
+        api.talker_changes()[2],
+        ("b".to_owned(), "claimed".to_owned(), json!("b"))
+    );
+    assert_eq!(api.stream().await["backchannel"]["talker"], "b");
+    assert_eq!(b.warnings("backchannel_declined"), 0, "{:?}", b.seen);
+    api.stop().await;
+}
+
 /// The downlink frames a viewer received in `window`, by arrival: their
 /// largest gap, and the RTP timestamp steps between them.
 fn video_in(viewer: &Viewer, window: (Instant, Instant)) -> (Duration, Vec<u32>, usize) {
