@@ -940,7 +940,7 @@ mod tests {
         let declined = start
             .split("if (mine !== attempt || claimed !== true) {")
             .nth(1)
-            .and_then(|rest| rest.split("return;\n    }").next())
+            .and_then(|rest| rest.split("return;\n  }").next())
             .expect(start);
         let stopped = declined
             .find("for (const track of stream.getTracks()) track.stop();")
@@ -978,11 +978,11 @@ mod tests {
     }
 
     /// Talk-back comes and goes by re-offer (`webrtc/renegotiate`, RFC
-    /// 8829 §5.2.2): Talk re-offers the m-line `sendonly` when the session
-    /// does not hold the backchannel, Stop talking re-offers it `inactive`,
-    /// which lets the backchannel go; nothing releases it by command. A
-    /// declined claim (answered `inactive`) leaves the microphone off and
-    /// Talk usable to ask again; a refused re-offer is rolled back.
+    /// 8829 §5.2.2): every Talk re-offers the m-line `sendonly`, Stop
+    /// talking re-offers it `inactive`, which lets the backchannel go;
+    /// nothing releases it by command. A declined claim (answered
+    /// `inactive`) leaves the microphone off and Talk usable to ask again;
+    /// a refused re-offer is rolled back.
     #[test]
     fn rfc8829_s5_2_2_talk_and_stop_re_offer_talk_back() {
         let page = PAGE;
@@ -1038,10 +1038,14 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
             .expect("startTalking()");
-        // Talk claims by re-offer only when the session does not hold it,
-        // before the microphone goes on the m-line.
-        let unheld = start
-            .find(r#"if (transceiver.currentDirection !== "sendonly") {"#)
+        // Talk claims by re-offer before the microphone goes on the
+        // m-line, on every press: an m-line answered recvonly says the
+        // session held the backchannel then, and another client's
+        // `backchannel/release` frees it without a re-offer, after which
+        // the worker drops the session's packets. A regression: Talk once
+        // skipped the re-offer while the m-line was negotiated `sendonly`.
+        let mic = start
+            .find("navigator.mediaDevices.getUserMedia({ audio: true })")
             .expect(start);
         let claim = start
             .find(r#"await renegotiate("sendonly", mine)"#)
@@ -1049,7 +1053,12 @@ mod tests {
         let on = start
             .find("await transceiver.sender.replaceTrack(track)")
             .expect(start);
-        assert!(unheld < claim && claim < on, "{start}");
+        assert!(mic < claim && claim < on, "{start}");
+        assert!(!start.contains("currentDirection"), "{start}");
+        assert!(
+            start.contains("\n  try {\n    claimed = await renegotiate(\"sendonly\", mine);"),
+            "the re-offer is unconditional: {start}"
+        );
         let declined = &start[claim..on];
         assert!(declined.contains("claimed !== true"), "{declined}");
         assert!(

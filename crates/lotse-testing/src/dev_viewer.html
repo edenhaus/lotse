@@ -583,8 +583,8 @@ async function play() {
     // opted in a live connection waits in the daemon for its restart to
     // ask for the backchannel. The offer claims the backchannel for this
     // session if nobody holds it; Stop talking re-offers the m-line
-    // inactive to let it go, and Talk re-offers it sendonly to claim it
-    // again. It carries no track until Talk, so nothing is sent before.
+    // inactive to let it go, and every Talk re-offers it sendonly to claim
+    // it again. It carries no track until Talk, so nothing is sent before.
     if (!features.includes("two_way_audio")) log("the daemon announces no two_way_audio: talk-back will not be negotiated", "bad");
     if (navigator.mediaDevices?.getUserMedia) {
       talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });
@@ -708,13 +708,17 @@ async function renegotiate(direction, mine) {
   return transceiver.currentDirection === "sendonly";
 }
 
-// Puts the microphone on the talk-back m-line. The session holds the
-// camera's backchannel while the m-line is answered recvonly: Play's
-// offer claimed it, else Talk re-offers the m-line sendonly to claim it
-// now. A claim while another session holds the backchannel, or one the
-// camera refuses, is answered inactive with a backchannel_declined
-// warning; the microphone stops and Talk asks again on the next press.
-// The browser asks for the microphone on this click, not on Play's.
+// Puts the microphone on the talk-back m-line. Every press re-offers the
+// m-line sendonly first, even one answered recvonly before: the answer
+// says the session held the camera's backchannel then, not now, as
+// another control client's release frees it without a re-offer, and the
+// worker drops the packets of a session that no longer holds it.
+// The daemon decides the claim: the session keeps one it holds, takes the
+// backchannel while it is free, and is answered inactive with a
+// backchannel_declined warning while another session holds it or the
+// camera refuses; then the microphone stops and Talk asks again on the
+// next press. The browser asks for the microphone on this click, not on
+// Play's.
 async function startTalking() {
   const mine = attempt;
   const transceiver = talkTransceiver;
@@ -735,28 +739,26 @@ async function startTalking() {
   }
   // The claim comes before the microphone is this session's: nothing
   // stops talking while the re-offer is on its way.
-  if (transceiver.currentDirection !== "sendonly") {
-    log("claiming the backchannel: re-offering talk-back");
-    let claimed, failed;
-    try {
-      claimed = await renegotiate("sendonly", mine);
-    } catch (err) {
-      failed = err;
-    }
-    if (mine !== attempt || claimed !== true) {
-      for (const track of stream.getTracks()) track.stop();
-      if (mine !== attempt) return;
-      // Declined, its warning says why; or the re-offer failed, the
-      // daemon's refusal logged with its result.
-      if (failed) log(`re-offer failed: ${failed.name}: ${failed.message}`, "bad");
-      log(claimed === false ? "talk-back declined; press Talk to ask again" : "talk-back not claimed; press Talk to ask again", "bad");
-      $("s-talk").textContent = claimed === false ? "declined (the warning says why); Talk asks again" : "not claimed (the log says why); Talk asks again";
-      $("s-talk").className = "bad";
-      $("talk").disabled = false;
-      return;
-    }
-    log("talk-back negotiated: the backchannel is this session's", "good");
+  log("claiming the backchannel: re-offering talk-back");
+  let claimed, failed;
+  try {
+    claimed = await renegotiate("sendonly", mine);
+  } catch (err) {
+    failed = err;
   }
+  if (mine !== attempt || claimed !== true) {
+    for (const track of stream.getTracks()) track.stop();
+    if (mine !== attempt) return;
+    // Declined, its warning says why; or the re-offer failed, the
+    // daemon's refusal logged with its result.
+    if (failed) log(`re-offer failed: ${failed.name}: ${failed.message}`, "bad");
+    log(claimed === false ? "talk-back declined; press Talk to ask again" : "talk-back not claimed; press Talk to ask again", "bad");
+    $("s-talk").textContent = claimed === false ? "declined (the warning says why); Talk asks again" : "not claimed (the log says why); Talk asks again";
+    $("s-talk").className = "bad";
+    $("talk").disabled = false;
+    return;
+  }
+  log("talk-back negotiated: the backchannel is this session's", "good");
   mic = stream;
   const track = stream.getAudioTracks()[0];
   // Unplugged, or the permission taken back.
