@@ -434,29 +434,89 @@ impl BackchannelSession {
 /// worker. A source spawns its session's task here
 /// ([`BackchannelTasks::spawn`]), the claim's drop closes the session, and
 /// the task ends once the device's side is closed.
+///
+/// The tasks run one at a time, each once the one spawned before it
+/// ended: a device takes one backchannel session at a time (a camera with
+/// one backchannel refuses a second `SETUP` of it, `453 Not Enough
+/// Bandwidth`, RFC 2326 §11.3.3), so the session a claim opens right
+/// after a release waits for the released one's bounded close to reach
+/// the device instead of racing it. A worker runs one connection, so the
+/// order holds across its sources.
 #[derive(Debug, Clone, Default)]
-pub struct BackchannelTasks(TaskTracker);
+pub struct BackchannelTasks {
+    /// The tasks, until each ends.
+    tracker: TaskTracker,
+    /// Held by the task whose session runs; the next one waits for it.
+    turn: Arc<tokio::sync::Mutex<()>>,
+}
 
 impl BackchannelTasks {
     /// Spawns `future`, one backchannel session's task, under `name`,
-    /// tracked until it ends.
-    pub fn spawn<F>(&self, name: &'static str, future: F) -> JoinHandle<()>
+    /// tracked until it ends. It runs once every task spawned before it
+    /// ended; cancelled meanwhile (the claim gave up or was released),
+    /// `close` ends the task without running it.
+    pub fn spawn<F>(
+        &self,
+        name: &'static str,
+        close: &CancellationToken,
+        future: F,
+    ) -> JoinHandle<()>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        spawn_named(name, self.0.track_future(future))
+        let task = in_turn(Arc::clone(&self.turn), close.clone(), Box::pin(future));
+        spawn_named(name, self.tracker.track_future(task))
     }
 
-    /// How many of the tracked tasks still run.
+    /// How many of the tracked tasks still run, waiting ones included.
     pub fn running(&self) -> usize {
-        self.0.len()
+        self.tracker.len()
     }
 
     /// Resolves once every tracked task ended, a task spawned meanwhile
     /// included. The caller bounds the wait.
     pub async fn ended(&self) {
-        self.0.close();
-        self.0.wait().await;
+        self.tracker.close();
+        self.tracker.wait().await;
+    }
+}
+
+/// Runs `session`, one backchannel session's task, once it has the
+/// `turn` ([`take_turn`]), holding it until it ends; never, when `close`
+/// is cancelled first.
+async fn in_turn(
+    turn: Arc<tokio::sync::Mutex<()>>,
+    close: CancellationToken,
+    session: BoxFuture<'static, ()>,
+) {
+    if let Some(held) = take_turn(turn, close).await {
+        session.await;
+        drop(held);
+    }
+}
+
+/// The turn of one backchannel session's task ([`BackchannelTasks::spawn`]):
+/// at once when no other task holds it, else once the one that does
+/// ended; `None` when `close` is cancelled first, the session closed
+/// before it opened.
+async fn take_turn(
+    turn: Arc<tokio::sync::Mutex<()>>,
+    close: CancellationToken,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    if let Ok(held) = Arc::clone(&turn).try_lock_owned() {
+        return Some(held);
+    }
+    tracing::info!(
+        "backchannel: the previous session still closes on the device; this one opens once it is closed"
+    );
+    tokio::select! {
+        held = turn.lock_owned() => Some(held),
+        () = close.cancelled() => {
+            tracing::info!(
+                "backchannel: the session was closed while it waited for the previous one; never opened"
+            );
+            None
+        }
     }
 }
 
@@ -1371,16 +1431,20 @@ mod tests {
         let slot = BackchannelSlot::default().tracked(tasks.clone());
         assert_eq!(BackchannelSlot::default().tasks().running(), 0);
         let (end, ended) = oneshot::channel::<()>();
-        let task = slot.tasks().spawn("test.session", async move {
-            let _ended = ended.await;
-        });
+        let task = slot
+            .tasks()
+            .spawn("test.session", &CancellationToken::new(), async move {
+                let _ended = ended.await;
+            });
         assert_eq!(tasks.running(), 1, "tracked by the tasks it was given");
         let waiting = tasks.clone();
         let wait = spawn_named("test.wait", async move { waiting.ended().await });
         let (more, later) = oneshot::channel::<()>();
-        let _late = slot.tasks().spawn("test.late", async move {
-            let _later = later.await;
-        });
+        let _late = slot
+            .tasks()
+            .spawn("test.late", &CancellationToken::new(), async move {
+                let _later = later.await;
+            });
         drop(end);
         bounded(task).await.unwrap();
         tokio::task::yield_now().await;
@@ -1388,6 +1452,40 @@ mod tests {
         assert_eq!(tasks.running(), 1);
         drop(more);
         bounded(wait).await.unwrap();
+        assert_eq!(tasks.running(), 0);
+    }
+
+    /// A device takes one backchannel session at a time (a camera with
+    /// one answers a second `SETUP` `453`, RFC 2326 §11.3.3): a session's
+    /// task runs once the one spawned before it ended, and one closed
+    /// while it waits ends without running.
+    #[tokio::test]
+    async fn rfc2326_11_3_3_backchannel_session_tasks_run_one_at_a_time() {
+        let tasks = BackchannelTasks::default();
+        let (end, ended) = oneshot::channel::<()>();
+        let (ran, mut runs) = mpsc::unbounded_channel();
+        let first_ran = ran.clone();
+        let first = tasks.spawn("test.first", &CancellationToken::new(), async move {
+            first_ran.send(1).unwrap();
+            let _ended = ended.await;
+        });
+        assert_eq!(bounded(runs.recv()).await, Some(1));
+        let close = CancellationToken::new();
+        // Run, it would never end.
+        let closed = tasks.spawn("test.closed", &close, std::future::pending());
+        let second = tasks.spawn("test.second", &CancellationToken::new(), async move {
+            ran.send(2).unwrap();
+        });
+        tokio::task::yield_now().await;
+        assert!(runs.try_recv().is_err(), "both wait for the first");
+        assert_eq!(tasks.running(), 3, "waiting ones count");
+        close.cancel();
+        bounded(closed).await.unwrap();
+        assert!(runs.try_recv().is_err(), "the second still waits");
+        drop(end);
+        bounded(first).await.unwrap();
+        bounded(second).await.unwrap();
+        assert_eq!(runs.try_recv(), Ok(2));
         assert_eq!(tasks.running(), 0);
     }
 

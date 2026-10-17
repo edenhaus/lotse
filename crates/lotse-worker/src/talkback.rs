@@ -33,7 +33,8 @@
 //!   releases it ([`Arbiter::release`], [`ChangeReason::Released`]): from
 //!   whoever holds it, or only from the session the release names,
 //!   decided against the claims under one lock. There is no timeout.
-//!   Every release closes the device's backchannel session. Free, the
+//!   Every release closes the device's backchannel session, one still
+//!   opening included (its handshake abandoned). Free, the
 //!   channel goes to the next offer that asks, from any session, the one
 //!   that let go included.
 //! - **Lost.** The device's backchannel session ending on its own while
@@ -58,6 +59,7 @@
 //! [`TalkerFeed`], which resynchronizes from the arbiter when it falls
 //! behind.
 
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -295,6 +297,10 @@ struct Talker {
     losses: mpsc::Sender<BackchannelRefused>,
     /// The way its packets reach the device, once built for the session.
     route: Option<Route>,
+    /// Dropped with the talker: a claim whose session still opens stops
+    /// waiting for it ([`Arbiter::claim`]) and abandons the handshake, so
+    /// a release frees the device's backchannel as well as the channel.
+    _abandon: oneshot::Sender<Infallible>,
 }
 
 /// Why a claim does not hold the channel: the `backchannel_declined`
@@ -528,7 +534,7 @@ impl Arbiter {
         limit: Duration,
         losses: mpsc::Sender<BackchannelRefused>,
     ) -> Result<Option<Claim>, ClaimError> {
-        let Some((offer, id)) = self.start_claim(session, held, losses)? else {
+        let Some((offer, id, abandoned)) = self.start_claim(session, held, losses)? else {
             return Ok(None);
         };
         // Lets go if this future is dropped before the session adopts it.
@@ -537,10 +543,14 @@ impl Arbiter {
             session: session.to_owned(),
             id: Some(id),
         };
-        // A session open at once wins over a limit used up already.
+        // A session open at once wins over a limit used up already. A
+        // release meanwhile drops the open, which abandons the handshake
+        // (RTSP: the camera's `TEARDOWN`, RFC 2326 §10.7, once it set the
+        // session up).
         let opened = tokio::select! {
             biased;
             opened = offer.opener.open() => opened,
+            _released = abandoned => return Err(Self::abandoned(claim, id)),
             () = self.clock.sleep(limit) => Err(BackchannelRefused {
                 status: None,
                 message: format!(
@@ -553,14 +563,15 @@ impl Arbiter {
     }
 
     /// The claim of [`Arbiter::claim`], decided under the lock: `None`
-    /// when `held` holds the channel already, else the offer to open and
-    /// the new claim, which holds the channel from now on.
+    /// when `held` holds the channel already, else the offer to open, the
+    /// new claim, which holds the channel from now on, and what resolves
+    /// once it no longer does (a release while its session opens).
     fn start_claim(
         &self,
         session: &str,
         held: Option<u64>,
         losses: mpsc::Sender<BackchannelRefused>,
-    ) -> Result<Option<(BackchannelOffer, u64)>, ClaimError> {
+    ) -> Result<Option<(BackchannelOffer, u64, oneshot::Receiver<Infallible>)>, ClaimError> {
         let offer = self.offered();
         let mut guard = self.lock();
         let state = &mut *guard;
@@ -584,12 +595,14 @@ impl Arbiter {
         let id = state.next_claim;
         state.next_claim = id.wrapping_add(1);
         self.emit(&mut state.last, session, id, ChangeReason::Claimed);
+        let (abandon, abandoned) = oneshot::channel();
         state.talker = Some(Talker {
             session: session.to_owned(),
             claim: id,
             open: None,
             losses,
             route: None,
+            _abandon: abandon,
         });
         drop(guard);
         let reason = ChangeReason::Claimed.code();
@@ -599,7 +612,25 @@ impl Arbiter {
             reason,
             "talk-back: backchannel claimed by the offer; opening the camera's backchannel session, the answer waits for it"
         );
-        Ok(Some((offer, id)))
+        Ok(Some((offer, id, abandoned)))
+    }
+
+    /// The claim numbered `id` was released while its session opened: the
+    /// open is dropped, which abandons the handshake and closes what the
+    /// device set up, before the next claim opens one; the offer is
+    /// declined.
+    fn abandoned(mut claim: Claim, id: u64) -> ClaimError {
+        // The release took the channel: nothing to let go.
+        claim.id = None;
+        tracing::info!(
+            session = claim.session,
+            claim = id,
+            "talk-back: the backchannel was released while its session opened; the handshake is abandoned and the offer declined"
+        );
+        ClaimError::Refused(BackchannelRefused {
+            status: None,
+            message: "the backchannel was released while its session opened".to_owned(),
+        })
     }
 
     /// The device's backchannel session for `claim`, numbered `id`, opened,
@@ -633,7 +664,8 @@ impl Arbiter {
                     return Ok(Some(claim));
                 }
                 drop(guard);
-                // Released while it opened: closed again at once.
+                // Released as it opened, before this claim saw the
+                // release: closed again at once.
                 drop(opened);
                 claim.id = None;
                 tracing::info!(
@@ -721,9 +753,11 @@ impl Arbiter {
     /// or, given `only`, only if that session holds it: decided under the
     /// lock a claim takes, so a release that names a session that already
     /// let go never frees the channel a later claim took. Its route stops
-    /// at once, and the next offer that asks for talk-back claims it, the
-    /// released session's included. Returns the session that held it when
-    /// it was freed.
+    /// at once, its backchannel session closes (one still opening is
+    /// abandoned), and the next offer that asks for talk-back claims it,
+    /// the released session's included; that claim's session opens once
+    /// the released one closed on the device. Returns the session that
+    /// held it when it was freed.
     pub(crate) fn release(&self, only: Option<&str>) -> Option<String> {
         let mut guard = self.lock();
         let state = &mut *guard;
@@ -1260,8 +1294,10 @@ mod tests {
     use tokio::sync::Notify;
     use tokio::sync::broadcast::error::TryRecvError;
     use tokio_util::sync::CancellationToken;
+    use tracing::Level;
 
     use super::*;
+    use crate::test_logs::Logs;
 
     /// A talk-back transcoder that hands each uplink frame on as one
     /// packet of the device's G.711 (PT 0, SSRC 9), recording the frames
@@ -1396,6 +1432,8 @@ mod tests {
         answers: Mutex<VecDeque<Answer>>,
         opened: mpsc::UnboundedSender<DeviceSession>,
         opens: AtomicU64,
+        /// Each open's close, opened or not.
+        closes: Mutex<Vec<CancellationToken>>,
     }
 
     impl BackchannelOpener for TestOpener {
@@ -1410,6 +1448,7 @@ mod tests {
             let (sender, packets) = mpsc::channel(self.capacity);
             let (on_loss, lost) = oneshot::channel();
             let close = CancellationToken::new();
+            self.closes.lock().unwrap().push(close.clone());
             let session = BackchannelSession::new(
                 self.codec.clone(),
                 self.frame,
@@ -1481,6 +1520,12 @@ mod tests {
         fn opens(&self) -> u64 {
             self.opener.opens.load(Ordering::Relaxed)
         }
+
+        /// Whether the session of the `nth` open, from 0, was closed or
+        /// abandoned.
+        fn closed(&self, nth: usize) -> bool {
+            self.opener.closes.lock().unwrap()[nth].is_cancelled()
+        }
     }
 
     /// Offers a backchannel of `codec` and `frame` whose sessions have
@@ -1494,6 +1539,7 @@ mod tests {
             answers: Mutex::default(),
             opened: handed,
             opens: AtomicU64::new(0),
+            closes: Mutex::default(),
         });
         let opener: Arc<dyn BackchannelOpener> = test_opener.clone();
         slot.offer(BackchannelOffer {
@@ -2040,29 +2086,73 @@ mod tests {
         assert!(!holds(&a));
     }
 
-    /// A release while the session opens frees the channel at once; the
-    /// session that opens after it is closed again and the offer declined.
-    /// A session that closes while its answer waits lets go and abandons
-    /// the session.
+    /// A release while the session opens frees the channel at once and
+    /// abandons the open, so the device's session is closed before the
+    /// next claim opens one, and the offer is declined; the claim that
+    /// follows opens a new one, and so does a claim after a release while
+    /// it plays. A session that opens just as the release comes, before
+    /// its claim sees it, is closed again. A session that closes while
+    /// its answer waits lets go and abandons the session.
     #[tokio::test]
     async fn a_release_or_a_close_while_the_session_opens_keeps_nothing() {
+        let (logs, _guard) = Logs::capture();
         let (arbiter, slot) = arbiter(None);
         let mut device = pcmu(&slot);
         let mut events = arbiter.subscribe();
-        let go = Arc::new(Notify::new());
-        device.answer(Answer::Later(Arc::clone(&go)));
+        device.answer(Answer::Hang);
         let a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
         let claiming = spawn_named("test.claim", a.claimant().claim(BACKCHANNEL_OPEN_LIMIT));
         eventually("the open asked for", || device.opens() == 1).await;
+        assert!(!device.closed(0));
         assert_eq!(arbiter.release(None).as_deref(), Some("a"));
-        go.notify_one();
+        let released = ClaimError::Refused(BackchannelRefused {
+            status: None,
+            message: "the backchannel was released while its session opened".into(),
+        });
+        assert_eq!(within(claiming).await.unwrap().unwrap_err(), released);
+        assert!(device.closed(0), "the open abandoned");
         assert_eq!(
-            within(claiming).await.unwrap().unwrap_err(),
-            ClaimError::Refused(BackchannelRefused {
-                status: None,
-                message: "the backchannel was released while its session opened".into(),
-            })
+            logs.count(
+                Level::INFO,
+                "talk-back: the backchannel was released while its session opened; the handshake is abandoned and the offer declined"
+            ),
+            1
         );
+        assert_eq!(change(&mut events), ("a".into(), ChangeReason::Claimed));
+        assert_eq!(change(&mut events), ("a".into(), ChangeReason::Released));
+        no_change(&mut events);
+        // Claimed again: a new session opens.
+        let mut b = Talkback::new(Arc::clone(&arbiter), "b".into(), Arc::default());
+        claims(&mut b).await;
+        assert_eq!(device.opens(), 2);
+        talk(&mut b, 0);
+        assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 0);
+        // Released while it plays and claimed again: closed, and another
+        // one opens.
+        assert_eq!(arbiter.release(None).as_deref(), Some("b"));
+        assert!(device.closed(1));
+        claims(&mut b).await;
+        assert_eq!(device.opens(), 3);
+        talk(&mut b, 1);
+        assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 1);
+        assert_eq!(arbiter.release(None).as_deref(), Some("b"));
+        for reason in [
+            ChangeReason::Claimed,
+            ChangeReason::Released,
+            ChangeReason::Claimed,
+            ChangeReason::Released,
+        ] {
+            assert_eq!(change(&mut events), ("b".into(), reason));
+        }
+        // The session opens and the release comes before the claim sees
+        // it: the open wins the race, and the session is closed again.
+        let go = Arc::new(Notify::new());
+        device.answer(Answer::Later(Arc::clone(&go)));
+        let claiming = spawn_named("test.claim", a.claimant().claim(BACKCHANNEL_OPEN_LIMIT));
+        eventually("the open asked for", || device.opens() == 4).await;
+        go.notify_one();
+        assert_eq!(arbiter.release(None).as_deref(), Some("a"));
+        assert_eq!(within(claiming).await.unwrap().unwrap_err(), released);
         assert!(device.session().close.is_cancelled(), "closed again");
         assert_eq!(change(&mut events), ("a".into(), ChangeReason::Claimed));
         assert_eq!(change(&mut events), ("a".into(), ChangeReason::Released));
@@ -2071,7 +2161,7 @@ mod tests {
         // channel is free again.
         device.answer(Answer::Hang);
         let claiming = spawn_named("test.claim", a.claimant().claim(BACKCHANNEL_OPEN_LIMIT));
-        eventually("the open asked for", || device.opens() == 2).await;
+        eventually("the open asked for", || device.opens() == 5).await;
         assert_eq!(change(&mut events), ("a".into(), ChangeReason::Claimed));
         claiming.abort();
         assert!(claiming.await.unwrap_err().is_cancelled());

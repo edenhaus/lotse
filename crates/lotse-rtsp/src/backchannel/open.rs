@@ -19,7 +19,12 @@
 //! `TEARDOWN` with `Require`, and the connection closes, as a camera may
 //! stay in two-way mode until it does. Should the camera end the session
 //! first (its connection lost, a request refused), the loss is reported
-//! with why; nothing is opened again until the next claim.
+//! with why; nothing is opened again until the next claim. A session
+//! opens only once the one before it closed on the camera, its bounded
+//! `TEARDOWN` included ([`BackchannelTasks::spawn`]): a camera with one
+//! backchannel refuses a `SETUP` of it while another session holds it
+//! (`453 Not Enough Bandwidth`, RFC 2326 §11.3.3), so the claim that
+//! follows a release waits for that close rather than race it.
 
 use std::time::Duration;
 
@@ -94,9 +99,11 @@ impl BackchannelOpener for Opener {
         let (opened, open) = oneshot::channel();
         let (on_loss, lost) = oneshot::channel();
         // Tracked, not joined: the claim's drop closes it, and the
-        // worker's shutdown waits for the task to end.
+        // worker's shutdown waits for the task to end. It starts once the
+        // session before it closed on the camera.
         let _session = self.tasks.spawn(
             "rtsp.backchannel",
+            &close,
             run(
                 self.camera.clone(),
                 self.codec.clone(),
@@ -375,7 +382,7 @@ mod tests {
     use lotse_core::source_url::SourceUrl;
     use lotse_core::task::spawn_named;
     use lotse_testing::fake_camera::{
-        BackchannelCodec, BackchannelSetup, CameraBackchannel, ConnectionLog,
+        BackchannelCodec, BackchannelSetup, CameraBackchannel, ConnectionLog, Stats,
     };
     use lotse_testing::{CameraConfig, FakeCamera};
 
@@ -521,6 +528,81 @@ mod tests {
         tokio::select! {
             () = tasks.ended() => {}
             () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the session's task never ended"),
+        }
+        cam.stop().await;
+    }
+
+    /// A camera with one PCMU backchannel ([`CameraBackchannel::single`])
+    /// that answers its requests as `setup` says.
+    async fn one_backchannel(setup: BackchannelSetup) -> FakeCamera {
+        let backchannel = CameraBackchannel {
+            setup,
+            single: true,
+            ..CameraBackchannel::new(BackchannelCodec::Pcmu)
+        };
+        let config = CameraConfig {
+            backchannel: Some(backchannel),
+            ..CameraConfig::default()
+        };
+        FakeCamera::start(config, Arc::new(SystemClock))
+            .await
+            .unwrap()
+    }
+
+    /// A camera with one backchannel holds it for the released session
+    /// until that session's connection closes, its `TEARDOWN` left
+    /// unanswered: the session a claim opens right after the release
+    /// waits for that close, the end of the `TEARDOWN`'s budget (RFC 2326
+    /// §10.7), rather than race it into a `453` (RFC 2326 §11.3.3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc2326_11_3_3_a_session_opened_after_a_release_while_playing_waits_for_its_close() {
+        let cam = one_backchannel(BackchannelSetup::Lingering).await;
+        let tasks = BackchannelTasks::default();
+        let opener = Opener::new(camera_at(&cam), Codec::Pcmu, tasks.clone());
+        let first = opener.open().await.unwrap();
+        drop(first);
+        let second = opener.open().await.unwrap();
+        assert_eq!(second.codec, Codec::Pcmu);
+        let stats = cam.stats();
+        assert_eq!(Stats::get(&stats.backchannel_busy), 0, "never refused");
+        let log = stats.connection_log();
+        assert_eq!(log[0].teardown, Some(true), "{log:?}");
+        assert!(log[0].closed_by_client, "{log:?}");
+        assert!(log[1].played, "{log:?}");
+        drop(second);
+        tokio::select! {
+            () = tasks.ended() => {}
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the sessions' tasks never ended"),
+        }
+        cam.stop().await;
+    }
+
+    /// A claim released while its session opens drops the open: the
+    /// handshake is abandoned, its `SETUP` taken by the camera and never
+    /// answered ending with its connection, and the session the next
+    /// claim opens gets the camera's one backchannel (RFC 2326 §11.3.3)
+    /// once the abandoned one closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc2326_11_3_3_a_session_opened_after_a_release_while_opening_gets_the_backchannel() {
+        let cam = one_backchannel(BackchannelSetup::Silent).await;
+        let tasks = BackchannelTasks::default();
+        let opener = Opener::new(camera_at(&cam), Codec::Pcmu, tasks.clone());
+        let opening = opener.open();
+        let deadline = SystemClock.now() + Duration::from_secs(5);
+        first_logged(&cam, deadline, |log| !log.setups.is_empty()).await;
+        drop(opening);
+        cam.set_backchannel_setup(BackchannelSetup::Accept);
+        let session = opener.open().await.unwrap();
+        let stats = cam.stats();
+        assert_eq!(Stats::get(&stats.backchannel_busy), 0, "never refused");
+        let log = stats.connection_log();
+        assert!(!log[0].played, "{log:?}");
+        assert!(log[0].closed_by_client, "{log:?}");
+        assert!(log[1].played, "{log:?}");
+        drop(session);
+        tokio::select! {
+            () = tasks.ended() => {}
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the sessions' tasks never ended"),
         }
         cam.stop().await;
     }

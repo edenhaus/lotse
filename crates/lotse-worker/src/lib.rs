@@ -4464,12 +4464,15 @@ mod tests {
             let (mut serving, _rx) = serving(&settings);
             let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let flag = Arc::clone(&closed);
-            let _session = serving.backchannels.spawn("test.backchannel", async move {
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
-                flag.store(true, Ordering::Relaxed);
-            });
+            let close = CancellationToken::new();
+            let _session = serving
+                .backchannels
+                .spawn("test.backchannel", &close, async move {
+                    for _ in 0..10 {
+                        tokio::task::yield_now().await;
+                    }
+                    flag.store(true, Ordering::Relaxed);
+                });
             let reason = if gone {
                 serving.on_supervisor_gone().await
             } else {
@@ -4493,7 +4496,11 @@ mod tests {
         let fake = Arc::new(FakeClock::default());
         let clock: Arc<dyn Clock> = fake.clone();
         let tasks = BackchannelTasks::default();
-        let _stuck = tasks.spawn("test.stuck", std::future::pending());
+        let _stuck = tasks.spawn(
+            "test.stuck",
+            &CancellationToken::new(),
+            std::future::pending(),
+        );
         let closing = spawn_named("test.close", async move {
             close_backchannels(&tasks, &clock).await;
         });
@@ -4544,7 +4551,11 @@ mod tests {
         )
         .unwrap();
         let slot = runner.backchannel.clone().unwrap();
-        let _session = slot.tasks().spawn("test.session", std::future::pending());
+        let _session = slot.tasks().spawn(
+            "test.session",
+            &CancellationToken::new(),
+            std::future::pending(),
+        );
         assert_eq!(tasks.running(), 1);
         stop_runner(runner, &clock).await;
     }
