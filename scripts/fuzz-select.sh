@@ -40,7 +40,8 @@ git diff --name-only --no-renames "$base" HEAD >"$tmp/changed"
 git diff --name-only --no-renames --diff-filter=D "$base" HEAD >"$tmp/deleted"
 # The crates (`crates/<name>/`, one per line) a change reaches as a whole.
 {
-  sed -n -e 's|^\(crates/[^/]*/\)Cargo\.toml$|\1|p' -e 's|^\(crates/[^/]*/\)build\.rs$|\1|p' "$tmp/changed"
+  sed -n -e 's|^\(crates/[^/]*/\)Cargo\.toml$|\1|p' -e 's|^\(crates/[^/]*/\)build\.rs$|\1|p' \
+    "$tmp/changed"
   sed -n 's|^\(crates/[^/]*/\).*|\1|p' "$tmp/deleted"
 } >"$tmp/crates"
 
