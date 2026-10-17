@@ -22,9 +22,13 @@ use lotse_core::runner::DEFAULT_READY_TIMEOUT;
 use lotse_core::task::BoxFuture;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
-/// How long a permit may be held for one attempt: the runner gives up on
-/// an attempt that is not live after its ready timeout, so a worker still
-/// holding the permit later is stuck or hostile, and the permit goes back.
+/// How long a permit may be held for one attempt or backchannel probe:
+/// the runner gives up on an attempt that is not live after its ready
+/// timeout, and a source on its probe after
+/// [`PROBE_TIMEOUT`](lotse_core::runner::PROBE_TIMEOUT), so a worker
+/// still holding the permit later is stuck or hostile, and the permit goes
+/// back. The 5 s beyond either cover the grant's way to the worker and the
+/// permit's way back.
 pub(crate) const CONNECT_LEASE: Duration =
     DEFAULT_READY_TIMEOUT.saturating_add(Duration::from_secs(5));
 
@@ -226,8 +230,19 @@ mod tests {
     )]
 
     use lotse_core::clock::FakeClock;
+    use lotse_core::runner::PROBE_TIMEOUT;
 
     use super::*;
+
+    /// A backchannel probe ends within `PROBE_TIMEOUT` of its grant, so it
+    /// gives its permit back before the lease runs out, with the same 5 s
+    /// to spare as an attempt has beyond its ready timeout.
+    #[test]
+    fn a_probe_ends_before_its_permits_lease_runs_out() {
+        let spare = Duration::from_secs(5);
+        assert_eq!(PROBE_TIMEOUT + spare, CONNECT_LEASE);
+        assert_eq!(DEFAULT_READY_TIMEOUT + spare, CONNECT_LEASE);
+    }
 
     fn slots(clock: &Arc<FakeClock>, count: usize) -> Vec<ConnectSlot> {
         (0..count)

@@ -40,6 +40,14 @@ pub const DEFAULT_STALL_CHECK: Duration = Duration::from_secs(1);
 /// gives up on it. A belt over the source's own connect timeout.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a backchannel probe may run once its [`ProbePermit`] is
+/// granted, its connection and the device's answer included, whatever
+/// the source's own timeouts: the ready timeout that bounds a connection
+/// attempt, so a probe gives its permit back within the lease the
+/// supervisor keeps on it, as an attempt does, and no probe runs on once
+/// the permit lets another connection through.
+pub const PROBE_TIMEOUT: Duration = DEFAULT_READY_TIMEOUT;
+
 /// How long a cancelled source may run on before the runner drops its
 /// future. Five times the ingest contract's 100 ms,
 /// which covers the RTSP source's 100 ms wait for its `TEARDOWN` answer,

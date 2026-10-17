@@ -12,12 +12,16 @@
 //! source ([`Probed`]); any other failure means none for this connection
 //! attempt, and the next one asks again, as every connect does: a
 //! rebooted camera may answer differently. The probe waits for a connect
-//! permit (`sources.connect_concurrency`) like any connection attempt.
+//! permit (`sources.connect_concurrency`) like any connection attempt,
+//! and ends within [`PROBE_TIMEOUT`] of its grant, connection and answer
+//! included, whatever the source's `timeout_ms`: no probe holds a permit
+//! past the lease the supervisor keeps on it.
 
 use std::future::Future;
 use std::sync::Arc;
 
 use futures_util::FutureExt as _;
+use lotse_core::runner::PROBE_TIMEOUT;
 use lotse_core::source::{BackchannelOffer, BackchannelRefused, BackchannelSlot, SourceError};
 use retina::client::{Session, SessionGroup};
 use tokio_util::sync::CancellationToken;
@@ -148,11 +152,29 @@ pub(crate) fn unanswered(error: SourceError) -> BackchannelRefused {
     refusal(None, &error)
 }
 
-/// One `DESCRIBE` with `Require` on a connection of its own: the
-/// backchannel's format, `None` when the answer has none the talk-back
-/// chain can feed, or why it failed, with the camera's status when it
-/// answered one.
+/// One `DESCRIBE` with `Require` on a connection of its own, all of it
+/// within [`PROBE_TIMEOUT`], however long the source's `timeout_ms` lets
+/// each step take: the backchannel's format, `None` when the answer has
+/// none the talk-back chain can feed, or why it failed, with the camera's
+/// status when it answered one.
 async fn describe(
+    camera: &Camera,
+    cancel: &CancellationToken,
+) -> Result<Option<BackchannelFormat>, BackchannelRefused> {
+    let probe = ask(camera, cancel).map(Ok::<_, SourceError>);
+    within_on(
+        &*camera.time,
+        cancel,
+        PROBE_TIMEOUT,
+        "backchannel probe",
+        probe,
+    )
+    .await
+    .map_err(unanswered)?
+}
+
+/// [`describe`]'s steps, each within the source's `timeout_ms`.
+async fn ask(
     camera: &Camera,
     cancel: &CancellationToken,
 ) -> Result<Option<BackchannelFormat>, BackchannelRefused> {
@@ -189,8 +211,11 @@ mod tests {
         reason = "test code"
     )]
 
-    use lotse_core::clock::SystemClock;
+    use lotse_core::clock::{Clock, FakeClock, SystemClock};
     use lotse_core::source_url::SourceUrl;
+    use std::time::Duration;
+
+    use lotse_core::task::spawn_named;
     use lotse_testing::{CameraConfig, FakeCamera};
 
     use super::*;
@@ -198,6 +223,10 @@ mod tests {
     use crate::relay::Listener;
 
     fn camera_at(addr: std::net::SocketAddr, timeout_ms: u64) -> Camera {
+        timed(addr, timeout_ms, Arc::new(SystemClock))
+    }
+
+    fn timed(addr: std::net::SocketAddr, timeout_ms: u64, time: Arc<dyn Clock>) -> Camera {
         Camera {
             url: SourceUrl::parse(&format!("rtsp://{addr}/stream")).unwrap(),
             options: RtspOptions {
@@ -208,8 +237,52 @@ mod tests {
             tls: None,
             relay: Listener::default(),
             addr,
-            time: Arc::new(SystemClock),
+            time,
         }
+    }
+
+    /// The whole probe, connection and `DESCRIBE`, ends within
+    /// `PROBE_TIMEOUT`, however long the source's `timeout_ms` lets each
+    /// step wait: it gives its connect permit back in time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_probe_ends_within_the_probe_timeout_whatever_the_read_deadline() {
+        let silent = FakeCamera::start(
+            CameraConfig {
+                silent: true,
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let time = Arc::new(FakeClock::from_system());
+        let camera = timed(silent.addr(), 60_000, time.clone());
+        let probe = spawn_named("test.probe", async move {
+            describe(&camera, &CancellationToken::new()).await
+        });
+        // Connected, so the probe's deadline runs.
+        let mut waited = 0;
+        while silent.stats().connection_log().is_empty() && waited < 500 {
+            SystemClock.sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert_eq!(silent.stats().connection_log().len(), 1, "connected");
+        time.advance(PROBE_TIMEOUT.checked_sub(Duration::from_millis(1)).unwrap());
+        SystemClock.sleep(Duration::from_millis(100)).await;
+        assert!(!probe.is_finished(), "not over yet");
+        time.advance(Duration::from_millis(1));
+        let refused = tokio::select! {
+            done = probe => done.unwrap().unwrap_err(),
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("outlived its timeout"),
+        };
+        assert_eq!(refused.status, None);
+        assert!(
+            refused
+                .message
+                .contains("backchannel probe: no answer within 30000 ms"),
+            "{refused:?}"
+        );
+        silent.stop().await;
     }
 
     /// A probe that cannot reach the camera, or that the camera never

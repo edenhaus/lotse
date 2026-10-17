@@ -36,14 +36,14 @@
 //! the backchannel, its `SETUP`s, its `PLAY`, its `TEARDOWN` and whether
 //! that carried `Require`, the backchannel RTP it took, and its close.
 //! Other modes: the `Require` tag refused with `551` (RFC 2326 §11.3.13,
-//! ONVIF Streaming Specification §5.3.2), only the offered payload type
-//! taken (§5.3.2), and the backchannel's `SETUP` or `PLAY` refused with a
-//! given status (RFC 2326 §11.3.3's `453`, say), hung up on or never
-//! answered, its `TEARDOWN` left unanswered, or the backchannel missing
-//! from a `DESCRIBE`'s answer, each one switchable while the camera runs
-//! ([`FakeCamera::set_backchannel_setup`]); one backchannel only, a
-//! `SETUP` of it refused `453` while another session holds it
-//! ([`CameraBackchannel::single`]); and the connections of the
+//! ONVIF Streaming Specification §5.3.2) or never answered, only the
+//! offered payload type taken (§5.3.2), and the backchannel's `SETUP` or
+//! `PLAY` refused with a given status (RFC 2326 §11.3.3's `453`, say),
+//! hung up on or never answered, its `TEARDOWN` left unanswered, or the
+//! backchannel missing from a `DESCRIBE`'s answer, each one switchable
+//! while the camera runs ([`FakeCamera::set_backchannel_setup`]); one
+//! backchannel only, a `SETUP` of it refused `453` while another session
+//! holds it ([`CameraBackchannel::single`]); and the connections of the
 //! backchannel's sessions hung up on alone
 //! ([`FakeCamera::hang_up_backchannel`]).
 
@@ -343,6 +343,9 @@ pub enum RequireAnswer {
     OptionNotSupported,
     /// Refused with this status, as a camera failing for another reason.
     Status(u16),
+    /// Never answered, the connection kept open and nothing on it
+    /// answered after: a client's deadline ends the wait.
+    Silent,
 }
 
 /// How the camera answers the requests of its backchannel.
@@ -1232,7 +1235,9 @@ impl CameraConfig {
 enum Answering {
     /// It does.
     Yes,
-    /// It hung at `PLAY` ([`PlayAnswer::Never`]) and answers nothing.
+    /// It hung at `PLAY` ([`PlayAnswer::Never`]), at the `SETUP` of the
+    /// backchannel ([`BackchannelSetup::Silent`]) or at a `DESCRIBE` with
+    /// `Require` ([`RequireAnswer::Silent`]) and answers nothing.
     Hung,
     /// It closes the connection instead of the next answer
     /// ([`BackchannelSetup::HangUp`]).
@@ -1884,6 +1889,10 @@ impl Connection {
             Some(RequireAnswer::Status(status)) if asked => {
                 Stats::bump(&self.stats.require_rejected);
                 return reply(cseq, status_code(status)).build(Vec::new());
+            }
+            Some(RequireAnswer::Silent) if asked => {
+                self.answering = Answering::Hung;
+                return reply(cseq, StatusCode::Ok).build(Vec::new());
             }
             _ => false,
         };

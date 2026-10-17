@@ -10,7 +10,8 @@
 //! hang-up, a camera that never answers and a lost connection each say
 //! why; a reconnect of the viewing session leaves the backchannel's
 //! alone; and the probe waits for a connect permit while a claim's
-//! connection does not.
+//! connection does not, and gives it back within its timeout however
+//! long the camera leaves it unanswered.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -27,10 +28,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lotse_core::clock::{Clock, SystemClock};
+use lotse_core::clock::{Clock, FakeClock, SystemClock};
 use lotse_core::codec::{Codec, Kind};
 use lotse_core::media::{MediaPacket, RtpHeaderFields};
-use lotse_core::runner::{ProbeAsk, ProbeGate};
+use lotse_core::runner::{PROBE_TIMEOUT, ProbeAsk, ProbeGate};
 use lotse_core::source::{
     BackchannelOffer, BackchannelRefused, BackchannelSession, BackchannelSlot, ResolvedPeer,
     Source, SourceFactory as _,
@@ -704,6 +705,50 @@ async fn a_claim_bypasses_the_connect_gate_while_the_probe_waits_for_a_permit() 
     assert!(!slot.is_probing());
     assert!(slot.current().is_some());
     drop(session);
+    cam.stop().await;
+}
+
+/// A probe the camera never answers ends within `PROBE_TIMEOUT` of its
+/// grant, however long the stream's `timeout_ms` lets each step wait, and
+/// gives its connect permit back before the supervisor's lease on it runs
+/// out, while the viewing session plays on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unanswered_probe_gives_its_permit_back_within_the_probe_timeout() {
+    let cam = camera(config(None, BackchannelCodec::Pcmu, |backchannel| {
+        backchannel.require = RequireAnswer::Silent;
+    }))
+    .await;
+    let source = source(&cam, &json!({ "timeout_ms": 60_000 }));
+    let time = Arc::new(FakeClock::from_system());
+    let (gate, mut asks) = ProbeGate::closed();
+    let slot = BackchannelSlot::gated(gate.clone());
+    let mut harness = Harness::start_with(source.as_ref(), peer(&cam), time.clone(), slot.clone());
+    assert!(harness.wait_ready().await, "ready");
+    assert_eq!(bounded(asks.recv()).await, Some(ProbeAsk::Connecting(1)));
+    assert!(gate.grant(1));
+    // The probe's `DESCRIBE` reached the camera, which never answers it.
+    assert!(
+        eventually(250, || log(&cam)
+            .get(1)
+            .is_some_and(|probe| probe.describes == [true]))
+        .await,
+        "{:?}",
+        log(&cam)
+    );
+    time.advance(PROBE_TIMEOUT.checked_sub(Duration::from_millis(1)).unwrap());
+    clock().sleep(Duration::from_millis(200)).await;
+    assert!(slot.is_probing(), "the probe still waits");
+    assert!(!log(&cam)[1].closed);
+    time.advance(Duration::from_millis(1));
+    probed(&cam, 2, &slot).await;
+    assert!(log(&cam)[1].closed_by_client, "{:?}", log(&cam)[1]);
+    assert_eq!(bounded(asks.recv()).await, Some(ProbeAsk::Ended(1)));
+    assert!(slot.current().is_none(), "no backchannel for this attempt");
+    // The viewing session plays on throughout.
+    let packets = count(&cam.stats().packets);
+    assert!(eventually(250, || count(&cam.stats().packets) > packets).await);
+    assert!(!log(&cam)[0].closed);
+    finish(harness).await;
     cam.stop().await;
 }
 
