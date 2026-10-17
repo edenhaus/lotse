@@ -227,14 +227,16 @@ pub(crate) struct DriverSpec {
 }
 
 impl DriverSpec {
-    /// The spec as the worker takes it, with the resolved addresses.
-    fn source_spec(&self, peer_addrs: Vec<SocketAddr>) -> SourceSpec {
+    /// The spec as the worker takes it, with the resolved addresses and
+    /// the step its reconnect schedule starts at.
+    fn source_spec(&self, peer_addrs: Vec<SocketAddr>, backoff_attempts: u32) -> SourceSpec {
         SourceSpec {
             connection_id: self.connection_id.clone(),
             url: self.url.clone(),
             options: self.options.clone(),
             peer_host: self.host.clone(),
             peer_addrs,
+            backoff_attempts,
         }
     }
 }
@@ -308,6 +310,8 @@ enum Wake {
     LingerExpired,
     /// The crash-backoff timer fired.
     CrashBackoffExpired,
+    /// The backoff-window timer fired.
+    BackoffWindowExpired,
     /// The worker sent nothing for [`WORKER_SILENCE_LIMIT`].
     WorkerSilent,
     /// The host lookup finished.
@@ -364,6 +368,8 @@ pub(crate) struct Driver {
     linger: Option<BoxFuture<'static, ()>>,
     /// The crash-backoff timer.
     crash: Option<BoxFuture<'static, ()>>,
+    /// The backoff-window timer: until it fires, no new worker connects.
+    window: Option<BoxFuture<'static, ()>>,
     /// The deadline for the running worker's next message; `None` while
     /// there is no worker, or its exit is expected.
     silence: Option<BoxFuture<'static, ()>>,
@@ -424,6 +430,7 @@ impl Driver {
             worker: None,
             linger: None,
             crash: None,
+            window: None,
             silence: None,
             pending: Pending::Nothing,
             connect,
@@ -467,6 +474,7 @@ impl Driver {
             worker,
             linger,
             crash,
+            window,
             silence,
             pending,
             connect,
@@ -486,6 +494,7 @@ impl Driver {
             Some(command) = commands.recv() => Wake::Command(command),
             () = timer(linger) => Wake::LingerExpired,
             () = timer(crash) => Wake::CrashBackoffExpired,
+            () = timer(window) => Wake::BackoffWindowExpired,
             () = timer(silence) => Wake::WorkerSilent,
             wake = pending.wait() => wake,
         }
@@ -515,6 +524,10 @@ impl Driver {
             Wake::CrashBackoffExpired => {
                 self.crash = None;
                 self.feed(Input::CrashBackoffExpired);
+            }
+            Wake::BackoffWindowExpired => {
+                self.window = None;
+                self.feed(Input::BackoffWindowExpired);
             }
             Wake::WorkerSilent => {
                 self.silence = None;
@@ -588,7 +601,9 @@ impl Driver {
                 self.pending = Pending::Nothing;
                 self.resolve_backoff.reset();
                 if let Some(worker) = self.worker.as_mut() {
-                    let spec = self.spec.source_spec(addrs);
+                    // A source switched to has failed no attempt yet: its
+                    // schedule starts at the first step.
+                    let spec = self.spec.source_spec(addrs, 0);
                     if let Err(err) = worker.switch_source(&spec).await {
                         tracing::warn!(pid = worker.pid(), error = %err, "source switch could not be sent to the worker");
                     }
@@ -940,6 +955,10 @@ impl Driver {
                 self.crash = None;
                 None
             }
+            Action::StartBackoffWindow(delay) => {
+                self.window = Some(self.shared.clock.sleep(delay));
+                None
+            }
         }
     }
 
@@ -958,7 +977,10 @@ impl Driver {
         let ports: Vec<u16> = self.spec.port.into_iter().collect();
         match self.shared.manager.spawn(&ports, self.spec.loopback_relay) {
             Ok(mut worker) => {
-                let spec = self.spec.source_spec(addrs);
+                // The schedule continues where the last worker's left off.
+                let spec = self
+                    .spec
+                    .source_spec(addrs, self.machine.backoff_attempts());
                 if let Err(err) = worker.run_source(&spec).await {
                     tracing::warn!(pid = worker.pid(), error = %err, "source could not be sent to the worker");
                 }
@@ -1134,6 +1156,7 @@ impl Driver {
         self.pending = Pending::Nothing;
         self.linger = None;
         self.crash = None;
+        self.window = None;
         if let Some(worker) = self.worker.take() {
             let _status = worker
                 .stop(self.shared.shutdown_budget, &self.shared.clock)
@@ -1690,6 +1713,88 @@ mod tests {
         )
     }
 
+    /// A viewer that re-offers right after a failed attempt is no new
+    /// camera login: inside the backoff window the connection publishes
+    /// the failure an offer closes with, and demand starts no lookup and
+    /// no worker; once the window ends the next worker starts, its
+    /// reconnect schedule continuing where the last one's left off.
+    #[tokio::test]
+    async fn demand_inside_the_backoff_window_starts_no_worker_and_the_next_continues_the_schedule()
+    {
+        let dir = private_dir("driver-window");
+        let out = dir.join("received");
+        let script = dir.join("worker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nexec cat > {}\n", out.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with(script.to_str().unwrap(), clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let run = |backoff_attempts| {
+            lotse_ipc::ToWorker::RunSource(SourceSpec {
+                connection_id: "c1".into(),
+                url: "fake://127.0.0.1/".into(),
+                options: "{}".into(),
+                peer_host: "127.0.0.1".into(),
+                peer_addrs: vec!["127.0.0.1:0".parse().unwrap()],
+                backoff_attempts,
+            })
+        };
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        step(&mut driver).await;
+        assert!(driver.worker.is_some());
+        recorded(&out, &run(0)).await;
+        // RFC 2326 §7.1.1: a 401 is a credential failure.
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Backoff {
+            error: SourceError::AuthFailed("401".into()),
+            retry_in: Duration::from_secs(5),
+        }));
+        // The waiting viewer closed with it; its demand goes.
+        demand_tx.send_replace(0);
+        step(&mut driver).await;
+        driver.publish();
+        assert_eq!(driver.machine.state(), ConnectionState::Idle);
+        assert!(driver.worker.is_none());
+        assert_eq!(
+            driver.snapshot.failure.as_ref().map(ConnectionError::code),
+            Some("source_auth_failed"),
+            "an offer now closes at once"
+        );
+        // Demand inside the window: no lookup, no worker.
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        assert!(matches!(driver.pending, Pending::Nothing));
+        assert!(driver.worker.is_none());
+        assert!(
+            ready_wake(&mut driver).await.is_none(),
+            "nothing before the end"
+        );
+        // The window ends: the demand connects, and the failure is over.
+        clock.advance(Duration::from_secs(5));
+        let wake = next_wake(&mut driver).await;
+        assert!(matches!(wake, Wake::BackoffWindowExpired));
+        driver.handle(wake).await;
+        driver.publish();
+        assert_eq!(driver.snapshot.failure, None);
+        assert!(matches!(driver.pending, Pending::Resolving(_)));
+        step(&mut driver).await;
+        recorded(&out, &run(1)).await;
+        assert!(driver.worker.is_some());
+        drop((driver, demand_tx));
+        shared.tracker.close();
+        while !shared.tracker.is_empty() {
+            clock.advance(shared.shutdown_budget);
+            SystemClock.sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn every_announced_attempt_holds_a_connect_permit_until_it_ends() {
         let dir = private_dir("driver-connect");
@@ -1940,6 +2045,7 @@ mod tests {
             options: "{}".into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
+            backoff_attempts: 0,
         });
         let messages = recorded(&out, &want).await;
         assert_eq!(messages, [want]);
@@ -2023,6 +2129,7 @@ mod tests {
             options: options.into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
+            backoff_attempts: 0,
         };
         let backchannel = |options: &str, asks: bool| {
             Wake::Command(DriverCommand::Backchannel(spec(options, asks)))

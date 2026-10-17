@@ -977,6 +977,7 @@ fn start_runner(
         addrs = ?spec.peer_addrs,
         role,
         backchannel = capable,
+        backoff_attempts = spec.backoff_attempts,
         "running source"
     );
 
@@ -994,7 +995,7 @@ fn start_runner(
         backchannel.clone().unwrap_or_default(),
         Arc::clone(clock),
         settings.runner,
-        ReconnectBackoff::new(jitter_seed(clock.as_ref())),
+        ReconnectBackoff::resumed(jitter_seed(clock.as_ref()), spec.backoff_attempts),
         events,
         gate.clone(),
         cancel.clone(),
@@ -1326,6 +1327,7 @@ mod tests {
             options: options.into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
+            backoff_attempts: 0,
         }
     }
 
@@ -4056,9 +4058,26 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_source_reports_reconnecting_then_backoff_with_their_codes() {
+        // A spec without earlier attempts starts the schedule at its first
+        // step, 1 s; one after five continues at the second, 5 s.
+        for (backoff_attempts, delays) in [(0, 800..=1_200), (5, 4_000..=6_000)] {
+            stalled_source_backs_off(backoff_attempts, delays).await;
+        }
+    }
+
+    /// Runs a silent source after `backoff_attempts` earlier delays and
+    /// checks it reports a drop, then a delay within `delays` ms.
+    async fn stalled_source_backs_off(
+        backoff_attempts: u32,
+        delays: std::ops::RangeInclusive<u32>,
+    ) {
         let mut h = start();
         h.next().await;
-        h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "null")), &[])
+        let source = SourceSpec {
+            backoff_attempts,
+            ..spec("fake://cam/", "null")
+        };
+        h.tx.send_msg(&ToWorker::RunSource(source), &[])
             .await
             .unwrap();
         // The fake video is silent: the watchdog drops the connection once
@@ -4078,7 +4097,7 @@ mod tests {
         );
         assert!(
             matches!(states.last(), Some(SourceState::Backoff { code, message, retry_ms })
-                if timeout(code, message) && (800..=1_200).contains(retry_ms)),
+                if timeout(code, message) && delays.contains(retry_ms)),
             "backoff last: {states:?}"
         );
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])

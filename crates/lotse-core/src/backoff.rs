@@ -107,6 +107,17 @@ impl ReconnectBackoff {
         }
     }
 
+    /// A schedule that continues where an earlier one left off, after
+    /// `attempts` delays: a new worker of a source whose earlier workers
+    /// kept failing starts at their step, not at the first.
+    pub const fn resumed(seed: u64, attempts: u32) -> Self {
+        Self {
+            attempts,
+            immediate_used: false,
+            jitter: Jitter::new(seed),
+        }
+    }
+
     /// The delay before the next attempt. `after_live` says the connection
     /// that just ended had reached the live state; the first such loss
     /// since a reset is retried at once.
@@ -245,6 +256,19 @@ mod tests {
             backoff.next_delay(false),
             Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn a_resumed_schedule_continues_at_its_step() {
+        let mut backoff = ReconnectBackoff::resumed(42, 5);
+        assert_eq!(backoff.attempts(), 5);
+        let delay = backoff.next_delay(false);
+        assert!(within_jitter(delay, Duration::from_secs(5)), "{delay:?}");
+        assert_eq!(backoff.attempts(), 6);
+        // The immediate attempt after a live period is still there.
+        assert_eq!(backoff.next_delay(true), Duration::ZERO);
+        let fresh = ReconnectBackoff::resumed(42, 0).next_delay(false);
+        assert!(within_jitter(fresh, Duration::from_secs(1)), "{fresh:?}");
     }
 
     #[test]

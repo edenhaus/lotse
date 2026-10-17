@@ -281,6 +281,11 @@ pub struct SourceSpec {
     pub peer_host: String,
     /// The resolved addresses to try, in order (workers have no DNS).
     pub peer_addrs: Vec<SocketAddr>,
+    /// Where the reconnect schedule starts: the delays the connection's
+    /// earlier workers handed out since its source was last live, so a
+    /// source that keeps failing is not retried at the first step's pace
+    /// whenever a worker starts over.
+    pub backoff_attempts: u32,
 }
 
 impl fmt::Debug for SourceSpec {
@@ -291,6 +296,7 @@ impl fmt::Debug for SourceSpec {
             .field("options", &"****")
             .field("peer_host", &self.peer_host)
             .field("peer_addrs", &self.peer_addrs)
+            .field("backoff_attempts", &self.backoff_attempts)
             .finish()
     }
 }
@@ -526,12 +532,14 @@ mod tests {
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec!["192.168.1.10:554".parse().unwrap()],
+            backoff_attempts: 3,
         };
         let text = format!("{spec:?}");
         assert!(!text.contains("hunter2"), "{text}");
         assert!(text.contains("url: \"****\""), "{text}");
         assert!(text.contains("options: \"****\""), "{text}");
         assert!(text.contains("192.168.1.10:554"), "{text}");
+        assert!(text.contains("backoff_attempts: 3"), "{text}");
         let wrapped = ToWorker::RunSource(spec);
         assert!(!format!("{wrapped:?}").contains("hunter2"));
         assert_eq!(

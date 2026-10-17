@@ -1135,6 +1135,7 @@ mod tests {
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
+            backoff_attempts: 0,
         };
         worker.run_source(&spec).await.unwrap();
         worker.backchannel(true).await.unwrap();
