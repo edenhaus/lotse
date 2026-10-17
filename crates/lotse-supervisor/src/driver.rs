@@ -464,10 +464,9 @@ impl Driver {
     /// within the shutdown budget.
     pub(crate) async fn run(mut self) {
         tracing::info!(spec = ?self.spec, "connection driver started");
+        // No demand yet leaves the machine idle and the slots unwanted.
         let initial = *self.demand.borrow_and_update();
-        if initial.total() > 0 {
-            self.follow(initial);
-        }
+        self.follow(initial);
         self.publish();
         loop {
             let wake = self.wait().await;

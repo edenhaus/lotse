@@ -137,7 +137,10 @@ impl ConnectPermits {
     }
 
     /// A place in the queue of attempts a viewer waits for (`wanted`) or
-    /// of the others.
+    /// of the others. A permit given back since the caller's failed
+    /// [`try_take`](Self::try_take) found nobody queued; it is granted
+    /// here, with the queue's order, so no attempt waits beside a free
+    /// permit.
     fn queue(&self, wanted: bool) -> Ticket {
         let mut books = lock(&self.books);
         let number = books.next;
@@ -147,6 +150,7 @@ impl ConnectPermits {
         } else {
             books.background.insert(number, None);
         }
+        books.grant_queued();
         drop(books);
         Ticket {
             books: Arc::clone(&self.books),
@@ -503,6 +507,25 @@ mod tests {
         for slot in &mut slots {
             slot.release("stopped");
         }
+        assert_eq!(permits.in_flight(), 0);
+    }
+
+    /// A slot that found no free permit queues under a second lock; a
+    /// permit given back between the two found nobody queued, so the queue
+    /// grants it as the ticket joins, or the attempt would wait for a
+    /// release that may never come.
+    #[tokio::test]
+    async fn a_permit_given_back_between_a_failed_take_and_the_queueing_goes_to_that_ticket() {
+        let permits = permits(1);
+        let held = permits.try_take().unwrap();
+        assert!(permits.try_take().is_none());
+        drop(held);
+        let ticket = permits.queue(false);
+        let waker = Waker::noop();
+        let permit = ticket.poll_take(&Context::from_waker(waker));
+        assert!(permit.is_ready(), "the free permit goes to the new ticket");
+        assert_eq!(permits.in_flight(), 1);
+        drop((permit, ticket));
         assert_eq!(permits.in_flight(), 0);
     }
 
