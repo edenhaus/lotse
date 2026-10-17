@@ -209,7 +209,8 @@ fn video_mid(sdp: &str) -> Option<&str> {
 /// offer change an m-line; the session takes that for the audio ones).
 /// A subsequent offer lists the codecs negotiated, not every one the
 /// first offered (RFC 8829 §5.2.2; str0m 0.24 and Chrome, observed
-/// 2026-10-16), so only the chosen payload type is held to.
+/// 2026-10-16), so only the chosen payload type is held to, its
+/// `a=fmtp` parameters as a media type's ([`fmtp_parameters`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VideoShape {
     /// The m-line's mid.
@@ -218,8 +219,34 @@ struct VideoShape {
     direction: Direction,
     /// The payload type the answer chose.
     pt: u8,
-    /// Its `a=rtpmap` and `a=fmtp` lines, sorted.
+    /// Its `a=rtpmap` line and its `a=fmtp` line, the latter's
+    /// parameters in their canonical form ([`fmtp_parameters`]), sorted.
     codec: Vec<String>,
+}
+
+/// The parameters of an `a=fmtp` line in a canonical form, so that two
+/// lines of the same configuration compare equal: each
+/// `parameter=value` pair trimmed of the whitespace around it, its name
+/// in lower case, the pairs sorted and joined by `;`. The H.264 and
+/// H.265 payload formats write their parameters into `a=fmtp` as a
+/// media type string, a `;`-separated list of `parameter=value` pairs
+/// (RFC 6184 §8.2.1, RFC 7798 §7.2.1, RFC 4855 §3), whose order is not
+/// significant and whose names are not case sensitive (RFC 2045 §5.1,
+/// RFC 6838 §4.3); RFC 7798 §7.2.1's own example writes a space after
+/// the `;`. Values stay as they are: they are case sensitive unless the
+/// format says otherwise (RFC 2045 §5.1).
+fn fmtp_parameters(parameters: &str) -> String {
+    let mut pairs: Vec<String> = parameters
+        .split(';')
+        .map(|pair| {
+            let pair = pair.trim();
+            let at = pair.find('=').unwrap_or(pair.len());
+            let (name, value) = pair.split_at_checked(at).unwrap_or((pair, ""));
+            format!("{}{value}", name.to_ascii_lowercase())
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs.join(";")
 }
 
 impl VideoShape {
@@ -231,12 +258,15 @@ impl VideoShape {
             .media()
             .iter()
             .find(|section| section.is("video") && section.mid().is_some())?;
-        let prefixes = [format!("a=rtpmap:{pt} "), format!("a=fmtp:{pt} ")];
+        let rtpmap = format!("a=rtpmap:{pt} ");
+        let fmtp = format!("a=fmtp:{pt} ");
         let mut codec: Vec<String> = section
             .lines()
             .iter()
-            .filter(|line| prefixes.iter().any(|prefix| line.starts_with(prefix)))
-            .map(|line| (*line).to_owned())
+            .filter_map(|line| match line.strip_prefix(fmtp.as_str()) {
+                Some(parameters) => Some(format!("{fmtp}{}", fmtp_parameters(parameters))),
+                None => line.starts_with(&rtpmap).then(|| (*line).to_owned()),
+            })
             .collect();
         codec.sort_unstable();
         Some(Self {
@@ -2072,5 +2102,51 @@ mod tests {
             VideoShape::of("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n", 96),
             None
         );
+    }
+
+    /// The chosen payload type's `a=fmtp` parameters are a media type's:
+    /// a re-offer may list them in another order, with whitespace around
+    /// the `;` and with names in another case, and keeps the video
+    /// m-line (RFC 6838 §4.3, RFC 2045 §5.1, RFC 6184 §8.2.1); another
+    /// value, a value in another case among them, or another parameter
+    /// changes its codecs.
+    #[test]
+    fn rfc6838_4_3_a_re_offer_may_reorder_the_fmtp_parameters_and_recase_their_names() {
+        let offer = |fmtp: &str| {
+            format!(
+                "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=recvonly\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 {fmtp}\r\n"
+            )
+        };
+        let shape =
+            VideoShape::of(&offer("packetization-mode=1;profile-level-id=42e01f"), 96).unwrap();
+        assert_eq!(
+            shape.codec,
+            [
+                "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
+                "a=rtpmap:96 H264/90000"
+            ]
+        );
+        for same in [
+            "packetization-mode=1;profile-level-id=42e01f",
+            "profile-level-id=42e01f;packetization-mode=1",
+            "profile-level-id=42e01f; packetization-mode=1",
+            " Packetization-Mode=1 ;PROFILE-LEVEL-ID=42e01f",
+        ] {
+            assert_eq!(shape.check(&offer(same)), Ok(()), "{same}");
+        }
+        for changed in [
+            "profile-level-id=42e01f;packetization-mode=0",
+            "profile-level-id=42E01F;packetization-mode=1",
+            "profile-level-id=42e01f",
+            "profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1",
+        ] {
+            assert_eq!(
+                shape.check(&offer(changed)),
+                Err(RenegotiateError::VideoChanged("its codecs".to_owned())),
+                "{changed}"
+            );
+        }
+        // A parameter without a value has its name in lower case too.
+        assert_eq!(fmtp_parameters("B=2; Flag"), "b=2;flag");
     }
 }
