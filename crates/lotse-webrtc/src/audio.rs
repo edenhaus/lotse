@@ -137,17 +137,46 @@ pub(crate) const fn clock_rate(family: CodecFamily) -> u32 {
     }
 }
 
+/// Whether an `a=rtpmap` encoding of `family` with the channel count
+/// `channels` (its encoding parameters, RFC 8866 §6.6; `None` when it
+/// has none) is the one the engine is configured with: str0m 0.24.0
+/// matches an offered format to its own only at the same channel count
+/// (`PayloadParams::match_score`, read 2026-10-17). It carries Opus at
+/// two channels, the only count RFC 7587 §7 allows (`opus/48000/2`), and
+/// G.711 and G.722 mono (RFC 3551 §4.5.14, §4.5.2, Table 4) at none
+/// (`enable_pcmu`, `enable_pcma`, `enable_g722`), which for G.722 it
+/// also reads from `/1` (`From<RtpMap> for CodecSpec`). So an offer's
+/// two-channel G.711 is no codec the engine carries, and the plan takes
+/// neither talk-back nor the downlink in it.
+///
+/// `SPEC-DEVIATION` (RFC 8866 §6.6: an audio encoding without encoding
+/// parameters has one channel, so `PCMU/8000/1` names the codec
+/// `PCMU/8000` does): a G.711 encoding that writes its one channel is
+/// not matched, since str0m 0.24.0 answers no format for it; the plan
+/// follows the engine, so it never counts on a codec the answer leaves
+/// out.
+const fn engine_channels(family: CodecFamily, channels: Option<u8>) -> bool {
+    match family {
+        CodecFamily::Opus => matches!(channels, Some(2)),
+        CodecFamily::G722 => matches!(channels, None | Some(1)),
+        _ => channels.is_none(),
+    }
+}
+
 /// The audio family the engine carries that an `a=rtpmap` encoding
 /// (`<name>/<clock>[/<channels>]`, RFC 8866 §6.6) names: its encoding
-/// name, case-insensitive (RFC 4855 §3), at its RTP clock rate; `None`
-/// for any other codec. The engine matches the rest.
+/// name, case-insensitive (RFC 4855 §3), at its RTP clock rate and with
+/// the channel count the engine carries it at ([`engine_channels`]);
+/// `None` for any other codec. The engine matches the rest.
 fn encoding_family(encoding: &str) -> Option<CodecFamily> {
     let mut parts = encoding.split('/');
     let name = parts.next()?;
     let clock = parts.next().and_then(|clock| clock.parse::<u32>().ok())?;
+    let channels = parts.next().map(str::parse::<u8>).transpose().ok()?;
     EVERY_CODEC.into_iter().find(|family| {
         encoding_name(*family).is_some_and(|known| known.eq_ignore_ascii_case(name))
             && clock_rate(*family) == clock
+            && engine_channels(*family, channels)
     })
 }
 
@@ -688,6 +717,56 @@ mod tests {
         assert_eq!(clock_rate(CodecFamily::Opus), 48_000);
         assert_eq!(clock_rate(CodecFamily::G722), 8_000);
         assert_eq!(clock_rate(CodecFamily::Pcmu), 8_000);
+    }
+
+    /// An encoding names a codec the engine carries only at the channel
+    /// count the engine carries it at (str0m 0.24.0): Opus at two
+    /// (RFC 7587 §7), G.711 and G.722 mono (RFC 3551 §4.5.14, §4.5.2),
+    /// G.722 with or without its `/1`; G.711 only without it
+    /// (`SPEC-DEVIATION`, [`engine_channels`]). A count that is no number
+    /// names nothing.
+    #[test]
+    fn rfc7587_7_rfc3551_4_5_14_an_encoding_names_a_carried_codec_only_at_its_channel_count() {
+        use CodecFamily::{G722, Opus, Pcma, Pcmu};
+        for (encoding, family) in [
+            ("opus/48000/2", Some(Opus)),
+            ("opus/48000", None),
+            ("opus/48000/1", None),
+            ("PCMU/8000", Some(Pcmu)),
+            ("PCMU/8000/1", None),
+            ("PCMU/8000/2", None),
+            ("PCMA/8000", Some(Pcma)),
+            ("PCMA/8000/2", None),
+            ("G722/8000", Some(G722)),
+            ("G722/8000/1", Some(G722)),
+            ("G722/8000/2", None),
+            ("PCMU/8000/x", None),
+        ] {
+            assert_eq!(encoding_family(encoding), family, "{encoding}");
+        }
+    }
+
+    /// Talk-back offered only in a format the engine does not carry
+    /// (two-channel PCMU to a PCMU backchannel) is off, not negotiated:
+    /// the engine answers no format for it (RFC 3264 §6), so a plan that
+    /// took it would have the session hold the backchannel without
+    /// talk-back. A downlink m-line that offers the stream's PCMU only in
+    /// two channels carries no stream audio either.
+    #[test]
+    fn rfc3264_6_talk_back_in_a_format_the_engine_does_not_carry_is_off() {
+        let offer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\na=recvonly\r\na=rtpmap:0 PCMU/8000/2\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=recvonly\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:2\r\na=sendonly\r\na=rtpmap:0 PCMU/8000/2\r\n";
+        let pcmu = reaching(&Codec::Pcmu);
+        let plan = plan_for(offer, Some(&Codec::Pcmu), Some(&pcmu));
+        assert_eq!(
+            plan.talkback,
+            Talkback::Off("the talk-back m-line lists no codec that reaches the backchannel")
+        );
+        assert_eq!(plan.send, None);
+        // The same m-lines in the engine's mono PCMU: both carried.
+        let mono = offer.replace("PCMU/8000/2", "PCMU/8000");
+        let plan = plan_for(&mono, Some(&Codec::Pcmu), Some(&pcmu));
+        assert_eq!(plan.talkback, negotiated("2", CodecFamily::Pcmu, true));
+        assert_eq!(plan.send, Some(CodecFamily::Pcmu));
     }
 
     /// The fixture matrix: {dedicated talk-back m-line,

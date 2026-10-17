@@ -35,7 +35,7 @@ use lotse_core::Orientation;
 use lotse_core::clock::{Clock as _, SystemClock};
 use lotse_core::codec::{Codec, CodecFamily, Kind};
 use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields};
-use lotse_core::output::OutputFactory as _;
+use lotse_core::output::{OutputFactory as _, TalkbackRequest};
 use lotse_core::session::{
     IceCredentials, RenegotiateError, SessionEngine, SessionEvent, SessionLimits, SessionOpenError,
     SessionOutput, SessionRequest, TalkbackClaim, TalkbackTarget, Transport,
@@ -2072,6 +2072,52 @@ fn rfc3264_6_an_audio_m_line_without_a_known_codec_is_still_rejected() {
         "{answer}"
     );
     assert_eq!(warnings(&mut session), ["audio_codec_unsupported"]);
+}
+
+/// What the worker arbitrates the backchannel on agrees with what the
+/// engine answers: the factory finds talk-back negotiable, so the worker
+/// claims the backchannel for it, exactly when the engine answers the
+/// talk-back m-line with a format and the session takes talk-back. A
+/// codec the engine carries at another channel count (PCMU or PCMA in
+/// two channels, RFC 3551 §4.5.14; Opus in other than two, RFC 7587 §7)
+/// is no codec of the engine's (RFC 3264 §6), so talk-back offered in it
+/// alone neither claims nor keeps the backchannel; nor does PCMU that
+/// writes its one channel, which str0m 0.24.0 does not match
+/// (`SPEC-DEVIATION`, RFC 8866 §6.6).
+#[test]
+fn rfc3264_6_the_factory_finds_talk_back_negotiable_exactly_when_the_engine_takes_it() {
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, TalkbackOffer::Dedicated)
+        .expect("a viewer");
+    let opus = Codec::Opus { channels: 2 };
+    for (codecs, backchannel, negotiable) in [
+        ("a=rtpmap:0 PCMU/8000\n", Codec::Pcmu, true),
+        ("a=rtpmap:104 PCMU/8000/2\n", Codec::Pcmu, false),
+        ("a=rtpmap:0 PCMU/8000/1\n", Codec::Pcmu, false),
+        ("a=rtpmap:104 PCMA/8000/2\n", Codec::Pcmu, false),
+        ("a=rtpmap:111 opus/48000/2\n", Codec::Pcmu, true),
+        ("a=rtpmap:111 opus/48000\n", Codec::Pcmu, false),
+        ("a=rtpmap:111 opus/48000/2\n", opus.clone(), true),
+        ("a=rtpmap:111 opus/48000/1\n", opus, false),
+    ] {
+        let offer = with_audio_codecs(viewer.offer(), codecs);
+        let target = chained(backchannel);
+        let asked = WebRtcFactory.talkback_request(&offer, Some(&target));
+        let mut request = request(&offer, h264(None));
+        request.backchannel = Some(target);
+        let (session, answer) = Session::answer(&request, now).expect("answered");
+        assert_eq!(
+            asked == TalkbackRequest::Negotiable,
+            negotiable,
+            "{codecs}: {asked:?}"
+        );
+        assert_eq!(
+            session.talkback().is_some(),
+            negotiable,
+            "{codecs}: {answer}"
+        );
+    }
 }
 
 /// Each audio codec the session carries is answered `sendonly` on the

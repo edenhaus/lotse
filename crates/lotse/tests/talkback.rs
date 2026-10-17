@@ -1523,26 +1523,17 @@ struct ApiPeer {
 
 impl ApiPeer {
     async fn offer(api: &Api, id: &'static str) -> Self {
-        let peer = Peer::new(None).await;
-        let events = subscription(
-            call(
-                &api.supervisor,
-                &json!({ "id": 4, "type": "webrtc/offer", "stream_id": "door",
-                         "session_id": id, "sdp": peer.offer }),
-            )
-            .await,
-        );
-        Self {
-            id,
-            peer,
-            events,
-            seen: Vec::new(),
-        }
+        Self::open(api, id, Box::new(Peer::new(None).await)).await
     }
 
     /// A viewer that offers no talk-back, through `webrtc/offer`.
     async fn offer_silent(api: &Api, id: &'static str) -> Self {
-        let peer = Peer::new_silent().await;
+        Self::open(api, id, Box::new(Peer::new_silent().await)).await
+    }
+
+    /// `peer`'s offer as it sends it, through `webrtc/offer`; boxed, so
+    /// the future holds no viewer.
+    async fn open(api: &Api, id: &'static str, peer: Box<Peer>) -> Self {
         let events = subscription(
             call(
                 &api.supervisor,
@@ -1553,7 +1544,7 @@ impl ApiPeer {
         );
         Self {
             id,
-            peer,
+            peer: *peer,
             events,
             seen: Vec::new(),
         }
@@ -2020,6 +2011,89 @@ async fn rfc3264_8_2_a_re_offer_that_stops_talk_back_with_its_direction_kept_fre
     );
     assert_eq!(api.stream().await["backchannel"]["talker"], "b");
     assert_eq!(b.warnings("backchannel_declined"), 0, "{:?}", b.seen);
+    api.stop().await;
+}
+
+/// `sdp` with its last audio m-line, the dedicated talk-back one after
+/// the video, offering two-channel PCMU, under a payload type no other
+/// m-line of the bundle uses (RFC 9143 §9.1.1), and G.722, which does
+/// not reach a G.711 backchannel: no codec talk-back can take, and one
+/// the engine answers the m-line `inactive` with. (Without one, str0m
+/// 0.24.0 rejects the m-line with an empty format list, which its own
+/// parser, the viewer's, refuses: RFC 8866 §5.14 wants a format.)
+fn two_channel_talkback(sdp: &str) -> String {
+    let at = sdp.rfind("m=audio ").expect("a talk-back m-line");
+    format!(
+        "{}{}",
+        &sdp[..at],
+        with_audio_codecs(
+            &sdp[at..],
+            "a=rtpmap:104 PCMU/8000/2\na=rtpmap:9 G722/8000\n"
+        )
+    )
+}
+
+/// Talk-back offered only in two-channel PCMU, which the engine does not
+/// carry (it carries G.711 mono, RFC 3551 §4.5.14), so it answers it no
+/// format (RFC 3264 §6): the offer is declined `unsupported` and does
+/// not claim the backchannel, which another viewer's offer then claims
+/// without a `busy` decline; and a talker's re-offer that asks for
+/// talk-back only in it lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3551_4_5_14_talk_back_only_in_two_channel_pcmu_neither_claims_nor_keeps_the_backchannel()
+ {
+    let mut api = Api::start(&json!({ "backchannel": "pcmu" })).await;
+    let mut stereo = Box::new(Peer::new(None).await);
+    stereo.offer = two_channel_talkback(&stereo.offer);
+    assert!(stereo.offer.contains("a=sendonly"), "{}", stereo.offer);
+    let mut a = ApiPeer::open(&api, "a", stereo).await;
+    let mut b = ApiPeer::offer(&api, "b").await;
+    pump(&mut api, &mut [&mut a, &mut b], |api, peers| {
+        peers.iter().all(|p| p.peer.viewer.is_connected())
+            && peers[0].warnings("backchannel_declined") > 0
+            && !api.talker_changes().is_empty()
+    })
+    .await;
+    let declined = a
+        .seen
+        .iter()
+        .find(|event| event["code"] == "backchannel_declined")
+        .unwrap();
+    assert_eq!(declined["reason"], "unsupported");
+    assert_eq!(
+        api.talker_changes(),
+        [("b".to_owned(), "claimed".to_owned(), json!("b"))]
+    );
+    assert_eq!(b.warnings("backchannel_declined"), 0, "{:?}", b.seen);
+    assert_eq!(api.session("a").await["backchannel"]["negotiated"], false);
+
+    // b re-offers its talk-back m-line `sendonly` in two-channel PCMU
+    // only: it lets go.
+    let dropped = b.peer.viewer.reoffer(Reoffer::Drop).expect("a re-offer");
+    let at = dropped.rfind("m=audio ").expect("the talk-back m-line");
+    let sdp = two_channel_talkback(&format!(
+        "{}{}",
+        &dropped[..at],
+        dropped[at..].replacen("a=inactive", "a=sendonly", 1)
+    ));
+    assert!(sdp[at..].contains("a=sendonly"), "{sdp}");
+    api.call(&json!({ "id": 20, "type": "webrtc/renegotiate", "session_id": "b", "sdp": sdp }))
+        .await;
+    pump(&mut api, &mut [&mut a, &mut b], |api, peers| {
+        api.talker_changes().len() >= 2 && peers[1].warnings("backchannel_declined") > 0
+    })
+    .await;
+    assert_eq!(
+        api.talker_changes()[1],
+        ("b".to_owned(), "renegotiated".to_owned(), Value::Null)
+    );
+    assert_eq!(api.stream().await["backchannel"]["talker"], Value::Null);
+    let declined = b
+        .seen
+        .iter()
+        .find(|event| event["code"] == "backchannel_declined")
+        .unwrap();
+    assert_eq!(declined["reason"], "unsupported");
     api.stop().await;
 }
 

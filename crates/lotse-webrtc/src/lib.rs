@@ -241,6 +241,16 @@ mod tests {
             factory.talkback_request(silent, Some(&pcmu)),
             TalkbackRequest::NotRequested
         );
+        // Only in two-channel PCMU, which the engine does not carry
+        // (`audio::engine_channels`): requested in vain, so the worker
+        // neither claims the backchannel for it nor keeps it.
+        let stereo = talking.replace("PCMU/8000", "PCMU/8000/2");
+        assert_eq!(
+            factory.talkback_request(&stereo, Some(&pcmu)),
+            TalkbackRequest::Unsupported(
+                "the talk-back m-line lists no codec that reaches the backchannel".into()
+            )
+        );
         // Stopped with port 0 (RFC 3264 §8.2), its `a=sendonly` kept: it
         // asks for nothing, so a session that held the backchannel lets
         // go.
