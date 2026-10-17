@@ -388,27 +388,16 @@ impl SessionManager {
         self.send(session_id, Control::Candidate(candidate));
     }
 
-    /// A re-offer for a session, which answers it with a `Renegotiated`
-    /// or `RenegotiateRefused` report; one for no session, or one whose
-    /// queue is full, is refused here, so the supervisor's command never
-    /// waits for an answer that cannot come.
-    pub(crate) async fn renegotiate(&self, session_id: &str, sdp: String) {
-        let queued = self
-            .sessions
+    /// Hands a re-offer to its session, which answers it with a
+    /// `Renegotiated` or `RenegotiateRefused` report: `false` when there
+    /// is no such session or its queue is full. The caller, the serve
+    /// loop, refuses that one itself, straight to the supervisor: the
+    /// loop is the one reader of the session events, so waiting for room
+    /// in their queue here could wait forever.
+    pub(crate) fn renegotiate(&self, session_id: &str, sdp: String) -> bool {
+        self.sessions
             .get(session_id)
-            .is_some_and(|handle| handle.control.try_send(Control::Renegotiate(sdp)).is_ok());
-        if queued {
-            return;
-        }
-        tracing::debug!(
-            session = session_id,
-            "re-offer refused: no such session, or its queue is full"
-        );
-        let event = IpcEvent::RenegotiateRefused {
-            code: "internal_error".to_owned(),
-            message: "the session is gone or busy".to_owned(),
-        };
-        let _sent = self.events.send((session_id.to_owned(), event)).await;
+            .is_some_and(|handle| handle.control.try_send(Control::Renegotiate(sdp)).is_ok())
     }
 
     /// A relay candidate for a session.
@@ -2066,8 +2055,9 @@ mod tests {
         assert_eq!(change(&mut feed).await, ("a".into(), "session_closed"));
     }
 
-    /// A re-offer before the answer is refused, and so is one for a
-    /// session the manager does not hold or whose queue is full.
+    /// A re-offer before the answer is refused; the manager hands one on
+    /// to its session, and tells its caller of one for a session it does
+    /// not hold or whose queue is full, for the caller to refuse.
     #[tokio::test]
     async fn a_re_offer_before_the_answer_or_for_no_session_is_refused() {
         let (mut rig, session) = session(Script::default(), false, false);
@@ -2085,35 +2075,16 @@ mod tests {
         assert!(rig.script.calls.lock().unwrap().is_empty(), "never opened");
 
         let mut m = managed();
-        m.manager.renegotiate("ghost", "v=0".into()).await;
-        assert_eq!(
-            m.next().await,
-            (
-                "ghost".to_owned(),
-                IpcEvent::RenegotiateRefused {
-                    code: "internal_error".into(),
-                    message: "the session is gone or busy".into(),
-                }
-            )
-        );
+        assert!(!m.manager.renegotiate("ghost", "v=0".into()), "no session");
         m.open("a").await;
+        assert!(m.manager.renegotiate("a", "v=0".into()), "handed on");
         // Its task has not run, so nothing reads the queue.
         while m.manager.sessions["a"]
             .control
             .try_send(Control::Candidate(String::new()))
             .is_ok()
         {}
-        m.manager.renegotiate("a", "v=0".into()).await;
-        assert_eq!(
-            m.next().await,
-            (
-                "a".to_owned(),
-                IpcEvent::RenegotiateRefused {
-                    code: "internal_error".into(),
-                    message: "the session is gone or busy".into(),
-                }
-            )
-        );
+        assert!(!m.manager.renegotiate("a", "v=0".into()), "queue full");
     }
 
     fn closed(code: &str, message: &str) -> IpcEvent {

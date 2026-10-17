@@ -476,16 +476,21 @@ impl Serving<'_> {
         }
     }
 
-    /// `Renegotiate`: a re-offer for a session, which the manager answers;
-    /// refused without a manager.
+    /// `Renegotiate`: a re-offer for a session, which its session answers.
+    /// One without a manager, for no session or for one whose queue is
+    /// full is refused here, straight to the supervisor, never through
+    /// the session events this loop alone drains, so a full queue of them
+    /// cannot stall it; the supervisor's command never waits for an
+    /// answer that cannot come. The refusal may overtake that session's
+    /// queued events, which is harmless: the supervisor has one re-offer
+    /// out per session, and this refusal is its only answer.
     async fn on_renegotiate(&mut self, session_id: String, sdp: String) -> Result<(), Error> {
-        match &self.sessions {
-            Some(manager) => {
-                manager.renegotiate(&session_id, sdp).await;
-                Ok(())
-            }
-            None => refuse_renegotiation(&mut self.tx, session_id).await,
-        }
+        let message = match &self.sessions {
+            Some(manager) if manager.renegotiate(&session_id, sdp) => return Ok(()),
+            Some(_) => "the session is gone or busy",
+            None => "the worker holds no sockets",
+        };
+        refuse_renegotiation(&mut self.tx, session_id, message).await
     }
 
     /// `Shutdown`: closes every session, stops the standby and the source
@@ -763,15 +768,20 @@ async fn refuse_session(
     Ok(())
 }
 
-/// Refuses a re-offer for `session_id` on a worker without sessions.
-async fn refuse_renegotiation(tx: &mut Sender, session_id: String) -> Result<(), Error> {
-    tracing::debug!(session = %session_id, "re-offer without sessions; refused");
+/// Refuses a re-offer for `session_id` that no session takes, saying why
+/// in `message`.
+async fn refuse_renegotiation(
+    tx: &mut Sender,
+    session_id: String,
+    message: &str,
+) -> Result<(), Error> {
+    tracing::debug!(session = %session_id, message, "re-offer refused by the worker");
     tx.send_msg(
         &ToSupervisor::Session {
             session_id,
             event: SessionEvent::RenegotiateRefused {
                 code: "internal_error".to_owned(),
-                message: "the worker holds no sockets".to_owned(),
+                message: message.to_owned(),
             },
         },
         &[],
@@ -2075,6 +2085,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
+    /// A re-offer no session takes is refused straight to the supervisor,
+    /// never through the session events the serve loop alone drains: with
+    /// their queue full, the loop refuses it all the same instead of
+    /// waiting for room only it could make.
+    #[tokio::test]
+    async fn a_re_offer_for_no_session_is_refused_while_the_session_events_are_full() {
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let (events, _undrained) = mpsc::channel(1);
+        events
+            .try_send((
+                "s".to_owned(),
+                SessionEvent::Closed {
+                    code: "session_closed".into(),
+                    message: "closed".into(),
+                },
+            ))
+            .unwrap();
+        let (datagrams, _demux) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let manager = SessionManager::new(
+            OwnedFd::from(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()),
+            None,
+            OwnedFd::from(datagrams),
+            1,
+            Arc::clone(&serving.clock),
+            events,
+        )
+        .unwrap();
+        serving.sessions = Some(manager);
+        within(serving.on_renegotiate("ghost".into(), "v=0".into()))
+            .await
+            .unwrap();
+        let (message, _) = within(rx.recv_msg::<ToSupervisor>())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            message,
+            ToSupervisor::Session {
+                session_id: "ghost".into(),
+                event: SessionEvent::RenegotiateRefused {
+                    code: "internal_error".into(),
+                    message: "the session is gone or busy".into(),
+                },
+            }
+        );
     }
 
     /// A release on a connection whose protocol has no backchannel does
