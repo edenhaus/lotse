@@ -17,14 +17,18 @@ base=${1:?usage: scripts/mutants-shards.sh <base|--all> [per] [max]}
 per=${2:-10}
 max=${3:-8}
 
-if [ "$base" = --all ]; then
-  mutants=$(cargo mutants --workspace --all-features --list | wc -l)
-else
-  diff=$(mktemp)
-  trap 'rm -f "$diff"' EXIT
+diff=$(mktemp)
+list=$(mktemp)
+trap 'rm -f "$diff" "$list"' EXIT
+set --
+if [ "$base" != --all ]; then
   git diff "$base...HEAD" >"$diff"
-  mutants=$(cargo mutants --workspace --all-features --in-diff "$diff" --list | wc -l)
+  set -- --in-diff "$diff"
 fi
+# Its own command, not a pipe into `wc`: sh has no pipefail, so a listing that fails would count
+# as no mutants and skip every Mutants job; `set -e` fails the plan instead.
+cargo mutants --workspace --all-features "$@" --list >"$list"
+mutants=$(wc -l <"$list")
 
 count=$(((mutants + per - 1) / per))
 [ "$count" -le "$max" ] || count=$max
