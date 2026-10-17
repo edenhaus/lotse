@@ -529,6 +529,64 @@ mod tests {
         assert_eq!(permits.in_flight(), 0);
     }
 
+    /// Counts its wakes.
+    #[derive(Default)]
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl CountingWaker {
+        fn wakes(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A grant wakes the driver that waits on the ticket, in either queue,
+    /// before anything polls it again: a driver asleep on its slot learns
+    /// of its permit from the grant alone.
+    #[test]
+    fn a_grant_wakes_the_waiting_driver_in_either_queue() {
+        let permits = permits(1);
+        let held = permits.try_take().unwrap();
+        let preload = permits.queue(false);
+        let viewer = permits.queue(true);
+        let preload_waker = Arc::new(CountingWaker::default());
+        let viewer_waker = Arc::new(CountingWaker::default());
+        let preload_cx = Waker::from(Arc::clone(&preload_waker));
+        let viewer_cx = Waker::from(Arc::clone(&viewer_waker));
+        assert!(
+            preload
+                .poll_take(&Context::from_waker(&preload_cx))
+                .is_pending()
+        );
+        assert!(
+            viewer
+                .poll_take(&Context::from_waker(&viewer_cx))
+                .is_pending()
+        );
+        drop(held);
+        assert_eq!(viewer_waker.wakes(), 1, "the viewer's driver is woken");
+        assert_eq!(preload_waker.wakes(), 0);
+        let permit = viewer.poll_take(&Context::from_waker(&viewer_cx));
+        assert!(permit.is_ready(), "granted");
+        drop(permit);
+        assert_eq!(preload_waker.wakes(), 1, "then the preload's");
+        assert_eq!(viewer_waker.wakes(), 1);
+        assert!(
+            preload
+                .poll_take(&Context::from_waker(&preload_cx))
+                .is_ready()
+        );
+    }
+
     /// Work list W3: a viewer's offer waits for its camera's connect, so
     /// preload retries queued before it must not hold it back.
     #[tokio::test]
