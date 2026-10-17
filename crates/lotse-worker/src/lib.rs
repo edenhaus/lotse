@@ -1808,7 +1808,12 @@ mod tests {
                 .await
                 .unwrap();
             until_live(&mut h).await;
-            let stats = stats_where(&mut h, &mut || {}, &|_| true).await;
+            // The probe asks for its permit once the source is live, and
+            // offers what it found once granted.
+            let stats = stats_where(&mut h, &mut || {}, &|stats| {
+                stats.backchannel.as_deref() == before
+            })
+            .await;
             assert_eq!(stats.backchannel.as_deref(), before, "{running}");
             // The standby offers PCMA; its keyframe a second after it went
             // live switches, and the counters follow its backchannel.
