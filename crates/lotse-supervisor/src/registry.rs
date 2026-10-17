@@ -342,13 +342,16 @@ impl State {
 
     /// Re-keys connection `id` to `key` and tells its driver to switch its
     /// worker to `spec`: the stream's sessions stay, and the tracks switch
-    /// at the new source's first keyframe.
+    /// at the new source's first keyframe. Whether the connection asks for
+    /// the camera's backchannel is left as it was: the switch keeps the
+    /// running source's talker, so a put that also changed the ask is
+    /// [`State::follow_backchannel`]'s, which tells the running worker
+    /// (an opt-out frees the talker) after the switch.
     pub(crate) fn switch_connection(&mut self, id: &str, key: ConnectionKey, spec: DriverSpec) {
         let Some(entry) = self.connections.get_mut(id) else {
             return;
         };
         entry.key = key;
-        entry.backchannel = spec.backchannel;
         if entry
             .commands
             .try_send(DriverCommand::SwitchSource(spec))
@@ -370,10 +373,10 @@ impl State {
     /// it does (ONVIF Streaming Specification §5.3.1, the `Require`
     /// header), after `stream_id`'s put or delete. When that changes, its
     /// driver gets the spec of a source that asks as the rule now says
-    /// ([`DriverCommand::Backchannel`]): an upgrade restarts a running
-    /// source once, a downgrade is deferred to the connection's next
-    /// connect. A connection that already asks is unaffected by streams
-    /// that do not; one gone (its last stream left) has nothing to follow.
+    /// ([`DriverCommand::Backchannel`]), and its running worker turns the
+    /// probe on or off without restarting the source. A connection that
+    /// already asks is unaffected by streams that do not; one gone (its
+    /// last stream left) has nothing to follow.
     pub(crate) fn follow_backchannel(&mut self, id: &str, stream_id: &str) {
         // A source that asks if there is one, else any.
         let chosen = self
@@ -391,9 +394,9 @@ impl State {
             return;
         }
         let decision = if after {
-            "upgrade: restarting the source once"
+            "probe on: the running source probes the camera, no restart"
         } else {
-            "downgrade deferred to next connect"
+            "probe off: the probe's result dropped and its talker released, no restart"
         };
         tracing::info!(
             connection.id = id,
@@ -952,7 +955,8 @@ impl State {
             TalkerReason::SessionClosed
             | TalkerReason::Released
             | TalkerReason::Renegotiated
-            | TalkerReason::Refused => entry.talker.session.as_deref() == Some(session_id),
+            | TalkerReason::Refused
+            | TalkerReason::OptedOut => entry.talker.session.as_deref() == Some(session_id),
         };
         let reason_name = reason.as_str();
         if !applies {
@@ -2024,22 +2028,22 @@ mod tests {
         state.follow_backchannel("c1", "front");
         assert!(rx.try_recv().is_err());
         // A stream asks: the connection does, with that source's spec, and
-        // its driver restarts the source once (upgrade).
+        // its driver turns the probe on.
         state.streams.insert("twin".into(), on_c1(true));
         state.follow_backchannel("c1", "twin");
         let_assert!(Ok(DriverCommand::Backchannel(sent)) = rx.try_recv());
         assert!(sent.backchannel);
         assert!(asks(&state));
-        let upgrade = captured.lines("connection backchannel changed");
-        assert_eq!(upgrade.len(), 1);
+        let changed = captured.lines("connection backchannel changed");
+        assert_eq!(changed.len(), 1);
         for field in [
             "connection.id=\"c1\"",
             "stream.id=\"twin\"",
             "backchannel.before=false",
             "backchannel.after=true",
-            "upgrade: restarting the source once",
+            "probe on: the running source probes the camera, no restart",
         ] {
-            assert!(upgrade[0].contains(field), "{field}: {}", upgrade[0]);
+            assert!(changed[0].contains(field), "{field}: {}", changed[0]);
         }
         // Any stream asking wins: one that does not changes nothing.
         state.streams.insert("front".into(), on_c1(false));
@@ -2047,14 +2051,16 @@ mod tests {
         assert!(rx.try_recv().is_err(), "it asks already");
         assert!(asks(&state));
         // The last one asking changes its mind: the driver hears of it and
-        // defers it to the next connect (downgrade).
+        // turns the probe off.
         state.streams.insert("twin".into(), on_c1(false));
         state.follow_backchannel("c1", "twin");
         let_assert!(Ok(DriverCommand::Backchannel(sent)) = rx.try_recv());
         assert!(!sent.backchannel);
         assert!(!asks(&state));
         assert_eq!(
-            captured.lines("downgrade deferred to next connect").len(),
+            captured
+                .lines("probe off: the probe's result dropped")
+                .len(),
             1
         );
         // A full queue: the connection asks as before until the next put.
@@ -2066,11 +2072,20 @@ mod tests {
         assert_eq!(captured.lines("driver queue full").len(), 1);
         let_assert!(Ok(DriverCommand::Backchannel(sent)) = rx.try_recv());
         assert!(sent.backchannel);
-        // A connection gone has nothing to follow; a switch carries its
-        // source's ask.
+        // A connection gone has nothing to follow.
         state.follow_backchannel("gone", "front");
         assert!(rx.try_recv().is_err());
+        // A switch to a source that no longer asks leaves the ask as it
+        // was, so following it after the put still tells the running
+        // worker, which frees the talker the switch keeps.
+        state.streams.insert("twin".into(), on_c1(false));
         state.switch_connection("c1", key, spec_on("c1", false));
+        assert!(asks(&state), "the switch leaves the ask");
+        let_assert!(Ok(DriverCommand::SwitchSource(switched)) = rx.try_recv());
+        assert!(!switched.backchannel);
+        state.follow_backchannel("c1", "twin");
+        let_assert!(Ok(DriverCommand::Backchannel(sent)) = rx.try_recv());
+        assert!(!sent.backchannel);
         assert!(!asks(&state));
     }
 

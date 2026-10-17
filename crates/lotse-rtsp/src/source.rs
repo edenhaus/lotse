@@ -21,11 +21,13 @@
 //! The ONVIF backchannel (ONVIF Streaming Specification §5.3) never rides
 //! in this session, which never carries its `Require` header and never
 //! sets up an `a=sendonly` media (§5.3.2) nor declares one as a track:
-//! once the session plays, a stream that opted in (`backchannel`, off by
-//! default) has the camera probed on a connection of its own
-//! ([`crate::backchannel::probe`]), and a talker's claim opens the
-//! backchannel in a session of its own ([`crate::backchannel::open`]),
-//! which a reconnect of this one leaves alone.
+//! once the session plays, a connection that asks for it (a stream on it
+//! opted in, `backchannel`, off by default) has the camera probed on a
+//! connection of its own ([`crate::backchannel::probe`]), and a talker's
+//! claim opens the backchannel in a session of its own
+//! ([`crate::backchannel::open`]), which a reconnect of this one leaves
+//! alone. A stream that opts in or out turns the probe on or off without
+//! this session noticing.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -91,10 +93,7 @@ pub struct RtspSource {
     /// Where the relays of its connections listen.
     relay: Listener,
     /// Whether the camera answered the backchannel's probe with `551`,
-    /// remembered across the connection's attempts. A source that does not
-    /// probe never learns anything here, so the new source the worker
-    /// builds when a stream's opt-in restarts a connection, which only
-    /// replaces a source that did not probe, loses nothing.
+    /// remembered across the connection's attempts and its streams' opt-ins.
     probed: Probed,
 }
 
@@ -861,8 +860,9 @@ pub(crate) async fn tear_down(
 
 /// Plays a connected session until the camera or core ends it: why it
 /// ended, with the session dropped, which starts its `TEARDOWN`. Beside
-/// it, a stream that opted in has the camera's backchannel probed on a
-/// connection of its own ([`probe::start`]), which ends with the session.
+/// it, a connection that asks for the camera's backchannel has it probed
+/// on a connection of its own, at once and whenever a stream opts in
+/// again ([`probe::start`]), which ends with the session.
 async fn play(connected: Connected, ask: &Ask, ctx: &SourceCtx) -> SourceError {
     let Connected {
         playing: mut packets,
@@ -874,7 +874,7 @@ async fn play(connected: Connected, ask: &Ask, ctx: &SourceCtx) -> SourceError {
         ctx.backchannel.clone(),
         ask.probed.clone(),
     );
-    let _probe = probe.map(|probe| Aborting(spawn_named("rtsp.probe", probe)));
+    let _probe = Aborting(spawn_named("rtsp.probe", probe));
     // Over TCP the session is live once PLAY is answered. Over UDP it is
     // live once the first RTP datagram arrived: a camera whose datagrams
     // never reach the daemon ends the attempt with why, not a stall.
@@ -931,8 +931,8 @@ async fn play(connected: Connected, ask: &Ask, ctx: &SourceCtx) -> SourceError {
     }
 }
 
-/// A task aborted when dropped: the probe, which ends with the session
-/// that started it.
+/// A task aborted when dropped: the probes, which end with the session
+/// that started them.
 struct Aborting(tokio::task::JoinHandle<()>);
 
 impl Drop for Aborting {

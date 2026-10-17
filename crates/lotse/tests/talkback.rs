@@ -17,7 +17,9 @@
 //! its `a=ptime` framing, a reconnect under a talker, and the downlink's
 //! A/V sync while talking; one goes through the control API to a real
 //! worker process running the RTSP source, whose backchannel session is
-//! torn down before the process exits at the daemon's shutdown.
+//! torn down before the process exits at the daemon's shutdown; and
+//! through the control API, a stream opting in and out while a viewer
+//! plays the camera.
 //! Needs the `source-fake` feature (on with `--all-features`) and
 //! `output-webrtc` (a default); the RTSP tests `source-rtsp` (a default)
 //! too.
@@ -589,7 +591,6 @@ impl InProcess {
                     tcp_candidates: vec![],
                     audio,
                     orientation: 1,
-                    talkback_required: false,
                 }),
                 &[],
             )
@@ -2392,7 +2393,7 @@ fn video_in(viewer: &Viewer, window: (Instant, Instant)) -> (Duration, Vec<u32>,
 /// viewer starts sending on its talk-back m-line, `replaceTrack`) claims
 /// the backchannel without disturbing the downlink: video frames keep
 /// arriving at the camera's 30 fps, no gap, and their timeline goes on
-/// without a jump, since the backchannel was set up with the stream.
+/// without a jump, since the backchannel opens in a session of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activating_talk_back_leaves_no_gap_in_the_video() {
     let mut api = Api::start(&json!({ "backchannel": "pcmu", "video": true })).await;
@@ -2447,4 +2448,140 @@ async fn activating_talk_back_leaves_no_gap_in_the_video() {
     assert_eq!(stream["state"], "live");
     assert_eq!(stream["sources"][0]["connection"]["worker"]["restarts"], 0);
     api.stop().await;
+}
+
+/// ONVIF Streaming Specification §5.3.1: opting a stream in and out, twice,
+/// while a viewer plays restarts nothing. The camera serves one viewing
+/// session throughout (one `DESCRIBE` without `Require`, one `SETUP`
+/// each, one `PLAY`), and the viewer's video goes on without a gap or a
+/// new timeline. Each opt-in probes on a connection of its own and offers
+/// the backchannel, which the viewer's re-offer claims; each opt-out
+/// drops the offer (`stream/get`'s `sources[].backchannel` gone) and frees
+/// the talker (`talker_changed` `opted_out`), whose backchannel session
+/// the camera sees torn down with `Require` and closed.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_1_opting_in_and_out_leaves_the_video_alone_and_frees_the_talker() {
+    let camera = FakeCamera::start(
+        CameraConfig {
+            fps: 30,
+            gop: 10,
+            backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+            keep_open_on_teardown: true,
+            ..CameraConfig::default()
+        },
+        clock(),
+    )
+    .await
+    .expect("camera");
+    let put = |options: Value| {
+        json!({ "id": 2, "type": "stream/put", "stream_id": "door",
+                "sources": [{ "url": camera.url(), "options": options }] })
+    };
+    let mut api = Api::start_with(
+        Arc::new(lotse_rtsp::RtspFactory::default()),
+        &camera.url(),
+        &json!({}),
+    )
+    .await;
+    let mut v = ApiPeer::offer_silent(&api, "v").await;
+    // Playing: past the first keyframe and a second of video.
+    pump(&mut api, &mut [&mut v], |_, peers| {
+        peers[0].peer.viewer.is_connected() && peers[0].peer.viewer.packets().len() >= 30
+    })
+    .await;
+    pump_for(&mut api, &mut [&mut v], Duration::from_secs(1)).await;
+    let start = clock().now();
+    for round in 1..=2 {
+        api.call(&put(json!({ "backchannel": true }))).await;
+        source_where(
+            &mut api,
+            &mut [&mut v],
+            &json!({ "codec": "pcmu", "state": "available" }),
+        )
+        .await;
+        v.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+            .await;
+        assert_eq!(
+            v.peer.viewer.talkback_direction(),
+            Some(lotse_testing::viewer::Direction::SendOnly),
+            "round {round}: claimed"
+        );
+        if round == 1 {
+            v.peer.talk(Mic::pcmu());
+        }
+        pump(&mut api, &mut [&mut v], |_, _| {
+            backchannel_session(&camera).is_some_and(|log| log.backchannel_packets > 0)
+                && camera
+                    .stats()
+                    .connection_log()
+                    .iter()
+                    .filter(|log| log.backchannel_only())
+                    .count()
+                    == round
+        })
+        .await;
+        api.call(&put(json!({}))).await;
+        pump(&mut api, &mut [&mut v], |api, _| {
+            api.talker_changes()
+                .iter()
+                .filter(|change| **change == ("v".to_owned(), "opted_out".to_owned(), Value::Null))
+                .count()
+                == round
+                && backchannel_session(&camera).is_some_and(|log| log.closed)
+        })
+        .await;
+        let log = backchannel_session(&camera).unwrap();
+        assert_eq!(
+            log.teardown,
+            Some(true),
+            "round {round}: TEARDOWN with Require"
+        );
+        assert!(log.closed_by_client, "round {round}: {log:?}");
+        let stream = source_where(&mut api, &mut [&mut v], &Value::Null).await;
+        assert_eq!(
+            stream["backchannel"]["talker"],
+            Value::Null,
+            "round {round}"
+        );
+    }
+    pump_for(&mut api, &mut [&mut v], Duration::from_millis(500)).await;
+    let end = clock().now();
+    let changes: Vec<String> = api
+        .talker_changes()
+        .into_iter()
+        .map(|(session, reason, _)| format!("{session} {reason}"))
+        .collect();
+    assert_eq!(
+        changes,
+        ["v claimed", "v opted_out", "v claimed", "v opted_out"]
+    );
+    let (gap, steps, frames) = video_in(&v.peer.viewer, (start, end));
+    println!("video across two opt-ins and opt-outs: largest gap {gap:?}, {frames} packets");
+    // A frame every 33 ms: a gap of three frames would be a visible stall.
+    assert!(gap <= Duration::from_millis(100), "a {gap:?} gap");
+    // RFC 3550 §5.1: a frame's ticks apart, or a frame's packets together;
+    // the session's timeline never reset.
+    assert!(
+        steps.iter().all(|&step| step == 0 || step == 3_000),
+        "{steps:?}"
+    );
+    let logs = camera.stats().connection_log();
+    let viewing: Vec<_> = logs
+        .iter()
+        .filter(|log| log.setups.iter().any(|setup| setup == "track0"))
+        .collect();
+    assert_eq!(viewing.len(), 1, "one viewing session: {logs:?}");
+    assert_eq!(viewing[0].describes, [false]);
+    assert!(viewing[0].played && !viewing[0].closed);
+    let probes = logs
+        .iter()
+        .filter(|log| log.describes == [true] && log.setups.is_empty())
+        .count();
+    assert_eq!(probes, 2, "one probe per opt-in: {logs:?}");
+    let stream = api.stream().await;
+    assert_eq!(stream["state"], "live");
+    assert_eq!(stream["sources"][0]["connection"]["worker"]["restarts"], 0);
+    api.stop().await;
+    camera.stop().await;
 }

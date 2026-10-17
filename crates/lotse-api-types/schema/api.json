@@ -817,7 +817,7 @@
       "oneOf": [
         {
           "const": "unsupported",
-          "description": "The stream has no backchannel the session can feed: its source\nprotocol cannot carry audio back, the camera offers none, or it\ntakes a codec talk-back cannot produce from what the offer lists.\nThe message says which.",
+          "description": "The stream has no backchannel the session can feed: its source\nprotocol cannot carry audio back, no stream on its connection opted\nin to it, the camera offers none, or it takes a codec talk-back\ncannot produce from what the offer lists. The message says which.",
           "type": "string"
         },
         {
@@ -1874,10 +1874,10 @@
           "type": "object"
         },
         {
-          "description": "The last event; the subscription ends with it. A session still\nwaiting for its answer has no deadline of its own: it waits while\nits source connects, and closes with the source's error as soon as\nthe attempt fails, at once when the offer reaches a source that has\nalready failed. A live source that drops is retried, at once or\nafter a delay, and the session waits for the retry; only a retry\nthat fails closes it. While a `stream/put` switches the stream to\nanother source, the old source's failures do not count. An answered\nsession rides every reconnect instead.\n\n`backchannel_unavailable`: the offer requests two-way audio (an\naudio m-line the browser offers `sendonly` or `sendrecv`) on a\nstream that opted in to the camera's backchannel (an RTSP source's\n`backchannel` option), and the session cannot have it: the camera\noffers no backchannel, setting it up failed, it takes a codec\ntalk-back cannot feed, or the talk-back m-line lists neither its\ncodec nor Opus (nor, for a G.711 backchannel, the other G.711\nlaw, which talk-back converts). The message says which. Such a\nsession is never played without talk-back; on a stream that did\nnot opt in, the request is answered without it instead (the\ndedicated m-line `inactive`, a `sendrecv` one send-only).",
+          "description": "The last event; the subscription ends with it. A session still\nwaiting for its answer has no deadline of its own: it waits while\nits source connects, and closes with the source's error as soon as\nthe attempt fails, at once when the offer reaches a source that has\nalready failed. A live source that drops is retried, at once or\nafter a delay, and the session waits for the retry; only a retry\nthat fails closes it. While a `stream/put` switches the stream to\nanother source, the old source's failures do not count. An answered\nsession rides every reconnect instead. A talk-back request the\nstream cannot serve never closes a session: its answer declines\nit (`backchannel_declined`).",
           "properties": {
             "code": {
-              "description": "The stable code (`peer_closed`, `session_closed`,\n`backchannel_unavailable`, ...). Before the answer, a failed\nsource closes the session with its error's code, the one\n`stream/get` reports as `last_error`:\n`source_unreachable`, `source_auth_failed`, `source_timeout`,\n`source_protocol_error`, `source_ended` or `worker_crashed`.",
+              "description": "The stable code (`peer_closed`, `session_closed`, ...). Before\nthe answer, a failed source closes the session with its error's\ncode, the one `stream/get` reports as `last_error`:\n`source_unreachable`, `source_auth_failed`, `source_timeout`,\n`source_protocol_error`, `source_ended` or `worker_crashed`.",
               "type": "string"
             },
             "message": {
@@ -1969,7 +1969,7 @@
             }
           ],
           "default": null,
-          "description": "The camera's backchannel, as the connection's probe found it, while\nthe connection is live: what a microphone button is gated on. The\nprobe asks the camera on a connection of its own each time the\nconnection connects; nothing is opened until a talker claims it.\nNull when the probe found none (the camera has none, refused the\nquestion or could not be asked), when no stream on the connection\nopted in (an RTSP source's `backchannel` option, off by default,\nwhich restarts a connection running without it once), and while\nthe connection is not live."
+          "description": "The camera's backchannel, as the connection's probe found it, while\nthe connection is live: what a microphone button is gated on. The\nprobe asks the camera on a connection of its own each time the\nconnection connects; nothing is opened until a talker claims it.\nNull when the probe found none (the camera has none, refused the\nquestion or could not be asked), when no stream on the connection\nopted in (an RTSP source's `backchannel` option, off by default,\nwhich turns the probe on and off without restarting the\nconnection), and while the connection is not live."
         },
         "connection": {
           "$ref": "#/$defs/ConnectionInfo",
@@ -2854,6 +2854,11 @@
           "const": "refused",
           "description": "The camera refused the talker's backchannel session, the session\ndid not open in time, or its connection was lost while the talker\nheld it: the backchannel is free, and the talker's session got a\n`backchannel_declined` warning with reason `refused`.",
           "type": "string"
+        },
+        {
+          "const": "opted_out",
+          "description": "No stream on the talker's connection asks for the camera's\nbackchannel any more (the last one that did was put without the\nRTSP option `backchannel`): the camera's backchannel session is\nclosed and the backchannel is no longer offered.",
+          "type": "string"
         }
       ]
     },
@@ -3053,7 +3058,7 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "api": "0.2.1",
+  "api": "0.3.0",
   "command": {
     "$ref": "#/$defs/Command"
   },

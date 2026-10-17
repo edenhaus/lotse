@@ -84,8 +84,8 @@ reconnecting; the CVO row says whether the answer negotiated the video
 orientation extension or the browser did not offer it. *Two-way audio*
 puts the stream with the RTSP option `backchannel` and offers a
 send-only audio m-line right after; the daemon answers it from the
-camera's backchannel once the connection asks for it, or closes the
-session with `backchannel_unavailable` and why (the page logs it); *Talk* then
+camera's backchannel once its probe found it, or declines it with
+`backchannel_declined` and why while the session plays (the page shows it); *Talk* then
 asks for the microphone and sends it to the camera's speaker, and
 stopping releases the backchannel for other viewers. The browser offers
 the microphone only to a page opened at `localhost` or a loopback

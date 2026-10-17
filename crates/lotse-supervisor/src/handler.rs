@@ -414,8 +414,9 @@ impl Supervisor {
     /// that stay. Each connection the put touched then asks for the
     /// camera's backchannel iff a source on it does
     /// ([`State::follow_backchannel`]): `backchannel` is not part of the
-    /// key, so opting in restarts the shared connection once instead of
-    /// opening a second camera session.
+    /// key, so opting in or out turns the shared connection's probe on or
+    /// off instead of opening a second camera session, and restarts
+    /// nothing.
     fn stream_put(&self, put: StreamPut) -> Outcome {
         let stream_id = match StreamId::new(&put.stream_id) {
             Ok(id) => id,
@@ -707,7 +708,6 @@ impl Supervisor {
         let SessionConnection {
             id: connection_id,
             commands,
-            talkback_required,
             failure,
         } = session_connection(&state, stream)?;
         if state.sessions.contains_key(&session_id) {
@@ -727,7 +727,6 @@ impl Supervisor {
             tcp_candidates: self.shared.tcp_hosts.clone(),
             audio,
             orientation: orientation.code(),
-            talkback_required,
         };
         // An offer to a connection that already failed is not handed on:
         // the session closes below with the failure.
@@ -769,7 +768,6 @@ impl Supervisor {
             connection.id = %connection_id,
             control.connection = connection.0,
             audio,
-            talkback_required,
             orientation = ?orientation,
             hosts,
             "session opened; offer handed to the connection"
@@ -1377,10 +1375,6 @@ struct SessionConnection {
     id: String,
     /// The connection's command queue.
     commands: mpsc::Sender<DriverCommand>,
-    /// Whether the stream asked for the camera's backchannel there: a
-    /// talk-back request it cannot meet then fails the session with
-    /// `backchannel_unavailable` rather than playing without talk-back.
-    talkback_required: bool,
     /// The failure a session waiting for its answer closes with, and the
     /// connection's state with it; none while the connection can answer.
     failure: Option<(ConnectionError, ConnectionState)>,
@@ -1397,7 +1391,6 @@ fn session_connection(state: &State, stream: &StreamEntry) -> Result<SessionConn
             Some(SessionConnection {
                 id: id.clone(),
                 commands: entry.commands.clone(),
-                talkback_required: source.spec.backchannel,
                 failure: snapshot.failure.clone().map(|e| (e, snapshot.state)),
             })
         })
@@ -2285,10 +2278,12 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// ONVIF Streaming Specification §5.3.1: a stream that opts in to the
+    /// camera's backchannel, or out of it, keeps its connection, worker
+    /// and session; the worker is only told to turn its probe on or off.
     #[tokio::test]
-    async fn opting_in_to_the_backchannel_restarts_the_shared_connection_once_onvif_5_3_1() {
-        let captured = Captured::default();
-        let _logs = captured.install();
+    async fn opting_in_or_out_of_the_backchannel_only_tells_the_shared_connection_s_worker_onvif_5_3_1()
+     {
         let dir = private_dir("backchannel-opt-in");
         let s = with_webrtc(&recording_worker(&dir), Arc::new(SystemClock));
         result(call(&s, &put_options(&json!({}))).await);
@@ -2298,14 +2293,19 @@ mod tests {
         wait_received(&dir, first, b"fake://127.0.0.1:1/").await;
         let asks = |s: &Supervisor| s.shared.lock().connections["c1"].backchannel;
         assert!(!asks(&s), "opt-in");
-        // The stream opts in: the same connection, worker and session, its
-        // source restarted once with the backchannel asked for.
+        // The message as the worker reads it: its length, then its body.
+        let told = |asks: bool| {
+            let body = lotse_ipc::encode(&lotse_ipc::ToWorker::Backchannel { asks }).unwrap();
+            let mut framed = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+            framed.extend_from_slice(&body);
+            framed
+        };
         let put = result(call(&s, &put_options(&json!({ "talk": true }))).await);
         assert_eq!(put["created"], false);
         assert_eq!(front_connection(&s).await, "c1");
         assert_eq!(s.shared.lock().connections.len(), 1, "no second session");
         assert!(asks(&s));
-        wait_received(&dir, first, br#"{"talk":true}"#).await;
+        wait_received(&dir, first, &told(true)).await;
         assert_eq!(worker_pid(&s).await, first, "the same worker");
         assert!(s.shared.lock().sessions.contains_key("s1"));
         assert_eq!(
@@ -2313,24 +2313,47 @@ mod tests {
             true,
             "the stream keeps its options as given"
         );
-        assert_eq!(
-            captured
-                .lines("backchannel upgrade: restarting the source once")
-                .len(),
-            1
-        );
-        // Opting out again does not reconnect: deferred to the next connect.
         result(call(&s, &put_options(&json!({}))).await);
         assert!(!asks(&s));
-        let deferred = || captured.lines("backchannel downgrade deferred to next connect");
-        for _ in 0..500 {
-            if !deferred().is_empty() {
-                break;
-            }
-            SystemClock.sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(deferred().len(), 1);
+        wait_received(&dir, first, &told(false)).await;
         assert_eq!(worker_pid(&s).await, first);
+        assert!(s.shared.lock().sessions.contains_key("s1"));
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// ONVIF Streaming Specification §5.3.1: a put that switches the
+    /// source in place (another connection option) and opts in to the
+    /// backchannel, or out of it, tells the worker both: the switch, and
+    /// the ask, so its running source probes, or frees the talker the
+    /// switch would keep, without a restart.
+    #[tokio::test]
+    async fn a_put_that_switches_the_source_and_opts_in_or_out_tells_the_worker_both_onvif_5_3_1() {
+        let dir = private_dir("backchannel-switch");
+        let s = with_webrtc(&recording_worker(&dir), Arc::new(SystemClock));
+        result(call(&s, &put_options(&json!({}))).await);
+        let mut s1 = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        assert_eq!(next(&mut s1).await["type"], "session");
+        let first = worker_pid(&s).await;
+        wait_received(&dir, first, b"fake://127.0.0.1:1/").await;
+        let asks = |s: &Supervisor| s.shared.lock().connections["c1"].backchannel;
+        let told =
+            |asks: bool| lotse_ipc::encode(&lotse_ipc::ToWorker::Backchannel { asks }).unwrap();
+        for (options, ask) in [
+            (json!({ "talk": true, "ready_after_ms": 1000 }), true),
+            (json!({ "ready_after_ms": 2000 }), false),
+        ] {
+            let put = result(call(&s, &put_options(&options)).await);
+            assert_eq!(put["created"], false);
+            assert_eq!(front_connection(&s).await, "c1");
+            assert_eq!(asks(&s), ask);
+            wait_received(&dir, first, &told(ask)).await;
+            let switched = format!(r#""ready_after_ms":{}"#, options["ready_after_ms"]);
+            wait_received(&dir, first, switched.as_bytes()).await;
+            assert_eq!(worker_pid(&s).await, first, "the same worker");
+            assert!(s.shared.lock().sessions.contains_key("s1"));
+        }
+        assert_eq!(s.shared.lock().connections.len(), 1);
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4039,7 +4062,6 @@ mod tests {
             );
             assert_eq!(spec.ice_ufrag, s.shared.lock().sessions[session].ufrag);
             assert_eq!(spec.ice_pass.len(), 24);
-            assert!(!spec.talkback_required, "neither opted in");
         }
         // A put that changes only the orientation is a change, keeps the
         // connection and the open session, and reaches the next offer.
@@ -4083,28 +4105,6 @@ mod tests {
         );
         assert!(s.shared.lock().sessions.is_empty());
         assert!(rx.try_recv().is_err(), "nothing for a worker that is gone");
-        s.shutdown().await;
-    }
-
-    /// The offer of a stream that opted in to the camera's backchannel
-    /// tells the worker so: a talk-back request it cannot meet fails the
-    /// session (`backchannel_unavailable`) instead of playing without.
-    #[tokio::test]
-    async fn an_offer_on_a_stream_that_opted_in_requires_its_talk_back() {
-        let dir = private_dir("talkback-required");
-        let s = with_webrtc(&blocking_worker(&dir), Arc::new(SystemClock));
-        let put = json!({ "id": 1, "type": "stream/put", "stream_id": "door",
-            "sources": [{ "url": "fake://127.0.0.1:4/", "options": { "talk": true } }] });
-        result(call(&s, &put.to_string()).await);
-        let (tx, mut rx) = mpsc::channel(8);
-        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
-        let _door = subscription(call_on(&s, 1, &offer(2, "door", Some("d1"))).await);
-        let_assert!(
-            Some(DriverCommand::OpenSession(spec)) = rx.recv().await,
-            "an offer"
-        );
-        assert_eq!(spec.session_id, "d1");
-        assert!(spec.talkback_required);
         s.shutdown().await;
     }
 

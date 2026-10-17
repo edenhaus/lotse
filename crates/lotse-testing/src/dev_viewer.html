@@ -377,6 +377,15 @@ let features = [];
 // Talk-back: the send-only audio transceiver the offer carried, and the
 // microphone while Talk is on, the one track on its sender.
 let talkTransceiver, mic;
+// Why the current negotiation's talk-back was declined, as its
+// backchannel_declined warning said, or undefined. Play's offer and every
+// re-offer start without one, so an earlier negotiation's reason never
+// shows for a later one.
+let declinedWhy;
+// The talk-back status after an answer that declined it: the warning's
+// reason once it came, which can be before the answer is applied, as
+// events are not awaited one after the other; else a pointer to it.
+const declinedStatus = () => `${declinedWhy ?? "declined (the warning says why)"}; Talk asks again`;
 // Whether Play's offer went without playout-delay, which the re-offers
 // leave out too: only the audio m-lines may change in them.
 let withoutPlayoutDelay = false;
@@ -499,17 +508,18 @@ async function onSessionEvent(event) {
       // backchannel_declined says why an offer's talk-back was declined,
       // and the camera's status when it refused.
       log(`warning ${event.code}${event.reason ? ` (${event.reason}${event.status ? ` ${event.status}` : ""})` : ""}: ${event.message}`, "bad");
+      if (event.code === "backchannel_declined") {
+        // The answer declined talk-back and the session plays on; the
+        // next press of Talk is another try. The reason is kept for the
+        // status set once the answer is applied.
+        declinedWhy = `declined (${event.reason}): ${event.message}`;
+        $("s-talk").textContent = declinedStatus();
+        $("s-talk").className = "bad";
+      }
       break;
     case "closed":
       log(`closed: ${event.code}: ${event.message}`, event.code === "session_closed" ? undefined : "bad");
       $("s-state").textContent = `closed (${event.code})`;
-      if (event.code === "backchannel_unavailable") {
-        // The stream opted in, so the daemon never plays a talk-back
-        // request without talk-back; nor does the page retry without.
-        $("s-talk").textContent = `unavailable: ${event.message}`;
-        $("s-talk").className = "bad";
-        log(`two-way audio unavailable, the session failed: ${event.message}; turn two-way audio off to play without it`, "bad");
-      }
       offerId = undefined; // the subscription ended with this event
       teardown(true);
       break;
@@ -539,6 +549,7 @@ async function play() {
   const talkback = $("talkback").checked;
   playing = { streamId, url, talkback };
   lastAnswer = undefined;
+  declinedWhy = undefined;
   save();
   $("play").disabled = true;
   $("stop").disabled = false;
@@ -577,14 +588,13 @@ async function play() {
     // Talk-back goes up on a dedicated send-only m-line, which the daemon
     // answers recvonly in the backchannel's codec, else for a G.711 camera
     // the other G.711 law (converted), else Opus (RFC 3264 §6.1)
-    // from the backchannel the live source offers: the stream opted in, so
-    // without one the session closes with backchannel_unavailable rather
-    // than playing without talk-back. An offer right after a put that
-    // opted in a live connection waits in the daemon for its restart to
-    // ask for the backchannel. The offer claims the backchannel for this
-    // session if nobody holds it; Stop talking re-offers the m-line
-    // inactive to let it go, and every Talk re-offers it sendonly to claim
-    // it again. It carries no track until Talk, so nothing is sent before.
+    // from the backchannel the connection's probe found; without one the
+    // answer declines it (backchannel_declined) and the session plays on.
+    // An offer right after a put that opted in waits in the daemon for that
+    // probe. The offer claims the backchannel for this session if nobody
+    // holds it; Stop talking re-offers the m-line inactive to let it go,
+    // and every Talk re-offers it sendonly to claim it again. It carries no
+    // track until Talk, so nothing is sent before.
     if (!features.includes("two_way_audio")) log("the daemon announces no two_way_audio: talk-back will not be negotiated", "bad");
     if (navigator.mediaDevices?.getUserMedia) {
       talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });
@@ -676,7 +686,7 @@ function sent(sdp) {
 function answeredTalkback() {
   const negotiated = talkTransceiver.currentDirection === "sendonly";
   $("talk").disabled = false;
-  $("s-talk").textContent = negotiated ? "negotiated; press Talk" : "declined (the warning says why); Talk asks again";
+  $("s-talk").textContent = negotiated ? "negotiated; press Talk" : declinedStatus();
   $("s-talk").className = negotiated ? "" : "bad";
   log(negotiated ? "talk-back negotiated" : "talk-back declined: the answer's m-line is inactive", negotiated ? "good" : "bad");
 }
@@ -684,7 +694,8 @@ function answeredTalkback() {
 // Re-offers with the talk-back transceiver's direction set to `direction`
 // (webrtc/renegotiate, RFC 8829 §5.2.2) and applies the answer: true when
 // the browser's side is sendonly then, the session holding the camera's
-// backchannel; false when the answer declined it (inactive). A re-offer
+// backchannel; false when the answer declined it (inactive). Each starts
+// without the last negotiation's decline reason. A re-offer
 // the daemon refused is rolled back, the session going on as it was, and
 // gives undefined, as does one a newer Play overtook.
 async function renegotiate(direction, mine) {
@@ -692,6 +703,7 @@ async function renegotiate(direction, mine) {
   const transceiver = talkTransceiver;
   const session = sessionId;
   const before = transceiver.direction;
+  declinedWhy = undefined;
   transceiver.direction = direction;
   const offer = await peer.createOffer();
   if (mine !== attempt) return undefined;
@@ -753,7 +765,7 @@ async function startTalking() {
     // daemon's refusal logged with its result.
     if (failed) log(`re-offer failed: ${failed.name}: ${failed.message}`, "bad");
     log(claimed === false ? "talk-back declined; press Talk to ask again" : "talk-back not claimed; press Talk to ask again", "bad");
-    $("s-talk").textContent = claimed === false ? "declined (the warning says why); Talk asks again" : "not claimed (the log says why); Talk asks again";
+    $("s-talk").textContent = claimed === false ? declinedStatus() : "not claimed (the log says why); Talk asks again";
     $("s-talk").className = "bad";
     $("talk").disabled = false;
     return;
