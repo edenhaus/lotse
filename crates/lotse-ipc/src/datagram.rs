@@ -31,6 +31,12 @@ pub const HEADER_LEN: usize = 2 * ADDR_LEN;
 /// the supervisor generates far shorter ones).
 pub const MAX_UFRAG_LEN: usize = 255;
 
+/// The longest frame [`encode`] writes for a UDP datagram: the ufrag's
+/// length byte, the longest ufrag, the header and the largest payload. A
+/// reader's buffer is one byte longer, so a frame cut to fit it is told
+/// apart from one that fits exactly.
+pub const MAX_FRAME_LEN: usize = 1 + MAX_UFRAG_LEN + HEADER_LEN + MAX_DATAGRAM_PAYLOAD;
+
 /// Why a frame is not a datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DatagramError {
@@ -206,6 +212,20 @@ mod tests {
         let long = "u".repeat(300);
         encode(&long, v4, v4, b"x", &mut out);
         assert_eq!(decode(&out).unwrap().ufrag.len(), MAX_UFRAG_LEN);
+    }
+
+    #[test]
+    fn the_longest_ufrag_and_payload_make_a_frame_of_max_frame_len() {
+        let addr: SocketAddr = "192.0.2.10:18556".parse().unwrap();
+        let mut out = Vec::new();
+        encode(
+            &"u".repeat(MAX_UFRAG_LEN),
+            addr,
+            addr,
+            &vec![0; MAX_DATAGRAM_PAYLOAD],
+            &mut out,
+        );
+        assert_eq!(out.len(), MAX_FRAME_LEN);
     }
 
     #[test]
