@@ -79,6 +79,36 @@ pub const WORKER_NICE_INCREMENT: i32 = 10;
 /// layer is unavailable. Lowering a hard limit needs no privilege.
 pub const WORKER_MAX_NICE_RLIMIT: u64 = 0;
 
+/// `RLIMIT_FSIZE` for a worker, soft and hard: 0, so it cannot write a
+/// byte to a regular file. getrlimit(2): an attempt to extend a file past
+/// the limit gets `SIGXFSZ`, or fails with `EFBIG` where the signal is
+/// caught or ignored; at 0 every write to a regular file does, overwriting
+/// included, since the kernel refuses any write at an offset at or past the
+/// limit (mm/filemap.c, `generic_write_check_limits`). Pipes, sockets and
+/// character devices such as `/dev/null` are not regular files and keep
+/// working. Lowering a hard limit needs no privilege.
+///
+/// Nothing a worker runs writes a file: it logs to its standard error,
+/// sends on sockets it holds and reads `/proc/self/smaps_rollup` through a
+/// descriptor opened before its sandbox. The limit backs Landlock, which
+/// lets a worker open no file but which the kernel may lack (Linux 5.13)
+/// or have disabled, and the seccomp allowlist, which keeps `openat`,
+/// `write` and `pwrite64` and denies only `memfd_create` and `ftruncate`.
+///
+/// Not set while the worker's standard error is a regular file
+/// (`lotse serve 2>lotse.log`, systemd's `StandardError=file:`, CI's
+/// Sandbox isolation job): a worker inherits the supervisor's standard
+/// error and logs to it, so its first log line would end it. The report
+/// then notes that the limit is missing; `require` does not refuse, since
+/// the limit is not one of the layers it requires.
+///
+/// `SIGXFSZ` keeps its default action, ending the worker (no core dump:
+/// `RLIMIT_CORE` is 0 and the worker is not dumpable), as seccomp's
+/// `SIGSYS` does: a worker writing a regular file runs code it was not
+/// built to run. Ignoring it would need sigaction(2), which nothing but
+/// `unsafe` code reaches, and would only turn the end into `EFBIG`.
+pub const WORKER_MAX_FILE_SIZE: u64 = 0;
+
 /// The descriptor number a worker keeps the shared WebRTC UDP socket at,
 /// the highest [`WORKER_MAX_FILES`] leaves it. Every worker sends on one
 /// open file description with the supervisor, which receives on it, so the
