@@ -249,8 +249,9 @@ impl SessionManager {
         self.sessions.len()
     }
 
-    /// The talk-back counters of every open session whose answer
-    /// negotiated talk-back, by session id.
+    /// The talk-back counters of every open session an answer of which
+    /// negotiated talk-back, its offer's or a re-offer's, by session id:
+    /// all it counted, also after a re-offer dropped talk-back.
     pub(crate) fn talkback(&mut self) -> Vec<(String, lotse_ipc::TalkbackStats)> {
         self.reap();
         let mut report: Vec<_> = self
@@ -389,27 +390,16 @@ impl SessionManager {
         self.send(session_id, Control::Candidate(candidate));
     }
 
-    /// A re-offer for a session, which answers it with a `Renegotiated`
-    /// or `RenegotiateRefused` report; one for no session, or one whose
-    /// queue is full, is refused here, so the supervisor's command never
-    /// waits for an answer that cannot come.
-    pub(crate) async fn renegotiate(&self, session_id: &str, sdp: String) {
-        let queued = self
-            .sessions
+    /// Hands a re-offer to its session, which answers it with a
+    /// `Renegotiated` or `RenegotiateRefused` report: `false` when there
+    /// is no such session or its queue is full. The caller, the serve
+    /// loop, refuses that one itself, straight to the supervisor: the
+    /// loop is the one reader of the session events, so waiting for room
+    /// in their queue here could wait forever.
+    pub(crate) fn renegotiate(&self, session_id: &str, sdp: String) -> bool {
+        self.sessions
             .get(session_id)
-            .is_some_and(|handle| handle.control.try_send(Control::Renegotiate(sdp)).is_ok());
-        if queued {
-            return;
-        }
-        tracing::debug!(
-            session = session_id,
-            "re-offer refused: no such session, or its queue is full"
-        );
-        let event = IpcEvent::RenegotiateRefused {
-            code: "internal_error".to_owned(),
-            message: "the session is gone or busy".to_owned(),
-        };
-        let _sent = self.events.send((session_id.to_owned(), event)).await;
+            .is_some_and(|handle| handle.control.try_send(Control::Renegotiate(sdp)).is_ok())
     }
 
     /// A relay candidate for a session.
@@ -918,7 +908,8 @@ struct Arbitration {
     /// go.
     granted: Option<Claim>,
     /// The offer claimed the backchannel, which the session did not hold
-    /// before: an engine that refuses the offer lets go again.
+    /// before, as the claim itself decided ([`Claimant::claim`]): an
+    /// engine that refuses the offer lets go again.
     claimed: bool,
     /// The offer drops talk-back the session held: it lets go once the
     /// engine took the offer, since the engine needs no claim to answer
@@ -1253,9 +1244,9 @@ async fn open_session(
         }
     };
     let negotiated = engine.talkback();
-    ctx.talkback
-        .negotiated
-        .store(negotiated.is_some(), Ordering::Relaxed);
+    if negotiated.is_some() {
+        ctx.talkback.ever_negotiated.store(true, Ordering::Relaxed);
+    }
     ctx.emit(IpcEvent::Answer {
         sdp: answer,
         talkback: negotiated.map(|codec| codec.name().to_owned()),
@@ -1358,10 +1349,12 @@ async fn answer(ctx: &SessionCtx, opened: &mut Opened, sdp: &str, mut arbitratio
             {
                 talkback.let_go();
             }
+            // A session that drops talk-back stays reported, with what
+            // it counted so far.
             let negotiated = opened.engine.talkback();
-            ctx.talkback
-                .negotiated
-                .store(negotiated.is_some(), Ordering::Relaxed);
+            if negotiated.is_some() {
+                ctx.talkback.ever_negotiated.store(true, Ordering::Relaxed);
+            }
             let talkback = negotiated.map(lotse_core::uplink::UplinkCodec::name);
             tracing::info!(talkback, "re-offer answered");
             ctx.emit(IpcEvent::Renegotiated {
@@ -2174,7 +2167,7 @@ mod tests {
             }]
         );
         assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
-        assert!(a.talkback.negotiated.load(Ordering::Relaxed));
+        assert!(a.talkback.ever_negotiated.load(Ordering::Relaxed));
 
         // b asks too: declined, after its answer.
         let (mut b, task) = session_on(
@@ -2202,7 +2195,7 @@ mod tests {
                 },
             ]
         );
-        assert!(!b.talkback.negotiated.load(Ordering::Relaxed));
+        assert!(!b.talkback.ever_negotiated.load(Ordering::Relaxed));
         // b's packets go nowhere, and are counted.
         b.script.then(uplink(b.clock.now()));
         b.control(Control::Candidate("candidate:x".into()));
@@ -2259,7 +2252,10 @@ mod tests {
             }]
         );
         assert_eq!(change(&mut feed).await, ("a".into(), "renegotiated"));
-        assert!(!a.talkback.negotiated.load(Ordering::Relaxed));
+        assert!(
+            a.talkback.ever_negotiated.load(Ordering::Relaxed),
+            "still reported, with what it counted"
+        );
         b.control(reoffer("v=0 talk"));
         assert!(poll_once(&mut b_task).await.is_pending());
         assert!(b.script.called("renegotiate v=0 talk claim=Granted"));
@@ -2271,7 +2267,7 @@ mod tests {
             }]
         );
         assert_eq!(change(&mut feed).await, ("b".into(), "claimed"));
-        assert!(b.talkback.negotiated.load(Ordering::Relaxed));
+        assert!(b.talkback.ever_negotiated.load(Ordering::Relaxed));
         // a asks again while b holds it: declined, after the answer.
         a.control(reoffer("v=0 talk"));
         assert!(poll_once(&mut a_task).await.is_pending());
@@ -2300,7 +2296,7 @@ mod tests {
                 message: "invalid re-offer: refused by the script".into(),
             }]
         );
-        assert!(b.talkback.negotiated.load(Ordering::Relaxed));
+        assert!(b.talkback.ever_negotiated.load(Ordering::Relaxed));
         // b lets go; a's refused re-offer claimed first, and lets go again.
         b.control(reoffer("v=0"));
         assert!(poll_once(&mut b_task).await.is_pending());
@@ -2625,8 +2621,9 @@ mod tests {
         );
     }
 
-    /// A re-offer before the answer is refused, and so is one for a
-    /// session the manager does not hold or whose queue is full.
+    /// A re-offer before the answer is refused; the manager hands one on
+    /// to its session, and tells its caller of one for a session it does
+    /// not hold or whose queue is full, for the caller to refuse.
     #[tokio::test]
     async fn a_re_offer_before_the_answer_or_for_no_session_is_refused() {
         let (mut rig, session) = session(Script::default(), false, false);
@@ -2644,35 +2641,16 @@ mod tests {
         assert!(rig.script.calls.lock().unwrap().is_empty(), "never opened");
 
         let mut m = managed();
-        m.manager.renegotiate("ghost", "v=0".into()).await;
-        assert_eq!(
-            m.next().await,
-            (
-                "ghost".to_owned(),
-                IpcEvent::RenegotiateRefused {
-                    code: "internal_error".into(),
-                    message: "the session is gone or busy".into(),
-                }
-            )
-        );
+        assert!(!m.manager.renegotiate("ghost", "v=0".into()), "no session");
         m.open("a").await;
+        assert!(m.manager.renegotiate("a", "v=0".into()), "handed on");
         // Its task has not run, so nothing reads the queue.
         while m.manager.sessions["a"]
             .control
             .try_send(Control::Candidate(String::new()))
             .is_ok()
         {}
-        m.manager.renegotiate("a", "v=0".into()).await;
-        assert_eq!(
-            m.next().await,
-            (
-                "a".to_owned(),
-                IpcEvent::RenegotiateRefused {
-                    code: "internal_error".into(),
-                    message: "the session is gone or busy".into(),
-                }
-            )
-        );
+        assert!(!m.manager.renegotiate("a", "v=0".into()), "queue full");
     }
 
     fn closed(code: &str, message: &str) -> IpcEvent {
@@ -3054,7 +3032,7 @@ mod tests {
         assert!(m.manager.talkback().is_empty(), "none negotiated");
         for id in ["b", "a"] {
             let stats = &m.manager.sessions[id].talkback;
-            stats.negotiated.store(true, Ordering::Relaxed);
+            stats.ever_negotiated.store(true, Ordering::Relaxed);
         }
         let b = &m.manager.sessions["b"].talkback;
         b.packets_received.store(2, Ordering::Relaxed);

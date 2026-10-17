@@ -158,7 +158,10 @@ impl OutputFactory for WebRtcFactory {
         offer: &str,
         backchannel: Option<&TalkbackTarget>,
     ) -> TalkbackRequest {
-        let order = audio::engine_codecs(backchannel.map(|backchannel| backchannel.codec.family()));
+        let order = audio::engine_codecs(
+            backchannel.map(|backchannel| backchannel.codec.family()),
+            None,
+        );
         match audio::AudioPlan::new(offer, None, backchannel, TalkbackClaim::Granted, &order)
             .talkback
         {
@@ -203,7 +206,7 @@ mod tests {
     /// it before the answer: a `sendonly` audio m-line in a codec that
     /// reaches the backchannel is negotiable, one the backchannel cannot
     /// take is requested in vain with the plan's reason, and an offer
-    /// without one asks for nothing.
+    /// without one, or with it stopped, asks for nothing.
     #[test]
     fn rfc8866_6_7_the_factory_reads_what_an_offer_asks_of_the_backchannel() {
         use lotse_core::codec::Codec;
@@ -236,6 +239,24 @@ mod tests {
         );
         assert_eq!(
             factory.talkback_request(silent, Some(&pcmu)),
+            TalkbackRequest::NotRequested
+        );
+        // Only in two-channel PCMU, which the engine does not carry
+        // (`audio::engine_channels`): requested in vain, so the worker
+        // neither claims the backchannel for it nor keeps it.
+        let stereo = talking.replace("PCMU/8000", "PCMU/8000/2");
+        assert_eq!(
+            factory.talkback_request(&stereo, Some(&pcmu)),
+            TalkbackRequest::Unsupported(
+                "the talk-back m-line lists no codec that reaches the backchannel".into()
+            )
+        );
+        // Stopped with port 0 (RFC 3264 §8.2), its `a=sendonly` kept: it
+        // asks for nothing, so a session that held the backchannel lets
+        // go.
+        let stopped = talking.replace("m=audio 9 ", "m=audio 0 ");
+        assert_eq!(
+            factory.talkback_request(&stopped, Some(&pcmu)),
             TalkbackRequest::NotRequested
         );
     }

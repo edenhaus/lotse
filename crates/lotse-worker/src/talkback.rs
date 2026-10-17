@@ -136,8 +136,10 @@ pub(crate) struct TalkerChanged {
 /// (`session/get`'s `backchannel`).
 #[derive(Debug, Default)]
 pub(crate) struct TalkbackStats {
-    /// The answer negotiated talk-back: only such a session is reported.
-    pub(crate) negotiated: AtomicBool,
+    /// An answer of the session negotiated talk-back, its offer's or a
+    /// re-offer's: only such a session is reported, and it stays reported
+    /// once a re-offer drops talk-back, so its counters never go back.
+    pub(crate) ever_negotiated: AtomicBool,
     /// Talk-back packets the engine took (`SessionStats::uplink_packets`,
     /// `session/get`'s `packets_received`).
     pub(crate) packets_received: AtomicU64,
@@ -160,11 +162,11 @@ impl TalkbackStats {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The counters as the supervisor gets them; `None` when the answer
-    /// did not negotiate talk-back.
+    /// The counters as the supervisor gets them, all the session counted
+    /// so far; `None` when no answer of the session negotiated talk-back.
     pub(crate) fn report(&self) -> Option<lotse_ipc::TalkbackStats> {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-        self.negotiated
+        self.ever_negotiated
             .load(Ordering::Relaxed)
             .then(|| lotse_ipc::TalkbackStats {
                 packets_received: load(&self.packets_received),
@@ -505,8 +507,10 @@ impl Arbiter {
     /// not open (the device refused it, no backchannel is offered, or it
     /// took longer than `limit`, what is left of [`BACKCHANNEL_OPEN_LIMIT`]
     /// for the offer), the claim not kept. The claim is decided under the
-    /// lock a release takes, and the channel is the claimant's while its
-    /// session opens; a loss of the session later is reported on `losses`.
+    /// lock a release takes, and whether it is new with it: a release just
+    /// before makes the next claim a new one. The channel is the
+    /// claimant's while its session opens; a loss of the session later is
+    /// reported on `losses`.
     pub(crate) async fn claim(
         self: &Arc<Self>,
         session: &str,
@@ -1621,7 +1625,8 @@ mod tests {
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("a", ChangeReason::Claimed));
         // Claiming again is the same claim: no change.
-        claims(&mut a).await;
+        let again = within(a.claimant().claim(BACKCHANNEL_OPEN_LIMIT)).await;
+        assert!(again.unwrap().is_none(), "held already");
         no_change(&mut events);
         talk(&mut a, 0);
         let first = within(device.recv()).await.unwrap();
@@ -1770,6 +1775,36 @@ mod tests {
         claims(&mut b).await;
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("b", ChangeReason::Claimed));
+    }
+
+    /// Whether a claim is new is decided with the claim, under the lock a
+    /// release takes: a session that held the channel and was released
+    /// just before its re-offer claims gets a new claim, which a re-offer
+    /// the engine refuses lets go again; one it still holds is no new
+    /// claim, and nothing changes.
+    #[tokio::test]
+    async fn a_claim_after_a_release_is_a_new_one_for_the_session_that_held_it() {
+        let (arbiter, slot) = arbiter(None);
+        let _device = pcmu(&slot);
+        let mut events = arbiter.subscribe();
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        let new = within(a.claimant().claim(BACKCHANNEL_OPEN_LIMIT)).await;
+        a.adopt(new.unwrap().expect("a new claim"));
+        let again = within(a.claimant().claim(BACKCHANNEL_OPEN_LIMIT)).await;
+        assert!(again.unwrap().is_none(), "held already");
+        assert_eq!(change(&mut events).1, ChangeReason::Claimed);
+        no_change(&mut events);
+        // Released while the session still has its claim: the next one is
+        // new, though the session believed it held the channel.
+        assert_eq!(arbiter.release(Some("a")).as_deref(), Some("a"));
+        let renewed = within(a.claimant().claim(BACKCHANNEL_OPEN_LIMIT)).await;
+        a.adopt(renewed.unwrap().expect("released meanwhile: a new claim"));
+        assert_eq!(change(&mut events).1, ChangeReason::Released);
+        assert_eq!(change(&mut events).1, ChangeReason::Claimed);
+        assert!(holds(&a));
+        a.let_go();
+        assert_eq!(change(&mut events).1, ChangeReason::Renegotiated);
+        assert!(!holds(&a), "the channel is free again");
     }
 
     /// A stale claim is not taken for a later one: a released talker that
@@ -2330,13 +2365,13 @@ mod tests {
         assert_eq!(load(&a.stats.bytes_sent), 2);
     }
 
-    /// `session/get`'s counters, only for a session whose answer
+    /// `session/get`'s counters, only for a session an answer of which
     /// negotiated talk-back.
     #[test]
     fn only_a_negotiated_session_reports_its_counters() {
         let stats = TalkbackStats::default();
         assert_eq!(stats.report(), None);
-        stats.negotiated.store(true, Ordering::Relaxed);
+        stats.ever_negotiated.store(true, Ordering::Relaxed);
         stats.packets_received.store(5, Ordering::Relaxed);
         TalkbackStats::count(&stats.packets_dropped_busy);
         TalkbackStats::count(&stats.packets_sent);
