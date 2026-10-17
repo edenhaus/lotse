@@ -8,9 +8,23 @@
 //! number is locked twice: an offer that gives one number two codec
 //! configurations reaches that assert, and with `panic = "abort"` the
 //! camera's worker dies with every viewer on it. [`check_payload_types`]
-//! refuses such an offer first.
+//! refuses such an offer first. The browser's text its reason quotes is
+//! capped (`BROWSER_TEXT_BYTES`): the session logs the reason and the
+//! API returns it.
 
 use std::fmt;
+
+/// The most bytes of one piece of the browser's text (a mid, a media type,
+/// an encoding, an `a=fmtp` value, a parameter name) a refusal or a log
+/// line carries: the session logs a refusal's reason and the API returns
+/// it, and the offer may hold any of them at the control API's offer cap.
+pub(crate) const BROWSER_TEXT_BYTES: usize = 200;
+
+/// A piece of the browser's `text` as a refusal or a log line carries it:
+/// on one line, control characters replaced, cut to [`BROWSER_TEXT_BYTES`].
+pub(crate) fn browser_text(text: &str) -> String {
+    lotse_core::text::plain(text, BROWSER_TEXT_BYTES)
+}
 
 /// An SDP split at its `m=` lines (RFC 8866 §5), each line without its
 /// line ending. Borrowed from the text; nothing is validated.
@@ -184,7 +198,8 @@ impl<'a> Section<'a> {
 /// parts of a codec configuration RFC 9143 §9.1.1 requires to be identical
 /// wherever a BUNDLE group reuses the number ("the same media type,
 /// encoding name, clock rate, and any parameter that can affect the codec
-/// configuration and packetization").
+/// configuration and packetization"). Displayed for a refusal with each
+/// piece as [`browser_text`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Configuration<'a> {
     /// The section's media type.
@@ -200,9 +215,11 @@ struct Configuration<'a> {
 
 impl fmt::Display for Configuration<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.media, self.encoding)?;
+        let media = browser_text(self.media);
+        let encoding = browser_text(&self.encoding);
+        write!(f, "{media} {encoding}")?;
         if !self.parameters.is_empty() {
-            write!(f, " ({})", self.parameters)?;
+            write!(f, " ({})", browser_text(self.parameters))?;
         }
         Ok(())
     }
@@ -259,10 +276,11 @@ fn repeated_parameter(parameters: &str) -> Option<&str> {
     None
 }
 
-/// Where a payload type is defined: `m-line <index> (mid <mid>)`.
+/// Where a payload type is defined: `m-line <index> (mid <mid>)`, the
+/// mid as [`browser_text`].
 fn place(index: usize, mid: Option<&str>) -> String {
     match mid {
-        Some(mid) => format!("m-line {index} (mid {mid})"),
+        Some(mid) => format!("m-line {index} (mid {})", browser_text(mid)),
         None => format!("m-line {index}"),
     }
 }
@@ -313,8 +331,9 @@ fn payload_types<'a>(
         }
         if let Some(name) = repeated_parameter(parameters) {
             return Err(format!(
-                "a=fmtp:{pt} in {} sets {name} twice (RFC 4588 §8.1 for apt)",
-                place(index, section.mid())
+                "a=fmtp:{pt} in {} sets {} twice (RFC 4588 §8.1 for apt)",
+                place(index, section.mid()),
+                browser_text(name)
             ));
         }
         fmtps.push((pt, parameters));
@@ -523,6 +542,46 @@ mod tests {
         assert!(!zero_port(""));
         assert!(!zero_port("+0"));
         assert!(!zero_port("0 "));
+    }
+
+    /// The browser's text in a refusal, which the session logs and the
+    /// API returns, is capped: the mid, the media type, the encoding, the
+    /// format parameters and a parameter's name, each at
+    /// [`BROWSER_TEXT_BYTES`] and on one line.
+    #[test]
+    fn rfc9143_9_1_1_the_browser_s_text_in_a_refusal_is_capped() {
+        let long = "x".repeat(10_000);
+        let shown = &long[..BROWSER_TEXT_BYTES];
+        let section = |lines: &str| format!("m=audio 9 x 96\r\na=mid:{long}\r\n{lines}");
+        assert_eq!(
+            check_payload_types(&section("a=rtpmap:96 a/1\r\na=rtpmap:96 b/1\r\n")).unwrap_err(),
+            format!(
+                "payload type 96 has two a=rtpmap lines in m-line 0 (mid {shown}) (RFC 8866 §6.6)"
+            )
+        );
+        assert_eq!(
+            check_payload_types(&section("a=fmtp:96 a=1\r\na=fmtp:96 a=2\r\n")).unwrap_err(),
+            format!(
+                "payload type 96 has two a=fmtp lines in m-line 0 (mid {shown}) (RFC 8866 §6.15)"
+            )
+        );
+        assert_eq!(
+            check_payload_types(&section(&format!("a=fmtp:96 {long}=1;{long}=2\r\n"))).unwrap_err(),
+            format!(
+                "a=fmtp:96 in m-line 0 (mid {shown}) sets {shown} twice (RFC 4588 §8.1 for apt)"
+            )
+        );
+        let err = check_payload_types(&format!(
+            "m={long} 9 x 96\r\na=mid:{long}\r\na=rtpmap:96 {long}/1\r\na=fmtp:96 {long}\r\nm=video 9 x 96\r\na=mid:v\r\na=rtpmap:96 H264/90000\r\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.starts_with(&format!(
+                "payload type 96 is {shown} {shown} ({shown}) in m-line 0 (mid {shown}) and video h264/90000 in m-line 1 (mid v), not bundled together"
+            )),
+            "{err}"
+        );
+        assert!(err.len() < 6 * BROWSER_TEXT_BYTES, "{err}");
     }
 
     #[test]

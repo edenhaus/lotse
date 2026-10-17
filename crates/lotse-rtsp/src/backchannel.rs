@@ -41,6 +41,8 @@ use lotse_core::codec::Codec;
 use lotse_core::media::{MediaPacket, RtpHeaderFields};
 use sdp_types::Media;
 
+use crate::error::camera_text;
+
 /// The G.711 RTP clock rate (RFC 3551 §4.5.14).
 const G711_CLOCK_RATE: u32 = 8_000;
 
@@ -85,42 +87,48 @@ pub struct BackchannelFormat {
 /// A format is named by its `a=rtpmap` (RFC 8866 §6.6), else by its static
 /// payload type (RFC 3551 Table 4: 0 is PCMU, 8 is PCMA). G.711 must run at
 /// 8000 Hz, mono (RFC 3551 §4.5.14), Opus at 48000 Hz (RFC 7587 §7); other
-/// formats (G.722, AAC, a G.711 at another rate) are skipped and logged.
+/// formats (G.722, AAC, a G.711 at another rate) are skipped. The camera's
+/// text reaches the log capped: the media name as `camera_text`, the
+/// format list as one line of counts, however many tokens it has.
 pub fn backchannel_format(media: &Media) -> Option<BackchannelFormat> {
     if !media.media.eq_ignore_ascii_case("audio") {
-        tracing::debug!(media = %media.media, "backchannel: not an audio media");
+        tracing::debug!(media = %camera_text(&media.media), "backchannel: not an audio media");
         return None;
     }
     let ptime = media
         .get_first_attribute_value("ptime")
         .flatten()
         .and_then(parse_ptime);
+    let mut not_payload_type: usize = 0;
+    let mut unsupported: usize = 0;
+    let mut chosen = None;
     for format in media.fmt.split_ascii_whitespace() {
         let Some(payload_type) = format
             .parse::<u8>()
             .ok()
             .filter(|pt| *pt <= MAX_PAYLOAD_TYPE)
         else {
-            tracing::debug!(
-                format,
-                "backchannel: skipped a format that is no payload type"
-            );
+            not_payload_type = not_payload_type.saturating_add(1);
             continue;
         };
         if let Some((codec, clock_rate)) = codec_of(payload_type, rtpmap(media, payload_type)) {
-            return Some(BackchannelFormat {
+            chosen = Some(BackchannelFormat {
                 codec,
                 payload_type,
                 clock_rate,
                 ptime,
             });
+            break;
         }
-        tracing::debug!(
-            payload_type,
-            "backchannel: skipped a format the talk-back chain cannot produce"
-        );
+        unsupported = unsupported.saturating_add(1);
     }
-    None
+    tracing::debug!(
+        chosen = ?chosen.as_ref().map(|format| format.payload_type),
+        not_payload_type,
+        unsupported,
+        "backchannel: format list read"
+    );
+    chosen
 }
 
 /// One `a=rtpmap` value, split: the encoding name, the clock rate and the
@@ -588,6 +596,47 @@ mod tests {
             format(&["m=audio 0 RTP/AVP 127", "a=rtpmap:127 PCMU/8000"]),
             Some(g711(Codec::Pcmu, 127))
         );
+    }
+
+    /// A camera's SDP may carry a format list or a media name of any
+    /// length: the media name reaches the log as `camera_text`, and the
+    /// formats skipped are one count per media, not one line per token.
+    #[test]
+    fn rfc8866_5_14_skipped_formats_are_one_count_per_media_and_the_media_name_is_capped() {
+        use crate::error::CAMERA_TEXT_BYTES;
+
+        let tokens = "x ".repeat(5_000);
+        let mut found = None;
+        let logs = logged(|| {
+            found = format(&[&format!("m=audio 0 RTP/AVP {tokens}200 9 96 0 8")]);
+        });
+        assert_eq!(found, Some(g711(Codec::Pcmu, 0)));
+        let lines: Vec<&str> = logs.lines().collect();
+        assert_eq!(lines.len(), 1, "{logs}");
+        assert!(
+            lines[0].ends_with(
+                "backchannel: format list read chosen=Some(0) not_payload_type=5001 unsupported=2"
+            ),
+            "{logs}"
+        );
+        let logs = logged(|| found = format(&["m=audio 0 RTP/AVP 9"]));
+        assert_eq!(found, None);
+        assert!(
+            logs.trim_end()
+                .ends_with("chosen=None not_payload_type=0 unsupported=1"),
+            "{logs}"
+        );
+
+        let name = "v".repeat(10_000);
+        let logs = logged(|| found = format(&[&format!("m={name} 0 RTP/AVP 0")]));
+        assert_eq!(found, None);
+        let shown = &name[..CAMERA_TEXT_BYTES];
+        assert!(
+            logs.trim_end()
+                .ends_with(&format!("backchannel: not an audio media media={shown}")),
+            "{logs}"
+        );
+        assert!(logs.len() < 2 * CAMERA_TEXT_BYTES, "{logs}");
     }
 
     #[test]
