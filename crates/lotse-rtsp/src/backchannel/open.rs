@@ -29,6 +29,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::stream::SplitSink;
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
 use lotse_core::codec::Codec;
 use lotse_core::media::MediaPacket;
@@ -331,16 +332,8 @@ async fn forward(
                 let sending = SendingPacket::new(index, rtp.ts, Bytes::from_owner(payload))
                     .mark(rtp.marker)
                     .payload_type(rtp.pt);
-                let sent = tokio::select! {
-                    sent = sink.send(sending) => sent,
-                    () = close.cancelled() => {
-                        tracing::info!(
-                            "rtsp: backchannel session closed while a packet waited for the camera to take data"
-                        );
-                        return None;
-                    }
-                };
-                if let Err(err) = sent {
+                // Closed while the send waits: `None`, as for any close.
+                if let Err(err) = send(&mut sink, sending, close).await? {
                     return Some(refusal(err.status_code(), &classify(&err, &camera.url)));
                 }
             }
@@ -351,6 +344,26 @@ async fn forward(
                 ended => return Some(lost(ended.and_then(Result::err).as_ref(), camera)),
             },
             () = close.cancelled() => return None,
+        }
+    }
+}
+
+/// Sends `sending` on `sink`, retina's way to the camera: the send's
+/// result, or `None` once `close` is cancelled while the send waits for
+/// the camera to take data (its TCP buffers full), so a release still
+/// reaches the session's bounded `TEARDOWN` ([`tear_down`]).
+async fn send(
+    sink: &mut SplitSink<Session<Playing>, SendingPacket>,
+    sending: SendingPacket,
+    close: &CancellationToken,
+) -> Option<Result<(), retina::Error>> {
+    tokio::select! {
+        sent = sink.send(sending) => Some(sent),
+        () = close.cancelled() => {
+            tracing::info!(
+                "rtsp: backchannel session closed while a packet waited for the camera to take data"
+            );
+            None
         }
     }
 }
