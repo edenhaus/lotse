@@ -491,9 +491,7 @@ mod tests {
         close.cancel();
         tokio::select! {
             ended = &mut session => ended.unwrap(),
-            () = SystemClock.sleep(Duration::from_secs(2)) => {
-                panic!("the session still waits in its send after the release")
-            }
+            () = SystemClock.sleep(Duration::from_secs(2)) => panic!("the send outlived the release"),
         }
         let log = cam.stats().connection_log();
         assert!(log[0].played, "{log:?}");
