@@ -893,7 +893,8 @@ struct Arbitration {
     /// The decline to report after the answer, if any.
     decline: Option<Decline>,
     /// The offer claimed the backchannel, which the session did not hold
-    /// before: an engine that refuses the offer lets go again.
+    /// before, as the claim itself decided ([`Talkback::claim`]): an
+    /// engine that refuses the offer lets go again.
     claimed: bool,
     /// The offer drops talk-back the session held: it lets go once the
     /// engine took the offer, since the engine needs no claim to answer
@@ -934,9 +935,10 @@ fn arbitrate(ctx: &SessionCtx, talkback: Option<&mut Talkback>, offer: &str) -> 
             arbitration.decline = Some(Decline::Unsupported(reason));
         }
         TalkbackRequest::Negotiable => {
-            let held = talkback.holds();
+            // Whether the claim is new comes from the claim itself, under
+            // the arbiter's lock: a release just before makes it new.
             match talkback.claim() {
-                Ok(()) => arbitration.claimed = !held,
+                Ok(claimed) => arbitration.claimed = claimed,
                 Err(holder) => {
                     arbitration.claim = TalkbackClaim::Busy;
                     arbitration.decline = Some(Decline::Busy(holder));

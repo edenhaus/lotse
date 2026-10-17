@@ -406,15 +406,17 @@ impl Arbiter {
     }
 
     /// Claims the channel for `session`'s offer: `Ok` when it holds the
-    /// channel now, with `claim` its claim (a new one, or the one it held
-    /// already); `Err` with the holder's session id when another session
-    /// holds it. Decided under the lock a release takes.
-    pub(crate) fn claim(&self, session: &str, claim: &mut Option<u64>) -> Result<(), String> {
+    /// channel now, with `claim` its claim, and `true` when this call
+    /// made it a new one, `false` when it held it already; `Err` with the
+    /// holder's session id when another session holds it. Decided under
+    /// the lock a release takes, so whether the claim is new is decided
+    /// with it: a release just before makes the next claim a new one.
+    pub(crate) fn claim(&self, session: &str, claim: &mut Option<u64>) -> Result<bool, String> {
         let mut guard = self.lock();
         let state = &mut *guard;
         if let Some(talker) = &state.talker {
             if Some(talker.claim) == *claim {
-                return Ok(());
+                return Ok(false);
             }
             *claim = None;
             return Err(talker.session.clone());
@@ -436,7 +438,7 @@ impl Arbiter {
             reason,
             "talk-back: backchannel claimed by the offer; this session is the talker"
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Whether `claim` holds the channel now.
@@ -798,9 +800,10 @@ impl Talkback {
     }
 
     /// Claims the connection's backchannel for the session's offer
-    /// ([`Arbiter::claim`]): `Ok` when the session holds it now, `Err`
-    /// with the holder's session id when another session does.
-    pub(crate) fn claim(&mut self) -> Result<(), String> {
+    /// ([`Arbiter::claim`]): `Ok` when the session holds it now, `true`
+    /// when this offer claimed it anew; `Err` with the holder's session id
+    /// when another session does.
+    pub(crate) fn claim(&mut self) -> Result<bool, String> {
         self.arbiter.claim(&self.session, &mut self.claim)
     }
 
@@ -1101,7 +1104,7 @@ mod tests {
 
     /// The session's offer claims the channel, which must be free.
     fn claims(talkback: &mut Talkback) {
-        talkback.claim().expect("the channel is free");
+        assert_eq!(talkback.claim(), Ok(true), "the channel is free");
     }
 
     async fn within<T>(future: impl Future<Output = T>) -> T {
@@ -1170,7 +1173,7 @@ mod tests {
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("a", ChangeReason::Claimed));
         // Claiming again is the same claim: no change.
-        claims(&mut a);
+        assert_eq!(a.claim(), Ok(false));
         no_change(&mut events);
         talk(&mut a, 0);
         let first = within(device.recv()).await.unwrap();
@@ -1319,6 +1322,31 @@ mod tests {
         claims(&mut b);
         let (session, reason) = change(&mut events);
         assert_eq!((session.as_str(), reason), ("b", ChangeReason::Claimed));
+    }
+
+    /// Whether a claim is new is decided with the claim, under the lock a
+    /// release takes: a session that held the channel and was released
+    /// just before its re-offer claims gets a new claim, which a re-offer
+    /// the engine refuses lets go again; one it still holds is no new
+    /// claim, and nothing changes.
+    #[tokio::test]
+    async fn a_claim_after_a_release_is_a_new_one_for_the_session_that_held_it() {
+        let (arbiter, _slot) = arbiter(None);
+        let mut events = arbiter.subscribe();
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        assert_eq!(a.claim(), Ok(true));
+        assert_eq!(a.claim(), Ok(false), "held already");
+        assert_eq!(change(&mut events).1, ChangeReason::Claimed);
+        no_change(&mut events);
+        // Released while the session still has its claim: the next one is
+        // new, though the session believed it held the channel.
+        assert_eq!(arbiter.release(Some("a")).as_deref(), Some("a"));
+        assert_eq!(a.claim(), Ok(true), "released meanwhile");
+        assert_eq!(change(&mut events).1, ChangeReason::Released);
+        assert_eq!(change(&mut events).1, ChangeReason::Claimed);
+        a.let_go();
+        assert_eq!(change(&mut events).1, ChangeReason::Renegotiated);
+        assert!(!a.holds(), "the channel is free again");
     }
 
     /// A stale claim is not taken for a later one: a released talker that
