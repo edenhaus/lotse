@@ -1,6 +1,6 @@
 //! Control API server: axum on the Unix socket, peer-credential check,
 //! the opt-in mutual-TLS listener ([`tls`]) with its server identity,
-//! WebSocket command and subscription dispatch, and the snapshot route.
+//! and WebSocket command and subscription dispatch.
 //!
 //! Runs in the supervisor. Defines the [`Handler`] trait the supervisor
 //! implements, so this crate never depends on the supervisor (dependency
