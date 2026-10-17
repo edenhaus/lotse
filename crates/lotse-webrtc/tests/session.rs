@@ -3225,6 +3225,127 @@ fn rfc3264_6_1_a_re_offer_may_drop_the_downlink_and_take_it_back() {
     );
 }
 
+/// The sequence numbers of the audio RTP the daemon sent under `ssrc`, in
+/// order: SRTP leaves the RTP header in the clear (RFC 3711 §3.1).
+fn audio_seqs(pair: &Pair, ssrc: u32) -> Vec<u16> {
+    pair.marked
+        .iter()
+        .filter(|(audio, datagram)| *audio && rtp_ssrc(datagram) == Some(ssrc))
+        .map(|(_, datagram)| u16::from_be_bytes([datagram[2], datagram[3]]))
+        .collect()
+}
+
+/// The SSRCs of the audio RTP the daemon sent, in order of first use.
+fn audio_ssrcs(pair: &Pair) -> Vec<u32> {
+    let mut ssrcs = Vec::new();
+    for ssrc in pair
+        .marked
+        .iter()
+        .filter(|(audio, _)| *audio)
+        .filter_map(|(_, datagram)| rtp_ssrc(datagram))
+    {
+        if !ssrcs.contains(&ssrc) {
+            ssrcs.push(ssrc);
+        }
+    }
+    ssrcs
+}
+
+/// Writes five audio packets from `seq` on and moves them to the viewer.
+fn write_five(pair: &mut Pair, seq: u16) {
+    for n in 0..5_u16 {
+        let packet = audio_packet(seq + n, u32::from(seq + n) * 160, 0, pair.now);
+        pair.session.write_audio(pair.now, &packet, pair.now);
+    }
+    pair.drain();
+    for _ in 0..5 {
+        pair.step();
+    }
+}
+
+/// Re-offers move the stream's audio from the downlink m-line A to
+/// another, B, and back to A by their directions (RFC 8829 §5.2.2): B
+/// gets a writer of its own, under its own SSRC, and A takes up its
+/// writer again, so A's sequence numbers run on from where they stopped
+/// (RFC 3550 §5.1) under the SSRC the engine kept for A, never repeating
+/// one the browser has seen, which it would drop as a replay (RFC 3711
+/// §3.3.2).
+#[test]
+fn rfc3550_5_1_audio_moved_off_an_m_line_and_back_runs_its_sequence_numbers_on() {
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
+    pair.connect(&answer);
+    pair.play_audio(0, 5, "on A");
+    let [a] = audio_ssrcs(&pair)[..] else {
+        panic!("one audio SSRC: {:?}", audio_ssrcs(&pair));
+    };
+
+    // To B: A `inactive`, B (the dedicated m-line) `sendrecv`, without a
+    // backchannel: the stream's audio goes down B, the first m-line the
+    // viewer receives on.
+    let reoffer = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let to_b =
+        reoffer
+            .replacen("a=recvonly", "a=inactive", 1)
+            .replacen("a=sendonly", "a=sendrecv", 1);
+    assert_ne!(to_b, reoffer);
+    let answer = pair
+        .session
+        .renegotiate(pair.now, &to_b, None, TalkbackClaim::Granted)
+        .expect("answered");
+    let sections = audio_sections(&answer);
+    assert!(sections[0].contains(&"a=inactive"), "{answer}");
+    assert!(sections[1].contains(&"a=sendonly"), "{answer}");
+    pair.viewer
+        .accept_answer(&answer, &mut pair.to_daemon)
+        .expect("applies");
+    pair.drain();
+    write_five(&mut pair, 5);
+    let ssrcs = audio_ssrcs(&pair);
+    assert_eq!(ssrcs.len(), 2, "{ssrcs:?}");
+    let b = ssrcs[1];
+    assert_ne!(a, b);
+    assert_eq!(audio_seqs(&pair, b), [0, 1, 2, 3, 4], "a writer of B's own");
+
+    // Back to A: A `recvonly` again, B as the viewer offers it, which,
+    // without a backchannel and after A, is answered `inactive`.
+    let reoffer = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let to_a = reoffer.replacen("a=inactive", "a=recvonly", 1);
+    let offered = audio_sections(&to_a);
+    assert!(offered[0].contains(&"a=recvonly"), "{to_a}");
+    let answer = pair
+        .session
+        .renegotiate(pair.now, &to_a, None, TalkbackClaim::Granted)
+        .expect("answered");
+    let sections = audio_sections(&answer);
+    assert!(sections[0].contains(&"a=sendonly"), "{answer}");
+    assert!(sections[1].contains(&"a=inactive"), "{answer}");
+    pair.viewer
+        .accept_answer(&answer, &mut pair.to_daemon)
+        .expect("applies");
+    pair.drain();
+    let received = pair.viewer.audio_packets().len();
+    write_five(&mut pair, 10);
+    assert_eq!(audio_ssrcs(&pair), [a, b], "A's SSRC again");
+    let seqs = audio_seqs(&pair, a);
+    assert_eq!(seqs.len(), 10, "{seqs:?}");
+    assert!(
+        seqs.windows(2).all(|w| w[1] == w[0].wrapping_add(1)),
+        "A runs on: {seqs:?}"
+    );
+    assert_eq!(audio_seqs(&pair, b).len(), 5, "nothing more on B");
+    pair.run_until(
+        |p| p.viewer.audio_packets().len() >= received + 5,
+        500,
+        "the viewer plays A again",
+    );
+}
+
 /// A re-offer whose downlink m-line lists codecs the stream's audio is not
 /// among stops the audio, although the writer the first answer made still
 /// sits on that m-line (RFC 3264 §6.1: an answer uses only the formats

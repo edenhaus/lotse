@@ -129,7 +129,9 @@ pub struct Session {
     video: NegotiatedVideo,
     /// The audio writer, once an answer carried audio: kept across
     /// re-offers, since the engine's send stream for the m-line keeps
-    /// its sequence numbers, and a writer made anew would restart them.
+    /// its sequence numbers, and a writer made anew would restart them;
+    /// one that moves the downlink to another m-line parks it
+    /// ([`Session::parked`]).
     audio: Option<AudioWriter>,
     /// Whether the last answer sends the stream's audio on the writer's
     /// m-line; `false` while a re-offer has the downlink off.
@@ -140,6 +142,15 @@ pub struct Session {
     /// The SSRC of the audio send stream, when the answer carries audio:
     /// its RTP is marked for DSCP EF.
     audio_ssrc: Option<u32>,
+    /// The writers of the m-lines a re-offer moved the stream's audio off,
+    /// each with its SSRC, at most one per m-line: the engine keeps an
+    /// m-line's send stream and its SSRC, so a re-offer that moves the
+    /// audio back takes up that m-line's writer again
+    /// ([`Session::downlink_writer`]), its sequence numbers and timestamps
+    /// running on (RFC 3550 §5.1). A writer made anew would restart them
+    /// at zero, under the SSRC the browser has seen them on, and the
+    /// browser drops what it takes for replays (RFC 3711 §3.3.2).
+    parked: Vec<(AudioWriter, u32)>,
     /// Talk-back, when the answer receives it.
     talkback: Option<TalkbackRx>,
     /// Rate-limits the log line for RTP the viewer sent that is no
@@ -503,6 +514,15 @@ fn audio_engine_codec(family: CodecFamily) -> Option<EngineCodec> {
     }
 }
 
+/// The mid of the downlink m-line `downlink`, when the engine has it as
+/// an audio m-line it did not reject.
+fn audio_mid(rtc: &Rtc, downlink: Option<&str>) -> Option<Mid> {
+    downlink.map(Mid::from).filter(|mid| {
+        rtc.media(*mid)
+            .is_some_and(|media| media.kind() == MediaKind::Audio && !media.disabled())
+    })
+}
+
 /// The audio writer for `codec` and the SSRC it sends with: the downlink
 /// m-line `downlink`, if the engine accepted it with the codec's payload
 /// type. str0m keeps the send stream of an m-line it rejected for lack of
@@ -515,10 +535,7 @@ fn audio_writer(
     anchor: WallAnchor,
 ) -> Option<(AudioWriter, u32)> {
     let engine_codec = audio_engine_codec(codec.family())?;
-    let mid = downlink.map(Mid::from).filter(|mid| {
-        rtc.media(*mid)
-            .is_some_and(|media| media.kind() == MediaKind::Audio && !media.disabled())
-    })?;
+    let mid = audio_mid(rtc, downlink)?;
     let pt = rtc
         .codec_config()
         .params()
@@ -959,6 +976,7 @@ impl Session {
             audio,
             warned_over_limit: false,
             audio_ssrc,
+            parked: Vec::new(),
             talkback,
             refused: Throttle::default(),
             pending,
@@ -986,8 +1004,9 @@ impl Session {
     /// and the worker's `claim` of it, the offer rewritten for the engine
     /// as the first one was, and the writers follow the plan: the
     /// downlink writer stays when the stream's audio still goes down the
-    /// same m-line, is made anew for another, or pauses while no m-line
-    /// carries the stream's audio; talk-back is
+    /// same m-line, is parked for another, whose own writer is taken up
+    /// again or made anew ([`Session::downlink_writer`]), or pauses while
+    /// no m-line carries the stream's audio; talk-back is
     /// received as the new plan says, or not at all. Nothing changes
     /// until the engine took the re-offer: a refused one leaves the
     /// session as it was. The re-offer's candidates are not added: the
@@ -1032,21 +1051,19 @@ impl Session {
             .map_err(|err| RenegotiateError::InvalidSdp(err.to_string()))?;
         let send = self
             .stream_audio
-            .as_deref()
+            .clone()
             .filter(|codec| plan.send == Some(codec.family()));
         let on_writer =
             |audio: &AudioWriter| plan.downlink == Some(audio.mid().to_string().as_str());
-        if let Some(codec) = send
+        if let Some(codec) = send.as_deref()
             && !self.audio.as_ref().is_some_and(on_writer)
-            && let Some((audio, audio_ssrc)) = audio_writer(
-                &mut self.rtc,
-                plan.downlink,
-                codec,
-                self.limits,
-                self.anchor,
-            )
+            && let Some((audio, audio_ssrc)) = self.downlink_writer(plan.downlink, codec)
         {
-            self.audio = Some(audio);
+            if let Some(previous) = self.audio.replace(audio)
+                && let Some(ssrc) = self.audio_ssrc
+            {
+                self.parked.push((previous, ssrc));
+            }
             self.audio_ssrc = Some(audio_ssrc);
         }
         self.audio_on = send.is_some() && self.audio.as_ref().is_some_and(on_writer);
@@ -1074,6 +1091,28 @@ impl Session {
             "session renegotiated"
         );
         Ok(one_sync_group(&answer.to_sdp_string()))
+    }
+
+    /// The writer for the stream's audio in `codec` on the downlink
+    /// m-line `downlink` of a re-offer, with its SSRC: the one parked on
+    /// that m-line ([`Session::parked`]), taken up again, else one made
+    /// for it ([`audio_writer`]); `None` when the engine has no such
+    /// m-line to send on.
+    fn downlink_writer(
+        &mut self,
+        downlink: Option<&str>,
+        codec: &Codec,
+    ) -> Option<(AudioWriter, u32)> {
+        let mid = audio_mid(&self.rtc, downlink)?;
+        let (resumed, parked): (Vec<_>, Vec<_>) = std::mem::take(&mut self.parked)
+            .into_iter()
+            .partition(|(writer, _)| writer.mid() == mid);
+        self.parked = parked;
+        if let Some((writer, ssrc)) = resumed.into_iter().next() {
+            tracing::info!(mid = %mid, ssrc, "stream audio back on an earlier m-line");
+            return Some((writer, ssrc));
+        }
+        audio_writer(&mut self.rtc, downlink, codec, self.limits, self.anchor)
     }
 
     /// Where the session is.
