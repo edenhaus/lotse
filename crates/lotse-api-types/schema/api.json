@@ -3058,7 +3058,7 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "api": "0.3.0",
+  "api": "0.1.0",
   "command": {
     "$ref": "#/$defs/Command"
   },
