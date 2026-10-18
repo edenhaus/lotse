@@ -656,7 +656,7 @@ impl Driver {
     fn on_switch_source(&mut self, spec: DriverSpec) {
         tracing::info!(spec = ?spec, "connection switches its source");
         self.spec = spec;
-        self.machine.source_switched();
+        self.machine.source_switched(self.worker.is_some());
         self.switching = true;
         self.switch_failure = None;
         self.snapshot.switches = self.snapshot.switches.wrapping_add(1);
@@ -740,6 +740,7 @@ impl Driver {
                     }
                     WorkerReport::Live => self.connect.release("live"),
                     WorkerReport::Backoff { .. } => self.connect.release("backoff"),
+                    WorkerReport::Stable => {}
                 }
                 self.feed(Input::Report(report));
             }
@@ -812,50 +813,63 @@ impl Driver {
     }
 
     /// The standby source's report, its stop, or its taking over: its
-    /// connect permit and the last error.
+    /// connect permit, the last error, and the machine's record of its
+    /// backoff window and schedule position.
     fn on_standby_event(&mut self, event: WorkerEvent) {
         match event {
-            WorkerEvent::SwitchReport(report) => match report {
-                WorkerReport::Connecting => {
-                    self.switch_failure = None;
-                    self.switch_connect
-                        .request(&self.shared.connects, "standby connecting");
-                }
-                WorkerReport::Reconnecting(_) => {
-                    self.switch_failure = None;
-                    self.switch_connect
-                        .request(&self.shared.connects, "standby reconnecting");
-                }
-                WorkerReport::Live => {
-                    self.switch_failure = None;
-                    self.switch_connect.release("standby live");
-                }
-                WorkerReport::Backoff {
-                    error, retry_in, ..
-                } => {
-                    self.switch_connect.release("standby backoff");
-                    tracing::warn!(
-                        error.code = error.code(),
-                        error = %error,
-                        retry_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
-                        "the source to switch to failed; the old one keeps streaming"
-                    );
-                    let error = ConnectionError::Source(error);
-                    self.snapshot.last_error = Some(error.clone());
-                    self.switch_failure = Some(error);
-                }
-            },
+            WorkerEvent::SwitchReport(report) => {
+                self.machine
+                    .standby_report(&report, self.shared.clock.now());
+                self.on_standby_report(report);
+            }
             WorkerEvent::StandbyStopped => self.switch_connect.release("standby stopped"),
             WorkerEvent::Switched => {
                 self.switch_connect.release("switched");
                 self.snapshot.last_error = None;
                 self.end_switch();
                 tracing::info!("the tracks switched to the new source");
-                // The tracks switch at a keyframe of the new source, which
-                // is live; the old one's state is over.
+                // The standby is the source now, with its schedule
+                // position; the tracks switch at a keyframe of it, which is
+                // live, and the old one's state is over.
+                self.machine.standby_took_over();
                 self.feed(Input::Report(WorkerReport::Live));
             }
             _ => {}
+        }
+    }
+
+    /// The standby source's report: its connect permit and the last error.
+    fn on_standby_report(&mut self, report: WorkerReport) {
+        match report {
+            WorkerReport::Connecting => {
+                self.switch_failure = None;
+                self.switch_connect
+                    .request(&self.shared.connects, "standby connecting");
+            }
+            WorkerReport::Reconnecting(_) => {
+                self.switch_failure = None;
+                self.switch_connect
+                    .request(&self.shared.connects, "standby reconnecting");
+            }
+            WorkerReport::Live => {
+                self.switch_failure = None;
+                self.switch_connect.release("standby live");
+            }
+            WorkerReport::Backoff {
+                error, retry_in, ..
+            } => {
+                self.switch_connect.release("standby backoff");
+                tracing::warn!(
+                    error.code = error.code(),
+                    error = %error,
+                    retry_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
+                    "the source to switch to failed; the old one keeps streaming"
+                );
+                let error = ConnectionError::Source(error);
+                self.snapshot.last_error = Some(error.clone());
+                self.switch_failure = Some(error);
+            }
+            WorkerReport::Stable => {}
         }
     }
 
@@ -1878,6 +1892,73 @@ mod tests {
         });
         recorded(&dir.join("received-1"), &run).await;
         assert!(driver.worker.is_some());
+        drop((driver, demand_tx));
+        shared.tracker.close();
+        while !shared.tracker.is_empty() {
+            clock.advance(shared.shutdown_budget);
+            SystemClock.sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The standby's retry state is its own: a standby that takes over
+    /// brings its schedule position, and a worker stopped while its
+    /// standby waits out a delay leaves that delay as the window the next
+    /// worker, which runs the source switched to, waits for.
+    #[tokio::test]
+    async fn the_standby_s_window_and_position_survive_its_takeover_or_its_worker() {
+        let dir = private_dir("driver-standby-retry");
+        let script = dir.join("worker.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with(script.to_str().unwrap(), clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        let failed = |attempts| {
+            WorkerEvent::SwitchReport(WorkerReport::Backoff {
+                error: SourceError::Unreachable("refused".into()),
+                retry_in: Duration::from_secs(60),
+                attempts,
+            })
+        };
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        step(&mut driver).await;
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Live));
+        // The standby fails once, recovers and takes over.
+        driver.on_switch_source(spec_of("fake://127.0.0.1:2/"));
+        driver.pending = Pending::Nothing;
+        driver.on_worker_event(failed(2));
+        driver.on_worker_event(WorkerEvent::SwitchReport(WorkerReport::Connecting));
+        driver.on_worker_event(WorkerEvent::SwitchReport(WorkerReport::Live));
+        driver.on_worker_event(WorkerEvent::Switched);
+        assert_eq!(driver.machine.state(), ConnectionState::Live);
+        assert_eq!(driver.machine.backoff_attempts(), 2, "the standby's");
+        // No standby is left to report; the source's stable streaming
+        // starts its schedule over.
+        driver.on_worker_event(WorkerEvent::SwitchReport(WorkerReport::Stable));
+        assert_eq!(driver.machine.backoff_attempts(), 2);
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Stable));
+        assert_eq!(driver.machine.backoff_attempts(), 0);
+        // The next standby waits out a delay when the demand goes.
+        driver.on_switch_source(spec_of("fake://127.0.0.1:3/"));
+        driver.pending = Pending::Nothing;
+        driver.on_worker_event(failed(4));
+        demand_tx.send_replace(0);
+        step(&mut driver).await;
+        assert_eq!(driver.machine.state(), ConnectionState::Draining);
+        clock.advance(lotse_core::connection::DEFAULT_LINGER);
+        step(&mut driver).await;
+        assert_eq!(driver.machine.state(), ConnectionState::Idle);
+        assert!(driver.worker.is_none());
+        assert!(driver.window.is_some(), "the standby's delay holds");
+        assert_eq!(driver.machine.backoff_attempts(), 4);
+        // Demand inside it starts no lookup.
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        assert!(matches!(driver.pending, Pending::Nothing));
         drop((driver, demand_tx));
         shared.tracker.close();
         while !shared.tracker.is_empty() {

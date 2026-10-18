@@ -1126,6 +1126,7 @@ fn source_state(event: RunnerEvent) -> SourceState {
     match event {
         RunnerEvent::Connecting { attempt } => SourceState::Connecting { attempt },
         RunnerEvent::Live => SourceState::Live,
+        RunnerEvent::Stable => SourceState::Stable,
         RunnerEvent::Reconnecting { error } => SourceState::Reconnecting {
             code: error.code().to_owned(),
             message: error.to_string(),
@@ -4112,6 +4113,16 @@ mod tests {
         assert_eq!(
             ended(h.worker).await.unwrap().unwrap(),
             ExitReason::Shutdown
+        );
+    }
+
+    /// A source that streamed stably says so: the supervisor's next worker
+    /// starts its schedule at the first step.
+    #[test]
+    fn stable_streaming_reaches_the_supervisor() {
+        assert_eq!(
+            super::source_state(RunnerEvent::Stable),
+            SourceState::Stable
         );
     }
 

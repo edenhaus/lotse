@@ -293,6 +293,12 @@ pub enum RunnerEvent {
     },
     /// The tracks are declared; media flows.
     Live,
+    /// The connection has streamed for `stable_after`: the reconnect
+    /// schedule starts over, from the end of this connection. Reported once
+    /// per connection, when reached, so a worker stopped while it streams
+    /// hands on a schedule at its first step; a shorter recovery reports
+    /// nothing and leaves the schedule where it is.
+    Stable,
     /// The live source dropped; an attempt starts at once.
     Reconnecting {
         /// Why it dropped.
@@ -310,6 +316,14 @@ pub enum RunnerEvent {
     },
     /// The runner was cancelled and the source is torn down.
     Stopped,
+}
+
+/// The timer in `slot` firing, or never while there is none.
+async fn until(slot: &mut Option<BoxFuture<'static, ()>>) {
+    match slot {
+        Some(sleep) => sleep.await,
+        None => std::future::pending().await,
+    }
 }
 
 /// How one connection attempt ended.
@@ -483,6 +497,8 @@ impl SourceRunner {
         let mut ready = self.tracks.ready();
         let started = self.clock.now();
         let mut live_since: Option<Instant> = None;
+        // Runs from going live until `stable_after`.
+        let mut stable: Option<BoxFuture<'static, ()>> = None;
         let mut watchdog_error: Option<SourceError> = None;
         let mut check = self.clock.sleep(self.config.stall_check);
 
@@ -500,8 +516,17 @@ impl SourceRunner {
                     if changed.is_ok() && *ready.borrow_and_update() {
                         let now = self.clock.now();
                         live_since = Some(now);
+                        stable = Some(self.clock.sleep(self.config.stable_after));
                         self.on_live(reconnect, now.saturating_duration_since(started)).await;
                     }
+                }
+                () = until(&mut stable) => {
+                    stable = None;
+                    tracing::debug!(
+                        stable_ms = self.config.stable_after.as_millis(),
+                        "stable streaming; the reconnect schedule starts over"
+                    );
+                    self.emit(RunnerEvent::Stable).await;
                 }
                 Some(report) = reports.recv() => self.mapper.ingest(report),
                 () = &mut check => {
@@ -972,11 +997,14 @@ mod tests {
             Some(RunnerEvent::Connecting { .. })
         ));
         assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Live));
-        // Stream past `stable_after`, then lose it: immediate again.
+        // Stream past `stable_after`: the reset is reported once, when it
+        // is reached, so a worker stopped while streaming hands on a
+        // schedule that starts over; then lose it: immediate again.
         for _ in 0..12 {
             tick(&h, Duration::from_secs(1)).await;
             video.publish_packet(packet(h.clock.now()));
         }
+        assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Stable));
         tick(&h, DEFAULT_STALL_VIDEO).await;
         assert!(matches!(
             next(&mut h.events).await,

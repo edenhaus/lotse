@@ -310,6 +310,7 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
         ToSupervisor::SourceState(state) => match state {
             SourceState::Connecting { .. } => WorkerEvent::Report(WorkerReport::Connecting),
             SourceState::Live => WorkerEvent::Report(WorkerReport::Live),
+            SourceState::Stable => WorkerEvent::Report(WorkerReport::Stable),
             SourceState::Reconnecting { code, message } => {
                 WorkerEvent::Report(WorkerReport::Reconnecting(source_error(&code, &message)))
             }
@@ -328,6 +329,7 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
         ToSupervisor::SwitchState(state) => match state {
             SourceState::Connecting { .. } => WorkerEvent::SwitchReport(WorkerReport::Connecting),
             SourceState::Live => WorkerEvent::SwitchReport(WorkerReport::Live),
+            SourceState::Stable => WorkerEvent::SwitchReport(WorkerReport::Stable),
             SourceState::Reconnecting { code, message } => {
                 WorkerEvent::SwitchReport(WorkerReport::Reconnecting(source_error(&code, &message)))
             }
@@ -756,6 +758,10 @@ mod tests {
             mapped(ToSupervisor::SourceState(SourceState::Live), None),
             WorkerEvent::Report(WorkerReport::Live)
         );
+        assert_eq!(
+            mapped(ToSupervisor::SourceState(SourceState::Stable), None),
+            WorkerEvent::Report(WorkerReport::Stable)
+        );
     }
 
     #[test]
@@ -768,6 +774,7 @@ mod tests {
                 WorkerReport::Connecting,
             ),
             (SourceState::Live, WorkerReport::Live),
+            (SourceState::Stable, WorkerReport::Stable),
             (
                 SourceState::Reconnecting {
                     code: "source_timeout".into(),

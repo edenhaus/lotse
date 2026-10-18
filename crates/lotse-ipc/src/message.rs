@@ -392,6 +392,10 @@ pub enum SourceState {
     },
     /// Tracks are ready; media flows.
     Live,
+    /// The source has streamed long enough that its reconnect schedule
+    /// starts over: the position a new worker continues from is the first
+    /// step again ([`SourceSpec::backoff_attempts`]).
+    Stable,
     /// The live source dropped; an attempt starts at once.
     Reconnecting {
         /// The error code (`source_timeout`, ...).
@@ -550,6 +554,24 @@ mod tests {
             decode::<ToWorker>(&encode(&wrapped).unwrap()).unwrap(),
             wrapped
         );
+    }
+
+    #[test]
+    fn the_reconnect_position_round_trips() {
+        for message in [
+            ToSupervisor::SourceState(SourceState::Stable),
+            ToSupervisor::SwitchState(SourceState::Backoff {
+                code: "source_timeout".into(),
+                message: "stall".into(),
+                retry_ms: 5_000,
+                attempts: 6,
+            }),
+        ] {
+            assert_eq!(
+                decode::<ToSupervisor>(&encode(&message).unwrap()).unwrap(),
+                message
+            );
+        }
     }
 
     #[test]
