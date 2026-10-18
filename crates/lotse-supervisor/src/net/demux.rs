@@ -11,7 +11,8 @@
 //! remote address, unless it sends a Binding Request naming another
 //! session; a STUN Binding Request by its USERNAME's local ufrag,
 //! verified with that session's password before the address is learned
-//! or moved to that session (RFC 8445 §7.2.2, §7.3, RFC 8489 §9.1); otherwise
+//! or moved to that session (RFC 8445 §7.2.2, §7.3, RFC 8489 §9.1), an
+//! address moving at most once per [`ADDR_IDLE_EXPIRY`]; otherwise
 //! dropped and counted. Forwarding is a non-blocking send on the worker's
 //! datagram channel; a full channel drops the datagram, so one stuck
 //! worker never slows the others.
@@ -368,6 +369,9 @@ pub struct DemuxStats {
     pub stun_rejected: AtomicU64,
     /// Addresses learned through verified STUN requests.
     pub addresses_learned: AtomicU64,
+    /// Learned addresses moved to another session by a verified STUN
+    /// request naming it; each also counts as learned.
+    pub addresses_moved: AtomicU64,
     /// Datagrams dropped because the worker's channel was full.
     pub worker_full: AtomicU64,
     /// Responses to the supervisor's own STUN requests.
@@ -765,6 +769,9 @@ pub struct Peers {
     /// The same for verified requests refused because their session has
     /// no room for another address.
     full_log: Throttle,
+    /// The same for verified requests refused because their address moved
+    /// less than [`ADDR_IDLE_EXPIRY`] ago.
+    move_log: Throttle,
 }
 
 /// One learned address.
@@ -774,6 +781,10 @@ struct Learned {
     registration: Arc<Registration>,
     /// When a datagram last came from it, on the clock.
     last_seen: Instant,
+    /// When it last moved to another session, on the clock; `None` while
+    /// it is with the session that learned it. It moves again no sooner
+    /// than [`ADDR_IDLE_EXPIRY`] after this.
+    moved: Option<Instant>,
 }
 
 impl Peers {
@@ -791,6 +802,7 @@ impl Peers {
             clock,
             rejected_log: Throttle::default(),
             full_log: Throttle::default(),
+            move_log: Throttle::default(),
             by_addr: HashMap::new(),
             frame: Vec::with_capacity(
                 datagram::MAX_DATAGRAM_PAYLOAD.saturating_add(datagram::HEADER_LEN),
@@ -866,6 +878,23 @@ impl Peers {
                         && message.fingerprint_ok(payload) =>
                 {
                     let now = self.clock.now();
+                    // The integrity proves which session the sender holds,
+                    // not that it sent from there: replayed or spoofed
+                    // checks of two sessions would bounce an address
+                    // between them on every datagram. One move per
+                    // address per consent timeout bounds that (RFC 7675
+                    // §5.1); the address stays where it is meanwhile.
+                    if let Some(learned) = self.by_addr.get(&source)
+                        && let Some(moved) = learned.moved
+                        && now.saturating_duration_since(moved) < ADDR_IDLE_EXPIRY
+                    {
+                        DemuxStats::bump(&self.stats.stun_rejected);
+                        if let Some(refused) = self.move_log.hit(now) {
+                            let since_ms = now.saturating_duration_since(moved).as_millis();
+                            tracing::warn!(%source, from = learned.registration.local_ufrag, to = registration.local_ufrag, since_ms, refused, "address move refused: it moved to another session too recently");
+                        }
+                        return;
+                    }
                     if !self.claim(&registration, now) {
                         DemuxStats::bump(&self.stats.stun_rejected);
                         if let Some(refused) = self.full_log.hit(now) {
@@ -890,14 +919,18 @@ impl Peers {
                         &mut self.frame,
                     );
                     let ufrag = registration.local_ufrag.clone();
+                    // Another session's address until now: this moves it.
+                    let moved = self.by_addr.contains_key(&source).then_some(now);
                     let previous = self.by_addr.insert(
                         source,
                         Learned {
                             registration,
                             last_seen: now,
+                            moved,
                         },
                     );
                     if let Some(previous) = previous {
+                        DemuxStats::bump(&self.stats.addresses_moved);
                         previous.registration.addrs.fetch_sub(1, Ordering::AcqRel);
                         tracing::info!(%source, from = previous.registration.local_ufrag, to = ufrag, "address moved to the session a verified stun request named");
                     }
@@ -1974,5 +2007,86 @@ mod tests {
         send(&mut peers, &check, at(77, 7));
         assert_eq!(DemuxStats::get(&stats.stun_rejected), 7);
         assert_eq!(other_sink.frames.lock().unwrap().len(), 1);
+    }
+
+    /// RFC 8445 §7.3 lets a verified Binding Request move its source
+    /// address to the session it names (a NAT rebinding, a peer-reflexive
+    /// candidate), but the integrity proves only the credentials, not the
+    /// source: whoever holds two sessions' passwords, or replays their
+    /// checks from a spoofed source, bounced the address between them on
+    /// every datagram. An address moves at most once per
+    /// [`ADDR_IDLE_EXPIRY`]; a move refused sooner is dropped, counted as
+    /// rejected and logged once per summary interval.
+    #[test]
+    fn rfc8445_7_3_an_address_moves_between_sessions_at_most_once_per_idle_expiry() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let clock = Arc::new(FakeClock::default());
+        let registrations = Arc::new(Registrations::default());
+        let stats = Arc::new(DemuxStats::default());
+        let a_sink = Arc::new(MemorySink::default());
+        let b_sink = Arc::new(MemorySink::default());
+        let a = registrations.register("a", b"pa".to_vec(), a_sink.clone());
+        let b = registrations.register("b", b"pb".to_vec(), b_sink.clone());
+        let mut peers = Peers::new(
+            Arc::clone(&registrations),
+            Arc::clone(&stats),
+            Arc::<FakeClock>::clone(&clock),
+        );
+        let local: SocketAddr = "192.0.2.10:3478".parse().unwrap();
+        let shared: SocketAddr = "198.51.100.1:40000".parse().unwrap();
+        let send = |peers: &mut Peers, payload: &[u8], source: SocketAddr| {
+            let message = stun::parse(payload).ok();
+            peers.route(payload, source, local, message.as_ref());
+        };
+        let frames = |sink: &MemorySink| sink.frames.lock().unwrap().len();
+        let moved = || DemuxStats::get(&stats.addresses_moved);
+        // Learned by a, then moved to b: the first move is allowed.
+        send(&mut peers, &binding_request("a", b"pa", 1), shared);
+        assert_eq!(moved(), 0, "learning is not moving");
+        send(&mut peers, &binding_request("b", b"pb", 2), shared);
+        assert_eq!(moved(), 1);
+        assert_eq!((frames(&a_sink), frames(&b_sink)), (1, 1));
+        // Moving it back within the expiry is refused, however often.
+        clock.advance(ADDR_IDLE_EXPIRY.saturating_sub(Duration::from_millis(1)));
+        for id in 3..6 {
+            send(&mut peers, &binding_request("a", b"pa", id), shared);
+        }
+        assert_eq!(moved(), 1);
+        assert_eq!(DemuxStats::get(&stats.stun_rejected), 3);
+        assert_eq!(DemuxStats::get(&stats.addresses_learned), 2);
+        assert_eq!(frames(&a_sink), 1, "dropped");
+        assert_eq!(
+            (
+                a.addrs.load(Ordering::Acquire),
+                b.addrs.load(Ordering::Acquire)
+            ),
+            (0, 1)
+        );
+        assert_eq!(captured.lines("address move refused").len(), 1);
+        send(&mut peers, b"media", shared);
+        assert_eq!(frames(&b_sink), 2, "still b's");
+        // Exactly at the expiry it may move again, once.
+        clock.advance(Duration::from_millis(1));
+        send(&mut peers, &binding_request("a", b"pa", 6), shared);
+        assert_eq!(moved(), 2);
+        assert_eq!(frames(&a_sink), 2);
+        assert_eq!(
+            (
+                a.addrs.load(Ordering::Acquire),
+                b.addrs.load(Ordering::Acquire)
+            ),
+            (1, 0)
+        );
+        send(&mut peers, &binding_request("b", b"pb", 7), shared);
+        assert_eq!(moved(), 2);
+        assert_eq!(DemuxStats::get(&stats.stun_rejected), 4);
+        assert_eq!(frames(&b_sink), 2);
+        // The expiry counts from the last move, not the first.
+        clock.advance(ADDR_IDLE_EXPIRY);
+        send(&mut peers, &binding_request("b", b"pb", 8), shared);
+        assert_eq!(moved(), 3);
+        assert_eq!(frames(&b_sink), 3);
+        assert_eq!(DemuxStats::get(&stats.stun_rejected), 4);
     }
 }

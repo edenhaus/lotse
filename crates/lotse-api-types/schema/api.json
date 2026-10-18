@@ -841,6 +841,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "addresses_moved": {
+          "description": "Learned addresses moved to another session by a verified STUN\nrequest naming it, at most once per address per 30 s; each also\ncounts as learned.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "forwarded": {
           "description": "Datagrams handed to a worker.",
           "format": "uint64",
@@ -902,6 +908,7 @@
         "unroutable",
         "stun_rejected",
         "addresses_learned",
+        "addresses_moved",
         "worker_full",
         "responses",
         "relayed",
