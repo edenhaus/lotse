@@ -366,7 +366,10 @@ async fn a_pin_mismatch_waits_for_the_reconnect_backoff() {
         events.recv().await,
         Some(RunnerEvent::Connecting { attempt: 1 })
     );
-    let Some(RunnerEvent::Backoff { error, retry_in }) = events.recv().await else {
+    let Some(RunnerEvent::Backoff {
+        error, retry_in, ..
+    }) = events.recv().await
+    else {
         panic!("a failed attempt backs off");
     };
     assert_eq!(error.code(), "source_auth_failed", "{error}");

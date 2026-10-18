@@ -407,6 +407,10 @@ pub enum SourceState {
         message: String,
         /// The wait.
         retry_ms: u32,
+        /// Delays the reconnect schedule handed out since it last started
+        /// over, this one included: where a new worker's schedule continues
+        /// ([`SourceSpec::backoff_attempts`]).
+        attempts: u32,
     },
     /// The runner stopped.
     Stopped,

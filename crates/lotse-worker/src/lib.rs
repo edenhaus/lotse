@@ -1130,10 +1130,15 @@ fn source_state(event: RunnerEvent) -> SourceState {
             code: error.code().to_owned(),
             message: error.to_string(),
         },
-        RunnerEvent::Backoff { error, retry_in } => SourceState::Backoff {
+        RunnerEvent::Backoff {
+            error,
+            retry_in,
+            attempts,
+        } => SourceState::Backoff {
             code: error.code().to_owned(),
             message: error.to_string(),
             retry_ms: u32::try_from(retry_in.as_millis()).unwrap_or(u32::MAX),
+            attempts,
         },
         RunnerEvent::Stopped => SourceState::Stopped,
     }
@@ -4096,8 +4101,9 @@ mod tests {
             "connecting, live, reconnecting expected: {states:?}"
         );
         assert!(
-            matches!(states.last(), Some(SourceState::Backoff { code, message, retry_ms })
-                if timeout(code, message) && delays.contains(retry_ms)),
+            matches!(states.last(), Some(SourceState::Backoff { code, message, retry_ms, attempts })
+                if timeout(code, message) && delays.contains(retry_ms)
+                    && *attempts == backoff_attempts + 1),
             "backoff last: {states:?}"
         );
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])

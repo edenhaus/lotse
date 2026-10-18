@@ -564,6 +564,8 @@ impl Driver {
                         self.spec.host
                     )),
                     retry_in,
+                    // The lookup is no step of the worker's schedule.
+                    attempts: self.machine.backoff_attempts(),
                 }));
             }
             Wake::Connect(SlotWake::Grant) => {
@@ -654,6 +656,7 @@ impl Driver {
     fn on_switch_source(&mut self, spec: DriverSpec) {
         tracing::info!(spec = ?spec, "connection switches its source");
         self.spec = spec;
+        self.machine.source_switched();
         self.switching = true;
         self.switch_failure = None;
         self.snapshot.switches = self.snapshot.switches.wrapping_add(1);
@@ -827,7 +830,9 @@ impl Driver {
                     self.switch_failure = None;
                     self.switch_connect.release("standby live");
                 }
-                WorkerReport::Backoff { error, retry_in } => {
+                WorkerReport::Backoff {
+                    error, retry_in, ..
+                } => {
                     self.switch_connect.release("standby backoff");
                     tracing::warn!(
                         error.code = error.code(),
@@ -1722,11 +1727,15 @@ mod tests {
     async fn demand_inside_the_backoff_window_starts_no_worker_and_the_next_continues_the_schedule()
     {
         let dir = private_dir("driver-window");
-        let out = dir.join("received");
+        // Each worker records into a file of its own: a stopped one may
+        // still write while the next runs.
         let script = dir.join("worker.sh");
         std::fs::write(
             &script,
-            format!("#!/bin/sh\nexec cat > {}\n", out.display()),
+            format!(
+                "#!/bin/sh\nn=$(ls {0} | grep -c '^received-')\nexec cat > {0}/received-$n\n",
+                dir.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
@@ -1749,11 +1758,12 @@ mod tests {
         step(&mut driver).await;
         step(&mut driver).await;
         assert!(driver.worker.is_some());
-        recorded(&out, &run(0)).await;
+        recorded(&dir.join("received-0"), &run(0)).await;
         // RFC 2326 §7.1.1: a 401 is a credential failure.
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Backoff {
             error: SourceError::AuthFailed("401".into()),
             retry_in: Duration::from_secs(5),
+            attempts: 1,
         }));
         // The waiting viewer closed with it; its demand goes.
         demand_tx.send_replace(0);
@@ -1784,7 +1794,89 @@ mod tests {
         assert_eq!(driver.snapshot.failure, None);
         assert!(matches!(driver.pending, Pending::Resolving(_)));
         step(&mut driver).await;
-        recorded(&out, &run(1)).await;
+        recorded(&dir.join("received-1"), &run(1)).await;
+        assert!(driver.worker.is_some());
+        drop((driver, demand_tx));
+        shared.tracker.close();
+        while !shared.tracker.is_empty() {
+            clock.advance(shared.shutdown_budget);
+            SystemClock.sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A source switched to inside the backoff window has failed no
+    /// attempt: its first worker's schedule starts at the first step. The
+    /// window still holds: the camera sees no login before it ends.
+    #[tokio::test]
+    async fn a_switch_inside_the_backoff_window_starts_the_new_source_s_schedule_over() {
+        let dir = private_dir("driver-window-switch");
+        // Each worker records into a file of its own: a stopped one may
+        // still write while the next runs.
+        let script = dir.join("worker.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nn=$(ls {0} | grep -c '^received-')\nexec cat > {0}/received-$n\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with(script.to_str().unwrap(), clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        step(&mut driver).await;
+        let first = lotse_ipc::ToWorker::RunSource(SourceSpec {
+            connection_id: "c1".into(),
+            url: "fake://127.0.0.1/".into(),
+            options: "{}".into(),
+            peer_host: "127.0.0.1".into(),
+            peer_addrs: vec!["127.0.0.1:0".parse().unwrap()],
+            backoff_attempts: 0,
+        });
+        recorded(&dir.join("received-0"), &first).await;
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Backoff {
+            error: SourceError::AuthFailed("401".into()),
+            retry_in: Duration::from_secs(5),
+            attempts: 3,
+        }));
+        demand_tx.send_replace(0);
+        step(&mut driver).await;
+        assert_eq!(driver.machine.state(), ConnectionState::Idle);
+        driver
+            .handle(Wake::Command(DriverCommand::SwitchSource(DriverSpec {
+                connection_id: "c1".into(),
+                url: "fake://127.0.0.1:2/".into(),
+                options: "{}".into(),
+                host: "127.0.0.1".into(),
+                port: Some(2),
+                loopback_relay: false,
+                backchannel: false,
+            })))
+            .await;
+        assert_eq!(driver.machine.backoff_attempts(), 0);
+        // The window holds: demand starts no lookup before its end.
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        assert!(matches!(driver.pending, Pending::Nothing));
+        clock.advance(Duration::from_secs(5));
+        step(&mut driver).await;
+        assert!(matches!(driver.pending, Pending::Resolving(_)));
+        step(&mut driver).await;
+        let run = lotse_ipc::ToWorker::RunSource(SourceSpec {
+            connection_id: "c1".into(),
+            url: "fake://127.0.0.1:2/".into(),
+            options: "{}".into(),
+            peer_host: "127.0.0.1".into(),
+            peer_addrs: vec!["127.0.0.1:2".parse().unwrap()],
+            backoff_attempts: 0,
+        });
+        recorded(&dir.join("received-1"), &run).await;
         assert!(driver.worker.is_some());
         drop((driver, demand_tx));
         shared.tracker.close();
@@ -1828,6 +1920,7 @@ mod tests {
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Backoff {
             error: SourceError::Unreachable("refused".into()),
             retry_in: Duration::from_secs(1),
+            attempts: 1,
         }));
         assert_eq!(in_flight(), 0, "a failed attempt gives it back");
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Connecting));
@@ -2229,6 +2322,7 @@ mod tests {
         driver.on_worker_event(WorkerEvent::SwitchReport(WorkerReport::Backoff {
             error: SourceError::AuthFailed("401".into()),
             retry_in: Duration::from_secs(1),
+            attempts: 1,
         }));
         assert_eq!(in_flight(), 1);
         assert_eq!(
@@ -2570,6 +2664,7 @@ mod tests {
         driver.on_worker_event(WorkerEvent::SwitchReport(WorkerReport::Backoff {
             error: SourceError::AuthFailed("401".into()),
             retry_in: Duration::from_millis(1_500),
+            attempts: 1,
         }));
         let logged = captured.lines("the source to switch to failed");
         assert!(
@@ -2814,6 +2909,7 @@ mod tests {
         let backoff = |error| WorkerReport::Backoff {
             error,
             retry_in: Duration::from_secs(1),
+            attempts: 1,
         };
         // A live source drops and its retry waits out a delay.
         on(&mut driver, WorkerEvent::Report(WorkerReport::Live));
@@ -2940,6 +3036,7 @@ mod tests {
             WorkerEvent::SwitchReport(WorkerReport::Backoff {
                 error: new.clone(),
                 retry_in: Duration::from_secs(1),
+                attempts: 1,
             }),
         );
         // Then the old one drops and its retry fails.
@@ -2954,6 +3051,7 @@ mod tests {
             WorkerEvent::Report(WorkerReport::Backoff {
                 error: SourceError::Unreachable("old".into()),
                 retry_in: Duration::from_secs(1),
+                attempts: 1,
             }),
         );
         let new = Some(ConnectionError::Source(new));
@@ -2982,6 +3080,7 @@ mod tests {
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Backoff {
             error: SourceError::Unreachable("old".into()),
             retry_in: Duration::from_secs(1),
+            attempts: 1,
         }));
         let mut events = waiting_session(&shared, "fake://127.0.0.1/");
         take_switch(&shared, &mut driver);
@@ -3092,6 +3191,7 @@ mod tests {
             driver.on_worker_event(WorkerEvent::Report(WorkerReport::Backoff {
                 error: SourceError::Unreachable("refused".into()),
                 retry_in: Duration::from_secs(60),
+                attempts: 1,
             }));
             assert_eq!(driver.machine.state(), ConnectionState::Backoff);
             driver.on_worker_event(WorkerEvent::Report(WorkerReport::Connecting));

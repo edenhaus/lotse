@@ -96,6 +96,7 @@ mod tests {
             code: "source_timeout".into(),
             message: "stall".into(),
             retry_ms: 1_000,
+            attempts: 1,
         });
         let bytes = encode(&message).unwrap();
         assert_eq!(decode::<ToSupervisor>(&bytes).unwrap(), message);

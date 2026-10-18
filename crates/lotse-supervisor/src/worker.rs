@@ -317,9 +317,11 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
                 code,
                 message,
                 retry_ms,
+                attempts,
             } => WorkerEvent::Report(WorkerReport::Backoff {
                 error: source_error(&code, &message),
                 retry_in: Duration::from_millis(u64::from(retry_ms)),
+                attempts,
             }),
             SourceState::Stopped => WorkerEvent::SourceStopped,
         },
@@ -333,9 +335,11 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
                 code,
                 message,
                 retry_ms,
+                attempts,
             } => WorkerEvent::SwitchReport(WorkerReport::Backoff {
                 error: source_error(&code, &message),
                 retry_in: Duration::from_millis(u64::from(retry_ms)),
+                attempts,
             }),
             SourceState::Stopped => WorkerEvent::StandbyStopped,
         },
@@ -776,10 +780,12 @@ mod tests {
                     code: "source_unreachable".into(),
                     message: "refused".into(),
                     retry_ms: 500,
+                    attempts: 1,
                 },
                 WorkerReport::Backoff {
                     error: SourceError::Unreachable("refused".into()),
                     retry_in: Duration::from_millis(500),
+                    attempts: 1,
                 },
             ),
         ] {
@@ -810,13 +816,15 @@ mod tests {
                 ToSupervisor::SourceState(SourceState::Backoff {
                     code: "made_up".into(),
                     message: "x".into(),
-                    retry_ms: 1500
+                    retry_ms: 1500,
+                    attempts: 7
                 }),
                 None
             ),
             WorkerEvent::Report(WorkerReport::Backoff {
                 error: SourceError::Protocol("made_up: x".into()),
-                retry_in: Duration::from_millis(1500)
+                retry_in: Duration::from_millis(1500),
+                attempts: 7
             })
         );
         assert_eq!(

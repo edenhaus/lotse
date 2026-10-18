@@ -304,6 +304,9 @@ pub enum RunnerEvent {
         error: SourceError,
         /// The wait.
         retry_in: Duration,
+        /// Delays the schedule handed out since it last started over, this
+        /// one included: where a new worker's schedule continues.
+        attempts: u32,
     },
     /// The runner was cancelled and the source is torn down.
     Stopped,
@@ -441,6 +444,7 @@ impl SourceRunner {
             self.emit(RunnerEvent::Backoff {
                 error: outcome.error,
                 retry_in,
+                attempts: self.backoff.attempts(),
             })
             .await;
             tokio::select! {
@@ -865,9 +869,14 @@ mod tests {
         // The second loss before stable streaming waits out the schedule.
         tick(&h, DEFAULT_STALL_VIDEO).await;
         crate::let_assert!(
-            Some(RunnerEvent::Backoff { error, retry_in }) = next(&mut h.events).await
+            Some(RunnerEvent::Backoff {
+                error,
+                retry_in,
+                attempts
+            }) = next(&mut h.events).await
         );
         assert_eq!(error.code(), "source_timeout");
+        assert_eq!(attempts, 1, "the schedule's first delay");
         assert!(retry_in >= Duration::from_millis(800) && retry_in <= Duration::from_millis(1200));
         assert!(h.events.try_recv().is_err(), "waiting");
         tick(&h, Duration::from_secs(2)).await;
