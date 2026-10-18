@@ -24,8 +24,9 @@ lotse-worker = ["lotse"]
 lotse-testing = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-api-types", "lotse-supervisor", "lotse-worker", "lotse"]
 
 [dev-only]
-# allocation-counter: its global allocator replaces the daemon's in whatever links it.
-crates = ["lotse-testing", "allocation-counter"]
+# allocation-counter: its global allocator replaces the daemon's in whatever links it. divan: the
+# benchmark harness, whose CLI and timers have no place in the daemon.
+crates = ["lotse-testing", "allocation-counter", "divan"]
 
 [external]
 # protocol engines and process-specific crates stay inside the crate that owns them
