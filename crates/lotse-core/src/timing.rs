@@ -106,22 +106,30 @@ impl TimingMeter {
                 let every = self.timing.marker_bit.unwrap_or(true);
                 self.timing.marker_bit = Some(every && marker);
             }
-            self.frame(packet.rtp.ts, packet.keyframe_start);
+            self.frame(packet.rtp.ts);
+        }
+        // Not always the frame's first packet: an SEI or AUD can lead the
+        // keyframe, its parameter sets starting the keyframe after it.
+        if packet.keyframe_start {
+            self.keyframe(packet.rtp.ts);
         }
         self.last = Some((packet.rtp.seq, packet.rtp.marker));
     }
 
-    /// Observes the start of a video frame at `rtp_ts`, a keyframe if
-    /// `keyframe`.
-    fn frame(&mut self, rtp_ts: u32, keyframe: bool) {
+    /// Observes the start of a video frame at `rtp_ts`.
+    fn frame(&mut self, rtp_ts: u32) {
         let ts = self.unwrapper.unwrap(rtp_ts);
         if self.max_ts.is_some_and(|max| ts < max) {
             self.timing.b_frames = Some(true);
         }
         self.max_ts = Some(self.max_ts.map_or(ts, |max| max.max(ts)));
-        if !keyframe {
-            return;
-        }
+    }
+
+    /// Observes the start of a keyframe at `rtp_ts`, which its frame's
+    /// start has already unwrapped: unwrapping it again gives the same
+    /// value.
+    fn keyframe(&mut self, rtp_ts: u32) {
+        let ts = self.unwrapper.unwrap(rtp_ts);
         if let Some(previous) = self.keyframe_ts
             && ts > previous
         {
@@ -208,6 +216,31 @@ mod tests {
         assert_eq!(
             meter.timing().keyframe_interval,
             Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn rfc6184_5_7_1_a_keyframe_behind_a_leading_sei_or_aud_counts() {
+        // Each keyframe as the HTTP source cuts it: an SEI (or AUD) packet
+        // starts the frame, the parameter sets after it start the
+        // keyframe (RFC 6184 §5.7.1's STAP-A), the IDR ends it marked.
+        let mut meter = TimingMeter::new(90_000);
+        let mut seq = 0_u16;
+        for ts in [0, 3000, 90_000] {
+            let keyframe = ts != 3000;
+            meter.packet(&packet(seq, ts, true, false, false), true);
+            meter.packet(&packet(seq + 1, ts, false, keyframe, false), true);
+            meter.packet(&packet(seq + 2, ts, false, false, true), true);
+            seq += 3;
+        }
+        assert_eq!(
+            meter.timing(),
+            TrackTiming {
+                keyframe_interval: Some(Duration::from_secs(1)),
+                b_frames: Some(false),
+                marker_bit: Some(true),
+                packet_latency: Some(Duration::from_micros(6)),
+            }
         );
     }
 
