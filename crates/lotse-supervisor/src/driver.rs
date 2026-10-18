@@ -2456,9 +2456,9 @@ mod tests {
     async fn a_switch_during_the_lookup_retry_looks_up_the_new_source_at_once() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/usr/bin/true", clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         driver
             .handle(Wake::Resolved(Err("no such host".into())))
