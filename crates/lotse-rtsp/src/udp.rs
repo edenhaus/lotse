@@ -1018,6 +1018,7 @@ mod tests {
     use std::time::Duration;
 
     use lotse_core::clock::SystemClock;
+    use lotse_core::text::CUT_MARK;
 
     use super::*;
 
@@ -1854,10 +1855,13 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains(r#"xxx": source "\"xxx"#),
-            "the reason Debug-escapes the value: {message}"
+            message.contains(&format!(r#"xxx{CUT_MARK}": source "\"xxx"#)),
+            "the Transport is cut and the reason Debug-escapes the value: {message}"
         );
-        assert!(message.ends_with("(RFC 2326 §12.39)"), "{message}");
+        assert!(
+            message.ends_with(&format!("xxx{CUT_MARK} (RFC 2326 §12.39)")),
+            "the reason is cut: {message}"
+        );
     }
 
     #[tokio::test]

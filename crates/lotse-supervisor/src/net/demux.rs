@@ -51,6 +51,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use lotse_core::clock::Clock;
+use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
 use lotse_ipc::datagram;
 use quinn_udp::{RecvMeta, UdpSocketState};
@@ -76,6 +77,11 @@ pub const ADDR_IDLE_EXPIRY: Duration = Duration::from_secs(30);
 
 /// Log every this many dropped datagrams from unknown addresses.
 const UNROUTABLE_LOG_EVERY: u64 = 1_000;
+
+/// The most bytes of a rejected request's ufrag a log line carries: an
+/// ICE ufrag is at most 256 characters (RFC 8839 §5.4, `ice-ufrag`), and
+/// a datagram's USERNAME may be anything up to its size.
+const MAX_LOGGED_UFRAG_BYTES: usize = 256;
 
 /// One read's receive buffer per datagram: any UDP datagram fits (65,507
 /// bytes of IPv4 payload, 65,527 of IPv6, RFC 768 and RFC 8200 §4.5 without
@@ -907,7 +913,10 @@ impl Peers {
                     // forged freely on UDP.
                     DemuxStats::bump(&self.stats.stun_rejected);
                     if let Some(rejected) = self.rejected_log.hit(self.clock.now()) {
-                        tracing::debug!(%source, ufrag = ?message.local_ufrag(), rejected, "stun requests rejected: unknown ufrag or wrong password");
+                        let ufrag = message
+                            .local_ufrag()
+                            .map(|ufrag| plain(ufrag, MAX_LOGGED_UFRAG_BYTES));
+                        tracing::debug!(%source, ?ufrag, rejected, "stun requests rejected: unknown ufrag or wrong password");
                     }
                 }
             }
@@ -1087,6 +1096,7 @@ mod tests {
 
     use lotse_core::clock::{FakeClock, SystemClock};
     use lotse_core::let_assert;
+    use lotse_core::text::CUT_MARK;
     use lotse_core::throttle::SUMMARY_INTERVAL;
 
     use super::super::udp::test_support::bind_dual_stack;
@@ -1896,6 +1906,44 @@ mod tests {
         );
         assert_eq!(DemuxStats::get(&stats.stun_rejected), 102);
         assert!(sink.frames.lock().unwrap().is_empty());
+    }
+
+    /// The ufrag of a rejected request is the sender's text, as long as
+    /// a datagram allows: the log line carries at most the 256 characters
+    /// an ICE ufrag has (RFC 8839 §5.4), a cut one ending in the cut mark.
+    #[test]
+    fn rfc8839_5_4_a_rejected_request_s_ufrag_is_logged_capped() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let mut peers = Peers::new(
+            Arc::new(Registrations::default()),
+            Arc::new(DemuxStats::default()),
+            Arc::new(FakeClock::default()),
+        );
+        let ufrag = "u".repeat(10_000);
+        // No session has the ufrag, so the request is rejected before any
+        // MESSAGE-INTEGRITY is checked: it carries none.
+        let request = Builder::new(Class::Request, METHOD_BINDING, [1; 12])
+            .username(&format!("{ufrag}:x"))
+            .build();
+        let message = stun::parse(&request).unwrap();
+        let source: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        peers.route(
+            &request,
+            source,
+            "192.0.2.10:3478".parse().unwrap(),
+            Some(&message),
+        );
+        let lines = captured.lines("stun requests rejected");
+        let shown = format!(
+            "{}{CUT_MARK}",
+            &ufrag[..MAX_LOGGED_UFRAG_BYTES - CUT_MARK.len()]
+        );
+        assert_eq!(MAX_LOGGED_UFRAG_BYTES, 256);
+        assert!(
+            lines[0].ends_with(&format!("ufrag=Some(\"{shown}\") rejected=1")),
+            "{lines:?}"
+        );
     }
 
     /// MESSAGE-INTEGRITY covers the message, not the IP header, so an

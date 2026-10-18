@@ -727,6 +727,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
 
     use lotse_core::clock::{FakeClock, SystemClock};
+    use lotse_core::text::CUT_MARK;
     use lotse_ipc::TalkerChange;
 
     use super::*;
@@ -996,11 +997,17 @@ mod tests {
     fn a_worker_s_source_error_is_plain_and_capped() {
         assert_eq!(
             source_error("source_timeout", &format!("a\nb\u{1b}{}", "x".repeat(1000))),
-            SourceError::Timeout(format!("a b\u{fffd}{}", "x".repeat(MAX_MESSAGE_BYTES - 6)))
+            SourceError::Timeout(format!(
+                "a b\u{fffd}{}{CUT_MARK}",
+                "x".repeat(MAX_MESSAGE_BYTES - 6 - CUT_MARK.len())
+            ))
         );
         assert_eq!(
             source_error(&format!("\u{1b}{}", "c".repeat(100)), "m"),
-            SourceError::Protocol(format!("\u{fffd}{}: m", "c".repeat(MAX_NAME_BYTES - 3)))
+            SourceError::Protocol(format!(
+                "\u{fffd}{}{CUT_MARK}: m",
+                "c".repeat(MAX_NAME_BYTES - 3 - CUT_MARK.len())
+            ))
         );
     }
 
