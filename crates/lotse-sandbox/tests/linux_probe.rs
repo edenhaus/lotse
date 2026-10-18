@@ -234,8 +234,9 @@ fn supervisor_probe_child() {
 /// worker, do what its runtime still does (name a thread, read its own
 /// limits), then try the act the variable names: lower the parent's
 /// limits, make itself dumpable again, clear its parent-death signal, ask
-/// for its parent's pid, create a memory file, resize a file or raise its
-/// scheduling priority again. An act after [`WITHOUT_SECCOMP`] is tried
+/// for its parent's pid, create a memory file, resize a file, write a
+/// regular file it opened before its sandbox or raise its scheduling
+/// priority again. An act after [`WITHOUT_SECCOMP`] is tried
 /// with the seccomp layer unavailable.
 #[test]
 #[expect(
@@ -257,6 +258,15 @@ fn escape_probe_child() {
         }
         None => act,
     };
+    // Opened before the sandbox, which lets a worker open no file; a
+    // worker's standard error, the one regular file it may hold, is the
+    // harness's pipe here. Unlinked at once, so nothing is left behind.
+    let file = (act == "write_file").then(|| {
+        let path = std::env::temp_dir().join(format!("lotse-probe-fsize-{}", std::process::id()));
+        let file = std::fs::File::create(&path).expect("file created");
+        std::fs::remove_file(&path).expect("file unlinked");
+        file
+    });
     let profile = Profile::Worker {
         connect_ports: vec![554],
     };
@@ -306,6 +316,13 @@ fn escape_probe_child() {
             // should it get through.
             let resized = rustix::fs::ftruncate(std::io::stdout(), 0);
             println!("ftruncate:{resized:?}");
+        }
+        "write_file" => {
+            let fsize = rustix::process::getrlimit(Resource::Fsize);
+            println!("fsize_limit:{:?}", (fsize.current, fsize.maximum));
+            let mut file = file.expect("opened for the act");
+            let written = std::io::Write::write(&mut file, b"x").map_err(|e| e.raw_os_error());
+            println!("write_file:{written:?}");
         }
         "setpriority" => {
             // Back to nice 0: should the call get through, refused
@@ -428,12 +445,32 @@ fn run_probe(
         .expect("child runs");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let status = finished(output.status, &stdout);
     let report_line = stdout
         .lines()
         .find(|line| line.starts_with('{'))
         .unwrap_or_else(|| panic!("no report in child output\nstdout: {stdout}\nstderr: {stderr}"));
     let report: SandboxReport = serde_json::from_str(report_line).expect("report parses");
-    (report, stdout, stderr, output.status)
+    (report, stdout, stderr, status)
+}
+
+/// The exit status of a probe child that applied the worker profile, with
+/// a coverage build's end after its test passed counted as exit 0. libtest
+/// runs the test on a thread of its own, so the privilege drop, Landlock
+/// and seccomp bind that thread alone, but `RLIMIT_FSIZE` binds the whole
+/// process (setrlimit(2)): the profiler runtime writes the profile from the
+/// main thread at exit, and the worker's limit of 0 ends it with
+/// `SIGXFSZ`. A worker sandboxes its main thread before any other exists,
+/// so there Landlock refuses to open the profile and nothing is written.
+fn finished(status: ExitStatus, stdout: &str) -> ExitStatus {
+    let profile_refused = cfg!(coverage)
+        && status.signal() == Some(libc::SIGXFSZ)
+        && stdout.contains("test result: ok.");
+    if profile_refused {
+        ExitStatus::from_raw(0)
+    } else {
+        status
+    }
 }
 
 /// Regression for SBX-1 (reproduced 2026-10-07 on Linux 7.0): the
@@ -572,6 +609,28 @@ fn a_worker_cannot_fill_memory_outside_its_address_space() {
     }
 }
 
+/// Regression for SBX-20: a worker could grow regular files, up to
+/// filling the disk where Landlock, which lets it open none, is missing
+/// (Linux before 5.13) and the dropped uid may write somewhere. With its
+/// standard error a pipe a worker's `RLIMIT_FSIZE` is 0, so its first write
+/// call on a regular file ends it with `SIGXFSZ` (getrlimit(2)), whether or
+/// not seccomp is enforced: the allowlist keeps `write`. A shared writable
+/// mapping is beyond the limit ([`lotse_sandbox::WORKER_MAX_FILE_SIZE`]).
+#[test]
+fn setrlimit2_a_worker_cannot_write_a_regular_file() {
+    let (report, stdout, stderr, status) =
+        run_probe("escape_probe_child", ESCAPE_PROBE, "write_file");
+    let context = format!("{status}\nstdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(report.mode, Mode::On, "{context}");
+    assert!(stdout.contains("nofile:Some(256)"), "{context}");
+    assert!(
+        stdout.contains("fsize_limit:(Some(0), Some(0))"),
+        "{context}"
+    );
+    assert!(!stdout.contains("write_file:"), "{context}");
+    assert_eq!(status.signal(), Some(libc::SIGXFSZ), "{context}");
+}
+
 /// Regression for SBX-25: a worker's threads ran at the supervisor's nice
 /// value, so one that spun took the supervisor's CPU share (sched(7)). A
 /// worker runs at [`lotse_sandbox::WORKER_NICE_INCREMENT`] above the nice
@@ -614,7 +673,8 @@ fn a_worker_and_every_thread_it_starts_run_at_a_lower_priority() {
     let output = child.wait_with_output().expect("child exits");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let context = format!("stdout: {lines}\nstderr: {stderr}");
-    assert!(output.status.success(), "{}\n{context}", output.status);
+    let status = finished(output.status, &lines);
+    assert!(status.success(), "{status}\n{context}");
     let report_line = lines
         .lines()
         .find(|line| line.starts_with('{'))
