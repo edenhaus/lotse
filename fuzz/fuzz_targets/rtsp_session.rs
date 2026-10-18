@@ -43,6 +43,27 @@
 //! port of the record's stream (channel 0 and 1 the first `SETUP`, RTCP
 //! on odd channels), through the relay's datagram checks into retina's
 //! interleaved path; a raw stream still goes on the RTSP connection.
+//!
+//! The URL carries credentials, as a camera's does, and the attempt's
+//! error never shows its password. Flag bit 5
+//! makes the camera challenge first (RFC 2326 §7.1.1, RFC 7235 §3.1): the
+//! first request on each connection, the source's, the backchannel
+//! probe's and the talker's, is answered `401 Unauthorized` with a
+//! `WWW-Authenticate` header, and the script answers the retried request
+//! and the rest as above. retina reads the challenge (RFC 7235 §4.1:
+//! RFC 7616 §3.3 Digest, RFC 7617 §2 Basic), sends the request again with
+//! `Authorization` (RFC 7616 §3.4, RFC 7617 §2), and keeps sending it on
+//! every request of that session; a second `401` (a whole-response
+//! section can be one) ends the attempt as a credential failure. With bit
+//! 6 clear the challenge is a fixed Digest one. With bit 6 set too, it is
+//! the fuzzer's: a fourth section, `[len:u16 le][bytes]` after `[play]`
+//! with its CR and LF dropped, cut from the front of the stream, so the
+//! input is `[flags][describe][setup][play][challenge]stream`.
+//!
+//! Bits 5 and 6 were unused before, so a corpus input with bit 5 clear
+//! plays as it did; one with bit 5 set and bit 6 clear plays the same
+//! script after one Digest round trip; one with both set gives its
+//! stream's first bytes to the challenge.
 
 #![no_main]
 
@@ -66,6 +87,13 @@ use tokio_util::sync::CancellationToken;
 /// How long the camera waits for the next request before it hangs up.
 const IDLE: Duration = Duration::from_millis(50);
 
+/// The password of the camera URL's credentials; no error may show it.
+const PASSWORD: &str = "pw-4e2d81";
+
+/// The challenge of flag bit 5 when bit 6 leaves it to the camera: a
+/// Digest one (RFC 7616 §3.3) with the fields retina answers.
+const DIGEST: &[u8] = br#"Digest realm="lotse", nonce="4f1c2b", qop="auth", algorithm=MD5"#;
+
 /// The camera's script, cut from the input.
 struct Script<'a> {
     /// Which sections are whole responses.
@@ -76,6 +104,9 @@ struct Script<'a> {
     setup: &'a [u8],
     /// The `PLAY` section.
     play: &'a [u8],
+    /// The `WWW-Authenticate` of the first answer on each connection,
+    /// when flag bit 5 asks for one.
+    challenge: Option<&'a [u8]>,
     /// What follows `PLAY`.
     stream: &'a [u8],
 }
@@ -95,11 +126,17 @@ impl<'a> Script<'a> {
         let describe = section(&mut rest)?;
         let setup = section(&mut rest)?;
         let play = section(&mut rest)?;
+        let challenge = match flags & 0x60 {
+            0x60 => Some(section(&mut rest)?),
+            0x20 => Some(DIGEST),
+            _ => None,
+        };
         Some(Self {
             flags,
             describe,
             setup,
             play,
+            challenge,
             stream: rest,
         })
     }
@@ -210,6 +247,8 @@ async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
     let mut buf = Vec::new();
     // The client ports of the streams set up over UDP, in order.
     let mut client_ports = Vec::new();
+    // The challenge the connection's first request is answered with.
+    let mut challenge = script.challenge;
     // A client that stops asking is waiting for the rest of a response
     // the script cut short: the camera hangs up instead of letting the
     // read deadline run out.
@@ -225,6 +264,16 @@ async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
             out.extend_from_slice(body);
             out
         };
+        if let Some(www_authenticate) = challenge.take() {
+            let reply = format!(
+                "RTSP/1.0 401 Unauthorized\r\nCSeq: {cseq}\r\nWWW-Authenticate: {}\r\nContent-Length: 0\r\n\r\n",
+                header_value(www_authenticate)
+            );
+            if socket.write_all(reply.as_bytes()).await.is_err() {
+                return;
+            }
+            continue;
+        }
         let (reply, then_stream) = match method.as_str() {
             "DESCRIBE" if script.flags & 1 != 0 => (script.describe.to_vec(), false),
             "DESCRIBE" => (
@@ -352,7 +401,7 @@ fuzz_target!(|data: &[u8]| {
         };
         let addr = listener.local_addr().expect("its address");
         let base = format!("rtsp://{addr}/stream");
-        let url = SourceUrl::parse(&base).expect("a source url");
+        let url = SourceUrl::parse(&format!("rtsp://user:{PASSWORD}@{addr}/stream")).expect("a source url");
         let transport = if script.flags & 0x10 != 0 {
             "udp"
         } else {
@@ -394,10 +443,16 @@ fuzz_target!(|data: &[u8]| {
             () = ingest => unreachable!("the ingest never ends"),
             () = talk(slot) => unreachable!("the talker never ends"),
         };
-        assert!(
-            matches!(exit, SourceExit::Ended(_)),
-            "an RTSP camera resolves to nothing"
-        );
+        let SourceExit::Ended(err) = exit else {
+            panic!("an RTSP camera resolves to nothing: {exit:?}");
+        };
+        let secret = PASSWORD.as_bytes();
+        if !data.windows(secret.len()).any(|window| window == secret) {
+            assert!(
+                !err.to_string().contains(PASSWORD),
+                "the error shows the password: {err}"
+            );
+        }
         for track in tracks.tracks() {
             let _ = mapper.map(track.id(), 0, std::time::Instant::now());
         }
