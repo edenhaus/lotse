@@ -17,9 +17,10 @@
 //! its `a=ptime` framing, a reconnect under a talker, and the downlink's
 //! A/V sync while talking; one goes through the control API to a real
 //! worker process running the RTSP source, whose backchannel session is
-//! torn down before the process exits at the daemon's shutdown; and
-//! through the control API, a stream opting in and out while a viewer
-//! plays the camera.
+//! torn down before the process exits at the daemon's shutdown; one more
+//! runs that worker under its sandbox, an Opus tone transcoded to the
+//! camera's μ-law on the way; and through the control API, a stream
+//! opting in and out while a viewer plays the camera.
 //! Needs the `source-fake` feature (on with `--all-features`) and
 //! `output-webrtc` (a default); the RTSP tests `source-rtsp` (a default)
 //! too.
@@ -1529,6 +1530,7 @@ async fn rfc2326_10_7_a_worker_process_tears_the_backchannel_session_down_before
         Arc::new(lotse_rtsp::RtspFactory::default()),
         &camera.url(),
         &json!({ "backchannel": true }),
+        "off",
     )
     .await;
     let mut a = ApiPeer::offer(&api, "a").await;
@@ -1539,6 +1541,70 @@ async fn rfc2326_10_7_a_worker_process_tears_the_backchannel_session_down_before
     api.stop().await;
     // The worker is gone: what it sent before its exit is all the camera
     // reads before the connection's end.
+    let deadline = clock().now() + Duration::from_secs(5);
+    while !backchannel_session(&camera).unwrap().closed {
+        assert!(clock().now() < deadline, "never closed");
+        clock().sleep(Duration::from_millis(5)).await;
+    }
+    let log = backchannel_session(&camera).unwrap();
+    assert_eq!(log.teardown, Some(true), "TEARDOWN with Require: {log:?}");
+    assert!(log.closed_by_client, "{log:?}");
+    camera.stop().await;
+}
+
+/// The talk-back path under the worker's sandbox (Landlock and seccomp on
+/// Linux, as `lotse serve --sandbox on` applies them): a real worker
+/// process runs the RTSP source, a browser that offers only Opus talks
+/// the tone, and the worker decodes it, encodes it in the camera's μ-law
+/// (`ToG711`, RFC 6716 to G.711) and sends it on the backchannel's
+/// interleaved channel (ONVIF Streaming Specification §5.3), where the
+/// camera takes it at its frequency; at the daemon's shutdown the
+/// sandboxed worker still tears the backchannel session down
+/// (RFC 2326 §10.7) before it exits. A syscall or a path the uplink needs
+/// that the sandbox denies fails this test. On macOS the sandbox is a
+/// no-op and this checks the same path in a worker process.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onvif_5_3_a_sandboxed_worker_process_transcodes_an_opus_tone_onto_the_rtsp_backchannel() {
+    let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
+    let mut api = Api::start_with(
+        Arc::new(lotse_rtsp::RtspFactory::default()),
+        &camera.url(),
+        &json!({ "backchannel": true }),
+        "on",
+    )
+    .await;
+    let opus = Peer::new(Some(
+        "a=rtpmap:111 opus/48000/2\na=fmtp:111 minptime=10;useinbandfec=1",
+    ))
+    .await;
+    let mut a = ApiPeer::open(&api, "a", Box::new(opus)).await;
+    pump(&mut api, &mut [&mut a], |_, peers| {
+        peers[0].peer.viewer.is_connected()
+    })
+    .await;
+    assert_eq!(a.peer.pt, Some(111), "the browser sends Opus");
+    a.peer.talk(Mic::opus());
+    pump(&mut api, &mut [&mut a], |_, peers| {
+        peers[0].peer.sent() >= TONE_PACKETS
+    })
+    .await;
+    let mic = a.peer.mute();
+    pump(&mut api, &mut [&mut a], |_, _| {
+        Stats::get(&camera.stats().backchannel_packets) >= u64::from(TONE_PACKETS)
+    })
+    .await;
+    pump_for(&mut api, &mut [&mut a], QUIET).await;
+    let frames: Vec<Frame> = camera
+        .stats()
+        .backchannel()
+        .iter()
+        .map(Frame::from)
+        .collect();
+    let latencies = check_tone(&frames, &mic, Law::Mu);
+    assert_eq!(Stats::get(&camera.stats().backchannel_refused), 0);
+    println!("Opus to PCMU in a sandboxed worker: uplink latency per onset {latencies:?}");
+    api.stop().await;
     let deadline = clock().now() + Duration::from_secs(5);
     while !backchannel_session(&camera).unwrap().closed {
         assert!(clock().now() < deadline, "never closed");
@@ -1608,13 +1674,18 @@ struct Api {
 impl Api {
     async fn start(options: &Value) -> Self {
         let factory = Arc::new(FakeSourceFactory::with_backchannel(&["fake"]));
-        Self::start_with(factory, "fake://127.0.0.1/", options).await
+        Self::start_with(factory, "fake://127.0.0.1/", options, "off").await
     }
 
     /// The supervisor and its demux, with stream `door` on `url` and
     /// `options`, its scheme validated by `factory` (the worker process
-    /// registers the binary's own).
-    async fn start_with(factory: Arc<dyn SourceFactory>, url: &str, options: &Value) -> Self {
+    /// registers the binary's own), its workers in `sandbox` mode.
+    async fn start_with(
+        factory: Arc<dyn SourceFactory>,
+        url: &str,
+        options: &Value,
+        sandbox: &str,
+    ) -> Self {
         let bound = bind_udp("127.0.0.1:0".parse().unwrap()).expect("the shared socket");
         let demux = Demux::start(
             Arc::clone(&bound.socket),
@@ -1656,7 +1727,7 @@ impl Api {
                 binary: PathBuf::from(env!("CARGO_BIN_EXE_lotse")),
                 log_format: "json".into(),
                 log_level: "info".into(),
-                sandbox: "off".into(),
+                sandbox: sandbox.into(),
                 worker_threads: 1,
                 worker_address_space: 1 << 30,
                 max_sessions: 256,
@@ -2483,6 +2554,7 @@ async fn onvif_5_3_1_opting_in_and_out_leaves_the_video_alone_and_frees_the_talk
         Arc::new(lotse_rtsp::RtspFactory::default()),
         &camera.url(),
         &json!({}),
+        "off",
     )
     .await;
     let mut v = ApiPeer::offer_silent(&api, "v").await;

@@ -30,7 +30,20 @@ tracing = { workspace = true }
 lotse-core = { workspace = true }
 
 [dev-dependencies]
+divan = { workspace = true } # the microbenchmarks (benches/)
 lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`, so the transcoder tests set each frame's arrival
+
+# The microbenchmarks (`mise run bench`): divan's harness, not libtest's. They build their input
+# from the hand-built parameter sets and the recorded AAC of `test-util`.
+[[bench]]
+name = "video"
+harness = false
+required-features = ["test-util"]
+
+[[bench]]
+name = "audio"
+harness = false
+required-features = ["test-util"]
 
 [lints]
 workspace = true

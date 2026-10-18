@@ -9,8 +9,9 @@
 //! file is written with mode 0600 from its creation (`O_EXCL`, then
 //! `rename`) and is refused when its mode lets the group or others read
 //! it, or when it belongs to anyone but the uid the daemon started as. The
-//! directory holding it must belong to that uid too and must not be
-//! writable by the group or others, so nobody else can replace the file.
+//! directory holding it must belong to that uid too and give the group and
+//! others no access at all, so nobody else can replace the file, list the
+//! directory or reach anything in it by name.
 //! The directory is opened once, then checked, locked and used through
 //! that descriptor (`openat`, `renameat`), so a directory swapped in at
 //! its path after the checks is never read or written. Starts sharing the
@@ -79,8 +80,8 @@ pub enum IdentityError {
     /// The data directory is not a directory.
     #[error("data directory {0} is not a directory")]
     NotADirectory(String),
-    /// The group or others may write to the data directory.
-    #[error("data directory {path} is mode {mode:04o}; the group and others must not write to it")]
+    /// The group or others may read, write or search the data directory.
+    #[error("data directory {path} is mode {mode:04o}; the group and others must have no access")]
     DirectoryMode {
         /// The directory.
         path: String,
@@ -256,9 +257,10 @@ fn open_directory(dir: &Path) -> io::Result<File> {
     Ok(File::from(rustix::fs::open(dir, flags, Mode::empty())?))
 }
 
-/// `dir` opened, refused when it is missing, not a directory, writable by
-/// the group or others, or not `owner_uid`'s, so nobody else can have put
-/// or replaced what is in it. With `lock`, it is held under an exclusive
+/// `dir` opened, refused when it is missing, not a directory, open to the
+/// group or others in any way (read, write or search), or not
+/// `owner_uid`'s, so nobody else can have put or replaced what is in it,
+/// or list it or reach a file in it by name. With `lock`, it is held under an exclusive
 /// `flock` until the returned handle drops: two daemons sharing the
 /// directory make and read the identity one at a time, so neither removes
 /// the other's partial file or renames over the identity the other
@@ -273,7 +275,7 @@ pub(crate) fn checked_directory(
     let handle = open_directory(dir).map_err(directory)?;
     let meta = handle.metadata().map_err(directory)?;
     let mode = meta.mode() & 0o777;
-    if mode & 0o022 != 0 {
+    if mode & 0o077 != 0 {
         return Err(IdentityError::DirectoryMode {
             path: text.clone(),
             mode,
@@ -465,6 +467,28 @@ mod tests {
     }
 
     #[test]
+    fn a_data_directory_others_can_search_is_refused() {
+        // Without write, the group or others could still list the
+        // directory or reach a file in it by name.
+        for mode in [0o711, 0o701, 0o750, 0o704] {
+            let dir = data_dir(&format!("search-{mode:o}"), mode);
+            let err = ServerIdentity::load_or_create(&dir, uid()).unwrap_err();
+            assert!(
+                matches!(err, IdentityError::DirectoryMode { mode: m, .. } if m == mode),
+                "{mode:04o}: {err}"
+            );
+            assert!(
+                err.to_string().ends_with(&format!(
+                    "is mode {mode:04o}; the group and others must have no access"
+                )),
+                "{err}"
+            );
+            assert!(!dir.join(IDENTITY_FILE).exists(), "{mode:04o}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
     fn a_directory_others_can_write_or_someone_else_owns_is_refused() {
         let missing = std::env::temp_dir().join("lotse-identity-missing-dir");
         let err = ServerIdentity::load_or_create(&missing, uid()).unwrap_err();
@@ -486,7 +510,7 @@ mod tests {
             matches!(err, IdentityError::DirectoryMode { mode: 0o770, .. }),
             "{err}"
         );
-        let private = data_dir("dir-owner", 0o750);
+        let private = data_dir("dir-owner", 0o700);
         let err = ServerIdentity::load_or_create(&private, uid().wrapping_add(1)).unwrap_err();
         assert!(matches!(err, IdentityError::DirectoryOwner { .. }), "{err}");
         let err = ServerIdentity::load(&private, uid().wrapping_add(1)).unwrap_err();

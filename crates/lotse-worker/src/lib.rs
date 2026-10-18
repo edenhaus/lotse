@@ -14,10 +14,14 @@
 //!
 //! Standards: RFC 8837 §5 (the audio track's DSCP, `sendmsg`), RFC 3542
 //! §6.1 and Linux `ip(7)` (the candidate's source address, `sendmsg`),
-//! RFC 8656 §12.4 (the `ChannelData` it frames, [`relay`]).
+//! RFC 8656 §12.4 (the `ChannelData` it frames, [`relay`]), RFC 6184 §8.1
+//! (the `profile-level-id` it reports) and the picture size of ISO/IEC
+//! 14496-10 §7.4.2.1.1 and ITU-T H.265 §7.4.3.2.1, which `lotse-codec`
+//! reads from a track's SPS.
 
 mod derived;
 mod ice_tcp;
+mod params;
 pub mod relay;
 mod sendmsg;
 mod sessions;
@@ -1201,17 +1205,23 @@ async fn talker_changed(talker: Option<&mut TalkerFeed>) -> TalkerChanged {
 /// track is synced as its source is, since its capture times come from
 /// the source's.
 fn track_infos(tracks: &DerivedTracks, mapper: &ClockMapper) -> Vec<TrackInfo> {
-    let info = |track: &Track, from: Option<TrackId>, delay: Option<Duration>| TrackInfo {
-        id: track.id().to_string(),
-        kind: track.kind().name().to_owned(),
-        codec: track.codec().name().to_owned(),
-        clock_rate: track.clock_rate(),
-        sync: mapper
-            .mode(from.unwrap_or_else(|| track.id()))
-            .name()
-            .to_owned(),
-        derived_from: from.map(|from| from.to_string()),
-        audio_delay_ms: delay.map(|delay| u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)),
+    let info = |track: &Track, from: Option<TrackId>, delay: Option<Duration>| {
+        // One snapshot of the descriptor for the name and the parameters:
+        // a reconnect can replace it between two loads.
+        let codec = track.codec();
+        TrackInfo {
+            id: track.id().to_string(),
+            kind: track.kind().name().to_owned(),
+            codec: codec.name().to_owned(),
+            clock_rate: track.clock_rate(),
+            sync: mapper
+                .mode(from.unwrap_or_else(|| track.id()))
+                .name()
+                .to_owned(),
+            derived_from: from.map(|from| from.to_string()),
+            audio_delay_ms: delay.map(|delay| u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)),
+            params: params::track_params(&codec),
+        }
     };
     let natives = tracks.tracks().tracks();
     let derived = tracks.derived();
@@ -2751,6 +2761,30 @@ mod tests {
         seen
     }
 
+    /// [`messages_until`], paced: the fake clock moves `step` only after
+    /// 10 ms of real time without a message, and never past `limit`, which
+    /// fails the test. Unpaced, it moves on every turn nothing is ready
+    /// yet, so on a loaded runner it runs ahead of the worker; this keeps
+    /// a wait clear of what the fake clock would bring on beyond `limit`.
+    async fn messages_paced(
+        h: &mut Harness,
+        step: Duration,
+        limit: Duration,
+        done: impl Fn(&[ToSupervisor]) -> bool,
+    ) -> Vec<ToSupervisor> {
+        let start = h.clock.now();
+        let mut seen = Vec::new();
+        while !done(&seen) {
+            let moved = h.clock.now().saturating_duration_since(start);
+            assert!(moved <= limit, "not within {limit:?}: {seen:?}");
+            tokio::select! {
+                message = h.next() => seen.push(message),
+                () = SystemClock.sleep(Duration::from_millis(10)) => h.clock.advance(step),
+            }
+        }
+        seen
+    }
+
     /// The session events among `messages`.
     fn session_events(messages: &[ToSupervisor]) -> impl Iterator<Item = (&str, &SessionEvent)> {
         messages.iter().filter_map(|message| match message {
@@ -2949,11 +2983,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rfc3550_6_4_1_tracks_synced_by_later_sender_reports_are_reported_again_once() {
         // The fake camera's first Sender Reports come a second after it
-        // went live (RFC 3550 §6.4.1), after the tracks were reported.
+        // went live (RFC 3550 §6.4.1), after the tracks were reported. Its
+        // clocks agree: drifting, the skew watchdog's re-anchor drops
+        // every fit after ten seconds or so, which a loaded runner's fake
+        // clock reached while the test waited (2026-10-18).
         let mut h = start_with_settings(registries(), quiet_settings());
         assert!(matches!(h.next().await, ToSupervisor::Ready { .. }));
         h.tx.send_msg(
-            &ToWorker::RunSource(spec("fake://cam/", r#"{"audio": "aac_drifting"}"#)),
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"audio": "aac_steady"}"#)),
             &[],
         )
         .await
@@ -3023,9 +3060,19 @@ mod tests {
         h.tx.send_msg(&ToWorker::OpenSession(early), &[])
             .await
             .unwrap();
-        let seen = messages_until(&mut h, |seen| {
-            echo_audio(seen).is_some() && seen.iter().any(|m| has_track(m, "a1") == Some(true))
-        })
+        // The session gets audio before the watchdog can withdraw it: that
+        // takes three occurrences of skew sustained 5 s, the first beyond
+        // 40 ms only 2 s after the first reports, so not within 15 s. A
+        // frame at a time, paced, so a loaded runner's fake clock does not
+        // run ahead of the worker into the withdrawal.
+        let seen = messages_paced(
+            &mut h,
+            Duration::from_millis(64),
+            Duration::from_secs(15),
+            |seen| {
+                echo_audio(seen).is_some() && seen.iter().any(|m| has_track(m, "a1") == Some(true))
+            },
+        )
         .await;
         assert_eq!(
             answers(&seen),

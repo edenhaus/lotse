@@ -729,6 +729,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
 
     use lotse_core::clock::{FakeClock, SystemClock};
+    use lotse_core::text::CUT_MARK;
     use lotse_ipc::TalkerChange;
 
     use super::*;
@@ -920,6 +921,7 @@ mod tests {
             sync: "arrival".into(),
             derived_from: None,
             audio_delay_ms: None,
+            params: lotse_ipc::TrackParams::default(),
         }
     }
 
@@ -1022,11 +1024,17 @@ mod tests {
     fn a_worker_s_source_error_is_plain_and_capped() {
         assert_eq!(
             source_error("source_timeout", &format!("a\nb\u{1b}{}", "x".repeat(1000))),
-            SourceError::Timeout(format!("a b\u{fffd}{}", "x".repeat(MAX_MESSAGE_BYTES - 6)))
+            SourceError::Timeout(format!(
+                "a b\u{fffd}{}{CUT_MARK}",
+                "x".repeat(MAX_MESSAGE_BYTES - 6 - CUT_MARK.len())
+            ))
         );
         assert_eq!(
             source_error(&format!("\u{1b}{}", "c".repeat(100)), "m"),
-            SourceError::Protocol(format!("\u{fffd}{}: m", "c".repeat(MAX_NAME_BYTES - 3)))
+            SourceError::Protocol(format!(
+                "\u{fffd}{}{CUT_MARK}: m",
+                "c".repeat(MAX_NAME_BYTES - 3 - CUT_MARK.len())
+            ))
         );
     }
 
@@ -1200,6 +1208,111 @@ mod tests {
             "{event:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// IPC-20: a worker starts with standard input, output and error and
+    /// nothing else of the supervisor's. Standard input is its control
+    /// channel (the worker's `lotse_sandbox::WORKER_CONTROL_FD`), output is
+    /// `/dev/null` and error is the supervisor's; the datagram channel and
+    /// the shared UDP socket come later, by `SCM_RIGHTS` with
+    /// [`ToWorker::Sockets`]. The stand-in worker `exec`s `sleep`, which
+    /// opens no descriptor, so what it holds once it runs is exactly what
+    /// crossed the `execve(2)`: none of the supervisor's end of the control
+    /// channel, the two ends of the datagram socketpair or the shared
+    /// socket, which the supervisor holds meanwhile. The supervisor in turn
+    /// keeps no copy of the worker's end.
+    ///
+    /// A descriptor the test process inherited without `FD_CLOEXEC` before
+    /// the test began crosses every `execve(2)` it makes: the GitHub
+    /// runner's test processes hold two such pipes (observed 2026-10-17 on
+    /// `ubuntu-24.04-arm`, fds 142 and 145). Those are expected in the worker
+    /// too, and nothing else is.
+    #[tokio::test]
+    async fn a_spawned_worker_holds_only_its_stdio_and_control_socket() {
+        let inherited = inheritable(&descriptors(std::path::Path::new("/proc/self")));
+        let dir = crate::test_support::private_dir("worker-descriptors");
+        let script = dir.join("worker.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mut config = crate::test_support::environment("/bin/sh").worker;
+        config.binary = script;
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let manager = WorkerManager::new(config, Some(udp));
+        let worker = manager.spawn(&[554], true).unwrap();
+        let proc = PathBuf::from(format!("/proc/{}", worker.pid()));
+        // The shell holds its script open until it `exec`s `sleep`: look
+        // every 10 ms for up to five seconds.
+        let mut ran_sleep = false;
+        let mut looks = 0;
+        while !ran_sleep && looks < 500 {
+            SystemClock.sleep(Duration::from_millis(10)).await;
+            looks += 1;
+            ran_sleep = std::fs::read_to_string(proc.join("comm")).unwrap_or_default() == "sleep\n";
+        }
+        assert!(ran_sleep, "the stand-in never ran `sleep`");
+        let (stdio, rest): (Vec<_>, Vec<_>) =
+            descriptors(&proc).into_iter().partition(|(fd, _)| *fd < 3);
+        assert_eq!(rest, inherited, "only what the test process inherited");
+        let numbers: Vec<u32> = stdio.iter().map(|(fd, _)| *fd).collect();
+        assert_eq!(numbers, [0, 1, 2], "{stdio:?}");
+        assert!(stdio[0].1.starts_with("socket:["), "{stdio:?}");
+        assert_eq!(stdio[1].1, "/dev/null");
+        let ours = descriptors(std::path::Path::new("/proc/self"));
+        let stderr = ours.iter().find(|(fd, _)| *fd == 2).unwrap();
+        assert_eq!(stdio[2].1, stderr.1);
+        let kept: Vec<_> = ours
+            .iter()
+            .filter(|(_, target)| *target == stdio[0].1)
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "the supervisor still holds the worker's end of the control channel: {kept:?}"
+        );
+        drop(worker);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The descriptors `proc` (a `/proc/<pid>` directory) holds, by number,
+    /// with what each names (`proc(5)` `/proc/pid/fd/`).
+    fn descriptors(proc: &std::path::Path) -> Vec<(u32, String)> {
+        let mut held: Vec<(u32, String)> = std::fs::read_dir(proc.join("fd"))
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                // A descriptor closed between the listing and this read
+                // (another test's, under `cargo test`) is skipped.
+                let target = std::fs::read_link(entry.path()).ok()?;
+                Some((
+                    entry.file_name().to_str().unwrap().parse().unwrap(),
+                    target.display().to_string(),
+                ))
+            })
+            .collect();
+        held.sort();
+        held
+    }
+
+    /// `O_CLOEXEC` as `/proc/self/fdinfo/<fd>` `flags:` shows it, in octal
+    /// (`proc(5)`; the generic value, which x86-64 and aarch64 share).
+    const O_CLOEXEC: u32 = 0o2_000_000;
+
+    /// Which of the test process's `held` descriptors above standard error
+    /// lack `FD_CLOEXEC` (`proc(5)` `/proc/pid/fdinfo/`), so that every
+    /// process it starts inherits them.
+    fn inheritable(held: &[(u32, String)]) -> Vec<(u32, String)> {
+        held.iter()
+            .filter(|(fd, _)| {
+                let info =
+                    std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap_or_default();
+                let flags = info
+                    .lines()
+                    .find_map(|line| line.strip_prefix("flags:"))
+                    .and_then(|flags| u32::from_str_radix(flags.trim(), 8).ok());
+                *fd > 2 && flags.is_some_and(|flags| flags & O_CLOEXEC == 0)
+            })
+            .cloned()
+            .collect()
     }
 
     #[tokio::test]

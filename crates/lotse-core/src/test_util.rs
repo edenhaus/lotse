@@ -62,7 +62,9 @@ macro_rules! let_assert {
 /// asks), `{"audio": true}` to carry a PCMU track too,
 /// `{"audio": "aac"}` to carry an AAC-LC track (side branch only), or
 /// `{"audio": "aac_drifting"}` for that and Sender Reports whose audio
-/// clock runs 2 % fast, so the skew watchdog withdraws its audio, or
+/// clock runs 2 % fast, so the skew watchdog withdraws its audio,
+/// `{"audio": "aac_steady"}` for that and Sender Reports whose clocks
+/// agree, so the tracks stay mapped from them, or
 /// `{"backchannel": "pcmu" | "pcma" | "opus"}` to offer a backchannel
 /// taking that codec in 20 ms frames once it runs, each claim opening a
 /// session of it at once (whose packets go into the factory's
@@ -375,12 +377,13 @@ impl SourceFactory for FakeSourceFactory {
             _ if audio_name == Some("aac_drifting") => {
                 (false, Duration::ZERO, FakeAudio::AacDrifting)
             }
+            _ if audio_name == Some("aac_steady") => (false, Duration::ZERO, FakeAudio::AacSteady),
             _ if doorbell.is_some() => (false, Duration::ZERO, FakeAudio::None),
             other => {
                 return Err(SourceConfigError::InvalidOptions {
                     scheme,
                     message: format!(
-                        "fake source takes no options but {{\"crash\": true}}, {{\"ready_after_ms\": n}}, {{\"keyframes_every_ms\": n}}, {{\"audio\": true | \"aac\" | \"aac_drifting\"}}, {{\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"}} and {{\"video\": true}}, got {other}"
+                        "fake source takes no options but {{\"crash\": true}}, {{\"ready_after_ms\": n}}, {{\"keyframes_every_ms\": n}}, {{\"audio\": true | \"aac\" | \"aac_drifting\" | \"aac_steady\"}}, {{\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"}} and {{\"video\": true}}, got {other}"
                     ),
                 });
             }
@@ -428,8 +431,11 @@ enum FakeAudio {
     /// 64 ms on the side branch, as the RTSP source frames it.
     Aac,
     /// [`FakeAudio::Aac`], and every second the Sender Reports of
-    /// [`drifting_reports`].
+    /// [`sender_reports`], audio's running 2 % fast.
     AacDrifting,
+    /// [`FakeAudio::Aac`], and every second the Sender Reports of
+    /// [`sender_reports`], whose clocks agree.
+    AacSteady,
 }
 
 impl FakeAudio {
@@ -440,24 +446,32 @@ impl FakeAudio {
             Self::Pcmu => "pcmu",
             Self::Aac => "aac",
             Self::AacDrifting => "aac_drifting",
+            Self::AacSteady => "aac_steady",
         }
+    }
+
+    /// Whether the camera sends Sender Reports, every [`REPORT_INTERVAL`].
+    const fn reports(self) -> bool {
+        matches!(self, Self::AacDrifting | Self::AacSteady)
     }
 }
 
-/// How often a drifting fake camera sends its Sender Reports.
-const DRIFTING_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+/// How often a fake camera with Sender Reports sends them.
+const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Reports the Sender Reports (RFC 3550 §6.4.1) a camera sends `elapsed`
-/// after going live when its audio clock runs 2 % fast against its NTP
-/// clock: video's claims the time that passed, audio's 2 % more. Its
-/// mapping keeps falling behind beyond what a slew can follow, which the
-/// skew watchdog cannot hold.
-fn drifting_reports(
+/// after going live: video's claims the time that passed, and so does
+/// audio's, unless `audio_kind` is [`FakeAudio::AacDrifting`], whose
+/// clock runs 2 % fast against its NTP clock, when audio's claims 2 %
+/// more. That mapping keeps falling behind beyond what a slew can follow,
+/// which the skew watchdog cannot hold.
+fn sender_reports(
     clock: &crate::source::ClockInput,
     video: &Track,
     audio: &Track,
     elapsed: Duration,
     arrival: Instant,
+    audio_kind: FakeAudio,
 ) {
     let report = |track: &Track, claimed: Duration| crate::source::ClockReport {
         track: track.id(),
@@ -468,9 +482,13 @@ fn drifting_reports(
         },
         arrival,
     };
-    let fast = elapsed.saturating_add(elapsed.checked_div(50).unwrap_or_default());
+    let drift = if audio_kind == FakeAudio::AacDrifting {
+        elapsed.checked_div(50).unwrap_or_default()
+    } else {
+        Duration::ZERO
+    };
     let _video_sent = clock.report(report(video, elapsed));
-    let _audio_sent = clock.report(report(audio, fast));
+    let _audio_sent = clock.report(report(audio, elapsed.saturating_add(drift)));
 }
 
 /// `since` the NTP era's start as a 32.32 fixed-point NTP timestamp
@@ -514,18 +532,18 @@ pub fn fake_aac() -> Codec {
 /// With audio it also declares a PCMU track and publishes a 20 ms packet
 /// of it every 20 ms on the injected clock, or an AAC-LC track and
 /// publishes a frame of it every 64 ms, stamped with its capture time on
-/// the 64 ms grid from the moment it went live; drifting, it also sends
-/// Sender Reports every second from a second after it went live, whose
-/// audio clock runs 2 % fast. With a backchannel it marks the slot probed
-/// before its tracks are ready, then probes beside its run, as the RTSP
-/// source does: under a permit of the slot's gate, which it asks for only
-/// once its tracks are ready, so a probe never waits for the permit its
-/// own attempt holds until it is live. It offers the backchannel in the
-/// slot once granted (20 ms frames), whose sessions take what arrives on
-/// them into its capture, if any, stamped with its arrival on the injected
-/// clock; the offer stands when its run ends. With video it publishes a
-/// [`video_packet`] every [`VIDEO_FRAME`] on the injected clock while it
-/// runs.
+/// the 64 ms grid from the moment it went live; drifting or steady, it
+/// also sends Sender Reports every second from a second after it went
+/// live, whose audio clock runs 2 % fast when drifting. With a
+/// backchannel it marks the slot probed before its tracks are ready, then
+/// probes beside its run, as the RTSP source does: under a permit of the
+/// slot's gate, which it asks for only once its tracks are ready, so a
+/// probe never waits for the permit its own attempt holds until it is
+/// live. It offers the backchannel in the slot once granted (20 ms
+/// frames), whose sessions take what arrives on them into its capture, if
+/// any, stamped with its arrival on the injected clock; the offer stands
+/// when its run ends. With video it publishes a [`video_packet`] every
+/// [`VIDEO_FRAME`] on the injected clock while it runs.
 #[derive(Debug)]
 pub struct FakeSource {
     /// The protocol name it reports.
@@ -635,7 +653,7 @@ impl Source for FakeSource {
                         return video_only(&ctx, &video, keyframes_every).await;
                     }
                     FakeAudio::Pcmu => (Codec::Pcmu, 8_000, Duration::from_millis(20)),
-                    FakeAudio::Aac | FakeAudio::AacDrifting => {
+                    FakeAudio::Aac | FakeAudio::AacDrifting | FakeAudio::AacSteady => {
                         (fake_aac(), 16_000, Duration::from_millis(64))
                     }
                 };
@@ -645,13 +663,13 @@ impl Source for FakeSource {
                 let (mut index, mut seq) = (0_u32, 0_u16);
                 // A camera's first report follows its first packets (RFC 3550
                 // §6.2), so the tracks are announced before it maps them.
-                let mut next_report = DRIFTING_REPORT_INTERVAL;
+                let mut next_report = REPORT_INTERVAL;
                 loop {
                     let now = ctx.time.now();
                     let elapsed = now.saturating_duration_since(start);
-                    if audio == FakeAudio::AacDrifting && elapsed >= next_report {
-                        drifting_reports(&ctx.clock, &video, &track, elapsed, now);
-                        next_report = next_report.saturating_add(DRIFTING_REPORT_INTERVAL);
+                    if audio.reports() && elapsed >= next_report {
+                        sender_reports(&ctx.clock, &video, &track, elapsed, now, audio);
+                        next_report = next_report.saturating_add(REPORT_INTERVAL);
                     }
                     if audio == FakeAudio::Pcmu {
                         track.publish_packet(pcmu_packet(ctx.time.now(), seq));
@@ -1782,7 +1800,8 @@ mod tests {
             .unwrap();
         let clock = Arc::new(FakeClock::default());
         let set = TrackSet::new(TrackLimits::default(), clock.now());
-        let (input, _reports) = ClockInput::channel(Arc::new(crate::clock_map::ClockMapper::new()));
+        let (input, mut reports) =
+            ClockInput::channel(Arc::new(crate::clock_map::ClockMapper::new()));
         let cancel = CancellationToken::new();
         let run = source.run(SourceCtx {
             peer: ResolvedPeer {
@@ -1815,6 +1834,13 @@ mod tests {
             assert_eq!(frame.wallclock, clock.now());
         }
         assert_eq!(audio.stats().packets, 0, "side branch only");
+        // A frame past the second the reporting fakes send their first
+        // Sender Reports at, it has sent none.
+        for _ in 3..=17 {
+            clock.advance(Duration::from_millis(64));
+            within(frames.recv()).await.unwrap();
+        }
+        assert!(reports.try_recv().is_err(), "no Sender Reports");
         cancel.cancel();
         assert!(matches!(
             run.await.unwrap(),
@@ -1822,16 +1848,19 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn fake_source_with_drifting_aac_reports_audio_running_2_percent_fast() {
+    /// What a fake source with `options` reports in its first Sender
+    /// Reports, video's and audio's: track, clock rate and hint. Asserts
+    /// that none comes within the first second, and that the pair comes
+    /// at once after it, 1024 ms on the frame grid.
+    async fn first_sender_reports(
+        options: serde_json::Value,
+    ) -> [(String, u32, crate::source::SyncHint); 2] {
         use crate::clock::FakeClock;
-        use crate::source::{ClockReport, SyncHint};
+        use crate::source::ClockReport;
 
         let factory = FakeSourceFactory::new(&["fake"]);
         let url = SourceUrl::parse("fake://cam/").unwrap();
-        let source = factory
-            .validate(&url, &serde_json::json!({"audio": "aac_drifting"}))
-            .unwrap();
+        let source = factory.validate(&url, &options).unwrap();
         let clock = Arc::new(FakeClock::default());
         let set = TrackSet::new(TrackLimits::default(), clock.now());
         let (input, mut reports) =
@@ -1853,9 +1882,7 @@ mod tests {
         assert!(ready.changed().await.is_ok());
         let live = clock.now();
         let hint = |report: ClockReport| (report.track.to_string(), report.clock_rate, report.hint);
-        let sr = |ntp, rtp_ts| SyncHint::RtcpSenderReport { ntp, rtp_ts };
-        // None at once: the first pair once a second has passed, 1024 ms
-        // on the frame grid.
+        // None at once: the first pair once a second has passed.
         for _ in 0..15 {
             clock.advance(Duration::from_millis(64));
             tokio::task::yield_now().await;
@@ -1869,6 +1896,23 @@ mod tests {
         assert_eq!(report.arrival, live + Duration::from_millis(1_024));
         let video = hint(report);
         let audio = hint(within(reports.recv()).await.unwrap());
+        cancel.cancel();
+        assert!(matches!(
+            run.await.unwrap(),
+            SourceExit::Ended(SourceError::Ended(_))
+        ));
+        [video, audio]
+    }
+
+    /// A Sender Report's hint.
+    fn sr(ntp: u64, rtp_ts: u32) -> crate::source::SyncHint {
+        crate::source::SyncHint::RtcpSenderReport { ntp, rtp_ts }
+    }
+
+    #[tokio::test]
+    async fn fake_source_with_drifting_aac_reports_audio_running_2_percent_fast() {
+        let [video, audio] =
+            first_sender_reports(serde_json::json!({"audio": "aac_drifting"})).await;
         assert_eq!(
             video,
             (
@@ -1893,11 +1937,14 @@ mod tests {
             rtp_timestamp(Duration::from_secs(1 << 20), 90_000),
             4_177_526_784
         );
-        cancel.cancel();
-        assert!(matches!(
-            run.await.unwrap(),
-            SourceExit::Ended(SourceError::Ended(_))
-        ));
+    }
+
+    #[tokio::test]
+    async fn fake_source_with_steady_aac_reports_both_clocks_agreeing() {
+        let [video, audio] = first_sender_reports(serde_json::json!({"audio": "aac_steady"})).await;
+        let claimed = ntp_timestamp(Duration::from_millis(1_024));
+        assert_eq!(video, ("v0".into(), 90_000, sr(claimed, 92_160)));
+        assert_eq!(audio, ("a0".into(), 16_000, sr(claimed, 16_384)));
     }
 
     #[test]
@@ -1912,7 +1959,7 @@ mod tests {
             err,
             SourceConfigError::InvalidOptions {
                 scheme: "fake",
-                message: "fake source takes no options but {\"crash\": true}, {\"ready_after_ms\": n}, {\"keyframes_every_ms\": n}, {\"audio\": true | \"aac\" | \"aac_drifting\"}, {\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"} and {\"video\": true}, got {\"transport\":\"udp\"}"
+                message: "fake source takes no options but {\"crash\": true}, {\"ready_after_ms\": n}, {\"keyframes_every_ms\": n}, {\"audio\": true | \"aac\" | \"aac_drifting\" | \"aac_steady\"}, {\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"} and {\"video\": true}, got {\"transport\":\"udp\"}"
                     .into()
             }
         );
@@ -1990,6 +2037,11 @@ mod tests {
                 serde_json::json!({"audio": "aac_drifting"}),
                 "audio",
                 serde_json::json!("aac_drifting"),
+            ),
+            (
+                serde_json::json!({"audio": "aac_steady"}),
+                "audio",
+                serde_json::json!("aac_steady"),
             ),
             (
                 serde_json::json!({"video": true}),

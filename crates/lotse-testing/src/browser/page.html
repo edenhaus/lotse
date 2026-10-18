@@ -17,7 +17,8 @@
      measurements, which the test checks: the page measures, the test decides.
      `?signal=go2rtc&api=ws://host:port/api/ws` signals to go2rtc instead,
      for the comparison (tests/browser/test_comparison.py): everything but the
-     signaling is the same for both servers.
+     signaling is the same for both servers. The dev viewer serves the page
+     only for an `api` on a loopback address.
      With `disrupt` in the configuration (pli, reconnect, crash) the page
      plays a window, disrupts the stream (a keyframe request of its own,
      or the harness acting at `lotseTest.checkpoint`), waits for the
