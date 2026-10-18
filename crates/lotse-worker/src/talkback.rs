@@ -58,6 +58,10 @@
 //!   the device without restarting it, and an offer meanwhile waits for
 //!   the probe; the last opt-out withdraws the offer and frees the channel
 //!   from its talker ([`Arbiter::ask`]).
+//! - **Pace.** A session's talk-back runs at most [`PACE_LEAD`] ahead of
+//!   real time, whatever codecs it alternates ([`Pace`], RFC 3550 §5.1):
+//!   a packet beyond that is dropped and counted before it opens a track,
+//!   starts a chain or reaches the device.
 //!
 //! The talker's route to the device starts on its uplink track before its
 //! first packet is published, so nothing is missed: the reverse
@@ -75,7 +79,7 @@
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lotse_core::clock::Clock;
 use lotse_core::codec::Codec;
@@ -86,6 +90,7 @@ use lotse_core::source::{
     BackchannelSlot,
 };
 use lotse_core::task::spawn_named;
+use lotse_core::throttle::Throttle;
 use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
 use lotse_core::transcode::{TrackHandle, TranscodeError, UplinkFactory};
 use lotse_core::uplink::{UPLINK_TRACK, UplinkCodec, UplinkPacket, UplinkTrack};
@@ -165,8 +170,9 @@ pub(crate) struct TalkbackStats {
     /// offer was declined, or it let go or was released since
     /// (`session/get`'s `packets_dropped_busy`).
     pub(crate) packets_dropped_busy: AtomicU64,
-    /// Packets of the talker dropped on the way: no route to its codec,
-    /// or its backchannel session's queue full or closed.
+    /// Packets dropped on the way: sent ahead of real time ([`Pace`]),
+    /// or the talker's with no route to its codec or its backchannel
+    /// session's queue full or closed.
     pub(crate) packets_dropped: AtomicU64,
     /// Packets handed to the backchannel, after any transcode.
     pub(crate) packets_sent: AtomicU64,
@@ -1220,6 +1226,51 @@ pub(crate) struct Talkback {
         mpsc::Sender<BackchannelRefused>,
         mpsc::Receiver<BackchannelRefused>,
     ),
+    /// The real-time pace of its packets, across its uplink tracks.
+    pace: Pace,
+}
+
+/// How far the audio a session's talk-back has taken may run past a
+/// packet's arrival before that packet is dropped: 120 ms, the longest
+/// frame a device asks the reverse chain for and the longest Opus packet
+/// (RFC 6716 §3.2.5), which also lets a burst after a network stall of
+/// that long through. It holds across codec changes, each of which gives
+/// the uplink a new track and a new chain. It bounds the audio; the
+/// camera's timeline, which the spans of the packets dropped here would
+/// otherwise move on, the RTSP backchannel's packetizer keeps to the wall
+/// clock.
+const PACE_LEAD: Duration = Duration::from_millis(120);
+
+/// The real-time pace of one session's talk-back, whatever its codec: a
+/// sender's clock runs in real time (RFC 3550 §5.1), so a session sending
+/// audio faster than the wall clock passes floods the device and the
+/// reverse chain, and what runs more than [`PACE_LEAD`] ahead is dropped
+/// before it opens a track or starts a chain.
+#[derive(Debug, Default)]
+struct Pace {
+    /// When the audio taken so far ends, each packet's played out from
+    /// its arrival or from the end of the audio before it, whichever is
+    /// later, so a sender that ran behind banks no lead for a burst;
+    /// `None` before the first packet.
+    end: Option<Instant>,
+    /// Packets dropped, for the log.
+    drops: Throttle,
+}
+
+impl Pace {
+    /// Takes a packet of `duration` arriving at `arrival`; or refuses it
+    /// with the lead it found, taking nothing, when the audio taken so far
+    /// ends more than [`PACE_LEAD`] after its arrival. Exactly
+    /// [`PACE_LEAD`] is taken.
+    fn take(&mut self, arrival: Instant, duration: Duration) -> Result<(), Duration> {
+        let from = self.end.map_or(arrival, |end| end.max(arrival));
+        let lead = from.saturating_duration_since(arrival);
+        if lead > PACE_LEAD {
+            return Err(lead);
+        }
+        self.end = Some(from.checked_add(duration).unwrap_or(from));
+        Ok(())
+    }
 }
 
 /// What one offer's claim needs, apart from the session it is made for:
@@ -1283,6 +1334,7 @@ impl Talkback {
             flow: Flow::Idle,
             stats,
             losses: mpsc::channel(1),
+            pace: Pace::default(),
         }
     }
 
@@ -1319,12 +1371,29 @@ impl Talkback {
         }
     }
 
-    /// Takes one uplink packet: opens a track for the first one or one in
-    /// another codec, has the arbiter decide, and publishes it if the
-    /// session is the talker with a way to the device; a packet of a
-    /// session that does not hold the backchannel is dropped and counted.
+    /// Takes one uplink packet: drops and counts it when the session
+    /// sends ahead of real time ([`Pace`]); otherwise opens a track for
+    /// the first one or one in another codec, has the arbiter decide, and
+    /// publishes it if the session is the talker with a way to the device;
+    /// a packet of a session that does not hold the backchannel is dropped
+    /// and counted.
     pub(crate) fn receive(&mut self, packet: UplinkPacket) {
-        let UplinkPacket { codec, packet } = packet;
+        let UplinkPacket {
+            codec,
+            packet,
+            duration,
+        } = packet;
+        if let Err(lead) = self.pace.take(packet.arrival, duration) {
+            TalkbackStats::count(&self.stats.packets_dropped);
+            if let Some(count) = self.pace.drops.hit(packet.arrival) {
+                tracing::debug!(
+                    lead_ms = lead.as_millis(),
+                    count,
+                    "talk-back packet dropped: the session sends ahead of real time"
+                );
+            }
+            return;
+        }
         let track = match self.track.take() {
             Some(track) if track.codec() == codec => track,
             previous => {
@@ -1754,6 +1823,7 @@ mod tests {
                 lateness: Duration::ZERO,
                 payload: Arc::from(payload),
             },
+            duration: Duration::ZERO,
         }
     }
 
@@ -2644,6 +2714,73 @@ mod tests {
                 .iter()
                 .all(|track| track.is_closed())
         );
+    }
+
+    #[test]
+    fn rfc3550_5_1_the_pace_takes_exactly_its_lead_and_banks_none_for_a_late_sender() {
+        let at = SystemClock.now();
+        let ms = Duration::from_millis;
+        let mut pace = Pace::default();
+        // 120 ms at once, then 20 ms starting exactly PACE_LEAD past it.
+        assert_eq!(pace.take(at, ms(120)), Ok(()));
+        assert_eq!(pace.take(at, ms(20)), Ok(()));
+        assert_eq!(pace.take(at, ms(20)), Err(ms(140)));
+        let mut pace = Pace::default();
+        assert_eq!(pace.take(at, PACE_LEAD + Duration::from_nanos(1)), Ok(()));
+        assert_eq!(
+            pace.take(at, ms(20)),
+            Err(PACE_LEAD + Duration::from_nanos(1))
+        );
+        // A sender a second behind: its audio plays from its arrival, so
+        // a burst gets the lead and no more.
+        let mut pace = Pace::default();
+        assert_eq!(pace.take(at, ms(20)), Ok(()));
+        let late = at + Duration::from_secs(1);
+        for _ in 0..7 {
+            assert_eq!(pace.take(late, ms(20)), Ok(()));
+        }
+        assert_eq!(pace.take(late, ms(20)), Err(ms(140)));
+    }
+
+    /// A talker flooding the uplink while it alternates codecs gets no
+    /// more through than real time and the lead allow: the pace is the
+    /// session's, so a new uplink track and its new chain start no new
+    /// budget, and a dropped packet starts no chain at all (RFC 3550 §5.1:
+    /// a sender's clock runs in real time).
+    #[tokio::test]
+    async fn rfc3550_5_1_a_codec_switching_flood_is_paced_across_its_chains() {
+        let (logs, _guard) = Logs::capture();
+        let uplink = Arc::new(FakeUplink::default());
+        let (arbiter, slot) = arbiter(Some(Arc::new(Factory(Arc::clone(&uplink)))));
+        let _device = offer(&slot, Codec::Pcma, Duration::from_millis(20), 64);
+        let mut a = Talkback::new(Arc::clone(&arbiter), "a".into(), Arc::default());
+        claims(&mut a).await;
+        // 20 packets of 20 ms, all at once, Opus and PCMU in turn.
+        let at = SystemClock.now();
+        for seq in 0..20_u16 {
+            let codec = [UplinkCodec::Opus, UplinkCodec::Pcmu][usize::from(seq % 2)];
+            let mut flood = packet(codec, 1, seq, &[1]);
+            flood.packet.arrival = at;
+            flood.duration = Duration::from_millis(20);
+            a.receive(flood);
+        }
+        // The audio taken may end up to 120 ms past the arrival: seven
+        // packets, the last exactly 120 ms ahead; a chain for each.
+        assert_eq!(uplink.stops.lock().unwrap().len(), 7);
+        assert_eq!(load(&a.stats.packets_dropped), 13);
+        let drops = logs.lines(
+            Level::DEBUG,
+            "talk-back packet dropped: the session sends ahead of real time",
+        );
+        assert_eq!(drops.len(), 1, "rate-limited");
+        assert_eq!(drops[0].fields, " lead_ms=140 count=1");
+        // Once the wall clock catches up, the session talks again.
+        let mut later = packet(UplinkCodec::Pcmu, 1, 20, &[1]);
+        later.packet.arrival = at + Duration::from_millis(20);
+        later.duration = Duration::from_millis(20);
+        a.receive(later);
+        assert_eq!(uplink.stops.lock().unwrap().len(), 8);
+        assert_eq!(load(&a.stats.packets_dropped), 13);
     }
 
     /// Opus to an Opus device is forwarded as received: no chain, though

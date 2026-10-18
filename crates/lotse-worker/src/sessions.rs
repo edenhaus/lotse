@@ -2224,6 +2224,7 @@ mod tests {
         SessionOutput::Uplink(lotse_core::uplink::UplinkPacket {
             codec,
             packet: packet(now),
+            duration: Duration::ZERO,
         })
     }
 
@@ -2935,6 +2936,7 @@ mod tests {
         talkback.receive(lotse_core::uplink::UplinkPacket {
             codec: lotse_core::uplink::UplinkCodec::Pcmu,
             packet: packet(SystemClock.now()),
+            duration: Duration::ZERO,
         });
         until(&|| stats.packets_sent.load(Ordering::Relaxed) == 1).await;
         assert!(camera.devices.lock().unwrap()[0].try_recv().is_ok());

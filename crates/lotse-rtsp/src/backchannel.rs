@@ -25,7 +25,8 @@
 //! types 0 and 8) and §4.5.14 (G.711 at 8 kHz); RFC 7587 §7 (`opus/48000/2`);
 //! RFC 3550 §5.1 (sequence numbers that count packets from a random start,
 //! timestamps from a random offset that advance with the sampling clock
-//! across silence) and §8.1 (a random SSRC); RFC 3551 §4.1 (the marker on
+//! across silence, and never ahead of the wall clock by more than a
+//! lead) and §8.1 (a random SSRC); RFC 3551 §4.1 (the marker on
 //! the first packet of a talkspurt); ONVIF Streaming Specification §5.3 (the
 //! backchannel media whose format this is).
 
@@ -39,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use lotse_core::codec::Codec;
 use lotse_core::media::{MediaPacket, RtpHeaderFields};
+use lotse_core::throttle::Throttle;
 use sdp_types::Media;
 
 use crate::error::camera_text;
@@ -262,6 +264,11 @@ struct Last {
 /// and the nearer reading wins (RFC 3550 §5.1).
 const HALF_RANGE: u32 = 0x8000_0000;
 
+/// How far a backchannel session's timestamps may run ahead of the wall
+/// clock: 250 ms, a burst the talker's pace lets through (120 ms) and the
+/// longest frame (120 ms), rounded up, so paced audio is never held.
+const MAX_LEAD: Duration = Duration::from_millis(250);
+
 /// Stamps a backchannel session's packets: the camera's payload type, one
 /// SSRC, a sequence number one past the previous packet's, and timestamps
 /// that advance with the sampling clock across silence (RFC 3550 §5.1),
@@ -270,11 +277,22 @@ const HALF_RANGE: u32 = 0x8000_0000;
 /// Within a talkspurt the output timestamps follow the input's at a fixed
 /// offset, so the sender's timing (the transcoder's frames, a browser's
 /// packets) is kept. A new talkspurt starts with an input packet that has
-/// the marker (RFC 3551 §4.1) or another SSRC (another sender, or a
+/// the marker (RFC 3551 §4.1), another SSRC (another sender, or a
 /// talk-back chain restarted for a new talker, whose timestamps restart
-/// too): its timestamp is the previous packet's advanced by the time
+/// too) or a timestamp further behind the last than reordering explains
+/// (a discontinuity in the sender's timeline): its timestamp is the previous packet's advanced by the time
 /// between their arrivals, at least by the last packet spacing so the two
 /// never overlap, and it carries the marker.
+///
+/// Whatever the input's timestamps claim, the output's keep to the wall
+/// clock: a timestamp more than 250 ms past where the first packet's
+/// arrival puts the wall clock now is held there, and its talkspurt
+/// follows on from it. The sampling clock the timestamps follow runs in
+/// real time (RFC 3550 §5.1), so a sender whose timestamps run faster
+/// (loss it claims, packets dropped ahead of real time, talkspurts
+/// restarted on top of each other) moves the camera's timeline no further
+/// than the wall clock. This is the one bound every route to the camera
+/// meets: the talk-back chain's frames and Opus forwarded as received.
 #[derive(Debug, Clone)]
 pub struct Packetizer {
     /// The payload type every packet carries.
@@ -292,6 +310,15 @@ pub struct Packetizer {
     /// The last forward timestamp step inside a talkspurt: the packet
     /// duration, as far as the input shows it; zero before one was seen.
     step: u32,
+    /// The first packet's timestamp and arrival: where the wall clock sits
+    /// on the output timeline. `None` before the first packet.
+    anchor: Option<(u32, Instant)>,
+    /// [`MAX_LEAD`] in ticks of the clock rate.
+    lead: u32,
+    /// Timestamps held to the wall clock, for the log.
+    held: Throttle,
+    /// Talkspurts started, for the log: a sender can start one a packet.
+    talkspurts: Throttle,
 }
 
 impl Packetizer {
@@ -306,34 +333,85 @@ impl Packetizer {
             first_ts: initial.ts,
             last: None,
             step: 0,
+            anchor: None,
+            lead: ticks(MAX_LEAD, format.clock_rate),
+            held: Throttle::default(),
+            talkspurts: Throttle::default(),
         }
+    }
+
+    /// Whether input timestamp `ts` reads as more than [`MAX_LEAD`] behind
+    /// `last`, the one before it from the same sender, on the nearer
+    /// reading (RFC 3550 §5.1): no reordered packet but a discontinuity in
+    /// the sender's timeline, which starts a talkspurt as a new sender
+    /// would, on the wall clock, so the camera's timeline never jumps
+    /// back. A step back within the lead is reordering and keeps the
+    /// talkspurt.
+    fn jumps_back(&self, ts: u32, last: u32) -> bool {
+        let back = last.wrapping_sub(ts);
+        back > self.lead && back <= HALF_RANGE
+    }
+
+    /// `ts` for a packet arriving at `arrival`, or the wall clock's limit
+    /// when `ts` runs further ahead: [`MAX_LEAD`] past the first packet's
+    /// timestamp advanced by the time since it arrived. Every packet is
+    /// judged against that limit alone, on the nearer reading (RFC 3550
+    /// §5.1), never against the packet before it, so no run of jumps that
+    /// each read as backwards from the last can carry the timeline past
+    /// it; a timestamp behind the limit (a reordered packet, a wrapped
+    /// input) stands.
+    fn hold(&mut self, ts: u32, arrival: Instant) -> u32 {
+        let (first, since) = *self.anchor.get_or_insert((ts, arrival));
+        let elapsed = ticks(arrival.saturating_duration_since(since), self.clock_rate);
+        let limit = first.wrapping_add(elapsed).wrapping_add(self.lead);
+        let ahead = ts.wrapping_sub(limit);
+        if ahead == 0 || ahead >= HALF_RANGE {
+            return ts;
+        }
+        if let Some(count) = self.held.hit(arrival) {
+            tracing::debug!(
+                ahead,
+                count,
+                "backchannel: timestamp held to the wall clock"
+            );
+        }
+        limit
     }
 
     /// The backchannel packet for `packet`, one of the handle's input in
     /// the camera's codec.
     pub fn packetize(&mut self, packet: &MediaPacket) -> BackchannelPacket {
         let input = packet.rtp;
-        let (ts, offset, marker) = match self.last {
-            Some(last) if !input.marker && input.ssrc == last.input_ssrc => {
+        let (ts, marker) = match self.last {
+            Some(last)
+                if !input.marker
+                    && input.ssrc == last.input_ssrc
+                    && !self.jumps_back(input.ts, last.input_ts) =>
+            {
                 let step = input.ts.wrapping_sub(last.input_ts);
                 // A reordered packet's step is no packet duration.
                 if step > 0 && step < HALF_RANGE {
                     self.step = step;
                 }
-                (input.ts.wrapping_add(last.offset), last.offset, false)
+                (input.ts.wrapping_add(last.offset), false)
             }
             Some(last) => {
                 let elapsed = packet.arrival.saturating_duration_since(last.arrival);
                 let advance = ticks(elapsed, self.clock_rate).max(self.step);
                 let ts = last.ts.wrapping_add(advance);
                 let sender_changed = input.ssrc != last.input_ssrc;
-                tracing::debug!(
-                    marker = input.marker,
-                    sender_changed,
-                    advance,
-                    "backchannel: talkspurt"
-                );
-                (ts, ts.wrapping_sub(input.ts), true)
+                let jumped_back = !input.marker && !sender_changed;
+                if let Some(count) = self.talkspurts.hit(packet.arrival) {
+                    tracing::debug!(
+                        marker = input.marker,
+                        sender_changed,
+                        advance,
+                        jumped_back,
+                        count,
+                        "backchannel: talkspurt"
+                    );
+                }
+                (ts, true)
             }
             None => {
                 tracing::debug!(
@@ -341,9 +419,11 @@ impl Packetizer {
                     ssrc = self.ssrc,
                     "backchannel: first talkspurt"
                 );
-                (self.first_ts, self.first_ts.wrapping_sub(input.ts), true)
+                (self.first_ts, true)
             }
         };
+        let ts = self.hold(ts, packet.arrival);
+        let offset = ts.wrapping_sub(input.ts);
         self.last = Some(Last {
             input_ssrc: input.ssrc,
             offset,
@@ -821,6 +901,7 @@ mod tests {
             logs.contains("talkspurt marker=true sender_changed=false"),
             "{logs}"
         );
+        assert!(logs.contains("jumped_back=false count=1"), "{logs}");
         let out = out.unwrap();
         assert!(out.marker);
         assert_eq!(out.ts, 1_000 + 160 + 4_000, "RFC 3550 §5.1");
@@ -878,9 +959,14 @@ mod tests {
         let start = SystemClock.now();
         p.packetize(&packet(start, 0, 1, false));
         p.packetize(&packet(start, 160, 1, false));
-        p.packetize(&packet(start, 160 + HALF_RANGE, 1, false));
+        // Behind the last packet's on the nearer reading, by more than the
+        // lead: no packet spacing, and no reordering but a discontinuity,
+        // a talkspurt one spacing on.
+        let back = p.packetize(&packet(start, 160 + HALF_RANGE, 1, false)).rtp;
+        assert_eq!((back.ts, back.marker), (1_000 + 160 + 160, true));
+        // The next talkspurt steps the spacing before the jump on again.
         let out = p.packetize(&packet(start, 0, 2, false)).rtp;
-        assert_eq!(out.ts, 1_000 + 160 + HALF_RANGE + 160);
+        assert_eq!(out.ts, 1_000 + 160 + 160 + 160);
     }
 
     #[test]
@@ -896,6 +982,160 @@ mod tests {
         p.packetize(&packet(start, 0, 1, false));
         let out = p.packetize(&packet(start + ms(100), 0, 2, false)).rtp;
         assert_eq!((out.pt, out.ts), (111, 1_000 + 4_800));
+    }
+
+    /// The packets' output timestamps against their arrivals: how far
+    /// each runs ahead of the wall clock since the first, in ticks.
+    fn leads(out: &[(u32, Instant)], start: Instant, rate: u32) -> Vec<u32> {
+        out.iter()
+            .map(|(ts, at)| {
+                ts.wrapping_sub(INITIAL.ts)
+                    .saturating_sub(ticks(at.saturating_duration_since(start), rate))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rfc3550_5_1_restarted_talkspurts_stay_within_the_lead_of_the_wall_clock() {
+        // A chain's output at real-time pace whose input claims 80 ms of
+        // loss before every packet and restarts a talkspurt every other
+        // one: each step 100 ms of timestamps per 20 ms of wall clock,
+        // and each marker advanced by that step.
+        let mut p = packetizer(&g711(Codec::Pcmu, 0));
+        let start = SystemClock.now();
+        let mut out = Vec::new();
+        let logs = logged(|| {
+            for k in 0..50_u32 {
+                let at = start + ms(20 * u64::from(k));
+                let rtp = p.packetize(&packet(at, 800 * k, 1, k % 2 == 1)).rtp;
+                out.push((rtp.ts, at));
+            }
+        });
+        // At most MAX_LEAD (250 ms, 2,000 ticks) ahead, reached at once
+        // and held there: 160 ticks per packet, the wall clock's pace.
+        let leads = leads(&out, start, 8_000);
+        assert!(leads.iter().all(|lead| *lead <= 2_000), "{leads:?}");
+        assert_eq!(leads[49], 2_000);
+        assert_eq!(out[49].0.wrapping_sub(out[48].0), 160);
+        assert_eq!(
+            logs.matches("backchannel: timestamp held to the wall clock")
+                .count(),
+            1,
+            "rate-limited: {logs}"
+        );
+    }
+
+    #[test]
+    fn rfc7587_4_1_forwarded_opus_stays_within_the_lead_of_the_wall_clock() {
+        // Opus forwarded as received, one talkspurt: the packets a paced
+        // flood leaves, 20 ms apart on the wall clock and 100 ms on the
+        // sender's 48 kHz timeline.
+        let opus = BackchannelFormat {
+            codec: Codec::Opus { channels: 2 },
+            payload_type: 111,
+            clock_rate: 48_000,
+            ptime: None,
+        };
+        let mut p = packetizer(&opus);
+        let start = SystemClock.now();
+        let out: Vec<(u32, Instant)> = (0..50_u32)
+            .map(|k| {
+                let at = start + ms(20 * u64::from(k));
+                (p.packetize(&packet(at, 4_800 * k, 1, false)).rtp.ts, at)
+            })
+            .collect();
+        let leads = leads(&out, start, 48_000);
+        assert!(leads.iter().all(|lead| *lead <= 12_000), "{leads:?}");
+        assert_eq!(leads[49], 12_000);
+    }
+
+    #[test]
+    fn rfc3550_5_1_backward_jumps_cannot_carry_a_talkspurt_past_the_wall_clock() {
+        // Forwarded Opus, one talkspurt: a jump of half the range reads as
+        // backwards, and a second jump from there would read backwards
+        // again, ten seconds ahead of the wall clock.
+        let opus = BackchannelFormat {
+            codec: Codec::Opus { channels: 2 },
+            payload_type: 111,
+            clock_rate: 48_000,
+            ptime: None,
+        };
+        let mut p = packetizer(&opus);
+        let start = SystemClock.now();
+        let mut out = Vec::new();
+        let logs = logged(|| {
+            for (ts, at) in [(0, 0), (HALF_RANGE, 20), (480_000, 40)] {
+                let at = start + ms(at);
+                out.push((p.packetize(&packet(at, ts, 1, false)).rtp.ts, at));
+            }
+        });
+        assert!(
+            logs.contains(
+                "talkspurt marker=false sender_changed=false advance=960 jumped_back=true count=1"
+            ),
+            "{logs}"
+        );
+        // Each jump back is a discontinuity in the sender's timeline: a
+        // talkspurt, on the wall clock, never a jump back on the camera's.
+        let ts: Vec<u32> = out.iter().map(|(ts, _)| *ts).collect();
+        assert_eq!(ts, [1_000, 1_000 + 960, 1_000 + 2 * 960]);
+        let leads = leads(&out, start, 48_000);
+        assert!(leads.iter().all(|lead| *lead <= 12_000), "{leads:?}");
+    }
+
+    #[test]
+    fn rfc3550_5_1_a_reordered_packet_and_a_wrapping_input_stand() {
+        let mut p = packetizer(&g711(Codec::Pcmu, 0));
+        let start = SystemClock.now();
+        // An input timeline that wraps, at real-time pace, and one packet
+        // that arrives after its successor, 20 ms behind it: within the
+        // lead, so reordering, it keeps its place on the talkspurt's
+        // timeline.
+        let out: Vec<u32> = [
+            (u32::MAX - 159, 0),
+            (0, 20),
+            (320, 40),
+            (160, 41),
+            (480, 60),
+        ]
+        .into_iter()
+        .map(|(ts, at)| p.packetize(&packet(start + ms(at), ts, 1, false)).rtp.ts)
+        .collect();
+        assert_eq!(out, [1_000, 1_160, 1_480, 1_320, 1_640]);
+    }
+
+    #[test]
+    fn rfc3550_5_1_a_step_back_of_the_lead_is_reordering_a_tick_more_a_discontinuity() {
+        let mut p = packetizer(&g711(Codec::Pcmu, 0));
+        let start = SystemClock.now();
+        p.packetize(&packet(start, 2_000, 1, false));
+        // Exactly MAX_LEAD (2,000 ticks) back: reordering, in place.
+        let reordered = p.packetize(&packet(start, 0, 1, false)).rtp;
+        assert_eq!(
+            (reordered.ts, reordered.marker),
+            (1_000_u32.wrapping_sub(2_000), false)
+        );
+        // A tick more back from that one: a discontinuity, a talkspurt.
+        let jumped = p
+            .packetize(&packet(start, 0_u32.wrapping_sub(2_001), 1, false))
+            .rtp;
+        assert!(jumped.marker);
+    }
+
+    #[test]
+    fn rfc3550_5_1_exactly_the_lead_ahead_stands_a_tick_more_is_held() {
+        let mut p = packetizer(&g711(Codec::Pcmu, 0));
+        let start = SystemClock.now();
+        p.packetize(&packet(start, 0, 1, false));
+        let at_lead = p.packetize(&packet(start, 2_000, 1, false)).rtp;
+        assert_eq!(at_lead.ts, 1_000 + 2_000, "exactly MAX_LEAD ahead");
+        let past = p.packetize(&packet(start, 2_001, 1, false)).rtp;
+        assert_eq!(past.ts, 1_000 + 2_000, "held at the wall clock's limit");
+        // The talkspurt follows on from where it was held.
+        let next = p
+            .packetize(&packet(start + ms(20), 2_001 + 160, 1, false))
+            .rtp;
+        assert_eq!((next.ts, next.marker), (1_000 + 2_000 + 160, false));
     }
 
     #[test]

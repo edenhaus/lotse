@@ -19,7 +19,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -99,6 +99,11 @@ pub struct UplinkPacket {
     /// `frame_start` is set (an audio packet is a frame), the epoch is
     /// the uplink track's to stamp.
     pub packet: MediaPacket,
+    /// The audio its payload carries, from the payload's framing as the
+    /// session checked it: an Opus packet's frames (RFC 6716 §3.4), a
+    /// G.711 payload's samples at 8 kHz (RFC 3551 §4.5.14). The worker
+    /// paces the session's talk-back by it, across codec changes.
+    pub duration: Duration,
 }
 
 /// The id every uplink track carries: an audio id no stream's track has

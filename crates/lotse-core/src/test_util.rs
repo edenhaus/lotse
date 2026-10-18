@@ -1096,6 +1096,12 @@ impl SessionEngine for EchoEngine {
                     lateness: Duration::ZERO,
                     payload: Arc::from(talk),
                 },
+                // PCMU: a sample per byte at 8 kHz.
+                duration: Duration::from_micros(
+                    u64::try_from(talk.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(125),
+                ),
             }));
         }
         if !self.connected {
@@ -2467,6 +2473,7 @@ mod tests {
                         lateness: Duration::ZERO,
                         payload: Arc::from(&[0xff_u8, 0xfe][..]),
                     },
+                    duration: Duration::from_micros(250),
                 })
             );
         }
