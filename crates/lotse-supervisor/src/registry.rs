@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::task::TaskTracker;
 
 use crate::connect::ConnectPermits;
-use crate::driver::{DriverCommand, DriverSpec};
+use crate::driver::{Demand, DriverCommand, DriverSpec};
 use crate::gather::Relayed;
 use crate::memory::MemoryProbe;
 use crate::millis;
@@ -248,7 +248,7 @@ pub(crate) struct ConnectionEntry {
     /// backchannel ([`State::follow_backchannel`]).
     pub(crate) backchannel: bool,
     /// The demand the driver follows; dropping it stops the driver.
-    pub(crate) demand: watch::Sender<u32>,
+    pub(crate) demand: watch::Sender<Demand>,
     /// What the driver last reported.
     pub(crate) snapshot: ConnectionSnapshot,
     /// The source switches queued for the driver: until its snapshot
@@ -453,9 +453,18 @@ impl State {
             .values()
             .filter(|session| session.connection == id)
             .count();
-        let demand = u32::try_from(preloads.saturating_add(viewers)).unwrap_or(u32::MAX);
+        let demand = Demand {
+            preloads: u32::try_from(preloads).unwrap_or(u32::MAX),
+            viewers: u32::try_from(viewers).unwrap_or(u32::MAX),
+        };
         if *entry.demand.borrow() != demand {
-            tracing::info!(connection.id = id, demand, "connection demand changed");
+            tracing::info!(
+                connection.id = id,
+                demand = demand.total(),
+                preloads = demand.preloads,
+                viewers = demand.viewers,
+                "connection demand changed"
+            );
             entry.demand.send_replace(demand);
         }
     }
@@ -671,7 +680,64 @@ impl State {
         }
     }
 
-    /// A worker's report about one of its sessions; a report about a
+    /// Connection `connection`'s worker reported `report` on session
+    /// `session_id`, which the supervisor no longer knows: the worker is
+    /// told to close it, so it does not run a session nobody can reach
+    /// until its own timeouts end it. A `Closed` report needs no close: it
+    /// is a session's last report, the one every close the supervisor asks
+    /// for ends with, so the worker has let the session go already. The
+    /// close takes a slot of the driver's queue only while more than half
+    /// of it is free, so a worker that reports on gone sessions without
+    /// end cannot crowd out the commands of the sessions that live. This
+    /// cannot loop: a close the worker gets for a session it no longer
+    /// runs, or for one already closing, reports nothing (its
+    /// `sessions::close`).
+    fn close_gone_session(&self, connection: &str, session_id: &str, report: &WorkerSessionEvent) {
+        if matches!(report, WorkerSessionEvent::Closed { .. }) {
+            tracing::debug!(
+                session.id = session_id,
+                connection.id = connection,
+                ?report,
+                "last report of a session that is gone"
+            );
+            return;
+        }
+        tracing::debug!(
+            session.id = session_id,
+            connection.id = connection,
+            ?report,
+            reason = "the worker still runs a session the supervisor no longer knows",
+            "report for a session that is gone; closing it on the worker"
+        );
+        let Some(entry) = self.connections.get(connection) else {
+            return;
+        };
+        if entry.commands.capacity().saturating_mul(2) <= entry.commands.max_capacity() {
+            tracing::debug!(
+                session.id = session_id,
+                connection.id = connection,
+                reason = "the driver queue is half full",
+                "close of a session that is gone skipped; its worker's timeouts end it"
+            );
+            return;
+        }
+        let close = DriverCommand::CloseSession {
+            session_id: session_id.to_owned(),
+            code: "session_closed",
+            message: "the session is gone".to_owned(),
+        };
+        if entry.commands.try_send(close).is_err() {
+            tracing::debug!(
+                session.id = session_id,
+                connection.id = connection,
+                "driver gone; the session went with its worker"
+            );
+        }
+    }
+
+    /// A worker's report about one of its sessions; one about a session
+    /// the supervisor no longer knows closes it on the worker
+    /// ([`State::close_gone_session`]); a report about a
     /// session of another connection is refused, and one whose answer or
     /// candidate fails [`worker_text::check`](crate::worker_text::check),
     /// or that is over the session's budget ([`SessionEntry::apply`]),
@@ -685,11 +751,7 @@ impl State {
         now: Instant,
     ) {
         let Some(entry) = self.sessions.get_mut(session_id) else {
-            tracing::debug!(
-                session.id = session_id,
-                ?report,
-                "report for a session that is gone"
-            );
+            self.close_gone_session(connection, session_id, &report);
             return;
         };
         if entry.connection != connection {
@@ -1577,7 +1639,7 @@ mod tests {
     #[test]
     fn demand_counts_each_preloaded_stream_and_each_viewer_of_the_connection() {
         let mut state = State::default();
-        let (demand, rx) = watch::channel(0);
+        let (demand, rx) = watch::channel(Demand::default());
         let (commands, _commands) = mpsc::channel(1);
         state.connections.insert(
             "c1".into(),
@@ -1600,27 +1662,45 @@ mod tests {
         state.streams.insert("front".into(), stream_on_c1(true));
         state.streams.insert("twin".into(), stream_on_c1(false));
         state.refresh_connection("c1");
-        assert_eq!(*rx.borrow(), 1, "one preloaded stream, no viewers");
+        let demand = |preloads, viewers| Demand { preloads, viewers };
+        assert_eq!(
+            *rx.borrow(),
+            demand(1, 0),
+            "one preloaded stream, no viewers"
+        );
         state.sessions.insert("s1".into(), session_on_c1(1, "twin"));
         state.refresh_connection("c1");
-        assert_eq!(*rx.borrow(), 2, "plus a viewer of the other stream");
+        assert_eq!(
+            *rx.borrow(),
+            demand(1, 1),
+            "plus a viewer of the other stream"
+        );
         // Both streams preloaded: each counts, so turning one off later
         // leaves the connection wanted.
         state.streams.insert("twin".into(), stream_on_c1(true));
         state.refresh_connection("c1");
-        assert_eq!(*rx.borrow(), 3);
+        assert_eq!(*rx.borrow(), demand(2, 1));
+        assert_eq!(rx.borrow().total(), 3);
         state.streams.insert("front".into(), stream_on_c1(false));
         state.streams.insert("twin".into(), stream_on_c1(false));
         state.refresh_connection("c1");
-        assert_eq!(*rx.borrow(), 1, "the viewer alone keeps it wanted");
+        assert_eq!(
+            *rx.borrow(),
+            demand(0, 1),
+            "the viewer alone keeps it wanted"
+        );
         assert!(state.finish_session("s1").is_some());
-        assert_eq!(*rx.borrow(), 0, "no preload, no viewer: no demand");
+        assert_eq!(
+            *rx.borrow(),
+            demand(0, 0),
+            "no preload, no viewer: no demand"
+        );
         // A stream that left the connection no longer counts; with none
         // left the connection is released, which stops its driver.
         state.streams.insert("front".into(), stream_on_c1(true));
         state.streams.remove("twin");
         state.refresh_connection("c1");
-        assert_eq!(*rx.borrow(), 1);
+        assert_eq!(*rx.borrow(), demand(1, 0));
         assert_eq!(
             state.connections["c1"].streams,
             BTreeSet::from(["front".to_owned()])
@@ -1644,7 +1724,7 @@ mod tests {
     )]
     fn a_talker_change_reaches_every_stream_on_the_connection_and_its_sessions() {
         let mut state = State::default();
-        let (demand, _demand) = watch::channel(0);
+        let (demand, _demand) = watch::channel(Demand::default());
         let (commands, _commands) = mpsc::channel(1);
         state.connections.insert(
             "c1".into(),
@@ -1895,7 +1975,7 @@ mod tests {
     #[test]
     fn onvif_5_3_a_source_reports_the_backchannel_its_live_connection_offers() {
         let mut state = State::default();
-        let (demand, _demand) = watch::channel(0);
+        let (demand, _demand) = watch::channel(Demand::default());
         let (commands, _commands) = mpsc::channel(1);
         state.connections.insert(
             "c1".into(),
@@ -1957,7 +2037,7 @@ mod tests {
     /// command, and its session `s1` (serial 1), gathering `gathers`.
     fn relay_state(gathers: usize) -> (State, mpsc::Receiver<DriverCommand>) {
         let mut state = State::default();
-        let (demand, _demand) = watch::channel(0);
+        let (demand, _demand) = watch::channel(Demand::default());
         let (commands, rx) = mpsc::channel(1);
         state.connections.insert(
             "c1".into(),
@@ -2006,6 +2086,80 @@ mod tests {
         assert_eq!(session_id, "s2");
     }
 
+    #[test]
+    fn a_report_for_a_session_that_is_gone_closes_it_on_the_reporting_worker() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let (mut state, mut rx) = relay_state(0);
+        let now = lotse_core::clock::SystemClock.now();
+        let candidate = || lotse_ipc::SessionEvent::Candidate {
+            candidate: String::new(),
+            mid: None,
+        };
+        state.session_report("c1", "gone", candidate(), now);
+        let_assert!(
+            Ok(DriverCommand::CloseSession {
+                session_id,
+                code,
+                message
+            }) = rx.try_recv()
+        );
+        assert_eq!(
+            (session_id.as_str(), code, message.as_str()),
+            ("gone", "session_closed", "the session is gone")
+        );
+        let logged = captured.lines("report for a session that is gone");
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains("session.id=\"gone\""), "{logged:?}");
+        assert!(logged[0].contains("connection.id=\"c1\""), "{logged:?}");
+        // `Closed` is a session's last report: the worker let it go
+        // already, and every close the supervisor asks for ends with one.
+        state.session_report(
+            "c1",
+            "gone",
+            lotse_ipc::SessionEvent::Closed {
+                code: "session_closed".into(),
+                message: "closed".into(),
+            },
+            now,
+        );
+        assert!(rx.try_recv().is_err(), "nothing to close");
+        assert_eq!(
+            captured
+                .lines("last report of a session that is gone")
+                .len(),
+            1
+        );
+        // A connection that is gone has no worker to tell.
+        state.session_report("c9", "gone", candidate(), now);
+        assert!(rx.try_recv().is_err());
+        // A close takes a slot only while more than half the queue is
+        // free: a worker reporting without end cannot fill it.
+        let (commands, mut rx) = mpsc::channel(2);
+        state.connections.get_mut("c1").unwrap().commands = commands;
+        state.session_report("c1", "gone", candidate(), now);
+        state.session_report("c1", "gone", candidate(), now);
+        let_assert!(Ok(DriverCommand::CloseSession { .. }) = rx.try_recv());
+        assert!(
+            rx.try_recv().is_err(),
+            "one close, then the queue was half full"
+        );
+        assert_eq!(
+            captured
+                .lines("close of a session that is gone skipped")
+                .len(),
+            1
+        );
+        // A driver that is gone takes nothing.
+        drop(rx);
+        state.session_report("c1", "gone", candidate(), now);
+        assert_eq!(captured.lines("driver gone; the session went").len(), 1);
+        assert!(
+            state.sessions.contains_key("s1"),
+            "the live session plays on"
+        );
+    }
+
     fn relayed(port: u16) -> Relayed {
         Relayed {
             lease: crate::net::turn_client::Lease::detached(SocketAddr::from((
@@ -2023,7 +2177,7 @@ mod tests {
         let captured = Captured::default();
         let _logs = captured.install();
         let mut state = State::default();
-        let (demand, _demand) = watch::channel(0);
+        let (demand, _demand) = watch::channel(Demand::default());
         let (commands, mut rx) = mpsc::channel(1);
         let key = ConnectionKey {
             url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
@@ -2207,7 +2361,7 @@ mod tests {
         let captured = Captured::default();
         let _logs = captured.install();
         let mut state = State::default();
-        let (demand, _demand) = watch::channel(0);
+        let (demand, _demand) = watch::channel(Demand::default());
         let (commands, _commands) = mpsc::channel(1);
         state.connections.insert(
             "c1".into(),

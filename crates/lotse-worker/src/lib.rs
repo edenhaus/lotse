@@ -8,7 +8,9 @@
 //! supervisor on the channel it inherited as stdin and runs `lotse-core` for
 //! its `SourceConnection`. Kept out of the binary so it is a library with
 //! tests; the counterpart of `lotse-supervisor`. A worker runs exactly one
-//! source; a second `RunSource` is a protocol error.
+//! source; a second `RunSource` is a protocol error. Its sockets come
+//! once too: a second `Sockets` message is refused and its descriptors
+//! closed.
 //!
 //! Standards: RFC 8837 §5 (the audio track's DSCP, `sendmsg`), RFC 3542
 //! §6.1 and Linux `ip(7)` (the candidate's source address, `sendmsg`),
@@ -722,8 +724,18 @@ impl Serving<'_> {
     }
 
     /// The shared UDP socket and the datagram channel: the session manager
-    /// starts on them.
+    /// starts on them. The supervisor hands them over once; a second
+    /// `Sockets` message once a session manager runs is refused, its
+    /// descriptors closed as they drop here, so it can neither replace the
+    /// manager with its sessions nor leave descriptors behind (WRK-6).
     fn on_sockets(&mut self, fds: Vec<OwnedFd>) {
+        if self.sessions.is_some() {
+            tracing::warn!(
+                fds = fds.len(),
+                "second sockets message: the worker holds its sockets; refused"
+            );
+            return;
+        }
         let mut fds = fds.into_iter();
         let (Some(udp), Some(datagrams)) = (fds.next(), fds.next()) else {
             tracing::warn!("sockets message without two descriptors; ignored");
@@ -2744,6 +2756,30 @@ mod tests {
         seen
     }
 
+    /// [`messages_until`], paced: the fake clock moves `step` only after
+    /// 10 ms of real time without a message, and never past `limit`, which
+    /// fails the test. Unpaced, it moves on every turn nothing is ready
+    /// yet, so on a loaded runner it runs ahead of the worker; this keeps
+    /// a wait clear of what the fake clock would bring on beyond `limit`.
+    async fn messages_paced(
+        h: &mut Harness,
+        step: Duration,
+        limit: Duration,
+        done: impl Fn(&[ToSupervisor]) -> bool,
+    ) -> Vec<ToSupervisor> {
+        let start = h.clock.now();
+        let mut seen = Vec::new();
+        while !done(&seen) {
+            let moved = h.clock.now().saturating_duration_since(start);
+            assert!(moved <= limit, "not within {limit:?}: {seen:?}");
+            tokio::select! {
+                message = h.next() => seen.push(message),
+                () = SystemClock.sleep(Duration::from_millis(10)) => h.clock.advance(step),
+            }
+        }
+        seen
+    }
+
     /// The session events among `messages`.
     fn session_events(messages: &[ToSupervisor]) -> impl Iterator<Item = (&str, &SessionEvent)> {
         messages.iter().filter_map(|message| match message {
@@ -2947,11 +2983,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rfc3550_6_4_1_tracks_synced_by_later_sender_reports_are_reported_again_once() {
         // The fake camera's first Sender Reports come a second after it
-        // went live (RFC 3550 §6.4.1), after the tracks were reported.
+        // went live (RFC 3550 §6.4.1), after the tracks were reported. Its
+        // clocks agree: drifting, the skew watchdog's re-anchor drops
+        // every fit after ten seconds or so, which a loaded runner's fake
+        // clock reached while the test waited (2026-10-18).
         let mut h = start_with_settings(registries(), quiet_settings());
         assert!(matches!(h.next().await, ToSupervisor::Ready { .. }));
         h.tx.send_msg(
-            &ToWorker::RunSource(spec("fake://cam/", r#"{"audio": "aac_drifting"}"#)),
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"audio": "aac_steady"}"#)),
             &[],
         )
         .await
@@ -3021,9 +3060,19 @@ mod tests {
         h.tx.send_msg(&ToWorker::OpenSession(early), &[])
             .await
             .unwrap();
-        let seen = messages_until(&mut h, |seen| {
-            echo_audio(seen).is_some() && seen.iter().any(|m| has_track(m, "a1") == Some(true))
-        })
+        // The session gets audio before the watchdog can withdraw it: that
+        // takes three occurrences of skew sustained 5 s, the first beyond
+        // 40 ms only 2 s after the first reports, so not within 15 s. A
+        // frame at a time, paced, so a loaded runner's fake clock does not
+        // run ahead of the worker into the withdrawal.
+        let seen = messages_paced(
+            &mut h,
+            Duration::from_millis(64),
+            Duration::from_secs(15),
+            |seen| {
+                echo_audio(seen).is_some() && seen.iter().any(|m| has_track(m, "a1") == Some(true))
+            },
+        )
         .await;
         assert_eq!(
             answers(&seen),
@@ -3849,6 +3898,66 @@ mod tests {
             h.next_closed().await,
             ("second".to_owned(), "internal_error".to_owned())
         );
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            ended(h.worker).await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+    }
+
+    /// WRK-6: the supervisor hands a worker its sockets once. A second
+    /// `Sockets` message is refused: its descriptors are closed at once,
+    /// and the session manager on the first ones, with its sessions, goes
+    /// on as it was.
+    #[tokio::test]
+    async fn a_second_sockets_message_is_refused_and_the_first_sockets_stay_in_use() {
+        let (logs, _guard) = Logs::capture();
+        let mut h = start_with(echo_registries());
+        h.next().await;
+        let (datagrams, shared_addr) = live_echo_session(&mut h).await;
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (ours, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
+        h.tx.send_msg(
+            &ToWorker::Sockets,
+            &[OwnedFd::from(udp).as_fd(), theirs.as_fd()],
+        )
+        .await
+        .unwrap();
+        drop(theirs);
+        let refused = "second sockets message: the worker holds its sockets; refused";
+        let deadline = SystemClock.now() + Duration::from_secs(10);
+        while logs.count(Level::WARN, refused) == 0 {
+            assert!(
+                SystemClock.now() < deadline,
+                "the second sockets message was not refused"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(logs.lines(Level::WARN, refused)[0].fields, " fds=2");
+        // Its channel's other end is closed: the worker kept no descriptor
+        // of it.
+        let ours = std::os::unix::net::UnixDatagram::from(ours);
+        ours.set_nonblocking(true).unwrap();
+        assert_eq!(ours.recv(&mut [0_u8; 1]).unwrap(), 0);
+        // The session still echoes over the first channel and the first
+        // shared socket.
+        let browser = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut frame = Vec::new();
+        lotse_ipc::datagram::encode(
+            "ufrag-echo",
+            browser.local_addr().unwrap(),
+            shared_addr,
+            b"still here",
+            &mut frame,
+        );
+        datagrams.send(&frame).unwrap();
+        browser.set_nonblocking(true).unwrap();
+        let browser = tokio::net::UdpSocket::from_std(browser).unwrap();
+        let mut buf = [0_u8; 64];
+        let (n, from) = within(browser.recv_from(&mut buf)).await.unwrap();
+        assert_eq!((&buf[..n], from), (&b"still here"[..], shared_addr));
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
             .await
             .unwrap();

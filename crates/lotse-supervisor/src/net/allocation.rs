@@ -15,8 +15,9 @@
 //! Implements RFC 8656 §5 (one allocation per 5-tuple, the same username
 //! for its life), §7.1 and §7.3 (Allocate and its success response), §7.4
 //! (437: an allocation of an earlier run holds the 5-tuple), §8 (Refresh
-//! before the lifetime ends, LIFETIME 0 deletes; §8.3: 437 means it is
-//! gone), §9 and §10 (permissions per peer IP, 300 s), §12 and §12.1
+//! before the lifetime ends, but not sooner than 10 s after a grant,
+//! since §7.2 and §8.2 never grant less than 600 s; LIFETIME 0 deletes;
+//! §8.3: 437 means it is gone), §9 and §10 (permissions per peer IP, 300 s), §12 and §12.1
 //! (channel bindings, 600 s, a number not rebound for 5 minutes), on RFC
 //! 8489 §5 (random transaction ids), §6.2.1 (UDP retransmission: `RTO`,
 //! `Rc`, `Rm`), §6.2.2 (reliable transports: `Ti`), §9.2 (the long-term
@@ -56,6 +57,23 @@ pub const CHANNEL_REBIND_WAIT: Duration = Duration::from_secs(300);
 /// The lifetime assumed when a success response carries no LIFETIME,
 /// which it must (RFC 8656 §7.3): the server default of §7.2, 10 minutes.
 const DEFAULT_LIFETIME: Duration = Duration::from_secs(600);
+
+/// The shortest wait from a server's grant of an allocation lifetime to
+/// its Refresh (RFC 8656 §8), so a server granting a LIFETIME at or below
+/// twice this (or zero) cannot make the client refresh in a loop.
+///
+/// A server following RFC 8656 never grants less than the 10-minute
+/// default: §7.2 (Allocate) and §8.2 (Refresh) both raise a shorter
+/// computed lifetime to it. A shorter grant comes from a server outside
+/// the RFC, and the floor bounds what it costs to one Refresh per 10 s.
+/// The alternative, assuming the 600 s default instead, is not taken:
+/// it would let the allocation lapse unnoticed for up to nine minutes,
+/// while the floor keeps honouring the grant as closely as a bounded
+/// rate allows and leaves every grant of 20 s or more as it was. A grant
+/// under 10 s may lapse before its Refresh; the Refresh is then answered
+/// 437 and the allocation re-created (§8.3), once per floor. Not from the
+/// RFCs, which leave how early to refresh to the client.
+const MIN_REFRESH_DELAY: Duration = Duration::from_secs(10);
 
 /// How often a signed request is signed again for a new challenge before
 /// it fails: a 401 that a fresh nonce does not cure is a credential the
@@ -100,7 +118,8 @@ pub struct AllocationConfig {
     pub lifetime: Duration,
     /// How long before an allocation, permission or binding ends it is
     /// refreshed: a minute; at most half the
-    /// lifetime the server granted.
+    /// lifetime the server granted, and an allocation never sooner than
+    /// 10 s after the grant (`MIN_REFRESH_DELAY`).
     pub refresh_margin: Duration,
 }
 
@@ -436,6 +455,10 @@ pub struct Allocation {
     closing: bool,
     /// An earlier run's allocation was deleted once already.
     cleared_stale: bool,
+    /// The server granted a lifetime too short for the refresh margin and
+    /// that was logged: the warning comes once per allocation machine, not
+    /// at every grant.
+    warned_short_lifetime: bool,
     /// Transaction ids.
     ids: TransactionIds,
     /// Outstanding requests by transaction id.
@@ -481,6 +504,7 @@ impl Allocation {
             state: State::Allocating,
             closing: false,
             cleared_stale: false,
+            warned_short_lifetime: false,
             ids: TransactionIds { seed, counter: 0 },
             transactions: HashMap::new(),
             sessions: BTreeSet::new(),
@@ -907,7 +931,7 @@ impl Allocation {
                 self.state = State::Allocated {
                     relayed,
                     expires: after(now, lifetime),
-                    refresh_at: after(now, refresh_delay(lifetime, self.config.refresh_margin)),
+                    refresh_at: after(now, self.allocation_refresh_delay(lifetime)),
                     refreshing: false,
                 };
                 self.events.push_back(Event::Allocated { relayed });
@@ -928,6 +952,19 @@ impl Allocation {
             }
             Err(err) => self.close(Some(AllocationError::Allocate(err))),
         }
+    }
+
+    /// How long after the server granted the allocation `lifetime` to
+    /// refresh it (RFC 8656 §8): [`refresh_delay`], but never under
+    /// [`MIN_REFRESH_DELAY`]. A grant the floor raises is a server outside
+    /// RFC 8656 §7.2 and §8.2, warned about once per machine.
+    fn allocation_refresh_delay(&mut self, lifetime: Duration) -> Duration {
+        let delay = refresh_delay(lifetime, self.config.refresh_margin);
+        if delay < MIN_REFRESH_DELAY && !self.warned_short_lifetime {
+            self.warned_short_lifetime = true;
+            tracing::warn!(server = %self.server, transport = self.transport.name(), granted_lifetime_s = lifetime.as_secs(), refresh_delay_s = MIN_REFRESH_DELAY.as_secs(), default_lifetime_s = DEFAULT_LIFETIME.as_secs(), "turn server granted an allocation lifetime below the RFC 8656 default; refreshing at the floor instead");
+        }
+        delay.max(MIN_REFRESH_DELAY)
     }
 
     /// The deletion of an earlier run's allocation ended: allocate again,
@@ -969,7 +1006,7 @@ impl Allocation {
                 self.state = State::Allocated {
                     relayed,
                     expires: after(now, lifetime),
-                    refresh_at: after(now, refresh_delay(lifetime, self.config.refresh_margin)),
+                    refresh_at: after(now, self.allocation_refresh_delay(lifetime)),
                     refreshing: false,
                 };
                 tracing::debug!(server = %self.server, lifetime_s = lifetime.as_secs(), "turn allocation refreshed");
@@ -1490,6 +1527,86 @@ mod tests {
         let mut rig = Rig::with_lifetime(Transport::Udp, 60 * SECOND);
         rig.allocated();
         assert_eq!(rig.machine.poll_timeout(), Some(rig.now() + 30 * SECOND));
+        assert!(!rig.machine.warned_short_lifetime);
+    }
+
+    #[test]
+    fn rfc8656_7_2_a_lifetime_below_the_refresh_margin_does_not_refresh_in_a_loop() {
+        let mut rig = Rig::with_lifetime(Transport::Udp, SECOND);
+        rig.allocated();
+        assert_eq!(rig.machine.poll_timeout(), Some(rig.now() + 10 * SECOND));
+        assert!(rig.machine.warned_short_lifetime);
+        rig.run_for(60 * SECOND);
+        // The 1 s allocation is gone by each Refresh, ten seconds later:
+        // the Refresh is answered 437 and the allocation re-created (§8.3),
+        // once per floor, not in a loop.
+        let refreshes = rig.log().iter().filter(|(m, ..)| *m == REFRESH).count();
+        assert_eq!(refreshes, 6);
+        let refreshed_at: Vec<Instant> = rig
+            .sent
+            .iter()
+            .filter(|(_, t)| stun::parse(&t.bytes).unwrap().method == turn::METHOD_REFRESH)
+            .map(|(at, _)| *at)
+            .collect();
+        for pair in refreshed_at.windows(2) {
+            assert_eq!(pair[1] - pair[0], 10 * SECOND);
+        }
+        assert!(rig.machine.warned_short_lifetime);
+    }
+
+    #[test]
+    fn rfc8656_7_2_a_lifetime_of_zero_is_refreshed_after_the_floor() {
+        let mut rig = Rig::with_lifetime(Transport::Udp, Duration::ZERO);
+        rig.pump();
+        assert_eq!(rig.machine.poll_timeout(), Some(rig.now() + 10 * SECOND));
+    }
+
+    #[test]
+    fn rfc8656_7_2_a_lifetime_just_under_twice_the_floor_is_refreshed_at_the_floor() {
+        let mut rig = Rig::with_lifetime(Transport::Udp, 19 * SECOND);
+        rig.allocated();
+        assert_eq!(rig.machine.poll_timeout(), Some(rig.now() + 10 * SECOND));
+        assert!(rig.machine.warned_short_lifetime);
+    }
+
+    #[test]
+    fn rfc8656_7_2_a_lifetime_of_twice_the_floor_is_refreshed_halfway_without_a_warning() {
+        let mut rig = Rig::with_lifetime(Transport::Udp, 20 * SECOND);
+        rig.allocated();
+        assert_eq!(rig.machine.poll_timeout(), Some(rig.now() + 10 * SECOND));
+        assert!(!rig.machine.warned_short_lifetime);
+    }
+
+    #[test]
+    fn rfc8656_7_2_a_lifetime_just_over_twice_the_floor_is_refreshed_halfway() {
+        let mut rig = Rig::with_lifetime(Transport::Udp, 21 * SECOND);
+        rig.allocated();
+        assert_eq!(
+            rig.machine.poll_timeout(),
+            Some(rig.now() + Duration::from_millis(10_500))
+        );
+        assert!(!rig.machine.warned_short_lifetime);
+    }
+
+    #[test]
+    fn rfc8656_8_a_short_lifetime_granted_by_a_refresh_is_floored_too() {
+        let mut rig = Rig::new(Transport::Udp);
+        rig.allocated();
+        assert!(!rig.machine.warned_short_lifetime);
+        rig.clock.advance(540 * SECOND);
+        rig.machine.handle_timeout(rig.now());
+        let refresh = rig.next();
+        let request = stun::parse(&refresh.bytes).unwrap();
+        // Signed as the user the rig already set up.
+        let user = rig.machine.credentials.username.clone();
+        let answer = signed(
+            &user,
+            Builder::new(Class::Success, turn::METHOD_REFRESH, request.transaction_id)
+                .attribute(turn::ATTR_LIFETIME, &2_u32.to_be_bytes()),
+        );
+        assert!(rig.machine.handle_input(rig.now(), &answer));
+        assert_eq!(rig.machine.poll_timeout(), Some(rig.now() + 10 * SECOND));
+        assert!(rig.machine.warned_short_lifetime);
     }
 
     #[test]

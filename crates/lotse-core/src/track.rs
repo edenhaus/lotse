@@ -7,9 +7,14 @@
 //! its capacity; the GOP cache is an immutable snapshot swapped on every
 //! frame, so readers take no lock; consecutive snapshots share their frames
 //! as one chain, so a frame costs the producer the same at any GOP length;
-//! the cache is bounded in payload bytes and in frames; a keyframe always
-//! fits the cache because `max_frame_bytes` never exceeds `gop_cache_bytes`
-//! and a keyframe alone is never over the frame bound.
+//! the cache always keeps its GOP's keyframe and adds frames after it only
+//! up to `gop_cache_bytes` of payload and `gop_cache_frames` frames, past
+//! which it is cut back to the keyframe; the keyframe itself is bounded
+//! only by `max_frame_bytes`, because a larger frame is dropped before it
+//! reaches the cache. Nothing checks `max_frame_bytes` against
+//! `gop_cache_bytes`: the cache holds at most the larger of the two, which
+//! is `gop_cache_bytes` with the defaults (equal, and the only limits a
+//! worker gives its tracks).
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};

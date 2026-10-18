@@ -114,22 +114,26 @@ run = [
 ]
 
 [tasks.mutants]
-description = "Mutation-testing gate on the lines changed against a base ref (default origin/main)"
+description = "Mutation-testing gate on the lines changed against a base ref (default origin/main), or on the whole workspace"
 usage = '''
 arg "[base]" help="git ref to diff against" default="origin/main"
+flag "--all" help="every mutant of the workspace, not only the changed lines; base is ignored (CI's nightly Mutants jobs)"
 flag "--shard <shard>" help="only this slice of the mutants, k/n with k from 0 (CI's Mutants jobs)"
 flag "--in-place" help="mutate the checked-out tree, not a copy, so its target/ builds (CI's throwaway checkout; an interrupted run can leave a mutation behind)"
-flag "--skip-baseline" help="no test run of the unmutated tree first; the tests' 240 s timeout is set instead of 5x the baseline's (CI, whose Mutants jobs start after its Tests jobs passed)"
+flag "--skip-baseline" help="no test run of the unmutated tree first; the tests' 240 s timeout is set instead of 5x the baseline's (CI, whose Mutants jobs test a tree its Tests jobs passed: a PR's in the same run, main's nightly in the run of its push)"
 '''
 run = """
-diff="$(mktemp)"
-git diff "${usage_base}...HEAD" > "$diff"
 set --
+if [ "${usage_all:-false}" != true ]; then
+  diff="$(mktemp)"
+  git diff "${usage_base}...HEAD" > "$diff"
+  set -- --in-diff "$diff"
+fi
 [ -z "${usage_shard:-}" ] || set -- "$@" --shard "$usage_shard"
 [ "${usage_in_place:-false}" != true ] || set -- "$@" --in-place
 # 240 s: nextest ends a hung test after 180 s (.config/nextest.toml), with room for the run around it.
 [ "${usage_skip_baseline:-false}" != true ] || set -- "$@" --baseline=skip --timeout 240
-cargo mutants --workspace --all-features --test-tool nextest --in-diff "$diff" "$@"
+cargo mutants --workspace --all-features --test-tool nextest "$@"
 """
 
 [tasks.mutants-cache]
@@ -143,6 +147,13 @@ for manifest in crates/*/Cargo.toml; do
   cargo nextest run --no-run --all-features --manifest-path "$manifest"
 done
 """
+
+[tasks.bench]
+description = "The divan microbenchmarks of the media path (benches/ of lotse-codec, lotse-http and lotse-supervisor), in the release profile; a report, not a gate. Arguments go to divan: a filter, --sample-count N, --help"
+# `--bench '*'`: the bench targets only; `--benches` would also run every library's unit tests
+# under libtest's bench harness, which rejects divan's flags. `--all-features`: the codec benches
+# build their input from its `test-util` fixtures. mise appends the task's arguments after `--`.
+run = "cargo bench --workspace --all-features --locked --bench '*' --"
 
 [tasks.turn-e2e]
 description = "The TURN client against a real coturn in Docker (UDP and TCP, long-term and REST credentials); needs docker and curl"

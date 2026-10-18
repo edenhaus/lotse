@@ -16,19 +16,21 @@
 //! 'none'`, CSP Level 3 §6.4.2), so no other page can click Play or Delete
 //! through them, and the viewer's page runs only its own inline script and
 //! style, matched by hash (CSP Level 3 §2.3.1), and connects only to its
-//! own origin. A browser message the daemon would refuse as too large is
-//! refused at the relay already. Its talk-back needs the microphone, which
-//! browsers expose to a secure context only: on plain HTTP, a page opened
-//! at a loopback address (W3C Secure Contexts §3.1). A development tool,
-//! never part of the daemon.
+//! own origin. The browser test's page connects where its `api` parameter
+//! says, so it is served only for an `api` on a loopback address. A
+//! browser message the daemon would refuse as too large is refused at the
+//! relay already. Its talk-back needs the microphone, which browsers
+//! expose to a secure context only: on plain HTTP, a page opened at a
+//! loopback address (W3C Secure Contexts §3.1). A development tool, never
+//! part of the daemon.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{self, WebSocket, WebSocketUpgrade};
+use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -38,6 +40,7 @@ use tokio::net::{TcpListener, UnixStream};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
+use url::{Host, Url};
 
 /// The page, which speaks the control API through the relay.
 pub const PAGE: &str = include_str!("dev_viewer.html");
@@ -54,9 +57,13 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// The browser test's page's policy: not framed (CSP Level 3 §6.4.2).
 /// Nothing else, because it runs its worker and audio worklet from `blob:`
 /// URLs and, for the comparison, signals to a server on another
-/// origin; it holds
+/// origin, which [`test_page`] keeps on a loopback address; it holds
 /// no credentials and runs in the test's own browser profile.
 const TEST_PAGE_POLICY: &str = "frame-ancestors 'none'";
+
+/// The most of a refused `api` parameter a log line carries, in bytes: it
+/// is whatever the link that opened the page says.
+const MAX_LOGGED_API_BYTES: usize = 256;
 
 /// The viewer page's policy ([`policy`] of [`PAGE`]).
 static PAGE_POLICY: LazyLock<String> = LazyLock::new(|| policy(PAGE));
@@ -142,10 +149,7 @@ fn same_origin(headers: &HeaderMap) -> bool {
 fn router(socket: PathBuf, cancel: CancellationToken) -> Router {
     Router::new()
         .route("/", get(|| async { page(PAGE, PAGE_POLICY.as_str()) }))
-        .route(
-            crate::browser::PAGE_PATH,
-            get(|| async { page(crate::browser::PAGE, TEST_PAGE_POLICY) }),
-        )
+        .route(crate::browser::PAGE_PATH, get(test_page))
         .route(RELAY_PATH, get(upgrade))
         .fallback(|| async { refuse(StatusCode::NOT_FOUND, "not found\n".to_owned()) })
         .with_state(Shared {
@@ -180,6 +184,69 @@ fn page(body: &'static str, policy: &str) -> Response {
         Html(body),
     )
         .into_response()
+}
+
+/// Whether the browser test page's `api` parameter, the go2rtc WebSocket
+/// URL it signals to for the comparison, names this machine: a `ws://` or
+/// `wss://` URL, without userinfo, whose host is a loopback address
+/// (127.0.0.0/8, RFC 1122 §3.2.1.3; `::1`, RFC 4291 §2.5.3) or
+/// `localhost` (RFC 6761 §6.3), as the browser's WebSocket constructor
+/// reads it (WHATWG URL Standard §4.4, `url`'s parser). Anything but
+/// visible ASCII, or a `\`, is refused before parsing: the URL parser
+/// strips tabs and newlines and reads `\` as `/`, and a browser that
+/// does so differently must not find another host in the same text.
+fn api_is_loopback(api: &str) -> bool {
+    if !api
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && byte != b'\\')
+    {
+        return false;
+    }
+    let Ok(url) = Url::parse(api) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "ws" | "wss")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        // The parser lowercases a special scheme's domain.
+        host => host == Some(Host::Domain("localhost")),
+    }
+}
+
+/// At most [`MAX_LOGGED_API_BYTES`] of `text`, cut at a character
+/// boundary.
+fn capped(text: &str) -> &str {
+    text.get(..text.floor_char_boundary(MAX_LOGGED_API_BYTES))
+        .unwrap_or(text)
+}
+
+/// `GET /test`: the browser test's page, unless an `api` parameter of its
+/// query (read as the page's `URLSearchParams` reads it, WHATWG URL
+/// Standard §5.1) is not on a loopback address ([`api_is_loopback`]):
+/// the page would open a WebSocket to it, so a link to the dev viewer
+/// could point the browser's signaling anywhere. Every `api` counts, not
+/// only the first, which the page takes.
+async fn test_page(RawQuery(query): RawQuery) -> Response {
+    let query = query.unwrap_or_default();
+    let refused = url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, value)| name == "api" && !api_is_loopback(value));
+    if let Some((_, api)) = refused {
+        tracing::warn!(
+            api = ?capped(&api),
+            "browser test page refused: its api parameter is not a WebSocket URL of a loopback address"
+        );
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "the api parameter must be a ws:// or wss:// URL of a loopback address\n".to_owned(),
+        );
+    }
+    page(crate::browser::PAGE, TEST_PAGE_POLICY)
 }
 
 /// A refusal with a plain-text reason.
@@ -825,6 +892,125 @@ mod tests {
             response.is_empty(),
             "a head cut short is no request: closed unanswered, {response}"
         );
+        cancel.cancel();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What counts as this machine in `api`: loopback addresses and
+    /// `localhost`, as the browser parses the URL, and nothing that a
+    /// parser could read as another host.
+    #[test]
+    fn rfc1122_s3_2_1_3_and_rfc4291_s2_5_3_only_a_loopback_api_is_accepted() {
+        for api in [
+            "ws://127.0.0.1:1984/api/ws",
+            "ws://127.255.255.254/",
+            "wss://127.0.0.1:1984/api/ws",
+            "ws://[::1]:1984/api/ws",
+            "ws://[0:0:0:0:0:0:0:1]/",
+            "ws://localhost:1984/api/ws",
+            "ws://LOCALHOST/",
+            "ws://0x7f.1/",
+        ] {
+            assert!(api_is_loopback(api), "{api}");
+        }
+        for api in [
+            "ws://192.0.2.1:1984/api/ws",
+            "ws://10.0.0.1/",
+            "ws://128.0.0.1/",
+            "ws://[2001:db8::1]:1984/api/ws",
+            "ws://[::ffff:127.0.0.1]/",
+            "ws://evil.example/",
+            "ws://localhost.evil.example/",
+            "ws://localhost./",
+            "http://127.0.0.1/",
+            "wss+x://127.0.0.1/",
+            "ws://user@127.0.0.1/",
+            "ws://:secret@127.0.0.1/",
+            "ws://127.0.0.1@evil.example/",
+            "ws://127.0.0.1\\@evil.example/",
+            "ws://127.0.0.1 /",
+            "ws://127.0.0.1\t.evil.example/",
+            "ws://127.0.0.1\n.evil.example/",
+            "ws://127.0.0.1/\u{e9}",
+            "ws://[::1/",
+            "/api/ws",
+            "",
+        ] {
+            assert!(!api_is_loopback(api), "{api:?}");
+        }
+    }
+
+    #[test]
+    fn a_logged_api_is_capped_at_a_character_boundary() {
+        assert_eq!(capped("ws://127.0.0.1/"), "ws://127.0.0.1/");
+        let long = "a".repeat(MAX_LOGGED_API_BYTES + 10);
+        assert_eq!(capped(&long).len(), MAX_LOGGED_API_BYTES);
+        let wide = format!("{}\u{e9}", "a".repeat(MAX_LOGGED_API_BYTES - 1));
+        assert_eq!(capped(&wide), "a".repeat(MAX_LOGGED_API_BYTES - 1));
+        let exact = "a".repeat(MAX_LOGGED_API_BYTES);
+        assert_eq!(capped(&exact), exact);
+    }
+
+    /// DEV-10 (2026-10-16): the browser test page opens a WebSocket to its
+    /// `api` parameter, so the page is served only when every `api` names a
+    /// loopback address (RFC 1122 §3.2.1.3, RFC 4291 §2.5.3) or
+    /// `localhost` (RFC 6761 §6.3); anything else is a `400` and the page
+    /// is not sent.
+    #[tokio::test]
+    async fn rfc1122_s3_2_1_3_the_test_page_refuses_an_api_that_is_not_loopback() {
+        let (dir, socket) = fake_daemon("api");
+        let (addr, cancel) = start(socket).await;
+        for api in [
+            "ws://127.0.0.1:1984/api/ws",
+            "ws%3A%2F%2F127.0.0.1%3A1984%2Fapi%2Fws",
+            "ws://127.255.255.254:1984/api/ws",
+            "ws://%5B::1%5D:1984/api/ws",
+            "wss://localhost:1984/api/ws",
+            "ws://LocalHost/api/ws",
+        ] {
+            let page = get(addr, &format!("/test?signal=go2rtc&api={api}")).await;
+            assert!(page.starts_with("HTTP/1.1 200 OK"), "{api}: {page}");
+            assert!(page.contains("window.lotseTest"), "{api}: {page}");
+        }
+        // Without `api`, or with other parameters only, it is the page.
+        for query in [
+            "",
+            "?signal=go2rtc",
+            "?apix=ws://192.0.2.1/",
+            "?signal=ws://192.0.2.1/",
+        ] {
+            let page = get(addr, &format!("/test{query}")).await;
+            assert!(page.starts_with("HTTP/1.1 200 OK"), "{query}: {page}");
+        }
+        for api in [
+            "ws://192.0.2.1:1984/api/ws",
+            "ws://10.0.0.1/api/ws",
+            "ws://%5B2001:db8::1%5D:1984/api/ws",
+            "ws://evil.example/api/ws",
+            "ws://localhost.evil.example/api/ws",
+            "ws://127.0.0.1@evil.example/api/ws",
+            "ws%3A%2F%2F192.0.2.1%2F",
+            "http://127.0.0.1:1984/api/ws",
+            "/api/ws",
+            "",
+        ] {
+            let refused = get(addr, &format!("/test?signal=go2rtc&api={api}")).await;
+            assert!(refused.starts_with("HTTP/1.1 400"), "{api}: {refused}");
+            assert!(!refused.contains("window.lotseTest"), "{api}: {refused}");
+            assert!(
+                refused.ends_with(
+                    "the api parameter must be a ws:// or wss:// URL of a loopback address\n"
+                ),
+                "{api}: {refused}"
+            );
+        }
+        // Every `api` counts, not only the first the page reads.
+        let second = get(
+            addr,
+            "/test?api=ws://127.0.0.1/api/ws&api=ws://192.0.2.1/api/ws",
+        )
+        .await;
+        assert!(second.starts_with("HTTP/1.1 400"), "{second}");
         cancel.cancel();
         std::fs::remove_dir_all(&dir).unwrap();
     }

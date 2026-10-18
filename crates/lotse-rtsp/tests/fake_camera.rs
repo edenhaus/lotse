@@ -3,6 +3,8 @@
 //! cut-through packets and side-branch frames, sync hints, credentials,
 //! typed errors for unreachable, timeout and ended, cancellation with a
 //! teardown, a camera without marker bits, a timestamp reset (one epoch),
+//! timestamps jumping on every frame (a bounded number of epochs, then a
+//! protocol error),
 //! a reconnect through core's runner (same tracks, one epoch), PCMU audio
 //! cut through, AAC audio framed on the side branch, an H.265 camera
 //! through the RFC 7798 normalizers, an H.265 camera whose payloads carry
@@ -745,6 +747,47 @@ async fn a_timestamp_reset_starts_one_epoch_and_forgets_the_clock_fit() {
     harness.cancel();
     harness.finish().await;
     cam.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rfc3550_5_1_timestamps_jumping_on_every_frame_end_the_attempt_after_a_bounded_number_of_epochs()
+ {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .finish();
+    let _logs = tracing::subscriber::set_default(subscriber);
+    // From the second GOP on, every frame jumps back by ~22 000 s.
+    let cam = camera(CameraConfig {
+        timestamp_jump: Some((30, 0x9000_0000)),
+        timestamp_jump_repeats: true,
+        ..CameraConfig::default()
+    })
+    .await;
+    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(harness.wait_ready().await);
+    let v0 = Arc::clone(&harness.tracks.tracks()[0]);
+    // Thirty frames a second: every jump falls within one 10 s window.
+    let exit = tokio::select! {
+        exit = harness.finish() => exit,
+        () = clock().sleep(Duration::from_secs(10)) => panic!("the attempt goes on"),
+    };
+    cam.stop().await;
+    assert!(
+        matches!(exit, SourceExit::Ended(SourceError::Protocol(ref m)) if m.contains("RFC 3550 §5.1")),
+        "{exit:?}"
+    );
+    assert_eq!(v0.epoch(), 10, "ten new timelines, then the attempt ends");
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let jumps = logs
+        .lines()
+        .filter(|l| l.contains("timestamps jumped; new epoch"))
+        .count();
+    assert_eq!(jumps, 1, "one line per summary interval: {logs}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

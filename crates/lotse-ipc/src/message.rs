@@ -28,7 +28,8 @@ pub enum ToWorker {
         deadline_ms: u32,
     },
     /// The shared UDP socket and the worker's end of the datagram channel
-    /// follow as descriptors, in that order.
+    /// follow as descriptors, in that order. Sent once per worker; the
+    /// worker refuses a second one.
     Sockets,
     /// An ICE-TCP connection whose first STUN request named one of this
     /// worker's sessions; its descriptor follows.

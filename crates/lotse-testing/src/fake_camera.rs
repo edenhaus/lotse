@@ -658,6 +658,9 @@ pub struct CameraConfig {
     /// From this frame on, add these ticks to every timestamp: a camera
     /// that reset its clock mid-stream.
     pub timestamp_jump: Option<(u32, u32)>,
+    /// With `timestamp_jump`, the jump repeats at every frame from its
+    /// first on: a camera whose clock leaves its timeline on every frame.
+    pub timestamp_jump_repeats: bool,
     /// Stamp every access unit with its send time since this origin, in a
     /// leading SEI NAL unit ([`crate::latency`]); H.264 only.
     pub stamp_origin: Option<Instant>,
@@ -782,6 +785,7 @@ impl Default for CameraConfig {
             sr_every: 30,
             packets_before_close: None,
             timestamp_jump: None,
+            timestamp_jump_repeats: false,
             stamp_origin: None,
             packet_spacing: Duration::ZERO,
             audio: None,
@@ -2164,6 +2168,9 @@ impl Connection {
             .checked_div(self.config.fps.max(1))
             .unwrap_or(3_000);
         let jump = match self.config.timestamp_jump {
+            Some((from, ticks)) if index >= from && self.config.timestamp_jump_repeats => {
+                ticks.wrapping_mul(index.wrapping_sub(from).wrapping_add(1))
+            }
             Some((from, ticks)) if index >= from => ticks,
             _ => 0,
         };

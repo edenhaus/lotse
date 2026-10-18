@@ -121,7 +121,8 @@ pub(crate) struct ServeArgs {
     pub(crate) allow_uid: Option<u32>,
 
     /// The control API over mutual TLS on this address, next to the socket;
-    /// off unless set. Needs `--data-dir` and at least one client pin.
+    /// off unless set. Needs `--data-dir`. Starts without a client pin too:
+    /// with no client allowed or paired, it logs a pairing code at startup.
     #[arg(long, env = "LOTSE_CONTROL_LISTEN", value_name = "ADDR")]
     pub(crate) control_listen: Option<SocketAddr>,
 
@@ -138,7 +139,7 @@ pub(crate) struct ServeArgs {
 
     /// Where the daemon keeps what outlives a restart: the control TLS
     /// listener's key and certificate. Must exist, belong to the starting uid
-    /// and not be writable by the group or others.
+    /// and give the group and others no access (mode 0700 or stricter).
     #[arg(long, env = "LOTSE_DATA_DIR", value_name = "PATH")]
     pub(crate) data_dir: Option<PathBuf>,
 
