@@ -45,7 +45,10 @@
 //! interleaved path; a raw stream still goes on the RTSP connection.
 //!
 //! The URL carries credentials, as a camera's does, and the attempt's
-//! error never shows its password. Flag bit 5
+//! error never shows its password unless the camera sent it: the camera
+//! records every byte it writes, as it writes them (headers without their
+//! CR and LF), and only a password among them may come back quoted.
+//! Flag bit 5
 //! makes the camera challenge first (RFC 2326 §7.1.1, RFC 7235 §3.1): the
 //! first request on each connection, the source's, the backchannel
 //! probe's and the talker's, is answered `401 Unauthorized` with a
@@ -67,6 +70,7 @@
 
 #![no_main]
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -221,8 +225,9 @@ async fn request(socket: &mut TcpStream, buf: &mut Vec<u8>) -> Option<(String, S
 
 /// Plays `script` to every connection on `listener`, side by side: the
 /// backchannel's probe and its session come on connections of their own
-/// while the stream's plays.
-async fn camera(listener: TcpListener, base: String, script: Script<'_>) {
+/// while the stream's plays. Every byte it sends, on any connection or as
+/// a datagram, is appended to `sent`.
+async fn camera(listener: TcpListener, base: String, script: Script<'_>, sent: &RefCell<Vec<u8>>) {
     let mut plays: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>> = Vec::new();
     loop {
         let accepted = std::future::poll_fn(|cx| {
@@ -233,13 +238,13 @@ async fn camera(listener: TcpListener, base: String, script: Script<'_>) {
         let Ok((socket, _)) = accepted else {
             return;
         };
-        plays.push(Box::pin(play(socket, &base, &script)));
+        plays.push(Box::pin(play(socket, &base, &script, sent)));
     }
 }
 
 /// Plays `script` on `socket`, then hangs up; returns once the source
-/// closed its end.
-async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
+/// closed its end. What it writes is appended to `sent` first.
+async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>, sent: &RefCell<Vec<u8>>) {
     // A reset, not a TIME_WAIT, when the attempt is over: tens of
     // thousands of connections a minute would run out of ports.
     let _ = socket.set_zero_linger();
@@ -269,6 +274,7 @@ async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
                 "RTSP/1.0 401 Unauthorized\r\nCSeq: {cseq}\r\nWWW-Authenticate: {}\r\nContent-Length: 0\r\n\r\n",
                 header_value(www_authenticate)
             );
+            sent.borrow_mut().extend_from_slice(reply.as_bytes());
             if socket.write_all(reply.as_bytes()).await.is_err() {
                 return;
             }
@@ -311,14 +317,17 @@ async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
             }
             _ => (ok("", &[]), false),
         };
+        sent.borrow_mut().extend_from_slice(&reply);
         if socket.write_all(&reply).await.is_err() {
             return;
         }
         if then_stream {
             if script.flags & 0x18 == 0x10 {
-                send_datagrams(script, &client_ports).await;
+                send_datagrams(script, &client_ports, sent).await;
             } else {
-                let _ = socket.write_all(&script.stream()).await;
+                let stream = script.stream();
+                sent.borrow_mut().extend_from_slice(&stream);
+                let _ = socket.write_all(&stream).await;
             }
             break;
         }
@@ -362,9 +371,10 @@ async fn talk(slot: BackchannelSlot) {
     std::future::pending::<()>().await;
 }
 
-/// Sends the script's records as datagrams to the client's ports, then
-/// gives the relay a moment to read them before the hang-up.
-async fn send_datagrams(script: &Script<'_>, client_ports: &[u16]) {
+/// Sends the script's records as datagrams to the client's ports, each
+/// appended to `sent` first, then gives the relay a moment to read them
+/// before the hang-up.
+async fn send_datagrams(script: &Script<'_>, client_ports: &[u16], sent: &RefCell<Vec<u8>>) {
     let Ok(sender) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else {
         return;
     };
@@ -373,6 +383,7 @@ async fn send_datagrams(script: &Script<'_>, client_ports: &[u16]) {
             continue;
         };
         let port = port.saturating_add(u16::from(channel & 1));
+        sent.borrow_mut().extend_from_slice(payload);
         let _ = sender.send_to(payload, ("127.0.0.1", port)).await;
     }
     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -437,9 +448,12 @@ fuzz_target!(|data: &[u8]| {
             }
             std::future::pending::<()>().await;
         };
+        // Every byte the camera sent: the password may come back only
+        // when it is among them.
+        let sent = RefCell::new(Vec::new());
         let exit = tokio::select! {
             exit = source.run(ctx) => exit,
-            () = camera(listener, base, script) => unreachable!("the camera never ends"),
+            () = camera(listener, base, script, &sent) => unreachable!("the camera never ends"),
             () = ingest => unreachable!("the ingest never ends"),
             () = talk(slot) => unreachable!("the talker never ends"),
         };
@@ -447,7 +461,8 @@ fuzz_target!(|data: &[u8]| {
             panic!("an RTSP camera resolves to nothing: {exit:?}");
         };
         let secret = PASSWORD.as_bytes();
-        if !data.windows(secret.len()).any(|window| window == secret) {
+        let sent = sent.into_inner();
+        if !sent.windows(secret.len()).any(|window| window == secret) {
             assert!(
                 !err.to_string().contains(PASSWORD),
                 "the error shows the password: {err}"
