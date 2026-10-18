@@ -19,7 +19,7 @@ changing `[tools]`, run `mise lock` and commit both files.
 
 Every check is a prek hook in `.pre-commit-config.yaml`: fmt, clippy,
 rustdoc, cargo-hack, cargo-shear, the fuzz crate's `cargo check`, the
-crate-layering and license-list checks, cargo-deny, codespell, actionlint, zizmor and file hygiene run on `git commit` (only when matching files changed).
+crate-layering, license-list and fuzz-select checks, cargo-deny, codespell, actionlint, zizmor and file hygiene run on `git commit` (only when matching files changed).
 Add new checks there. No test
 is a hook: the tests, the doctests, coverage and mutants are mise tasks
 that CI runs.

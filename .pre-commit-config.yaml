@@ -113,6 +113,14 @@ repos:
         language: system
         files: (\.cargo/deny\.toml|\.cargo/about\.toml|scripts/check_license_lists\.py)$
         pass_filenames: false
+      - id: fuzz-select
+        name: fuzz select (scripts/fuzz-select.sh picks the targets a change reaches)
+        # CI's Fuzz build job runs only the targets the script picks on a PR, so a target it misses
+        # goes unfuzzed: its cases in a throwaway git repository.
+        entry: scripts/fuzz-select-test.sh
+        language: system
+        files: ^scripts/fuzz-select
+        pass_filenames: false
       - id: cargo-deny
         name: cargo deny
         # advisories need the network and change without our code changing: CI's Security audit job
