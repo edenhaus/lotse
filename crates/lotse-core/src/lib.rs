@@ -51,7 +51,7 @@ pub use id::{IdError, SessionId, StreamId};
 pub use media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields};
 pub use negotiate::{NegotiationError, TrackInfo, TrackPlan, negotiate};
 pub use orientation::Orientation;
-pub use output::{Delivery, JoinPolicy, OutputFactory, Sink, StreamSubscription, TrackRequest};
+pub use output::{OutputFactory, TrackRequest};
 pub use registry::Registries;
 pub use runner::{RunnerConfig, RunnerEvent, SourceRunner};
 pub use secret::{RedactedUrl, Secret};

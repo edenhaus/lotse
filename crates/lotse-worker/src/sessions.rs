@@ -1662,7 +1662,7 @@ mod tests {
     use lotse_core::codec::{Codec, Kind};
     use lotse_core::let_assert;
     use lotse_core::media::RtpHeaderFields;
-    use lotse_core::output::{OutputShape, TrackRequest};
+    use lotse_core::output::TrackRequest;
     use lotse_core::session::{SessionOpenError, SessionStats};
     use lotse_core::source::{TrackPublisher, TrackSet};
     use lotse_core::track::{GopSnapshot, TrackId, TrackLimits};
@@ -1875,10 +1875,6 @@ mod tests {
     impl OutputFactory for ScriptedOutput {
         fn kind(&self) -> &'static str {
             "webrtc"
-        }
-
-        fn shape(&self) -> OutputShape {
-            OutputShape::Session
         }
 
         fn session_tracks(&self, audio: bool) -> Vec<TrackRequest> {
@@ -3245,8 +3241,6 @@ mod tests {
             )]
         );
         // The parts no test session reaches.
-        let output = ScriptedOutput::default();
-        assert_eq!(output.shape(), OutputShape::Session);
         let engine = Scripted {
             script: Arc::default(),
             idle: rig.clock.now(),

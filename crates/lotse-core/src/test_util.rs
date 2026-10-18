@@ -13,7 +13,7 @@ use crate::clock::Clock;
 use crate::codec::{Codec, CodecFamily, Kind};
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
 use crate::orientation::Orientation;
-use crate::output::{OutputFactory, OutputShape, TalkbackRequest, TrackRequest};
+use crate::output::{OutputFactory, TalkbackRequest, TrackRequest};
 use crate::session::{
     RenegotiateError, SessionEngine, SessionEvent, SessionOpenError, SessionOutput, SessionRequest,
     SessionStats, TalkbackClaim, TalkbackTarget, Transport,
@@ -853,17 +853,25 @@ fn pcmu_packet(arrival: Instant, seq: u16) -> MediaPacket {
     }
 }
 
-/// An output factory with a fixed kind and shape.
+/// An output factory with a fixed kind that wants no tracks and answers
+/// no offer: it refuses every one as invalid SDP.
 #[derive(Debug)]
-pub struct FakeOutputFactory(pub &'static str, pub OutputShape);
+pub struct FakeOutputFactory(pub &'static str);
 
 impl OutputFactory for FakeOutputFactory {
     fn kind(&self) -> &'static str {
         self.0
     }
 
-    fn shape(&self) -> OutputShape {
-        self.1
+    fn open_session(
+        &self,
+        _request: SessionRequest,
+        _now: Instant,
+    ) -> Result<(Box<dyn SessionEngine>, String), SessionOpenError> {
+        Err(SessionOpenError::InvalidSdp(format!(
+            "the fake {} output answers no offer",
+            self.0
+        )))
     }
 }
 
@@ -909,10 +917,6 @@ fn echo_talkback(
 impl OutputFactory for EchoSessionFactory {
     fn kind(&self) -> &'static str {
         "webrtc"
-    }
-
-    fn shape(&self) -> OutputShape {
-        OutputShape::Session
     }
 
     fn session_tracks(&self, audio: bool) -> Vec<TrackRequest> {
@@ -2097,10 +2101,7 @@ mod tests {
                 to: CodecFamily::Opus
             }
         );
-        assert_eq!(
-            FakeOutputFactory("snapshot", OutputShape::Request).kind(),
-            "snapshot"
-        );
+        assert_eq!(FakeOutputFactory("snapshot").kind(), "snapshot");
     }
 
     #[test]
@@ -2290,10 +2291,7 @@ mod tests {
             wall: std::time::SystemTime::UNIX_EPOCH,
         };
         let factory = EchoSessionFactory;
-        assert_eq!(
-            (factory.kind(), factory.shape()),
-            ("webrtc", OutputShape::Session)
-        );
+        assert_eq!(factory.kind(), "webrtc");
         let tracks = factory.session_tracks(true);
         assert_eq!(tracks.len(), 2);
         assert!(tracks[0].required && tracks[0].accept == [CodecFamily::H264]);
@@ -2303,6 +2301,14 @@ mod tests {
             factory.open_session(request("refuse"), now),
             Err(SessionOpenError::InvalidSdp(_))
         ));
+        assert_eq!(
+            FakeOutputFactory("fake")
+                .open_session(request("v=0"), now)
+                .err(),
+            Some(SessionOpenError::InvalidSdp(
+                "the fake fake output answers no offer".into()
+            ))
+        );
         let (mut engine, answer) = factory.open_session(request("v=0"), now).unwrap();
         assert_eq!(answer, ECHO_ANSWER);
         assert_eq!(

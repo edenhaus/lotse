@@ -1276,7 +1276,6 @@ mod tests {
     use lotse_core::clock::FakeClock;
     use lotse_core::codec::{Codec, Kind};
     use lotse_core::let_assert;
-    use lotse_core::output::OutputShape;
     use lotse_core::source::{
         Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor, SourceError,
         SourceFactory,
@@ -1322,7 +1321,7 @@ mod tests {
             .unwrap();
         registries
             .outputs
-            .register(Arc::new(FakeOutputFactory("webrtc", OutputShape::Session)))
+            .register(Arc::new(FakeOutputFactory("webrtc")))
             .unwrap();
         Arc::new(registries)
     }
@@ -3152,23 +3151,46 @@ mod tests {
             "webrtc"
         }
 
-        fn shape(&self) -> OutputShape {
-            OutputShape::Session
-        }
-
         fn session_tracks(&self, audio: bool) -> Vec<lotse_core::output::TrackRequest> {
             let mut requests = EchoSessionFactory.session_tracks(audio);
             requests[0].accept = vec![lotse_core::codec::CodecFamily::H265];
             requests
         }
+
+        fn open_session(
+            &self,
+            request: lotse_core::session::SessionRequest,
+            now: std::time::Instant,
+        ) -> Result<
+            (Box<dyn lotse_core::session::SessionEngine>, String),
+            lotse_core::session::SessionOpenError,
+        > {
+            EchoSessionFactory.open_session(request, now)
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unmet_video_request_closes_the_session_and_stops_what_audio_started() {
-        assert_eq!(
-            lotse_core::output::OutputFactory::shape(&WantsH265),
-            OutputShape::Session
-        );
+        // It answers as the echo does, should negotiation ever let it.
+        let request = lotse_core::session::SessionRequest {
+            offer: "v=0".into(),
+            ice: lotse_core::session::IceCredentials {
+                ufrag: "u".into(),
+                pass: "p".into(),
+            },
+            candidates: vec![],
+            tcp_candidates: vec![],
+            video: Arc::new(Codec::Pcmu),
+            audio: None,
+            backchannel: None,
+            claim: lotse_core::session::TalkbackClaim::Granted,
+            orientation: lotse_core::Orientation::default(),
+            limits: SessionLimits::default(),
+            wall: SystemTime::UNIX_EPOCH,
+        };
+        let opened =
+            lotse_core::output::OutputFactory::open_session(&WantsH265, request, SystemClock.now());
+        assert_eq!(opened.map(|(_, answer)| answer), Ok(ECHO_ANSWER.to_owned()));
         let (mut h, transcoder) =
             aac_worker_with(derived::fake::Forwarding::default(), Arc::new(WantsH265)).await;
         let mut session = session_spec("h265");

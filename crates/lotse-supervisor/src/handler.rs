@@ -1473,7 +1473,6 @@ mod tests {
     use lotse_core::clock::{FakeClock, SystemClock};
     use lotse_core::connection::{ConnectionError, ConnectionState};
     use lotse_core::let_assert;
-    use lotse_core::output::OutputShape;
     use lotse_core::source::SourceError;
     use lotse_core::test_util::{FakeOutputFactory, FakeSourceFactory};
     use lotse_ipc::SessionEvent as Report;
@@ -1566,7 +1565,7 @@ mod tests {
         environment
             .registries
             .outputs
-            .register(Arc::new(FakeOutputFactory(WEBRTC, OutputShape::Session)))
+            .register(Arc::new(FakeOutputFactory(WEBRTC)))
             .unwrap();
         environment.front_door = Some(front_door);
         environment
@@ -1732,7 +1731,7 @@ mod tests {
                 environment
                     .registries
                     .outputs
-                    .register(Arc::new(FakeOutputFactory(WEBRTC, OutputShape::Session)))
+                    .register(Arc::new(FakeOutputFactory(WEBRTC)))
                     .unwrap();
             }
             let s = Supervisor::new(

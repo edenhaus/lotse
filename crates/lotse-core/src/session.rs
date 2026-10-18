@@ -161,9 +161,6 @@ pub enum SessionOpenError {
     /// No offered video payload type carries the stream's codec.
     #[error("video codec unsupported: {0}")]
     VideoCodecUnsupported(String),
-    /// The output kind does not open sessions.
-    #[error("{0} outputs do not open sessions")]
-    NotASession(&'static str),
 }
 
 impl SessionOpenError {
@@ -173,7 +170,6 @@ impl SessionOpenError {
             Self::InvalidSdp(_) => "invalid_sdp",
             Self::NoVideoTrack => "no_video_track",
             Self::VideoCodecUnsupported(_) => "video_codec_unsupported",
-            Self::NotASession(_) => "internal_error",
         }
     }
 }
@@ -547,7 +543,6 @@ mod tests {
             SessionOpenError::VideoCodecUnsupported("h265".into()).code(),
             "video_codec_unsupported"
         );
-        assert_eq!(SessionOpenError::NotASession("x").code(), "internal_error");
         assert_eq!(
             RenegotiateError::InvalidSdp("x".into()).code(),
             "invalid_sdp"
