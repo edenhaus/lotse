@@ -31,6 +31,7 @@ tokio-rustls = { workspace = true } # the fake camera's TLS mode (`rtsps`)
 tokio-tungstenite = { workspace = true } # the dev viewer's WebSocket to the daemon; the load generator's control connection
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true } # the dev viewer: the browser test page's `api` parameter, parsed as the browser parses it
 lotse-api-types = { workspace = true } # the load generator reads `metrics/get` through its type
 lotse-codec = { workspace = true, features = ["test-util"] } # hand-built parameter sets for the fake camera's stream
 lotse-core = { workspace = true }

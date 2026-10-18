@@ -29,11 +29,11 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: "14 0 * * *" # nightly: the browser test, the go2rtc comparison, load, soak, every fuzz target for 5 min
+    - cron: "14 0 * * *" # nightly: the browser test, the go2rtc comparison, load, soak, every fuzz target for 5 min, every mutant
   workflow_dispatch:
     inputs:
       nightly:
-        description: "Also run the nightly jobs (browser test, comparison, load, soak) and fuzz each target for 5 min"
+        description: "Also run the nightly jobs (browser test, comparison, load, soak, every mutant) and fuzz each target for 5 min"
         type: boolean
         default: false
       play:
@@ -378,9 +378,10 @@ jobs:
       - id: plan
         run: scripts/mutants-shards.sh "origin/$BASE_REF" >>"$GITHUB_OUTPUT"
 
-  # The Mutants jobs' build cache, made on main, whose caches every PR restores: each package's tests
-  # built alone (`mise run mutants-cache`), as cargo-mutants builds a mutant. The Mutants jobs save
-  # none: a job that misses a mutant fails, and rust-cache saves only after a job that passes.
+  # The Mutants jobs' build cache, made on main, which every PR and the nightly run restore: each
+  # package's tests built alone (`mise run mutants-cache`), as cargo-mutants builds a mutant. The
+  # Mutants jobs save none: a job that misses a mutant fails, and rust-cache saves only after a job
+  # that passes.
   mutants-cache:
     name: Mutants cache
     if: github.event_name == 'push'
@@ -437,6 +438,61 @@ jobs:
           shared-key: mutants
           save-if: false # the Mutants cache job's, from main
       - run: mise run mutants --shard "$SHARD/$SHARDS" --in-place --skip-baseline "origin/$BASE_REF"
+
+  # How many nightly Mutants jobs the whole workspace needs (scripts/mutants-shards.sh --all): up
+  # to 300 mutants a job, at most 40 jobs. The PR runs' shards took 3 to 11 s a mutant
+  # (2026-10-17), so a slice of 300 takes under an hour, and the 6 h job limit leaves room for
+  # mutants that hang until their 240 s timeout. The workspace had 6030 mutants (2026-10-17), 21
+  # jobs; 40 jobs hold 12000 before a job gets more than 300. Listing them builds nothing.
+  mutants-all-plan:
+    name: Mutants plan (whole workspace)
+    if: github.event_name == 'schedule' || inputs.nightly
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: rust cargo:cargo-mutants
+      - id: plan
+        run: scripts/mutants-shards.sh --all 300 40 >>"$GITHUB_OUTPUT"
+
+  # Every mutant of the workspace, nightly and by hand, tested as the Mutants jobs test a PR's
+  # changed lines: consecutive slices, each mutating its checkout in place from the Mutants cache
+  # job's build on main, no baseline, no debug info. The baseline's stand-in is main's push run,
+  # whose Tests jobs passed the same tree; a nightly run has no Tests jobs of its own.
+  mutants-all:
+    name: Mutants (whole workspace, shard ${{ matrix.shard }})
+    needs: mutants-all-plan
+    if: needs.mutants-all-plan.outputs.shards != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.mutants-all-plan.outputs.shards) }}
+    runs-on: ubuntu-latest
+    env:
+      SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ needs.mutants-all-plan.outputs.count }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: rust cmake github:nextest-rs/nextest cargo:cargo-mutants
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mutants
+          save-if: false # the Mutants cache job's, from main
+      - run: mise run mutants --all --shard "$SHARD/$SHARDS" --in-place --skip-baseline
 
   # The fuzz targets, built once (cargo-fuzz's release build with AddressSanitizer, on the pinned
   # nightly) when the change reaches what they are built from. On a PR only the targets built from
@@ -685,6 +741,7 @@ jobs:
       - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           languages: ${{ matrix.language }}
+          config-file: ./.github/codeql/codeql-config.yml # test code kept out of the results
       - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           category: /language:${{ matrix.language }}
@@ -951,6 +1008,8 @@ jobs:
       - mutants-plan
       - mutants-cache
       - mutants
+      - mutants-all-plan
+      - mutants-all
       - fuzz-build
       - fuzz
       - fuzz-corpus

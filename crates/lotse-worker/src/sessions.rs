@@ -518,12 +518,35 @@ fn request_close(close: &watch::Sender<CloseRequest>, code: &'static str, messag
     });
 }
 
-/// Reads the datagram channel and queues each frame for its session.
+/// Reads the datagram channel and queues each frame for its session,
+/// until the channel fails or the supervisor closes its end.
+///
+/// The buffer is one byte longer than [`datagram::MAX_FRAME_LEN`]: the
+/// socket cuts a longer frame to the buffer, so a read that fills it is a
+/// cut frame, malformed, and one that does not is whole.
 async fn route_loop(datagrams: Arc<UnixDatagram>, routes: Routes, stats: Arc<RouterStats>) {
-    let mut buf =
-        vec![0_u8; datagram::MAX_DATAGRAM_PAYLOAD.saturating_add(datagram::HEADER_LEN + 256)];
+    let mut buf = vec![0_u8; datagram::MAX_FRAME_LEN.saturating_add(1)];
     loop {
         let len = match datagrams.recv(&mut buf).await {
+            // A read of zero bytes on a `SOCK_SEQPACKET` socket is the
+            // peer's end closing (unix(7), recv(2)); every lotse frame
+            // carries a header, so none is empty.
+            Ok(0) => {
+                tracing::info!(
+                    reason = "zero-length read",
+                    "datagram channel closed by the supervisor; routing stopped"
+                );
+                return;
+            }
+            Ok(len) if len > datagram::MAX_FRAME_LEN => {
+                tracing::debug!(
+                    len,
+                    max = datagram::MAX_FRAME_LEN,
+                    "datagram frame longer than the longest; truncated"
+                );
+                stats.malformed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             Ok(len) => len,
             Err(err) => {
                 tracing::warn!(error = %err, "datagram channel read failed; routing stopped");
@@ -3462,6 +3485,62 @@ mod tests {
             logs.count(Level::WARN, "datagram channel read failed; routing stopped"),
             1
         );
+    }
+
+    /// On Linux the channel is a `SOCK_SEQPACKET` pair, where a read of
+    /// zero bytes is the peer's end closing (unix(7), `recv(2)`); no lotse
+    /// frame is empty, so the router stops instead of reading again at
+    /// once, forever.
+    #[tokio::test]
+    async fn the_supervisor_closing_its_end_of_the_datagram_channel_stops_the_router() {
+        let (logs, _guard) = Logs::capture();
+        let (datagrams, demux) = datagram::datagram_pair().unwrap();
+        let (events, _rx) = mpsc::channel(1);
+        let mut manager = SessionManager::new(
+            OwnedFd::from(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            None,
+            datagrams,
+            8,
+            Arc::new(FakeClock::default()),
+            events,
+        )
+        .unwrap();
+        drop(demux);
+        tokio::select! {
+            joined = &mut manager.reader => joined.unwrap(),
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the router still runs"),
+        }
+        assert_eq!(
+            logs.count(
+                Level::INFO,
+                "datagram channel closed by the supervisor; routing stopped"
+            ),
+            1
+        );
+        assert_eq!(manager.stats().malformed.load(Ordering::Relaxed), 0);
+    }
+
+    /// The read buffer is one byte longer than the longest frame, so a
+    /// frame longer than that, which the socket cuts to the buffer, is
+    /// told apart from one of exactly the longest length: the first is
+    /// malformed, the second routes.
+    #[tokio::test]
+    async fn a_frame_longer_than_the_longest_is_malformed_and_one_of_the_longest_routes() {
+        let m = managed();
+        let addr: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let ufrag = "u".repeat(datagram::MAX_UFRAG_LEN);
+        let mut frame = Vec::new();
+        let payload = vec![0; datagram::MAX_DATAGRAM_PAYLOAD + 1];
+        datagram::encode(&ufrag, addr, addr, &payload, &mut frame);
+        assert_eq!(frame.len(), datagram::MAX_FRAME_LEN + 1);
+        m.demux.send(&frame).unwrap();
+        until(&|| m.manager.stats().malformed.load(Ordering::Relaxed) == 1).await;
+        assert_eq!(m.manager.stats().unroutable.load(Ordering::Relaxed), 0);
+        datagram::encode(&ufrag, addr, addr, &payload[1..], &mut frame);
+        assert_eq!(frame.len(), datagram::MAX_FRAME_LEN);
+        m.demux.send(&frame).unwrap();
+        until(&|| m.manager.stats().unroutable.load(Ordering::Relaxed) == 1).await;
+        assert_eq!(m.manager.stats().malformed.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

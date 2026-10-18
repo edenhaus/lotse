@@ -43,9 +43,34 @@
 //! port of the record's stream (channel 0 and 1 the first `SETUP`, RTCP
 //! on odd channels), through the relay's datagram checks into retina's
 //! interleaved path; a raw stream still goes on the RTSP connection.
+//!
+//! The URL carries credentials, as a camera's does, and the attempt's
+//! error never shows its password unless the camera sent it: the camera
+//! records every byte it writes, as it writes them (headers without their
+//! CR and LF), and only a password among them may come back quoted.
+//! Flag bit 5
+//! makes the camera challenge first (RFC 2326 §7.1.1, RFC 7235 §3.1): the
+//! first request on each connection, the source's, the backchannel
+//! probe's and the talker's, is answered `401 Unauthorized` with a
+//! `WWW-Authenticate` header, and the script answers the retried request
+//! and the rest as above. retina reads the challenge (RFC 7235 §4.1:
+//! RFC 7616 §3.3 Digest, RFC 7617 §2 Basic), sends the request again with
+//! `Authorization` (RFC 7616 §3.4, RFC 7617 §2), and keeps sending it on
+//! every request of that session; a second `401` (a whole-response
+//! section can be one) ends the attempt as a credential failure. With bit
+//! 6 clear the challenge is a fixed Digest one. With bit 6 set too, it is
+//! the fuzzer's: a fourth section, `[len:u16 le][bytes]` after `[play]`
+//! with its CR and LF dropped, cut from the front of the stream, so the
+//! input is `[flags][describe][setup][play][challenge]stream`.
+//!
+//! Bits 5 and 6 were unused before, so a corpus input with bit 5 clear
+//! plays as it did; one with bit 5 set and bit 6 clear plays the same
+//! script after one Digest round trip; one with both set gives its
+//! stream's first bytes to the challenge.
 
 #![no_main]
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,6 +91,13 @@ use tokio_util::sync::CancellationToken;
 /// How long the camera waits for the next request before it hangs up.
 const IDLE: Duration = Duration::from_millis(50);
 
+/// The password of the camera URL's credentials; no error may show it.
+const PASSWORD: &str = "pw-4e2d81";
+
+/// The challenge of flag bit 5 when bit 6 leaves it to the camera: a
+/// Digest one (RFC 7616 §3.3) with the fields retina answers.
+const DIGEST: &[u8] = br#"Digest realm="lotse", nonce="4f1c2b", qop="auth", algorithm=MD5"#;
+
 /// The camera's script, cut from the input.
 struct Script<'a> {
     /// Which sections are whole responses.
@@ -76,6 +108,9 @@ struct Script<'a> {
     setup: &'a [u8],
     /// The `PLAY` section.
     play: &'a [u8],
+    /// The `WWW-Authenticate` of the first answer on each connection,
+    /// when flag bit 5 asks for one.
+    challenge: Option<&'a [u8]>,
     /// What follows `PLAY`.
     stream: &'a [u8],
 }
@@ -95,11 +130,17 @@ impl<'a> Script<'a> {
         let describe = section(&mut rest)?;
         let setup = section(&mut rest)?;
         let play = section(&mut rest)?;
+        let challenge = match flags & 0x60 {
+            0x60 => Some(section(&mut rest)?),
+            0x20 => Some(DIGEST),
+            _ => None,
+        };
         Some(Self {
             flags,
             describe,
             setup,
             play,
+            challenge,
             stream: rest,
         })
     }
@@ -184,8 +225,9 @@ async fn request(socket: &mut TcpStream, buf: &mut Vec<u8>) -> Option<(String, S
 
 /// Plays `script` to every connection on `listener`, side by side: the
 /// backchannel's probe and its session come on connections of their own
-/// while the stream's plays.
-async fn camera(listener: TcpListener, base: String, script: Script<'_>) {
+/// while the stream's plays. Every byte it sends, on any connection or as
+/// a datagram, is appended to `sent`.
+async fn camera(listener: TcpListener, base: String, script: Script<'_>, sent: &RefCell<Vec<u8>>) {
     let mut plays: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>> = Vec::new();
     loop {
         let accepted = std::future::poll_fn(|cx| {
@@ -196,13 +238,13 @@ async fn camera(listener: TcpListener, base: String, script: Script<'_>) {
         let Ok((socket, _)) = accepted else {
             return;
         };
-        plays.push(Box::pin(play(socket, &base, &script)));
+        plays.push(Box::pin(play(socket, &base, &script, sent)));
     }
 }
 
 /// Plays `script` on `socket`, then hangs up; returns once the source
-/// closed its end.
-async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
+/// closed its end. What it writes is appended to `sent` first.
+async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>, sent: &RefCell<Vec<u8>>) {
     // A reset, not a TIME_WAIT, when the attempt is over: tens of
     // thousands of connections a minute would run out of ports.
     let _ = socket.set_zero_linger();
@@ -210,6 +252,8 @@ async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
     let mut buf = Vec::new();
     // The client ports of the streams set up over UDP, in order.
     let mut client_ports = Vec::new();
+    // The challenge the connection's first request is answered with.
+    let mut challenge = script.challenge;
     // A client that stops asking is waiting for the rest of a response
     // the script cut short: the camera hangs up instead of letting the
     // read deadline run out.
@@ -225,6 +269,17 @@ async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
             out.extend_from_slice(body);
             out
         };
+        if let Some(www_authenticate) = challenge.take() {
+            let reply = format!(
+                "RTSP/1.0 401 Unauthorized\r\nCSeq: {cseq}\r\nWWW-Authenticate: {}\r\nContent-Length: 0\r\n\r\n",
+                header_value(www_authenticate)
+            );
+            sent.borrow_mut().extend_from_slice(reply.as_bytes());
+            if socket.write_all(reply.as_bytes()).await.is_err() {
+                return;
+            }
+            continue;
+        }
         let (reply, then_stream) = match method.as_str() {
             "DESCRIBE" if script.flags & 1 != 0 => (script.describe.to_vec(), false),
             "DESCRIBE" => (
@@ -262,14 +317,17 @@ async fn play(mut socket: TcpStream, base: &str, script: &Script<'_>) {
             }
             _ => (ok("", &[]), false),
         };
+        sent.borrow_mut().extend_from_slice(&reply);
         if socket.write_all(&reply).await.is_err() {
             return;
         }
         if then_stream {
             if script.flags & 0x18 == 0x10 {
-                send_datagrams(script, &client_ports).await;
+                send_datagrams(script, &client_ports, sent).await;
             } else {
-                let _ = socket.write_all(&script.stream()).await;
+                let stream = script.stream();
+                sent.borrow_mut().extend_from_slice(&stream);
+                let _ = socket.write_all(&stream).await;
             }
             break;
         }
@@ -313,9 +371,10 @@ async fn talk(slot: BackchannelSlot) {
     std::future::pending::<()>().await;
 }
 
-/// Sends the script's records as datagrams to the client's ports, then
-/// gives the relay a moment to read them before the hang-up.
-async fn send_datagrams(script: &Script<'_>, client_ports: &[u16]) {
+/// Sends the script's records as datagrams to the client's ports, each
+/// appended to `sent` first, then gives the relay a moment to read them
+/// before the hang-up.
+async fn send_datagrams(script: &Script<'_>, client_ports: &[u16], sent: &RefCell<Vec<u8>>) {
     let Ok(sender) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else {
         return;
     };
@@ -324,6 +383,7 @@ async fn send_datagrams(script: &Script<'_>, client_ports: &[u16]) {
             continue;
         };
         let port = port.saturating_add(u16::from(channel & 1));
+        sent.borrow_mut().extend_from_slice(payload);
         let _ = sender.send_to(payload, ("127.0.0.1", port)).await;
     }
     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -352,7 +412,7 @@ fuzz_target!(|data: &[u8]| {
         };
         let addr = listener.local_addr().expect("its address");
         let base = format!("rtsp://{addr}/stream");
-        let url = SourceUrl::parse(&base).expect("a source url");
+        let url = SourceUrl::parse(&format!("rtsp://user:{PASSWORD}@{addr}/stream")).expect("a source url");
         let transport = if script.flags & 0x10 != 0 {
             "udp"
         } else {
@@ -388,16 +448,26 @@ fuzz_target!(|data: &[u8]| {
             }
             std::future::pending::<()>().await;
         };
+        // Every byte the camera sent: the password may come back only
+        // when it is among them.
+        let sent = RefCell::new(Vec::new());
         let exit = tokio::select! {
             exit = source.run(ctx) => exit,
-            () = camera(listener, base, script) => unreachable!("the camera never ends"),
+            () = camera(listener, base, script, &sent) => unreachable!("the camera never ends"),
             () = ingest => unreachable!("the ingest never ends"),
             () = talk(slot) => unreachable!("the talker never ends"),
         };
-        assert!(
-            matches!(exit, SourceExit::Ended(_)),
-            "an RTSP camera resolves to nothing"
-        );
+        let SourceExit::Ended(err) = exit else {
+            panic!("an RTSP camera resolves to nothing: {exit:?}");
+        };
+        let secret = PASSWORD.as_bytes();
+        let sent = sent.into_inner();
+        if !sent.windows(secret.len()).any(|window| window == secret) {
+            assert!(
+                !err.to_string().contains(PASSWORD),
+                "the error shows the password: {err}"
+            );
+        }
         for track in tracks.tracks() {
             let _ = mapper.map(track.id(), 0, std::time::Instant::now());
         }
