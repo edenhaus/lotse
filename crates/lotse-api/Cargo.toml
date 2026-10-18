@@ -1,6 +1,6 @@
 [package]
 name = "lotse-api"
-description = "Control API: axum on a Unix socket with a peer-credential check and an opt-in mutual-TLS listener, WebSocket dispatch and snapshot route."
+description = "Control API: axum on a Unix socket with a peer-credential check, an opt-in mutual-TLS listener and WebSocket dispatch."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -486,8 +486,9 @@ impl Resolver<'_> {
 
     /// The control TLS listener, from `control.listen`, `control.clients`
     /// and `data_dir`: none without a listen address, and an error without
-    /// a data directory for its identity. An empty allowlist is refused
-    /// when the listener binds.
+    /// a data directory for its identity. No `control.clients` is no
+    /// error: the listener then admits the clients enrolled by pairing,
+    /// and until there is one, only a client that pairs.
     fn control(
         &mut self,
         args: &ServeArgs,
