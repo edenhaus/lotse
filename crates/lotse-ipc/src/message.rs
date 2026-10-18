@@ -44,7 +44,14 @@ pub enum ToWorker {
     /// Connect this source as the standby of the one running: the tracks
     /// switch to it at its first keyframe, and the old source stops. A
     /// standby still connecting is replaced.
-    SwitchSource(SourceSpec),
+    SwitchSource {
+        /// The supervisor's count of the connection's switches: the
+        /// standby's reports carry it ([`ToSupervisor::SwitchState`]), so
+        /// those of a standby this one replaces are told apart.
+        generation: u64,
+        /// The source.
+        spec: SourceSpec,
+    },
     /// The connection asks for the camera's backchannel from now on (a
     /// stream on it opted in), or no longer (the last one opted out): the
     /// running source and the standby probe it, at once while they play,
@@ -281,11 +288,22 @@ pub struct SourceSpec {
     pub peer_host: String,
     /// The resolved addresses to try, in order (workers have no DNS).
     pub peer_addrs: Vec<SocketAddr>,
-    /// Where the reconnect schedule starts: the delays the connection's
-    /// earlier workers handed out since its source was last live, so a
-    /// source that keeps failing is not retried at the first step's pace
-    /// whenever a worker starts over.
-    pub backoff_attempts: u32,
+    /// Where the reconnect schedule starts: where the connection's earlier
+    /// workers left it, so a source that keeps failing is not retried at
+    /// the first step's pace, nor at once again, whenever a worker starts
+    /// over.
+    pub backoff: BackoffPosition,
+}
+
+/// Where a source's reconnect schedule stands: all a new worker needs to
+/// continue it exactly. The wire form of
+/// `lotse_core::backoff::BackoffPosition`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackoffPosition {
+    /// Delays handed out since the schedule last started over.
+    pub attempts: u32,
+    /// The immediate attempt after a live period has been used since then.
+    pub immediate_used: bool,
 }
 
 impl fmt::Debug for SourceSpec {
@@ -296,7 +314,7 @@ impl fmt::Debug for SourceSpec {
             .field("options", &"****")
             .field("peer_host", &self.peer_host)
             .field("peer_addrs", &self.peer_addrs)
-            .field("backoff_attempts", &self.backoff_attempts)
+            .field("backoff", &self.backoff)
             .finish()
     }
 }
@@ -320,7 +338,13 @@ pub enum ToSupervisor {
     SourceState(SourceState),
     /// The standby source changed state; the connection's own state is
     /// the running source's until `Switched`.
-    SwitchState(SourceState),
+    SwitchState {
+        /// The switch the standby was started for
+        /// ([`ToWorker::SwitchSource`]).
+        generation: u64,
+        /// Its state.
+        state: SourceState,
+    },
     /// The tracks switched to the standby, which is the source now; its
     /// tracks follow.
     Switched,
@@ -394,9 +418,10 @@ pub enum SourceState {
     Live,
     /// The source has streamed long enough that its reconnect schedule
     /// starts over: the position a new worker continues from is the first
-    /// step again ([`SourceSpec::backoff_attempts`]).
+    /// step again ([`SourceSpec::backoff`]).
     Stable,
-    /// The live source dropped; an attempt starts at once.
+    /// The live source dropped; an attempt starts at once: the schedule's
+    /// immediate attempt, used from now on.
     Reconnecting {
         /// The error code (`source_timeout`, ...).
         code: String,
@@ -411,10 +436,9 @@ pub enum SourceState {
         message: String,
         /// The wait.
         retry_ms: u32,
-        /// Delays the reconnect schedule handed out since it last started
-        /// over, this one included: where a new worker's schedule continues
-        /// ([`SourceSpec::backoff_attempts`]).
-        attempts: u32,
+        /// Where the reconnect schedule stands, this delay included: where
+        /// a new worker's continues ([`SourceSpec::backoff`]).
+        position: BackoffPosition,
     },
     /// The runner stopped.
     Stopped,
@@ -540,14 +564,20 @@ mod tests {
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec!["192.168.1.10:554".parse().unwrap()],
-            backoff_attempts: 3,
+            backoff: BackoffPosition {
+                attempts: 3,
+                immediate_used: true,
+            },
         };
         let text = format!("{spec:?}");
         assert!(!text.contains("hunter2"), "{text}");
         assert!(text.contains("url: \"****\""), "{text}");
         assert!(text.contains("options: \"****\""), "{text}");
         assert!(text.contains("192.168.1.10:554"), "{text}");
-        assert!(text.contains("backoff_attempts: 3"), "{text}");
+        assert!(
+            text.contains("backoff: BackoffPosition { attempts: 3, immediate_used: true }"),
+            "{text}"
+        );
         let wrapped = ToWorker::RunSource(spec);
         assert!(!format!("{wrapped:?}").contains("hunter2"));
         assert_eq!(
@@ -560,18 +590,39 @@ mod tests {
     fn the_reconnect_position_round_trips() {
         for message in [
             ToSupervisor::SourceState(SourceState::Stable),
-            ToSupervisor::SwitchState(SourceState::Backoff {
-                code: "source_timeout".into(),
-                message: "stall".into(),
-                retry_ms: 5_000,
-                attempts: 6,
-            }),
+            ToSupervisor::SwitchState {
+                generation: 2,
+                state: SourceState::Backoff {
+                    code: "source_timeout".into(),
+                    message: "stall".into(),
+                    retry_ms: 5_000,
+                    position: BackoffPosition {
+                        attempts: 6,
+                        immediate_used: false,
+                    },
+                },
+            },
         ] {
             assert_eq!(
                 decode::<ToSupervisor>(&encode(&message).unwrap()).unwrap(),
                 message
             );
         }
+        let switch = ToWorker::SwitchSource {
+            generation: 7,
+            spec: SourceSpec {
+                connection_id: "c1".into(),
+                url: "rtsp://cam/sub".into(),
+                options: "{}".into(),
+                peer_host: "cam".into(),
+                peer_addrs: vec![],
+                backoff: BackoffPosition::default(),
+            },
+        };
+        assert_eq!(
+            decode::<ToWorker>(&encode(&switch).unwrap()).unwrap(),
+            switch
+        );
     }
 
     #[test]

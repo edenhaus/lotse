@@ -84,6 +84,16 @@ impl Jitter {
     }
 }
 
+/// Where a reconnect schedule stands: all a new schedule needs to continue
+/// exactly where an earlier one left off ([`ReconnectBackoff::resumed`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackoffPosition {
+    /// Delays handed out since the schedule last started over.
+    pub attempts: u32,
+    /// The immediate attempt after a live period has been used since then.
+    pub immediate_used: bool,
+}
+
 /// The source reconnect schedule: after a live period one immediate
 /// attempt, then 1 s ×5, 5 s ×5, 10 s ×10, then 60 s, each jittered
 /// ±20 %; reset by the runner after `stable_after` of streaming.
@@ -107,14 +117,23 @@ impl ReconnectBackoff {
         }
     }
 
-    /// A schedule that continues where an earlier one left off, after
-    /// `attempts` delays: a new worker of a source whose earlier workers
-    /// kept failing starts at their step, not at the first.
-    pub const fn resumed(seed: u64, attempts: u32) -> Self {
+    /// A schedule that continues exactly where an earlier one stood at
+    /// `position`: a new worker of a source whose earlier workers kept
+    /// failing starts at their step, not at the first, and gets no second
+    /// immediate attempt if theirs is used.
+    pub const fn resumed(seed: u64, position: BackoffPosition) -> Self {
         Self {
-            attempts,
-            immediate_used: false,
+            attempts: position.attempts,
+            immediate_used: position.immediate_used,
             jitter: Jitter::new(seed),
+        }
+    }
+
+    /// Where the schedule stands.
+    pub const fn position(&self) -> BackoffPosition {
+        BackoffPosition {
+            attempts: self.attempts,
+            immediate_used: self.immediate_used,
         }
     }
 
@@ -260,15 +279,25 @@ mod tests {
 
     #[test]
     fn a_resumed_schedule_continues_at_its_step() {
-        let mut backoff = ReconnectBackoff::resumed(42, 5);
-        assert_eq!(backoff.attempts(), 5);
+        let at = |attempts, immediate_used| BackoffPosition {
+            attempts,
+            immediate_used,
+        };
+        let mut backoff = ReconnectBackoff::resumed(42, at(5, false));
+        assert_eq!(backoff.position(), at(5, false));
         let delay = backoff.next_delay(false);
         assert!(within_jitter(delay, Duration::from_secs(5)), "{delay:?}");
         assert_eq!(backoff.attempts(), 6);
         // The immediate attempt after a live period is still there.
         assert_eq!(backoff.next_delay(true), Duration::ZERO);
-        let fresh = ReconnectBackoff::resumed(42, 0).next_delay(false);
+        assert_eq!(backoff.position(), at(6, true));
+        let fresh = ReconnectBackoff::resumed(42, at(0, false)).next_delay(false);
         assert!(within_jitter(fresh, Duration::from_secs(1)), "{fresh:?}");
+        // One whose immediate attempt is used gets no second one.
+        let mut used = ReconnectBackoff::resumed(42, at(2, true));
+        let delay = used.next_delay(true);
+        assert!(within_jitter(delay, Duration::from_secs(1)), "{delay:?}");
+        assert_eq!(used.position(), at(3, true));
     }
 
     #[test]

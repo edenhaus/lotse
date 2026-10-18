@@ -16,7 +16,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::backoff::CrashBackoff;
+use crate::backoff::{BackoffPosition, CrashBackoff};
 use crate::source::SourceError;
 
 /// Default of `stream.linger`.
@@ -93,7 +93,8 @@ pub enum WorkerReport {
     /// The source streamed long enough that the worker's reconnect
     /// schedule starts over at its first step.
     Stable,
-    /// The live source dropped for this reason; an attempt starts at once.
+    /// The live source dropped for this reason; an attempt starts at once:
+    /// the schedule's immediate attempt, which is used from now on.
     Reconnecting(SourceError),
     /// An attempt failed; the next one is `retry_in` away.
     Backoff {
@@ -101,9 +102,9 @@ pub enum WorkerReport {
         error: SourceError,
         /// The wait before the next attempt.
         retry_in: Duration,
-        /// Delays the worker's reconnect schedule handed out since it last
-        /// started over, this one included.
-        attempts: u32,
+        /// Where the worker's reconnect schedule stands, this delay
+        /// included.
+        position: BackoffPosition,
     },
 }
 
@@ -164,14 +165,30 @@ impl Default for ConnectionConfig {
 }
 
 /// The reconnect state of the standby a switch in place runs beside the
-/// source: its own backoff window and schedule position, which become the
+/// source: its own schedule position and delay, which become the
 /// connection's once it takes over or the next worker runs its source.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Standby {
-    /// The end of its reconnect delay, while it waits one out.
-    not_before: Option<Instant>,
+    /// The switch it was started for: reports of a standby it replaced,
+    /// still on their way, carry an older one and are stale.
+    generation: u64,
     /// Where its reconnect schedule stands, as it reported.
-    attempts: u32,
+    position: BackoffPosition,
+    /// The delay it waits out after a failed attempt or a drop.
+    delay: Option<StandbyDelay>,
+    /// It was live at its last report, so a delay now follows a drop.
+    live: bool,
+}
+
+/// A standby's reconnect delay and why it waits it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StandbyDelay {
+    /// Its end.
+    until: Instant,
+    /// The error of the attempt that failed, or of the drop.
+    error: SourceError,
+    /// It follows a drop of the live standby, not a failed attempt.
+    dropped: bool,
 }
 
 /// The machine.
@@ -208,14 +225,13 @@ pub struct ConnectionMachine {
     /// entering `Idle` when it is already over: while `Idle` it is always
     /// in the future, with the timer running until it.
     not_before: Option<Instant>,
-    /// Where the worker's reconnect schedule stood at its last failed
-    /// attempt, as it reported: where the next worker's schedule continues,
-    /// so a source that keeps failing is not retried at the first step's
-    /// pace whenever a worker starts over. The worker's own schedule
-    /// starts over only after streaming stably, which it reports
-    /// (`WorkerReport::Stable`), not on every recovery, so the machine
-    /// never resets it on its own.
-    backoff_attempts: u32,
+    /// Where the worker's reconnect schedule stands, as its reports say:
+    /// where the next worker's schedule continues, so a source that keeps
+    /// failing is not retried at the first step's pace, nor at once again,
+    /// whenever a worker starts over. A `Backoff` carries it whole, a
+    /// `Reconnecting` uses the immediate attempt, and `Stable` starts it
+    /// over; the machine never moves it on its own.
+    backoff: BackoffPosition,
     /// The standby of a switch in place, until it takes over or its worker
     /// goes.
     standby: Option<Standby>,
@@ -236,7 +252,10 @@ impl ConnectionMachine {
             resume: ConnectionState::Live,
             crashes: 0,
             not_before: None,
-            backoff_attempts: 0,
+            backoff: BackoffPosition {
+                attempts: 0,
+                immediate_used: false,
+            },
             standby: None,
         }
     }
@@ -286,56 +305,79 @@ impl ConnectionMachine {
         self.crashes
     }
 
-    /// Where the worker's reconnect schedule stood at its last failed
-    /// attempt, and the next worker's starts.
-    pub const fn backoff_attempts(&self) -> u32 {
-        self.backoff_attempts
+    /// Where the worker's reconnect schedule stands, and the next
+    /// worker's starts.
+    pub const fn backoff_position(&self) -> BackoffPosition {
+        self.backoff
     }
 
     /// The connection runs another source from now on, which has failed
-    /// no attempt yet. `in_place`: a running worker starts it as a standby
-    /// beside the old source, whose reports still count until it takes
-    /// over ([`Self::standby_report`], [`Self::standby_took_over`]);
-    /// otherwise the next worker runs it, its schedule at the first step. A
-    /// backoff window under way still holds either way, so the switch is no
-    /// way around it to a new login.
-    pub const fn source_switched(&mut self, in_place: bool) {
-        if in_place {
-            self.standby = Some(Standby {
-                not_before: None,
-                attempts: 0,
-            });
-        } else {
-            self.standby = None;
-            self.backoff_attempts = 0;
+    /// no attempt yet. With `standby_generation`, a running worker starts
+    /// it as a standby for that switch beside the old source, whose reports
+    /// still count until it takes over ([`Self::standby_report`],
+    /// [`Self::standby_took_over`]); without, the next worker runs it, its
+    /// schedule at the first step. A backoff window under way still holds
+    /// either way, so the switch is no way around it to a new login.
+    pub fn source_switched(&mut self, standby_generation: Option<u64>) {
+        self.standby = standby_generation.map(|generation| Standby {
+            generation,
+            position: BackoffPosition::default(),
+            delay: None,
+            live: false,
+        });
+        if standby_generation.is_none() {
+            self.backoff = BackoffPosition::default();
         }
     }
 
-    /// The standby reported at `now`: a failed attempt opens its own
-    /// window, an attempt under way or a live standby ends it, and stable
-    /// streaming starts its schedule over. Without a standby it is stale.
-    pub fn standby_report(&mut self, report: &WorkerReport, now: Instant) {
-        if let Some(standby) = self.standby.as_mut() {
-            match report {
-                WorkerReport::Backoff {
-                    retry_in, attempts, ..
-                } => {
-                    standby.not_before = now.checked_add(*retry_in);
-                    standby.attempts = *attempts;
-                }
-                WorkerReport::Stable => standby.attempts = 0,
-                WorkerReport::Connecting | WorkerReport::Live | WorkerReport::Reconnecting(_) => {
-                    standby.not_before = None;
-                }
+    /// The standby of switch `generation` reported at `now`: a failed
+    /// attempt or a drop opens its own delay, an attempt under way or a
+    /// live standby ends it, and its position moves as the connection's
+    /// does. A report of another switch's standby, or without one, is
+    /// stale.
+    pub fn standby_report(&mut self, generation: u64, report: &WorkerReport, now: Instant) {
+        let Some(standby) = self
+            .standby
+            .as_mut()
+            .filter(|standby| standby.generation == generation)
+        else {
+            tracing::debug!(generation, "report of a standby that is gone; ignored");
+            return;
+        };
+        match report {
+            WorkerReport::Backoff {
+                error,
+                retry_in,
+                position,
+            } => {
+                let dropped = standby.live;
+                standby.delay = now.checked_add(*retry_in).map(|until| StandbyDelay {
+                    until,
+                    error: error.clone(),
+                    dropped,
+                });
+                standby.position = *position;
+                standby.live = false;
             }
+            WorkerReport::Stable => standby.position = BackoffPosition::default(),
+            WorkerReport::Live => {
+                standby.delay = None;
+                standby.live = true;
+            }
+            WorkerReport::Reconnecting(_) => {
+                standby.delay = None;
+                standby.live = false;
+                standby.position.immediate_used = true;
+            }
+            WorkerReport::Connecting => standby.delay = None,
         }
     }
 
     /// The standby took over: it is the source now, live, and its schedule
     /// position is the connection's.
-    pub const fn standby_took_over(&mut self) {
+    pub fn standby_took_over(&mut self) {
         if let Some(standby) = self.standby.take() {
-            self.backoff_attempts = standby.attempts;
+            self.backoff = standby.position;
         }
     }
 
@@ -459,13 +501,14 @@ impl ConnectionMachine {
             }
             (S::Live, WorkerReport::Stable) => {
                 tracing::info!(
-                    attempts = self.backoff_attempts,
+                    attempts = self.backoff.attempts,
                     "source streamed stably; the next worker's reconnect schedule starts at its first step"
                 );
-                self.backoff_attempts = 0;
+                self.backoff = BackoffPosition::default();
             }
             (S::Live | S::Reconnecting, WorkerReport::Reconnecting(error)) => {
                 self.last_error = Some(ConnectionError::Source(error));
+                self.backoff.immediate_used = true;
                 self.state = S::Reconnecting;
             }
             (
@@ -473,13 +516,13 @@ impl ConnectionMachine {
                 WorkerReport::Backoff {
                     error,
                     retry_in,
-                    attempts,
+                    position,
                 },
             ) => {
                 self.last_error = Some(ConnectionError::Source(error));
                 self.dropped = from == S::Live;
                 self.not_before = now.checked_add(retry_in);
-                self.backoff_attempts = attempts;
+                self.backoff = position;
                 self.state = S::Backoff;
             }
             // `Draining` is handled above, on the state it resumes.
@@ -518,8 +561,9 @@ impl ConnectionMachine {
             actions.push(Action::CancelLinger);
         }
         // The next worker waits out the crash backoff or the source's own
-        // delay, whichever ends later, with demand or without.
-        self.adopt_standby();
+        // delay, whichever ends later, with demand or without; the crash is
+        // the failure.
+        self.adopt_standby(true);
         let source_left = self.window_left(now).unwrap_or_default();
         let wait = self.crash.next_delay().max(source_left);
         self.not_before = now.checked_add(wait);
@@ -573,17 +617,27 @@ impl ConnectionMachine {
     fn stop_worker(&mut self, now: Instant, actions: &mut Vec<Action>) {
         actions.push(Action::StopWorker);
         self.stopping = true;
-        self.adopt_standby();
+        self.adopt_standby(false);
         self.enter_idle(now, actions);
     }
 
     /// The worker goes with a standby beside its source: the next worker
     /// runs the source switched to, so its position is the standby's, and
-    /// its delay holds as long as the old source's would.
-    fn adopt_standby(&mut self) {
+    /// a delay the standby waits out holds as long as the old source's
+    /// would. After a normal stop that delay's error and its kind, failed
+    /// attempt or drop, are the connection's, so an offer meanwhile is
+    /// refused as it would be for the source's own failure; after a crash
+    /// the crash is.
+    fn adopt_standby(&mut self, crashed: bool) {
         if let Some(standby) = self.standby.take() {
-            self.backoff_attempts = standby.attempts;
-            self.not_before = self.not_before.max(standby.not_before);
+            self.backoff = standby.position;
+            if let Some(delay) = standby.delay {
+                self.not_before = self.not_before.max(Some(delay.until));
+                if !crashed {
+                    self.last_error = Some(ConnectionError::Source(delay.error));
+                    self.dropped = delay.dropped;
+                }
+            }
         }
     }
 
@@ -623,6 +677,13 @@ mod tests {
 
     fn machine() -> ConnectionMachine {
         ConnectionMachine::new(ConnectionConfig::default())
+    }
+
+    fn at(attempts: u32) -> BackoffPosition {
+        BackoffPosition {
+            attempts,
+            immediate_used: false,
+        }
     }
 
     fn timeout() -> SourceError {
@@ -671,7 +732,7 @@ mod tests {
             Input::Report(WorkerReport::Backoff {
                 error,
                 retry_in: Duration::from_secs(1),
-                attempts: 1,
+                position: at(1),
             })
         };
         m.handle(Input::Demand(1), now);
@@ -745,7 +806,7 @@ mod tests {
         let backoff = WorkerReport::Backoff {
             error: SourceError::Unreachable("refused".into()),
             retry_in: Duration::from_secs(1),
-            attempts: 1,
+            position: at(1),
         };
         assert!(m.handle(Input::Report(backoff), now).is_empty());
         assert_eq!(m.state(), S::Backoff);
@@ -779,7 +840,7 @@ mod tests {
             Input::Report(WorkerReport::Backoff {
                 error: SourceError::Ended("eof".into()),
                 retry_in: Duration::from_secs(5),
-                attempts: 1,
+                position: at(1),
             }),
             now,
         );
@@ -825,7 +886,7 @@ mod tests {
             Input::Report(WorkerReport::Backoff {
                 error: timeout(),
                 retry_in: Duration::from_secs(1),
-                attempts: 1,
+                position: at(1),
             }),
             now,
         );
@@ -858,7 +919,7 @@ mod tests {
             Input::Report(WorkerReport::Backoff {
                 error,
                 retry_in: Duration::from_secs(1),
-                attempts: 1,
+                position: at(1),
             })
         };
         let draining = || {
@@ -954,7 +1015,7 @@ mod tests {
                 Some(WorkerReport::Backoff {
                     error: timeout(),
                     retry_in: Duration::from_secs(1),
-                    attempts: 1,
+                    position: at(1),
                 }),
                 vec![
                     Action::StopWorker,
@@ -1044,7 +1105,7 @@ mod tests {
         Input::Report(WorkerReport::Backoff {
             error: SourceError::AuthFailed("401".into()),
             retry_in,
-            attempts: 1,
+            position: at(1),
         })
     }
 
@@ -1323,7 +1384,7 @@ mod tests {
         Input::Report(WorkerReport::Backoff {
             error: timeout(),
             retry_in: Duration::from_secs(1),
-            attempts,
+            position: at(attempts),
         })
     }
 
@@ -1336,23 +1397,27 @@ mod tests {
     fn backoff_attempts_follow_the_worker_s_schedule() {
         let clock = FakeClock::default();
         let mut m = machine();
-        assert_eq!(m.backoff_attempts(), 0);
+        assert_eq!(m.backoff_position().attempts, 0);
         m.handle(Input::Demand(1), clock.now());
         m.handle(failed_at(5), clock.now());
-        assert_eq!(m.backoff_attempts(), 5);
+        assert_eq!(m.backoff_position().attempts, 5);
         // A repeated report is stale.
         m.handle(failed_at(9), clock.now());
-        assert_eq!(m.backoff_attempts(), 5);
+        assert_eq!(m.backoff_position().attempts, 5);
         // A brief recovery: live, a drop, its retry fails a step further.
         m.handle(Input::Report(WorkerReport::Connecting), clock.now());
         m.handle(Input::Report(WorkerReport::Live), clock.now());
-        assert_eq!(m.backoff_attempts(), 5, "not rewound by going live");
+        assert_eq!(
+            m.backoff_position().attempts,
+            5,
+            "not rewound by going live"
+        );
         m.handle(
             Input::Report(WorkerReport::Reconnecting(timeout())),
             clock.now(),
         );
         m.handle(failed_at(6), clock.now());
-        assert_eq!(m.backoff_attempts(), 6);
+        assert_eq!(m.backoff_position().attempts, 6);
         // The next worker continues it, after a stop or a crash.
         m.handle(Input::Demand(0), clock.now());
         m.handle(Input::WorkerExited, clock.now());
@@ -1360,14 +1425,14 @@ mod tests {
         m.handle(Input::Demand(1), clock.now());
         m.handle(Input::WorkerExited, clock.now());
         assert_eq!(m.state(), S::Restarting);
-        assert_eq!(m.backoff_attempts(), 6);
+        assert_eq!(m.backoff_position().attempts, 6);
         clock.advance(Duration::from_secs(1));
         m.handle(Input::CrashBackoffExpired, clock.now());
         m.handle(Input::Report(WorkerReport::Live), clock.now());
         // During the linger too: a worker that streamed stably starts over.
         m.handle(Input::Demand(0), clock.now());
         m.handle(failed_at(1), clock.now());
-        assert_eq!(m.backoff_attempts(), 1);
+        assert_eq!(m.backoff_position().attempts, 1);
     }
 
     /// Another source starts its schedule at the first step, but the
@@ -1379,8 +1444,8 @@ mod tests {
         m.handle(Input::Demand(1), clock.now());
         m.handle(failed_at(4), clock.now());
         m.handle(Input::Demand(0), clock.now());
-        m.source_switched(false);
-        assert_eq!(m.backoff_attempts(), 0);
+        m.source_switched(None);
+        assert_eq!(m.backoff_position().attempts, 0);
         assert!(m.failure().is_some());
         assert!(m.handle(Input::Demand(1), clock.now()).is_empty());
     }
@@ -1389,7 +1454,7 @@ mod tests {
         WorkerReport::Backoff {
             error: timeout(),
             retry_in,
-            attempts,
+            position: at(attempts),
         }
     }
 
@@ -1412,11 +1477,11 @@ mod tests {
         // A normal stop after stable streaming.
         let mut m = streaming();
         m.handle(Input::Report(WorkerReport::Stable), clock.now());
-        assert_eq!(m.backoff_attempts(), 0);
+        assert_eq!(m.backoff_position().attempts, 0);
         m.handle(Input::Demand(0), clock.now());
         m.handle(Input::LingerExpired, clock.now());
         m.handle(Input::WorkerExited, clock.now());
-        assert_eq!((m.state(), m.backoff_attempts()), (S::Idle, 0));
+        assert_eq!((m.state(), m.backoff_position().attempts), (S::Idle, 0));
         let stable = logs.lines(
             tracing::Level::INFO,
             "source streamed stably; the next worker's reconnect schedule starts at its first step",
@@ -1433,18 +1498,18 @@ mod tests {
             m.handle(Input::Demand(0), clock.now()),
             [Action::StopWorker]
         );
-        assert_eq!(m.backoff_attempts(), 0);
+        assert_eq!(m.backoff_position().attempts, 0);
         // Stable during the linger.
         let mut m = streaming();
         m.handle(Input::Demand(0), clock.now());
         m.handle(Input::Report(WorkerReport::Stable), clock.now());
-        assert_eq!(m.backoff_attempts(), 0);
+        assert_eq!(m.backoff_position().attempts, 0);
         // A stale one, while the worker waits out a delay.
         let mut m = machine();
         m.handle(Input::Demand(1), clock.now());
         m.handle(failed_at(3), clock.now());
         m.handle(Input::Report(WorkerReport::Stable), clock.now());
-        assert_eq!(m.backoff_attempts(), 3);
+        assert_eq!(m.backoff_position().attempts, 3);
     }
 
     /// A crash keeps the source's own delay when it is the longer: a
@@ -1510,8 +1575,8 @@ mod tests {
         m.handle(failed_at(7), clock.now());
         m.handle(Input::Report(WorkerReport::Connecting), clock.now());
         m.handle(Input::Report(WorkerReport::Live), clock.now());
-        m.source_switched(true);
-        m.standby_report(&failed_for(Duration::from_secs(60), 2), clock.now());
+        m.source_switched(Some(1));
+        m.standby_report(1, &failed_for(Duration::from_secs(60), 2), clock.now());
         m.handle(Input::Demand(0), clock.now());
         assert_eq!(
             m.handle(Input::LingerExpired, clock.now()),
@@ -1520,20 +1585,20 @@ mod tests {
                 Action::StartBackoffWindow(Duration::from_secs(60))
             ]
         );
-        assert_eq!(m.backoff_attempts(), 2, "the standby's");
+        assert_eq!(m.backoff_position().attempts, 2, "the standby's");
         assert!(m.handle(Input::Demand(1), clock.now()).is_empty());
 
         // A crash hands them on too.
         let mut m = machine();
         m.handle(Input::Demand(1), clock.now());
         m.handle(Input::Report(WorkerReport::Live), clock.now());
-        m.source_switched(true);
-        m.standby_report(&failed_for(Duration::from_secs(60), 3), clock.now());
+        m.source_switched(Some(1));
+        m.standby_report(1, &failed_for(Duration::from_secs(60), 3), clock.now());
         assert_eq!(
             m.handle(Input::WorkerExited, clock.now()),
             [Action::StartCrashBackoff(Duration::from_secs(60))]
         );
-        assert_eq!(m.backoff_attempts(), 3);
+        assert_eq!(m.backoff_position().attempts, 3);
     }
 
     /// A standby that takes over brings its position, not its finished
@@ -1546,37 +1611,173 @@ mod tests {
         m.handle(failed_at(9), clock.now());
         m.handle(Input::Report(WorkerReport::Connecting), clock.now());
         m.handle(Input::Report(WorkerReport::Live), clock.now());
-        m.source_switched(true);
-        m.standby_report(&failed_for(Duration::from_secs(60), 2), clock.now());
-        m.standby_report(&WorkerReport::Connecting, clock.now());
-        m.standby_report(&WorkerReport::Live, clock.now());
+        m.source_switched(Some(1));
+        m.standby_report(1, &failed_for(Duration::from_secs(60), 2), clock.now());
+        m.standby_report(1, &WorkerReport::Connecting, clock.now());
+        m.standby_report(1, &WorkerReport::Live, clock.now());
         m.standby_took_over();
         m.handle(Input::Report(WorkerReport::Live), clock.now());
-        assert_eq!(m.backoff_attempts(), 2);
-        m.standby_report(&failed_for(Duration::from_secs(60), 5), clock.now());
+        assert_eq!(m.backoff_position().attempts, 2);
+        m.standby_report(1, &failed_for(Duration::from_secs(60), 5), clock.now());
         m.standby_took_over();
         m.handle(Input::Demand(0), clock.now());
         assert_eq!(
             m.handle(Input::LingerExpired, clock.now()),
             [Action::StopWorker]
         );
-        assert_eq!(m.backoff_attempts(), 2);
+        assert_eq!(m.backoff_position().attempts, 2);
 
         // A standby that streamed stably starts over; a drop or a retry
         // under way ends its delay.
         let mut m = machine();
         m.handle(Input::Demand(1), clock.now());
         m.handle(Input::Report(WorkerReport::Live), clock.now());
-        m.source_switched(true);
-        m.standby_report(&failed_for(Duration::from_secs(60), 4), clock.now());
-        m.standby_report(&WorkerReport::Reconnecting(timeout()), clock.now());
-        m.standby_report(&WorkerReport::Stable, clock.now());
+        m.source_switched(Some(1));
+        m.standby_report(1, &failed_for(Duration::from_secs(60), 4), clock.now());
+        m.standby_report(1, &WorkerReport::Reconnecting(timeout()), clock.now());
+        m.standby_report(1, &WorkerReport::Stable, clock.now());
         m.handle(Input::Demand(0), clock.now());
         assert_eq!(
             m.handle(Input::LingerExpired, clock.now()),
             [Action::StopWorker]
         );
-        assert_eq!(m.backoff_attempts(), 0);
+        assert_eq!(m.backoff_position().attempts, 0);
+    }
+
+    /// The whole schedule position carries over: a worker stopped after
+    /// its immediate attempt hands on that it is used, so the next one gets
+    /// no second immediate retry; a failed attempt's report carries it, and
+    /// stable streaming starts both over.
+    #[test]
+    fn the_position_carries_a_used_immediate_attempt() {
+        let clock = FakeClock::default();
+        let used = |attempts| BackoffPosition {
+            attempts,
+            immediate_used: true,
+        };
+        let mut m = machine();
+        m.handle(Input::Demand(1), clock.now());
+        m.handle(Input::Report(WorkerReport::Live), clock.now());
+        m.handle(
+            Input::Report(WorkerReport::Reconnecting(timeout())),
+            clock.now(),
+        );
+        assert_eq!(m.backoff_position(), used(0));
+        m.handle(Input::Demand(0), clock.now());
+        assert_eq!(m.backoff_position(), used(0), "the stopped worker's");
+        // A report carries both halves.
+        let mut m = machine();
+        m.handle(Input::Demand(1), clock.now());
+        m.handle(
+            Input::Report(WorkerReport::Backoff {
+                error: timeout(),
+                retry_in: Duration::from_secs(1),
+                position: used(3),
+            }),
+            clock.now(),
+        );
+        assert_eq!(m.backoff_position(), used(3));
+        m.handle(Input::Report(WorkerReport::Connecting), clock.now());
+        m.handle(Input::Report(WorkerReport::Live), clock.now());
+        m.handle(Input::Report(WorkerReport::Stable), clock.now());
+        assert_eq!(m.backoff_position(), BackoffPosition::default());
+    }
+
+    /// Reports of a standby that a later switch replaced, still on their
+    /// way, are not the new standby's: it takes over with its own position,
+    /// and the replaced one's delay holds nothing back.
+    #[test]
+    fn a_replaced_standby_s_reports_are_stale() {
+        let (logs, _guard) = crate::test_logs::Logs::capture();
+        let clock = FakeClock::default();
+        let mut m = machine();
+        m.handle(Input::Demand(1), clock.now());
+        m.handle(Input::Report(WorkerReport::Live), clock.now());
+        m.source_switched(Some(1));
+        m.standby_report(1, &failed_for(Duration::from_secs(1), 2), clock.now());
+        m.source_switched(Some(2));
+        m.standby_report(1, &failed_for(Duration::from_secs(60), 20), clock.now());
+        assert_eq!(
+            logs.lines(
+                tracing::Level::DEBUG,
+                "report of a standby that is gone; ignored"
+            )[0]
+            .fields,
+            " generation=1"
+        );
+        m.standby_report(2, &WorkerReport::Connecting, clock.now());
+        m.standby_report(2, &WorkerReport::Live, clock.now());
+        m.standby_took_over();
+        assert_eq!(m.backoff_position(), at(0), "the new standby's own");
+        // A stale delay holds nothing back when the worker stops.
+        m.source_switched(Some(3));
+        m.standby_report(2, &failed_for(Duration::from_secs(60), 20), clock.now());
+        m.handle(Input::Demand(0), clock.now());
+        assert_eq!(
+            m.handle(Input::LingerExpired, clock.now()),
+            [Action::StopWorker]
+        );
+        assert_eq!(m.failure(), None);
+    }
+
+    /// The source switched to failed while the old one streamed: after a
+    /// normal stop its failure is the connection's, so an offer inside its
+    /// delay is refused; a drop of the live standby waits instead, and a
+    /// crash stays the crash.
+    #[test]
+    fn a_standby_s_failure_is_the_connection_s_after_a_stop() {
+        let clock = FakeClock::default();
+        let stopped = |reports: &[WorkerReport]| {
+            let mut m = machine();
+            m.handle(Input::Demand(1), clock.now());
+            m.handle(Input::Report(WorkerReport::Live), clock.now());
+            m.source_switched(Some(1));
+            for report in reports {
+                m.standby_report(1, report, clock.now());
+            }
+            m.handle(Input::Demand(0), clock.now());
+            let actions = m.handle(Input::LingerExpired, clock.now());
+            assert_eq!(
+                actions,
+                [
+                    Action::StopWorker,
+                    Action::StartBackoffWindow(Duration::from_secs(60))
+                ]
+            );
+            m
+        };
+        // RFC 2326 §7.1.1: a 401 is a credential failure.
+        let auth = WorkerReport::Backoff {
+            error: SourceError::AuthFailed("401".into()),
+            retry_in: Duration::from_secs(60),
+            position: at(1),
+        };
+        let m = stopped(std::slice::from_ref(&auth));
+        assert_eq!(
+            m.failure().map(ConnectionError::code),
+            Some("source_auth_failed")
+        );
+        // A drop of the live standby is no failure; its retry failing is.
+        let drop = failed_for(Duration::from_secs(60), 1);
+        let m = stopped(&[WorkerReport::Live, drop.clone()]);
+        assert_eq!(m.failure(), None, "a drop");
+        let m = stopped(&[
+            WorkerReport::Live,
+            WorkerReport::Reconnecting(timeout()),
+            drop,
+        ]);
+        assert_eq!(
+            m.failure().map(ConnectionError::code),
+            Some("source_timeout")
+        );
+        // A crash is the failure, whatever the standby's.
+        let mut m = machine();
+        m.handle(Input::Demand(1), clock.now());
+        m.handle(Input::Report(WorkerReport::Live), clock.now());
+        m.source_switched(Some(1));
+        m.standby_report(1, &auth, clock.now());
+        m.handle(Input::WorkerExited, clock.now());
+        assert_eq!(m.failure(), Some(&ConnectionError::WorkerCrashed));
     }
 
     #[test]

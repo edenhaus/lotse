@@ -541,7 +541,7 @@ impl InProcess {
                 options: options.into(),
                 peer_host: "cam".into(),
                 peer_addrs,
-                backoff_attempts: 0,
+                backoff: lotse_ipc::BackoffPosition::default(),
             }),
             &[],
         )

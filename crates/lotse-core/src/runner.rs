@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::backoff::ReconnectBackoff;
+use crate::backoff::{BackoffPosition, ReconnectBackoff};
 use crate::clock::Clock;
 use crate::clock_map::ClockMapper;
 use crate::codec::Kind;
@@ -299,7 +299,9 @@ pub enum RunnerEvent {
     /// hands on a schedule at its first step; a shorter recovery reports
     /// nothing and leaves the schedule where it is.
     Stable,
-    /// The live source dropped; an attempt starts at once.
+    /// The live source dropped; an attempt starts at once. Only the
+    /// schedule's immediate attempt after a live period starts at once, so
+    /// this report also says that attempt is now used.
     Reconnecting {
         /// Why it dropped.
         error: SourceError,
@@ -310,9 +312,9 @@ pub enum RunnerEvent {
         error: SourceError,
         /// The wait.
         retry_in: Duration,
-        /// Delays the schedule handed out since it last started over, this
-        /// one included: where a new worker's schedule continues.
-        attempts: u32,
+        /// Where the schedule stands, this delay included: where a new
+        /// worker's schedule continues.
+        position: BackoffPosition,
     },
     /// The runner was cancelled and the source is torn down.
     Stopped,
@@ -458,7 +460,7 @@ impl SourceRunner {
             self.emit(RunnerEvent::Backoff {
                 error: outcome.error,
                 retry_in,
-                attempts: self.backoff.attempts(),
+                position: self.backoff.position(),
             })
             .await;
             tokio::select! {
@@ -897,11 +899,18 @@ mod tests {
             Some(RunnerEvent::Backoff {
                 error,
                 retry_in,
-                attempts
+                position
             }) = next(&mut h.events).await
         );
         assert_eq!(error.code(), "source_timeout");
-        assert_eq!(attempts, 1, "the schedule's first delay");
+        assert_eq!(
+            position,
+            BackoffPosition {
+                attempts: 1,
+                immediate_used: true
+            },
+            "the schedule's first delay, after its immediate attempt"
+        );
         assert!(retry_in >= Duration::from_millis(800) && retry_in <= Duration::from_millis(1200));
         assert!(h.events.try_recv().is_err(), "waiting");
         tick(&h, Duration::from_secs(2)).await;

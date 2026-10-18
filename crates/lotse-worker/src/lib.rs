@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
-use lotse_core::backoff::ReconnectBackoff;
+use lotse_core::backoff::{BackoffPosition, ReconnectBackoff};
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::registry::Registries;
@@ -249,6 +249,7 @@ pub async fn serve(
         session_tx,
         running: None,
         standby: None,
+        standby_generation: 0,
         sessions: None,
         lost_hand_offs: Throttle::default(),
         probes,
@@ -337,6 +338,10 @@ struct Serving<'a> {
     running: Option<Running>,
     /// The standby source, while one connects or waits for its keyframe.
     standby: Option<Standby>,
+    /// The switch the standby reporting now was started for: its reports
+    /// carry it, so the supervisor tells them from those of a standby it
+    /// replaced.
+    standby_generation: u64,
     /// The sessions, once the sockets arrived.
     sessions: Option<SessionManager>,
     /// The log line for hand-offs whose connection the kernel discarded,
@@ -437,7 +442,9 @@ impl Serving<'_> {
                 )?);
             }
             ToWorker::ConnectGranted => self.on_connect_granted(),
-            ToWorker::SwitchSource(spec) => self.on_switch_source(&spec).await?,
+            ToWorker::SwitchSource { generation, spec } => {
+                self.on_switch_source(&spec, generation).await?;
+            }
             ToWorker::Backchannel { asks } => self.on_backchannel(asks),
             ToWorker::ProbeConnectGranted { probe } => self.on_probe_granted(probe),
             ToWorker::SwitchConnectGranted => {
@@ -580,16 +587,26 @@ impl Serving<'_> {
     /// `SwitchSource`: connects `spec` as the standby of the running
     /// source, replacing a standby still on its way; a standby before any
     /// source is a protocol error.
-    async fn on_switch_source(&mut self, spec: &SourceSpec) -> Result<(), Error> {
+    async fn on_switch_source(&mut self, spec: &SourceSpec, generation: u64) -> Result<(), Error> {
         let Some(running) = self.running.as_ref() else {
             return Err(Error::SwitchWithoutSource);
         };
+        let staging = TrackSet::staging(running.tracks.tracks());
         if let Some(replaced) = self.standby.take() {
-            tracing::info!("standby source replaced before it took over");
+            tracing::info!(
+                replaced = self.standby_generation,
+                generation,
+                "standby source replaced before it took over"
+            );
             replaced.staging.disarm();
             stop_runner(replaced.runner, &self.clock).await;
+            // Its last reports, `Stopped` included, still go out as its
+            // own, not the new standby's.
+            while let Ok(event) = self.standby_rx.try_recv() {
+                self.send_standby_state(event).await?;
+            }
         }
-        let staging = TrackSet::staging(running.tracks.tracks());
+        self.standby_generation = generation;
         let runner = start_runner(
             spec,
             &self.registries,
@@ -613,9 +630,17 @@ impl Serving<'_> {
         {
             standby.staging.arm_switch();
         }
-        self.tx
-            .send_msg(&ToSupervisor::SwitchState(source_state(event)), &[])
-            .await?;
+        self.send_standby_state(event).await
+    }
+
+    /// Tells the supervisor the standby's report, as the standby of the
+    /// switch it was started for.
+    async fn send_standby_state(&mut self, event: RunnerEvent) -> Result<(), Error> {
+        let state = ToSupervisor::SwitchState {
+            generation: self.standby_generation,
+            state: source_state(event),
+        };
+        self.tx.send_msg(&state, &[]).await?;
         Ok(())
     }
 
@@ -977,7 +1002,8 @@ fn start_runner(
         addrs = ?spec.peer_addrs,
         role,
         backchannel = capable,
-        backoff_attempts = spec.backoff_attempts,
+        backoff_attempts = spec.backoff.attempts,
+        immediate_used = spec.backoff.immediate_used,
         "running source"
     );
 
@@ -995,7 +1021,13 @@ fn start_runner(
         backchannel.clone().unwrap_or_default(),
         Arc::clone(clock),
         settings.runner,
-        ReconnectBackoff::resumed(jitter_seed(clock.as_ref()), spec.backoff_attempts),
+        ReconnectBackoff::resumed(
+            jitter_seed(clock.as_ref()),
+            BackoffPosition {
+                attempts: spec.backoff.attempts,
+                immediate_used: spec.backoff.immediate_used,
+            },
+        ),
         events,
         gate.clone(),
         cancel.clone(),
@@ -1134,12 +1166,15 @@ fn source_state(event: RunnerEvent) -> SourceState {
         RunnerEvent::Backoff {
             error,
             retry_in,
-            attempts,
+            position,
         } => SourceState::Backoff {
             code: error.code().to_owned(),
             message: error.to_string(),
             retry_ms: u32::try_from(retry_in.as_millis()).unwrap_or(u32::MAX),
-            attempts,
+            position: lotse_ipc::BackoffPosition {
+                attempts: position.attempts,
+                immediate_used: position.immediate_used,
+            },
         },
         RunnerEvent::Stopped => SourceState::Stopped,
     }
@@ -1333,7 +1368,7 @@ mod tests {
             options: options.into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
-            backoff_attempts: 0,
+            backoff: lotse_ipc::BackoffPosition::default(),
         }
     }
 
@@ -1412,9 +1447,10 @@ mod tests {
             }
             if matches!(
                 message,
-                ToSupervisor::SwitchState(
-                    SourceState::Connecting { .. } | SourceState::Reconnecting { .. }
-                )
+                ToSupervisor::SwitchState {
+                    state: SourceState::Connecting { .. } | SourceState::Reconnecting { .. },
+                    ..
+                }
             ) {
                 self.tx
                     .send_msg(&ToWorker::SwitchConnectGranted, &[])
@@ -1494,24 +1530,58 @@ mod tests {
         // A standby for another URL: it reports as the standby, on its own
         // grant, while the source's state stands.
         let standby = spec("fake://cam2/", r#"{"keyframes_every_ms": 10}"#);
-        h.tx.send_msg(&ToWorker::SwitchSource(standby.clone()), &[])
-            .await
-            .unwrap();
+        h.tx.send_msg(
+            &ToWorker::SwitchSource {
+                generation: 1,
+                spec: standby.clone(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
         // Replaced at once by the same spec again: the first standby's
         // `Stopped` is a standby report too.
-        h.tx.send_msg(&ToWorker::SwitchSource(standby), &[])
-            .await
-            .unwrap();
-        let live = ToSupervisor::SwitchState(SourceState::Live);
+        h.tx.send_msg(
+            &ToWorker::SwitchSource {
+                generation: 2,
+                spec: standby,
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        let live = ToSupervisor::SwitchState {
+            generation: 2,
+            state: SourceState::Live,
+        };
         let seen = messages_until_still(&mut h, |seen| seen.last() == Some(&live)).await;
         assert!(
             seen.iter()
-                .all(|m| matches!(m, ToSupervisor::SwitchState(_))),
+                .all(|m| matches!(m, ToSupervisor::SwitchState { .. })),
+            "{seen:?}"
+        );
+        // Each standby's reports carry its own switch, the replaced one's
+        // last ones too.
+        let stopped = ToSupervisor::SwitchState {
+            generation: 1,
+            state: SourceState::Stopped,
+        };
+        assert!(seen.contains(&stopped), "{seen:?}");
+        assert!(
+            !seen.contains(&ToSupervisor::SwitchState {
+                generation: 2,
+                state: SourceState::Stopped
+            }),
             "{seen:?}"
         );
         assert!(
-            seen.iter()
-                .any(|m| matches!(m, ToSupervisor::SwitchState(SourceState::Connecting { .. }))),
+            seen.iter().any(|m| matches!(
+                m,
+                ToSupervisor::SwitchState {
+                    state: SourceState::Connecting { .. },
+                    ..
+                }
+            )),
             "{seen:?}"
         );
         // Its next keyframe, 10 ms on, switches: the worker says so and
@@ -1529,7 +1599,10 @@ mod tests {
         assert!(video.1.packets >= 1, "{stats:?}");
         // A standby pending at shutdown stops with the rest.
         h.tx.send_msg(
-            &ToWorker::SwitchSource(spec("fake://cam3/", r#"{"ready_after_ms": 60000}"#)),
+            &ToWorker::SwitchSource {
+                generation: 3,
+                spec: spec("fake://cam3/", r#"{"ready_after_ms": 60000}"#),
+            },
             &[],
         )
         .await
@@ -1541,7 +1614,7 @@ mod tests {
         let seen = messages_until_still(&mut h, |seen| seen.contains(&stopped)).await;
         assert!(
             seen.iter()
-                .all(|m| matches!(m, ToSupervisor::SwitchState(_)) || *m == stopped),
+                .all(|m| matches!(m, ToSupervisor::SwitchState { .. }) || *m == stopped),
             "{seen:?}"
         );
         assert!(matches!(h.worker.await, Ok(Ok(ExitReason::Shutdown))));
@@ -1588,10 +1661,10 @@ mod tests {
         );
         // A standby on its way follows the word too.
         h.tx.send_msg(
-            &ToWorker::SwitchSource(spec(
-                "talk://cam/",
-                r#"{"backchannel": "pcmu", "video": true}"#,
-            )),
+            &ToWorker::SwitchSource {
+                generation: 1,
+                spec: spec("talk://cam/", r#"{"backchannel": "pcmu", "video": true}"#),
+            },
             &[],
         )
         .await
@@ -1665,9 +1738,15 @@ mod tests {
         h.tx.send_msg(&ToWorker::SwitchConnectGranted, &[])
             .await
             .unwrap();
-        h.tx.send_msg(&ToWorker::SwitchSource(spec("fake://cam/", "{}")), &[])
-            .await
-            .unwrap();
+        h.tx.send_msg(
+            &ToWorker::SwitchSource {
+                generation: 1,
+                spec: spec("fake://cam/", "{}"),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(matches!(h.next().await, ToSupervisor::Ready { .. }));
         assert!(matches!(
             ended(h.worker).await,
@@ -1933,16 +2012,19 @@ mod tests {
             // The standby offers PCMA; its keyframe a second after it went
             // live switches, and the counters follow its backchannel.
             h.tx.send_msg(
-                &ToWorker::SwitchSource(spec(
-                    "talk://cam2/",
-                    r#"{"backchannel": "pcma", "video": true}"#,
-                )),
+                &ToWorker::SwitchSource {
+                    generation: 1,
+                    spec: spec("talk://cam2/", r#"{"backchannel": "pcma", "video": true}"#),
+                },
                 &[],
             )
             .await
             .unwrap();
             next_where(&mut h, &|m| {
-                *m == ToSupervisor::SwitchState(SourceState::Live)
+                *m == ToSupervisor::SwitchState {
+                    generation: 1,
+                    state: SourceState::Live,
+                }
             })
             .await;
             stats_where(&mut h, &mut || {}, &|stats| {
@@ -4064,23 +4146,34 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_source_reports_reconnecting_then_backoff_with_their_codes() {
+        let at = |attempts, immediate_used| lotse_ipc::BackoffPosition {
+            attempts,
+            immediate_used,
+        };
         // A spec without earlier attempts starts the schedule at its first
-        // step, 1 s; one after five continues at the second, 5 s.
-        for (backoff_attempts, delays) in [(0, 800..=1_200), (5, 4_000..=6_000)] {
-            stalled_source_backs_off(backoff_attempts, delays).await;
+        // step, 1 s; one after five continues at the second, 5 s; one whose
+        // immediate attempt is used gets none again.
+        for (backoff, reconnects, delays) in [
+            (at(0, false), true, 800..=1_200),
+            (at(5, false), true, 4_000..=6_000),
+            (at(5, true), false, 4_000..=6_000),
+        ] {
+            stalled_source_backs_off(backoff, reconnects, delays).await;
         }
     }
 
-    /// Runs a silent source after `backoff_attempts` earlier delays and
-    /// checks it reports a drop, then a delay within `delays` ms.
+    /// Runs a silent source from schedule position `backoff` and checks it
+    /// reports a drop retried at once when `reconnects`, then a delay
+    /// within `delays` ms, one step further.
     async fn stalled_source_backs_off(
-        backoff_attempts: u32,
+        backoff: lotse_ipc::BackoffPosition,
+        reconnects: bool,
         delays: std::ops::RangeInclusive<u32>,
     ) {
         let mut h = start();
         h.next().await;
         let source = SourceSpec {
-            backoff_attempts,
+            backoff,
             ..spec("fake://cam/", "null")
         };
         h.tx.send_msg(&ToWorker::RunSource(source), &[])
@@ -4097,14 +4190,18 @@ mod tests {
         let timeout = |code: &str, message: &str| {
             code == "source_timeout" && message.contains("no video for")
         };
-        assert!(
+        assert_eq!(
             matches!(states.get(2), Some(SourceState::Reconnecting { code, message }) if timeout(code, message)),
-            "connecting, live, reconnecting expected: {states:?}"
+            reconnects,
+            "connecting, live, then reconnecting or not: {states:?}"
         );
+        let after = lotse_ipc::BackoffPosition {
+            attempts: backoff.attempts + 1,
+            immediate_used: true,
+        };
         assert!(
-            matches!(states.last(), Some(SourceState::Backoff { code, message, retry_ms, attempts })
-                if timeout(code, message) && delays.contains(retry_ms)
-                    && *attempts == backoff_attempts + 1),
+            matches!(states.last(), Some(SourceState::Backoff { code, message, retry_ms, position })
+                if timeout(code, message) && delays.contains(retry_ms) && *position == after),
             "backoff last: {states:?}"
         );
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
@@ -4173,9 +4270,15 @@ mod tests {
         h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "null")), &[])
             .await
             .unwrap();
-        h.tx.send_msg(&ToWorker::SwitchSource(spec("rtsp://cam/", "null")), &[])
-            .await
-            .unwrap();
+        h.tx.send_msg(
+            &ToWorker::SwitchSource {
+                generation: 1,
+                spec: spec("rtsp://cam/", "null"),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
         let err = within(h.worker).await.unwrap().unwrap_err();
         let_assert!(Error::SourceRejected { code: got, .. } = err);
         assert_eq!(got, "scheme_unsupported");
@@ -4233,6 +4336,7 @@ mod tests {
             session_tx: mpsc::channel(1).0,
             running: None,
             standby: None,
+            standby_generation: 0,
             sessions: None,
             lost_hand_offs: Throttle::default(),
             probes: ProbeGate::default(),
@@ -4486,12 +4590,18 @@ mod tests {
             .unwrap();
         until_live(&mut h).await;
         h.tx.send_msg(
-            &ToWorker::SwitchSource(spec("stubborn://cam2/", "null")),
+            &ToWorker::SwitchSource {
+                generation: 1,
+                spec: spec("stubborn://cam2/", "null"),
+            },
             &[],
         )
         .await
         .unwrap();
-        let live = ToSupervisor::SwitchState(SourceState::Live);
+        let live = ToSupervisor::SwitchState {
+            generation: 1,
+            state: SourceState::Live,
+        };
         next_where(&mut h, &|m| *m == live).await;
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 1_000 }, &[])
             .await
