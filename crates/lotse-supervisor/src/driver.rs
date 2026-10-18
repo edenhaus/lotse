@@ -2448,6 +2448,7 @@ mod tests {
             derived_from: None,
             audio_delay_ms: None,
             params: lotse_ipc::TrackParams::default(),
+            delivery: lotse_ipc::Delivery::CutThrough,
         };
         driver.on_worker_event(WorkerEvent::Tracks(vec![track.clone()]));
         assert_eq!(driver.snapshot.tracks, [track]);
@@ -2500,6 +2501,7 @@ mod tests {
             derived_from: None,
             audio_delay_ms: None,
             params: lotse_ipc::TrackParams::default(),
+            delivery: lotse_ipc::Delivery::CutThrough,
         };
         for _ in 0..100 {
             driver.on_worker_event(WorkerEvent::Tracks(vec![track("v0")]));

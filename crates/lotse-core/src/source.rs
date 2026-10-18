@@ -1452,6 +1452,42 @@ mod tests {
         assert_eq!(a0.codec().family(), CodecFamily::Pcma);
     }
 
+    #[test]
+    fn a_standby_brings_its_delivery_to_the_live_tracks_at_the_switch() {
+        use crate::track::Delivery;
+        // An RTSP camera's tracks, replaced by an HTTP source's.
+        let live = TrackSet::new(TrackLimits::default(), SystemClock.now());
+        let v0 = live.publisher().declare(Kind::Video, h264(), 90_000);
+        let staging = TrackSet::staging(&live);
+        let mut standby = staging.publisher();
+        let sv0 = standby.declare(Kind::Video, h264(), 90_000);
+        let sa0 = standby.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        sv0.set_delivery(Delivery::Repacketized);
+        sa0.set_delivery(Delivery::Repacketized);
+        // Kept on the standby's own tracks until the switch.
+        assert_eq!(
+            (v0.delivery(), sv0.delivery()),
+            (Delivery::CutThrough, Delivery::Repacketized)
+        );
+        standby.ready();
+        staging.arm_switch();
+        sv0.publish_packet(packet(1, true));
+        assert!(staging.is_active());
+        let a0 = live
+            .get(TrackId::new(Kind::Audio, 0))
+            .expect("declared at the switch");
+        assert_eq!(
+            (v0.delivery(), a0.delivery()),
+            (Delivery::Repacketized, Delivery::Repacketized)
+        );
+        // The old source's declaration is dropped now; the standby's
+        // reaches the live track.
+        v0.set_delivery(Delivery::CutThrough);
+        assert_eq!(v0.delivery(), Delivery::Repacketized);
+        sv0.set_delivery(Delivery::CutThrough);
+        assert_eq!(v0.delivery(), Delivery::CutThrough);
+    }
+
     #[tokio::test]
     async fn a_disarmed_standby_does_not_switch_and_the_live_set_cannot_be_armed() {
         let live = TrackSet::new(TrackLimits::default(), SystemClock.now());

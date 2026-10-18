@@ -9,7 +9,9 @@
 //! wrappers in `.cargo/deny.toml`. Test fakes for core's own types live behind
 //! its `test-util` feature, never in `lotse-testing`.
 //!
-//! Standards: RFC 3550 (RTP timestamps, sequence numbers, Sender Reports).
+//! Standards: RFC 3550 (RTP timestamps, sequence numbers, Sender Reports,
+//! the marker bit), RFC 6184 §5.1 and RFC 7798 §4.1 (the marker bit ends a
+//! video access unit, observed by [`timing`]).
 
 pub mod backoff;
 pub mod clock;
@@ -39,6 +41,7 @@ mod test_logs;
 pub mod test_util;
 pub mod text;
 pub mod throttle;
+pub mod timing;
 pub mod track;
 pub mod transcode;
 pub mod uplink;

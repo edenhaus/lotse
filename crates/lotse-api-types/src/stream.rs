@@ -284,10 +284,63 @@ pub struct TrackInfo {
     /// `sample_rate` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u8>,
+    /// How the track's live packets reach viewers.
+    pub delivery: Delivery,
+    /// How a viewer's keyframe request reaches the track's source.
+    pub keyframe_request: KeyframeRequest,
+    /// The media time between a video track's latest two keyframes, in
+    /// milliseconds (RFC 3550 §5.1 timestamps). Absent on audio, and until
+    /// two keyframes came since the track's latest timeline began (a
+    /// reconnect, a timestamp reset, a source switch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyframe_interval_ms: Option<u32>,
+    /// Whether a video track's frames come out of presentation order
+    /// (B-frames, ISO/IEC 14496-10 §C.4): `true` once a frame's timestamp
+    /// stepped back behind an earlier one's, `false` once a whole keyframe
+    /// interval went by without that. Absent on audio, and before either
+    /// on the track's latest timeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b_frames: Option<bool>,
+    /// Whether a video track's source ends every frame with the RTP marker
+    /// bit (RFC 6184 §5.1, RFC 7798 §4.1): `false` once one frame ended
+    /// without it. Frames whose last packet was lost do not count. Absent
+    /// on audio, whose marker bit means something else (RFC 3551 §4.1),
+    /// and until a frame ended on the track's latest timeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_bit: Option<bool>,
     /// Frames seen.
     pub frames: u64,
     /// Bytes seen.
     pub bytes: u64,
+    /// How late the track's latest frame arrived compared with its best of
+    /// the last 5 to 10 seconds, in microseconds: the ingest lateness live
+    /// sessions skip stalled frames by, not the end-to-end latency, which
+    /// the daemon cannot know. Absent until a frame arrived on the track's
+    /// latest timeline. At most a second old.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_latency_us: Option<u64>,
+}
+
+/// How a track's live packets reach viewers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    /// Each packet as the source sent it, forwarded the moment it is read:
+    /// an RTSP camera's RTP.
+    CutThrough,
+    /// Packets the daemon cut from whole frames itself: an HTTP source's
+    /// tracks, and derived (transcoded) tracks.
+    Repacketized,
+}
+
+/// How a viewer's keyframe request (RTCP PLI or FIR) reaches a track's
+/// source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyframeRequest {
+    /// It does not: no source protocol can force a keyframe yet, so the
+    /// camera's next keyframe repairs the picture.
+    None,
 }
 
 /// A stream's counters.
@@ -602,8 +655,14 @@ mod tests {
                 height: Some(480),
                 sample_rate: None,
                 channels: None,
+                delivery: Delivery::CutThrough,
+                keyframe_request: KeyframeRequest::None,
+                keyframe_interval_ms: Some(2000),
+                b_frames: Some(false),
+                marker_bit: Some(true),
                 frames: 1,
                 bytes: 2,
+                packet_latency_us: Some(1500),
             },
             TrackInfo {
                 id: "a1".into(),
@@ -617,8 +676,14 @@ mod tests {
                 height: None,
                 sample_rate: Some(48_000),
                 channels: Some(2),
+                delivery: Delivery::Repacketized,
+                keyframe_request: KeyframeRequest::None,
+                keyframe_interval_ms: None,
+                b_frames: None,
+                marker_bit: None,
                 frames: 3,
                 bytes: 4,
+                packet_latency_us: None,
             },
         ]
     }
@@ -649,6 +714,44 @@ mod tests {
         assert!(json[1].get("profile_level_id").is_none());
         let back: Vec<TrackInfo> = serde_json::from_value(json).unwrap();
         assert_eq!(back, tracks());
+    }
+
+    #[test]
+    fn rfc3550_5_1_a_tracks_timing_serializes_and_unmeasured_values_are_left_out() {
+        let json = serde_json::to_value(tracks()).unwrap();
+        assert_eq!(
+            (
+                &json[0]["delivery"],
+                &json[0]["keyframe_request"],
+                &json[0]["keyframe_interval_ms"],
+                &json[0]["b_frames"],
+                &json[0]["marker_bit"],
+                &json[0]["packet_latency_us"],
+            ),
+            (
+                &json!("cut_through"),
+                &json!("none"),
+                &json!(2000),
+                &json!(false),
+                &json!(true),
+                &json!(1500),
+            )
+        );
+        assert_eq!(
+            (&json[1]["delivery"], &json[1]["keyframe_request"]),
+            (&json!("repacketized"), &json!("none"))
+        );
+        for field in [
+            "keyframe_interval_ms",
+            "b_frames",
+            "marker_bit",
+            "packet_latency_us",
+        ] {
+            assert!(
+                json[1].get(field).is_none(),
+                "the derived track has no {field}"
+            );
+        }
     }
 
     #[test]
@@ -813,7 +916,8 @@ mod tests {
     fn a_track_without_codec_parameters_parses_with_none_known() {
         let track: TrackInfo = serde_json::from_value(json!({
             "id": "v0", "kind": "video", "codec": "mjpeg", "derived_from": null,
-            "sync": "arrival", "frames": 0, "bytes": 0
+            "sync": "arrival", "delivery": "cut_through", "keyframe_request": "none",
+            "frames": 0, "bytes": 0
         }))
         .unwrap();
         assert_eq!(
@@ -825,6 +929,15 @@ mod tests {
                 track.channels
             ),
             (None, None, None, None, None)
+        );
+        assert_eq!(
+            (
+                track.keyframe_interval_ms,
+                track.b_frames,
+                track.marker_bit,
+                track.packet_latency_us
+            ),
+            (None, None, None, None)
         );
     }
 

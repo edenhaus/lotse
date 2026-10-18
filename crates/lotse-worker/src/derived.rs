@@ -33,7 +33,7 @@ use lotse_core::codec::{Codec, Kind};
 use lotse_core::negotiate::{NegotiationError, TrackInfo, TrackPlan, negotiate};
 use lotse_core::output::TrackRequest;
 use lotse_core::source::TrackSet;
-use lotse_core::track::{Track, TrackId};
+use lotse_core::track::{Delivery, Track, TrackId};
 use lotse_core::transcode::{TrackHandle, TranscodeError, Transcoder};
 use tokio::sync::watch;
 
@@ -249,6 +249,8 @@ impl DerivedTracks {
             .ok_or_else(|| TranscodeError::Failed(format!("{codec} has no RTP clock rate")))
             .and_then(|clock_rate| {
                 let output = Track::new(id, to, clock_rate, source.limits(), self.clock.now());
+                // A transcoder packetizes the frames it encodes.
+                output.set_delivery(Delivery::Repacketized);
                 transcoder.spawn(source.subscribe_frames(), &input, Arc::new(output))
             });
         let handle = match handle {
@@ -592,6 +594,11 @@ mod tests {
         assert_eq!(first.track.id(), A1, "derived beside the native a0");
         assert_eq!(*first.track.codec(), Codec::Opus { channels: 1 });
         assert_eq!(first.track.clock_rate(), 48_000);
+        assert_eq!(
+            (video.track.delivery(), first.track.delivery()),
+            (Delivery::CutThrough, Delivery::Repacketized),
+            "the transcoder cuts its own packets"
+        );
         assert!(first.lease.is_some());
         assert!(changes.has_changed().unwrap(), "reported");
         changes.mark_unchanged();

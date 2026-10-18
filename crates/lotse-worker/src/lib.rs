@@ -45,7 +45,7 @@ use lotse_core::source::{BackchannelSlot, BackchannelTasks, ResolvedPeer, TrackS
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
-use lotse_core::track::{Track, TrackId, TrackLimits};
+use lotse_core::track::{Delivery, Track, TrackId, TrackLimits};
 use lotse_ipc::{
     Channel, Decoded, IpcError, Sender, SessionEvent, SessionSpec, SourceSpec, SourceState,
     ToSupervisor, ToWorker, TrackInfo, TrackStats, WorkerStats,
@@ -1192,6 +1192,10 @@ fn track_infos(tracks: &DerivedTracks, mapper: &ClockMapper) -> Vec<TrackInfo> {
             derived_from: from.map(|from| from.to_string()),
             audio_delay_ms: delay.map(|delay| u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)),
             params: params::track_params(&codec),
+            delivery: match track.delivery() {
+                Delivery::CutThrough => lotse_ipc::Delivery::CutThrough,
+                Delivery::Repacketized => lotse_ipc::Delivery::Repacketized,
+            },
         }
     };
     let natives = tracks.tracks().tracks();
@@ -1237,9 +1241,10 @@ fn worker_stats(tracks: &DerivedTracks, mapper: &ClockMapper) -> WorkerStats {
     }
 }
 
-/// One track's counters in wire form.
+/// One track's counters and timing in wire form.
 fn track_stats(track: &Track) -> TrackStats {
     let stats = track.stats();
+    let timing = track.timing();
     TrackStats {
         packets: stats.packets,
         packet_bytes: stats.packet_bytes,
@@ -1248,6 +1253,14 @@ fn track_stats(track: &Track) -> TrackStats {
         keyframes: stats.keyframes,
         frames_dropped_oversize: stats.frames_dropped_oversize,
         frames_over_browser_limit: stats.frames_over_browser_limit,
+        keyframe_interval_ms: timing
+            .keyframe_interval
+            .map(|interval| u32::try_from(interval.as_millis()).unwrap_or(u32::MAX)),
+        b_frames: timing.b_frames,
+        marker_bit: timing.marker_bit,
+        packet_latency_us: timing
+            .packet_latency
+            .map(|latency| u64::try_from(latency.as_micros()).unwrap_or(u64::MAX)),
     }
 }
 
@@ -2820,7 +2833,9 @@ mod tests {
             )
         );
         assert_eq!(a1.sync, "arrival", "its source's");
+        assert_eq!(a1.delivery, lotse_ipc::Delivery::Repacketized);
         let a0 = tracks.iter().find(|track| track.id == "a0").unwrap();
+        assert_eq!(a0.delivery, lotse_ipc::Delivery::CutThrough);
         assert_eq!(
             (
                 a0.codec.as_str(),
@@ -2835,6 +2850,9 @@ mod tests {
         .await;
         let_assert!(ToSupervisor::Stats(stats) = message);
         assert_eq!(stats.sessions, 2);
+        let (_, a1) = stats.tracks.iter().find(|(id, _)| id == "a1").unwrap();
+        assert!(a1.packet_latency_us.is_some(), "{a1:?}");
+        assert_eq!((a1.keyframe_interval_ms, a1.marker_bit), (None, None));
 
         // The first to leave keeps it running; the last stops it.
         h.tx.send_msg(
@@ -4657,5 +4675,54 @@ mod tests {
         clock.advance(Duration::from_millis(1));
         assert_ne!(a, jitter_seed(&clock));
         assert_eq!(STATS_INTERVAL, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn rfc3550_5_1_a_tracks_timing_is_reported_in_milliseconds_and_microseconds() {
+        use lotse_core::media::{MediaPacket, RtpHeaderFields};
+        let t0 = SystemClock.now();
+        let track = Track::new(
+            TrackId::new(Kind::Video, 0),
+            Codec::Mjpeg,
+            90_000,
+            TrackLimits::default(),
+            t0,
+        );
+        assert_eq!(
+            (
+                track_stats(&track).keyframe_interval_ms,
+                track_stats(&track).packet_latency_us
+            ),
+            (None, None)
+        );
+        // Two keyframes a second apart in media time, the second read
+        // 1.5 ms later than the first's transit says.
+        for (seq, ts, after) in [(1, 0, 0), (2, 90_000, 1_001_500)] {
+            track.publish_packet(MediaPacket {
+                arrival: t0 + Duration::from_micros(after),
+                rtp: RtpHeaderFields {
+                    pt: 26,
+                    seq,
+                    ts,
+                    marker: true,
+                    ssrc: 1,
+                },
+                frame_start: true,
+                keyframe_start: true,
+                epoch: 0,
+                lateness: Duration::ZERO,
+                payload: Arc::from(&[0_u8; 4][..]),
+            });
+        }
+        let stats = track_stats(&track);
+        assert_eq!(
+            (
+                stats.keyframe_interval_ms,
+                stats.b_frames,
+                stats.marker_bit,
+                stats.packet_latency_us
+            ),
+            (Some(1000), Some(false), Some(true), Some(1500))
+        );
     }
 }

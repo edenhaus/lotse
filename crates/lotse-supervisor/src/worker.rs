@@ -894,6 +894,7 @@ mod tests {
             derived_from: None,
             audio_delay_ms: None,
             params: lotse_ipc::TrackParams::default(),
+            delivery: lotse_ipc::Delivery::CutThrough,
         }
     }
 
@@ -937,6 +938,10 @@ mod tests {
                         keyframes: 5,
                         frames_dropped_oversize: 6,
                         frames_over_browser_limit: 7,
+                        keyframe_interval_ms: None,
+                        b_frames: None,
+                        marker_bit: None,
+                        packet_latency_us: None,
                     };
                     ((*id).to_owned(), counters)
                 })
@@ -974,6 +979,10 @@ mod tests {
             keyframes: 5,
             frames_dropped_oversize: 6,
             frames_over_browser_limit: 7,
+            keyframe_interval_ms: None,
+            b_frames: None,
+            marker_bit: None,
+            packet_latency_us: None,
         };
         let stats = WorkerStats {
             tracks: (0..=MAX_TRACKS)

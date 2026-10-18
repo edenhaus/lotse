@@ -832,6 +832,21 @@
         }
       ]
     },
+    "Delivery": {
+      "description": "How a track's live packets reach viewers.",
+      "oneOf": [
+        {
+          "const": "cut_through",
+          "description": "Each packet as the source sent it, forwarded the moment it is read:\nan RTSP camera's RTP.",
+          "type": "string"
+        },
+        {
+          "const": "repacketized",
+          "description": "Packets the daemon cut from whole frames itself: an HTTP source's\ntracks, and derived (transcoded) tracks.",
+          "type": "string"
+        }
+      ]
+    },
     "DemuxMetrics": {
       "description": "The supervisor's demux counters: what the receive thread did with each\ndatagram on the shared UDP socket.",
       "properties": {
@@ -1333,6 +1348,16 @@
         "sandbox"
       ],
       "type": "object"
+    },
+    "KeyframeRequest": {
+      "description": "How a viewer's keyframe request (RTCP PLI or FIR) reaches a track's\nsource.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "It does not: no source protocol can force a keyframe yet, so the\ncamera's next keyframe repairs the picture.",
+          "type": "string"
+        }
+      ]
     },
     "LandlockInfo": {
       "description": "The Landlock layers.",
@@ -2874,6 +2899,13 @@
             "null"
           ]
         },
+        "b_frames": {
+          "description": "Whether a video track's frames come out of presentation order\n(B-frames, ISO/IEC 14496-10 §C.4): `true` once a frame's timestamp\nstepped back behind an earlier one's, `false` once a whole keyframe\ninterval went by without that. Absent on audio, and before either\non the track's latest timeline.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "bytes": {
           "description": "Bytes seen.",
           "format": "uint64",
@@ -2893,6 +2925,10 @@
         "codec": {
           "description": "The codec name (`h264`, `aac_lc`).",
           "type": "string"
+        },
+        "delivery": {
+          "$ref": "#/$defs/Delivery",
+          "description": "How the track's live packets reach viewers."
         },
         "derived_from": {
           "description": "The native track a derived track came from.",
@@ -2920,9 +2956,38 @@
           "description": "`v0`, `a0`, `a1`.",
           "type": "string"
         },
+        "keyframe_interval_ms": {
+          "description": "The media time between a video track's latest two keyframes, in\nmilliseconds (RFC 3550 §5.1 timestamps). Absent on audio, and until\ntwo keyframes came since the track's latest timeline began (a\nreconnect, a timestamp reset, a source switch).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "keyframe_request": {
+          "$ref": "#/$defs/KeyframeRequest",
+          "description": "How a viewer's keyframe request reaches the track's source."
+        },
         "kind": {
           "description": "`video` or `audio`.",
           "type": "string"
+        },
+        "marker_bit": {
+          "description": "Whether a video track's source ends every frame with the RTP marker\nbit (RFC 6184 §5.1, RFC 7798 §4.1): `false` once one frame ended\nwithout it. Frames whose last packet was lost do not count. Absent\non audio, whose marker bit means something else (RFC 3551 §4.1),\nand until a frame ended on the track's latest timeline.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "packet_latency_us": {
+          "description": "How late the track's latest frame arrived compared with its best of\nthe last 5 to 10 seconds, in microseconds: the ingest lateness live\nsessions skip stalled frames by, not the end-to-end latency, which\nthe daemon cannot know. Absent until a frame arrived on the track's\nlatest timeline. At most a second old.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "profile_level_id": {
           "description": "An H.264 track's `profile-level-id` (RFC 6184 §8.1): its sequence\nparameter set's `profile_idc`, constraint flags and `level_idc` as\nsix lowercase hex digits, as an SDP `fmtp` spells them (`42e01f`).\nAbsent on other codecs, and until the camera sent its SPS.",
@@ -2960,6 +3025,8 @@
         "kind",
         "codec",
         "sync",
+        "delivery",
+        "keyframe_request",
         "frames",
         "bytes"
       ],

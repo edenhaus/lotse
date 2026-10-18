@@ -428,6 +428,17 @@ pub struct TrackInfo {
     pub audio_delay_ms: Option<u32>,
     /// The codec's parameters, as far as they are known.
     pub params: TrackParams,
+    /// How the track's live packets reach its viewers.
+    pub delivery: Delivery,
+}
+
+/// How a track's live packets reach its viewers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Delivery {
+    /// Each packet as the source sent it.
+    CutThrough,
+    /// Packets the worker cut from whole frames itself.
+    Repacketized,
 }
 
 /// A track's codec parameters, as far as the worker knows them: each is
@@ -468,6 +479,18 @@ pub struct TrackStats {
     /// Frames the live path carried in more RTP packets than some
     /// libwebrtc receivers assemble.
     pub frames_over_browser_limit: u64,
+    /// The media time between a video track's latest two keyframes, in
+    /// milliseconds, once two were seen in the current epoch.
+    pub keyframe_interval_ms: Option<u32>,
+    /// Whether a video track's frames are reordered, once seen or ruled
+    /// out over a whole keyframe interval.
+    pub b_frames: Option<bool>,
+    /// Whether a video track's source ends every frame with the marker
+    /// bit, once a frame ended.
+    pub marker_bit: Option<bool>,
+    /// How late the latest frame arrived against the track's recent best,
+    /// in microseconds, once a frame arrived.
+    pub packet_latency_us: Option<u64>,
 }
 
 /// The worker's counters, pushed once per second.
@@ -579,6 +602,7 @@ mod tests {
                     sample_rate: None,
                     channels: None,
                 },
+                delivery: Delivery::CutThrough,
             }]),
             ToSupervisor::Tracks(vec![TrackInfo {
                 id: "a1".into(),
@@ -593,6 +617,7 @@ mod tests {
                     channels: Some(2),
                     ..TrackParams::default()
                 },
+                delivery: Delivery::Repacketized,
             }]),
         ];
         for message in messages {
@@ -625,6 +650,10 @@ mod tests {
                         keyframes: 5,
                         frames_dropped_oversize: 6,
                         frames_over_browser_limit: 7,
+                        keyframe_interval_ms: Some(2000),
+                        b_frames: Some(true),
+                        marker_bit: Some(false),
+                        packet_latency_us: Some(1500),
                     },
                 )],
                 sessions: 0,

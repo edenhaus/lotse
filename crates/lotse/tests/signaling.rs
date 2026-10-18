@@ -417,6 +417,18 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
         ),
         "{front}"
     );
+    // RFC 6184 §5.1: an RTSP camera's packets, forwarded as read, each
+    // frame's last one marked, timed since the switch's new timeline.
+    assert_eq!(
+        (
+            &video["delivery"],
+            &video["keyframe_request"],
+            &video["marker_bit"]
+        ),
+        (&json!("cut_through"), &json!("none"), &json!(true)),
+        "{front}"
+    );
+    assert!(video["packet_latency_us"].is_u64(), "{front}");
 
     s.shutdown().await;
     demux.stop();

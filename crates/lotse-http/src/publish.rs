@@ -44,7 +44,7 @@ use lotse_core::ingest::IngestCounters;
 use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields};
 use lotse_core::source::{ClockInput, SourceError, TrackPublisher, TrackSet};
 use lotse_core::throttle::Throttle;
-use lotse_core::track::{Track, TrackId};
+use lotse_core::track::{Delivery, Track, TrackId};
 use lotse_core::{Codec, Kind};
 
 use crate::media::{Layout, LayoutTrack, Unit};
@@ -436,6 +436,8 @@ impl Publisher {
             );
             let codec = codec_to_declare(tracks.tracks(), &this);
             let track = tracks.declare(this.kind, codec, this.clock_rate);
+            // The live path is cut from the frames read, never forwarded.
+            track.set_delivery(Delivery::Repacketized);
             carried.push(Carried::new(track, &this));
             declared.push(this);
         }
@@ -859,6 +861,12 @@ mod tests {
             "{declared:?}"
         );
         let tracks = f.set.tracks();
+        // Every track's live path is cut from its frames.
+        assert!(
+            tracks
+                .iter()
+                .all(|track| track.delivery() == Delivery::Repacketized)
+        );
         let mut video_frames = tracks[0].subscribe_frames();
         let mut video_packets = tracks[0].subscribe_packets();
         let mut audio_frames = tracks[1].subscribe_frames();

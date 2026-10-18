@@ -24,6 +24,7 @@ use crate::codec::{Codec, Kind};
 use crate::lateness::LatenessMeter;
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
 use crate::throttle::Throttle;
+use crate::timing::{TimingMeter, TrackTiming};
 
 /// The id of a track within its stream: a kind letter and an index (`v0`,
 /// `a0`, `a1` for a derived track), as the API reports it.
@@ -228,6 +229,18 @@ pub struct TrackStats {
     /// libwebrtc receivers assemble, as the source reported them
     /// ([`Track::count_frame_over_browser_limit`]).
     pub frames_over_browser_limit: u64,
+}
+
+/// How a track's live packets reach its viewers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Delivery {
+    /// Each packet as the source read it, forwarded the moment it is: the
+    /// camera's own packetization (an RTSP camera's RTP).
+    #[default]
+    CutThrough,
+    /// Packets the daemon cut from whole frames itself: a source that
+    /// reads frames (HTTP), or a transcoder's output.
+    Repacketized,
 }
 
 /// The live counters behind [`TrackStats`].
@@ -604,7 +617,7 @@ impl Feeds {
     }
 
     /// Switches to the armed standby `tag`: a new epoch on every live
-    /// track, the standby's codecs on their counterparts, live tracks
+    /// track, the standby's codecs and deliveries on their counterparts, live tracks
     /// declared for standby tracks without one, the live set ready.
     fn switch(&self, tag: u8) {
         let staging: Vec<Arc<Track>> = std::mem::take(
@@ -625,10 +638,14 @@ impl Feeds {
         for track in &staging {
             let codec = (*track.codec()).clone();
             match track.forward_to.load_full() {
-                Some(target) => target.set_codec_inner(codec),
+                Some(target) => {
+                    target.set_codec_inner(codec);
+                    target.set_delivery_inner(track.delivery());
+                }
                 None => {
                     if let Some(live) = &live {
                         let declared = live.declare(track.id(), codec, track.clock_rate());
+                        declared.set_delivery_inner(track.delivery());
                         track.forward_to.store(Some(declared));
                     }
                 }
@@ -679,6 +696,12 @@ pub struct Track {
     /// Measures each frame's ingest lateness; only the source's task
     /// publishes, so the lock is never contended.
     lateness: Mutex<LatenessMeter>,
+    /// Observes the track's timing habits; only the source's task
+    /// publishes, so the lock is never contended.
+    timing: Mutex<TimingMeter>,
+    /// The packets are the daemon's own, not the source's
+    /// ([`Delivery::Repacketized`]).
+    repacketized: AtomicBool,
     /// Rate-limits the log line of a GOP outgrowing the cache, which a
     /// camera with long GOPs hits on every GOP; only the source's task
     /// publishes, so the lock is never contended.
@@ -761,6 +784,8 @@ impl Track {
             epoch: AtomicU32::new(0),
             epoch_frame_pending: AtomicBool::new(false),
             lateness: Mutex::new(LatenessMeter::new(clock_rate)),
+            timing: Mutex::new(TimingMeter::new(clock_rate)),
+            repacketized: AtomicBool::new(false),
             gop_truncations: Mutex::new(Throttle::default()),
             codec_changes: Mutex::new(Throttle::default()),
             closed: AtomicBool::new(false),
@@ -837,14 +862,48 @@ impl Track {
     /// one is a no-op. The line is rate-limited, timed by the track's
     /// activity: a camera can change its parameter sets on every frame.
     pub fn set_codec(&self, codec: Codec) {
+        self.describe(|track| track.set_codec_inner(codec));
+    }
+
+    /// Runs a source's write of what the track is (its codec, its
+    /// delivery) on the track it lands on: the live counterpart while this
+    /// track's source is the active feed and forwards, this track while it
+    /// is fed itself, and a standby's own track before its switch, kept
+    /// there for it. A live track whose source is no longer fed takes
+    /// nothing.
+    fn describe(&self, write: impl FnOnce(&Self)) {
         if self.fed() {
             match self.forwarded() {
-                Some(target) => target.set_codec_inner(codec),
-                None => self.set_codec_inner(codec),
+                Some(target) => write(&target),
+                None => write(self),
             }
         } else if self.tag != 0 {
-            // A standby's codec, kept for the switch.
-            self.set_codec_inner(codec);
+            write(self);
+        }
+    }
+
+    /// How the track's live packets reach its viewers.
+    pub fn delivery(&self) -> Delivery {
+        if self.repacketized.load(Ordering::Relaxed) {
+            Delivery::Repacketized
+        } else {
+            Delivery::CutThrough
+        }
+    }
+
+    /// Declares how the track's live packets reach its viewers; a track
+    /// starts out [`Delivery::CutThrough`]. A source that cuts its own
+    /// packets, and whoever makes a transcoder's output track, declare it
+    /// before the first packet. Routed as [`Self::set_codec`] is.
+    pub fn set_delivery(&self, delivery: Delivery) {
+        self.describe(|track| track.set_delivery_inner(delivery));
+    }
+
+    /// [`Self::set_delivery`] on this track itself, whoever feeds it.
+    fn set_delivery_inner(&self, delivery: Delivery) {
+        let repacketized = delivery == Delivery::Repacketized;
+        if self.repacketized.swap(repacketized, Ordering::Relaxed) != repacketized {
+            tracing::debug!(track = %self.id, ?delivery, "track delivery changed");
         }
     }
 
@@ -890,6 +949,10 @@ impl Track {
         let epoch = self.epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         self.epoch_frame_pending.store(true, Ordering::Relaxed);
         self.lateness
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reset();
+        self.timing
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .reset();
@@ -946,6 +1009,15 @@ impl Track {
     /// The counters now.
     pub fn stats(&self) -> TrackStats {
         self.counters.snapshot()
+    }
+
+    /// What the live path has shown of the track's timing in the current
+    /// epoch ([`crate::timing`]).
+    pub fn timing(&self) -> TrackTiming {
+        self.timing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .timing()
     }
 
     /// The GOP cache, once a keyframe has been seen.
@@ -1059,6 +1131,10 @@ impl Track {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .packet(packet.arrival, packet.rtp.ts, packet.frame_start);
+        self.timing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .packet(&packet, self.kind() == Kind::Video);
         self.touch(packet.arrival);
         self.counters.packets.fetch_add(1, Ordering::Relaxed);
         Counters::add_bytes(&self.counters.packet_bytes, packet.payload.len());
@@ -1900,6 +1976,78 @@ mod tests {
             .map(|p| p.lateness)
             .collect();
         assert_eq!(lateness, [ms(0), ms(367), ms(367), ms(0)]);
+    }
+
+    #[test]
+    fn rfc3550_5_1_the_live_path_shows_the_tracks_timing_per_epoch() {
+        let track = video_track(TrackLimits::default());
+        assert_eq!(track.timing(), TrackTiming::default());
+        let t0 = SystemClock.now();
+        let keyframe = |seq: u16, ts: u32, after: Duration| MediaPacket {
+            arrival: t0 + after,
+            rtp: RtpHeaderFields {
+                seq,
+                ts,
+                marker: true,
+                ..packet(0).rtp
+            },
+            frame_start: true,
+            keyframe_start: true,
+            ..packet(0)
+        };
+        track.publish_packet(keyframe(1, 0, Duration::ZERO));
+        track.publish_packet(keyframe(2, 90_000, Duration::from_secs(1)));
+        assert_eq!(
+            track.timing(),
+            TrackTiming {
+                keyframe_interval: Some(Duration::from_secs(1)),
+                b_frames: Some(false),
+                marker_bit: Some(true),
+                packet_latency: Some(Duration::ZERO),
+            }
+        );
+        // A new epoch starts every observation over.
+        let _epoch = track.start_epoch();
+        assert_eq!(track.timing(), TrackTiming::default());
+        // An audio track's marker bit and keyframes say nothing of these.
+        let audio = Track::new(
+            TrackId::new(Kind::Audio, 0),
+            Codec::Pcmu,
+            8_000,
+            TrackLimits::default(),
+            t0,
+        );
+        audio.publish_packet(keyframe(1, 0, Duration::ZERO));
+        audio.publish_packet(keyframe(2, 8_000, Duration::from_secs(1)));
+        assert_eq!(
+            audio.timing(),
+            TrackTiming {
+                packet_latency: Some(Duration::ZERO),
+                ..TrackTiming::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_track_is_cut_through_until_declared_repacketized_and_says_when_that_changes() {
+        let (logs, _guard) = Logs::capture();
+        let track = video_track(TrackLimits::default());
+        assert_eq!(track.delivery(), Delivery::CutThrough);
+        assert_eq!(Delivery::default(), Delivery::CutThrough);
+        track.set_delivery(Delivery::Repacketized);
+        track.set_delivery(Delivery::Repacketized);
+        assert_eq!(track.delivery(), Delivery::Repacketized);
+        track.set_delivery(Delivery::CutThrough);
+        assert_eq!(track.delivery(), Delivery::CutThrough);
+        let lines = logs.lines(tracing::Level::DEBUG, "track delivery changed");
+        let fields: Vec<_> = lines.iter().map(|line| line.fields.as_str()).collect();
+        assert_eq!(
+            fields,
+            [
+                " track=v0 delivery=Repacketized",
+                " track=v0 delivery=CutThrough"
+            ]
+        );
     }
 
     #[tokio::test]

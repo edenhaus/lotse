@@ -18,9 +18,9 @@ use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::info::{ProcessMetrics, WorkerMetrics};
 use lotse_api_types::session::{Session, SessionEvent};
 use lotse_api_types::stream::{
-    AudioMode, BackchannelState, ConnectionInfo, LastError, Orientation, SourceBackchannel,
-    SourceInfo, Stream, StreamBackchannel, StreamEvent, StreamState, StreamStats, TalkerReason,
-    TrackInfo, WorkerInfo,
+    AudioMode, BackchannelState, ConnectionInfo, Delivery, KeyframeRequest, LastError, Orientation,
+    SourceBackchannel, SourceInfo, Stream, StreamBackchannel, StreamEvent, StreamState,
+    StreamStats, TalkerReason, TrackInfo, WorkerInfo,
 };
 use lotse_api_types::time::rfc3339;
 use lotse_core::clock::Clock;
@@ -28,8 +28,8 @@ use lotse_core::connection::{ConnectionError, ConnectionState};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_ipc::{
-    SessionEvent as WorkerSessionEvent, SessionSpec, TalkbackStats, TrackInfo as IpcTrackInfo,
-    WorkerStats,
+    Delivery as IpcDelivery, SessionEvent as WorkerSessionEvent, SessionSpec, TalkbackStats,
+    TrackInfo as IpcTrackInfo, WorkerStats,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::task::TaskTracker;
@@ -1334,8 +1334,20 @@ fn track_dto(track: &IpcTrackInfo, stats: Option<&WorkerStats>) -> TrackInfo {
         height: track.params.picture.map(|(_, height)| height),
         sample_rate: track.params.sample_rate,
         channels: track.params.channels,
+        delivery: match track.delivery {
+            IpcDelivery::CutThrough => Delivery::CutThrough,
+            IpcDelivery::Repacketized => Delivery::Repacketized,
+        },
+        // No source protocol can force a keyframe yet: every factory
+        // declares `keyframe_request: false` and every source answers
+        // `KeyframeRequest::Unsupported`.
+        keyframe_request: KeyframeRequest::None,
+        keyframe_interval_ms: counters.and_then(|t| t.keyframe_interval_ms),
+        b_frames: counters.and_then(|t| t.b_frames),
+        marker_bit: counters.and_then(|t| t.marker_bit),
         frames: counters.map_or(0, |t| t.frames),
         bytes: counters.map_or(0, |t| t.packet_bytes.max(t.frame_bytes)),
+        packet_latency_us: counters.and_then(|t| t.packet_latency_us),
     }
 }
 
@@ -1470,6 +1482,7 @@ mod tests {
                 channels: Some(2),
                 ..TrackParams::default()
             },
+            delivery: IpcDelivery::Repacketized,
         }
     }
 
@@ -2405,21 +2418,27 @@ mod tests {
         );
     }
 
+    /// An audio track's counters, with no timing measured.
+    const fn audio_counters() -> TrackStats {
+        TrackStats {
+            packets: 5,
+            packet_bytes: 300,
+            frames: 5,
+            frame_bytes: 200,
+            keyframes: 5,
+            frames_dropped_oversize: 2,
+            frames_over_browser_limit: 3,
+            keyframe_interval_ms: None,
+            b_frames: None,
+            marker_bit: None,
+            packet_latency_us: None,
+        }
+    }
+
     #[test]
     fn tracks_and_streams_are_reported_with_their_counters() {
         let stats = WorkerStats {
-            tracks: vec![(
-                "a1".into(),
-                TrackStats {
-                    packets: 5,
-                    packet_bytes: 300,
-                    frames: 5,
-                    frame_bytes: 200,
-                    keyframes: 5,
-                    frames_dropped_oversize: 2,
-                    frames_over_browser_limit: 3,
-                },
-            )],
+            tracks: vec![("a1".into(), audio_counters())],
             sessions: 1,
             send_failures: 0,
             av_sync_lost: 1,
@@ -2507,5 +2526,62 @@ mod tests {
         let dto = registry.stream_dto("front", &entry).stream;
         assert_eq!(dto.tracks.len(), 1);
         assert_eq!((dto.tracks[0].id.as_str(), dto.tracks[0].frames), ("a1", 5));
+    }
+
+    #[test]
+    fn rfc3550_5_1_a_video_tracks_timing_comes_with_the_latest_counters() {
+        let video = IpcTrackInfo {
+            kind: "video".into(),
+            codec: "h264".into(),
+            params: TrackParams::default(),
+            ..ipc_track("v0", None, None)
+        };
+        let counters = TrackStats {
+            packets: 1,
+            packet_bytes: 1,
+            frames: 1,
+            frame_bytes: 1,
+            keyframes: 1,
+            frames_dropped_oversize: 0,
+            frames_over_browser_limit: 0,
+            keyframe_interval_ms: Some(2000),
+            b_frames: Some(true),
+            marker_bit: Some(false),
+            packet_latency_us: Some(1500),
+        };
+        let stats = WorkerStats {
+            tracks: vec![("v0".into(), counters)],
+            ..WorkerStats::default()
+        };
+        let timed = track_dto(&video, Some(&stats));
+        assert_eq!(
+            (
+                timed.keyframe_interval_ms,
+                timed.b_frames,
+                timed.marker_bit,
+                timed.packet_latency_us
+            ),
+            (Some(2000), Some(true), Some(false), Some(1500))
+        );
+        assert_eq!(
+            (timed.delivery, timed.keyframe_request),
+            (Delivery::Repacketized, KeyframeRequest::None)
+        );
+        // Before the first counters, none is known.
+        let cut_through = IpcTrackInfo {
+            delivery: IpcDelivery::CutThrough,
+            ..video
+        };
+        let untimed = track_dto(&cut_through, None);
+        assert_eq!(untimed.delivery, Delivery::CutThrough);
+        assert_eq!(
+            (
+                untimed.keyframe_interval_ms,
+                untimed.b_frames,
+                untimed.marker_bit,
+                untimed.packet_latency_us
+            ),
+            (None, None, None, None)
+        );
     }
 }
