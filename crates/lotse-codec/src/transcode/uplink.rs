@@ -16,10 +16,9 @@
 //! untouched; only the framing and the RTP header change. Nothing
 //! waits but a frame for its last sample: no playout buffer, no pacing, no
 //! timer. The frames follow the input's timing, so the camera never gets
-//! audio earlier than it arrived, nor more of it than real time holds.
-//! The camera absorbs the network's jitter itself: a Reolink
-//! `TrackMix WiFi` (firmware `v3.0.0.3748_2408281837`), observed
-//! 2026-10-11, buffers about 1.1 s of
+//! audio earlier than it arrived, nor more of it. The camera absorbs the
+//! network's jitter itself: a Reolink `TrackMix WiFi` (firmware
+//! `v3.0.0.3748_2408281837`), observed 2026-10-11, buffers about 1.1 s of
 //! backchannel audio whatever the packet size (10, 20 and 40 ms tried),
 //! and a one-frame playout lead in front of it changed nothing measurable.
 //!
@@ -33,25 +32,26 @@
 //!   reach the camera as extra audio in a burst, and a camera that plays
 //!   everything it receives keeps that delay for the rest of the session.
 //!   The output timestamps advance by the gap instead, at the end of the
-//!   frame being filled when the gap falls inside one. Opus input runs
-//!   libopus's loss concealment over the gap's end, as much of it as the
-//!   next packet carries, and discards it, so the next packet decodes from
-//!   the state libopus expects after a loss, and a sender's timestamps buy
-//!   no decoder work beyond the audio it sends.
+//!   frame being filled when the gap falls inside one, and only as far as
+//!   the wall clock explains it: to one frame past the packet's arrival at
+//!   most, so a sender's timestamps (or the spans of packets the session
+//!   dropped, see Floods) cannot move the camera's timeline ahead of it.
+//!   Opus input runs libopus's loss concealment over the gap's end, as
+//!   much of it as the next packet carries, and discards it, so the next
+//!   packet decodes from the state libopus expects after a loss, and a
+//!   sender's timestamps buy no decoder work beyond the audio it sends.
 //! - **Late packets.** A packet behind the input already taken (late,
 //!   reordered, duplicated) is dropped: its place on the timeline has
 //!   passed.
 //! - **Floods.** A sender's audio is sampled in real time (RFC 3550 §5.1:
 //!   the timestamps come from a clock that "increments monotonically and
-//!   linearly in time"), so its packets cannot bring audio faster than
-//!   the wall clock passes. The audio taken is played out, in the chain's
-//!   books, from each packet's arrival or from the end of the audio before
-//!   it, whichever is later; a packet arriving while that audio runs more
-//!   than one frame past its arrival is dropped before it is decoded, its
-//!   place on the input timeline taken, and counted. A browser pushing
-//!   120 ms of audio every millisecond gets real time through and costs
-//!   no more than real time does; a sender that ran behind banks no lead
-//!   for a burst later, and a jitter burst of up to one frame passes.
+//!   linearly in time"), so the session keeps it to that: the worker's
+//!   talk-back pace, the one gate, drops what a session sends ahead of
+//!   real time before it reaches a chain, whatever codecs it alternates.
+//!   The chain takes what passes as it comes: the dropped packets' spans
+//!   are gaps the wall clock bounds (Gaps), and concealment is bounded by
+//!   the audio that passed, so neither the camera's timeline nor the
+//!   decoder's work outruns the wall clock.
 //! - **Talk spurts.** A gap over [`MAX_GAP`] in the input timestamps, or a
 //!   sender silent for longer than that, starts a new spurt: marker set,
 //!   timestamp advanced by the time that passed. The partial frame the last
@@ -332,12 +332,9 @@ struct Spurt {
     /// Samples the input skipped inside the frame being filled: the frame
     /// after it starts that much later.
     skipped: i64,
-    /// When the audio taken so far ends, each packet's played out from its
-    /// capture time or from the end of the audio before it, whichever is
-    /// later: never behind the last packet's capture time plus its
-    /// duration. A packet captured more than [`MAX_GAP`] later finds the
-    /// sender stopped; one captured more than a frame earlier runs ahead
-    /// of real time ([`Chain::runs_ahead`]). A new spurt keeps it.
+    /// When the audio taken so far ends: the last packet's capture time
+    /// plus its duration. A packet captured more than [`MAX_GAP`] later
+    /// finds the sender stopped.
     end: Instant,
     /// The next frame is the spurt's first.
     first: bool,
@@ -377,11 +374,6 @@ struct Chain {
     failures: Throttle,
     /// Lags on the input subscription.
     lags: Throttle,
-    /// Packets dropped for running ahead of real time, for the log.
-    floods: Throttle,
-    /// Packets dropped for running ahead of real time since the start,
-    /// for the stop log.
-    ahead_dropped: u64,
 }
 
 impl Chain {
@@ -409,14 +401,11 @@ impl Chain {
             gaps: Throttle::default(),
             failures: Throttle::default(),
             lags: Throttle::default(),
-            floods: Throttle::default(),
-            ahead_dropped: 0,
         }
     }
 
     /// One uplink packet: dropped when it is behind the input already
-    /// taken, or when the audio taken runs more than a frame ahead of it;
-    /// otherwise it starts a spurt, a new one after a long gap or
+    /// taken; otherwise it starts a spurt, a new one after a long gap or
     /// silence, or bridges a short gap before it, and its audio goes into
     /// the frame being filled, sending every frame that completes.
     fn packet(&mut self, frame: &MediaFrame) {
@@ -454,10 +443,6 @@ impl Chain {
             .unwrap_or(0);
         let mut spurt = match self.spurt {
             None => self.start(frame.wallclock, 0, "first_packet"),
-            Some(spurt) if self.runs_ahead(&spurt, frame.wallclock) => {
-                self.drop_ahead(frame, &spurt, now);
-                return;
-            }
             Some(spurt) if gap > MAX_GAP_SAMPLES => {
                 self.restart(&spurt, frame.wallclock, "input_gap")
             }
@@ -470,7 +455,7 @@ impl Chain {
                     .ticks(&frame.payload)
                     .checked_div(self.input.ticks_per_sample())
                     .unwrap_or(0);
-                self.bridge(spurt, gap, carried, now)
+                self.bridge(spurt, gap, carried, frame.wallclock, now)
             }
             Some(spurt) => spurt,
         };
@@ -482,8 +467,10 @@ impl Chain {
                 let samples = i64::try_from(samples).unwrap_or(i64::MAX);
                 self.expected =
                     Some(ts.saturating_add(samples.saturating_mul(self.input.ticks_per_sample())));
-                let from = spurt.end.max(frame.wallclock);
-                spurt.end = from.checked_add(span(samples)).unwrap_or(from);
+                spurt.end = frame
+                    .wallclock
+                    .checked_add(span(samples))
+                    .unwrap_or(frame.wallclock);
                 spurt = self.flush(spurt, now);
             }
             Err(err) => {
@@ -534,42 +521,7 @@ impl Chain {
             "uplink: talk spurt ended"
         );
         self.fifo.clear();
-        let mut next = self.start(wallclock, end.saturating_add(samples_in(silence)), reason);
-        // The audio taken still plays out: a new spurt is no way past the
-        // flood bound.
-        next.end = next.end.max(spurt.end);
-        next
-    }
-
-    /// Whether the audio `spurt` has taken ends more than one frame after
-    /// `wallclock`, a packet's capture time: that packet would put the
-    /// output more than a frame ahead of real time, past what one frame's
-    /// jitter explains (RFC 3550 §5.1: a sender's clock runs in real
-    /// time). Exactly one frame ahead is not.
-    fn runs_ahead(&self, spurt: &Spurt, wallclock: Instant) -> bool {
-        wallclock
-            .checked_add(self.frame.duration())
-            .is_some_and(|limit| spurt.end > limit)
-    }
-
-    /// Drops `frame`, which the audio `spurt` has taken runs more than a
-    /// frame ahead of, before it costs a decode, and counts it. Its place
-    /// on the input timeline is taken, so the next packet follows on
-    /// without a gap and a copy of it is late; the output timeline does
-    /// not move for it.
-    fn drop_ahead(&mut self, frame: &MediaFrame, spurt: &Spurt, now: Instant) {
-        let ts = frame.ts.ticks();
-        self.expected = Some(ts.saturating_add(self.input.ticks(&frame.payload)));
-        self.ahead_dropped = self.ahead_dropped.saturating_add(1);
-        if let Some(count) = self.floods.hit(now) {
-            tracing::debug!(
-                track = %self.output.id(),
-                lead_ms = spurt.end.saturating_duration_since(frame.wallclock).as_millis(),
-                ts,
-                count,
-                "uplink: packet dropped; it runs ahead of real time"
-            );
-        }
+        self.start(wallclock, end.saturating_add(samples_in(silence)), reason)
     }
 
     /// Bridges a gap of `gap` samples, up to [`MAX_GAP`], in `spurt`
@@ -580,11 +532,27 @@ impl Chain {
     /// of the gap, as much of it as the packet carries, and discards the
     /// samples, so the next packet decodes as libopus expects after a
     /// loss (RFC 6716 §4.4). The cap keeps the decoder's work with the
-    /// audio taken, which the flood bound paces, not with the timestamps a
+    /// audio taken, which the session's pace bounds, not with the timestamps a
     /// sender claims: short packets each 100 ms past the last would
     /// otherwise buy 100 ms of concealment apiece. A lost packet of the
     /// same size as the next is concealed whole.
-    fn bridge(&mut self, mut spurt: Spurt, gap: i64, carried: i64, now: Instant) -> Spurt {
+    ///
+    /// The output timeline moves on by the gap only as far as the wall
+    /// clock explains it: to one frame past `wallclock`, the packet's
+    /// capture time, at most. Our timestamps follow our own sampling
+    /// clock, which runs in real time (RFC 3550 §5.1); a sender whose
+    /// timestamps claim more loss than time passed, or whose packets the
+    /// session dropped for running ahead of real time, moves them no
+    /// further, so the camera's timeline keeps to the wall clock as its
+    /// audio does.
+    fn bridge(
+        &mut self,
+        mut spurt: Spurt,
+        gap: i64,
+        carried: i64,
+        wallclock: Instant,
+        now: Instant,
+    ) -> Spurt {
         if let Input::Opus(decoder) = &mut self.input {
             let steps = usize::try_from(gap.min(carried))
                 .unwrap_or(0)
@@ -594,19 +562,34 @@ impl Chain {
                 .map_or(0, <[i16]>::len);
             tracing::trace!(track = %self.output.id(), concealed, "uplink: loss run through the decoder");
         }
+        // Where the audio taken so far ends on the output timeline.
+        let held = i64::try_from(self.fifo.len())
+            .unwrap_or(i64::MAX)
+            .saturating_add(spurt.skipped);
+        let taken = spurt
+            .wallclock
+            .checked_add(span(held))
+            .unwrap_or(spurt.wallclock);
+        let room = wallclock
+            .checked_add(self.frame.duration())
+            .map_or(0, |limit| {
+                samples_in(limit.saturating_duration_since(taken))
+            });
+        let advanced = gap.min(room);
         if self.fifo.is_empty() {
-            spurt.ts = spurt.ts.saturating_add(gap);
+            spurt.ts = spurt.ts.saturating_add(advanced);
             spurt.wallclock = spurt
                 .wallclock
-                .checked_add(span(gap))
+                .checked_add(span(advanced))
                 .unwrap_or(spurt.wallclock);
         } else {
-            spurt.skipped = spurt.skipped.saturating_add(gap);
+            spurt.skipped = spurt.skipped.saturating_add(advanced);
         }
         if let Some(count) = self.gaps.hit(now) {
             tracing::debug!(
                 track = %self.output.id(),
                 gap_samples = gap,
+                advanced_samples = advanced,
                 count,
                 "uplink: input gap bridged; timestamps advanced by it"
             );
@@ -719,7 +702,6 @@ async fn run(mut chain: Chain, mut input: FrameSubscription, stop: CancellationT
         track = %chain.output.id(),
         reason,
         dropped_samples = chain.fifo.len(),
-        ahead_dropped_packets = chain.ahead_dropped,
         "transcoder stopped"
     );
 }
@@ -748,7 +730,6 @@ mod tests {
     const ENDED: &str = "uplink: talk spurt ended";
     const LATE: &str = "uplink: late packet dropped; its place has passed";
     const BRIDGED: &str = "uplink: input gap bridged; timestamps advanced by it";
-    const AHEAD: &str = "uplink: packet dropped; it runs ahead of real time";
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -878,16 +859,6 @@ mod tests {
             }
             out.extend(self.run_to(until).await);
             out
-        }
-
-        /// Drops the handle, waits for the task to stop and returns the
-        /// fields of its stop log.
-        async fn stop(&mut self, logs: &Logs) -> Vec<String> {
-            self.handle = None;
-            stopped(&self.output, 1).await;
-            logs.fields(Level::INFO, "transcoder stopped")
-                .pop()
-                .unwrap()
         }
     }
 
@@ -1366,15 +1337,15 @@ mod tests {
             let (logs, _guard) = Logs::capture();
             let mut rig = Rig::pcmu(FrameSize::DEFAULT);
             let input = codes(4);
-            let mut out = rig.feed(&input[..3], 160, &[], ms(60)).await;
+            // The next packet 100 ms after its place, on the wall clock too.
+            let mut out = rig.feed(&input[..3], 160, &[], ms(160)).await;
             rig.publish(3 * 160 + gap, &input[3]);
-            out.extend(rig.run_to(ms(80)).await);
+            out.extend(rig.run_to(ms(180)).await);
             assert_eq!(&out[3].payload[..], &input[3][..]);
             assert_eq!(out[3].rtp.marker, new_spurt, "{gap}");
-            // A bridged gap moves the timestamps on; a new spurt continues
-            // them by the time that passed, none here.
-            let ts = if new_spurt { 480 } else { 480 + 800 };
-            assert_eq!(out[3].rtp.ts, ts, "{gap}");
+            // A bridged gap moves the timestamps on by itself; a new spurt
+            // continues them by the time that passed: 100 ms either way.
+            assert_eq!(out[3].rtp.ts, 480 + 800, "{gap}");
             assert_eq!(logs.count(Level::DEBUG, BRIDGED), usize::from(!new_spurt));
             if new_spurt {
                 let ended = logs.fields(Level::DEBUG, ENDED);
@@ -1516,11 +1487,12 @@ mod tests {
         assert_eq!(&out[0].payload[..], &input[3][..]);
         assert_eq!(&out[1].payload[..], &input[4][..]);
         // A second lag is counted, not logged; the skipped audio is a
-        // gap the timestamps run over.
+        // gap the timestamps run over, the wall clock having run on too.
+        out.extend(rig.run_to(ms(100)).await);
         for (k, payload) in input.iter().enumerate() {
             rig.publish(160 * (k as i64 + 5), payload);
         }
-        out.extend(rig.run_to(ms(60)).await);
+        out.extend(rig.run_to(ms(120)).await);
         assert_eq!(&out[2].payload[..], &input[3][..]);
         assert_eq!(timestamps(&out), [0, 160, 800, 960]);
         assert_eq!(
@@ -1563,168 +1535,31 @@ mod tests {
         }
     }
 
-    /// `samples` G.711 codes, sample `n` holding `n % 251`.
-    fn g711(samples: usize) -> Vec<u8> {
-        (0..samples).map(|n| (n % 251) as u8).collect()
-    }
-
     #[tokio::test]
-    async fn rfc3550_5_1_120_ms_packets_a_millisecond_apart_get_real_time_through() {
+    async fn rfc3550_5_1_a_gap_moves_the_timestamps_only_as_far_as_the_wall_clock_explains() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::pcmu(FrameSize::DEFAULT);
-        let packet = g711(960);
-        let mut out = Vec::new();
-        for k in 0..600_u64 {
-            out.extend(rig.run_to(ms(k)).await);
-            rig.publish(960 * k as i64, &packet);
-        }
-        out.extend(rig.run_to(ms(700)).await);
-        // The first is taken; the next once the audio taken ends no more
-        // than a frame (20 ms) past its arrival: 120 ms of audio per 120
-        // ms of wall clock, after a lead of one frame.
-        let taken = [0, 100, 220, 340, 460, 580];
-        let at: Vec<Duration> = taken.iter().flat_map(|t| [ms(*t); 6]).collect();
-        assert_eq!(arrivals(&rig, &out), at);
-        // No frame ends more than a frame after its packet's audio would
-        // in real time.
-        for (at, wallclock) in at.iter().zip(&rig.wallclocks) {
-            assert!(*wallclock + ms(20) <= *at + ms(120) + ms(20), "{at:?}");
-        }
-        // The dropped packets' places are taken: one spurt, contiguous.
-        assert_eq!(
-            timestamps(&out),
-            (0..36).map(|k| 160 * k).collect::<Vec<_>>()
-        );
+        let input = codes(6);
+        // At real-time pace, each packet claims 80 ms of loss before it
+        // (what a sender gets from packets dropped ahead of it): the first
+        // gap fills the frame of lead, then none passes.
+        let out = rig.feed(&input, 160 + 640, &[], ms(200)).await;
+        assert_eq!(sent(&out), fed(&input));
+        assert_eq!(timestamps(&out), [0, 320, 480, 640, 800, 960]);
         assert_eq!(
             rig.wallclocks,
-            (0..36).map(|k| ms(20 * k)).collect::<Vec<_>>()
+            [ms(0), ms(40), ms(60), ms(80), ms(100), ms(120)]
         );
-        assert_eq!(markers(&out).iter().filter(|m| **m).count(), 1);
-        assert_eq!(sent(&out), packet.repeat(6));
-        for message in [BRIDGED, ENDED, LATE] {
-            assert_eq!(logs.count(Level::DEBUG, message), 0, "{message}");
-        }
-        // Counted, logged once with the lead it found.
-        let drops = logs.fields(Level::DEBUG, AHEAD);
-        assert_eq!(drops.len(), 1, "rate-limited");
-        assert!(drops[0].contains(&"lead_ms=119".to_owned()), "{drops:?}");
-        assert!(drops[0].contains(&"ts=960".to_owned()), "{drops:?}");
-        let stop = rig.stop(&logs).await;
+        assert!(markers(&out).iter().skip(1).all(|m| !m));
+        let bridged = logs.fields(Level::DEBUG, BRIDGED);
+        assert_eq!(bridged.len(), 1, "rate-limited");
         assert!(
-            stop.contains(&"ahead_dropped_packets=594".to_owned()),
-            "{stop:?}"
+            bridged[0].contains(&"gap_samples=640".to_owned()),
+            "{bridged:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn rfc3550_5_1_120_ms_packets_at_real_time_pace_drop_nothing() {
-        let (logs, _guard) = Logs::capture();
-        let mut rig = Rig::pcmu(FrameSize::DEFAULT);
-        let packet = g711(960);
-        let mut out = Vec::new();
-        for k in 0..5_u64 {
-            out.extend(rig.run_to(ms(120 * k)).await);
-            rig.publish(960 * k as i64, &packet);
-        }
-        out.extend(rig.run_to(ms(700)).await);
-        let at: Vec<Duration> = (0..5).flat_map(|k| [ms(120 * k); 6]).collect();
-        assert_eq!(arrivals(&rig, &out), at);
-        assert_eq!(sent(&out), packet.repeat(5));
-        assert_eq!(logs.count(Level::DEBUG, AHEAD), 0);
-        let stop = rig.stop(&logs).await;
         assert!(
-            stop.contains(&"ahead_dropped_packets=0".to_owned()),
-            "{stop:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rfc3550_5_1_exactly_one_frame_ahead_is_taken_one_sample_more_is_dropped() {
-        for (len, dropped) in [(320_usize, false), (321, true)] {
-            let (logs, _guard) = Logs::capture();
-            let mut rig = Rig::pcmu(FrameSize::DEFAULT);
-            // A first packet of 40 ms (or a sample more) at 0; at 20 ms the
-            // audio taken ends 20 ms (or a sample more) past the next.
-            rig.publish(0, &g711(len));
-            let mut out = rig.run_to(ms(20)).await;
-            rig.publish(len as i64, &[1; 160]);
-            out.extend(rig.run_to(ms(40)).await);
-            // The next one follows on: the dropped packet's place is
-            // taken, and a copy of it is late.
-            rig.publish(len as i64 + 160, &[2; 160]);
-            rig.publish(len as i64, &[1; 160]);
-            out.extend(rig.run_to(ms(100)).await);
-            let mut expected = g711(len);
-            if !dropped {
-                expected.extend([1; 160]);
-            }
-            expected.extend([2; 160]);
-            expected.truncate(expected.len() / 160 * 160);
-            assert_eq!(sent(&out), expected, "{len}");
-            assert_eq!(markers(&out).iter().filter(|m| **m).count(), 1, "{len}");
-            assert_eq!(
-                logs.count(Level::DEBUG, AHEAD),
-                usize::from(dropped),
-                "{len}"
-            );
-            assert_eq!(logs.count(Level::DEBUG, BRIDGED), 0, "{len}");
-            assert_eq!(logs.count(Level::DEBUG, LATE), 1, "{len}");
-            let stop = rig.stop(&logs).await;
-            let count = format!("ahead_dropped_packets={}", u8::from(dropped));
-            assert!(stop.contains(&count), "{len}: {stop:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn rfc7587_4_1_an_opus_flood_is_dropped_on_its_48_khz_clock() {
-        let (logs, _guard) = Logs::capture();
-        let mut rig = Rig::opus();
-        let input = opus_tone(100);
-        let mut out = Vec::new();
-        for (k, payload) in input.iter().enumerate() {
-            out.extend(rig.run_to(ms(k as u64)).await);
-            rig.publish(960 * k as i64, payload);
-        }
-        out.extend(rig.run_to(ms(200)).await);
-        // A burst of one frame passes, then 20 ms per 20 ms.
-        assert_eq!(
-            arrivals(&rig, &out),
-            [ms(0), ms(1), ms(20), ms(40), ms(60), ms(80)]
-        );
-        // Each dropped packet's 960 ticks are 160 samples taken: no gap.
-        assert_eq!(timestamps(&out), [0, 160, 320, 480, 640, 800]);
-        assert_eq!(logs.count(Level::DEBUG, BRIDGED), 0);
-        assert_eq!(logs.count(Level::DEBUG, ENDED), 0);
-        let stop = rig.stop(&logs).await;
-        assert!(
-            stop.contains(&"ahead_dropped_packets=94".to_owned()),
-            "{stop:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rfc3551_4_1_a_flood_of_new_spurts_is_held_to_real_time_too() {
-        let (logs, _guard) = Logs::capture();
-        let mut rig = Rig::pcmu(FrameSize::DEFAULT);
-        let packet = g711(160);
-        let mut out = Vec::new();
-        // Each packet 125 ms past the last on the input timeline: each one
-        // taken starts a new spurt, which keeps the lead of the last.
-        for k in 0..100_u64 {
-            out.extend(rig.run_to(ms(k)).await);
-            rig.publish(1_160 * k as i64, &packet);
-        }
-        out.extend(rig.run_to(ms(200)).await);
-        assert_eq!(
-            arrivals(&rig, &out),
-            [ms(0), ms(1), ms(20), ms(40), ms(60), ms(80)]
-        );
-        assert!(markers(&out).iter().all(|m| *m));
-        assert_eq!(logs.count(Level::DEBUG, ENDED), 5);
-        let stop = rig.stop(&logs).await;
-        assert!(
-            stop.contains(&"ahead_dropped_packets=94".to_owned()),
-            "{stop:?}"
+            bridged[0].contains(&"advanced_samples=160".to_owned()),
+            "{bridged:?}"
         );
     }
 
@@ -1753,38 +1588,12 @@ mod tests {
         );
         assert_eq!(logs.count(Level::DEBUG, BRIDGED), 1, "rate-limited");
         assert_eq!(logs.count(Level::DEBUG, ENDED), 0);
-        // The timestamps still run over the gaps (RFC 3550 §5.1): eight
-        // packets of 20 samples and 800 skipped to a frame.
-        assert_eq!(
-            timestamps(&out),
-            (0..5).map(|k| 8 * (20 + 800) * k).collect::<Vec<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn rfc3550_5_1_a_sender_behind_real_time_banks_no_lead_for_a_burst() {
-        let (logs, _guard) = Logs::capture();
-        let mut rig = Rig::pcmu(FrameSize::DEFAULT);
-        let input = codes(10);
-        let mut out = Vec::new();
-        // 20 ms of audio every 40 ms, 100 ms behind by the fifth; then the
-        // other five at once.
-        for (k, payload) in input[..5].iter().enumerate() {
-            out.extend(rig.run_to(ms(40 * k as u64)).await);
-            rig.publish(160 * k as i64, payload);
+        // The timestamps run over the gaps only as far as the wall clock
+        // does (RFC 3550 §5.1): no frame starts more than a frame past the
+        // packet it leaves with.
+        assert_eq!(out.len(), 5, "40 packets of 20 samples");
+        for (packet, at) in out.iter().zip(arrivals(&rig, &out)) {
+            assert!(span(i64::from(packet.rtp.ts)) <= at + ms(20), "{at:?}");
         }
-        out.extend(rig.run_to(ms(200)).await);
-        for (k, payload) in input.iter().enumerate().skip(5) {
-            rig.publish(160 * k as i64, payload);
-        }
-        out.extend(rig.run_to(ms(300)).await);
-        // A burst of one frame and the packet passes, no more.
-        assert_eq!(sent(&out), fed(&input[..7]));
-        assert_eq!(logs.count(Level::DEBUG, ENDED), 0);
-        let stop = rig.stop(&logs).await;
-        assert!(
-            stop.contains(&"ahead_dropped_packets=3".to_owned()),
-            "{stop:?}"
-        );
     }
 }

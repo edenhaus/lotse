@@ -174,6 +174,8 @@ struct Mic {
     marker: bool,
     /// When the next packet is due.
     next: Instant,
+    /// The time between packets: [`FRAME`], real time, unless it floods.
+    pace: Duration,
     /// When each packet was handed to the socket, by index; for a lost
     /// one, when it would have been.
     sent: Vec<Instant>,
@@ -193,10 +195,18 @@ impl Mic {
             ts: 0x0010_0000,
             marker: true,
             next: clock().now(),
+            pace: FRAME,
             sent: Vec::new(),
             lost: Vec::new(),
             payloads: Vec::new(),
         }
+    }
+
+    /// The same microphone sending a packet every `pace`: faster than
+    /// real time when under [`FRAME`].
+    fn every(mut self, pace: Duration) -> Self {
+        self.pace = pace;
+        self
     }
 
     /// The same microphone behind a network that loses packet `index`.
@@ -388,7 +398,7 @@ impl Peer {
             mic.marker = false;
             mic.seq = mic.seq.wrapping_add(1);
             mic.ts = mic.ts.wrapping_add(step);
-            mic.next += FRAME;
+            mic.next += mic.pace;
         }
         for datagram in self.out.drain(..) {
             let _sent = self
@@ -979,6 +989,72 @@ async fn rfc6716_an_opus_tone_reaches_a_pcmu_camera_at_its_frequency_within_10_m
     let latencies = check_tone(&run.frames(), &run.mic, Law::Mu);
     let median = check_latency(&latencies);
     println!("Opus to PCMU: uplink latency per onset {latencies:?}, median {median:?}");
+}
+
+/// A browser flooding the uplink with 20 ms PCMU packets every 4 ms, a
+/// second of them: five times real time. The session's pace drops what
+/// runs ahead of the wall clock and the chain takes the rest; the dropped
+/// packets' spans reach the chain as gaps, which move the camera's
+/// timestamps no further than the wall clock does, so they never run
+/// ahead of the frames' arrivals by more than the pace's lead (RFC 3550
+/// §5.1: timestamps follow the sampling clock, which runs in real time).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3550_5_1_a_pcmu_flood_reaches_the_camera_at_real_time_on_its_timestamps() {
+    let capture = BackchannelCapture::default();
+    let mut worker = InProcess::start(&capture, r#"{"backchannel": "pcmu"}"#).await;
+    let mut peer = Peer::new(None).await;
+    worker.open("0", &peer.offer).await;
+    worker
+        .pump(&mut [&mut peer], |_, peers| peers[0].viewer.is_connected())
+        .await;
+    peer.talk(Mic::pcmu().every(Duration::from_millis(4)));
+    let start = clock().now();
+    worker
+        .pump(&mut [&mut peer], |_, _| {
+            clock().now() >= start + Duration::from_secs(1)
+        })
+        .await;
+    let mic = peer.mute();
+    let talked = clock().now().duration_since(start);
+    let quiet = clock().now() + QUIET;
+    worker
+        .pump(&mut [&mut peer], |_, _| clock().now() >= quiet)
+        .await;
+    worker.stop().await;
+    let sent = mic.sent.len();
+    let frames: Vec<Frame> = capture.captured().iter().map(Frame::from).collect();
+    // At least twice real time even on a loaded machine (five times
+    // when it keeps up).
+    let real_time = (talked.as_millis() / FRAME.as_millis()) as usize;
+    assert!(
+        sent >= 2 * real_time,
+        "the browser flooded: {sent} packets in {talked:?}"
+    );
+    let (first, last) = (frames.first().unwrap(), frames.last().unwrap());
+    // Each frame's timestamp, from the first's, against its arrival:
+    // never ahead by more than the pace's lead, a packet and a frame
+    // (160 ms), with margin for a loaded machine's late wakes; unpaced,
+    // the timestamps run seconds ahead within the second.
+    let ahead = frames
+        .iter()
+        .map(|frame| {
+            let audio = Duration::from_micros(u64::from(frame.ts.wrapping_sub(first.ts)) * 125);
+            audio.saturating_sub(frame.at.duration_since(first.at))
+        })
+        .max()
+        .unwrap();
+    let wall = last.at.duration_since(first.at);
+    assert!(
+        ahead <= Duration::from_millis(400),
+        "{} frames over {wall:?} of {sent} packets: timestamps up to {ahead:?} ahead",
+        frames.len()
+    );
+    // At most real time and the pace's lead in audio: 20 ms frames.
+    assert!(
+        frames.len() <= real_time + 8,
+        "{} frames in {talked:?}: at most real time",
+        frames.len()
+    );
 }
 
 /// The reverse chain, G.711 in and out: the browser offers PCMU and
