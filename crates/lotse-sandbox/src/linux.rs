@@ -840,7 +840,7 @@ mod tests {
         };
         let report = crate::apply(&worker, &SandboxConfig::default()).unwrap();
         let notes = report.notes;
-        assert!(notes.contains(&STDERR_IS_A_FILE.to_owned()), "{notes:?}");
+        assert!(notes.contains(&STDERR_IS_A_FILE.to_owned()), "noted");
         assert_eq!(limits(Resource::Fsize), file_size);
         let logged = writeln!(io::stderr(), "child: logged under the sandbox");
         assert!(logged.is_ok(), "{logged:?}");
@@ -871,7 +871,7 @@ mod tests {
         // No closure over the notes: unprivileged, under a kernel with
         // every layer, there are none, and it would never run.
         let notes = report.notes;
-        assert!(!notes.contains(&STDERR_IS_A_FILE.to_owned()), "{notes:?}");
+        assert!(!notes.contains(&STDERR_IS_A_FILE.to_owned()), "not noted");
         println!("{CHILD_DONE}");
     }
 
