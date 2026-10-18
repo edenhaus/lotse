@@ -29,9 +29,7 @@ pub fn plain(text: &str, max: usize) -> String {
         out.push(c);
     }
     if cut && max >= CUT_MARK.len() {
-        while out.len().saturating_add(CUT_MARK.len()) > max {
-            out.pop();
-        }
+        out.truncate(out.floor_char_boundary(max.saturating_sub(CUT_MARK.len())));
         out.push_str(CUT_MARK);
     }
     out
