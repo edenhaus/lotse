@@ -1,5 +1,5 @@
-//! RTSP and RTSPS source on `retina`, the ONVIF keyframe-request client and
-//! the backchannel extension point (M4).
+//! RTSP and RTSPS source on `retina` and the camera's ONVIF backchannel
+//! (M4).
 //!
 //! First implementation of the source contract; runs in a worker. Depends on
 //! `lotse-core`, `lotse-codec` and `lotse-tls` only, never on another source.

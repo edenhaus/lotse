@@ -1304,8 +1304,7 @@ mod tests {
         let spec = DriverSpec {
             connection_id: "c1".into(),
             url: "rtsps://admin:secret@cam/key?token=tok".into(),
-            options: r#"{"onvif":{"url":"http://admin:secret@cam/onvif","profile_token":"p"}}"#
-                .into(),
+            options: r#"{"user_agent":"secret/1"}"#.into(),
             host: "cam".into(),
             port: Some(322),
             loopback_relay: true,
@@ -1315,7 +1314,7 @@ mod tests {
         for secret in ["secret", "key", "tok"] {
             assert!(!logged.contains(secret), "{logged}");
         }
-        assert!(logged.contains(r#"options: ["onvif"]"#), "{logged}");
+        assert!(logged.contains(r#"options: ["user_agent"]"#), "{logged}");
         assert!(
             logged.contains("port: Some(322)") && logged.contains("loopback_relay: true"),
             "{logged}"
