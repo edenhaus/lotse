@@ -44,14 +44,7 @@ pub enum ToWorker {
     /// Connect this source as the standby of the one running: the tracks
     /// switch to it at its first keyframe, and the old source stops. A
     /// standby still connecting is replaced.
-    SwitchSource {
-        /// The supervisor's count of the connection's switches: the
-        /// standby's reports carry it ([`ToSupervisor::SwitchState`]), so
-        /// those of a standby this one replaces are told apart.
-        generation: u64,
-        /// The source.
-        spec: SourceSpec,
-    },
+    SwitchSource(SourceSpec),
     /// The connection asks for the camera's backchannel from now on (a
     /// stream on it opted in), or no longer (the last one opted out): the
     /// running source and the standby probe it, at once while they play,
@@ -338,13 +331,7 @@ pub enum ToSupervisor {
     SourceState(SourceState),
     /// The standby source changed state; the connection's own state is
     /// the running source's until `Switched`.
-    SwitchState {
-        /// The switch the standby was started for
-        /// ([`ToWorker::SwitchSource`]).
-        generation: u64,
-        /// Its state.
-        state: SourceState,
-    },
+    SwitchState(SourceState),
     /// The tracks switched to the standby, which is the source now; its
     /// tracks follow.
     Switched,
@@ -590,39 +577,21 @@ mod tests {
     fn the_reconnect_position_round_trips() {
         for message in [
             ToSupervisor::SourceState(SourceState::Stable),
-            ToSupervisor::SwitchState {
-                generation: 2,
-                state: SourceState::Backoff {
-                    code: "source_timeout".into(),
-                    message: "stall".into(),
-                    retry_ms: 5_000,
-                    position: BackoffPosition {
-                        attempts: 6,
-                        immediate_used: false,
-                    },
+            ToSupervisor::SwitchState(SourceState::Backoff {
+                code: "source_timeout".into(),
+                message: "stall".into(),
+                retry_ms: 5_000,
+                position: BackoffPosition {
+                    attempts: 6,
+                    immediate_used: false,
                 },
-            },
+            }),
         ] {
             assert_eq!(
                 decode::<ToSupervisor>(&encode(&message).unwrap()).unwrap(),
                 message
             );
         }
-        let switch = ToWorker::SwitchSource {
-            generation: 7,
-            spec: SourceSpec {
-                connection_id: "c1".into(),
-                url: "rtsp://cam/sub".into(),
-                options: "{}".into(),
-                peer_host: "cam".into(),
-                peer_addrs: vec![],
-                backoff: BackoffPosition::default(),
-            },
-        };
-        assert_eq!(
-            decode::<ToWorker>(&encode(&switch).unwrap()).unwrap(),
-            switch
-        );
     }
 
     #[test]

@@ -79,9 +79,8 @@ pub enum WorkerEvent {
     Report(WorkerReport),
     /// The runner stopped (after a shutdown request).
     SourceStopped,
-    /// The state of the standby of switch `.0`; the connection's own is
-    /// unchanged.
-    SwitchReport(u64, WorkerReport),
+    /// The standby source's state; the connection's own is unchanged.
+    SwitchReport(WorkerReport),
     /// The standby's runner stopped: replaced, or stopped with the worker.
     StandbyStopped,
     /// The tracks switched to the standby, which is the source now.
@@ -339,10 +338,9 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
         ToSupervisor::SourceState(state) => {
             source_report(state).map_or(WorkerEvent::SourceStopped, WorkerEvent::Report)
         }
-        ToSupervisor::SwitchState { generation, state } => source_report(state)
-            .map_or(WorkerEvent::StandbyStopped, |report| {
-                WorkerEvent::SwitchReport(generation, report)
-            }),
+        ToSupervisor::SwitchState(state) => {
+            source_report(state).map_or(WorkerEvent::StandbyStopped, WorkerEvent::SwitchReport)
+        }
         ToSupervisor::Switched => WorkerEvent::Switched,
         ToSupervisor::Tracks(tracks) => WorkerEvent::Tracks(declared(tracks, &mut trims.tracks)),
         ToSupervisor::Stats(stats) => WorkerEvent::Stats(counted(stats, &mut trims.stats)),
@@ -493,19 +491,12 @@ impl Worker {
         self.control.send_msg(&ToWorker::ConnectGranted, &[]).await
     }
 
-    /// Tells the worker to connect `spec` as the standby of its source for
-    /// switch `generation`, whose number its reports carry, and to switch
-    /// to it at its first keyframe.
-    pub async fn switch_source(
-        &mut self,
-        spec: &SourceSpec,
-        generation: u64,
-    ) -> Result<(), IpcError> {
-        let switch = ToWorker::SwitchSource {
-            generation,
-            spec: spec.clone(),
-        };
-        self.control.send_msg(&switch, &[]).await
+    /// Tells the worker to connect `spec` as the standby of its source and
+    /// switch to it at its first keyframe.
+    pub async fn switch_source(&mut self, spec: &SourceSpec) -> Result<(), IpcError> {
+        self.control
+            .send_msg(&ToWorker::SwitchSource(spec.clone()), &[])
+            .await
     }
 
     /// Tells the worker whether its connection asks for the camera's
@@ -808,24 +799,12 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                mapped(
-                    ToSupervisor::SwitchState {
-                        generation: 4,
-                        state
-                    },
-                    None
-                ),
-                WorkerEvent::SwitchReport(4, report)
+                mapped(ToSupervisor::SwitchState(state), None),
+                WorkerEvent::SwitchReport(report)
             );
         }
         assert_eq!(
-            mapped(
-                ToSupervisor::SwitchState {
-                    generation: 4,
-                    state: SourceState::Stopped
-                },
-                None
-            ),
+            mapped(ToSupervisor::SwitchState(SourceState::Stopped), None),
             WorkerEvent::StandbyStopped
         );
     }
