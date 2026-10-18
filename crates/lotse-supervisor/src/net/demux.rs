@@ -1556,8 +1556,12 @@ mod tests {
         demux
             .registrations()
             .register("cap", b"pw".to_vec(), sink.clone());
-        for i in 0..9_u8 {
-            let from = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // All bound at once: a port freed and handed out again would be
+        // an address already learned, forwarded instead of counted.
+        let sources: Vec<UdpSocket> = (0..9)
+            .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
+            .collect();
+        for (i, from) in (0..9_u8).zip(&sources) {
             let request = Builder::new(Class::Request, METHOD_BINDING, [10 + i; 12])
                 .username("cap:x")
                 .integrity(b"pw")
@@ -2026,8 +2030,13 @@ mod tests {
         let stats = Arc::new(DemuxStats::default());
         let a_sink = Arc::new(MemorySink::default());
         let b_sink = Arc::new(MemorySink::default());
-        let a = registrations.register("a", b"pa".to_vec(), a_sink.clone());
-        let b = registrations.register("b", b"pb".to_vec(), b_sink.clone());
+        // Credentials as a session gets them.
+        let register = |sink: &Arc<MemorySink>| {
+            let (ufrag, pass) = crate::session::ice_credentials().unwrap();
+            registrations.register(&ufrag, pass.into_bytes(), sink.clone())
+        };
+        let a = register(&a_sink);
+        let b = register(&b_sink);
         let mut peers = Peers::new(
             Arc::clone(&registrations),
             Arc::clone(&stats),
@@ -2039,18 +2048,19 @@ mod tests {
             let message = stun::parse(payload).ok();
             peers.route(payload, source, local, message.as_ref());
         };
+        let check = |r: &Registration, id: u8| binding_request(&r.local_ufrag, &r.password, id);
         let frames = |sink: &MemorySink| sink.frames.lock().unwrap().len();
         let moved = || DemuxStats::get(&stats.addresses_moved);
         // Learned by a, then moved to b: the first move is allowed.
-        send(&mut peers, &binding_request("a", b"pa", 1), shared);
+        send(&mut peers, &check(&a, 1), shared);
         assert_eq!(moved(), 0, "learning is not moving");
-        send(&mut peers, &binding_request("b", b"pb", 2), shared);
+        send(&mut peers, &check(&b, 2), shared);
         assert_eq!(moved(), 1);
         assert_eq!((frames(&a_sink), frames(&b_sink)), (1, 1));
         // Moving it back within the expiry is refused, however often.
         clock.advance(ADDR_IDLE_EXPIRY.saturating_sub(Duration::from_millis(1)));
         for id in 3..6 {
-            send(&mut peers, &binding_request("a", b"pa", id), shared);
+            send(&mut peers, &check(&a, id), shared);
         }
         assert_eq!(moved(), 1);
         assert_eq!(DemuxStats::get(&stats.stun_rejected), 3);
@@ -2068,7 +2078,7 @@ mod tests {
         assert_eq!(frames(&b_sink), 2, "still b's");
         // Exactly at the expiry it may move again, once.
         clock.advance(Duration::from_millis(1));
-        send(&mut peers, &binding_request("a", b"pa", 6), shared);
+        send(&mut peers, &check(&a, 6), shared);
         assert_eq!(moved(), 2);
         assert_eq!(frames(&a_sink), 2);
         assert_eq!(
@@ -2078,13 +2088,13 @@ mod tests {
             ),
             (1, 0)
         );
-        send(&mut peers, &binding_request("b", b"pb", 7), shared);
+        send(&mut peers, &check(&b, 7), shared);
         assert_eq!(moved(), 2);
         assert_eq!(DemuxStats::get(&stats.stun_rejected), 4);
         assert_eq!(frames(&b_sink), 2);
         // The expiry counts from the last move, not the first.
         clock.advance(ADDR_IDLE_EXPIRY);
-        send(&mut peers, &binding_request("b", b"pb", 8), shared);
+        send(&mut peers, &check(&b, 8), shared);
         assert_eq!(moved(), 3);
         assert_eq!(frames(&b_sink), 3);
         assert_eq!(DemuxStats::get(&stats.stun_rejected), 4);
