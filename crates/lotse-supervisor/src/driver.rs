@@ -587,11 +587,7 @@ impl Driver {
                     tracing::warn!(pid = worker.pid(), error = %err, "probe connect grant could not be sent to the worker");
                 }
             }
-            Wake::RetryResolve => {
-                self.pending = Pending::Nothing;
-                self.feed(Input::Report(WorkerReport::Connecting));
-                self.start_resolving();
-            }
+            Wake::RetryResolve => self.retry_resolving(),
             Wake::SwitchResolved(_)
             | Wake::RetrySwitchResolve
             | Wake::SwitchConnect(SlotWake::Grant) => self.handle_switch(wake).await,
@@ -654,8 +650,9 @@ impl Driver {
 
     /// `SwitchSource`: the connection runs `spec` from now on. A running
     /// worker switches to it in place once its host is resolved; without
-    /// one, the next worker starts with it, and a lookup under way is
-    /// started over for the new host.
+    /// one, the next worker starts with it, a lookup under way is started
+    /// over for the new host, and so is a lookup waiting to retry: its wait
+    /// was the old host's, so the new one is looked up at once.
     fn on_switch_source(&mut self, spec: DriverSpec) {
         tracing::info!(spec = ?spec, "connection switches its source");
         self.spec = spec;
@@ -665,9 +662,28 @@ impl Driver {
         self.machine.source_switched();
         if self.worker.is_some() {
             self.start_resolving_switch();
-        } else if matches!(self.pending, Pending::Resolving(_)) {
-            self.start_resolving();
+        } else {
+            match self.pending {
+                Pending::Resolving(_) => self.start_resolving(),
+                Pending::Retry(_) => {
+                    tracing::debug!(
+                        host = self.spec.host,
+                        "source switched while the lookup waited to retry; the new host is looked up at once"
+                    );
+                    self.retry_resolving();
+                }
+                Pending::Nothing | Pending::ResolvingSwitch(_) | Pending::RetrySwitch(_) => {}
+            }
         }
+    }
+
+    /// Ends the wait before the host lookup is retried, which drops its
+    /// timer, and looks the host up again: the connection is connecting
+    /// once more.
+    fn retry_resolving(&mut self) {
+        self.pending = Pending::Nothing;
+        self.feed(Input::Report(WorkerReport::Connecting));
+        self.start_resolving();
     }
 
     /// `Backchannel`: the connection runs `spec` from now on, which differs
@@ -2698,6 +2714,47 @@ mod tests {
         assert!(
             matches!(driver.pending, Pending::Resolving(_)),
             "looked up again"
+        );
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
+    async fn a_switch_during_the_lookup_retry_looks_up_the_new_source_at_once() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (demand_tx, demand) = watch::channel(0);
+        let mut driver = driver_on(&shared, demand);
+        demand_tx.send_replace(1);
+        step(&mut driver).await;
+        driver
+            .handle(Wake::Resolved(Err("no such host".into())))
+            .await;
+        assert!(matches!(driver.pending, Pending::Retry(_)));
+        assert_eq!(driver.machine.state(), ConnectionState::Backoff);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver
+            .handle(Wake::Command(DriverCommand::SwitchSource(DriverSpec {
+                host: "127.0.0.2".into(),
+                port: Some(7),
+                ..spec_of("fake://127.0.0.2:7/")
+            })))
+            .await;
+        assert_eq!(driver.machine.state(), ConnectionState::Connecting);
+        assert!(
+            matches!(driver.pending, Pending::Resolving(_)),
+            "the new source is looked up without waiting out the old retry"
+        );
+        let logged = captured.lines("source switched while the lookup waited to retry");
+        assert!(logged[0].contains(r#"host="127.0.0.2""#), "{logged:?}");
+        // The old retry's wait is gone: past it, the wake is the new
+        // source's lookup, not the old one's retry.
+        clock.advance(Duration::from_secs(120));
+        let new_source: SocketAddr = "127.0.0.2:7".parse().unwrap();
+        let wake = next_wake(&mut driver).await;
+        assert!(
+            matches!(&wake, Wake::Resolved(Ok(addrs)) if addrs == &[new_source]),
+            "the new source's lookup finishes first"
         );
         drop((driver, demand_tx));
     }
