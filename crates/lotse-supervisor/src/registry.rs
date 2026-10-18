@@ -680,7 +680,64 @@ impl State {
         }
     }
 
-    /// A worker's report about one of its sessions; a report about a
+    /// Connection `connection`'s worker reported `report` on session
+    /// `session_id`, which the supervisor no longer knows: the worker is
+    /// told to close it, so it does not run a session nobody can reach
+    /// until its own timeouts end it. A `Closed` report needs no close: it
+    /// is a session's last report, the one every close the supervisor asks
+    /// for ends with, so the worker has let the session go already. The
+    /// close takes a slot of the driver's queue only while more than half
+    /// of it is free, so a worker that reports on gone sessions without
+    /// end cannot crowd out the commands of the sessions that live. This
+    /// cannot loop: a close the worker gets for a session it no longer
+    /// runs, or for one already closing, reports nothing (its
+    /// `sessions::close`).
+    fn close_gone_session(&self, connection: &str, session_id: &str, report: &WorkerSessionEvent) {
+        if matches!(report, WorkerSessionEvent::Closed { .. }) {
+            tracing::debug!(
+                session.id = session_id,
+                connection.id = connection,
+                ?report,
+                "last report of a session that is gone"
+            );
+            return;
+        }
+        tracing::debug!(
+            session.id = session_id,
+            connection.id = connection,
+            ?report,
+            reason = "the worker still runs a session the supervisor no longer knows",
+            "report for a session that is gone; closing it on the worker"
+        );
+        let Some(entry) = self.connections.get(connection) else {
+            return;
+        };
+        if entry.commands.capacity().saturating_mul(2) <= entry.commands.max_capacity() {
+            tracing::debug!(
+                session.id = session_id,
+                connection.id = connection,
+                reason = "the driver queue is half full",
+                "close of a session that is gone skipped; its worker's timeouts end it"
+            );
+            return;
+        }
+        let close = DriverCommand::CloseSession {
+            session_id: session_id.to_owned(),
+            code: "session_closed",
+            message: "the session is gone".to_owned(),
+        };
+        if entry.commands.try_send(close).is_err() {
+            tracing::debug!(
+                session.id = session_id,
+                connection.id = connection,
+                "driver gone; the session went with its worker"
+            );
+        }
+    }
+
+    /// A worker's report about one of its sessions; one about a session
+    /// the supervisor no longer knows closes it on the worker
+    /// ([`State::close_gone_session`]); a report about a
     /// session of another connection is refused, and one whose answer or
     /// candidate fails [`worker_text::check`](crate::worker_text::check),
     /// or that is over the session's budget ([`SessionEntry::apply`]),
@@ -694,11 +751,7 @@ impl State {
         now: Instant,
     ) {
         let Some(entry) = self.sessions.get_mut(session_id) else {
-            tracing::debug!(
-                session.id = session_id,
-                ?report,
-                "report for a session that is gone"
-            );
+            self.close_gone_session(connection, session_id, &report);
             return;
         };
         if entry.connection != connection {
@@ -2003,6 +2056,80 @@ mod tests {
         let _event = state.close_session("s2", "source_timeout", "late", CloseBy::Supervisor);
         let_assert!(Ok(DriverCommand::CloseSession { session_id, .. }) = rx.try_recv());
         assert_eq!(session_id, "s2");
+    }
+
+    #[test]
+    fn a_report_for_a_session_that_is_gone_closes_it_on_the_reporting_worker() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let (mut state, mut rx) = relay_state(0);
+        let now = lotse_core::clock::SystemClock.now();
+        let candidate = || lotse_ipc::SessionEvent::Candidate {
+            candidate: String::new(),
+            mid: None,
+        };
+        state.session_report("c1", "gone", candidate(), now);
+        let_assert!(
+            Ok(DriverCommand::CloseSession {
+                session_id,
+                code,
+                message
+            }) = rx.try_recv()
+        );
+        assert_eq!(
+            (session_id.as_str(), code, message.as_str()),
+            ("gone", "session_closed", "the session is gone")
+        );
+        let logged = captured.lines("report for a session that is gone");
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains("session.id=\"gone\""), "{logged:?}");
+        assert!(logged[0].contains("connection.id=\"c1\""), "{logged:?}");
+        // `Closed` is a session's last report: the worker let it go
+        // already, and every close the supervisor asks for ends with one.
+        state.session_report(
+            "c1",
+            "gone",
+            lotse_ipc::SessionEvent::Closed {
+                code: "session_closed".into(),
+                message: "closed".into(),
+            },
+            now,
+        );
+        assert!(rx.try_recv().is_err(), "nothing to close");
+        assert_eq!(
+            captured
+                .lines("last report of a session that is gone")
+                .len(),
+            1
+        );
+        // A connection that is gone has no worker to tell.
+        state.session_report("c9", "gone", candidate(), now);
+        assert!(rx.try_recv().is_err());
+        // A close takes a slot only while more than half the queue is
+        // free: a worker reporting without end cannot fill it.
+        let (commands, mut rx) = mpsc::channel(2);
+        state.connections.get_mut("c1").unwrap().commands = commands;
+        state.session_report("c1", "gone", candidate(), now);
+        state.session_report("c1", "gone", candidate(), now);
+        let_assert!(Ok(DriverCommand::CloseSession { .. }) = rx.try_recv());
+        assert!(
+            rx.try_recv().is_err(),
+            "one close, then the queue was half full"
+        );
+        assert_eq!(
+            captured
+                .lines("close of a session that is gone skipped")
+                .len(),
+            1
+        );
+        // A driver that is gone takes nothing.
+        drop(rx);
+        state.session_report("c1", "gone", candidate(), now);
+        assert_eq!(captured.lines("driver gone; the session went").len(), 1);
+        assert!(
+            state.sessions.contains_key("s1"),
+            "the live session plays on"
+        );
     }
 
     fn relayed(port: u16) -> Relayed {
