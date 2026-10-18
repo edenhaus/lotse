@@ -893,6 +893,7 @@ mod tests {
             sync: "arrival".into(),
             derived_from: None,
             audio_delay_ms: None,
+            params: lotse_ipc::TrackParams::default(),
         }
     }
 

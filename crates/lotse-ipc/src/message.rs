@@ -427,6 +427,28 @@ pub struct TrackInfo {
     /// The delay a derived track's transcoder adds, in milliseconds;
     /// `None` for a native track.
     pub audio_delay_ms: Option<u32>,
+    /// The codec's parameters, as far as they are known.
+    pub params: TrackParams,
+}
+
+/// A track's codec parameters, as far as the worker knows them: each is
+/// `None` where the codec has no such parameter or it is not known yet.
+/// Bytes and numbers, never text, so the supervisor formats what it
+/// reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TrackParams {
+    /// An H.264 track's `profile_idc`, constraint flags and `level_idc`,
+    /// the three bytes RFC 6184 §8.1 spells as `profile-level-id`, once
+    /// its sequence parameter set is known.
+    pub profile_level_id: Option<[u8; 3]>,
+    /// A video track's picture width and height in pixels, cropping
+    /// applied, from its sequence parameter set once known (ISO/IEC
+    /// 14496-10 §7.4.2.1.1, ITU-T H.265 §7.4.3.2.1).
+    pub picture: Option<(u32, u32)>,
+    /// An audio track's sampling rate in Hz.
+    pub sample_rate: Option<u32>,
+    /// An audio track's channel count.
+    pub channels: Option<u8>,
 }
 
 /// One track's counters.
@@ -542,6 +564,47 @@ mod tests {
     }
 
     #[test]
+    fn tracks_round_trip_with_their_codec_parameters() {
+        let messages = vec![
+            ToSupervisor::Tracks(vec![TrackInfo {
+                id: "v0".into(),
+                kind: "video".into(),
+                codec: "h264".into(),
+                clock_rate: 90_000,
+                sync: "arrival".into(),
+                derived_from: None,
+                audio_delay_ms: None,
+                params: TrackParams {
+                    profile_level_id: Some([0x42, 0xc0, 0x28]),
+                    picture: Some((640, 480)),
+                    sample_rate: None,
+                    channels: None,
+                },
+            }]),
+            ToSupervisor::Tracks(vec![TrackInfo {
+                id: "a1".into(),
+                kind: "audio".into(),
+                codec: "opus".into(),
+                clock_rate: 48_000,
+                sync: "sender_reports".into(),
+                derived_from: Some("a0".into()),
+                audio_delay_ms: Some(88),
+                params: TrackParams {
+                    sample_rate: Some(48_000),
+                    channels: Some(2),
+                    ..TrackParams::default()
+                },
+            }]),
+        ];
+        for message in messages {
+            assert_eq!(
+                decode::<ToSupervisor>(&encode(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
     fn every_message_round_trips() {
         let messages = vec![
             ToSupervisor::Ready { pid: 1 },
@@ -552,24 +615,6 @@ mod tests {
                 message: "eof".into(),
             }),
             ToSupervisor::SourceState(SourceState::Stopped),
-            ToSupervisor::Tracks(vec![TrackInfo {
-                id: "v0".into(),
-                kind: "video".into(),
-                codec: "h264".into(),
-                clock_rate: 90_000,
-                sync: "arrival".into(),
-                derived_from: None,
-                audio_delay_ms: None,
-            }]),
-            ToSupervisor::Tracks(vec![TrackInfo {
-                id: "a1".into(),
-                kind: "audio".into(),
-                codec: "opus".into(),
-                clock_rate: 48_000,
-                sync: "sender_reports".into(),
-                derived_from: Some("a0".into()),
-                audio_delay_ms: Some(88),
-            }]),
             ToSupervisor::Stats(WorkerStats {
                 tracks: vec![(
                     "v0".into(),

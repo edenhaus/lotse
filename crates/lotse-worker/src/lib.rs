@@ -14,10 +14,14 @@
 //!
 //! Standards: RFC 8837 §5 (the audio track's DSCP, `sendmsg`), RFC 3542
 //! §6.1 and Linux `ip(7)` (the candidate's source address, `sendmsg`),
-//! RFC 8656 §12.4 (the `ChannelData` it frames, [`relay`]).
+//! RFC 8656 §12.4 (the `ChannelData` it frames, [`relay`]), RFC 6184 §8.1
+//! (the `profile-level-id` it reports) and the picture size of ISO/IEC
+//! 14496-10 §7.4.2.1.1 and ITU-T H.265 §7.4.3.2.1, which `lotse-codec`
+//! reads from a track's SPS.
 
 mod derived;
 mod ice_tcp;
+mod params;
 pub mod relay;
 mod sendmsg;
 mod sessions;
@@ -1184,17 +1188,23 @@ async fn talker_changed(talker: Option<&mut TalkerFeed>) -> TalkerChanged {
 /// track is synced as its source is, since its capture times come from
 /// the source's.
 fn track_infos(tracks: &DerivedTracks, mapper: &ClockMapper) -> Vec<TrackInfo> {
-    let info = |track: &Track, from: Option<TrackId>, delay: Option<Duration>| TrackInfo {
-        id: track.id().to_string(),
-        kind: track.kind().name().to_owned(),
-        codec: track.codec().name().to_owned(),
-        clock_rate: track.clock_rate(),
-        sync: mapper
-            .mode(from.unwrap_or_else(|| track.id()))
-            .name()
-            .to_owned(),
-        derived_from: from.map(|from| from.to_string()),
-        audio_delay_ms: delay.map(|delay| u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)),
+    let info = |track: &Track, from: Option<TrackId>, delay: Option<Duration>| {
+        // One snapshot of the descriptor for the name and the parameters:
+        // a reconnect can replace it between two loads.
+        let codec = track.codec();
+        TrackInfo {
+            id: track.id().to_string(),
+            kind: track.kind().name().to_owned(),
+            codec: codec.name().to_owned(),
+            clock_rate: track.clock_rate(),
+            sync: mapper
+                .mode(from.unwrap_or_else(|| track.id()))
+                .name()
+                .to_owned(),
+            derived_from: from.map(|from| from.to_string()),
+            audio_delay_ms: delay.map(|delay| u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)),
+            params: params::track_params(&codec),
+        }
     };
     let natives = tracks.tracks().tracks();
     let derived = tracks.derived();

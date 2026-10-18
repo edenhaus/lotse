@@ -2880,6 +2880,16 @@
           "minimum": 0,
           "type": "integer"
         },
+        "channels": {
+          "description": "An audio track's channel count: 1 for G.711 and G.722 (RFC 3551\n§4.5), the stream's own for Opus and AAC. Absent where\n`sample_rate` is.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "codec": {
           "description": "The codec name (`h264`, `aac_lc`).",
           "type": "string"
@@ -2897,6 +2907,15 @@
           "minimum": 0,
           "type": "integer"
         },
+        "height": {
+          "description": "A video track's picture height in pixels, present with `width`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "id": {
           "description": "`v0`, `a0`, `a1`.",
           "type": "string"
@@ -2905,9 +2924,35 @@
           "description": "`video` or `audio`.",
           "type": "string"
         },
+        "profile_level_id": {
+          "description": "An H.264 track's `profile-level-id` (RFC 6184 §8.1): its sequence\nparameter set's `profile_idc`, constraint flags and `level_idc` as\nsix lowercase hex digits, as an SDP `fmtp` spells them (`42e01f`).\nAbsent on other codecs, and until the camera sent its SPS.",
+          "pattern": "^[0-9a-f]{6}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sample_rate": {
+          "description": "An audio track's sampling rate in Hz, which is not always its RTP\nclock rate: G.722 samples at 16000 on an 8000 clock (RFC 3551\n§4.5.2), Opus is decoded at 48000 (RFC 7587 §4.1), AAC at its\n`AudioSpecificConfig`'s rate (ISO/IEC 14496-3 §1.6.2.1). Absent on\nvideo tracks and on codecs the daemon cannot carry.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "sync": {
           "description": "How the track is timed now: `arrival` until the camera's first\nSender Report for it, `sender_reports` from then on, `arrival` again\non a new timeline until the next report; at most a second old. A\nderived track's is its source's.",
           "type": "string"
+        },
+        "width": {
+          "description": "A video track's picture width in pixels, cropping applied (ISO/IEC\n14496-10 §7.4.2.1.1, ITU-T H.265 §7.4.3.2.1). Absent on audio and\nMJPEG tracks, and until the camera sent its SPS.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [

@@ -25,5 +25,5 @@ pub use channel::{Channel, Decoded, Message, Receiver, Sender};
 pub use codec::{IpcError, MAX_MESSAGE_BYTES, decode, encode};
 pub use message::{
     SessionEvent, SessionSpec, SourceSpec, SourceState, TalkbackStats, TalkerChange, ToSupervisor,
-    ToWorker, TrackInfo, TrackStats, WorkerStats,
+    ToWorker, TrackInfo, TrackParams, TrackStats, WorkerStats,
 };

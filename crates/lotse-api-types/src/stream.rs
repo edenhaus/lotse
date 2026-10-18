@@ -257,6 +257,33 @@ pub struct TrackInfo {
     /// on native tracks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_delay_ms: Option<u32>,
+    /// An H.264 track's `profile-level-id` (RFC 6184 §8.1): its sequence
+    /// parameter set's `profile_idc`, constraint flags and `level_idc` as
+    /// six lowercase hex digits, as an SDP `fmtp` spells them (`42e01f`).
+    /// Absent on other codecs, and until the camera sent its SPS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^[0-9a-f]{6}$"))]
+    pub profile_level_id: Option<String>,
+    /// A video track's picture width in pixels, cropping applied (ISO/IEC
+    /// 14496-10 §7.4.2.1.1, ITU-T H.265 §7.4.3.2.1). Absent on audio and
+    /// MJPEG tracks, and until the camera sent its SPS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// A video track's picture height in pixels, present with `width`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// An audio track's sampling rate in Hz, which is not always its RTP
+    /// clock rate: G.722 samples at 16000 on an 8000 clock (RFC 3551
+    /// §4.5.2), Opus is decoded at 48000 (RFC 7587 §4.1), AAC at its
+    /// `AudioSpecificConfig`'s rate (ISO/IEC 14496-3 §1.6.2.1). Absent on
+    /// video tracks and on codecs the daemon cannot carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    /// An audio track's channel count: 1 for G.711 and G.722 (RFC 3551
+    /// §4.5), the stream's own for Opus and AAC. Absent where
+    /// `sample_rate` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u8>,
     /// Frames seen.
     pub frames: u64,
     /// Bytes seen.
@@ -560,6 +587,70 @@ mod tests {
         assert_eq!(back, event);
     }
 
+    /// A native H.264 track whose SPS is known and a derived Opus track.
+    fn tracks() -> Vec<TrackInfo> {
+        vec![
+            TrackInfo {
+                id: "v0".into(),
+                kind: "video".into(),
+                codec: "h264".into(),
+                derived_from: None,
+                sync: "arrival".into(),
+                audio_delay_ms: None,
+                profile_level_id: Some("42c028".into()),
+                width: Some(640),
+                height: Some(480),
+                sample_rate: None,
+                channels: None,
+                frames: 1,
+                bytes: 2,
+            },
+            TrackInfo {
+                id: "a1".into(),
+                kind: "audio".into(),
+                codec: "opus".into(),
+                derived_from: Some("a0".into()),
+                sync: "sender_reports".into(),
+                audio_delay_ms: Some(88),
+                profile_level_id: None,
+                width: None,
+                height: None,
+                sample_rate: Some(48_000),
+                channels: Some(2),
+                frames: 3,
+                bytes: 4,
+            },
+        ]
+    }
+
+    #[test]
+    fn rfc6184_8_1_a_tracks_codec_parameters_serialize_and_unknown_ones_are_left_out() {
+        let json = serde_json::to_value(tracks()).unwrap();
+        assert_eq!(
+            (
+                &json[0]["profile_level_id"],
+                &json[0]["width"],
+                &json[0]["height"],
+            ),
+            (&json!("42c028"), &json!(640), &json!(480))
+        );
+        assert_eq!(
+            (&json[1]["sample_rate"], &json[1]["channels"]),
+            (&json!(48_000), &json!(2))
+        );
+        for (track, absent) in [(0, ["sample_rate", "channels"]), (1, ["width", "height"])] {
+            for field in absent {
+                assert!(
+                    json[track].get(field).is_none(),
+                    "track {track} has no {field}"
+                );
+            }
+        }
+        assert!(json[1].get("profile_level_id").is_none());
+        let back: Vec<TrackInfo> = serde_json::from_value(json).unwrap();
+        assert_eq!(back, tracks());
+    }
+
     #[test]
     fn a_stream_round_trips_and_states_have_names() {
         let stream = Stream {
@@ -588,28 +679,7 @@ mod tests {
                     }),
                 },
             }],
-            tracks: vec![
-                TrackInfo {
-                    id: "v0".into(),
-                    kind: "video".into(),
-                    codec: "h264".into(),
-                    derived_from: None,
-                    sync: "arrival".into(),
-                    audio_delay_ms: None,
-                    frames: 1,
-                    bytes: 2,
-                },
-                TrackInfo {
-                    id: "a1".into(),
-                    kind: "audio".into(),
-                    codec: "opus".into(),
-                    derived_from: Some("a0".into()),
-                    sync: "sender_reports".into(),
-                    audio_delay_ms: Some(88),
-                    frames: 3,
-                    bytes: 4,
-                },
-            ],
+            tracks: tracks(),
             sessions: vec![],
             stats: StreamStats::default(),
             backchannel: StreamBackchannel {
@@ -736,6 +806,25 @@ mod tests {
             })
             .unwrap(),
             json!({ "talker": "s1", "since": "2026-09-28T11:02:04.000Z" })
+        );
+    }
+
+    #[test]
+    fn a_track_without_codec_parameters_parses_with_none_known() {
+        let track: TrackInfo = serde_json::from_value(json!({
+            "id": "v0", "kind": "video", "codec": "mjpeg", "derived_from": null,
+            "sync": "arrival", "frames": 0, "bytes": 0
+        }))
+        .unwrap();
+        assert_eq!(
+            (
+                track.profile_level_id,
+                track.width,
+                track.height,
+                track.sample_rate,
+                track.channels
+            ),
+            (None, None, None, None, None)
         );
     }
 
