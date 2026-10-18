@@ -66,8 +66,9 @@ const FEATURES: [&str; 1] = ["session_adopt"];
 /// ([`Supervisor::features`]).
 const TWO_WAY_AUDIO: &str = "two_way_audio";
 
-/// The video codec families the daemon carries.
-const VIDEO_CODECS: [CodecFamily; 3] = [CodecFamily::H264, CodecFamily::H265, CodecFamily::Mjpeg];
+/// The video codec families a viewer can play: MJPEG is ingested and
+/// reported per track, but no output negotiates it.
+const VIDEO_CODECS: [CodecFamily; 2] = [CodecFamily::H264, CodecFamily::H265];
 
 /// The audio codec families the daemon carries.
 const AUDIO_CODECS: [CodecFamily; 5] = [
@@ -1618,12 +1619,9 @@ mod tests {
         let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
         assert_eq!(info["schemes"], json!(["fake"]));
         assert_eq!(info["build"]["target"], "test");
-        assert!(
-            info["codecs"]["video"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("h264"))
-        );
+        // Only what an output can play: MJPEG is ingested and reported per
+        // track, but no output negotiates it.
+        assert_eq!(info["codecs"]["video"], json!(["h264", "h265"]));
         assert_eq!(info["limits"]["max_streams"], 2);
         assert_eq!(info["limits"]["session_grace_ms"], 10_000);
         assert_eq!(info["sandbox"]["mode"], "off");

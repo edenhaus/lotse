@@ -238,7 +238,6 @@ fn serve(args: &ServeArgs, matches: &ArgMatches) -> anyhow::Result<()> {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             build: BuildInfo {
                 target: env!("LOTSE_TARGET").to_owned(),
-                git_sha: option_env!("LOTSE_GIT_SHA").map(str::to_owned),
                 rustc: env!("LOTSE_RUSTC").to_owned(),
             },
             sandbox: sandbox_info(&report),

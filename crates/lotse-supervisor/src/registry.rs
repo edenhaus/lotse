@@ -1228,7 +1228,6 @@ impl State {
                     state: snapshot.map_or(StreamState::Idle, |s| api_state(s.state)),
                     reconnects: snapshot.map_or(0, |s| s.reconnects),
                     backchannel: connection.and_then(source_backchannel),
-                    details: serde_json::Map::new(),
                     connection: ConnectionInfo {
                         id: source.connection.clone(),
                         worker: snapshot.and_then(|s| {
@@ -1367,7 +1366,6 @@ fn stream_stats_of(stats: Option<&WorkerStats>) -> StreamStats {
         packets_lost: stats.map_or(0, |s| s.packets_lost),
         packets_out_of_order: stats.map_or(0, |s| s.packets_out_of_order),
         datagrams_rejected: stats.map_or(0, |s| s.datagrams_rejected),
-        ..StreamStats::default()
     }
 }
 

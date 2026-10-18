@@ -1845,7 +1845,6 @@ impl Api {
                 version: "0.0.0-test".into(),
                 build: BuildInfo {
                     target: "test".into(),
-                    git_sha: None,
                     rustc: "test".into(),
                 },
                 sandbox: SandboxInfo {
