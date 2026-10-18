@@ -2733,6 +2733,30 @@ mod tests {
         seen
     }
 
+    /// [`messages_until`], paced: the fake clock moves `step` only after
+    /// 10 ms of real time without a message, and never past `limit`, which
+    /// fails the test. Unpaced, it moves on every turn nothing is ready
+    /// yet, so on a loaded runner it runs ahead of the worker; this keeps
+    /// a wait clear of what the fake clock would bring on beyond `limit`.
+    async fn messages_paced(
+        h: &mut Harness,
+        step: Duration,
+        limit: Duration,
+        done: impl Fn(&[ToSupervisor]) -> bool,
+    ) -> Vec<ToSupervisor> {
+        let start = h.clock.now();
+        let mut seen = Vec::new();
+        while !done(&seen) {
+            let moved = h.clock.now().saturating_duration_since(start);
+            assert!(moved <= limit, "not within {limit:?}: {seen:?}");
+            tokio::select! {
+                message = h.next() => seen.push(message),
+                () = SystemClock.sleep(Duration::from_millis(10)) => h.clock.advance(step),
+            }
+        }
+        seen
+    }
+
     /// The session events among `messages`.
     fn session_events(messages: &[ToSupervisor]) -> impl Iterator<Item = (&str, &SessionEvent)> {
         messages.iter().filter_map(|message| match message {
@@ -2931,11 +2955,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rfc3550_6_4_1_tracks_synced_by_later_sender_reports_are_reported_again_once() {
         // The fake camera's first Sender Reports come a second after it
-        // went live (RFC 3550 §6.4.1), after the tracks were reported.
+        // went live (RFC 3550 §6.4.1), after the tracks were reported. Its
+        // clocks agree: drifting, the skew watchdog's re-anchor drops
+        // every fit after ten seconds or so, which a loaded runner's fake
+        // clock reached while the test waited (2026-10-18).
         let mut h = start_with_settings(registries(), quiet_settings());
         assert!(matches!(h.next().await, ToSupervisor::Ready { .. }));
         h.tx.send_msg(
-            &ToWorker::RunSource(spec("fake://cam/", r#"{"audio": "aac_drifting"}"#)),
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"audio": "aac_steady"}"#)),
             &[],
         )
         .await
@@ -3005,9 +3032,19 @@ mod tests {
         h.tx.send_msg(&ToWorker::OpenSession(early), &[])
             .await
             .unwrap();
-        let seen = messages_until(&mut h, |seen| {
-            echo_audio(seen).is_some() && seen.iter().any(|m| has_track(m, "a1") == Some(true))
-        })
+        // The session gets audio before the watchdog can withdraw it: that
+        // takes three occurrences of skew sustained 5 s, the first beyond
+        // 40 ms only 2 s after the first reports, so not within 15 s. A
+        // frame at a time, paced, so a loaded runner's fake clock does not
+        // run ahead of the worker into the withdrawal.
+        let seen = messages_paced(
+            &mut h,
+            Duration::from_millis(64),
+            Duration::from_secs(15),
+            |seen| {
+                echo_audio(seen).is_some() && seen.iter().any(|m| has_track(m, "a1") == Some(true))
+            },
+        )
         .await;
         assert_eq!(
             answers(&seen),

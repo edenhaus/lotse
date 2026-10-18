@@ -164,6 +164,10 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 # The allocation-counting tests of the hot paths: a global allocator counting the calling thread's
 # allocations, linked only into the test binaries that use it.
 allocation-counter = { version = "0.8", default-features = false }
+# The microbenchmarks of the media path (`benches/` of lotse-codec, lotse-http and lotse-supervisor,
+# `mise run bench`): wall-clock timing with throughput counters; dev-only, never linked into the
+# binary. Its `wrap_help` default only formats `--help`.
+divan = { version = "0.1", default-features = false }
 # The WebSocket client of `lotse ctl` over the Unix socket; the same engine axum uses.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 

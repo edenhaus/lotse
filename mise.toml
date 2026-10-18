@@ -148,6 +148,13 @@ for manifest in crates/*/Cargo.toml; do
 done
 """
 
+[tasks.bench]
+description = "The divan microbenchmarks of the media path (benches/ of lotse-codec, lotse-http and lotse-supervisor), in the release profile; a report, not a gate. Arguments go to divan: a filter, --sample-count N, --help"
+# `--bench '*'`: the bench targets only; `--benches` would also run every library's unit tests
+# under libtest's bench harness, which rejects divan's flags. `--all-features`: the codec benches
+# build their input from its `test-util` fixtures. mise appends the task's arguments after `--`.
+run = "cargo bench --workspace --all-features --locked --bench '*' --"
+
 [tasks.turn-e2e]
 description = "The TURN client against a real coturn in Docker (UDP and TCP, long-term and REST credentials); needs docker and curl"
 run = "scripts/turn-e2e.sh"

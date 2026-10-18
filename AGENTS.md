@@ -60,6 +60,7 @@ workflow and job names start with a capital letter.
 | `mise run coverage-musl` | the 100 % line-coverage gate on the musl target, from `coverage-archive`'s archive; writes `target/cov/lcov.info` (CI's Tests jobs) |
 | `mise run mutants [base] [--all]` | `cargo mutants --in-diff` against a base ref (default `origin/main`), or with `--all` the whole workspace (CI's nightly run); CI splits it over up to 8 jobs, nightly up to 40 (`scripts/mutants-shards.sh`, `--shard k/n --in-place --skip-baseline`) |
 | `mise run mutants-cache` | each package's tests built alone, as cargo-mutants builds a mutant (CI's Mutants cache job on `main`) |
+| `mise run bench [divan args]` | the divan microbenchmarks of the media path (`benches/` of lotse-codec, lotse-http, lotse-supervisor) in the release profile, e.g. `mise run bench h264 --sample-count 10`; a report, not a gate, and no CI job yet |
 | `mise run turn-e2e` | the TURN client against a real coturn in Docker (ignored `coturn_` tests) |
 | `mise run load [cameras] [viewers] [duration]` | the load generator against a release daemon (`target/load-report.json`) |
 | `mise run soak [duration] [cycle]` | the soak: viewer and camera churn, checked for memory, task and descriptor growth (`target/soak-report.json`) |
