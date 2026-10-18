@@ -75,6 +75,11 @@ pub const MAX_ADDRS_PER_SESSION: usize = 8;
 /// addresses for its life.
 pub const ADDR_IDLE_EXPIRY: Duration = Duration::from_secs(30);
 
+/// Addresses whose last move to another session is remembered at once.
+/// Each is forgotten [`ADDR_IDLE_EXPIRY`] after its move; while this many
+/// are remembered, any further move is refused.
+pub const MAX_RECENT_MOVES: usize = 4_096;
+
 /// Log every this many dropped datagrams from unknown addresses.
 const UNROUTABLE_LOG_EVERY: u64 = 1_000;
 
@@ -758,6 +763,11 @@ pub struct Peers {
     /// sessions that came and went; a live session's go when they were
     /// silent for [`ADDR_IDLE_EXPIRY`] and it needs the room.
     by_addr: HashMap<SocketAddr, Learned>,
+    /// When each address last moved to another session, on the clock,
+    /// for [`ADDR_IDLE_EXPIRY`] after it: kept apart from `by_addr`, so a
+    /// session that closes, and its addresses with it, does not take the
+    /// cooldown along. At most [`MAX_RECENT_MOVES`].
+    moves: HashMap<SocketAddr, Instant>,
     /// The frame being encoded for a worker, reused.
     frame: Vec<u8>,
     /// Times the addresses' silence and the rate limit of the log lines.
@@ -781,10 +791,6 @@ struct Learned {
     registration: Arc<Registration>,
     /// When a datagram last came from it, on the clock.
     last_seen: Instant,
-    /// When it last moved to another session, on the clock; `None` while
-    /// it is with the session that learned it. It moves again no sooner
-    /// than [`ADDR_IDLE_EXPIRY`] after this.
-    moved: Option<Instant>,
 }
 
 impl Peers {
@@ -804,6 +810,7 @@ impl Peers {
             full_log: Throttle::default(),
             move_log: Throttle::default(),
             by_addr: HashMap::new(),
+            moves: HashMap::new(),
             frame: Vec::with_capacity(
                 datagram::MAX_DATAGRAM_PAYLOAD.saturating_add(datagram::HEADER_LEN),
             ),
@@ -884,14 +891,17 @@ impl Peers {
                     // between them on every datagram. One move per
                     // address per consent timeout bounds that (RFC 7675
                     // §5.1); the address stays where it is meanwhile.
-                    if let Some(learned) = self.by_addr.get(&source)
-                        && let Some(moved) = learned.moved
-                        && now.saturating_duration_since(moved) < ADDR_IDLE_EXPIRY
+                    // Decided before `claim`, which may forget the
+                    // requester's idle addresses for one it gets.
+                    if let Some(owner) = self
+                        .by_addr
+                        .get(&source)
+                        .map(|learned| Arc::clone(&learned.registration))
+                        && let Some(reason) = self.move_refusal(source, now)
                     {
                         DemuxStats::bump(&self.stats.stun_rejected);
                         if let Some(refused) = self.move_log.hit(now) {
-                            let since_ms = now.saturating_duration_since(moved).as_millis();
-                            tracing::warn!(%source, from = learned.registration.local_ufrag, to = registration.local_ufrag, since_ms, refused, "address move refused: it moved to another session too recently");
+                            tracing::warn!(%source, from = owner.local_ufrag, to = registration.local_ufrag, reason, refused, "address move refused");
                         }
                         return;
                     }
@@ -919,17 +929,15 @@ impl Peers {
                         &mut self.frame,
                     );
                     let ufrag = registration.local_ufrag.clone();
-                    // Another session's address until now: this moves it.
-                    let moved = self.by_addr.contains_key(&source).then_some(now);
                     let previous = self.by_addr.insert(
                         source,
                         Learned {
                             registration,
                             last_seen: now,
-                            moved,
                         },
                     );
                     if let Some(previous) = previous {
+                        self.moves.insert(source, now);
                         DemuxStats::bump(&self.stats.addresses_moved);
                         previous.registration.addrs.fetch_sub(1, Ordering::AcqRel);
                         tracing::info!(%source, from = previous.registration.local_ufrag, to = ufrag, "address moved to the session a verified stun request named");
@@ -955,6 +963,20 @@ impl Peers {
         if dropped.is_multiple_of(UNROUTABLE_LOG_EVERY) || dropped == 1 {
             tracing::warn!(%source, dropped, "unroutable datagrams");
         }
+    }
+
+    /// Why `source` may not move to another session at `now`, after
+    /// forgetting the moves older than [`ADDR_IDLE_EXPIRY`]: it moved
+    /// more recently than that, or [`MAX_RECENT_MOVES`] others did, and
+    /// forgetting one of them would let it move again early. `None` when
+    /// it may.
+    fn move_refusal(&mut self, source: SocketAddr, now: Instant) -> Option<&'static str> {
+        self.moves
+            .retain(|_, moved| now.saturating_duration_since(*moved) < ADDR_IDLE_EXPIRY);
+        if self.moves.contains_key(&source) {
+            return Some("moved to another session too recently");
+        }
+        (self.moves.len() >= MAX_RECENT_MOVES).then_some("too many addresses moved recently")
     }
 
     /// Counts one more address for `registration`; at the cap, first
@@ -2098,5 +2120,156 @@ mod tests {
         assert_eq!(moved(), 3);
         assert_eq!(frames(&b_sink), 3);
         assert_eq!(DemuxStats::get(&stats.stun_rejected), 4);
+    }
+
+    /// A session registered with credentials as a session gets them, so
+    /// no password in these tests is a literal.
+    fn register_fresh(registrations: &Registrations, sink: &Arc<MemorySink>) -> Arc<Registration> {
+        let (ufrag, pass) = crate::session::ice_credentials().unwrap();
+        registrations.register(&ufrag, pass.into_bytes(), sink.clone())
+    }
+
+    /// A verified check naming `registration`.
+    fn check_of(registration: &Registration, id: u8) -> Vec<u8> {
+        binding_request(&registration.local_ufrag, &registration.password, id)
+    }
+
+    /// Routes `payload` from `source` as the receive thread does.
+    fn route_from(peers: &mut Peers, payload: &[u8], source: SocketAddr) {
+        let local: SocketAddr = "192.0.2.10:3478".parse().unwrap();
+        let message = stun::parse(payload).ok();
+        peers.route(payload, source, local, message.as_ref());
+    }
+
+    /// Peers on a fake clock, with the registrations and counters they use.
+    fn move_bench() -> (Arc<FakeClock>, Arc<Registrations>, Arc<DemuxStats>, Peers) {
+        let clock = Arc::new(FakeClock::default());
+        let registrations = Arc::new(Registrations::default());
+        let stats = Arc::new(DemuxStats::default());
+        let peers = Peers::new(
+            Arc::clone(&registrations),
+            Arc::clone(&stats),
+            Arc::<FakeClock>::clone(&clock),
+        );
+        (clock, registrations, stats, peers)
+    }
+
+    /// The last move of an address outlives the session it moved to: a
+    /// closed owner's entry is dropped when the address sends again, or
+    /// swept when another address is learned, and the address is learned
+    /// afresh, but moving it on from there waits for the expiry as well.
+    #[test]
+    fn rfc8445_7_3_closing_the_owner_does_not_reset_the_move_cooldown() {
+        let (clock, registrations, stats, mut peers) = move_bench();
+        let sink = Arc::new(MemorySink::default());
+        let shared: SocketAddr = "198.51.100.1:40000".parse().unwrap();
+        let other: SocketAddr = "198.51.100.2:40000".parse().unwrap();
+        let a = register_fresh(&registrations, &sink);
+        let b = register_fresh(&registrations, &sink);
+        route_from(&mut peers, &check_of(&a, 1), shared);
+        route_from(&mut peers, &check_of(&b, 2), shared);
+        assert_eq!(DemuxStats::get(&stats.addresses_moved), 1);
+        // The owner closes; the address sends again and is learned afresh.
+        registrations.unregister(&b.local_ufrag);
+        clock.advance(Duration::from_millis(1));
+        route_from(&mut peers, &check_of(&a, 3), shared);
+        assert_eq!(DemuxStats::get(&stats.addresses_learned), 3);
+        let c = register_fresh(&registrations, &sink);
+        route_from(&mut peers, &check_of(&c, 4), shared);
+        assert_eq!(
+            DemuxStats::get(&stats.stun_rejected),
+            1,
+            "still cooling down"
+        );
+        assert_eq!(c.addrs.load(Ordering::Acquire), 0);
+        // The owner closes; the sweep of another learn drops its entry.
+        registrations.unregister(&a.local_ufrag);
+        let d = register_fresh(&registrations, &sink);
+        route_from(&mut peers, &check_of(&d, 5), other);
+        assert!(!peers.by_addr.contains_key(&shared), "swept");
+        route_from(&mut peers, &check_of(&c, 6), shared);
+        assert_eq!(c.addrs.load(Ordering::Acquire), 1, "learned afresh");
+        route_from(&mut peers, &check_of(&d, 7), shared);
+        assert_eq!(
+            DemuxStats::get(&stats.stun_rejected),
+            2,
+            "still cooling down"
+        );
+        assert_eq!(DemuxStats::get(&stats.addresses_moved), 1);
+        // The expiry counts from the move, closes or not.
+        clock.advance(ADDR_IDLE_EXPIRY.saturating_sub(Duration::from_millis(1)));
+        route_from(&mut peers, &check_of(&d, 8), shared);
+        assert_eq!(DemuxStats::get(&stats.addresses_moved), 2);
+        assert_eq!(d.addrs.load(Ordering::Acquire), 2);
+    }
+
+    /// The moves remembered are bounded: once [`MAX_RECENT_MOVES`]
+    /// addresses moved within [`ADDR_IDLE_EXPIRY`], another move is
+    /// refused until the oldest expire, rather than forgetting one that
+    /// may still be cooling down.
+    #[test]
+    fn rfc8445_7_3_at_most_max_recent_moves_are_remembered_and_they_expire() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let (clock, registrations, stats, mut peers) = move_bench();
+        let sink = Arc::new(MemorySink::default());
+        let at = |i: u32| SocketAddr::new(std::net::Ipv4Addr::from(0xC612_0000 + i).into(), 1);
+        let x = register_fresh(&registrations, &sink);
+        let mut y = register_fresh(&registrations, &sink);
+        let total = u32::try_from(MAX_RECENT_MOVES).unwrap();
+        for i in 0..=total {
+            // Each taker holds at most its cap.
+            if i % 8 == 0 {
+                registrations.unregister(&y.local_ufrag);
+                y = register_fresh(&registrations, &sink);
+            }
+            route_from(&mut peers, &check_of(&x, 1), at(i));
+            route_from(&mut peers, &check_of(&y, 2), at(i));
+        }
+        assert_eq!(DemuxStats::get(&stats.addresses_moved), u64::from(total));
+        assert_eq!(DemuxStats::get(&stats.stun_rejected), 1, "the one over");
+        assert_eq!(peers.moves.len(), MAX_RECENT_MOVES);
+        assert_eq!(captured.lines("too many addresses moved recently").len(), 1);
+        // Once they expire, the moves are forgotten and the next is made.
+        clock.advance(ADDR_IDLE_EXPIRY);
+        route_from(&mut peers, &check_of(&y, 3), at(total));
+        assert_eq!(
+            DemuxStats::get(&stats.addresses_moved),
+            u64::from(total) + 1
+        );
+        assert_eq!(peers.moves.len(), 1);
+    }
+
+    /// A refused move is decided before the requester counts another
+    /// address: at its cap, with addresses silent for the expiry, it
+    /// forgets none of them for an address it does not get.
+    #[test]
+    fn rfc8445_7_3_a_refused_move_leaves_the_requesters_idle_addresses_alone() {
+        let (clock, registrations, stats, mut peers) = move_bench();
+        let a_sink = Arc::new(MemorySink::default());
+        let b_sink = Arc::new(MemorySink::default());
+        let a = register_fresh(&registrations, &a_sink);
+        let b = register_fresh(&registrations, &b_sink);
+        let shared: SocketAddr = "198.51.100.1:40000".parse().unwrap();
+        let own = |port: u16| SocketAddr::new([203, 0, 113, 1].into(), port);
+        route_from(&mut peers, &check_of(&a, 1), shared);
+        for port in 1..=7 {
+            route_from(&mut peers, &check_of(&a, 2), own(port));
+        }
+        // 30 s on, b takes the shared address and a fills its cap again.
+        clock.advance(ADDR_IDLE_EXPIRY);
+        route_from(&mut peers, &check_of(&b, 3), shared);
+        route_from(&mut peers, &check_of(&a, 4), own(8));
+        assert_eq!(a.addrs.load(Ordering::Acquire), MAX_ADDRS_PER_SESSION);
+        // Refused, and a's seven idle addresses are still a's.
+        route_from(&mut peers, &check_of(&a, 5), shared);
+        assert_eq!(DemuxStats::get(&stats.stun_rejected), 1);
+        assert_eq!(a.addrs.load(Ordering::Acquire), MAX_ADDRS_PER_SESSION);
+        let before = a_sink.frames.lock().unwrap().len();
+        for port in 1..=8 {
+            route_from(&mut peers, b"media", own(port));
+        }
+        assert_eq!(a_sink.frames.lock().unwrap().len(), before + 8);
+        assert_eq!(b.addrs.load(Ordering::Acquire), 1);
     }
 }
