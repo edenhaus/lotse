@@ -29,6 +29,7 @@
 //! alone. A stream that opts in or out turns the probe on or off without
 //! this session noticing.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -887,6 +888,7 @@ async fn play(connected: Connected, ask: &Ask, ctx: &SourceCtx) -> SourceError {
     let mut first_media = ctx.time.sleep(deadline);
     let ingest = ctx.tracks.ingest();
     let mut loss_log = Throttle::default();
+    let mut timelines = Timelines::default();
     let mut normalized = Vec::new();
     loop {
         let item = tokio::select! {
@@ -911,8 +913,11 @@ async fn play(connected: Connected, ask: &Ask, ctx: &SourceCtx) -> SourceError {
                     .get_mut(index)
                     .and_then(Option::as_mut)
                     .and_then(|entry| entry.guard.observe(ts, arrival));
-                if let Some(moved_ms) = jumped {
-                    new_timeline(&mut carried, index, ctx, moved_ms);
+                if let Some(moved_ms) = jumped
+                    && let Err(err) =
+                        new_timeline(&mut carried, index, ctx, &mut timelines, moved_ms, arrival)
+                {
+                    break err;
                 }
                 if let Some(Some(entry)) = carried.get_mut(index) {
                     on_rtp(entry, ctx, arrival, packet, &mut normalized);
@@ -953,17 +958,95 @@ fn count_loss(ingest: &IngestCounters, log: &mut Throttle, lost: u16, arrival: I
     }
 }
 
-/// The camera's timestamps left their timeline on stream `index`: one new
-/// epoch for every track, the clock mapping forgotten, and every stream's
-/// timestamp state restarted so the other tracks' own jumps are part of
-/// the same epoch.
-fn new_timeline(carried: &mut [Option<Carried>], index: usize, ctx: &SourceCtx, moved_ms: i64) {
+/// How many new timelines one connection attempt starts within
+/// [`TIMELINE_WINDOW`] before its camera's timestamps count as broken.
+///
+/// RFC 3550 §5.1 has a stream's timestamps come from a clock that
+/// "increments monotonically and linearly in time", 32-bit wrap aside: a
+/// jump ([`TimestampGuard`]) is a reset of that clock, a camera reboot or
+/// an encoder restart, which happens once, not every few frames. A new
+/// timeline is not free either: every track starts an epoch, so every
+/// viewer's video waits for the next keyframe
+/// ([`lotse_core::session::apply_track_event`]),
+/// and the clock mapping forgets its Sender Report fit (RFC 3550 §6.4.1),
+/// so lip sync falls back to arrival times until the next report. A
+/// camera whose timestamps jump on every packet would start one epoch per
+/// packet: viewers never reach a keyframe of the epoch they wait for and
+/// the mapping never fits again. Capping the epochs while the attempt goes
+/// on would leave the jumps inside an epoch, where a viewer's timestamp
+/// offset no longer holds, so the attempt ends instead, with a protocol
+/// error the stream's status shows, and core's runner reconnects under its
+/// backoff, which bounds the epochs of the reconnects. Ten per window, one
+/// a second on average, still passes a camera that restarts its clock at
+/// every keyframe of a one-second GOP.
+const MAX_TIMELINES: usize = 10;
+
+/// The sliding window [`MAX_TIMELINES`] counts the new timelines of one
+/// connection attempt in: the summary interval of the rate-limited log.
+const TIMELINE_WINDOW: Duration = lotse_core::throttle::SUMMARY_INTERVAL;
+
+/// The new timelines of one connection attempt: when the last
+/// [`MAX_TIMELINES`] started, for the bound, and the rate limit of their
+/// log line.
+#[derive(Debug, Default)]
+struct Timelines {
+    /// When each new timeline within the last [`TIMELINE_WINDOW`] started,
+    /// oldest first; never more than [`MAX_TIMELINES`].
+    recent: VecDeque<Instant>,
+    /// The rate limit of the `timestamps jumped` line.
+    log: Throttle,
+}
+
+impl Timelines {
+    /// Admits one more new timeline at `now`, or refuses it as the
+    /// [`MAX_TIMELINES`] + 1st within [`TIMELINE_WINDOW`]: the camera's
+    /// timestamps no longer follow a clock (RFC 3550 §5.1).
+    fn admit(&mut self, now: Instant) -> Result<(), SourceError> {
+        while let Some(first) = self.recent.front()
+            && now.saturating_duration_since(*first) >= TIMELINE_WINDOW
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= MAX_TIMELINES {
+            tracing::warn!(
+                timelines = MAX_TIMELINES,
+                window_s = TIMELINE_WINDOW.as_secs(),
+                "rtsp: the camera's timestamps keep jumping; ending the attempt"
+            );
+            return Err(SourceError::Protocol(format!(
+                "the camera's RTP timestamps jumped more than {MAX_TIMELINES} times within {} s: they must follow one clock that increments linearly in time (RFC 3550 §5.1)",
+                TIMELINE_WINDOW.as_secs()
+            )));
+        }
+        self.recent.push_back(now);
+        Ok(())
+    }
+}
+
+/// The camera's timestamps left their timeline on stream `index` at
+/// `arrival`: one new epoch for every track, the clock mapping forgotten,
+/// and every stream's timestamp state restarted so the other tracks' own
+/// jumps are part of the same epoch, logged at most once per summary
+/// interval. An error, and nothing restarted, when `timelines` refuses
+/// one more ([`MAX_TIMELINES`]).
+fn new_timeline(
+    carried: &mut [Option<Carried>],
+    index: usize,
+    ctx: &SourceCtx,
+    timelines: &mut Timelines,
+    moved_ms: i64,
+    arrival: Instant,
+) -> Result<(), SourceError> {
+    timelines.admit(arrival)?;
+    let logged = timelines.log.hit(arrival);
     for (i, entry) in carried.iter_mut().enumerate() {
         let Some(entry) = entry.as_mut() else {
             continue;
         };
         if i == index {
-            tracing::info!(track = %entry.track.id(), moved_ms, "rtsp: timestamps jumped; new epoch");
+            if let Some(count) = logged {
+                tracing::info!(track = %entry.track.id(), moved_ms, count, "rtsp: timestamps jumped; new epoch");
+            }
         } else {
             entry.guard.rebase();
         }
@@ -972,6 +1055,7 @@ fn new_timeline(carried: &mut [Option<Carried>], index: usize, ctx: &SourceCtx, 
     }
     ctx.tracks.discontinuity();
     ctx.clock.reset();
+    Ok(())
 }
 
 /// Publishes the live path's packets of one source packet on `track`.
@@ -1645,7 +1729,7 @@ mod tests {
                 .observe(5_000_000, t0)
                 .is_some()
         );
-        new_timeline(&mut carried, 0, &ctx, 55);
+        new_timeline(&mut carried, 0, &ctx, &mut Timelines::default(), 55, t0).unwrap();
         assert_eq!((v0.epoch(), a0.epoch()), (1, 1), "one epoch for all tracks");
         assert_eq!(mapper.mode(v0.id()), SyncMode::Arrival);
         let [v, none, a] = <&mut [Option<Carried>; 3]>::try_from(carried.as_mut_slice()).unwrap();
@@ -1663,6 +1747,65 @@ mod tests {
             assert_eq!(entry.unwrapper.last(), None);
             assert_eq!(entry.last_ts, None);
         }
+    }
+
+    #[test]
+    fn rfc3550_5_1_the_timelines_beyond_the_bound_within_the_window_are_refused() {
+        use lotse_core::clock::{Clock as _, FakeClock};
+
+        let t0 = FakeClock::from_system().now();
+        let mut timelines = Timelines::default();
+        // Exactly the bound at one instant: every one admitted.
+        for n in 0..MAX_TIMELINES {
+            assert!(timelines.admit(t0).is_ok(), "timeline {n}");
+        }
+        let refused = timelines.admit(t0 + TIMELINE_WINDOW.saturating_sub(Duration::from_nanos(1)));
+        assert!(
+            matches!(&refused, Err(SourceError::Protocol(m)) if m.contains("more than 10 times within 10 s") && m.contains("RFC 3550 §5.1")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            timelines.recent.len(),
+            MAX_TIMELINES,
+            "a refusal is not counted"
+        );
+        // A window after them, they have left it.
+        assert!(timelines.admit(t0 + TIMELINE_WINDOW).is_ok());
+        assert_eq!(timelines.recent.len(), 1);
+    }
+
+    #[test]
+    fn occasional_timelines_below_the_bound_are_each_admitted() {
+        use lotse_core::clock::{Clock as _, FakeClock};
+
+        let t0 = FakeClock::from_system().now();
+        let mut timelines = Timelines::default();
+        // One a second, for a minute: never more than the bound in a window.
+        let every = TIMELINE_WINDOW / u32::try_from(MAX_TIMELINES).unwrap();
+        for n in 0..60_u32 {
+            assert!(timelines.admit(t0 + every * n).is_ok(), "timeline {n}");
+        }
+        assert_eq!(timelines.recent.len(), MAX_TIMELINES);
+    }
+
+    #[test]
+    fn a_refused_timeline_restarts_nothing() {
+        let (t0, _set, mut ctx) = video_ctx();
+        let declared = declare("video", "h264", 90_000, None, Sprop::None, &[]).unwrap();
+        let v0 = ctx
+            .tracks
+            .declare(declared.kind, declared.codec.clone(), 90_000);
+        let mut carried = vec![Some(Carried::new(Arc::clone(&v0), 96, &declared))];
+        carried[0].as_mut().unwrap().last_ts = Some(1_000);
+        let mut timelines = Timelines::default();
+        for _ in 0..MAX_TIMELINES {
+            new_timeline(&mut carried, 0, &ctx, &mut timelines, 55, t0).unwrap();
+        }
+        assert_eq!(v0.epoch(), 10);
+        carried[0].as_mut().unwrap().last_ts = Some(1_000);
+        assert!(new_timeline(&mut carried, 0, &ctx, &mut timelines, 55, t0).is_err());
+        assert_eq!(v0.epoch(), 10, "no epoch for the refused one");
+        assert_eq!(carried[0].as_ref().unwrap().last_ts, Some(1_000));
     }
 
     /// A source context on a fresh track set, for the video path tests.
