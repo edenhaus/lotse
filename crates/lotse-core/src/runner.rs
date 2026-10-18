@@ -333,6 +333,11 @@ async fn until(slot: &mut Option<BoxFuture<'static, ()>>) {
 struct Outcome {
     /// The tracks were declared.
     reached_live: bool,
+    /// It streamed for `stable_after` and reported `Stable`: the schedule
+    /// starts over. A connection that ends before the stability timer is
+    /// seen, at the deadline itself or while its source winds down, did not
+    /// report it and resets nothing.
+    stable: bool,
     /// How long it streamed.
     live_for: Duration,
     /// Why it ended.
@@ -438,7 +443,9 @@ impl SourceRunner {
             if self.cancel.is_cancelled() {
                 break;
             }
-            if outcome.live_for >= self.config.stable_after {
+            // The reset is the one `Stable` reported, so the supervisor's
+            // copy of the position never misses one.
+            if outcome.stable {
                 tracing::debug!(
                     live_ms = outcome.live_for.as_millis(),
                     "stable streaming; reconnect backoff reset"
@@ -501,6 +508,7 @@ impl SourceRunner {
         let mut live_since: Option<Instant> = None;
         // Runs from going live until `stable_after`.
         let mut stable: Option<BoxFuture<'static, ()>> = None;
+        let mut stable_reported = false;
         let mut watchdog_error: Option<SourceError> = None;
         let mut check = self.clock.sleep(self.config.stall_check);
 
@@ -524,6 +532,7 @@ impl SourceRunner {
                 }
                 () = until(&mut stable) => {
                     stable = None;
+                    stable_reported = true;
                     tracing::debug!(
                         stable_ms = self.config.stable_after.as_millis(),
                         "stable streaming; the reconnect schedule starts over"
@@ -554,6 +563,7 @@ impl SourceRunner {
         });
         Outcome {
             reached_live: live_since.is_some(),
+            stable: stable_reported,
             live_for: live_since.map_or(Duration::ZERO, |since| {
                 self.clock.now().saturating_duration_since(since)
             }),
@@ -1379,6 +1389,17 @@ mod tests {
         Arc<std::sync::atomic::AtomicU32>,
         Arc<std::sync::atomic::AtomicU32>,
     ) {
+        start_deaf_with(RunnerConfig::default())
+    }
+
+    /// [`start_deaf`] with `config`.
+    fn start_deaf_with(
+        config: RunnerConfig,
+    ) -> (
+        Harness,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
         let deaf = Deaf::default();
         assert_eq!(
             (deaf.describe().protocol, deaf.connection_options()),
@@ -1400,7 +1421,7 @@ mod tests {
             Arc::clone(&mapper),
             BackchannelSlot::default(),
             clock.clone(),
-            RunnerConfig::default(),
+            config,
             ReconnectBackoff::new(1),
             tx,
             ConnectGate::open(),
@@ -1457,6 +1478,39 @@ mod tests {
         assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Stopped));
         h.runner.await.unwrap();
         assert_eq!(warnings.count(tracing::Level::WARN, DROPPED), 2);
+    }
+
+    /// A connection that crosses `stable_after` only while its source winds
+    /// down never saw the stability timer: it reports no `Stable`, and so
+    /// resets nothing, and its second loss waits out the schedule rather
+    /// than being retried at once.
+    #[tokio::test]
+    async fn a_connection_that_turns_stable_while_winding_down_resets_nothing() {
+        let config = RunnerConfig {
+            stable_after: DEFAULT_STALL_VIDEO + DEFAULT_STOP_GRACE / 2,
+            ..RunnerConfig::default()
+        };
+        let (mut h, _runs, _dropped) = start_deaf_with(config);
+        next(&mut h.events).await;
+        assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Live));
+        // Stalled at 5 s, dropped 500 ms on: past `stable_after` by then.
+        tick(&h, DEFAULT_STALL_VIDEO).await;
+        h.clock.advance(DEFAULT_STOP_GRACE);
+        assert!(matches!(
+            next(&mut h.events).await,
+            Some(RunnerEvent::Reconnecting { .. })
+        ));
+        assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Live));
+        tick(&h, DEFAULT_STALL_VIDEO).await;
+        h.clock.advance(DEFAULT_STOP_GRACE);
+        assert!(
+            matches!(
+                next(&mut h.events).await,
+                Some(RunnerEvent::Backoff { position, .. }) if position.attempts == 1
+            ),
+            "no `Stable`, no reset: the immediate attempt is used"
+        );
+        h.cancel.cancel();
     }
 
     /// Security review WRK-3: a stop is over `stop_grace` after the cancel
