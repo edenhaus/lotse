@@ -104,16 +104,24 @@ impl Depacketizer {
         arrival: Instant,
     ) -> Result<UplinkPacket, Refused> {
         let codec = self.codec(rtp.pt).ok_or(Refused::PayloadType(rtp.pt))?;
-        match codec {
-            UplinkCodec::Opus => {
-                opus::packet_samples(&payload).map_err(Refused::Opus)?;
-            }
+        // The audio it carries: 48 kHz samples by its framing for Opus
+        // (RFC 6716 §3.4, RFC 7587 §4.1), a byte per 8 kHz sample for
+        // G.711 (RFC 3551 §4.5.14).
+        let samples = match codec {
+            UplinkCodec::Opus => opus::packet_samples(&payload).map_err(Refused::Opus)?,
             UplinkCodec::Pcmu | UplinkCodec::Pcma => {
                 if payload.is_empty() {
                     return Err(Refused::Empty);
                 }
+                u32::try_from(payload.len()).unwrap_or(u32::MAX)
             }
-        }
+        };
+        let duration = Duration::from_micros(
+            u64::from(samples)
+                .saturating_mul(1_000_000)
+                .checked_div(u64::from(codec.clock_rate()))
+                .unwrap_or_default(),
+        );
         Ok(UplinkPacket {
             codec,
             packet: MediaPacket {
@@ -125,6 +133,7 @@ impl Depacketizer {
                 lateness: Duration::ZERO,
                 payload,
             },
+            duration,
         })
     }
 }
@@ -181,6 +190,30 @@ mod tests {
             assert_eq!(packet.packet.lateness, Duration::ZERO);
         }
         assert_eq!(depacketizer.codec(0), Some(UplinkCodec::Pcmu));
+    }
+
+    #[test]
+    fn rfc6716_3_4_and_rfc3551_4_5_14_a_packet_carries_the_duration_of_its_framing() {
+        let depacketizer = browser();
+        let now = SystemClock.now();
+        // TOC configuration 31 is CELT's 20 ms, 16 its 2.5 ms (RFC 6716
+        // §3.1); code 1 is two frames (§3.2.3).
+        for (pt, payload, micros) in [
+            (111, &[0xfc_u8, 0xff, 0xfe][..], 20_000),
+            (111, &[0x80][..], 2_500),
+            (111, &[0x81, 1, 2][..], 5_000),
+            (0, &[0xff; 80][..], 10_000),
+            (8, &[0xd5; 1][..], 125),
+        ] {
+            let packet = depacketizer
+                .depacketize(rtp(pt), Arc::from(payload), now)
+                .unwrap();
+            assert_eq!(
+                packet.duration,
+                Duration::from_micros(micros),
+                "{payload:?}"
+            );
+        }
     }
 
     #[test]
