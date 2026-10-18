@@ -1176,18 +1176,23 @@ async fn talker_changed(talker: Option<&mut TalkerFeed>) -> TalkerChanged {
 /// track is synced as its source is, since its capture times come from
 /// the source's.
 fn track_infos(tracks: &DerivedTracks, mapper: &ClockMapper) -> Vec<TrackInfo> {
-    let info = |track: &Track, from: Option<TrackId>, delay: Option<Duration>| TrackInfo {
-        id: track.id().to_string(),
-        kind: track.kind().name().to_owned(),
-        codec: track.codec().name().to_owned(),
-        clock_rate: track.clock_rate(),
-        sync: mapper
-            .mode(from.unwrap_or_else(|| track.id()))
-            .name()
-            .to_owned(),
-        derived_from: from.map(|from| from.to_string()),
-        audio_delay_ms: delay.map(|delay| u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)),
-        params: params::track_params(&track.codec()),
+    let info = |track: &Track, from: Option<TrackId>, delay: Option<Duration>| {
+        // One snapshot of the descriptor for the name and the parameters:
+        // a reconnect can replace it between two loads.
+        let codec = track.codec();
+        TrackInfo {
+            id: track.id().to_string(),
+            kind: track.kind().name().to_owned(),
+            codec: codec.name().to_owned(),
+            clock_rate: track.clock_rate(),
+            sync: mapper
+                .mode(from.unwrap_or_else(|| track.id()))
+                .name()
+                .to_owned(),
+            derived_from: from.map(|from| from.to_string()),
+            audio_delay_ms: delay.map(|delay| u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)),
+            params: params::track_params(&codec),
+        }
     };
     let natives = tracks.tracks().tracks();
     let derived = tracks.derived();
