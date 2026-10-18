@@ -609,12 +609,13 @@ fn a_worker_cannot_fill_memory_outside_its_address_space() {
     }
 }
 
-/// Regression for SBX-20: a worker could write regular files, up to
+/// Regression for SBX-20: a worker could grow regular files, up to
 /// filling the disk where Landlock, which lets it open none, is missing
 /// (Linux before 5.13) and the dropped uid may write somewhere. With its
 /// standard error a pipe a worker's `RLIMIT_FSIZE` is 0, so its first write
-/// to a regular file ends it with `SIGXFSZ` (getrlimit(2)), whether or not
-/// seccomp is enforced: the allowlist keeps `write`.
+/// call on a regular file ends it with `SIGXFSZ` (getrlimit(2)), whether or
+/// not seccomp is enforced: the allowlist keeps `write`. A shared writable
+/// mapping is beyond the limit ([`lotse_sandbox::WORKER_MAX_FILE_SIZE`]).
 #[test]
 fn setrlimit2_a_worker_cannot_write_a_regular_file() {
     let (report, stdout, stderr, status) =

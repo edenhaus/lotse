@@ -757,8 +757,9 @@ mod tests {
         assert_eq!(own_nice(), before);
     }
 
-    /// Regression for SBX-20: workers could write regular files, and a
-    /// worker logging to a regular file must keep logging. With its
+    /// Regression for SBX-20: workers could grow and write regular files
+    /// with write calls, and a worker logging to a regular file must keep
+    /// logging. With its
     /// standard error a regular file the worker keeps the `RLIMIT_FSIZE` it
     /// inherited, says so, and its log line after the limits lands in the
     /// file; under the limit of 0 that write would end it with `SIGXFSZ`
@@ -838,10 +839,8 @@ mod tests {
             connect_ports: vec![554],
         };
         let report = crate::apply(&worker, &SandboxConfig::default()).unwrap();
-        assert!(
-            report.notes.contains(&STDERR_IS_A_FILE.to_owned()),
-            "{report:?}"
-        );
+        let notes = report.notes;
+        assert!(notes.contains(&STDERR_IS_A_FILE.to_owned()), "{notes:?}");
         assert_eq!(limits(Resource::Fsize), file_size);
         let logged = writeln!(io::stderr(), "child: logged under the sandbox");
         assert!(logged.is_ok(), "{logged:?}");
@@ -869,13 +868,10 @@ mod tests {
         };
         let report = crate::apply(&supervisor, &SandboxConfig::default()).unwrap();
         assert_eq!(limits(Resource::Fsize), file_size);
-        assert!(
-            !report
-                .notes
-                .iter()
-                .any(|note| note.contains("RLIMIT_FSIZE")),
-            "{report:?}"
-        );
+        // No closure over the notes: unprivileged, under a kernel with
+        // every layer, there are none, and it would never run.
+        let notes = report.notes;
+        assert!(!notes.contains(&STDERR_IS_A_FILE.to_owned()), "{notes:?}");
         println!("{CHILD_DONE}");
     }
 

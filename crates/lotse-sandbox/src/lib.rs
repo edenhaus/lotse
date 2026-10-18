@@ -79,21 +79,30 @@ pub const WORKER_NICE_INCREMENT: i32 = 10;
 /// layer is unavailable. Lowering a hard limit needs no privilege.
 pub const WORKER_MAX_NICE_RLIMIT: u64 = 0;
 
-/// `RLIMIT_FSIZE` for a worker, soft and hard: 0, so it cannot write a
-/// byte to a regular file. getrlimit(2): an attempt to extend a file past
-/// the limit gets `SIGXFSZ`, or fails with `EFBIG` where the signal is
-/// caught or ignored; at 0 every write to a regular file does, overwriting
-/// included, since the kernel refuses any write at an offset at or past the
-/// limit (mm/filemap.c, `generic_write_check_limits`). Pipes, sockets and
-/// character devices such as `/dev/null` are not regular files and keep
-/// working. Lowering a hard limit needs no privilege.
+/// `RLIMIT_FSIZE` for a worker, soft and hard: 0, so every write(2)-family
+/// call on a regular file fails. getrlimit(2): an attempt to extend a file
+/// past the limit gets `SIGXFSZ`, or fails with `EFBIG` where the signal is
+/// caught or ignored; at 0 the kernel refuses any write at an offset at or
+/// past the limit (mm/filemap.c, `generic_write_check_limits`), so
+/// `write`, `pwrite` and `writev` fail even within a file's current size,
+/// and no file can grow. Pipes, sockets and character devices such as
+/// `/dev/null` are not regular files and keep working. Lowering a hard
+/// limit needs no privilege.
+///
+/// The limit does not cover a shared writable mapping: stores through
+/// `mmap(MAP_SHARED, PROT_WRITE)` change an existing file in place, within
+/// its size, with no write call to refuse (observed on Linux 6.18 on
+/// 2026-10-17). What keeps a worker from opening a file for writing at all
+/// is Landlock; where the kernel lacks it (Linux 5.13) or has it disabled,
+/// a worker can still modify, in place, an existing file its uid may open
+/// for writing, since its seccomp allowlist keeps `openat` and `mmap`.
 ///
 /// Nothing a worker runs writes a file: it logs to its standard error,
 /// sends on sockets it holds and reads `/proc/self/smaps_rollup` through a
-/// descriptor opened before its sandbox. The limit backs Landlock, which
-/// lets a worker open no file but which the kernel may lack (Linux 5.13)
-/// or have disabled, and the seccomp allowlist, which keeps `openat`,
-/// `write` and `pwrite64` and denies only `memfd_create` and `ftruncate`.
+/// descriptor opened before its sandbox. The limit backs Landlock with what
+/// it does cover: no file a worker opens can grow, and none can be written
+/// by a write call, which the seccomp allowlist keeps (`write`, `pwrite64`;
+/// it denies `memfd_create` and `ftruncate`).
 ///
 /// Not set while the worker's standard error is a regular file
 /// (`lotse serve 2>lotse.log`, systemd's `StandardError=file:`, CI's
