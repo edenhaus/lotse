@@ -1808,7 +1808,7 @@ mod tests {
             .unwrap();
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with(script.to_str().unwrap(), clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let run = |attempts, immediate_used| {
             lotse_ipc::ToWorker::RunSource(SourceSpec {
@@ -1823,7 +1823,7 @@ mod tests {
                 },
             })
         };
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         step(&mut driver).await;
         assert!(driver.worker.is_some());
@@ -1838,7 +1838,7 @@ mod tests {
             },
         }));
         // The waiting viewer closed with it; its demand goes.
-        demand_tx.send_replace(0);
+        demand_tx.send_replace(Demand::default());
         step(&mut driver).await;
         driver.publish();
         assert_eq!(driver.machine.state(), ConnectionState::Idle);
@@ -1849,7 +1849,7 @@ mod tests {
             "an offer now closes at once"
         );
         // Demand inside the window: no lookup, no worker.
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         assert!(matches!(driver.pending, Pending::Nothing));
         assert!(driver.worker.is_none());
@@ -1898,9 +1898,9 @@ mod tests {
             .unwrap();
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with(script.to_str().unwrap(), clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         step(&mut driver).await;
         let first = lotse_ipc::ToWorker::RunSource(SourceSpec {
@@ -1920,7 +1920,7 @@ mod tests {
                 immediate_used: false,
             },
         }));
-        demand_tx.send_replace(0);
+        demand_tx.send_replace(Demand::default());
         step(&mut driver).await;
         assert_eq!(driver.machine.state(), ConnectionState::Idle);
         driver
@@ -1936,7 +1936,7 @@ mod tests {
             .await;
         assert_eq!(driver.machine.backoff_position().attempts, 0);
         // The window holds: demand starts no lookup before its end.
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         assert!(matches!(driver.pending, Pending::Nothing));
         clock.advance(Duration::from_secs(5));
@@ -1985,9 +1985,9 @@ mod tests {
             .unwrap();
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with(script.to_str().unwrap(), clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         step(&mut driver).await;
         let first = driver.spec.source_spec(
@@ -2018,7 +2018,7 @@ mod tests {
             retry_in: Duration::from_secs(60),
             position: BackoffPosition::default(),
         }));
-        demand_tx.send_replace(0);
+        demand_tx.send_replace(Demand::default());
         step(&mut driver).await;
         clock.advance(lotse_core::connection::DEFAULT_LINGER);
         step(&mut driver).await;
@@ -2026,7 +2026,7 @@ mod tests {
         assert!(driver.window.is_none(), "no window of the standby's");
         // The next demand logs in to the source switched to, at once, its
         // schedule at the first step.
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         assert!(matches!(driver.pending, Pending::Resolving(_)));
         step(&mut driver).await;
@@ -2050,14 +2050,14 @@ mod tests {
                 immediate_used: false,
             },
         }));
-        demand_tx.send_replace(0);
+        demand_tx.send_replace(Demand::default());
         step(&mut driver).await;
         driver.publish();
         assert_eq!(
             driver.snapshot.failure.as_ref().map(ConnectionError::code),
             Some("source_auth_failed")
         );
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         assert!(
             matches!(driver.pending, Pending::Nothing),
@@ -2078,7 +2078,7 @@ mod tests {
     #[tokio::test]
     async fn only_the_source_s_stable_streaming_starts_the_schedule_over() {
         let shared = shared("/usr/bin/true");
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         driver.feed(Input::Demand(1));
         let at = BackoffPosition {
@@ -2818,9 +2818,9 @@ mod tests {
     async fn a_switch_during_the_lookup_retry_looks_up_the_new_source_at_once() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/usr/bin/true", clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         driver
             .handle(Wake::Resolved(Err("no such host".into())))
