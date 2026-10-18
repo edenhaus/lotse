@@ -8,7 +8,9 @@
 //! supervisor on the channel it inherited as stdin and runs `lotse-core` for
 //! its `SourceConnection`. Kept out of the binary so it is a library with
 //! tests; the counterpart of `lotse-supervisor`. A worker runs exactly one
-//! source; a second `RunSource` is a protocol error.
+//! source; a second `RunSource` is a protocol error. Its sockets come
+//! once too: a second `Sockets` message is refused and its descriptors
+//! closed.
 //!
 //! Standards: RFC 8837 §5 (the audio track's DSCP, `sendmsg`), RFC 3542
 //! §6.1 and Linux `ip(7)` (the candidate's source address, `sendmsg`),
@@ -718,8 +720,18 @@ impl Serving<'_> {
     }
 
     /// The shared UDP socket and the datagram channel: the session manager
-    /// starts on them.
+    /// starts on them. The supervisor hands them over once; a second
+    /// `Sockets` message once a session manager runs is refused, its
+    /// descriptors closed as they drop here, so it can neither replace the
+    /// manager with its sessions nor leave descriptors behind (WRK-6).
     fn on_sockets(&mut self, fds: Vec<OwnedFd>) {
+        if self.sessions.is_some() {
+            tracing::warn!(
+                fds = fds.len(),
+                "second sockets message: the worker holds its sockets; refused"
+            );
+            return;
+        }
         let mut fds = fds.into_iter();
         let (Some(udp), Some(datagrams)) = (fds.next(), fds.next()) else {
             tracing::warn!("sockets message without two descriptors; ignored");
@@ -3839,6 +3851,66 @@ mod tests {
             h.next_closed().await,
             ("second".to_owned(), "internal_error".to_owned())
         );
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            ended(h.worker).await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+    }
+
+    /// WRK-6: the supervisor hands a worker its sockets once. A second
+    /// `Sockets` message is refused: its descriptors are closed at once,
+    /// and the session manager on the first ones, with its sessions, goes
+    /// on as it was.
+    #[tokio::test]
+    async fn a_second_sockets_message_is_refused_and_the_first_sockets_stay_in_use() {
+        let (logs, _guard) = Logs::capture();
+        let mut h = start_with(echo_registries());
+        h.next().await;
+        let (datagrams, shared_addr) = live_echo_session(&mut h).await;
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (ours, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
+        h.tx.send_msg(
+            &ToWorker::Sockets,
+            &[OwnedFd::from(udp).as_fd(), theirs.as_fd()],
+        )
+        .await
+        .unwrap();
+        drop(theirs);
+        let refused = "second sockets message: the worker holds its sockets; refused";
+        let deadline = SystemClock.now() + Duration::from_secs(10);
+        while logs.count(Level::WARN, refused) == 0 {
+            assert!(
+                SystemClock.now() < deadline,
+                "the second sockets message was not refused"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(logs.lines(Level::WARN, refused)[0].fields, " fds=2");
+        // Its channel's other end is closed: the worker kept no descriptor
+        // of it.
+        let ours = std::os::unix::net::UnixDatagram::from(ours);
+        ours.set_nonblocking(true).unwrap();
+        assert_eq!(ours.recv(&mut [0_u8; 1]).unwrap(), 0);
+        // The session still echoes over the first channel and the first
+        // shared socket.
+        let browser = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut frame = Vec::new();
+        lotse_ipc::datagram::encode(
+            "ufrag-echo",
+            browser.local_addr().unwrap(),
+            shared_addr,
+            b"still here",
+            &mut frame,
+        );
+        datagrams.send(&frame).unwrap();
+        browser.set_nonblocking(true).unwrap();
+        let browser = tokio::net::UdpSocket::from_std(browser).unwrap();
+        let mut buf = [0_u8; 64];
+        let (n, from) = within(browser.recv_from(&mut buf)).await.unwrap();
+        assert_eq!((&buf[..n], from), (&b"still here"[..], shared_addr));
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
             .await
             .unwrap();
