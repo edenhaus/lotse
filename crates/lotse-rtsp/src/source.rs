@@ -49,10 +49,7 @@ use lotse_core::codec::{Codec, Kind};
 use lotse_core::discontinuity::TimestampGuard;
 use lotse_core::ingest::IngestCounters;
 use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields, TimestampUnwrapper};
-use lotse_core::source::{
-    ClockReport, KeyframeRequest, Source, SourceCtx, SourceDescriptor, SourceError, SourceExit,
-    SyncHint,
-};
+use lotse_core::source::{ClockReport, Source, SourceCtx, SourceDescriptor, SourceError, SyncHint};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::throttle::Throttle;
@@ -133,7 +130,7 @@ impl Source for RtspSource {
         self.options.backchannel
     }
 
-    fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+    fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
         let url = self.url.clone();
         let options = self.options.clone();
         let tls = self.tls.clone();
@@ -142,10 +139,10 @@ impl Source for RtspSource {
         Box::pin(async move {
             let mut ctx = ctx;
             let Some(addr) = ctx.peer.addrs.first().copied() else {
-                return SourceExit::Ended(SourceError::Unreachable(format!(
+                return SourceError::Unreachable(format!(
                     "rtsp: no address resolved for {}",
                     ctx.peer.host
-                )));
+                ));
             };
             let ask = Ask {
                 camera: Camera {
@@ -160,7 +157,7 @@ impl Source for RtspSource {
             };
             let attempt = Attempt::new(ask, addr, &ctx);
             let tls = attempt.ask.camera.tls.clone();
-            let end = match &tls {
+            match &tls {
                 None => {
                     tracing::info!(host = %ctx.peer.host, %addr, "rtsp: connecting");
                     // The relay's state makes the attempt large: on the heap.
@@ -174,13 +171,8 @@ impl Source for RtspSource {
                     };
                     Box::pin(attempt.run(&mut ctx, "TLS handshake", handshake)).await
                 }
-            };
-            SourceExit::Ended(end)
+            }
         })
-    }
-
-    fn request_keyframe(&self) -> KeyframeRequest {
-        KeyframeRequest::Unsupported
     }
 }
 

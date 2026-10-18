@@ -20,8 +20,8 @@ use crate::session::{
 };
 use crate::source::{
     BackchannelOffer, BackchannelOpener, BackchannelRefused, BackchannelSession, BackchannelSlot,
-    Direction, ProbeMark, Source, SourceCapabilities, SourceConfigError, SourceCtx,
-    SourceDescriptor, SourceError, SourceExit, SourceFactory,
+    ProbeMark, Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor,
+    SourceError, SourceFactory,
 };
 use crate::source_url::SourceUrl;
 use crate::task::BoxFuture;
@@ -329,10 +329,7 @@ impl SourceFactory for FakeSourceFactory {
 
     fn capabilities(&self) -> SourceCapabilities {
         SourceCapabilities {
-            direction: Direction::Pull,
             backchannel: self.backchannel,
-            keyframe_request: false,
-            snapshot_uri: false,
         }
     }
 
@@ -594,7 +591,7 @@ impl Source for FakeSource {
         self.talk
     }
 
-    fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+    fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
         let crash = self.crash;
         let abort = self.abort;
         let audio = self.audio;
@@ -616,7 +613,7 @@ impl Source for FakeSource {
             tokio::select! {
                 () = ready_after => {}
                 () = ctx.cancel.cancelled() => {
-                    return SourceExit::Ended(SourceError::Ended("cancelled before live".into()));
+                    return SourceError::Ended("cancelled before live".into());
                 }
             }
             let video: Arc<Track> = ctx.tracks.declare(
@@ -696,7 +693,7 @@ impl Source for FakeSource {
                     tokio::select! {
                         () = ctx.time.sleep(step) => {}
                         () = ctx.cancel.cancelled() => {
-                            return SourceExit::Ended(SourceError::Ended("cancelled".into()));
+                            return SourceError::Ended("cancelled".into());
                         }
                     }
                 }
@@ -735,10 +732,10 @@ async fn fake_probe(
 /// The run of a fake source without audio once it is live: until
 /// cancelled, publishing a one-packet keyframe on `video` every `every`
 /// if set, a video source a standby can switch in at.
-async fn video_only(ctx: &SourceCtx, video: &Track, every: Option<Duration>) -> SourceExit {
+async fn video_only(ctx: &SourceCtx, video: &Track, every: Option<Duration>) -> SourceError {
     let Some(every) = every else {
         ctx.cancel.cancelled().await;
-        return SourceExit::Ended(SourceError::Ended("cancelled".into()));
+        return SourceError::Ended("cancelled".into());
     };
     let mut seq = 0_u16;
     loop {
@@ -747,7 +744,7 @@ async fn video_only(ctx: &SourceCtx, video: &Track, every: Option<Duration>) -> 
         tokio::select! {
             () = ctx.time.sleep(every) => {}
             () = ctx.cancel.cancelled() => {
-                return SourceExit::Ended(SourceError::Ended("cancelled".into()));
+                return SourceError::Ended("cancelled".into());
             }
         }
     }
@@ -770,7 +767,7 @@ async fn fake_video(
     track: &Track,
     time: &dyn Clock,
     cancel: &tokio_util::sync::CancellationToken,
-) -> SourceExit {
+) -> SourceError {
     let start = time.now();
     let mut index = 0_u32;
     loop {
@@ -783,7 +780,7 @@ async fn fake_video(
         tokio::select! {
             () = time.sleep(due.saturating_duration_since(time.now())) => {}
             () = cancel.cancelled() => {
-                return SourceExit::Ended(SourceError::Ended("cancelled".into()));
+                return SourceError::Ended("cancelled".into());
             }
         }
     }
@@ -1313,7 +1310,6 @@ mod tests {
     #[tokio::test]
     async fn fake_source_declares_a_video_track_and_ends_on_cancel() {
         let factory = FakeSourceFactory::new(&["fake"]);
-        assert_eq!(factory.capabilities().direction, Direction::Pull);
         // The contract's defaults: no default port, no loopback relay.
         assert_eq!(factory.default_port("fake"), None);
         assert!(!factory.loopback_relay("fake"));
@@ -1321,10 +1317,6 @@ mod tests {
         let source = factory.validate(&url, &serde_json::Value::Null).unwrap();
         assert_eq!(source.describe().protocol, "fake");
         assert_eq!(source.describe().url, url);
-        assert!(matches!(
-            source.request_keyframe(),
-            crate::source::KeyframeRequest::Unsupported
-        ));
 
         let set = TrackSet::new(TrackLimits::default(), SystemClock.now());
         let (clock, _reports) = ClockInput::channel(Arc::new(crate::clock_map::ClockMapper::new()));
@@ -1345,10 +1337,7 @@ mod tests {
         assert!(ready.changed().await.is_ok());
         assert_eq!(set.tracks().len(), 1);
         cancel.cancel();
-        assert!(matches!(
-            run.await.unwrap(),
-            SourceExit::Ended(SourceError::Ended(_))
-        ));
+        assert!(matches!(run.await.unwrap(), SourceError::Ended(_)));
     }
 
     /// The injected abort of `a_crashing_fake_source_aborts_once_ready`:
@@ -1364,7 +1353,7 @@ mod tests {
         options: &serde_json::Value,
         clock: Arc<dyn Clock>,
     ) -> (
-        tokio::task::JoinHandle<SourceExit>,
+        tokio::task::JoinHandle<SourceError>,
         Arc<TrackSet>,
         CancellationToken,
     ) {
@@ -1440,10 +1429,7 @@ mod tests {
         assert!(packet.keyframe_start && packet.rtp.marker);
         assert_eq!(packet.rtp.seq, 1, "the second keyframe, 40 ms on");
         cancel.cancel();
-        assert!(matches!(
-            run.await.unwrap(),
-            SourceExit::Ended(SourceError::Ended(_))
-        ));
+        assert!(matches!(run.await.unwrap(), SourceError::Ended(_)));
     }
 
     #[tokio::test]
@@ -1524,10 +1510,7 @@ mod tests {
                 assert_eq!(capture.packets().len(), before, "nowhere to put them");
             }
             cancel.cancel();
-            assert!(matches!(
-                run.await.unwrap(),
-                SourceExit::Ended(SourceError::Ended(_))
-            ));
+            assert!(matches!(run.await.unwrap(), SourceError::Ended(_)));
             assert!(slot.current().is_some(), "the offer stands after the run");
             // The session is its holder's: open until dropped.
             assert!(!session.sender.is_closed());
@@ -1637,10 +1620,7 @@ mod tests {
         assert_eq!(captured.at, clock.now(), "stamped on the injected clock");
         assert_eq!(capture.packets().len(), 1);
         cancel.cancel();
-        assert!(matches!(
-            packets.1.await.unwrap(),
-            SourceExit::Ended(SourceError::Ended(_))
-        ));
+        assert!(matches!(packets.1.await.unwrap(), SourceError::Ended(_)));
         drop(session);
     }
 
@@ -1673,10 +1653,7 @@ mod tests {
         let run = crate::task::spawn_named("test.fake_source", run);
         tokio::task::yield_now().await;
         cancel.cancel();
-        assert!(matches!(
-            within(run).await.unwrap(),
-            SourceExit::Ended(SourceError::Ended(_))
-        ));
+        assert!(matches!(within(run).await.unwrap(), SourceError::Ended(_)));
         assert!(set.tracks().is_empty(), "cancelled before it declared any");
     }
 
@@ -1726,10 +1703,7 @@ mod tests {
                 assert_eq!(slot.current().unwrap().codec, Codec::Pcmu);
             }
             cancel.cancel();
-            assert!(matches!(
-                within(run).await.unwrap(),
-                SourceExit::Ended(SourceError::Ended(_))
-            ));
+            assert!(matches!(within(run).await.unwrap(), SourceError::Ended(_)));
             assert!(!slot.is_probing(), "{granted}");
             assert_eq!(slot.current().is_some(), granted);
             if !granted {
@@ -1789,10 +1763,7 @@ mod tests {
             assert_eq!(packet.rtp.ts, 160 * u32::from(step + 1));
         }
         cancel.cancel();
-        assert!(matches!(
-            run.await.unwrap(),
-            SourceExit::Ended(SourceError::Ended(_))
-        ));
+        assert!(matches!(run.await.unwrap(), SourceError::Ended(_)));
     }
 
     #[tokio::test]
@@ -1848,10 +1819,7 @@ mod tests {
         }
         assert!(reports.try_recv().is_err(), "no Sender Reports");
         cancel.cancel();
-        assert!(matches!(
-            run.await.unwrap(),
-            SourceExit::Ended(SourceError::Ended(_))
-        ));
+        assert!(matches!(run.await.unwrap(), SourceError::Ended(_)));
     }
 
     /// What a fake source with `options` reports in its first Sender
@@ -1903,10 +1871,7 @@ mod tests {
         let video = hint(report);
         let audio = hint(within(reports.recv()).await.unwrap());
         cancel.cancel();
-        assert!(matches!(
-            run.await.unwrap(),
-            SourceExit::Ended(SourceError::Ended(_))
-        ));
+        assert!(matches!(run.await.unwrap(), SourceError::Ended(_)));
         [video, audio]
     }
 

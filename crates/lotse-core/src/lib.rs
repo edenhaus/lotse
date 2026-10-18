@@ -55,7 +55,7 @@ pub use output::{Delivery, JoinPolicy, OutputFactory, Sink, StreamSubscription, 
 pub use registry::Registries;
 pub use runner::{RunnerConfig, RunnerEvent, SourceRunner};
 pub use secret::{RedactedUrl, Secret};
-pub use source::{Source, SourceCtx, SourceError, SourceExit, SourceFactory, TrackSet};
+pub use source::{Source, SourceCtx, SourceError, SourceFactory, TrackSet};
 pub use source_url::{Credentials, SourceUrl, SourceUrlError};
 pub use track::{GopSnapshot, Track, TrackEvent, TrackId, TrackLimits, TrackSubscription, Unit};
 pub use transcode::Transcoder;

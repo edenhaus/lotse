@@ -60,8 +60,8 @@ use lotse_core::codec::Codec;
 use lotse_core::media::{MediaFrame, MediaPacket};
 use lotse_core::runner::{ConnectGate, RunnerConfig, RunnerEvent, SourceRunner};
 use lotse_core::source::{
-    BackchannelSlot, KeyframeRequest, ResolvedPeer, Source, SourceConfigError, SourceError,
-    SourceExit, SourceFactory as _, TrackSet,
+    BackchannelSlot, ResolvedPeer, Source, SourceConfigError, SourceError, SourceFactory as _,
+    TrackSet,
 };
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
@@ -181,17 +181,10 @@ fn serve_vod(server: &FakeHttp, dir: &str, segments: &[usize]) {
     );
 }
 
-fn ended(exit: SourceExit) -> SourceError {
-    let SourceExit::Ended(err) = exit else {
-        panic!("{exit:?}");
-    };
-    err
-}
-
 /// Waits up to `real` for the exit of a source that needs no clock.
 async fn exit_within(harness: Harness, real: Duration) -> SourceError {
     tokio::select! {
-        exit = harness.finish() => ended(exit),
+        exit = harness.finish() => exit,
         () = SystemClock.sleep(real) => panic!("the source did not exit within {real:?}"),
     }
 }
@@ -213,7 +206,7 @@ async fn run_to_exit(clock: &FakeClock, harness: Harness, mut each: impl FnMut()
         tokio::select! {
             exit = &mut finish => {
                 each();
-                return ended(exit);
+                return exit;
             }
             () = SystemClock.sleep(Duration::from_millis(1)) => {
                 clock.advance(STEP);
@@ -786,15 +779,4 @@ fn unknown_options_are_refused() {
             .validate(&url, &json!({ "timeout_ms": 1_000 }))
             .is_ok()
     );
-}
-
-#[test]
-fn keyframe_requests_are_not_offered() {
-    assert!(!HttpFactory.capabilities().keyframe_request);
-    assert!(!HttpFactory.capabilities().backchannel);
-    let source = make_source("http://camera.local/index.m3u8", &json!(null));
-    assert!(matches!(
-        source.request_keyframe(),
-        KeyframeRequest::Unsupported
-    ));
 }

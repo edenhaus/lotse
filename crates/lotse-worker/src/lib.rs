@@ -1279,7 +1279,7 @@ mod tests {
     use lotse_core::output::OutputShape;
     use lotse_core::source::{
         Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor, SourceError,
-        SourceExit, SourceFactory,
+        SourceFactory,
     };
     use lotse_core::task::BoxFuture;
     use lotse_core::test_util::{
@@ -4488,7 +4488,7 @@ mod tests {
             serde_json::Value::Null
         }
 
-        fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+        fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
             let cancelled = Arc::clone(&self.cancelled);
             let released = Arc::clone(&self.released);
             Box::pin(async move {
@@ -4503,7 +4503,7 @@ mod tests {
                 cancelled.notify_one();
                 released.notified().await;
                 cancelled.notify_one();
-                SourceExit::Ended(SourceError::Ended("released".into()))
+                SourceError::Ended("released".into())
             })
         }
     }

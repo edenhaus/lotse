@@ -7,7 +7,8 @@ use std::sync::Arc;
 use lotse_core::clock::Clock;
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::source::{
-    BackchannelSlot, ClockInput, ClockReport, ResolvedPeer, Source, SourceCtx, SourceExit, TrackSet,
+    BackchannelSlot, ClockInput, ClockReport, ResolvedPeer, Source, SourceCtx, SourceError,
+    TrackSet,
 };
 use lotse_core::task::spawn_named;
 use lotse_core::track::TrackLimits;
@@ -29,7 +30,7 @@ pub struct Harness {
     /// Ends the attempt.
     cancel: CancellationToken,
     /// The attempt.
-    run: JoinHandle<SourceExit>,
+    run: JoinHandle<SourceError>,
 }
 
 impl Harness {
@@ -101,11 +102,9 @@ impl Harness {
     }
 
     /// Waits for the source to exit and returns how.
-    pub async fn finish(self) -> SourceExit {
-        self.run.await.unwrap_or_else(|err| {
-            SourceExit::Ended(lotse_core::source::SourceError::Protocol(format!(
-                "the source task failed: {err}"
-            )))
-        })
+    pub async fn finish(self) -> SourceError {
+        self.run
+            .await
+            .unwrap_or_else(|err| SourceError::Protocol(format!("the source task failed: {err}")))
     }
 }

@@ -1,7 +1,7 @@
 //! The `http` and `https` schemes' factory: options checked, the source
 //! built.
 
-use lotse_core::source::{Direction, Source, SourceCapabilities, SourceConfigError, SourceFactory};
+use lotse_core::source::{Source, SourceCapabilities, SourceConfigError, SourceFactory};
 use lotse_core::source_url::SourceUrl;
 use lotse_tls::{TlsTarget, Trust};
 
@@ -57,15 +57,9 @@ impl SourceFactory for HttpFactory {
         &["http", "https"]
     }
 
-    /// Pulled; nothing goes back to the server, and a server that serves
-    /// a playlist or a stream has no way to be asked for a keyframe.
+    /// Nothing goes back to the server: no backchannel.
     fn capabilities(&self) -> SourceCapabilities {
-        SourceCapabilities {
-            direction: Direction::Pull,
-            backchannel: false,
-            keyframe_request: false,
-            snapshot_uri: false,
-        }
+        SourceCapabilities { backchannel: false }
     }
 
     fn default_port(&self, scheme: &str) -> Option<u16> {
@@ -99,7 +93,6 @@ mod tests {
         reason = "test code"
     )]
 
-    use lotse_core::source::KeyframeRequest;
     use serde_json::json;
 
     use super::*;
@@ -111,14 +104,10 @@ mod tests {
     }
 
     #[test]
-    fn the_factory_serves_http_and_https_pulled_without_keyframe_requests() {
+    fn the_factory_serves_http_and_https_without_a_backchannel() {
         let factory = HttpFactory;
         assert_eq!(factory.schemes(), ["http", "https"]);
-        let capabilities = factory.capabilities();
-        assert_eq!(capabilities.direction, Direction::Pull);
-        assert!(!capabilities.backchannel);
-        assert!(!capabilities.keyframe_request);
-        assert!(!capabilities.snapshot_uri);
+        assert!(!factory.capabilities().backchannel);
         for scheme in ["http", "https"] {
             assert!(!factory.loopback_relay(scheme), "{scheme}");
         }
@@ -145,10 +134,6 @@ mod tests {
             source.connection_options(),
             HttpOptions::default().connection_key()
         );
-        assert!(matches!(
-            source.request_keyframe(),
-            KeyframeRequest::Unsupported
-        ));
         // `{}` and the defaults spelled out are the same connection.
         let spelled = factory
             .validate(&url, &json!({ "timeout_ms": 10_000 }))
