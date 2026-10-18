@@ -1722,6 +1722,7 @@ version = "0.0.0-dev"
 dependencies = [
  "allocation-counter",
  "libc",
+ "lotse-codec",
  "lotse-core",
  "lotse-ipc",
  "lotse-testing",

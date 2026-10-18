@@ -7,7 +7,7 @@
 [dependents]
 # crate = the workspace crates that may depend on it directly
 lotse-core = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-supervisor", "lotse-worker", "lotse-testing", "lotse"]
-lotse-codec = ["lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-testing", "lotse"]
+lotse-codec = ["lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-worker", "lotse-testing", "lotse"] # lotse-worker: the picture size of `stream/get`, read from a track's SPS
 lotse-ipc = ["lotse-supervisor", "lotse-worker", "lotse-snapshot", "lotse"] # lotse: dev-only, the talk-back tone test's in-process worker
 lotse-sandbox = ["lotse"]
 lotse-api-types = ["lotse-api", "lotse-supervisor", "lotse", "lotse-testing"] # lotse-testing: the load generator reads `metrics/get`

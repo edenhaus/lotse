@@ -201,6 +201,36 @@ impl Codec {
             Self::Unsupported { .. } => None,
         }
     }
+
+    /// The sampling rate of an audio codec in Hz, which is not always its
+    /// RTP clock rate; `None` for video and for an unsupported codec.
+    ///
+    /// G.711 samples at 8 kHz (RFC 3551 §4.5.14), G.722 at 16 kHz on an
+    /// 8000 clock (RFC 3551 §4.5.2), AAC at the rate its
+    /// `AudioSpecificConfig` names (ISO/IEC 14496-3 §1.6.2.1, Table 1.18),
+    /// and Opus is decoded at 48 kHz whatever bandwidth it was encoded
+    /// with (RFC 7587 §4.1, RFC 6716 §2).
+    pub const fn sample_rate(&self) -> Option<u32> {
+        match self {
+            Self::Opus { .. } => Some(48_000),
+            Self::Pcmu | Self::Pcma => Some(8_000),
+            Self::G722 => Some(16_000),
+            Self::AacLc { sample_rate, .. } => Some(*sample_rate),
+            Self::H264 { .. } | Self::H265 { .. } | Self::Mjpeg | Self::Unsupported { .. } => None,
+        }
+    }
+
+    /// The channel count of an audio codec; `None` for video and for an
+    /// unsupported codec. G.711 and G.722 are mono (RFC 3551 §4.5.14,
+    /// §4.5.2); Opus and AAC carry theirs (RFC 7587 §7.1 `stereo`, the
+    /// `channelConfiguration` of ISO/IEC 14496-3 Table 1.19).
+    pub const fn channels(&self) -> Option<u8> {
+        match self {
+            Self::Opus { channels } | Self::AacLc { channels, .. } => Some(*channels),
+            Self::Pcmu | Self::Pcma | Self::G722 => Some(1),
+            Self::H264 { .. } | Self::H265 { .. } | Self::Mjpeg | Self::Unsupported { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +329,47 @@ mod tests {
             assert_eq!(codec.name(), name, "{codec:?}");
             assert_eq!(codec.rtp_clock_rate(), clock_rate, "{codec:?}");
             assert_eq!(codec.is_supported(), family != CodecFamily::Unsupported);
+        }
+    }
+
+    #[test]
+    fn rfc3551_4_5_audio_codecs_report_their_sample_rate_and_channels() {
+        let aac = Codec::AacLc {
+            sample_rate: 44_100,
+            channels: 2,
+            config: Bytes::from_static(&[0x12, 0x10]),
+        };
+        let cases: [(Codec, Option<u32>, Option<u8>); 9] = [
+            (Codec::Pcmu, Some(8_000), Some(1)),
+            (Codec::Pcma, Some(8_000), Some(1)),
+            // RFC 3551 §4.5.2: sampled at 16 kHz, clocked at 8000.
+            (Codec::G722, Some(16_000), Some(1)),
+            // RFC 7587 §4.1: decoded at 48 kHz.
+            (Codec::Opus { channels: 1 }, Some(48_000), Some(1)),
+            (aac, Some(44_100), Some(2)),
+            (h264(), None, None),
+            (
+                Codec::H265 {
+                    vps: None,
+                    sps: None,
+                    pps: None,
+                },
+                None,
+                None,
+            ),
+            (Codec::Mjpeg, None, None),
+            (
+                Codec::Unsupported {
+                    kind: Kind::Audio,
+                    name: "l16".into(),
+                },
+                None,
+                None,
+            ),
+        ];
+        for (codec, sample_rate, channels) in cases {
+            assert_eq!(codec.sample_rate(), sample_rate, "{codec:?}");
+            assert_eq!(codec.channels(), channels, "{codec:?}");
         }
     }
 

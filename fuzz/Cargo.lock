@@ -1598,6 +1598,7 @@ name = "lotse-worker"
 version = "0.0.0-dev"
 dependencies = [
  "libc",
+ "lotse-codec",
  "lotse-core",
  "lotse-ipc",
  "rustix",

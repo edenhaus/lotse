@@ -1324,6 +1324,16 @@ fn track_dto(track: &IpcTrackInfo, stats: Option<&WorkerStats>) -> TrackInfo {
         derived_from: track.derived_from.clone(),
         sync: track.sync.clone(),
         audio_delay_ms: track.audio_delay_ms,
+        profile_level_id: track
+            .params
+            .profile_level_id
+            .map(|[profile, constraints, level]| {
+                format!("{profile:02x}{constraints:02x}{level:02x}")
+            }),
+        width: track.params.picture.map(|(width, _)| width),
+        height: track.params.picture.map(|(_, height)| height),
+        sample_rate: track.params.sample_rate,
+        channels: track.params.channels,
         frames: counters.map_or(0, |t| t.frames),
         bytes: counters.map_or(0, |t| t.packet_bytes.max(t.frame_bytes)),
     }
@@ -1441,7 +1451,7 @@ mod tests {
     )]
 
     use lotse_core::let_assert;
-    use lotse_ipc::TrackStats;
+    use lotse_ipc::{TrackParams, TrackStats};
 
     use super::*;
     use crate::test_support::Captured;
@@ -1455,6 +1465,11 @@ mod tests {
             sync: "sender_reports".into(),
             derived_from: derived_from.map(Into::into),
             audio_delay_ms: delay,
+            params: TrackParams {
+                sample_rate: Some(48_000),
+                channels: Some(2),
+                ..TrackParams::default()
+            },
         }
     }
 
@@ -2445,10 +2460,43 @@ mod tests {
             (Some("a0"), Some(88), 5, 300)
         );
         assert_eq!(derived.sync, "sender_reports");
+        assert_eq!(
+            (
+                derived.sample_rate,
+                derived.channels,
+                derived.profile_level_id,
+                derived.width,
+                derived.height
+            ),
+            (Some(48_000), Some(2), None, None, None)
+        );
         let native = track_dto(&ipc_track("a0", None, None), None);
         assert_eq!(
             (native.derived_from, native.audio_delay_ms, native.frames),
             (None, None, 0)
+        );
+        // RFC 6184 §8.1: the three bytes as six hex digits, each byte's
+        // leading zero kept.
+        let video = IpcTrackInfo {
+            kind: "video".into(),
+            codec: "h264".into(),
+            params: TrackParams {
+                profile_level_id: Some([0x4d, 0x00, 0x0a]),
+                picture: Some((1920, 1080)),
+                ..TrackParams::default()
+            },
+            ..ipc_track("v0", None, None)
+        };
+        let video = track_dto(&video, None);
+        assert_eq!(
+            (
+                video.profile_level_id.as_deref(),
+                video.width,
+                video.height,
+                video.sample_rate,
+                video.channels
+            ),
+            (Some("4d000a"), Some(1920), Some(1080), None, None)
         );
         // A stream's DTO lists its connection's tracks with their counters.
         let (mut registry, _rx) = relay_state(0);
