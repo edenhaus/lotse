@@ -1,7 +1,7 @@
 {
   "$defs": {
     "ApiError": {
-      "description": "An error as the API carries it, in results, `closed` events and\n`last_error`.",
+      "description": "An error as the API carries it, in results and `last_error`.",
       "properties": {
         "code": {
           "$ref": "#/$defs/ErrorCode",
@@ -99,6 +99,96 @@
         "clients"
       ],
       "type": "object"
+    },
+    "CloseCode": {
+      "description": "The code of a `closed` event: every reason a session may end, and\nnothing else. The `source_*` codes and `worker_crashed` are also the\ncodes of `stream/get`'s `last_error`.",
+      "oneOf": [
+        {
+          "const": "peer_closed",
+          "description": "The browser closed the peer connection.",
+          "type": "string"
+        },
+        {
+          "const": "session_closed",
+          "description": "`unsubscribe`, `session/close`, or the grace expired.",
+          "type": "string"
+        },
+        {
+          "const": "stream_deleted",
+          "description": "The stream was deleted.",
+          "type": "string"
+        },
+        {
+          "const": "stream_changed",
+          "description": "The codec family changed on reconnect.",
+          "type": "string"
+        },
+        {
+          "const": "worker_crashed",
+          "description": "The connection's worker process died.",
+          "type": "string"
+        },
+        {
+          "const": "source_unreachable",
+          "description": "Connecting to the source failed.",
+          "type": "string"
+        },
+        {
+          "const": "source_auth_failed",
+          "description": "The source rejected the credentials.",
+          "type": "string"
+        },
+        {
+          "const": "source_timeout",
+          "description": "The read deadline or stall watchdog hit.",
+          "type": "string"
+        },
+        {
+          "const": "source_protocol_error",
+          "description": "The source violated its protocol.",
+          "type": "string"
+        },
+        {
+          "const": "source_ended",
+          "description": "The source or publisher closed the stream.",
+          "type": "string"
+        },
+        {
+          "const": "source_not_live",
+          "description": "The offer reached a worker that runs no source.",
+          "type": "string"
+        },
+        {
+          "const": "ice_failed",
+          "description": "ICE failed or stayed disconnected.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_sdp",
+          "description": "The offer could not be parsed.",
+          "type": "string"
+        },
+        {
+          "const": "no_video_track",
+          "description": "The stream has no video track, or the offer no video m-line.",
+          "type": "string"
+        },
+        {
+          "const": "video_codec_unsupported",
+          "description": "No video codec both sides can use.",
+          "type": "string"
+        },
+        {
+          "const": "shutting_down",
+          "description": "The daemon is shutting down.",
+          "type": "string"
+        },
+        {
+          "const": "internal_error",
+          "description": "An invariant failed, or a worker reported a code the API does not\nknow; a bug, always logged with context.",
+          "type": "string"
+        }
+      ]
     },
     "Codecs": {
       "description": "The codecs a stream can have for a viewer to play it, natively or\nthrough a transcoder.",
@@ -908,7 +998,7 @@
       "type": "object"
     },
     "ErrorCode": {
-      "description": "Every stable error code. `code` is the contract; `message` may change.",
+      "description": "Every stable error code of a result or a `last_error`. `code` is the\ncontract; `message` may change.",
       "oneOf": [
         {
           "const": "invalid_request",
@@ -1011,58 +1101,8 @@
           "type": "string"
         },
         {
-          "const": "audio_codec_unsupported",
-          "description": "Audio omitted from a session; video continues.",
-          "type": "string"
-        },
-        {
-          "const": "turn_unsupported",
-          "description": "A `turns:` entry was ignored.",
-          "type": "string"
-        },
-        {
-          "const": "h264_profile_mismatch",
-          "description": "The browser did not offer the stream's H.264 profile.",
-          "type": "string"
-        },
-        {
-          "const": "frame_over_browser_limit",
-          "description": "A video frame needed more RTP packets than some libwebrtc receivers\nassemble; it was sent whole.",
-          "type": "string"
-        },
-        {
           "const": "backchannel_unsupported",
           "description": "`backchannel/release` on a stream whose source protocol cannot\ncarry audio back.",
-          "type": "string"
-        },
-        {
-          "const": "av_sync_lost",
-          "description": "Audio withdrawn because sync could not be held.",
-          "type": "string"
-        },
-        {
-          "const": "peer_closed",
-          "description": "The browser closed the peer connection.",
-          "type": "string"
-        },
-        {
-          "const": "session_closed",
-          "description": "`unsubscribe`, `session/close`, or the grace expired.",
-          "type": "string"
-        },
-        {
-          "const": "stream_deleted",
-          "description": "The stream was deleted.",
-          "type": "string"
-        },
-        {
-          "const": "stream_changed",
-          "description": "The codec family changed on reconnect.",
-          "type": "string"
-        },
-        {
-          "const": "ice_failed",
-          "description": "ICE failed or stayed disconnected.",
           "type": "string"
         },
         {
@@ -1073,11 +1113,6 @@
         {
           "const": "no_video_track",
           "description": "The stream has no video track, or the offer no video m-line.",
-          "type": "string"
-        },
-        {
-          "const": "video_codec_unsupported",
-          "description": "No video codec both sides can use.",
           "type": "string"
         }
       ]
@@ -1812,11 +1847,11 @@
           "type": "object"
         },
         {
-          "description": "Non-fatal (`audio_codec_unsupported`, `turn_unsupported`,\n`h264_profile_mismatch`, `backchannel_declined`, ...). Each code\ncomes at most once per session, but `backchannel_declined`, which\ncomes once per offer (`webrtc/offer` or `webrtc/renegotiate`) that\nasked for talk-back the session did not get: the talk-back m-line\nwas answered `inactive` (or `sendonly` when it carries the\nstream's audio too, RFC 3264 §6.1), and `reason` says why.",
+          "description": "Non-fatal. Each code comes at most once per session, but `backchannel_declined`, which\ncomes once per offer (`webrtc/offer` or `webrtc/renegotiate`) that\nasked for talk-back the session did not get: the talk-back m-line\nwas answered `inactive` (or `sendonly` when it carries the\nstream's audio too, RFC 3264 §6.1), and `reason` says why.",
           "properties": {
             "code": {
-              "description": "The stable code.",
-              "type": "string"
+              "$ref": "#/$defs/WarningCode",
+              "description": "The stable code."
             },
             "message": {
               "description": "For humans.",
@@ -1860,8 +1895,8 @@
           "description": "The last event; the subscription ends with it. A session still\nwaiting for its answer has no deadline of its own: it waits while\nits source connects, and closes with the source's error as soon as\nthe attempt fails, at once when the offer reaches a source that has\nalready failed. A live source that drops is retried, at once or\nafter a delay, and the session waits for the retry; only a retry\nthat fails closes it. While a `stream/put` switches the stream to\nanother source, the old source's failures do not count. An answered\nsession rides every reconnect instead. A talk-back request the\nstream cannot serve never closes a session: its answer declines\nit (`backchannel_declined`).",
           "properties": {
             "code": {
-              "description": "The stable code (`peer_closed`, `session_closed`, ...). Before\nthe answer, a failed source closes the session with its error's\ncode, the one `stream/get` reports as `last_error`:\n`source_unreachable`, `source_auth_failed`, `source_timeout`,\n`source_protocol_error`, `source_ended` or `worker_crashed`.",
-              "type": "string"
+              "$ref": "#/$defs/CloseCode",
+              "description": "The stable code. Before the answer, a failed source closes the\nsession with its error's code, the one `stream/get` reports as\n`last_error`: `source_unreachable`, `source_auth_failed`,\n`source_timeout`, `source_protocol_error`, `source_ended` or\n`worker_crashed`."
             },
             "message": {
               "description": "For humans; for a source's error, its text as `last_error`\ncarries it, never the source's credentials.",
@@ -2907,6 +2942,46 @@
         "bytes"
       ],
       "type": "object"
+    },
+    "WarningCode": {
+      "description": "The code of a `warning` event: every code a session may warn with,\nand nothing else.",
+      "oneOf": [
+        {
+          "const": "audio_codec_unsupported",
+          "description": "Audio omitted from the session; video continues.",
+          "type": "string"
+        },
+        {
+          "const": "turn_unsupported",
+          "description": "A `turns:` entry of `ice_servers` was ignored.",
+          "type": "string"
+        },
+        {
+          "const": "av_sync_lost",
+          "description": "Audio withdrawn because sync could not be held.",
+          "type": "string"
+        },
+        {
+          "const": "h264_profile_mismatch",
+          "description": "The browser did not offer the stream's H.264 profile.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_candidate",
+          "description": "A `webrtc/candidate` the session could not parse was ignored.",
+          "type": "string"
+        },
+        {
+          "const": "frame_over_browser_limit",
+          "description": "A video frame needed more RTP packets than some libwebrtc receivers\nassemble; it was sent whole.",
+          "type": "string"
+        },
+        {
+          "const": "backchannel_declined",
+          "description": "The offer asked for talk-back the session did not get; `reason`\nsays why.",
+          "type": "string"
+        }
+      ]
     },
     "WebrtcRenegotiateResult": {
       "description": "`webrtc/renegotiate`'s result.",

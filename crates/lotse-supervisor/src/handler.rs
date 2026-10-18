@@ -24,7 +24,7 @@ use lotse_api_types::info::{
     BuildInfo, Codecs, DemuxMetrics, InfoResult, Limits, Metrics, ProcessMetrics, SandboxInfo,
     SupervisorMetrics,
 };
-use lotse_api_types::session::{SessionEvent, SessionList, WebrtcRenegotiateResult};
+use lotse_api_types::session::{CloseCode, SessionEvent, SessionList, WebrtcRenegotiateResult};
 use lotse_api_types::stream::{AudioMode, BackchannelReleaseResult, StreamList, StreamPutResult};
 use lotse_core::clock::Clock;
 use lotse_core::codec::CodecFamily;
@@ -224,7 +224,7 @@ impl Supervisor {
     pub fn close_sessions(&self) {
         self.shared.lock().close_sessions_where(
             |_| true,
-            "shutting_down",
+            CloseCode::ShuttingDown,
             "the daemon is shutting down",
             CloseBy::Supervisor,
         );
@@ -628,7 +628,7 @@ impl Supervisor {
             let mut state = self.shared.lock();
             state.close_sessions_where(
                 |session| session.stream_id == stream_id,
-                "stream_deleted",
+                CloseCode::StreamDeleted,
                 "the stream was deleted",
                 CloseBy::Supervisor,
             );
@@ -1038,7 +1038,7 @@ impl Supervisor {
     fn session_close(&self, session_id: &str) -> Outcome {
         let _event = self.shared.lock().close_session(
             session_id,
-            "session_closed",
+            CloseCode::SessionClosed,
             "closed by session/close",
             CloseBy::Supervisor,
         );
@@ -1217,7 +1217,7 @@ impl Handler for Supervisor {
             .map(|(id, _)| id.clone())?;
         state.close_session(
             &session_id,
-            "session_closed",
+            CloseCode::SessionClosed,
             "unsubscribed",
             CloseBy::Unsubscribe,
         )
@@ -1239,7 +1239,7 @@ impl Handler for Supervisor {
                     }) {
                         let _event = state.close_session(
                             &id,
-                            "session_closed",
+                            CloseCode::SessionClosed,
                             "not adopted within the grace period",
                             CloseBy::Supervisor,
                         );
@@ -1336,7 +1336,7 @@ fn close_moved_sessions(state: &mut State, stream_id: &str) {
         .map(|source| source.connection.clone());
     state.close_sessions_where(
         |session| session.stream_id == stream_id && current.as_ref() != Some(&session.connection),
-        "stream_changed",
+        CloseCode::StreamChanged,
         "the stream's source changed",
         CloseBy::Supervisor,
     );
@@ -3189,7 +3189,7 @@ mod tests {
                 assert_eq!(&last.unwrap()["type"], last_event, "{name}");
                 let _event = s.shared.lock().close_session(
                     name,
-                    "session_closed",
+                    CloseCode::SessionClosed,
                     "test",
                     CloseBy::Supervisor,
                 );
@@ -4105,7 +4105,7 @@ mod tests {
         assert_eq!((session_id.as_str(), code), ("f1", "session_closed"));
         s.shared.lock().close_sessions_where(
             |_| true,
-            "worker_crashed",
+            CloseCode::WorkerCrashed,
             "gone",
             CloseBy::WorkerGone,
         );

@@ -41,6 +41,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lotse_api_types::session::CloseCode;
 use lotse_core::backoff::ReconnectBackoff;
 use lotse_core::connection::{
     Action, ConnectionConfig, ConnectionError, ConnectionMachine, ConnectionState, Input,
@@ -903,7 +904,7 @@ impl Driver {
         let connection = self.spec.connection_id.clone();
         self.shared.lock().close_sessions_where(
             |session| session.connection == connection,
-            "worker_crashed",
+            CloseCode::WorkerCrashed,
             "the camera's worker process exited",
             CloseBy::WorkerGone,
         );
