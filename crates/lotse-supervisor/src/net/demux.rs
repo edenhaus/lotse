@@ -1920,7 +1920,11 @@ mod tests {
             Arc::new(FakeClock::default()),
         );
         let ufrag = "u".repeat(10_000);
-        let request = binding_request(&ufrag, b"pw", 1);
+        // No session has the ufrag, so the request is rejected before any
+        // MESSAGE-INTEGRITY is checked: it carries none.
+        let request = Builder::new(Class::Request, METHOD_BINDING, [1; 12])
+            .username(&format!("{ufrag}:x"))
+            .build();
         let message = stun::parse(&request).unwrap();
         let source: SocketAddr = "192.0.2.1:1".parse().unwrap();
         peers.route(
