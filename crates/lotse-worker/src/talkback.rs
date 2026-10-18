@@ -1234,10 +1234,11 @@ pub(crate) struct Talkback {
 /// packet's arrival before that packet is dropped: 120 ms, the longest
 /// frame a device asks the reverse chain for and the longest Opus packet
 /// (RFC 6716 §3.2.5), which also lets a burst after a network stall of
-/// that long through. The pace is the one gate: it holds across codec
-/// changes, each of which gives the uplink a new track and a new chain,
-/// and the chain keeps its output timeline to the wall clock, so the
-/// spans of the packets dropped here move no timestamps.
+/// that long through. It holds across codec changes, each of which gives
+/// the uplink a new track and a new chain. It bounds the audio; the
+/// camera's timeline, which the spans of the packets dropped here would
+/// otherwise move on, the RTSP backchannel's packetizer keeps to the wall
+/// clock.
 const PACE_LEAD: Duration = Duration::from_millis(120);
 
 /// The real-time pace of one session's talk-back, whatever its codec: a

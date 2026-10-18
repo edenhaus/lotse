@@ -991,72 +991,6 @@ async fn rfc6716_an_opus_tone_reaches_a_pcmu_camera_at_its_frequency_within_10_m
     println!("Opus to PCMU: uplink latency per onset {latencies:?}, median {median:?}");
 }
 
-/// A browser flooding the uplink with 20 ms PCMU packets every 4 ms, a
-/// second of them: five times real time. The session's pace drops what
-/// runs ahead of the wall clock and the chain takes the rest; the dropped
-/// packets' spans reach the chain as gaps, which move the camera's
-/// timestamps no further than the wall clock does, so they never run
-/// ahead of the frames' arrivals by more than the pace's lead (RFC 3550
-/// §5.1: timestamps follow the sampling clock, which runs in real time).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc3550_5_1_a_pcmu_flood_reaches_the_camera_at_real_time_on_its_timestamps() {
-    let capture = BackchannelCapture::default();
-    let mut worker = InProcess::start(&capture, r#"{"backchannel": "pcmu"}"#).await;
-    let mut peer = Peer::new(None).await;
-    worker.open("0", &peer.offer).await;
-    worker
-        .pump(&mut [&mut peer], |_, peers| peers[0].viewer.is_connected())
-        .await;
-    peer.talk(Mic::pcmu().every(Duration::from_millis(4)));
-    let start = clock().now();
-    worker
-        .pump(&mut [&mut peer], |_, _| {
-            clock().now() >= start + Duration::from_secs(1)
-        })
-        .await;
-    let mic = peer.mute();
-    let talked = clock().now().duration_since(start);
-    let quiet = clock().now() + QUIET;
-    worker
-        .pump(&mut [&mut peer], |_, _| clock().now() >= quiet)
-        .await;
-    worker.stop().await;
-    let sent = mic.sent.len();
-    let frames: Vec<Frame> = capture.captured().iter().map(Frame::from).collect();
-    // At least twice real time even on a loaded machine (five times
-    // when it keeps up).
-    let real_time = (talked.as_millis() / FRAME.as_millis()) as usize;
-    assert!(
-        sent >= 2 * real_time,
-        "the browser flooded: {sent} packets in {talked:?}"
-    );
-    let (first, last) = (frames.first().unwrap(), frames.last().unwrap());
-    // Each frame's timestamp, from the first's, against its arrival:
-    // never ahead by more than the pace's lead, a packet and a frame
-    // (160 ms), with margin for a loaded machine's late wakes; unpaced,
-    // the timestamps run seconds ahead within the second.
-    let ahead = frames
-        .iter()
-        .map(|frame| {
-            let audio = Duration::from_micros(u64::from(frame.ts.wrapping_sub(first.ts)) * 125);
-            audio.saturating_sub(frame.at.duration_since(first.at))
-        })
-        .max()
-        .unwrap();
-    let wall = last.at.duration_since(first.at);
-    assert!(
-        ahead <= Duration::from_millis(400),
-        "{} frames over {wall:?} of {sent} packets: timestamps up to {ahead:?} ahead",
-        frames.len()
-    );
-    // At most real time and the pace's lead in audio: 20 ms frames.
-    assert!(
-        frames.len() <= real_time + 8,
-        "{} frames in {talked:?}: at most real time",
-        frames.len()
-    );
-}
-
 /// The reverse chain, G.711 in and out: the browser offers PCMU and
 /// the camera wants PCMU, so the answer names PCMU and the codes pass
 /// through untouched; only the RTP header changes. The network loses one
@@ -1230,6 +1164,97 @@ async fn onvif_5_3_a_pcmu_tone_through_the_rtsp_source_reaches_the_camera_within
     println!("PCMU through RTSP: uplink latency per onset {latencies:?}, median {median:?}");
     worker.stop().await;
     camera.stop().await;
+}
+
+/// A browser floods the talk-back uplink to an RTSP camera taking
+/// `codec`: `mic`'s 20 ms packets every 4 ms for a second, five times real
+/// time. What the camera's backchannel took, how many packets the browser
+/// sent, and for how long.
+#[cfg(feature = "source-rtsp")]
+async fn rtsp_flood(codec: BackchannelCodec, mic: Mic) -> (Vec<Frame>, usize, Duration) {
+    let camera = rtsp_camera(None, codec, 20).await;
+    let mut worker = InProcess::rtsp(&camera).await;
+    let mic = mic.every(Duration::from_millis(4));
+    let mut peer = talking(&mut worker, false, mic).await;
+    let start = clock().now();
+    worker
+        .pump(&mut [&mut peer], |_, _| {
+            clock().now() >= start + Duration::from_secs(1)
+        })
+        .await;
+    let mic = peer.mute();
+    let talked = clock().now().duration_since(start);
+    let quiet = clock().now() + QUIET;
+    worker
+        .pump(&mut [&mut peer], |_, _| clock().now() >= quiet)
+        .await;
+    let frames = camera
+        .stats()
+        .backchannel()
+        .iter()
+        .map(Frame::from)
+        .collect();
+    worker.stop().await;
+    camera.stop().await;
+    (frames, mic.sent.len(), talked)
+}
+
+/// What an RTSP camera took of a flood (`rtsp_flood`) at its clock
+/// `rate`: the session's pace let through no more than real time and its
+/// lead, and the camera's timestamps never ran ahead of the packets'
+/// arrivals by more than the packetizer's lead (250 ms), with margin for
+/// a loaded machine's late wakes; unbounded, they run seconds ahead
+/// within the second (RFC 3550 §5.1: timestamps follow the sampling
+/// clock, which runs in real time).
+#[cfg(feature = "source-rtsp")]
+fn check_flood(frames: &[Frame], sent: usize, talked: Duration, rate: u32) {
+    let real_time = (talked.as_millis() / FRAME.as_millis()) as usize;
+    assert!(
+        sent >= 2 * real_time,
+        "the browser flooded: {sent} packets in {talked:?}"
+    );
+    assert!(
+        frames.len() <= real_time + 8,
+        "{} frames in {talked:?}: at most real time",
+        frames.len()
+    );
+    let first = frames
+        .first()
+        .expect("the camera took the flood's first packets");
+    let ahead = frames
+        .iter()
+        .map(|frame| {
+            let ticks = u64::from(frame.ts.wrapping_sub(first.ts));
+            let audio = Duration::from_micros(ticks * 1_000_000 / u64::from(rate));
+            audio.saturating_sub(frame.at.duration_since(first.at))
+        })
+        .max()
+        .unwrap();
+    assert!(
+        ahead <= Duration::from_millis(500),
+        "{} frames of {sent} packets: timestamps up to {ahead:?} ahead",
+        frames.len()
+    );
+}
+
+/// The talk-back chain's route: the pace drops what runs ahead, the chain
+/// bridges the dropped packets' spans as gaps, and the packetizer keeps
+/// the camera's timestamps to the wall clock over them.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3550_5_1_a_pcmu_flood_reaches_an_rtsp_camera_on_wall_clock_timestamps() {
+    let (frames, sent, talked) = Box::pin(rtsp_flood(BackchannelCodec::Pcmu, Mic::pcmu())).await;
+    check_flood(&frames, sent, talked, 8_000);
+}
+
+/// Opus to an Opus camera, forwarded as received: no chain, so the
+/// packetizer alone keeps the survivors' timestamps, 100 ms apart on the
+/// browser's timeline, to the wall clock.
+#[cfg(feature = "source-rtsp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc7587_4_1_an_opus_flood_forwarded_to_an_opus_camera_keeps_to_the_wall_clock() {
+    let (frames, sent, talked) = Box::pin(rtsp_flood(BackchannelCodec::Opus, Mic::opus())).await;
+    check_flood(&frames, sent, talked, 48_000);
 }
 
 /// A viewer playing the camera re-offers talk-back (`webrtc/renegotiate`
