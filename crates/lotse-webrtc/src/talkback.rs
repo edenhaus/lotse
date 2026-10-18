@@ -24,7 +24,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lotse_codec::opus::{self, PacketError};
+use lotse_codec::opus::{self, MAX_PACKET_DURATION, PacketError};
 use lotse_core::codec::CodecFamily;
 use lotse_core::media::{MediaPacket, RtpHeaderFields};
 use lotse_core::uplink::{UplinkCodec, UplinkPacket};
@@ -38,6 +38,9 @@ pub enum Refused {
     Empty,
     /// No Opus packet (RFC 6716 §3.4).
     Opus(PacketError),
+    /// A G.711 packet of more audio than [`MAX_PACKET_DURATION`], its
+    /// duration.
+    TooLong(Duration),
 }
 
 impl Refused {
@@ -47,6 +50,7 @@ impl Refused {
             Self::PayloadType(_) => "payload type of no talk-back codec",
             Self::Empty => "empty G.711 payload",
             Self::Opus(_) => "not an Opus packet",
+            Self::TooLong(_) => "G.711 packet over 120 ms",
         }
     }
 }
@@ -57,6 +61,11 @@ impl fmt::Display for Refused {
             Self::PayloadType(pt) => write!(f, "payload type {pt} names no talk-back codec"),
             Self::Empty => f.write_str("a G.711 payload without a sample (RFC 3551 §4.5.14)"),
             Self::Opus(err) => write!(f, "{err}"),
+            Self::TooLong(duration) => write!(
+                f,
+                "a G.711 packet of {} ms, over the 120 ms one packet may carry",
+                duration.as_millis()
+            ),
         }
     }
 }
@@ -122,6 +131,15 @@ impl Depacketizer {
                 .checked_div(u64::from(codec.clock_rate()))
                 .unwrap_or_default(),
         );
+        // SPEC-DEVIATION: RFC 3551 §4.2 has a receiver accept packets of up
+        // to 200 ms. One packet's audio leaves the reverse chain at once,
+        // as frames the camera gets in a burst, so a packet may carry no
+        // more than the talk-back path's leads absorb: 120 ms, Opus's
+        // longest packet (RFC 6716 §3.2.5), which an Opus packet cannot
+        // exceed anyway (§3.4 R5); RFC 3551 §4.2's default is 20 ms.
+        if duration > MAX_PACKET_DURATION {
+            return Err(Refused::TooLong(duration));
+        }
         Ok(UplinkPacket {
             codec,
             packet: MediaPacket {
@@ -214,6 +232,32 @@ mod tests {
                 "{payload:?}"
             );
         }
+    }
+
+    #[test]
+    fn rfc3551_4_2_a_g711_packet_over_120_ms_is_refused() {
+        let depacketizer = browser();
+        let now = SystemClock.now();
+        // 120 ms, Opus's longest packet, is taken in either law.
+        for pt in [0, 8] {
+            let packet = depacketizer
+                .depacketize(rtp(pt), Arc::from(&[0xff_u8; 960][..]), now)
+                .unwrap();
+            assert_eq!(packet.duration, Duration::from_millis(120));
+        }
+        // A sample more is refused, and so is a second of audio at once.
+        for len in [961, 8_000] {
+            assert_eq!(
+                depacketizer.depacketize(rtp(0), Arc::from(vec![0xff_u8; len]), now),
+                Err(Refused::TooLong(Duration::from_micros(125 * len as u64)))
+            );
+        }
+        let refused = Refused::TooLong(Duration::from_secs(1));
+        assert_eq!(refused.reason(), "G.711 packet over 120 ms");
+        assert_eq!(
+            refused.to_string(),
+            "a G.711 packet of 1000 ms, over the 120 ms one packet may carry"
+        );
     }
 
     #[test]
