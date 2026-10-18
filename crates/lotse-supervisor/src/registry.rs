@@ -1521,7 +1521,6 @@ mod tests {
             id: id.into(),
             kind: "audio".into(),
             codec: "opus".into(),
-            clock_rate: 48_000,
             sync: "sender_reports".into(),
             derived_from: derived_from.map(Into::into),
             audio_delay_ms: delay,
@@ -2563,11 +2562,9 @@ mod tests {
             tracks: vec![(
                 "a1".into(),
                 TrackStats {
-                    packets: 5,
                     packet_bytes: 300,
                     frames: 5,
                     frame_bytes: 200,
-                    keyframes: 5,
                     frames_dropped_oversize: 2,
                     frames_over_browser_limit: 3,
                 },

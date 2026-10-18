@@ -890,7 +890,6 @@ mod tests {
             id: id.into(),
             kind: "video".into(),
             codec: "h264".into(),
-            clock_rate: 90_000,
             sync: "arrival".into(),
             derived_from: None,
             audio_delay_ms: None,
@@ -931,11 +930,9 @@ mod tests {
                 .iter()
                 .map(|id| {
                     let counters = lotse_ipc::TrackStats {
-                        packets: 1,
                         packet_bytes: 2,
                         frames: 3,
                         frame_bytes: 4,
-                        keyframes: 5,
                         frames_dropped_oversize: 6,
                         frames_over_browser_limit: 7,
                     };
@@ -968,11 +965,9 @@ mod tests {
     fn a_worker_s_repeated_trims_are_logged_once() {
         let tracks: Vec<TrackInfo> = (0..=MAX_TRACKS).map(|n| track(&n.to_string())).collect();
         let counters = lotse_ipc::TrackStats {
-            packets: 1,
             packet_bytes: 2,
             frames: 3,
             frame_bytes: 4,
-            keyframes: 5,
             frames_dropped_oversize: 6,
             frames_over_browser_limit: 7,
         };

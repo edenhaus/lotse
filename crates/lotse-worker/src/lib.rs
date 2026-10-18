@@ -1196,7 +1196,6 @@ fn track_infos(tracks: &DerivedTracks, mapper: &ClockMapper) -> Vec<TrackInfo> {
             id: track.id().to_string(),
             kind: track.kind().name().to_owned(),
             codec: codec.name().to_owned(),
-            clock_rate: track.clock_rate(),
             sync: mapper
                 .mode(from.unwrap_or_else(|| track.id()))
                 .name()
@@ -1253,11 +1252,9 @@ fn worker_stats(tracks: &DerivedTracks, mapper: &ClockMapper) -> WorkerStats {
 fn track_stats(track: &Track) -> TrackStats {
     let stats = track.stats();
     TrackStats {
-        packets: stats.packets,
         packet_bytes: stats.packet_bytes,
         frames: stats.frames,
         frame_bytes: stats.frame_bytes,
-        keyframes: stats.keyframes,
         frames_dropped_oversize: stats.frames_dropped_oversize,
         frames_over_browser_limit: stats.frames_over_browser_limit,
     }
@@ -1539,7 +1536,7 @@ mod tests {
         h.clock.advance(STATS_INTERVAL);
         let_assert!(ToSupervisor::Stats(stats) = h.next().await);
         let video = stats.tracks.iter().find(|(id, _)| id == "v0").unwrap();
-        assert!(video.1.packets >= 1, "{stats:?}");
+        assert!(video.1.packet_bytes >= 1, "{stats:?}");
         // A standby pending at shutdown stops with the rest.
         h.tx.send_msg(
             &ToWorker::SwitchSource(spec("fake://cam3/", r#"{"ready_after_ms": 60000}"#)),
@@ -2843,13 +2840,11 @@ mod tests {
         assert_eq!(
             (
                 a1.codec.as_str(),
-                a1.clock_rate,
                 a1.derived_from.as_deref(),
                 a1.audio_delay_ms
             ),
             (
                 "opus",
-                48_000,
                 Some("a0"),
                 Some(u32::try_from(derived::fake::DELAY.as_millis()).unwrap())
             )
@@ -2865,7 +2860,7 @@ mod tests {
             ("aac_lc", None, None)
         );
         let message = message_where(&mut h, |m| {
-            matches!(m, ToSupervisor::Stats(stats) if stats.tracks.iter().any(|(id, t)| id == "a1" && t.packets > 0))
+            matches!(m, ToSupervisor::Stats(stats) if stats.tracks.iter().any(|(id, t)| id == "a1" && t.packet_bytes > 0))
         })
         .await;
         let_assert!(ToSupervisor::Stats(stats) = message);
@@ -4121,10 +4116,7 @@ mod tests {
             (tracks[0].id.as_str(), tracks[0].kind.as_str()),
             ("v0", "video")
         );
-        assert_eq!(
-            (tracks[0].codec.as_str(), tracks[0].clock_rate),
-            ("h264", 90_000)
-        );
+        assert_eq!(tracks[0].codec, "h264");
         assert_eq!(tracks[0].sync, "arrival");
 
         h.clock.advance(STATS_INTERVAL);
