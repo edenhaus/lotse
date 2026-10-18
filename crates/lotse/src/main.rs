@@ -136,7 +136,7 @@ fn registered(what: &str, outcome: Result<(), lotse_core::registry::RegistryErro
 /// The worker process: logging from its flags, the panic hook, the worker
 /// sandbox, then the runtime on the channel it inherited as stdin.
 fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
-    logging::init(args.log_format, &args.log_level).context("logging")?;
+    logging::init(args.log_format, &args.log_level, Arc::new(SystemClock)).context("logging")?;
     let _process =
         tracing::info_span!("process", kind = "worker", pid = std::process::id()).entered();
     logging::install_panic_hook();
@@ -188,7 +188,12 @@ fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
 /// logging, panic hook, the control socket, sandbox, runtime.
 fn serve(args: &ServeArgs, matches: &ArgMatches) -> anyhow::Result<()> {
     let (settings, provenance) = config::load(args, matches).context("configuration")?;
-    logging::init(settings.log.format, &settings.log.level).context("logging")?;
+    logging::init(
+        settings.log.format,
+        &settings.log.level,
+        Arc::new(SystemClock),
+    )
+    .context("logging")?;
     let _process =
         tracing::info_span!("process", kind = "supervisor", pid = std::process::id()).entered();
     logging::install_panic_hook();
