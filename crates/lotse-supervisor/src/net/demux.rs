@@ -768,6 +768,9 @@ pub struct Peers {
     /// session that closes, and its addresses with it, does not take the
     /// cooldown along. At most [`MAX_RECENT_MOVES`].
     moves: HashMap<SocketAddr, Instant>,
+    /// The entries of `moves` oldest first, so the expired ones are
+    /// forgotten from the front, each once, without a scan of the rest.
+    move_order: VecDeque<(Instant, SocketAddr)>,
     /// The frame being encoded for a worker, reused.
     frame: Vec<u8>,
     /// Times the addresses' silence and the rate limit of the log lines.
@@ -811,6 +814,7 @@ impl Peers {
             move_log: Throttle::default(),
             by_addr: HashMap::new(),
             moves: HashMap::new(),
+            move_order: VecDeque::new(),
             frame: Vec::with_capacity(
                 datagram::MAX_DATAGRAM_PAYLOAD.saturating_add(datagram::HEADER_LEN),
             ),
@@ -897,12 +901,10 @@ impl Peers {
                         .by_addr
                         .get(&source)
                         .map(|learned| Arc::clone(&learned.registration))
-                        && let Some(reason) = self.move_refusal(source, now)
+                        && let Some(refusal) = self.move_refusal(source, now)
                     {
                         DemuxStats::bump(&self.stats.stun_rejected);
-                        if let Some(refused) = self.move_log.hit(now) {
-                            tracing::warn!(%source, from = owner.local_ufrag, to = registration.local_ufrag, reason, refused, "address move refused");
-                        }
+                        self.log_refused_move(refusal, source, &owner, &registration, now);
                         return;
                     }
                     if !self.claim(&registration, now) {
@@ -938,6 +940,7 @@ impl Peers {
                     );
                     if let Some(previous) = previous {
                         self.moves.insert(source, now);
+                        self.move_order.push_back((now, source));
                         DemuxStats::bump(&self.stats.addresses_moved);
                         previous.registration.addrs.fetch_sub(1, Ordering::AcqRel);
                         tracing::info!(%source, from = previous.registration.local_ufrag, to = ufrag, "address moved to the session a verified stun request named");
@@ -965,18 +968,52 @@ impl Peers {
         }
     }
 
-    /// Why `source` may not move to another session at `now`, after
-    /// forgetting the moves older than [`ADDR_IDLE_EXPIRY`]: it moved
-    /// more recently than that, or [`MAX_RECENT_MOVES`] others did, and
-    /// forgetting one of them would let it move again early. `None` when
-    /// it may.
-    fn move_refusal(&mut self, source: SocketAddr, now: Instant) -> Option<&'static str> {
-        self.moves
-            .retain(|_, moved| now.saturating_duration_since(*moved) < ADDR_IDLE_EXPIRY);
-        if self.moves.contains_key(&source) {
-            return Some("moved to another session too recently");
+    /// Logs that `source` did not move from `owner` to `to` at `now`, for
+    /// `refusal`: the first refusal, then one summary per
+    /// [`lotse_core::throttle::SUMMARY_INTERVAL`].
+    fn log_refused_move(
+        &mut self,
+        refusal: MoveRefusal,
+        source: SocketAddr,
+        owner: &Registration,
+        to: &Registration,
+        now: Instant,
+    ) {
+        let Some(refused) = self.move_log.hit(now) else {
+            return;
+        };
+        match refusal {
+            MoveRefusal::TooRecent(since) => {
+                let since_ms = since.as_millis();
+                tracing::warn!(%source, from = owner.local_ufrag, to = to.local_ufrag, since_ms, refused, "address move refused: it moved to another session too recently");
+            }
+            MoveRefusal::TooMany => {
+                tracing::warn!(%source, from = owner.local_ufrag, to = to.local_ufrag, max = MAX_RECENT_MOVES, refused, "address move refused: too many addresses moved recently");
+            }
         }
-        (self.moves.len() >= MAX_RECENT_MOVES).then_some("too many addresses moved recently")
+    }
+
+    /// Why `source` may not move to another session at `now`: it moved
+    /// less than [`ADDR_IDLE_EXPIRY`] ago, which its own entry answers, or
+    /// [`MAX_RECENT_MOVES`] others did, and forgetting one of them would
+    /// let it move again early. Otherwise forgets the moves that expired,
+    /// oldest first, so that every move is forgotten once and `None`
+    /// leaves `moves` and `move_order` the same entries, ready for this
+    /// one.
+    fn move_refusal(&mut self, source: SocketAddr, now: Instant) -> Option<MoveRefusal> {
+        if let Some(moved) = self.moves.get(&source) {
+            let since = now.saturating_duration_since(*moved);
+            if since < ADDR_IDLE_EXPIRY {
+                return Some(MoveRefusal::TooRecent(since));
+            }
+        }
+        while let Some(&(moved, addr)) = self.move_order.front()
+            && now.saturating_duration_since(moved) >= ADDR_IDLE_EXPIRY
+        {
+            self.move_order.pop_front();
+            self.moves.remove(&addr);
+        }
+        (self.moves.len() >= MAX_RECENT_MOVES).then_some(MoveRefusal::TooMany)
     }
 
     /// Counts one more address for `registration`; at the cap, first
@@ -1001,6 +1038,16 @@ impl Peers {
         });
         claim_one(registration)
     }
+}
+
+/// Why an address may not move to another session yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveRefusal {
+    /// It moved this long ago, less than [`ADDR_IDLE_EXPIRY`].
+    TooRecent(Duration),
+    /// [`MAX_RECENT_MOVES`] other addresses moved within
+    /// [`ADDR_IDLE_EXPIRY`].
+    TooMany,
 }
 
 /// Counts one more address for `registration` unless it has
@@ -2095,7 +2142,9 @@ mod tests {
             ),
             (0, 1)
         );
-        assert_eq!(captured.lines("address move refused").len(), 1);
+        let refused = captured.lines("address move refused");
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0].contains("since_ms=29999"), "{refused:?}");
         send(&mut peers, b"media", shared);
         assert_eq!(frames(&b_sink), 2, "still b's");
         // Exactly at the expiry it may move again, once.
@@ -2271,5 +2320,42 @@ mod tests {
         }
         assert_eq!(a_sink.frames.lock().unwrap().len(), before + 8);
         assert_eq!(b.addrs.load(Ordering::Acquire), 1);
+    }
+
+    /// The moves are forgotten oldest first, each [`ADDR_IDLE_EXPIRY`]
+    /// after it, when another address moves; a check refused for its own
+    /// address's cooldown is answered from that address's entry alone.
+    #[test]
+    fn rfc8445_7_3_moves_are_forgotten_in_the_order_they_expire() {
+        let (clock, registrations, stats, mut peers) = move_bench();
+        let sink = Arc::new(MemorySink::default());
+        let x = register_fresh(&registrations, &sink);
+        let y = register_fresh(&registrations, &sink);
+        let at = |port: u16| SocketAddr::new([198, 51, 100, 9].into(), port);
+        let move_from = |peers: &mut Peers, port: u16| {
+            route_from(peers, &check_of(&x, 1), at(port));
+            route_from(peers, &check_of(&y, 2), at(port));
+        };
+        let remembered = |peers: &Peers| {
+            let mut ports: Vec<u16> = peers.moves.keys().map(SocketAddr::port).collect();
+            ports.sort_unstable();
+            (ports, peers.move_order.len())
+        };
+        move_from(&mut peers, 1);
+        clock.advance(Duration::from_secs(10));
+        move_from(&mut peers, 2);
+        // 30 s after the first: refused for the second's cooldown, and
+        // nothing else looked at.
+        clock.advance(Duration::from_secs(20));
+        route_from(&mut peers, &check_of(&x, 3), at(2));
+        assert_eq!(DemuxStats::get(&stats.stun_rejected), 1);
+        assert_eq!(remembered(&peers), (vec![1, 2], 2));
+        // The next move forgets the first, the one after the second.
+        move_from(&mut peers, 3);
+        assert_eq!(remembered(&peers), (vec![2, 3], 2));
+        clock.advance(Duration::from_secs(10));
+        move_from(&mut peers, 4);
+        assert_eq!(remembered(&peers), (vec![3, 4], 2));
+        assert_eq!(DemuxStats::get(&stats.addresses_moved), 4);
     }
 }
