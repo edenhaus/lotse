@@ -1367,6 +1367,7 @@ mod tests {
     )]
 
     use lotse_core::source::ResolvedPeer;
+    use lotse_core::text::CUT_MARK;
 
     use super::*;
 
@@ -1659,6 +1660,7 @@ mod tests {
             let name = declared.codec.name();
             assert_eq!(name.len(), crate::error::CAMERA_TEXT_BYTES, "{media}");
             assert!(name.starts_with("x\u{fffd}yyy"), "{media}: {name}");
+            assert!(name.ends_with(&format!("y{CUT_MARK}")), "{media}: {name}");
         }
     }
 

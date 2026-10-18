@@ -41,6 +41,7 @@ use lotse_core::session::{
     SessionOutput, SessionRequest, TalkbackClaim, TalkbackTarget, Transport,
 };
 use lotse_core::source::TrackSet;
+use lotse_core::text::CUT_MARK;
 use lotse_core::track::{Track, TrackLimits};
 use lotse_core::uplink::{UplinkCodec, UplinkPacket};
 use lotse_testing::viewer::{
@@ -3216,9 +3217,20 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
     );
 }
 
+/// The cap the session cuts a piece of the browser's text to before a log
+/// line carries it (`BROWSER_TEXT_BYTES` in the crate's `sdp`).
+const BROWSER_TEXT_BYTES: usize = 200;
+
+/// Whether `line` carries a run of `x` cut to [`BROWSER_TEXT_BYTES`]: the
+/// run ends in [`CUT_MARK`] within the cap, and no run is longer.
+fn carries_capped_xs(line: &str) -> bool {
+    let kept = "x".repeat(BROWSER_TEXT_BYTES - CUT_MARK.len());
+    line.contains(&format!("{kept}{CUT_MARK}")) && !line.contains(&format!("{kept}x"))
+}
+
 /// The browser's text a payload type refusal quotes, a 10 kB `a=fmtp`
-/// value and mid here, reaches the log line capped, for an offer and a
-/// re-offer alike (RFC 9143 §9.1.1).
+/// value and mid here, reaches the log line capped, ending in the cut
+/// mark, for an offer and a re-offer alike (RFC 9143 §9.1.1).
 #[test]
 fn rfc9143_9_1_1_a_payload_type_refusal_logs_the_browser_s_text_capped() {
     let long = "x".repeat(10_000);
@@ -3227,10 +3239,7 @@ fn rfc9143_9_1_1_a_payload_type_refusal_logs_the_browser_s_text_capped() {
             .lines()
             .find(|line| line.contains(what))
             .unwrap_or_else(|| panic!("{what}: {logs}"));
-        assert!(
-            line.contains(&"x".repeat(200)) && !line.contains(&"x".repeat(201)),
-            "{line}"
-        );
+        assert!(carries_capped_xs(line), "{line}");
         assert!(line.len() < 2_000, "{} bytes", line.len());
     };
     let now = SystemClock.now();
@@ -3280,7 +3289,8 @@ fn rfc9143_9_1_1_a_payload_type_refusal_logs_the_browser_s_text_capped() {
 }
 
 /// The talk-back m-line's mid, browser text of any length, reaches the
-/// `talk-back negotiated` line capped (RFC 5888 §4).
+/// `talk-back negotiated` line capped, ending in the cut mark (RFC 5888
+/// §4).
 #[test]
 fn rfc5888_4_the_talk_back_mid_is_logged_capped() {
     let now = SystemClock.now();
@@ -3313,10 +3323,7 @@ fn rfc5888_4_the_talk_back_mid_is_logged_capped() {
         .lines()
         .find(|line| line.contains("talk-back negotiated"))
         .unwrap_or_else(|| panic!("{logs}"));
-    assert!(
-        line.contains(&"x".repeat(200)) && !line.contains(&"x".repeat(201)),
-        "{line}"
-    );
+    assert!(carries_capped_xs(line), "{line}");
 }
 
 /// A re-offer that writes the video's encoding name in another case

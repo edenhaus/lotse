@@ -1096,6 +1096,7 @@ mod tests {
 
     use lotse_core::clock::{FakeClock, SystemClock};
     use lotse_core::let_assert;
+    use lotse_core::text::CUT_MARK;
     use lotse_core::throttle::SUMMARY_INTERVAL;
 
     use super::super::udp::test_support::bind_dual_stack;
@@ -1909,7 +1910,7 @@ mod tests {
 
     /// The ufrag of a rejected request is the sender's text, as long as
     /// a datagram allows: the log line carries at most the 256 characters
-    /// an ICE ufrag has (RFC 8839 §5.4).
+    /// an ICE ufrag has (RFC 8839 §5.4), a cut one ending in the cut mark.
     #[test]
     fn rfc8839_5_4_a_rejected_request_s_ufrag_is_logged_capped() {
         let captured = Captured::default();
@@ -1934,7 +1935,10 @@ mod tests {
             Some(&message),
         );
         let lines = captured.lines("stun requests rejected");
-        let shown = &ufrag[..MAX_LOGGED_UFRAG_BYTES];
+        let shown = format!(
+            "{}{CUT_MARK}",
+            &ufrag[..MAX_LOGGED_UFRAG_BYTES - CUT_MARK.len()]
+        );
         assert_eq!(MAX_LOGGED_UFRAG_BYTES, 256);
         assert!(
             lines[0].ends_with(&format!("ufrag=Some(\"{shown}\") rejected=1")),

@@ -599,11 +599,13 @@ mod tests {
     }
 
     /// A camera's SDP may carry a format list or a media name of any
-    /// length: the media name reaches the log as `camera_text`, and the
-    /// formats skipped are one count per media, not one line per token.
+    /// length: the media name reaches the log as `camera_text`, cut to
+    /// its cap and ending in the cut mark, and the formats skipped are one
+    /// count per media, not one line per token.
     #[test]
     fn rfc8866_5_14_skipped_formats_are_one_count_per_media_and_the_media_name_is_capped() {
         use crate::error::CAMERA_TEXT_BYTES;
+        use lotse_core::text::CUT_MARK;
 
         let tokens = "x ".repeat(5_000);
         let mut found = None;
@@ -630,7 +632,7 @@ mod tests {
         let name = "v".repeat(10_000);
         let logs = logged(|| found = format(&[&format!("m={name} 0 RTP/AVP 0")]));
         assert_eq!(found, None);
-        let shown = &name[..CAMERA_TEXT_BYTES];
+        let shown = format!("{}{CUT_MARK}", &name[..CAMERA_TEXT_BYTES - CUT_MARK.len()]);
         assert!(
             logs.trim_end()
                 .ends_with(&format!("backchannel: not an audio media media={shown}")),

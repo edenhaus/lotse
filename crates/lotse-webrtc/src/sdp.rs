@@ -9,8 +9,8 @@
 //! configurations reaches that assert, and with `panic = "abort"` the
 //! camera's worker dies with every viewer on it. [`check_payload_types`]
 //! refuses such an offer first. The browser's text its reason quotes is
-//! capped (`BROWSER_TEXT_BYTES`): the session logs the reason and the
-//! API returns it.
+//! capped (`BROWSER_TEXT_BYTES`, cut text ending in `CUT_MARK`): the
+//! session logs the reason and the API returns it.
 
 use std::fmt;
 
@@ -21,7 +21,8 @@ use std::fmt;
 pub(crate) const BROWSER_TEXT_BYTES: usize = 200;
 
 /// A piece of the browser's `text` as a refusal or a log line carries it:
-/// on one line, control characters replaced, cut to [`BROWSER_TEXT_BYTES`].
+/// on one line, control characters replaced, cut to [`BROWSER_TEXT_BYTES`];
+/// cut text ends in [`CUT_MARK`](lotse_core::text::CUT_MARK) within them.
 pub(crate) fn browser_text(text: &str) -> String {
     lotse_core::text::plain(text, BROWSER_TEXT_BYTES)
 }
@@ -427,6 +428,8 @@ pub fn check_payload_types(offer: &str) -> Result<(), String> {
 mod tests {
     #![allow(clippy::missing_docs_in_private_items, reason = "test code")]
 
+    use lotse_core::text::CUT_MARK;
+
     use super::*;
 
     /// An audio and a video section in one BUNDLE group, the shape a web
@@ -546,12 +549,12 @@ mod tests {
 
     /// The browser's text in a refusal, which the session logs and the
     /// API returns, is capped: the mid, the media type, the encoding, the
-    /// format parameters and a parameter's name, each at
-    /// [`BROWSER_TEXT_BYTES`] and on one line.
+    /// format parameters and a parameter's name, each cut to
+    /// [`BROWSER_TEXT_BYTES`], ending in the cut mark, and on one line.
     #[test]
     fn rfc9143_9_1_1_the_browser_s_text_in_a_refusal_is_capped() {
         let long = "x".repeat(10_000);
-        let shown = &long[..BROWSER_TEXT_BYTES];
+        let shown = format!("{}{CUT_MARK}", &long[..BROWSER_TEXT_BYTES - CUT_MARK.len()]);
         let section = |lines: &str| format!("m=audio 9 x 96\r\na=mid:{long}\r\n{lines}");
         assert_eq!(
             check_payload_types(&section("a=rtpmap:96 a/1\r\na=rtpmap:96 b/1\r\n")).unwrap_err(),
