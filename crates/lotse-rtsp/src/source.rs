@@ -1760,10 +1760,12 @@ mod tests {
             assert!(timelines.admit(t0).is_ok(), "timeline {n}");
         }
         let refused = timelines.admit(t0 + TIMELINE_WINDOW.saturating_sub(Duration::from_nanos(1)));
+        let message = refused.unwrap_err().to_string();
         assert!(
-            matches!(&refused, Err(SourceError::Protocol(m)) if m.contains("more than 10 times within 10 s") && m.contains("RFC 3550 §5.1")),
-            "{refused:?}"
+            message.contains("more than 10 times within 10 s"),
+            "{message}"
         );
+        assert!(message.contains("(RFC 3550 §5.1)"), "{message}");
         assert_eq!(
             timelines.recent.len(),
             MAX_TIMELINES,
@@ -1788,24 +1790,62 @@ mod tests {
         assert_eq!(timelines.recent.len(), MAX_TIMELINES);
     }
 
+    /// What `run` logs at `info` and above, every field evaluated.
+    fn logged(run: impl FnOnce()) -> String {
+        let mut captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        std::io::Write::flush(&mut captured).unwrap();
+        let bytes = captured.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// A log writer into a shared buffer.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
-    fn a_refused_timeline_restarts_nothing() {
+    fn a_refused_timeline_restarts_nothing_and_every_jump_logs_throttled() {
         let (t0, _set, mut ctx) = video_ctx();
         let declared = declare("video", "h264", 90_000, None, Sprop::None, &[]).unwrap();
         let v0 = ctx
             .tracks
             .declare(declared.kind, declared.codec.clone(), 90_000);
         let mut carried = vec![Some(Carried::new(Arc::clone(&v0), 96, &declared))];
-        carried[0].as_mut().unwrap().last_ts = Some(1_000);
         let mut timelines = Timelines::default();
-        for _ in 0..MAX_TIMELINES {
-            new_timeline(&mut carried, 0, &ctx, &mut timelines, 55, t0).unwrap();
-        }
-        assert_eq!(v0.epoch(), 10);
-        carried[0].as_mut().unwrap().last_ts = Some(1_000);
-        assert!(new_timeline(&mut carried, 0, &ctx, &mut timelines, 55, t0).is_err());
+        let logs = logged(|| {
+            for _ in 0..MAX_TIMELINES {
+                new_timeline(&mut carried, 0, &ctx, &mut timelines, 55, t0).unwrap();
+            }
+            carried[0].as_mut().unwrap().last_ts = Some(1_000);
+            assert!(new_timeline(&mut carried, 0, &ctx, &mut timelines, 55, t0).is_err());
+        });
         assert_eq!(v0.epoch(), 10, "no epoch for the refused one");
         assert_eq!(carried[0].as_ref().unwrap().last_ts, Some(1_000));
+        let jumped: Vec<&str> = logs.lines().filter(|l| l.contains("jumped")).collect();
+        assert_eq!(jumped.len(), 1, "{logs}");
+        assert!(jumped[0].contains("moved_ms=55 count=1"), "{logs}");
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains("ending the attempt timelines=10 window_s=10"),
+            "{logs}"
+        );
     }
 
     /// A source context on a fresh track set, for the video path tests.
