@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lotse_core::clock::{Clock, SystemClock};
-use lotse_core::source::{ResolvedPeer, SourceError, SourceExit, SourceFactory as _};
+use lotse_core::source::{ResolvedPeer, SourceError, SourceFactory as _};
 use lotse_core::source_url::SourceUrl;
 use lotse_rtsp::RtspFactory;
 use lotse_testing::fake_camera::{CameraAudio, CameraUdp, PlayAnswer, Stats, UdpService};
@@ -108,7 +108,7 @@ async fn rfc2326_10_7_a_refused_play_is_torn_down() {
         let harness = start(&cam, transport);
         let exit = harness.finish().await;
         assert!(
-            matches!(exit, SourceExit::Ended(SourceError::Protocol(ref m)) if m.contains("503")),
+            matches!(exit, SourceError::Protocol(ref m) if m.contains("503")),
             "{transport}: {exit:?}"
         );
         torn_down_once(&cam, transport).await;
@@ -127,7 +127,7 @@ async fn rfc2326_10_7_an_unanswered_play_is_torn_down_at_the_read_deadline() {
         let harness = start(&cam, transport);
         let exit = harness.finish().await;
         assert!(
-            matches!(exit, SourceExit::Ended(SourceError::Timeout(ref m)) if m.starts_with("PLAY")),
+            matches!(exit, SourceError::Timeout(ref m) if m.starts_with("PLAY")),
             "{transport}: {exit:?}"
         );
         torn_down_once(&cam, transport).await;
@@ -153,7 +153,7 @@ async fn rfc2326_10_7_a_cancel_while_play_is_pending_tears_down() {
         assert!(!harness.wait_ready().await);
         let exit = harness.finish().await;
         assert!(
-            matches!(exit, SourceExit::Ended(SourceError::Ended(ref m)) if m == "cancelled"),
+            matches!(exit, SourceError::Ended(ref m) if m == "cancelled"),
             "{transport}: {exit:?}"
         );
         torn_down_once(&cam, transport).await;
@@ -170,7 +170,7 @@ async fn rfc2326_10_7_a_cancel_while_playing_tears_down() {
         harness.cancel();
         let exit = harness.finish().await;
         assert!(
-            matches!(exit, SourceExit::Ended(SourceError::Ended(ref m)) if m == "cancelled"),
+            matches!(exit, SourceError::Ended(ref m) if m == "cancelled"),
             "{transport}: {exit:?}"
         );
         torn_down_once(&cam, transport).await;
@@ -192,7 +192,7 @@ async fn rfc2326_10_7_no_datagram_within_the_read_deadline_tears_down_over_udp()
     let harness = start(&cam, "udp");
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Timeout(ref m)) if m.contains("of PLAY")),
+        matches!(exit, SourceError::Timeout(ref m) if m.contains("of PLAY")),
         "{exit:?}"
     );
     torn_down_once(&cam, "udp").await;
@@ -211,7 +211,7 @@ async fn rfc2326_10_7_a_camera_the_relay_refuses_is_torn_down_on_a_fresh_connect
     let harness = start(&cam, "udp");
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Protocol(ref m)) if m.contains("unreadable")),
+        matches!(exit, SourceError::Protocol(ref m) if m.contains("unreadable")),
         "{exit:?}"
     );
     torn_down_once(&cam, "udp").await;
@@ -234,7 +234,7 @@ async fn rfc2326_10_7_a_camera_that_hangs_up_is_torn_down_on_a_fresh_connection_
         let harness = start(&cam, transport);
         let exit = harness.finish().await;
         assert!(
-            matches!(exit, SourceExit::Ended(SourceError::Ended(_))),
+            matches!(exit, SourceError::Ended(_)),
             "{transport}: {exit:?}"
         );
         let stats = cam.stats();

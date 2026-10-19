@@ -69,13 +69,6 @@
     "BuildInfo": {
       "description": "How the daemon was built.",
       "properties": {
-        "git_sha": {
-          "description": "The git commit, when known.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "rustc": {
           "description": "The Rust version.",
           "type": "string"
@@ -108,7 +101,7 @@
       "type": "object"
     },
     "Codecs": {
-      "description": "The codecs the daemon can carry.",
+      "description": "The codecs a stream can have for a viewer to play it, natively or\nthrough a transcoder.",
       "properties": {
         "audio": {
           "description": "Audio codec names.",
@@ -1086,16 +1079,6 @@
           "const": "video_codec_unsupported",
           "description": "No video codec both sides can use.",
           "type": "string"
-        },
-        {
-          "const": "snapshot_timeout",
-          "description": "No keyframe within the snapshot timeout.",
-          "type": "string"
-        },
-        {
-          "const": "snapshot_busy",
-          "description": "The snapshot decode queue is full.",
-          "type": "string"
         }
       ]
     },
@@ -1975,11 +1958,6 @@
           "$ref": "#/$defs/ConnectionInfo",
           "description": "The shared connection."
         },
-        "details": {
-          "additionalProperties": true,
-          "description": "Protocol-specific detail, documented by the scheme's options schema.",
-          "type": "object"
-        },
         "protocol": {
           "description": "The protocol (`rtsp`).",
           "type": "string"
@@ -2298,13 +2276,6 @@
     "StreamStats": {
       "description": "A stream's counters.",
       "properties": {
-        "age_skips": {
-          "default": 0,
-          "description": "Live packets skipped for age.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "av_sync_lost": {
           "default": 0,
           "description": "Times the skew watchdog withdrew the stream's audio for sync; at\nmost 1, since it stays withdrawn while the source runs.",
@@ -2333,27 +2304,6 @@
           "minimum": 0,
           "type": "integer"
         },
-        "ingest_late_skips": {
-          "default": 0,
-          "description": "Frames skipped as late after an ingest stall.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "keyframe_requests": {
-          "default": 0,
-          "description": "Upstream keyframe requests.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "lag_events": {
-          "default": 0,
-          "description": "Fan-out lag events.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "packets_lost": {
           "default": 0,
           "description": "RTP packets from the camera that never arrived, by their sequence\nnumbers: loss on the network (RTSP over UDP) or packets the camera\ndropped itself.",
@@ -2364,13 +2314,6 @@
         "packets_out_of_order": {
           "default": 0,
           "description": "RTP packets from the camera dropped because they came again or\nafter a later one (RTSP over UDP): duplicates and reordering.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "stalls": {
-          "default": 0,
-          "description": "Stall watchdog hits.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

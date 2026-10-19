@@ -14,13 +14,12 @@ use crate::stream::StreamStats;
 pub struct BuildInfo {
     /// The target triple.
     pub target: String,
-    /// The git commit, when known.
-    pub git_sha: Option<String>,
     /// The Rust version.
     pub rustc: String,
 }
 
-/// The codecs the daemon can carry.
+/// The codecs a stream can have for a viewer to play it, natively or
+/// through a transcoder.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Codecs {
@@ -217,7 +216,6 @@ mod tests {
             version: "0.1.0".into(),
             build: BuildInfo {
                 target: "aarch64-unknown-linux-musl".into(),
-                git_sha: Some("abc123".into()),
                 rustc: "1.98.0".into(),
             },
             schemes: vec!["rtsp".into(), "rtsps".into()],
@@ -249,7 +247,7 @@ mod tests {
             },
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["build"]["git_sha"], "abc123");
+        assert_eq!(json["build"]["rustc"], "1.98.0");
         assert_eq!(json["limits"]["session_grace_ms"], 10_000);
         assert_eq!(
             json["sandbox"],
@@ -305,7 +303,7 @@ mod tests {
         assert_eq!(json["supervisor"]["demux"]["forwarded"], 4);
         assert_eq!(json["workers"]["c1"]["pss_bytes"], 5_242_880);
         assert_eq!(json["workers"]["c1"]["streams"], json!(["front"]));
-        assert_eq!(json["streams"]["front"]["stalls"], 0);
+        assert_eq!(json["streams"]["front"]["frames_dropped"], 0);
         assert_eq!(serde_json::from_value::<Metrics>(json).unwrap(), metrics);
         assert_eq!(Codecs::default().video.len(), 0);
     }

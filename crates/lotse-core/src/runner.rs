@@ -23,7 +23,7 @@ use crate::clock_map::ClockMapper;
 use crate::codec::Kind;
 use crate::connection::DEFAULT_STABLE_AFTER;
 use crate::source::{
-    BackchannelSlot, ClockInput, ResolvedPeer, Source, SourceCtx, SourceError, SourceExit, TrackSet,
+    BackchannelSlot, ClockInput, ResolvedPeer, Source, SourceCtx, SourceError, TrackSet,
 };
 use crate::task::BoxFuture;
 
@@ -514,13 +514,7 @@ impl SourceRunner {
         if live_since.is_some() {
             self.tracks.set_source_lost(true);
         }
-        let error = watchdog_error.unwrap_or_else(|| match exit {
-            SourceExit::Ended(error) => error,
-            SourceExit::Resolved(spec) => {
-                tracing::warn!(url = %spec.url, "source resolved to another spec, which is not supported yet");
-                SourceError::Protocol("resolver sources are not supported yet".into())
-            }
-        });
+        let error = watchdog_error.unwrap_or(exit);
         Outcome {
             reached_live: live_since.is_some(),
             live_for: live_since.map_or(Duration::ZERO, |since| {
@@ -535,15 +529,15 @@ impl SourceRunner {
     /// is stuck in, and the attempt ends as a timeout; `reason` says why it
     /// was cancelled. Security review WRK-3: before, a source that ignored
     /// its cancel held a stop or a stall's reconnect forever.
-    async fn wind_down(&self, run: BoxFuture<'static, SourceExit>, reason: &str) -> SourceExit {
+    async fn wind_down(&self, run: BoxFuture<'static, SourceError>, reason: &str) -> SourceError {
         let grace_ms = self.config.stop_grace.as_millis();
         tokio::select! {
             exit = run => exit,
             () = self.clock.sleep(self.config.stop_grace) => {
                 tracing::warn!(grace_ms, reason, "source ignored its cancel; dropped");
-                SourceExit::Ended(SourceError::Timeout(format!(
+                SourceError::Timeout(format!(
                     "source still running {grace_ms} ms after its cancel"
-                )))
+                ))
             }
         }
     }
@@ -1082,7 +1076,7 @@ mod tests {
             fn connection_options(&self) -> serde_json::Value {
                 serde_json::Value::Null
             }
-            fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+            fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
                 let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Box::pin(async move {
                     let codec = crate::codec::Codec::Pcmu;
@@ -1092,7 +1086,7 @@ mod tests {
                     p.rtp.seq = u16::try_from(run).unwrap();
                     track.publish_packet(p);
                     ctx.cancel.cancelled().await;
-                    SourceExit::Ended(SourceError::Ended("cancelled".into()))
+                    SourceError::Ended("cancelled".into())
                 })
             }
         }
@@ -1165,13 +1159,10 @@ mod tests {
         fn connection_options(&self) -> serde_json::Value {
             serde_json::Value::Null
         }
-        fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+        fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
             Box::pin(async move {
                 ctx.cancel.cancelled().await;
-                SourceExit::Resolved(crate::source::SourceSpec {
-                    url: SourceUrl::parse("rtsp://x/").unwrap(),
-                    options: serde_json::Value::Null,
-                })
+                SourceError::Ended("cancelled".into())
             })
         }
     }
@@ -1225,37 +1216,6 @@ mod tests {
         cancel.cancel();
         assert_eq!(next(&mut events).await, Some(RunnerEvent::Stopped));
         runner.await.unwrap();
-
-        // A resolved exit without the watchdog is reported as a protocol error.
-        let (tx, mut events) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-        let runner = SourceRunner::new(
-            Box::new(Silent),
-            ResolvedPeer {
-                host: "x".into(),
-                addrs: vec![],
-            },
-            Arc::clone(&tracks),
-            Arc::new(ClockMapper::new()),
-            BackchannelSlot::default(),
-            clock.clone(),
-            RunnerConfig::default(),
-            ReconnectBackoff::new(1),
-            tx,
-            ConnectGate::open(),
-            cancel.clone(),
-        );
-        let outcome = {
-            let cancel_soon = cancel.clone();
-            spawn_named("test.cancel", async move {
-                tokio::task::yield_now().await;
-                cancel_soon.cancel();
-            });
-            runner.run_once(false).await
-        };
-        assert!(!outcome.reached_live);
-        assert_eq!(outcome.error.code(), "source_protocol_error");
-        assert!(events.try_recv().is_err(), "run_once alone reports nothing");
     }
 
     /// The warning of a source dropped after `stop_grace`.
@@ -1289,12 +1249,12 @@ mod tests {
     }
 
     impl Future for DeafRun {
-        type Output = SourceExit;
+        type Output = SourceError;
 
         fn poll(
             mut self: std::pin::Pin<&mut Self>,
             _: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<SourceExit> {
+        ) -> std::task::Poll<SourceError> {
             if !self.live {
                 self.live = true;
                 self.ctx
@@ -1317,7 +1277,7 @@ mod tests {
         fn connection_options(&self) -> serde_json::Value {
             serde_json::Value::Null
         }
-        fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+        fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
             self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Box::pin(DeafRun {
                 ctx,

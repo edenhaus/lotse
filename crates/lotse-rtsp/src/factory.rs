@@ -4,7 +4,7 @@
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use lotse_core::source::{Direction, Source, SourceCapabilities, SourceConfigError, SourceFactory};
+use lotse_core::source::{Source, SourceCapabilities, SourceConfigError, SourceFactory};
 use lotse_core::source_url::SourceUrl;
 use lotse_tls::{TlsTarget, Trust};
 
@@ -90,10 +90,7 @@ impl SourceFactory for RtspFactory {
 
     fn capabilities(&self) -> SourceCapabilities {
         SourceCapabilities {
-            direction: Direction::Pull,
             backchannel: BACKCHANNEL,
-            keyframe_request: false,
-            snapshot_uri: false,
         }
     }
 
@@ -155,7 +152,6 @@ mod tests {
     fn the_factory_validates_scheme_and_options() {
         let factory = RtspFactory::default();
         assert_eq!(factory.schemes(), ["rtsp", "rtsps"]);
-        assert_eq!(factory.capabilities().direction, Direction::Pull);
         assert!(factory.capabilities().backchannel, "the ONVIF backchannel");
         let url = SourceUrl::parse("rtsp://user:pass@192.168.1.10/h264").unwrap();
         let source = factory.validate(&url, &serde_json::Value::Null).unwrap();
@@ -167,10 +163,6 @@ mod tests {
             source.connection_options(),
             RtspOptions::default().connection_key()
         );
-        assert!(matches!(
-            source.request_keyframe(),
-            lotse_core::source::KeyframeRequest::Unsupported
-        ));
         // ONVIF Streaming Specification §5.3.1: the `Require` header only
         // for a stream that opted in, on the same connection either way.
         assert!(!source.wants_backchannel(), "opt-in");

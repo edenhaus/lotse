@@ -79,7 +79,7 @@ use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::media::{MediaPacket, RtpHeaderFields};
 use lotse_core::source::{
-    BackchannelSlot, ClockInput, ResolvedPeer, SourceCtx, SourceExit, SourceFactory as _, TrackSet,
+    BackchannelSlot, ClockInput, ResolvedPeer, SourceCtx, SourceFactory as _, TrackSet,
 };
 use lotse_core::source_url::SourceUrl;
 use lotse_core::track::TrackLimits;
@@ -451,14 +451,11 @@ fuzz_target!(|data: &[u8]| {
         // Every byte the camera sent: the password may come back only
         // when it is among them.
         let sent = RefCell::new(Vec::new());
-        let exit = tokio::select! {
+        let err = tokio::select! {
             exit = source.run(ctx) => exit,
             () = camera(listener, base, script, &sent) => unreachable!("the camera never ends"),
             () = ingest => unreachable!("the ingest never ends"),
             () = talk(slot) => unreachable!("the talker never ends"),
-        };
-        let SourceExit::Ended(err) = exit else {
-            panic!("an RTSP camera resolves to nothing: {exit:?}");
         };
         let secret = PASSWORD.as_bytes();
         let sent = sent.into_inner();

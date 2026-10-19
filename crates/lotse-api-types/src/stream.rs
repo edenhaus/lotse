@@ -215,9 +215,6 @@ pub struct SourceInfo {
     /// connection), and while the connection is not live.
     #[serde(default)]
     pub backchannel: Option<SourceBackchannel>,
-    /// Protocol-specific detail, documented by the scheme's options schema.
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub details: serde_json::Map<String, serde_json::Value>,
     /// The shared connection.
     pub connection: ConnectionInfo,
 }
@@ -315,21 +312,6 @@ pub struct StreamStats {
     /// a keyframe that fits.
     #[serde(default)]
     pub frames_over_browser_limit: u64,
-    /// Live packets skipped for age.
-    #[serde(default)]
-    pub age_skips: u64,
-    /// Frames skipped as late after an ingest stall.
-    #[serde(default)]
-    pub ingest_late_skips: u64,
-    /// Fan-out lag events.
-    #[serde(default)]
-    pub lag_events: u64,
-    /// Stall watchdog hits.
-    #[serde(default)]
-    pub stalls: u64,
-    /// Upstream keyframe requests.
-    #[serde(default)]
-    pub keyframe_requests: u64,
     /// Times the skew watchdog withdrew the stream's audio for sync; at
     /// most 1, since it stays withdrawn while the source runs.
     #[serde(default)]
@@ -688,7 +670,6 @@ mod tests {
                     codec: "pcmu".into(),
                     state: BackchannelState::Available,
                 }),
-                details: serde_json::Map::new(),
                 connection: ConnectionInfo {
                     id: "c3".into(),
                     worker: Some(WorkerInfo {
@@ -710,11 +691,7 @@ mod tests {
         let json = serde_json::to_value(&stream).unwrap();
         assert_eq!(json["state"], "live");
         assert_eq!(json["sources"][0]["connection"]["worker"]["pid"], 4711);
-        assert!(
-            json["sources"][0].get("details").is_none(),
-            "empty details are omitted"
-        );
-        assert_eq!(json["stats"]["age_skips"], 0);
+        assert_eq!(json["stats"]["frames_dropped"], 0);
         assert!(
             json["tracks"][0].get("audio_delay_ms").is_none(),
             "native tracks have no audio delay"
@@ -749,9 +726,8 @@ mod tests {
         assert_eq!(AudioMode::default(), AudioMode::Auto);
         assert_eq!(Orientation::default(), Orientation::NoTransform);
         // A partial stats object (older daemon, newer client) still parses.
-        let partial: StreamStats = serde_json::from_value(json!({ "stalls": 3 })).unwrap();
-        assert_eq!(partial.stalls, 3);
-        assert_eq!(partial.age_skips, 0);
+        let partial: StreamStats = serde_json::from_value(json!({ "frames_dropped": 3 })).unwrap();
+        assert_eq!(partial.frames_dropped, 3);
         assert_eq!(partial.frames_over_browser_limit, 0);
     }
 
@@ -850,7 +826,7 @@ mod tests {
 
     #[test]
     fn the_ingest_counters_default_to_zero_when_a_daemon_leaves_them_out() {
-        let partial: StreamStats = serde_json::from_value(json!({ "stalls": 3 })).unwrap();
+        let partial: StreamStats = serde_json::from_value(json!({ "frames_dropped": 3 })).unwrap();
         assert_eq!(
             (
                 partial.packets_lost,

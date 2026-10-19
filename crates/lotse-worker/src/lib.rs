@@ -1196,7 +1196,6 @@ fn track_infos(tracks: &DerivedTracks, mapper: &ClockMapper) -> Vec<TrackInfo> {
             id: track.id().to_string(),
             kind: track.kind().name().to_owned(),
             codec: codec.name().to_owned(),
-            clock_rate: track.clock_rate(),
             sync: mapper
                 .mode(from.unwrap_or_else(|| track.id()))
                 .name()
@@ -1253,11 +1252,9 @@ fn worker_stats(tracks: &DerivedTracks, mapper: &ClockMapper) -> WorkerStats {
 fn track_stats(track: &Track) -> TrackStats {
     let stats = track.stats();
     TrackStats {
-        packets: stats.packets,
         packet_bytes: stats.packet_bytes,
         frames: stats.frames,
         frame_bytes: stats.frame_bytes,
-        keyframes: stats.keyframes,
         frames_dropped_oversize: stats.frames_dropped_oversize,
         frames_over_browser_limit: stats.frames_over_browser_limit,
     }
@@ -1276,10 +1273,9 @@ mod tests {
     use lotse_core::clock::FakeClock;
     use lotse_core::codec::{Codec, Kind};
     use lotse_core::let_assert;
-    use lotse_core::output::OutputShape;
     use lotse_core::source::{
         Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor, SourceError,
-        SourceExit, SourceFactory,
+        SourceFactory,
     };
     use lotse_core::task::BoxFuture;
     use lotse_core::test_util::{
@@ -1322,7 +1318,7 @@ mod tests {
             .unwrap();
         registries
             .outputs
-            .register(Arc::new(FakeOutputFactory("webrtc", OutputShape::Session)))
+            .register(Arc::new(FakeOutputFactory("webrtc")))
             .unwrap();
         Arc::new(registries)
     }
@@ -1540,7 +1536,7 @@ mod tests {
         h.clock.advance(STATS_INTERVAL);
         let_assert!(ToSupervisor::Stats(stats) = h.next().await);
         let video = stats.tracks.iter().find(|(id, _)| id == "v0").unwrap();
-        assert!(video.1.packets >= 1, "{stats:?}");
+        assert!(video.1.packet_bytes >= 1, "{stats:?}");
         // A standby pending at shutdown stops with the rest.
         h.tx.send_msg(
             &ToWorker::SwitchSource(spec("fake://cam3/", r#"{"ready_after_ms": 60000}"#)),
@@ -2844,13 +2840,11 @@ mod tests {
         assert_eq!(
             (
                 a1.codec.as_str(),
-                a1.clock_rate,
                 a1.derived_from.as_deref(),
                 a1.audio_delay_ms
             ),
             (
                 "opus",
-                48_000,
                 Some("a0"),
                 Some(u32::try_from(derived::fake::DELAY.as_millis()).unwrap())
             )
@@ -2866,7 +2860,7 @@ mod tests {
             ("aac_lc", None, None)
         );
         let message = message_where(&mut h, |m| {
-            matches!(m, ToSupervisor::Stats(stats) if stats.tracks.iter().any(|(id, t)| id == "a1" && t.packets > 0))
+            matches!(m, ToSupervisor::Stats(stats) if stats.tracks.iter().any(|(id, t)| id == "a1" && t.packet_bytes > 0))
         })
         .await;
         let_assert!(ToSupervisor::Stats(stats) = message);
@@ -3152,23 +3146,46 @@ mod tests {
             "webrtc"
         }
 
-        fn shape(&self) -> OutputShape {
-            OutputShape::Session
-        }
-
         fn session_tracks(&self, audio: bool) -> Vec<lotse_core::output::TrackRequest> {
             let mut requests = EchoSessionFactory.session_tracks(audio);
             requests[0].accept = vec![lotse_core::codec::CodecFamily::H265];
             requests
         }
+
+        fn open_session(
+            &self,
+            request: lotse_core::session::SessionRequest,
+            now: std::time::Instant,
+        ) -> Result<
+            (Box<dyn lotse_core::session::SessionEngine>, String),
+            lotse_core::session::SessionOpenError,
+        > {
+            EchoSessionFactory.open_session(request, now)
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unmet_video_request_closes_the_session_and_stops_what_audio_started() {
-        assert_eq!(
-            lotse_core::output::OutputFactory::shape(&WantsH265),
-            OutputShape::Session
-        );
+        // It answers as the echo does, should negotiation ever let it.
+        let request = lotse_core::session::SessionRequest {
+            offer: "v=0".into(),
+            ice: lotse_core::session::IceCredentials {
+                ufrag: "u".into(),
+                pass: "p".into(),
+            },
+            candidates: vec![],
+            tcp_candidates: vec![],
+            video: Arc::new(Codec::Pcmu),
+            audio: None,
+            backchannel: None,
+            claim: lotse_core::session::TalkbackClaim::Granted,
+            orientation: lotse_core::Orientation::default(),
+            limits: SessionLimits::default(),
+            wall: SystemTime::UNIX_EPOCH,
+        };
+        let opened =
+            lotse_core::output::OutputFactory::open_session(&WantsH265, request, SystemClock.now());
+        assert_eq!(opened.map(|(_, answer)| answer), Ok(ECHO_ANSWER.to_owned()));
         let (mut h, transcoder) =
             aac_worker_with(derived::fake::Forwarding::default(), Arc::new(WantsH265)).await;
         let mut session = session_spec("h265");
@@ -4099,10 +4116,7 @@ mod tests {
             (tracks[0].id.as_str(), tracks[0].kind.as_str()),
             ("v0", "video")
         );
-        assert_eq!(
-            (tracks[0].codec.as_str(), tracks[0].clock_rate),
-            ("h264", 90_000)
-        );
+        assert_eq!(tracks[0].codec, "h264");
         assert_eq!(tracks[0].sync, "arrival");
 
         h.clock.advance(STATS_INTERVAL);
@@ -4488,7 +4502,7 @@ mod tests {
             serde_json::Value::Null
         }
 
-        fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+        fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
             let cancelled = Arc::clone(&self.cancelled);
             let released = Arc::clone(&self.released);
             Box::pin(async move {
@@ -4503,7 +4517,7 @@ mod tests {
                 cancelled.notify_one();
                 released.notified().await;
                 cancelled.notify_one();
-                SourceExit::Ended(SourceError::Ended("released".into()))
+                SourceError::Ended("released".into())
             })
         }
     }
