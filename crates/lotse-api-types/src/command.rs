@@ -4,19 +4,23 @@
 //! its `id`: the envelope (`id`, `type`) is read leniently first, then the
 //! full command strictly. Unknown fields are rejected so typos fail loudly.
 
+#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorCode};
+#[cfg(feature = "schema")]
+use crate::limits::ID_PATTERN;
 use crate::limits::{
-    ID_PATTERN, MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_SDP_CHARS,
-    MAX_SOURCES, MAX_TEXT_CHARS, MAX_URL_CHARS,
+    MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_SDP_CHARS, MAX_SOURCES,
+    MAX_TEXT_CHARS, MAX_URL_CHARS,
 };
 use crate::session::IceServer;
 use crate::stream::{AudioMode, Orientation, SourceSpec};
 
 /// `ping`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Ping {
     /// The command id.
@@ -24,7 +28,8 @@ pub struct Ping {
 }
 
 /// `info`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Info {
     /// The command id.
@@ -32,7 +37,8 @@ pub struct Info {
 }
 
 /// `metrics/get`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MetricsGet {
     /// The command id.
@@ -40,7 +46,8 @@ pub struct MetricsGet {
 }
 
 /// `schema`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Schema {
     /// The command id.
@@ -48,7 +55,8 @@ pub struct Schema {
 }
 
 /// `pairing/create`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct PairingCreate {
     /// The command id.
@@ -56,7 +64,8 @@ pub struct PairingCreate {
 }
 
 /// `clients/list`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ClientsList {
     /// The command id.
@@ -64,28 +73,30 @@ pub struct ClientsList {
 }
 
 /// `clients/remove`; idempotent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ClientsRemove {
     /// The command id.
     pub id: u64,
     /// The client certificate's SHA-256, 64 hex digits, optionally with a
     /// colon between each pair.
-    #[schemars(length(max = MAX_PIN_CHARS))]
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_PIN_CHARS)))]
     pub pin: String,
 }
 
 /// `stream/put`: the idempotent upsert of a stream's desired state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct StreamPut {
     /// The command id.
     pub id: u64,
     /// The stream, `^[A-Za-z0-9._-]{1,128}$`.
-    #[schemars(regex(pattern = ID_PATTERN))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub stream_id: String,
     /// The sources, in order; the first that provides a kind wins.
-    #[schemars(length(min = 1, max = MAX_SOURCES))]
+    #[cfg_attr(feature = "schema", schemars(length(min = 1, max = MAX_SOURCES)))]
     pub sources: Vec<SourceSpec>,
     /// Keep the source connected without viewers: connected at put and
     /// reconnected after failures while set, so the first viewer gets a
@@ -104,18 +115,20 @@ pub struct StreamPut {
 }
 
 /// `stream/get`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct StreamGet {
     /// The command id.
     pub id: u64,
     /// The stream.
-    #[schemars(regex(pattern = ID_PATTERN))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub stream_id: String,
 }
 
 /// `stream/list`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct StreamList {
     /// The command id.
@@ -123,31 +136,34 @@ pub struct StreamList {
 }
 
 /// `stream/delete`; idempotent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct StreamDelete {
     /// The command id.
     pub id: u64,
     /// The stream.
-    #[schemars(regex(pattern = ID_PATTERN))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub stream_id: String,
 }
 
 /// `stream/subscribe`: a subscription to one stream's state, or every
 /// stream's.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct StreamSubscribe {
     /// The command id, which becomes the subscription id.
     pub id: u64,
     /// One stream, or all when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(pattern = ID_PATTERN))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub stream_id: Option<String>,
 }
 
 /// `unsubscribe`: ends a subscription of this connection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Unsubscribe {
     /// The command id.
@@ -165,44 +181,46 @@ pub struct Unsubscribe {
 /// the stream in, it waits for that probe, and when the stream has no
 /// backchannel its talk-back is declined in the answer
 /// (`backchannel_declined`) while the session plays.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WebrtcOffer {
     /// The command id, which becomes the subscription id.
     pub id: u64,
     /// The stream to view.
-    #[schemars(regex(pattern = ID_PATTERN))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub stream_id: String,
     /// The client's session id, `^[A-Za-z0-9._-]{1,128}$`; a ULID when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(pattern = ID_PATTERN))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub session_id: Option<String>,
     /// The browser's SDP offer.
-    #[schemars(length(max = MAX_SDP_CHARS))]
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_SDP_CHARS)))]
     pub sdp: String,
     /// Overrides the configured ICE servers for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = MAX_ICE_SERVERS))]
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_ICE_SERVERS)))]
     pub ice_servers: Option<Vec<IceServer>>,
 }
 
 /// `webrtc/candidate`: a trickled candidate from the browser, taken only
 /// from the connection that owns the session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WebrtcCandidate {
     /// The command id.
     pub id: u64,
     /// The session.
-    #[schemars(regex(pattern = ID_PATTERN))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub session_id: String,
     /// The `candidate:` attribute value; empty is end-of-candidates.
-    #[schemars(length(max = MAX_TEXT_CHARS))]
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_TEXT_CHARS)))]
     pub candidate: String,
     /// The media section, when the browser named it (a client may forward
     /// only this string; BUNDLE makes it redundant).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = MAX_TEXT_CHARS))]
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_TEXT_CHARS)))]
     pub sdp_mid: Option<String>,
     /// The media section's index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,32 +238,35 @@ pub struct WebrtcCandidate {
 /// the backchannel go. A re-offer that changes the video m-line (its
 /// mid, codecs or direction) fails with `invalid_sdp`, one without a
 /// video m-line with `no_video_track`; the session goes on as it was.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WebrtcRenegotiate {
     /// The command id.
     pub id: u64,
     /// The session.
-    #[schemars(regex(pattern = ID_PATTERN))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub session_id: String,
     /// The browser's SDP re-offer.
-    #[schemars(length(max = MAX_SDP_CHARS))]
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_SDP_CHARS)))]
     pub sdp: String,
 }
 
 /// `session/get`, `session/close` and `session/adopt`: one session by id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SessionRef {
     /// The command id.
     pub id: u64,
     /// The session.
-    #[schemars(regex(pattern = ID_PATTERN))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub session_id: String,
 }
 
 /// `session/list`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SessionListCommand {
     /// The command id.
@@ -255,7 +276,8 @@ pub struct SessionListCommand {
 /// `backchannel/release`: frees the camera's backchannel from whichever
 /// session holds it, or only from `session_id`, so the next offer that
 /// asks for talk-back claims it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct BackchannelRelease {
     /// The command id.
@@ -269,7 +291,7 @@ pub struct BackchannelRelease {
     /// changes nothing. Absent, it is freed from whichever session holds
     /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(pattern = ID_PATTERN))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub session_id: Option<String>,
 }
 
@@ -277,102 +299,103 @@ pub struct BackchannelRelease {
 /// Python client's class for it (`StreamPutCommand`), and its `type` names
 /// the client's method: `domain/verb` is `client.domain.verb(...)`, a type
 /// without a slash a method of the client itself.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(tag = "type")]
 pub enum Command {
     /// `ping`: answered with `pong`, not a `result`.
     #[serde(rename = "ping")]
-    #[schemars(title = "PingCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "PingCommand"))]
     Ping(Ping),
     /// `info`: version, build, schemes, outputs, codecs, limits and sandbox.
     #[serde(rename = "info")]
-    #[schemars(title = "InfoCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "InfoCommand"))]
     Info(Info),
     /// `metrics/get`: process, worker and stream counters.
     #[serde(rename = "metrics/get")]
-    #[schemars(title = "MetricsGetCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "MetricsGetCommand"))]
     MetricsGet(MetricsGet),
     /// `schema`: the JSON Schema bundle of every message.
     #[serde(rename = "schema")]
-    #[schemars(title = "SchemaCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "SchemaCommand"))]
     Schema(Schema),
     /// `pairing/create`: a one-time pairing code for the control TLS
     /// listener, replacing any open one; only on the Unix socket.
     #[serde(rename = "pairing/create")]
-    #[schemars(title = "PairingCreateCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "PairingCreateCommand"))]
     PairingCreate(PairingCreate),
     /// `clients/list`: every client the control TLS listener lets in, fixed
     /// by the configuration or enrolled by pairing.
     #[serde(rename = "clients/list")]
-    #[schemars(title = "ClientsListCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "ClientsListCommand"))]
     ClientsList(ClientsList),
     /// `clients/remove`: removes an enrolled client and closes its control
     /// connections; idempotent. Over the TLS listener a client may remove
     /// only itself; a fixed pin cannot be removed.
     #[serde(rename = "clients/remove")]
-    #[schemars(title = "ClientsRemoveCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "ClientsRemoveCommand"))]
     ClientsRemove(ClientsRemove),
     /// `stream/put`: the idempotent upsert of a stream's desired state.
     #[serde(rename = "stream/put")]
-    #[schemars(title = "StreamPutCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "StreamPutCommand"))]
     StreamPut(StreamPut),
     /// `stream/get`: one stream's state, sources, tracks and counters.
     #[serde(rename = "stream/get")]
-    #[schemars(title = "StreamGetCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "StreamGetCommand"))]
     StreamGet(StreamGet),
     /// `stream/list`: every stream, by id.
     #[serde(rename = "stream/list")]
-    #[schemars(title = "StreamListCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "StreamListCommand"))]
     StreamList(StreamList),
     /// `stream/delete`: removes a stream and closes its sessions; idempotent.
     #[serde(rename = "stream/delete")]
-    #[schemars(title = "StreamDeleteCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "StreamDeleteCommand"))]
     StreamDelete(StreamDelete),
     /// `stream/subscribe`: a subscription to one stream's state, or every
     /// stream's.
     #[serde(rename = "stream/subscribe")]
-    #[schemars(title = "StreamSubscribeCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "StreamSubscribeCommand"))]
     StreamSubscribe(StreamSubscribe),
     /// `unsubscribe`: ends a subscription of this connection.
     #[serde(rename = "unsubscribe")]
-    #[schemars(title = "UnsubscribeCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "UnsubscribeCommand"))]
     Unsubscribe(Unsubscribe),
     /// `webrtc/offer`: opens a session; the subscription's events carry the
     /// whole signaling conversation.
     #[serde(rename = "webrtc/offer")]
-    #[schemars(title = "WebrtcOfferCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "WebrtcOfferCommand"))]
     WebrtcOffer(WebrtcOffer),
     /// `webrtc/candidate`: a trickled candidate from the browser, taken
     /// only from the connection that owns the session.
     #[serde(rename = "webrtc/candidate")]
-    #[schemars(title = "WebrtcCandidateCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "WebrtcCandidateCommand"))]
     WebrtcCandidate(WebrtcCandidate),
     /// `webrtc/renegotiate`: a re-offer for an answered session, taken
     /// only from the connection that owns it; the result carries the
     /// answer.
     #[serde(rename = "webrtc/renegotiate")]
-    #[schemars(title = "WebrtcRenegotiateCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "WebrtcRenegotiateCommand"))]
     WebrtcRenegotiate(WebrtcRenegotiate),
     /// `session/get`: one session's state.
     #[serde(rename = "session/get")]
-    #[schemars(title = "SessionGetCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "SessionGetCommand"))]
     SessionGet(SessionRef),
     /// `session/list`: every session.
     #[serde(rename = "session/list")]
-    #[schemars(title = "SessionListCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "SessionListCommand"))]
     SessionList(SessionListCommand),
     /// `session/close`; idempotent.
     #[serde(rename = "session/close")]
-    #[schemars(title = "SessionCloseCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "SessionCloseCommand"))]
     SessionClose(SessionRef),
     /// `session/adopt`: takes back an orphaned session.
     #[serde(rename = "session/adopt")]
-    #[schemars(title = "SessionAdoptCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "SessionAdoptCommand"))]
     SessionAdopt(SessionRef),
     /// `backchannel/release`: frees the camera's backchannel from its
     /// talker, or only from the session given.
     #[serde(rename = "backchannel/release")]
-    #[schemars(title = "BackchannelReleaseCommand")]
+    #[cfg_attr(feature = "schema", schemars(title = "BackchannelReleaseCommand"))]
     BackchannelRelease(BackchannelRelease),
 }
 

@@ -2,11 +2,13 @@
 
 use std::fmt;
 
+#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Every stable error code. `code` is the contract; `message` may change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// Malformed JSON, an unknown field, a bad value.
@@ -142,7 +144,8 @@ impl fmt::Display for ErrorCode {
 
 /// An error as the API carries it, in results, `closed` events and
 /// `last_error`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct ApiError {
     /// The stable code.
     pub code: ErrorCode,

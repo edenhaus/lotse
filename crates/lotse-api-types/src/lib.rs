@@ -1,6 +1,7 @@
 //! Serde DTOs of the control API: every command, result, event and error
-//! code, plus JSON Schema generation (`schemars`) for the `schema` command,
-//! the `AsyncAPI` document and the generated Python client.
+//! code, plus the JSON Schema bundle that the `schema` command returns and
+//! the `AsyncAPI` document and the generated Python client are built from;
+//! generating it (`schemars`) takes the `schema` feature.
 //!
 //! Shared by the server (`lotse-api`), the supervisor and `lotse ctl`. Holds
 //! no behavior and no domain types: conversions from `lotse-core` live in the

@@ -3,11 +3,13 @@
 
 use std::fmt;
 
+#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// What `pairing/create` answers.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct PairingCreateResult {
     /// The code to paste into the client, `LOTSE1-<server pin>-<secret>`:

@@ -96,8 +96,8 @@ repos:
       - id: api-schema
         name: api schema (schema/api.json matches the DTOs)
         # The committed bundle is what the clients (lotse-clients) are generated from; regenerate it with
-        # `cargo run -p lotse-api-types --example schema > crates/lotse-api-types/schema/api.json`.
-        entry: sh -c 'cargo run -q -p lotse-api-types --example schema --locked | diff -u crates/lotse-api-types/schema/api.json -'
+        # `cargo run -p lotse-api-types --features schema --example schema > crates/lotse-api-types/schema/api.json`.
+        entry: sh -c 'cargo run -q -p lotse-api-types --features schema --example schema --locked | diff -u crates/lotse-api-types/schema/api.json -'
         language: system
         files: ^crates/lotse-api-types/
         pass_filenames: false
