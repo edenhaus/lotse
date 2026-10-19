@@ -1449,6 +1449,7 @@ fn demux_metrics(stats: &DemuxStats) -> DemuxMetrics {
         unroutable: DemuxStats::get(&stats.unroutable),
         stun_rejected: DemuxStats::get(&stats.stun_rejected),
         addresses_learned: DemuxStats::get(&stats.addresses_learned),
+        addresses_moved: DemuxStats::get(&stats.addresses_moved),
         worker_full: DemuxStats::get(&stats.worker_full),
         responses: DemuxStats::get(&stats.responses),
         relayed: DemuxStats::get(&stats.relayed),
@@ -4277,11 +4278,17 @@ mod tests {
             next(&mut events).await,
             json!({ "type": "candidate", "candidate": "" })
         );
-        // The demux counted the STUN response as `metrics/get` shows.
+        // The demux counted the STUN response as `metrics/get` shows, and
+        // each counter is its own.
+        demux
+            .stats()
+            .addresses_moved
+            .store(3, std::sync::atomic::Ordering::Relaxed);
         let counted =
             &result(call(&s, r#"{"id":3,"type":"metrics/get"}"#).await)["supervisor"]["demux"];
         assert!(counted["responses"].as_u64().unwrap() >= 1, "{counted}");
         assert_eq!(counted["received"], counted["responses"], "{counted}");
+        assert_eq!(counted["addresses_moved"], 3, "{counted}");
         s.shutdown().await;
         demux.stop();
     }
