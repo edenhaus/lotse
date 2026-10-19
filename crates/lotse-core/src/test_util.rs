@@ -971,6 +971,7 @@ impl OutputFactory for EchoSessionFactory {
     fn talkback_request(
         &self,
         offer: &str,
+        _audio: Option<&Codec>,
         backchannel: Option<&TalkbackTarget>,
     ) -> TalkbackRequest {
         if !offer.contains("talk") {
@@ -2201,15 +2202,15 @@ mod tests {
         // What an offer asks for, as the worker arbitrates it.
         let target = turned.backchannel.as_ref();
         assert_eq!(
-            EchoSessionFactory.talkback_request("v=0", target),
+            EchoSessionFactory.talkback_request("v=0", None, target),
             TalkbackRequest::NotRequested
         );
         assert_eq!(
-            EchoSessionFactory.talkback_request("v=0 talk", target),
+            EchoSessionFactory.talkback_request("v=0 talk", None, target),
             TalkbackRequest::Negotiable
         );
         assert_eq!(
-            EchoSessionFactory.talkback_request("v=0 talk", None),
+            EchoSessionFactory.talkback_request("v=0 talk", None, None),
             TalkbackRequest::Unsupported("the camera offers no backchannel".into())
         );
         let unroutable = TalkbackTarget {
@@ -2217,7 +2218,7 @@ mod tests {
             takes: vec![UplinkCodec::Opus],
         };
         assert_eq!(
-            EchoSessionFactory.talkback_request("v=0 talk", Some(&unroutable)),
+            EchoSessionFactory.talkback_request("v=0 talk", None, Some(&unroutable)),
             TalkbackRequest::Unsupported(
                 "the backchannel takes a codec talk-back cannot feed".into()
             )

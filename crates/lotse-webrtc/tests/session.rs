@@ -2103,7 +2103,7 @@ fn rfc3264_6_the_factory_finds_talk_back_negotiable_exactly_when_the_engine_take
     ] {
         let offer = with_audio_codecs(viewer.offer(), codecs);
         let target = chained(backchannel);
-        let asked = WebRtcFactory.talkback_request(&offer, Some(&target));
+        let asked = WebRtcFactory.talkback_request(&offer, None, Some(&target));
         let mut request = request(&offer, h264(None));
         request.backchannel = Some(target);
         let (session, answer) = Session::answer(&request, now).expect("answered");
@@ -2381,6 +2381,44 @@ fn rfc8866_6_7_a_talk_back_request_is_answered_with_talk_back_or_without_it_neve
     assert_eq!(session.talkback(), None);
 }
 
+/// A `sendrecv` downlink m-line whose stream audio (PCMU) cannot come
+/// back to the backchannel (Opus, which the viewer offers too) lists no
+/// codec the session both sends and receives, which an m-line answered
+/// `sendrecv` must (RFC 3264 §6.1): it is answered `sendonly`, without
+/// talk-back, and the stream's audio plays on it. The factory says so
+/// before the answer, so the worker claims nothing.
+#[test]
+fn rfc3264_6_1_a_sendrecv_downlink_whose_audio_cannot_come_back_is_answered_sendonly() {
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, TalkbackOffer::SendRecv)
+        .expect("a viewer");
+    let mut request = request(viewer.offer(), h264(None));
+    request.audio = Some(Arc::new(Codec::Pcmu));
+    let target = chained(Codec::Opus { channels: 2 });
+    assert_eq!(
+        WebRtcFactory.talkback_request(viewer.offer(), Some(&Codec::Pcmu), Some(&target)),
+        TalkbackRequest::Unsupported(
+            "the stream audio's codec on its sendrecv m-line does not reach the backchannel; talk-back needs a sendonly m-line".into()
+        )
+    );
+    request.backchannel = Some(target);
+    let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+    assert_eq!(pair.session.talkback(), None);
+    let sections = audio_sections(&answer);
+    assert_eq!(sections.len(), 1, "{answer}");
+    assert!(sections[0].contains(&"a=sendonly"), "{answer}");
+    assert!(sections[0].contains(&"a=rtpmap:0 PCMU/8000"), "{answer}");
+    pair.connect(&answer);
+    assert_eq!(pair.viewer.audio_direction(), Some(Direction::RecvOnly));
+    for seq in 0..5_u16 {
+        let packet = audio_packet(seq, u32::from(seq) * 160, 0, pair.now);
+        pair.session.write_audio(pair.now, &packet, pair.now);
+    }
+    pair.drain();
+    pair.run_until(|p| p.viewer.audio_packets().len() >= 5, 500, "one way");
+}
+
 /// `codec`'s backchannel as a worker with the reverse chain installed
 /// routes to it: Opus and both G.711 laws to a G.711 camera, Opus to an
 /// Opus one, nothing to any other.
@@ -2557,8 +2595,9 @@ fn rfc3264_6_1_rtp_that_is_no_talk_back_is_refused_and_counted() {
 /// though the viewer offers Opus, G.722, PCMU and PCMA on it and the engine
 /// answers every m-line from one codec list: without stream audio no
 /// G.722, and with PCMU down and an Opus backchannel no PCMU on a
-/// dedicated m-line. A `sendrecv` m-line that carries the stream's PCMU
-/// too lists it after Opus, the codec the browser sends (RFC 3264 §7);
+/// dedicated m-line (a `sendrecv` one that carries the stream's PCMU gets
+/// no talk-back then:
+/// `rfc3264_6_1_a_sendrecv_downlink_whose_audio_cannot_come_back_is_answered_sendonly`);
 /// a packet in a codec that does not reach the camera is refused there,
 /// never handed on, or dropped by the engine already when no m-line
 /// negotiated it (G.722 beside stream audio).
@@ -2583,7 +2622,7 @@ fn rfc3264_7_the_talk_back_m_line_lists_only_codecs_that_reach_the_camera() {
         (
             TalkbackOffer::Dedicated,
             Some(Codec::Pcmu),
-            chained(opus.clone()),
+            chained(opus),
             &["opus/48000/2"],
             &[UplinkCodec::Opus],
             2,
@@ -2595,14 +2634,6 @@ fn rfc3264_7_the_talk_back_m_line_lists_only_codecs_that_reach_the_camera() {
             all,
             &[UplinkCodec::Pcmu, UplinkCodec::Opus],
             1,
-        ),
-        (
-            TalkbackOffer::SendRecv,
-            Some(Codec::Pcmu),
-            chained(opus),
-            &["opus/48000/2", "PCMU/8000"],
-            &[UplinkCodec::Opus],
-            2,
         ),
         // Without the reverse chain a PCMU camera takes PCMU alone.
         (

@@ -373,6 +373,16 @@ impl<'a> AudioPlan<'a> {
     /// backchannel would take is declined all the same while another
     /// session holds the backchannel ([`TalkbackClaim::Busy`]).
     ///
+    /// Talk-back on the downlink m-line itself, offered `sendrecv`, is off
+    /// while the stream audio's codec, which the session sends there, does
+    /// not reach the backchannel (an Opus backchannel under G.711 stream
+    /// audio, a G.711 one under G.722): an m-line answered `sendrecv`
+    /// lists at least one codec the answerer both sends and receives
+    /// (RFC 3264 §6.1), and that m-line has one format list for both
+    /// directions. It is answered `sendonly` instead, as RFC 3264 §6.1
+    /// lets a `sendrecv` offer be, so the stream's audio still goes down;
+    /// a dedicated `sendonly` m-line gets talk-back.
+    ///
     /// A stopped m-line ([`Sdp::stopped`]: a zero port, not a bundled
     /// `bundle-only` one) carries neither: its stream is disabled
     /// (RFC 3264 §8.2), whatever direction it still names, so it neither
@@ -423,11 +433,18 @@ impl<'a> AudioPlan<'a> {
                 Talkback::Off("the backchannel takes a codec talk-back cannot feed")
             }
             (Some(((section, mid, _), dedicated)), Some(family)) => {
+                // Only a `sendrecv` m-line is both: a dedicated one is
+                // `sendonly`, never the downlink.
+                let one_way = downlink.is_some_and(|(_, downlink, _)| downlink == mid)
+                    && send.is_some_and(|sent| !reaching.contains(&sent));
                 match [Some(family), other_law(family), Some(CodecFamily::Opus)]
                     .into_iter()
                     .flatten()
                     .find(|family| reaching.contains(family) && lists(section, *family))
                 {
+                    Some(_) if one_way => Talkback::Off(
+                        "the stream audio's codec on its sendrecv m-line does not reach the backchannel; talk-back needs a sendonly m-line",
+                    ),
                     Some(_) if claim == TalkbackClaim::Busy => Talkback::Busy,
                     Some(codec) => Talkback::Negotiated {
                         mid,
@@ -474,21 +491,13 @@ impl<'a> AudioPlan<'a> {
     /// Talk-back's own codec is always taken and listed, so the m-line
     /// keeps a format.
     ///
-    /// `SPEC-DEVIATION` (RFC 3264 §6.1: an m-line answered `sendrecv`
-    /// lists at least one codec the answerer both sends and receives):
-    /// on a `sendrecv` m-line that carries both, a stream audio codec
-    /// that does not reach the camera (G.711 or G.722 to an Opus
-    /// backchannel, G.722 to a G.711 one) stays listed beside talk-back's,
-    /// since the session sends it there, and an m-line has one format list
-    /// for both directions. The session then sends one codec and receives
-    /// another, neither both ways. Dropping either would lose the stream's
-    /// audio or talk-back, and no uplink chain produces Opus from G.711.
-    /// The browser sends talk-back's, first in the answer (RFC 3264 §7);
-    /// a packet in the other is refused on receipt, never routed. The
-    /// stream audio's codec also stays where the engine prefers it to
-    /// talk-back's, and the browser then sends it when the session can
-    /// take it (the Opus of an Opus stream to a G.711 backchannel, after
-    /// a re-offer on a session that opened with an Opus backchannel).
+    /// On a `sendrecv` m-line that carries both, the stream audio's codec
+    /// reaches the camera, or talk-back is off there ([`AudioPlan::new`]),
+    /// so the answer lists a codec the session both sends and receives
+    /// (RFC 3264 §6.1). It stays where the engine prefers it to
+    /// talk-back's, and the browser then sends it (the Opus of an Opus
+    /// stream to a G.711 backchannel, after a re-offer on a session that
+    /// opened with an Opus backchannel).
     fn unroutable(&self, section: &Section<'_>) -> Vec<u8> {
         if !section.is("audio") {
             return Vec::new();
@@ -1523,25 +1532,22 @@ mod tests {
     }
 
     /// A `sendrecv` m-line that carries the downlink and talk-back lists
-    /// the codecs that reach the camera and the stream audio's, which the
-    /// session sends there. When the stream audio's does not reach the
-    /// camera it stays all the same (the `SPEC-DEVIATION` of
-    /// [`AudioPlan::unroutable`]), after talk-back's, which the browser
-    /// sends (RFC 3264 §7).
+    /// the codecs that reach the camera, the stream audio's among them,
+    /// which the session sends there, so one codec goes both ways
+    /// (RFC 3264 §6.1); talk-back's comes first, which the browser sends
+    /// (RFC 3264 §7).
     #[test]
     fn rfc3264_6_1_a_shared_sendrecv_m_line_keeps_the_stream_audio_beside_talk_back() {
-        use CodecFamily::{G722, Opus, Pcma, Pcmu};
+        use CodecFamily::{Opus, Pcma, Pcmu};
         let offer = shared_in(&["opus", "PCMU", "PCMA", "G722"]);
         let opus = Codec::Opus { channels: 2 };
         for (backchannel, audio, expected) in [
             (Codec::Pcmu, Some(&opus), &[Pcmu, Pcma, Opus][..]),
             (Codec::Pcmu, Some(&Codec::Pcmu), &[Pcmu, Pcma, Opus]),
+            (Codec::Pcmu, Some(&Codec::Pcma), &[Pcmu, Pcma, Opus]),
             (Codec::Pcmu, None, &[Pcmu, Pcma, Opus]),
             (opus.clone(), Some(&opus), &[Opus]),
             (opus.clone(), None, &[Opus]),
-            // The residual cases: sent down, not taken up.
-            (opus.clone(), Some(&Codec::Pcmu), &[Opus, Pcmu]),
-            (Codec::Pcma, Some(&Codec::G722), &[Pcma, Pcmu, Opus, G722]),
         ] {
             let what = format!("{backchannel:?} up, {audio:?} down");
             let plan = plan_for(&offer, audio, Some(&reaching(&backchannel)));
@@ -1568,6 +1574,7 @@ mod tests {
                     "{what}: {family:?}"
                 );
             }
+            assert!(send.is_none_or(|sent| plan.takes(sent)), "{what}");
         }
         // A `sendrecv` m-line after the downlink one carries talk-back
         // alone: the stream audio's goes down elsewhere and is dropped
@@ -1581,6 +1588,76 @@ mod tests {
             plan.engine_offer(offer),
             "v=0\r\nm=audio 9 x 0 111\r\na=mid:d\r\na=recvonly\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:111 opus/48000/2\r\nm=audio 9 x 111\r\na=mid:s\r\na=rtpmap:111 opus/48000/2\r\na=sendonly\r\n"
         );
+    }
+
+    /// A `sendrecv` m-line that carries the downlink, whose stream audio's
+    /// codec does not reach the camera (G.711 down to an Opus backchannel,
+    /// G.722 down to a G.711 one), has no codec the session both sends
+    /// and receives there, which an m-line answered `sendrecv` must list
+    /// (RFC 3264 §6.1): talk-back is off with the reason, whoever holds
+    /// the backchannel, and the m-line is answered `sendonly`, its
+    /// formats as offered (RFC 3264 §6.1 lets a `sendrecv` offer be
+    /// answered so), so the stream's audio still goes down. A dedicated
+    /// `sendonly` m-line of the same offer gets talk-back.
+    #[test]
+    fn rfc3264_6_1_a_shared_m_line_whose_stream_audio_cannot_come_back_is_answered_sendonly() {
+        const ONE_WAY: &str = "the stream audio's codec on its sendrecv m-line does not reach the backchannel; talk-back needs a sendonly m-line";
+        let offer = shared_in(&["opus", "PCMU", "PCMA", "G722"]);
+        let opus = Codec::Opus { channels: 2 };
+        for (backchannel, audio) in [
+            (opus.clone(), Codec::Pcmu),
+            (opus.clone(), Codec::Pcma),
+            (opus, Codec::G722),
+            (Codec::Pcmu, Codec::G722),
+            (Codec::Pcma, Codec::G722),
+        ] {
+            let what = format!("{backchannel:?} up, {audio:?} down");
+            let target = reaching(&backchannel);
+            let order = engine_codecs(Some(backchannel.family()), Some(audio.family()));
+            for claim in [TalkbackClaim::Granted, TalkbackClaim::Busy] {
+                let plan = AudioPlan::new(&offer, Some(&audio), Some(&target), claim, &order);
+                assert_eq!(plan.talkback, Talkback::Off(ONE_WAY), "{what}");
+                assert_eq!(plan.send, Some(audio.family()), "{what}");
+                assert_eq!(plan.answer(Some("0")), Direction::SendOnly, "{what}");
+                for family in EVERY_CODEC {
+                    assert!(!plan.takes(family), "{what}: {family:?}");
+                }
+                // Offered to the engine `recvonly`, no format dropped.
+                assert_eq!(
+                    plan.engine_offer(&offer),
+                    offer
+                        .replace("a=mid:0\r\na=sendrecv\r\n", "a=mid:0\r\n")
+                        .replace("m=video", "a=recvonly\r\nm=video"),
+                    "{what}"
+                );
+            }
+            // Talk-back on a dedicated m-line beside it is negotiated.
+            let both = talking_in(&["opus", "PCMU", "PCMA", "G722"]).replacen(
+                "a=recvonly",
+                "a=sendrecv",
+                1,
+            );
+            let plan = plan_for(&both, Some(&audio), Some(&target));
+            assert!(
+                matches!(
+                    plan.talkback,
+                    Talkback::Negotiated {
+                        mid: "2",
+                        dedicated: true,
+                        ..
+                    }
+                ),
+                "{what}"
+            );
+            assert_eq!(plan.answer(Some("2")), Direction::RecvOnly, "{what}");
+            // The downlink sends what it lists (no G.722 there).
+            let sends = audio.family() != CodecFamily::G722;
+            assert_eq!(
+                plan.answer(Some("0")),
+                Direction::new(sends, false),
+                "{what}"
+            );
+        }
     }
 
     /// The formats str0m reads on the talk-back m-line are the ones

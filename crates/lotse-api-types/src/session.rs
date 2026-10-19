@@ -144,7 +144,12 @@ pub enum DeclineReason {
     /// The stream has no backchannel the session can feed: its source
     /// protocol cannot carry audio back, no stream on its connection opted
     /// in to it, the camera offers none, or it takes a codec talk-back
-    /// cannot produce from what the offer lists. The message says which.
+    /// cannot produce from what the offer lists. Or the offer asks for
+    /// talk-back on its `sendrecv` downlink audio m-line while the
+    /// stream's audio codec cannot reach the camera, so no codec on that
+    /// m-line goes both ways (RFC 3264 §6.1): it is answered `sendonly`,
+    /// and an offer with a `sendonly` m-line for talk-back gets it. The
+    /// message says which.
     Unsupported,
     /// Another session holds the backchannel; `backchannel/release`, its
     /// re-offer dropping talk-back, or its close frees it.

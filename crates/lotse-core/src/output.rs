@@ -8,7 +8,7 @@
 use std::fmt;
 use std::time::Instant;
 
-use crate::codec::{CodecFamily, Kind};
+use crate::codec::{Codec, CodecFamily, Kind};
 use crate::session::{SessionEngine, SessionOpenError, SessionRequest, TalkbackTarget};
 use crate::track::Unit;
 
@@ -34,16 +34,19 @@ pub trait OutputFactory: fmt::Debug + Send + Sync {
     ) -> Result<(Box<dyn SessionEngine>, String), SessionOpenError>;
 
     /// What `offer` (an offer or a re-offer) asks of the stream's
-    /// backchannel, `backchannel` as the camera offers it now: the worker
-    /// claims the backchannel for a session whose offer could receive
-    /// talk-back before the engine answers it, so the answer carries the
-    /// claim's outcome. A kind without talk-back never asks for it.
+    /// backchannel, `backchannel` as the camera offers it now, for a
+    /// session that sends the stream's audio in `audio` (`None` without
+    /// any; [`SessionRequest::audio`]): the worker claims the backchannel
+    /// for a session whose offer could receive talk-back before the
+    /// engine answers it, so the answer carries the claim's outcome. A
+    /// kind without talk-back never asks for it.
     fn talkback_request(
         &self,
         offer: &str,
+        audio: Option<&Codec>,
         backchannel: Option<&TalkbackTarget>,
     ) -> TalkbackRequest {
-        let _ = (offer, backchannel);
+        let _ = (offer, audio, backchannel);
         TalkbackRequest::NotRequested
     }
 }
@@ -59,8 +62,10 @@ pub enum TalkbackRequest {
     /// claims it for the session.
     Negotiable,
     /// Talk-back the session cannot receive, and why: the camera offers
-    /// no backchannel, or the offer lists no codec that reaches it. The
-    /// m-line is answered without it, and nothing is claimed.
+    /// no backchannel, the offer lists no codec that reaches it, or it
+    /// asks for talk-back on an m-line whose stream audio cannot come
+    /// back in the same codec. The m-line is answered without it, and
+    /// nothing is claimed.
     Unsupported(String),
 }
 
@@ -95,11 +100,11 @@ mod tests {
         let factory = FakeOutputFactory("fake");
         assert!(factory.session_tracks(true).is_empty());
         let target = TalkbackTarget {
-            codec: crate::codec::Codec::Pcmu,
+            codec: Codec::Pcmu,
             takes: vec![crate::uplink::UplinkCodec::Pcmu],
         };
         assert_eq!(
-            factory.talkback_request("a=sendonly", Some(&target)),
+            factory.talkback_request("a=sendonly", None, Some(&target)),
             TalkbackRequest::NotRequested,
             "a kind without talk-back asks for none"
         );

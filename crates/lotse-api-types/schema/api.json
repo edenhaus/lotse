@@ -810,7 +810,7 @@
       "oneOf": [
         {
           "const": "unsupported",
-          "description": "The stream has no backchannel the session can feed: its source\nprotocol cannot carry audio back, no stream on its connection opted\nin to it, the camera offers none, or it takes a codec talk-back\ncannot produce from what the offer lists. The message says which.",
+          "description": "The stream has no backchannel the session can feed: its source\nprotocol cannot carry audio back, no stream on its connection opted\nin to it, the camera offers none, or it takes a codec talk-back\ncannot produce from what the offer lists. Or the offer asks for\ntalk-back on its `sendrecv` downlink audio m-line while the\nstream's audio codec cannot reach the camera, so no codec on that\nm-line goes both ways (RFC 3264 §6.1): it is answered `sendonly`,\nand an offer with a `sendonly` m-line for talk-back gets it. The\nmessage says which.",
           "type": "string"
         },
         {
