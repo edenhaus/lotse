@@ -192,6 +192,7 @@ async fn run_camera_with(door: &mut FrontDoor, cam: &FakeCamera, options: &str) 
             options: options.into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec![cam.addr()],
+            backoff: lotse_ipc::BackoffPosition::default(),
         })
         .await
         .expect("run source");

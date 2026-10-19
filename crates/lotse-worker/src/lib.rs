@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
-use lotse_core::backoff::ReconnectBackoff;
+use lotse_core::backoff::{BackoffPosition, ReconnectBackoff};
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::registry::Registries;
@@ -590,12 +590,12 @@ impl Serving<'_> {
         let Some(running) = self.running.as_ref() else {
             return Err(Error::SwitchWithoutSource);
         };
+        let staging = TrackSet::staging(running.tracks.tracks());
         if let Some(replaced) = self.standby.take() {
             tracing::info!("standby source replaced before it took over");
             replaced.staging.disarm();
             stop_runner(replaced.runner, &self.clock).await;
         }
-        let staging = TrackSet::staging(running.tracks.tracks());
         let runner = start_runner(
             spec,
             &self.registries,
@@ -993,6 +993,8 @@ fn start_runner(
         addrs = ?spec.peer_addrs,
         role,
         backchannel = capable,
+        backoff_attempts = spec.backoff.attempts,
+        immediate_used = spec.backoff.immediate_used,
         "running source"
     );
 
@@ -1010,7 +1012,13 @@ fn start_runner(
         backchannel.clone().unwrap_or_default(),
         Arc::clone(clock),
         settings.runner,
-        ReconnectBackoff::new(jitter_seed(clock.as_ref())),
+        ReconnectBackoff::resumed(
+            jitter_seed(clock.as_ref()),
+            BackoffPosition {
+                attempts: spec.backoff.attempts,
+                immediate_used: spec.backoff.immediate_used,
+            },
+        ),
         events,
         gate.clone(),
         cancel.clone(),
@@ -1141,14 +1149,23 @@ fn source_state(event: RunnerEvent) -> SourceState {
     match event {
         RunnerEvent::Connecting { attempt } => SourceState::Connecting { attempt },
         RunnerEvent::Live => SourceState::Live,
+        RunnerEvent::Stable => SourceState::Stable,
         RunnerEvent::Reconnecting { error } => SourceState::Reconnecting {
             code: error.code().to_owned(),
             message: error.to_string(),
         },
-        RunnerEvent::Backoff { error, retry_in } => SourceState::Backoff {
+        RunnerEvent::Backoff {
+            error,
+            retry_in,
+            position,
+        } => SourceState::Backoff {
             code: error.code().to_owned(),
             message: error.to_string(),
             retry_ms: u32::try_from(retry_in.as_millis()).unwrap_or(u32::MAX),
+            position: lotse_ipc::BackoffPosition {
+                attempts: position.attempts,
+                immediate_used: position.immediate_used,
+            },
         },
         RunnerEvent::Stopped => SourceState::Stopped,
     }
@@ -1344,6 +1361,7 @@ mod tests {
             options: options.into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
+            backoff: lotse_ipc::BackoffPosition::default(),
         }
     }
 
@@ -4189,9 +4207,37 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_source_reports_reconnecting_then_backoff_with_their_codes() {
+        let at = |attempts, immediate_used| lotse_ipc::BackoffPosition {
+            attempts,
+            immediate_used,
+        };
+        // A spec without earlier attempts starts the schedule at its first
+        // step, 1 s; one after five continues at the second, 5 s; one whose
+        // immediate attempt is used gets none again.
+        for (backoff, reconnects, delays) in [
+            (at(0, false), true, 800..=1_200),
+            (at(5, false), true, 4_000..=6_000),
+            (at(5, true), false, 4_000..=6_000),
+        ] {
+            stalled_source_backs_off(backoff, reconnects, delays).await;
+        }
+    }
+
+    /// Runs a silent source from schedule position `backoff` and checks it
+    /// reports a drop retried at once when `reconnects`, then a delay
+    /// within `delays` ms, one step further.
+    async fn stalled_source_backs_off(
+        backoff: lotse_ipc::BackoffPosition,
+        reconnects: bool,
+        delays: std::ops::RangeInclusive<u32>,
+    ) {
         let mut h = start();
         h.next().await;
-        h.tx.send_msg(&ToWorker::RunSource(spec("fake://cam/", "null")), &[])
+        let source = SourceSpec {
+            backoff,
+            ..spec("fake://cam/", "null")
+        };
+        h.tx.send_msg(&ToWorker::RunSource(source), &[])
             .await
             .unwrap();
         // The fake video is silent: the watchdog drops the connection once
@@ -4205,13 +4251,18 @@ mod tests {
         let timeout = |code: &str, message: &str| {
             code == "source_timeout" && message.contains("no video for")
         };
-        assert!(
+        assert_eq!(
             matches!(states.get(2), Some(SourceState::Reconnecting { code, message }) if timeout(code, message)),
-            "connecting, live, reconnecting expected: {states:?}"
+            reconnects,
+            "connecting, live, then reconnecting or not: {states:?}"
         );
+        let after = lotse_ipc::BackoffPosition {
+            attempts: backoff.attempts + 1,
+            immediate_used: true,
+        };
         assert!(
-            matches!(states.last(), Some(SourceState::Backoff { code, message, retry_ms })
-                if timeout(code, message) && (800..=1_200).contains(retry_ms)),
+            matches!(states.last(), Some(SourceState::Backoff { code, message, retry_ms, position })
+                if timeout(code, message) && delays.contains(retry_ms) && *position == after),
             "backoff last: {states:?}"
         );
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
@@ -4220,6 +4271,16 @@ mod tests {
         assert_eq!(
             ended(h.worker).await.unwrap().unwrap(),
             ExitReason::Shutdown
+        );
+    }
+
+    /// A source that streamed stably says so: the supervisor's next worker
+    /// starts its schedule at the first step.
+    #[test]
+    fn stable_streaming_reaches_the_supervisor() {
+        assert_eq!(
+            super::source_state(RunnerEvent::Stable),
+            SourceState::Stable
         );
     }
 
