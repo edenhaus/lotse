@@ -82,7 +82,6 @@ fn supervisor_with(connects: NonZeroUsize) -> Supervisor {
             version: "0.0.0-test".into(),
             build: BuildInfo {
                 target: "test".into(),
-                git_sha: None,
                 rustc: "test".into(),
             },
             sandbox: SandboxInfo {
@@ -162,6 +161,18 @@ async fn preload_starts_a_worker_that_goes_live_and_linger_stops_it() {
     assert_eq!(front["tracks"][0]["id"], "v0");
     assert_eq!(front["tracks"][0]["codec"], "h264");
     assert_eq!(front["tracks"][0]["kind"], "video");
+    // The fake source's H.264 track carries no SPS: neither its
+    // `profile-level-id` nor its picture is known, and it has no audio
+    // parameters.
+    for field in [
+        "profile_level_id",
+        "width",
+        "height",
+        "sample_rate",
+        "channels",
+    ] {
+        assert!(front["tracks"][0].get(field).is_none(), "{field}: {front}");
+    }
     let worker = &front["sources"][0]["connection"]["worker"];
     assert!(worker["pid"].as_u64().unwrap() > 0, "{front}");
     assert_eq!(worker["restarts"], 0);
@@ -212,7 +223,7 @@ async fn rfc3550_6_4_1_stream_get_reports_the_sync_tracks_have_now() {
     }
     let clock = SystemClock;
     let deadline = clock.now() + Duration::from_secs(10);
-    loop {
+    let front = loop {
         let front = result(
             call(
                 &s,
@@ -227,11 +238,20 @@ async fn rfc3550_6_4_1_stream_get_reports_the_sync_tracks_have_now() {
             .map(|track| track["sync"].as_str().unwrap())
             .collect();
         if syncs == ["sender_reports", "sender_reports"] {
-            break;
+            break front;
         }
         assert!(clock.now() < deadline, "still {syncs:?}: {front}");
         clock.sleep(Duration::from_millis(50)).await;
-    }
+    };
+    // ISO/IEC 14496-3 §1.6.2.1: the AAC track's rate and channels, from
+    // its `AudioSpecificConfig`.
+    let audio = &front["tracks"][1];
+    assert_eq!(
+        (&audio["codec"], &audio["sample_rate"], &audio["channels"]),
+        (&json!("aac_lc"), &json!(16_000), &json!(1)),
+        "{front}"
+    );
+    assert!(audio.get("width").is_none(), "{front}");
     s.shutdown().await;
 }
 

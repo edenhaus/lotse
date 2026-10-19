@@ -18,7 +18,9 @@
 //! Every connection attempt the worker announces waits for a permit at
 //! the connect gate; the driver sends the worker its grant once its slot
 //! holds one, and gives the permit back when the attempt ends, the worker
-//! exits or is stopped, or the driver stops ([`crate::connect`]).
+//! exits or is stopped, or the driver stops ([`crate::connect`]). While a
+//! viewer session is on the connection ([`Demand::viewers`]), its
+//! attempts queue there ahead of those only preloads want.
 //!
 //! A stream that opts in to the camera's backchannel or out of it only
 //! tells the running worker, whose source turns its probe on or off
@@ -66,6 +68,25 @@ pub(crate) const COMMAND_QUEUE: usize = 256;
 /// counters once a second from the moment it runs its source, so ten
 /// missed in a row is a worker that hangs, not one that is busy.
 pub(crate) const WORKER_SILENCE_LIMIT: Duration = Duration::from_secs(10);
+
+/// Who wants a connection, as its registry counts them; the driver follows
+/// it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Demand {
+    /// The preloaded streams reading from the connection.
+    pub(crate) preloads: u32,
+    /// The viewer sessions on the connection: each waits for its answer
+    /// or its media, so the connection's attempts come first at the
+    /// connect gate while there is one.
+    pub(crate) viewers: u32,
+}
+
+impl Demand {
+    /// How many want the connection: the machine runs it while any does.
+    pub(crate) const fn total(self) -> u32 {
+        self.preloads.saturating_add(self.viewers)
+    }
+}
 
 /// A message for the connection's worker.
 #[derive(Debug)]
@@ -299,7 +320,7 @@ impl Pending {
 /// What woke the driver.
 enum Wake {
     /// Demand changed, or the registry dropped the connection (`None`).
-    Demand(Option<u32>),
+    Demand(Option<Demand>),
     /// The worker said something or exited.
     Worker(WorkerEvent),
     /// A session message for the worker.
@@ -349,7 +370,7 @@ pub(crate) struct Driver {
     /// The registry side.
     shared: Arc<Shared>,
     /// The demand to follow.
-    demand: watch::Receiver<u32>,
+    demand: watch::Receiver<Demand>,
     /// Session messages from the handler.
     commands: mpsc::Receiver<DriverCommand>,
     /// The queue's sending side, for the sessions' demux sinks.
@@ -404,7 +425,7 @@ impl Driver {
     pub(crate) fn new(
         spec: DriverSpec,
         shared: Arc<Shared>,
-        demand: watch::Receiver<u32>,
+        demand: watch::Receiver<Demand>,
         commands: (mpsc::Sender<DriverCommand>, mpsc::Receiver<DriverCommand>),
         config: ConnectionConfig,
     ) -> Self {
@@ -443,10 +464,9 @@ impl Driver {
     /// within the shutdown budget.
     pub(crate) async fn run(mut self) {
         tracing::info!(spec = ?self.spec, "connection driver started");
+        // No demand yet leaves the machine idle and the slots unwanted.
         let initial = *self.demand.borrow_and_update();
-        if initial > 0 {
-            self.feed(Input::Demand(initial));
-        }
+        self.follow(initial);
         self.publish();
         loop {
             let wake = self.wait().await;
@@ -491,10 +511,21 @@ impl Driver {
         }
     }
 
+    /// Follows `demand`: the machine runs the connection while anyone wants
+    /// it, and its attempts come first at the connect gate while a viewer
+    /// does.
+    fn follow(&mut self, demand: Demand) {
+        let wanted = demand.viewers > 0;
+        self.connect.want(wanted);
+        self.switch_connect.want(wanted);
+        self.probe_connect.want(wanted);
+        self.feed(Input::Demand(demand.total()));
+    }
+
     /// Acts on what happened.
     async fn handle(&mut self, wake: Wake) {
         match wake {
-            Wake::Demand(Some(demand)) => self.feed(Input::Demand(demand)),
+            Wake::Demand(Some(demand)) => self.follow(demand),
             Wake::Demand(None)
             | Wake::Connect(SlotWake::LeaseExpired)
             | Wake::SwitchConnect(SlotWake::LeaseExpired)
@@ -569,11 +600,7 @@ impl Driver {
                     tracing::warn!(pid = worker.pid(), error = %err, "probe connect grant could not be sent to the worker");
                 }
             }
-            Wake::RetryResolve => {
-                self.pending = Pending::Nothing;
-                self.feed(Input::Report(WorkerReport::Connecting));
-                self.start_resolving();
-            }
+            Wake::RetryResolve => self.retry_resolving(),
             Wake::SwitchResolved(_)
             | Wake::RetrySwitchResolve
             | Wake::SwitchConnect(SlotWake::Grant) => self.handle_switch(wake).await,
@@ -634,8 +661,9 @@ impl Driver {
 
     /// `SwitchSource`: the connection runs `spec` from now on. A running
     /// worker switches to it in place once its host is resolved; without
-    /// one, the next worker starts with it, and a lookup under way is
-    /// started over for the new host.
+    /// one, the next worker starts with it, a lookup under way is started
+    /// over for the new host, and so is a lookup waiting to retry: its wait
+    /// was the old host's, so the new one is looked up at once.
     fn on_switch_source(&mut self, spec: DriverSpec) {
         tracing::info!(spec = ?spec, "connection switches its source");
         self.spec = spec;
@@ -644,9 +672,28 @@ impl Driver {
         self.snapshot.switches = self.snapshot.switches.wrapping_add(1);
         if self.worker.is_some() {
             self.start_resolving_switch();
-        } else if matches!(self.pending, Pending::Resolving(_)) {
-            self.start_resolving();
+        } else {
+            match self.pending {
+                Pending::Resolving(_) => self.start_resolving(),
+                Pending::Retry(_) => {
+                    tracing::debug!(
+                        host = self.spec.host,
+                        "source switched while the lookup waited to retry; the new host is looked up at once"
+                    );
+                    self.retry_resolving();
+                }
+                Pending::Nothing | Pending::ResolvingSwitch(_) | Pending::RetrySwitch(_) => {}
+            }
         }
+    }
+
+    /// Ends the wait before the host lookup is retried, which drops its
+    /// timer, and looks the host up again: the connection is connecting
+    /// once more.
+    fn retry_resolving(&mut self) {
+        self.pending = Pending::Nothing;
+        self.feed(Input::Report(WorkerReport::Connecting));
+        self.start_resolving();
     }
 
     /// `Backchannel`: the connection runs `spec` from now on, which differs
@@ -1167,6 +1214,12 @@ mod tests {
     use crate::test_support::{environment, private_dir};
     use crate::worker::WorkerManager;
 
+    /// One preloaded stream wants the connection, no viewer.
+    const PRELOAD: Demand = Demand {
+        preloads: 1,
+        viewers: 0,
+    };
+
     fn shared(binary: &str) -> Arc<Shared> {
         shared_with(binary, Arc::new(SystemClock))
     }
@@ -1251,8 +1304,7 @@ mod tests {
         let spec = DriverSpec {
             connection_id: "c1".into(),
             url: "rtsps://admin:secret@cam/key?token=tok".into(),
-            options: r#"{"onvif":{"url":"http://admin:secret@cam/onvif","profile_token":"p"}}"#
-                .into(),
+            options: r#"{"user_agent":"secret/1"}"#.into(),
             host: "cam".into(),
             port: Some(322),
             loopback_relay: true,
@@ -1262,7 +1314,7 @@ mod tests {
         for secret in ["secret", "key", "tok"] {
             assert!(!logged.contains(secret), "{logged}");
         }
-        assert!(logged.contains(r#"options: ["onvif"]"#), "{logged}");
+        assert!(logged.contains(r#"options: ["user_agent"]"#), "{logged}");
         assert!(
             logged.contains("port: Some(322)") && logged.contains("loopback_relay: true"),
             "{logged}"
@@ -1297,7 +1349,7 @@ mod tests {
 
     #[test]
     fn messages_wait_for_a_worker_and_a_close_withdraws_its_session() {
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = Driver::new(
             DriverSpec {
                 connection_id: "c1".into(),
@@ -1582,7 +1634,7 @@ mod tests {
         use lotse_api_types::stream::TalkerReason;
 
         let shared = shared("/bin/sh");
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let (commands, _commands) = mpsc::channel(1);
         let (events, _events) = mpsc::channel(1);
         {
@@ -1672,7 +1724,7 @@ mod tests {
     }
 
     /// A driver of `fake://127.0.0.1/` on `shared`, following `demand`.
-    fn driver_on(shared: &Arc<Shared>, demand: watch::Receiver<u32>) -> Driver {
+    fn driver_on(shared: &Arc<Shared>, demand: watch::Receiver<Demand>) -> Driver {
         Driver::new(
             DriverSpec {
                 connection_id: "c1".into(),
@@ -1700,9 +1752,9 @@ mod tests {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with(script.to_str().unwrap(), clock.clone());
         let in_flight = || shared.connects.in_flight();
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let driver = &mut driver_on(&shared, demand);
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(driver).await;
         step(driver).await;
         assert!(driver.worker.is_some());
@@ -1743,7 +1795,7 @@ mod tests {
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Connecting));
         driver.on_worker_event(WorkerEvent::ProbeConnecting(1));
         assert_eq!(in_flight(), 2);
-        demand_tx.send_replace(0);
+        demand_tx.send_replace(Demand::default());
         step(driver).await;
         assert_eq!(driver.machine.state(), ConnectionState::Idle);
         assert_eq!(in_flight(), 0, "a stopped worker gives both back");
@@ -1797,7 +1849,7 @@ mod tests {
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let shared = shared(script.to_str().unwrap());
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         driver.worker = Some(shared.manager.spawn(&[], false).unwrap());
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Connecting));
@@ -1814,6 +1866,65 @@ mod tests {
         drop(driver);
         let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The slot's wake if one is ready within a few scheduler turns.
+    async fn slot_ready(slot: &mut ConnectSlot) -> Option<SlotWake> {
+        for _ in 0..10 {
+            tokio::select! {
+                biased;
+                wake = slot.wait() => return Some(wake),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        None
+    }
+
+    /// Work list W3: once a viewer is on the connection, its attempt goes
+    /// ahead of the preloads' queued at the connect gate; before, it
+    /// queues behind them like any preload's.
+    #[tokio::test]
+    async fn a_viewer_on_the_connection_puts_its_attempt_ahead_of_queued_preload_retries() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        // Every permit is held, and two preloads' retries queue.
+        let mut others: Vec<ConnectSlot> = (0..6)
+            .map(|_| ConnectSlot::new(clock.clone(), CONNECT_LEASE))
+            .collect();
+        for (n, other) in others.iter_mut().enumerate() {
+            other.request(&shared.connects, "reconnecting");
+            let expected = (n < 4).then_some(SlotWake::Grant);
+            assert_eq!(slot_ready(other).await, expected);
+        }
+        assert_eq!(shared.connects.in_flight(), 4);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        driver.handle(Wake::Demand(Some(PRELOAD))).await;
+        driver.on_worker_event(WorkerEvent::Report(WorkerReport::Connecting));
+        assert_eq!(slot_ready(&mut driver.connect).await, None);
+        // Only a preload wants the connection: it waits its turn.
+        others[0].release("live");
+        assert_eq!(slot_ready(&mut others[4]).await, Some(SlotWake::Grant));
+        assert_eq!(slot_ready(&mut driver.connect).await, None);
+        // A viewer comes: the attempt goes before the other preload's.
+        let viewer = Demand {
+            preloads: 1,
+            viewers: 1,
+        };
+        driver.handle(Wake::Demand(Some(viewer))).await;
+        for slot in [
+            &driver.connect,
+            &driver.switch_connect,
+            &driver.probe_connect,
+        ] {
+            assert!(format!("{slot:?}").contains("wanted: true"));
+        }
+        others[1].release("live");
+        assert_eq!(slot_ready(&mut others[5]).await, None);
+        assert_eq!(slot_ready(&mut driver.connect).await, Some(SlotWake::Grant));
+        assert_eq!(shared.connects.in_flight(), 4);
+        drop(driver);
+        assert_eq!(slot_ready(&mut others[5]).await, Some(SlotWake::Grant));
     }
 
     /// A probe of the camera's backchannel takes a connect permit of its
@@ -1834,7 +1945,7 @@ mod tests {
             .unwrap();
         let shared = shared(script.to_str().unwrap());
         let in_flight = || shared.connects.in_flight();
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         driver.worker = Some(shared.manager.spawn(&[], false).unwrap());
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Connecting));
@@ -1889,7 +2000,7 @@ mod tests {
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let shared = shared(script.to_str().unwrap());
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let switch = |url: &str, host: &str| DriverSpec {
             connection_id: "c1".into(),
@@ -2006,7 +2117,7 @@ mod tests {
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let shared = shared(script.to_str().unwrap());
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let spec = |options: &str, backchannel: bool| DriverSpec {
             connection_id: "c1".into(),
@@ -2084,7 +2195,7 @@ mod tests {
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
         let shared = shared("/usr/bin/true");
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         driver.worker = Some(dead_worker(&shared).await);
         driver.start_resolving();
@@ -2096,7 +2207,7 @@ mod tests {
     async fn a_standby_s_attempts_hold_their_own_connect_permit() {
         let shared = shared("/usr/bin/true");
         let in_flight = || shared.connects.in_flight();
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         // The source's attempt and the standby's each hold one.
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Connecting));
@@ -2151,7 +2262,7 @@ mod tests {
     #[tokio::test]
     async fn a_grant_to_a_worker_that_is_gone_waits_for_its_exit() {
         let shared = shared("/usr/bin/true");
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let mut worker = shared.manager.spawn(&[], false).unwrap();
         while !matches!(worker.next_event().await, WorkerEvent::Exited(_)) {}
@@ -2215,10 +2326,10 @@ mod tests {
             &worker_script(&dir, "exec 0<&-\nexec sleep 30"),
             clock.clone(),
         );
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut owned = driver_on(&shared, demand);
         let driver = &mut owned;
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(driver).await;
         assert_eq!(bounded_step(driver).await, "resolved:true");
         assert!(driver.silence.is_some(), "a spawned worker is timed");
@@ -2249,9 +2360,9 @@ mod tests {
         let dir = private_dir("driver-silent");
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with(&worker_script(&dir, "exec sleep 30"), clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         assert_eq!(bounded_step(&mut driver).await, "resolved:true");
         let almost = WORKER_SILENCE_LIMIT
@@ -2276,7 +2387,7 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         step(&mut driver).await;
         assert_eq!(bounded_step(&mut driver).await, "resolved:true");
-        demand_tx.send_replace(0);
+        demand_tx.send_replace(Demand::default());
         step(&mut driver).await;
         assert_eq!(driver.machine.state(), ConnectionState::Idle);
         assert!(driver.silence.is_none());
@@ -2307,9 +2418,9 @@ mod tests {
     async fn a_failed_lookup_is_a_backoff_and_retried_on_the_clock() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/usr/bin/true", clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         assert!(matches!(driver.pending, Pending::Resolving(_)));
         let captured = crate::test_support::Captured::default();
@@ -2341,10 +2452,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_switch_during_the_lookup_retry_looks_up_the_new_source_at_once() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        demand_tx.send_replace(PRELOAD);
+        step(&mut driver).await;
+        driver
+            .handle(Wake::Resolved(Err("no such host".into())))
+            .await;
+        assert!(matches!(driver.pending, Pending::Retry(_)));
+        assert_eq!(driver.machine.state(), ConnectionState::Backoff);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver
+            .handle(Wake::Command(DriverCommand::SwitchSource(DriverSpec {
+                host: "127.0.0.2".into(),
+                port: Some(7),
+                ..spec_of("fake://127.0.0.2:7/")
+            })))
+            .await;
+        assert_eq!(driver.machine.state(), ConnectionState::Connecting);
+        assert!(
+            matches!(driver.pending, Pending::Resolving(_)),
+            "the new source is looked up without waiting out the old retry"
+        );
+        let logged = captured.lines("source switched while the lookup waited to retry");
+        assert!(logged[0].contains(r#"host="127.0.0.2""#), "{logged:?}");
+        // The old retry's wait is gone: past it, the wake is the new
+        // source's lookup, not the old one's retry.
+        clock.advance(Duration::from_secs(120));
+        let new_source: SocketAddr = "127.0.0.2:7".parse().unwrap();
+        let wake = next_wake(&mut driver).await;
+        assert!(
+            matches!(&wake, Wake::Resolved(Ok(addrs)) if addrs == &[new_source]),
+            "the new source's lookup finishes first"
+        );
+        drop((driver, demand_tx));
+    }
+
+    #[tokio::test]
     async fn a_switch_whose_lookup_fails_waits_on_the_clock_and_a_dead_worker_is_not_told() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/usr/bin/true", clock.clone());
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
@@ -2420,7 +2572,7 @@ mod tests {
     #[tokio::test]
     async fn the_worker_s_reports_reach_the_snapshot_and_the_log() {
         let shared = shared("/usr/bin/true");
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
@@ -2443,10 +2595,10 @@ mod tests {
             id: "v0".into(),
             kind: "video".into(),
             codec: "h264".into(),
-            clock_rate: 90_000,
             sync: "arrival".into(),
             derived_from: None,
             audio_delay_ms: None,
+            params: lotse_ipc::TrackParams::default(),
         };
         driver.on_worker_event(WorkerEvent::Tracks(vec![track.clone()]));
         assert_eq!(driver.snapshot.tracks, [track]);
@@ -2486,7 +2638,7 @@ mod tests {
     async fn a_worker_s_repeated_declaration_logs_nothing_and_a_changed_one_once_per_interval() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/usr/bin/true", clock.clone());
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
@@ -2494,10 +2646,10 @@ mod tests {
             id: id.into(),
             kind: "video".into(),
             codec: "h264".into(),
-            clock_rate: 90_000,
             sync: "arrival".into(),
             derived_from: None,
             audio_delay_ms: None,
+            params: lotse_ipc::TrackParams::default(),
         };
         for _ in 0..100 {
             driver.on_worker_event(WorkerEvent::Tracks(vec![track("v0")]));
@@ -2530,10 +2682,10 @@ mod tests {
     async fn a_worker_that_cannot_start_counts_as_a_crash() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/nonexistent/lotse", clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut owned = driver_on(&shared, demand);
         let driver = &mut owned;
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(driver).await;
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
@@ -2588,7 +2740,11 @@ mod tests {
                 port: None,
                 loopback_relay: false,
                 backchannel: false,
-                demand: watch::channel(1).0,
+                demand: watch::channel(Demand {
+                    preloads: 0,
+                    viewers: 1,
+                })
+                .0,
                 snapshot: ConnectionSnapshot::idle(UNIX_EPOCH),
                 switches,
                 streams: ["front".to_owned()].into(),
@@ -2624,7 +2780,7 @@ mod tests {
     async fn a_failed_lookup_closes_the_waiting_session_with_its_error_and_no_credentials() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/usr/bin/true", clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = Driver::new(
             DriverSpec {
                 connection_id: "c1".into(),
@@ -2641,7 +2797,7 @@ mod tests {
             ConnectionConfig::default(),
         );
         let mut events = waiting_session(&shared, "fake://admin:hunter2@cam.example/");
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         driver.publish();
         assert!(shared.lock().sessions.contains_key("s1"), "connecting");
@@ -2672,10 +2828,10 @@ mod tests {
     async fn a_worker_that_cannot_start_closes_the_waiting_session_with_worker_crashed() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/nonexistent/lotse", clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let mut events = waiting_session(&shared, "fake://127.0.0.1/");
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         driver
             .handle(Wake::Resolved(Ok(vec!["127.0.0.1:1".parse().unwrap()])))
@@ -2695,10 +2851,10 @@ mod tests {
     async fn a_waiting_session_closes_only_with_a_failed_attempt_of_the_current_source() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/usr/bin/true", clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let mut events = waiting_session(&shared, "fake://127.0.0.1/");
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         let on = |driver: &mut Driver, event| {
             driver.on_worker_event(event);
@@ -2796,9 +2952,9 @@ mod tests {
     #[tokio::test]
     async fn a_worker_crash_during_a_switch_is_the_failure_an_offer_closes_with() {
         let shared = shared("/usr/bin/true");
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Live));
         driver.on_switch_source(driver.spec.clone());
@@ -2815,9 +2971,9 @@ mod tests {
     #[tokio::test]
     async fn the_last_error_during_a_switch_is_the_failure_a_waiting_session_closes_with() {
         let shared = shared("/usr/bin/true");
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         let on = |driver: &mut Driver, event| {
             driver.on_worker_event(event);
@@ -2862,9 +3018,9 @@ mod tests {
     async fn a_waiting_session_closes_with_the_failed_lookup_of_the_source_switched_to() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/usr/bin/true", clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         // The old source's retry has failed, and the switch away from it
         // waits for the new host.
@@ -2902,11 +3058,11 @@ mod tests {
         let dir = private_dir("driver-too-large");
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with(&worker_script(&dir, "exec sleep 30"), clock.clone());
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         // Over the channel's message limit: the send fails before a write.
         driver.spec.url = format!("fake://127.0.0.1/{}", "x".repeat(300 * 1024));
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
@@ -2927,7 +3083,7 @@ mod tests {
     #[tokio::test]
     async fn the_silence_limit_without_a_worker_does_nothing() {
         let shared = shared("/usr/bin/true");
-        let (_demand_tx, demand) = watch::channel(0);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         driver.handle(Wake::WorkerSilent).await;
         assert!(driver.worker.is_none());
@@ -2945,7 +3101,7 @@ mod tests {
         let shared = shared_with(script.to_str().unwrap(), clock.clone());
         let linger = Duration::from_secs(5);
         let almost = Duration::from_millis(4_999);
-        let (demand_tx, demand) = watch::channel(0);
+        let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = Driver::new(
             DriverSpec {
                 connection_id: "c1".into(),
@@ -2965,7 +3121,7 @@ mod tests {
             },
         );
         // `preload: true` is demand without a viewer: the worker starts.
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         assert_eq!(driver.machine.state(), ConnectionState::Connecting);
         step(&mut driver).await;
@@ -3003,19 +3159,19 @@ mod tests {
         );
 
         // Preload off with no viewers: the linger runs, the worker stays.
-        demand_tx.send_replace(0);
+        demand_tx.send_replace(Demand::default());
         step(&mut driver).await;
         assert_eq!(driver.machine.state(), ConnectionState::Draining);
         clock.advance(almost);
         assert!(ready_wake(&mut driver).await.is_none(), "still lingering");
         // A viewer within the linger takes the warm worker.
-        demand_tx.send_replace(1);
+        demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         assert_eq!(driver.machine.state(), ConnectionState::Live);
         assert!(driver.linger.is_none(), "the linger is cancelled");
         assert_eq!(driver.snapshot.worker.as_ref().map(|w| w.pid), Some(pid));
         // It leaves; this time the linger runs out and the worker stops.
-        demand_tx.send_replace(0);
+        demand_tx.send_replace(Demand::default());
         step(&mut driver).await;
         assert_eq!(driver.machine.state(), ConnectionState::Draining);
         clock.advance(almost);

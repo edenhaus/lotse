@@ -1,6 +1,7 @@
 //! The frames on the WebSocket: `hello`, commands' `result`s, `event`s,
 //! `pong` and `shutdown`.
 
+#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +13,8 @@ use crate::error::ApiError;
 macro_rules! frame_tag {
     ($(#[$doc:meta])* $name:ident = $value:literal) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schema", derive(JsonSchema))]
         pub enum $name {
             /// The only value.
             #[default]
@@ -44,7 +46,8 @@ frame_tag! {
 }
 
 /// The first message on every connection, before any result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Hello {
     /// `"hello"`.
     #[serde(rename = "type")]
@@ -61,8 +64,9 @@ pub struct Hello {
 }
 
 /// A successful `result`: exactly one per command.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[schemars(rename = "Success_for_{T}")] // a definition per result type, named after it
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "Success_for_{T}"))] // a definition per result type, named after it
 pub struct Success<T> {
     /// `"result"`.
     #[serde(rename = "type")]
@@ -88,7 +92,8 @@ impl<T> Success<T> {
 }
 
 /// A failed `result`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Failure {
     /// `"result"`.
     #[serde(rename = "type")]
@@ -114,8 +119,9 @@ impl Failure {
 }
 
 /// An `event` of a subscription; `id` is the subscribing command's.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[schemars(rename = "EventFrame_for_{E}")] // a definition per event type, named after it
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "EventFrame_for_{E}"))] // a definition per event type, named after it
 pub struct EventFrame<E> {
     /// `"event"`.
     #[serde(rename = "type")]
@@ -138,7 +144,8 @@ impl<E> EventFrame<E> {
 }
 
 /// The answer to `ping`, sent instead of a `result`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Pong {
     /// `"pong"`.
     #[serde(rename = "type")]
@@ -158,7 +165,8 @@ impl Pong {
 }
 
 /// Sent once when the daemon shuts down gracefully, before the close.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Shutdown {
     /// `"shutdown"`.
     #[serde(rename = "type")]
@@ -167,7 +175,8 @@ pub struct Shutdown {
 
 /// An empty result (`stream/delete`, `unsubscribe`, the subscriptions,
 /// `webrtc/candidate`, `session/close`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Empty {}
 
 #[cfg(test)]

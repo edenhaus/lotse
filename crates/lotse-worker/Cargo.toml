@@ -20,11 +20,13 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "net", "io-util"] } # the worker's runtime, channels, the datagram channel and ICE-TCP framing
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+lotse-codec = { workspace = true } # a video track's picture size, read from its SPS for `stream/get`
 lotse-core = { workspace = true }
 lotse-ipc = { workspace = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true } # the relay framer's allocation count (tests/allocations.rs)
+lotse-codec = { workspace = true, features = ["test-util"] } # hand-built parameter sets
 lotse-core = { workspace = true, features = ["test-util"] } # the fake source
 lotse-testing = { workspace = true } # the DSCP datagrams arrive with (Linux)
 rustix = { workspace = true, features = ["fs", "process", "stdio"] } # reads the shared socket's O_NONBLOCK, fills the descriptor table and puts the control channel on stdin in tests

@@ -1,5 +1,5 @@
 //! Prints the JSON Schema bundle, for committing it:
-//! `cargo run -p lotse-api-types --example schema > crates/lotse-api-types/schema/api.json`.
+//! `cargo run -p lotse-api-types --features schema --example schema > crates/lotse-api-types/schema/api.json`.
 
 use std::io::Write as _;
 

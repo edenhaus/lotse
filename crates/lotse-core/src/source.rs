@@ -28,29 +28,11 @@ use crate::source_url::SourceUrl;
 use crate::task::{BoxFuture, spawn_named};
 use crate::track::{Feeds, Track, TrackId, TrackLimits};
 
-/// How a source protocol obtains media.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Direction {
-    /// The daemon connects to the source (RTSP, RTMP `play`, HTTP).
-    Pull,
-    /// A publisher connects to the daemon (RTMP `publish`, WHIP). Behaves as
-    /// `preload: true`, since a publisher cannot be asked to start.
-    Push,
-    /// Control logic that yields a spec for another scheme (ONVIF).
-    Resolver,
-}
-
 /// What a source protocol can do, declared by its factory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceCapabilities {
-    /// Pull, push or resolver.
-    pub direction: Direction,
     /// The protocol can carry audio back to the device.
     pub backchannel: bool,
-    /// The protocol or device can be asked for a keyframe.
-    pub keyframe_request: bool,
-    /// The protocol can hand out a camera-native snapshot URI.
-    pub snapshot_uri: bool,
 }
 
 /// Why a factory refused a URL and its options. The API reports it as
@@ -79,7 +61,7 @@ pub enum SourceConfigError {
 /// One source protocol, registered at startup behind its Cargo feature.
 pub trait SourceFactory: fmt::Debug + Send + Sync {
     /// The URL schemes this protocol serves (`rtsp`, `rtsps`; `http`,
-    /// `https`; later `rtmp`, `onvif`, ...), lowercase. `info.schemes` is the union over the registry.
+    /// `https`; later `rtmp`, ...), lowercase. `info.schemes` is the union over the registry.
     fn schemes(&self) -> &'static [&'static str];
 
     /// What the protocol can do.
@@ -123,25 +105,6 @@ pub struct SourceDescriptor {
     pub options: serde_json::Value,
 }
 
-/// How a keyframe request went. Sources that cannot force a keyframe
-/// answer `Unsupported`, and the next camera keyframe repairs the picture.
-pub enum KeyframeRequest {
-    /// The protocol or device has no way to force a keyframe.
-    Unsupported,
-    /// The request is on its way; the future resolves when the device
-    /// acknowledged it (or refused it).
-    Sent(BoxFuture<'static, Result<(), SourceError>>),
-}
-
-impl fmt::Debug for KeyframeRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Unsupported => "KeyframeRequest::Unsupported",
-            Self::Sent(_) => "KeyframeRequest::Sent(..)",
-        })
-    }
-}
-
 /// One validated source. `run` is called once per connection attempt.
 pub trait Source: fmt::Debug + Send + Sync {
     /// Protocol, URL and options with every secret redacted.
@@ -171,31 +134,8 @@ pub trait Source: fmt::Debug + Send + Sync {
 
     /// Runs one connection (or one publisher session) until it ends. Must
     /// honor `ctx.cancel` within 100 ms, send the protocol's teardown, and
-    /// return a typed exit. Boxed so `dyn Source` stays object-safe.
-    fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceExit>;
-
-    /// Asks the device for a keyframe, if the protocol can.
-    fn request_keyframe(&self) -> KeyframeRequest {
-        KeyframeRequest::Unsupported
-    }
-}
-
-/// How a connection ended.
-#[derive(Debug)]
-pub enum SourceExit {
-    /// A resolver found the spec to run instead (ONVIF → `rtsp://`).
-    Resolved(SourceSpec),
-    /// The connection is over, for this reason.
-    Ended(SourceError),
-}
-
-/// A URL and its options, as `stream/put` carries them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceSpec {
-    /// The source URL.
-    pub url: SourceUrl,
-    /// The per-scheme options, untyped until a factory validates them.
-    pub options: serde_json::Value,
+    /// return why it ended. Boxed so `dyn Source` stays object-safe.
+    fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceError>;
 }
 
 /// Why a connection ended. The API code is the variant's `code()`; the
@@ -2104,15 +2044,5 @@ mod tests {
             .to_string(),
             "invalid url for scheme rtsp: no path"
         );
-    }
-
-    #[test]
-    fn keyframe_request_debug_names_the_variant() {
-        assert_eq!(
-            format!("{:?}", KeyframeRequest::Unsupported),
-            "KeyframeRequest::Unsupported"
-        );
-        let sent = KeyframeRequest::Sent(Box::pin(std::future::ready(Ok(()))));
-        assert_eq!(format!("{sent:?}"), "KeyframeRequest::Sent(..)");
     }
 }

@@ -19,7 +19,7 @@ changing `[tools]`, run `mise lock` and commit both files.
 
 Every check is a prek hook in `.pre-commit-config.yaml`: fmt, clippy,
 rustdoc, cargo-hack, cargo-shear, the fuzz crate's `cargo check`, the
-crate-layering and license-list checks, cargo-deny, codespell, actionlint, zizmor and file hygiene run on `git commit` (only when matching files changed).
+crate-layering, license-list and fuzz-select checks, cargo-deny, codespell, actionlint, zizmor and file hygiene run on `git commit` (only when matching files changed).
 Add new checks there. No test
 is a hook: the tests, the doctests, coverage and mutants are mise tasks
 that CI runs.
@@ -42,8 +42,9 @@ parallel: on a PR only the targets built from a file it changed
 its corpus in `edenhaus/lotse-fuzz-corpus`, which only `main`'s Fuzz corpus
 job writes (a token of the lotse-bot app, whose key is in the `lotse-bot` environment); every compiling job keeps a Rust
 cache, saved by every run and restored from the PR's own (GitHub scopes
-them to it) or else from `main`'s; only the Mutants jobs save none and
-restore the one the Mutants cache job builds on `main`. A new job goes
+them to it) or else from `main`'s; only the Mutants jobs (a PR's changed
+lines, and nightly the whole workspace, each sharded by its Mutants plan job)
+save none and restore the one the Mutants cache job builds on `main`. A new job goes
 into `ci.yml` and into the needs of its last job, All required jobs pass,
 the run's one verdict and the one check of it the ruleset requires;
 workflow and job names start with a capital letter.
@@ -57,8 +58,9 @@ workflow and job names start with a capital letter.
 | `mise run coverage` | the 100 % line-coverage gate as CI runs it: `coverage-archive`, then `coverage-musl` |
 | `mise run coverage-archive` | the musl tests built with coverage instrumentation and archived for other machines (CI's Coverage build job) |
 | `mise run coverage-musl` | the 100 % line-coverage gate on the musl target, from `coverage-archive`'s archive; writes `target/cov/lcov.info` (CI's Tests jobs) |
-| `mise run mutants [base]` | `cargo mutants --in-diff` against a base ref (default `origin/main`); CI splits it over up to 8 jobs (`scripts/mutants-shards.sh`, `--shard k/n --in-place --skip-baseline`) |
+| `mise run mutants [base] [--all]` | `cargo mutants --in-diff` against a base ref (default `origin/main`), or with `--all` the whole workspace (CI's nightly run); CI splits it over up to 8 jobs, nightly up to 40 (`scripts/mutants-shards.sh`, `--shard k/n --in-place --skip-baseline`) |
 | `mise run mutants-cache` | each package's tests built alone, as cargo-mutants builds a mutant (CI's Mutants cache job on `main`) |
+| `mise run bench [divan args]` | the divan microbenchmarks of the media path (`benches/` of lotse-codec, lotse-http, lotse-supervisor) in the release profile, e.g. `mise run bench h264 --sample-count 10`; a report, not a gate, and no CI job yet |
 | `mise run turn-e2e` | the TURN client against a real coturn in Docker (ignored `coturn_` tests) |
 | `mise run load [cameras] [viewers] [duration]` | the load generator against a release daemon (`target/load-report.json`) |
 | `mise run soak [duration] [cycle]` | the soak: viewer and camera churn, checked for memory, task and descriptor growth (`target/soak-report.json`) |
@@ -142,7 +144,7 @@ The clients, the Python `lotse-client` among them, live in their own repository,
 - Conventional Commits PR titles, enforced by `pr-title.yml`: PRs are
   squash-merged with their title, so commit messages are not checked.
 - An API change flows Rust DTOs, then the bundle (`cargo run -p
-  lotse-api-types --example schema > crates/lotse-api-types/schema/api.json`),
+  lotse-api-types --features schema --example schema > crates/lotse-api-types/schema/api.json`),
   in one commit; the `api-schema` hook fails on a stale bundle. Once it
   reaches `main`, CI's clients job has lotse-clients open a PR with the bundle
   and the regenerated models, whose CI runs the contract tests against

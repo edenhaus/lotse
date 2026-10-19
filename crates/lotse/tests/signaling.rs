@@ -159,7 +159,6 @@ fn supervisor_with(linger: Duration) -> Daemon {
             version: "0.0.0-test".into(),
             build: BuildInfo {
                 target: "test".into(),
-                git_sha: None,
                 rustc: "test".into(),
             },
             sandbox: SandboxInfo {
@@ -401,6 +400,22 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
     assert_eq!(front["sessions"], json!(["ha-1"]));
     assert_eq!(front["last_error"], Value::Null);
     assert_eq!(front["sources"][0]["connection"]["id"], "c1");
+    // The camera's SPS, as its standby read it: RFC 6184 §8.1's
+    // `profile-level-id` and the picture of ISO/IEC 14496-10 §7.4.2.1.1.
+    let video = &front["tracks"][0];
+    assert_eq!(
+        (
+            &video["profile_level_id"],
+            &video["width"],
+            &video["height"]
+        ),
+        (
+            &json!("42c028"),
+            &json!(lotse_testing::fake_camera::WIDTH),
+            &json!(lotse_testing::fake_camera::HEIGHT)
+        ),
+        "{front}"
+    );
 
     s.shutdown().await;
     demux.stop();

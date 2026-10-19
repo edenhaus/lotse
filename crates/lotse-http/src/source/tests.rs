@@ -13,8 +13,9 @@ use bytes::Bytes;
 use lotse_core::clock::{Clock, FakeClock, SystemClock};
 use lotse_core::codec::CodecFamily;
 use lotse_core::media::MediaFrame;
-use lotse_core::source::{ResolvedPeer, Source, SourceError, SourceExit, TrackSet};
+use lotse_core::source::{ResolvedPeer, Source, SourceError, TrackSet};
 use lotse_core::source_url::SourceUrl;
+use lotse_core::text::CUT_MARK;
 use lotse_core::track::{FrameSubscription, SubscriptionError, Track};
 use lotse_core::{Codec, Kind};
 use lotse_testing::Harness;
@@ -178,7 +179,7 @@ impl Rig {
             }
         };
         tokio::select! {
-            exit = harness.finish() => ended(exit),
+            exit = harness.finish() => exit,
             () = ticker => panic!("the source did not exit"),
         }
     }
@@ -211,17 +212,10 @@ impl ReadyWithin for Harness {
     }
 }
 
-fn ended(exit: SourceExit) -> SourceError {
-    let SourceExit::Ended(err) = exit else {
-        panic!("{exit:?}");
-    };
-    err
-}
-
 /// Waits for the exit of a source the clock does not have to move for.
 async fn exit_within(harness: Harness, real: Duration) -> SourceError {
     tokio::select! {
-        exit = harness.finish() => ended(exit),
+        exit = harness.finish() => exit,
         () = SystemClock.sleep(real) => panic!("the source did not exit within {real:?}"),
     }
 }
@@ -544,10 +538,6 @@ async fn the_source_describes_itself_without_secrets() {
     assert!(!described.url.to_string().contains("secret"));
     assert_eq!(described.options["max_bandwidth"], 1);
     assert_eq!(source.connection_options()["max_bandwidth"], 1);
-    assert!(matches!(
-        source.request_keyframe(),
-        lotse_core::source::KeyframeRequest::Unsupported
-    ));
 }
 
 /// A camera key in the path, a token in the query of every URL and a
@@ -1391,9 +1381,9 @@ async fn a_refused_content_type_is_named_on_one_line_of_at_most_200_bytes() {
     let long = format!("text/html; q={}", "x".repeat(4096));
     rig.body("/long", &long, &b"<html></html>"[..]);
     let err = rig.exit(rig.start("/long")).await;
-    let shown = lotse_core::text::plain(&long, 200);
-    assert_eq!(shown.len(), 200);
-    assert!(shown.starts_with("text/html; q=xxx"), "{shown}");
+    let kept = SERVER_TEXT_BYTES - "text/html; q=".len() - CUT_MARK.len();
+    let shown = format!("text/html; q={}{CUT_MARK}", "x".repeat(kept));
+    assert_eq!(shown.len(), SERVER_TEXT_BYTES);
     assert_protocol(&err, &format!("Content-Type {shown}"));
     assert!(!err.to_string().contains(&"x".repeat(200)), "{err}");
     rig.stop().await;

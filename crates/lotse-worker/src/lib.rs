@@ -8,14 +8,20 @@
 //! supervisor on the channel it inherited as stdin and runs `lotse-core` for
 //! its `SourceConnection`. Kept out of the binary so it is a library with
 //! tests; the counterpart of `lotse-supervisor`. A worker runs exactly one
-//! source; a second `RunSource` is a protocol error.
+//! source; a second `RunSource` is a protocol error. Its sockets come
+//! once too: a second `Sockets` message is refused and its descriptors
+//! closed.
 //!
 //! Standards: RFC 8837 §5 (the audio track's DSCP, `sendmsg`), RFC 3542
 //! §6.1 and Linux `ip(7)` (the candidate's source address, `sendmsg`),
-//! RFC 8656 §12.4 (the `ChannelData` it frames, [`relay`]).
+//! RFC 8656 §12.4 (the `ChannelData` it frames, [`relay`]), RFC 6184 §8.1
+//! (the `profile-level-id` it reports) and the picture size of ISO/IEC
+//! 14496-10 §7.4.2.1.1 and ITU-T H.265 §7.4.3.2.1, which `lotse-codec`
+//! reads from a track's SPS.
 
 mod derived;
 mod ice_tcp;
+mod params;
 pub mod relay;
 mod sendmsg;
 mod sessions;
@@ -718,8 +724,18 @@ impl Serving<'_> {
     }
 
     /// The shared UDP socket and the datagram channel: the session manager
-    /// starts on them.
+    /// starts on them. The supervisor hands them over once; a second
+    /// `Sockets` message once a session manager runs is refused, its
+    /// descriptors closed as they drop here, so it can neither replace the
+    /// manager with its sessions nor leave descriptors behind (WRK-6).
     fn on_sockets(&mut self, fds: Vec<OwnedFd>) {
+        if self.sessions.is_some() {
+            tracing::warn!(
+                fds = fds.len(),
+                "second sockets message: the worker holds its sockets; refused"
+            );
+            return;
+        }
         let mut fds = fds.into_iter();
         let (Some(udp), Some(datagrams)) = (fds.next(), fds.next()) else {
             tracing::warn!("sockets message without two descriptors; ignored");
@@ -1172,17 +1188,22 @@ async fn talker_changed(talker: Option<&mut TalkerFeed>) -> TalkerChanged {
 /// track is synced as its source is, since its capture times come from
 /// the source's.
 fn track_infos(tracks: &DerivedTracks, mapper: &ClockMapper) -> Vec<TrackInfo> {
-    let info = |track: &Track, from: Option<TrackId>, delay: Option<Duration>| TrackInfo {
-        id: track.id().to_string(),
-        kind: track.kind().name().to_owned(),
-        codec: track.codec().name().to_owned(),
-        clock_rate: track.clock_rate(),
-        sync: mapper
-            .mode(from.unwrap_or_else(|| track.id()))
-            .name()
-            .to_owned(),
-        derived_from: from.map(|from| from.to_string()),
-        audio_delay_ms: delay.map(|delay| u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)),
+    let info = |track: &Track, from: Option<TrackId>, delay: Option<Duration>| {
+        // One snapshot of the descriptor for the name and the parameters:
+        // a reconnect can replace it between two loads.
+        let codec = track.codec();
+        TrackInfo {
+            id: track.id().to_string(),
+            kind: track.kind().name().to_owned(),
+            codec: codec.name().to_owned(),
+            sync: mapper
+                .mode(from.unwrap_or_else(|| track.id()))
+                .name()
+                .to_owned(),
+            derived_from: from.map(|from| from.to_string()),
+            audio_delay_ms: delay.map(|delay| u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)),
+            params: params::track_params(&codec),
+        }
     };
     let natives = tracks.tracks().tracks();
     let derived = tracks.derived();
@@ -1231,11 +1252,9 @@ fn worker_stats(tracks: &DerivedTracks, mapper: &ClockMapper) -> WorkerStats {
 fn track_stats(track: &Track) -> TrackStats {
     let stats = track.stats();
     TrackStats {
-        packets: stats.packets,
         packet_bytes: stats.packet_bytes,
         frames: stats.frames,
         frame_bytes: stats.frame_bytes,
-        keyframes: stats.keyframes,
         frames_dropped_oversize: stats.frames_dropped_oversize,
         frames_over_browser_limit: stats.frames_over_browser_limit,
     }
@@ -1254,10 +1273,9 @@ mod tests {
     use lotse_core::clock::FakeClock;
     use lotse_core::codec::{Codec, Kind};
     use lotse_core::let_assert;
-    use lotse_core::output::OutputShape;
     use lotse_core::source::{
         Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor, SourceError,
-        SourceExit, SourceFactory,
+        SourceFactory,
     };
     use lotse_core::task::BoxFuture;
     use lotse_core::test_util::{
@@ -1300,7 +1318,7 @@ mod tests {
             .unwrap();
         registries
             .outputs
-            .register(Arc::new(FakeOutputFactory("webrtc", OutputShape::Session)))
+            .register(Arc::new(FakeOutputFactory("webrtc")))
             .unwrap();
         Arc::new(registries)
     }
@@ -1518,7 +1536,7 @@ mod tests {
         h.clock.advance(STATS_INTERVAL);
         let_assert!(ToSupervisor::Stats(stats) = h.next().await);
         let video = stats.tracks.iter().find(|(id, _)| id == "v0").unwrap();
-        assert!(video.1.packets >= 1, "{stats:?}");
+        assert!(video.1.packet_bytes >= 1, "{stats:?}");
         // A standby pending at shutdown stops with the rest.
         h.tx.send_msg(
             &ToWorker::SwitchSource(spec("fake://cam3/", r#"{"ready_after_ms": 60000}"#)),
@@ -2721,6 +2739,30 @@ mod tests {
         seen
     }
 
+    /// [`messages_until`], paced: the fake clock moves `step` only after
+    /// 10 ms of real time without a message, and never past `limit`, which
+    /// fails the test. Unpaced, it moves on every turn nothing is ready
+    /// yet, so on a loaded runner it runs ahead of the worker; this keeps
+    /// a wait clear of what the fake clock would bring on beyond `limit`.
+    async fn messages_paced(
+        h: &mut Harness,
+        step: Duration,
+        limit: Duration,
+        done: impl Fn(&[ToSupervisor]) -> bool,
+    ) -> Vec<ToSupervisor> {
+        let start = h.clock.now();
+        let mut seen = Vec::new();
+        while !done(&seen) {
+            let moved = h.clock.now().saturating_duration_since(start);
+            assert!(moved <= limit, "not within {limit:?}: {seen:?}");
+            tokio::select! {
+                message = h.next() => seen.push(message),
+                () = SystemClock.sleep(Duration::from_millis(10)) => h.clock.advance(step),
+            }
+        }
+        seen
+    }
+
     /// The session events among `messages`.
     fn session_events(messages: &[ToSupervisor]) -> impl Iterator<Item = (&str, &SessionEvent)> {
         messages.iter().filter_map(|message| match message {
@@ -2798,13 +2840,11 @@ mod tests {
         assert_eq!(
             (
                 a1.codec.as_str(),
-                a1.clock_rate,
                 a1.derived_from.as_deref(),
                 a1.audio_delay_ms
             ),
             (
                 "opus",
-                48_000,
                 Some("a0"),
                 Some(u32::try_from(derived::fake::DELAY.as_millis()).unwrap())
             )
@@ -2820,7 +2860,7 @@ mod tests {
             ("aac_lc", None, None)
         );
         let message = message_where(&mut h, |m| {
-            matches!(m, ToSupervisor::Stats(stats) if stats.tracks.iter().any(|(id, t)| id == "a1" && t.packets > 0))
+            matches!(m, ToSupervisor::Stats(stats) if stats.tracks.iter().any(|(id, t)| id == "a1" && t.packet_bytes > 0))
         })
         .await;
         let_assert!(ToSupervisor::Stats(stats) = message);
@@ -2919,11 +2959,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rfc3550_6_4_1_tracks_synced_by_later_sender_reports_are_reported_again_once() {
         // The fake camera's first Sender Reports come a second after it
-        // went live (RFC 3550 §6.4.1), after the tracks were reported.
+        // went live (RFC 3550 §6.4.1), after the tracks were reported. Its
+        // clocks agree: drifting, the skew watchdog's re-anchor drops
+        // every fit after ten seconds or so, which a loaded runner's fake
+        // clock reached while the test waited (2026-10-18).
         let mut h = start_with_settings(registries(), quiet_settings());
         assert!(matches!(h.next().await, ToSupervisor::Ready { .. }));
         h.tx.send_msg(
-            &ToWorker::RunSource(spec("fake://cam/", r#"{"audio": "aac_drifting"}"#)),
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"audio": "aac_steady"}"#)),
             &[],
         )
         .await
@@ -2993,9 +3036,19 @@ mod tests {
         h.tx.send_msg(&ToWorker::OpenSession(early), &[])
             .await
             .unwrap();
-        let seen = messages_until(&mut h, |seen| {
-            echo_audio(seen).is_some() && seen.iter().any(|m| has_track(m, "a1") == Some(true))
-        })
+        // The session gets audio before the watchdog can withdraw it: that
+        // takes three occurrences of skew sustained 5 s, the first beyond
+        // 40 ms only 2 s after the first reports, so not within 15 s. A
+        // frame at a time, paced, so a loaded runner's fake clock does not
+        // run ahead of the worker into the withdrawal.
+        let seen = messages_paced(
+            &mut h,
+            Duration::from_millis(64),
+            Duration::from_secs(15),
+            |seen| {
+                echo_audio(seen).is_some() && seen.iter().any(|m| has_track(m, "a1") == Some(true))
+            },
+        )
         .await;
         assert_eq!(
             answers(&seen),
@@ -3093,23 +3146,46 @@ mod tests {
             "webrtc"
         }
 
-        fn shape(&self) -> OutputShape {
-            OutputShape::Session
-        }
-
         fn session_tracks(&self, audio: bool) -> Vec<lotse_core::output::TrackRequest> {
             let mut requests = EchoSessionFactory.session_tracks(audio);
             requests[0].accept = vec![lotse_core::codec::CodecFamily::H265];
             requests
         }
+
+        fn open_session(
+            &self,
+            request: lotse_core::session::SessionRequest,
+            now: std::time::Instant,
+        ) -> Result<
+            (Box<dyn lotse_core::session::SessionEngine>, String),
+            lotse_core::session::SessionOpenError,
+        > {
+            EchoSessionFactory.open_session(request, now)
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unmet_video_request_closes_the_session_and_stops_what_audio_started() {
-        assert_eq!(
-            lotse_core::output::OutputFactory::shape(&WantsH265),
-            OutputShape::Session
-        );
+        // It answers as the echo does, should negotiation ever let it.
+        let request = lotse_core::session::SessionRequest {
+            offer: "v=0".into(),
+            ice: lotse_core::session::IceCredentials {
+                ufrag: "u".into(),
+                pass: "p".into(),
+            },
+            candidates: vec![],
+            tcp_candidates: vec![],
+            video: Arc::new(Codec::Pcmu),
+            audio: None,
+            backchannel: None,
+            claim: lotse_core::session::TalkbackClaim::Granted,
+            orientation: lotse_core::Orientation::default(),
+            limits: SessionLimits::default(),
+            wall: SystemTime::UNIX_EPOCH,
+        };
+        let opened =
+            lotse_core::output::OutputFactory::open_session(&WantsH265, request, SystemClock.now());
+        assert_eq!(opened.map(|(_, answer)| answer), Ok(ECHO_ANSWER.to_owned()));
         let (mut h, transcoder) =
             aac_worker_with(derived::fake::Forwarding::default(), Arc::new(WantsH265)).await;
         let mut session = session_spec("h265");
@@ -3830,6 +3906,66 @@ mod tests {
         );
     }
 
+    /// WRK-6: the supervisor hands a worker its sockets once. A second
+    /// `Sockets` message is refused: its descriptors are closed at once,
+    /// and the session manager on the first ones, with its sessions, goes
+    /// on as it was.
+    #[tokio::test]
+    async fn a_second_sockets_message_is_refused_and_the_first_sockets_stay_in_use() {
+        let (logs, _guard) = Logs::capture();
+        let mut h = start_with(echo_registries());
+        h.next().await;
+        let (datagrams, shared_addr) = live_echo_session(&mut h).await;
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (ours, theirs) = lotse_ipc::datagram::datagram_pair().unwrap();
+        h.tx.send_msg(
+            &ToWorker::Sockets,
+            &[OwnedFd::from(udp).as_fd(), theirs.as_fd()],
+        )
+        .await
+        .unwrap();
+        drop(theirs);
+        let refused = "second sockets message: the worker holds its sockets; refused";
+        let deadline = SystemClock.now() + Duration::from_secs(10);
+        while logs.count(Level::WARN, refused) == 0 {
+            assert!(
+                SystemClock.now() < deadline,
+                "the second sockets message was not refused"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(logs.lines(Level::WARN, refused)[0].fields, " fds=2");
+        // Its channel's other end is closed: the worker kept no descriptor
+        // of it.
+        let ours = std::os::unix::net::UnixDatagram::from(ours);
+        ours.set_nonblocking(true).unwrap();
+        assert_eq!(ours.recv(&mut [0_u8; 1]).unwrap(), 0);
+        // The session still echoes over the first channel and the first
+        // shared socket.
+        let browser = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut frame = Vec::new();
+        lotse_ipc::datagram::encode(
+            "ufrag-echo",
+            browser.local_addr().unwrap(),
+            shared_addr,
+            b"still here",
+            &mut frame,
+        );
+        datagrams.send(&frame).unwrap();
+        browser.set_nonblocking(true).unwrap();
+        let browser = tokio::net::UdpSocket::from_std(browser).unwrap();
+        let mut buf = [0_u8; 64];
+        let (n, from) = within(browser.recv_from(&mut buf)).await.unwrap();
+        assert_eq!((&buf[..n], from), (&b"still here"[..], shared_addr));
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            ended(h.worker).await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+    }
+
     #[tokio::test]
     async fn sessions_are_refused_with_codes_and_closed_on_shutdown() {
         let (logs, _guard) = Logs::capture();
@@ -3980,10 +4116,7 @@ mod tests {
             (tracks[0].id.as_str(), tracks[0].kind.as_str()),
             ("v0", "video")
         );
-        assert_eq!(
-            (tracks[0].codec.as_str(), tracks[0].clock_rate),
-            ("h264", 90_000)
-        );
+        assert_eq!(tracks[0].codec, "h264");
         assert_eq!(tracks[0].sync, "arrival");
 
         h.clock.advance(STATS_INTERVAL);
@@ -4369,7 +4502,7 @@ mod tests {
             serde_json::Value::Null
         }
 
-        fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+        fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
             let cancelled = Arc::clone(&self.cancelled);
             let released = Arc::clone(&self.released);
             Box::pin(async move {
@@ -4384,7 +4517,7 @@ mod tests {
                 cancelled.notify_one();
                 released.notified().await;
                 cancelled.notify_one();
-                SourceExit::Ended(SourceError::Ended("released".into()))
+                SourceError::Ended("released".into())
             })
         }
     }

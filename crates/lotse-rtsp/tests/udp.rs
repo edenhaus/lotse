@@ -27,7 +27,7 @@ use std::time::Duration;
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::codec::Kind;
 use lotse_core::ingest::IngestStats;
-use lotse_core::source::{ResolvedPeer, SourceError, SourceExit, SourceFactory as _};
+use lotse_core::source::{ResolvedPeer, SourceError, SourceFactory as _};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::track::{SubscriptionError, Track};
 use lotse_rtsp::RtspFactory;
@@ -123,7 +123,7 @@ async fn play(config: CameraConfig) -> (FakeCamera, usize, IngestStats) {
     harness.cancel();
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Ended(ref m)) if m == "cancelled"),
+        matches!(exit, SourceError::Ended(ref m) if m == "cancelled"),
         "{exit:?}"
     );
     (cam, frames, stats)
@@ -171,7 +171,7 @@ async fn rfc2326_12_39_video_audio_and_sender_reports_flow_over_udp_then_tear_do
     harness.cancel();
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Ended(ref m)) if m == "cancelled"),
+        matches!(exit, SourceError::Ended(ref m) if m == "cancelled"),
         "{exit:?}"
     );
     // The control connection carried the TEARDOWN: the camera stops.
@@ -281,7 +281,7 @@ async fn rfc2326_12_39_a_named_source_that_stays_silent_is_not_replaced_by_the_r
     assert!(!harness.wait_ready().await);
     let stats = harness.tracks.ingest();
     let exit = harness.finish().await;
-    let SourceExit::Ended(SourceError::Timeout(message)) = exit else {
+    let SourceError::Timeout(message) = exit else {
         panic!("a timeout, not {exit:?}");
     };
     assert!(message.contains("firewall or NAT"), "{message}");
@@ -307,7 +307,7 @@ async fn rfc1122_3_2_1_3_a_source_the_camera_cannot_send_from_ends_the_attempt()
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(!harness.wait_ready().await);
     let exit = harness.finish().await;
-    let SourceExit::Ended(SourceError::Protocol(message)) = exit else {
+    let SourceError::Protocol(message) = exit else {
         panic!("a protocol error, not {exit:?}");
     };
     assert!(
@@ -331,7 +331,7 @@ async fn rfc2326_11_3_11_a_camera_that_refuses_udp_fails_with_a_repair_hint() {
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(!harness.wait_ready().await);
     let exit = harness.finish().await;
-    let SourceExit::Ended(SourceError::Protocol(message)) = exit else {
+    let SourceError::Protocol(message) = exit else {
         panic!("a protocol error, not {exit:?}");
     };
     assert!(message.contains("461"), "{message}");
@@ -366,7 +366,7 @@ async fn rfc2326_11_3_11_a_udp_only_camera_plays_over_udp_and_refuses_tcp_withou
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(!harness.wait_ready().await, "not over TCP");
     let exit = harness.finish().await;
-    let SourceExit::Ended(SourceError::Protocol(message)) = exit else {
+    let SourceError::Protocol(message) = exit else {
         panic!("a protocol error, not {exit:?}");
     };
     assert!(message.contains("461"), "{message}");
@@ -394,7 +394,7 @@ async fn datagrams_that_never_arrive_end_the_attempt_with_a_repair_hint() {
     // Never live: no stall later, a timeout that says why.
     assert!(!harness.wait_ready().await);
     let exit = harness.finish().await;
-    let SourceExit::Ended(SourceError::Timeout(message)) = exit else {
+    let SourceError::Timeout(message) = exit else {
         panic!("a timeout, not {exit:?}");
     };
     assert!(message.contains("within 300 ms of PLAY"), "{message}");

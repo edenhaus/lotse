@@ -59,7 +59,7 @@ use str0m::{Candidate, Event, IceConnectionState, IceCreds, Input, Output, Rtc, 
 use crate::audio::{self, AudioPlan, Direction, Talkback};
 use crate::capture_time::{CaptureTimeSender, WallAnchor};
 use crate::cvo::Cvo;
-use crate::sdp::{Sdp, Section, check_payload_types};
+use crate::sdp::{Sdp, Section, browser_text, check_payload_types};
 use crate::talkback::{Depacketizer, Refused};
 use crate::video::{NegotiatedVideo, VideoPlan};
 use crate::writer::{AudioWriter, RTX_CACHE_PACKETS, VideoWriter};
@@ -849,8 +849,8 @@ fn push_opening_events(pending: &mut VecDeque<SessionOutput>, candidates: Vec<St
     }));
 }
 
-/// Logs what the answer did with talk-back: the m-line and codec it is
-/// received in, or why it is not.
+/// Logs what the answer did with talk-back: the m-line (its mid as
+/// [`browser_text`]) and codec it is received in, or why it is not.
 fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&TalkbackTarget>) {
     match plan.talkback {
         Talkback::Negotiated {
@@ -861,7 +861,14 @@ fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&TalkbackTarget>) {
             let m_line = if dedicated { "dedicated" } else { "sendrecv" };
             let backchannel = backchannel.map(|backchannel| backchannel.codec.name());
             let codec = codec.name();
-            tracing::info!(mid, codec, backchannel, m_line, "talk-back negotiated");
+            let mid = browser_text(mid);
+            tracing::info!(
+                mid = mid.as_str(),
+                codec,
+                backchannel,
+                m_line,
+                "talk-back negotiated"
+            );
         }
         Talkback::Off(reason) => tracing::info!(reason, "talk-back not negotiated"),
         Talkback::Busy => {

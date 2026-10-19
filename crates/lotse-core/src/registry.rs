@@ -134,7 +134,6 @@ mod tests {
     )]
 
     use super::*;
-    use crate::output::OutputShape;
     use crate::test_util::{FakeOutputFactory, FakeSourceFactory, FakeTranscoder};
 
     #[test]
@@ -168,16 +167,13 @@ mod tests {
     fn outputs_register_by_kind_once() {
         let mut registry = OutputRegistry::default();
         registry
-            .register(Arc::new(FakeOutputFactory("webrtc", OutputShape::Session)))
+            .register(Arc::new(FakeOutputFactory("webrtc")))
             .unwrap();
         assert_eq!(registry.kinds(), ["webrtc"]);
-        assert_eq!(
-            registry.get("webrtc").unwrap().shape(),
-            OutputShape::Session
-        );
+        assert_eq!(registry.get("webrtc").unwrap().kind(), "webrtc");
         assert_eq!(
             registry
-                .register(Arc::new(FakeOutputFactory("webrtc", OutputShape::Request)))
+                .register(Arc::new(FakeOutputFactory("webrtc")))
                 .unwrap_err(),
             RegistryError::DuplicateOutput("webrtc")
         );

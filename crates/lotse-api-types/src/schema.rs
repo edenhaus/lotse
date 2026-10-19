@@ -2,123 +2,145 @@
 //! and committed as `schema/api.json`, returned by the `schema` command and
 //! diffed in CI so an incompatible change cannot slip through.
 //!
-//! Regenerate with `cargo run -p lotse-api-types --example schema >
+//! The generator needs the `schema` feature; the daemon serves the committed
+//! bundle and links none of it. Regenerate with `cargo run -p
+//! lotse-api-types --features schema --example schema >
 //! crates/lotse-api-types/schema/api.json`.
 
-use schemars::JsonSchema;
-use schemars::generate::{SchemaGenerator, SchemaSettings};
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 
-use crate::API_VERSION;
-use crate::clients::ClientList;
-use crate::command::Command;
-use crate::frame::{Empty, EventFrame, Failure, Hello, Pong, Shutdown, Success};
-use crate::info::{InfoResult, Metrics};
-use crate::pairing::PairingCreateResult;
-use crate::session::{Session, SessionEvent, SessionList, WebrtcRenegotiateResult};
-use crate::stream::{BackchannelReleaseResult, Stream, StreamEvent, StreamList, StreamPutResult};
+#[cfg(feature = "schema")]
+pub use generator::{bundle, bundle_text};
 
 /// The committed bundle, byte for byte.
 pub const COMMITTED: &str = include_str!("../schema/api.json");
 
-/// A `$ref` to `T`'s schema, which `generator` keeps in its definitions.
-fn reference<T: JsonSchema>(generator: &mut SchemaGenerator) -> Value {
-    serde_json::to_value(generator.subschema_for::<T>()).unwrap_or(Value::Null)
+/// The committed bundle as the `schema` command returns it. The
+/// `api-schema` hook and `the_committed_bundle_matches_the_types` keep it
+/// equal to the generated one (`bundle`, `schema` feature), so the daemon
+/// answers with the types' schema without linking the generator.
+pub fn committed() -> Value {
+    serde_json::from_str(COMMITTED).unwrap_or(Value::Null)
 }
 
-/// The bundle: frames, commands, their results, and events, each a `$ref`
-/// into one shared `$defs`, so the bundle is a single valid JSON Schema
-/// document that tools (the Python client's generator) read as it is.
-pub fn bundle() -> Value {
-    let mut generator = SchemaSettings::draft2020_12().into_generator();
-    let mut results = Map::new();
-    results.insert("ping".into(), reference::<Pong>(&mut generator));
-    results.insert(
-        "info".into(),
-        reference::<Success<InfoResult>>(&mut generator),
-    );
-    results.insert(
-        "metrics/get".into(),
-        reference::<Success<Metrics>>(&mut generator),
-    );
-    results.insert("schema".into(), reference::<Success<Value>>(&mut generator));
-    results.insert(
-        "pairing/create".into(),
-        reference::<Success<PairingCreateResult>>(&mut generator),
-    );
-    results.insert(
-        "clients/list".into(),
-        reference::<Success<ClientList>>(&mut generator),
-    );
-    results.insert(
-        "stream/put".into(),
-        reference::<Success<StreamPutResult>>(&mut generator),
-    );
-    results.insert(
-        "stream/get".into(),
-        reference::<Success<Stream>>(&mut generator),
-    );
-    results.insert(
-        "stream/list".into(),
-        reference::<Success<StreamList>>(&mut generator),
-    );
-    for name in [
-        "clients/remove",
-        "stream/delete",
-        "stream/subscribe",
-        "unsubscribe",
-        "webrtc/offer",
-        "webrtc/candidate",
-        "session/close",
-        "session/adopt",
-    ] {
-        results.insert(name.into(), reference::<Success<Empty>>(&mut generator));
+/// The bundle generated from the types, for committing it and for the test
+/// that the committed one is not stale.
+#[cfg(feature = "schema")]
+mod generator {
+    use schemars::JsonSchema;
+    use schemars::generate::{SchemaGenerator, SchemaSettings};
+    use serde_json::{Map, Value, json};
+
+    use crate::API_VERSION;
+    use crate::clients::ClientList;
+    use crate::command::Command;
+    use crate::frame::{Empty, EventFrame, Failure, Hello, Pong, Shutdown, Success};
+    use crate::info::{InfoResult, Metrics};
+    use crate::pairing::PairingCreateResult;
+    use crate::session::{Session, SessionEvent, SessionList, WebrtcRenegotiateResult};
+    use crate::stream::{
+        BackchannelReleaseResult, Stream, StreamEvent, StreamList, StreamPutResult,
+    };
+
+    /// A `$ref` to `T`'s schema, which `generator` keeps in its definitions.
+    fn reference<T: JsonSchema>(generator: &mut SchemaGenerator) -> Value {
+        serde_json::to_value(generator.subschema_for::<T>()).unwrap_or(Value::Null)
     }
-    results.insert(
-        "webrtc/renegotiate".into(),
-        reference::<Success<WebrtcRenegotiateResult>>(&mut generator),
-    );
-    results.insert(
-        "session/get".into(),
-        reference::<Success<Session>>(&mut generator),
-    );
-    results.insert(
-        "session/list".into(),
-        reference::<Success<SessionList>>(&mut generator),
-    );
-    results.insert(
-        "backchannel/release".into(),
-        reference::<Success<BackchannelReleaseResult>>(&mut generator),
-    );
-    let hello = reference::<Hello>(&mut generator);
-    let shutdown = reference::<Shutdown>(&mut generator);
-    let command = reference::<Command>(&mut generator);
-    let failure = reference::<Failure>(&mut generator);
-    let stream_events = reference::<EventFrame<StreamEvent>>(&mut generator);
-    let session_events = reference::<EventFrame<SessionEvent>>(&mut generator);
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "lotse control API",
-        "api": API_VERSION,
-        "hello": hello,
-        "shutdown": shutdown,
-        "command": command,
-        "failure": failure,
-        "results": results,
-        "events": {
-            "stream/subscribe": stream_events,
-            "webrtc/offer": session_events,
-            "session/adopt": session_events,
-        },
-        "$defs": generator.take_definitions(true),
-    })
-}
 
-/// The bundle as pretty JSON with a trailing newline, as committed.
-pub fn bundle_text() -> String {
-    let mut text = serde_json::to_string_pretty(&bundle()).unwrap_or_default();
-    text.push('\n');
-    text
+    /// The bundle: frames, commands, their results, and events, each a `$ref`
+    /// into one shared `$defs`, so the bundle is a single valid JSON Schema
+    /// document that tools (the Python client's generator) read as it is.
+    pub fn bundle() -> Value {
+        let mut generator = SchemaSettings::draft2020_12().into_generator();
+        let mut results = Map::new();
+        results.insert("ping".into(), reference::<Pong>(&mut generator));
+        results.insert(
+            "info".into(),
+            reference::<Success<InfoResult>>(&mut generator),
+        );
+        results.insert(
+            "metrics/get".into(),
+            reference::<Success<Metrics>>(&mut generator),
+        );
+        results.insert("schema".into(), reference::<Success<Value>>(&mut generator));
+        results.insert(
+            "pairing/create".into(),
+            reference::<Success<PairingCreateResult>>(&mut generator),
+        );
+        results.insert(
+            "clients/list".into(),
+            reference::<Success<ClientList>>(&mut generator),
+        );
+        results.insert(
+            "stream/put".into(),
+            reference::<Success<StreamPutResult>>(&mut generator),
+        );
+        results.insert(
+            "stream/get".into(),
+            reference::<Success<Stream>>(&mut generator),
+        );
+        results.insert(
+            "stream/list".into(),
+            reference::<Success<StreamList>>(&mut generator),
+        );
+        for name in [
+            "clients/remove",
+            "stream/delete",
+            "stream/subscribe",
+            "unsubscribe",
+            "webrtc/offer",
+            "webrtc/candidate",
+            "session/close",
+            "session/adopt",
+        ] {
+            results.insert(name.into(), reference::<Success<Empty>>(&mut generator));
+        }
+        results.insert(
+            "webrtc/renegotiate".into(),
+            reference::<Success<WebrtcRenegotiateResult>>(&mut generator),
+        );
+        results.insert(
+            "session/get".into(),
+            reference::<Success<Session>>(&mut generator),
+        );
+        results.insert(
+            "session/list".into(),
+            reference::<Success<SessionList>>(&mut generator),
+        );
+        results.insert(
+            "backchannel/release".into(),
+            reference::<Success<BackchannelReleaseResult>>(&mut generator),
+        );
+        let hello = reference::<Hello>(&mut generator);
+        let shutdown = reference::<Shutdown>(&mut generator);
+        let command = reference::<Command>(&mut generator);
+        let failure = reference::<Failure>(&mut generator);
+        let stream_events = reference::<EventFrame<StreamEvent>>(&mut generator);
+        let session_events = reference::<EventFrame<SessionEvent>>(&mut generator);
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "lotse control API",
+            "api": API_VERSION,
+            "hello": hello,
+            "shutdown": shutdown,
+            "command": command,
+            "failure": failure,
+            "results": results,
+            "events": {
+                "stream/subscribe": stream_events,
+                "webrtc/offer": session_events,
+                "session/adopt": session_events,
+            },
+            "$defs": generator.take_definitions(true),
+        })
+    }
+
+    /// The bundle as pretty JSON with a trailing newline, as committed.
+    pub fn bundle_text() -> String {
+        let mut text = serde_json::to_string_pretty(&bundle()).unwrap_or_default();
+        text.push('\n');
+        text
+    }
 }
 
 #[cfg(test)]
@@ -130,13 +152,15 @@ mod tests {
     )]
 
     use super::*;
+    use crate::{API_VERSION, Command};
 
+    #[cfg(feature = "schema")]
     #[test]
     fn the_committed_bundle_matches_the_types() {
         assert_eq!(
             COMMITTED,
             bundle_text(),
-            "schema/api.json is stale: regenerate with `cargo run -p lotse-api-types --example schema > crates/lotse-api-types/schema/api.json`"
+            "schema/api.json is stale: regenerate with `cargo run -p lotse-api-types --features schema --example schema > crates/lotse-api-types/schema/api.json`"
         );
     }
 
@@ -181,7 +205,7 @@ mod tests {
 
     #[test]
     fn the_bundle_is_one_document_whose_references_all_resolve() {
-        let bundle = bundle();
+        let bundle = committed();
         let mut found = Vec::new();
         references(&bundle, &mut found);
         assert!(found.len() > 30, "{found:?}");
@@ -201,7 +225,7 @@ mod tests {
 
     #[test]
     fn the_bundle_carries_every_command_and_the_frame_tags() {
-        let bundle = bundle();
+        let bundle = committed();
         assert_eq!(bundle["api"], API_VERSION);
         let command = resolve(&bundle, &bundle["command"]);
         let variants = command["oneOf"].as_array().expect("tagged enum as oneOf");

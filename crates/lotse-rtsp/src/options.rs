@@ -4,9 +4,6 @@
 //! does a `tls_fingerprint` that is not a SHA-256 in hex or a `user_agent`
 //! that is not a header field value (RFC 7230 §3.2, RFC 2326 §12.41).
 
-use std::fmt;
-
-use lotse_core::secret::{REDACTED, RedactedUrl};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use lotse_tls::Fingerprint;
@@ -66,47 +63,6 @@ pub enum Transport {
     Udp,
 }
 
-/// Whether to ask the camera's ONVIF service for keyframes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OnvifKeyframe {
-    /// Probe the device service once per connection and use it if there.
-    #[default]
-    Auto,
-    /// Never.
-    Off,
-}
-
-/// The ONVIF endpoint a client can pass, so no probing is needed. Its URL
-/// can carry credentials and tokens as a source URL can, so `Debug` and
-/// [`RtspOptions::redacted`] print it as [`RedactedUrl`] does, or `****`
-/// when it does not parse.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OnvifEndpoint {
-    /// The device or media service URL.
-    pub url: String,
-    /// The media profile the stream belongs to.
-    pub profile_token: String,
-}
-
-impl fmt::Debug for OnvifEndpoint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OnvifEndpoint")
-            .field("url", &redact_url(&self.url))
-            .field("profile_token", &self.profile_token)
-            .finish()
-    }
-}
-
-/// `url` as [`RedactedUrl`] prints it, or `****` when it does not parse.
-fn redact_url(url: &str) -> String {
-    url::Url::parse(url).map_or_else(
-        |_| REDACTED.to_owned(),
-        |url| RedactedUrl::new(&url).to_string(),
-    )
-}
-
 /// The typed options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -132,10 +88,6 @@ pub struct RtspOptions {
     /// talk-back request the backchannel cannot serve is answered without
     /// it, with a `backchannel_declined` warning.
     pub backchannel: bool,
-    /// Keyframe requests through ONVIF.
-    pub onvif_keyframe: OnvifKeyframe,
-    /// The ONVIF endpoint, when known.
-    pub onvif: Option<OnvifEndpoint>,
     /// SHA-256 pin of the camera's leaf certificate for `rtsps`: replaces
     /// the check against the embedded roots and the host name.
     pub tls_fingerprint: Option<Fingerprint>,
@@ -155,8 +107,6 @@ impl Default for RtspOptions {
         Self {
             transport: Transport::Tcp,
             backchannel: false,
-            onvif_keyframe: OnvifKeyframe::Auto,
-            onvif: None,
             tls_fingerprint: None,
             insecure_tls: false,
             timeout_ms: DEFAULT_TIMEOUT_MS,
@@ -178,15 +128,10 @@ impl RtspOptions {
         }
     }
 
-    /// The options as `stream/get` reports them: the ONVIF URL redacted
-    /// as a source URL is; nothing else here is secret (a certificate
-    /// fingerprint is public).
+    /// The options as `stream/get` reports them: nothing here is secret
+    /// (a certificate fingerprint is public).
     pub fn redacted(&self) -> serde_json::Value {
-        let mut shown = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
-        if let (Some(onvif), Some(url)) = (self.onvif.as_ref(), shown.pointer_mut("/onvif/url")) {
-            *url = serde_json::Value::String(redact_url(&onvif.url));
-        }
-        shown
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
     }
 
     /// The options half of the connection key:
@@ -232,8 +177,7 @@ mod tests {
         assert_eq!(defaults.user_agent(), DEFAULT_USER_AGENT);
         assert_eq!(RtspOptions::parse(&json!({})).unwrap(), defaults);
         let full = RtspOptions::parse(&json!({
-            "transport": "udp", "backchannel": true, "onvif_keyframe": "off",
-            "onvif": { "url": "http://cam/onvif/device_service", "profile_token": "p0" },
+            "transport": "udp", "backchannel": true,
             "tls_fingerprint": PIN, "insecure_tls": true, "timeout_ms": 5000,
             "user_agent": "test/1"
         }))
@@ -241,8 +185,6 @@ mod tests {
         assert_eq!(full.transport, Transport::Udp);
         assert!(full.backchannel);
         assert_eq!(full.redacted()["backchannel"], true);
-        assert_eq!(full.onvif_keyframe, OnvifKeyframe::Off);
-        assert_eq!(full.onvif.as_ref().unwrap().profile_token, "p0");
         assert_eq!(full.user_agent(), "test/1");
         assert_eq!(full.redacted()["timeout_ms"], 5000);
         assert_eq!(full.redacted()["tls_fingerprint"], PIN.to_lowercase());
@@ -250,34 +192,8 @@ mod tests {
         assert!(err.to_string().contains("64 hex digits"), "{err}");
         assert!(RtspOptions::parse(&json!({ "transports": "tcp" })).is_err());
         assert!(RtspOptions::parse(&json!({ "transport": "sctp" })).is_err());
-        assert!(RtspOptions::parse(&json!({ "onvif": { "url": "x" } })).is_err());
-        assert!(defaults.redacted()["onvif"].is_null());
+        assert!(RtspOptions::parse(&json!({ "onvif_keyframe": "off" })).is_err());
         assert!(RtspOptions::parse(&json!([])).is_err());
-    }
-
-    #[test]
-    fn the_onvif_url_is_redacted_in_debug_and_the_report() {
-        for (url, shown) in [
-            (
-                "http://admin:hunter2@cam/onvif/KEY?token=TOK",
-                "http://****@cam/****?****",
-            ),
-            ("not a url KEY", "****"),
-        ] {
-            let options = RtspOptions::parse(&json!({
-                "onvif": { "url": url, "profile_token": "p0" }
-            }))
-            .unwrap();
-            let report = options.redacted();
-            assert_eq!(report["onvif"]["url"], shown, "{url}");
-            assert_eq!(report["onvif"]["profile_token"], "p0");
-            assert_eq!(options.onvif.as_ref().unwrap().url, url);
-            let debug = format!("{options:?}");
-            assert!(debug.contains(&format!("url: {shown:?}")), "{debug}");
-            for secret in ["hunter2", "KEY", "TOK"] {
-                assert!(!debug.contains(secret) && !report.to_string().contains(secret));
-            }
-        }
     }
 
     #[test]

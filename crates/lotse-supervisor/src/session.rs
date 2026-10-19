@@ -18,7 +18,8 @@
 //! `backchannel_declined` per offer or re-offer answered; the client
 //! asked for each of these last three, so they are bounded by its
 //! requests and not charged. Messages are cut to
-//! [`MAX_MESSAGE_BYTES`], and the rest of the worker's text, the
+//! [`MAX_MESSAGE_BYTES`], ending in [`CUT_MARK`](lotse_core::text::CUT_MARK)
+//! where they were, and the rest of the worker's text, the
 //! candidates and warnings, to [`MAX_REPORT_TEXT_BYTES`] over the
 //! session's life. A report over the budget closes
 //! the session; a repeated warning is dropped. A state goes on only when
@@ -997,6 +998,7 @@ mod tests {
     )]
 
     use lotse_core::clock::{FakeClock, SystemClock};
+    use lotse_core::text::CUT_MARK;
     use lotse_core::throttle::SUMMARY_INTERVAL;
     use serde_json::json;
 
@@ -1445,6 +1447,7 @@ mod tests {
                 matches!(
                     events.as_slice(),
                     [SessionEvent::Warning { message, .. }] if message.len() <= MAX_MESSAGE_BYTES
+                        && message.ends_with(CUT_MARK)
                 ),
                 "one warning, cut to size: {events:?}"
             );
@@ -1576,7 +1579,10 @@ mod tests {
             session.applied(warning("av_sync_lost", format!("a\nb{}", "x".repeat(1000)))),
             vec![SessionEvent::Warning {
                 code: "av_sync_lost".into(),
-                message: format!("a b{}", "x".repeat(MAX_MESSAGE_BYTES - 3)),
+                message: format!(
+                    "a b{}{CUT_MARK}",
+                    "x".repeat(MAX_MESSAGE_BYTES - 3 - CUT_MARK.len())
+                ),
                 reason: None,
                 status: None,
             }]
@@ -1650,7 +1656,10 @@ mod tests {
             }),
             vec![SessionEvent::Closed {
                 code: "internal_error".into(),
-                message: format!("x\u{fffd}  {}", "y".repeat(MAX_MESSAGE_BYTES - 6)),
+                message: format!(
+                    "x\u{fffd}  {}{CUT_MARK}",
+                    "y".repeat(MAX_MESSAGE_BYTES - 6 - CUT_MARK.len())
+                ),
             }]
         );
         let lines = captured.lines("unknown code");
@@ -1663,7 +1672,10 @@ mod tests {
             closed_event("invalid_sdp", &"z".repeat(1000)),
             SessionEvent::Closed {
                 code: "invalid_sdp".into(),
-                message: "z".repeat(MAX_MESSAGE_BYTES),
+                message: format!(
+                    "{}{CUT_MARK}",
+                    "z".repeat(MAX_MESSAGE_BYTES - CUT_MARK.len())
+                ),
             }
         );
     }

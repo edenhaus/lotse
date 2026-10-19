@@ -7,7 +7,7 @@
 //! The camera's own text, which retina's messages quote (a header, an
 //! SDP line), reaches the log and the API's error only through
 //! `camera_text`: one line, no control characters, at most
-//! `CAMERA_TEXT_BYTES`.
+//! `CAMERA_TEXT_BYTES`, ending in `CUT_MARK` where it was cut.
 //!
 //! RFC 2326 §7.1.1: 401 and 403 are the credential failures.
 
@@ -20,7 +20,8 @@ use lotse_core::source_url::SourceUrl;
 pub(crate) const CAMERA_TEXT_BYTES: usize = 200;
 
 /// A camera's `text` as an error or a log line carries it: on one line,
-/// control characters replaced, cut to [`CAMERA_TEXT_BYTES`].
+/// control characters replaced, cut to [`CAMERA_TEXT_BYTES`]; cut text
+/// ends in [`CUT_MARK`](lotse_core::text::CUT_MARK) within them.
 pub(crate) fn camera_text(text: &str) -> String {
     lotse_core::text::plain(text, CAMERA_TEXT_BYTES)
 }
@@ -76,6 +77,8 @@ mod tests {
         reason = "test code"
     )]
 
+    use lotse_core::text::CUT_MARK;
+
     use super::*;
 
     /// A source URL with nothing to scrub.
@@ -113,11 +116,13 @@ mod tests {
     fn camera_text_is_one_line_of_at_most_200_bytes() {
         assert_eq!(camera_text("a\r\nb\u{1b}[2J"), "a  b\u{fffd}[2J");
         let long = "é".repeat(CAMERA_TEXT_BYTES);
-        assert_eq!(camera_text(&long).len(), CAMERA_TEXT_BYTES);
-        assert_eq!(
-            camera_text(&format!("x{long}")).len(),
-            CAMERA_TEXT_BYTES - 1
-        );
+        let room = CAMERA_TEXT_BYTES - CUT_MARK.len();
+        let capped = camera_text(&long);
+        assert_eq!(capped, format!("{}{CUT_MARK}", "é".repeat(room / 2)));
+        assert_eq!(capped.len(), CAMERA_TEXT_BYTES - 1, "é does not fit whole");
+        let capped = camera_text(&format!("x{long}"));
+        assert_eq!(capped, format!("x{}{CUT_MARK}", "é".repeat((room - 1) / 2)));
+        assert_eq!(capped.len(), CAMERA_TEXT_BYTES);
     }
 
     #[test]
@@ -127,7 +132,8 @@ mod tests {
         let err = classify_text(&text, None, &cam());
         assert!(
             matches!(&err, SourceError::Protocol(m) if m.len() == CAMERA_TEXT_BYTES
-                && m.starts_with(r#"Unparseable Session header "x\r\nyyy"#)),
+                && m.starts_with(r#"Unparseable Session header "x\r\nyyy"#)
+                && m.ends_with(&format!("y{CUT_MARK}"))),
             "{err:?}"
         );
         assert_eq!(
@@ -154,14 +160,17 @@ mod tests {
 
     /// A camera that echoes the path without a scheme, where the message
     /// is cut: scrubbed after the cut, the path's first bytes would show.
+    /// The scrubbed path's start fills the cap up to the cut mark.
     #[test]
     fn a_path_echoed_where_the_message_is_cut_is_scrubbed_before_the_cut() {
         let url = SourceUrl::parse("rtsp://cam/camkey7f3a/live?token=tok9d2e").unwrap();
-        let lead = "x".repeat(CAMERA_TEXT_BYTES - 18);
+        let lead = "x".repeat(CAMERA_TEXT_BYTES - 18 - CUT_MARK.len());
         let text = format!("Bad request {lead} /camkey7f3a/live?token=tok9d2e");
+        let cut = format!("Bad request {lead} /****{CUT_MARK}");
+        assert_eq!(cut.len(), CAMERA_TEXT_BYTES);
         assert_eq!(
             classify_text(&text, Some(400), &url),
-            SourceError::Protocol(format!("Bad request {lead} /****"))
+            SourceError::Protocol(cut)
         );
     }
 

@@ -2,11 +2,13 @@
 
 use std::fmt;
 
+#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Every stable error code. `code` is the contract; `message` may change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// Malformed JSON, an unknown field, a bad value.
@@ -84,10 +86,6 @@ pub enum ErrorCode {
     NoVideoTrack,
     /// No video codec both sides can use.
     VideoCodecUnsupported,
-    /// No keyframe within the snapshot timeout.
-    SnapshotTimeout,
-    /// The snapshot decode queue is full.
-    SnapshotBusy,
 }
 
 impl ErrorCode {
@@ -129,8 +127,6 @@ impl ErrorCode {
             Self::InvalidSdp => "invalid_sdp",
             Self::NoVideoTrack => "no_video_track",
             Self::VideoCodecUnsupported => "video_codec_unsupported",
-            Self::SnapshotTimeout => "snapshot_timeout",
-            Self::SnapshotBusy => "snapshot_busy",
         }
     }
 
@@ -148,7 +144,8 @@ impl fmt::Display for ErrorCode {
 
 /// An error as the API carries it, in results, `closed` events and
 /// `last_error`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct ApiError {
     /// The stable code.
     pub code: ErrorCode,
@@ -230,8 +227,6 @@ mod tests {
             ErrorCode::InvalidSdp,
             ErrorCode::NoVideoTrack,
             ErrorCode::VideoCodecUnsupported,
-            ErrorCode::SnapshotTimeout,
-            ErrorCode::SnapshotBusy,
             ErrorCode::FrameOverBrowserLimit,
             ErrorCode::NotPermitted,
         ];

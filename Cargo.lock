@@ -456,6 +456,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "condtype"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf0a07a401f374238ab8e2f11a104d2851bf9ce711ec69804834de8af45c7af"
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -727,6 +733,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "divan"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a405457ec78b8fe08b0e32b4a3570ab5dff6dd16eb9e76a5ee0a9d9cbd898933"
+dependencies = [
+ "cfg-if",
+ "clap",
+ "condtype",
+ "divan-macros",
+ "libc",
+ "regex-lite",
+]
+
+[[package]]
+name = "divan-macros"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9556bc800956545d6420a640173e5ba7dfa82f38d3ea5a167eb555bc69ac3323"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1450,6 +1481,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures-util",
+ "log",
  "lotse-api-types",
  "lotse-codec",
  "lotse-core",
@@ -1470,6 +1502,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
 ]
 
@@ -1515,6 +1548,7 @@ version = "0.0.0-dev"
 dependencies = [
  "adts-reader",
  "bytes",
+ "divan",
  "h264-reader 0.9.0",
  "lotse-core",
  "opus",
@@ -1550,6 +1584,7 @@ name = "lotse-http"
 version = "0.0.0-dev"
 dependencies = [
  "bytes",
+ "divan",
  "http-auth",
  "http-body-util",
  "hyper",
@@ -1626,6 +1661,7 @@ name = "lotse-supervisor"
 version = "0.0.0-dev"
 dependencies = [
  "allocation-counter",
+ "divan",
  "getrandom 0.3.4",
  "hmac",
  "lotse-api",
@@ -1677,6 +1713,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1722,6 +1759,7 @@ version = "0.0.0-dev"
 dependencies = [
  "allocation-counter",
  "libc",
+ "lotse-codec",
  "lotse-core",
  "lotse-ipc",
  "lotse-testing",
@@ -3195,6 +3233,17 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
  "valuable",
+]
+
+[[package]]
+name = "tracing-log"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
+dependencies = [
+ "log",
+ "once_cell",
+ "tracing-core",
 ]
 
 [[package]]

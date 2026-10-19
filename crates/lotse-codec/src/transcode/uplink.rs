@@ -33,11 +33,22 @@
 //!   everything it receives keeps that delay for the rest of the session.
 //!   The output timestamps advance by the gap instead, at the end of the
 //!   frame being filled when the gap falls inside one. Opus input runs
-//!   libopus's loss concealment over the gap and discards it, so the next
-//!   packet decodes from the state libopus expects after a loss.
+//!   libopus's loss concealment over the gap's end, as much of it as the
+//!   next packet carries, and discards it, so the next
+//!   packet decodes from the state libopus expects after a loss, and a
+//!   sender's timestamps buy no decoder work beyond the audio it sends.
 //! - **Late packets.** A packet behind the input already taken (late,
 //!   reordered, duplicated) is dropped: its place on the timeline has
 //!   passed.
+//! - **Floods.** A sender's audio is sampled in real time (RFC 3550 §5.1:
+//!   the timestamps come from a clock that "increments monotonically and
+//!   linearly in time"), so the session keeps it to that: the worker's
+//!   talk-back pace drops what a session sends ahead of real time before
+//!   it reaches a chain, whatever codecs it alternates, and the RTSP
+//!   backchannel's packetizer keeps the camera's timestamps to the wall
+//!   clock whatever gaps reach it. The chain takes what passes as it
+//!   comes, and its concealment is bounded by the audio that passed
+//!   (Gaps), so the decoder's work does not outrun the wall clock either.
 //! - **Talk spurts.** A gap over [`MAX_GAP`] in the input timestamps, or a
 //!   sender silent for longer than that, starts a new spurt: marker set,
 //!   timestamp advanced by the time that passed. The partial frame the last
@@ -70,7 +81,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{failed, rtp_ts};
 use crate::g711::{Law, SAMPLE_RATE};
-use crate::opus::{Decoder, OpusError};
+use crate::opus::{Decoder, OpusError, packet_samples};
 
 /// The SSRC on the output's packets; the backchannel writes its own.
 const SSRC: u32 = 0x4737_3131;
@@ -282,6 +293,18 @@ impl Input {
             Self::G711(_) => 1,
         }
     }
+
+    /// The input timestamp ticks `payload` spans, without decoding it:
+    /// RFC 6716 §3.4's framing at Opus's 48 kHz clock (RFC 7587 §4.1), a
+    /// tick per byte for G.711 (RFC 3551 §4.5.14). Nothing for an Opus
+    /// payload that is no packet, which the session refuses before it gets
+    /// here.
+    fn ticks(&self, payload: &[u8]) -> i64 {
+        match self {
+            Self::Opus(_) => packet_samples(payload).map_or(0, i64::from),
+            Self::G711(_) => i64::try_from(payload.len()).unwrap_or(i64::MAX),
+        }
+    }
 }
 
 /// The duration of `samples` at 8 kHz, 125 µs each; none for a negative
@@ -423,7 +446,14 @@ impl Chain {
             Some(spurt) if frame.wallclock.saturating_duration_since(spurt.end) > MAX_GAP => {
                 self.restart(&spurt, frame.wallclock, "sender_stopped")
             }
-            Some(spurt) if gap > 0 => self.bridge(spurt, gap, now),
+            Some(spurt) if gap > 0 => {
+                let carried = self
+                    .input
+                    .ticks(&frame.payload)
+                    .checked_div(self.input.ticks_per_sample())
+                    .unwrap_or(0);
+                self.bridge(spurt, gap, carried, now)
+            }
             Some(spurt) => spurt,
         };
         // The packet's place is taken even if it does not decode: its
@@ -492,15 +522,22 @@ impl Chain {
     }
 
     /// Bridges a gap of `gap` samples, up to [`MAX_GAP`], in `spurt`
-    /// before the packet being taken: nothing is sent for it, and the
-    /// output timeline moves on by it, at once when no frame is being
-    /// filled, else after that frame, which the gap falls inside. Opus
-    /// runs its loss concealment over the gap and discards the samples, so
-    /// the next packet decodes as libopus expects after a loss (RFC 6716
-    /// §4.4).
-    fn bridge(&mut self, mut spurt: Spurt, gap: i64, now: Instant) -> Spurt {
+    /// before the packet being taken, which carries `carried` samples:
+    /// nothing is sent for it, and the output timeline moves on by it, at
+    /// once when no frame is being filled, else after that frame, which
+    /// the gap falls inside. Opus runs its loss concealment over the end
+    /// of the gap, as much of it as the packet carries, and discards the
+    /// samples, so the next packet decodes as libopus expects after a
+    /// loss (RFC 6716 §4.4). The cap keeps the decoder's work with the
+    /// audio taken, which the session's pace bounds, not with the
+    /// timestamps a sender claims: short packets each 100 ms past the last
+    /// would otherwise buy 100 ms of concealment apiece. A lost packet of
+    /// the same size as the next is concealed whole.
+    fn bridge(&mut self, mut spurt: Spurt, gap: i64, carried: i64, now: Instant) -> Spurt {
         if let Input::Opus(decoder) = &mut self.input {
-            let steps = usize::try_from(gap).unwrap_or(0).div_ceil(CONCEAL_STEP);
+            let steps = usize::try_from(gap.min(carried))
+                .unwrap_or(0)
+                .div_ceil(CONCEAL_STEP);
             let concealed = decoder
                 .conceal(steps.saturating_mul(CONCEAL_STEP))
                 .map_or(0, <[i16]>::len);
@@ -1461,5 +1498,38 @@ mod tests {
                 "{fields:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rfc6716_4_4_concealment_is_bounded_by_the_packet_that_reveals_the_gap() {
+        let (logs, _guard) = Logs::capture();
+        let mut rig = Rig::opus();
+        // 2.5 ms packets (TOC configuration 16, RFC 6716 §3.1; an empty
+        // frame), at real-time pace or slower, each 100 ms past the last
+        // on the input timeline: a gap to bridge before every one.
+        let mut out = Vec::new();
+        for k in 0..40_u64 {
+            out.extend(rig.run_to(ms(3 * k)).await);
+            rig.publish(4_920 * k as i64, &[0x80]);
+        }
+        out.extend(rig.run_to(ms(200)).await);
+        // Each gap is 800 samples; each packet carries 20, and that is all
+        // the concealment it buys: the decoder's work stays with the
+        // audio taken, not with the timestamps the sender claims.
+        let runs = logs.fields(Level::TRACE, "uplink: loss run through the decoder");
+        assert_eq!(runs.len(), 39);
+        assert!(
+            runs.iter()
+                .all(|fields| fields.contains(&"concealed=20".to_owned())),
+            "{runs:?}"
+        );
+        assert_eq!(logs.count(Level::DEBUG, BRIDGED), 1, "rate-limited");
+        assert_eq!(logs.count(Level::DEBUG, ENDED), 0);
+        // The timestamps run over the gaps (RFC 3550 §5.1): eight packets
+        // of 20 samples and 800 skipped to a frame.
+        assert_eq!(
+            timestamps(&out),
+            (0..5).map(|k| 8 * (20 + 800) * k).collect::<Vec<_>>()
+        );
     }
 }

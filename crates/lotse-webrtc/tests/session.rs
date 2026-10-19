@@ -41,6 +41,7 @@ use lotse_core::session::{
     SessionOutput, SessionRequest, TalkbackClaim, TalkbackTarget, Transport,
 };
 use lotse_core::source::TrackSet;
+use lotse_core::text::CUT_MARK;
 use lotse_core::track::{Track, TrackLimits};
 use lotse_core::uplink::{UplinkCodec, UplinkPacket};
 use lotse_testing::viewer::{
@@ -3214,6 +3215,115 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
         refused(&mut pair, &reoffer),
         RenegotiateError::InvalidSdp("the session is closed".into())
     );
+}
+
+/// The cap the session cuts a piece of the browser's text to before a log
+/// line carries it (`BROWSER_TEXT_BYTES` in the crate's `sdp`).
+const BROWSER_TEXT_BYTES: usize = 200;
+
+/// Whether `line` carries a run of `x` cut to [`BROWSER_TEXT_BYTES`]: the
+/// run ends in [`CUT_MARK`] within the cap, and no run is longer.
+fn carries_capped_xs(line: &str) -> bool {
+    let kept = "x".repeat(BROWSER_TEXT_BYTES - CUT_MARK.len());
+    line.contains(&format!("{kept}{CUT_MARK}")) && !line.contains(&format!("{kept}x"))
+}
+
+/// The browser's text a payload type refusal quotes, a 10 kB `a=fmtp`
+/// value and mid here, reaches the log line capped, ending in the cut
+/// mark, for an offer and a re-offer alike (RFC 9143 §9.1.1).
+#[test]
+fn rfc9143_9_1_1_a_payload_type_refusal_logs_the_browser_s_text_capped() {
+    let long = "x".repeat(10_000);
+    let capped = |logs: &str, what: &str| {
+        let line = logs
+            .lines()
+            .find(|line| line.contains(what))
+            .unwrap_or_else(|| panic!("{what}: {logs}"));
+        assert!(carries_capped_xs(line), "{line}");
+        assert!(line.len() < 2_000, "{} bytes", line.len());
+    };
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_with_audio(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let offer = with_audio_codecs(
+        viewer.offer(),
+        &format!("a=rtpmap:109 opus/48000/2\na=fmtp:109 {long}\na=mid:{long}\n"),
+    );
+    let (logs, captured) = capture_logs(tracing::Level::DEBUG);
+    let err = Session::answer(&request(&offer, h264(None)), now).err();
+    drop(logs);
+    assert!(
+        matches!(&err, Some(SessionOpenError::InvalidSdp(_))),
+        "{err:?}"
+    );
+    capped(&captured.text(), "offer refused: payload types conflict");
+
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
+    pair.connect(&answer);
+    let reoffer = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let last_audio = reoffer.rfind("m=audio").unwrap();
+    let conflict = format!(
+        "{}{}",
+        &reoffer[..last_audio],
+        reoffer[last_audio..]
+            .replacen("a=rtpmap:111 opus/48000/2", "a=rtpmap:111 PCMU/8000", 1)
+            .replacen("a=fmtp:111 ", &format!("a=fmtp:111 {long};"), 1)
+    );
+    assert_ne!(conflict, reoffer);
+    let (logs, captured) = capture_logs(tracing::Level::DEBUG);
+    let err = pair.session.renegotiate(
+        pair.now,
+        &conflict,
+        Some(chained(Codec::Pcmu)),
+        TalkbackClaim::Granted,
+    );
+    drop(logs);
+    assert!(
+        matches!(&err, Err(RenegotiateError::InvalidSdp(_))),
+        "{err:?}"
+    );
+    capped(&captured.text(), "re-offer refused: payload types conflict");
+}
+
+/// The talk-back m-line's mid, browser text of any length, reaches the
+/// `talk-back negotiated` line capped, ending in the cut mark (RFC 5888
+/// §4).
+#[test]
+fn rfc5888_4_the_talk_back_mid_is_logged_capped() {
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_with_talkback(BROWSER.parse().unwrap(), now, TalkbackOffer::Dedicated)
+        .expect("a viewer");
+    let offer = viewer.offer();
+    let last_audio = offer.rfind("m=audio").unwrap();
+    let mid_at = last_audio + offer[last_audio..].find("a=mid:").unwrap() + "a=mid:".len();
+    let mid_len = offer[mid_at..].find("\r\n").unwrap();
+    let mid = &offer[mid_at..mid_at + mid_len];
+    let long = "x".repeat(10_000);
+    let group = offer
+        .lines()
+        .find(|line| line.starts_with("a=group:BUNDLE"))
+        .unwrap();
+    let offer = format!("{}{long}{}", &offer[..mid_at], &offer[mid_at + mid_len..]).replacen(
+        group,
+        &group.replacen(&format!(" {mid}"), &format!(" {long}"), 1),
+        1,
+    );
+    let mut request = request(&offer, h264(None));
+    request.backchannel = Some(chained(Codec::Pcmu));
+    let (logs, captured) = capture_logs(tracing::Level::INFO);
+    let answered = Session::answer(&request, now);
+    drop(logs);
+    assert!(answered.is_ok(), "{:?}", answered.err());
+    let logs = captured.text();
+    let line = logs
+        .lines()
+        .find(|line| line.contains("talk-back negotiated"))
+        .unwrap_or_else(|| panic!("{logs}"));
+    assert!(carries_capped_xs(line), "{line}");
 }
 
 /// A re-offer that writes the video's encoding name in another case

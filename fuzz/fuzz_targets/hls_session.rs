@@ -55,7 +55,7 @@ use libfuzzer_sys::fuzz_target;
 use lotse_core::clock::{Clock, FakeClock};
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::source::{
-    BackchannelSlot, ClockInput, ResolvedPeer, SourceCtx, SourceExit, SourceFactory as _, TrackSet,
+    BackchannelSlot, ClockInput, ResolvedPeer, SourceCtx, SourceFactory as _, TrackSet,
 };
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
@@ -484,7 +484,7 @@ fuzz_target!(|data: &[u8]| {
                 () = tokio::time::sleep(Duration::from_millis(1)) => clock.advance(STEP),
             }
         }
-        let exit = match exit {
+        let err = match exit {
             Some(exit) => exit,
             None => {
                 cancel.cancel();
@@ -496,9 +496,6 @@ fuzz_target!(|data: &[u8]| {
                     }
                 }
             }
-        };
-        let SourceExit::Ended(err) = exit else {
-            panic!("an HTTP source resolves to nothing: {exit:?}");
         };
         let secret = PASSWORD.as_bytes();
         if !data.windows(secret.len()).any(|window| window == secret) {

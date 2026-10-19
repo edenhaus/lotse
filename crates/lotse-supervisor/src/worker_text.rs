@@ -12,8 +12,10 @@
 //! The rest of a worker's text, a warning's or a close's message, a source
 //! error, an unknown code, is for humans and logs:
 //! [`plain`](lotse_core::text::plain) caps it at [`MAX_MESSAGE_BYTES`] or
-//! [`MAX_NAME_BYTES`] and replaces its control characters, so a worker can
-//! neither forge log lines nor make the client carry more than a sentence.
+//! [`MAX_NAME_BYTES`], cut text ending in
+//! [`CUT_MARK`](lotse_core::text::CUT_MARK), and replaces its control
+//! characters, so a worker can neither forge log lines nor make the client
+//! carry more than a sentence.
 //! A track's names are not cut but checked: a track with a name over
 //! [`MAX_NAME_BYTES`] is dropped, with the tracks over
 //! [`MAX_TRACKS`](crate::worker::MAX_TRACKS) ([`crate::worker`]).

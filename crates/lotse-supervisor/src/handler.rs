@@ -39,7 +39,7 @@ use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 
 use crate::connect::ConnectPermits;
-use crate::driver::{COMMAND_QUEUE, Driver, DriverCommand, DriverSpec};
+use crate::driver::{COMMAND_QUEUE, Demand, Driver, DriverCommand, DriverSpec};
 use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnServer};
 use crate::memory::{Memory, MemoryProbe};
 use crate::net::demux::{DemuxStats, Registrations};
@@ -66,8 +66,9 @@ const FEATURES: [&str; 1] = ["session_adopt"];
 /// ([`Supervisor::features`]).
 const TWO_WAY_AUDIO: &str = "two_way_audio";
 
-/// The video codec families the daemon carries.
-const VIDEO_CODECS: [CodecFamily; 3] = [CodecFamily::H264, CodecFamily::H265, CodecFamily::Mjpeg];
+/// The video codec families a viewer can play: MJPEG is ingested and
+/// reported per track, but no output negotiates it.
+const VIDEO_CODECS: [CodecFamily; 2] = [CodecFamily::H264, CodecFamily::H265];
 
 /// The audio codec families the daemon carries.
 const AUDIO_CODECS: [CodecFamily; 5] = [
@@ -557,7 +558,7 @@ impl Supervisor {
     fn create_connection(&self, state: &mut State, source: &ValidatedSource) -> String {
         state.next_connection = state.next_connection.saturating_add(1);
         let id = format!("c{}", state.next_connection);
-        let (demand, demand_rx) = watch::channel(0);
+        let (demand, demand_rx) = watch::channel(Demand::default());
         let sessions = usize::try_from(self.settings.limits.max_sessions).unwrap_or(usize::MAX);
         let (commands, commands_rx) = mpsc::channel(COMMAND_QUEUE.saturating_add(sessions));
         state.connections.insert(
@@ -1473,7 +1474,6 @@ mod tests {
     use lotse_core::clock::{FakeClock, SystemClock};
     use lotse_core::connection::{ConnectionError, ConnectionState};
     use lotse_core::let_assert;
-    use lotse_core::output::OutputShape;
     use lotse_core::source::SourceError;
     use lotse_core::test_util::{FakeOutputFactory, FakeSourceFactory};
     use lotse_ipc::SessionEvent as Report;
@@ -1566,7 +1566,7 @@ mod tests {
         environment
             .registries
             .outputs
-            .register(Arc::new(FakeOutputFactory(WEBRTC, OutputShape::Session)))
+            .register(Arc::new(FakeOutputFactory(WEBRTC)))
             .unwrap();
         environment.front_door = Some(front_door);
         environment
@@ -1619,12 +1619,9 @@ mod tests {
         let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
         assert_eq!(info["schemes"], json!(["fake"]));
         assert_eq!(info["build"]["target"], "test");
-        assert!(
-            info["codecs"]["video"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("h264"))
-        );
+        // Only what an output can play: MJPEG is ingested and reported per
+        // track, but no output negotiates it.
+        assert_eq!(info["codecs"]["video"], json!(["h264", "h265"]));
         assert_eq!(info["limits"]["max_streams"], 2);
         assert_eq!(info["limits"]["session_grace_ms"], 10_000);
         assert_eq!(info["sandbox"]["mode"], "off");
@@ -1735,7 +1732,7 @@ mod tests {
                 environment
                     .registries
                     .outputs
-                    .register(Arc::new(FakeOutputFactory(WEBRTC, OutputShape::Session)))
+                    .register(Arc::new(FakeOutputFactory(WEBRTC)))
                     .unwrap();
             }
             let s = Supervisor::new(
@@ -2182,7 +2179,7 @@ mod tests {
         let _s1 = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
         assert_eq!(next(&mut events).await["state"], "connecting");
         let pid = worker_pid(&s).await;
-        let demand = |s: &Supervisor| *s.shared.lock().connections["c1"].demand.borrow();
+        let demand = |s: &Supervisor| s.shared.lock().connections["c1"].demand.borrow().total();
         assert_eq!(demand(&s), 1, "the viewer");
         // Preload on, then off again, with the same sources: the demand
         // follows, the stream reports the flag, and nothing restarts.
@@ -2538,7 +2535,7 @@ mod tests {
         assert_eq!(id.len(), 26);
 
         // The sessions are demand on the connection; both are listed.
-        assert_eq!(*s.shared.lock().connections["c1"].demand.borrow(), 2);
+        assert_eq!(s.shared.lock().connections["c1"].demand.borrow().total(), 2);
         let front = result(call(&s, r#"{"id":5,"type":"stream/get","stream_id":"front"}"#).await);
         let mut listed: Vec<Value> = front["sessions"].as_array().unwrap().clone();
         listed.sort_by_key(|v| v.as_str().unwrap().to_owned());
@@ -3510,7 +3507,7 @@ mod tests {
             let state_now = s.shared.lock();
             assert!(state_now.sessions.is_empty());
             assert_eq!(
-                *state_now.connections[&connection].demand.borrow(),
+                state_now.connections[&connection].demand.borrow().total(),
                 0,
                 "no attempt for it"
             );
@@ -3534,7 +3531,10 @@ mod tests {
         assert_eq!(delivered(&mut events)["type"], "session");
         assert!(events.try_recv().is_err(), "no closed for a drop");
         assert_eq!(
-            *s.shared.lock().connections[&connection].demand.borrow(),
+            s.shared.lock().connections[&connection]
+                .demand
+                .borrow()
+                .total(),
             1,
             "handed to the driver"
         );
@@ -3560,7 +3560,10 @@ mod tests {
         let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
         assert_eq!(delivered(&mut events)["type"], "session");
         assert_eq!(
-            *s.shared.lock().connections[&connection].demand.borrow(),
+            s.shared.lock().connections[&connection]
+                .demand
+                .borrow()
+                .total(),
             1,
             "the offer starts an attempt"
         );
@@ -3623,7 +3626,10 @@ mod tests {
         assert_eq!(delivered(&mut events)["type"], "session");
         assert!(events.try_recv().is_err(), "no closed with the old error");
         assert_eq!(
-            *s.shared.lock().connections[&connection].demand.borrow(),
+            s.shared.lock().connections[&connection]
+                .demand
+                .borrow()
+                .total(),
             1,
             "handed to the driver"
         );

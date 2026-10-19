@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use lotse_core::secret::RedactedUrl;
-use lotse_core::source::{Source, SourceCtx, SourceDescriptor, SourceError, SourceExit};
+use lotse_core::source::{Source, SourceCtx, SourceDescriptor, SourceError};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::BoxFuture;
 use lotse_tls::{TlsStream, TlsTarget};
@@ -89,8 +89,9 @@ const SNIFF_BYTES: usize = 2 * TS_PACKET + 1;
 const MJPEG: &str = "multipart/x-mixed-replace";
 
 /// The most bytes of a server's `Content-Type` a refusal names, as the
-/// RTSP source caps a camera's text: a media type is a few words, and a
-/// header value may be kilobytes of anything.
+/// RTSP source caps a camera's text, a cut one ending in
+/// [`CUT_MARK`](lotse_core::text::CUT_MARK): a media type is a few words,
+/// and a header value may be kilobytes of anything.
 const SERVER_TEXT_BYTES: usize = 200;
 
 /// How far ahead a unit may be due before the pacer takes it for a jump of
@@ -161,7 +162,7 @@ impl Source for HttpSource {
         self.options.connection_key()
     }
 
-    fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceExit> {
+    fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
         let url = self.url.clone();
         let options = self.options.clone();
         let tls = self.tls.clone();
@@ -170,7 +171,7 @@ impl Source for HttpSource {
                 None => attempt(Plain, url, options, ctx).await,
                 Some(target) => attempt(Https(target), url, options, ctx).await,
             };
-            SourceExit::Ended(exit)
+            exit
         })
     }
 }

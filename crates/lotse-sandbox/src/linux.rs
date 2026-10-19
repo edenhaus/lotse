@@ -24,7 +24,8 @@ use rustix::process::{DumpableBehavior, Gid, Resource, Rlimit, Signal, Uid};
 use crate::report::{LandlockReport, LayerStatus};
 use crate::{
     DECODER_ADDRESS_SPACE, DECODER_CPU_SECONDS, Mode, Profile, SandboxConfig, SandboxError,
-    SandboxReport, WORKER_MAX_FILES, WORKER_MAX_NICE_RLIMIT, WORKER_NICE_INCREMENT, seccomp,
+    SandboxReport, WORKER_MAX_FILE_SIZE, WORKER_MAX_FILES, WORKER_MAX_NICE_RLIMIT,
+    WORKER_NICE_INCREMENT, seccomp,
 };
 
 /// The highest Landlock ABI this crate asks for. Filesystem rules need
@@ -40,7 +41,7 @@ pub(crate) fn apply(
     // Before the drop: the dropped uid may not reach a rule's path.
     let rules = open_rules(profile);
     let (uid, gid) = drop_privileges(config)?;
-    apply_rlimits(profile, config)?;
+    apply_rlimits(profile, config, &mut notes)?;
     apply_priority(profile)?;
     rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable)
         .map_err(step("PR_SET_DUMPABLE"))?;
@@ -163,8 +164,15 @@ fn drop_ids(calls: &mut impl IdCalls, config: &SandboxConfig) -> Result<(u32, u3
     Ok((config.uid, config.gid))
 }
 
-/// `RLIMIT_CORE` zero everywhere, plus the profile's own limits.
-fn apply_rlimits(profile: &Profile, config: &SandboxConfig) -> Result<(), SandboxError> {
+/// `RLIMIT_CORE` zero everywhere, plus the profile's own limits. A
+/// worker's `RLIMIT_FSIZE` ([`WORKER_MAX_FILE_SIZE`]) comes last, and only
+/// while its standard error is not a regular file; otherwise `notes` says
+/// it is missing.
+fn apply_rlimits(
+    profile: &Profile,
+    config: &SandboxConfig,
+    notes: &mut Vec<String>,
+) -> Result<(), SandboxError> {
     let hard = |value: u64| Rlimit {
         current: Some(value),
         maximum: Some(value),
@@ -179,6 +187,15 @@ fn apply_rlimits(profile: &Profile, config: &SandboxConfig) -> Result<(), Sandbo
                 .map_err(step("RLIMIT_AS"))?;
             rustix::process::setrlimit(Resource::Nice, hard(WORKER_MAX_NICE_RLIMIT))
                 .map_err(step("RLIMIT_NICE"))?;
+            if stderr_is_a_regular_file() {
+                notes.push(
+                    "rlimit: no RLIMIT_FSIZE of 0, standard error is a regular file the worker logs to"
+                        .to_owned(),
+                );
+            } else {
+                rustix::process::setrlimit(Resource::Fsize, hard(WORKER_MAX_FILE_SIZE))
+                    .map_err(step("RLIMIT_FSIZE"))?;
+            }
         }
         Profile::Decoder => {
             rustix::process::setrlimit(Resource::As, hard(DECODER_ADDRESS_SPACE))
@@ -188,6 +205,15 @@ fn apply_rlimits(profile: &Profile, config: &SandboxConfig) -> Result<(), Sandbo
         }
     }
     Ok(())
+}
+
+/// Whether the calling process's standard error is a regular file
+/// (fstat(2)), which an `RLIMIT_FSIZE` of 0 would forbid it to write. One it
+/// cannot inspect counts as none.
+fn stderr_is_a_regular_file() -> bool {
+    rustix::fs::fstat(io::stderr()).is_ok_and(|stat| {
+        rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::RegularFile
+    })
 }
 
 /// Lowers a worker's scheduling priority by [`WORKER_NICE_INCREMENT`] nice
@@ -488,6 +514,7 @@ mod tests {
         reason = "test code"
     )]
 
+    use std::io::Write as _;
     use std::os::fd::{AsRawFd as _, OwnedFd};
     use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
@@ -585,6 +612,41 @@ mod tests {
         println!("{CHILD_DONE}");
     }
 
+    /// [`in_child`] with the child's standard error a regular file, as
+    /// `lotse serve 2>lotse.log` makes the daemon's and so every worker's:
+    /// what the child wrote to its standard error.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "spawns this test binary as the child"
+    )]
+    fn in_child_logging_to_a_file(test: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "lotse-sandbox-stderr-{}-{}",
+            std::process::id(),
+            test.rsplit("::").next().unwrap()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .stderr(file)
+            .output()
+            .unwrap();
+        let stderr = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(CHILD_DONE),
+            "{}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+        stderr
+    }
+
+    /// The note a worker whose standard error is a regular file reports.
+    const STDERR_IS_A_FILE: &str =
+        "rlimit: no RLIMIT_FSIZE of 0, standard error is a regular file the worker logs to";
+
     #[test]
     fn setrlimit2_a_decoder_gets_its_address_space_and_cpu_limits() {
         in_child("linux::tests::setrlimit2_decoder_limits_child");
@@ -596,17 +658,21 @@ mod tests {
         if !is_child() {
             return;
         }
-        apply_rlimits(&Profile::Decoder, &SandboxConfig::default()).unwrap();
+        let file_size = limits(Resource::Fsize);
+        let mut notes = Vec::new();
+        apply_rlimits(&Profile::Decoder, &SandboxConfig::default(), &mut notes).unwrap();
         let supervisor = Profile::Supervisor {
             binary: "/lotse".into(),
             state_dir: None,
         };
-        apply_rlimits(&supervisor, &SandboxConfig::default()).unwrap();
+        apply_rlimits(&supervisor, &SandboxConfig::default(), &mut notes).unwrap();
         let address_space = Some(DECODER_ADDRESS_SPACE);
         assert_eq!(limits(Resource::As), (address_space, address_space));
         let cpu = Some(DECODER_CPU_SECONDS);
         assert_eq!(limits(Resource::Cpu), (cpu, cpu));
         assert_eq!(limits(Resource::Core), (Some(0), Some(0)));
+        assert_eq!(limits(Resource::Fsize), file_size, "a worker's limit only");
+        assert!(notes.is_empty(), "{notes:?}");
         println!("{CHILD_DONE}");
     }
 
@@ -691,14 +757,28 @@ mod tests {
         assert_eq!(own_nice(), before);
     }
 
+    /// Regression for SBX-20: workers could grow and write regular files
+    /// with write calls, and a worker logging to a regular file must keep
+    /// logging. With its
+    /// standard error a regular file the worker keeps the `RLIMIT_FSIZE` it
+    /// inherited, says so, and its log line after the limits lands in the
+    /// file; under the limit of 0 that write would end it with `SIGXFSZ`
+    /// (getrlimit(2)). Where a worker gets the limit, the kernel's refusal
+    /// is checked through the whole profile in `tests/linux_probe.rs`: a
+    /// process under it cannot write its coverage profile at exit.
     #[test]
     fn setrlimit2_a_worker_gets_its_limits_and_cannot_raise_its_priority_again() {
-        in_child("linux::tests::setrlimit2_worker_limits_child");
+        let stderr = in_child_logging_to_a_file("linux::tests::setrlimit2_worker_limits_child");
+        assert!(
+            stderr.contains("child: logged after the limits"),
+            "{stderr}"
+        );
     }
 
-    /// The child: the worker's limits, set and read back, over whatever
-    /// `RLIMIT_NICE` it inherited (`docker run --ulimit nice=20:20` lets an
-    /// unprivileged process lower its nice value to 0); then its lower
+    /// The child, its standard error a regular file: the worker's limits,
+    /// set and read back, over whatever `RLIMIT_NICE` it inherited (`docker
+    /// run --ulimit nice=20:20` lets an unprivileged process lower its nice
+    /// value to 0), and its `RLIMIT_FSIZE` left as it was; then its lower
     /// priority, which it cannot undo unless it holds `CAP_SYS_NICE`, as
     /// root does outside a container (setpriority(2): `EACCES`; Docker's
     /// default capability set has no `CAP_SYS_NICE`).
@@ -710,7 +790,13 @@ mod tests {
         let worker = Profile::Worker {
             connect_ports: vec![554],
         };
-        apply_rlimits(&worker, &SandboxConfig::default()).unwrap();
+        let file_size = limits(Resource::Fsize);
+        let mut notes = Vec::new();
+        apply_rlimits(&worker, &SandboxConfig::default(), &mut notes).unwrap();
+        assert_eq!(limits(Resource::Fsize), file_size);
+        assert_eq!(notes, [STDERR_IS_A_FILE]);
+        let logged = writeln!(io::stderr(), "child: logged after the limits");
+        assert!(logged.is_ok(), "{logged:?}");
         let nice = Some(WORKER_MAX_NICE_RLIMIT);
         assert_eq!(limits(Resource::Nice), (nice, nice));
         assert_eq!(nice, Some(0));
@@ -724,6 +810,140 @@ mod tests {
         let effective = rustix::thread::capabilities(None).unwrap().effective;
         let privileged = effective.contains(rustix::thread::CapabilitySet::SYS_NICE);
         assert_eq!(raised.err(), (!privileged).then_some(Errno::ACCESS));
+        println!("{CHILD_DONE}");
+    }
+
+    /// Regression for SBX-20: a worker whose standard error is a regular
+    /// file keeps logging to it under its whole profile, which notes the
+    /// `RLIMIT_FSIZE` it does without. A child that gets the limit cannot
+    /// write its coverage profile at exit; this one can.
+    #[test]
+    fn setrlimit2_a_sandboxed_worker_logging_to_a_regular_file_keeps_logging() {
+        let stderr =
+            in_child_logging_to_a_file("linux::tests::setrlimit2_worker_logging_to_a_file_child");
+        assert!(
+            stderr.contains("child: logged under the sandbox"),
+            "{stderr}"
+        );
+    }
+
+    /// The child, its standard error a regular file: the whole worker
+    /// profile, then a log line.
+    #[test]
+    fn setrlimit2_worker_logging_to_a_file_child() {
+        if !is_child() {
+            return;
+        }
+        let file_size = limits(Resource::Fsize);
+        let worker = Profile::Worker {
+            connect_ports: vec![554],
+        };
+        let report = crate::apply(&worker, &SandboxConfig::default()).unwrap();
+        let notes = report.notes;
+        assert!(notes.contains(&STDERR_IS_A_FILE.to_owned()), "noted");
+        assert_eq!(limits(Resource::Fsize), file_size);
+        let logged = writeln!(io::stderr(), "child: logged under the sandbox");
+        assert!(logged.is_ok(), "{logged:?}");
+        println!("{CHILD_DONE}");
+    }
+
+    /// The supervisor writes files in its state directory, so its whole
+    /// profile leaves its `RLIMIT_FSIZE` as it was, whatever its standard
+    /// error is (here a pipe).
+    #[test]
+    fn setrlimit2_the_supervisor_keeps_its_file_size_limit() {
+        in_child("linux::tests::setrlimit2_supervisor_file_size_child");
+    }
+
+    /// The child: the whole supervisor profile.
+    #[test]
+    fn setrlimit2_supervisor_file_size_child() {
+        if !is_child() {
+            return;
+        }
+        let file_size = limits(Resource::Fsize);
+        let supervisor = Profile::Supervisor {
+            binary: std::env::current_exe().unwrap(),
+            state_dir: None,
+        };
+        let report = crate::apply(&supervisor, &SandboxConfig::default()).unwrap();
+        assert_eq!(limits(Resource::Fsize), file_size);
+        // No closure over the notes: unprivileged, under a kernel with
+        // every layer, there are none, and it would never run.
+        let notes = report.notes;
+        assert!(!notes.contains(&STDERR_IS_A_FILE.to_owned()), "not noted");
+        println!("{CHILD_DONE}");
+    }
+
+    /// `RLIMIT_FSIZE` (asm-generic/resource.h), as prlimit(2) takes it.
+    const RLIMIT_FSIZE: u64 = 1;
+
+    /// Regression for SBX-20: a worker whose standard error is not a
+    /// regular file (here a pipe) asks for an `RLIMIT_FSIZE` of 0, after its
+    /// other limits, and a refusal names its step, as every refused limit
+    /// does.
+    #[test]
+    fn setrlimit2_a_refused_file_size_limit_names_its_step() {
+        in_child("linux::tests::setrlimit2_refused_file_size_child");
+    }
+
+    /// The child: a filter on its one thread answers prlimit(2), which
+    /// setrlimit(2) is made of, with `EPERM` when it sets `RLIMIT_FSIZE`, so
+    /// the child keeps the limit it had and writes its coverage profile at
+    /// exit.
+    #[test]
+    fn setrlimit2_refused_file_size_child() {
+        if !is_child() {
+            return;
+        }
+        let arch = seccompiler::TargetArch::try_from(std::env::consts::ARCH).unwrap();
+        let resource = seccompiler::SeccompCondition::new(
+            1,
+            seccompiler::SeccompCmpArgLen::Dword,
+            seccompiler::SeccompCmpOp::Eq,
+            RLIMIT_FSIZE,
+        )
+        .unwrap();
+        // A new limit given: rustix reads a limit with prlimit(2) too.
+        let setting = seccompiler::SeccompCondition::new(
+            2,
+            seccompiler::SeccompCmpArgLen::Qword,
+            seccompiler::SeccompCmpOp::Ne,
+            0,
+        )
+        .unwrap();
+        let rule = seccompiler::SeccompRule::new(vec![resource, setting]).unwrap();
+        let rules = std::collections::BTreeMap::from([(libc::SYS_prlimit64, vec![rule])]);
+        let eperm = u32::try_from(libc::EPERM).unwrap();
+        let refuse: seccompiler::BpfProgram = seccompiler::SeccompFilter::new(
+            rules,
+            seccompiler::SeccompAction::Allow,
+            seccompiler::SeccompAction::Errno(eperm),
+            arch,
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        seccompiler::apply_filter(&refuse).unwrap();
+        let file_size = limits(Resource::Fsize);
+        let worker = Profile::Worker {
+            connect_ports: vec![554],
+        };
+        let mut notes = Vec::new();
+        let err = apply_rlimits(&worker, &SandboxConfig::default(), &mut notes).unwrap_err();
+        assert!(
+            matches!(&err, SandboxError::Step { step: "RLIMIT_FSIZE", source }
+                if source.raw_os_error() == Some(libc::EPERM)),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "RLIMIT_FSIZE failed: Operation not permitted (os error 1)"
+        );
+        assert_eq!(limits(Resource::Fsize), file_size);
+        let nice = Some(WORKER_MAX_NICE_RLIMIT);
+        assert_eq!(limits(Resource::Nice), (nice, nice), "set before");
+        assert!(notes.is_empty(), "{notes:?}");
         println!("{CHILD_DONE}");
     }
 

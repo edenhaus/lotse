@@ -11,11 +11,20 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# The JSON Schema generator (`schema::bundle`): the `schema` example and the test that the
+# committed bundle is not stale. The daemon serves the committed bundle and leaves it out.
+schema = ["dep:schemars"]
+
 [dependencies]
-schemars = { workspace = true }
+schemars = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[[example]]
+name = "schema"
+required-features = ["schema"]
 
 [lints]
 workspace = true
