@@ -835,7 +835,7 @@
           "type": "integer"
         },
         "addresses_moved": {
-          "description": "Learned addresses moved to another session by a verified STUN\nrequest naming it, at most once per address per 30 s; each also\ncounts as learned.",
+          "description": "Learned addresses moved to another session by a verified STUN\nrequest naming it: away from the session that held one at most\nonce per address per 30 s, and back to it within that time; each\nalso counts as learned.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

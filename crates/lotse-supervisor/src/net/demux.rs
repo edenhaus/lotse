@@ -12,7 +12,8 @@
 //! session; a STUN Binding Request by its USERNAME's local ufrag,
 //! verified with that session's password before the address is learned
 //! or moved to that session (RFC 8445 §7.2.2, §7.3, RFC 8489 §9.1), an
-//! address moving at most once per [`ADDR_IDLE_EXPIRY`]; otherwise
+//! address moving away from the session that held it at most once per
+//! [`ADDR_IDLE_EXPIRY`], and back to it within that time; otherwise
 //! dropped and counted. Forwarding is a non-blocking send on the worker's
 //! datagram channel; a full channel drops the datagram, so one stuck
 //! worker never slows the others.
@@ -47,7 +48,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixDatagram;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -76,9 +77,9 @@ pub const MAX_ADDRS_PER_SESSION: usize = 8;
 /// addresses for its life.
 pub const ADDR_IDLE_EXPIRY: Duration = Duration::from_secs(30);
 
-/// Addresses whose last move to another session is remembered at once.
-/// Each is forgotten [`ADDR_IDLE_EXPIRY`] after its move; while this many
-/// are remembered, any further move is refused.
+/// Addresses whose move window is remembered at once. Each is forgotten
+/// [`ADDR_IDLE_EXPIRY`] after the move that opened it; while this many are
+/// remembered, any move that would open another is refused.
 pub const MAX_RECENT_MOVES: usize = 4_096;
 
 /// Log every this many dropped datagrams from unknown addresses.
@@ -381,7 +382,8 @@ pub struct DemuxStats {
     /// Addresses learned through verified STUN requests.
     pub addresses_learned: AtomicU64,
     /// Learned addresses moved to another session by a verified STUN
-    /// request naming it; each also counts as learned.
+    /// request naming it, a move back to the session an address moved
+    /// away from included; each also counts as learned.
     pub addresses_moved: AtomicU64,
     /// Datagrams dropped because the worker's channel was full.
     pub worker_full: AtomicU64,
@@ -769,11 +771,11 @@ pub struct Peers {
     /// sessions that came and went; a live session's go when they were
     /// silent for [`ADDR_IDLE_EXPIRY`] and it needs the room.
     by_addr: HashMap<SocketAddr, Learned>,
-    /// When each address last moved to another session, on the clock,
-    /// for [`ADDR_IDLE_EXPIRY`] after it: kept apart from `by_addr`, so a
-    /// session that closes, and its addresses with it, does not take the
-    /// cooldown along. At most [`MAX_RECENT_MOVES`].
-    moves: HashMap<SocketAddr, Instant>,
+    /// Each address's move window, for [`ADDR_IDLE_EXPIRY`] after the
+    /// move that opened it: kept apart from `by_addr`, so a session that
+    /// closes, and its addresses with it, does not take the window along.
+    /// At most [`MAX_RECENT_MOVES`].
+    moves: HashMap<SocketAddr, MoveWindow>,
     /// The entries of `moves` oldest first, so the expired ones are
     /// forgotten from the front, each once, without a scan of the rest.
     move_order: VecDeque<(Instant, SocketAddr)>,
@@ -788,9 +790,26 @@ pub struct Peers {
     /// The same for verified requests refused because their session has
     /// no room for another address.
     full_log: Throttle,
-    /// The same for verified requests refused because their address moved
-    /// less than [`ADDR_IDLE_EXPIRY`] ago.
+    /// The same for verified requests refused because their address's
+    /// move window is open and their session is not its incumbent, or
+    /// because too many windows are.
     move_log: Throttle,
+    /// The same for addresses moved back to their window's incumbent.
+    reclaim_log: Throttle,
+}
+
+/// The window a move of an address away from the session that held it
+/// opens, [`ADDR_IDLE_EXPIRY`] long: within it the address moves only
+/// back to that session, the incumbent.
+#[derive(Debug)]
+struct MoveWindow {
+    /// When the move that opened it was made, on the clock.
+    opened: Instant,
+    /// The session the address moved away from. Weak, so a closed
+    /// session's registration is not kept for the window; its allocation
+    /// is, so no session registered later shares its address and passes
+    /// for it.
+    incumbent: Weak<Registration>,
 }
 
 /// One learned address.
@@ -818,6 +837,7 @@ impl Peers {
             rejected_log: Throttle::default(),
             full_log: Throttle::default(),
             move_log: Throttle::default(),
+            reclaim_log: Throttle::default(),
             by_addr: HashMap::new(),
             moves: HashMap::new(),
             move_order: VecDeque::new(),
@@ -898,20 +918,35 @@ impl Peers {
                     // The integrity proves which session the sender holds,
                     // not that it sent from there: replayed or spoofed
                     // checks of two sessions would bounce an address
-                    // between them on every datagram. One move per
-                    // address per consent timeout bounds that (RFC 7675
-                    // §5.1); the address stays where it is meanwhile.
+                    // between them on every datagram. A move away from
+                    // the session that held the address opens a window
+                    // of one consent timeout (RFC 7675 §5.1) in which the
+                    // address moves only back to that session, its
+                    // incumbent. A peer that spoofs another's learned
+                    // address with checks of its own sessions diverts it
+                    // until the other's next check takes it back, once
+                    // per window however many sessions it holds. That
+                    // does not protect an address whose first verified
+                    // check is the spoofer's, as the spoofer is then its
+                    // incumbent: only return routability does, a check
+                    // to the address whose response proves a peer there
+                    // before the move is made (RFC 8445 §7.3.1.4).
                     // Decided before `claim`, which may forget the
                     // requester's idle addresses for one it gets.
+                    let mut reclaim = None;
                     if let Some(owner) = self
                         .by_addr
                         .get(&source)
                         .map(|learned| Arc::clone(&learned.registration))
-                        && let Some(refusal) = self.move_refusal(source, now)
                     {
-                        DemuxStats::bump(&self.stats.stun_rejected);
-                        self.log_refused_move(refusal, source, &owner, &registration, now);
-                        return;
+                        match self.move_decision(source, &registration, now) {
+                            Ok(since) => reclaim = since,
+                            Err(refusal) => {
+                                DemuxStats::bump(&self.stats.stun_rejected);
+                                self.log_refused_move(refusal, source, &owner, &registration, now);
+                                return;
+                            }
+                        }
                     }
                     if !self.claim(&registration, now) {
                         DemuxStats::bump(&self.stats.stun_rejected);
@@ -945,11 +980,7 @@ impl Peers {
                         },
                     );
                     if let Some(previous) = previous {
-                        self.moves.insert(source, now);
-                        self.move_order.push_back((now, source));
-                        DemuxStats::bump(&self.stats.addresses_moved);
-                        previous.registration.addrs.fetch_sub(1, Ordering::AcqRel);
-                        tracing::info!(%source, from = previous.registration.local_ufrag, to = ufrag, "address moved to the session a verified stun request named");
+                        self.moved(source, &previous.registration, &ufrag, reclaim, now);
                     }
                 }
                 _ => {
@@ -977,6 +1008,38 @@ impl Peers {
         }
     }
 
+    /// Counts that `source` moved at `now` from `from` to the session
+    /// whose ufrag is `to`, and gives `from` its address back. A reclaim,
+    /// `reclaim` the time since the address's window opened, leaves the
+    /// window as it is and is logged once per
+    /// [`lotse_core::throttle::SUMMARY_INTERVAL`]; any other move opens
+    /// the window, `from` its incumbent.
+    fn moved(
+        &mut self,
+        source: SocketAddr,
+        from: &Arc<Registration>,
+        to: &str,
+        reclaim: Option<Duration>,
+        now: Instant,
+    ) {
+        DemuxStats::bump(&self.stats.addresses_moved);
+        from.addrs.fetch_sub(1, Ordering::AcqRel);
+        if let Some(since) = reclaim {
+            if let Some(reclaimed) = self.reclaim_log.hit(now) {
+                let since_ms = since.as_millis();
+                tracing::warn!(%source, from = from.local_ufrag, to, since_ms, reclaimed, "address reclaimed by the session it moved away from within its move window");
+            }
+            return;
+        }
+        let window = MoveWindow {
+            opened: now,
+            incumbent: Arc::downgrade(from),
+        };
+        self.moves.insert(source, window);
+        self.move_order.push_back((now, source));
+        tracing::info!(%source, from = from.local_ufrag, to, "address moved to the session a verified stun request named");
+    }
+
     /// Logs that `source` did not move from `owner` to `to` at `now`, for
     /// `refusal`: the first refusal, then one summary per
     /// [`lotse_core::throttle::SUMMARY_INTERVAL`].
@@ -1002,27 +1065,43 @@ impl Peers {
         }
     }
 
-    /// Why `source` may not move to another session at `now`: it moved
-    /// less than [`ADDR_IDLE_EXPIRY`] ago, which its own entry answers, or
-    /// [`MAX_RECENT_MOVES`] others did, and forgetting one of them would
-    /// let it move again early. Otherwise forgets the moves that expired,
-    /// oldest first, so that every move is forgotten once and `None`
-    /// leaves `moves` and `move_order` the same entries, ready for this
-    /// one.
-    fn move_refusal(&mut self, source: SocketAddr, now: Instant) -> Option<MoveRefusal> {
-        if let Some(moved) = self.moves.get(&source) {
-            let since = now.saturating_duration_since(*moved);
+    /// Whether `source`, learned for another session, may move to `to`
+    /// at `now`. Within its window, which its own entry answers, it may
+    /// only move back to the window's incumbent: `Ok(Some(since))`, the
+    /// time since the window opened, and the window stays as it is.
+    /// Otherwise the move opens a window, `Ok(None)`, unless
+    /// [`MAX_RECENT_MOVES`] others are open, and forgetting one of them
+    /// would let its address move again early. Before that, forgets the
+    /// windows that ended, oldest first, so that each is forgotten once
+    /// and `Ok(None)` leaves `moves` and `move_order` the same entries,
+    /// ready for this one.
+    fn move_decision(
+        &mut self,
+        source: SocketAddr,
+        to: &Arc<Registration>,
+        now: Instant,
+    ) -> Result<Option<Duration>, MoveRefusal> {
+        if let Some(window) = self.moves.get(&source) {
+            let since = now.saturating_duration_since(window.opened);
             if since < ADDR_IDLE_EXPIRY {
-                return Some(MoveRefusal::TooRecent(since));
+                return if std::ptr::eq(window.incumbent.as_ptr(), Arc::as_ptr(to)) {
+                    Ok(Some(since))
+                } else {
+                    Err(MoveRefusal::TooRecent(since))
+                };
             }
         }
-        while let Some(&(moved, addr)) = self.move_order.front()
-            && now.saturating_duration_since(moved) >= ADDR_IDLE_EXPIRY
+        while let Some(&(opened, addr)) = self.move_order.front()
+            && now.saturating_duration_since(opened) >= ADDR_IDLE_EXPIRY
         {
             self.move_order.pop_front();
             self.moves.remove(&addr);
         }
-        (self.moves.len() >= MAX_RECENT_MOVES).then_some(MoveRefusal::TooMany)
+        if self.moves.len() >= MAX_RECENT_MOVES {
+            Err(MoveRefusal::TooMany)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Counts one more address for `registration`; at the cap, first
@@ -1052,10 +1131,10 @@ impl Peers {
 /// Why an address may not move to another session yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MoveRefusal {
-    /// It moved this long ago, less than [`ADDR_IDLE_EXPIRY`].
+    /// Its window opened this long ago, less than [`ADDR_IDLE_EXPIRY`],
+    /// and the session is not the window's incumbent.
     TooRecent(Duration),
-    /// [`MAX_RECENT_MOVES`] other addresses moved within
-    /// [`ADDR_IDLE_EXPIRY`].
+    /// [`MAX_RECENT_MOVES`] other addresses' windows are open.
     TooMany,
 }
 
@@ -2135,88 +2214,82 @@ mod tests {
     /// candidate), but the integrity proves only the credentials, not the
     /// source: whoever holds two sessions' passwords, or replays their
     /// checks from a spoofed source, bounced the address between them on
-    /// every datagram. An address moves at most once per
-    /// [`ADDR_IDLE_EXPIRY`]; a move refused sooner is dropped, counted as
-    /// rejected and logged once per summary interval.
+    /// every datagram. An address moves away from the session that held
+    /// it at most once per [`ADDR_IDLE_EXPIRY`], the window that move
+    /// opens; a move refused within it is dropped, counted as rejected and
+    /// logged once per summary interval. The window counts from its first
+    /// move, not from the incumbent's reclaim.
     #[test]
     fn rfc8445_7_3_an_address_moves_between_sessions_at_most_once_per_idle_expiry() {
         let captured = Captured::default();
         let _logs = captured.install();
-        let clock = Arc::new(FakeClock::default());
-        let registrations = Arc::new(Registrations::default());
-        let stats = Arc::new(DemuxStats::default());
+        let (clock, registrations, stats, mut peers) = move_bench();
         let a_sink = Arc::new(MemorySink::default());
         let b_sink = Arc::new(MemorySink::default());
-        // Credentials as a session gets them.
-        let register = |sink: &Arc<MemorySink>| {
-            let (ufrag, pass) = crate::session::ice_credentials().unwrap();
-            registrations.register(&ufrag, pass.into_bytes(), sink.clone())
-        };
-        let a = register(&a_sink);
-        let b = register(&b_sink);
-        let mut peers = Peers::new(
-            Arc::clone(&registrations),
-            Arc::clone(&stats),
-            Arc::<FakeClock>::clone(&clock),
-        );
-        let local: SocketAddr = "192.0.2.10:3478".parse().unwrap();
+        let c_sink = Arc::new(MemorySink::default());
+        let a = register_fresh(&registrations, &a_sink);
+        let b = register_fresh(&registrations, &b_sink);
+        let c = register_fresh(&registrations, &c_sink);
         let shared: SocketAddr = "198.51.100.1:40000".parse().unwrap();
-        let send = |peers: &mut Peers, payload: &[u8], source: SocketAddr| {
-            let message = stun::parse(payload).ok();
-            peers.route(payload, source, local, message.as_ref());
-        };
-        let check = |r: &Registration, id: u8| binding_request(&r.local_ufrag, &r.password, id);
         let frames = |sink: &MemorySink| sink.frames.lock().unwrap().len();
         let moved = || DemuxStats::get(&stats.addresses_moved);
-        // Learned by a, then moved to b: the first move is allowed.
-        send(&mut peers, &check(&a, 1), shared);
-        assert_eq!(moved(), 0, "learning is not moving");
-        send(&mut peers, &check(&b, 2), shared);
-        assert_eq!(moved(), 1);
-        assert_eq!((frames(&a_sink), frames(&b_sink)), (1, 1));
-        // Moving it back within the expiry is refused, however often.
-        clock.advance(ADDR_IDLE_EXPIRY.saturating_sub(Duration::from_millis(1)));
-        for id in 3..6 {
-            send(&mut peers, &check(&a, id), shared);
-        }
-        assert_eq!(moved(), 1);
-        assert_eq!(DemuxStats::get(&stats.stun_rejected), 3);
-        assert_eq!(DemuxStats::get(&stats.addresses_learned), 2);
-        assert_eq!(frames(&a_sink), 1, "dropped");
-        assert_eq!(
+        let rejected = || DemuxStats::get(&stats.stun_rejected);
+        let addrs = || {
             (
                 a.addrs.load(Ordering::Acquire),
-                b.addrs.load(Ordering::Acquire)
-            ),
-            (0, 1)
-        );
+                b.addrs.load(Ordering::Acquire),
+                c.addrs.load(Ordering::Acquire),
+            )
+        };
+        // Learned by a, then moved to b: the first move is allowed and
+        // opens the window, a its incumbent.
+        route_from(&mut peers, &check_of(&a, 1), shared);
+        assert_eq!(moved(), 0, "learning is not moving");
+        route_from(&mut peers, &check_of(&b, 2), shared);
+        assert_eq!(moved(), 1);
+        assert_eq!((frames(&a_sink), frames(&b_sink)), (1, 1));
+        // Moving it on to c within the window is refused, however often.
+        clock.advance(ADDR_IDLE_EXPIRY.saturating_sub(Duration::from_millis(1)));
+        for id in 3..6 {
+            route_from(&mut peers, &check_of(&c, id), shared);
+        }
+        assert_eq!(moved(), 1);
+        assert_eq!(rejected(), 3);
+        assert_eq!(DemuxStats::get(&stats.addresses_learned), 2);
+        assert_eq!(frames(&c_sink), 0, "dropped");
+        assert_eq!(addrs(), (0, 1, 0));
         let refused = captured.lines("address move refused");
         assert_eq!(refused.len(), 1);
         assert!(refused[0].contains("since_ms=29999"), "{refused:?}");
-        send(&mut peers, b"media", shared);
+        route_from(&mut peers, b"media", shared);
         assert_eq!(frames(&b_sink), 2, "still b's");
-        // Exactly at the expiry it may move again, once.
+        // Exactly at the window's end it may move again, once, and the
+        // window that move opens has b as its incumbent, not a.
         clock.advance(Duration::from_millis(1));
-        send(&mut peers, &check(&a, 6), shared);
+        route_from(&mut peers, &check_of(&c, 6), shared);
         assert_eq!(moved(), 2);
-        assert_eq!(frames(&a_sink), 2);
-        assert_eq!(
-            (
-                a.addrs.load(Ordering::Acquire),
-                b.addrs.load(Ordering::Acquire)
-            ),
-            (1, 0)
-        );
-        send(&mut peers, &check(&b, 7), shared);
+        assert_eq!(frames(&c_sink), 1);
+        assert_eq!(addrs(), (0, 0, 1));
+        route_from(&mut peers, &check_of(&a, 7), shared);
         assert_eq!(moved(), 2);
-        assert_eq!(DemuxStats::get(&stats.stun_rejected), 4);
-        assert_eq!(frames(&b_sink), 2);
-        // The expiry counts from the last move, not the first.
-        clock.advance(ADDR_IDLE_EXPIRY);
-        send(&mut peers, &check(&b, 8), shared);
+        assert_eq!(rejected(), 4);
+        assert_eq!(frames(&a_sink), 1);
+        // b reclaims it, which does not open another window: c's next
+        // move waits for the end of the one c's move opened.
+        clock.advance(Duration::from_secs(1));
+        route_from(&mut peers, &check_of(&b, 8), shared);
         assert_eq!(moved(), 3);
-        assert_eq!(frames(&b_sink), 3);
-        assert_eq!(DemuxStats::get(&stats.stun_rejected), 4);
+        assert_eq!(addrs(), (0, 1, 0));
+        clock.advance(
+            ADDR_IDLE_EXPIRY.saturating_sub(Duration::from_secs(1) + Duration::from_millis(1)),
+        );
+        route_from(&mut peers, &check_of(&c, 9), shared);
+        assert_eq!(rejected(), 5);
+        clock.advance(Duration::from_millis(1));
+        route_from(&mut peers, &check_of(&c, 10), shared);
+        assert_eq!(moved(), 4);
+        assert_eq!(frames(&c_sink), 2);
+        assert_eq!(rejected(), 5);
     }
 
     /// A session registered with credentials as a session gets them, so
@@ -2345,29 +2418,32 @@ mod tests {
         let (clock, registrations, stats, mut peers) = move_bench();
         let a_sink = Arc::new(MemorySink::default());
         let b_sink = Arc::new(MemorySink::default());
+        let c_sink = Arc::new(MemorySink::default());
         let a = register_fresh(&registrations, &a_sink);
         let b = register_fresh(&registrations, &b_sink);
+        let c = register_fresh(&registrations, &c_sink);
         let shared: SocketAddr = "198.51.100.1:40000".parse().unwrap();
         let own = |port: u16| SocketAddr::new([203, 0, 113, 1].into(), port);
         route_from(&mut peers, &check_of(&a, 1), shared);
         for port in 1..=7 {
-            route_from(&mut peers, &check_of(&a, 2), own(port));
+            route_from(&mut peers, &check_of(&c, 2), own(port));
         }
-        // 30 s on, b takes the shared address and a fills its cap again.
+        // 30 s on, b takes the shared address from a, and c fills its cap.
         clock.advance(ADDR_IDLE_EXPIRY);
         route_from(&mut peers, &check_of(&b, 3), shared);
-        route_from(&mut peers, &check_of(&a, 4), own(8));
-        assert_eq!(a.addrs.load(Ordering::Acquire), MAX_ADDRS_PER_SESSION);
-        // Refused, and a's seven idle addresses are still a's.
-        route_from(&mut peers, &check_of(&a, 5), shared);
+        route_from(&mut peers, &check_of(&c, 4), own(8));
+        assert_eq!(c.addrs.load(Ordering::Acquire), MAX_ADDRS_PER_SESSION);
+        // Refused, as c is not a, and c's seven idle addresses are still c's.
+        route_from(&mut peers, &check_of(&c, 5), shared);
         assert_eq!(DemuxStats::get(&stats.stun_rejected), 1);
-        assert_eq!(a.addrs.load(Ordering::Acquire), MAX_ADDRS_PER_SESSION);
-        let before = a_sink.frames.lock().unwrap().len();
+        assert_eq!(c.addrs.load(Ordering::Acquire), MAX_ADDRS_PER_SESSION);
+        let before = c_sink.frames.lock().unwrap().len();
         for port in 1..=8 {
             route_from(&mut peers, b"media", own(port));
         }
-        assert_eq!(a_sink.frames.lock().unwrap().len(), before + 8);
+        assert_eq!(c_sink.frames.lock().unwrap().len(), before + 8);
         assert_eq!(b.addrs.load(Ordering::Acquire), 1);
+        assert_eq!(a.addrs.load(Ordering::Acquire), 0);
     }
 
     /// The moves are forgotten oldest first, each [`ADDR_IDLE_EXPIRY`]
@@ -2379,6 +2455,7 @@ mod tests {
         let sink = Arc::new(MemorySink::default());
         let x = register_fresh(&registrations, &sink);
         let y = register_fresh(&registrations, &sink);
+        let z = register_fresh(&registrations, &sink);
         let at = |port: u16| SocketAddr::new([198, 51, 100, 9].into(), port);
         let move_from = |peers: &mut Peers, port: u16| {
             route_from(peers, &check_of(&x, 1), at(port));
@@ -2395,7 +2472,7 @@ mod tests {
         // 30 s after the first: refused for the second's cooldown, and
         // nothing else looked at.
         clock.advance(Duration::from_secs(20));
-        route_from(&mut peers, &check_of(&x, 3), at(2));
+        route_from(&mut peers, &check_of(&z, 3), at(2));
         assert_eq!(DemuxStats::get(&stats.stun_rejected), 1);
         assert_eq!(remembered(&peers), (vec![1, 2], 2));
         // The next move forgets the first, the one after the second.
@@ -2405,5 +2482,177 @@ mod tests {
         move_from(&mut peers, 4);
         assert_eq!(remembered(&peers), (vec![3, 4], 2));
         assert_eq!(DemuxStats::get(&stats.addresses_moved), 4);
+    }
+
+    /// A verified check proves the session's credentials, not its source
+    /// (RFC 8445 §7.3, RFC 8489 §9.1.3): a session X that spoofs the
+    /// learned address of a session V with a check under its own password
+    /// moves the address to X. V's next check, a consent interval later
+    /// (RFC 7675 §5.1), moves it back within the window X's move opened,
+    /// as V held it before that move; a second move away from V within
+    /// the window is refused. The reclaim is logged once per summary
+    /// interval.
+    #[test]
+    fn rfc8445_7_3_the_incumbent_reclaims_its_address_within_the_window() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let (clock, registrations, stats, mut peers) = move_bench();
+        let v_sink = Arc::new(MemorySink::default());
+        let x_sink = Arc::new(MemorySink::default());
+        let v = register_fresh(&registrations, &v_sink);
+        let x = register_fresh(&registrations, &x_sink);
+        let victim: SocketAddr = "198.51.100.1:40000".parse().unwrap();
+        let frames = |sink: &MemorySink| sink.frames.lock().unwrap().len();
+        let moved = || DemuxStats::get(&stats.addresses_moved);
+        let rejected = || DemuxStats::get(&stats.stun_rejected);
+        route_from(&mut peers, &check_of(&v, 1), victim);
+        // X moves V's address with its own password: the window's first
+        // move, allowed, and V's other datagrams go to X meanwhile.
+        clock.advance(Duration::from_secs(1));
+        route_from(&mut peers, &check_of(&x, 2), victim);
+        route_from(&mut peers, b"rtcp", victim);
+        assert_eq!(moved(), 1);
+        assert_eq!((frames(&v_sink), frames(&x_sink)), (1, 2));
+        // V's next check takes it back.
+        clock.advance(Duration::from_secs(5));
+        let check = check_of(&v, 3);
+        route_from(&mut peers, &check, victim);
+        assert_eq!(moved(), 2);
+        assert_eq!(rejected(), 0);
+        assert_eq!(v_sink.frames.lock().unwrap()[1].2, check);
+        assert_eq!(
+            (
+                v.addrs.load(Ordering::Acquire),
+                x.addrs.load(Ordering::Acquire)
+            ),
+            (1, 0)
+        );
+        route_from(&mut peers, b"rtcp", victim);
+        assert_eq!((frames(&v_sink), frames(&x_sink)), (3, 2));
+        let reclaimed = captured.lines("address reclaimed");
+        assert_eq!(reclaimed.len(), 1);
+        assert!(
+            reclaimed[0].contains(&format!(
+                "from=\"{}\" to=\"{}\" since_ms=5000 reclaimed=1",
+                x.local_ufrag, v.local_ufrag
+            )),
+            "{reclaimed:?}"
+        );
+        // Another address reclaimed within the summary interval logs no
+        // line of its own.
+        let other: SocketAddr = "198.51.100.2:40000".parse().unwrap();
+        route_from(&mut peers, &check_of(&v, 4), other);
+        route_from(&mut peers, &check_of(&x, 5), other);
+        route_from(&mut peers, &check_of(&v, 6), other);
+        assert_eq!(moved(), 4);
+        assert_eq!(captured.lines("address reclaimed").len(), 1);
+        // X's second move within the window is refused.
+        clock.advance(ADDR_IDLE_EXPIRY.saturating_sub(Duration::from_secs(6)));
+        route_from(&mut peers, &check_of(&x, 7), victim);
+        assert_eq!(moved(), 4);
+        assert_eq!(rejected(), 1);
+        assert_eq!(frames(&x_sink), 3, "the other address's move alone");
+        assert_eq!(v.addrs.load(Ordering::Acquire), 2);
+    }
+
+    /// Only the session that held the address before the window's first
+    /// move takes it back within the window: the mover's other session
+    /// does not, before the reclaim or after it, so a peer holding many
+    /// sessions' passwords still moves an address away once per window.
+    #[test]
+    fn rfc8445_7_3_only_the_incumbent_reclaims_within_the_window() {
+        let (clock, registrations, stats, mut peers) = move_bench();
+        let sink = Arc::new(MemorySink::default());
+        let v = register_fresh(&registrations, &sink);
+        let x = register_fresh(&registrations, &sink);
+        let y = register_fresh(&registrations, &sink);
+        let victim: SocketAddr = "198.51.100.1:40000".parse().unwrap();
+        route_from(&mut peers, &check_of(&v, 1), victim);
+        route_from(&mut peers, &check_of(&x, 2), victim);
+        // X's other session is not the incumbent.
+        clock.advance(Duration::from_secs(1));
+        route_from(&mut peers, &check_of(&y, 3), victim);
+        assert_eq!(DemuxStats::get(&stats.stun_rejected), 1);
+        assert_eq!(x.addrs.load(Ordering::Acquire), 1);
+        assert_eq!(y.addrs.load(Ordering::Acquire), 0);
+        // Nor after V's reclaim.
+        route_from(&mut peers, &check_of(&v, 4), victim);
+        route_from(&mut peers, &check_of(&y, 5), victim);
+        route_from(&mut peers, &check_of(&x, 6), victim);
+        assert_eq!(DemuxStats::get(&stats.stun_rejected), 3);
+        assert_eq!(DemuxStats::get(&stats.addresses_moved), 2);
+        assert_eq!(
+            (
+                v.addrs.load(Ordering::Acquire),
+                x.addrs.load(Ordering::Acquire),
+                y.addrs.load(Ordering::Acquire)
+            ),
+            (1, 0, 0)
+        );
+    }
+
+    /// The incumbent is the session itself, not whoever registers after
+    /// it closes: a closed incumbent reclaims nothing, and no session
+    /// opened since takes the address within the window. The window does
+    /// not keep the closed session's registration alive.
+    #[test]
+    fn rfc8445_7_3_a_closed_incumbent_reclaims_nothing() {
+        let (clock, registrations, stats, mut peers) = move_bench();
+        let x_sink = Arc::new(MemorySink::default());
+        let sink = Arc::new(MemorySink::default());
+        let v = register_fresh(&registrations, &sink);
+        let x = register_fresh(&registrations, &x_sink);
+        let victim: SocketAddr = "198.51.100.1:40000".parse().unwrap();
+        route_from(&mut peers, &check_of(&v, 1), victim);
+        route_from(&mut peers, &check_of(&x, 2), victim);
+        // V closes; its check names no session now.
+        let v_check = check_of(&v, 3);
+        registrations.unregister(&v.local_ufrag);
+        drop(v);
+        assert_eq!(peers.moves[&victim].incumbent.strong_count(), 0);
+        route_from(&mut peers, &v_check, victim);
+        let w = register_fresh(&registrations, &sink);
+        clock.advance(ADDR_IDLE_EXPIRY.saturating_sub(Duration::from_millis(1)));
+        route_from(&mut peers, &check_of(&w, 4), victim);
+        assert_eq!(DemuxStats::get(&stats.stun_rejected), 2);
+        route_from(&mut peers, b"rtcp", victim);
+        assert_eq!(x_sink.frames.lock().unwrap().len(), 2, "still x's");
+        // At the window's end W may move it.
+        clock.advance(Duration::from_millis(1));
+        route_from(&mut peers, &check_of(&w, 5), victim);
+        assert_eq!(w.addrs.load(Ordering::Acquire), 1);
+        assert_eq!(DemuxStats::get(&stats.addresses_moved), 2);
+    }
+
+    /// Each window has its own incumbent, the session the address moved
+    /// away from to open it: once a window ends, the next move opens one
+    /// whose incumbent is the session that held the address then.
+    #[test]
+    fn rfc8445_7_3_a_window_s_end_resets_the_incumbent() {
+        let (clock, registrations, stats, mut peers) = move_bench();
+        let sink = Arc::new(MemorySink::default());
+        let v = register_fresh(&registrations, &sink);
+        let x = register_fresh(&registrations, &sink);
+        let y = register_fresh(&registrations, &sink);
+        let victim: SocketAddr = "198.51.100.1:40000".parse().unwrap();
+        route_from(&mut peers, &check_of(&v, 1), victim);
+        route_from(&mut peers, &check_of(&x, 2), victim);
+        // V stays silent; after the window, Y takes the address from X.
+        clock.advance(ADDR_IDLE_EXPIRY);
+        route_from(&mut peers, &check_of(&y, 3), victim);
+        assert_eq!(DemuxStats::get(&stats.addresses_moved), 2);
+        // V is no longer the incumbent; X is.
+        route_from(&mut peers, &check_of(&v, 4), victim);
+        assert_eq!(DemuxStats::get(&stats.stun_rejected), 1);
+        route_from(&mut peers, &check_of(&x, 5), victim);
+        assert_eq!(DemuxStats::get(&stats.addresses_moved), 3);
+        assert_eq!(
+            (
+                v.addrs.load(Ordering::Acquire),
+                x.addrs.load(Ordering::Acquire),
+                y.addrs.load(Ordering::Acquire)
+            ),
+            (0, 1, 0)
+        );
     }
 }

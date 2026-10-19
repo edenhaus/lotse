@@ -139,8 +139,9 @@ pub struct DemuxMetrics {
     /// Addresses learned through verified STUN requests.
     pub addresses_learned: u64,
     /// Learned addresses moved to another session by a verified STUN
-    /// request naming it, at most once per address per 30 s; each also
-    /// counts as learned.
+    /// request naming it: away from the session that held one at most
+    /// once per address per 30 s, and back to it within that time; each
+    /// also counts as learned.
     pub addresses_moved: u64,
     /// Datagrams dropped because the worker's channel was full.
     pub worker_full: u64,
