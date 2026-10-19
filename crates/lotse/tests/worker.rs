@@ -55,6 +55,7 @@ fn spec(options: &str) -> SourceSpec {
         options: options.into(),
         peer_host: "cam".into(),
         peer_addrs: vec![],
+        backoff: lotse_ipc::BackoffPosition::default(),
     }
 }
 
@@ -135,7 +136,7 @@ async fn a_worker_crash_is_observed_and_contained() {
             | WorkerEvent::Session { .. } => {}
             other @ (WorkerEvent::Ready { .. }
             | WorkerEvent::SourceStopped
-            | WorkerEvent::SwitchReport(_)
+            | WorkerEvent::SwitchReport(..)
             | WorkerEvent::StandbyStopped
             | WorkerEvent::Switched
             | WorkerEvent::ProbeConnecting(_)
@@ -204,6 +205,7 @@ async fn a_sandboxed_worker_plays_rtsps_through_its_loopback_relay() {
         options: format!("{{\"tls_fingerprint\": \"{pin}\"}}"),
         peer_host: "camera.test".into(),
         peer_addrs: vec![cam.addr()],
+        backoff: lotse_ipc::BackoffPosition::default(),
     };
     worker.run_source(&spec).await.expect("run source");
     assert_eq!(
@@ -253,6 +255,7 @@ async fn a_sandboxed_worker_receives_rtsp_media_over_udp() {
         options: r#"{"transport": "udp"}"#.into(),
         peer_host: "127.0.0.1".into(),
         peer_addrs: vec![cam.addr()],
+        backoff: lotse_ipc::BackoffPosition::default(),
     };
     worker.run_source(&spec).await.expect("run source");
     assert_eq!(
@@ -321,6 +324,7 @@ async fn play_http_in_sandbox(
         options,
         peer_host: "camera.test".into(),
         peer_addrs: vec![server.addr()],
+        backoff: lotse_ipc::BackoffPosition::default(),
     };
     worker.run_source(&spec).await.expect("run source");
     assert_eq!(

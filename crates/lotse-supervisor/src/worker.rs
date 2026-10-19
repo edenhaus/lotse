@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lotse_api_types::stream::TalkerReason;
+use lotse_core::backoff::BackoffPosition;
 use lotse_core::clock::Clock;
 use lotse_core::connection::WorkerReport;
 use lotse_core::source::SourceError;
@@ -298,6 +299,33 @@ async fn relay(mut rx: Receiver, events: mpsc::Sender<WorkerEvent>) {
     }
 }
 
+/// A source state as the connection machine takes it; `None` for a
+/// runner that stopped.
+fn source_report(state: SourceState) -> Option<WorkerReport> {
+    Some(match state {
+        SourceState::Connecting { .. } => WorkerReport::Connecting,
+        SourceState::Live => WorkerReport::Live,
+        SourceState::Stable => WorkerReport::Stable,
+        SourceState::Reconnecting { code, message } => {
+            WorkerReport::Reconnecting(source_error(&code, &message))
+        }
+        SourceState::Backoff {
+            code,
+            message,
+            retry_ms,
+            position,
+        } => WorkerReport::Backoff {
+            error: source_error(&code, &message),
+            retry_in: Duration::from_millis(u64::from(retry_ms)),
+            position: BackoffPosition {
+                attempts: position.attempts,
+                immediate_used: position.immediate_used,
+            },
+        },
+        SourceState::Stopped => return None,
+    })
+}
+
 /// A worker message as a trusted event; `memory` is the descriptor that
 /// came with it, kept only for `Ready` and closed otherwise, and `trims`
 /// what the worker's earlier messages logged.
@@ -307,38 +335,12 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
             pid,
             memory: memory.map(MemoryProbe::from_fd),
         },
-        ToSupervisor::SourceState(state) => match state {
-            SourceState::Connecting { .. } => WorkerEvent::Report(WorkerReport::Connecting),
-            SourceState::Live => WorkerEvent::Report(WorkerReport::Live),
-            SourceState::Reconnecting { code, message } => {
-                WorkerEvent::Report(WorkerReport::Reconnecting(source_error(&code, &message)))
-            }
-            SourceState::Backoff {
-                code,
-                message,
-                retry_ms,
-            } => WorkerEvent::Report(WorkerReport::Backoff {
-                error: source_error(&code, &message),
-                retry_in: Duration::from_millis(u64::from(retry_ms)),
-            }),
-            SourceState::Stopped => WorkerEvent::SourceStopped,
-        },
-        ToSupervisor::SwitchState(state) => match state {
-            SourceState::Connecting { .. } => WorkerEvent::SwitchReport(WorkerReport::Connecting),
-            SourceState::Live => WorkerEvent::SwitchReport(WorkerReport::Live),
-            SourceState::Reconnecting { code, message } => {
-                WorkerEvent::SwitchReport(WorkerReport::Reconnecting(source_error(&code, &message)))
-            }
-            SourceState::Backoff {
-                code,
-                message,
-                retry_ms,
-            } => WorkerEvent::SwitchReport(WorkerReport::Backoff {
-                error: source_error(&code, &message),
-                retry_in: Duration::from_millis(u64::from(retry_ms)),
-            }),
-            SourceState::Stopped => WorkerEvent::StandbyStopped,
-        },
+        ToSupervisor::SourceState(state) => {
+            source_report(state).map_or(WorkerEvent::SourceStopped, WorkerEvent::Report)
+        }
+        ToSupervisor::SwitchState(state) => {
+            source_report(state).map_or(WorkerEvent::StandbyStopped, WorkerEvent::SwitchReport)
+        }
         ToSupervisor::Switched => WorkerEvent::Switched,
         ToSupervisor::Tracks(tracks) => WorkerEvent::Tracks(declared(tracks, &mut trims.tracks)),
         ToSupervisor::Stats(stats) => WorkerEvent::Stats(counted(stats, &mut trims.stats)),
@@ -753,6 +755,10 @@ mod tests {
             mapped(ToSupervisor::SourceState(SourceState::Live), None),
             WorkerEvent::Report(WorkerReport::Live)
         );
+        assert_eq!(
+            mapped(ToSupervisor::SourceState(SourceState::Stable), None),
+            WorkerEvent::Report(WorkerReport::Stable)
+        );
     }
 
     #[test]
@@ -765,6 +771,7 @@ mod tests {
                 WorkerReport::Connecting,
             ),
             (SourceState::Live, WorkerReport::Live),
+            (SourceState::Stable, WorkerReport::Stable),
             (
                 SourceState::Reconnecting {
                     code: "source_timeout".into(),
@@ -777,10 +784,18 @@ mod tests {
                     code: "source_unreachable".into(),
                     message: "refused".into(),
                     retry_ms: 500,
+                    position: lotse_ipc::BackoffPosition {
+                        attempts: 1,
+                        immediate_used: true,
+                    },
                 },
                 WorkerReport::Backoff {
                     error: SourceError::Unreachable("refused".into()),
                     retry_in: Duration::from_millis(500),
+                    position: BackoffPosition {
+                        attempts: 1,
+                        immediate_used: true,
+                    },
                 },
             ),
         ] {
@@ -793,6 +808,10 @@ mod tests {
             mapped(ToSupervisor::SwitchState(SourceState::Stopped), None),
             WorkerEvent::StandbyStopped
         );
+    }
+
+    #[test]
+    fn the_other_messages_map_onto_their_events() {
         assert_eq!(mapped(ToSupervisor::Switched, None), WorkerEvent::Switched);
         assert_eq!(
             mapped(
@@ -811,13 +830,21 @@ mod tests {
                 ToSupervisor::SourceState(SourceState::Backoff {
                     code: "made_up".into(),
                     message: "x".into(),
-                    retry_ms: 1500
+                    retry_ms: 1500,
+                    position: lotse_ipc::BackoffPosition {
+                        attempts: 7,
+                        immediate_used: false
+                    }
                 }),
                 None
             ),
             WorkerEvent::Report(WorkerReport::Backoff {
                 error: SourceError::Protocol("made_up: x".into()),
-                retry_in: Duration::from_millis(1500)
+                retry_in: Duration::from_millis(1500),
+                position: BackoffPosition {
+                    attempts: 7,
+                    immediate_used: false
+                }
             })
         );
         assert_eq!(
@@ -1138,6 +1165,7 @@ mod tests {
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
+            backoff: lotse_ipc::BackoffPosition::default(),
         };
         worker.run_source(&spec).await.unwrap();
         worker.backchannel(true).await.unwrap();

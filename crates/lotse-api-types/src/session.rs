@@ -9,27 +9,30 @@
 
 use std::fmt;
 
+#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "schema")]
 use crate::limits::{MAX_ICE_URLS, MAX_TEXT_CHARS};
 
 /// One entry of `webrtc/offer`'s `ice_servers`, as the client forwards what it
 /// gave the browser (the W3C `RTCIceServer` dictionary). `Debug` redacts the
 /// credential.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct IceServer {
     /// `stun:`, `turn:` or `turns:` URLs (RFC 7064, RFC 7065).
-    #[schemars(length(max = MAX_ICE_URLS), inner(length(max = MAX_TEXT_CHARS)))]
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_ICE_URLS), inner(length(max = MAX_TEXT_CHARS))))]
     pub urls: Vec<String>,
     /// The TURN username.
     #[serde(default)]
-    #[schemars(length(max = MAX_TEXT_CHARS))]
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_TEXT_CHARS)))]
     pub username: Option<String>,
     /// The TURN credential.
     #[serde(default)]
-    #[schemars(length(max = MAX_TEXT_CHARS))]
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_TEXT_CHARS)))]
     pub credential: Option<String>,
 }
 
@@ -48,23 +51,24 @@ impl fmt::Debug for IceServer {
 /// An event of `webrtc/offer` and `session/adopt`, in the order 04 lists
 /// them; `closed` is always the last.
 /// Each variant's schema title names the Python client's class for it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
     /// The first event: the session's id, the client's or a generated ULID.
-    #[schemars(title = "SessionEventSession")]
+    #[cfg_attr(feature = "schema", schemars(title = "SessionEventSession"))]
     Session {
         /// The session.
         session_id: String,
     },
     /// The SDP answer, before any candidate.
-    #[schemars(title = "SessionEventAnswer")]
+    #[cfg_attr(feature = "schema", schemars(title = "SessionEventAnswer"))]
     Answer {
         /// The SDP.
         sdp: String,
     },
     /// A local candidate; an empty `candidate` is end-of-candidates.
-    #[schemars(title = "SessionEventCandidate")]
+    #[cfg_attr(feature = "schema", schemars(title = "SessionEventCandidate"))]
     Candidate {
         /// The `candidate:` attribute value, or empty.
         candidate: String,
@@ -76,7 +80,7 @@ pub enum SessionEvent {
         sdp_mline_index: Option<u32>,
     },
     /// ICE or DTLS changed; also the first event of `session/adopt`.
-    #[schemars(title = "SessionEventState")]
+    #[cfg_attr(feature = "schema", schemars(title = "SessionEventState"))]
     State {
         /// The ICE state, as the browser names it.
         ice: String,
@@ -88,7 +92,7 @@ pub enum SessionEvent {
     /// asked for talk-back the session did not get: the talk-back m-line
     /// was answered `inactive` (or `sendonly` when it carries the
     /// stream's audio too, RFC 3264 §6.1), and `reason` says why.
-    #[schemars(title = "SessionEventWarning")]
+    #[cfg_attr(feature = "schema", schemars(title = "SessionEventWarning"))]
     Warning {
         /// The stable code.
         code: WarningCode,
@@ -115,7 +119,7 @@ pub enum SessionEvent {
     /// session rides every reconnect instead. A talk-back request the
     /// stream cannot serve never closes a session: its answer declines
     /// it (`backchannel_declined`).
-    #[schemars(title = "SessionEventClosed")]
+    #[cfg_attr(feature = "schema", schemars(title = "SessionEventClosed"))]
     Closed {
         /// The stable code. Before the answer, a failed source closes the
         /// session with its error's code, the one `stream/get` reports as
@@ -131,7 +135,8 @@ pub enum SessionEvent {
 
 /// The code of a `warning` event: every code a session may warn with,
 /// and nothing else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WarningCode {
     /// Audio omitted from the session; video continues.
@@ -181,7 +186,8 @@ impl fmt::Display for WarningCode {
 /// The code of a `closed` event: every reason a session may end, and
 /// nothing else. The `source_*` codes and `worker_crashed` are also the
 /// codes of `stream/get`'s `last_error`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CloseCode {
     /// The browser closed the peer connection.
@@ -260,7 +266,8 @@ impl fmt::Display for CloseCode {
 
 /// Why an offer's talk-back was declined: the `reason` of a
 /// `backchannel_declined` warning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DeclineReason {
     /// The stream has no backchannel the session can feed: its source
@@ -295,14 +302,16 @@ impl DeclineReason {
 }
 
 /// `webrtc/renegotiate`'s result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct WebrtcRenegotiateResult {
     /// The SDP answer to the re-offer.
     pub sdp: String,
 }
 
 /// A session as `session/get` and `session/list` return it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Session {
     /// The session.
     pub session_id: String,
@@ -331,7 +340,8 @@ pub struct Session {
 /// by that much; `negotiated`, `codec` and `talker` are current. They add
 /// up over the session's life and never go back: a re-offer that drops
 /// talk-back keeps them, and one that adds it again counts on.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct SessionBackchannel {
     /// The answer accepted the browser's talk-back m-line (`recvonly`, or
     /// `sendrecv` on its downlink audio m-line).
@@ -360,7 +370,8 @@ pub struct SessionBackchannel {
 }
 
 /// `session/list`'s result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct SessionList {
     /// Every session on every connection, by id.
     pub sessions: Vec<Session>,

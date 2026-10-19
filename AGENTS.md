@@ -144,7 +144,7 @@ The clients, the Python `lotse-client` among them, live in their own repository,
 - Conventional Commits PR titles, enforced by `pr-title.yml`: PRs are
   squash-merged with their title, so commit messages are not checked.
 - An API change flows Rust DTOs, then the bundle (`cargo run -p
-  lotse-api-types --example schema > crates/lotse-api-types/schema/api.json`),
+  lotse-api-types --features schema --example schema > crates/lotse-api-types/schema/api.json`),
   in one commit; the `api-schema` hook fails on a stale bundle. Once it
   reaches `main`, CI's clients job has lotse-clients open a PR with the bundle
   and the regenerated models, whose CI runs the contract tests against

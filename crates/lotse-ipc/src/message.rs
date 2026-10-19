@@ -282,6 +282,22 @@ pub struct SourceSpec {
     pub peer_host: String,
     /// The resolved addresses to try, in order (workers have no DNS).
     pub peer_addrs: Vec<SocketAddr>,
+    /// Where the reconnect schedule starts: where the connection's earlier
+    /// workers left it, so a source that keeps failing is not retried at
+    /// the first step's pace, nor at once again, whenever a worker starts
+    /// over.
+    pub backoff: BackoffPosition,
+}
+
+/// Where a source's reconnect schedule stands: all a new worker needs to
+/// continue it exactly. The wire form of
+/// `lotse_core::backoff::BackoffPosition`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackoffPosition {
+    /// Delays handed out since the schedule last started over.
+    pub attempts: u32,
+    /// The immediate attempt after a live period has been used since then.
+    pub immediate_used: bool,
 }
 
 impl fmt::Debug for SourceSpec {
@@ -292,6 +308,7 @@ impl fmt::Debug for SourceSpec {
             .field("options", &"****")
             .field("peer_host", &self.peer_host)
             .field("peer_addrs", &self.peer_addrs)
+            .field("backoff", &self.backoff)
             .finish()
     }
 }
@@ -387,7 +404,12 @@ pub enum SourceState {
     },
     /// Tracks are ready; media flows.
     Live,
-    /// The live source dropped; an attempt starts at once.
+    /// The source has streamed long enough that its reconnect schedule
+    /// starts over: the position a new worker continues from is the first
+    /// step again ([`SourceSpec::backoff`]).
+    Stable,
+    /// The live source dropped; an attempt starts at once: the schedule's
+    /// immediate attempt, used from now on.
     Reconnecting {
         /// The error code (`source_timeout`, ...).
         code: String,
@@ -402,6 +424,9 @@ pub enum SourceState {
         message: String,
         /// The wait.
         retry_ms: u32,
+        /// Where the reconnect schedule stands, this delay included: where
+        /// a new worker's continues ([`SourceSpec::backoff`]).
+        position: BackoffPosition,
     },
     /// The runner stopped.
     Stopped,
@@ -543,18 +568,47 @@ mod tests {
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec!["192.168.1.10:554".parse().unwrap()],
+            backoff: BackoffPosition {
+                attempts: 3,
+                immediate_used: true,
+            },
         };
         let text = format!("{spec:?}");
         assert!(!text.contains("hunter2"), "{text}");
         assert!(text.contains("url: \"****\""), "{text}");
         assert!(text.contains("options: \"****\""), "{text}");
         assert!(text.contains("192.168.1.10:554"), "{text}");
+        assert!(
+            text.contains("backoff: BackoffPosition { attempts: 3, immediate_used: true }"),
+            "{text}"
+        );
         let wrapped = ToWorker::RunSource(spec);
         assert!(!format!("{wrapped:?}").contains("hunter2"));
         assert_eq!(
             decode::<ToWorker>(&encode(&wrapped).unwrap()).unwrap(),
             wrapped
         );
+    }
+
+    #[test]
+    fn the_reconnect_position_round_trips() {
+        for message in [
+            ToSupervisor::SourceState(SourceState::Stable),
+            ToSupervisor::SwitchState(SourceState::Backoff {
+                code: "source_timeout".into(),
+                message: "stall".into(),
+                retry_ms: 5_000,
+                position: BackoffPosition {
+                    attempts: 6,
+                    immediate_used: false,
+                },
+            }),
+        ] {
+            assert_eq!(
+                decode::<ToSupervisor>(&encode(&message).unwrap()).unwrap(),
+                message
+            );
+        }
     }
 
     #[test]
