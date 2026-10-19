@@ -35,7 +35,7 @@ use lotse_core::codec::Codec;
 use lotse_core::media::{MediaFrame, MediaPacket};
 use lotse_core::runner::{ConnectGate, RunnerConfig, RunnerEvent, SourceRunner};
 use lotse_core::source::{
-    BackchannelSlot, ResolvedPeer, SourceError, SourceExit, SourceFactory as _, TrackSet,
+    BackchannelSlot, ResolvedPeer, SourceError, SourceFactory as _, TrackSet,
 };
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
@@ -183,10 +183,7 @@ async fn h265_flows_cut_through_and_as_frames_with_its_sprop_sets_rfc7798() {
     assert!(ticks.windows(2).all(|w| w[1] - w[0] == 3_000), "{ticks:?}");
     harness.cancel();
     let exit = harness.finish().await;
-    assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Ended(_))),
-        "{exit:?}"
-    );
+    assert!(matches!(exit, SourceError::Ended(_)), "{exit:?}");
     cam.stop().await;
 }
 
@@ -316,7 +313,7 @@ async fn h264_flows_cut_through_and_as_frames_with_sync_hints_then_tears_down() 
     harness.cancel();
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Ended(ref m)) if m == "cancelled"),
+        matches!(exit, SourceError::Ended(ref m) if m == "cancelled"),
         "{exit:?}"
     );
     let counters = cam.stats();
@@ -347,10 +344,7 @@ async fn credentials_are_checked_and_never_reported() {
         let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
         assert!(!harness.wait_ready().await);
         let exit = harness.finish().await;
-        assert!(
-            matches!(exit, SourceExit::Ended(SourceError::AuthFailed(_))),
-            "{exit:?}"
-        );
+        assert!(matches!(exit, SourceError::AuthFailed(_)), "{exit:?}");
     }
     assert!(lotse_testing::fake_camera::Stats::get(&cam.stats().unauthorized) >= 2);
     // The right ones: live, and the description hides them.
@@ -380,10 +374,7 @@ async fn a_closed_port_is_unreachable_and_a_silent_camera_times_out() {
     );
     assert!(!harness.wait_ready().await);
     let exit = harness.finish().await;
-    assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Unreachable(_))),
-        "{exit:?}"
-    );
+    assert!(matches!(exit, SourceError::Unreachable(_)), "{exit:?}");
 
     let cam = camera(CameraConfig {
         silent: true,
@@ -400,7 +391,7 @@ async fn a_closed_port_is_unreachable_and_a_silent_camera_times_out() {
     assert!(!harness.wait_ready().await);
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Timeout(ref m)) if m.starts_with("DESCRIBE")),
+        matches!(exit, SourceError::Timeout(ref m) if m.starts_with("DESCRIBE")),
         "{exit:?}"
     );
     cam.stop().await;
@@ -418,7 +409,7 @@ async fn a_camera_that_hangs_up_ends_the_source() {
     assert!(harness.wait_ready().await);
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Ended(ref m)) if m == "the camera closed the session"),
+        matches!(exit, SourceError::Ended(ref m) if m == "the camera closed the session"),
         "{exit:?}"
     );
     cam.stop().await;
@@ -437,7 +428,7 @@ async fn an_sdp_retina_cannot_parse_is_refused_as_protocol_rfc8866_5() {
     let source = make_source(&cam.url(), &serde_json::Value::Null);
     let harness = Harness::start(source.as_ref(), peer(&cam), clock());
     let exit = harness.finish().await;
-    let SourceExit::Ended(SourceError::Protocol(message)) = exit else {
+    let SourceError::Protocol(message) = exit else {
         panic!("a protocol error, not {exit:?}");
     };
     assert!(message.contains("Unable to parse SDP"), "{message}");
@@ -465,7 +456,7 @@ async fn a_describe_answer_over_64_kib_is_refused_as_protocol() {
         exit = harness.finish() => exit,
         () = clock().sleep(Duration::from_secs(10)) => panic!("the answer was read"),
     };
-    let SourceExit::Ended(SourceError::Protocol(message)) = exit else {
+    let SourceError::Protocol(message) = exit else {
         panic!("a protocol error, not {exit:?}");
     };
     assert!(message.contains("max_message_size"), "{message}");
@@ -547,7 +538,7 @@ async fn a_request_over_64_kib_is_refused_by_the_relay_as_protocol() {
     let harness = Harness::start(source.as_ref(), peer(&cam), clock());
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Protocol(ref m)) if m.contains("retina's request is unreadable")),
+        matches!(exit, SourceError::Protocol(ref m) if m.contains("retina's request is unreadable")),
         "{exit:?}"
     );
     assert_eq!(
@@ -631,10 +622,7 @@ async fn rfc2326_10_12_an_unreadable_message_while_playing_ends_the_source_as_pr
     .await;
     let harness = Harness::start(source.as_ref(), peer, clock());
     let exit = harness.finish().await;
-    assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Protocol(_))),
-        "{exit:?}"
-    );
+    assert!(matches!(exit, SourceError::Protocol(_)), "{exit:?}");
     camera.await.unwrap();
 }
 
@@ -650,7 +638,7 @@ async fn an_sdp_without_video_or_audio_is_refused_as_protocol_rfc8866_5_14() {
     let harness = Harness::start(source.as_ref(), peer, clock());
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Protocol(ref m)) if m == "the SDP describes no video or audio stream"),
+        matches!(exit, SourceError::Protocol(ref m) if m == "the SDP describes no video or audio stream"),
         "{exit:?}"
     );
     camera.await.unwrap();
@@ -778,7 +766,7 @@ async fn rfc3550_5_1_timestamps_jumping_on_every_frame_end_the_attempt_after_a_b
     };
     cam.stop().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Protocol(ref m)) if m.contains("RFC 3550 §5.1")),
+        matches!(exit, SourceError::Protocol(ref m) if m.contains("RFC 3550 §5.1")),
         "{exit:?}"
     );
     assert_eq!(v0.epoch(), 10, "ten new timelines, then the attempt ends");
@@ -952,7 +940,7 @@ async fn rfc2326_12_33_a_play_answer_without_rtptime_plays_two_streams_on_the_fi
     harness.cancel();
     let exit = harness.finish().await;
     assert!(
-        matches!(exit, SourceExit::Ended(SourceError::Ended(ref m)) if m == "cancelled"),
+        matches!(exit, SourceError::Ended(ref m) if m == "cancelled"),
         "{exit:?}"
     );
     cam.stop().await;
@@ -1116,9 +1104,7 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
         harness.cancel();
         let exit = harness.finish().await;
         printed.push(format!("{exit:?}"));
-        if let SourceExit::Ended(error) = exit {
-            printed.push(error.to_string());
-        }
+        printed.push(exit.to_string());
     }
     cam.stop().await;
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();

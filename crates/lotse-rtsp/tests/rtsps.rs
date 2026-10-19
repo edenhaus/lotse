@@ -24,7 +24,7 @@ use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::runner::{ConnectGate, RunnerConfig, RunnerEvent, SourceRunner};
 use lotse_core::source::{
-    BackchannelSlot, ResolvedPeer, Source, SourceError, SourceExit, SourceFactory as _, TrackSet,
+    BackchannelSlot, ResolvedPeer, Source, SourceError, SourceFactory as _, TrackSet,
 };
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
@@ -96,10 +96,7 @@ async fn plays(source: &dyn Source, peer: ResolvedPeer) {
 async fn fails(source: &dyn Source, peer: ResolvedPeer) -> SourceError {
     let mut harness = Harness::start(source, peer, clock());
     assert!(!harness.wait_ready().await, "never ready");
-    let SourceExit::Ended(err) = harness.finish().await else {
-        panic!("ended");
-    };
-    err
+    harness.finish().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

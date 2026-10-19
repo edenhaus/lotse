@@ -416,8 +416,6 @@ pub struct TrackInfo {
     pub kind: String,
     /// The codec name (`h264`, `aac_lc`, ...).
     pub codec: String,
-    /// Ticks per second.
-    pub clock_rate: u32,
     /// `arrival` or `sender_reports`, as the connection's clock mapper has
     /// it when sent; a derived track's is its source's.
     pub sync: String,
@@ -454,16 +452,12 @@ pub struct TrackParams {
 /// One track's counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackStats {
-    /// Packets published.
-    pub packets: u64,
-    /// Payload bytes of those packets.
+    /// Payload bytes of the packets published.
     pub packet_bytes: u64,
     /// Frames accepted on the side branch.
     pub frames: u64,
     /// Payload bytes of those frames.
     pub frame_bytes: u64,
-    /// Keyframes among them.
-    pub keyframes: u64,
     /// Frames dropped as oversize.
     pub frames_dropped_oversize: u64,
     /// Frames the live path carried in more RTP packets than some
@@ -570,7 +564,6 @@ mod tests {
                 id: "v0".into(),
                 kind: "video".into(),
                 codec: "h264".into(),
-                clock_rate: 90_000,
                 sync: "arrival".into(),
                 derived_from: None,
                 audio_delay_ms: None,
@@ -585,7 +578,6 @@ mod tests {
                 id: "a1".into(),
                 kind: "audio".into(),
                 codec: "opus".into(),
-                clock_rate: 48_000,
                 sync: "sender_reports".into(),
                 derived_from: Some("a0".into()),
                 audio_delay_ms: Some(88),
@@ -619,11 +611,9 @@ mod tests {
                 tracks: vec![(
                     "v0".into(),
                     TrackStats {
-                        packets: 1,
                         packet_bytes: 2,
                         frames: 3,
                         frame_bytes: 4,
-                        keyframes: 5,
                         frames_dropped_oversize: 6,
                         frames_over_browser_limit: 7,
                     },

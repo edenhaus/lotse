@@ -13,7 +13,7 @@ use bytes::Bytes;
 use lotse_core::clock::{Clock, FakeClock, SystemClock};
 use lotse_core::codec::CodecFamily;
 use lotse_core::media::MediaFrame;
-use lotse_core::source::{ResolvedPeer, Source, SourceError, SourceExit, TrackSet};
+use lotse_core::source::{ResolvedPeer, Source, SourceError, TrackSet};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::text::CUT_MARK;
 use lotse_core::track::{FrameSubscription, SubscriptionError, Track};
@@ -179,7 +179,7 @@ impl Rig {
             }
         };
         tokio::select! {
-            exit = harness.finish() => ended(exit),
+            exit = harness.finish() => exit,
             () = ticker => panic!("the source did not exit"),
         }
     }
@@ -212,17 +212,10 @@ impl ReadyWithin for Harness {
     }
 }
 
-fn ended(exit: SourceExit) -> SourceError {
-    let SourceExit::Ended(err) = exit else {
-        panic!("{exit:?}");
-    };
-    err
-}
-
 /// Waits for the exit of a source the clock does not have to move for.
 async fn exit_within(harness: Harness, real: Duration) -> SourceError {
     tokio::select! {
-        exit = harness.finish() => ended(exit),
+        exit = harness.finish() => exit,
         () = SystemClock.sleep(real) => panic!("the source did not exit within {real:?}"),
     }
 }
@@ -545,10 +538,6 @@ async fn the_source_describes_itself_without_secrets() {
     assert!(!described.url.to_string().contains("secret"));
     assert_eq!(described.options["max_bandwidth"], 1);
     assert_eq!(source.connection_options()["max_bandwidth"], 1);
-    assert!(matches!(
-        source.request_keyframe(),
-        lotse_core::source::KeyframeRequest::Unsupported
-    ));
 }
 
 /// A camera key in the path, a token in the query of every URL and a

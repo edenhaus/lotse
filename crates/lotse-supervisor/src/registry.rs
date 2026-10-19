@@ -1228,7 +1228,6 @@ impl State {
                     state: snapshot.map_or(StreamState::Idle, |s| api_state(s.state)),
                     reconnects: snapshot.map_or(0, |s| s.reconnects),
                     backchannel: connection.and_then(source_backchannel),
-                    details: serde_json::Map::new(),
                     connection: ConnectionInfo {
                         id: source.connection.clone(),
                         worker: snapshot.and_then(|s| {
@@ -1367,7 +1366,6 @@ fn stream_stats_of(stats: Option<&WorkerStats>) -> StreamStats {
         packets_lost: stats.map_or(0, |s| s.packets_lost),
         packets_out_of_order: stats.map_or(0, |s| s.packets_out_of_order),
         datagrams_rejected: stats.map_or(0, |s| s.datagrams_rejected),
-        ..StreamStats::default()
     }
 }
 
@@ -1523,7 +1521,6 @@ mod tests {
             id: id.into(),
             kind: "audio".into(),
             codec: "opus".into(),
-            clock_rate: 48_000,
             sync: "sender_reports".into(),
             derived_from: derived_from.map(Into::into),
             audio_delay_ms: delay,
@@ -2565,11 +2562,9 @@ mod tests {
             tracks: vec![(
                 "a1".into(),
                 TrackStats {
-                    packets: 5,
                     packet_bytes: 300,
                     frames: 5,
                     frame_bytes: 200,
-                    keyframes: 5,
                     frames_dropped_oversize: 2,
                     frames_over_browser_limit: 3,
                 },

@@ -33,9 +33,7 @@ mod writer;
 use std::time::{Duration, Instant};
 
 use lotse_core::codec::{CodecFamily, Kind};
-use lotse_core::output::{
-    Delivery, JoinPolicy, OutputFactory, OutputShape, TalkbackRequest, TrackRequest,
-};
+use lotse_core::output::{OutputFactory, TalkbackRequest, TrackRequest};
 use lotse_core::session::{
     SessionEngine, SessionOpenError, SessionRequest, TalkbackClaim, TalkbackTarget,
 };
@@ -81,22 +79,6 @@ pub fn session_config(ice: IceCreds) -> RtcConfig {
         .set_extension_map(extensions)
 }
 
-/// The policy a WebRTC session declares:
-/// live packets at the live edge, best effort.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Policy {
-    /// Where it joins.
-    pub join: JoinPolicy,
-    /// How it is delivered.
-    pub delivery: Delivery,
-}
-
-/// The policy of every WebRTC session.
-pub const POLICY: Policy = Policy {
-    join: JoinPolicy::LiveEdge,
-    delivery: Delivery::BestEffort,
-};
-
 /// The tracks a session wants: H.264 or H.265 video, required (which one
 /// the offer can take is the session's to find out); audio when asked for,
 /// optional, preferring Opus, then PCMU, PCMA and G.722.
@@ -130,10 +112,6 @@ pub struct WebRtcFactory;
 impl OutputFactory for WebRtcFactory {
     fn kind(&self) -> &'static str {
         "webrtc"
-    }
-
-    fn shape(&self) -> OutputShape {
-        OutputShape::Session
     }
 
     fn session_tracks(&self, audio: bool) -> Vec<TrackRequest> {
@@ -185,12 +163,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_factory_declares_its_kind_shape_and_tracks() {
+    fn the_factory_declares_its_kind_and_tracks() {
         let factory = WebRtcFactory;
         assert_eq!(factory.kind(), "webrtc");
-        assert_eq!(factory.shape(), OutputShape::Session);
         assert_eq!(factory.session_tracks(true), track_requests(true));
-        assert_eq!(POLICY.join, JoinPolicy::LiveEdge);
         let video_only = track_requests(false);
         assert_eq!(video_only.len(), 1);
         assert!(video_only[0].required);

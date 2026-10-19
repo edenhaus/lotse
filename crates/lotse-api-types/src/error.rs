@@ -84,10 +84,6 @@ pub enum ErrorCode {
     NoVideoTrack,
     /// No video codec both sides can use.
     VideoCodecUnsupported,
-    /// No keyframe within the snapshot timeout.
-    SnapshotTimeout,
-    /// The snapshot decode queue is full.
-    SnapshotBusy,
 }
 
 impl ErrorCode {
@@ -129,8 +125,6 @@ impl ErrorCode {
             Self::InvalidSdp => "invalid_sdp",
             Self::NoVideoTrack => "no_video_track",
             Self::VideoCodecUnsupported => "video_codec_unsupported",
-            Self::SnapshotTimeout => "snapshot_timeout",
-            Self::SnapshotBusy => "snapshot_busy",
         }
     }
 
@@ -230,8 +224,6 @@ mod tests {
             ErrorCode::InvalidSdp,
             ErrorCode::NoVideoTrack,
             ErrorCode::VideoCodecUnsupported,
-            ErrorCode::SnapshotTimeout,
-            ErrorCode::SnapshotBusy,
             ErrorCode::FrameOverBrowserLimit,
             ErrorCode::NotPermitted,
         ];
