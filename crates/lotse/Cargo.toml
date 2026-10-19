@@ -27,6 +27,7 @@ source-fake = ["lotse-core/test-util"] # the `fake://` source of lotse-core's fa
 anyhow = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true } # the WebSocket halves of `lotse ctl`
+log = { workspace = true } # the logger that bridges the `log` records of the crates below
 rustix = { workspace = true, features = ["process"] } # the starting uid, the default of `allow_uid`
 serde = { workspace = true }
 serde_json = { workspace = true } # `lotse ctl` frames
@@ -36,6 +37,7 @@ tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true } # the `log` records as `tracing` events
 lotse-api-types = { workspace = true }
 lotse-codec = { workspace = true } # the AAC-LC → Opus transcoder, registered in every build
 lotse-core = { workspace = true }
@@ -47,6 +49,7 @@ lotse-webrtc = { workspace = true, optional = true }
 lotse-worker = { workspace = true }
 
 [dev-dependencies]
+lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`: the `log` bridge's throttle
 rustix = { workspace = true, features = ["process"] } # SIGTERM to the daemon under test
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync"] } # the worker-manager and session tests drive a worker; the ICE-TCP viewer frames its connection; the session viewer reads its socket on a task of its own
 tokio-util = { workspace = true } # the cancellation token of the ICE-TCP acceptor the signaling test runs
