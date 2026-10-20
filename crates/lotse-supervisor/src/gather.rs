@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use lotse_api_types::error::{ApiError, ErrorCode};
-use lotse_api_types::session::{IceServer, SessionEvent};
+use lotse_api_types::session::{IceServer, SessionEvent, WarningCode};
 use lotse_core::secret::Secret;
 
 use crate::net::allocation::Transport;
@@ -143,7 +143,7 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
             }
             "turns" if plan.warnings.len() < MAX_WARNINGS => {
                 plan.warnings.push(SessionEvent::Warning {
-                    code: "turn_unsupported".to_owned(),
+                    code: WarningCode::TurnUnsupported,
                     message: format!("{url} ignored: TURN over TLS is not supported yet"),
                     reason: None,
                     status: None,
@@ -409,7 +409,7 @@ mod tests {
         assert_eq!(
             warnings[MAX_WARNINGS - 1],
             SessionEvent::Warning {
-                code: "turn_unsupported".into(),
+                code: WarningCode::TurnUnsupported,
                 message: format!(
                     "turns:t{} ignored: TURN over TLS is not supported yet",
                     MAX_WARNINGS - 1

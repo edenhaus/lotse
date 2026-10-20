@@ -1,4 +1,7 @@
-//! The error model: stable codes, a human message, and details.
+//! The error model of results and `last_error`: stable codes, a human
+//! message, and details. A session's `warning` and `closed` events carry
+//! codes of their own ([`WarningCode`](crate::session::WarningCode),
+//! [`CloseCode`](crate::session::CloseCode)).
 
 use std::fmt;
 
@@ -6,7 +9,8 @@ use std::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Every stable error code. `code` is the contract; `message` may change.
+/// Every stable error code of a result or a `last_error`. `code` is the
+/// contract; `message` may change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -55,37 +59,14 @@ pub enum ErrorCode {
     SourceEnded,
     /// The connection's worker process died.
     WorkerCrashed,
-    /// Audio omitted from a session; video continues.
-    AudioCodecUnsupported,
-    /// A `turns:` entry was ignored.
-    TurnUnsupported,
-    /// The browser did not offer the stream's H.264 profile.
-    H264ProfileMismatch,
-    /// A video frame needed more RTP packets than some libwebrtc receivers
-    /// assemble; it was sent whole.
-    FrameOverBrowserLimit,
     /// `backchannel/release` on a stream whose source protocol cannot
     /// carry audio back.
     BackchannelUnsupported,
-    /// Audio withdrawn because sync could not be held.
-    AvSyncLost,
-    /// The browser closed the peer connection.
-    PeerClosed,
-    /// `unsubscribe`, `session/close`, or the grace expired.
-    SessionClosed,
-    /// The stream was deleted.
-    StreamDeleted,
-    /// The codec family changed on reconnect.
-    StreamChanged,
-    /// ICE failed or stayed disconnected.
-    IceFailed,
     /// The offer could not be parsed, or a re-offer changes the video
     /// m-line a session keeps.
     InvalidSdp,
     /// The stream has no video track, or the offer no video m-line.
     NoVideoTrack,
-    /// No video codec both sides can use.
-    VideoCodecUnsupported,
 }
 
 impl ErrorCode {
@@ -112,21 +93,10 @@ impl ErrorCode {
             Self::SourceProtocolError => "source_protocol_error",
             Self::SourceEnded => "source_ended",
             Self::WorkerCrashed => "worker_crashed",
-            Self::AudioCodecUnsupported => "audio_codec_unsupported",
-            Self::TurnUnsupported => "turn_unsupported",
-            Self::H264ProfileMismatch => "h264_profile_mismatch",
-            Self::FrameOverBrowserLimit => "frame_over_browser_limit",
 
             Self::BackchannelUnsupported => "backchannel_unsupported",
-            Self::AvSyncLost => "av_sync_lost",
-            Self::PeerClosed => "peer_closed",
-            Self::SessionClosed => "session_closed",
-            Self::StreamDeleted => "stream_deleted",
-            Self::StreamChanged => "stream_changed",
-            Self::IceFailed => "ice_failed",
             Self::InvalidSdp => "invalid_sdp",
             Self::NoVideoTrack => "no_video_track",
-            Self::VideoCodecUnsupported => "video_codec_unsupported",
         }
     }
 
@@ -142,8 +112,7 @@ impl fmt::Display for ErrorCode {
     }
 }
 
-/// An error as the API carries it, in results, `closed` events and
-/// `last_error`.
+/// An error as the API carries it, in results and `last_error`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct ApiError {
@@ -214,20 +183,9 @@ mod tests {
             ErrorCode::SourceProtocolError,
             ErrorCode::SourceEnded,
             ErrorCode::WorkerCrashed,
-            ErrorCode::AudioCodecUnsupported,
-            ErrorCode::TurnUnsupported,
-            ErrorCode::H264ProfileMismatch,
             ErrorCode::BackchannelUnsupported,
-            ErrorCode::AvSyncLost,
-            ErrorCode::PeerClosed,
-            ErrorCode::SessionClosed,
-            ErrorCode::StreamDeleted,
-            ErrorCode::StreamChanged,
-            ErrorCode::IceFailed,
             ErrorCode::InvalidSdp,
             ErrorCode::NoVideoTrack,
-            ErrorCode::VideoCodecUnsupported,
-            ErrorCode::FrameOverBrowserLimit,
             ErrorCode::NotPermitted,
         ];
         for code in all {
@@ -237,10 +195,9 @@ mod tests {
             assert_eq!(code.to_string(), code.as_str());
         }
         assert_eq!(ErrorCode::parse("made_up"), None);
-        assert_eq!(
-            ErrorCode::H264ProfileMismatch.as_str(),
-            "h264_profile_mismatch"
-        );
+        // A session event's code is not a result's.
+        assert_eq!(ErrorCode::parse("peer_closed"), None);
+        assert_eq!(ErrorCode::parse("h264_profile_mismatch"), None);
     }
 
     #[test]

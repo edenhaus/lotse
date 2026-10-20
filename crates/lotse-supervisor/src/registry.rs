@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use lotse_api::{ConnectionId, Event, EventClass};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::info::{ProcessMetrics, WorkerMetrics};
-use lotse_api_types::session::{Session, SessionEvent};
+use lotse_api_types::session::{CloseCode, Session, SessionEvent};
 use lotse_api_types::stream::{
     AudioMode, BackchannelState, ConnectionInfo, LastError, Orientation, SourceBackchannel,
     SourceInfo, Stream, StreamBackchannel, StreamEvent, StreamState, StreamStats, TalkerReason,
@@ -43,7 +43,7 @@ use crate::net::allocation::Transport;
 use crate::net::demux::{DatagramSink, Registrations};
 use crate::net::stun_client::StunClient;
 use crate::net::turn_client::TurnClient;
-use crate::session::{ChannelRequest, SessionEntry, api_event};
+use crate::session::{ChannelRequest, SessionEntry, api_event, close_code};
 use crate::worker::WorkerManager;
 
 /// Events a subscription may hold before the server's forwarder drains
@@ -547,7 +547,7 @@ impl State {
     pub(crate) fn close_session(
         &mut self,
         session_id: &str,
-        code: &'static str,
+        code: CloseCode,
         message: &str,
         by: CloseBy,
     ) -> Option<Event> {
@@ -555,7 +555,7 @@ impl State {
         if !matches!(by, CloseBy::WorkerGone | CloseBy::Offer) {
             let close = DriverCommand::CloseSession {
                 session_id: session_id.to_owned(),
-                code,
+                code: code.as_str(),
                 message: message.to_owned(),
             };
             // The slot the offer reserved always takes it.
@@ -570,9 +570,9 @@ impl State {
                 );
             }
         }
-        tracing::info!(event = "session_closed", session.id = session_id, stream.id = %entry.stream_id, code, detail = message, by = ?by, "session closed");
+        tracing::info!(event = "session_closed", session.id = session_id, stream.id = %entry.stream_id, code = code.as_str(), detail = message, by = ?by, "session closed");
         let event = api_event(&SessionEvent::Closed {
-            code: code.to_owned(),
+            code,
             message: message.to_owned(),
         });
         if by != CloseBy::Unsubscribe {
@@ -585,7 +585,7 @@ impl State {
     pub(crate) fn close_sessions_where(
         &mut self,
         select: impl Fn(&SessionEntry) -> bool,
-        code: &'static str,
+        code: CloseCode,
         message: &str,
         by: CloseBy,
     ) {
@@ -623,8 +623,12 @@ impl State {
             "offer closed at once with its source's error"
         );
         self.sessions.insert(session_id.to_owned(), entry);
-        let _event =
-            self.close_session(session_id, error.code(), &error.to_string(), CloseBy::Offer);
+        let _event = self.close_session(
+            session_id,
+            close_code(error),
+            &error.to_string(),
+            CloseBy::Offer,
+        );
     }
 
     /// Closes every session of connection `connection` that has no answer
@@ -651,7 +655,7 @@ impl State {
                 reason = "the source connection failed before the session was answered",
                 "session closed with its source's error"
             );
-            let _event = self.close_session(&id, error.code(), &message, CloseBy::Supervisor);
+            let _event = self.close_session(&id, close_code(error), &message, CloseBy::Supervisor);
         }
     }
 
@@ -771,7 +775,7 @@ impl State {
             );
             let _event = self.close_session(
                 session_id,
-                "internal_error",
+                CloseCode::InternalError,
                 "the worker's answer or candidate was malformed",
                 CloseBy::Supervisor,
             );
@@ -788,7 +792,7 @@ impl State {
                 );
                 let _event = self.close_session(
                     session_id,
-                    "internal_error",
+                    CloseCode::InternalError,
                     "the worker reported more than its session allows",
                     CloseBy::Supervisor,
                 );
@@ -920,7 +924,7 @@ impl State {
                     tracing::info!(
                         event = "session_warning",
                         session.id = session_id,
-                        code,
+                        code = code.as_str(),
                         detail = ?message,
                         "session warning"
                     );
@@ -931,7 +935,7 @@ impl State {
                 tracing::info!(
                     event = "session_closed",
                     session.id = session_id,
-                    code,
+                    code = code.as_str(),
                     detail = ?message,
                     by,
                     "session closed"
@@ -2058,14 +2062,16 @@ mod tests {
             .streams
             .insert("front".into());
         let_assert!(
-            Some(event) = state.close_session("s1", "source_timeout", "late", CloseBy::Offer)
+            Some(event) =
+                state.close_session("s1", CloseCode::SourceTimeout, "late", CloseBy::Offer)
         );
         assert_eq!(event.payload["code"], "source_timeout");
         assert!(rx.try_recv().is_err(), "the driver never had it");
         state
             .sessions
             .insert("s2".into(), session_on_c1(2, "front"));
-        let _event = state.close_session("s2", "source_timeout", "late", CloseBy::Supervisor);
+        let _event =
+            state.close_session("s2", CloseCode::SourceTimeout, "late", CloseBy::Supervisor);
         let_assert!(Ok(DriverCommand::CloseSession { session_id, .. }) = rx.try_recv());
         assert_eq!(session_id, "s2");
     }

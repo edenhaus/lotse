@@ -41,6 +41,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lotse_api_types::session::CloseCode;
 use lotse_core::backoff::{BackoffPosition, ReconnectBackoff};
 use lotse_core::connection::{
     Action, ConnectionConfig, ConnectionError, ConnectionMachine, ConnectionState, Input,
@@ -930,7 +931,7 @@ impl Driver {
         let connection = self.spec.connection_id.clone();
         self.shared.lock().close_sessions_where(
             |session| session.connection == connection,
-            "worker_crashed",
+            CloseCode::WorkerCrashed,
             "the camera's worker process exited",
             CloseBy::WorkerGone,
         );
@@ -1738,6 +1739,35 @@ mod tests {
         drop(driver);
         assert_eq!(talker(&shared), None);
         assert!(shared.lock().connections["c1"].talker.since.is_some());
+    }
+
+    /// A worker's exit closes the sessions of its own connection and no
+    /// other: another camera's session stays open.
+    #[tokio::test]
+    async fn a_worker_exit_closes_only_its_own_connection_s_sessions() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let shared = shared("/bin/sh");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let (events, _events) = mpsc::channel(2);
+        for (id, connection) in [("s1", "c1"), ("s2", "c2")] {
+            shared.lock().sessions.insert(
+                id.into(),
+                SessionEntry::new(
+                    1,
+                    "front".into(),
+                    connection.into(),
+                    format!("u{id}"),
+                    (ConnectionId(1), 1, events.clone()),
+                    Arc::new(SystemClock),
+                ),
+            );
+        }
+        let mut driver = driver_on(&shared, demand);
+        driver.on_worker_event(WorkerEvent::Exited(ExitStatus::from_raw(0)));
+        drop(driver);
+        assert!(!shared.lock().sessions.contains_key("s1"));
+        assert!(shared.lock().sessions.contains_key("s2"));
     }
 
     /// The driver's next wake if one is ready now, `None` otherwise.

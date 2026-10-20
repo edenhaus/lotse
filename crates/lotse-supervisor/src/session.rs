@@ -48,9 +48,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use lotse_api::{ConnectionId, Event, EventClass};
 use lotse_api_types::error::{ApiError, ErrorCode};
-use lotse_api_types::session::{DeclineReason, Session, SessionBackchannel, SessionEvent};
+use lotse_api_types::session::{
+    CloseCode, DeclineReason, Session, SessionBackchannel, SessionEvent, WarningCode,
+};
 use lotse_api_types::time::rfc3339;
 use lotse_core::clock::Clock;
+use lotse_core::connection::ConnectionError;
+use lotse_core::source::SourceError;
 use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
 use lotse_ipc::SessionEvent as WorkerSessionEvent;
@@ -97,47 +101,19 @@ pub(crate) const MAX_REPORT_TEXT_BYTES: usize = 16 * 1024;
 /// seen through it, which the demux caps at 8 addresses.
 pub(crate) const MAX_RELAY_CHANNELS: usize = 16;
 
-/// The `closed` codes of the API; anything else a worker reports is an
-/// `internal_error`. The `source_*` codes and `worker_crashed` are the
-/// connection's own errors
-/// ([`ConnectionError::code`](lotse_core::connection::ConnectionError::code)),
-/// which close a session still waiting for its answer when its connection
-/// fails; `source_not_live` is a worker that runs no source when the
-/// offer reaches it.
-const CLOSED_CODES: [&str; 17] = [
-    "peer_closed",
-    "session_closed",
-    "stream_deleted",
-    "stream_changed",
-    "worker_crashed",
-    "source_unreachable",
-    "source_auth_failed",
-    "source_timeout",
-    "source_protocol_error",
-    "source_ended",
-    "source_not_live",
-    "ice_failed",
-    "invalid_sdp",
-    "no_video_track",
-    "video_codec_unsupported",
-    "shutting_down",
-    "internal_error",
-];
-
-/// The `warning` codes of the API a worker may report once per session;
-/// a worker's other warnings are dropped. `backchannel_declined` comes
-/// as its own report, once per offer.
-const WARNING_CODES: [&str; 6] = [
-    "audio_codec_unsupported",
-    "turn_unsupported",
-    "av_sync_lost",
-    "h264_profile_mismatch",
-    "invalid_candidate",
-    "frame_over_browser_limit",
-];
-
-/// The `warning` code of a declined talk-back request.
-const BACKCHANNEL_DECLINED: &str = "backchannel_declined";
+/// The `closed` code of a connection's error, which closes a session
+/// still waiting for its answer when its connection fails: the same code
+/// `stream/get` reports as `last_error`.
+pub(crate) const fn close_code(error: &ConnectionError) -> CloseCode {
+    match error {
+        ConnectionError::WorkerCrashed => CloseCode::WorkerCrashed,
+        ConnectionError::Source(SourceError::Unreachable(_)) => CloseCode::SourceUnreachable,
+        ConnectionError::Source(SourceError::AuthFailed(_)) => CloseCode::SourceAuthFailed,
+        ConnectionError::Source(SourceError::Timeout(_)) => CloseCode::SourceTimeout,
+        ConnectionError::Source(SourceError::Protocol(_)) => CloseCode::SourceProtocolError,
+        ConnectionError::Source(SourceError::Ended(_)) => CloseCode::SourceEnded,
+    }
+}
 
 /// The error codes a worker may refuse a re-offer with; any other is an
 /// `internal_error`.
@@ -253,7 +229,7 @@ pub(crate) struct SessionEntry {
     /// [`MAX_REPORT_TEXT_BYTES`].
     report_bytes: usize,
     /// The warning codes forwarded, each once.
-    warned: Vec<&'static str>,
+    warned: Vec<WarningCode>,
     /// The `backchannel_declined` reports still allowed: one per offer,
     /// or re-offer handed to the worker, answered, until it comes; a
     /// report that answers no request allows none.
@@ -796,12 +772,14 @@ impl SessionEntry {
     }
 
     /// A worker's warning: a known code once, its message made
-    /// [`plain`]; a repeated or unknown one is dropped.
+    /// [`plain`]; a repeated or unknown one is dropped, and so is
+    /// `backchannel_declined`, which comes as its own report
+    /// ([`Self::declined`]).
     fn warning(&mut self, code: &str, message: &str) -> Result<Vec<SessionEvent>, &'static str> {
-        let fresh = WARNING_CODES
-            .iter()
-            .find(|known| **known == code && !self.warned.contains(known));
-        let Some(&code) = fresh else {
+        let fresh = WarningCode::parse(code).filter(|known| {
+            *known != WarningCode::BackchannelDeclined && !self.warned.contains(known)
+        });
+        let Some(code) = fresh else {
             if self.warnings_dropped == 0 {
                 tracing::warn!(
                     stream.id = %self.stream_id,
@@ -816,7 +794,7 @@ impl SessionEntry {
         self.charge(message.len())?;
         self.warned.push(code);
         Ok(vec![SessionEvent::Warning {
-            code: code.to_owned(),
+            code,
             message,
             reason: None,
             status: None,
@@ -845,7 +823,7 @@ impl SessionEntry {
         let message = plain(message, MAX_MESSAGE_BYTES);
         self.declines_due = self.declines_due.saturating_sub(1);
         vec![SessionEvent::Warning {
-            code: BACKCHANNEL_DECLINED.to_owned(),
+            code: WarningCode::BackchannelDeclined,
             message,
             reason: Some(reason),
             status,
@@ -903,21 +881,14 @@ fn reply(waiting: oneshot::Sender<Result<String, ApiError>>, answer: Result<Stri
 /// is an `internal_error`, logged and not passed on.
 fn closed_event(code: &str, message: &str) -> SessionEvent {
     let message = plain(message, MAX_MESSAGE_BYTES);
-    let code = CLOSED_CODES
-        .iter()
-        .find(|known| **known == code)
-        .copied()
-        .unwrap_or_else(|| {
-            tracing::warn!(
-                code = ?plain(code, MAX_NAME_BYTES),
-                "a worker closed a session with an unknown code; internal_error"
-            );
-            "internal_error"
-        });
-    SessionEvent::Closed {
-        code: code.to_owned(),
-        message,
-    }
+    let code = CloseCode::parse(code).unwrap_or_else(|| {
+        tracing::warn!(
+            code = ?plain(code, MAX_NAME_BYTES),
+            "a worker closed a session with an unknown code; internal_error"
+        );
+        CloseCode::InternalError
+    });
+    SessionEvent::Closed { code, message }
 }
 
 /// A session event as the server queues it: `state` is a diagnostic the
@@ -1075,7 +1046,7 @@ mod tests {
         assert_eq!(
             closed_event("backchannel_unavailable", "m"),
             SessionEvent::Closed {
-                code: "internal_error".into(),
+                code: CloseCode::InternalError,
                 message: "m".into()
             }
         );
@@ -1122,7 +1093,7 @@ mod tests {
                 message: "m".into(),
             }),
             vec![SessionEvent::Warning {
-                code: "h264_profile_mismatch".into(),
+                code: WarningCode::H264ProfileMismatch,
                 message: "m".into(),
                 reason: None,
                 status: None,
@@ -1141,14 +1112,14 @@ mod tests {
                 message: "m".into()
             }),
             vec![SessionEvent::Closed {
-                code: "ice_failed".into(),
+                code: CloseCode::IceFailed,
                 message: "m".into()
             }]
         );
         assert_eq!(
             closed_event("bogus", "m"),
             SessionEvent::Closed {
-                code: "internal_error".into(),
+                code: CloseCode::InternalError,
                 message: "m".into()
             }
         );
@@ -1268,7 +1239,7 @@ mod tests {
         assert_eq!(
             session.applied(declined("busy", None)),
             vec![SessionEvent::Warning {
-                code: "backchannel_declined".into(),
+                code: WarningCode::BackchannelDeclined,
                 message: "why".into(),
                 reason: Some(DeclineReason::Busy),
                 status: None,
@@ -1313,7 +1284,7 @@ mod tests {
         assert_eq!(
             session.applied(declined("refused", Some(503))),
             vec![SessionEvent::Warning {
-                code: "backchannel_declined".into(),
+                code: WarningCode::BackchannelDeclined,
                 message: "why".into(),
                 reason: Some(DeclineReason::Refused),
                 status: Some(503),
@@ -1578,7 +1549,7 @@ mod tests {
         assert_eq!(
             session.applied(warning("av_sync_lost", format!("a\nb{}", "x".repeat(1000)))),
             vec![SessionEvent::Warning {
-                code: "av_sync_lost".into(),
+                code: WarningCode::AvSyncLost,
                 message: format!(
                     "a b{}{CUT_MARK}",
                     "x".repeat(MAX_MESSAGE_BYTES - 3 - CUT_MARK.len())
@@ -1596,6 +1567,13 @@ mod tests {
         assert_eq!(session.warnings_dropped, 1);
         assert_eq!(session.applied(warning("made_up", "m".into())), vec![]);
         assert_eq!(session.warnings_dropped, 2);
+        // A known code, but one that comes only as its own report, with
+        // the reason a declined talk-back needs.
+        assert_eq!(
+            session.applied(warning("backchannel_declined", "m".into())),
+            vec![]
+        );
+        assert_eq!(session.warnings_dropped, 3);
         assert_eq!(
             session.report_bytes, MAX_MESSAGE_BYTES,
             "dropped ones are free"
@@ -1603,14 +1581,17 @@ mod tests {
         assert_eq!(
             session.applied(warning("invalid_candidate", "m".into())),
             vec![SessionEvent::Warning {
-                code: "invalid_candidate".into(),
+                code: WarningCode::InvalidCandidate,
                 message: "m".into(),
                 reason: None,
                 status: None,
             }],
             "another code passes"
         );
-        assert_eq!(session.warned, ["av_sync_lost", "invalid_candidate"]);
+        assert_eq!(
+            session.warned,
+            [WarningCode::AvSyncLost, WarningCode::InvalidCandidate]
+        );
         let lines = captured.lines("repeated a warning");
         assert_eq!(lines.len(), 1, "logged once: {lines:?}");
         assert!(
@@ -1621,8 +1602,6 @@ mod tests {
 
     #[test]
     fn every_connection_error_is_a_closed_code() {
-        use lotse_core::connection::ConnectionError;
-        use lotse_core::source::SourceError;
         let errors = [
             ConnectionError::WorkerCrashed,
             ConnectionError::Source(SourceError::Unreachable("x".into())),
@@ -1632,11 +1611,12 @@ mod tests {
             ConnectionError::Source(SourceError::Ended("x".into())),
         ];
         for error in errors {
-            assert!(CLOSED_CODES.contains(&error.code()), "{}", error.code());
+            // The `closed` code is the one `last_error` reports.
+            assert_eq!(close_code(&error).as_str(), error.code());
             assert_eq!(
                 closed_event(error.code(), "m"),
                 SessionEvent::Closed {
-                    code: error.code().into(),
+                    code: close_code(&error),
                     message: "m".into()
                 }
             );
@@ -1655,7 +1635,7 @@ mod tests {
                 message: format!("x\u{1b}\r\n{}", "y".repeat(1000)),
             }),
             vec![SessionEvent::Closed {
-                code: "internal_error".into(),
+                code: CloseCode::InternalError,
                 message: format!(
                     "x\u{fffd}  {}{CUT_MARK}",
                     "y".repeat(MAX_MESSAGE_BYTES - 6 - CUT_MARK.len())
@@ -1671,7 +1651,7 @@ mod tests {
         assert_eq!(
             closed_event("invalid_sdp", &"z".repeat(1000)),
             SessionEvent::Closed {
-                code: "invalid_sdp".into(),
+                code: CloseCode::InvalidSdp,
                 message: format!(
                     "{}{CUT_MARK}",
                     "z".repeat(MAX_MESSAGE_BYTES - CUT_MARK.len())
@@ -1904,7 +1884,7 @@ mod tests {
             session.deliver(
                 "s1",
                 api_event(&SessionEvent::Warning {
-                    code: "av_sync_lost".into(),
+                    code: WarningCode::AvSyncLost,
                     message: n.to_string(),
                     reason: None,
                     status: None,

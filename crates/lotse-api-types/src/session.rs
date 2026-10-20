@@ -87,9 +87,7 @@ pub enum SessionEvent {
         /// The DTLS state, as the browser names it.
         dtls: String,
     },
-    /// Non-fatal (`audio_codec_unsupported`, `turn_unsupported`,
-    /// `h264_profile_mismatch`, `backchannel_declined`, ...). Each code
-    /// comes at most once per session, but `backchannel_declined`, which
+    /// Non-fatal. Each code comes at most once per session, but `backchannel_declined`, which
     /// comes once per offer (`webrtc/offer` or `webrtc/renegotiate`) that
     /// asked for talk-back the session did not get: the talk-back m-line
     /// was answered `inactive` (or `sendonly` when it carries the
@@ -97,7 +95,7 @@ pub enum SessionEvent {
     #[cfg_attr(feature = "schema", schemars(title = "SessionEventWarning"))]
     Warning {
         /// The stable code.
-        code: String,
+        code: WarningCode,
         /// For humans.
         message: String,
         /// Why, for `backchannel_declined`; absent for every other code.
@@ -123,16 +121,147 @@ pub enum SessionEvent {
     /// it (`backchannel_declined`).
     #[cfg_attr(feature = "schema", schemars(title = "SessionEventClosed"))]
     Closed {
-        /// The stable code (`peer_closed`, `session_closed`, ...). Before
-        /// the answer, a failed source closes the session with its error's
-        /// code, the one `stream/get` reports as `last_error`:
-        /// `source_unreachable`, `source_auth_failed`, `source_timeout`,
-        /// `source_protocol_error`, `source_ended` or `worker_crashed`.
-        code: String,
+        /// The stable code. Before the answer, a failed source closes the
+        /// session with its error's code, the one `stream/get` reports as
+        /// `last_error`: `source_unreachable`, `source_auth_failed`,
+        /// `source_timeout`, `source_protocol_error`, `source_ended` or
+        /// `worker_crashed`.
+        code: CloseCode,
         /// For humans; for a source's error, its text as `last_error`
         /// carries it, never the source's credentials.
         message: String,
     },
+}
+
+/// The code of a `warning` event: every code a session may warn with,
+/// and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WarningCode {
+    /// Audio omitted from the session; video continues.
+    AudioCodecUnsupported,
+    /// A `turns:` entry of `ice_servers` was ignored.
+    TurnUnsupported,
+    /// Audio withdrawn because sync could not be held.
+    AvSyncLost,
+    /// The browser did not offer the stream's H.264 profile.
+    H264ProfileMismatch,
+    /// A `webrtc/candidate` the session could not parse was ignored.
+    InvalidCandidate,
+    /// A video frame needed more RTP packets than some libwebrtc receivers
+    /// assemble; it was sent whole.
+    FrameOverBrowserLimit,
+    /// The offer asked for talk-back the session did not get; `reason`
+    /// says why.
+    BackchannelDeclined,
+}
+
+impl WarningCode {
+    /// The code as the API spells it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AudioCodecUnsupported => "audio_codec_unsupported",
+            Self::TurnUnsupported => "turn_unsupported",
+            Self::AvSyncLost => "av_sync_lost",
+            Self::H264ProfileMismatch => "h264_profile_mismatch",
+            Self::InvalidCandidate => "invalid_candidate",
+            Self::FrameOverBrowserLimit => "frame_over_browser_limit",
+            Self::BackchannelDeclined => "backchannel_declined",
+        }
+    }
+
+    /// The code for its API name, as a worker reports it.
+    pub fn parse(code: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(code.to_owned())).ok()
+    }
+}
+
+impl fmt::Display for WarningCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The code of a `closed` event: every reason a session may end, and
+/// nothing else. The `source_*` codes and `worker_crashed` are also the
+/// codes of `stream/get`'s `last_error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CloseCode {
+    /// The browser closed the peer connection.
+    PeerClosed,
+    /// `unsubscribe`, `session/close`, or the grace expired.
+    SessionClosed,
+    /// The stream was deleted.
+    StreamDeleted,
+    /// The codec family changed on reconnect.
+    StreamChanged,
+    /// The connection's worker process died.
+    WorkerCrashed,
+    /// Connecting to the source failed.
+    SourceUnreachable,
+    /// The source rejected the credentials.
+    SourceAuthFailed,
+    /// The read deadline or stall watchdog hit.
+    SourceTimeout,
+    /// The source violated its protocol.
+    SourceProtocolError,
+    /// The source or publisher closed the stream.
+    SourceEnded,
+    /// The offer reached a worker that runs no source.
+    SourceNotLive,
+    /// ICE failed or stayed disconnected.
+    IceFailed,
+    /// The offer could not be parsed.
+    InvalidSdp,
+    /// The stream has no video track, or the offer no video m-line.
+    NoVideoTrack,
+    /// No video codec both sides can use.
+    VideoCodecUnsupported,
+    /// The daemon is shutting down.
+    ShuttingDown,
+    /// An invariant failed, or a worker reported a code the API does not
+    /// know; a bug, always logged with context.
+    InternalError,
+}
+
+impl CloseCode {
+    /// The code as the API spells it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerClosed => "peer_closed",
+            Self::SessionClosed => "session_closed",
+            Self::StreamDeleted => "stream_deleted",
+            Self::StreamChanged => "stream_changed",
+            Self::WorkerCrashed => "worker_crashed",
+            Self::SourceUnreachable => "source_unreachable",
+            Self::SourceAuthFailed => "source_auth_failed",
+            Self::SourceTimeout => "source_timeout",
+            Self::SourceProtocolError => "source_protocol_error",
+            Self::SourceEnded => "source_ended",
+            Self::SourceNotLive => "source_not_live",
+            Self::IceFailed => "ice_failed",
+            Self::InvalidSdp => "invalid_sdp",
+            Self::NoVideoTrack => "no_video_track",
+            Self::VideoCodecUnsupported => "video_codec_unsupported",
+            Self::ShuttingDown => "shutting_down",
+            Self::InternalError => "internal_error",
+        }
+    }
+
+    /// The code for its API name, as a worker or a connection error
+    /// reports it.
+    pub fn parse(code: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(code.to_owned())).ok()
+    }
+}
+
+impl fmt::Display for CloseCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Why an offer's talk-back was declined: the `reason` of a
@@ -305,7 +434,7 @@ mod tests {
             ),
             (
                 SessionEvent::Warning {
-                    code: "turn_unsupported".into(),
+                    code: WarningCode::TurnUnsupported,
                     message: "m".into(),
                     reason: None,
                     status: None,
@@ -314,7 +443,7 @@ mod tests {
             ),
             (
                 SessionEvent::Warning {
-                    code: "backchannel_declined".into(),
+                    code: WarningCode::BackchannelDeclined,
                     message: "m".into(),
                     reason: Some(DeclineReason::Busy),
                     status: None,
@@ -324,7 +453,7 @@ mod tests {
             ),
             (
                 SessionEvent::Warning {
-                    code: "backchannel_declined".into(),
+                    code: WarningCode::BackchannelDeclined,
                     message: "m".into(),
                     reason: Some(DeclineReason::Refused),
                     status: Some(503),
@@ -334,7 +463,7 @@ mod tests {
             ),
             (
                 SessionEvent::Closed {
-                    code: "peer_closed".into(),
+                    code: CloseCode::PeerClosed,
                     message: "m".into(),
                 },
                 json!({ "type": "closed", "code": "peer_closed", "message": "m" }),
@@ -346,6 +475,60 @@ mod tests {
                 event
             );
         }
+    }
+
+    #[test]
+    fn event_codes_serialize_as_their_snake_case_names_and_parse_back() {
+        let warnings = [
+            WarningCode::AudioCodecUnsupported,
+            WarningCode::TurnUnsupported,
+            WarningCode::AvSyncLost,
+            WarningCode::H264ProfileMismatch,
+            WarningCode::InvalidCandidate,
+            WarningCode::FrameOverBrowserLimit,
+            WarningCode::BackchannelDeclined,
+        ];
+        for code in warnings {
+            let json = serde_json::to_value(code).unwrap();
+            assert_eq!(json, serde_json::Value::String(code.as_str().to_owned()));
+            assert_eq!(WarningCode::parse(code.as_str()), Some(code));
+            assert_eq!(code.to_string(), code.as_str());
+        }
+        let closes = [
+            CloseCode::PeerClosed,
+            CloseCode::SessionClosed,
+            CloseCode::StreamDeleted,
+            CloseCode::StreamChanged,
+            CloseCode::WorkerCrashed,
+            CloseCode::SourceUnreachable,
+            CloseCode::SourceAuthFailed,
+            CloseCode::SourceTimeout,
+            CloseCode::SourceProtocolError,
+            CloseCode::SourceEnded,
+            CloseCode::SourceNotLive,
+            CloseCode::IceFailed,
+            CloseCode::InvalidSdp,
+            CloseCode::NoVideoTrack,
+            CloseCode::VideoCodecUnsupported,
+            CloseCode::ShuttingDown,
+            CloseCode::InternalError,
+        ];
+        for code in closes {
+            let json = serde_json::to_value(code).unwrap();
+            assert_eq!(json, serde_json::Value::String(code.as_str().to_owned()));
+            assert_eq!(CloseCode::parse(code.as_str()), Some(code));
+            assert_eq!(code.to_string(), code.as_str());
+        }
+        // A code of the other kind, or none at all, is not one.
+        assert_eq!(WarningCode::parse("peer_closed"), None);
+        assert_eq!(CloseCode::parse("turn_unsupported"), None);
+        assert_eq!(CloseCode::parse("nope"), None);
+        assert!(
+            serde_json::from_value::<SessionEvent>(
+                json!({ "type": "closed", "code": "turn_unsupported", "message": "m" })
+            )
+            .is_err()
+        );
     }
 
     #[test]
