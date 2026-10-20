@@ -120,7 +120,7 @@ jobs:
         with:
           version: 2026.9.15
           # What the hooks run; cmake builds libopus for clippy and rustdoc.
-          install_args: rust cmake prek cargo-deny github:taiki-e/cargo-hack github:boshen/cargo-shear uv shellcheck
+          install_args: rust cmake prek cargo-deny github:taiki-e/cargo-hack github:boshen/cargo-shear uv shellcheck zizmor
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: check
@@ -131,7 +131,7 @@ jobs:
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/browser/uv.lock') }}
-      # The hooks prek fetches itself (actionlint, zizmor, codespell, ruff), by their pins.
+      # The hooks prek fetches itself (actionlint, codespell, ruff), by their pins.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/prek
@@ -775,6 +775,35 @@ jobs:
           install_args: rust cargo-deny # cargo-deny reads `cargo metadata`
       - run: mise run audit
 
+  # The workflows' security audit with zizmor's online audits, which the prek hook leaves out (an
+  # advisory against a pinned action, a pin no tag or branch of its repository holds, a ref both a
+  # tag and a branch): on main and nightly, so a finding that appears without our code changing
+  # fails no unrelated PR. The findings go to code scanning, under the zizmor category, and fail no
+  # run: an alert stays open there until a commit fixes it.
+  zizmor:
+    name: Zizmor
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # uploading the findings to code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          version: 2026.9.15
+          install_args: zizmor
+      - name: Audit the workflows
+        env:
+          GH_TOKEN: ${{ github.token }} # the online audits read the actions' repositories
+        run: zizmor --persona=pedantic --strict-collection --no-exit-codes --no-progress --format=sarif . > zizmor.sarif
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
   # The browser test (scripts/browser.sh): one pytest test in tests/browser/, run once per browser
   # and case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash), has
   # Selenium drive a real browser that plays the synthetic camera (ffmpeg publishing to MediaMTX,
@@ -1017,6 +1046,7 @@ jobs:
       - codeql
       - dependency-review
       - audit
+      - zizmor
       - browser
       - compare
       - load

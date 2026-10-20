@@ -44,7 +44,9 @@ job writes (a token of the lotse-bot app, whose key is in the `lotse-bot` enviro
 cache, saved by every run and restored from the PR's own (GitHub scopes
 them to it) or else from `main`'s; only the Mutants jobs (a PR's changed
 lines, and nightly the whole workspace, each sharded by its Mutants plan job)
-save none and restore the one the Mutants cache job builds on `main`. A new job goes
+save none and restore the one the Mutants cache job builds on `main`. The zizmor
+hook runs offline; on `main` and nightly the Zizmor job runs the same pinned
+zizmor with its online audits and sends the findings to code scanning. A new job goes
 into `ci.yml` and into the needs of its last job, All required jobs pass,
 the run's one verdict and the one check of it the ruleset requires;
 workflow and job names start with a capital letter.
