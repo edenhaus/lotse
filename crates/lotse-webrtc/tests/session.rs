@@ -661,6 +661,9 @@ fn cut_through_renumbers_and_the_age_gate_skips_to_a_keyframe() {
         assert_eq!(*packet.seq_no, i as u64, "{:?}", packet.header);
     }
     assert_eq!(received[0].header.timestamp, 93_000);
+    // The payload bytes counted are those the viewer received.
+    let bytes: usize = received.iter().map(|packet| packet.payload.len()).sum();
+    assert_eq!(stats.bytes, bytes as u64);
     assert!(pair.viewer.keyframe_starts() >= 1);
     assert_eq!(received.iter().filter(|p| p.header.marker).count(), 3);
 

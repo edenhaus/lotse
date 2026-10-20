@@ -244,9 +244,9 @@ pub struct WebrtcCandidate {
 /// why); one offered `inactive` or `recvonly`, or removed (port 0), lets
 /// the backchannel go. A re-offer that changes the video m-line (its
 /// mid, codecs or direction) fails with `invalid_sdp`, one without a
-/// video m-line with `no_video_track`, and one that adds a video m-line
-/// to a session opened without video with `invalid_sdp`; the session
-/// goes on as it was.
+/// video m-line, for a session that plays video, with `no_video_track`,
+/// and one that adds a video m-line to a session opened without video
+/// with `invalid_sdp`; the session goes on as it was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
