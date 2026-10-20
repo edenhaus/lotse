@@ -210,11 +210,11 @@ fuzz_target!(|data: &[u8]| {
         },
         candidates: vec![DAEMON],
         tcp_candidates: vec![],
-        video: Arc::new(Codec::H264 {
+        video: Some(Arc::new(Codec::H264 {
             profile_level_id: None,
             sps: None,
             pps: None,
-        }),
+        })),
         audio: audio.then(|| Arc::new(Codec::Pcmu)),
         backchannel: None,
         claim: lotse_core::session::TalkbackClaim::Granted,

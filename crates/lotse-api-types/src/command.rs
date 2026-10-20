@@ -175,6 +175,13 @@ pub struct Unsubscribe {
 /// `webrtc/offer`: opens a session; the subscription's events carry the
 /// whole signaling conversation.
 ///
+/// A session plays video when the offer has a video m-line, and none
+/// otherwise: a client that only talks to the camera offers one
+/// `sendonly` audio m-line, and one that only listens one `recvonly`
+/// audio m-line, each in a session of its own beside a viewer's. Such a
+/// session takes the stream's audio only when its offer receives audio,
+/// and keeps the source live as a viewer's does.
+///
 /// The answer comes once the source is live. An offer that requests
 /// two-way audio is answered from the camera's backchannel as the
 /// connection's probe found it: sent right after a `stream/put` that opted
@@ -237,7 +244,9 @@ pub struct WebrtcCandidate {
 /// why); one offered `inactive` or `recvonly`, or removed (port 0), lets
 /// the backchannel go. A re-offer that changes the video m-line (its
 /// mid, codecs or direction) fails with `invalid_sdp`, one without a
-/// video m-line with `no_video_track`; the session goes on as it was.
+/// video m-line with `no_video_track`, and one that adds a video m-line
+/// to a session opened without video with `invalid_sdp`; the session
+/// goes on as it was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]

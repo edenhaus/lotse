@@ -323,6 +323,24 @@ impl Peer {
         }
     }
 
+    /// A client that only talks back: one `sendonly` audio m-line and
+    /// no video.
+    async fn new_talk_only() -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("viewer socket");
+        lotse_webrtc::install_crypto_provider();
+        let viewer =
+            Viewer::new_talk_only(socket.local_addr().unwrap(), clock().now()).expect("a viewer");
+        let offer = viewer.offer().to_owned();
+        Self {
+            viewer,
+            socket,
+            offer,
+            pt: None,
+            mic: None,
+            out: Vec::new(),
+        }
+    }
+
     /// The viewer's host candidate, as the browser trickles it.
     fn candidate(&self) -> String {
         let addr = self.socket.local_addr().unwrap();
@@ -1970,6 +1988,11 @@ impl ApiPeer {
         Self::open(api, id, Box::new(Peer::new_silent().await)).await
     }
 
+    /// A client that only talks back, through `webrtc/offer`.
+    async fn offer_talk_only(api: &Api, id: &'static str) -> Self {
+        Self::open(api, id, Box::new(Peer::new_talk_only().await)).await
+    }
+
     /// `peer`'s offer as it sends it, through `webrtc/offer`; boxed, so
     /// the future holds no viewer.
     async fn open(api: &Api, id: &'static str, peer: Box<Peer>) -> Self {
@@ -2559,6 +2582,79 @@ fn video_in(viewer: &Viewer, window: (Instant, Instant)) -> (Duration, Vec<u32>,
         })
         .collect();
     (gap, steps, frames.len())
+}
+
+/// A client that only talks back opens a session of its own beside a
+/// viewer's: its offer has one `sendonly` audio m-line and no video, which
+/// claims the backchannel as a viewer's offer does and is answered
+/// `recvonly` (RFC 8829 §5.3.1), and its tone reaches the camera, while
+/// the viewer, which offered no talk-back, plays on and the talker gets
+/// no media. A second such client is declined `busy` (RFC 3264 §6.1:
+/// answered `inactive`); closing the talker frees the backchannel for
+/// its re-offer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc8829_5_3_1_a_talk_only_session_beside_a_viewer_talks_to_the_camera() {
+    let mut api = Api::start(&json!({ "backchannel": "pcmu", "video": true })).await;
+    let mut v = ApiPeer::offer_silent(&api, "v").await;
+    let mut t = ApiPeer::offer_talk_only(&api, "t").await;
+    assert!(!t.peer.offer.contains("m=video"), "{}", t.peer.offer);
+    pump(&mut api, &mut [&mut v, &mut t], |api, peers| {
+        peers.iter().all(|p| p.peer.viewer.is_connected()) && !api.talker_changes().is_empty()
+    })
+    .await;
+    assert_eq!(
+        t.peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::SendOnly)
+    );
+    assert_eq!(t.peer.pt, Some(0));
+    assert_eq!(v.peer.viewer.talkback_direction(), None);
+    assert_eq!(
+        api.talker_changes(),
+        [("t".to_owned(), "claimed".to_owned(), json!("t"))]
+    );
+
+    t.peer.talk(Mic::pcmu());
+    let talker = session_where(&mut api, &mut [&mut v, &mut t], "t", |bc| {
+        bc["bytes_sent"].as_u64().unwrap() > 0
+    })
+    .await;
+    assert_eq!(talker["talker"], true);
+    assert_eq!(talker["codec"], "pcmu");
+    let video = v.peer.viewer.packets().len();
+    pump_for(&mut api, &mut [&mut v, &mut t], Duration::from_millis(500)).await;
+    assert!(v.peer.viewer.packets().len() > video, "the viewer plays on");
+    assert!(v.peer.viewer.packets().len() >= 15, "{video}");
+    assert!(t.peer.viewer.packets().is_empty());
+    assert!(t.peer.viewer.audio_packets().is_empty());
+
+    let mut u = ApiPeer::offer_talk_only(&api, "u").await;
+    pump(&mut api, &mut [&mut v, &mut t, &mut u], |_, peers| {
+        peers[2].peer.viewer.is_connected() && peers[2].warnings("backchannel_declined") == 1
+    })
+    .await;
+    assert_eq!(
+        u.peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::Inactive)
+    );
+
+    api.call(&json!({ "id": 6, "type": "session/close", "session_id": "t" }))
+        .await;
+    pump(&mut api, &mut [&mut v, &mut t, &mut u], |api, _| {
+        api.talker_changes().len() >= 2
+    })
+    .await;
+    u.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .await;
+    assert_eq!(
+        u.peer.viewer.talkback_direction(),
+        Some(lotse_testing::viewer::Direction::SendOnly)
+    );
+    pump(&mut api, &mut [&mut v, &mut u], |api, _| {
+        api.talker_changes().len() >= 3
+    })
+    .await;
+    assert_eq!(api.talker_changes()[2].0, "u");
+    api.stop().await;
 }
 
 /// Pressing the microphone (the

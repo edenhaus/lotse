@@ -433,15 +433,15 @@ async fn sessions_are_refused_with_a_code_when_they_cannot_start() {
         .await
         .expect("camera");
     run_camera(&mut door, &cam).await;
-    // An offer without video.
-    let no_video = viewer.offer().replace("m=video", "m=audio");
+    // An offer with neither video nor audio.
+    let nothing = viewer.offer().replace("m=video", "m=text");
     door.worker
-        .open_session(&spec("audio", &no_video, door.local))
+        .open_session(&spec("nothing", &nothing, door.local))
         .await
         .expect("open");
     assert_eq!(
         closed(&mut door.worker).await,
-        ("audio".to_owned(), "no_video_track".to_owned())
+        ("nothing".to_owned(), "invalid_sdp".to_owned())
     );
     // An unknown output kind, and a second session under an id in use.
     let mut unknown = spec("nope", viewer.offer(), door.local);

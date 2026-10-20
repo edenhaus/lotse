@@ -94,8 +94,11 @@ pub struct SessionRequest {
     pub candidates: Vec<SocketAddr>,
     /// The passive ICE-TCP host candidates: the listener's addresses.
     pub tcp_candidates: Vec<SocketAddr>,
-    /// The video track's codec.
-    pub video: Arc<Codec>,
+    /// The video track's codec, when the session plays video: `None`
+    /// when the offer has no video m-line ([`crate::output::OutputFactory::session_tracks`]
+    /// asks for no video then), a session that only sends talk-back or
+    /// only receives audio.
+    pub video: Option<Arc<Codec>>,
     /// The audio track's codec, when the stream has one and audio is on.
     pub audio: Option<Arc<Codec>>,
     /// The connection's backchannel, when its source protocol can carry
@@ -155,8 +158,8 @@ pub enum SessionOpenError {
     /// The offer is not an SDP the engine accepts.
     #[error("invalid offer: {0}")]
     InvalidSdp(String),
-    /// The offer has no video m-line.
-    #[error("the offer has no video m-line")]
+    /// The offer has a video m-line, and the stream no video track.
+    #[error("the stream has no video track for the offer's video m-line")]
     NoVideoTrack,
     /// No offered video payload type carries the stream's codec.
     #[error("video codec unsupported: {0}")]
@@ -183,10 +186,11 @@ pub enum RenegotiateError {
     #[error("invalid re-offer: {0}")]
     InvalidSdp(String),
     /// The re-offer changes the video m-line the session plays on: its
-    /// mid, direction or codecs, or stops it (its port).
+    /// mid, direction or codecs, or stops it (its port); or it adds one
+    /// to a session that opened without video.
     #[error("the re-offer changes the video m-line: {0}")]
     VideoChanged(String),
-    /// The re-offer has no video m-line.
+    /// The re-offer has no video m-line, and the session plays video.
     #[error("the re-offer has no video m-line")]
     NoVideoTrack,
 }
@@ -391,7 +395,8 @@ pub trait SessionEngine: fmt::Debug + Send {
     /// `backchannel` what the camera offers now and `claim` whether the
     /// session holds it for this re-offer
     /// ([`SessionRequest::backchannel`], [`SessionRequest::claim`]);
-    /// the video m-line must be the one the session opened with.
+    /// the video m-line must be the one the session opened with, and a
+    /// session that opened without one takes none.
     fn renegotiate(
         &mut self,
         now: Instant,
@@ -469,8 +474,8 @@ pub fn apply_track_event(
 /// - a `TrackChanged` closes with `stream_changed` only when the family
 ///   changed, since the answer named the old codec's payload type;
 /// - `SourceLost` and `SourceRestored` keep the session;
-/// - the track's end stops the audio; the video track's end closes the
-///   session.
+/// - the track's end stops the audio; the video track's end closes a
+///   session that plays video.
 pub fn apply_audio_event(
     engine: &mut dyn SessionEngine,
     now: Instant,
@@ -504,7 +509,7 @@ pub fn apply_audio_event(
             | TrackEvent::Frame(_),
         ) => true,
         None => {
-            tracing::info!("audio track closed; the session continues with video");
+            tracing::info!("audio track closed; the session continues without it");
             false
         }
     }

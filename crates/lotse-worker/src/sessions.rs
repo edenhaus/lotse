@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use lotse_core::clock::Clock;
 use lotse_core::clock_map::ClockMapper;
-use lotse_core::codec::{Codec, CodecFamily};
+use lotse_core::codec::{Codec, CodecFamily, Kind};
 use lotse_core::media::MediaPacket;
 use lotse_core::negotiate::NegotiationError;
 use lotse_core::orientation::Orientation;
@@ -51,7 +51,7 @@ use lotse_core::session::{
 use lotse_core::skew::AV_SYNC_LOST;
 use lotse_core::source::{BACKCHANNEL_OPEN_LIMIT, BackchannelRefused};
 use lotse_core::task::{BoxFuture, spawn_named};
-use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
+use lotse_core::track::{Track, TrackEvent, TrackId, TrackSubscription, Unit};
 use lotse_ipc::{SessionEvent as IpcEvent, SessionSpec, datagram};
 use tokio::net::UnixDatagram;
 use tokio::sync::{mpsc, watch};
@@ -809,57 +809,75 @@ async fn wait_ready(
 }
 
 /// What negotiation picked for a session.
+#[derive(Default)]
 struct Picked {
-    /// The video track.
-    video: PickedTrack,
+    /// The video track, when the session plays video.
+    video: Option<PickedTrack>,
     /// The audio track, when one was picked.
     audio: Option<PickedTrack>,
     /// Why no audio was picked although the stream has some.
     warning: Option<NegotiationError>,
 }
 
-/// The tracks negotiation picked, with audio if `audio`; a derived one
-/// comes leased, so its transcoder runs until the session lets go.
+/// The tracks negotiation picked for the session's offer, with audio if
+/// `audio` ([`OutputFactory::session_tracks`]: an offer without video
+/// wants none); a derived one comes leased, so its transcoder runs until
+/// the session lets go. A required track that cannot be had is the
+/// error; audio that cannot is a warning, or nothing when the stream has
+/// none.
 fn pick_tracks(ctx: &SessionCtx, audio: bool) -> Result<Picked, NegotiationError> {
-    let requests = ctx.factory.session_tracks(audio);
-    let mut picks = ctx.tracks.pick(&requests).into_iter();
-    let video = match picks.next() {
-        Some(Ok(video)) => video,
-        Some(Err(err)) => return Err(err),
-        None => {
-            return Err(NegotiationError::NoTrack {
-                kind: lotse_core::codec::Kind::Video,
-            });
+    let requests = ctx.factory.session_tracks(&ctx.spec.offer, audio);
+    let mut picked = Picked::default();
+    for (request, pick) in requests.iter().zip(ctx.tracks.pick(&requests)) {
+        match pick {
+            Ok(track) if request.kind == Kind::Video => picked.video = Some(track),
+            Ok(track) => picked.audio = Some(track),
+            Err(err) if request.required => return Err(err),
+            Err(err @ NegotiationError::CodecUnsupported { .. }) => picked.warning = Some(err),
+            Err(NegotiationError::NoTrack { .. }) => {}
         }
-    };
-    let (audio, warning) = match picks.next() {
-        Some(Ok(audio)) => (Some(audio), None),
-        Some(Err(err @ NegotiationError::CodecUnsupported { .. })) => (None, Some(err)),
-        _ => (None, None),
-    };
-    Ok(Picked {
-        video,
-        audio,
-        warning,
-    })
+    }
+    Ok(picked)
 }
 
-/// What the preamble of a session produced: the engine and the video
-/// track it serves.
-struct Opened {
-    /// The engine.
-    engine: Box<dyn SessionEngine>,
-    /// The video track.
-    video: Arc<Track>,
+/// The video a session plays: the track, the family it opened with, its
+/// packets.
+struct VideoSubscription {
+    /// The track.
+    track: Arc<Track>,
     /// Its codec family when the session opened; a change of it closes the
     /// session.
     family: CodecFamily,
     /// Its live packets.
     subscription: TrackSubscription,
+    /// Keeps a derived video track's transcoder running; none today.
+    _lease: Option<Lease>,
+}
+
+/// The next event of a session's video, with its track and the family
+/// it opened with, or never without video.
+async fn next_video(
+    video: &mut Option<VideoSubscription>,
+) -> (TrackId, CodecFamily, Option<TrackEvent>) {
+    match video {
+        Some(video) => (
+            video.track.id(),
+            video.family,
+            video.subscription.next().await,
+        ),
+        None => std::future::pending().await,
+    }
+}
+
+/// What the preamble of a session produced: the engine and the tracks it
+/// serves.
+struct Opened {
+    /// The engine.
+    engine: Box<dyn SessionEngine>,
+    /// The video, when the session plays video.
+    video: Option<VideoSubscription>,
     /// The audio track's live packets, until it ends.
     audio: Option<AudioSubscription>,
-    /// Keeps a derived video track's transcoder running; none today.
-    _video_lease: Option<Lease>,
     /// The relay candidates and their channels.
     relays: Relays,
     /// The datagram-channel message to the supervisor being encoded,
@@ -1250,8 +1268,12 @@ async fn open_session(
     }
     // Subscribed before the answer so the queue starts at the live edge
     // of now; the age gate drops what grows old meanwhile.
-    let video = picked.video.track;
-    let subscription = video.subscribe(Unit::Packets);
+    let video = picked.video.map(|video| VideoSubscription {
+        family: video.track.codec().family(),
+        subscription: video.track.subscribe(Unit::Packets),
+        track: video.track,
+        _lease: video.lease,
+    });
     let audio = picked.audio.map(|audio| AudioSubscription {
         family: audio.track.codec().family(),
         subscription: audio.track.subscribe(Unit::Packets),
@@ -1280,7 +1302,7 @@ async fn open_session(
         },
         candidates: ctx.spec.candidates.clone(),
         tcp_candidates: ctx.spec.tcp_candidates.clone(),
-        video: video.codec(),
+        video: video.as_ref().map(|video| video.track.codec()),
         audio: stream_audio.clone(),
         // What the source offers now, behind its protocol's gate (a new
         // session holds no backchannel session yet), and whether this
@@ -1312,11 +1334,8 @@ async fn open_session(
     }
     let mut opened = Opened {
         engine,
-        family: video.codec().family(),
         video,
-        subscription,
         audio,
-        _video_lease: picked.video.lease,
         relays: Relays::default(),
         uplink: Vec::new(),
         talkback,
@@ -1517,8 +1536,10 @@ async fn drain(
                 }
             }
             SessionOutput::Event(SessionEvent::Connected) => {
-                let gop = opened.video.gop();
-                opened.engine.join(ctx.clock.now(), gop.as_deref());
+                if let Some(video) = &opened.video {
+                    let gop = video.track.gop();
+                    opened.engine.join(ctx.clock.now(), gop.as_deref());
+                }
             }
             SessionOutput::Event(SessionEvent::Closed { code, message }) => {
                 ctx.finish(code, message).await;
@@ -1610,10 +1631,9 @@ async fn run_session(
             }
             // The reactions to track events are core's, shared by every
             // session output.
-            event = opened.subscription.next() => {
+            (track, family, event) = next_video(&mut opened.video) => {
                 let now = ctx.clock.now();
-                let track = opened.video.id();
-                apply_track_event(opened.engine.as_mut(), now, opened.family, event, |packet| {
+                apply_track_event(opened.engine.as_mut(), now, family, event, |packet| {
                     ctx.mapper.map(track, packet.rtp.ts, packet.arrival)
                 });
             }
@@ -1901,8 +1921,9 @@ mod tests {
         }
     }
 
-    /// The `webrtc` output of [`Scripted`] engines: H.264 video, and PCMU
-    /// audio when asked. An offer with `talk` asks for talk-back, which a
+    /// The `webrtc` output of [`Scripted`] engines: H.264 video unless the
+    /// offer says `no video`, and PCMU audio when asked. An offer with
+    /// `talk` asks for talk-back, which a
     /// camera's backchannel takes unless the offer says `unsupported`, or
     /// `one-way` for a session with stream audio, or names no codec it
     /// takes ([`scripted_codec`]).
@@ -1914,20 +1935,20 @@ mod tests {
             "webrtc"
         }
 
-        fn session_tracks(&self, audio: bool) -> Vec<TrackRequest> {
-            let video = TrackRequest {
+        fn session_tracks(&self, offer: &str, audio: bool) -> Vec<TrackRequest> {
+            let video = (!offer.contains("no video")).then(|| TrackRequest {
                 kind: Kind::Video,
                 accept: vec![CodecFamily::H264],
                 unit: Unit::Packets,
                 required: true,
-            };
+            });
             let audio = audio.then(|| TrackRequest {
                 kind: Kind::Audio,
                 accept: vec![CodecFamily::Pcmu],
                 unit: Unit::Packets,
                 required: false,
             });
-            std::iter::once(video).chain(audio).collect()
+            video.into_iter().chain(audio).collect()
         }
 
         fn open_session(
@@ -1935,6 +1956,8 @@ mod tests {
             request: SessionRequest,
             now: Instant,
         ) -> Result<(Box<dyn SessionEngine>, String), SessionOpenError> {
+            self.0
+                .call(&format!("open video={}", request.video.is_some()));
             self.0
                 .call(&format!("open audio={}", request.audio.is_some()));
             self.0
@@ -2121,8 +2144,22 @@ mod tests {
         offer: &str,
         backchannel: Option<Arc<Arbiter>>,
     ) -> (Rig, impl Future<Output = ()> + Send) {
+        session_with(id, script, (audio, audio), ready, offer, backchannel)
+    }
+
+    /// [`session_on`], its connection with an audio track when
+    /// `audio.0` and the session asking for audio when `audio.1`.
+    fn session_with(
+        id: &str,
+        script: Script,
+        audio: (bool, bool),
+        ready: bool,
+        offer: &str,
+        backchannel: Option<Arc<Arbiter>>,
+    ) -> (Rig, impl Future<Output = ()> + Send) {
+        let (stream_audio, audio) = audio;
         let clock = Arc::new(FakeClock::default());
-        let publisher = connection(&clock, audio, ready);
+        let publisher = connection(&clock, stream_audio, ready);
         let script = Arc::new(script);
         let (events_tx, events) = mpsc::channel(64);
         let (control, control_rx) = mpsc::channel(64);
@@ -2245,6 +2282,66 @@ mod tests {
         let mut next = pin!(next);
         let_assert!(Poll::Ready(Some(changed)) = poll_once(&mut next).await);
         (changed.session, changed.reason.code())
+    }
+
+    /// A client that only talks back offers no video: its session claims
+    /// the backchannel for the offer as a viewer's does, opens its engine
+    /// without video, takes none of the stream's video and joins none
+    /// once connected; the stream's audio it was asked for reaches it.
+    #[tokio::test]
+    async fn a_talk_only_session_claims_the_backchannel_and_plays_no_video() {
+        let (arbiter, mut feed) = arbiter();
+        let (mut rig, task) = session_on(
+            "t",
+            Script::default(),
+            true,
+            true,
+            "v=0 talk, no video",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut task = pin!(task);
+        assert!(poll_once(&mut task).await.is_pending());
+        assert!(rig.script.called("open video=false"));
+        assert!(rig.script.called("open backchannel=true claim=Granted"));
+        assert_eq!(
+            rig.events(),
+            [IpcEvent::Answer {
+                sdp: "answer".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+        assert_eq!(change(&mut feed).await, ("t".into(), "claimed"));
+
+        rig.track(Kind::Video)
+            .publish_packet(packet(rig.clock.now()));
+        rig.track(Kind::Audio)
+            .publish_packet(packet(rig.clock.now()));
+        rig.script
+            .then(SessionOutput::Event(SessionEvent::Connected));
+        rig.control(Control::Candidate("candidate:browser".into()));
+        assert!(poll_once(&mut task).await.is_pending());
+        assert!(rig.script.called("audio"));
+        assert!(!rig.script.called("video"));
+        assert!(!rig.script.called("join"));
+    }
+
+    /// A session that asks for the stream's audio on a stream without
+    /// any opens without it, and without a warning: there is no audio to
+    /// miss.
+    #[tokio::test]
+    async fn a_session_asking_for_audio_on_a_stream_without_any_opens_without_it() {
+        let (mut rig, task) =
+            session_with("s", Script::default(), (false, true), true, "v=0", None);
+        let mut task = pin!(task);
+        assert!(poll_once(&mut task).await.is_pending());
+        assert!(rig.script.called("open video=true") && rig.script.called("open audio=false"));
+        assert_eq!(
+            rig.events(),
+            [IpcEvent::Answer {
+                sdp: "answer".into(),
+                talkback: None,
+            }]
+        );
     }
 
     /// A re-offer, as the manager hands it to the session.
@@ -3107,7 +3204,7 @@ mod tests {
                 talkback: None,
             }]
         );
-        assert!(rig.script.called("open audio=true"));
+        assert!(rig.script.called("open video=true") && rig.script.called("open audio=true"));
 
         rig.track(Kind::Video)
             .publish_packet(packet(rig.clock.now()));
@@ -3212,7 +3309,7 @@ mod tests {
         assert_eq!(
             logs.count(
                 Level::INFO,
-                "audio track closed; the session continues with video"
+                "audio track closed; the session continues without it"
             ),
             1
         );

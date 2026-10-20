@@ -38,7 +38,7 @@ use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields};
 use lotse_core::output::{OutputFactory as _, TalkbackRequest};
 use lotse_core::session::{
     IceCredentials, RenegotiateError, SessionEngine, SessionEvent, SessionLimits, SessionOpenError,
-    SessionOutput, SessionRequest, TalkbackClaim, TalkbackTarget, Transport,
+    SessionOutput, SessionRequest, SessionStats, TalkbackClaim, TalkbackTarget, Transport,
 };
 use lotse_core::source::TrackSet;
 use lotse_core::text::CUT_MARK;
@@ -72,7 +72,7 @@ fn request(offer: &str, video: Arc<Codec>) -> SessionRequest {
         },
         candidates: vec![DAEMON.parse().unwrap()],
         tcp_candidates: vec![DAEMON_TCP.parse().unwrap()],
-        video,
+        video: Some(video),
         audio: None,
         backchannel: None,
         claim: TalkbackClaim::Granted,
@@ -474,12 +474,21 @@ fn negotiation_errors_map_to_codes_rfc6184_8_2_2() {
         matches!(bad, Some(SessionOpenError::InvalidSdp(_))),
         "{bad:?}"
     );
-    let no_video = viewer.offer().replace("m=video", "m=audio");
-    let err = Session::answer(&request(&no_video, h264(None)), now).err();
+    // A video m-line to play on, and no video in the stream.
+    let mut no_track = request(viewer.offer(), h264(None));
+    no_track.video = None;
+    let err = Session::answer(&no_track, now).err();
     assert!(
         matches!(err, Some(SessionOpenError::NoVideoTrack)),
         "{err:?}"
     );
+    // Neither a video nor an audio m-line: nothing to carry.
+    let nothing = viewer.offer().replace("m=video ", "m=text ");
+    let err = Session::answer(&request(&nothing, h264(None)), now).err();
+    let Some(SessionOpenError::InvalidSdp(message)) = &err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(message, "the offer has no video or audio m-line");
     let err = Session::answer(&request(viewer.offer(), Arc::new(Codec::Mjpeg)), now).err();
     assert!(
         matches!(err, Some(SessionOpenError::VideoCodecUnsupported(_))),
@@ -2041,7 +2050,7 @@ fn rfc3264_6_1_an_offer_without_the_stream_audio_codec_gets_inactive_audio_and_a
     let found = warning_messages(&mut session);
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, "audio_codec_unsupported");
-    assert!(found[0].1.contains("video only"), "{found:?}");
+    assert!(found[0].1.ends_with("no audio is sent"), "{found:?}");
     session.write_audio(now, &audio_packet(1, 160, 0, now), now);
     assert_eq!(session.stats().audio_dropped, 1);
 }
@@ -3145,7 +3154,7 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
         .viewer
         .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
         .expect("a re-offer");
-    let video_mid = format!("a=mid:{}\r\n", pair.viewer.mid());
+    let video_mid = format!("a=mid:{}\r\n", pair.viewer.mid().unwrap());
     let target = Some(chained(Codec::Pcmu));
     let refused = |pair: &mut Pair, offer: &str| {
         pair.session
@@ -3415,7 +3424,7 @@ fn rfc3264_8_2_a_re_offer_that_stops_the_video_m_line_is_refused_and_video_plays
         .viewer
         .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
         .expect("a re-offer");
-    let mid = pair.viewer.mid().to_string();
+    let mid = pair.viewer.mid().unwrap().to_string();
     let bundle = reoffer
         .lines()
         .find(|line| line.starts_with("a=group:BUNDLE "))
@@ -5289,4 +5298,181 @@ fn rfc8445_8_1_2_once_no_other_pair_can_succeed_the_session_reports_ice_complete
     };
     pair.run_until(completed, 6_000, "completed");
     assert_eq!(pair.session.state(), State::Connected);
+}
+
+/// The ports of the answer's m-lines of `kind`, in order.
+fn ports(answer: &str, kind: &str) -> Vec<String> {
+    answer
+        .lines()
+        .filter_map(|line| line.strip_prefix(&format!("m={kind} ")))
+        .map(|rest| rest.split(' ').next().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// A client that only talks back offers one `sendonly` audio m-line and
+/// no video: the session answers it `recvonly` in the backchannel's codec
+/// (RFC 8829 §5.3.1), with its host candidates on that m-line, plays no
+/// video whether the stream has any or not, and hands the talk-back on.
+/// What the worker would write of the stream's video goes nowhere and is
+/// not counted.
+#[test]
+fn rfc8829_5_3_1_a_talk_only_offer_is_answered_without_video_and_its_talk_back_handed_on() {
+    for video in [Some(h264(None)), None] {
+        let now = SystemClock.now();
+        lotse_webrtc::install_crypto_provider();
+        let viewer = Viewer::new_talk_only(BROWSER.parse().unwrap(), now).expect("a viewer");
+        assert!(!viewer.offer().contains("m=video"), "{}", viewer.offer());
+        let mut request = request(viewer.offer(), h264(None));
+        request.video = video.clone();
+        request.backchannel = Some(chained(Codec::Pcmu));
+        let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+        assert!(ports(&answer, "video").is_empty(), "{answer}");
+        assert_eq!(
+            talkback_answered(&answer),
+            ("a=recvonly".to_owned(), "PCMU/8000".to_owned())
+        );
+        assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcmu));
+        let mids: BTreeSet<Option<String>> = pair
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Candidate { candidate, mid } if !candidate.is_empty() => {
+                    Some(mid.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let offered = pair
+            .viewer
+            .offer()
+            .lines()
+            .find_map(|line| line.strip_prefix("a=mid:"))
+            .map(str::to_owned);
+        assert_eq!(mids, BTreeSet::from([offered]), "{video:?}");
+        pair.connect(&answer);
+
+        let mu_law = [0xff_u8; 160];
+        talk(&mut pair, &[(0, &mu_law), (0, &mu_law)]);
+        assert_eq!(pair.uplink.len(), 2, "{video:?}");
+
+        let mut normalizer = normalizer();
+        let mut seq = 0;
+        for packet in packets(&mut normalizer, &mut seq, 0, true, 3_000, pair.now) {
+            pair.session.write_video(pair.now, &packet, pair.now);
+        }
+        pair.session.skip_to_keyframe("gap");
+        pair.session.set_orientation(Orientation::Rotate180);
+        pair.session.join(pair.now, None);
+        assert_eq!(
+            pair.session.check_video_change(&Codec::Mjpeg),
+            Ok(()),
+            "no video, so no codec it cannot carry"
+        );
+        pair.settle_talkback();
+        assert!(pair.viewer.packets().is_empty());
+        assert!(pair.viewer.audio_packets().is_empty());
+        let stats = pair.session.stats();
+        assert_eq!(
+            stats,
+            SessionStats {
+                uplink_packets: 2,
+                ..SessionStats::default()
+            },
+            "{video:?}"
+        );
+        assert!(
+            !pair
+                .events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::KeyframeRequest)),
+            "{:?}",
+            pair.events
+        );
+    }
+}
+
+/// A session opened without video keeps none: a re-offer that adds a
+/// video m-line is refused and the session goes on as it was (RFC 8829
+/// §5.2.2 lets a subsequent offer add one; the session negotiates no
+/// video on a live engine), while one that drops talk-back is answered
+/// `inactive` (RFC 3264 §6.1) and one that asks for it again `recvonly`.
+#[test]
+fn rfc8829_5_2_2_a_talk_only_session_takes_talk_back_re_offers_but_no_video() {
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_talk_only(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let mut request = request(viewer.offer(), h264(None));
+    request.backchannel = Some(chained(Codec::Pcmu));
+    let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+    pair.connect(&answer);
+
+    let with_video = format!(
+        "{}m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:9\r\na=recvonly\r\na=rtpmap:96 H264/90000\r\n",
+        pair.viewer.offer()
+    );
+    let backchannel = request.backchannel;
+    let err = pair
+        .session
+        .renegotiate(
+            pair.now,
+            &with_video,
+            backchannel.clone(),
+            TalkbackClaim::Granted,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        RenegotiateError::VideoChanged("it adds one".to_owned())
+    );
+    assert_eq!(err.code(), "invalid_sdp");
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcmu));
+
+    let drop = pair.viewer.reoffer(Reoffer::Drop).expect("a re-offer");
+    let answer = pair
+        .session
+        .renegotiate(pair.now, &drop, backchannel.clone(), TalkbackClaim::Granted)
+        .expect("answered");
+    assert!(ports(&answer, "video").is_empty(), "{answer}");
+    assert_eq!(talkback_answered(&answer).0, "a=inactive");
+    assert_eq!(pair.session.talkback(), None);
+    pair.viewer
+        .accept_answer(&answer, &mut pair.to_daemon)
+        .expect("the answer applies");
+
+    let again = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let answer = pair
+        .session
+        .renegotiate(pair.now, &again, backchannel, TalkbackClaim::Granted)
+        .expect("answered");
+    assert_eq!(talkback_answered(&answer).0, "a=recvonly");
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcmu));
+}
+
+/// A client that only listens offers one `recvonly` audio m-line and no
+/// video: the stream's audio goes down it (RFC 8829 §5.3.1), and no
+/// video m-line is answered.
+#[test]
+fn rfc8829_5_3_1_a_listen_only_offer_gets_the_stream_audio_and_no_video() {
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_listen_only(BROWSER.parse().unwrap(), now).expect("a viewer");
+    assert!(!viewer.offer().contains("m=video"));
+    let mut request = request(viewer.offer(), h264(None));
+    request.audio = Some(Arc::new(Codec::Pcmu));
+    let (mut pair, answer) = Pair::with_request(&request, viewer, now);
+    assert!(ports(&answer, "video").is_empty(), "{answer}");
+    pair.connect(&answer);
+    assert_eq!(pair.viewer.audio_direction(), Some(Direction::RecvOnly));
+    for i in 0..5_u32 {
+        let packet = audio_packet(i as u16, 1_000 + i * 160, 0, pair.now);
+        pair.session.write_audio(pair.now, &packet, pair.now);
+    }
+    pair.drain();
+    pair.run_until(|p| p.viewer.audio_packets().len() >= 5, 500, "audio");
+    let stats = pair.session.stats();
+    assert_eq!((stats.audio_packets, stats.packets), (5, 0));
+    assert!(pair.viewer.packets().is_empty());
 }

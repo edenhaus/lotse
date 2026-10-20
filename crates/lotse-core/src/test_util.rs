@@ -878,7 +878,9 @@ impl OutputFactory for FakeOutputFactory {
 /// A `webrtc` session output whose engine echoes (see [`EchoEngine`]), so a
 /// worker can run whole sessions without a WebRTC engine. It wants the
 /// H.264 video track and Opus or PCMU audio, in that order, as the WebRTC
-/// output does; an offer of `"refuse"` is refused as invalid SDP. The
+/// output does, but no video for an offer containing `no video`, as the
+/// WebRTC output wants none for an offer without a video m-line; an offer
+/// of `"refuse"` is refused as invalid SDP. The
 /// answer is [`ECHO_ANSWER`], followed by ` audio=<codec>` with audio,
 /// ` backchannel=<codec>` with a backchannel and ` orientation=<name>` for
 /// a turned stream. An offer containing `talk` asks for talk-back
@@ -919,13 +921,16 @@ impl OutputFactory for EchoSessionFactory {
         "webrtc"
     }
 
-    fn session_tracks(&self, audio: bool) -> Vec<TrackRequest> {
-        let mut requests = vec![TrackRequest {
-            kind: Kind::Video,
-            accept: vec![CodecFamily::H264],
-            unit: Unit::Packets,
-            required: true,
-        }];
+    fn session_tracks(&self, offer: &str, audio: bool) -> Vec<TrackRequest> {
+        let mut requests = Vec::new();
+        if !offer.contains("no video") {
+            requests.push(TrackRequest {
+                kind: Kind::Video,
+                accept: vec![CodecFamily::H264],
+                unit: Unit::Packets,
+                required: true,
+            });
+        }
         if audio {
             requests.push(TrackRequest {
                 kind: Kind::Audio,
@@ -2141,7 +2146,7 @@ mod tests {
             },
             candidates: vec![],
             tcp_candidates: vec![],
-            video: Arc::new(Codec::Pcmu),
+            video: Some(Arc::new(Codec::Pcmu)),
             audio: Some(Arc::new(Codec::Pcmu)),
             backchannel: Some(TalkbackTarget {
                 codec: Codec::Pcma,
@@ -2271,6 +2276,17 @@ mod tests {
         );
     }
 
+    /// An offer without video wants no video track, as the WebRTC
+    /// output's does.
+    #[test]
+    fn the_echo_factory_wants_no_video_for_an_offer_without_it() {
+        let factory = EchoSessionFactory;
+        let talk_only = factory.session_tracks("talk, no video", true);
+        assert_eq!(talk_only.len(), 1);
+        assert_eq!(talk_only[0].kind, Kind::Audio);
+        assert!(factory.session_tracks("talk, no video", false).is_empty());
+    }
+
     #[test]
     #[expect(clippy::too_many_lines, reason = "one engine's whole contract")]
     fn the_echo_engine_sends_back_reports_once_and_counts() {
@@ -2283,7 +2299,7 @@ mod tests {
             },
             candidates: vec![],
             tcp_candidates: vec![],
-            video: Arc::new(Codec::Pcmu),
+            video: Some(Arc::new(Codec::Pcmu)),
             audio: None,
             backchannel: None,
             claim: TalkbackClaim::Granted,
@@ -2293,11 +2309,15 @@ mod tests {
         };
         let factory = EchoSessionFactory;
         assert_eq!(factory.kind(), "webrtc");
-        let tracks = factory.session_tracks(true);
+        let tracks = factory.session_tracks("offer", true);
         assert_eq!(tracks.len(), 2);
         assert!(tracks[0].required && tracks[0].accept == [CodecFamily::H264]);
         assert!(!tracks[1].required && tracks[1].accept == [CodecFamily::Opus, CodecFamily::Pcmu]);
-        assert_eq!(factory.session_tracks(false).len(), 1, "video-first");
+        assert_eq!(
+            factory.session_tracks("offer", false).len(),
+            1,
+            "video-first"
+        );
         assert!(matches!(
             factory.open_session(request("refuse"), now),
             Err(SessionOpenError::InvalidSdp(_))

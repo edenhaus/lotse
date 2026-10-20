@@ -236,11 +236,11 @@ mod tests {
             },
             candidates: vec![],
             tcp_candidates: vec![],
-            video: std::sync::Arc::new(Codec::H264 {
+            video: Some(std::sync::Arc::new(Codec::H264 {
                 profile_level_id: None,
                 sps: None,
                 pps: None,
-            }),
+            })),
             audio: None,
             backchannel: None,
             claim: lotse_core::session::TalkbackClaim::Granted,
@@ -248,9 +248,10 @@ mod tests {
             limits: SessionLimits::default(),
             wall: std::time::SystemTime::UNIX_EPOCH,
         };
-        let video = super::super::VideoPlan::for_codec(&request.video).unwrap();
+        let video = super::super::VideoPlan::for_codec(request.video.as_deref().unwrap()).unwrap();
         let mut rtc =
-            crate::session::build_config(&request, &video, &crate::audio::EVERY_CODEC).build(now);
+            crate::session::build_config(&request, Some(&video), &crate::audio::EVERY_CODEC)
+                .build(now);
         rtc.sdp_api()
             .accept_offer(SdpOffer::from_sdp_string(&offer).unwrap())
             .unwrap();

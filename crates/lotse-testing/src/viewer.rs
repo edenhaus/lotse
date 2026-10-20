@@ -1,7 +1,7 @@
 //! A headless browser stand-in on str0m: offers `recvonly` video the way
 //! Chrome does (standard extensions plus `playout-delay`, and
-//! `abs-capture-time` as Chrome offers it to a page that asks), takes the
-//! daemon's answer, re-offers to add or drop talk-back
+//! `abs-capture-time` as Chrome offers it to a page that asks), or audio
+//! alone, takes the daemon's answer, re-offers to add or drop talk-back
 //! ([`Viewer::reoffer`]), and collects the RTP it receives.
 //!
 //! Sans-IO like the session it talks to, so the same viewer runs in memory
@@ -67,6 +67,8 @@ enum AudioOffer {
     Receive,
     /// Talk-back as well.
     Talkback(TalkbackOffer),
+    /// Only a `sendonly` one, for talk-back.
+    TalkOnly,
 }
 
 /// A datagram the viewer wants sent.
@@ -95,8 +97,8 @@ pub struct Viewer {
     pending: Option<SdpPendingOffer>,
     /// The offer's SDP.
     offer: String,
-    /// The video mid.
-    mid: Mid,
+    /// The video mid, without a video m-line `None`.
+    mid: Option<Mid>,
     /// Video RTP received, in arrival order.
     packets: Vec<RtpPacket>,
     /// The audio mid, without an audio m-line `None`.
@@ -164,7 +166,20 @@ impl Viewer {
     /// A viewer at `addr` whose offer is ready; `Err` names what the
     /// engine refused (an unroutable address).
     pub fn new(addr: SocketAddr, now: Instant) -> Result<Self, String> {
-        Self::with_transport(addr, false, AudioOffer::Off, &[], now)
+        Self::with_transport(addr, false, AudioOffer::Off, &[], true, now)
+    }
+
+    /// A client that only talks back: its offer is one `sendonly` audio
+    /// m-line (`addTransceiver("audio", {direction: "sendonly"})`) and no
+    /// video, with no track to send yet.
+    pub fn new_talk_only(addr: SocketAddr, now: Instant) -> Result<Self, String> {
+        Self::with_transport(addr, false, AudioOffer::TalkOnly, &[], false, now)
+    }
+
+    /// A client that only listens: its offer is one `recvonly` audio
+    /// m-line and no video.
+    pub fn new_listen_only(addr: SocketAddr, now: Instant) -> Result<Self, String> {
+        Self::with_transport(addr, false, AudioOffer::Receive, &[], false, now)
     }
 
     /// A viewer whose only video codecs are H.265 entries, one per
@@ -177,13 +192,13 @@ impl Viewer {
         now: Instant,
         entries: &[(u8, u8, u8)],
     ) -> Result<Self, String> {
-        Self::with_transport(addr, false, AudioOffer::Off, entries, now)
+        Self::with_transport(addr, false, AudioOffer::Off, entries, true, now)
     }
 
     /// A viewer that also receives audio: a `recvonly` audio m-line before
     /// the video one, as a web player offers them.
     pub fn new_with_audio(addr: SocketAddr, now: Instant) -> Result<Self, String> {
-        Self::with_transport(addr, false, AudioOffer::Receive, &[], now)
+        Self::with_transport(addr, false, AudioOffer::Receive, &[], true, now)
     }
 
     /// A viewer that receives audio and offers talk-back the way `offer`
@@ -194,18 +209,19 @@ impl Viewer {
         now: Instant,
         offer: TalkbackOffer,
     ) -> Result<Self, String> {
-        Self::with_transport(addr, false, AudioOffer::Talkback(offer), &[], now)
+        Self::with_transport(addr, false, AudioOffer::Talkback(offer), &[], true, now)
     }
 
     /// A viewer whose one candidate is an active ICE-TCP one at `addr`, as
     /// a browser on a network that blocks UDP offers it. The caller opens
     /// the connection a TCP [`Outgoing`] asks for and frames it.
     pub fn new_tcp(addr: SocketAddr, now: Instant) -> Result<Self, String> {
-        Self::with_transport(addr, true, AudioOffer::Off, &[], now)
+        Self::with_transport(addr, true, AudioOffer::Off, &[], true, now)
     }
 
     /// A viewer with a UDP or an active ICE-TCP candidate, with or without
-    /// audio, with str0m's video codecs or only the `h265` entries. It runs
+    /// audio, with str0m's video codecs or only the `h265` entries, and a
+    /// video m-line when `video`. It runs
     /// on str0m's process-default crypto provider, which
     /// the caller installs first with `lotse_webrtc::install_crypto_provider`
     /// (this crate cannot depend on `lotse-webrtc`); without one it is an
@@ -215,6 +231,7 @@ impl Viewer {
         tcp: bool,
         audio: AudioOffer,
         h265: &[(u8, u8, u8)],
+        video: bool,
         now: Instant,
     ) -> Result<Self, String> {
         if CryptoProvider::get_default().is_none() {
@@ -262,7 +279,7 @@ impl Viewer {
         rtc.add_local_candidate(host);
         let mut api = rtc.sdp_api();
         let downlink = match audio {
-            AudioOffer::Off => None,
+            AudioOffer::Off | AudioOffer::TalkOnly => None,
             AudioOffer::Receive | AudioOffer::Talkback(TalkbackOffer::Dedicated) => {
                 Some(Direction::RecvOnly)
             }
@@ -270,9 +287,10 @@ impl Viewer {
         };
         let audio_mid =
             downlink.map(|direction| api.add_media(MediaKind::Audio, direction, None, None, None));
-        let mid = api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        let mid =
+            video.then(|| api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None));
         let talkback_mid = match audio {
-            AudioOffer::Talkback(TalkbackOffer::Dedicated) => {
+            AudioOffer::Talkback(TalkbackOffer::Dedicated) | AudioOffer::TalkOnly => {
                 Some(api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None))
             }
             AudioOffer::Talkback(TalkbackOffer::SendRecv) => audio_mid,
@@ -314,8 +332,8 @@ impl Viewer {
         self.addr
     }
 
-    /// The video mid.
-    pub const fn mid(&self) -> Mid {
+    /// The video mid, `None` without a video m-line.
+    pub const fn mid(&self) -> Option<Mid> {
         self.mid
     }
 
@@ -530,7 +548,9 @@ impl Viewer {
 
     /// Asks the daemon for a keyframe with a PLI.
     pub fn request_keyframe(&mut self, out: &mut Vec<Outgoing>) {
-        if let Some(stream) = self.rtc.direct_api().stream_rx_by_mid(self.mid, None) {
+        if let Some(mid) = self.mid
+            && let Some(stream) = self.rtc.direct_api().stream_rx_by_mid(mid, None)
+        {
             stream.request_keyframe(KeyframeRequestKind::Pli);
         }
         self.drain(out);

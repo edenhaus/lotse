@@ -3164,8 +3164,12 @@ mod tests {
             "webrtc"
         }
 
-        fn session_tracks(&self, audio: bool) -> Vec<lotse_core::output::TrackRequest> {
-            let mut requests = EchoSessionFactory.session_tracks(audio);
+        fn session_tracks(
+            &self,
+            offer: &str,
+            audio: bool,
+        ) -> Vec<lotse_core::output::TrackRequest> {
+            let mut requests = EchoSessionFactory.session_tracks(offer, audio);
             requests[0].accept = vec![lotse_core::codec::CodecFamily::H265];
             requests
         }
@@ -3193,7 +3197,7 @@ mod tests {
             },
             candidates: vec![],
             tcp_candidates: vec![],
-            video: Arc::new(Codec::Pcmu),
+            video: Some(Arc::new(Codec::Pcmu)),
             audio: None,
             backchannel: None,
             claim: lotse_core::session::TalkbackClaim::Granted,
@@ -4039,13 +4043,14 @@ mod tests {
             h.next_closed().await,
             ("hls".to_owned(), "internal_error".to_owned())
         );
-        // The fake output wants no tracks, so negotiation finds no video.
+        // The fake output wants no tracks, so the session opens on none,
+        // and the output refuses its offer.
         h.tx.send_msg(&ToWorker::OpenSession(session_spec("novideo")), &[])
             .await
             .unwrap();
         assert_eq!(
             h.next_closed().await,
-            ("novideo".to_owned(), "no_video_track".to_owned())
+            ("novideo".to_owned(), "invalid_sdp".to_owned())
         );
         // Unknown sessions are ignored; a malformed frame on the datagram
         // channel is counted, not fatal.
