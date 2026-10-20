@@ -29,11 +29,6 @@ repos:
     rev: v1.7.12
     hooks:
       - id: actionlint
-  - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.30.1
-    hooks:
-      - id: zizmor
-        args: ["--persona=pedantic"]
   # The browser test's lint and format (tests/browser/); its settings are in its pyproject.toml.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.10 # the ruff in tests/browser/pyproject.toml; Renovate updates both in one PR
@@ -44,6 +39,16 @@ repos:
         files: ^tests/browser/
   - repo: local
     hooks:
+      # The workflows' security audit, by the zizmor mise.toml pins (CI's Zizmor job runs the same one
+      # online). Offline, so a commit's verdict depends on the commit alone: the online audits, an
+      # advisory against a pinned action among them, change without our code changing.
+      - id: zizmor
+        name: zizmor
+        entry: zizmor --persona=pedantic --offline --no-progress
+        language: system
+        # The inputs zizmor audits, as zizmor-pre-commit's own hook selects them.
+        files: (^|/)(\.github/(workflows/[^/]+|dependabot)\.ya?ml|action\.ya?ml|\.pre-commit-(config|hooks)\.ya?ml)$
+        require_serial: true
       # The browser test (tests/browser/). uv installs the Python and the packages pinned in
       # tests/browser/uv.lock on first use; the test itself needs a browser (`mise run browser`).
       - id: browser-test-mypy
