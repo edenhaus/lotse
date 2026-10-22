@@ -1,4 +1,4 @@
-//! Allocation counts of the live fan-out.
+//! Allocation counts of the live fan-out and the pre-roll ring.
 //!
 //! Linking `allocation-counter` makes its counting allocator this test
 //! binary's global allocator; it counts the calling thread's allocations,
@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use allocation_counter::AllocationInfo;
+use bytes::Bytes;
 use lotse_core::clock::{Clock as _, SystemClock};
 use lotse_core::codec::{Codec, Kind};
-use lotse_core::media::{MediaPacket, RtpHeaderFields};
+use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields};
 use lotse_core::source::TrackSet;
 use lotse_core::track::{PacketSubscription, Track, TrackLimits};
 
@@ -101,5 +102,74 @@ fn a_published_packet_costs_one_allocation_whatever_the_viewers_and_reading_cost
             "{viewers} viewers: {publish:?}"
         );
         assert_eq!(receive.count_total, 0, "{viewers} viewers: {receive:?}");
+    }
+}
+
+/// Frames per pre-roll measurement: 80 s of 25 fps.
+const FRAMES: u64 = 2_000;
+
+/// The `n`th frame of a 25 fps stream from `t0`, a keyframe every second
+/// on video; every audio frame is one.
+fn frame_at(t0: Instant, n: u64, video: bool, payload: &Bytes) -> MediaFrame {
+    let at = t0 + Duration::from_millis(n * 40);
+    MediaFrame {
+        ts: MediaTime::from_ticks(i64::try_from(n * 3_600).unwrap()),
+        wallclock: at,
+        arrival: at,
+        keyframe: !video || n.is_multiple_of(25),
+        discontinuity: false,
+        epoch: 0,
+        payload: payload.clone(),
+    }
+}
+
+/// Publishes frames `from..to` and returns the allocations of the
+/// publishing.
+fn publish_frames(track: &Track, t0: Instant, from: u64, to: u64, payload: &Bytes) -> u64 {
+    let video = track.kind() == Kind::Video;
+    let mut total = 0;
+    for n in from..to {
+        let frame = frame_at(t0, n, video, payload);
+        total += allocation_counter::measure(|| assert!(track.publish_frame(frame))).count_total;
+    }
+    total
+}
+
+/// Once the ring has grown to its window, a frame costs the same
+/// allocations with a pre-roll as without: the ring holds the frame's
+/// `Arc`, which the track allocates anyway, in a slot it already has.
+#[test]
+fn a_pre_roll_allocates_nothing_per_frame_once_its_window_is_full() {
+    let payload = Bytes::from(vec![7_u8; 1_200]);
+    for (kind, codec, rate) in [
+        (
+            Kind::Video,
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+        ),
+        (Kind::Audio, Codec::Pcmu, 8_000),
+    ] {
+        let t0 = SystemClock.now();
+        let without = TrackSet::new(TrackLimits::default(), t0)
+            .publisher()
+            .declare(kind, codec.clone(), rate);
+        let with = TrackSet::new(TrackLimits::default(), t0)
+            .publisher()
+            .declare(kind, codec, rate);
+        with.set_preroll(Some(Duration::from_secs(5)));
+        // Warm-up: the window and an open GOP, twice over.
+        let warm_up = 500;
+        let _ = publish_frames(&without, t0, 0, warm_up, &payload);
+        let _ = publish_frames(&with, t0, 0, warm_up, &payload);
+        let baseline = publish_frames(&without, t0, warm_up, warm_up + FRAMES, &payload);
+        let measured = publish_frames(&with, t0, warm_up, warm_up + FRAMES, &payload);
+        assert!(baseline >= FRAMES, "{kind}: {baseline}");
+        assert_eq!(measured, baseline, "{kind}");
+        let held = with.stats().preroll.unwrap().held;
+        assert!(held >= Duration::from_secs(5), "{kind}: {held:?}");
     }
 }

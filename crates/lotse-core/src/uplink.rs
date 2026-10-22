@@ -119,6 +119,7 @@ const UPLINK_LIMITS: TrackLimits = TrackLimits {
     max_frame_bytes: 16 * 1024,
     gop_cache_bytes: 0,
     gop_cache_frames: 0,
+    preroll_bytes: 0,
     packet_capacity: 64,
     frame_capacity: 64,
 };
