@@ -138,7 +138,7 @@ fuzz_target!(|data: &[u8]| {
         },
         candidates: vec!["192.0.2.10:18556".parse().expect("an address")],
         tcp_candidates: vec![],
-        video: Arc::new(if pick & 8 == 0 {
+        video: Some(Arc::new(if pick & 8 == 0 {
             Codec::H264 {
                 profile_level_id: None,
                 sps: None,
@@ -151,7 +151,7 @@ fuzz_target!(|data: &[u8]| {
                     .then(|| lotse_codec::h265::test_data::sps_of_tier(1, true, 640, 480).into()),
                 pps: None,
             }
-        }),
+        })),
         audio,
         backchannel: None,
         claim: lotse_core::session::TalkbackClaim::Granted,

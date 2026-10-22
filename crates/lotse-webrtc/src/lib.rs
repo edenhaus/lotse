@@ -79,16 +79,20 @@ pub fn session_config(ice: IceCreds) -> RtcConfig {
         .set_extension_map(extensions)
 }
 
-/// The tracks a session wants: H.264 or H.265 video, required (which one
-/// the offer can take is the session's to find out); audio when asked for,
-/// optional, preferring Opus, then PCMU, PCMA and G.722.
-pub fn track_requests(audio: bool) -> Vec<TrackRequest> {
-    let mut requests = vec![TrackRequest {
-        kind: Kind::Video,
-        accept: vec![CodecFamily::H264, CodecFamily::H265],
-        unit: Unit::Packets,
-        required: true,
-    }];
+/// The tracks a session wants: H.264 or H.265 video when `video`,
+/// required (which one the offer can take is the session's to find out);
+/// audio when `audio`, optional, preferring Opus, then PCMU, PCMA and
+/// G.722.
+pub fn track_requests(video: bool, audio: bool) -> Vec<TrackRequest> {
+    let mut requests = Vec::new();
+    if video {
+        requests.push(TrackRequest {
+            kind: Kind::Video,
+            accept: vec![CodecFamily::H264, CodecFamily::H265],
+            unit: Unit::Packets,
+            required: true,
+        });
+    }
     if audio {
         requests.push(TrackRequest {
             kind: Kind::Audio,
@@ -114,8 +118,14 @@ impl OutputFactory for WebRtcFactory {
         "webrtc"
     }
 
-    fn session_tracks(&self, audio: bool) -> Vec<TrackRequest> {
-        track_requests(audio)
+    /// Video when the offer has a video m-line the session plays on, and
+    /// the stream's audio when asked for: always beside video, where a
+    /// re-offer may add the m-line it goes down on, and without video only
+    /// when the offer receives audio, so a session that only sends
+    /// talk-back subscribes to nothing.
+    fn session_tracks(&self, offer: &str, audio: bool) -> Vec<TrackRequest> {
+        let video = session::video_mid(offer).is_some();
+        track_requests(video, audio && (video || audio::receives_audio(offer)))
     }
 
     fn open_session(
@@ -167,16 +177,63 @@ mod tests {
     fn the_factory_declares_its_kind_and_tracks() {
         let factory = WebRtcFactory;
         assert_eq!(factory.kind(), "webrtc");
-        assert_eq!(factory.session_tracks(true), track_requests(true));
-        let video_only = track_requests(false);
+        let video = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=recvonly\r\n";
+        assert_eq!(
+            factory.session_tracks(video, true),
+            track_requests(true, true)
+        );
+        assert_eq!(
+            factory.session_tracks(video, false),
+            track_requests(true, false)
+        );
+        let video_only = track_requests(true, false);
         assert_eq!(video_only.len(), 1);
         assert!(video_only[0].required);
         assert_eq!(video_only[0].accept, [CodecFamily::H264, CodecFamily::H265]);
-        let both = track_requests(true);
+        let both = track_requests(true, true);
         assert_eq!(both.len(), 2);
         assert!(!both[1].required);
         assert_eq!(both[1].accept[0], CodecFamily::Opus);
+        assert_eq!(track_requests(false, true), both[1..]);
+        assert!(track_requests(false, false).is_empty());
         assert_eq!(MAX_PACER_DELAY, Duration::from_millis(50));
+    }
+
+    /// An offer without a video m-line wants no video track, and the
+    /// stream's audio only
+    /// when it has an audio m-line the browser receives on (RFC 8866
+    /// §6.7): a client that only sends talk-back subscribes to nothing.
+    #[test]
+    fn rfc8866_6_7_an_offer_without_video_wants_only_the_audio_it_receives() {
+        let factory = WebRtcFactory;
+        let audio = |direction: &str| {
+            format!(
+                "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\na={direction}\r\na=rtpmap:0 PCMU/8000\r\n"
+            )
+        };
+        assert!(factory.session_tracks(&audio("sendonly"), true).is_empty());
+        assert!(factory.session_tracks(&audio("inactive"), true).is_empty());
+        for receiving in ["recvonly", "sendrecv"] {
+            assert_eq!(
+                factory.session_tracks(&audio(receiving), true),
+                track_requests(false, true),
+                "{receiving}"
+            );
+            assert!(factory.session_tracks(&audio(receiving), false).is_empty());
+        }
+        // Stopped, its direction kept: it receives nothing.
+        let stopped = audio("recvonly").replace("m=audio 9 ", "m=audio 0 ");
+        assert!(factory.session_tracks(&stopped, true).is_empty());
+        // Beside video the stream's audio is wanted whatever the audio
+        // m-lines say: a re-offer may add the one it goes down on.
+        let talking = format!(
+            "{}m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=recvonly\r\n",
+            audio("sendonly")
+        );
+        assert_eq!(
+            factory.session_tracks(&talking, true),
+            track_requests(true, true)
+        );
     }
 
     /// What an offer asks of the backchannel, as the worker arbitrates

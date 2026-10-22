@@ -180,6 +180,31 @@ fn encoding_family(encoding: &str) -> Option<CodecFamily> {
     })
 }
 
+/// The audio m-lines of `sdp` a plan reads, in order, each with its mid
+/// and its direction as offered: those with a mid (RFC 8829 §5.2.1) that
+/// are not stopped ([`Sdp::stopped`]).
+fn live_lines<'s, 'a>(sdp: &'s Sdp<'a>) -> Vec<(&'s Section<'a>, &'a str, Direction)> {
+    sdp.media()
+        .iter()
+        .filter(|section| section.is("audio") && !sdp.stopped(section))
+        .filter_map(|section| Some((section, section.mid()?, Direction::of(section))))
+        .collect()
+}
+
+/// Whether `offer` has an audio m-line a plan reads ([`live_lines`]).
+pub(crate) fn offers_audio(offer: &str) -> bool {
+    !live_lines(&Sdp::parse(offer)).is_empty()
+}
+
+/// Whether `offer` has an audio m-line a plan reads ([`live_lines`]) that
+/// the browser receives on (`recvonly` or `sendrecv`, RFC 8866 §6.7): the
+/// only kind the stream's audio can go down.
+pub(crate) fn receives_audio(offer: &str) -> bool {
+    live_lines(&Sdp::parse(offer))
+        .iter()
+        .any(|(_, _, offered)| offered.receives())
+}
+
 /// Whether `section` lists `family` in an `a=rtpmap` (RFC 8866 §6.6), by
 /// [`encoding_family`].
 fn lists(section: &Section<'_>, family: CodecFamily) -> bool {
@@ -395,12 +420,7 @@ impl<'a> AudioPlan<'a> {
         order: &[CodecFamily],
     ) -> Self {
         let sdp = Sdp::parse(offer);
-        let lines: Vec<(&Section<'a>, &'a str, Direction)> = sdp
-            .media()
-            .iter()
-            .filter(|section| section.is("audio") && !sdp.stopped(section))
-            .filter_map(|section| Some((section, section.mid()?, Direction::of(section))))
-            .collect();
+        let lines = live_lines(&sdp);
         let downlink = lines.iter().find(|(_, _, offered)| offered.receives());
         let send = audio
             .map(Codec::family)

@@ -165,12 +165,12 @@
         },
         {
           "const": "invalid_sdp",
-          "description": "The offer could not be parsed.",
+          "description": "The offer could not be parsed, or has neither a video nor an\naudio m-line.",
           "type": "string"
         },
         {
           "const": "no_video_track",
-          "description": "The stream has no video track, or the offer no video m-line.",
+          "description": "The offer has a video m-line, and the stream no video track.",
           "type": "string"
         },
         {
@@ -1114,12 +1114,12 @@
         },
         {
           "const": "invalid_sdp",
-          "description": "The offer could not be parsed, or a re-offer changes the video\nm-line a session keeps.",
+          "description": "The offer could not be parsed, or a re-offer changes the video\nm-line a session keeps, or adds one to a session without video.",
           "type": "string"
         },
         {
           "const": "no_video_track",
-          "description": "The stream has no video track, or the offer no video m-line.",
+          "description": "A re-offer has no video m-line, and its session plays video.",
           "type": "string"
         }
       ]
@@ -2955,7 +2955,7 @@
       "oneOf": [
         {
           "const": "audio_codec_unsupported",
-          "description": "Audio omitted from the session; video continues.",
+          "description": "Audio omitted from the session; the rest of it continues.",
           "type": "string"
         },
         {

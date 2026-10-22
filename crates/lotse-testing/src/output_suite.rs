@@ -288,7 +288,7 @@ impl SessionUnderTest {
             },
             candidates: vec![DAEMON],
             tcp_candidates: vec![],
-            video: track.codec(),
+            video: Some(track.codec()),
             audio: None,
             backchannel: None,
             claim: lotse_core::session::TalkbackClaim::Granted,

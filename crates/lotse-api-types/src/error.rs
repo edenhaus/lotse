@@ -63,9 +63,9 @@ pub enum ErrorCode {
     /// carry audio back.
     BackchannelUnsupported,
     /// The offer could not be parsed, or a re-offer changes the video
-    /// m-line a session keeps.
+    /// m-line a session keeps, or adds one to a session without video.
     InvalidSdp,
-    /// The stream has no video track, or the offer no video m-line.
+    /// A re-offer has no video m-line, and its session plays video.
     NoVideoTrack,
 }
 

@@ -398,7 +398,7 @@ mod tests {
                 },
                 candidates: vec![],
                 tcp_candidates: vec![],
-                video: std::sync::Arc::new(Codec::Mjpeg),
+                video: Some(std::sync::Arc::new(Codec::Mjpeg)),
                 audio: None,
                 backchannel: None,
                 claim: lotse_core::session::TalkbackClaim::Granted,
@@ -412,7 +412,7 @@ mod tests {
                 level_id: None,
             });
             let mut rtc =
-                crate::session::build_config(&request, &video, &crate::audio::EVERY_CODEC)
+                crate::session::build_config(&request, Some(&video), &crate::audio::EVERY_CODEC)
                     .build(now);
             rtc.sdp_api()
                 .accept_offer(SdpOffer::from_sdp_string(&offer).unwrap())

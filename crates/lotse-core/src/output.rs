@@ -18,10 +18,12 @@ pub trait OutputFactory: fmt::Debug + Send + Sync {
     /// `info.outputs` is the list over the registry.
     fn kind(&self) -> &'static str;
 
-    /// The tracks a session of this kind wants, audio included when the
-    /// viewer asked for it; none by default.
-    fn session_tracks(&self, audio: bool) -> Vec<TrackRequest> {
-        let _ = audio;
+    /// The tracks a session of this kind wants for the viewer's `offer`,
+    /// audio included when the viewer asked for it; none by default. An
+    /// offer that has no media of a kind needs no track of it: a session
+    /// that only sends talk-back plays no video.
+    fn session_tracks(&self, offer: &str, audio: bool) -> Vec<TrackRequest> {
+        let _ = (offer, audio);
         Vec::new()
     }
 
@@ -79,8 +81,9 @@ pub struct TrackRequest {
     pub accept: Vec<CodecFamily>,
     /// Packets (live outputs) or frames (frame outputs).
     pub unit: Unit,
-    /// Whether the session cannot work without it. Video is required for
-    /// a WebRTC session; audio is not.
+    /// Whether the session cannot work without it: the session closes
+    /// with the request's error when it cannot be met. Video is required
+    /// for a WebRTC session that plays it; audio never is.
     pub required: bool,
 }
 
@@ -98,7 +101,7 @@ mod tests {
     #[test]
     fn a_kind_by_default_wants_no_tracks_and_no_talkback() {
         let factory = FakeOutputFactory("fake");
-        assert!(factory.session_tracks(true).is_empty());
+        assert!(factory.session_tracks("m=video", true).is_empty());
         let target = TalkbackTarget {
             codec: Codec::Pcmu,
             takes: vec![crate::uplink::UplinkCodec::Pcmu],

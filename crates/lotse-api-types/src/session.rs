@@ -139,7 +139,7 @@ pub enum SessionEvent {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WarningCode {
-    /// Audio omitted from the session; video continues.
+    /// Audio omitted from the session; the rest of it continues.
     AudioCodecUnsupported,
     /// A `turns:` entry of `ice_servers` was ignored.
     TurnUnsupported,
@@ -214,9 +214,10 @@ pub enum CloseCode {
     SourceNotLive,
     /// ICE failed or stayed disconnected.
     IceFailed,
-    /// The offer could not be parsed.
+    /// The offer could not be parsed, or has neither a video nor an
+    /// audio m-line.
     InvalidSdp,
-    /// The stream has no video track, or the offer no video m-line.
+    /// The offer has a video m-line, and the stream no video track.
     NoVideoTrack,
     /// No video codec both sides can use.
     VideoCodecUnsupported,

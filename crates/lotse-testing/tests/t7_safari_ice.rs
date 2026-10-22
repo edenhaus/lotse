@@ -296,11 +296,11 @@ impl Safari {
             },
             candidates: vec![DAEMON.parse().unwrap()],
             tcp_candidates: vec![DAEMON_TCP.parse().unwrap()],
-            video: Arc::new(Codec::H264 {
+            video: Some(Arc::new(Codec::H264 {
                 profile_level_id: None,
                 sps: None,
                 pps: None,
-            }),
+            })),
             audio: None,
             backchannel: None,
             claim: lotse_core::session::TalkbackClaim::Granted,

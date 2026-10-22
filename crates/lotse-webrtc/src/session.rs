@@ -11,6 +11,12 @@
 //! ([`Session::renegotiate`]) may change the audio m-lines only; the
 //! video m-line is the one the session opened with (`VideoShape`).
 //!
+//! A session plays video when the offer has a video m-line (`video_mid`),
+//! and none otherwise: a client that only sends talk-back, or only
+//! receives the stream's audio, offers audio m-lines alone, beside a
+//! viewer's session of its own if it wants the picture too. Such a
+//! session takes no video m-line on re-offers either.
+//!
 //! Sans-IO: the worker's session task owns it and drains [`Session::poll`]
 //! after every call. Standards: RFC 8829 §5.3 (the answer; §5.3.1 its
 //! directions; §5.3.2 the answers to re-offers, on the same transport),
@@ -62,7 +68,7 @@ use crate::cvo::Cvo;
 use crate::sdp::{Sdp, Section, browser_text, check_payload_types};
 use crate::talkback::{Depacketizer, Refused};
 use crate::video::{NegotiatedVideo, VideoPlan};
-use crate::writer::{AudioWriter, RTX_CACHE_PACKETS, VideoWriter};
+use crate::writer::{AudioWriter, OverLimit, RTX_CACHE_PACKETS, VideoWriter};
 use crate::{install_crypto_provider, session_config};
 
 /// The video RTP clock rate (RFC 6184 §8.2.1, RFC 7798 §7.1: 90 kHz).
@@ -119,14 +125,12 @@ pub struct Session {
     ice: &'static str,
     /// The last DTLS state name reported.
     dtls: &'static str,
-    /// The cut-through writer.
-    writer: VideoWriter,
-    /// Whether the answer negotiated CVO, which decides whether an
-    /// orientation change reaches the browser.
-    cvo: Cvo,
-    /// The video the answer negotiated, which judges the stream's codec
-    /// changes.
-    video: NegotiatedVideo,
+    /// The video the session plays, when the offer has a video m-line
+    /// ([`video_mid`]).
+    video: Option<VideoOut>,
+    /// The session's counters but the video writer's, which
+    /// [`SessionEngine::stats`] adds.
+    stats: SessionStats,
     /// The audio writer, once an answer carried audio: kept across
     /// re-offers, since the engine's send stream for the m-line keeps
     /// its sequence numbers, and a writer made anew would restart them;
@@ -176,9 +180,6 @@ pub struct Session {
     /// The engine's audio codecs in its order ([`audio::engine_codecs`]),
     /// fixed when the session opened.
     order: Vec<CodecFamily>,
-    /// The video m-line the session opened with, which every re-offer
-    /// must keep.
-    video_shape: VideoShape,
 }
 
 impl fmt::Debug for Session {
@@ -187,15 +188,51 @@ impl fmt::Debug for Session {
             .field("state", &self.state)
             .field("ice", &self.ice)
             .field("dtls", &self.dtls)
-            .field("stats", &self.writer.stats)
+            .field("stats", &self.stats())
             .finish_non_exhaustive()
     }
 }
 
-/// The `a=mid` of the first video m-line of an SDP (RFC 8829 §5.2.1:
-/// every m-line carries one), or `None`.
-fn video_mid(sdp: &str) -> Option<&str> {
-    first_mid(sdp, "video")
+/// The video a session plays: its writer, and what the answer negotiated.
+#[derive(Debug)]
+struct VideoOut {
+    /// The cut-through writer.
+    writer: VideoWriter,
+    /// Whether the answer negotiated CVO, which decides whether an
+    /// orientation change reaches the browser.
+    cvo: Cvo,
+    /// The video the answer negotiated, which judges the stream's codec
+    /// changes.
+    negotiated: NegotiatedVideo,
+    /// The video m-line the session opened with, which every re-offer
+    /// must keep.
+    shape: VideoShape,
+}
+
+/// The `a=mid` of the video m-line a session plays on in `offer`: the
+/// first video m-line with a mid (RFC 8829 §5.2.1: every m-line carries
+/// one), the one [`VideoShape`] holds re-offers to; `None` without one,
+/// and the session plays no video. A stopped one counts: the engine of a
+/// session without video has no video codec to list in the answer's
+/// m-line (RFC 8866 §5.14 wants one), so it never answers a video
+/// m-line.
+pub(crate) fn video_mid(offer: &str) -> Option<&str> {
+    Sdp::parse(offer)
+        .media()
+        .iter()
+        .filter(|section| section.is("video"))
+        .find_map(Section::mid)
+}
+
+/// Whether the re-offer `offer` keeps a session that opened without video
+/// without it: one with a video m-line ([`video_mid`]), stopped or not,
+/// would need the video negotiated on a live engine, which the session
+/// does not do ([`VideoShape`]), so it is refused.
+fn check_no_video(offer: &str) -> Result<(), RenegotiateError> {
+    match video_mid(offer) {
+        Some(_) => Err(RenegotiateError::VideoChanged("it adds one".to_owned())),
+        None => Ok(()),
+    }
 }
 
 /// What a re-offer must keep of the video m-line a session plays on: its
@@ -326,22 +363,68 @@ impl VideoShape {
     }
 }
 
-/// The `a=mid` of the first m-line of `kind` (`audio`, `video`) that has
-/// one.
-fn first_mid<'a>(sdp: &'a str, kind: &str) -> Option<&'a str> {
-    Sdp::parse(sdp)
-        .media()
-        .iter()
-        .filter(|section| section.is(kind))
-        .find_map(Section::mid)
+/// The `a=mid` of the first m-line of `sdp` that has one.
+fn first_mid(sdp: &str) -> Option<&str> {
+    Sdp::parse(sdp).media().iter().find_map(Section::mid)
+}
+
+/// The video a session plays on the m-line `mid` of `request.offer`,
+/// once the engine took the offer with `plan`'s entries: the payload type
+/// the answer chose ([`VideoPlan::negotiate`], its warnings to
+/// `pending`), CVO and `abs-capture-time` as negotiated, and the writer
+/// on the m-line's send stream, which keeps an RTX cache. Its
+/// `playout-delay` is on until the session knows its audio.
+fn video_out(
+    rtc: &mut Rtc,
+    request: &SessionRequest,
+    plan: &VideoPlan,
+    mid: Mid,
+    anchor: WallAnchor,
+    pending: &mut VecDeque<SessionOutput>,
+) -> Result<VideoOut, SessionOpenError> {
+    // str0m reports `MediaAdded` only once SRTP is up, so the m-line is
+    // looked up by the offer's mid.
+    rtc.media(mid)
+        .filter(|media| media.kind() == MediaKind::Video)
+        .ok_or(SessionOpenError::NoVideoTrack)?;
+    let negotiated = plan.negotiate(rtc, &request.offer, pending)?;
+    let pt = negotiated.pt();
+    let shape = VideoShape::of(&request.offer, *pt).ok_or(SessionOpenError::NoVideoTrack)?;
+    let (cvo, orientation) = Cvo::negotiate(rtc, mid, request.orientation);
+    let capture_time = CaptureTimeSender::negotiate(rtc, mid, "video", VIDEO_CLOCK_RATE, anchor);
+    {
+        let mut api = rtc.direct_api();
+        let Some(stream) = api.stream_tx_by_mid(mid, None) else {
+            return Err(SessionOpenError::InvalidSdp(
+                "the answer declared no send stream for the video m-line".to_owned(),
+            ));
+        };
+        stream.set_rtx_cache(RTX_CACHE_PACKETS, request.limits.max_packet_age, None);
+    }
+    tracing::info!(mid = %mid, pt = *pt, "session answered");
+    Ok(VideoOut {
+        writer: VideoWriter::new(
+            pt,
+            mid,
+            negotiated.packetizer(),
+            request.limits,
+            true,
+            orientation,
+        )
+        .with_capture_time(capture_time),
+        cvo,
+        negotiated,
+        shape,
+    })
 }
 
 /// The engine configuration of a session: the stream's video codec
-/// (the entries its [`VideoPlan`] lists), and the audio `codecs` in their
-/// order of preference ([`audio::engine_codecs`]).
+/// (the entries its [`VideoPlan`] lists) when the session plays video,
+/// and the audio `codecs` in their order of preference
+/// ([`audio::engine_codecs`]).
 pub(crate) fn build_config(
     request: &SessionRequest,
-    video: &VideoPlan,
+    video: Option<&VideoPlan>,
     codecs: &[CodecFamily],
 ) -> RtcConfig {
     let mut config = session_config(IceCreds {
@@ -349,7 +432,9 @@ pub(crate) fn build_config(
         pass: request.ice.pass.clone(),
     })
     .clear_codecs();
-    video.configure(config.codec_config(), &request.offer);
+    if let Some(video) = video {
+        video.configure(config.codec_config(), &request.offer);
+    }
     audio_config(config, codecs)
 }
 
@@ -736,7 +821,7 @@ fn no_audio(
     if let Some(codec) = audio {
         let message = if audio_engine_codec(codec.family()).is_some() {
             format!(
-                "the offer has no audio m-line that takes {}; video only",
+                "the offer has no audio m-line that takes {}; no audio is sent",
                 codec.name()
             )
         } else {
@@ -830,13 +915,18 @@ fn prepare(request: &SessionRequest) -> Result<Prepared<'_>, SessionOpenError> {
 }
 
 /// Queues what a session reports as it opens: its host `candidates` on
-/// the video m-line `mid`, end-of-candidates (an empty candidate without a
-/// mid) and the first state.
-fn push_opening_events(pending: &mut VecDeque<SessionOutput>, candidates: Vec<String>, mid: Mid) {
+/// the m-line `mid` (the video one, else the offer's first; BUNDLE puts
+/// every m-line on their transport, RFC 9143 §5), end-of-candidates (an
+/// empty candidate without a mid) and the first state.
+fn push_opening_events(
+    pending: &mut VecDeque<SessionOutput>,
+    candidates: Vec<String>,
+    mid: Option<Mid>,
+) {
     for candidate in candidates {
         pending.push_back(SessionOutput::Event(SessionEvent::Candidate {
             candidate,
-            mid: Some(mid.to_string()),
+            mid: mid.map(|mid| mid.to_string()),
         }));
     }
     pending.push_back(SessionOutput::Event(SessionEvent::Candidate {
@@ -879,19 +969,19 @@ fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&TalkbackTarget>) {
 }
 
 impl Session {
-    /// The first frame the writer sent over the libwebrtc packet limit
-    /// becomes the session's one `frame_over_browser_limit` warning, with
-    /// the advice a client can show; the session's stats count every one. The
-    /// frame went out whole all the same.
-    fn warn_over_limit(&mut self) {
-        let Some(frame) = self.writer.take_over_limit() else {
+    /// The first frame the video writer sent over the libwebrtc packet
+    /// limit, `frame`, in `codec`, becomes the session's one
+    /// `frame_over_browser_limit` warning, with the advice a client can
+    /// show; the session's stats count every one. The frame went out
+    /// whole all the same.
+    fn warn_over_limit(&mut self, frame: Option<OverLimit>, codec: &'static str) {
+        let Some(frame) = frame else {
             return;
         };
         if self.warned_over_limit {
             return;
         }
         self.warned_over_limit = true;
-        let codec = self.video.name();
         tracing::info!(
             codec,
             packets = frame.packets,
@@ -915,7 +1005,10 @@ impl Session {
 
     /// Answers `request.offer`: the session and its SDP answer, or why
     /// there is none. Emits the host candidates, end-of-candidates and the
-    /// first state.
+    /// first state. The session plays video when the offer has a video
+    /// m-line (`video_mid`), which needs the stream's video; an offer
+    /// with neither that nor an audio m-line has nothing for a session
+    /// to carry.
     pub fn answer(
         request: &SessionRequest,
         now: Instant,
@@ -933,10 +1026,20 @@ impl Session {
             .filter(|codec| plan.send == Some(codec.family()));
         let offer = SdpOffer::from_sdp_string(&rewritten)
             .map_err(|err| SessionOpenError::InvalidSdp(err.to_string()))?;
-        let video = VideoPlan::for_codec(&request.video)?;
+        let video = match (video_mid(&request.offer), request.video.as_deref()) {
+            (Some(mid), Some(codec)) => Some((Mid::from(mid), VideoPlan::for_codec(codec)?)),
+            (Some(_), None) => return Err(SessionOpenError::NoVideoTrack),
+            (None, _) if !audio::offers_audio(&request.offer) => {
+                return Err(SessionOpenError::InvalidSdp(
+                    "the offer has no video or audio m-line".to_owned(),
+                ));
+            }
+            (None, _) => None,
+        };
 
         let mut pending = VecDeque::new();
-        let mut rtc = build_config(request, &video, &order).build(now);
+        let mut rtc =
+            build_config(request, video.as_ref().map(|(_, plan)| plan), &order).build(now);
 
         let (candidates, scopes) = add_host_candidates(&mut rtc, request);
         let answer = rtc
@@ -944,33 +1047,18 @@ impl Session {
             .accept_offer(offer)
             .map_err(|err| SessionOpenError::InvalidSdp(err.to_string()))?;
 
-        // The video m-line: str0m reports `MediaAdded` only once SRTP is
-        // up, so the mid comes from the offer itself.
-        let mid = video_mid(&request.offer)
-            .map(Mid::from)
-            .filter(|mid| {
-                rtc.media(*mid)
-                    .is_some_and(|media| media.kind() == MediaKind::Video)
-            })
-            .ok_or(SessionOpenError::NoVideoTrack)?;
-        let negotiated = video.negotiate(&rtc, &request.offer, &mut pending)?;
-        let pt = negotiated.pt();
-        let video_shape =
-            VideoShape::of(&request.offer, *pt).ok_or(SessionOpenError::NoVideoTrack)?;
-        let (cvo, orientation) = Cvo::negotiate(&rtc, mid, request.orientation);
         let anchor = WallAnchor::new(now, request.wall);
-        let capture_time =
-            CaptureTimeSender::negotiate(&rtc, mid, "video", VIDEO_CLOCK_RATE, anchor);
-        {
-            let mut api = rtc.direct_api();
-            let Some(stream) = api.stream_tx_by_mid(mid, None) else {
-                return Err(SessionOpenError::InvalidSdp(
-                    "the answer declared no send stream for the video m-line".to_owned(),
-                ));
-            };
-            stream.set_rtx_cache(RTX_CACHE_PACKETS, request.limits.max_packet_age, None);
-        }
-
+        let mut video = match video {
+            Some((mid, plan)) => Some(video_out(
+                &mut rtc,
+                request,
+                &plan,
+                mid,
+                anchor,
+                &mut pending,
+            )?),
+            None => None,
+        };
         let (audio, audio_ssrc) = send
             .and_then(|codec| audio_writer(&mut rtc, plan.downlink, codec, request.limits, anchor))
             .unzip();
@@ -983,29 +1071,26 @@ impl Session {
             Talkback::Off(_) | Talkback::Busy | Talkback::NotRequested => None,
         };
 
+        // `playout-delay` caps every delay the browser adds to video,
+        // its lip-sync hold included (Chrome and Safari, 2026-10-01:
+        // audio 113–156 ms behind video with it, in sync without), so
+        // only a session without audio asks for render-on-decode.
+        let mid = if let Some(video) = video.as_mut() {
+            video.writer.set_playout_delay(audio.is_none());
+            Some(Mid::from(video.shape.mid.as_str()))
+        } else {
+            tracing::info!("session answered without video");
+            first_mid(&request.offer).map(Mid::from)
+        };
         push_opening_events(&mut pending, candidates, mid);
-        tracing::info!(mid = %mid, pt = *pt, "session answered");
         let mut session = Self {
             rtc,
             limits: request.limits,
             state: State::Gathering,
             ice: "new",
             dtls: "new",
-            // `playout-delay` caps every delay the browser adds to video,
-            // its lip-sync hold included (Chrome and Safari, 2026-10-01:
-            // audio 113–156 ms behind video with it, in sync without), so
-            // only a session without audio asks for render-on-decode.
-            writer: VideoWriter::new(
-                pt,
-                mid,
-                negotiated.packetizer(),
-                request.limits,
-                audio.is_none(),
-                orientation,
-            )
-            .with_capture_time(capture_time),
-            cvo,
-            video: negotiated,
+            video,
+            stats: SessionStats::default(),
             audio_on: audio.is_some(),
             audio,
             warned_over_limit: false,
@@ -1024,7 +1109,6 @@ impl Session {
             stream_audio: request.audio.clone(),
             anchor,
             order,
-            video_shape,
         };
         for line in &offered {
             session.add_remote(line);
@@ -1064,7 +1148,10 @@ impl Session {
         // What is no SDP at all is refused as such, before the video
         // m-line is looked for in it.
         SdpOffer::from_sdp_string(offer).map_err(invalid_sdp)?;
-        self.video_shape.check(offer)?;
+        match &self.video {
+            Some(video) => video.shape.check(offer)?,
+            None => check_no_video(offer)?,
+        }
         let plan = AudioPlan::new(
             offer,
             self.stream_audio.as_deref(),
@@ -1109,7 +1196,9 @@ impl Session {
         // answer: render-on-decode only while no audio goes down, so the
         // browser may hold video for lip sync once a re-offer adds audio
         // ([`Session::answer`]).
-        self.writer.set_playout_delay(!self.audio_on);
+        if let Some(video) = self.video.as_mut() {
+            video.writer.set_playout_delay(!self.audio_on);
+        }
         if !self.audio_on {
             no_audio(
                 &self.rtc,
@@ -1226,8 +1315,7 @@ impl Session {
             }
             Event::KeyframeRequest(request) => {
                 tracing::debug!(kind = ?request.kind, "viewer asked for a keyframe");
-                self.writer.stats.keyframe_requests =
-                    self.writer.stats.keyframe_requests.saturating_add(1);
+                self.stats.keyframe_requests = self.stats.keyframe_requests.saturating_add(1);
                 self.pending
                     .push_back(SessionOutput::Event(SessionEvent::KeyframeRequest));
             }
@@ -1296,7 +1384,7 @@ impl Session {
             Some(talkback) => talkback.take(mid, rtp, packet.payload, packet.timestamp),
             None => Err("talk-back not negotiated"),
         };
-        let stats = &mut self.writer.stats;
+        let stats = &mut self.stats;
         match taken {
             Ok(uplink) => {
                 stats.uplink_packets = stats.uplink_packets.saturating_add(1);
@@ -1426,7 +1514,7 @@ impl SessionEngine for Session {
     ) {
         self.now = now;
         let Ok(contents) = DatagramRecv::try_from(bytes) else {
-            self.writer.stats.bad_datagrams = self.writer.stats.bad_datagrams.saturating_add(1);
+            self.stats.bad_datagrams = self.stats.bad_datagrams.saturating_add(1);
             return;
         };
         if self.state == State::Gathering {
@@ -1508,34 +1596,46 @@ impl SessionEngine for Session {
         Some(line)
     }
 
+    /// Nothing without video.
     fn join(&mut self, now: Instant, gop: Option<&GopSnapshot>) {
         self.now = now;
+        let Some(video) = self.video.as_mut() else {
+            return;
+        };
         if !matches!(self.state, State::Connected | State::Disconnected) {
             return;
         }
-        if self.writer.join(&mut self.rtc, now, gop) {
+        if video.writer.join(&mut self.rtc, now, gop) {
             self.pending
                 .push_back(SessionOutput::Event(SessionEvent::KeyframeRequest));
         }
-        self.warn_over_limit();
+        let (frame, codec) = (video.writer.take_over_limit(), video.negotiated.name());
+        self.warn_over_limit(frame, codec);
     }
 
+    /// Dropped without video, and not counted: the session has no video
+    /// to count it against.
     fn write_video(&mut self, now: Instant, packet: &MediaPacket, wallclock: Instant) {
         self.now = now;
+        let Some(video) = self.video.as_mut() else {
+            return;
+        };
         if !matches!(self.state, State::Connected | State::Disconnected) {
-            self.writer.stats.dropped_waiting = self.writer.stats.dropped_waiting.saturating_add(1);
+            video.writer.stats.dropped_waiting =
+                video.writer.stats.dropped_waiting.saturating_add(1);
             return;
         }
-        if self.writer.write(&mut self.rtc, now, packet, wallclock) {
+        if video.writer.write(&mut self.rtc, now, packet, wallclock) {
             self.pending
                 .push_back(SessionOutput::Event(SessionEvent::KeyframeRequest));
         }
-        self.warn_over_limit();
+        let (frame, codec) = (video.writer.take_over_limit(), video.negotiated.name());
+        self.warn_over_limit(frame, codec);
     }
 
     fn write_audio(&mut self, now: Instant, packet: &MediaPacket, wallclock: Instant) {
         self.now = now;
-        let stats = &mut self.writer.stats;
+        let stats = &mut self.stats;
         let written = match self.audio.as_mut() {
             Some(audio)
                 if self.audio_on
@@ -1555,20 +1655,29 @@ impl SessionEngine for Session {
     }
 
     /// The rule that chose the payload type, applied to the new codec
-    /// (`NegotiatedVideo::check_change`).
+    /// (`NegotiatedVideo::check_change`); any codec without video, which
+    /// sends none.
     fn check_video_change(&self, codec: &Codec) -> Result<(), String> {
-        self.video.check_change(codec)
+        match &self.video {
+            Some(video) => video.negotiated.check_change(codec),
+            None => Ok(()),
+        }
     }
 
+    /// Nothing without video.
     fn skip_to_keyframe(&mut self, reason: &'static str) {
-        self.writer.skip(reason);
+        if let Some(video) = self.video.as_mut() {
+            video.writer.skip(reason);
+        }
     }
 
     /// The browser turns each frame by the CVO on its last packet
     /// (`crate::cvo`), so the change needs neither a keyframe nor a new
-    /// answer; without CVO negotiated nothing changes.
+    /// answer; without CVO negotiated, or without video, nothing changes.
     fn set_orientation(&mut self, orientation: Orientation) {
-        self.writer.set_orientation(self.cvo.change(orientation));
+        if let Some(video) = self.video.as_mut() {
+            video.writer.set_orientation(video.cvo.change(orientation));
+        }
     }
 
     fn close(&mut self, now: Instant, code: &'static str, message: String) {
@@ -1610,8 +1719,24 @@ impl SessionEngine for Session {
         }
     }
 
+    /// The session's own counters, with the video writer's.
     fn stats(&self) -> SessionStats {
-        self.writer.stats
+        let Some(video) = &self.video else {
+            return self.stats;
+        };
+        let written = video.writer.stats;
+        SessionStats {
+            packets: written.packets,
+            bytes: written.bytes,
+            dropped_old: written.dropped_old,
+            dropped_waiting: written.dropped_waiting,
+            dropped_late: written.dropped_late,
+            ingest_late_skips: written.ingest_late_skips,
+            skips: written.skips,
+            frames_over_browser_limit: written.frames_over_browser_limit,
+            join_frames: written.join_frames,
+            ..self.stats
+        }
     }
 
     fn talkback(&self) -> Option<UplinkCodec> {
@@ -1818,7 +1943,8 @@ mod tests {
         let viewer =
             lotse_testing::Viewer::new_with_audio("192.0.2.20:40000".parse().unwrap(), now)
                 .unwrap();
-        let audio_mid = first_mid(viewer.offer(), "audio").unwrap().to_owned();
+        // The viewer offers its audio m-line first.
+        let audio_mid = first_mid(viewer.offer()).unwrap().to_owned();
         let answer = |offer: &str, codecs: &[CodecFamily]| {
             let request = SessionRequest {
                 offer: offer.to_owned(),
@@ -1828,11 +1954,11 @@ mod tests {
                 },
                 candidates: vec![],
                 tcp_candidates: vec![],
-                video: Arc::new(Codec::H264 {
+                video: Some(Arc::new(Codec::H264 {
                     profile_level_id: None,
                     sps: None,
                     pps: None,
-                }),
+                })),
                 audio: None,
                 backchannel: None,
                 claim: TalkbackClaim::Granted,
@@ -1840,8 +1966,8 @@ mod tests {
                 limits: SessionLimits::default(),
                 wall: std::time::SystemTime::UNIX_EPOCH,
             };
-            let video = VideoPlan::for_codec(&request.video).unwrap();
-            let mut rtc = build_config(&request, &video, codecs).build(now);
+            let video = VideoPlan::for_codec(request.video.as_deref().unwrap()).unwrap();
+            let mut rtc = build_config(&request, Some(&video), codecs).build(now);
             rtc.sdp_api()
                 .accept_offer(SdpOffer::from_sdp_string(offer).unwrap())
                 .unwrap();
@@ -1893,11 +2019,11 @@ mod tests {
             },
             candidates: vec![],
             tcp_candidates: vec![],
-            video: Arc::new(Codec::H264 {
+            video: Some(Arc::new(Codec::H264 {
                 profile_level_id: None,
                 sps: None,
                 pps: None,
-            }),
+            })),
             audio: None,
             backchannel: None,
             claim: TalkbackClaim::Granted,
@@ -1906,8 +2032,8 @@ mod tests {
             wall: std::time::SystemTime::UNIX_EPOCH,
         };
         let panicked = std::panic::catch_unwind(|| {
-            let video = VideoPlan::for_codec(&request.video).unwrap();
-            let mut rtc = build_config(&request, &video, &audio::EVERY_CODEC).build(now);
+            let video = VideoPlan::for_codec(request.video.as_deref().unwrap()).unwrap();
+            let mut rtc = build_config(&request, Some(&video), &audio::EVERY_CODEC).build(now);
             let offer = AudioPlan::new(
                 &offer,
                 None,
@@ -1945,13 +2071,9 @@ mod tests {
         );
         assert_eq!(audio_engine_codec(CodecFamily::AacLc), None);
         assert_eq!(
-            first_mid(
-                "m=audio 9 x 0\r\na=mid:a\r\nm=video 9 x 96\r\na=mid:v\r\n",
-                "audio"
-            ),
-            Some("a")
+            first_mid("m=audio 9 x 0\r\nm=video 9 x 96\r\na=mid:v\r\n"),
+            Some("v")
         );
-        assert_eq!(first_mid("m=audiox 9 x 0\r\na=mid:a\r\n", "audio"), None);
     }
 
     #[test]
@@ -2022,17 +2144,34 @@ mod tests {
         ] {
             assert_eq!(ice_name(state), name);
         }
-        assert_eq!(
-            video_mid(
-                "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\n"
-            ),
-            Some("1")
-        );
-        assert_eq!(
-            video_mid("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n"),
-            None
-        );
+        let both = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\n";
+        assert_eq!(video_mid(both), Some("1"));
+        assert_eq!(first_mid(both), Some("0"));
+        let audio = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n";
+        assert_eq!(video_mid(audio), None);
         assert_eq!(video_mid("m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"), None);
+        assert_eq!(first_mid("m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"), None);
+        // A stopped one (RFC 3264 §8.2) counts.
+        let stopped = both.replace("m=video 9 ", "m=video 0 ");
+        assert_eq!(video_mid(&stopped), Some("1"));
+    }
+
+    /// A session opened without video takes a re-offer without a video
+    /// m-line and refuses one with it, stopped or not (RFC 8829 §5.2.2
+    /// lets a subsequent offer add an m-line; the session does not
+    /// negotiate video on a live engine).
+    #[test]
+    fn rfc8829_5_2_2_a_session_without_video_refuses_a_re_offer_that_adds_it() {
+        let audio = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\na=sendonly\r\n";
+        assert_eq!(check_no_video(audio), Ok(()));
+        let video = format!("{audio}m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=recvonly\r\n");
+        for offer in [video.clone(), video.replace("m=video 9 ", "m=video 0 ")] {
+            assert_eq!(
+                check_no_video(&offer),
+                Err(RenegotiateError::VideoChanged("it adds one".to_owned())),
+                "{offer}"
+            );
+        }
     }
 
     /// A re-offer keeps the video m-line: the same mid, direction and
