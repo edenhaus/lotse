@@ -1,0 +1,26 @@
+[package]
+name = "lotse-mux"
+description = "Fragmented MP4 output: event clips from H.264, H.265, AAC-LC and Opus frames."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bytes = { workspace = true } # the frames' payloads, written out as slices of themselves
+lotse-codec = { workspace = true } # the SPS fields of the sample entries, Annex B units, Opus packet durations
+lotse-core = { workspace = true } # the clip contract, frames and codecs
+mp4-atom = { workspace = true } # the boxes of the init segment and of each movie fragment
+
+[dev-dependencies]
+lotse-codec = { workspace = true, features = ["test-util"] } # the hand-built parameter sets and the recorded AAC of the fixtures
+lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`, the instants the frames are captured at
+serde_json = { workspace = true } # ffprobe's JSON report of the fixtures
+
+[lints]
+workspace = true

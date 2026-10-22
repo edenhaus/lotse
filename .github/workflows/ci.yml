@@ -264,8 +264,8 @@ jobs:
           fail_ci_if_error: true # a report Codecov never got would leave its gate unchecked
 
   # The daemon against a third-party RTSP server (MediaMTX) fed by ffmpeg, over TCP and UDP, video
-  # only and with AAC, PCMU and Opus. Both tools are pinned in mise.toml; both arches, so both
-  # ffmpeg pins are exercised.
+  # only and with AAC, PCMU and Opus; and ffprobe reading the clip muxer's fixtures. Both tools are
+  # pinned in mise.toml; both arches, so both ffmpeg pins are exercised.
   interop:
     name: Interop with MediaMTX and ffmpeg (${{ matrix.arch }})
     needs: build

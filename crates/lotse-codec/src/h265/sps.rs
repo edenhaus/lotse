@@ -5,7 +5,7 @@
 //! the `h265_ptl` target.
 //!
 //! Implements ITU-T H.265 §7.3.1.1 and §7.4.2 (emulation prevention),
-//! §7.3.2.2.1 (SPS up to the conformance window), §7.3.3
+//! §7.3.2.2.1 (SPS up to the bit depths), §7.3.3
 //! (`profile_tier_level`), §7.4.3.2.1 (cropping by `SubWidthC` and
 //! `SubHeightC`, Table 6-1), §7.3.5 (`sei_message`), §9.2 (`ue(v)`) and
 //! D.2.8 / D.3.8 (recovery point SEI); RFC 7798 §7.1 names the
@@ -35,8 +35,23 @@ pub struct SpsInfo {
     /// significant bit: bit `31 - j` set means the stream conforms to
     /// profile `j` too (§7.4.4).
     pub compatibility: u32,
+    /// The 48 bits after the compatibility flags (§7.3.3): the source and
+    /// constraint flags, `general_progressive_source_flag` first, as an
+    /// `HEVCDecoderConfigurationRecord` carries them.
+    pub constraint_flags: [u8; 6],
     /// `general_level_idc` (RFC 7798 `level-id`): 30 times the level.
     pub level_idc: u8,
+    /// `sps_max_sub_layers_minus1 + 1`, 1 to 7: the temporal sub-layers.
+    pub sub_layers: u8,
+    /// `sps_temporal_id_nesting_flag`.
+    pub temporal_id_nesting: bool,
+    /// `chroma_format_idc` (Table 6-1): 0 monochrome, 1 4:2:0, 2 4:2:2,
+    /// 3 4:4:4.
+    pub chroma_format_idc: u8,
+    /// The luma bit depth, `bit_depth_luma_minus8 + 8`, 8 to 16.
+    pub bit_depth_luma: u8,
+    /// The chroma bit depth, `bit_depth_chroma_minus8 + 8`, 8 to 16.
+    pub bit_depth_chroma: u8,
     /// Picture width in luma samples, the conformance window applied.
     pub width: u32,
     /// Picture height in luma samples, the conformance window applied.
@@ -67,8 +82,8 @@ pub enum SpsError {
     #[error("sps ends early")]
     Truncated,
     /// A value outside its range (§7.4.3.2.1): an Exp-Golomb code longer
-    /// than 32 bits, `sps_max_sub_layers_minus1` above 6, or
-    /// `chroma_format_idc` above 3.
+    /// than 32 bits, `sps_max_sub_layers_minus1` above 6,
+    /// `chroma_format_idc` above 3, or a bit depth minus 8 above 8.
     #[error("sps value out of range")]
     OutOfRange,
     /// The conformance window takes the whole picture: §7.4.3.2.1 keeps it
@@ -156,12 +171,28 @@ impl<'a> Bits<'a> {
     }
 }
 
+/// The general part of a `profile_tier_level` (§7.3.3).
+struct GeneralPtl {
+    /// `general_profile_space`.
+    profile_space: u8,
+    /// `general_tier_flag`.
+    high_tier: bool,
+    /// `general_profile_idc`.
+    profile_idc: u8,
+    /// `general_profile_compatibility_flag[0..32]`, flag 0 first.
+    compatibility: u32,
+    /// The source and constraint flags (48 bits).
+    constraint_flags: [u8; 6],
+    /// `general_level_idc`.
+    level_idc: u8,
+}
+
 /// The general part of a `profile_tier_level` (§7.3.3) with its sub-layer
 /// parts skipped.
 fn profile_tier_level(
     bits: &mut Bits<'_>,
     max_sub_layers_minus1: u32,
-) -> Result<(u8, bool, u8, u32, u8), SpsError> {
+) -> Result<GeneralPtl, SpsError> {
     let profile_space = u8::try_from(bits.bits(2)?).unwrap_or(0);
     let high_tier = bits.bit()?;
     let profile_idc = u8::try_from(bits.bits(5)?).unwrap_or(0);
@@ -169,7 +200,10 @@ fn profile_tier_level(
     // progressive_source_flag, interlaced_source_flag,
     // non_packed_constraint_flag, frame_only_constraint_flag, the 43
     // constraint bits and general_inbld_flag or its reserved bit.
-    bits.skip(48)?;
+    let mut constraint_flags = [0_u8; 6];
+    for byte in &mut constraint_flags {
+        *byte = u8::try_from(bits.bits(8)?).unwrap_or(0);
+    }
     let level_idc = u8::try_from(bits.bits(8)?).unwrap_or(0);
     let mut profile_present = [false; 8];
     let mut level_present = [false; 8];
@@ -197,13 +231,22 @@ fn profile_tier_level(
             bits.skip(8)?;
         }
     }
-    Ok((
+    Ok(GeneralPtl {
         profile_space,
         high_tier,
         profile_idc,
         compatibility,
+        constraint_flags,
         level_idc,
-    ))
+    })
+}
+
+/// A bit depth from its `bit_depth_*_minus8` (§7.4.3.2.1: 0 to 8).
+fn bit_depth(bits: &mut Bits<'_>) -> Result<u8, SpsError> {
+    match bits.ue()? {
+        minus8 @ 0..=8 => Ok(u8::try_from(minus8).unwrap_or(0).saturating_add(8)),
+        _ => Err(SpsError::OutOfRange),
+    }
 }
 
 /// `SubWidthC` and `SubHeightC` of a `chroma_format_idc` (Table 6-1);
@@ -216,7 +259,7 @@ const fn chroma_subsampling(chroma_format_idc: u32) -> (u32, u32) {
     }
 }
 
-/// Reads an SPS NAL unit (header included) up to its conformance window.
+/// Reads an SPS NAL unit (header included) up to its bit depths.
 pub fn parse_sps(unit: &[u8]) -> Result<SpsInfo, SpsError> {
     if nal::unit_type(unit) != Some(nal::SPS_NUT) {
         return Err(SpsError::NotSps);
@@ -229,10 +272,8 @@ pub fn parse_sps(unit: &[u8]) -> Result<SpsInfo, SpsError> {
     if max_sub_layers_minus1 >= MAX_SUB_LAYERS {
         return Err(SpsError::OutOfRange);
     }
-    // sps_temporal_id_nesting_flag.
-    bits.skip(1)?;
-    let (profile_space, high_tier, profile_idc, compatibility, level_idc) =
-        profile_tier_level(&mut bits, max_sub_layers_minus1)?;
+    let temporal_id_nesting = bits.bit()?;
+    let ptl = profile_tier_level(&mut bits, max_sub_layers_minus1)?;
     // sps_seq_parameter_set_id.
     bits.ue()?;
     let chroma_format_idc = bits.ue()?;
@@ -264,12 +305,21 @@ pub fn parse_sps(unit: &[u8]) -> Result<SpsInfo, SpsError> {
     if width == 0 || height == 0 {
         return Err(SpsError::EmptyPicture);
     }
+    let bit_depth_luma = bit_depth(&mut bits)?;
+    let bit_depth_chroma = bit_depth(&mut bits)?;
     Ok(SpsInfo {
-        profile_space,
-        high_tier,
-        profile_idc,
-        compatibility,
-        level_idc,
+        profile_space: ptl.profile_space,
+        high_tier: ptl.high_tier,
+        profile_idc: ptl.profile_idc,
+        compatibility: ptl.compatibility,
+        constraint_flags: ptl.constraint_flags,
+        level_idc: ptl.level_idc,
+        // At most 7: checked against MAX_SUB_LAYERS above.
+        sub_layers: u8::try_from(max_sub_layers_minus1.saturating_add(1)).unwrap_or(u8::MAX),
+        temporal_id_nesting,
+        chroma_format_idc: u8::try_from(chroma_format_idc).unwrap_or(u8::MAX),
+        bit_depth_luma,
+        bit_depth_chroma,
         width: u32::try_from(width).unwrap_or(u32::MAX),
         height: u32::try_from(height).unwrap_or(u32::MAX),
     })
@@ -535,7 +585,14 @@ mod tests {
                 high_tier: false,
                 profile_idc: 1,
                 compatibility: 0x6000_0000,
+                // Progressive and frame only, the first and fourth bits.
+                constraint_flags: [0x90, 0, 0, 0, 0, 0],
                 level_idc: LEVEL_IDC,
+                sub_layers: 1,
+                temporal_id_nesting: true,
+                chroma_format_idc: 1,
+                bit_depth_luma: 8,
+                bit_depth_chroma: 8,
                 width: 640,
                 height: 480,
             }
@@ -581,6 +638,7 @@ mod tests {
         for offset in crop {
             b.ue(offset);
         }
+        b.ue(2).ue(1); // bit_depth_luma_minus8, bit_depth_chroma_minus8
         unit(nal::SPS_NUT, &b.finish())
     }
 
@@ -592,6 +650,16 @@ mod tests {
             (1, true, 4)
         );
         assert_eq!(info.level_idc, 153);
+        assert_eq!((info.sub_layers, info.temporal_id_nesting), (4, true));
+        assert_eq!(info.constraint_flags, [0; 6]);
+        assert_eq!(
+            (
+                info.chroma_format_idc,
+                info.bit_depth_luma,
+                info.bit_depth_chroma
+            ),
+            (1, 10, 9)
+        );
         assert_eq!((info.width, info.height), (1920, 1080), "4:2:0 crops by 2");
         let info = parse_sps(&sps_with(1, 2, false, [1, 1, 1, 1])).unwrap();
         assert_eq!((info.width, info.height), (1916, 1086), "4:2:2: 2 and 1");
@@ -631,6 +699,17 @@ mod tests {
             Err(SpsError::OutOfRange),
             "chroma_format_idc 4"
         );
+        for (luma, chroma) in [(9, 0), (0, 9)] {
+            let mut b = Writer::default();
+            b.bits(0, 8);
+            b.bits(0, 32).bits(0, 32).bits(0, 32);
+            b.ue(0).ue(1).ue(64).ue(64).bit(false).ue(luma).ue(chroma);
+            assert_eq!(
+                parse_sps(&unit(nal::SPS_NUT, &b.finish())),
+                Err(SpsError::OutOfRange),
+                "bit depth minus 8 of {luma}, {chroma}: above 8 (7.4.3.2.1)"
+            );
+        }
         assert_eq!(SpsError::NotSps.to_string(), "not a sequence parameter set");
     }
 

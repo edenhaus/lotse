@@ -23,11 +23,13 @@ lotse-codec = { path = "../crates/lotse-codec", features = ["test-util"] }
 lotse-core = { path = "../crates/lotse-core", features = ["test-util"] }
 lotse-http = { path = "../crates/lotse-http" }
 lotse-ipc = { path = "../crates/lotse-ipc" }
+lotse-mux = { path = "../crates/lotse-mux" }
 lotse-rtsp = { path = "../crates/lotse-rtsp" }
 lotse-supervisor = { path = "../crates/lotse-supervisor" }
 lotse-testing = { path = "../crates/lotse-testing" }
 lotse-webrtc = { path = "../crates/lotse-webrtc" }
 lotse-worker = { path = "../crates/lotse-worker" }
+mp4-atom = { version = "0.16", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # Without its default features, as in the root: they link aws-lc-rs, which .cargo/deny.toml bans.
 str0m = { version = "0.24", default-features = false }
@@ -220,6 +222,13 @@ bench = false
 [[bin]]
 name = "fmp4_segment"
 path = "fuzz_targets/fmp4_segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fmp4_mux"
+path = "fuzz_targets/fmp4_mux.rs"
 test = false
 doc = false
 bench = false

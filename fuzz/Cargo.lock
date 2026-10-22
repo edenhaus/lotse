@@ -1431,11 +1431,13 @@ dependencies = [
  "lotse-core",
  "lotse-http",
  "lotse-ipc",
+ "lotse-mux",
  "lotse-rtsp",
  "lotse-supervisor",
  "lotse-testing",
  "lotse-webrtc",
  "lotse-worker",
+ "mp4-atom",
  "serde_json",
  "str0m",
  "tokio",
@@ -1477,6 +1479,16 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "lotse-mux"
+version = "0.0.0-dev"
+dependencies = [
+ "bytes",
+ "lotse-codec",
+ "lotse-core",
+ "mp4-atom",
 ]
 
 [[package]]

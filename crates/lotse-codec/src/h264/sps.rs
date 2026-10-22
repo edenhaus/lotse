@@ -3,7 +3,8 @@
 //! SEI messages, through `h264-reader`.
 //!
 //! Implements ISO/IEC 14496-10 §7.3.2.1 (SPS: `profile_idc`,
-//! `constraint_set` flags, `level_idc`, picture size), §7.4.1 (emulation
+//! `constraint_set` flags, `level_idc`, `chroma_format_idc` and the bit
+//! depths, picture size), §7.4.1 (emulation
 //! prevention) and D.2.7 (recovery point SEI); RFC 6184 §8.1
 //! `profile-level-id` is the three SPS bytes in order.
 
@@ -22,6 +23,13 @@ pub struct SpsInfo {
     pub width: u32,
     /// Picture height in pixels, cropping applied.
     pub height: u32,
+    /// `chroma_format_idc` (§7.4.2.1.1): 1 (4:2:0) unless a High profile
+    /// SPS says otherwise.
+    pub chroma_format_idc: u8,
+    /// The luma bit depth, `bit_depth_luma_minus8 + 8`.
+    pub bit_depth_luma: u8,
+    /// The chroma bit depth, `bit_depth_chroma_minus8 + 8`.
+    pub bit_depth_chroma: u8,
 }
 
 /// Why an SPS could not be read.
@@ -69,6 +77,9 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, SpsError> {
         ],
         width,
         height,
+        chroma_format_idc: u8::try_from(sps.chroma_info.chroma_format.to_u32()).unwrap_or(u8::MAX),
+        bit_depth_luma: sps.chroma_info.bit_depth_luma_minus8.saturating_add(8),
+        bit_depth_chroma: sps.chroma_info.bit_depth_chroma_minus8.saturating_add(8),
     })
 }
 
@@ -182,6 +193,44 @@ pub mod test_data {
         nal
     }
 
+    /// A 640 × 480 SPS of a High profile `profile_idc` (100, 110, 122,
+    /// 244: the ones whose SPS carries the chroma fields, §7.3.2.1.1) with
+    /// the chroma format and the bit depths minus 8 given, no scaling
+    /// matrices, otherwise as [`sps`].
+    pub fn high_sps(
+        profile_idc: u32,
+        chroma_format_idc: u32,
+        luma_minus8: u32,
+        chroma_minus8: u32,
+    ) -> Vec<u8> {
+        let mut b = Bits::default();
+        b.bits(profile_idc, 8)
+            .bits(0, 8) // no constraint_set flags
+            .bits(30, 8) // level_idc 3.0
+            .ue(0) // seq_parameter_set_id
+            .ue(chroma_format_idc);
+        if chroma_format_idc == 3 {
+            b.bit(false); // separate_colour_plane_flag
+        }
+        b.ue(luma_minus8)
+            .ue(chroma_minus8)
+            .bit(false) // qpprime_y_zero_transform_bypass_flag
+            .bit(false) // seq_scaling_matrix_present_flag
+            .ue(0) // log2_max_frame_num_minus4
+            .ue(2) // pic_order_cnt_type
+            .ue(1) // max_num_ref_frames
+            .bit(false) // gaps_in_frame_num_value_allowed_flag
+            .ue(640 / 16 - 1)
+            .ue(480 / 16 - 1)
+            .bit(true) // frame_mbs_only_flag
+            .bit(true) // direct_8x8_inference_flag
+            .bit(false) // frame_cropping_flag
+            .bit(false); // vui_parameters_present_flag
+        let mut nal = vec![0x67];
+        nal.extend(b.finish());
+        nal
+    }
+
     /// A PPS for the SPS above.
     pub fn pps() -> Vec<u8> {
         let mut b = Bits::default();
@@ -227,7 +276,7 @@ mod tests {
         reason = "test code"
     )]
 
-    use super::test_data::{pps, recovery_point_sei, sps};
+    use super::test_data::{high_sps, pps, recovery_point_sei, sps};
     use super::*;
 
     #[test]
@@ -237,6 +286,40 @@ mod tests {
         assert_eq!((info.width, info.height), (640, 480));
         let info = parse_sps(&sps(1920, 1088)).unwrap();
         assert_eq!((info.width, info.height), (1920, 1088));
+        // Baseline carries no chroma fields: 4:2:0, 8 bits (§7.4.2.1.1).
+        assert_eq!(
+            (
+                info.chroma_format_idc,
+                info.bit_depth_luma,
+                info.bit_depth_chroma
+            ),
+            (1, 8, 8)
+        );
+    }
+
+    #[test]
+    fn a_high_profile_sps_yields_chroma_format_and_bit_depths_14496_10_7_3_2_1_1() {
+        let info = parse_sps(&high_sps(110, 2, 2, 1)).unwrap();
+        assert_eq!(info.profile_level_id[0], 110);
+        assert_eq!(
+            (
+                info.chroma_format_idc,
+                info.bit_depth_luma,
+                info.bit_depth_chroma
+            ),
+            (2, 10, 9)
+        );
+        assert_eq!((info.width, info.height), (640, 480));
+        // 4:4:4 reads `separate_colour_plane_flag` before the bit depths.
+        let info = parse_sps(&high_sps(244, 3, 0, 0)).unwrap();
+        assert_eq!(
+            (
+                info.chroma_format_idc,
+                info.bit_depth_luma,
+                info.bit_depth_chroma
+            ),
+            (3, 8, 8)
+        );
     }
 
     #[test]
