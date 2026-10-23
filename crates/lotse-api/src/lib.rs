@@ -14,10 +14,14 @@
 //! strictly increasing ids, one `result` per command, a bounded outbound
 //! queue that sheds low-value traffic and disconnects a client that still
 //! overflows it, and a deadline on the closing handshake, so a peer that
-//! stops reading cannot hold a connection or its slot.
+//! stops reading cannot hold a connection or its slot. Beside the upgrade
+//! it serves event clips' bytes, `GET /v0/clips/{clip_id}`, as chunked
+//! response bodies the handler hands over ([`Handler::clip_body`]),
+//! bounded by the client taking them.
 //!
 //! Standards: RFC 6455 (WebSocket, close codes §7.4.1, `Origin` §10.2),
-//! RFC 9110 (HTTP), RFC 6585 §5 (431 for an oversized request head),
+//! RFC 9110 (HTTP), RFC 9112 (HTTP/1.1, the chunked transfer coding §7.1
+//! of a clip's body), RFC 6585 §5 (431 for an oversized request head),
 //! unix(7) `SO_PEERCRED`, RFC 8446 (TLS 1.3, in [`tls`]).
 
 use std::future::Future;
@@ -37,6 +41,7 @@ use lotse_api_types::command::Command;
 use lotse_api_types::error::ApiError;
 use lotse_api_types::frame::Hello;
 use lotse_core::clock::Clock;
+use lotse_core::id::ClipId;
 use lotse_core::task::{BoxFuture, spawn_named};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -45,14 +50,18 @@ use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 
 mod clients;
+mod clip;
 mod connection;
 pub mod identity;
 mod listener;
 mod outbox;
 pub mod pairing;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub mod tls;
 
 pub use clients::ClientsError;
+pub use clip::{ClipBody, ClipBodyError};
 pub use listener::{BindError, PeerInfo};
 pub use tls::TlsConfig;
 
@@ -87,6 +96,18 @@ pub const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 /// without waiting on the client; a peer that reads nothing would never see
 /// the Close anyway).
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long what a clip's body handed over may wait for the client to
+/// make room for it: 10 s, after which the connection is dropped and the
+/// body ends without its last chunk. A client reading at any pace keeps
+/// the body going; one that stopped reading cannot hold the connection,
+/// or the clip's pipe, once the clip has ended.
+pub const BODY_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// From the end of a clip's bytes to the producer's report of how many it
+/// wrote: 5 s, after which the body ends without its last chunk. A worker
+/// reports as it closes its pipe.
+pub const CLIP_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connections accepted and not yet upgraded, at once: 8. One more is
 /// closed at accept, without a response. A TLS connection takes its place
@@ -142,7 +163,8 @@ pub enum Outcome {
 
 /// What the supervisor implements. `ping`, `schema`, `unsubscribe`,
 /// `pairing/create`, `clients/list` and `clients/remove` are answered by
-/// the server itself; everything else goes here.
+/// the server itself; everything else goes here, and so do the requests
+/// for clips' bytes.
 pub trait Handler: Send + Sync + 'static {
     /// The `hello` frame's content.
     fn hello(&self) -> Hello;
@@ -170,6 +192,17 @@ pub trait Handler: Send + Sync + 'static {
     fn connection_closed(&self, connection: ConnectionId) {
         let _ = connection;
     }
+
+    /// `GET /v0/clips/{clip_id}`, from any peer either listener admits:
+    /// the bytes of clip `clip_id`, handed over once, so a second request
+    /// is [`ClipBodyError::AlreadyFetched`]. The server sends them as the
+    /// response body and ends it whole only when the reader ended and the
+    /// report agrees with what arrived. Never waits. Without clips, every
+    /// id is [`ClipBodyError::NotFound`].
+    fn clip_body(&self, clip_id: &ClipId) -> Result<ClipBody, ClipBodyError> {
+        let _ = clip_id;
+        Err(ClipBodyError::NotFound)
+    }
 }
 
 /// The server's settings.
@@ -185,7 +218,7 @@ pub struct Config {
     /// Control connections at once.
     pub max_connections: u32,
     /// Open subscriptions per connection (`stream/subscribe`,
-    /// `webrtc/offer`, `session/adopt`); one more is answered
+    /// `webrtc/offer`, `session/adopt`, `clip/start`); one more is answered
     /// `limit_reached` before the handler sees it. Ended ones do not count.
     pub max_subscriptions: u32,
     /// The mutual-TLS listener, if one is configured.
@@ -290,8 +323,9 @@ impl Server {
 
     /// Serves until `shutdown` is cancelled: then no new connections, the
     /// ones not yet upgraded (or still in their TLS handshake) are closed,
-    /// every upgraded one gets `shutdown` and a `1001` close, and the call
-    /// returns once each has closed, within [`CLOSE_TIMEOUT`], and no
+    /// every upgraded one gets `shutdown` and a `1001` close, a clip body
+    /// still being sent may end, and the call returns once each has
+    /// closed, within [`CLOSE_TIMEOUT`], and no
     /// command about the TLS listener's clients is still at the disk: the
     /// data directory can be bound again at once. `clock` times the
     /// handshake, upgrade and close deadlines.
@@ -350,8 +384,15 @@ impl Server {
             clients,
             serving: serving.token(),
         };
+        let serving_token = serving.token();
         let app = Router::new()
             .route(lotse_api_types::WS_PATH, get(connection::upgrade::<H>))
+            .route(
+                &format!("{}/{{clip_id}}", lotse_api_types::CLIPS_PATH),
+                get(clip::fetch::<H>)
+                    .head(clip::not_allowed)
+                    .fallback(clip::not_allowed),
+            )
             .with_state(state);
         let mut http = http1::Builder::new();
         // Keep-alive stays on: hyper's `Connection: close` would replace the
@@ -365,6 +406,7 @@ impl Server {
             pending,
             clock,
             shutdown: shutdown.clone(),
+            serving: serving_token,
         };
         tracing::info!(event = "api_listening", "control API listening");
         loop {
@@ -391,7 +433,8 @@ impl Server {
         drop(drained);
         tracing::info!("control API stopped accepting");
         // The router holds the state, and with it a token, as does every
-        // upgraded connection until it has closed.
+        // upgraded connection until it has closed and every connection
+        // still sending a clip's body.
         drop(admission);
         serving.close();
         serving.wait().await;
@@ -413,6 +456,9 @@ struct Admission {
     clock: Arc<dyn Clock>,
     /// Cancelled on graceful shutdown.
     shutdown: CancellationToken,
+    /// Held by every connection's task until it ends, so the server's
+    /// stop waits for a clip body still being sent.
+    serving: TaskTrackerToken,
 }
 
 impl Admission {
@@ -441,14 +487,31 @@ impl Admission {
     ) where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let service = TowerToHyperService::new(self.app.clone().layer(Extension(peer.clone())));
+        let body = clip::BodyWatch::new();
+        let service = TowerToHyperService::new(
+            self.app
+                .clone()
+                .layer(Extension(peer.clone()))
+                .layer(Extension(body.clone())),
+        );
         let connection = self
             .http
             .serve_connection(TokioIo::new(stream), service)
             .with_upgrades();
         spawn_named(
             "api.handshake",
-            handshake(connection, deadline, self.shutdown.clone(), peer, slot),
+            handshake(
+                Box::pin(connection),
+                deadline,
+                Accepted {
+                    shutdown: self.shutdown.clone(),
+                    peer,
+                    slot,
+                    body,
+                    clock: Arc::clone(&self.clock),
+                    serving: self.serving.clone(),
+                },
+            ),
         );
     }
 }
@@ -471,24 +534,48 @@ pub(crate) fn upgrade_slot(
     slot
 }
 
+/// What a connection's task holds besides the connection.
+struct Accepted {
+    /// Cancelled on graceful shutdown.
+    shutdown: CancellationToken,
+    /// Who is connected.
+    peer: PeerInfo,
+    /// Its place among the connections awaiting their upgrade.
+    slot: OwnedSemaphorePermit,
+    /// Whether the connection sends a clip's body.
+    body: clip::BodyWatch,
+    /// Times a clip body's waits.
+    clock: Arc<dyn Clock>,
+    /// Held until the connection ends.
+    serving: TaskTrackerToken,
+}
+
 /// Drives one connection from accept to the upgrade, after which the
 /// connection task in [`connection`] owns it. Closes it at `deadline` or
 /// on shutdown if it has not upgraded by then, and returns the pending
-/// slot either way.
-async fn handshake<F>(
-    connection: F,
+/// slot either way. A connection whose response is a clip's body leaves
+/// the slot and the deadline when the body begins, and is driven until
+/// the body ends ([`clip::send_body`]).
+async fn handshake(
+    mut connection: BoxFuture<'static, hyper::Result<()>>,
     deadline: BoxFuture<'static, ()>,
-    shutdown: CancellationToken,
-    peer: PeerInfo,
-    permit: OwnedSemaphorePermit,
-) where
-    F: Future<Output = hyper::Result<()>> + Send,
-{
-    tokio::select! {
-        served = connection => {
+    accepted: Accepted,
+) {
+    let Accepted {
+        shutdown,
+        peer,
+        slot,
+        body,
+        clock,
+        serving: _serving,
+    } = accepted;
+    let mut sending = body.subscribe();
+    let sends_a_clip = tokio::select! {
+        served = &mut connection => {
             if let Err(err) = served {
                 tracing::debug!(%peer, error = %err, "control connection ended before the upgrade");
             }
+            false
         }
         () = deadline => {
             let timeout_ms = UPGRADE_TIMEOUT.as_millis();
@@ -497,13 +584,23 @@ async fn handshake<F>(
                 timeout_ms,
                 "control connection closed: no upgrade before the deadline"
             );
+            false
         }
-        () = shutdown.cancelled() => tracing::debug!(
-            %peer,
-            "control connection closed before the upgrade: shutting down"
-        ),
+        () = shutdown.cancelled() => {
+            tracing::debug!(
+                %peer,
+                "control connection closed before the upgrade: shutting down"
+            );
+            false
+        }
+        _ = sending.wait_for(clip::BodyState::is_sending) => true,
+    };
+    if sends_a_clip {
+        drop(slot);
+        clip::send_body(connection, sending, clock.as_ref(), &shutdown, &peer).await;
     }
-    drop(permit);
+    // The body's sender, which `send_body`'s receiver needs, lives until here.
+    drop(body);
 }
 
 #[cfg(test)]
@@ -553,6 +650,12 @@ mod tests {
         assert!(handler.unsubscribed(ConnectionId(1), 2).is_none());
         handler.connection_closed(ConnectionId(1));
         assert_eq!(handler.hello().api, lotse_api_types::API_VERSION);
+        // Without clips, no id has a body.
+        let clip_id = ClipId::new("c1").unwrap();
+        assert_eq!(
+            handler.clip_body(&clip_id).unwrap_err(),
+            ClipBodyError::NotFound
+        );
     }
 
     /// A WebSocket upgrade as the router extracts it, from a request the

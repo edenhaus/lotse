@@ -43,6 +43,24 @@ pub struct Limits {
     pub max_connections: u32,
     /// How long an orphaned session outlives its connection.
     pub session_grace_ms: u64,
+    /// The longest pre-roll window `stream/put` may ask for
+    /// (`preroll_ms`), and so the furthest back a clip can start; 0 when
+    /// the daemon keeps none.
+    #[serde(default)]
+    pub preroll_max_ms: u32,
+    /// The memory one track's pre-roll ring may hold, in bytes.
+    #[serde(default)]
+    pub preroll_bytes: u64,
+    /// The longest clip, in milliseconds: the most `after_ms` may ask, and
+    /// where an open-ended clip ends (`max_duration`).
+    #[serde(default)]
+    pub clip_max_ms: u32,
+    /// Clips open at once on all streams; 0 when the daemon records none.
+    #[serde(default)]
+    pub max_clips: u32,
+    /// Clips open at once on one stream.
+    #[serde(default)]
+    pub clips_per_stream: u32,
 }
 
 /// The Landlock layers.
@@ -216,6 +234,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn limits_from_a_daemon_without_clips_say_none() {
+        let limits: Limits = serde_json::from_value(json!({
+            "max_streams": 1, "max_sessions": 1, "max_sessions_per_stream": 1,
+            "max_connections": 1, "session_grace_ms": 1
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(limits).unwrap()["clips_per_stream"], 0);
+        assert_eq!(
+            (
+                limits.preroll_max_ms,
+                limits.preroll_bytes,
+                limits.clip_max_ms,
+                limits.max_clips,
+                limits.clips_per_stream
+            ),
+            (0, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
     fn info_serializes_like_the_contract_example() {
         let info = InfoResult {
             version: "0.1.0".into(),
@@ -236,6 +274,11 @@ mod tests {
                 max_sessions_per_stream: 16,
                 max_connections: 8,
                 session_grace_ms: 10_000,
+                preroll_max_ms: 120_000,
+                preroll_bytes: 32 << 20,
+                clip_max_ms: 600_000,
+                max_clips: 8,
+                clips_per_stream: 2,
             },
             sandbox: SandboxInfo {
                 mode: "on".into(),
@@ -254,6 +297,7 @@ mod tests {
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["build"]["rustc"], "1.98.0");
         assert_eq!(json["limits"]["session_grace_ms"], 10_000);
+
         assert_eq!(
             json["sandbox"],
             json!({ "mode": "on", "uid": 65534, "gid": 65534, "no_new_privs": true,
