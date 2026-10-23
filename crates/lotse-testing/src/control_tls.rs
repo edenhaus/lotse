@@ -90,6 +90,9 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// The protocol versions the listener speaks: TLS 1.3 alone.
+pub const TLS13: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
+
 /// A client configuration that trusts exactly the server certificate with
 /// `server_pin`, offers `versions`, and presents `cert`. Session resumption
 /// stays on, as rustls has it by default, so a test can see the server
