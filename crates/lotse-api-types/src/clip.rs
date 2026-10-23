@@ -115,9 +115,14 @@ pub enum ClipEvent {
     Stopped {
         /// Why.
         reason: ClipStopReason,
-        /// The bytes of the file written to the body.
+        /// The bytes of the file written to the body; 0 when the clip
+        /// ended without its worker's last word (`worker_crashed`,
+        /// `stream_deleted`, `stream_changed` by a move to another
+        /// connection, `shutting_down`, `internal_error` for a malformed
+        /// report), whose body is then cut.
         bytes: u64,
-        /// The media time the file covers, in milliseconds.
+        /// The media time the file covers, in milliseconds; 0 for the
+        /// same ends.
         duration_ms: u32,
         /// The gaps the clip had, every one counted even where not each
         /// was reported as an event.

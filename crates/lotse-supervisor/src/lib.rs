@@ -1,8 +1,11 @@
 //! Supervisor process: stream registry and desired state, worker manager
 //! (spawn, crash backoff), host resolution, the control API handler with
 //! the viewer sessions' signaling (offer, trickle, orphaning and adoption),
-//! the UDP receive and demux, ICE-TCP accept and srflx gathering with the
-//! STUN client, the TURN client (the codec, the long-term credential and
+//! the event clips (their pipes' read ends until fetched, the workers'
+//! reports checked and passed on, the counters, the pre-roll window each
+//! connection keeps), the UDP receive and demux, ICE-TCP accept and srflx
+//! gathering with the STUN client, the TURN client (the codec, the
+//! long-term credential and
 //! the shared allocations over UDP and TCP, whose servers' relayed
 //! datagrams the demux or the TCP allocation's task unwraps as the peers',
 //! and the TCP allocations' writing of what workers frame); later snapshot
@@ -35,6 +38,7 @@ use lotse_core::task::spawn_named;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+mod clip;
 mod connect;
 mod driver;
 mod gather;
