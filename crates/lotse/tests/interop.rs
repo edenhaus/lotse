@@ -19,10 +19,15 @@
 //! and ffmpeg's own raw MPEG-TS (ISO/IEC 13818-1) over HTTP; a publisher
 //! that restarts is seen as a reconnect.
 //!
-//! Ignored by default: they need `mediamtx` and `ffmpeg` on `PATH`, which
-//! `mise run interop` provides (pinned in `mise.toml`) before it runs them.
-//! Needs the `source-rtsp` and `output-webrtc` features (the defaults), and
-//! `source-http` for the HTTP tests.
+//! The [`clip`] tests record event clips of the stream (H.264 or libx265's
+//! H.265; AAC, Opus, PCMU or G.722) from the daemon's pre-roll window and
+//! have ffprobe decode them (ISO/IEC 14496-12).
+//!
+//! Ignored by default: they need `mediamtx`, `ffmpeg` and `ffprobe` on
+//! `PATH`, which `mise run interop` provides (pinned in `mise.toml`) before
+//! it runs them. Needs the `source-rtsp` and `output-webrtc` features (the
+//! defaults), `source-http` for the HTTP tests and `output-clip` for the
+//! clip tests.
 
 #![cfg(all(feature = "source-rtsp", feature = "output-webrtc"))]
 #![allow(
@@ -88,6 +93,8 @@ fn negotiated(audio: Audio) -> Option<&'static str> {
         Audio::None => None,
         Audio::Aac | Audio::Opus => Some("opus"),
         Audio::Pcmu => Some("pcmu"),
+        // Not played by these tests: the clips transcode it.
+        Audio::G722 => Some("g722"),
     }
 }
 
@@ -772,5 +779,575 @@ mod http {
         let (count, ended) = attempts(&rest);
         assert!(count >= 1, "attempts at the source, ended by {ended:?}");
         server.stop();
+    }
+}
+
+/// Event clips of MediaMTX's stream, checked by ffprobe, an independent
+/// reader of ISO/IEC 14496-12 that decodes every frame: a preloaded
+/// stream with a pre-roll window records a clip from `before_ms` ago to
+/// `after_ms` from now (`clip/start`), fetched as it runs (`GET
+/// /v0/clips/{clip_id}`), written to a file and read with `ffprobe
+/// -show_streams -show_frames`. Each test checks the streams and their
+/// codecs (H.264 as `avc1`, H.265 as `hvc1`, AAC-LC as the camera sent it,
+/// Opus as sent or transcoded from G.711 and G.722, never `audio_omitted`),
+/// that every frame decodes (ffprobe reports no error), the frames against
+/// the clip's duration, the first video frame a keyframe, and the audio
+/// starting with the video; a publisher restart inside a clip is one `gap`
+/// event where the file has a real hole.
+#[cfg(feature = "output-clip")]
+mod clip {
+    use std::path::Path;
+
+    use lotse_testing::mediamtx::{FPS, HEIGHT, Video, WIDTH};
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::common::SocketDir;
+    use crate::common::clip_body::{Fetched, fetch_on_socket};
+
+    /// The pre-roll window the stream keeps.
+    const PREROLL_MS: u64 = 10_000;
+
+    /// How much of the window the clip asks for.
+    const BEFORE_MS: u64 = 2_000;
+
+    /// How long the clip runs after it starts.
+    const AFTER_MS: u64 = 3_000;
+
+    /// One video frame at the camera's rate, in the 90 kHz RTP clock of
+    /// H.264 and H.265 (RFC 6184 §8.2.1, RFC 7798 §7.1), which the clip's
+    /// video track keeps as its timescale.
+    const FRAME_TICKS: i64 = 90_000 / FPS as i64;
+
+    /// One video frame, in milliseconds (33.3, rounded up).
+    const FRAME_MS: u64 = 34;
+
+    /// EBU R37's bound on audio against video: within 40 ms.
+    const AV_SYNC_MS: u64 = 40;
+
+    /// The G.711 to Opus transcode's delay, 312 ticks at 48 kHz: what the
+    /// clip's origin lies before its first frame's capture time, so its
+    /// first video sample starts there.
+    const G711_DELAY_US: u64 = 6_500;
+
+    /// The G.722 to Opus transcode's delay, 282 ticks at 48 kHz.
+    const G722_DELAY_US: u64 = 5_875;
+
+    /// A daemon on a socket of its own with its control connection.
+    async fn daemon(test: &str) -> (Daemon, Arc<Control>, SocketDir) {
+        let dir = socket_dir(&format!("interop-clip-{test}"));
+        let socket = dir.join("lotse.sock");
+        let mut daemon = Daemon::start(
+            &[
+                "--webrtc-udp-listen",
+                "127.0.0.1:0",
+                "--webrtc-tcp-listen",
+                "off",
+                "--socket",
+                socket.to_str().unwrap(),
+                // The test binary is dynamic, and Landlock checks `execute`
+                // on its loader too; the sandbox records a clip in
+                // `worker.rs`.
+                "--sandbox",
+                "off",
+                "--log-format",
+                "json",
+            ],
+            &[],
+        );
+        daemon.wait_for("\"event\":\"ready\"");
+        let (control, _hello) = Control::connect(&socket).await.expect("the control socket");
+        (daemon, Arc::new(control), dir)
+    }
+
+    /// `stream/put` of the camera, preloaded with a [`PREROLL_MS`] window,
+    /// then `stream/get` until it is live with every track and the video's
+    /// window holds `held_ms`.
+    async fn put_and_fill(
+        control: &Control,
+        camera: &Camera,
+        held_ms: u64,
+        clock: &dyn Clock,
+    ) -> Value {
+        control
+            .command(json!({
+                "type": "stream/put",
+                "stream_id": STREAM,
+                "sources": [{ "url": camera.url() }],
+                "preload": true,
+                "preroll_ms": PREROLL_MS,
+            }))
+            .await
+            .expect("stream/put");
+        let live = wait_live(control, camera.audio(), clock).await;
+        assert_eq!(
+            native(&live, "video")["codec"],
+            camera.video().lotse_codec(),
+            "{live}"
+        );
+        wait_stream(control, clock, |stream| {
+            native(stream, "video")["preroll"]["held_ms"]
+                .as_u64()
+                .is_some_and(|held| held >= held_ms)
+        })
+        .await
+    }
+
+    /// The next event of a clip's subscription, or a failure after
+    /// [`LIVE_WITHIN`].
+    async fn next_event(events: &mut mpsc::UnboundedReceiver<Value>, clock: &dyn Clock) -> Value {
+        tokio::select! {
+            event = events.recv() => event.expect("the subscription ends with stopped"),
+            () = clock.sleep(LIVE_WITHIN) => panic!("no clip event in {LIVE_WITHIN:?}"),
+        }
+    }
+
+    /// The events up to and including `stopped`.
+    async fn until_stopped(
+        events: &mut mpsc::UnboundedReceiver<Value>,
+        clock: &dyn Clock,
+    ) -> Vec<Value> {
+        let mut seen = Vec::new();
+        loop {
+            let event = next_event(events, clock).await;
+            let stopped = event["type"] == "stopped";
+            seen.push(event);
+            if stopped {
+                return seen;
+            }
+        }
+    }
+
+    /// The body as the clip ended `reason`: 200 `video/mp4`, ended with its
+    /// last chunk (RFC 9112 §7.1), as many bytes as `stopped` counts.
+    fn check_whole(fetched: &Fetched, events: &[Value], reason: &str) {
+        assert_eq!(fetched.status, 200, "{fetched:?}");
+        assert_eq!(fetched.content_type.as_deref(), Some("video/mp4"));
+        assert!(fetched.whole, "the body ends with its last chunk");
+        assert_eq!(events[0]["type"], "started", "{events:?}");
+        let stopped = events.last().unwrap();
+        assert_eq!(
+            (&stopped["reason"], stopped["bytes"].as_u64()),
+            (&json!(reason), u64::try_from(fetched.bytes.len()).ok()),
+            "{events:?}"
+        );
+    }
+
+    /// One decoded frame as ffprobe reports it, its times in its stream's
+    /// timescale.
+    #[derive(Debug, Clone)]
+    struct Frame {
+        pts: i64,
+        duration: i64,
+        key: bool,
+        picture: Option<String>,
+    }
+
+    /// One stream of the file: its description and its decoded frames.
+    #[derive(Debug)]
+    struct Probed {
+        stream: Value,
+        /// The stream's timescale: ticks a second.
+        rate: i64,
+        frames: Vec<Frame>,
+    }
+
+    impl Probed {
+        /// Milliseconds from the file's zero to `ticks`, rounded down as the
+        /// daemon's clip times are.
+        fn ms(&self, ticks: i64) -> u64 {
+            u64::try_from(ticks * 1_000 / self.rate).unwrap()
+        }
+
+        /// Where the first frame begins, in microseconds.
+        fn start_us(&self) -> u64 {
+            u64::try_from(self.frames[0].pts * 1_000_000 / self.rate).unwrap()
+        }
+
+        /// From the first frame's start to the last one's end, in ms.
+        fn span_ms(&self) -> u64 {
+            let (first, last) = (&self.frames[0], self.frames.last().unwrap());
+            self.ms(last.pts + last.duration - first.pts)
+        }
+
+        /// Each place a frame begins later than the one before it ended:
+        /// the holes on the stream's timeline, as the indexes of the frames
+        /// around them.
+        fn holes(&self) -> Vec<(usize, usize)> {
+            (1..self.frames.len())
+                .filter(|&at| {
+                    let before = &self.frames[at - 1];
+                    self.frames[at].pts > before.pts + before.duration
+                })
+                .map(|at| (at - 1, at))
+                .collect()
+        }
+    }
+
+    /// ffprobe's streams and frames of `file`: the video, and the audio if
+    /// the file has any. ffprobe decodes every frame (`-show_frames`) and
+    /// reports at `-v error` whatever does not decode, so its silence says
+    /// every frame did.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a third-party reader of the daemon's clip, never the daemon's code"
+    )]
+    fn ffprobe(file: &Path) -> (Probed, Option<Probed>) {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_streams",
+                "-show_frames",
+                "-of",
+                "json",
+            ])
+            .arg(file)
+            .output()
+            .expect(
+                "ffprobe is not on PATH: `mise install`, then run through mise (mise run interop)",
+            );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr, "", "ffprobe decodes every frame without an error");
+        let probe: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let streams = probe["streams"].as_array().unwrap();
+        let probed = |kind: &str| {
+            let stream = streams.iter().find(|s| s["codec_type"] == kind)?;
+            let index = stream["index"].as_u64();
+            let (_, rate) = stream["time_base"]
+                .as_str()
+                .and_then(|base| base.split_once('/'))
+                .unwrap();
+            let frames = probe["frames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|frame| frame["stream_index"].as_u64() == index)
+                .map(|frame| Frame {
+                    pts: frame["pts"].as_i64().unwrap(),
+                    duration: frame["duration"].as_i64().unwrap(),
+                    key: frame["key_frame"] == 1,
+                    picture: frame["pict_type"].as_str().map(str::to_owned),
+                })
+                .collect();
+            Some(Probed {
+                stream: stream.clone(),
+                rate: rate.parse().unwrap(),
+                frames,
+            })
+        };
+        assert!(streams.len() <= 2, "{streams:?}");
+        (probed("video").expect("a video stream"), probed("audio"))
+    }
+
+    /// The file's video as ffprobe decodes it: `video`'s codec in its
+    /// MP4 sample entry (`avc1`, ISO/IEC 14496-15 §5.4.2.1; `hvc1`,
+    /// §8.4.1.1.2) at the camera's size and timescale, its first frame a
+    /// keyframe (an I picture), and every frame there, one after the other
+    /// at the camera's rate, without a hole.
+    fn check_video(video: &Probed, codec: Video) {
+        let (name, tag) = match codec {
+            Video::H264 => ("h264", "avc1"),
+            Video::H265 => ("hevc", "hvc1"),
+        };
+        assert_eq!(
+            (
+                &video.stream["codec_name"],
+                &video.stream["codec_tag_string"]
+            ),
+            (&json!(name), &json!(tag)),
+            "{}",
+            video.stream
+        );
+        assert_eq!(
+            (&video.stream["width"], &video.stream["height"]),
+            (&json!(WIDTH), &json!(HEIGHT))
+        );
+        assert_eq!(video.rate, 90_000);
+        let first = &video.frames[0];
+        assert!(
+            first.key && first.picture.as_deref() == Some("I"),
+            "the first frame is a keyframe: {first:?}"
+        );
+        assert!(
+            video
+                .frames
+                .windows(2)
+                .all(|pair| pair[1].pts - pair[0].pts == FRAME_TICKS),
+            "every frame at {FPS} fps"
+        );
+        let frames = i64::try_from(video.frames.len()).unwrap();
+        let last = video.frames.last().unwrap();
+        assert_eq!(
+            last.pts + last.duration - first.pts,
+            frames * FRAME_TICKS,
+            "as many frames as the span holds"
+        );
+    }
+
+    /// A clip of a preloaded camera sending `video` and `audio`: from the
+    /// newest keyframe at least [`BEFORE_MS`] old to [`AFTER_MS`] from the
+    /// start, whole, its streams checked by ffprobe.
+    async fn clip(video: Video, audio: Audio) {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let camera = Camera::start_video(video, audio, Arc::clone(&clock))
+            .await
+            .expect("MediaMTX and ffmpeg (run through `mise run interop`)");
+        let (daemon, control, dir) = daemon(&format!("{}-{}", video.name(), audio.name())).await;
+        put_and_fill(&control, &camera, BEFORE_MS + 1_000, &*clock).await;
+
+        let (_id, result, mut events) = control
+            .subscribe(json!({
+                "type": "clip/start",
+                "stream_id": STREAM,
+                "before_ms": BEFORE_MS,
+                "after_ms": AFTER_MS,
+            }))
+            .await
+            .expect("clip/start");
+        let fetch = fetch_on_socket(&dir.join("lotse.sock"), result["url"].as_str().unwrap()).await;
+        let events = until_stopped(&mut events, &*clock).await;
+        let fetched = fetch.await.expect("the fetch");
+        check_whole(&fetched, &events, "completed");
+        assert_eq!(
+            fetched.clip_id.as_ref(),
+            result["clip_id"].as_str().map(str::to_owned).as_ref()
+        );
+        // `started` and `stopped`: no gap, and no `audio_omitted` warning.
+        assert_eq!(events.len(), 2, "{events:?}");
+        let started = &events[0];
+        let audio_codec = match audio {
+            Audio::None => None,
+            Audio::Aac => Some("aac_lc"),
+            Audio::Opus | Audio::Pcmu | Audio::G722 => Some("opus"),
+        };
+        assert_eq!(
+            (&started["video"], &started["audio"]),
+            (
+                &json!({ "codec": video.lotse_codec(), "width": WIDTH, "height": HEIGHT }),
+                &audio_codec.map_or(Value::Null, |codec| json!({ "codec": codec })),
+            ),
+            "{started}"
+        );
+        let before_ms = started["before_ms"].as_u64().unwrap();
+        assert!(
+            (BEFORE_MS..BEFORE_MS + 1_000 + FRAME_MS).contains(&before_ms),
+            "the newest keyframe {BEFORE_MS} ms ago or more, a second apart: {before_ms}"
+        );
+
+        let file = dir.join("clip.mp4");
+        std::fs::write(&file, &fetched.bytes).unwrap();
+        let (video_frames, audio_frames) = ffprobe(&file);
+        check_video(&video_frames, video);
+        // From the keyframe `before_ms` ago to the first frame at or after
+        // `after_ms` from the start, which the clip leaves out.
+        let span = video_frames.span_ms();
+        assert!(
+            span.abs_diff(before_ms + AFTER_MS) <= 2 * FRAME_MS,
+            "the video covers {span} ms, the clip {before_ms} + {AFTER_MS} ms"
+        );
+        let stopped = events.last().unwrap();
+        assert!(
+            stopped["duration_ms"].as_u64().unwrap().abs_diff(span) <= 2 * FRAME_MS,
+            "{stopped} for {span} ms of video"
+        );
+
+        check_audio(audio, &video_frames, audio_frames.as_ref());
+
+        Arc::into_inner(control).expect("one owner").close().await;
+        let (code, rest) = daemon.terminate();
+        assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
+        camera.stop();
+    }
+
+    /// The file's audio against what the camera sent: none, AAC-LC as sent
+    /// (16 kHz mono, 1024 samples a frame, ISO/IEC 14496-3 §4.5.1.1), or
+    /// Opus in 20 ms packets at 48 kHz (RFC 7587 §4.2), as sent (two
+    /// channels, the count RFC 7587 §7 has every Opus `rtpmap` declare,
+    /// whatever the encoder sends; mono packets decode to both) or
+    /// transcoded (mono), without a hole, over the video's span. The audio starts with the
+    /// video (EBU R37, within 40 ms), except AAC-LC: the clip starts with
+    /// the audio frame playing at the keyframe, 64 ms long, so the keyframe
+    /// falls inside the first audio frame. A transcoded clip's origin lies
+    /// the transcode's delay before its first frame, so its video starts at
+    /// that delay, plus the lead of the audio frame playing at the keyframe
+    /// when that one was captured before it and so came first.
+    fn check_audio(audio: Audio, video: &Probed, sound: Option<&Probed>) {
+        let Some(sound) = sound else {
+            assert_eq!(audio, Audio::None, "an audio stream");
+            return;
+        };
+        let (codec, rate, frame_ticks, channels) = match audio {
+            Audio::Aac => ("aac", 16_000, 1_024, 1),
+            Audio::Opus => ("opus", 48_000, 960, 2),
+            _ => ("opus", 48_000, 960, 1),
+        };
+        assert_eq!(
+            (
+                &sound.stream["codec_name"],
+                &sound.stream["sample_rate"],
+                sound.rate
+            ),
+            (&json!(codec), &json!(rate.to_string()), rate),
+            "{}",
+            sound.stream
+        );
+        assert_eq!(sound.stream["channels"], channels, "{}", sound.stream);
+        assert!(
+            sound
+                .frames
+                .iter()
+                .all(|frame| frame.duration == frame_ticks),
+            "every audio frame {frame_ticks} ticks"
+        );
+        assert_eq!(sound.holes(), [], "the audio runs without a hole");
+        let (video_us, audio_us) = (video.start_us(), sound.start_us());
+        if audio == Audio::Aac {
+            assert!(
+                audio_us <= video_us + 1_000 && video_us < audio_us + 64_000 + 1_000,
+                "audio at {audio_us} us, video at {video_us} us"
+            );
+        } else {
+            assert!(
+                audio_us.abs_diff(video_us) <= AV_SYNC_MS * 1_000,
+                "audio at {audio_us} us, video at {video_us} us"
+            );
+        }
+        let delay_us = match audio {
+            Audio::Pcmu => Some(G711_DELAY_US),
+            Audio::G722 => Some(G722_DELAY_US),
+            _ => None,
+        };
+        if let Some(delay_us) = delay_us {
+            // Whole ticks of 90 kHz, rounded down: 12 µs at most; the audio
+            // frame playing at the keyframe began less than its 20 ms before
+            // it (observed 10 to 20 ms with MediaMTX 1.21.1 and ffmpeg 9.0.2,
+            // 2026-10-23), give or take a millisecond of the two tracks'
+            // Sender Report fits.
+            assert!(
+                video_us + 12 >= delay_us && video_us < delay_us + 21_000,
+                "video at {video_us} us, the delay {delay_us} us"
+            );
+        }
+        // Give or take a frame at each end, and the 20 ms a transcode keeps.
+        let (audio_span, video_span) = (sound.span_ms(), video.span_ms());
+        assert!(
+            audio_span.abs_diff(video_span) <= 2 * sound.ms(frame_ticks) + 20,
+            "audio over {audio_span} ms, video over {video_span} ms"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_clip_h264_aac() {
+        clip(Video::H264, Audio::Aac).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_clip_h265() {
+        clip(Video::H265, Audio::None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_clip_opus() {
+        clip(Video::H264, Audio::Opus).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_clip_pcmu_to_opus() {
+        clip(Video::H264, Audio::Pcmu).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_clip_g722_to_opus() {
+        clip(Video::H264, Audio::G722).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_clip_reconnect() {
+        // ffmpeg restarts while the clip runs, a camera that reboots:
+        // MediaMTX drops the path, the daemon reconnects once ffmpeg
+        // publishes again, and the clip goes on with a hole of the real time
+        // the restart took.
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut camera = Camera::start_video(Video::H264, Audio::Aac, Arc::clone(&clock))
+            .await
+            .expect("MediaMTX and ffmpeg (run through `mise run interop`)");
+        let (daemon, control, dir) = daemon("reconnect").await;
+        put_and_fill(&control, &camera, 1_000, &*clock).await;
+        let (_id, result, mut events) = control
+            .subscribe(json!({ "type": "clip/start", "stream_id": STREAM, "before_ms": 1_000 }))
+            .await
+            .expect("clip/start");
+        let clip_id = result["clip_id"].as_str().unwrap().to_owned();
+        let fetch = fetch_on_socket(&dir.join("lotse.sock"), result["url"].as_str().unwrap()).await;
+        let started = next_event(&mut events, &*clock).await;
+        assert_eq!(started["type"], "started", "{started}");
+
+        camera
+            .restart_publisher(Arc::clone(&clock))
+            .await
+            .expect("ffmpeg restarts");
+        let gap = next_event(&mut events, &*clock).await;
+        assert_eq!(
+            (&gap["type"], &gap["reason"]),
+            (&json!("gap"), &json!("reconnect")),
+            "{gap}"
+        );
+        // Two seconds of the new connection's media in the clip.
+        clock.sleep(Duration::from_secs(2)).await;
+        control
+            .command(json!({ "type": "clip/stop", "clip_id": clip_id }))
+            .await
+            .expect("clip/stop");
+        let mut all = vec![started, gap.clone()];
+        all.extend(until_stopped(&mut events, &*clock).await);
+        let fetched = fetch.await.expect("the fetch");
+        check_whole(&fetched, &all, "stopped");
+        assert_eq!(all.len(), 3, "one gap: {all:?}");
+        assert_eq!(all[2]["gaps"], 1, "{all:?}");
+
+        let file = dir.join("clip.mp4");
+        std::fs::write(&file, &fetched.bytes).unwrap();
+        let (video, sound) = ffprobe(&file);
+        assert!(video.frames[0].key, "the clip starts at a keyframe");
+        assert!(sound.is_some(), "with its audio");
+        // One hole: from the last frame before the restart to the new
+        // connection's first, a keyframe, at the times the gap names (whole
+        // milliseconds, rounded down by both), and a real one: what the
+        // restart took beyond the last frame's length.
+        let holes = video.holes();
+        assert_eq!(holes.len(), 1, "one hole in the video: {holes:?}");
+        let (before, after) = holes[0];
+        let (from, to) = (&video.frames[before], &video.frames[after]);
+        assert!(to.key && to.picture.as_deref() == Some("I"), "{to:?}");
+        assert_eq!(
+            (video.ms(from.pts), video.ms(to.pts)),
+            (
+                gap["from_ms"].as_u64().unwrap(),
+                gap["to_ms"].as_u64().unwrap()
+            ),
+            "{gap}"
+        );
+        let hole_ms = video.ms(to.pts - from.pts - from.duration);
+        assert!(hole_ms >= 100, "a hole of {hole_ms} ms");
+        assert!(
+            video.frames[after..]
+                .windows(2)
+                .all(|pair| pair[1].pts - pair[0].pts == FRAME_TICKS)
+                && video.frames.len() - after >= usize::try_from(FPS).unwrap(),
+            "a second or more of the new connection at {FPS} fps"
+        );
+
+        Arc::into_inner(control).expect("one owner").close().await;
+        let (code, rest) = daemon.terminate();
+        assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
+        camera.stop();
     }
 }

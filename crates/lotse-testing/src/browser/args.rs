@@ -24,7 +24,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<ServeConfig, Stri
             // The page measures a beep, so the camera has audio.
             "--audio" => {
                 audio = Audio::parse(&value)
-                    .filter(|audio| *audio != Audio::None)
+                    .filter(|audio| matches!(audio, Audio::Pcmu | Audio::Aac | Audio::Opus))
                     .ok_or_else(|| format!("--audio {value}: pcmu, aac or opus"))?;
             }
             _ => return Err(format!("unknown flag {flag}")),
@@ -67,7 +67,7 @@ mod tests {
                 .contains("--socket is required")
         );
         assert!(args(&["--socket"]).unwrap_err().contains("needs a value"));
-        for audio in ["none", "mp3"] {
+        for audio in ["none", "mp3", "g722"] {
             let err = args(&["--socket", "/s", "--audio", audio]).unwrap_err();
             assert!(err.contains("pcmu, aac or opus"), "{err}");
         }
