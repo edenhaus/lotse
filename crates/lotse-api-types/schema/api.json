@@ -104,7 +104,7 @@
       "description": "A clip's audio, as `started` reports it.",
       "properties": {
         "codec": {
-          "description": "The codec name (`aac_lc`, `opus`).",
+          "description": "The codec name in the clip (`aac_lc`, `opus`): G.711 and G.722\naudio is transcoded to `opus`.",
           "type": "string"
         }
       },
@@ -412,7 +412,7 @@
       "oneOf": [
         {
           "const": "audio_omitted",
-          "description": "The stream's audio does not fit the clip's container; the clip has\nno audio, and the message names the codec.",
+          "description": "The stream's audio neither fits the clip's container nor can be\ntranscoded into it; the clip has no audio, and the message names\nthe codec.",
           "type": "string"
         }
       ]
@@ -1185,7 +1185,7 @@
             },
             "audio": {
               "default": true,
-              "description": "Take the stream's audio into the clip when it fits the container\n(AAC-LC, Opus; any other codec is left out with an\n`audio_omitted` warning); `false` makes a video-only clip.",
+              "description": "Take the stream's audio into the clip: AAC-LC and Opus as they are,\nG.711 (PCMU, PCMA) and G.722 transcoded to Opus; any other codec is\nleft out with an `audio_omitted` warning. `false` makes a\nvideo-only clip.",
               "type": "boolean"
             },
             "before_ms": {

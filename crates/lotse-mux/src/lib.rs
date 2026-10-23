@@ -113,7 +113,8 @@ struct Clip {
     video: TrackWriter,
     /// The audio track, when the clip has one.
     audio: Option<TrackWriter>,
-    /// The capture time of the clip's first frame: decode time 0.
+    /// Decode time 0: the capture time [`ClipMuxer::set_origin`] gave, else
+    /// the clip's first frame's.
     origin: Option<Instant>,
     /// Where the current fragment's span counts from on the video track:
     /// see [`Clip::began`].
@@ -266,6 +267,14 @@ impl ClipMuxer for Muxer {
         let init = init::init_segment(video, audio)?;
         self.state = State::Running(Box::new(Clip::new(video, audio)));
         Ok(vec![init])
+    }
+
+    fn set_origin(&mut self, origin: Instant) {
+        if let State::Running(clip) = &mut self.state
+            && clip.origin.is_none()
+        {
+            clip.origin = Some(origin);
+        }
     }
 
     fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, ClipError> {

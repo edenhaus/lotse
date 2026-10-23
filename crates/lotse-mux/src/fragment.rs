@@ -35,7 +35,9 @@
 //! The timeline: a track's timescale is its clock rate, so the camera's
 //! timestamps are the file's. Each epoch of a track is presented from its
 //! first frame's capture time after the clip's origin (the capture time
-//! of the clip's first frame), in ticks, and no earlier than where the
+//! of the clip's first frame, or the earlier one the clip task set with
+//! [`ClipMuxer::set_origin`](lotse_core::clip::ClipMuxer::set_origin)),
+//! in ticks, and no earlier than where the
 //! track's presentation so far ends; inside the epoch a sample's
 //! presentation time is that anchor plus its timestamp's distance from
 //! the epoch's first. A reconnect is so a hole of the real time between

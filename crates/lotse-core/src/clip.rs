@@ -16,7 +16,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -106,6 +106,13 @@ pub trait ClipMuxer: Send {
         video: &ClipTrack,
         audio: Option<&ClipTrack>,
     ) -> Result<Vec<Bytes>, ClipError>;
+
+    /// Puts the clip's media time 0 at capture time `origin` instead of
+    /// at its first frame's: a clip whose audio is transcoded moves the
+    /// packets back by the transcode's delay and so starts that much
+    /// before its first frame, where the first packets belong. Called
+    /// after `start`, before the first `push`; ignored otherwise.
+    fn set_origin(&mut self, origin: Instant);
 
     /// Takes the next frame of the `track` kind, in the order the
     /// interleaver hands them out; returns the fragment it completed, if
