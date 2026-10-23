@@ -225,13 +225,13 @@
           "description": "The last event; the subscription ends with it, and the body ends\nonce the bytes before it are read.",
           "properties": {
             "bytes": {
-              "description": "The bytes of the file written to the body.",
+              "description": "The bytes of the file written to the body; 0 when the clip\nended without its worker's last word (`worker_crashed`,\n`stream_deleted`, `stream_changed` by a move to another\nconnection, `shutting_down`, `internal_error` for a malformed\nreport), whose body is then cut.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
             },
             "duration_ms": {
-              "description": "The media time the file covers, in milliseconds.",
+              "description": "The media time the file covers, in milliseconds; 0 for the\nsame ends.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"

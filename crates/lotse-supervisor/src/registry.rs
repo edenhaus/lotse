@@ -1,7 +1,7 @@
 //! The registry: every stream's desired state, the source connections
 //! streams share, each connection's demand and its latest snapshot as the
-//! driver reports it, the viewer sessions, and the subscribers of
-//! `stream/subscribe`.
+//! driver reports it, the viewer sessions, the event clips
+//! ([`crate::clip`]), and the subscribers of `stream/subscribe`.
 //!
 //! One mutex over the maps, taken only on control-plane operations and
 //! never held across an await. Drivers publish snapshots into it, the
@@ -34,6 +34,7 @@ use lotse_ipc::{
 use tokio::sync::{mpsc, watch};
 use tokio_util::task::TaskTracker;
 
+use crate::clip::{ClipCounters, ClipEntry, ClipLimits, FinishedClip};
 use crate::connect::ConnectPermits;
 use crate::driver::{Demand, DriverCommand, DriverSpec};
 use crate::gather::Relayed;
@@ -231,6 +232,12 @@ pub(crate) struct StreamEntry {
     /// When the stream was created, the `since` of a stream without a
     /// connection.
     pub(crate) created: SystemTime,
+    /// The pre-roll window its connection keeps for clips, in
+    /// milliseconds; 0 for none. Not demand: the window fills only while
+    /// the connection is up for a preload or a viewer.
+    pub(crate) preroll_ms: u32,
+    /// Its clips' counters.
+    pub(crate) clips: ClipCounters,
 }
 
 /// A source connection and the streams that reference it.
@@ -247,6 +254,9 @@ pub(crate) struct ConnectionEntry {
     /// Whether the spec its driver last got asks for the camera's
     /// backchannel ([`State::follow_backchannel`]).
     pub(crate) backchannel: bool,
+    /// The pre-roll window its driver last got, in milliseconds
+    /// ([`State::follow_preroll`]).
+    pub(crate) preroll_ms: u32,
     /// The demand the driver follows; dropping it stops the driver.
     pub(crate) demand: watch::Sender<Demand>,
     /// What the driver last reported.
@@ -311,6 +321,15 @@ pub(crate) struct State {
     pub(crate) sessions: BTreeMap<String, SessionEntry>,
     /// The serial of the last session opened.
     pub(crate) last_session: u64,
+    /// Event clips that run, by id.
+    pub(crate) clips: BTreeMap<String, ClipEntry>,
+    /// The bodies of clips that ended before they were fetched, by id,
+    /// until their fetch deadline.
+    pub(crate) finished_clips: BTreeMap<String, FinishedClip>,
+    /// The serial of the last clip started.
+    pub(crate) last_clip: u64,
+    /// The limits on clips and the pre-roll window.
+    pub(crate) clip_limits: ClipLimits,
     /// The demux's sessions; `None` without a front door (tests).
     pub(crate) registrations: Option<Arc<Registrations>>,
 }
@@ -425,6 +444,46 @@ impl State {
         }
     }
 
+    /// Gives connection `id` the largest pre-roll window of the streams on
+    /// it, after `stream_id`'s put or delete. When that changes, its driver
+    /// is told ([`DriverCommand::Preroll`]): a running worker keeps or frees
+    /// its tracks' rings without reconnecting, the next one starts with
+    /// it. A connection gone (its last stream left) has nothing to follow.
+    pub(crate) fn follow_preroll(&mut self, id: &str, stream_id: &str) {
+        let window = self
+            .streams
+            .values()
+            .filter(|stream| stream.sources.iter().any(|source| source.connection == id))
+            .map(|stream| stream.preroll_ms)
+            .max();
+        let (Some(window), Some(entry)) = (window, self.connections.get_mut(id)) else {
+            return;
+        };
+        let before = entry.preroll_ms;
+        if before == window {
+            return;
+        }
+        if entry
+            .commands
+            .try_send(DriverCommand::Preroll { ms: window })
+            .is_err()
+        {
+            tracing::warn!(
+                connection.id = id,
+                "driver queue full; the connection keeps its pre-roll window until the next put"
+            );
+            return;
+        }
+        entry.preroll_ms = window;
+        tracing::info!(
+            connection.id = id,
+            stream.id = stream_id,
+            preroll.before_ms = before,
+            preroll.after_ms = window,
+            "connection pre-roll window changed; nothing reconnects"
+        );
+    }
+
     /// Recomputes which streams reference connection `id` and its demand
     /// from them; a connection nothing references any more is dropped,
     /// which stops its driver.
@@ -448,11 +507,18 @@ impl State {
             .iter()
             .filter(|stream| streams.get(*stream).is_some_and(|s| s.preload))
             .count();
+        // A clip is a viewer: it keeps the connection up while it runs.
         let viewers = self
             .sessions
             .values()
             .filter(|session| session.connection == id)
-            .count();
+            .count()
+            .saturating_add(
+                self.clips
+                    .values()
+                    .filter(|clip| clip.connection == id)
+                    .count(),
+            );
         let demand = Demand {
             preloads: u32::try_from(preloads).unwrap_or(u32::MAX),
             viewers: u32::try_from(viewers).unwrap_or(u32::MAX),
@@ -1175,12 +1241,19 @@ impl State {
             .collect()
     }
 
-    /// A stream's counters, for `metrics/get`.
+    /// A stream's counters, for `metrics/get`: its worker's, and its
+    /// clips'.
     pub(crate) fn stream_stats(&self, entry: &StreamEntry) -> StreamStats {
-        stream_stats_of(
-            self.first_connection(entry)
-                .and_then(|c| c.snapshot.stats.as_ref()),
-        )
+        StreamStats {
+            clips_started: entry.clips.started,
+            clips_completed: entry.clips.completed,
+            clip_gaps: entry.clips.gaps,
+            clip_bytes: entry.clips.bytes,
+            ..stream_stats_of(
+                self.first_connection(entry)
+                    .and_then(|c| c.snapshot.stats.as_ref()),
+            )
+        }
     }
 
     /// The running workers for `metrics/get`, by connection id, each with
@@ -1275,9 +1348,13 @@ impl State {
                     since: connection.talker.since.map(rfc3339),
                 },
             ),
-            // No window is accepted and no clip recorded yet.
-            preroll_ms: 0,
-            clips: Vec::new(),
+            preroll_ms: entry.preroll_ms,
+            clips: self
+                .clips
+                .iter()
+                .filter(|(_, clip)| clip.stream_id == stream_id)
+                .map(|(id, _)| id.clone())
+                .collect(),
         };
         UnreadStream { stream, probes }
     }
@@ -1373,7 +1450,7 @@ fn stream_stats_of(stats: Option<&WorkerStats>) -> StreamStats {
         packets_lost: stats.map_or(0, |s| s.packets_lost),
         packets_out_of_order: stats.map_or(0, |s| s.packets_out_of_order),
         datagrams_rejected: stats.map_or(0, |s| s.datagrams_rejected),
-        // No clip is recorded yet.
+        // The stream's own ([`State::stream_stats`]).
         clips_started: 0,
         clips_completed: 0,
         clip_gaps: 0,
@@ -1582,6 +1659,8 @@ mod tests {
             audio: AudioMode::Auto,
             orientation: Orientation::NoTransform,
             created: SystemTime::UNIX_EPOCH,
+            preroll_ms: 0,
+            clips: ClipCounters::default(),
         }
     }
 
@@ -1653,6 +1732,7 @@ mod tests {
                 port: None,
                 loopback_relay: false,
                 backchannel: false,
+                preroll_ms: 0,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -1738,6 +1818,7 @@ mod tests {
                 port: None,
                 loopback_relay: false,
                 backchannel: false,
+                preroll_ms: 0,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -1989,6 +2070,7 @@ mod tests {
                 port: None,
                 loopback_relay: false,
                 backchannel: false,
+                preroll_ms: 0,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -2051,6 +2133,7 @@ mod tests {
                 port: None,
                 loopback_relay: false,
                 backchannel: false,
+                preroll_ms: 0,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -2197,6 +2280,7 @@ mod tests {
                 port: None,
                 loopback_relay: false,
                 backchannel: false,
+                preroll_ms: 0,
                 key: key.clone(),
                 demand,
                 snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
@@ -2377,6 +2461,7 @@ mod tests {
                 port: None,
                 loopback_relay: false,
                 backchannel: false,
+                preroll_ms: 0,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
