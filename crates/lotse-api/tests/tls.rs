@@ -25,8 +25,8 @@ use lotse_api::tls::{
     HANDSHAKE_TIMEOUT, MAX_HANDSHAKES_PER_ADDRESS, MAX_PENDING_HANDSHAKES, TlsConfig,
 };
 use lotse_api::{
-    BindError, CLOSE_TIMEOUT, Config, ConnectionId, Handler, MAX_PENDING_UPGRADES, Outcome,
-    ServeError, Server, UPGRADE_TIMEOUT,
+    BindError, CLOSE_TIMEOUT, ClipBody, ClipBodyError, Config, ConnectionId, Handler,
+    MAX_PENDING_UPGRADES, Outcome, ServeError, Server, UPGRADE_TIMEOUT,
 };
 use lotse_api_types::command::Command;
 use lotse_api_types::frame::{Hello, HelloTag};
@@ -47,7 +47,7 @@ use tokio_util::sync::CancellationToken;
 const TLS13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
 /// Answers every command with `null`, but `metrics/get` never: a command
-/// the handler is still awaiting.
+/// the handler is still awaiting. Its one clip, `c1`, is four bytes.
 struct Minimal;
 
 /// Notified each time [`Minimal`] begins a `metrics/get`.
@@ -77,6 +77,18 @@ impl Handler for Minimal {
             }
             Outcome::Result(Value::Null)
         }
+    }
+
+    fn clip_body(&self, clip_id: &lotse_core::id::ClipId) -> Result<ClipBody, ClipBodyError> {
+        if clip_id.as_str() != "c1" {
+            return Err(ClipBodyError::NotFound);
+        }
+        let (report, written) = tokio::sync::oneshot::channel();
+        report.send(4).unwrap();
+        Ok(ClipBody {
+            reader: Box::new(&b"ftyp"[..]),
+            written,
+        })
     }
 }
 
@@ -301,6 +313,17 @@ async fn an_allowed_client_gets_the_api_and_is_logged_with_its_pin() {
         )),
         "{text}"
     );
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rfc9112_7_1_the_listener_serves_a_clips_chunked_body_as_the_socket_does() {
+    let client = ClientIdentity::generate().unwrap();
+    let running = start("clip", vec![client.pin]);
+    let connected = connect(running.addr, running.config(ClientCert::Own(&client))).await;
+    // The connection ends with the body: `Connection: close`.
+    let answer = request(connected, "GET", "/v0/clips/c1", "").await.unwrap();
+    assert_eq!(answer, (200, "4\r\nftyp\r\n0\r\n\r\n".to_owned()));
     running.finish().await;
 }
 

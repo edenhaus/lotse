@@ -64,8 +64,8 @@ const CLOSE_UNSUPPORTED_DATA: u16 = 1003;
 /// the client was removed).
 const CLOSE_POLICY_VIOLATION: u16 = 1008;
 
-/// A JSON error body for a refused upgrade.
-fn refuse(status: StatusCode, code: ErrorCode, message: &str) -> Response {
+/// A JSON error body for a refused upgrade or clip request.
+pub(crate) fn refuse(status: StatusCode, code: ErrorCode, message: &str) -> Response {
     let body = serde_json::to_string(&ApiError::new(code, message)).unwrap_or_default();
     (status, [("content-type", "application/json")], body).into_response()
 }
@@ -658,7 +658,10 @@ impl<H: Handler> Connection<H> {
 const fn opens_subscription(command: &Command) -> bool {
     matches!(
         command,
-        Command::StreamSubscribe(_) | Command::WebrtcOffer(_) | Command::SessionAdopt(_)
+        Command::StreamSubscribe(_)
+            | Command::WebrtcOffer(_)
+            | Command::SessionAdopt(_)
+            | Command::ClipStart(_)
     )
 }
 
