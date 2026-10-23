@@ -1769,6 +1769,7 @@ name = "lotse-worker"
 version = "0.0.0-dev"
 dependencies = [
  "allocation-counter",
+ "bytes",
  "libc",
  "lotse-codec",
  "lotse-core",

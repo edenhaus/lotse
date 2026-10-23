@@ -1603,6 +1603,7 @@ dependencies = [
 name = "lotse-worker"
 version = "0.0.0-dev"
 dependencies = [
+ "bytes",
  "libc",
  "lotse-codec",
  "lotse-core",
