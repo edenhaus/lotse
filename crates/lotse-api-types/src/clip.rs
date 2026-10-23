@@ -58,7 +58,8 @@ pub struct ClipVideo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct ClipAudio {
-    /// The codec name (`aac_lc`, `opus`).
+    /// The codec name in the clip (`aac_lc`, `opus`): G.711 and G.722
+    /// audio is transcoded to `opus`.
     pub codec: String,
 }
 
@@ -136,8 +137,9 @@ pub enum ClipEvent {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ClipWarningCode {
-    /// The stream's audio does not fit the clip's container; the clip has
-    /// no audio, and the message names the codec.
+    /// The stream's audio neither fits the clip's container nor can be
+    /// transcoded into it; the clip has no audio, and the message names
+    /// the codec.
     AudioOmitted,
 }
 

@@ -30,7 +30,7 @@
 //! The timeline: a track's timescale is its clock rate, so the camera's
 //! timestamps are the file's. Each epoch of a track starts at its first
 //! frame's capture time after the clip's origin (the capture time of the
-//! clip's first frame), in ticks, and no earlier than where the track's
+//! clip's first frame, or the earlier one the clip task set), in ticks, and no earlier than where the track's
 //! last sample began; inside the epoch a sample's decode time is that
 //! anchor plus its timestamp's distance from the epoch's first. A
 //! reconnect is so a hole of the real time between the epochs, in a new
