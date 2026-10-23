@@ -51,6 +51,7 @@ mod session;
 pub mod worker;
 mod worker_text;
 
+pub use clip::ClipLimits;
 pub use handler::{Environment, FrontDoor, Identity, Supervisor};
 pub use lotse_api::Server as ApiServer;
 pub use lotse_api::TlsConfig as ControlTls;
@@ -94,6 +95,10 @@ pub struct Limits {
     pub worker_threads: usize,
     /// `RLIMIT_AS` per worker.
     pub worker_address_space: u64,
+    /// `limits.preroll_*` and `limits.clip_*`: the pre-roll window and the
+    /// event clips. Without a clip output the supervisor holds
+    /// [`ClipLimits::NONE`] instead.
+    pub clips: ClipLimits,
 }
 
 /// The supervisor's effective settings, resolved by the binary.
@@ -489,6 +494,7 @@ pub(crate) mod test_support {
                 session_grace: Duration::from_secs(10),
                 worker_threads: 1,
                 worker_address_space: 1 << 30,
+                clips: ClipLimits::DEFAULT,
             },
             linger: Duration::from_secs(5),
             connect_concurrency: DEFAULT_CONNECT_CONCURRENCY,
@@ -552,6 +558,7 @@ pub(crate) mod test_support {
                 worker_threads: 1,
                 worker_address_space: 1 << 30,
                 max_sessions: 256,
+                clips: ClipLimits::DEFAULT,
             },
             udp: None,
             front_door: None,

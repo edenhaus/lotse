@@ -203,6 +203,7 @@ lotse-codec = { path = "crates/lotse-codec" }
 lotse-core = { path = "crates/lotse-core" }
 lotse-http = { path = "crates/lotse-http" }
 lotse-ipc = { path = "crates/lotse-ipc" }
+lotse-mux = { path = "crates/lotse-mux" }
 lotse-rtsp = { path = "crates/lotse-rtsp" }
 lotse-sandbox = { path = "crates/lotse-sandbox" }
 lotse-supervisor = { path = "crates/lotse-supervisor" }

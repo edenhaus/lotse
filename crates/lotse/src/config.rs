@@ -18,7 +18,9 @@ use clap::ArgMatches;
 use clap::parser::ValueSource;
 use lotse_core::fingerprint::Fingerprint;
 use lotse_sandbox::{Mode, SandboxConfig};
-use lotse_supervisor::{ControlTls, DEFAULT_CONNECT_CONCURRENCY, Limits, SHUTDOWN_BUDGET};
+use lotse_supervisor::{
+    ClipLimits, ControlTls, DEFAULT_CONNECT_CONCURRENCY, Limits, SHUTDOWN_BUDGET,
+};
 use serde::Deserialize;
 
 use crate::cli::ServeArgs;
@@ -317,6 +319,22 @@ struct LimitsFile {
     worker_threads: Option<usize>,
     /// `limits.worker_address_space`.
     worker_address_space: Option<u64>,
+    /// `limits.preroll_bytes`.
+    preroll_bytes: Option<u64>,
+    /// `limits.preroll_max_ms`.
+    preroll_max_ms: Option<u32>,
+    /// `limits.clip_max_ms`.
+    clip_max_ms: Option<u32>,
+    /// `limits.clip_queue_bytes`.
+    clip_queue_bytes: Option<u64>,
+    /// `limits.clip_fetch_timeout_ms`.
+    clip_fetch_timeout_ms: Option<u64>,
+    /// `limits.clip_start_timeout_ms`.
+    clip_start_timeout_ms: Option<u64>,
+    /// `limits.max_clips`.
+    max_clips: Option<u32>,
+    /// `limits.clips_per_stream`.
+    clips_per_stream: Option<u32>,
 }
 
 /// `[stream]` in the file.
@@ -481,6 +499,72 @@ impl Resolver<'_> {
                 file.worker_address_space,
                 lotse_sandbox::DEFAULT_WORKER_ADDRESS_SPACE,
             ),
+            clips: self.clip_limits(args, file),
+        }
+    }
+
+    /// The pre-roll and clip limits of the `[limits]` group, defaults
+    /// [`ClipLimits::DEFAULT`]; the supervisor holds them when the build has
+    /// a clip output, and passes the worker's share to every worker.
+    fn clip_limits(&mut self, args: &ServeArgs, file: &LimitsFile) -> ClipLimits {
+        let default = ClipLimits::DEFAULT;
+        ClipLimits {
+            preroll_bytes: self.pick(
+                "limits.preroll_bytes",
+                "preroll_bytes",
+                args.preroll_bytes,
+                file.preroll_bytes,
+                default.preroll_bytes,
+            ),
+            preroll_max_ms: self.pick(
+                "limits.preroll_max_ms",
+                "preroll_max_ms",
+                args.preroll_max_ms,
+                file.preroll_max_ms,
+                default.preroll_max_ms,
+            ),
+            clip_max_ms: self.pick(
+                "limits.clip_max_ms",
+                "clip_max_ms",
+                args.clip_max_ms,
+                file.clip_max_ms,
+                default.clip_max_ms,
+            ),
+            clip_queue_bytes: self.pick(
+                "limits.clip_queue_bytes",
+                "clip_queue_bytes",
+                args.clip_queue_bytes,
+                file.clip_queue_bytes,
+                default.clip_queue_bytes,
+            ),
+            fetch_timeout: Duration::from_millis(self.pick(
+                "limits.clip_fetch_timeout_ms",
+                "clip_fetch_timeout_ms",
+                args.clip_fetch_timeout_ms,
+                file.clip_fetch_timeout_ms,
+                millis(default.fetch_timeout),
+            )),
+            start_timeout: Duration::from_millis(self.pick(
+                "limits.clip_start_timeout_ms",
+                "clip_start_timeout_ms",
+                args.clip_start_timeout_ms,
+                file.clip_start_timeout_ms,
+                millis(default.start_timeout),
+            )),
+            max_clips: self.pick(
+                "limits.max_clips",
+                "max_clips",
+                args.max_clips,
+                file.max_clips,
+                default.max_clips,
+            ),
+            clips_per_stream: self.pick(
+                "limits.clips_per_stream",
+                "clips_per_stream",
+                args.clips_per_stream,
+                file.clips_per_stream,
+                default.clips_per_stream,
+            ),
         }
     }
 
@@ -558,6 +642,12 @@ impl Resolver<'_> {
             ignored_rust_log,
         }
     }
+}
+
+/// `duration` in whole milliseconds, as the `*_ms` settings count; one
+/// beyond `u64` saturates.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Client pins, printed comma-separated for the provenance log; they are
@@ -808,6 +898,110 @@ mod tests {
             source_of(&provenance, "webrtc.tcp_listen"),
             ("[::]:18556".into(), Source::Default)
         );
+    }
+
+    #[test]
+    fn the_clip_limits_come_from_flags_over_the_file_over_the_defaults() {
+        let (settings, provenance) = resolve(&["lotse", "serve", "--socket", "/s"]).unwrap();
+        assert_eq!(settings.supervisor.limits.clips, ClipLimits::DEFAULT);
+        assert_eq!(
+            source_of(&provenance, "limits.preroll_bytes"),
+            ("33554432".into(), Source::Default)
+        );
+        assert_eq!(
+            source_of(&provenance, "limits.clip_fetch_timeout_ms"),
+            ("10000".into(), Source::Default)
+        );
+        let dir = std::env::temp_dir().join(format!("lotse-config-clips-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lotse.toml");
+        std::fs::write(
+            &path,
+            "socket = \"/s\"\n[limits]\npreroll_bytes = 1048576\npreroll_max_ms = 30000\n\
+             clip_max_ms = 45000\nclip_queue_bytes = 65536\nclip_fetch_timeout_ms = 3000\n\
+             clip_start_timeout_ms = 4000\nmax_clips = 5\nclips_per_stream = 1\n",
+        )
+        .unwrap();
+        let config = path.to_str().unwrap();
+        let (settings, provenance) = resolve(&["lotse", "serve", "--config", config]).unwrap();
+        let from_file = ClipLimits {
+            preroll_max_ms: 30_000,
+            preroll_bytes: 1 << 20,
+            clip_max_ms: 45_000,
+            clip_queue_bytes: 1 << 16,
+            fetch_timeout: Duration::from_secs(3),
+            start_timeout: Duration::from_secs(4),
+            max_clips: 5,
+            clips_per_stream: 1,
+        };
+        assert_eq!(settings.supervisor.limits.clips, from_file);
+        for (name, value) in [
+            ("limits.preroll_bytes", "1048576"),
+            ("limits.preroll_max_ms", "30000"),
+            ("limits.clip_max_ms", "45000"),
+            ("limits.clip_queue_bytes", "65536"),
+            ("limits.clip_fetch_timeout_ms", "3000"),
+            ("limits.clip_start_timeout_ms", "4000"),
+            ("limits.max_clips", "5"),
+            ("limits.clips_per_stream", "1"),
+        ] {
+            assert_eq!(
+                source_of(&provenance, name),
+                (value.into(), Source::File),
+                "{name}"
+            );
+        }
+        let (flagged, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--config",
+            config,
+            "--preroll-bytes",
+            "2097152",
+            "--preroll-max-ms",
+            "60000",
+            "--clip-max-ms",
+            "90000",
+            "--clip-queue-bytes",
+            "131072",
+            "--clip-fetch-timeout-ms",
+            "6000",
+            "--clip-start-timeout-ms",
+            "2500",
+            "--max-clips",
+            "4",
+            "--clips-per-stream",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(
+            flagged.supervisor.limits.clips,
+            ClipLimits {
+                preroll_max_ms: 60_000,
+                preroll_bytes: 2 << 20,
+                clip_max_ms: 90_000,
+                clip_queue_bytes: 2 << 16,
+                fetch_timeout: Duration::from_secs(6),
+                start_timeout: Duration::from_millis(2_500),
+                max_clips: 4,
+                clips_per_stream: 3,
+            }
+        );
+        assert_eq!(
+            source_of(&provenance, "limits.clip_start_timeout_ms"),
+            ("2500".into(), Source::Flag)
+        );
+        assert_eq!(
+            source_of(&provenance, "limits.clips_per_stream"),
+            ("3".into(), Source::Flag)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn millis_saturates_beyond_u64() {
+        assert_eq!(millis(Duration::from_millis(1_500)), 1_500);
+        assert_eq!(millis(Duration::MAX), u64::MAX);
     }
 
     #[test]

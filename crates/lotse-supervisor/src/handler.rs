@@ -67,6 +67,10 @@ use crate::{Settings, millis};
 /// The output kind that opens WebRTC sessions.
 const WEBRTC: &str = "webrtc";
 
+/// The output kind of event clips, announced when the build has a clip
+/// container (`Registries::clip`).
+const CLIP: &str = "clip";
+
 /// What `hello` and `info` always announce beyond the outputs.
 const FEATURES: [&str; 1] = ["session_adopt"];
 
@@ -206,7 +210,7 @@ impl Supervisor {
         // Without a clip output the workers refuse every clip: no window
         // and no clip is accepted, which `info` reports.
         state.clip_limits = if environment.registries.clip.is_some() {
-            ClipLimits::DEFAULT
+            settings.limits.clips
         } else {
             ClipLimits::NONE
         };
@@ -329,12 +333,14 @@ impl Supervisor {
             .collect()
     }
 
-    /// The output kinds compiled in.
+    /// The output kinds compiled in: the session outputs, then `clip` with
+    /// a clip container.
     fn outputs(&self) -> Vec<String> {
         self.registries
             .outputs
             .kinds()
             .into_iter()
+            .chain(self.registries.clip.is_some().then_some(CLIP))
             .map(str::to_owned)
             .collect()
     }
@@ -5037,6 +5043,50 @@ mod tests {
 
     fn demand(s: &Supervisor) -> Demand {
         *s.shared.lock().connections["c1"].demand.borrow()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_configured_clip_limits_are_reported_and_enforced() {
+        let mut settings = session_settings();
+        settings.limits.clips = ClipLimits {
+            preroll_max_ms: 30_000,
+            preroll_bytes: 1 << 20,
+            clip_max_ms: 45_000,
+            max_clips: 5,
+            clips_per_stream: 1,
+            ..ClipLimits::DEFAULT
+        };
+        let mut environment = environment("/bin/sh");
+        environment.registries.clip = Some(Arc::new(
+            lotse_core::test_util::FakeClipMuxerFactory::default(),
+        ));
+        let s = Supervisor::new(settings, environment, Arc::new(SystemClock));
+        let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
+        assert_eq!(info["outputs"], json!(["clip"]));
+        assert_eq!(s.hello().outputs, ["clip"]);
+        assert_eq!(
+            (
+                &info["limits"]["preroll_max_ms"],
+                &info["limits"]["preroll_bytes"],
+                &info["limits"]["clip_max_ms"],
+                &info["limits"]["max_clips"],
+                &info["limits"]["clips_per_stream"],
+            ),
+            (
+                &json!(30_000),
+                &json!(1 << 20),
+                &json!(45_000),
+                &json!(5),
+                &json!(1)
+            )
+        );
+        let windowed = json!({ "id": 2, "type": "stream/put", "stream_id": "front",
+                               "sources": [{ "url": "fake://127.0.0.1/" }], "preroll_ms": 30_001 });
+        let err = error(call(&s, &windowed.to_string()).await);
+        assert_eq!(
+            err.message,
+            "`preroll_ms` is 30001, the maximum is 30000 (`limits.preroll_max_ms`)"
+        );
     }
 
     #[tokio::test]
