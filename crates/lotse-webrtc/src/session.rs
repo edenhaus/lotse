@@ -785,6 +785,25 @@ fn talkback_rx(
     })
 }
 
+/// The audio codecs the engine answers the m-line `mid` with, in its
+/// order ([`engine_codecs`](crate::audio::engine_codecs)), once it
+/// answered that m-line: str0m 0.24.0 keeps the payload types of an
+/// m-line's first answer (`Media::set_remote_pts`, read 2026-10-24) and
+/// answers it with its own codecs among them, in its order
+/// (`Media::remote_pts`); none for an m-line it has not answered.
+fn kept_codecs(rtc: &Rtc, mid: &str) -> Vec<CodecFamily> {
+    let Some(media) = rtc.media(Mid::from(mid)) else {
+        return Vec::new();
+    };
+    let kept = media.remote_pts();
+    rtc.codec_config()
+        .params()
+        .iter()
+        .filter(|params| kept.contains(&params.pt()))
+        .filter_map(|params| engine_family(params.spec().codec))
+        .collect()
+}
+
 /// Whether `datagram`, as the engine sends it, is an RTP packet of the
 /// SSRC `audio`: a first byte in 128 to 191 is RTP or RTCP (RFC 7983 §7),
 /// a second byte in 192 to 223 RTCP (RFC 5761 §4), and the SSRC follows
@@ -961,7 +980,7 @@ fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&TalkbackTarget>) {
             );
         }
         Talkback::Off(reason) => tracing::info!(reason, "talk-back not negotiated"),
-        Talkback::Busy => {
+        Talkback::Busy { .. } => {
             tracing::info!("talk-back declined: another session holds the backchannel");
         }
         Talkback::NotRequested => tracing::debug!("talk-back not requested"),
@@ -1068,7 +1087,7 @@ impl Session {
         log_talkback(&plan, request.backchannel.as_ref());
         let talkback = match plan.talkback {
             Talkback::Negotiated { mid, codec, .. } => talkback_rx(&rtc, &plan, mid, codec),
-            Talkback::Off(_) | Talkback::Busy | Talkback::NotRequested => None,
+            Talkback::Off(_) | Talkback::Busy { .. } | Talkback::NotRequested => None,
         };
 
         // `playout-delay` caps every delay the browser adds to video,
@@ -1119,7 +1138,9 @@ impl Session {
     /// Answers the re-offer `offer` on the live engine
     /// ([`SessionEngine::renegotiate`]): the audio m-lines are planned
     /// again ([`AudioPlan`]) for the `backchannel` the camera offers now
-    /// and the worker's `claim` of it, the offer rewritten for the engine
+    /// and the worker's `claim` of it, talk-back on an m-line the engine
+    /// answered before in the codec it kept first ([`AudioPlan::kept`],
+    /// [`kept_codecs`]), the offer rewritten for the engine
     /// as the first one was, and the writers follow the plan: the
     /// downlink writer stays when the stream's audio still goes down the
     /// same m-line, is parked for another, whose own writer is taken up
@@ -1158,7 +1179,8 @@ impl Session {
             backchannel,
             claim,
             &self.order,
-        );
+        )
+        .kept(|mid| kept_codecs(&self.rtc, mid));
         let directed = plan.engine_offer(offer);
         // The re-offer's candidates are ignored: the trickled ones reached
         // the agent already. Counted on the answer's log line.
@@ -1210,7 +1232,7 @@ impl Session {
         log_talkback(&plan, backchannel);
         self.talkback = match plan.talkback {
             Talkback::Negotiated { mid, codec, .. } => talkback_rx(&self.rtc, &plan, mid, codec),
-            Talkback::Off(_) | Talkback::Busy | Talkback::NotRequested => None,
+            Talkback::Off(_) | Talkback::Busy { .. } | Talkback::NotRequested => None,
         };
         let talkback = self
             .talkback

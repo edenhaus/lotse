@@ -1412,7 +1412,13 @@ async fn next_loss(talkback: Option<&mut Talkback>) -> Option<BackchannelRefused
 /// Answers a re-offer once its talk-back is arbitrated: has the engine
 /// answer it and reports the answer (`Renegotiated`) and the decline, if
 /// any; a refused re-offer is reported (`RenegotiateRefused`) and leaves
-/// the session as it was, a backchannel it claimed let go again.
+/// the session as it was, a backchannel it claimed let go again. An
+/// answer without talk-back lets go of a backchannel the session still
+/// holds, declined `unsupported`: the engine may find what the output
+/// judged negotiable from the offer alone
+/// ([`OutputFactory::talkback_request`]) not receivable, on an m-line
+/// it answered before, and a claim for no talk-back would keep every
+/// other session's out.
 async fn answer(ctx: &SessionCtx, opened: &mut Opened, sdp: &str, mut arbitration: Arbitration) {
     arbitration.log();
     if let (Some(talkback), Some(claim)) = (opened.talkback.as_mut(), arbitration.granted.take()) {
@@ -1429,9 +1435,21 @@ async fn answer(ctx: &SessionCtx, opened: &mut Opened, sdp: &str, mut arbitratio
             {
                 talkback.let_go();
             }
+            let negotiated = opened.engine.talkback();
+            if negotiated.is_none()
+                && let Some(talkback) = opened.talkback.as_mut()
+                && talkback.holds()
+            {
+                talkback.let_go();
+                tracing::info!(
+                    "talk-back declined: the engine answered the re-offer without it; the backchannel is let go"
+                );
+                arbitration.decline = Some(Decline::Unsupported(
+                    "the session answered without talk-back".to_owned(),
+                ));
+            }
             // A session that drops talk-back stays reported, with what
             // it counted so far.
-            let negotiated = opened.engine.talkback();
             if negotiated.is_some() {
                 ctx.talkback.ever_negotiated.store(true, Ordering::Relaxed);
             }
@@ -1787,7 +1805,10 @@ mod tests {
     /// in which codec: it asks (`talk` in the offer) for talk-back the
     /// camera's backchannel takes (not `unsupported`, nor `one-way` for a
     /// session with stream audio, `audio`, in a codec it takes,
-    /// [`scripted_codec`]), and the session holds the backchannel.
+    /// [`scripted_codec`]), and the session holds the backchannel; but
+    /// never where the offer says `kept`, which the output still judges
+    /// negotiable, as an engine whose m-line kept a codec the camera does
+    /// not take.
     fn scripted_talkback(
         offer: &str,
         audio: bool,
@@ -1796,6 +1817,7 @@ mod tests {
     ) -> Option<lotse_core::uplink::UplinkCodec> {
         if !offer.contains("talk")
             || offer.contains("unsupported")
+            || offer.contains("kept")
             || (audio && offer.contains("one-way"))
             || claim != TalkbackClaim::Granted
         {
@@ -2545,6 +2567,87 @@ mod tests {
         request_close(&a.close, "session_closed", "bye".into());
         assert!(poll_once(&mut a_task).await.is_ready());
         assert_eq!(change(&mut feed).await, ("a".into(), "session_closed"));
+    }
+
+    /// A re-offer whose talk-back the output judged negotiable, which the
+    /// engine answers without (an m-line it answered before kept a codec
+    /// the camera does not take), lets go of the backchannel the session
+    /// claimed for it, or held from before, and is declined
+    /// `unsupported` after the answer; another session claims it then.
+    #[tokio::test]
+    async fn a_re_offer_the_engine_answers_without_talk_back_lets_go_of_the_backchannel() {
+        let declined = IpcEvent::TalkbackDeclined {
+            reason: "unsupported".into(),
+            status: None,
+            message: "talk-back declined: the session answered without talk-back".into(),
+        };
+        let (arbiter, mut feed) = arbiter();
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = pin!(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(a.events().len(), 1, "answered");
+        // Claimed for the re-offer, and let go once it is answered.
+        a.control(reoffer("v=0 talk kept"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("renegotiate v=0 talk kept claim=Granted"));
+        assert_eq!(
+            a.events(),
+            [
+                IpcEvent::Renegotiated {
+                    sdp: "answer to v=0 talk kept".into(),
+                    talkback: None,
+                },
+                declined.clone(),
+            ]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        assert_eq!(change(&mut feed).await, ("a".into(), "renegotiated"));
+        assert!(!a.talkback.ever_negotiated.load(Ordering::Relaxed));
+        // Held from before: let go all the same.
+        a.control(reoffer("v=0 talk"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Renegotiated {
+                sdp: "answer to v=0 talk".into(),
+                talkback: Some("pcmu".into()),
+            }]
+        );
+        a.control(reoffer("v=0 talk kept"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("renegotiate v=0 talk kept claim=Granted"));
+        assert_eq!(
+            a.events(),
+            [
+                IpcEvent::Renegotiated {
+                    sdp: "answer to v=0 talk kept".into(),
+                    talkback: None,
+                },
+                declined,
+            ]
+        );
+        assert_eq!(change(&mut feed).await, ("a".into(), "renegotiated"));
+        // The backchannel is free for another session.
+        let (b, task) = session_on(
+            "b",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut b_task = pin!(task);
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert!(b.script.called("open backchannel=true claim=Granted"));
+        assert_eq!(change(&mut feed).await, ("b".into(), "claimed"));
     }
 
     /// The stream audio a session sends weighs its offer's talk-back

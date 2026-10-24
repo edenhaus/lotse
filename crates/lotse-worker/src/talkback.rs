@@ -1356,6 +1356,12 @@ impl Talkback {
         }
     }
 
+    /// Whether the session holds the backchannel: an offer's claim was
+    /// adopted ([`Talkback::adopt`]) and not let go since.
+    pub(crate) const fn holds(&self) -> bool {
+        self.claim.is_some()
+    }
+
     /// The next loss of the session's backchannel session the arbiter
     /// reports, and why; pending until one comes.
     pub(crate) async fn lost(&mut self) -> Option<BackchannelRefused> {
