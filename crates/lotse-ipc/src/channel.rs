@@ -107,9 +107,14 @@ impl Socket {
     fn new(fd: Descriptor) -> io::Result<Self> {
         rustix::io::ioctl_fionbio(&fd, true)?;
         rustix::io::fcntl_setfd(&fd, FdFlags::CLOEXEC)?;
-        Ok(Self {
-            fd: AsyncFd::new(fd)?,
-        })
+        #[expect(
+            deprecated,
+            reason = "`AsyncFd::register` is `unsafe`, which the workspace forbids; a `Descriptor` \
+                      keeps its contract: it owns its descriptor, or is standard input, which \
+                      nothing closes, and always returns the same number"
+        )]
+        let fd = AsyncFd::new(fd)?;
+        Ok(Self { fd })
     }
 }
 
