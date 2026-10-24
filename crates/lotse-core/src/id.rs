@@ -1,5 +1,5 @@
-//! The identifiers a client and the daemon exchange: [`StreamId`] and
-//! [`SessionId`]. Both match `^[A-Za-z0-9._-]{1,128}$`,
+//! The identifiers a client and the daemon exchange: [`StreamId`],
+//! [`SessionId`] and [`ClipId`]. All match `^[A-Za-z0-9._-]{1,128}$`,
 //! checked on construction so an invalid id never exists inside the daemon.
 //! The API maps [`IdError`] to `invalid_stream_id` or `invalid_request`.
 
@@ -106,6 +106,13 @@ identifier! {
     SessionId
 }
 
+identifier! {
+    /// The id of an event clip (`clip_id` in the API), which names its
+    /// bytes' route. The client passes its own; the daemon generates a ULID
+    /// when it does not.
+    ClipId
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -121,7 +128,23 @@ mod tests {
         for id in ["front", "reolink_1234.main-sub", "A", "0", "-", "_", "."] {
             assert_eq!(StreamId::new(id).unwrap().as_str(), id);
             assert_eq!(SessionId::new(id).unwrap().as_str(), id);
+            assert_eq!(ClipId::new(id).unwrap().as_str(), id);
         }
+    }
+
+    #[test]
+    fn a_clip_id_keeps_the_same_rules_and_round_trips() {
+        assert_eq!(ClipId::new("").unwrap_err(), IdError::Empty);
+        assert_eq!(
+            ClipId::new("a/b").unwrap_err(),
+            IdError::InvalidChar { ch: '/', index: 1 }
+        );
+        let id: ClipId = "01JB.clip".parse().unwrap();
+        assert_eq!(
+            (id.to_string().as_str(), id.as_ref()),
+            ("01JB.clip", "01JB.clip")
+        );
+        assert_eq!(format!("{id:?}"), "ClipId(\"01JB.clip\")");
     }
 
     #[test]

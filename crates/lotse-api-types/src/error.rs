@@ -65,8 +65,17 @@ pub enum ErrorCode {
     /// The offer could not be parsed, or a re-offer changes the video
     /// m-line a session keeps, or adds one to a session without video.
     InvalidSdp,
-    /// A re-offer has no video m-line, and its session plays video.
+    /// A re-offer has no video m-line, and its session plays video; or
+    /// `clip/start` on a stream without a video track.
     NoVideoTrack,
+    /// `GET /v0/clips/{clip_id}` (HTTP 404) of a clip that is not open:
+    /// never started, already ended, or an id that is no clip id.
+    ClipNotFound,
+    /// `clip/start` with the id of a clip that is still open.
+    ClipIdInUse,
+    /// `GET /v0/clips/{clip_id}` (HTTP 409) of a clip whose bytes another
+    /// request already took: a clip has one body.
+    ClipAlreadyFetched,
 }
 
 impl ErrorCode {
@@ -97,6 +106,9 @@ impl ErrorCode {
             Self::BackchannelUnsupported => "backchannel_unsupported",
             Self::InvalidSdp => "invalid_sdp",
             Self::NoVideoTrack => "no_video_track",
+            Self::ClipNotFound => "clip_not_found",
+            Self::ClipIdInUse => "clip_id_in_use",
+            Self::ClipAlreadyFetched => "clip_already_fetched",
         }
     }
 
@@ -187,6 +199,9 @@ mod tests {
             ErrorCode::InvalidSdp,
             ErrorCode::NoVideoTrack,
             ErrorCode::NotPermitted,
+            ErrorCode::ClipNotFound,
+            ErrorCode::ClipIdInUse,
+            ErrorCode::ClipAlreadyFetched,
         ];
         for code in all {
             let json = serde_json::to_value(code).unwrap();
@@ -198,6 +213,9 @@ mod tests {
         // A session event's code is not a result's.
         assert_eq!(ErrorCode::parse("peer_closed"), None);
         assert_eq!(ErrorCode::parse("h264_profile_mismatch"), None);
+        // Nor is a clip event's.
+        assert_eq!(ErrorCode::parse("audio_omitted"), None);
+        assert_eq!(ErrorCode::parse("not_fetched"), None);
     }
 
     #[test]

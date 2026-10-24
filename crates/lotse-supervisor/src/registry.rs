@@ -20,7 +20,7 @@ use lotse_api_types::session::{CloseCode, Session, SessionEvent};
 use lotse_api_types::stream::{
     AudioMode, BackchannelState, ConnectionInfo, LastError, Orientation, SourceBackchannel,
     SourceInfo, Stream, StreamBackchannel, StreamEvent, StreamState, StreamStats, TalkerReason,
-    TrackInfo, WorkerInfo,
+    TrackInfo, TrackPreroll, WorkerInfo,
 };
 use lotse_api_types::time::rfc3339;
 use lotse_core::clock::Clock;
@@ -28,8 +28,8 @@ use lotse_core::connection::{ConnectionError, ConnectionState};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_ipc::{
-    SessionEvent as WorkerSessionEvent, SessionSpec, TalkbackStats, TrackInfo as IpcTrackInfo,
-    WorkerStats,
+    PrerollStats, SessionEvent as WorkerSessionEvent, SessionSpec, TalkbackStats,
+    TrackInfo as IpcTrackInfo, WorkerStats,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::task::TaskTracker;
@@ -1275,6 +1275,9 @@ impl State {
                     since: connection.talker.since.map(rfc3339),
                 },
             ),
+            // No window is accepted and no clip recorded yet.
+            preroll_ms: 0,
+            clips: Vec::new(),
         };
         UnreadStream { stream, probes }
     }
@@ -1370,6 +1373,11 @@ fn stream_stats_of(stats: Option<&WorkerStats>) -> StreamStats {
         packets_lost: stats.map_or(0, |s| s.packets_lost),
         packets_out_of_order: stats.map_or(0, |s| s.packets_out_of_order),
         datagrams_rejected: stats.map_or(0, |s| s.datagrams_rejected),
+        // No clip is recorded yet.
+        clips_started: 0,
+        clips_completed: 0,
+        clip_gaps: 0,
+        clip_bytes: 0,
     }
 }
 
@@ -1400,6 +1408,16 @@ fn track_dto(track: &IpcTrackInfo, stats: Option<&WorkerStats>) -> TrackInfo {
         channels: track.params.channels,
         frames: counters.map_or(0, |t| t.frames),
         bytes: counters.map_or(0, |t| t.packet_bytes.max(t.frame_bytes)),
+        preroll: counters.and_then(|t| t.preroll).map(preroll_dto),
+    }
+}
+
+/// A track's pre-roll ring as the API reports it.
+const fn preroll_dto(ring: PrerollStats) -> TrackPreroll {
+    TrackPreroll {
+        bytes: ring.bytes,
+        held_ms: ring.held_ms,
+        truncations: ring.truncations,
     }
 }
 
@@ -2663,5 +2681,58 @@ mod tests {
         let dto = registry.stream_dto("front", &entry).stream;
         assert_eq!(dto.tracks.len(), 1);
         assert_eq!((dto.tracks[0].id.as_str(), dto.tracks[0].frames), ("a1", 5));
+        assert_eq!((dto.preroll_ms, dto.clips.len()), (0, 0));
+        assert_eq!(dto.tracks[0].preroll, None, "no window");
+    }
+
+    #[test]
+    fn a_tracks_pre_roll_ring_is_reported_as_its_worker_counts_it() {
+        let ring = PrerollStats {
+            bytes: 14_201_337,
+            held_ms: 29_800,
+            truncations: 1,
+        };
+        let stats = WorkerStats {
+            tracks: vec![(
+                "v0".into(),
+                TrackStats {
+                    packet_bytes: 0,
+                    frames: 0,
+                    frame_bytes: 0,
+                    frames_dropped_oversize: 0,
+                    frames_over_browser_limit: 0,
+                    preroll: Some(ring),
+                },
+            )],
+            sessions: 0,
+            send_failures: 0,
+            av_sync_lost: 0,
+            relay_unbound: 0,
+            tasks: 0,
+            packets_lost: 0,
+            packets_out_of_order: 0,
+            datagrams_rejected: 0,
+            talkback: Vec::new(),
+            backchannel: None,
+        };
+        let video = track_dto(&ipc_track("v0", None, None), Some(&stats));
+        assert_eq!(
+            video.preroll,
+            Some(TrackPreroll {
+                bytes: 14_201_337,
+                held_ms: 29_800,
+                truncations: 1
+            })
+        );
+        let clips = stream_stats_of(Some(&stats));
+        assert_eq!(
+            (
+                clips.clips_started,
+                clips.clips_completed,
+                clips.clip_gaps,
+                clips.clip_bytes
+            ),
+            (0, 0, 0, 0)
+        );
     }
 }
