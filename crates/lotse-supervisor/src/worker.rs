@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::task::AbortOnDropHandle;
 
+use crate::clip::ClipLimits;
 use crate::memory::MemoryProbe;
 use crate::net::turn_client::{RelayOwner, TurnClient, uplink};
 use crate::worker_text::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES};
@@ -64,6 +65,10 @@ pub struct WorkerConfig {
     /// `--max-sessions`: the daemon's `limits.max_sessions`, the most
     /// sessions one worker can be asked to hold.
     pub max_sessions: u32,
+    /// The worker's share of the clip limits, the same values the
+    /// supervisor checks against: `--preroll-bytes`, `--clip-max-ms`,
+    /// `--clip-queue-bytes`, `--clip-start-timeout-ms` and `--max-clips`.
+    pub clips: ClipLimits,
 }
 
 /// What a worker tells the supervisor, mapped onto trusted types.
@@ -225,6 +230,18 @@ impl WorkerManager {
             .arg(self.config.worker_address_space.to_string())
             .arg("--max-sessions")
             .arg(self.config.max_sessions.to_string());
+        let clips = &self.config.clips;
+        command
+            .arg("--preroll-bytes")
+            .arg(clips.preroll_bytes.to_string())
+            .arg("--clip-max-ms")
+            .arg(clips.clip_max_ms.to_string())
+            .arg("--clip-queue-bytes")
+            .arg(clips.clip_queue_bytes.to_string())
+            .arg("--clip-start-timeout-ms")
+            .arg(clips.start_timeout.as_millis().to_string())
+            .arg("--max-clips")
+            .arg(clips.max_clips.to_string());
         if !connect_ports.is_empty() {
             let ports: Vec<String> = connect_ports.iter().map(u16::to_string).collect();
             command.arg("--connect-ports").arg(ports.join(","));
@@ -1220,6 +1237,14 @@ mod tests {
         let dir = crate::test_support::private_dir("worker-recording");
         let mut config = crate::test_support::environment("/bin/sh").worker;
         config.binary = recording_worker(&dir);
+        config.clips = ClipLimits {
+            preroll_bytes: 1 << 20,
+            clip_max_ms: 45_000,
+            clip_queue_bytes: 1 << 16,
+            start_timeout: Duration::from_millis(2_500),
+            max_clips: 3,
+            ..ClipLimits::DEFAULT
+        };
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
         let manager = WorkerManager::new(config, Some(udp));
         let mut worker = manager.spawn(&[554, 8554], true).unwrap();
@@ -1272,6 +1297,13 @@ mod tests {
         assert!(
             args.contains("--connect-ports\n554,8554\n--loopback-relay\n"),
             "{args}"
+        );
+        assert!(
+            args.contains(
+                "--preroll-bytes\n1048576\n--clip-max-ms\n45000\n--clip-queue-bytes\n65536\n\
+                 --clip-start-timeout-ms\n2500\n--max-clips\n3\n"
+            ),
+            "the clip limits as the supervisor holds them: {args}"
         );
         // A kill is sent once, however often it is asked for.
         let captured = Captured::default();
@@ -1442,6 +1474,7 @@ mod tests {
                 worker_threads: 1,
                 worker_address_space: 1 << 30,
                 max_sessions: 256,
+                clips: ClipLimits::DEFAULT,
             },
             None,
         );
