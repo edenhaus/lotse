@@ -49,8 +49,9 @@ use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
 use lotse_core::track::{Track, TrackId, TrackLimits};
 use lotse_ipc::{
-    Channel, Decoded, IpcError, Sender, SessionEvent, SessionSpec, SourceSpec, SourceState,
-    ToSupervisor, ToWorker, TrackInfo, TrackStats, WorkerStats,
+    Channel, ClipReport, ClipSpec, Decoded, IpcError, PrerollStats, Sender, SessionEvent,
+    SessionSpec, SourceSpec, SourceState, ToSupervisor, ToWorker, TrackInfo, TrackStats,
+    WorkerStats,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -388,21 +389,27 @@ impl Serving<'_> {
     /// One received message. A hand-off whose connection the kernel
     /// discarded, because this process had no free descriptor for it,
     /// costs that connection alone: the browser sees it close and tries
-    /// another pair, and the camera's other viewers keep playing. Any
-    /// other message that lost its descriptors ends the worker, as it
-    /// cannot do its work without them.
+    /// another pair, and the camera's other viewers keep playing. A clip
+    /// whose pipe was discarded likewise costs that clip alone, refused as
+    /// one without a pipe. Any other message that lost its descriptors
+    /// ends the worker, as it cannot do its work without them.
     async fn on_decoded(
         &mut self,
         decoded: Decoded<ToWorker>,
     ) -> Result<Option<ExitReason>, Error> {
         if decoded.fds_truncated {
-            let ToWorker::IceTcp { peer, .. } = &decoded.message else {
-                return Err(IpcError::FdsTruncated.into());
-            };
-            if let Some(lost) = self.lost_hand_offs.hit(self.clock.now()) {
-                tracing::warn!(%peer, lost, "ice-tcp hand-off arrived without its connection: no free descriptor; dropped");
+            match &decoded.message {
+                ToWorker::IceTcp { peer, .. } => {
+                    if let Some(lost) = self.lost_hand_offs.hit(self.clock.now()) {
+                        tracing::warn!(%peer, lost, "ice-tcp hand-off arrived without its connection: no free descriptor; dropped");
+                    }
+                    return Ok(None);
+                }
+                ToWorker::StartClip(spec) => {
+                    tracing::warn!(clip.id = %spec.clip_id, "clip arrived without its pipe: no free descriptor");
+                }
+                _ => return Err(IpcError::FdsTruncated.into()),
             }
-            return Ok(None);
         }
         self.on_message(decoded.message, decoded.fds).await
     }
@@ -446,13 +453,7 @@ impl Serving<'_> {
             ToWorker::SwitchSource(spec) => self.on_switch_source(&spec).await?,
             ToWorker::Backchannel { asks } => self.on_backchannel(asks),
             ToWorker::ProbeConnectGranted { probe } => self.on_probe_granted(probe),
-            ToWorker::SwitchConnectGranted => {
-                if let Some(standby) = &self.standby {
-                    standby.runner.gate.grant();
-                } else {
-                    tracing::debug!("connect grant without a standby; ignored");
-                }
-            }
+            ToWorker::SwitchConnectGranted => self.on_switch_connect_granted(),
             ToWorker::Sockets => self.on_sockets(fds),
             ToWorker::IceTcp {
                 local_ufrag,
@@ -518,11 +519,46 @@ impl Serving<'_> {
             ToWorker::ReleaseBackchannel { session_id } => {
                 self.release_backchannel(session_id.as_deref());
             }
+            ToWorker::Preroll { ms } => on_preroll(ms),
+            ToWorker::StartClip(spec) => self.refuse_clip(spec, fds).await?,
+            ToWorker::StopClip { clip_id } => on_stop_clip(&clip_id),
             ToWorker::Shutdown { deadline_ms } => {
                 return self.on_shutdown(deadline_ms).await.map(Some);
             }
         }
         Ok(None)
+    }
+
+    /// `StartClip`: this worker runs no clips, so it refuses `spec` at once
+    /// with `internal_error` and closes its pipe, if one came, which ends
+    /// the clip's body for the reader.
+    async fn refuse_clip(&mut self, spec: ClipSpec, pipe: Vec<OwnedFd>) -> Result<(), Error> {
+        tracing::warn!(
+            clip.id = %spec.clip_id,
+            pipe = !pipe.is_empty(),
+            "clip refused: this worker runs no clips"
+        );
+        drop(pipe);
+        let stopped = ToSupervisor::Clip {
+            clip_id: spec.clip_id,
+            event: ClipReport::Stopped {
+                reason: "internal_error".to_owned(),
+                bytes: 0,
+                duration_ms: 0,
+                gaps: 0,
+            },
+        };
+        self.tx.send_msg(&stopped, &[]).await?;
+        Ok(())
+    }
+
+    /// `SwitchConnectGranted`: the standby may connect now.
+    fn on_switch_connect_granted(&self) {
+        if let Some(standby) = &self.standby {
+            standby.runner.gate.grant();
+        } else {
+            tracing::debug!("connect grant without a standby; ignored");
+        }
     }
 
     /// `ConnectGranted`: the running source may connect now.
@@ -858,6 +894,20 @@ async fn refuse_session(
     )
     .await?;
     Ok(())
+}
+
+/// `Preroll`: the connection's pre-roll window is `ms` now, which this
+/// worker, running no clips, keeps no ring for.
+fn on_preroll(ms: u32) {
+    tracing::debug!(
+        window_ms = ms,
+        "pre-roll window received; this worker keeps none"
+    );
+}
+
+/// `StopClip`: this worker runs no clips, so `clip_id` is none of its.
+fn on_stop_clip(clip_id: &str) {
+    tracing::debug!(clip.id = %clip_id, "stop for a clip this worker does not run; ignored");
 }
 
 /// Refuses a re-offer for `session_id` that no session takes, saying why
@@ -1274,6 +1324,11 @@ fn track_stats(track: &Track) -> TrackStats {
         frame_bytes: stats.frame_bytes,
         frames_dropped_oversize: stats.frames_dropped_oversize,
         frames_over_browser_limit: stats.frames_over_browser_limit,
+        preroll: stats.preroll.map(|ring| PrerollStats {
+            bytes: ring.bytes,
+            held_ms: u32::try_from(ring.held.as_millis()).unwrap_or(u32::MAX),
+            truncations: ring.truncations,
+        }),
     }
 }
 
@@ -1362,6 +1417,7 @@ mod tests {
             peer_host: "cam".into(),
             peer_addrs: vec![],
             backoff: lotse_ipc::BackoffPosition::default(),
+            preroll_ms: 0,
         }
     }
 
@@ -4846,5 +4902,172 @@ mod tests {
         clock.advance(Duration::from_millis(1));
         assert_ne!(a, jitter_seed(&clock));
         assert_eq!(STATS_INTERVAL, Duration::from_secs(1));
+    }
+
+    fn start_clip(clip_id: &str) -> ToWorker {
+        ToWorker::StartClip(ClipSpec {
+            clip_id: clip_id.into(),
+            before_ms: 10_000,
+            after_ms: None,
+            audio: true,
+        })
+    }
+
+    fn refused(clip_id: &str) -> ToSupervisor {
+        ToSupervisor::Clip {
+            clip_id: clip_id.into(),
+            event: ClipReport::Stopped {
+                reason: "internal_error".into(),
+                bytes: 0,
+                duration_ms: 0,
+                gaps: 0,
+            },
+        }
+    }
+
+    /// What is left to read from `reader` until its end: nothing, when
+    /// every write end is closed unwritten.
+    fn drained(mut reader: io::PipeReader) -> Vec<u8> {
+        let mut rest = Vec::new();
+        io::Read::read_to_end(&mut reader, &mut rest).unwrap();
+        rest
+    }
+
+    /// A worker that runs no clips refuses every `StartClip` at once with
+    /// `internal_error` and closes the pipe that came with it, and one
+    /// without a pipe too; a pre-roll window and a stop for a clip it
+    /// does not run send nothing back, and it keeps serving.
+    #[tokio::test]
+    async fn a_clip_is_refused_with_its_pipe_closed_and_a_window_or_a_stop_is_ignored() {
+        let (logs, _guard) = Logs::capture();
+        let mut h = start();
+        h.next().await;
+        h.tx.send_msg(&ToWorker::Preroll { ms: 30_000 }, &[])
+            .await
+            .unwrap();
+        h.tx.send_msg(
+            &ToWorker::StopClip {
+                clip_id: "k0".into(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        let (reader, writer) = io::pipe().unwrap();
+        let writer = OwnedFd::from(writer);
+        h.tx.send_msg(&start_clip("k1"), &[writer.as_fd()])
+            .await
+            .unwrap();
+        drop(writer);
+        h.tx.send_msg(&start_clip("k2"), &[]).await.unwrap();
+        assert_eq!(
+            h.next().await,
+            refused("k1"),
+            "nothing for the window or the stop"
+        );
+        assert_eq!(h.next().await, refused("k2"));
+        assert!(drained(reader).is_empty());
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "pre-roll window received; this worker keeps none"
+            ),
+            1
+        );
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "stop for a clip this worker does not run; ignored"
+            ),
+            1
+        );
+        let refusals = logs.lines(Level::WARN, "clip refused: this worker runs no clips");
+        assert_eq!(refusals.len(), 2, "{refusals:?}");
+        assert!(refusals[0].fields.contains("pipe=true"), "{refusals:?}");
+        assert!(refusals[1].fields.contains("pipe=false"), "{refusals:?}");
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            ended(h.worker).await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+    }
+
+    /// WRK-20 for a clip: its pipe arrives while the worker's descriptor
+    /// table is full, so the kernel discards it. That costs the one clip,
+    /// refused as one without a pipe, never the worker.
+    #[tokio::test]
+    async fn a_clip_whose_pipe_found_no_free_descriptor_is_refused_and_the_worker_lives() {
+        let (logs, _guard) = Logs::capture();
+        let mut h = start();
+        h.next().await;
+        let (reader, writer) = io::pipe().unwrap();
+        let writer = OwnedFd::from(writer);
+        let limit = starve_descriptors();
+        h.tx.send_msg(&start_clip("k1"), &[writer.as_fd()])
+            .await
+            .unwrap();
+        // Closed only once the worker received: closed before, its number
+        // would be free for the passed descriptor.
+        let answer = h.next().await;
+        rustix::process::setrlimit(rustix::process::Resource::Nofile, limit).unwrap();
+        drop(writer);
+        assert_eq!(answer, refused("k1"));
+        assert!(drained(reader).is_empty());
+        assert_eq!(
+            logs.count(
+                Level::WARN,
+                "clip arrived without its pipe: no free descriptor"
+            ),
+            1
+        );
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            ended(h.worker).await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+    }
+
+    /// A track's pre-roll ring reaches its wire counters, the held window
+    /// in milliseconds; a track without a window reports none.
+    #[test]
+    fn a_track_s_pre_roll_ring_reaches_its_counters() {
+        let clock = FakeClock::default();
+        let t0 = clock.now();
+        let track = Track::new(
+            TrackId::new(Kind::Video, 0),
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+            TrackLimits::default(),
+            t0,
+        );
+        assert_eq!(track_stats(&track).preroll, None);
+        track.set_preroll(Some(Duration::from_secs(30)));
+        for n in 0..3_u32 {
+            let at = t0 + Duration::from_millis(u64::from(n) * 1_500);
+            assert!(track.publish_frame(lotse_core::media::MediaFrame {
+                ts: lotse_core::media::MediaTime::from_ticks(i64::from(n) * 135_000),
+                wallclock: at,
+                arrival: at,
+                keyframe: true,
+                discontinuity: false,
+                epoch: 0,
+                payload: vec![0, 0, 0, 1, 0x65, 0x88].into(),
+            }));
+        }
+        let ring = track_stats(&track).preroll.unwrap();
+        let core = track.stats().preroll.unwrap();
+        assert_eq!(
+            (ring.bytes, ring.held_ms, ring.truncations),
+            (core.bytes, 3_000, 0)
+        );
+        assert!(ring.bytes > 0);
     }
 }
