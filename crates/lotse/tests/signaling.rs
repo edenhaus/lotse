@@ -111,6 +111,7 @@ fn supervisor_with(linger: Duration) -> Daemon {
             session_grace: Duration::from_secs(10),
             worker_threads: 1,
             worker_address_space: 1 << 30,
+            clips: lotse_supervisor::ClipLimits::DEFAULT,
         },
         linger,
         connect_concurrency: lotse_supervisor::DEFAULT_CONNECT_CONCURRENCY,
@@ -135,6 +136,7 @@ fn supervisor_with(linger: Duration) -> Daemon {
             worker_threads: 1,
             worker_address_space: 1 << 30,
             max_sessions: 256,
+            clips: lotse_supervisor::ClipLimits::DEFAULT,
         },
         udp: Some(Arc::clone(&bound.socket)),
         front_door: Some(FrontDoor {
