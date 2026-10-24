@@ -66,6 +66,11 @@ const FEATURES: [&str; 1] = ["session_adopt"];
 /// ([`Supervisor::features`]).
 const TWO_WAY_AUDIO: &str = "two_way_audio";
 
+/// The longest pre-roll window `stream/put` accepts while the supervisor
+/// keeps none for clips: none at all, so a window asked for is refused
+/// rather than ignored.
+const PREROLL_MAX_MS: u32 = 0;
+
 /// The video codec families a viewer can play: MJPEG is ingested and
 /// reported per track, but no output negotiates it.
 const VIDEO_CODECS: [CodecFamily; 2] = [CodecFamily::H264, CodecFamily::H265];
@@ -274,6 +279,13 @@ impl Supervisor {
                 max_sessions_per_stream: limits.max_sessions_per_stream,
                 max_connections: limits.max_connections,
                 session_grace_ms: millis(limits.session_grace),
+                // Clips are not recorded yet: no window and no clip is
+                // accepted, which these zeros say.
+                preroll_max_ms: PREROLL_MAX_MS,
+                preroll_bytes: 0,
+                clip_max_ms: 0,
+                max_clips: 0,
+                clips_per_stream: 0,
             },
             sandbox: self.identity.sandbox.clone(),
         }
@@ -433,6 +445,18 @@ impl Supervisor {
                 ErrorCode::InvalidRequest,
                 "sources must name at least one source",
             ));
+        }
+        if put.preroll_ms > PREROLL_MAX_MS {
+            return Outcome::Error(
+                ApiError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "`preroll_ms` is {}, the maximum is {PREROLL_MAX_MS} (`limits.preroll_max_ms`)",
+                        put.preroll_ms
+                    ),
+                )
+                .with_detail("field", "preroll_ms"),
+            );
         }
         let mut validated = Vec::with_capacity(put.sources.len());
         for source in &put.sources {
@@ -1137,6 +1161,19 @@ impl Supervisor {
         )
     }
 
+    /// `clip/start`: refused while the supervisor records no clips
+    /// (`limits.max_clips` 0).
+    fn clip_start() -> Outcome {
+        tracing::debug!("clip/start refused: this daemon records no clips");
+        Outcome::Error(
+            ApiError::new(
+                ErrorCode::LimitReached,
+                "this daemon records no clips (`limits.max_clips` is 0)",
+            )
+            .with_detail("limit", "max_clips"),
+        )
+    }
+
     /// Answers one command.
     async fn dispatch(&self, connection: ConnectionId, command: Command) -> Outcome {
         match command {
@@ -1169,6 +1206,11 @@ impl Supervisor {
             }
             Command::BackchannelRelease(release) => {
                 self.backchannel_release(&release.stream_id, release.session_id.as_deref())
+            }
+            Command::ClipStart(_) => Self::clip_start(),
+            // Idempotent: no clip is open, so there is none to stop.
+            Command::ClipStop(_) => {
+                Outcome::Result(serde_json::Value::Object(serde_json::Map::new()))
             }
             Command::Ping(_)
             | Command::Schema(_)
@@ -1649,6 +1691,52 @@ mod tests {
         assert!(
             logged[3].contains("command=\"clients/remove\""),
             "{logged:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn without_clips_no_window_or_clip_is_taken_and_info_says_so() {
+        let s = supervisor("/bin/sh", Arc::new(SystemClock));
+        let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
+        for limit in [
+            "preroll_max_ms",
+            "preroll_bytes",
+            "clip_max_ms",
+            "max_clips",
+            "clips_per_stream",
+        ] {
+            assert_eq!(info["limits"][limit], 0, "{limit}");
+        }
+        let captured = Captured::default();
+        let _logs = captured.install();
+        // A window asked for is refused, not ignored.
+        let windowed = json!({ "id": 2, "type": "stream/put", "stream_id": "front",
+                               "sources": [{ "url": "fake://127.0.0.1/" }], "preroll_ms": 1 });
+        let err = error(call(&s, &windowed.to_string()).await);
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert_eq!(
+            err.message,
+            "`preroll_ms` is 1, the maximum is 0 (`limits.preroll_max_ms`)"
+        );
+        assert_eq!(err.details["field"], "preroll_ms");
+        assert!(s.shared.lock().streams.is_empty());
+        let err = error(call(&s, r#"{"id":3,"type":"clip/start","stream_id":"front"}"#).await);
+        assert_eq!(err.code, ErrorCode::LimitReached);
+        assert_eq!(err.details["limit"], "max_clips");
+        assert_eq!(
+            captured
+                .lines("clip/start refused: this daemon records no clips")
+                .len(),
+            1
+        );
+        // Stopping is idempotent: there is no clip to stop.
+        let stopped = result(call(&s, r#"{"id":4,"type":"clip/stop","clip_id":"c1"}"#).await);
+        assert_eq!(stopped, json!({}));
+        // Nor has any id a body.
+        let clip_id = lotse_core::id::ClipId::new("c1").unwrap();
+        assert_eq!(
+            s.clip_body(&clip_id).unwrap_err(),
+            lotse_api::ClipBodyError::NotFound
         );
     }
 

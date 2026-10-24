@@ -10,9 +10,11 @@
 //! ignored by clients, so additive changes need no version bump.
 //!
 //! Standards: JSON Schema 2020-12, RFC 3339, ULID, Semantic Versioning
-//! 2.0.0.
+//! 2.0.0; the clip DTOs describe fragmented MP4 files (ISO/IEC 14496-12)
+//! whose bytes are chunked HTTP bodies (RFC 9112 §7.1).
 
 pub mod clients;
+pub mod clip;
 pub mod command;
 pub mod error;
 pub mod frame;
@@ -30,4 +32,4 @@ pub use error::{ApiError, ErrorCode};
 pub use frame::{EventFrame, Failure, Hello, Pong, Shutdown, Success};
 pub use info::{InfoResult, Metrics};
 pub use stream::{Stream, StreamEvent, StreamState};
-pub use version::{API_VERSION, ApiVersion, WS_PATH};
+pub use version::{API_VERSION, ApiVersion, CLIPS_PATH, WS_PATH};

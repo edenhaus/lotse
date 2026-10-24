@@ -11,6 +11,10 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+# `test_util`: a stand-in for the handler's clips, for tests here and in other crates.
+[features]
+test-util = ["tokio/io-util"]
+
 [dependencies]
 axum = { workspace = true }
 futures-util = { workspace = true }
@@ -24,7 +28,7 @@ subtle = { workspace = true } # the pairing secret compared in constant time
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "macros"] } # the Unix and TLS listeners, channels
 tokio-rustls = { workspace = true } # the TLS listener's handshake on a tokio stream
-tokio-util = { workspace = true, features = ["rt"] } # shutdown tokens; `rt`: the pairing redemptions a closed connection still waits for
+tokio-util = { workspace = true, features = ["rt", "io"] } # shutdown tokens; `rt`: the pairing redemptions a closed connection still waits for; `io`: a clip's pipe read as a stream of chunks
 tracing = { workspace = true }
 rustix = { workspace = true, features = ["process", "fs"] } # umask around the bind (`fs` for the mode type)
 lotse-api-types = { workspace = true }
@@ -36,6 +40,11 @@ lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock` drives
 tokio-tungstenite = { version = "0.29", default-features = false } # the client side of the tests; axum's own WebSocket engine
 lotse-testing = { workspace = true } # the TLS listener's clients, well-behaved and not
 tracing-subscriber = { workspace = true } # captures log lines with their spans
+
+# The clip route against `test_util`'s clips.
+[[test]]
+name = "clip"
+required-features = ["test-util"]
 
 [lints]
 workspace = true

@@ -11,8 +11,8 @@
 //! client: before that no client exists to be incompatible with, so an
 //! API change does not bump it.
 
-/// Defines [`API_VERSION`], [`CURRENT`] and [`WS_PATH`] from one
-/// `major, minor, patch`, so the three cannot disagree.
+/// Defines [`API_VERSION`], [`CURRENT`], [`WS_PATH`] and [`CLIPS_PATH`]
+/// from one `major, minor, patch`, so they cannot disagree.
 macro_rules! api_version {
     ($major:literal, $minor:literal, $patch:literal) => {
         /// The API version in `hello.api` and the schema bundle's `api`.
@@ -27,6 +27,10 @@ macro_rules! api_version {
 
         /// The WebSocket path: `/v<major>/ws`.
         pub const WS_PATH: &str = concat!("/v", $major, "/ws");
+
+        /// Where event clips' bytes are served: `/v<major>/clips`, each
+        /// clip at `/v<major>/clips/{clip_id}` ([`crate::clip::clip_path`]).
+        pub const CLIPS_PATH: &str = concat!("/v", $major, "/clips");
     };
 }
 
@@ -102,6 +106,7 @@ mod tests {
         assert_eq!(API_VERSION, "0.1.0");
         assert_eq!(CURRENT, v(0, 1, 0));
         assert_eq!(WS_PATH, "/v0/ws");
+        assert_eq!(CLIPS_PATH, "/v0/clips");
         assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
     }
 

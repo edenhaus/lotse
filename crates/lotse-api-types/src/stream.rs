@@ -297,6 +297,30 @@ pub struct TrackInfo {
     pub frames: u64,
     /// Bytes seen.
     pub bytes: u64,
+    /// What the track's pre-roll ring holds for clips; null without a
+    /// window (`stream/put`'s `preroll_ms` 0). The worker's figures,
+    /// pushed once per second.
+    #[serde(default)]
+    pub preroll: Option<TrackPreroll>,
+}
+
+/// A track's pre-roll ring, as `stream/get` reports it: whole GOPs of the
+/// newest media, kept for clips while the stream has a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct TrackPreroll {
+    /// The memory the ring holds: its frames' payloads plus a fixed cost
+    /// per frame, at most `limits.preroll_bytes`. The open GOP is also in
+    /// the track's GOP cache, so the two overlap; the frames are shared,
+    /// not copied.
+    pub bytes: u64,
+    /// The window it holds, in milliseconds: from its oldest keyframe to
+    /// its newest frame; shorter than `preroll_ms` while it fills, after
+    /// a reconnect, or when `limits.preroll_bytes` caps it.
+    pub held_ms: u32,
+    /// GOPs larger than `limits.preroll_bytes` the ring could keep only
+    /// the start of.
+    pub truncations: u64,
 }
 
 /// A stream's counters.
@@ -330,6 +354,19 @@ pub struct StreamStats {
     /// another synchronization source.
     #[serde(default)]
     pub datagrams_rejected: u64,
+    /// Clips started on the stream.
+    #[serde(default)]
+    pub clips_started: u64,
+    /// Clips that ended with their whole file written: `completed`,
+    /// `stopped` or `max_duration`.
+    #[serde(default)]
+    pub clips_completed: u64,
+    /// Gaps in the stream's clips.
+    #[serde(default)]
+    pub clip_gaps: u64,
+    /// Bytes of clip files written to their bodies.
+    #[serde(default)]
+    pub clip_bytes: u64,
 }
 
 /// A stream, as `stream/get` returns it and `stream/list` lists it.
@@ -357,6 +394,13 @@ pub struct Stream {
     /// Who talks to the camera through its backchannel.
     #[serde(default)]
     pub backchannel: StreamBackchannel,
+    /// The pre-roll window `stream/put` asked for, in milliseconds; 0
+    /// without one. What each track holds is its `preroll`.
+    #[serde(default)]
+    pub preroll_ms: u32,
+    /// Open clip ids.
+    #[serde(default)]
+    pub clips: Vec<String>,
 }
 
 /// The talker of a stream's backchannel, as `stream/get` reports it.
@@ -606,6 +650,11 @@ mod tests {
                 channels: None,
                 frames: 1,
                 bytes: 2,
+                preroll: Some(TrackPreroll {
+                    bytes: 14_201_337,
+                    held_ms: 29_800,
+                    truncations: 0,
+                }),
             },
             TrackInfo {
                 id: "a1".into(),
@@ -621,6 +670,7 @@ mod tests {
                 channels: Some(2),
                 frames: 3,
                 bytes: 4,
+                preroll: None,
             },
         ]
     }
@@ -687,8 +737,20 @@ mod tests {
                 talker: Some("s1".into()),
                 since: Some("2026-09-28T11:02:04.000Z".into()),
             },
+            preroll_ms: 30_000,
+            clips: vec!["01JB".into()],
         };
         let json = serde_json::to_value(&stream).unwrap();
+        assert_eq!(
+            (&json["preroll_ms"], &json["clips"]),
+            (&json!(30_000), &json!(["01JB"]))
+        );
+        assert_eq!(
+            json["tracks"][0]["preroll"],
+            json!({ "bytes": 14_201_337, "held_ms": 29_800, "truncations": 0 })
+        );
+        assert!(json["tracks"][1]["preroll"].is_null(), "no window, null");
+        assert_eq!(json["stats"]["clip_bytes"], 0);
         assert_eq!(json["state"], "live");
         assert_eq!(json["sources"][0]["connection"]["worker"]["pid"], 4711);
         assert_eq!(json["stats"]["frames_dropped"], 0);
@@ -775,6 +837,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(stream.backchannel, StreamBackchannel::default());
+        assert_eq!((stream.preroll_ms, stream.clips.len()), (0, 0));
         let source: SourceInfo = serde_json::from_value(json!({
             "url": "rtsp://cam/", "protocol": "rtsp", "state": "live", "reconnects": 0,
             "connection": { "id": "c1", "worker": null }
@@ -822,6 +885,7 @@ mod tests {
             ),
             (None, None, None, None, None)
         );
+        assert_eq!(track.preroll, None, "an older daemon keeps no window");
     }
 
     #[test]
@@ -834,6 +898,15 @@ mod tests {
                 partial.datagrams_rejected
             ),
             (0, 0, 0)
+        );
+        assert_eq!(
+            (
+                partial.clips_started,
+                partial.clips_completed,
+                partial.clip_gaps,
+                partial.clip_bytes
+            ),
+            (0, 0, 0, 0)
         );
     }
 

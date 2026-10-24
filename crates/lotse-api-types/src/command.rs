@@ -112,6 +112,15 @@ pub struct StreamPut {
     /// Changing only this never reconnects.
     #[serde(default)]
     pub orientation: Orientation,
+    /// Keep the last `preroll_ms` milliseconds of the stream's media in
+    /// memory, so a `clip/start` can begin before it was asked for; 0, the
+    /// default, keeps none. At most `limits.preroll_max_ms`, and each track
+    /// holds at most `limits.preroll_bytes` of whole GOPs, so the window
+    /// held may be shorter (`stream/get` reports it). Not a reason to
+    /// connect: the window fills only while `preload` or a viewer keeps
+    /// the source connected. Changing only this never reconnects.
+    #[serde(default)]
+    pub preroll_ms: u32,
 }
 
 /// `stream/get`.
@@ -304,6 +313,66 @@ pub struct BackchannelRelease {
     pub session_id: Option<String>,
 }
 
+/// `clip/start`: records an event clip of a stream into one fragmented MP4
+/// file, whose bytes `GET /v0/clips/{clip_id}` serves once (the result's
+/// `url`); the subscription's events say how it goes, `stopped` last.
+///
+/// The clip starts at the newest keyframe captured at least `before_ms`
+/// ago that the stream's pre-roll window holds, else at the oldest one it
+/// holds, and with none held (no window, or the source not live yet) at
+/// the next one. A running clip keeps the source connected, as a viewer
+/// does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ClipStart {
+    /// The command id, which becomes the subscription id.
+    pub id: u64,
+    /// The stream to record.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub stream_id: String,
+    /// The client's clip id, `^[A-Za-z0-9._-]{1,128}$`, unique among the
+    /// open clips; a ULID when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub clip_id: Option<String>,
+    /// How far before now the clip should start, in milliseconds, up to
+    /// `limits.preroll_max_ms`; what the window holds bounds what it gets
+    /// (`started.before_ms`).
+    #[serde(default)]
+    pub before_ms: u32,
+    /// How long the clip runs after now, in milliseconds, 1 to
+    /// `limits.clip_max_ms`; absent, it runs until `clip/stop`, at most
+    /// `limits.clip_max_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub after_ms: Option<u32>,
+    /// Take the stream's audio into the clip when it fits the container
+    /// (AAC-LC, Opus; any other codec is left out with an
+    /// `audio_omitted` warning); `false` makes a video-only clip.
+    #[serde(default = "with_audio")]
+    pub audio: bool,
+}
+
+/// `clip/start`'s default `audio`: with it.
+const fn with_audio() -> bool {
+    true
+}
+
+/// `clip/stop`: ends a clip cleanly, its last fragment written and its
+/// body ended with its last chunk; idempotent, so an id that is no open
+/// clip succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ClipStop {
+    /// The command id.
+    pub id: u64,
+    /// The clip.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub clip_id: String,
+}
+
 /// Every command, tagged by `type`. Each variant's schema title names the
 /// Python client's class for it (`StreamPutCommand`), and its `type` names
 /// the client's method: `domain/verb` is `client.domain.verb(...)`, a type
@@ -406,6 +475,15 @@ pub enum Command {
     #[serde(rename = "backchannel/release")]
     #[cfg_attr(feature = "schema", schemars(title = "BackchannelReleaseCommand"))]
     BackchannelRelease(BackchannelRelease),
+    /// `clip/start`: records an event clip of a stream; its bytes are
+    /// fetched with `GET /v0/clips/{clip_id}`.
+    #[serde(rename = "clip/start")]
+    #[cfg_attr(feature = "schema", schemars(title = "ClipStartCommand"))]
+    ClipStart(ClipStart),
+    /// `clip/stop`: ends a clip cleanly; idempotent.
+    #[serde(rename = "clip/stop")]
+    #[cfg_attr(feature = "schema", schemars(title = "ClipStopCommand"))]
+    ClipStop(ClipStop),
 }
 
 impl Command {
@@ -432,6 +510,8 @@ impl Command {
         "session/close",
         "session/adopt",
         "backchannel/release",
+        "clip/start",
+        "clip/stop",
     ];
 
     /// The command's id.
@@ -456,6 +536,8 @@ impl Command {
             Self::SessionGet(c) | Self::SessionClose(c) | Self::SessionAdopt(c) => c.id,
             Self::SessionList(c) => c.id,
             Self::BackchannelRelease(c) => c.id,
+            Self::ClipStart(c) => c.id,
+            Self::ClipStop(c) => c.id,
         }
     }
 
@@ -483,6 +565,8 @@ impl Command {
             Self::SessionClose(_) => "session/close",
             Self::SessionAdopt(_) => "session/adopt",
             Self::BackchannelRelease(_) => "backchannel/release",
+            Self::ClipStart(_) => "clip/start",
+            Self::ClipStop(_) => "clip/stop",
         }
     }
 }
@@ -682,6 +766,19 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             cap_stream_id(subscribe.stream_id.as_deref().unwrap_or_default())?;
         }
         Command::ClientsRemove(remove) => cap_chars("pin", &remove.pin, MAX_PIN_CHARS)?,
+        Command::ClipStart(start) => {
+            cap_stream_id(&start.stream_id)?;
+            let clip_id = start.clip_id.as_deref().unwrap_or_default();
+            cap_chars("clip_id", clip_id, MAX_ID_CHARS)?;
+            if start.after_ms == Some(0) {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidRequest,
+                    "`after_ms` must be at least 1; leave it out for a clip that runs until `clip/stop`",
+                )
+                .with_detail("field", "after_ms"));
+            }
+        }
+        Command::ClipStop(stop) => cap_chars("clip_id", &stop.clip_id, MAX_ID_CHARS)?,
         Command::Ping(_)
         | Command::Info(_)
         | Command::MetricsGet(_)
@@ -842,6 +939,14 @@ mod tests {
                 r#"{"id":21,"type":"clients/remove","pin":"00"}"#,
                 "clients/remove",
             ),
+            (
+                r#"{"id":22,"type":"clip/start","stream_id":"front","clip_id":"01JB","before_ms":10000,"after_ms":20000,"audio":true}"#,
+                "clip/start",
+            ),
+            (
+                r#"{"id":23,"type":"clip/stop","clip_id":"01JB"}"#,
+                "clip/stop",
+            ),
         ];
         for (index, (text, name)) in cases.iter().enumerate() {
             let_assert!(Ok(command) = parse_command(text), "{text}");
@@ -853,6 +958,10 @@ mod tests {
             assert_eq!(serde_json::from_value::<Command>(json).unwrap(), command);
         }
         assert_eq!(Command::NAMES.len(), cases.len());
+    }
+
+    #[test]
+    fn the_fields_a_command_leaves_out_take_their_defaults() {
         let minimal = parse_command(
             r#"{"id":1,"type":"stream/put","stream_id":"x","sources":[{"url":"rtsp://c/"}]}"#,
         )
@@ -863,6 +972,7 @@ mod tests {
                 && minimal.audio == AudioMode::Auto
                 && minimal.orientation == Orientation::NoTransform
                 && minimal.sources[0].options.is_empty()
+                && minimal.preroll_ms == 0
         );
         // A client may send only the offer and the stream; the rest defaults.
         let_assert!(
@@ -941,6 +1051,66 @@ mod tests {
             json,
             json!({ "id": 3, "type": "backchannel/release", "stream_id": "x" })
         );
+    }
+
+    #[test]
+    fn a_clip_starts_with_audio_from_now_until_stopped_unless_asked_otherwise() {
+        let_assert!(
+            Command::ClipStart(start) =
+                parse_command(r#"{"id":1,"type":"clip/start","stream_id":"front"}"#).unwrap()
+        );
+        assert_eq!(
+            (
+                start.clip_id.as_deref(),
+                start.before_ms,
+                start.after_ms,
+                start.audio
+            ),
+            (None, 0, None, true)
+        );
+        // It serializes back with the defaults it took, the absent ones left out.
+        assert_eq!(
+            serde_json::to_value(Command::ClipStart(start)).unwrap(),
+            json!({ "id": 1, "type": "clip/start", "stream_id": "front", "before_ms": 0, "audio": true })
+        );
+        let_assert!(
+            Command::ClipStart(start) = parse_command(
+                r#"{"id":2,"type":"clip/start","stream_id":"front","after_ms":1,"audio":false}"#
+            )
+            .unwrap()
+        );
+        assert_eq!((start.after_ms, start.audio), (Some(1), false));
+        // A clip of no time is a mistake, not an open-ended one.
+        let err = parse_command(r#"{"id":3,"type":"clip/start","stream_id":"front","after_ms":0}"#)
+            .unwrap_err();
+        assert_eq!(
+            (err.id, err.error.code),
+            (Some(3), ErrorCode::InvalidRequest)
+        );
+        assert_eq!(err.error.details["field"], "after_ms");
+        assert_eq!(err.error.details["type"], "clip/start");
+        for frame in [
+            r#"{"id":4,"type":"clip/start","stream_id":"front","after_ms":-1}"#,
+            r#"{"id":5,"type":"clip/start","stream_id":"front","before_ms":4294967296}"#,
+            r#"{"id":6,"type":"clip/start","stream_id":"front","preroll_ms":1}"#,
+            r#"{"id":7,"type":"clip/stop"}"#,
+        ] {
+            let err = parse_command(frame).unwrap_err();
+            assert_eq!(err.error.code, ErrorCode::InvalidRequest, "{frame}");
+        }
+    }
+
+    #[test]
+    fn a_put_keeps_a_pre_roll_window_only_when_it_asks_for_one() {
+        let_assert!(
+            Command::StreamPut(put) = parse_command(
+                r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"url":"rtsp://c/"}],"preroll_ms":30000}"#
+            )
+            .unwrap()
+        );
+        assert_eq!(put.preroll_ms, 30_000);
+        let json = serde_json::to_value(Command::StreamPut(put)).unwrap();
+        assert_eq!(json["preroll_ms"], 30_000);
     }
 
     /// `frame` parsed, or the field and message of its refusal; the
@@ -1057,6 +1227,21 @@ mod tests {
     }
 
     #[test]
+    fn a_clips_ids_are_capped_like_a_sessions() {
+        let text = |n: usize| "x".repeat(n);
+        let clip_as =
+            |n| json!({ "id": 1, "type": "clip/start", "stream_id": "a", "clip_id": text(n) });
+        let stop_as = |n| json!({ "id": 1, "type": "clip/stop", "clip_id": text(n) });
+        for frame in [clip_as(MAX_ID_CHARS), stop_as(MAX_ID_CHARS)] {
+            assert!(limited(&frame).is_ok(), "{}", frame["type"]);
+        }
+        for frame in [clip_as(MAX_ID_CHARS + 1), stop_as(MAX_ID_CHARS + 1)] {
+            let kind = &frame["type"];
+            assert_eq!(limited(&frame).unwrap_err().0, "clip_id", "{kind}");
+        }
+    }
+
+    #[test]
     fn every_stream_id_is_capped_at_parse_as_an_invalid_stream_id_without_its_value() {
         let id = |n: usize| "x".repeat(n);
         let frames = |n: usize| {
@@ -1067,6 +1252,7 @@ mod tests {
                 json!({ "id": 1, "type": "stream/subscribe", "stream_id": id(n) }),
                 json!({ "id": 1, "type": "webrtc/offer", "stream_id": id(n), "sdp": "v=0" }),
                 json!({ "id": 1, "type": "backchannel/release", "stream_id": id(n), "session_id": "s" }),
+                json!({ "id": 1, "type": "clip/start", "stream_id": id(n) }),
             ]
         };
         for frame in frames(MAX_ID_CHARS) {
