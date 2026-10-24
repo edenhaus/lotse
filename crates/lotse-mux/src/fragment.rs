@@ -50,24 +50,31 @@
 //! frame duration after the latest presentation time of the samples
 //! before it, if later: reordered video's last sample in decode order is
 //! not its last in presentation order, and the durations, steps of the
-//! decode times, are not how long the samples before it are shown.
-//! Durations are the distances to the next sample's decode time; the
-//! last one of an epoch, which has no next, takes its frame's own length
-//! where the codec states one (an AAC-LC frame's 1024 samples, ISO/IEC
-//! 14496-3 §4.4.1; an Opus packet's frames, RFC 6716 §3.1), else the one
-//! before it (video), cut short so its presentation ends where the next
-//! epoch begins when that is sooner and no sooner than the track's
-//! presentation so far ends, and an epoch captured before the track's
-//! presentation ends starts where it ends.
+//! decode times, are not how long the samples before it are shown. The
+//! nominal frame duration is the smallest distance between two of the
+//! epoch's timestamps, wherever they are in decode order: a GOP a
+//! reconnect cut short, its later pictures lost, keeps it as long as two
+//! of the pictures it kept are a frame apart (`B1` and `I0` of
+//! `I0 P3 B1`), and short of that it is the shortest the timestamps show,
+//! which cannot tell a lost picture from a longer frame (`I0 P4 B2` of a
+//! pyramid is `I0 P2 B1` at half the rate). Durations are the distances
+//! to the next sample's decode time; the last one of an epoch, which has
+//! no next, takes its frame's own length where the codec states one (an
+//! AAC-LC frame's 1024 samples, ISO/IEC 14496-3 §4.4.1; an Opus packet's
+//! frames, RFC 6716 §3.1), else the one before it (video), cut short so
+//! its presentation ends where the next epoch begins when that is sooner
+//! and no sooner than the track's presentation so far ends, and an epoch
+//! captured before the track's presentation ends starts where it ends.
 //!
 //! Video whose timestamps go back in decode order is reordered
 //! (B-frames): from the first such frame on, the epoch's decode times
-//! step by its nominal frame duration, the smallest distance seen between
-//! two consecutive timestamps, and each sample's composition offset is
-//! its presentation time minus its decode time, negative for the frames
-//! presented before the ones decoded earlier. Audio is never reordered:
-//! audio whose timestamp does not advance starts a new epoch.
+//! step by the smallest distance seen between two consecutive timestamps,
+//! and each sample's composition offset is its presentation time minus
+//! its decode time, negative for the frames presented before the ones
+//! decoded earlier. Audio is never reordered: audio whose timestamp does
+//! not advance starts a new epoch.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -91,6 +98,17 @@ const NANOS_PER_SECOND: u128 = 1_000_000_000;
 /// The frame rate a video track's only sample is timed at: nothing else
 /// says how long it lasts.
 const FALLBACK_FRAME_RATE: u32 = 30;
+
+/// How many of an epoch's highest timestamps it keeps to find a new
+/// timestamp's neighbours ([`Epoch::space`]): one more than the pictures a
+/// stream may decode before a picture and present after it, so the
+/// neighbours of every new one are among them. That is at most 16 in H.264
+/// (ITU-T H.264 §E.2.1: `num_reorder_frames` at most
+/// `max_dec_frame_buffering`; §A.3.1: that at most `MaxDpbFrames`, at most
+/// 16) and at most 15 in H.265 (ITU-T H.265 §7.4.3.2.1:
+/// `sps_max_num_reorder_pics` at most `sps_max_dec_pic_buffering_minus1`;
+/// §A.4.2: that below `MaxDpbSize`, at most 16).
+const NEIGHBOURHOOD: usize = 17;
 
 /// `elapsed` in ticks of `rate`, rounded down.
 pub(crate) fn ticks(elapsed: Duration, rate: u32) -> u64 {
@@ -133,7 +151,7 @@ enum FrameLength {
 }
 
 /// One epoch of a track: where its timeline is anchored, and how it runs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct Epoch {
     /// The frames' epoch number.
     number: u32,
@@ -150,8 +168,15 @@ struct Epoch {
     /// The latest decode time.
     last_dts: i128,
     /// The smallest distance between two consecutive timestamps seen: the
-    /// nominal frame duration of reordered video.
+    /// step of reordered video's decode times.
     step: Option<i128>,
+    /// The smallest distance between two of its timestamps seen, consecutive
+    /// or not: its nominal frame duration (see [`Epoch::shown`]).
+    spacing: Option<i128>,
+    /// Its [`NEIGHBOURHOOD`] highest timestamps, among which a new one's
+    /// neighbours are: never more, so an epoch holds the same whatever it
+    /// lasts.
+    highest: BTreeSet<i128>,
     /// Whether a timestamp went back: the epoch's decode times step by
     /// `step` from then on.
     reordered: bool,
@@ -163,7 +188,7 @@ struct Epoch {
 impl Epoch {
     /// An epoch whose first frame has `ts`, is presented at `anchor` and
     /// is decoded `lead` (at least 0) later.
-    const fn new(number: u32, ts: i128, anchor: i128, lead: i128) -> Self {
+    fn new(number: u32, ts: i128, anchor: i128, lead: i128) -> Self {
         Self {
             number,
             first_ts: ts,
@@ -172,6 +197,8 @@ impl Epoch {
             last_ts: ts,
             last_dts: anchor.saturating_add(lead),
             step: None,
+            spacing: None,
+            highest: BTreeSet::from([ts]),
             reordered: false,
             top: None,
         }
@@ -184,18 +211,51 @@ impl Epoch {
     }
 
     /// Where the presentation of its frames before the latest one ends:
-    /// one nominal frame duration after the latest of their presentation
-    /// times (a tick before it has one, as its decode times step), `None`
-    /// before the second frame. Not where their durations end, which are
-    /// steps of the decode times: `P3` of `I0 P3 B1 B2` at 25 fps is
-    /// decoded at 120 ms and `B1`, a step of the 2 frames between them,
-    /// at 200 ms, while the four pictures are shown until 160 ms. In order,
-    /// the latest frame is presented at least a step after the ones before
-    /// it, so its own end decides. Asked when the epoch ends: the step only
-    /// shrinks.
+    /// one nominal frame duration, the spacing, after the latest of their
+    /// presentation times (a tick after it while all its timestamps are
+    /// equal), `None` before the second frame. Not where their durations
+    /// end, which are steps of the decode times: `P3` of `I0 P3 B1 B2` at
+    /// 25 fps is decoded at 120 ms and `B1`, a step of the 2 frames between
+    /// them, at 200 ms, while the four pictures are shown until 160 ms.
+    /// Each of those frames but the one presented latest is shown until a
+    /// later one begins, so before this. Of pictures a frame apart, the
+    /// spacing is a frame or more, and a frame once two of them a frame
+    /// apart arrived, whichever were lost (`I0 P3 B1`, missing `B2`, has
+    /// `B1` a frame after `I0`): the next epoch is never presented over the
+    /// latest, and no later than it ends unless the timestamps cannot tell
+    /// (see the module). The spacing is never longer than the step of the
+    /// decode times, as two consecutive timestamps are two of the epoch's.
+    /// In order, the latest frame is presented at least a spacing after the
+    /// ones before it, so its own end decides. Asked when the epoch ends:
+    /// the spacing only shrinks.
     fn shown(&self) -> Option<i128> {
         self.top
-            .map(|top| top.saturating_add(self.step.unwrap_or(1)))
+            .map(|top| top.saturating_add(self.spacing.unwrap_or(1)))
+    }
+
+    /// Takes in its next frame's timestamp `ts`: narrows the spacing to the
+    /// distance from `ts` to its neighbours among the highest timestamps,
+    /// and keeps it if it is one of them. Every timestamp above `ts` is of
+    /// a picture decoded before it and presented after it, at most
+    /// [`NEIGHBOURHOOD`] less one, so both neighbours are kept, and the
+    /// spacing is the smallest distance between any two timestamps of the
+    /// epoch: two closest ones are neighbours, and the later decoded finds
+    /// the other. A stream reordered deeper, which neither codec allows,
+    /// may find a longer one.
+    fn space(&mut self, ts: i128) {
+        let below = self.highest.range(..ts).next_back();
+        let above = self.highest.range(ts..).next();
+        let nearest = below
+            .into_iter()
+            .chain(above)
+            .map(|neighbour| neighbour.saturating_sub(ts).saturating_abs())
+            .filter(|distance| *distance != 0)
+            .min();
+        self.spacing = self.spacing.into_iter().chain(nearest).min();
+        self.highest.insert(ts);
+        if self.highest.len() > NEIGHBOURHOOD {
+            self.highest.pop_first();
+        }
     }
 
     /// The composition offset of a sample before the epoch is reordered:
@@ -214,6 +274,7 @@ impl Epoch {
             let distance = delta.saturating_abs();
             self.step = Some(self.step.map_or(distance, |step| step.min(distance)));
         }
+        self.space(ts);
         self.reordered |= video && delta <= 0;
         self.last_ts = ts;
         let pts = self.pts(ts);
@@ -365,8 +426,9 @@ impl TrackWriter {
                 let anchor = at.max(self.shown);
                 let lead = self.end.saturating_sub(anchor).max(0);
                 let epoch = Epoch::new(frame.epoch, ts, anchor, lead);
+                let offset = epoch.offset();
                 self.epoch = Some(epoch);
-                (anchor.saturating_add(lead), epoch.offset(), anchored)
+                (anchor.saturating_add(lead), offset, anchored)
             }
         };
         let dts = u64::try_from(dts).map_err(|_| out_of_range("a decode time", dts))?;

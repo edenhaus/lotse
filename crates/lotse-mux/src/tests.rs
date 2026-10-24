@@ -1425,6 +1425,166 @@ fn iso14496_12_8_8_8_1_an_epoch_after_a_short_reordered_gop_is_presented_at_its_
     );
 }
 
+/// The presentation times of `file`'s track `track_id`, in its ticks: each
+/// sample's decode time plus its composition offset.
+fn presented_ticks(file: &[u8], track_id: u32) -> Vec<i64> {
+    samples(file, track_id)
+        .iter()
+        .map(|s| i64::try_from(s.dts).unwrap() + i64::from(s.cts))
+        .collect()
+}
+
+/// The capture times of `frames` of `kind` after `base`, in ticks of `rate`.
+fn captured_ticks(
+    frames: &[(Kind, Arc<MediaFrame>)],
+    base: Instant,
+    kind: Kind,
+    rate: i64,
+) -> Vec<i64> {
+    frames
+        .iter()
+        .filter(|(pushed, _)| *pushed == kind)
+        .map(|(_, frame)| {
+            i64::try_from((frame.wallclock - base).as_millis()).unwrap() * rate / 1000
+        })
+        .collect()
+}
+
+/// An epoch after a reordered GOP cut short before any two pictures
+/// decoded one after the other are a frame apart is presented at its
+/// capture time too: the GOP's frame duration is the smallest distance
+/// between any two of its presentation times, here B1's from I0, not only
+/// between consecutive ones in decode order (ISO/IEC 14496-12 §8.8.8.1).
+/// Regression: after `I0 P3 B1` at 25 fps, whose consecutive timestamps
+/// are 120 ms and 80 ms apart, P3 was taken as shown until 200 ms, so the
+/// epoch captured at 160 ms, where P3 ends, was presented at 200 ms, and
+/// the rest of the video 40 ms behind the audio.
+#[test]
+fn iso14496_12_8_8_8_1_an_epoch_after_a_gop_cut_before_b2_is_presented_at_its_capture_time() {
+    let base = base();
+    let aac = frames(SINE_16K_MONO);
+    // AAC frame `i` of the audio's one epoch: 64 ms each.
+    let audio = |i: u16| {
+        let at = ms(base, u64::from(i) * 64);
+        let payload = Bytes::copy_from_slice(aac[usize::from(i)]);
+        (
+            Kind::Audio,
+            frame(at, i64::from(i) * 1024, true, 0, payload),
+        )
+    };
+    // The camera reconnects before B2 arrives; its timestamps start over
+    // 160 ms in, where P3 ends, and the audio goes on.
+    let mut frames = gop(&[0, 3, 1], base, 0, 0, 0);
+    frames.extend((0..3).map(audio));
+    frames.extend(gop(&[0, 3, 1, 2], base, 160, 1, 3));
+    frames.extend((3..6).map(audio));
+    let written = run(
+        &mut Muxer::new(&policy(10_000)),
+        &h264_track(),
+        Some(&aac_track()),
+        &frames,
+    );
+
+    // Every sample of both tracks is presented at its capture time.
+    assert_eq!(
+        presented_ticks(&written.file, 1),
+        captured_ticks(&frames, base, Kind::Video, 90_000)
+    );
+    assert_eq!(
+        presented_ticks(&written.file, 2),
+        captured_ticks(&frames, base, Kind::Audio, 16_000)
+    );
+    // The new epoch's I0 is decoded where B1's decode ends (280 ms) and
+    // presented at 160 ms.
+    let video = samples(&written.file, 1);
+    assert_eq!((video[3].dts, video[3].cts), (25_200, -10_800));
+}
+
+/// An epoch after any part of a reordered GOP, a reconnect at any point of
+/// its decode order, is presented at its capture time whenever that is
+/// where or after the GOP's last picture ends, a frame after it at 25 fps,
+/// and decode times never go back (ISO/IEC 14496-12 §8.8.8.1): whichever
+/// pictures the GOP lost, two of the ones it kept a frame apart give its
+/// frame duration. Regression: `I0 P3 B1`, of both GOPs, ended at 200 ms.
+#[test]
+fn iso14496_12_8_8_8_1_an_epoch_after_any_part_of_a_reordered_gop_is_presented_at_its_capture_time()
+{
+    let base = base();
+    // (GOP length, frames kept, capture time, where the epoch was
+    // presented) of each new epoch presented elsewhere than captured.
+    let mut misplaced = Vec::new();
+    for order in [&[0, 3, 1, 2, 6, 4, 5][..], &[0, 3, 1, 2]] {
+        for kept in 1..=order.len() {
+            let gop_part = &order[..kept];
+            let ends = u64::from(*gop_part.iter().max().unwrap()) * 40 + 40;
+            for capture_ms in (ends..=ends + 80).step_by(10) {
+                let mut frames = gop(gop_part, base, 0, 0, 0);
+                frames.extend(gop(&[0, 3, 1, 2], base, capture_ms, 1, 10));
+                let written = run(
+                    &mut Muxer::new(&policy(10_000)),
+                    &h264_track(),
+                    None,
+                    &frames,
+                );
+                let presented = presented_ticks(&written.file, 1);
+                if presented != captured_ticks(&frames, base, Kind::Video, 90_000) {
+                    misplaced.push((order.len(), kept, capture_ms, presented[kept] / 90));
+                }
+                let video = samples(&written.file, 1);
+                assert!(
+                    video
+                        .windows(2)
+                        .all(|pair| pair[0].dts + u64::from(pair[0].duration) <= pair[1].dts),
+                    "decode times go back after {kept} of {order:?}, captured at {capture_ms} ms"
+                );
+            }
+        }
+    }
+    assert_eq!(misplaced, []);
+}
+
+/// The frame duration of a GOP comes from the presentation times of its 17
+/// latest pictures, which hold the neighbours of each new one as long as at
+/// most 16 pictures decoded before it are presented after it: all H.264
+/// allows (§E.2.1: `num_reorder_frames` at most `max_dec_frame_buffering`;
+/// §A.3.1: at most `MaxDpbFrames`, at most 16) and more than H.265 does
+/// (§7.4.3.2.1, §A.4.2: at most 15). Deeper reordering finds a longer one,
+/// and what the muxer keeps stays bounded.
+#[test]
+fn h264_e_2_1_a_gop_s_frame_duration_comes_from_as_many_pictures_as_it_may_reorder() {
+    let base = base();
+    // I0, then `deep` pictures 80 ms apart, then a B-frame 20 ms after I0,
+    // decoded after them all, and the next epoch captured 20 ms after the
+    // last picture: where that epoch is presented, in ms.
+    let presented = |deep: u8| -> i64 {
+        let mut frames = vec![(Kind::Video, frame(base, 0, true, 0, h264_au(true, 0)))];
+        frames.extend((1..=deep).map(|n| {
+            let at = ms(base, u64::from(n) * 80);
+            let ts = i64::from(n) * 2 * FRAME;
+            (Kind::Video, frame(at, ts, false, 0, h264_au(false, n)))
+        }));
+        frames.push((
+            Kind::Video,
+            frame(ms(base, 20), FRAME / 2, false, 0, h264_au(false, 100)),
+        ));
+        let capture = ms(base, u64::from(deep) * 80 + 20);
+        frames.push((Kind::Video, frame(capture, 0, true, 1, h264_au(true, 101))));
+        let written = run(
+            &mut Muxer::new(&policy(100_000)),
+            &h264_track(),
+            None,
+            &frames,
+        );
+        presented_ticks(&written.file, 1).last().unwrap() / 90
+    };
+    // 16 deep: the B-frame's distance from I0, 20 ms, is the frame
+    // duration, so the last picture ends 20 ms after it.
+    assert_eq!(presented(16), 16 * 80 + 20);
+    // 17 deep: I0 is no longer kept, and the B-frame's distance from the
+    // picture after it, 60 ms, is the shortest the muxer sees.
+    assert_eq!(presented(17), 17 * 80 + 60);
+}
+
 /// Consecutive reconnects after reordered video keep the video at its
 /// capture times, in sync with the audio that goes on: an epoch captured
 /// inside the presentation of the last sample, an epoch's only frame here,
