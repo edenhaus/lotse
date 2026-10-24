@@ -21,6 +21,7 @@
     reason = "test code; the helpers outside #[test] functions panic on harness failures"
 )]
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -33,6 +34,7 @@ use lotse_core::clip::{ClipMuxer as _, ClipPolicy, ClipTrack};
 use lotse_core::clock::{Clock as _, FakeClock};
 use lotse_core::{Codec, Kind, MediaFrame, MediaTime};
 use lotse_mux::Muxer;
+use mp4_atom::{Any, Decode as _};
 use serde_json::Value;
 
 /// One video frame at 25 fps in 90 kHz ticks.
@@ -64,11 +66,33 @@ struct At {
     payload: Bytes,
 }
 
-/// The clip of `video`, `audio` and `frames` (pushed in capture order,
-/// video first on a tie) with the default policy, as one file.
-fn clip(video: &ClipTrack, audio: Option<&ClipTrack>, mut frames: Vec<At>) -> Vec<u8> {
+/// `frames` as a track's subscription hands them on: each track's in the
+/// order given (video's in decode order, whose capture times go back at
+/// a B-frame), the two tracks merged by capture time, video first on a
+/// tie.
+fn merged(frames: Vec<At>) -> Vec<At> {
+    let (mut video, mut audio): (VecDeque<At>, VecDeque<At>) = frames
+        .into_iter()
+        .partition(|frame| frame.kind == Kind::Video);
+    let mut out = Vec::with_capacity(video.len() + audio.len());
+    loop {
+        let next = match (video.front(), audio.front()) {
+            (Some(first), Some(other)) if other.after < first.after => audio.pop_front(),
+            (Some(_), _) => video.pop_front(),
+            (None, _) => audio.pop_front(),
+        };
+        let Some(frame) = next else {
+            return out;
+        };
+        out.push(frame);
+    }
+}
+
+/// The clip of `video`, `audio` and `frames` ([`merged`]) with the
+/// default policy, as one file.
+fn clip(video: &ClipTrack, audio: Option<&ClipTrack>, frames: Vec<At>) -> Vec<u8> {
     let base: Instant = FakeClock::from_system().now();
-    frames.sort_by_key(|frame| (frame.after, frame.kind));
+    let frames = merged(frames);
     let mut muxer = Muxer::new(&ClipPolicy::default());
     let mut file = Vec::new();
     let mut write = |pieces: Vec<Bytes>| {
@@ -228,15 +252,19 @@ fn h264_opus() -> Vec<u8> {
     clip(&h264_track(), Some(&audio), frames)
 }
 
-/// H.264 with B-frames: two closed GOPs of 12 frames in decode order
-/// I0 P3 B1 B2 P6 B4 B5 P9 B7 B8 P11 B10.
-fn h264_bframes() -> Vec<u8> {
+/// The frame numbers of [`h264_bframes`] in decode order: two closed
+/// GOPs of 12 frames, I0 P3 B1 B2 P6 B4 B5 P9 B7 B8 P11 B10.
+fn bframes_order() -> Vec<u32> {
     let gop = [0, 3, 1, 2, 6, 4, 5, 9, 7, 8, 11, 10];
-    let order: Vec<u32> = [0, 12]
+    [0, 12]
         .iter()
         .flat_map(|start| gop.iter().map(move |n| start + n))
-        .collect();
-    clip(&h264_track(), None, h264_frames(&order, 0, 12))
+        .collect()
+}
+
+/// H.264 with B-frames, pushed in decode order ([`bframes_order`]).
+fn h264_bframes() -> Vec<u8> {
+    clip(&h264_track(), None, h264_frames(&bframes_order(), 0, 12))
 }
 
 #[test]
@@ -248,6 +276,33 @@ fn the_fixtures_are_what_the_muxer_writes() {
             "{name} differs: rerun write_fixtures and check it"
         );
     }
+}
+
+#[test]
+fn iso14496_12_8_8_8_1_the_b_frame_fixture_keeps_decode_order_with_negative_composition_offsets() {
+    let file = std::fs::read(path("h264_bframes.mp4")).unwrap();
+    let mut rest = file.as_slice();
+    let (mut presented, mut negative) = (Vec::new(), 0);
+    while !rest.is_empty() {
+        let Any::Moof(moof) = Any::decode(&mut rest).unwrap() else {
+            continue;
+        };
+        for traf in moof.traf {
+            let mut dts = i64::try_from(traf.tfdt.unwrap().base_media_decode_time).unwrap();
+            for entry in traf.trun.iter().flat_map(|trun| &trun.entries) {
+                let cts = i64::from(entry.cts.unwrap_or(0));
+                negative += usize::from(cts < 0);
+                presented.push(dts + cts);
+                dts += i64::from(entry.duration.unwrap());
+            }
+        }
+    }
+    let expected: Vec<i64> = bframes_order()
+        .into_iter()
+        .map(|n| i64::from(n) * FRAME)
+        .collect();
+    assert_eq!(presented, expected);
+    assert!(negative > 0, "no negative composition offset");
 }
 
 #[test]
@@ -376,8 +431,23 @@ fn ffprobe_iso14496_12_8_8_8_1_reads_negative_composition_offsets_in_presentatio
         packets.windows(2).all(|pair| pair[0].1 < pair[1].1),
         "decode times increase"
     );
-    let mut presented: Vec<i64> = packets.iter().map(|packet| packet.0).collect();
-    presented.sort_unstable();
-    let expected: Vec<i64> = (0..24).map(|n| n * FRAME).collect();
+    let keyframes: Vec<usize> = (0..packets.len()).filter(|&i| packets[i].2).collect();
+    assert_eq!(keyframes, [0, 12]);
+    // The packets in decode order, each presented at its frame number.
+    // Counted from the first packet: ffprobe 6.1.1 shifts every PTS by the
+    // largest negative offset (observed 2026-10-24).
+    let first = packets[0];
+    let presented: Vec<i64> = packets.iter().map(|packet| packet.0 - first.0).collect();
+    let expected: Vec<i64> = bframes_order()
+        .into_iter()
+        .map(|n| i64::from(n) * FRAME)
+        .collect();
     assert_eq!(presented, expected);
+    // Negative composition offsets: PTS - DTS below the first packet's.
+    assert!(
+        packets
+            .iter()
+            .any(|packet| packet.0 - packet.1 < first.0 - first.1),
+        "no negative composition offset"
+    );
 }

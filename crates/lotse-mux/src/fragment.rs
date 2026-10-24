@@ -21,11 +21,16 @@
 //! samples), as ffmpeg 9.0.2 leaves them out of `hvc1` (observed
 //! 2026-10-23).
 //!
-//! SPEC-DEVIATION: an H.265 parameter set that differs from the sample
-//! entry's stays in its sample. Only a pre-roll GOP from before a change
-//! of the sets within the codec family has one (the ring keeps those
-//! GOPs, the clip's sample entry has the newest sets), and without its
-//! own sets that GOP would not decode.
+//! SPEC-DEVIATION: from the first H.265 sample with a parameter set the
+//! sample entry lacks on, every sample keeps all its parameter sets, the
+//! entry's included. Only a pre-roll GOP from before a change of the sets
+//! within the codec family has such a set (the ring keeps those GOPs, the
+//! clip's sample entry has the newest sets), and without it that GOP
+//! would not decode. Its set takes the place of the entry's with the same
+//! ID in the decoder (ITU-T H.265 §7.4.2.4.2), and a new fragment does not
+//! bring the entry's back, so the GOPs after it need their own in-band
+//! sets (every keyframe carries them, [`MediaFrame::payload`]) to decode
+//! with the current ones, and keep them wherever a player starts or seeks.
 //!
 //! The timeline: a track's timescale is its clock rate, so the camera's
 //! timestamps are the file's. Each epoch of a track starts at its first
@@ -54,6 +59,7 @@ use std::time::{Duration, Instant};
 use bytes::{BufMut as _, Bytes, BytesMut};
 use lotse_codec::aac::FRAME_SAMPLES as AAC_FRAME_SAMPLES;
 use lotse_codec::h264::annex_b_units;
+use lotse_codec::h265::nal;
 use lotse_codec::opus::packet_samples;
 use lotse_core::clip::{ClipError, ClipTrack};
 use lotse_core::{Codec, Kind, MediaFrame};
@@ -219,7 +225,8 @@ pub(crate) struct TrackWriter {
     /// How its last sample learns its length.
     length: FrameLength,
     /// The parameter sets the sample entry carries that the samples leave
-    /// out: H.265's (see the module).
+    /// out: H.265's, until a sample brings one the entry lacks, and none
+    /// from then on (see the module).
     out_of_band: Vec<Bytes>,
     /// The current epoch; `None` before the first frame.
     epoch: Option<Epoch>,
@@ -358,11 +365,24 @@ impl TrackWriter {
         u32::try_from(ticks).ok()
     }
 
+    /// Whether `unit` is an H.265 parameter set the sample entry lacks
+    /// while the samples still leave the entry's out (see the module).
+    fn foreign_set(&self, unit: &[u8]) -> bool {
+        !self.out_of_band.is_empty()
+            && nal::unit_type(unit).is_some_and(nal::is_parameter_set)
+            && !self.out_of_band.iter().any(|set| set.as_ref() == unit)
+    }
+
     /// Makes `held` a sample of `duration` ready for the next fragment.
     fn finish(&mut self, held: &Held, duration: u32) {
         let payload = &held.frame.payload;
         let pieces = if self.video {
             let units = annex_b_units(payload);
+            if units.iter().any(|unit| self.foreign_set(unit)) {
+                // SPEC-DEVIATION (see the module): this sample's sets and
+                // every later one's stay in band.
+                self.out_of_band.clear();
+            }
             let mut lengths = BytesMut::with_capacity(units.len().saturating_mul(4));
             let mut pieces = Vec::with_capacity(units.len().saturating_mul(2));
             for unit in units {

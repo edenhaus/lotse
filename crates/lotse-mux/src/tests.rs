@@ -756,21 +756,46 @@ fn iso14496_15_8_3_3_1_hvcc_carries_profile_tier_level_and_complete_parameter_se
 }
 
 #[test]
-fn h265_parameter_sets_other_than_the_entry_s_stay_in_their_sample() {
+fn h265_parameter_sets_other_than_the_entry_s_stay_in_band_with_every_later_sample_s() {
     let base = base();
-    // A pre-roll GOP from before the sets changed: another picture size.
+    // A pre-roll GOP from before the sets changed: another picture size
+    // under the same SPS ID, which replaces the entry's in the decoder.
+    // The GOPs after it bring the current sets back in band: a new
+    // fragment does not reload `hvcC`, so without them they would decode
+    // with the older SPS.
     let older = h265::test_data::sps(320, 240);
     let slice = [19 << 1, 0x01, 0xaf, 0];
-    let au = annex_b(&[
+    let older_gop = annex_b(&[
         &h265::test_data::vps(),
         &older,
         &h265::test_data::pps(),
         &slice,
     ]);
-    let frames = [(Kind::Video, frame(base, 0, true, 0, au))];
+    let frames = [
+        (Kind::Video, frame(base, 0, true, 0, older_gop)),
+        (
+            Kind::Video,
+            frame(ms(base, 40), FRAME, false, 0, h265_au(false, 1)),
+        ),
+        (
+            Kind::Video,
+            frame(ms(base, 80), 2 * FRAME, true, 0, h265_au(true, 2)),
+        ),
+        (
+            Kind::Video,
+            frame(ms(base, 120), 3 * FRAME, true, 0, h265_au(true, 3)),
+        ),
+    ];
     let written = run(&mut Muxer::new(&policy(1000)), &h265_track(), None, &frames);
-    let read = samples(&written.file, 1);
-    assert_eq!(read[0].bytes, length_prefixed(&annex_b(&[&older, &slice])));
+    let read: Vec<Vec<u8>> = samples(&written.file, 1)
+        .into_iter()
+        .map(|s| s.bytes)
+        .collect();
+    let expected: Vec<Vec<u8>> = frames
+        .iter()
+        .map(|(_, frame)| length_prefixed(&frame.payload))
+        .collect();
+    assert_eq!(read, expected);
     // H.264 keeps every set.
     let au = h264_au(true, 0);
     let frames = [(Kind::Video, frame(base, 0, true, 0, au.clone()))];
