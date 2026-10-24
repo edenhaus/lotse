@@ -545,6 +545,19 @@ impl ReliableQueue {
         }
     }
 
+    /// The oldest frame `track` queued that is not out yet, past the gaps
+    /// and control events ahead of it: where a sink that took none of the
+    /// track's frames starts it.
+    pub fn first_frame(&self, track: Kind) -> Option<&Arc<MediaFrame>> {
+        self.lane(track)
+            .items
+            .iter()
+            .find_map(|item| match &item.entry {
+                Entry::Frame(frame) => Some(frame),
+                Entry::Gap { .. } | Entry::Control(_) => None,
+            })
+    }
+
     /// The oldest item `track` queued, taken out.
     pub fn pop(&mut self, track: Kind) -> Option<Out> {
         let item = self.lane_mut(track).items.pop_front()?;
@@ -1438,7 +1451,7 @@ mod tests {
             assert!(track.publish_frame(MediaFrame::clone(&clip.frame(ms, keyframe, 10))));
         };
         publish(0, true);
-        let (mut subscription, snapshot) = track.subscribe_from_preroll(clip.at(80));
+        let (mut subscription, snapshot, _) = track.subscribe_from_preroll(clip.at(80));
         publish(40, false);
         publish(80, true);
         publish(120, false);
@@ -1485,7 +1498,7 @@ mod tests {
             },
             clip.now(),
         ));
-        let (mut subscription, snapshot) = track.subscribe_from_preroll(clip.at(0));
+        let (mut subscription, snapshot, _) = track.subscribe_from_preroll(clip.at(0));
         assert!(snapshot.is_none(), "no window, no pre-roll");
         let publish = |ms: u64, keyframe: bool, bytes: usize| {
             track.publish_frame(MediaFrame::clone(&clip.frame(ms, keyframe, bytes)))
@@ -1593,6 +1606,26 @@ mod tests {
             ]
         );
         assert_eq!(queue.bytes(), 0);
+    }
+
+    /// A sink that took none of a track's frames starts it at the oldest
+    /// frame its lane holds, past the control events ahead of it; none
+    /// for a track that queued none.
+    #[test]
+    fn the_first_frame_is_the_oldest_queued_past_the_events_ahead_of_it() {
+        let clip = Clip::new();
+        let mut queue = ReliableQueue::new(usize::MAX, true);
+        assert!(queue.first_frame(Kind::Video).is_none());
+        queue.push(Kind::Video, TrackEvent::EpochStart { epoch: 1 }, clip.now());
+        clip.push(&mut queue, Kind::Video, 40, true);
+        clip.push(&mut queue, Kind::Video, 80, false);
+        let first = |queue: &ReliableQueue| queue.first_frame(Kind::Video).map(|f| f.wallclock);
+        assert_eq!(first(&queue), Some(clip.at(40)));
+        assert!(queue.first_frame(Kind::Audio).is_none());
+        assert_eq!(drain(&mut queue, Kind::Video, &clip).len(), 3);
+        assert_eq!(first(&queue), None);
+        clip.push(&mut queue, Kind::Video, 120, false);
+        assert_eq!(first(&queue), Some(clip.at(120)));
     }
 
     #[test]

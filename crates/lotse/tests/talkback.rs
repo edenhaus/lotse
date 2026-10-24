@@ -537,6 +537,7 @@ impl InProcess {
             session: SessionLimits::default(),
             max_sessions: 256,
             shared_udp_fd: None,
+            clip: lotse_worker::ClipSettings::default(),
         };
         let registries = Arc::new(registries);
         let worker = spawn_named("test.worker", async move {
