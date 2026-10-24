@@ -10,7 +10,8 @@
 //! so it keeps the window plus the open GOP; at any frame it drops its
 //! oldest GOPs while it would hold more than `preroll_bytes`. A GOP that
 //! alone outgrows `preroll_bytes` keeps its keyframe and the frames that
-//! fit, drops the rest until the next keyframe and is counted; a keyframe
+//! fit, drops the rest and is counted, and goes whole at the next keyframe,
+//! so every GOP held but the newest is whole; a keyframe
 //! itself is bounded only by `max_frame_bytes`, as in the GOP cache. An
 //! audio ring follows the video: it keeps the newest frame at or before
 //! the video ring's oldest keyframe and everything after it (by its own
@@ -87,7 +88,8 @@ impl PrerollSnapshot {
     }
 
     /// Whether the newest GOP was cut short by `preroll_bytes`, so the
-    /// frames after the last one held are missing.
+    /// frames after the last one held are missing; every GOP before it is
+    /// whole.
     pub const fn truncated(&self) -> bool {
         self.truncated
     }
@@ -152,7 +154,8 @@ pub(crate) struct Preroll {
     /// What `frames` counts against `preroll_bytes`.
     bytes: usize,
     /// The newest GOP outgrew `preroll_bytes`; its frames are dropped
-    /// until the next keyframe. Meaningless while nothing is held: only a
+    /// until the next keyframe, which drops the GOP too, so no older GOP
+    /// held is ever truncated. Meaningless while nothing is held: only a
     /// keyframe starts an empty ring, and it resets this.
     truncated: bool,
     /// See [`PrerollStats::truncations`].
@@ -235,7 +238,14 @@ impl Preroll {
     ) -> Option<Truncation> {
         let cost = cost(frame);
         if frame.keyframe {
-            self.truncated = false;
+            if self.truncated {
+                // The truncated GOP lost frames before this keyframe: a
+                // clip from its keyframe would skip them, so it goes whole
+                // (and, as the cap already dropped every GOP before it,
+                // the ring starts again here).
+                self.drop_front(self.frames.len());
+                self.truncated = false;
+            }
             self.append(frame, cost);
             let start = self.window_start(frame.wallclock, window);
             self.drop_front(start);
@@ -559,6 +569,32 @@ mod tests {
             );
         }
         assert_eq!(held(&ring), [0, 250]);
+    }
+
+    #[test]
+    fn a_truncated_gop_goes_whole_at_the_next_keyframe_even_when_that_fits() {
+        let clip = Clip::new();
+        let mut ring = ring(true, 60_000);
+        let cap = 4 * c(10);
+        gop(&mut ring, &clip, 0, 500, cap);
+        assert_eq!(
+            ring.push(&clip.frame(500, false, 3 * c(10)), cap, || None),
+            Some(Truncation {
+                gop_bytes: 2 * c(10) + c(3 * c(10)),
+                count: 1
+            })
+        );
+        assert_eq!(held(&ring), [0, 250]);
+        // The next keyframe fits beside the truncated GOP, which still goes.
+        assert_eq!(ring.push(&clip.frame(750, true, 10), cap, || None), None);
+        assert_eq!(held(&ring), [750], "no clip may span the lost frame");
+        assert_eq!(ring.stats().unwrap().bytes, u64::try_from(c(10)).unwrap());
+        let snapshot = ring.snapshot(clip.at(0)).unwrap();
+        assert_eq!(snapshot.start().ts.ticks(), 750);
+        assert!(!snapshot.truncated());
+        assert_eq!(ring.stats().unwrap().truncations, 1);
+        assert_eq!(ring.push(&clip.frame(1000, false, 10), cap, || None), None);
+        assert_eq!(held(&ring), [750, 1000]);
     }
 
     #[test]

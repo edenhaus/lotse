@@ -112,7 +112,7 @@ pub struct TrackLimits {
     /// The pre-roll ring holds no more than this, counted as
     /// [`PREROLL_FRAME_OVERHEAD`](crate::preroll::PREROLL_FRAME_OVERHEAD)
     /// plus the payload per frame; a GOP larger than this keeps only its
-    /// start.
+    /// start, until the next keyframe drops it.
     pub preroll_bytes: usize,
     /// Capacity of the packet broadcast, in packets. Zero is treated as one.
     pub packet_capacity: usize,
@@ -713,8 +713,10 @@ pub struct Track {
     /// source's task publishes, and only a clip's start reads it, so the
     /// lock is never contended.
     preroll: Mutex<Preroll>,
-    /// The oldest keyframe of the connection's `v0` ring, which the audio
-    /// rings trim by; shared by the connection's tracks.
+    /// The oldest keyframe of the live set's `v0` ring, which the audio
+    /// rings trim by; shared by the connection's tracks, staging ones
+    /// included, and written only by that live `v0`
+    /// ([`Self::leads_preroll`]).
     preroll_floor: Arc<PrerollFloor>,
     /// Set by [`Track::close`]; subscriptions end and nothing is published.
     closed: AtomicBool,
@@ -762,7 +764,7 @@ impl Track {
 
     /// [`Self::new`] as the source tagged `tag` of `feeds` writes it,
     /// forwarding into `forward_to` while that source is active; its
-    /// audio pre-roll trims by `preroll_floor`, its `v0` writes it.
+    /// audio pre-roll trims by `preroll_floor`, which only a live set's `v0` writes.
     #[expect(
         clippy::too_many_arguments,
         reason = "a constructor wiring the track into its set's feeds; called from the set alone"
@@ -1006,9 +1008,13 @@ impl Track {
     }
 
     /// Whether this track's ring sets the floor the connection's audio
-    /// rings trim by: the first video track, the one a clip reads.
+    /// rings trim by: the live set's first video track (tag 0, `v0`), the
+    /// one a clip reads. A staging track never does: once its source is
+    /// active its frames and codec land on that live track, and while it is
+    /// a standby its codec changes and its close leave the live ring as it
+    /// is.
     fn leads_preroll(&self) -> bool {
-        self.id == TrackId::new(Kind::Video, 0)
+        self.tag == 0 && self.id == TrackId::new(Kind::Video, 0)
     }
 
     /// Sets how far back the pre-roll ring holds this track's frames;
@@ -2481,6 +2487,67 @@ mod tests {
         audio.set_preroll(None);
         assert!(audio.publish_frame(timed(t0, 3600, true, 10)));
         assert_eq!(audio.preroll_floor.get(), None);
+    }
+
+    #[test]
+    fn an_inactive_standby_never_moves_the_live_pre_roll_floor() {
+        let t0 = SystemClock.now();
+        let live = crate::source::TrackSet::new(TrackLimits::default(), t0);
+        let mut publisher = live.publisher();
+        let h264 = Codec::H264 {
+            profile_level_id: None,
+            sps: None,
+            pps: None,
+        };
+        let video = publisher.declare(Kind::Video, h264.clone(), 90_000);
+        let audio = publisher.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        let staging = crate::source::TrackSet::staging(&live);
+        let standby = staging.publisher().declare(Kind::Video, h264, 90_000);
+        assert_eq!(standby.id(), video.id(), "the standby's v0 shares the id");
+        for track in [&video, &audio] {
+            track.set_preroll(Some(Duration::from_secs(1)));
+        }
+        for ms in (0..=3200_u64).step_by(50) {
+            if ms.is_multiple_of(250) {
+                assert!(video.publish_frame(timed(t0, ms, ms.is_multiple_of(1000), 10)));
+            }
+            if ms.is_multiple_of(200) {
+                assert!(audio.publish_frame(timed(t0, ms, true, 10)));
+            }
+        }
+        let floor = Some(t0 + Duration::from_secs(2));
+        assert_eq!(video.preroll_floor.get(), floor);
+
+        // The standby changes family between live video and audio frames.
+        standby.set_codec(Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        });
+        assert_eq!(
+            standby.codec().family(),
+            CodecFamily::H265,
+            "kept for the switch"
+        );
+        assert_eq!(video.codec().family(), CodecFamily::H264);
+        assert_eq!(
+            video.preroll_floor.get(),
+            floor,
+            "the live ring is unchanged"
+        );
+        assert!(audio.publish_frame(timed(t0, 3400, true, 10)));
+        assert_eq!(
+            preroll(&audio, t0 + Duration::from_secs(2)),
+            (2000..=3400).step_by(200).collect::<Vec<_>>(),
+            "audio from the live video's oldest keyframe"
+        );
+
+        // Neither a standby's window nor its close moves it.
+        standby.set_preroll(Some(Duration::from_secs(1)));
+        standby.set_preroll(None);
+        standby.close();
+        assert_eq!(video.preroll_floor.get(), floor);
+        assert_eq!(preroll(&video, t0).first(), Some(&2000));
     }
 
     use crate::codec::CodecFamily;
