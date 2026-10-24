@@ -28,9 +28,10 @@
 //! frames while it holds more than `preroll_bytes`, down to the newest one.
 //! Windows are measured by arrival, which only moves forward on a track,
 //! never by capture time, which a camera's Sender Reports can move ahead
-//! and back; only the floor and a snapshot's start, which line audio up
-//! with video, use capture time, and the floor never counts from after its
-//! keyframe arrived.
+//! and back; only the floor, the audio frames trimmed by it and a
+//! snapshot's start, which line audio up with video, use capture time, and
+//! neither the floor nor an audio frame compared with it counts from after
+//! it arrived.
 //! Every frame is charged its payload plus [`PREROLL_FRAME_OVERHEAD`], so a
 //! camera sending tiny frames cannot hold more memory than the bound says.
 //! Every trim drops a prefix in one pass that stops where the kept frames
@@ -54,6 +55,14 @@ pub const PREROLL_FRAME_OVERHEAD: usize = size_of::<MediaFrame>()
 /// What `frame` counts against `preroll_bytes`.
 fn cost(frame: &MediaFrame) -> usize {
     frame.payload.len().saturating_add(PREROLL_FRAME_OVERHEAD)
+}
+
+/// When `frame` was captured, but never later than it arrived: a capture
+/// time ahead of the arrival is a Sender Report mapping off, which a
+/// later report corrects back. Arrival only moves forward on a track, so
+/// a frame dated ahead cannot hold back what a trim by it drops.
+fn captured(frame: &MediaFrame) -> Instant {
+    frame.wallclock.min(frame.arrival)
 }
 
 /// A pre-roll ring's state, as a track reports it while a window is set.
@@ -115,7 +124,7 @@ impl PrerollSnapshot {
     /// old as its arrival makes it, as [`GopSnapshot::age`](crate::track::GopSnapshot::age)
     /// counts: how far before `now` a clip from it starts.
     pub fn age(&self, now: Instant) -> Duration {
-        now.saturating_duration_since(self.start.wallclock.min(self.start.arrival))
+        now.saturating_duration_since(captured(&self.start))
     }
 }
 
@@ -231,11 +240,10 @@ impl Preroll {
     /// When the oldest held frame (a keyframe, on video) was captured, but
     /// never later than it arrived, as [`PrerollSnapshot::age`] counts: a
     /// capture time ahead of the arrival is a mapping off, and as the audio
-    /// rings' floor it would drop the audio a clip from that keyframe plays.
+    /// rings' floor it would drop the audio a clip from that keyframe plays
+    /// ([`captured`]).
     pub(crate) fn oldest(&self) -> Option<Instant> {
-        self.frames
-            .front()
-            .map(|frame| frame.wallclock.min(frame.arrival))
+        self.frames.front().map(|frame| captured(frame))
     }
 
     /// Takes `frame`, just published, and trims; `floor` is asked, on an
@@ -317,8 +325,14 @@ impl Preroll {
     }
 
     /// [`Self::push`] on an audio ring: keeps the newest frame captured at
-    /// or before `floor`, else the newest that arrived at least the window
-    /// before this one, and what follows.
+    /// or before `floor`, a frame dated ahead of its arrival counting by
+    /// its arrival as the floor does ([`captured`]), else the newest that
+    /// arrived at least the window before this one, and what follows. A
+    /// capture time that moves back while behind its arrival still ends the
+    /// stale run at the frame before it: the ring holds what follows until
+    /// the floor passes that frame or `preroll_bytes` drops it, and a
+    /// snapshot still starts at the newest frame captured at or before its
+    /// target.
     fn push_audio(
         &mut self,
         frame: &Arc<MediaFrame>,
@@ -332,7 +346,7 @@ impl Preroll {
                 .frames
                 .iter()
                 .skip(1)
-                .take_while(|next| next.wallclock <= floor)
+                .take_while(|next| captured(next) <= floor)
                 .count(),
             None => frame.arrival.checked_sub(window).map_or(0, |cutoff| {
                 self.frames
@@ -896,6 +910,56 @@ mod tests {
             [1200, 1600, 2000],
             "a frame captured at the floor starts"
         );
+    }
+
+    #[test]
+    fn an_audio_ring_s_floor_counts_a_frame_dated_ahead_of_its_arrival_by_its_arrival() {
+        let clip = Clip::new();
+        let mut ring = ring(false, 60_000);
+        let floor = || Some(clip.at(1000));
+        // A Sender Report maps the second frame an hour ahead; the next
+        // one corrects it.
+        for (capture, arrival) in [
+            (0, 0),
+            (3_600_000, 400),
+            (800, 800),
+            (1200, 1200),
+            (1600, 1600),
+        ] {
+            assert_eq!(
+                ring.push(&clip.shifted(capture, arrival, false), usize::MAX, floor),
+                None
+            );
+        }
+        assert_eq!(
+            held(&ring),
+            [800, 1200, 1600],
+            "the frame dated ahead does not hold the obsolete prefix"
+        );
+        assert_eq!(
+            ring.stats().unwrap().bytes,
+            u64::try_from(3 * c(10)).unwrap()
+        );
+        let snapshot = ring.snapshot(clip.at(1000)).unwrap();
+        assert_eq!(
+            snapshot
+                .frames()
+                .map(|frame| frame.ts.ticks())
+                .collect::<Vec<_>>(),
+            [800, 1200, 1600],
+            "the snapshot at the floor starts where the ring does"
+        );
+
+        // A capture time before the arrival stands: captured at 900, read
+        // at 1300, it plays at the floor.
+        let mut late = self::ring(false, 60_000);
+        for (capture, arrival) in [(600, 1000), (900, 1300), (1200, 1600)] {
+            assert_eq!(
+                late.push(&clip.shifted(capture, arrival, false), usize::MAX, floor),
+                None
+            );
+        }
+        assert_eq!(held(&late), [1300, 1600]);
     }
 
     #[test]
