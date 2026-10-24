@@ -159,6 +159,15 @@ pub enum Outcome {
     /// An empty `result`, then the events on this channel until it closes
     /// or the client unsubscribes.
     Subscribed(mpsc::Receiver<Event>),
+    /// A successful `result` with content, then the events on this
+    /// channel as for [`Outcome::Subscribed`]: `clip/start`'s, whose
+    /// result names the clip and where its bytes are fetched.
+    SubscribedWith {
+        /// The `result`.
+        result: serde_json::Value,
+        /// The events.
+        events: mpsc::Receiver<Event>,
+    },
 }
 
 /// What the supervisor implements. `ping`, `schema`, `unsubscribe`,

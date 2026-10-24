@@ -218,7 +218,7 @@ fn result(outcome: Outcome) -> Value {
     match outcome {
         Outcome::Result(value) => value,
         Outcome::Error(err) => panic!("error {err}"),
-        Outcome::Subscribed(_) => panic!("subscription"),
+        Outcome::Subscribed(_) | Outcome::SubscribedWith { .. } => panic!("subscription"),
     }
 }
 
