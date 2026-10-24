@@ -699,8 +699,21 @@ impl Serving<'_> {
         let clips = self.clips.len();
         tracing::info!(deadline_ms, sessions, clips, "shutdown requested");
         // First, while the tracks still run: each clip writes its last
-        // fragment, and its report waits for the flush.
-        self.clips.shutdown(&self.clock).await;
+        // fragment, and its report waits for the flush. Their reports go
+        // on meanwhile: a clip waiting for room in their channel would be
+        // aborted at the grace's end, its `Stopped` lost.
+        let ending = self.clips.shutdown(&self.clock);
+        tokio::pin!(ending);
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut ending => break,
+                // `self` holds the clips' sender, so the reports never end.
+                Some((clip_id, event)) = self.clip_rx.recv() => {
+                    self.tx.send_msg(&ToSupervisor::Clip { clip_id, event }, &[]).await?;
+                }
+            }
+        }
         if let Some(mut manager) = self.sessions.take() {
             manager
                 .close_all("shutting_down", "the daemon is stopping")
@@ -5585,5 +5598,84 @@ mod tests {
         let bytes = clip_bytes(reader).await;
         assert!(bytes.starts_with(b"init video=h264\n"), "{bytes:?}");
         assert!(!bytes.ends_with(b"end\n"), "{bytes:?}");
+    }
+
+    /// The shutdown passes the clips' reports on while it waits for them:
+    /// a full report channel (here one slot, filled by a report the loop
+    /// had not passed on yet) never blocks a clip's `Stopped` until its
+    /// grace runs out. Regression: the shutdown took no report while it
+    /// waited, so the clip waited for room until it was aborted, its
+    /// `Stopped` lost.
+    #[tokio::test]
+    async fn a_shutdown_passes_the_clips_reports_on_while_it_waits_for_them() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let clock = Arc::new(FakeClock::default());
+        serving.clock = clock.clone();
+        let (clip_tx, clip_rx) = mpsc::channel(1);
+        let queued = ClipReport::Warning {
+            code: "audio_omitted".into(),
+            message: "queued before the shutdown".into(),
+        };
+        clip_tx.try_send(("k0".into(), queued.clone())).unwrap();
+        serving.clips = Clips::new(clip_tx);
+        serving.clip_rx = clip_rx;
+        let (reader, writer) = clip_pipe();
+        serving.clips.start(ClipStart {
+            spec: ClipSpec {
+                clip_id: "k1".into(),
+                before_ms: 0,
+                after_ms: None,
+                audio: false,
+            },
+            pipe: tokio::net::unix::pipe::Sender::from_owned_fd(writer).unwrap(),
+            // Never ready: the clip waits for its tracks.
+            tracks: TrackSet::new(TrackLimits::default(), clock.now()),
+            factory: Arc::new(FakeClipMuxerFactory::default()),
+            settings: ClipSettings::default(),
+            clock: clock.clone(),
+        });
+        let (exit, ()) = tokio::join!(serving.on_shutdown(1_000), async {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            // Past the shutdown's grace: a clip still waiting is aborted.
+            clock.advance(Duration::from_secs(2));
+        });
+        assert_eq!(exit.unwrap(), ExitReason::Shutdown);
+        let mut session_rx = mpsc::channel(1).1;
+        serving
+            .flush(ExitReason::Shutdown, &mut session_rx)
+            .await
+            .unwrap();
+        drop(serving);
+        let mut seen = Vec::new();
+        while let Some((message, _)) = within(rx.recv_msg::<ToSupervisor>()).await.unwrap() {
+            seen.push(message);
+        }
+        assert_eq!(
+            seen,
+            [
+                ToSupervisor::Clip {
+                    clip_id: "k0".into(),
+                    event: queued,
+                },
+                ToSupervisor::Clip {
+                    clip_id: "k1".into(),
+                    event: ClipReport::Stopped {
+                        reason: "shutting_down".into(),
+                        bytes: 0,
+                        duration_ms: 0,
+                        gaps: 0,
+                    },
+                },
+            ]
+        );
+        assert_eq!(
+            logs.count(Level::WARN, "clip still finishing at shutdown; aborted"),
+            0
+        );
+        assert!(clip_bytes(reader).await.is_empty());
     }
 }
