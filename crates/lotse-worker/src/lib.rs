@@ -692,41 +692,61 @@ impl Serving<'_> {
         refuse_renegotiation(&mut self.tx, session_id, message).await
     }
 
-    /// `Shutdown`: closes every session, stops the standby and the source
-    /// within `deadline_ms`.
+    /// `Shutdown`: ends the clips, closes every session, stops the standby
+    /// and the source within `deadline_ms`, past which the supervisor
+    /// kills the worker. The clips end beside the rest, never ahead of it,
+    /// and by that deadline at the latest, so a clip whose reader stalls
+    /// costs the source's teardown nothing.
     async fn on_shutdown(&mut self, deadline_ms: u32) -> Result<ExitReason, Error> {
         let sessions = self.sessions.as_mut().map_or(0, SessionManager::len);
         let clips = self.clips.len();
         tracing::info!(deadline_ms, sessions, clips, "shutdown requested");
-        // First, while the tracks still run: each clip writes its last
-        // fragment, and its report waits for the flush. Their reports go
-        // on meanwhile: a clip waiting for room in their channel would be
-        // aborted at the grace's end, its `Stopped` lost.
-        let ending = self.clips.shutdown(&self.clock);
-        tokio::pin!(ending);
-        loop {
-            tokio::select! {
-                biased;
-                () = &mut ending => break,
-                // `self` holds the clips' sender, so the reports never end.
-                Some((clip_id, event)) = self.clip_rx.recv() => {
-                    self.tx.send_msg(&ToSupervisor::Clip { clip_id, event }, &[]).await?;
+        let budget = Duration::from_millis(u64::from(deadline_ms));
+        let now = self.clock.now();
+        let deadline = now.checked_add(budget).unwrap_or(now);
+        let Self {
+            tx,
+            clock,
+            clips,
+            clip_rx,
+            sessions,
+            standby,
+            running,
+            backchannels,
+            ..
+        } = self;
+        // Each clip writes its last fragment, and its report waits for the
+        // flush. Their reports go on meanwhile: a clip waiting for room in
+        // their channel would be aborted at the deadline, its `Stopped`
+        // lost.
+        let ending = async {
+            let ending = clips.shutdown(clock, deadline);
+            tokio::pin!(ending);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut ending => return Ok::<(), Error>(()),
+                    // `self` holds the clips' sender, so the reports never end.
+                    Some((clip_id, event)) = clip_rx.recv() => {
+                        tx.send_msg(&ToSupervisor::Clip { clip_id, event }, &[]).await?;
+                    }
                 }
             }
-        }
-        if let Some(mut manager) = self.sessions.take() {
-            manager
-                .close_all("shutting_down", "the daemon is stopping")
-                .await;
-        }
-        stop_standby(self.standby.take(), &self.clock).await;
-        stop_source(
-            self.running.take(),
-            &self.clock,
-            Duration::from_millis(u64::from(deadline_ms)),
-        )
-        .await?;
-        close_backchannels(&self.backchannels, &self.clock).await;
+        };
+        let teardown = async {
+            if let Some(mut manager) = sessions.take() {
+                manager
+                    .close_all("shutting_down", "the daemon is stopping")
+                    .await;
+            }
+            stop_standby(standby.take(), clock).await;
+            stop_source(running.take(), clock, budget).await?;
+            close_backchannels(backchannels, clock).await;
+            Ok::<(), Error>(())
+        };
+        let (ended, torn_down) = tokio::join!(ending, teardown);
+        ended?;
+        torn_down?;
         Ok(ExitReason::Shutdown)
     }
 
@@ -802,7 +822,9 @@ impl Serving<'_> {
             clips = self.clips.len(),
             "tracks switched to the standby; stopping the old source and the clips"
         );
-        // Another source is another stream: a clip's file ends here.
+        // Another source is another stream: each clip ended at the switch
+        // itself, in its place among the frames (`SourceSwitched`); this
+        // ends one that missed it with its subscription's control events.
         self.clips.stop_all(EndReason::StreamChanged);
         running.cancel.cancel();
         let old = Runner {
@@ -5546,14 +5568,20 @@ mod tests {
         h.tx.send_msg(&ToWorker::SwitchSource(standby), &[])
             .await
             .unwrap();
-        let seen = messages_until(&mut h, |seen| stop_reason(seen, "k1").is_some()).await;
+        // The clip ends at the switch itself, before or after the worker
+        // hears of it.
+        let seen = messages_until(&mut h, |seen| {
+            stop_reason(seen, "k1").is_some() && seen.contains(&ToSupervisor::Switched)
+        })
+        .await;
         assert_eq!(stop_reason(&seen, "k1").unwrap(), "stream_changed");
-        assert!(seen.contains(&ToSupervisor::Switched), "{seen:?}");
-        let switched = logs.lines(
-            Level::INFO,
-            "tracks switched to the standby; stopping the old source and the clips",
+        assert_eq!(
+            logs.count(
+                Level::INFO,
+                "tracks switched to the standby; stopping the old source and the clips",
+            ),
+            1
         );
-        assert!(switched[0].fields.contains("clips=1"), "{switched:?}");
         assert!(clip_bytes(reader).await.ends_with(b"end\n"));
         messages_until(&mut h, |seen| {
             seen.iter().any(|message| {
@@ -5677,5 +5705,79 @@ mod tests {
             0
         );
         assert!(clip_bytes(reader).await.is_empty());
+    }
+
+    /// A clip whose reader stalls ends by the shutdown's deadline, aborted
+    /// then, and its wait runs beside the sources' teardown rather than
+    /// ahead of it, so the worker is done within the deadline the
+    /// supervisor kills it at. Regression: the clips had their whole grace
+    /// (1.5 s) first, whatever the deadline, and the source its whole
+    /// deadline after it.
+    #[tokio::test]
+    async fn a_shutdown_ends_a_stalled_clip_by_its_deadline() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, _rx) = serving(&settings);
+        let clock = Arc::new(FakeClock::default());
+        serving.clock = clock.clone();
+        let (clip_tx, clip_rx) = mpsc::channel(16);
+        serving.clips = Clips::new(clip_tx);
+        serving.clip_rx = clip_rx;
+        let tracks = TrackSet::new(TrackLimits::default(), clock.now());
+        let mut publisher = tracks.publisher();
+        let video = publisher.declare(
+            Kind::Video,
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+        );
+        publisher.ready();
+        let (_reader, writer) = clip_pipe();
+        serving.clips.start(ClipStart {
+            spec: ClipSpec {
+                clip_id: "k1".into(),
+                before_ms: 0,
+                after_ms: None,
+                audio: false,
+            },
+            pipe: tokio::net::unix::pipe::Sender::from_owned_fd(writer).unwrap(),
+            tracks,
+            factory: Arc::new(FakeClipMuxerFactory::default()),
+            settings: ClipSettings::default(),
+            clock: clock.clone(),
+        });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        // More than the pipe takes: the reader never reads, so bytes stay
+        // pending.
+        assert!(video.publish_frame(lotse_core::media::MediaFrame {
+            ts: lotse_core::media::MediaTime::ZERO,
+            wallclock: clock.now(),
+            arrival: clock.now(),
+            keyframe: true,
+            discontinuity: false,
+            epoch: 0,
+            payload: vec![0x65; 256 * 1024].into(),
+        }));
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let (exit, ()) = within(async {
+            tokio::join!(serving.on_shutdown(500), async {
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+                clock.advance(Duration::from_millis(500));
+            })
+        })
+        .await;
+        assert_eq!(exit.unwrap(), ExitReason::Shutdown);
+        let aborted = logs.lines(Level::WARN, "clip still finishing at shutdown; aborted");
+        assert_eq!(aborted.len(), 1);
+        assert!(aborted[0].fields.contains("grace_ms=500"), "{aborted:?}");
     }
 }
