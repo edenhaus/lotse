@@ -178,6 +178,7 @@ fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
         // The filter keeps the shared socket to sending at this number; the
         // control channel stays on standard input, `WORKER_CONTROL_FD`.
         shared_udp_fd: Some(lotse_sandbox::WORKER_SHARED_UDP_FD),
+        clip: lotse_worker::ClipSettings::default(),
     };
     let reason = lotse_worker::run(&settings, registries(relay), memory).context("worker")?;
     tracing::info!(reason = ?reason, "worker exited");
