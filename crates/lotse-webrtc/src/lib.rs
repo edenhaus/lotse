@@ -155,7 +155,7 @@ impl OutputFactory for WebRtcFactory {
             .talkback
         {
             audio::Talkback::NotRequested => TalkbackRequest::NotRequested,
-            audio::Talkback::Negotiated { .. } | audio::Talkback::Busy => {
+            audio::Talkback::Negotiated { .. } | audio::Talkback::Busy { .. } => {
                 TalkbackRequest::Negotiable
             }
             audio::Talkback::Off(reason) => TalkbackRequest::Unsupported(reason.to_owned()),

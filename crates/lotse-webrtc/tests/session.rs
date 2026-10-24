@@ -2948,13 +2948,19 @@ fn rfc3264_6_a_re_offer_that_stops_talk_back_with_a_padded_port_is_answered_with
 /// (RFC 3264 §6.1): `inactive` for a dedicated m-line, `sendonly` for the
 /// downlink one offered `sendrecv`, which keeps the stream's audio; while
 /// another session holds the backchannel ([`TalkbackClaim::Busy`]) and
-/// when the camera offers none alike, with the codecs as offered. The
-/// session says nothing of it: the worker tells the client why.
+/// when the camera offers none alike. A busy one lists the codecs it
+/// would be negotiated with, those that reach the camera; one without a
+/// backchannel the codecs as offered. The session says nothing of it:
+/// the worker tells the client why.
 #[test]
 fn rfc3264_6_1_a_declined_re_offer_is_answered_inactive_or_sendonly() {
-    for (backchannel, claim) in [
-        (Some(chained(Codec::Pcmu)), TalkbackClaim::Busy),
-        (None, TalkbackClaim::Granted),
+    for (backchannel, claim, listed) in [
+        (
+            Some(chained(Codec::Pcmu)),
+            TalkbackClaim::Busy,
+            &["0", "111", "8"][..],
+        ),
+        (None, TalkbackClaim::Granted, &["0", "111", "8", "9"][..]),
     ] {
         let what = format!("{backchannel:?} under {claim:?}");
         let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
@@ -2973,12 +2979,8 @@ fn rfc3264_6_1_a_declined_re_offer_is_answered_inactive_or_sendonly() {
         );
         let up = audio_sections(&answer).pop().unwrap();
         // The session opened without a backchannel: the stream's PCMU
-        // first, then the rest.
-        assert_eq!(
-            payload_types(&up),
-            ["0", "111", "8", "9"],
-            "{what}: as offered, in the engine's order"
-        );
+        // first, then the rest; G.722 reaches no camera.
+        assert_eq!(payload_types(&up), listed, "{what}: in the engine's order");
         assert_eq!(pair.session.talkback(), None, "{what}");
         assert_eq!(
             pair.viewer.talkback_direction(),
@@ -3027,6 +3029,159 @@ fn rfc3264_6_1_a_declined_re_offer_is_answered_inactive_or_sendonly() {
             pair.events
         );
     }
+}
+
+/// A connected pair whose viewer offers audio, for a stream without audio
+/// the engine carries and a camera that offers no backchannel yet: the
+/// engine prefers Opus, then PCMU, PCMA and G.722, as for a session that
+/// opened before the source's probe found the backchannel.
+fn opened_before_the_backchannel() -> Pair {
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_with_audio(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let (mut pair, answer) = Pair::with_request(&request(viewer.offer(), h264(None)), viewer, now);
+    pair.connect(&answer);
+    pair
+}
+
+/// A talk-back re-offer declined while another session holds the
+/// backchannel ([`TalkbackClaim::Busy`]), then granted on the same
+/// m-line, is answered with the backchannel's codec first (RFC 3264 §7),
+/// which the session reports and takes. The session opened before the
+/// camera offered a backchannel, so the engine prefers Opus: the declined
+/// answer already lists only codecs that reach the camera, the
+/// backchannel's first, since str0m 0.24.0 keeps an m-line's formats from
+/// its first answer (`Media::set_remote_pts`, read 2026-10-24) and answers
+/// every later re-offer with them, in its own order.
+#[test]
+fn rfc3264_7_a_re_offer_claimed_after_a_declined_one_names_the_backchannels_codec_first() {
+    let mut pair = opened_before_the_backchannel();
+    let target = Some(chained(Codec::Pcmu));
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            target.clone(),
+            TalkbackClaim::Busy,
+        )
+        .expect("answered");
+    let up = audio_sections(&answer).pop().unwrap();
+    assert!(up.contains(&"a=inactive"), "{answer}");
+    assert_eq!(
+        payload_types(&up),
+        ["0", "8"],
+        "Opus ranks before PCMU, G.722 never reaches: {answer}"
+    );
+    assert_eq!(pair.session.talkback(), None);
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            target,
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    assert_eq!(
+        talkback_answered(&answer),
+        ("a=recvonly".to_owned(), "PCMU/8000".to_owned()),
+        "{answer}"
+    );
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcmu));
+    talk(&mut pair, &[(0, &[0xff; 160])]);
+    let got: Vec<_> = pair
+        .uplink
+        .iter()
+        .map(|up| (up.codec, up.packet.rtp.pt))
+        .collect();
+    assert_eq!(got, [(UplinkCodec::Pcmu, 0)]);
+}
+
+/// An m-line str0m answered before keeps that answer's formats, in the
+/// engine's order (str0m 0.24.0 `Media::set_remote_pts`, read
+/// 2026-10-24): talk-back granted on it later is reported, and taken, in
+/// the codec that answer names first, which the browser sends (RFC 3264
+/// §7), not the one the plan would pick for a fresh m-line. Here the
+/// dedicated m-line was first answered while the camera offered no
+/// backchannel, every format kept, Opus first; and the downlink m-line
+/// turned `sendrecv` keeps the formats of the session's first answer.
+#[test]
+fn rfc3264_7_talk_back_on_an_m_line_answered_before_is_received_in_the_codec_it_kept_first() {
+    // Dedicated: declined for want of a backchannel, then granted.
+    let mut pair = opened_before_the_backchannel();
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            None,
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    let up = audio_sections(&answer).pop().unwrap();
+    assert!(up.contains(&"a=inactive"), "{answer}");
+    assert_eq!(payload_types(&up), ["111", "0", "8", "9"], "{answer}");
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            Some(chained(Codec::Pcmu)),
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    assert_eq!(
+        talkback_answered(&answer),
+        ("a=recvonly".to_owned(), "opus/48000/2".to_owned()),
+        "{answer}"
+    );
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Opus));
+    talk(&mut pair, &[(111, &[0xf8, 1, 2])]);
+    let got: Vec<_> = pair.uplink.iter().map(|up| up.codec).collect();
+    assert_eq!(got, [UplinkCodec::Opus]);
+
+    // Shared: the session opened with Opus stream audio and no
+    // backchannel, so its downlink m-line kept Opus first.
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Opus { channels: 2 }));
+    pair.connect(&answer);
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::SendRecv),
+            Some(chained(Codec::Pcmu)),
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    let shared = &audio_sections(&answer)[0];
+    assert!(shared.contains(&"a=sendrecv"), "{answer}");
+    assert_eq!(first_encoding(shared), "opus/48000/2", "{answer}");
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Opus));
+}
+
+/// Talk-back granted on an m-line whose kept formats (str0m 0.24.0 keeps
+/// its first answer's, read 2026-10-24) name first a codec that does not
+/// reach the backchannel is declined, the m-line answered `inactive`
+/// (RFC 3264 §6.1), rather than negotiated in a codec the browser would
+/// send and the camera never get: the session opened with G.722 stream
+/// audio and no backchannel, so the engine prefers G.722, which no
+/// talk-back route takes.
+#[test]
+fn rfc3264_6_1_talk_back_on_an_m_line_that_kept_an_unroutable_codec_first_is_declined() {
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::G722));
+    pair.connect(&answer);
+    pair.renegotiate(
+        Reoffer::Talkback(TalkbackOffer::Dedicated),
+        None,
+        TalkbackClaim::Granted,
+    )
+    .expect("answered");
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            Some(chained(Codec::Pcmu)),
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    assert_eq!(
+        talkback_answered(&answer),
+        ("a=inactive".to_owned(), "G722/8000".to_owned()),
+        "{answer}"
+    );
+    assert_eq!(pair.session.talkback(), None);
+    talk(&mut pair, &[(0, &[0xff; 160])]);
+    assert!(pair.uplink.is_empty(), "nothing taken");
 }
 
 /// A re-offer turning the downlink m-line `sendrecv` shares it: answered
