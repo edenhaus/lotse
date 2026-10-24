@@ -33,17 +33,24 @@
 //! with the current ones, and keep them wherever a player starts or seeks.
 //!
 //! The timeline: a track's timescale is its clock rate, so the camera's
-//! timestamps are the file's. Each epoch of a track starts at its first
-//! frame's capture time after the clip's origin (the capture time of the
-//! clip's first frame), in ticks, and no earlier than where the track's
-//! last sample began; inside the epoch a sample's decode time is that
-//! anchor plus its timestamp's distance from the epoch's first. A
-//! reconnect is so a hole of the real time between the epochs, in a new
-//! fragment. Durations are the distances to the next sample's decode
-//! time; the last one of an epoch, which has no next, takes the one
-//! before it (audio without one: its frame's length), cut short where the
-//! next epoch begins when that is sooner, and an epoch captured before the
-//! last sample began starts where that sample ends.
+//! timestamps are the file's. Each epoch of a track is presented from its
+//! first frame's capture time after the clip's origin (the capture time
+//! of the clip's first frame), in ticks, and no earlier than where the
+//! track's presentation so far ends; inside the epoch a sample's
+//! presentation time is that anchor plus its timestamp's distance from
+//! the epoch's first. A reconnect is so a hole of the real time between
+//! the epochs, in a new fragment. Its decode times start at the anchor
+//! too, unless the track's last sample is decoded until later (reordered
+//! video is decoded ahead of its presentation): then from where that
+//! sample's decode ends, and every sample of the epoch in order carries
+//! the difference, the epoch's lead, as a negative composition offset
+//! (§8.8.8.1), so decode times never go back and the video stays at its
+//! capture times, in sync with the audio. Durations are the distances to
+//! the next sample's decode time; the last one of an epoch, which has no
+//! next, takes the one before it (audio without one: its frame's length),
+//! cut short where the next epoch begins when that is sooner, and an
+//! epoch captured before the track's presentation ends starts where it
+//! ends.
 //!
 //! Video whose timestamps go back in decode order is reordered
 //! (B-frames): from the first such frame on, the epoch's decode times
@@ -124,8 +131,12 @@ struct Epoch {
     number: u32,
     /// The epoch's first timestamp.
     first_ts: i128,
-    /// The decode time of its first sample.
+    /// The presentation time of its first sample.
     anchor: i128,
+    /// How far its decode times run ahead of its presentation times until
+    /// it is reordered: where the track's decode so far ends past the
+    /// anchor, else 0 (see the module).
+    lead: i128,
     /// The latest timestamp, in decode order.
     last_ts: i128,
     /// The latest decode time.
@@ -139,17 +150,25 @@ struct Epoch {
 }
 
 impl Epoch {
-    /// An epoch whose first frame has `ts` and is decoded at `anchor`.
-    const fn new(number: u32, ts: i128, anchor: i128) -> Self {
+    /// An epoch whose first frame has `ts`, is presented at `anchor` and
+    /// is decoded `lead` (at least 0) later.
+    const fn new(number: u32, ts: i128, anchor: i128, lead: i128) -> Self {
         Self {
             number,
             first_ts: ts,
             anchor,
+            lead,
             last_ts: ts,
-            last_dts: anchor,
+            last_dts: anchor.saturating_add(lead),
             step: None,
             reordered: false,
         }
+    }
+
+    /// The composition offset of a sample before the epoch is reordered:
+    /// minus its lead, none without one.
+    fn offset(&self) -> Option<i128> {
+        (self.lead != 0).then(|| self.lead.saturating_neg())
     }
 
     /// The decode time and, once reordered, the composition offset of the
@@ -167,7 +186,7 @@ impl Epoch {
             let dts = self.last_dts.saturating_add(self.step.unwrap_or(1));
             (dts, Some(pts.saturating_sub(dts)))
         } else {
-            (pts, None)
+            (pts.saturating_add(self.lead), self.offset())
         };
         self.last_dts = dts;
         (dts, cts)
@@ -230,9 +249,13 @@ pub(crate) struct TrackWriter {
     out_of_band: Vec<Bytes>,
     /// The current epoch; `None` before the first frame.
     epoch: Option<Epoch>,
-    /// Where the latest finished sample ends; the next epoch starts no
-    /// earlier.
+    /// Where the latest finished sample's decode ends; the next epoch is
+    /// decoded no earlier.
     end: i128,
+    /// Where the presentation of the finished samples ends (the latest
+    /// end of a sample's presentation time and duration); the next epoch
+    /// is presented no earlier.
+    shown: i128,
     /// The latest frame, waiting for its duration.
     held: Option<Held>,
     /// The latest finished sample's duration.
@@ -267,6 +290,7 @@ impl TrackWriter {
             out_of_band,
             epoch: None,
             end: 0,
+            shown: 0,
             held: None,
             last_duration: None,
             latest: 0,
@@ -296,9 +320,11 @@ impl TrackWriter {
                 let since = frame.wallclock.saturating_duration_since(origin);
                 let at = i128::from(ticks(since, self.clock_rate));
                 self.close_before(Some(at));
-                let anchor = at.max(self.end);
-                self.epoch = Some(Epoch::new(frame.epoch, ts, anchor));
-                (anchor, None, anchored)
+                let anchor = at.max(self.shown);
+                let lead = self.end.saturating_sub(anchor).max(0);
+                let epoch = Epoch::new(frame.epoch, ts, anchor, lead);
+                self.epoch = Some(epoch);
+                (anchor.saturating_add(lead), epoch.offset(), anchored)
             }
         };
         let dts = u64::try_from(dts).map_err(|_| out_of_range("a decode time", dts))?;
@@ -421,6 +447,8 @@ impl TrackWriter {
         self.ready_bytes = self.ready_bytes.saturating_add(u64::from(size));
         self.last_duration = Some(duration);
         self.end = i128::from(held.dts).saturating_add(i128::from(duration));
+        let shown = self.end.saturating_add(held.cts.map_or(0, i128::from));
+        self.shown = self.shown.max(shown);
     }
 
     /// The bytes of the samples ready for the next fragment.

@@ -1081,6 +1081,138 @@ fn iso14496_12_8_8_12_an_epoch_inside_the_last_sample_cuts_it_short_at_its_captu
     assert_eq!(timing, [(0, 3600), (3600, 900), (4500, 3600)]);
 }
 
+/// Decode order `I0 P3 B1 B2 P6 B4 B5` of `epoch`, its timestamps from 0
+/// and its payloads numbered from `first`, each frame captured at its
+/// presentation, from `at_ms` on at 25 fps.
+fn reordered_gop(base: Instant, at_ms: u64, epoch: u32, first: u8) -> Vec<(Kind, Arc<MediaFrame>)> {
+    [0_u8, 3, 1, 2, 6, 4, 5]
+        .into_iter()
+        .map(|n| {
+            let at = ms(base, at_ms + u64::from(n) * 40);
+            let payload = h264_au(n == 0, first + n);
+            (
+                Kind::Video,
+                frame(at, i64::from(n) * FRAME, n == 0, epoch, payload),
+            )
+        })
+        .collect()
+}
+
+/// A new epoch after reordered video is presented at its capture time,
+/// in sync with the audio that goes on: its decode times start where the
+/// last sample's decode ends, after its capture time, and each of its
+/// samples carries the difference in its composition offset (ISO/IEC
+/// 14496-12 §8.8.8.1, `trun` version 1). Regression: the epoch captured at
+/// 280 ms after `I0 P3 B1 B2 P6 B4 B5` at 25 fps was presented at 400 ms,
+/// where B5's decode ended, and the rest of the video 120 ms behind the
+/// audio.
+#[test]
+fn iso14496_12_8_8_8_1_an_epoch_after_reordered_video_is_presented_at_its_capture_time() {
+    let base = base();
+    let aac = frames(SINE_16K_MONO);
+    // AAC frame `n` of `epoch`, its `i`th: 64 ms each from `first_ms` on.
+    let audio = |n: usize, epoch: u32, i: u16, first_ms: u64| {
+        let at = ms(base, first_ms + u64::from(i) * 64);
+        let payload = Bytes::copy_from_slice(aac[n]);
+        (
+            Kind::Audio,
+            frame(at, i64::from(i) * 1024, true, epoch, payload),
+        )
+    };
+    // The camera's timestamps start over 280 ms in, without a hole: the
+    // next GOP and the next audio frame are captured where the last end.
+    let mut frames = reordered_gop(base, 0, 0, 0);
+    frames.extend((0..5).map(|i| audio(usize::from(i), 0, i, 0)));
+    frames.extend(reordered_gop(base, 280, 1, 7));
+    frames.extend((0..3).map(|i| audio(usize::from(5 + i), 1, i, 320)));
+    let written = run(
+        &mut Muxer::new(&policy(10_000)),
+        &h264_track(),
+        Some(&aac_track()),
+        &frames,
+    );
+
+    // Every sample of both tracks is presented at its capture time.
+    let captured = |kind: Kind| -> Vec<u64> {
+        frames
+            .iter()
+            .filter(|(pushed, _)| *pushed == kind)
+            .map(|(_, frame)| u64::try_from((frame.wallclock - base).as_millis()).unwrap())
+            .collect()
+    };
+    let presented = |track_id: u32, rate: i64| -> Vec<u64> {
+        samples(&written.file, track_id)
+            .iter()
+            .map(|s| {
+                let ticks = i64::try_from(s.dts).unwrap() + i64::from(s.cts);
+                u64::try_from(ticks * 1000 / rate).unwrap()
+            })
+            .collect()
+    };
+    assert_eq!(presented(1, 90_000), captured(Kind::Video));
+    assert_eq!(presented(2, 16_000), captured(Kind::Audio));
+    // The new epoch's I0 is decoded where B5's decode ends (400 ms) and
+    // presented at its capture time (280 ms); its P3, still in order,
+    // keeps that offset.
+    let video = samples(&written.file, 1);
+    let timing: Vec<(u64, i32)> = video[7..9].iter().map(|s| (s.dts, s.cts)).collect();
+    assert_eq!(timing, [(36_000, -10_800), (46_800, -10_800)]);
+    // Decode times never go back.
+    assert!(
+        video
+            .windows(2)
+            .all(|pair| pair[0].dts + u64::from(pair[0].duration) <= pair[1].dts)
+    );
+}
+
+/// Where a new epoch after reordered video begins, by its capture time:
+/// the media time the muxer reports for its first frame (ISO/IEC 14496-12
+/// §8.8.12), and that frame's decode time and composition offset
+/// (§8.8.8.1). The last presented frame, P6, ends at 280 ms, the last
+/// decoded, B5, at 400 ms.
+#[test]
+fn iso14496_12_8_8_8_1_a_new_epoch_is_presented_no_earlier_than_the_last_frame_ends() {
+    let base = base();
+    // The new epoch's first frame captured at `capture_ms`, and `more`
+    // frames after it with its timestamp: where the muxer reports the
+    // first, and each one's decode time and composition offset.
+    let epoch = |capture_ms: u64, more: u8| -> (Duration, Vec<(u64, i32)>) {
+        let mut muxer = Muxer::new(&policy(10_000));
+        let mut file: Vec<u8> = muxer.start(&h264_track(), None).unwrap().concat();
+        for (kind, frame) in reordered_gop(base, 0, 0, 0) {
+            file.extend(muxer.push(kind, frame).unwrap().concat());
+        }
+        let first = frame(ms(base, capture_ms), 0, true, 1, h264_au(true, 7));
+        file.extend(muxer.push(Kind::Video, first).unwrap().concat());
+        let media_time = muxer.media_time(Kind::Video);
+        for n in 0..more {
+            let next = frame(ms(base, capture_ms), 0, false, 1, h264_au(false, 8 + n));
+            file.extend(muxer.push(Kind::Video, next).unwrap().concat());
+        }
+        file.extend(muxer.finish().unwrap().concat());
+        let timing = samples(&file, 1)[7..]
+            .iter()
+            .map(|s| (s.dts, s.cts))
+            .collect();
+        (media_time, timing)
+    };
+    let first = |capture_ms: u64| {
+        let (media_time, timing) = epoch(capture_ms, 0);
+        (media_time, timing[0].0, timing[0].1)
+    };
+    // Captured where P6 ends: presented there, decoded where B5 ends.
+    assert_eq!(first(280), (Duration::from_millis(280), 36_000, -10_800));
+    // Captured between the two ends.
+    assert_eq!(first(360), (Duration::from_millis(360), 36_000, -3600));
+    // Captured inside P6: presented where it ends, not over it.
+    assert_eq!(first(200), (Duration::from_millis(280), 36_000, -10_800));
+    // Captured after B5's decode ends: decoded where presented.
+    assert_eq!(first(1000), (Duration::from_millis(1000), 90_000, 0));
+    // A frame repeating the first's timestamp is decoded a tick after it,
+    // after B5's decode too.
+    assert_eq!(epoch(280, 1).1, [(36_000, -10_800), (36_001, -10_801)]);
+}
+
 /// The media time the muxer gives the latest frame of a track is its
 /// presentation time from the clip's origin, where the file has it (ISO/IEC
 /// 14496-12 §8.8.12), an epoch moved off its capture time included; zero
