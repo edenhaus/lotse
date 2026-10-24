@@ -45,15 +45,20 @@
 //! sample's decode ends, and every sample of the epoch in order carries
 //! the difference, the epoch's lead, as a negative composition offset
 //! (§8.8.8.1), so decode times never go back and the video stays at its
-//! capture times, in sync with the audio. Durations are the distances to
-//! the next sample's decode time; the last one of an epoch, which has no
-//! next, takes its frame's own length where the codec states one (an
-//! AAC-LC frame's 1024 samples, ISO/IEC 14496-3 §4.4.1; an Opus
-//! packet's frames, RFC 6716 §3.1), else the one before it (video), cut
-//! short so its presentation ends where the next epoch begins when
-//! that is sooner and no sooner than the track's presentation so far ends,
-//! and an epoch captured before the track's presentation ends starts where
-//! it ends.
+//! capture times, in sync with the audio. Where the track's presentation
+//! so far ends is where its last epoch's last sample ends, or one nominal
+//! frame duration after the latest presentation time of the samples
+//! before it, if later: reordered video's last sample in decode order is
+//! not its last in presentation order, and the durations, steps of the
+//! decode times, are not how long the samples before it are shown.
+//! Durations are the distances to the next sample's decode time; the
+//! last one of an epoch, which has no next, takes its frame's own length
+//! where the codec states one (an AAC-LC frame's 1024 samples, ISO/IEC
+//! 14496-3 §4.4.1; an Opus packet's frames, RFC 6716 §3.1), else the one
+//! before it (video), cut short so its presentation ends where the next
+//! epoch begins when that is sooner and no sooner than the track's
+//! presentation so far ends, and an epoch captured before the track's
+//! presentation ends starts where it ends.
 //!
 //! Video whose timestamps go back in decode order is reordered
 //! (B-frames): from the first such frame on, the epoch's decode times
@@ -150,6 +155,9 @@ struct Epoch {
     /// Whether a timestamp went back: the epoch's decode times step by
     /// `step` from then on.
     reordered: bool,
+    /// The latest presentation time of its frames before the latest one
+    /// (see [`Epoch::shown`]); `None` before the second.
+    top: Option<i128>,
 }
 
 impl Epoch {
@@ -165,7 +173,29 @@ impl Epoch {
             last_dts: anchor.saturating_add(lead),
             step: None,
             reordered: false,
+            top: None,
         }
+    }
+
+    /// The presentation time of its frame with timestamp `ts`: the anchor
+    /// plus the timestamp's distance from the first.
+    const fn pts(&self, ts: i128) -> i128 {
+        self.anchor.saturating_add(ts.saturating_sub(self.first_ts))
+    }
+
+    /// Where the presentation of its frames before the latest one ends:
+    /// one nominal frame duration after the latest of their presentation
+    /// times (a tick before it has one, as its decode times step), `None`
+    /// before the second frame. Not where their durations end, which are
+    /// steps of the decode times: `P3` of `I0 P3 B1 B2` at 25 fps is
+    /// decoded at 120 ms and `B1`, a step of the 2 frames between them,
+    /// at 200 ms, while the four pictures are shown until 160 ms. In order,
+    /// the latest frame is presented at least a step after the ones before
+    /// it, so its own end decides. Asked when the epoch ends: the step only
+    /// shrinks.
+    fn shown(&self) -> Option<i128> {
+        self.top
+            .map(|top| top.saturating_add(self.step.unwrap_or(1)))
     }
 
     /// The composition offset of a sample before the epoch is reordered:
@@ -177,6 +207,8 @@ impl Epoch {
     /// The decode time and, once reordered, the composition offset of the
     /// next frame of the epoch, `ts`.
     fn next(&mut self, ts: i128, video: bool) -> (i128, Option<i128>) {
+        let before = self.pts(self.last_ts);
+        self.top = Some(self.top.map_or(before, |top| top.max(before)));
         let delta = ts.saturating_sub(self.last_ts);
         if delta != 0 {
             let distance = delta.saturating_abs();
@@ -184,7 +216,7 @@ impl Epoch {
         }
         self.reordered |= video && delta <= 0;
         self.last_ts = ts;
-        let pts = self.anchor.saturating_add(ts.saturating_sub(self.first_ts));
+        let pts = self.pts(ts);
         let (dts, cts) = if self.reordered {
             let dts = self.last_dts.saturating_add(self.step.unwrap_or(1));
             (dts, Some(pts.saturating_sub(dts)))
@@ -262,9 +294,9 @@ pub(crate) struct TrackWriter {
     /// Where the latest finished sample's decode ends; the next epoch is
     /// decoded no earlier.
     end: i128,
-    /// Where the presentation of the finished samples ends (the latest
-    /// end of a sample's presentation time and duration); the next epoch
-    /// is presented no earlier.
+    /// Where the presentation of the earlier epochs ends, each settled as
+    /// it ends ([`Self::close_before`]); with the current epoch's,
+    /// [`Self::presented`]. The next epoch is presented no earlier.
     shown: i128,
     /// The latest frame, waiting for its duration.
     held: Option<Held>,
@@ -274,7 +306,7 @@ pub(crate) struct TrackWriter {
     latest: i128,
     /// The finished samples of the next fragment.
     ready: Vec<Sample>,
-    /// Their bytes.
+    /// What they hold (see [`Self::finish`]).
     ready_bytes: u64,
 }
 
@@ -353,6 +385,17 @@ impl TrackWriter {
         Ok(anchored)
     }
 
+    /// Where the presentation of the samples finished so far ends: where
+    /// the earlier epochs' ends ([`Self::shown`]) or where the current
+    /// one's before its held sample ends ([`Epoch::shown`]), whichever is
+    /// later.
+    fn presented(&self) -> i128 {
+        self.epoch
+            .as_ref()
+            .and_then(Epoch::shown)
+            .map_or(self.shown, |shown| self.shown.max(shown))
+    }
+
     /// The presentation time of the latest frame taken, from the clip's
     /// media time 0; zero before the first.
     pub(crate) fn media_time(&self) -> Duration {
@@ -390,7 +433,9 @@ impl TrackWriter {
     /// order may be presented before the others end, and cutting it would
     /// not bring the next epoch sooner. The cut is the hole's, not the
     /// frame's: the duration the next epoch's last sample inherits is the
-    /// uncut one.
+    /// uncut one. The epoch so ends: where its presentation ends, the
+    /// sample's end or the ones' before it ([`Epoch::shown`]), goes into
+    /// [`Self::shown`].
     fn close_before(&mut self, next: Option<i128>) {
         let Some(held) = self.held.take() else {
             return;
@@ -399,11 +444,14 @@ impl TrackWriter {
             .frame_length(&held.frame)
             .or(self.last_duration)
             .unwrap_or(self.clock_rate / FALLBACK_FRAME_RATE);
+        let shown = self.presented();
         let cut = next
-            .map(|next| next.max(self.shown).saturating_sub(held.pts()))
+            .map(|next| next.max(shown).saturating_sub(held.pts()))
             .and_then(|cut| u32::try_from(cut).ok())
             .filter(|cut| (1..duration).contains(cut));
-        self.finish(&held, cut.unwrap_or(duration));
+        let length = cut.unwrap_or(duration);
+        self.finish(&held, length);
+        self.shown = shown.max(held.pts().saturating_add(i128::from(length)));
         self.last_duration = Some(duration);
     }
 
@@ -429,31 +477,41 @@ impl TrackWriter {
             && !self.out_of_band.iter().any(|set| set.as_ref() == unit)
     }
 
-    /// Makes `held` a sample of `duration` ready for the next fragment.
+    /// Makes `held` a sample of `duration` ready for the next fragment,
+    /// and counts what it holds until the fragment goes out: its frame's
+    /// payload, which its slices keep whole, its units' 4-byte lengths, and
+    /// the descriptors of its pieces and its own. A frame of many tiny NAL
+    /// units holds far more in descriptors than in media data: an access
+    /// unit of one-byte units behind four-byte start codes, 64 bytes of
+    /// descriptors per 5 bytes of media.
     fn finish(&mut self, held: &Held, duration: u32) {
         let payload = &held.frame.payload;
-        let pieces = if self.video {
-            let units = annex_b_units(payload);
+        let (pieces, lengths) = if self.video {
+            let mut units = annex_b_units(payload);
             if units.iter().any(|unit| self.foreign_set(unit)) {
                 // SPEC-DEVIATION (see the module): this sample's sets and
                 // every later one's stay in band.
                 self.out_of_band.clear();
             }
-            let mut lengths = BytesMut::with_capacity(units.len().saturating_mul(4));
+            units.retain(|unit| !self.out_of_band.iter().any(|set| set.as_ref() == *unit));
+            let lengths_bytes = units.len().saturating_mul(4);
+            let mut lengths = BytesMut::with_capacity(lengths_bytes);
             let mut pieces = Vec::with_capacity(units.len().saturating_mul(2));
             for unit in units {
-                if self.out_of_band.iter().any(|set| set.as_ref() == unit) {
-                    continue;
-                }
                 // A unit is shorter than its frame, which a sample bounds.
                 lengths.put_u32(u32::try_from(unit.len()).unwrap_or(u32::MAX));
                 pieces.push(lengths.split().freeze());
                 pieces.push(payload.slice_ref(unit));
             }
-            pieces
+            (pieces, lengths_bytes)
         } else {
-            vec![payload.clone()]
+            (vec![payload.clone()], 0)
         };
+        let holds = payload
+            .len()
+            .saturating_add(lengths)
+            .saturating_add(pieces.len().saturating_mul(size_of::<Bytes>()))
+            .saturating_add(size_of::<Sample>());
         let size = pieces
             .iter()
             .map(Bytes::len)
@@ -474,14 +532,16 @@ impl TrackWriter {
             flags,
             cts: held.cts,
         });
-        self.ready_bytes = self.ready_bytes.saturating_add(u64::from(size));
+        self.ready_bytes = self
+            .ready_bytes
+            .saturating_add(u64::try_from(holds).unwrap_or(u64::MAX));
         self.last_duration = Some(duration);
         self.end = i128::from(held.dts).saturating_add(i128::from(duration));
-        let shown = held.pts().saturating_add(i128::from(duration));
-        self.shown = self.shown.max(shown);
     }
 
-    /// The bytes of the samples ready for the next fragment.
+    /// What the samples ready for the next fragment hold: their frames'
+    /// payloads, their lengths and their descriptors (see
+    /// [`Self::finish`]).
     pub(crate) const fn ready_bytes(&self) -> u64 {
         self.ready_bytes
     }

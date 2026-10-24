@@ -17,7 +17,7 @@ use lotse_core::{Codec, CodecFamily, Kind, MediaFrame, MediaTime};
 use mp4_atom::{Any, Codec as SampleEntry, Decode as _, Ftyp, Moof, Moov};
 
 use super::{Factory, Limits, MAX_FRAGMENT_BYTES, MAX_SAMPLE_BYTES, Muxer, State, encode_failed};
-use crate::fragment::{duration_of, ticks};
+use crate::fragment::{Sample, duration_of, ticks};
 use crate::init::{NON_SYNC_SAMPLE, SYNC_SAMPLE};
 
 /// One H.264 frame at 25 fps in 90 kHz ticks.
@@ -990,12 +990,79 @@ fn fragments_end_after_the_span_of_decode_time_whatever_the_capture_times() {
     assert_eq!(written.cuts, [51]);
 }
 
+/// Each track's span counts on its own decode times, never against the
+/// other track's, whose epochs are anchored apart. Regression: one shared
+/// mark, set by the track whose frame last ended a fragment, so an audio
+/// frame a Sender Report dated an hour ahead ended the fragment and moved
+/// the mark an hour on, and the video after it, with no audio, never
+/// reached it: only a keyframe ended a fragment again.
 #[test]
-fn fragments_end_once_their_media_data_reach_the_bound() {
+fn each_track_s_span_counts_on_its_own_decode_times() {
     let base = base();
-    // Samples of 25 bytes: a 4-byte length and a 21-byte unit.
-    let au = annex_b(&[&[0x41; 21]]);
-    let frames: Vec<_> = (0..10_u8)
+    let aac = Bytes::copy_from_slice(frames(SINE_16K_MONO)[0]);
+    // One GOP of 2.4 s with an audio frame captured an hour ahead after its
+    // second frame, then no audio.
+    let mut frames: Vec<_> = (0..60_u8)
+        .map(|i| {
+            let key = i == 0;
+            let at = ms(base, u64::from(i) * 40);
+            (
+                Kind::Video,
+                frame(at, i64::from(i) * FRAME, key, 0, h264_au(key, i)),
+            )
+        })
+        .collect();
+    let ahead = frame(ms(base, 3_600_000), 0, true, 0, aac);
+    frames.insert(2, (Kind::Audio, ahead));
+    let written = run(
+        &mut Muxer::new(&policy(1000)),
+        &h264_track(),
+        Some(&aac_track()),
+        &frames,
+    );
+    // The video frames at 1 s and 2 s end the fragments before them, as
+    // without the audio; the audio frame starts its own span.
+    assert_eq!(written.cuts, [26, 51]);
+
+    // The other way round: a video epoch an hour ahead, then audio alone.
+    let mut frames = vec![
+        (Kind::Video, frame(base, 0, true, 0, h264_au(true, 0))),
+        (
+            Kind::Video,
+            frame(ms(base, 3_600_000), 0, true, 1, h264_au(true, 1)),
+        ),
+    ];
+    for i in 0..110_u8 {
+        let at = ms(base, 20 * u64::from(i));
+        frames.push((
+            Kind::Audio,
+            frame(at, 960 * i64::from(i), true, 0, opus_packet(i)),
+        ));
+    }
+    let written = run(
+        &mut Muxer::new(&policy(1000)),
+        &h264_track(),
+        Some(&opus_track(1)),
+        &frames,
+    );
+    // The new epoch ends the first fragment; the audio at 1 s and 2 s,
+    // counted from its own first frame, the next two.
+    assert_eq!(written.cuts, [1, 52, 102]);
+}
+
+/// What a video sample of `units` NAL units from a frame of `payload`
+/// bytes holds: the payload, a 4-byte length and two piece descriptors per
+/// unit, and its own descriptor.
+fn holds(payload: usize, units: usize) -> u64 {
+    u64::try_from(payload + units * (4 + 2 * size_of::<Bytes>()) + size_of::<Sample>()).unwrap()
+}
+
+/// `count` video frames of `au` at 25 fps, the first a keyframe, under a
+/// span far above them and a fragment bound of `fragment_bytes`: which
+/// pushes completed a fragment.
+fn cuts_at_the_bound(au: &Bytes, count: u8, fragment_bytes: u64) -> Written {
+    let base = base();
+    let frames: Vec<_> = (0..count)
         .map(|i| {
             (
                 Kind::Video,
@@ -1012,16 +1079,85 @@ fn fragments_end_once_their_media_data_reach_the_bound() {
     let mut muxer = Muxer {
         limits: Limits {
             sample_bytes: MAX_SAMPLE_BYTES,
-            fragment_bytes: 100,
+            fragment_bytes,
         },
         ..Muxer::new(&policy(10_000))
     };
-    let written = run(&mut muxer, &h264_track(), None, &frames);
-    // Four samples are 100 bytes: the fifth frame's push ends the fragment.
+    run(&mut muxer, &h264_track(), None, &frames)
+}
+
+/// Audio that goes on while video stalls ends a fragment a span after
+/// its own first frame in it, not a span after the decode time of the
+/// keyframe that began the fragment, which reordering puts after its
+/// capture time. Regression: after `I0 P3 B1 B2 P6 B4 B5` at 25 fps, the
+/// keyframe captured at 280 ms is decoded at 400 ms; that began the one
+/// span mark both tracks shared, so with no more video the audio ended
+/// the fragment only at its frame at 1408 ms, the first a second after
+/// 400 ms.
+#[test]
+fn audio_after_a_reordered_gop_ends_the_fragment_a_span_after_its_own_first_frame() {
+    let base = base();
+    let aac = Bytes::copy_from_slice(frames(SINE_16K_MONO)[0]);
+    // AAC frame `i`, 64 ms each.
+    let audio = |i: u16| {
+        let at = ms(base, u64::from(i) * 64);
+        (
+            Kind::Audio,
+            frame(at, i64::from(i) * 1024, true, 0, aac.clone()),
+        )
+    };
+    let mut frames = reordered_gop(base, 0, 0, 0);
+    frames.extend((0..5).map(audio));
+    // The next keyframe, in the same epoch: captured at 280 ms, decoded at
+    // 400 ms after the reordering. Then the video stalls.
+    let keyframe = frame(ms(base, 280), 7 * FRAME, true, 0, h264_au(true, 7));
+    frames.push((Kind::Video, keyframe));
+    frames.extend((5..25).map(audio));
+    let written = run(
+        &mut Muxer::new(&policy(1000)),
+        &h264_track(),
+        Some(&aac_track()),
+        &frames,
+    );
+    let video = samples(&written.file, 1);
+    assert_eq!((video[7].dts, video[7].cts), (36_000, -10_800));
+    // The keyframe ends the first fragment; the audio's span then counts
+    // from its first frame after it, at 320 ms, so its frame at 1344 ms,
+    // the first a second later, ends the second.
+    assert_eq!(written.cuts, [12, 29]);
+    let (_, cutting) = &frames[29];
+    assert_eq!(cutting.wallclock - base, Duration::from_millis(1344));
+}
+
+#[test]
+fn fragments_end_once_what_their_samples_hold_reaches_the_bound() {
+    // Samples of 25 bytes: a 4-byte length and a 21-byte unit.
+    let au = annex_b(&[&[0x41; 21]]);
+    let written = cuts_at_the_bound(&au, 10, 4 * holds(au.len(), 1));
+    // Four samples reach the bound: the fifth frame's push ends the fragment.
     assert_eq!(written.cuts, [4, 8]);
     let samples = samples(&written.file, 1);
     assert!(samples.iter().all(|s| s.bytes.len() == 25));
     assert_eq!(MAX_FRAGMENT_BYTES, 1 << 30);
+}
+
+/// A frame of many tiny NAL units counts the descriptors of its pieces,
+/// not only its media data. Regression: a sample counted only its bytes,
+/// so a 4 MiB access unit of one-byte units, 838 860 of them, counted
+/// 4 MiB against the 1 GiB bound while it held 54 MiB more in its
+/// pieces' descriptors and lengths: a fragment of such frames, which
+/// constant timestamps keep from its span, held about 15 GiB.
+#[test]
+fn a_frame_of_many_tiny_nal_units_counts_what_it_holds_against_the_bound() {
+    let units = vec![[0x41_u8]; 1000];
+    let units: Vec<&[u8]> = units.iter().map(<[u8; 1]>::as_slice).collect();
+    let au = annex_b(&units);
+    // 5000 bytes of media in each sample, 64 000 of descriptors.
+    assert_eq!(au.len(), 5000);
+    let written = cuts_at_the_bound(&au, 10, 2 * holds(au.len(), 1000));
+    assert_eq!(written.cuts, [2, 4, 6, 8]);
+    let samples = samples(&written.file, 1);
+    assert!(samples.iter().all(|s| s.bytes.len() == 5000));
 }
 
 #[test]
@@ -1134,9 +1270,20 @@ fn iso14496_12_8_8_12_an_epoch_inside_the_last_sample_cuts_it_short_at_its_captu
 /// and its payloads numbered from `first`, each frame captured at its
 /// presentation, from `at_ms` on at 25 fps.
 fn reordered_gop(base: Instant, at_ms: u64, epoch: u32, first: u8) -> Vec<(Kind, Arc<MediaFrame>)> {
-    [0_u8, 3, 1, 2, 6, 4, 5]
-        .into_iter()
-        .map(|n| {
+    gop(&[0, 3, 1, 2, 6, 4, 5], base, at_ms, epoch, first)
+}
+
+/// [`reordered_gop`] in decode `order` (frame numbers, 0 the keyframe).
+fn gop(
+    order: &[u8],
+    base: Instant,
+    at_ms: u64,
+    epoch: u32,
+    first: u8,
+) -> Vec<(Kind, Arc<MediaFrame>)> {
+    order
+        .iter()
+        .map(|&n| {
             let at = ms(base, at_ms + u64::from(n) * 40);
             let payload = h264_au(n == 0, first + n);
             (
@@ -1211,6 +1358,70 @@ fn iso14496_12_8_8_8_1_an_epoch_after_reordered_video_is_presented_at_its_captur
         video
             .windows(2)
             .all(|pair| pair[0].dts + u64::from(pair[0].duration) <= pair[1].dts)
+    );
+}
+
+/// An epoch after a reordered GOP whose last frame in presentation order
+/// was decoded two frames before the next is presented at its capture
+/// time too: that frame is shown for the epoch's nominal frame duration,
+/// not for the step of its decode time, which the frames after it stretch
+/// over the reordering (ISO/IEC 14496-12 §8.8.8.1). Regression: after
+/// `I0 P3 B1 B2` at 25 fps, P3, decoded at 120 ms and B1 at 200 ms, was
+/// taken as shown until 200 ms, so the epoch captured at 160 ms, where
+/// the four pictures end, was presented at 200 ms, and the rest of the
+/// video 40 ms behind the audio.
+#[test]
+fn iso14496_12_8_8_8_1_an_epoch_after_a_short_reordered_gop_is_presented_at_its_capture_time() {
+    let base = base();
+    let aac = frames(SINE_16K_MONO);
+    // AAC frame `i` of the audio's one epoch: 64 ms each.
+    let audio = |i: u16| {
+        let at = ms(base, u64::from(i) * 64);
+        let payload = Bytes::copy_from_slice(aac[usize::from(i)]);
+        (
+            Kind::Audio,
+            frame(at, i64::from(i) * 1024, true, 0, payload),
+        )
+    };
+    // The camera's timestamps start over 160 ms in, without a hole; the
+    // audio goes on.
+    let mut frames = gop(&[0, 3, 1, 2], base, 0, 0, 0);
+    frames.extend((0..3).map(audio));
+    frames.extend(gop(&[0, 3, 1, 2], base, 160, 1, 4));
+    frames.extend((3..6).map(audio));
+    let written = run(
+        &mut Muxer::new(&policy(10_000)),
+        &h264_track(),
+        Some(&aac_track()),
+        &frames,
+    );
+
+    // Every sample of both tracks is presented at its capture time.
+    let captured = |kind: Kind| -> Vec<u64> {
+        frames
+            .iter()
+            .filter(|(pushed, _)| *pushed == kind)
+            .map(|(_, frame)| u64::try_from((frame.wallclock - base).as_millis()).unwrap())
+            .collect()
+    };
+    let presented = |track_id: u32, rate: i64| -> Vec<u64> {
+        samples(&written.file, track_id)
+            .iter()
+            .map(|s| {
+                let ticks = i64::try_from(s.dts).unwrap() + i64::from(s.cts);
+                u64::try_from(ticks * 1000 / rate).unwrap()
+            })
+            .collect()
+    };
+    assert_eq!(presented(1, 90_000), captured(Kind::Video));
+    assert_eq!(presented(2, 16_000), captured(Kind::Audio));
+    // P3 still lasts its decode step of 80 ms; the new epoch's I0 is
+    // decoded where B2's decode ends (280 ms) and presented at 160 ms.
+    let video = samples(&written.file, 1);
+    let timing: Vec<(u64, u32, i32)> = video.iter().map(|s| (s.dts, s.duration, s.cts)).collect();
+    assert_eq!(
+        [timing[1], timing[4]],
+        [(10_800, 7200, 0), (25_200, 10_800, -10_800)]
     );
 }
 
