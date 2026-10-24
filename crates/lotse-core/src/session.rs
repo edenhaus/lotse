@@ -434,6 +434,7 @@ pub trait SessionEngine: fmt::Debug + Send {
 ///   browser follows parameter-set changes in band;
 /// - `SourceLost` and `SourceRestored` keep the session: the stream
 ///   reconnects, and media resumes with the new epoch's keyframe;
+///   `SourceSwitched` too: a switch is a hot swap, its epoch follows;
 /// - the track's end closes with `stream_deleted`.
 pub fn apply_track_event(
     engine: &mut dyn SessionEngine,
@@ -471,8 +472,10 @@ pub fn apply_track_event(
         },
         Some(TrackEvent::SourceLost) => tracing::info!("source lost; the session waits"),
         Some(TrackEvent::SourceRestored) => tracing::info!("source restored"),
-        // A packet subscription yields no frames.
-        Some(TrackEvent::Frame(_)) => {}
+        // A packet subscription yields no frames; a source switch is a hot
+        // swap to a session, and the epoch that follows it skips to the
+        // new source's keyframe.
+        Some(TrackEvent::Frame(_) | TrackEvent::SourceSwitched) => {}
         None => engine.close(now, "stream_deleted", "the track closed".to_owned()),
     }
 }
@@ -486,7 +489,7 @@ pub fn apply_track_event(
 ///   offset follows each packet's epoch;
 /// - a `TrackChanged` closes with `stream_changed` only when the family
 ///   changed, since the answer named the old codec's payload type;
-/// - `SourceLost` and `SourceRestored` keep the session;
+/// - `SourceLost`, `SourceRestored` and `SourceSwitched` keep the session;
 /// - the track's end stops the audio; the video track's end closes a
 ///   session that plays video.
 pub fn apply_audio_event(
@@ -519,6 +522,7 @@ pub fn apply_audio_event(
             | TrackEvent::TrackChanged(_)
             | TrackEvent::SourceLost
             | TrackEvent::SourceRestored
+            | TrackEvent::SourceSwitched
             | TrackEvent::Frame(_),
         ) => true,
         None => {
