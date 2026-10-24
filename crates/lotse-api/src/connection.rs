@@ -642,14 +642,24 @@ impl<H: Handler> Connection<H> {
                 }
                 Outcome::Subscribed(events) => {
                     self.send(Class::Signaling, &Success::new(id, Empty::default()));
-                    let forwarder = lotse_core::task::spawn_named(
-                        "api.subscription",
-                        forward(id, events, Arc::clone(&self.outbox)).in_current_span(),
-                    );
-                    self.subscriptions.insert(id, forwarder);
+                    self.subscribe(id, events);
+                }
+                Outcome::SubscribedWith { result, events } => {
+                    self.send(Class::Signaling, &Success::new(id, result));
+                    self.subscribe(id, events);
                 }
             },
         }
+    }
+
+    /// Forwards subscription `id`'s `events` as frames from now on, until
+    /// they end or the client unsubscribes.
+    fn subscribe(&mut self, id: u64, events: mpsc::Receiver<Event>) {
+        let forwarder = lotse_core::task::spawn_named(
+            "api.subscription",
+            forward(id, events, Arc::clone(&self.outbox)).in_current_span(),
+        );
+        self.subscriptions.insert(id, forwarder);
     }
 }
 

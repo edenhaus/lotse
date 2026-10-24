@@ -120,6 +120,19 @@ impl Handler for FakeHandler {
                 self.sessions.lock().unwrap().push((offer.id, tx));
                 Outcome::Subscribed(rx)
             }
+            Command::ClipStart(start) => {
+                // A result with content, then the clip's events.
+                let (tx, rx) = mpsc::channel(8);
+                let clip_id = start.clip_id.unwrap_or_default();
+                let _queued = tx.try_send(Event {
+                    class: EventClass::Signaling,
+                    payload: json!({ "type": "stopped", "reason": "completed", "bytes": 0, "duration_ms": 0, "gaps": 0 }),
+                });
+                Outcome::SubscribedWith {
+                    result: json!({ "clip_id": clip_id, "url": format!("/v0/clips/{clip_id}") }),
+                    events: rx,
+                }
+            }
             Command::Info(_) => Outcome::Result(json!({ "version": "0.0.0-test" })),
             Command::StreamList(_) => Outcome::Result(json!({ "streams": {} })),
             // A result over the whole outbound budget.
@@ -132,7 +145,6 @@ impl Handler for FakeHandler {
             | Command::SessionClose(_)
             | Command::SessionAdopt(_)
             | Command::BackchannelRelease(_)
-            | Command::ClipStart(_)
             | Command::ClipStop(_) => Outcome::Result(json!({})),
             Command::Ping(_)
             | Command::Schema(_)
@@ -503,6 +515,28 @@ async fn unsubscribing_a_session_sends_its_closed_event_before_the_result() {
         recv(&mut ws).await,
         json!({ "id": 4, "type": "result", "success": true, "result": {} })
     );
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `clip/start`'s result names the clip, and its events follow it on the
+/// subscription the command opened.
+#[tokio::test]
+async fn a_subscription_may_start_with_a_result_of_its_own() {
+    let running = start("result-and-events", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    send(
+        &mut ws,
+        json!({ "id": 1, "type": "clip/start", "stream_id": "a", "clip_id": "k1" }),
+    )
+    .await;
+    assert_eq!(
+        recv(&mut ws).await,
+        json!({ "id": 1, "type": "result", "success": true,
+                "result": { "clip_id": "k1", "url": "/v0/clips/k1" } })
+    );
+    assert_eq!(recv(&mut ws).await["event"]["type"], "stopped");
     ws.close(None).await.unwrap();
     running.finish().await;
 }

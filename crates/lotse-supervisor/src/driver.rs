@@ -28,6 +28,14 @@
 //! it, and an offer that requests talk-back meanwhile goes to the worker
 //! as any other, where it waits for the probe.
 //!
+//! A stream's pre-roll window reaches the running worker the same way
+//! ([`DriverCommand::Preroll`]): its tracks keep or free their rings, and
+//! nothing reconnects; the next worker starts with the window. An event
+//! clip's start carries the write end of its pipe to the worker as the
+//! message's descriptor; one that never reached a worker before it was
+//! stopped ends here, as the worker would have ended it, and the clips of
+//! a worker that exits end `worker_crashed`.
+//!
 //! A worker that can no longer be told what to do is killed, so its exit
 //! runs the crash path and the machine restarts it with backoff: one whose
 //! channel ended while it runs, and one that sent nothing for
@@ -41,6 +49,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lotse_api_types::clip::ClipStopReason;
 use lotse_api_types::session::CloseCode;
 use lotse_core::backoff::{BackoffPosition, ReconnectBackoff};
 use lotse_core::connection::{
@@ -49,9 +58,8 @@ use lotse_core::connection::{
 };
 use lotse_core::source::SourceError;
 use lotse_core::task::{BoxFuture, spawn_named};
-use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
-use lotse_ipc::{SessionSpec, SourceSpec};
+use lotse_ipc::{ClipReport, ClipSpec, SessionSpec, SourceSpec};
 use tokio::sync::{mpsc, watch};
 
 use crate::connect::{CONNECT_LEASE, ConnectSlot, SlotWake};
@@ -59,7 +67,6 @@ use crate::net::demux::{DatagramSink, WorkerSink};
 use crate::net::turn_client::LeaseGrant;
 use crate::registry::{CloseBy, ConnectionSnapshot, Shared, WorkerProcess};
 use crate::worker::{Worker, WorkerEvent};
-use crate::worker_text::MAX_NAME_BYTES;
 
 /// Session messages a driver holds, queued or in flight, besides the
 /// close each open session reserves (`SessionEntry::close_slot`): a
@@ -103,6 +110,24 @@ pub(crate) enum DriverCommand {
     /// running worker, whose sources turn their probe on or off without
     /// restarting.
     Backchannel(DriverSpec),
+    /// The connection's pre-roll window is `ms` from now on, 0 for none:
+    /// tell a running worker, and start the next one with it.
+    Preroll {
+        /// The window, in milliseconds.
+        ms: u32,
+    },
+    /// Start this event clip, writing into `pipe`.
+    StartClip {
+        /// The clip.
+        spec: ClipSpec,
+        /// The write end of the clip's pipe, which goes to the worker.
+        pipe: OwnedFd,
+    },
+    /// Stop this event clip cleanly.
+    StopClip {
+        /// The clip.
+        clip_id: String,
+    },
     /// Open this session.
     OpenSession(SessionSpec),
     /// A trickled browser candidate.
@@ -195,6 +220,9 @@ impl DriverCommand {
             Self::IceTcp { .. }
             | Self::SwitchSource(_)
             | Self::Backchannel(_)
+            | Self::Preroll { .. }
+            | Self::StartClip { .. }
+            | Self::StopClip { .. }
             | Self::ReleaseBackchannel { .. } => None,
         }
     }
@@ -251,9 +279,14 @@ pub(crate) struct DriverSpec {
 }
 
 impl DriverSpec {
-    /// The spec as the worker takes it, with the resolved addresses and
-    /// where its reconnect schedule starts.
-    fn source_spec(&self, peer_addrs: Vec<SocketAddr>, backoff: BackoffPosition) -> SourceSpec {
+    /// The spec as the worker takes it, with the resolved addresses, where
+    /// its reconnect schedule starts, and the connection's pre-roll window.
+    fn source_spec(
+        &self,
+        peer_addrs: Vec<SocketAddr>,
+        backoff: BackoffPosition,
+        preroll_ms: u32,
+    ) -> SourceSpec {
         SourceSpec {
             connection_id: self.connection_id.clone(),
             url: self.url.clone(),
@@ -264,8 +297,7 @@ impl DriverSpec {
                 attempts: backoff.attempts,
                 immediate_used: backoff.immediate_used,
             },
-            // No stream asks the supervisor for a pre-roll window.
-            preroll_ms: 0,
+            preroll_ms,
         }
     }
 }
@@ -431,13 +463,17 @@ pub(crate) struct Driver {
     switching: bool,
     /// The failed attempt of the source to switch to, until its next one.
     switch_failure: Option<ConnectionError>,
+    /// The connection's pre-roll window, in milliseconds, which every
+    /// worker it starts and every source it switches to gets.
+    preroll_ms: u32,
 }
 
 impl Driver {
     /// A driver for `spec` following `demand` and taking `commands`, whose
-    /// sending side is `commands_tx`.
+    /// sending side is `commands_tx`, keeping a pre-roll window of
+    /// `preroll_ms` until told another.
     pub(crate) fn new(
-        spec: DriverSpec,
+        (spec, preroll_ms): (DriverSpec, u32),
         shared: Arc<Shared>,
         demand: watch::Receiver<Demand>,
         commands: (mpsc::Sender<DriverCommand>, mpsc::Receiver<DriverCommand>),
@@ -472,6 +508,7 @@ impl Driver {
             published: (ConnectionState::Idle, None),
             switching: false,
             switch_failure: None,
+            preroll_ms,
         }
     }
 
@@ -550,6 +587,7 @@ impl Driver {
             Wake::Worker(event) => self.on_worker_event(event),
             Wake::Command(DriverCommand::SwitchSource(spec)) => self.on_switch_source(spec),
             Wake::Command(DriverCommand::Backchannel(spec)) => self.on_backchannel(spec).await,
+            Wake::Command(DriverCommand::Preroll { ms }) => self.on_preroll(ms).await,
             Wake::Command(command) => match self.worker.as_mut() {
                 Some(worker) => {
                     Self::send(worker, &self.shared, &self.commands_tx, command).await;
@@ -640,7 +678,9 @@ impl Driver {
                 if let Some(worker) = self.worker.as_mut() {
                     // A source switched to has failed no attempt yet: its
                     // schedule starts at the first step.
-                    let spec = self.spec.source_spec(addrs, BackoffPosition::default());
+                    let spec =
+                        self.spec
+                            .source_spec(addrs, BackoffPosition::default(), self.preroll_ms);
                     if let Err(err) = worker.switch_source(&spec).await {
                         tracing::warn!(pid = worker.pid(), error = %err, "source switch could not be sent to the worker");
                     }
@@ -758,6 +798,29 @@ impl Driver {
         }
     }
 
+    /// `Preroll`: the connection keeps a window of `ms` from now on. A
+    /// running worker is told, and its tracks keep or free their rings
+    /// without reconnecting; without one, the next starts with it.
+    async fn on_preroll(&mut self, ms: u32) {
+        self.preroll_ms = ms;
+        let Some(worker) = self.worker.as_mut() else {
+            tracing::info!(
+                preroll_ms = ms,
+                "no worker runs; the next one starts with the pre-roll window"
+            );
+            return;
+        };
+        tracing::info!(
+            pid = worker.pid(),
+            preroll_ms = ms,
+            "pre-roll window passed to the running worker; nothing reconnects"
+        );
+        if let Err(err) = worker.preroll(ms).await {
+            // The exit follows, and the next worker starts with the window.
+            tracing::warn!(pid = worker.pid(), error = %err, "pre-roll window could not be sent to the worker");
+        }
+    }
+
     /// Starts the host lookup of the source to switch to; the worker is
     /// told once it is done.
     fn start_resolving_switch(&mut self) {
@@ -839,13 +902,11 @@ impl Driver {
                     now,
                 );
             }
-            WorkerEvent::Clip { clip_id, .. } => {
-                // The supervisor starts no clip, so it holds none a report
-                // could be for.
-                tracing::debug!(
-                    clip.id = %plain(&clip_id, MAX_NAME_BYTES),
-                    "report for a clip the supervisor does not hold; dropped"
-                );
+            WorkerEvent::Clip { clip_id, event } => {
+                let at = self.shared.clock.wall_now();
+                self.shared
+                    .lock()
+                    .clip_report(&self.spec.connection_id, &clip_id, event, at);
             }
             WorkerEvent::Talker {
                 session_id,
@@ -941,12 +1002,19 @@ impl Driver {
         // offer meanwhile closes with.
         self.end_switch();
         let connection = self.spec.connection_id.clone();
-        self.shared.lock().close_sessions_where(
+        let mut state = self.shared.lock();
+        state.close_sessions_where(
             |session| session.connection == connection,
             CloseCode::WorkerCrashed,
             "the camera's worker process exited",
             CloseBy::WorkerGone,
         );
+        // The pipes' write ends died with it: the bodies are cut.
+        state.end_clips_where(
+            |clip| clip.connection == connection,
+            ClipStopReason::WorkerCrashed,
+        );
+        drop(state);
         let crashes = self.machine.crashes();
         self.feed(Input::WorkerExited);
         if self.machine.crashes() > crashes {
@@ -1050,9 +1118,9 @@ impl Driver {
         match self.shared.manager.spawn(&ports, self.spec.loopback_relay) {
             Ok(mut worker) => {
                 // The schedule continues where the last worker's left off.
-                let spec = self
-                    .spec
-                    .source_spec(addrs, self.machine.backoff_position());
+                let spec =
+                    self.spec
+                        .source_spec(addrs, self.machine.backoff_position(), self.preroll_ms);
                 if let Err(err) = worker.run_source(&spec).await {
                     tracing::warn!(pid = worker.pid(), error = %err, "source could not be sent to the worker");
                 }
@@ -1085,6 +1153,7 @@ impl Driver {
             DriverCommand::IceTcp { peer, .. } => {
                 tracing::debug!(%peer, "ice-tcp connection without a worker; closed");
             }
+            DriverCommand::StopClip { clip_id } => self.unqueue_clip(&clip_id),
             // Without a worker no session talks.
             DriverCommand::ReleaseBackchannel { session_id } => {
                 tracing::debug!(
@@ -1094,6 +1163,38 @@ impl Driver {
             }
             command => self.queued.push(command),
         }
+    }
+
+    /// A clip stopped while it waits for a worker: its start leaves the
+    /// queue with its pipe, and it ends here as its worker would have
+    /// ended it, `stopped` with nothing written. One not queued went with
+    /// the worker that had it, which ended it.
+    fn unqueue_clip(&mut self, clip_id: &str) {
+        let before = self.queued.len();
+        self.queued.retain(|queued| {
+            !matches!(queued, DriverCommand::StartClip { spec, .. } if spec.clip_id == clip_id)
+        });
+        if self.queued.len() == before {
+            tracing::debug!(
+                clip.id = clip_id,
+                "clip stop without a worker for a clip none holds; dropped"
+            );
+            return;
+        }
+        tracing::debug!(
+            clip.id = clip_id,
+            "clip stopped before a worker got it; ended here"
+        );
+        let stopped = ClipReport::Stopped {
+            reason: ClipStopReason::Stopped.as_str().to_owned(),
+            bytes: 0,
+            duration_ms: 0,
+            gaps: 0,
+        };
+        let at = self.shared.clock.wall_now();
+        self.shared
+            .lock()
+            .clip_report(&self.spec.connection_id, clip_id, stopped, at);
     }
 
     /// Passes a message to `worker`. An offer is registered with the demux
@@ -1108,7 +1209,11 @@ impl Driver {
         let session = command.session_id().map(str::to_owned);
         let sent = match command {
             // Handled by the driver itself, never queued for a worker.
-            DriverCommand::SwitchSource(_) | DriverCommand::Backchannel(_) => return,
+            DriverCommand::SwitchSource(_)
+            | DriverCommand::Backchannel(_)
+            | DriverCommand::Preroll { .. } => return,
+            DriverCommand::StartClip { spec, pipe } => worker.start_clip(&spec, pipe).await,
+            DriverCommand::StopClip { clip_id } => worker.stop_clip(&clip_id).await,
             DriverCommand::OpenSession(spec) => {
                 let sink = Arc::new(SessionSink {
                     local_ufrag: spec.ice_ufrag.clone(),
@@ -1405,15 +1510,18 @@ mod tests {
     fn messages_wait_for_a_worker_and_a_close_withdraws_its_session() {
         let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = Driver::new(
-            DriverSpec {
-                connection_id: "c1".into(),
-                url: "fake://h/".into(),
-                options: "{}".into(),
-                host: "h".into(),
-                port: None,
-                loopback_relay: false,
-                backchannel: false,
-            },
+            (
+                DriverSpec {
+                    connection_id: "c1".into(),
+                    url: "fake://h/".into(),
+                    options: "{}".into(),
+                    host: "h".into(),
+                    port: None,
+                    loopback_relay: false,
+                    backchannel: false,
+                },
+                0,
+            ),
             shared("/bin/sh"),
             demand,
             mpsc::channel(4),
@@ -1699,6 +1807,7 @@ mod tests {
                     port: None,
                     loopback_relay: false,
                     backchannel: false,
+                    preroll_ms: 0,
                     key: crate::registry::ConnectionKey {
                         url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                         options: serde_json::Value::Null,
@@ -1725,6 +1834,8 @@ mod tests {
                     audio: lotse_api_types::stream::AudioMode::Auto,
                     orientation: lotse_api_types::stream::Orientation::NoTransform,
                     created: UNIX_EPOCH,
+                    preroll_ms: 0,
+                    clips: crate::clip::ClipCounters::default(),
                 },
             );
             state.sessions.insert(
@@ -1809,15 +1920,18 @@ mod tests {
     /// A driver of `fake://127.0.0.1/` on `shared`, following `demand`.
     fn driver_on(shared: &Arc<Shared>, demand: watch::Receiver<Demand>) -> Driver {
         Driver::new(
-            DriverSpec {
-                connection_id: "c1".into(),
-                url: "fake://127.0.0.1/".into(),
-                options: "{}".into(),
-                host: "127.0.0.1".into(),
-                port: None,
-                loopback_relay: false,
-                backchannel: false,
-            },
+            (
+                DriverSpec {
+                    connection_id: "c1".into(),
+                    url: "fake://127.0.0.1/".into(),
+                    options: "{}".into(),
+                    host: "127.0.0.1".into(),
+                    port: None,
+                    loopback_relay: false,
+                    backchannel: false,
+                },
+                0,
+            ),
             Arc::clone(shared),
             demand,
             mpsc::channel(4),
@@ -2037,6 +2151,7 @@ mod tests {
         let first = driver.spec.source_spec(
             vec!["127.0.0.1:0".parse().unwrap()],
             BackoffPosition::default(),
+            0,
         );
         recorded(
             &dir.join("received-0"),
@@ -2077,6 +2192,7 @@ mod tests {
         let switched = driver.spec.source_spec(
             vec!["127.0.0.1:1".parse().unwrap()],
             BackoffPosition::default(),
+            0,
         );
         assert_eq!(switched.url, "fake://127.0.0.1:2/");
         recorded(
@@ -2623,7 +2739,7 @@ mod tests {
         let mut driver = driver_on(&shared, demand);
         driver.on_worker_event(WorkerEvent::Clip {
             clip_id: format!("k\n{}", "x".repeat(100)),
-            event: crate::worker::ClipReport::Stopped {
+            event: ClipReport::Stopped {
                 reason: "internal_error".into(),
                 bytes: 0,
                 duration_ms: 0,
@@ -2635,7 +2751,8 @@ mod tests {
         let lines = captured.lines("report for a clip the supervisor does not hold");
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("clip.id=k x"), "{lines:?}");
-        assert!(!lines[0].contains(&"x".repeat(MAX_NAME_BYTES)), "{lines:?}");
+        let cap = crate::worker_text::MAX_NAME_BYTES;
+        assert!(!lines[0].contains(&"x".repeat(cap)), "{lines:?}");
     }
 
     #[tokio::test]
@@ -3165,6 +3282,8 @@ mod tests {
                 audio: AudioMode::Auto,
                 orientation: Orientation::NoTransform,
                 created: UNIX_EPOCH,
+                preroll_ms: 0,
+                clips: crate::clip::ClipCounters::default(),
             },
         );
         state.connections.insert(
@@ -3177,6 +3296,7 @@ mod tests {
                 port: None,
                 loopback_relay: false,
                 backchannel: false,
+                preroll_ms: 0,
                 demand: watch::channel(Demand {
                     preloads: 0,
                     viewers: 1,
@@ -3219,15 +3339,18 @@ mod tests {
         let shared = shared_with("/usr/bin/true", clock.clone());
         let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = Driver::new(
-            DriverSpec {
-                connection_id: "c1".into(),
-                url: "fake://admin:hunter2@cam.example/".into(),
-                options: "{}".into(),
-                host: "cam.example".into(),
-                port: None,
-                loopback_relay: false,
-                backchannel: false,
-            },
+            (
+                DriverSpec {
+                    connection_id: "c1".into(),
+                    url: "fake://admin:hunter2@cam.example/".into(),
+                    options: "{}".into(),
+                    host: "cam.example".into(),
+                    port: None,
+                    loopback_relay: false,
+                    backchannel: false,
+                },
+                0,
+            ),
             Arc::clone(&shared),
             demand,
             mpsc::channel(4),
@@ -3544,15 +3667,18 @@ mod tests {
         let almost = Duration::from_millis(4_999);
         let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = Driver::new(
-            DriverSpec {
-                connection_id: "c1".into(),
-                url: "fake://127.0.0.1/".into(),
-                options: "{}".into(),
-                host: "127.0.0.1".into(),
-                port: None,
-                loopback_relay: false,
-                backchannel: false,
-            },
+            (
+                DriverSpec {
+                    connection_id: "c1".into(),
+                    url: "fake://127.0.0.1/".into(),
+                    options: "{}".into(),
+                    host: "127.0.0.1".into(),
+                    port: None,
+                    loopback_relay: false,
+                    backchannel: false,
+                },
+                0,
+            ),
             Arc::clone(&shared),
             demand,
             mpsc::channel(4),
@@ -3637,5 +3763,207 @@ mod tests {
             SystemClock.sleep(Duration::from_millis(5)).await;
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A recording worker's script under `dir`, writing what it gets to
+    /// `received`.
+    fn recording_script(dir: &std::path::Path) -> (String, std::path::PathBuf) {
+        let out = dir.join("received");
+        let script = dir.join("worker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nexec cat > {}\n", out.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        (script.to_string_lossy().into_owned(), out)
+    }
+
+    fn clip_spec(clip_id: &str) -> ClipSpec {
+        ClipSpec {
+            clip_id: clip_id.into(),
+            before_ms: 10_000,
+            after_ms: None,
+            audio: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pre_roll_window_and_the_clip_messages_reach_the_worker_and_the_next_starts_with_it()
+     {
+        use std::io::Read as _;
+
+        let dir = private_dir("driver-preroll");
+        let (script, out) = recording_script(&dir);
+        let shared = shared(&script);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        // Without a worker the window waits for the next one.
+        driver
+            .handle(Wake::Command(DriverCommand::Preroll { ms: 30_000 }))
+            .await;
+        assert_eq!(
+            captured
+                .lines("no worker runs; the next one starts with the pre-roll window")
+                .len(),
+            1
+        );
+        let addrs = vec!["127.0.0.1:1".parse().unwrap()];
+        driver.spawn_worker(addrs.clone()).await;
+        let run = driver
+            .spec
+            .source_spec(addrs, driver.machine.backoff_position(), 30_000);
+        recorded(&out, &lotse_ipc::ToWorker::RunSource(run)).await;
+        driver
+            .handle(Wake::Command(DriverCommand::Preroll { ms: 0 }))
+            .await;
+        assert_eq!(
+            captured
+                .lines("pre-roll window passed to the running worker; nothing reconnects")
+                .len(),
+            1
+        );
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        driver
+            .handle(Wake::Command(DriverCommand::StartClip {
+                spec: clip_spec("k1"),
+                pipe: writer.into(),
+            }))
+            .await;
+        driver
+            .handle(Wake::Command(DriverCommand::StopClip {
+                clip_id: "k1".into(),
+            }))
+            .await;
+        let stop = lotse_ipc::ToWorker::StopClip {
+            clip_id: "k1".into(),
+        };
+        let messages = recorded(&out, &stop).await;
+        assert_eq!(
+            messages[1..],
+            [
+                lotse_ipc::ToWorker::Preroll { ms: 0 },
+                lotse_ipc::ToWorker::StartClip(clip_spec("k1")),
+                stop
+            ]
+        );
+        // The worker's write end was the only one: once the worker read the
+        // message and discarded it, the read end is at its end.
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+        let worker = driver.worker.take().unwrap();
+        drop(driver);
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn clip_messages_to_a_dead_worker_are_logged_and_the_window_waits_for_the_next() {
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver.worker = Some(dead_worker(&shared).await);
+        driver
+            .handle(Wake::Command(DriverCommand::Preroll { ms: 1_000 }))
+            .await;
+        assert_eq!(driver.preroll_ms, 1_000);
+        assert_eq!(
+            captured
+                .lines("pre-roll window could not be sent to the worker")
+                .len(),
+            1
+        );
+        let (commands, _rx) = mpsc::channel(1);
+        let worker = driver.worker.as_mut().unwrap();
+        let (_reader, writer) = std::io::pipe().unwrap();
+        for command in [
+            DriverCommand::StartClip {
+                spec: clip_spec("k1"),
+                pipe: writer.into(),
+            },
+            DriverCommand::StopClip {
+                clip_id: "k1".into(),
+            },
+            // Never the worker's.
+            DriverCommand::Preroll { ms: 0 },
+        ] {
+            assert!(command.session_id().is_none());
+            Driver::send(worker, &shared, &commands, command).await;
+        }
+        drop(driver);
+        assert_eq!(captured.lines("session message could not be sent").len(), 2);
+    }
+
+    /// A clip stopped while its start waits for a worker leaves the queue
+    /// with its pipe and ends as its worker would have ended it.
+    #[tokio::test]
+    async fn a_clip_stopped_before_a_worker_got_it_ends_here_with_nothing_written() {
+        use std::io::Read as _;
+
+        let shared = shared("/bin/sh");
+        let (events, mut rx) = mpsc::channel(4);
+        let (written, report) = tokio::sync::oneshot::channel();
+        let body = lotse_api::ClipBody {
+            reader: Box::new(tokio::io::empty()),
+            written: report,
+        };
+        let owner = crate::clip::ClipOwner {
+            connection: ConnectionId(1),
+            subscription: 1,
+            events,
+        };
+        shared.lock().clips.insert(
+            "k1".into(),
+            crate::clip::ClipEntry::new(
+                1,
+                ("front".into(), "c1".into()),
+                clip_spec("k1"),
+                owner,
+                (body, written),
+            ),
+        );
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        driver.queue(DriverCommand::StartClip {
+            spec: clip_spec("k1"),
+            pipe: writer.into(),
+        });
+        driver.queue(DriverCommand::StartClip {
+            spec: clip_spec("k2"),
+            pipe: fd(),
+        });
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver.queue(DriverCommand::StopClip {
+            clip_id: "k1".into(),
+        });
+        assert_eq!(driver.queued.len(), 1, "k2 waits on");
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "its pipe went with it");
+        let stopped = rx.recv().await.unwrap().payload;
+        assert_eq!(
+            (&stopped["reason"], &stopped["bytes"]),
+            (&serde_json::json!("stopped"), &serde_json::json!(0))
+        );
+        assert!(shared.lock().clips.is_empty());
+        // One not queued went with the worker that had it.
+        driver.queue(DriverCommand::StopClip {
+            clip_id: "k3".into(),
+        });
+        assert_eq!(driver.queued.len(), 1);
+        assert_eq!(
+            captured
+                .lines("clip stop without a worker for a clip none holds")
+                .len(),
+            1
+        );
     }
 }
