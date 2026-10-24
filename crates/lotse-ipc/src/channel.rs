@@ -70,12 +70,17 @@ pub struct Decoded<T> {
     pub fds_truncated: bool,
 }
 
-/// The descriptor a channel's socket is on.
+/// The descriptor a channel's socket is on. Either way it stays open, on
+/// the same socket and at the same number, for as long as the channel
+/// holds it: the precondition of tokio's `AsyncFd::register`
+/// (RUSTSEC-2026-0386), which [`Socket::new`] relies on.
 #[derive(Debug)]
 enum Descriptor {
     /// One the channel owns and closes when dropped.
     Owned(OwnedFd),
-    /// Standard input, used at its own number and never closed (see
+    /// Standard input, used at its own number and never closed: std does
+    /// not close it, nothing in lotse replaces it, and the worker's
+    /// seccomp filter refuses `close` and `dup2`/`dup3` onto it (see
     /// [`Channel::from_stdin`]).
     Stdin(io::Stdin),
 }
@@ -104,12 +109,20 @@ struct Socket {
 
 impl Socket {
     /// Registers `fd` after making it non-blocking and close-on-exec.
+    ///
+    /// The registration's precondition (tokio's `AsyncFd::register`, the
+    /// fix of RUSTSEC-2026-0386) holds by construction: the descriptor
+    /// stays open, on the same file description and at the same number,
+    /// until the `AsyncFd` drops it (see [`Descriptor`]).
     fn new(fd: Descriptor) -> io::Result<Self> {
         rustix::io::ioctl_fionbio(&fd, true)?;
         rustix::io::fcntl_setfd(&fd, FdFlags::CLOEXEC)?;
-        Ok(Self {
-            fd: AsyncFd::new(fd)?,
-        })
+        #[expect(
+            deprecated,
+            reason = "`AsyncFd::register` is `unsafe`, which the workspace forbids; its precondition holds: `Descriptor` owns its socket or is standard input, which nothing closes or replaces (see `Descriptor`)"
+        )]
+        let fd = AsyncFd::new(fd)?;
+        Ok(Self { fd })
     }
 }
 
