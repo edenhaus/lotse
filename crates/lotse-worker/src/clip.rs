@@ -11,10 +11,11 @@
 //! frames the pre-roll holds. It starts at the newest held keyframe
 //! captured at or before `now − before_ms` (else the oldest held),
 //! preferring a later held one whose in-band parameter sets are the
-//! track's, which the container's sample entry carries (both taken again
-//! from there, together); the audio starts with the frame playing when
-//! that keyframe was captured, by the ring's measure ([`captured`]: its
-//! arrival when it is dated ahead of it), from where `before_ms` counts.
+//! track's, which the container's sample entry carries (the snapshot cut
+//! there, by position, never by capture time); the audio starts with the
+//! frame playing when that keyframe was captured, by the ring's measure
+//! ([`captured`]: its arrival when it is dated ahead of it), from where
+//! `before_ms` counts.
 //! With nothing held it starts at the next keyframe, waiting for it up to
 //! the start timeout, which a keyframe queued meets even while the
 //! interleaver holds it for the audio. `before_ms` is the age of the first
@@ -585,35 +586,27 @@ impl Continuity {
 /// A clip's video subscription and the snapshot it starts from, taken
 /// together ([`Track::subscribe_from_preroll`]): the ring's frames from
 /// the newest keyframe captured at or before `target` (else the oldest
-/// held), or from a later held keyframe when that one carries parameter
-/// sets other than the track's and a later one does not, since the
-/// container's sample entry has the track's newest; no snapshot when
-/// nothing is held. The later start is taken again, with a subscription of
-/// its own: the ring moved on since the first, and a snapshot taken beside
-/// the first subscription could start after frames that one yields. The
+/// held), or from the first later keyframe the snapshot holds when that one
+/// carries parameter sets other than the track's and a later one does not,
+/// since the container's sample entry has the track's newest; no snapshot
+/// when nothing is held. The later start is cut from the same snapshot, by
+/// position: its frames still come before every frame the subscription
+/// yields, and a camera's Sender Reports can date a keyframe ahead of a
+/// later one, so a search by capture time could start past it. The
 /// descriptor and the source the track takes come with the pair they were
 /// taken with.
 fn start_video(video: &Arc<Track>, target: Instant) -> TrackStart {
-    let (subscription, snapshot, codec, source) = video.subscribe_from_preroll(target);
-    let Some(snapshot) = snapshot else {
-        return (subscription, None, codec, source);
-    };
-    if sets_match(&codec, &snapshot.start().payload) {
-        return (subscription, Some(snapshot), codec, source);
+    let (subscription, mut snapshot, codec, source) = video.subscribe_from_preroll(target);
+    if let Some(snapshot) = &mut snapshot
+        && !sets_match(&codec, &snapshot.start().payload)
+    {
+        let later = snapshot.advance_to_keyframe(|frame| sets_match(&codec, &frame.payload));
+        tracing::debug!(
+            later,
+            "clip: the start keyframe carries other parameter sets than the track's"
+        );
     }
-    let tidy = snapshot
-        .frames()
-        .find(|frame| frame.keyframe && sets_match(&codec, &frame.payload))
-        .map(|frame| frame.wallclock);
-    tracing::debug!(
-        later = tidy.is_some(),
-        "clip: the start keyframe carries other parameter sets than the track's"
-    );
-    match tidy.map(|at| video.subscribe_from_preroll(at)) {
-        Some((later, Some(from), codec, source)) => (later, Some(from), codec, source),
-        // None later, or the ring emptied since: the first pair stands.
-        _ => (subscription, Some(snapshot), codec, source),
-    }
+    (subscription, snapshot, codec, source)
 }
 
 /// A track's start as [`Track::subscribe_from_preroll`] takes it: the
@@ -2643,23 +2636,10 @@ mod tests {
         let (logs, _guard) = Logs::capture();
         let old = h264::test_data::sps(640, 480);
         let new = h264::test_data::sps(1280, 720);
-        let pps = h264::test_data::pps();
-        let access_unit = |sps: &[u8]| {
-            let mut unit = Vec::new();
-            for nal in [sps, &pps[..], &[0x65, 0x88][..]] {
-                unit.extend_from_slice(&[0, 0, 0, 1]);
-                unit.extend_from_slice(nal);
-            }
-            unit
-        };
-        let codec = Codec::H264 {
-            profile_level_id: None,
-            sps: Some(new.clone().into()),
-            pps: Some(pps.clone().into()),
-        };
-        for (second, before_ms) in [(access_unit(&new), 1_000), (access_unit(&old), 2_000)] {
+        let codec = h264_with(&new);
+        for (second, before_ms) in [(idr_with(&new), 1_000), (idr_with(&old), 2_000)] {
             let mut rig = Rig::with(Some(codec.clone()), None, true, 16);
-            for (ms, payload) in [(0, access_unit(&old)), (1_000, second)] {
+            for (ms, payload) in [(0, idr_with(&old)), (1_000, second)] {
                 rig.advance_to(ms);
                 assert!(rig.video().publish_frame(MediaFrame {
                     ts: MediaTime::from_ticks(i64::try_from(ms).unwrap() * 90),
@@ -2685,6 +2665,74 @@ mod tests {
         assert_eq!(other.len(), 2, "{other:?}");
         assert!(other[0].fields.contains("later=true"), "{other:?}");
         assert!(other[1].fields.contains("later=false"), "{other:?}");
+    }
+
+    /// The compatible keyframe a clip prefers is the one it starts at,
+    /// whatever capture times the ring's later keyframes carry: before a
+    /// camera's Sender Report corrects the mapping (RFC 3550 §6.4.1) a
+    /// frame can be dated ahead of a later one. Regression: the clip took
+    /// the ring again from the chosen keyframe's capture time, so a
+    /// keyframe arriving at 1 s dated 61 s, followed by one arriving at
+    /// 2 s dated 9 s, started the clip at the latter and dropped a second
+    /// of pre-roll.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_clip_keeps_its_compatible_keyframe_when_capture_times_move_back() {
+        let (logs, _guard) = Logs::capture();
+        let old = h264::test_data::sps(640, 480);
+        let new = h264::test_data::sps(1280, 720);
+        let codec = h264_with(&new);
+        let mut rig = Rig::with(Some(codec), None, true, 16);
+        // (captured, arrived) in ms after the start: the second keyframe is
+        // dated a minute ahead, the third back behind it.
+        for ((ms, arrival_ms), sps) in [
+            ((0, 0), &old),
+            ((61_000, 1_000), &new),
+            ((9_000, 2_000), &new),
+        ] {
+            rig.advance_to(arrival_ms);
+            assert!(rig.video().publish_frame(MediaFrame {
+                ts: MediaTime::from_ticks(i64::try_from(arrival_ms).unwrap() * 90),
+                wallclock: rig.at(ms),
+                arrival: rig.at(arrival_ms),
+                keyframe: true,
+                discontinuity: false,
+                epoch: 0,
+                payload: idr_with(sps).into(),
+            }));
+        }
+        rig.advance_to(3_000);
+        let _reader = rig.start(spec(5_000, None, false));
+        settle().await;
+        // From the keyframe that arrived at 1 s, by its arrival: the
+        // capture time ahead of it does not count (`captured`).
+        let_assert_started(&rig.report().await, 2_000);
+        rig.clips.stop("k1", EndReason::Stopped);
+        rig.until_stopped().await;
+        let other = logs.lines(
+            Level::DEBUG,
+            "clip: the start keyframe carries other parameter sets than the track's",
+        );
+        assert_eq!(other.len(), 1, "{other:?}");
+        assert!(other[0].fields.contains("later=true"), "{other:?}");
+    }
+
+    /// H.264 whose in-band sets are `sps` and the test PPS.
+    fn h264_with(sps: &[u8]) -> Codec {
+        Codec::H264 {
+            profile_level_id: None,
+            sps: Some(sps.to_vec().into()),
+            pps: Some(h264::test_data::pps().into()),
+        }
+    }
+
+    /// An IDR access unit (Annex B) carrying `sps` and the test PPS.
+    fn idr_with(sps: &[u8]) -> Vec<u8> {
+        let mut unit = Vec::new();
+        for nal in [sps, &h264::test_data::pps()[..], &[0x65, 0x88][..]] {
+            unit.extend_from_slice(&[0, 0, 0, 1]);
+            unit.extend_from_slice(nal);
+        }
+        unit
     }
 
     fn let_assert_started(report: &ClipReport, expected: u32) {

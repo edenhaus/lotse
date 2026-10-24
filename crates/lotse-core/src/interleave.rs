@@ -245,8 +245,7 @@ impl Lane {
     /// duplicates are the ones the track published after the clip
     /// subscribed: with the subscription and the snapshot taken together,
     /// at most the newest, which the track's source task held in the ring
-    /// but had not broadcast yet; more for a snapshot taken again later
-    /// from a frame of the first. They come first, in order; the first
+    /// but had not broadcast yet. They come first, in order; the first
     /// frame that is none of them ends the check.
     fn is_duplicate(&mut self, frame: &Arc<MediaFrame>) -> bool {
         if let Some(at) = self

@@ -111,6 +111,31 @@ impl PrerollSnapshot {
         std::iter::once(&self.start).chain(&self.following)
     }
 
+    /// Starts the snapshot at its first keyframe after `start` that
+    /// `accept` takes, dropping the frames before it; returns whether it
+    /// moved, and leaves it as it is when none qualifies. The frames it
+    /// drops all come before the ones it keeps, so the snapshot still pairs
+    /// with the subscription it was taken with
+    /// ([`Track::subscribe_from_preroll`](crate::track::Track::subscribe_from_preroll)).
+    /// By position, never by capture time: a camera's Sender Reports can
+    /// date a frame ahead of a later one.
+    pub fn advance_to_keyframe(&mut self, mut accept: impl FnMut(&MediaFrame) -> bool) -> bool {
+        let Some(at) = self
+            .following
+            .iter()
+            .position(|frame| frame.keyframe && accept(frame))
+        else {
+            return false;
+        };
+        let mut kept = std::mem::take(&mut self.following).into_iter().skip(at);
+        // `at` is a position in `following`: the keyframe is next.
+        if let Some(keyframe) = kept.next() {
+            self.start = keyframe;
+        }
+        self.following = kept.collect();
+        true
+    }
+
     /// Frames held, `start` included.
     pub const fn frame_count(&self) -> usize {
         self.following.len().saturating_add(1)
@@ -1141,6 +1166,53 @@ mod tests {
         assert!(text.contains("start_ts: MediaTime(2000)"), "{text}");
         assert!(text.contains("frames: 8"), "{text}");
         assert!(text.contains("truncated: false"), "{text}");
+    }
+
+    /// A snapshot advances to a later keyframe by position, whatever its
+    /// capture time: a Sender Report can date a keyframe ahead of a later
+    /// one (RFC 3550 §6.4.1).
+    #[test]
+    fn rfc3550_6_4_1_a_snapshot_advances_to_a_later_keyframe_by_position_not_capture_time() {
+        let clip = Clip::new();
+        let mut ring = ring(true, 60_000);
+        gop(&mut ring, &clip, 1000, 2000, usize::MAX);
+        // Labelled by arrival: the keyframe at 2 s is dated 61 s, the one
+        // at 3 s back to 9 s.
+        for frame in [
+            clip.shifted(61_000, 2000, true),
+            clip.shifted(61_250, 2250, false),
+            clip.shifted(9000, 3000, true),
+            clip.shifted(9250, 3250, false),
+        ] {
+            assert_eq!(ring.push(&frame, usize::MAX, || None), None);
+        }
+        let labels = |snapshot: &PrerollSnapshot| {
+            snapshot
+                .frames()
+                .map(|frame| frame.ts.ticks())
+                .collect::<Vec<_>>()
+        };
+        let mut snapshot = ring.snapshot(clip.at(1000)).unwrap();
+        let all = labels(&snapshot);
+        assert!(!snapshot.advance_to_keyframe(|_| false));
+        assert_eq!(labels(&snapshot), all, "none qualifies: unchanged");
+        assert!(
+            !snapshot.advance_to_keyframe(|frame| !frame.keyframe),
+            "only a keyframe qualifies"
+        );
+        assert_eq!(labels(&snapshot), all);
+
+        assert!(snapshot.advance_to_keyframe(|_| true));
+        assert_eq!(labels(&snapshot), [2000, 2250, 3000, 3250]);
+        assert_eq!(snapshot.frame_count(), 4);
+        assert!(
+            Arc::ptr_eq(snapshot.start(), ring.frames.get(4).unwrap()),
+            "the ring's frames, not copies"
+        );
+
+        let mut snapshot = ring.snapshot(clip.at(1000)).unwrap();
+        assert!(snapshot.advance_to_keyframe(|frame| frame.ts.ticks() == 3000));
+        assert_eq!(labels(&snapshot), [3000, 3250]);
     }
 
     #[test]
