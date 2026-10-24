@@ -5,7 +5,8 @@
 //! through the loopback relay it bound before the sandbox; an `rtsp`
 //! camera whose media takes UDP, received under the same sandbox; and an
 //! HLS stream over `http` and over `https` with a pinned certificate,
-//! fetched by a sandboxed worker from the server's port alone. Needs the
+//! fetched by a sandboxed worker from the server's port alone; and a
+//! clip's pipe passed to a sandboxed worker. Needs the
 //! `source-fake` feature (on with `--all-features`).
 
 #![cfg(feature = "source-fake")]
@@ -26,7 +27,9 @@ use std::time::Duration;
 
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::connection::WorkerReport;
-use lotse_supervisor::worker::{SourceSpec, WorkerConfig, WorkerEvent, WorkerManager};
+use lotse_supervisor::worker::{
+    ClipReport, ClipSpec, SourceSpec, WorkerConfig, WorkerEvent, WorkerManager,
+};
 
 fn manager() -> WorkerManager {
     manager_with_sandbox("off")
@@ -56,6 +59,7 @@ fn spec(options: &str) -> SourceSpec {
         peer_host: "cam".into(),
         peer_addrs: vec![],
         backoff: lotse_ipc::BackoffPosition::default(),
+        preroll_ms: 0,
     }
 }
 
@@ -141,7 +145,8 @@ async fn a_worker_crash_is_observed_and_contained() {
             | WorkerEvent::Switched
             | WorkerEvent::ProbeConnecting(_)
             | WorkerEvent::ProbeEnded(_)
-            | WorkerEvent::Talker { .. }) => {
+            | WorkerEvent::Talker { .. }
+            | WorkerEvent::Clip { .. }) => {
                 panic!("unexpected {other:?}")
             }
         }
@@ -153,6 +158,53 @@ async fn a_worker_crash_is_observed_and_contained() {
     let mut next = manager().spawn(&[], false).expect("spawns again");
     assert!(matches!(next.next_event().await, WorkerEvent::Ready { .. }));
     assert!(next.stop(Duration::from_secs(5), &clock).await.success());
+}
+
+/// A clip's pipe crosses into a worker under its sandbox with its
+/// `StartClip`, and the worker, which runs no clips, refuses the clip and
+/// closes the pipe: the reader sees its end, with nothing written.
+#[tokio::test]
+async fn a_sandboxed_worker_takes_a_clip_s_pipe_and_closes_it() {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let mut worker = manager_with_sandbox("on")
+        .spawn(&[], false)
+        .expect("spawns");
+    assert!(matches!(
+        worker.next_event().await,
+        WorkerEvent::Ready { .. }
+    ));
+    let (mut reader, writer) = std::io::pipe().expect("a pipe");
+    let clip = ClipSpec {
+        clip_id: "k1".into(),
+        before_ms: 10_000,
+        after_ms: Some(20_000),
+        audio: true,
+    };
+    worker
+        .start_clip(&clip, writer.into())
+        .await
+        .expect("start clip");
+    let mut event = worker.next_event().await;
+    while matches!(event, WorkerEvent::Stats(_)) {
+        event = worker.next_event().await;
+    }
+    assert_eq!(
+        event,
+        WorkerEvent::Clip {
+            clip_id: "k1".into(),
+            event: ClipReport::Stopped {
+                reason: "internal_error".into(),
+                bytes: 0,
+                duration_ms: 0,
+                gaps: 0,
+            },
+        }
+    );
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut rest).expect("reads to the end");
+    assert!(rest.is_empty());
+    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    assert!(exit.success(), "clean exit, got {exit:?}");
 }
 
 /// On Linux the worker's Landlock rules allow TCP only to the camera's port
@@ -206,6 +258,7 @@ async fn a_sandboxed_worker_plays_rtsps_through_its_loopback_relay() {
         peer_host: "camera.test".into(),
         peer_addrs: vec![cam.addr()],
         backoff: lotse_ipc::BackoffPosition::default(),
+        preroll_ms: 0,
     };
     worker.run_source(&spec).await.expect("run source");
     assert_eq!(
@@ -256,6 +309,7 @@ async fn a_sandboxed_worker_receives_rtsp_media_over_udp() {
         peer_host: "127.0.0.1".into(),
         peer_addrs: vec![cam.addr()],
         backoff: lotse_ipc::BackoffPosition::default(),
+        preroll_ms: 0,
     };
     worker.run_source(&spec).await.expect("run source");
     assert_eq!(
@@ -325,6 +379,7 @@ async fn play_http_in_sandbox(
         peer_host: "camera.test".into(),
         peer_addrs: vec![server.addr()],
         backoff: lotse_ipc::BackoffPosition::default(),
+        preroll_ms: 0,
     };
     worker.run_source(&spec).await.expect("run source");
     assert_eq!(

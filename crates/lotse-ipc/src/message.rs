@@ -138,6 +138,41 @@ pub enum ToWorker {
         /// against the claims; any talker when `None`.
         session_id: Option<String>,
     },
+    /// The connection's pre-roll window changed (a `stream/put`): its
+    /// tracks keep the last `ms` of media in memory for clips from now
+    /// on, or none when 0. Nothing reconnects; a new worker gets the
+    /// window with its [`SourceSpec::preroll_ms`].
+    Preroll {
+        /// The window in milliseconds, 0 for none.
+        ms: u32,
+    },
+    /// Start an event clip; the write end of the pipe its bytes go to
+    /// follows as the one descriptor. Reports come back as
+    /// [`ToSupervisor::Clip`], the last a [`ClipReport::Stopped`], after
+    /// which the worker holds the write end no more.
+    StartClip(ClipSpec),
+    /// End the clip `clip_id` cleanly: its last fragment is written and
+    /// it reports `Stopped`. One the worker does not run is ignored.
+    StopClip {
+        /// The clip.
+        clip_id: String,
+    },
+}
+
+/// An event clip to start: what the client asked for, checked against
+/// the limits by the supervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipSpec {
+    /// The clip id, the client's or a generated one.
+    pub clip_id: String,
+    /// How far before now the clip should start, in milliseconds; what
+    /// the pre-roll window holds bounds what it gets.
+    pub before_ms: u32,
+    /// How long it runs after now, in milliseconds; `None` until it is
+    /// stopped, bounded by the worker's longest clip.
+    pub after_ms: Option<u32>,
+    /// Take the stream's audio into the clip when it has one that fits.
+    pub audio: bool,
 }
 
 /// A session to open: the browser's offer, the ICE credentials the
@@ -287,6 +322,9 @@ pub struct SourceSpec {
     /// the first step's pace, nor at once again, whenever a worker starts
     /// over.
     pub backoff: BackoffPosition,
+    /// The pre-roll window the connection's tracks keep, in milliseconds,
+    /// 0 for none; [`ToWorker::Preroll`] changes it later.
+    pub preroll_ms: u32,
 }
 
 /// Where a source's reconnect schedule stands: all a new worker needs to
@@ -309,6 +347,7 @@ impl fmt::Debug for SourceSpec {
             .field("peer_host", &self.peer_host)
             .field("peer_addrs", &self.peer_addrs)
             .field("backoff", &self.backoff)
+            .field("preroll_ms", &self.preroll_ms)
             .finish()
     }
 }
@@ -365,6 +404,62 @@ pub enum ToSupervisor {
     ProbeEnded {
         /// The probe's id, as its `ProbeConnecting` named it.
         probe: u64,
+    },
+    /// An event clip reported something.
+    Clip {
+        /// The clip, as its [`ToWorker::StartClip`] named it.
+        clip_id: String,
+        /// What happened.
+        event: ClipReport,
+    },
+}
+
+/// What an event clip reports, in the order the API's events come: one
+/// `Started` unless it ends first, warnings and gaps, and `Stopped` last.
+/// Names and numbers only; the supervisor checks each against what it
+/// knows before the client sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipReport {
+    /// The clip's first fragment is under way.
+    Started {
+        /// How far before the start the clip begins, in milliseconds:
+        /// the age of the keyframe it starts at.
+        before_ms: u32,
+        /// The video codec by its API name (`h264`, `h265`).
+        video: String,
+        /// The picture's width and height in pixels, cropping applied,
+        /// when the sequence parameter set gives them.
+        picture: Option<(u32, u32)>,
+        /// The audio codec by its API name (`aac_lc`, `opus`); `None` for
+        /// a clip without audio.
+        audio: Option<String>,
+    },
+    /// Non-fatal (`audio_omitted`).
+    Warning {
+        /// The code.
+        code: String,
+        /// For humans.
+        message: String,
+    },
+    /// The clip has a hole.
+    Gap {
+        /// Why (`reconnect`, `overflow`, `lagged`, `frames_dropped`).
+        reason: String,
+        /// Where the hole begins, in milliseconds of clip media time.
+        from_ms: u32,
+        /// Where it ends.
+        to_ms: u32,
+    },
+    /// The last report: the clip ended and the worker closed its pipe.
+    Stopped {
+        /// Why (`completed`, `stopped`, `client_gone`, ...).
+        reason: String,
+        /// The bytes written to the pipe.
+        bytes: u64,
+        /// The media time the clip covers, in milliseconds.
+        duration_ms: u32,
+        /// The gaps it reported.
+        gaps: u32,
     },
 }
 
@@ -488,6 +583,22 @@ pub struct TrackStats {
     /// Frames the live path carried in more RTP packets than some
     /// libwebrtc receivers assemble.
     pub frames_over_browser_limit: u64,
+    /// The pre-roll ring, while a window is set; `None` without one.
+    pub preroll: Option<PrerollStats>,
+}
+
+/// A track's pre-roll ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrerollStats {
+    /// What the held frames count against `limits.preroll_bytes`: their
+    /// payload plus a fixed overhead each.
+    pub bytes: u64,
+    /// The capture time from the oldest held frame to the newest, in
+    /// milliseconds: how far back a clip can start now.
+    pub held_ms: u32,
+    /// GOPs that alone outgrew `limits.preroll_bytes`, so only their
+    /// start was held, over the track's life.
+    pub truncations: u64,
 }
 
 /// The worker's counters, pushed once per second.
@@ -572,6 +683,7 @@ mod tests {
                 attempts: 3,
                 immediate_used: true,
             },
+            preroll_ms: 30_000,
         };
         let text = format!("{spec:?}");
         assert!(!text.contains("hunter2"), "{text}");
@@ -582,6 +694,7 @@ mod tests {
             text.contains("backoff: BackoffPosition { attempts: 3, immediate_used: true }"),
             "{text}"
         );
+        assert!(text.contains("preroll_ms: 30000"), "{text}");
         let wrapped = ToWorker::RunSource(spec);
         assert!(!format!("{wrapped:?}").contains("hunter2"));
         assert_eq!(
@@ -670,6 +783,11 @@ mod tests {
                         frame_bytes: 4,
                         frames_dropped_oversize: 6,
                         frames_over_browser_limit: 7,
+                        preroll: Some(PrerollStats {
+                            bytes: 14_201_337,
+                            held_ms: 29_800,
+                            truncations: 1,
+                        }),
                     },
                 )],
                 sessions: 0,
@@ -805,6 +923,72 @@ mod tests {
             assert_eq!(
                 decode::<ToWorker>(&encode(&release).unwrap()).unwrap(),
                 release
+            );
+        }
+    }
+
+    #[test]
+    fn the_clip_messages_round_trip() {
+        for message in [
+            ToWorker::Preroll { ms: 30_000 },
+            ToWorker::Preroll { ms: 0 },
+            ToWorker::StartClip(ClipSpec {
+                clip_id: "01JB".into(),
+                before_ms: 10_000,
+                after_ms: Some(20_000),
+                audio: true,
+            }),
+            ToWorker::StartClip(ClipSpec {
+                clip_id: "open".into(),
+                before_ms: 0,
+                after_ms: None,
+                audio: false,
+            }),
+            ToWorker::StopClip {
+                clip_id: "01JB".into(),
+            },
+        ] {
+            assert_eq!(
+                decode::<ToWorker>(&encode(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+        for event in [
+            ClipReport::Started {
+                before_ms: 9_800,
+                video: "h264".into(),
+                picture: Some((1920, 1080)),
+                audio: Some("aac_lc".into()),
+            },
+            ClipReport::Started {
+                before_ms: 0,
+                video: "h265".into(),
+                picture: None,
+                audio: None,
+            },
+            ClipReport::Warning {
+                code: "audio_omitted".into(),
+                message: "pcmu does not fit an MP4".into(),
+            },
+            ClipReport::Gap {
+                reason: "reconnect".into(),
+                from_ms: 12_040,
+                to_ms: 15_310,
+            },
+            ClipReport::Stopped {
+                reason: "completed".into(),
+                bytes: 24_117_248,
+                duration_ms: 29_800,
+                gaps: 1,
+            },
+        ] {
+            let message = ToSupervisor::Clip {
+                clip_id: "01JB".into(),
+                event,
+            };
+            assert_eq!(
+                decode::<ToSupervisor>(&encode(&message).unwrap()).unwrap(),
+                message
             );
         }
     }
