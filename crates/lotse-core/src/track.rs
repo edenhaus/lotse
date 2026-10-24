@@ -1053,9 +1053,33 @@ impl Track {
     /// The pre-roll ring's frames from the newest keyframe captured at or
     /// before `target` (else the oldest held) to the newest frame; `None`
     /// when it holds nothing. On an audio track, `target` is the video
-    /// snapshot's start, and the frames start with the one playing then.
+    /// snapshot's start, and the frames start with the one playing then. A
+    /// clip takes it with [`Self::subscribe_from_preroll`], so nothing the
+    /// track publishes falls between its subscription and its pre-roll.
     pub fn preroll_snapshot(&self, target: Instant) -> Option<PrerollSnapshot> {
         self.lock_preroll().snapshot(target)
+    }
+
+    /// A frame subscription and the pre-roll ring's snapshot from `target`
+    /// (as [`Self::preroll_snapshot`] chooses it), taken together under the
+    /// ring's lock: every frame reaches the ring under that lock before it
+    /// is broadcast, so the snapshot starts at a frame published before the
+    /// subscription and the subscription yields no frame published before
+    /// the snapshot's start. It yields first, at most, the snapshot's newest
+    /// frame, when the track's source task had put it in the ring but not
+    /// yet broadcast it (a [`ReliableQueue`](crate::interleave::ReliableQueue)
+    /// drops it as the pre-roll's), then every frame published after. The
+    /// snapshot is `None` when the ring holds nothing. The lock is held for
+    /// the subscribe and the copy only.
+    pub fn subscribe_from_preroll(
+        self: &Arc<Self>,
+        target: Instant,
+    ) -> (TrackSubscription, Option<PrerollSnapshot>) {
+        let ring = self.lock_preroll();
+        let subscription = self.subscribe(Unit::Frames);
+        let snapshot = ring.snapshot(target);
+        drop(ring);
+        (subscription, snapshot)
     }
 
     /// Empties the pre-roll ring and keeps its window; whether it held
@@ -2435,6 +2459,35 @@ mod tests {
         assert_eq!(track.stats().preroll, None);
         assert!(track.preroll_snapshot(t0).is_none());
         assert_eq!(track.preroll_floor.get(), None);
+    }
+
+    #[test]
+    fn a_subscription_taken_with_the_pre_roll_yields_only_what_follows_it() {
+        let t0 = SystemClock.now();
+        let track = video_track_at(t0);
+        track.set_preroll(Some(Duration::from_secs(10)));
+        assert!(track.publish_frame(timed(t0, 0, true, 10)));
+        assert!(track.publish_frame(timed(t0, 40, false, 10)));
+        assert!(track.publish_frame(timed(t0, 80, true, 10)));
+        let (mut sub, snapshot) = track.subscribe_from_preroll(t0 + Duration::from_millis(80));
+        let ts: Vec<_> = snapshot
+            .unwrap()
+            .frames()
+            .map(|frame| frame.ts.ticks())
+            .collect();
+        assert_eq!(ts, [80], "the snapshot starts at the newest keyframe");
+        nothing_queued(&mut sub);
+        assert!(track.publish_frame(timed(t0, 120, false, 10)));
+        crate::let_assert!(Some(TrackEvent::Frame(frame)) = queued(&mut sub));
+        assert_eq!(frame.ts.ticks(), 120);
+        nothing_queued(&mut sub);
+
+        let track = video_track_at(t0);
+        let (mut sub, snapshot) = track.subscribe_from_preroll(t0);
+        assert!(snapshot.is_none(), "no window, no ring");
+        assert!(track.publish_frame(timed(t0, 0, true, 10)));
+        crate::let_assert!(Some(TrackEvent::Frame(frame)) = queued(&mut sub));
+        assert_eq!(frame.ts.ticks(), 0);
     }
 
     #[test]

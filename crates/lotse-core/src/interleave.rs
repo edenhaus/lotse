@@ -14,13 +14,24 @@
 //! [`QUEUED_FRAME_OVERHEAD`] against the bound; a pre-roll frame counts
 //! nothing, since its ring bounded it by `preroll_bytes` already, and the
 //! live frames the pre-roll holds too are dropped, so none is written
-//! twice. A frame always fits a queue that counts nothing, so a frame
-//! larger than the bound cannot stall it. Video starts at a keyframe and,
-//! after a hole, resumes at one; audio resumes at any frame, waits for the
-//! video's first keyframe and is dropped while the queue overflows, so an
-//! overflow is one hole for the clip. A hole after a track's first frame
-//! is an explicit gap, queued before the frame that ends it; one before it
-//! only starts the track later. Each track's items keep their order: the
+//! twice. The snapshot must start at a frame the track published before the
+//! clip subscribed, which
+//! [`Track::subscribe_from_preroll`](crate::track::Track::subscribe_from_preroll)
+//! guarantees: a live frame published before the snapshot's start could not
+//! be told from one after its newest. A lag while those frames may still
+//! come is no hole if the next frame is one of them, since what was lost
+//! then is the pre-roll's. A frame always fits a queue that counts nothing,
+//! so a frame larger than the bound cannot stall it. Video starts at a
+//! keyframe and, after a hole, resumes at one; audio resumes at any frame,
+//! waits for the video's first keyframe and is dropped while the queue
+//! overflows, so an overflow is one hole for the clip; once the video
+//! ended, an overflow is the audio's own hole, and the audio resumes at its
+//! next frame that fits. A hole after a track's first frame is an explicit
+//! gap, queued before the frame that ends it; one before it only starts the
+//! track later. A gap or a control event counts nothing: a gap is queued
+//! only before a frame, and a control event replaces one of its kind queued
+//! since the track's last frame, so the items beside the frames stay
+//! bounded with them. Each track's items keep their order: the
 //! interleaver chooses between the tracks, never within one.
 
 use std::collections::VecDeque;
@@ -47,8 +58,9 @@ pub enum GapReason {
     Overflow,
     /// The track's broadcast dropped frames before the clip took them.
     Lagged,
-    /// The pre-roll ring cut its newest GOP short at `preroll_bytes`, so
-    /// the live frames up to the next keyframe have nothing to follow.
+    /// The pre-roll ring cut its newest GOP short at `preroll_bytes` or
+    /// lost a frame the track dropped over `max_frame_bytes`, so the live
+    /// frames up to the next keyframe have nothing to follow.
     PrerollTruncated,
 }
 
@@ -76,7 +88,8 @@ pub enum Out {
     /// `track` has a hole: no frame of it was captured after `from` and
     /// before `to` that the clip holds.
     Gap {
-        /// The track's kind; an overflow is the video's hole.
+        /// The track's kind; an overflow is the video's hole while the
+        /// video is open, else the audio's.
         track: Kind,
         /// Why.
         reason: GapReason,
@@ -86,7 +99,8 @@ pub enum Out {
         to: Instant,
     },
     /// A control event of `track`, in its place among the track's frames:
-    /// `EpochStart`, `TrackChanged`, `SourceLost` or `SourceRestored`.
+    /// `EpochStart`, `TrackChanged`, `SourceLost` or `SourceRestored`: the
+    /// newest of its kind since the track's previous frame.
     Control {
         /// The track's kind.
         track: Kind,
@@ -167,8 +181,14 @@ struct Lane {
     /// has passed it, so the other waits for nothing before it.
     newest: Option<Instant>,
     /// The pre-roll's frames, oldest first, while the live frames that
-    /// duplicate them may still come; empty once one did not.
+    /// repeat them may still come: those the track published after the
+    /// clip subscribed, which the snapshot starting before the subscription
+    /// makes its newest; empty once a live frame was none of them.
     duplicates: Vec<Arc<MediaFrame>>,
+    /// The subscription lagged while `duplicates` may still come: a hole
+    /// only once the next frame is none of them, since the frames lost
+    /// before one of them are the pre-roll's.
+    lagged: bool,
 }
 
 impl Lane {
@@ -183,6 +203,7 @@ impl Lane {
             last: None,
             newest: None,
             duplicates: Vec::new(),
+            lagged: false,
         }
     }
 
@@ -197,19 +218,26 @@ impl Lane {
         !self.started || self.hole.is_some()
     }
 
-    /// Whether audio is dropped now: this (video) lane has not started or
-    /// the queue overflowed.
+    /// Whether the lane is in an overflow's hole.
+    fn overflowing(&self) -> bool {
+        self.hole
+            .is_some_and(|hole| hole.reason == GapReason::Overflow)
+    }
+
+    /// Whether audio is dropped now: this (video) lane has not started, or
+    /// it is open and in an overflow's hole, which only its next keyframe
+    /// ends; once it ended, the audio recovers on its own.
     fn blocks_audio(&self) -> bool {
-        !self.started
-            || self
-                .hole
-                .is_some_and(|hole| hole.reason == GapReason::Overflow)
+        !self.started || (self.open && self.overflowing())
     }
 
     /// Whether `frame` is a live frame the pre-roll already queued. The
-    /// duplicates are the pre-roll's newest frames, published after the
-    /// clip subscribed and before it took the pre-roll, and come first, in
-    /// order; the first frame that is none of them ends the check.
+    /// duplicates are the ones the track published after the clip
+    /// subscribed: with the subscription and the snapshot taken together,
+    /// at most the newest, which the track's source task held in the ring
+    /// but had not broadcast yet; more for a snapshot taken again later
+    /// from a frame of the first. They come first, in order; the first
+    /// frame that is none of them ends the check.
     fn is_duplicate(&mut self, frame: &Arc<MediaFrame>) -> bool {
         if let Some(at) = self
             .duplicates
@@ -232,6 +260,54 @@ impl Lane {
         }
         self.hole = self.last.map(|from| Hole { reason, from });
         self.hole.is_some()
+    }
+
+    /// Enters an overflow's hole, keeping the start of a hole the lane is
+    /// in already; none before the lane's first frame.
+    fn overflow(&mut self) {
+        self.hole = self
+            .hole
+            .map_or(self.last, |hole| Some(hole.from))
+            .map(|from| Hole {
+                reason: GapReason::Overflow,
+                from,
+            });
+    }
+
+    /// Queues the control `event`, replacing one of its kind queued since
+    /// the lane's last frame: no frame came under that one. So at most one
+    /// of each kind waits between two frames, and a reader stalled through
+    /// an overflow, which drops the frames, holds no more than one of each.
+    fn queue_control(&mut self, event: TrackEvent, queued: Instant) {
+        let run = self
+            .items
+            .iter()
+            .rev()
+            .take_while(|item| matches!(item.entry, Entry::Control(_)))
+            .count();
+        let start = self.items.len().saturating_sub(run);
+        let kind = std::mem::discriminant(&event);
+        let replaced = self
+            .items
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, item)| {
+                matches!(&item.entry, Entry::Control(held) if std::mem::discriminant(held) == kind)
+            })
+            .map(|(at, _)| at);
+        if let Some(at) = replaced {
+            tracing::trace!(
+                track = %self.kind,
+                "clip queue: a control event replaces one of its kind no frame came under"
+            );
+            let _replaced = self.items.remove(at);
+        }
+        self.items.push_back(Item {
+            entry: Entry::Control(event),
+            queued,
+            cost: 0,
+        });
     }
 
     /// Queues `frame`, which counts `cost`.
@@ -298,12 +374,16 @@ impl ReliableQueue {
     }
 
     /// Queues the pre-roll `track` starts from, counting nothing, before
-    /// any live item of the track: the clip subscribed first and took the
-    /// snapshot after, so the live frames it holds too are dropped as they
-    /// come. A video snapshot starts at a keyframe; an audio one is taken
-    /// only after the video's (it is ignored before), from the video
-    /// snapshot's start. A truncated snapshot puts the track in a hole
-    /// until its next keyframe.
+    /// any live item of the track: the snapshot starts at a frame published
+    /// before the clip subscribed
+    /// ([`Track::subscribe_from_preroll`](crate::track::Track::subscribe_from_preroll)),
+    /// so the live frames it holds too come first and are dropped as they
+    /// come; a live frame published before the snapshot's start would be
+    /// queued after it, so a clip never takes a snapshot that starts later.
+    /// A video snapshot starts at a keyframe; an audio one is taken only
+    /// after the video's (it is ignored before), from the video snapshot's
+    /// start. A truncated snapshot puts the track in a hole until its next
+    /// keyframe.
     pub fn preroll(&mut self, track: Kind, snapshot: &PrerollSnapshot, now: Instant) {
         let blocked = track == Kind::Audio && self.video.blocks_audio();
         let lane = self.lane_mut(track);
@@ -329,8 +409,12 @@ impl ReliableQueue {
 
     /// Takes what `track`'s subscription yielded at `now`. A frame is
     /// queued or dropped by the module's rules; a `Gap` (the broadcast
-    /// lagged) puts the track in a hole; a control event is queued in its
-    /// place. Nothing once the track ended or for a clip without it.
+    /// lagged) puts the track in a hole; one while the pre-roll's frames
+    /// may still repeat waits for the next frame and is no hole if that
+    /// frame is one of them, as what was lost then is the pre-roll's; a
+    /// control event is queued in its place, replacing one of its kind no
+    /// frame came under. Nothing once the track ended or for a clip without
+    /// it.
     pub fn push(&mut self, track: Kind, event: TrackEvent, now: Instant) {
         if !self.lane(track).open {
             return;
@@ -339,15 +423,16 @@ impl ReliableQueue {
             TrackEvent::Frame(frame) => self.push_frame(track, frame, now),
             TrackEvent::Gap { skipped } => {
                 tracing::debug!(%track, skipped, "clip queue: the subscription lagged");
-                self.hole(track, GapReason::Lagged, now);
+                let lane = self.lane_mut(track);
+                if lane.duplicates.is_empty() {
+                    self.hole(track, GapReason::Lagged, now);
+                } else {
+                    lane.lagged = true;
+                }
             }
             // A clip subscribes to frames, which yield no packet.
             TrackEvent::Packet(_) => {}
-            control => self.lane_mut(track).items.push_back(Item {
-                entry: Entry::Control(control),
-                queued: now,
-                cost: 0,
-            }),
+            control => self.lane_mut(track).queue_control(control, now),
         }
     }
 
@@ -356,7 +441,16 @@ impl ReliableQueue {
         let blocked = track == Kind::Audio && self.video.blocks_audio();
         let lane = self.lane_mut(track);
         lane.newest = lane.newest.max(Some(frame.wallclock));
-        if lane.is_duplicate(&frame) || blocked || (lane.waiting() && !lane.resumes_at(&frame)) {
+        let duplicate = lane.is_duplicate(&frame);
+        if std::mem::take(&mut lane.lagged) {
+            if duplicate {
+                tracing::debug!(%track, "clip queue: the lag fell within the pre-roll, no hole");
+            } else {
+                self.hole(track, GapReason::Lagged, now);
+            }
+        }
+        let lane = self.lane_mut(track);
+        if duplicate || blocked || (lane.waiting() && !lane.resumes_at(&frame)) {
             tracing::trace!(%track, ts = %frame.ts, "clip queue: frame dropped");
             return;
         }
@@ -381,24 +475,26 @@ impl ReliableQueue {
         self.bytes = self.bytes.saturating_add(cost);
     }
 
-    /// A frame did not fit: the video drops to its next keyframe that
-    /// fits, the audio until then, and the hole is the video's (an earlier
-    /// hole of the video keeps its start).
+    /// A frame did not fit: while the video is open it drops to its next
+    /// keyframe that fits, the audio until then, and the hole is the
+    /// video's (an earlier hole keeps its start); once the video ended no
+    /// keyframe comes, so the hole is the audio's, which resumes at its
+    /// next frame that fits behind a gap of its own.
     fn overflow(&mut self, now: Instant) {
-        let video = &mut self.video;
-        video.hole = video
-            .hole
-            .map_or(video.last, |hole| Some(hole.from))
-            .map(|from| Hole {
-                reason: GapReason::Overflow,
-                from,
-            });
+        let lane = if self.video.open {
+            &mut self.video
+        } else {
+            &mut self.audio
+        };
+        lane.overflow();
+        let track = lane.kind;
         if let Some(count) = self.holes.hit(now) {
             tracing::debug!(
+                %track,
                 bytes = self.bytes,
                 limit = self.max_bytes,
                 count,
-                "clip queue: full, dropping to the next video keyframe"
+                "clip queue: full, dropping until the track can resume"
             );
         }
     }
@@ -419,13 +515,19 @@ impl ReliableQueue {
 
     /// Ends `track`: its subscription ended. What it queued still goes
     /// out; nothing more is taken, and the interleaver no longer waits for
-    /// it.
+    /// it. An overflow hole the video ends in passes to the audio.
     pub fn end(&mut self, track: Kind) {
         let lane = self.lane_mut(track);
         if lane.open {
             tracing::debug!(%track, queued = lane.items.len(), "clip queue: track ended");
         }
         lane.open = false;
+        if track == Kind::Video && self.video.overflowing() {
+            // No keyframe ends the video's overflow now: the audio it
+            // blocked takes the hole and resumes at its next frame.
+            tracing::debug!("clip queue: the video ended in an overflow, the audio takes the hole");
+            self.audio.overflow();
+        }
     }
 
     /// The oldest item `track` queued, taken out.
@@ -1037,10 +1139,15 @@ mod tests {
         assert_eq!(
             logs.count(
                 tracing::Level::DEBUG,
-                "clip queue: full, dropping to the next video keyframe"
+                "clip queue: full, dropping until the track can resume"
             ),
             1
         );
+        let full = logs.lines(
+            tracing::Level::DEBUG,
+            "clip queue: full, dropping until the track can resume",
+        );
+        assert!(full[0].fields.starts_with(" track=video"), "{full:?}");
         assert_eq!(
             logs.count(
                 tracing::Level::DEBUG,
@@ -1235,5 +1342,196 @@ mod tests {
             release(&mut merged, &clip),
             ["v0", "v40", "v80", "v120", "v160"]
         );
+    }
+
+    #[tokio::test]
+    async fn taking_the_subscription_with_the_pre_roll_queues_no_frame_before_its_start() {
+        let clip = Clip::new();
+        let track = Arc::new(Track::new(
+            TrackId::new(Kind::Video, 0),
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+            TrackLimits::default(),
+            clip.now(),
+        ));
+        track.set_preroll(Some(Duration::from_secs(10)));
+        let publish = |ms: u64, keyframe: bool| {
+            assert!(track.publish_frame(MediaFrame::clone(&clip.frame(ms, keyframe, 10))));
+        };
+        publish(0, true);
+        let (mut subscription, snapshot) = track.subscribe_from_preroll(clip.at(80));
+        publish(40, false);
+        publish(80, true);
+        publish(120, false);
+        let mut merged = interleaver(false);
+        merged
+            .queue_mut()
+            .preroll(Kind::Video, &snapshot.unwrap(), clip.now());
+        for _ in 0..3 {
+            let event = subscription.next().await.unwrap();
+            merged.queue_mut().push(Kind::Video, event, clip.now());
+        }
+        assert_eq!(release(&mut merged, &clip), ["v0", "v40", "v80", "v120"]);
+    }
+
+    #[test]
+    fn a_lag_the_pre_roll_covers_opens_no_hole() {
+        let (logs, _guard) = crate::test_logs::Logs::capture();
+        let clip = Clip::new();
+        let gop = [
+            clip.frame(0, true, 10),
+            clip.frame(40, false, 10),
+            clip.frame(80, false, 10),
+        ];
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        queue.preroll(Kind::Video, &snapshot(&clip, &gop, usize::MAX), clip.now());
+        queue.push(Kind::Video, TrackEvent::Gap { skipped: 2 }, clip.now());
+        queue.push(
+            Kind::Video,
+            TrackEvent::Frame(Arc::clone(&gop[2])),
+            clip.now(),
+        );
+        clip.push(&mut queue, Kind::Video, 120, false);
+        assert_eq!(
+            drain(&mut queue, Kind::Video, &clip),
+            ["v0", "v40", "v80", "v120"]
+        );
+        assert_eq!(
+            logs.count(
+                tracing::Level::DEBUG,
+                "clip queue: the lag fell within the pre-roll, no hole"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_lag_past_the_pre_roll_still_opens_a_hole() {
+        let clip = Clip::new();
+        let gop = [
+            clip.frame(0, true, 10),
+            clip.frame(40, false, 10),
+            clip.frame(80, false, 10),
+        ];
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        queue.preroll(Kind::Video, &snapshot(&clip, &gop, usize::MAX), clip.now());
+        queue.push(Kind::Video, TrackEvent::Gap { skipped: 2 }, clip.now());
+        queue.push(Kind::Video, TrackEvent::SourceLost, clip.now());
+        clip.push(&mut queue, Kind::Video, 120, false);
+        clip.push(&mut queue, Kind::Video, 160, true);
+        assert_eq!(
+            drain(&mut queue, Kind::Video, &clip),
+            [
+                "v0",
+                "v40",
+                "v80",
+                "vSourceLost",
+                "vgap lagged 80-160",
+                "v160"
+            ]
+        );
+    }
+
+    #[test]
+    fn control_events_no_frame_came_under_are_replaced_by_their_kind_s_newest() {
+        let clip = Clip::new();
+        let mut queue = ReliableQueue::new(c(10), false);
+        clip.push(&mut queue, Kind::Video, 0, true);
+        let mut last = Arc::new(Codec::Pcmu);
+        for i in 1..=500_u32 {
+            queue.push(Kind::Video, TrackEvent::EpochStart { epoch: i }, clip.now());
+            last = Arc::new(if i % 2 == 0 { Codec::Pcmu } else { Codec::Pcma });
+            queue.push(
+                Kind::Video,
+                TrackEvent::TrackChanged(Arc::clone(&last)),
+                clip.now(),
+            );
+            queue.push(Kind::Video, TrackEvent::SourceLost, clip.now());
+            queue.push(Kind::Video, TrackEvent::SourceRestored, clip.now());
+            clip.push(&mut queue, Kind::Video, 40 * u64::from(i), false);
+        }
+        assert_eq!(
+            drain(&mut queue, Kind::Video, &clip),
+            [
+                "v0".to_owned(),
+                "vEpochStart { epoch: 500 }".to_owned(),
+                format!("v{:?}", TrackEvent::TrackChanged(last)),
+                "vSourceLost".to_owned(),
+                "vSourceRestored".to_owned(),
+            ]
+        );
+        assert_eq!(queue.bytes(), 0);
+    }
+
+    #[test]
+    fn a_control_event_a_frame_came_under_stays() {
+        let clip = Clip::new();
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        clip.push(&mut queue, Kind::Video, 0, true);
+        queue.push(Kind::Video, TrackEvent::EpochStart { epoch: 1 }, clip.now());
+        clip.push(&mut queue, Kind::Video, 40, false);
+        queue.push(Kind::Video, TrackEvent::EpochStart { epoch: 2 }, clip.now());
+        queue.push(Kind::Video, TrackEvent::EpochStart { epoch: 3 }, clip.now());
+        assert_eq!(
+            drain(&mut queue, Kind::Video, &clip),
+            [
+                "v0",
+                "vEpochStart { epoch: 1 }",
+                "v40",
+                "vEpochStart { epoch: 3 }"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_overflow_after_the_video_ended_is_the_audio_s_own_hole() {
+        let clip = Clip::new();
+        let mut queue = ReliableQueue::new(2 * c(10), true);
+        clip.push(&mut queue, Kind::Video, 0, true);
+        clip.push(&mut queue, Kind::Audio, 10, true);
+        queue.end(Kind::Video);
+        clip.push(&mut queue, Kind::Audio, 20, true);
+        assert_eq!(drain(&mut queue, Kind::Video, &clip), ["v0"]);
+        assert_eq!(drain(&mut queue, Kind::Audio, &clip), ["a10"]);
+        clip.push(&mut queue, Kind::Audio, 30, true);
+        assert_eq!(
+            drain(&mut queue, Kind::Audio, &clip),
+            ["agap overflow 10-30", "a30"]
+        );
+    }
+
+    #[test]
+    fn the_video_ending_in_an_overflow_hands_the_hole_to_the_audio() {
+        let clip = Clip::new();
+        let mut queue = ReliableQueue::new(2 * c(10), true);
+        clip.push(&mut queue, Kind::Video, 0, true);
+        clip.push(&mut queue, Kind::Audio, 10, true);
+        clip.push(&mut queue, Kind::Video, 40, true);
+        clip.push(&mut queue, Kind::Audio, 50, true);
+        queue.end(Kind::Video);
+        assert_eq!(drain(&mut queue, Kind::Video, &clip), ["v0"]);
+        assert_eq!(drain(&mut queue, Kind::Audio, &clip), ["a10"]);
+        clip.push(&mut queue, Kind::Audio, 60, true);
+        assert_eq!(
+            drain(&mut queue, Kind::Audio, &clip),
+            ["agap overflow 10-60", "a60"]
+        );
+
+        let mut queue = ReliableQueue::new(usize::MAX, true);
+        clip.push(&mut queue, Kind::Video, 0, true);
+        clip.push(&mut queue, Kind::Audio, 10, true);
+        queue.end(Kind::Video);
+        clip.push(&mut queue, Kind::Audio, 20, true);
+        assert_eq!(drain(&mut queue, Kind::Audio, &clip), ["a10", "a20"]);
+
+        let mut queue = ReliableQueue::new(usize::MAX, true);
+        clip.push(&mut queue, Kind::Audio, 0, true);
+        queue.end(Kind::Video);
+        clip.push(&mut queue, Kind::Audio, 20, true);
+        assert!(drain(&mut queue, Kind::Audio, &clip).is_empty());
     }
 }
