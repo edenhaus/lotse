@@ -886,7 +886,12 @@ impl Track {
 
     /// [`Self::set_codec`] on this track itself, whoever feeds it.
     /// Another family clears the pre-roll: nothing before it can share a
-    /// clip with what follows.
+    /// clip with what follows. On audio any change does: an audio frame
+    /// carries no decoder configuration (AAC's `AudioSpecificConfig`,
+    /// ISO/IEC 14496-3 §1.6.2.1, travels out of band, RFC 3640 §4.1; so
+    /// does Opus's channel count), so the frames before it would be read
+    /// with the new descriptor. A video keyframe carries its parameter sets
+    /// in-band ([`MediaFrame::payload`]), so a video ring keeps its GOPs.
     fn set_codec_inner(&self, codec: Codec) {
         let family = {
             let current = self.codec.load();
@@ -896,7 +901,8 @@ impl Track {
             current.family()
         };
         let codec = Arc::new(codec);
-        let preroll_cleared = family != codec.family() && self.clear_preroll();
+        let preroll_cleared =
+            (family != codec.family() || self.kind() == Kind::Audio) && self.clear_preroll();
         let due = self
             .codec_changes
             .lock()
@@ -1017,10 +1023,10 @@ impl Track {
         self.tag == 0 && self.id == TrackId::new(Kind::Video, 0)
     }
 
-    /// Sets how far back the pre-roll ring holds this track's frames;
-    /// `None` frees it at once. A longer window fills forward from now, a
-    /// shorter one trims at the next keyframe (the next frame, on audio).
-    /// Neither touches the connection or the subscribers.
+    /// Sets how far back, by arrival, the pre-roll ring holds this track's
+    /// frames; `None` frees it at once. A longer window fills forward from
+    /// now, a shorter one trims at the next keyframe (the next frame, on
+    /// audio). Neither touches the connection or the subscribers.
     pub fn set_preroll(&self, window: Option<Duration>) {
         let (previous, freed) = {
             let mut ring = self.lock_preroll();
@@ -2349,8 +2355,57 @@ mod tests {
             sps: Some(Bytes::from_static(&[0x42, 0x01])),
             pps: None,
         });
-        assert_eq!(preroll(&track, t0), [1000], "the same family keeps it");
+        assert_eq!(
+            preroll(&track, t0),
+            [1000],
+            "the same family keeps a video ring: its keyframes carry their parameter sets"
+        );
         assert_eq!(track.preroll_floor.get(), Some(t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn an_audio_descriptor_change_within_its_family_clears_the_audio_pre_roll() {
+        let (logs, _guard) = Logs::capture();
+        let t0 = SystemClock.now();
+        let aac = |config: &'static [u8]| Codec::AacLc {
+            sample_rate: 16_000,
+            channels: 1,
+            config: Bytes::from_static(config),
+        };
+        let track = Track::new(
+            TrackId::new(Kind::Audio, 0),
+            aac(&[0x14, 0x08]),
+            16_000,
+            TrackLimits::default(),
+            t0,
+        );
+        track.set_preroll(Some(Duration::from_secs(10)));
+        for ms in [0, 64] {
+            assert!(track.publish_frame(timed(t0, ms, true, 10)));
+        }
+        track.set_codec(aac(&[0x14, 0x08]));
+        assert_eq!(
+            preroll(&track, t0),
+            [0, 64],
+            "an equal descriptor changes nothing"
+        );
+        track.set_codec(aac(&[0x11, 0x90]));
+        assert!(
+            preroll(&track, t0).is_empty(),
+            "the old frames need the old AudioSpecificConfig"
+        );
+        assert_eq!(
+            track.stats().preroll,
+            Some(PrerollStats::default()),
+            "the window stays"
+        );
+        let lines = logs.lines(tracing::Level::INFO, "track codec changed");
+        assert_eq!(
+            lines[0].fields,
+            " track=a0 codec=\"aac_lc\" preroll_cleared=true count=1"
+        );
+        assert!(track.publish_frame(timed(t0, 128, true, 10)));
+        assert_eq!(preroll(&track, t0), [128]);
     }
 
     #[test]
@@ -2490,6 +2545,36 @@ mod tests {
         audio.set_preroll(None);
         assert!(audio.publish_frame(timed(t0, 3600, true, 10)));
         assert_eq!(audio.preroll_floor.get(), None);
+    }
+
+    #[test]
+    fn a_keyframe_captured_ahead_of_its_arrival_never_trims_the_audio_pre_roll() {
+        let t0 = SystemClock.now();
+        let set = crate::source::TrackSet::new(TrackLimits::default(), t0);
+        let mut publisher = set.publisher();
+        let video = publisher.declare(
+            Kind::Video,
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+        );
+        let audio = publisher.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        for track in [&video, &audio] {
+            track.set_preroll(Some(Duration::from_secs(10)));
+        }
+        // A mapping an hour ahead of the keyframe's arrival.
+        assert!(video.publish_frame(MediaFrame {
+            wallclock: t0 + Duration::from_secs(3600),
+            ..timed(t0, 0, true, 10)
+        }));
+        for ms in (0..=1000).step_by(200) {
+            assert!(audio.publish_frame(timed(t0, ms, true, 10)));
+        }
+        assert_eq!(video.preroll_floor.get(), Some(t0));
+        assert_eq!(preroll(&audio, t0), [0, 200, 400, 600, 800, 1000]);
     }
 
     #[test]
