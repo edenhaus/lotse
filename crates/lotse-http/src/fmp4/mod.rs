@@ -61,7 +61,11 @@
 //! whose samples cover more bytes than its media data boxes hold is
 //! refused, because they overlap (runs pointing at the same bytes would
 //! have each copied again), so a segment's units hold at most its media
-//! data, each NAL unit's length prefix replaced by a start code. Pure: no
+//! data, each NAL unit's length prefix replaced by a start code. An
+//! item reference box (ISO/IEC 14496-12 §8.11.12) in the movie box or a
+//! movie fragment whose references claim more bytes than it holds is
+//! refused before mp4-atom reads it, as mp4-atom 0.16.2 counts them
+//! unchecked (its `Iref::decode_body_ext`). Pure: no
 //! I/O, no clock, no logging (mp4-atom's own `tracing` warnings name
 //! boxes it does not know).
 
@@ -104,6 +108,9 @@ const TRUN: FourCC = FourCC::new(b"trun");
 
 /// The media data box (ISO/IEC 14496-12 §8.1.1).
 const MDAT: FourCC = FourCC::new(b"mdat");
+
+/// The item reference box (ISO/IEC 14496-12 §8.11.12).
+const IREF: FourCC = FourCC::new(b"iref");
 
 /// The video handler (ISO/IEC 14496-12 §8.4.3, `handler_type`).
 const VIDE: FourCC = FourCC::new(b"vide");
@@ -344,6 +351,91 @@ fn declared_samples(moof: &[u8]) -> Result<u64, mp4_atom::Error> {
     Ok(count)
 }
 
+/// Whether mp4-atom 0.16.2 counts past zero reading `body`, the body of
+/// an item reference box (ISO/IEC 14496-12 §8.11.12.2): after the
+/// version and flags, its `SingleItemTypeReferenceBox`es, each its size,
+/// `reference_type`, `from_item_ID`, `reference_count` and that many
+/// `to_item_ID`s, the IDs 16-bit in version 0 and 32-bit in version 1.
+///
+/// mp4-atom 0.16.2 (`Iref::decode_body_ext`, observed 2026-10-24, the
+/// newest release) subtracts each reference's size from the bytes it has
+/// left unchecked: a size past them panics where overflow checks are on
+/// (debug builds, the fuzz targets) and wraps elsewhere, after which it
+/// reads on until the body ends and refuses the box. This reads the body
+/// as it does, every reference after its fields rather than after its
+/// size, and stops where mp4-atom stops without counting past zero: at
+/// another version, which it refuses, at a field the body is too short
+/// for, and once the sizes add up to the body.
+fn references_overrun(body: &[u8]) -> bool {
+    let Some((&[version, ..], mut rest)) = body.split_first_chunk::<4>() else {
+        return false;
+    };
+    // `reference_type` and `from_item_ID`, and the size of a `to_item_ID`.
+    let (fields, id_size) = match version {
+        0 => (6, 2_usize),
+        1 => (8, 4_usize),
+        _ => return false,
+    };
+    let mut left = rest.len();
+    while left > 0 {
+        let Some((size, after)) = rest.split_first_chunk::<4>() else {
+            return false;
+        };
+        let size = usize::try_from(u32::from_be_bytes(*size)).unwrap_or(usize::MAX);
+        let Some(still) = left.checked_sub(size) else {
+            return true;
+        };
+        left = still;
+        let Some((count, ids)) = after.get(fields..).and_then(<[u8]>::split_first_chunk::<2>)
+        else {
+            return false;
+        };
+        let ids_len = usize::from(u16::from_be_bytes(*count)).saturating_mul(id_size);
+        let Some(next) = ids.get(ids_len..) else {
+            return false;
+        };
+        rest = next;
+    }
+    false
+}
+
+/// Refuses `body`, the body of a box mp4-atom is to read, when mp4-atom
+/// 0.16.2 would count past zero reading an item reference box inside it
+/// ([`references_overrun`]). It reads one wherever it meets one, at any
+/// depth of every box it walks (its `Any`), not only in a `meta` (ISO/IEC
+/// 14496-12 §8.11.1), so every `iref` type in `body` is taken for one
+/// whose header (§4.2) begins four bytes before it: one mp4-atom reads
+/// lies there, with its body inside `body`. A header mp4-atom refuses or
+/// a box past the end of `body` is not one it reads. A size of 0 runs to
+/// the end of a box this does not know, and §4.2 allows it to the last
+/// top-level box alone: refused. Such a type inside other data is taken
+/// for a box too, and its bytes read as references.
+///
+/// # Errors
+///
+/// mp4-atom's own error for such a box once its count wraps: an over
+/// decode of `iref`.
+fn check_item_references(body: &[u8]) -> Result<(), mp4_atom::Error> {
+    let starts = body
+        .windows(4)
+        .enumerate()
+        .filter(|(_, kind)| *kind == IREF.as_ref())
+        .filter_map(|(at, _)| at.checked_sub(4));
+    for start in starts {
+        let mut cursor = body.get(start..).unwrap_or_default();
+        let Ok(Some(header)) = Header::decode_maybe(&mut cursor) else {
+            continue;
+        };
+        let Some(size) = header.size else {
+            return Err(mp4_atom::Error::OverDecode(IREF));
+        };
+        if cursor.get(..size).is_some_and(references_overrun) {
+            return Err(mp4_atom::Error::OverDecode(IREF));
+        }
+    }
+    Ok(())
+}
+
 /// The name of a sample entry lotse does not read: its type, in lower
 /// case (ISO/IEC 14496-12 §8.5.2.2, the entry's box type).
 fn entry_name(entry: &SampleEntry) -> String {
@@ -575,6 +667,7 @@ impl Reader {
             .iter()
             .find(|placed| placed.kind == MOOV)
             .ok_or(Fmp4Error::NoMovie)?;
+        check_item_references(moov.body).map_err(box_error("movie box"))?;
         let mut bytes = init.get(moov.start..).unwrap_or_default();
         let moov = Moov::decode(&mut bytes).map_err(box_error("movie box"))?;
         let mut tracks = Vec::new();
@@ -661,6 +754,7 @@ impl Reader {
             return Err(Fmp4Error::TooManySamples { count });
         }
         for fragment in fragments {
+            check_item_references(fragment.body).map_err(box_error("movie fragment"))?;
             let mut bytes = segment.get(fragment.start..).unwrap_or_default();
             let moof = Moof::decode(&mut bytes).map_err(box_error("movie fragment"))?;
             self.fragment(&moof, fragment.start, &mut media, &mut units, &mut stats)?;
