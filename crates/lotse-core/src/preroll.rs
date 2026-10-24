@@ -10,14 +10,18 @@
 //! so it keeps the window plus the open GOP; at any frame it drops its
 //! oldest GOPs while it would hold more than `preroll_bytes`. A GOP that
 //! alone outgrows `preroll_bytes` keeps its keyframe and the frames that
-//! fit, drops the rest and is counted, and goes whole at the next keyframe,
-//! so every GOP held but the newest is whole; a keyframe
-//! itself is bounded only by `max_frame_bytes`, as in the GOP cache. An
-//! audio ring follows the video: it keeps the newest frame at or before
-//! the video ring's oldest keyframe and everything after it (by its own
-//! window while the video ring holds nothing), and drops its oldest frames
-//! while it holds more than `preroll_bytes`, down to the newest one. Every
-//! frame is charged its payload plus [`PREROLL_FRAME_OVERHEAD`], so a
+//! fit, drops the rest and is counted; a GOP that loses a frame the track
+//! dropped over `max_frame_bytes` (a keyframe too, whose frames would
+//! otherwise follow the GOP before) is cut there the same way, counted by
+//! the track. A cut GOP holds nothing after the cut, and the next keyframe
+//! drops it with everything before it, so the ring starts again there, no
+//! clip spans a gap unreported, and every GOP held but the newest is whole;
+//! a keyframe itself is bounded only by `max_frame_bytes`, as in the GOP
+//! cache. An audio ring follows the video: it keeps the newest frame at or
+//! before the video ring's oldest keyframe and everything after it (by its
+//! own window while the video ring holds nothing), and drops its oldest
+//! frames while it holds more than `preroll_bytes`, down to the newest one.
+//! Every frame is charged its payload plus [`PREROLL_FRAME_OVERHEAD`], so a
 //! camera sending tiny frames cannot hold more memory than the bound says.
 //! Every trim drops a prefix in one pass that stops where the kept frames
 //! begin, so it costs what it drops.
@@ -53,7 +57,9 @@ pub struct PrerollStats {
     /// to the newest: how far back a clip can start now.
     pub held: Duration,
     /// GOPs that alone outgrew `preroll_bytes`, so only their start was
-    /// held, over the track's life.
+    /// held, over the track's life. A frame the track dropped over
+    /// `max_frame_bytes` cuts a GOP short too, but is counted in
+    /// [`TrackStats::frames_dropped_oversize`](crate::track::TrackStats::frames_dropped_oversize).
     pub truncations: u64,
 }
 
@@ -66,8 +72,9 @@ pub struct PrerollSnapshot {
     /// The frames after `start`, in the order the track published them.
     following: Vec<Arc<MediaFrame>>,
     /// The ring stopped holding the newest GOP because it outgrew
-    /// `preroll_bytes`: the live frames after the snapshot's last one are
-    /// not the next of its GOP, so a reader resumes at the next keyframe.
+    /// `preroll_bytes` or lost a frame the track dropped: the live frames
+    /// after the snapshot's last one are not the next of its GOP, so a
+    /// reader resumes at the next keyframe.
     truncated: bool,
 }
 
@@ -87,9 +94,9 @@ impl PrerollSnapshot {
         self.following.len().saturating_add(1)
     }
 
-    /// Whether the newest GOP was cut short by `preroll_bytes`, so the
-    /// frames after the last one held are missing; every GOP before it is
-    /// whole.
+    /// Whether the newest GOP was cut short, by `preroll_bytes` or by a
+    /// frame the track dropped over `max_frame_bytes`, so the frames after
+    /// the last one held are missing; every GOP before it is whole.
     pub const fn truncated(&self) -> bool {
         self.truncated
     }
@@ -153,15 +160,18 @@ pub(crate) struct Preroll {
     frames: VecDeque<Arc<MediaFrame>>,
     /// What `frames` counts against `preroll_bytes`.
     bytes: usize,
-    /// The newest GOP outgrew `preroll_bytes`; its frames are dropped
-    /// until the next keyframe, which drops the GOP too, so no older GOP
-    /// held is ever truncated. Meaningless while nothing is held: only a
+    /// The newest GOP outgrew `preroll_bytes` or lost a frame the track
+    /// dropped ([`Self::frame_dropped`]); its frames are dropped until
+    /// the next keyframe, which drops the GOP too, so no older GOP held
+    /// is ever truncated. Meaningless while nothing is held: only a
     /// keyframe starts an empty ring, and it resets this.
     truncated: bool,
     /// See [`PrerollStats::truncations`].
     truncations: u64,
     /// Rate-limits the line of a truncation, which a camera with GOPs
-    /// larger than the bound hits on every GOP.
+    /// larger than the bound hits on every GOP. Timed by the frames'
+    /// arrival, never their capture time, which a camera's Sender Reports
+    /// can move hours ahead and back.
     truncation_log: Throttle,
 }
 
@@ -229,6 +239,20 @@ impl Preroll {
         }
     }
 
+    /// The track dropped a frame before the ring saw it (larger than
+    /// `max_frame_bytes`). On video, the GOP it belongs to (the one it
+    /// would have started, for a keyframe) lacks a frame the ones after
+    /// it may reference: the ring holds nothing more of it and starts
+    /// again at the next keyframe, as for a GOP outgrowing
+    /// `preroll_bytes`, and a snapshot until then reports the cut. Not
+    /// counted in [`PrerollStats::truncations`]: the track counts the
+    /// frame. An audio ring keeps going, as every audio frame is a start.
+    pub(crate) fn frame_dropped(&mut self) {
+        if self.video {
+            self.truncated = true;
+        }
+    }
+
     /// [`Self::push`] on a video ring.
     fn push_video(
         &mut self,
@@ -240,9 +264,10 @@ impl Preroll {
         if frame.keyframe {
             if self.truncated {
                 // The truncated GOP lost frames before this keyframe: a
-                // clip from its keyframe would skip them, so it goes whole
-                // (and, as the cap already dropped every GOP before it,
-                // the ring starts again here).
+                // clip from its keyframe would skip them, and one from an
+                // older keyframe would jump over the gap unreported, so
+                // the ring starts again here. (After a cap truncation the
+                // cap had already dropped every GOP before it.)
                 self.drop_front(self.frames.len());
                 self.truncated = false;
             }
@@ -266,7 +291,7 @@ impl Preroll {
             self.truncations = self.truncations.saturating_add(1);
             return self
                 .truncation_log
-                .hit(frame.wallclock)
+                .hit(frame.arrival)
                 .map(|count| Truncation { gop_bytes, count });
         }
         self.append(frame, cost);
@@ -633,6 +658,114 @@ mod tests {
         );
         assert_eq!(held(&ring), [1250, 1500]);
         assert_eq!(ring.stats().unwrap().truncations, 2);
+    }
+
+    #[test]
+    fn a_dropped_frame_cuts_its_gop_and_the_next_keyframe_starts_the_ring_again() {
+        let clip = Clip::new();
+        let mut ring = ring(true, 60_000);
+        gop(&mut ring, &clip, 0, 1000, usize::MAX);
+        gop(&mut ring, &clip, 1000, 1500, usize::MAX);
+        // The frame at 1500 never reaches the ring.
+        ring.frame_dropped();
+        assert_eq!(
+            ring.push(&clip.frame(1750, false, 10), usize::MAX, || None),
+            None
+        );
+        assert_eq!(
+            held(&ring),
+            [0, 250, 500, 750, 1000, 1250],
+            "the whole GOPs before the gap stay"
+        );
+        let snapshot = ring.snapshot(clip.at(0)).unwrap();
+        assert!(snapshot.truncated());
+        assert_eq!(snapshot.frames().last().unwrap().ts.ticks(), 1250);
+        assert_eq!(ring.stats().unwrap().truncations, 0, "counted by the track");
+        assert_eq!(ring.oldest(), Some(clip.at(0)), "the floor does not move");
+
+        gop(&mut ring, &clip, 2000, 2500, usize::MAX);
+        assert_eq!(held(&ring), [2000, 2250], "the next keyframe restarts");
+        assert!(!ring.snapshot(clip.at(0)).unwrap().truncated());
+
+        // A lost keyframe: the frames of its GOP stay out as well.
+        ring.frame_dropped();
+        assert_eq!(
+            ring.push(&clip.frame(3250, false, 10), usize::MAX, || None),
+            None
+        );
+        assert_eq!(held(&ring), [2000, 2250]);
+        assert!(ring.snapshot(clip.at(0)).unwrap().truncated());
+        assert_eq!(
+            ring.push(&clip.frame(4000, true, 10), usize::MAX, || None),
+            None
+        );
+        assert_eq!(held(&ring), [4000]);
+        assert!(!ring.snapshot(clip.at(0)).unwrap().truncated());
+    }
+
+    #[test]
+    fn a_dropped_audio_frame_leaves_the_audio_ring_whole() {
+        let clip = Clip::new();
+        let mut ring = ring(false, 60_000);
+        for ms in [0, 400] {
+            assert_eq!(
+                ring.push(&clip.frame(ms, false, 10), usize::MAX, || None),
+                None
+            );
+        }
+        ring.frame_dropped();
+        assert_eq!(
+            ring.push(&clip.frame(1200, false, 10), usize::MAX, || None),
+            None
+        );
+        assert_eq!(held(&ring), [0, 400, 1200]);
+        assert!(
+            !ring.snapshot(clip.at(0)).unwrap().truncated(),
+            "every audio frame is a start"
+        );
+    }
+
+    #[test]
+    fn a_truncation_line_is_timed_by_arrival_not_by_the_capture_time() {
+        let clip = Clip::new();
+        // Ten hours: no keyframe here is ever a window old.
+        let mut ring = ring(true, 36_000_000);
+        let cap = 2 * c(10);
+        // Captured at `capture`, read at `arrival`, labelled by `arrival`.
+        let frame = |capture: u64, arrival: u64, keyframe: bool| {
+            Arc::new(MediaFrame {
+                wallclock: clip.at(capture),
+                ..(*clip.frame(arrival, keyframe, 10)).clone()
+            })
+        };
+        let truncation = Some(Truncation {
+            gop_bytes: 3 * c(10),
+            count: 1,
+        });
+        // A Sender Report maps the third frame an hour ahead.
+        assert_eq!(ring.push(&frame(0, 0, true), cap, || None), None);
+        assert_eq!(ring.push(&frame(250, 250, false), cap, || None), None);
+        assert_eq!(
+            ring.push(&frame(3_600_500, 500, false), cap, || None),
+            truncation
+        );
+        // The mapping is corrected; 12 s later by arrival a line is due.
+        assert_eq!(ring.push(&frame(12_000, 12_000, true), cap, || None), None);
+        assert_eq!(ring.push(&frame(12_250, 12_250, false), cap, || None), None);
+        assert_eq!(
+            ring.push(&frame(12_500, 12_500, false), cap, || None),
+            truncation,
+            "not held back by the capture time an hour ahead"
+        );
+        // A jump ahead 1 s later by arrival is still inside the interval.
+        assert_eq!(ring.push(&frame(13_000, 13_000, true), cap, || None), None);
+        assert_eq!(ring.push(&frame(13_250, 13_250, false), cap, || None), None);
+        assert_eq!(
+            ring.push(&frame(3_613_500, 13_500, false), cap, || None),
+            None,
+            "a capture time ahead does not bypass the interval"
+        );
+        assert_eq!(ring.stats().unwrap().truncations, 3);
     }
 
     #[test]

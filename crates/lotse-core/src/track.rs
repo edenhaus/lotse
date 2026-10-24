@@ -1192,7 +1192,8 @@ impl Track {
     /// Publishes a frame on the side branch, stamped with the current epoch
     /// (and `discontinuity` if it is the epoch's first): updates the GOP
     /// cache (video) and broadcasts it. Returns `false` for a frame larger
-    /// than `max_frame_bytes`, which is dropped and counted.
+    /// than `max_frame_bytes`, which is dropped and counted, and cuts the
+    /// pre-roll's GOP short there (until the next keyframe).
     pub fn publish_frame(&self, frame: MediaFrame) -> bool {
         self.touch(frame.arrival);
         if !self.feeds.admits(self.tag, self.kind(), frame.keyframe) {
@@ -1224,6 +1225,8 @@ impl Track {
                 limit = self.limits.max_frame_bytes,
                 "frame dropped: larger than max_frame_bytes"
             );
+            // The pre-roll's GOP now misses this frame: it is cut there.
+            self.lock_preroll().frame_dropped();
             return false;
         }
         self.touch(frame.arrival);
@@ -2548,6 +2551,106 @@ mod tests {
         standby.close();
         assert_eq!(video.preroll_floor.get(), floor);
         assert_eq!(preroll(&video, t0).first(), Some(&2000));
+    }
+
+    #[test]
+    fn an_oversize_reference_frame_cuts_the_pre_roll_gop_until_the_next_keyframe() {
+        let t0 = SystemClock.now();
+        let track = video_track(TrackLimits {
+            max_frame_bytes: 100,
+            ..TrackLimits::default()
+        });
+        track.set_preroll(Some(Duration::from_secs(10)));
+        for (ms, keyframe) in [(0, true), (250, false), (1000, true), (1250, false)] {
+            assert!(track.publish_frame(timed(t0, ms, keyframe, 10)));
+        }
+        assert!(!track.publish_frame(timed(t0, 1500, false, 101)), "dropped");
+        assert!(track.publish_frame(timed(t0, 1750, false, 10)));
+        assert_eq!(
+            preroll(&track, t0),
+            [0, 250, 1000, 1250],
+            "nothing after the lost frame"
+        );
+        assert!(track.preroll_snapshot(t0).unwrap().truncated());
+        assert!(
+            track
+                .preroll_snapshot(t0 + Duration::from_secs(1))
+                .unwrap()
+                .truncated(),
+            "a clip from the cut GOP is told"
+        );
+        let stats = track.stats();
+        assert_eq!(stats.frames_dropped_oversize, 1);
+        assert_eq!(stats.preroll.unwrap().truncations, 0, "the track counts it");
+        assert_eq!(track.preroll_floor.get(), Some(t0), "the floor stays");
+
+        assert!(track.publish_frame(timed(t0, 2000, true, 10)));
+        assert_eq!(preroll(&track, t0), [2000], "the ring starts again");
+        assert!(!track.preroll_snapshot(t0).unwrap().truncated());
+        assert_eq!(track.preroll_floor.get(), Some(t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn an_oversize_keyframe_keeps_its_gop_out_of_the_pre_roll_and_the_audio_follows() {
+        let t0 = SystemClock.now();
+        let set = crate::source::TrackSet::new(
+            TrackLimits {
+                max_frame_bytes: 100,
+                ..TrackLimits::default()
+            },
+            t0,
+        );
+        let mut publisher = set.publisher();
+        let video = publisher.declare(
+            Kind::Video,
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+        );
+        let audio = publisher.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        for track in [&video, &audio] {
+            track.set_preroll(Some(Duration::from_secs(10)));
+        }
+        assert!(video.publish_frame(timed(t0, 0, true, 10)));
+        assert!(audio.publish_frame(timed(t0, 0, true, 10)));
+        assert!(video.publish_frame(timed(t0, 250, false, 10)));
+        assert!(audio.publish_frame(timed(t0, 500, true, 10)));
+        assert!(!video.publish_frame(timed(t0, 1000, true, 101)), "dropped");
+        assert!(
+            video.publish_frame(timed(t0, 1250, false, 10)),
+            "the track takes it"
+        );
+        for ms in [1000, 1500] {
+            assert!(audio.publish_frame(timed(t0, ms, true, 10)));
+        }
+        assert_eq!(
+            preroll(&video, t0),
+            [0, 250],
+            "the lost keyframe's GOP stays out"
+        );
+        assert!(video.preroll_snapshot(t0).unwrap().truncated());
+        assert_eq!(video.preroll_floor.get(), Some(t0));
+        assert_eq!(
+            preroll(&audio, t0),
+            [0, 500, 1000, 1500],
+            "audio still from the oldest video keyframe"
+        );
+        assert!(!audio.preroll_snapshot(t0).unwrap().truncated());
+
+        assert!(video.publish_frame(timed(t0, 2000, true, 10)));
+        assert_eq!(preroll(&video, t0), [2000]);
+        assert_eq!(video.preroll_floor.get(), Some(t0 + Duration::from_secs(2)));
+        for ms in [2000, 2500] {
+            assert!(audio.publish_frame(timed(t0, ms, true, 10)));
+        }
+        assert_eq!(
+            preroll(&audio, t0),
+            [2000, 2500],
+            "audio from the frame playing at the new keyframe"
+        );
     }
 
     use crate::codec::CodecFamily;
