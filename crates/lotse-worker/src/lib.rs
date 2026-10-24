@@ -808,7 +808,11 @@ impl Serving<'_> {
 
     /// The tracks switched to the standby `tag`: the old source is
     /// stopped, the standby becomes the source, and the supervisor hears
-    /// of the switch and the tracks as they are now.
+    /// of the switch and the tracks as they are now. The clips are left
+    /// alone: each ended at the switch itself, in its place among its
+    /// frames (`SourceSwitched`, or `ControlLost` when its subscription
+    /// lost that to a lag), and one started since runs on the new source
+    /// alone, the ring cleared at the switch.
     async fn on_switched(&mut self, tag: u8) -> Result<(), Error> {
         let Some(standby) = self.standby.take() else {
             tracing::warn!(tag, "tracks switched without a standby; ignored");
@@ -820,12 +824,8 @@ impl Serving<'_> {
         tracing::info!(
             tag,
             clips = self.clips.len(),
-            "tracks switched to the standby; stopping the old source and the clips"
+            "tracks switched to the standby; stopping the old source"
         );
-        // Another source is another stream: each clip ended at the switch
-        // itself, in its place among the frames (`SourceSwitched`); this
-        // ends one that missed it with its subscription's control events.
-        self.clips.stop_all(EndReason::StreamChanged);
         running.cancel.cancel();
         let old = Runner {
             cancel: std::mem::replace(&mut running.cancel, standby.runner.cancel),
@@ -5578,7 +5578,7 @@ mod tests {
         assert_eq!(
             logs.count(
                 Level::INFO,
-                "tracks switched to the standby; stopping the old source and the clips",
+                "tracks switched to the standby; stopping the old source",
             ),
             1
         );
@@ -5596,6 +5596,58 @@ mod tests {
             ended(h.worker).await.unwrap().unwrap(),
             ExitReason::Shutdown
         );
+    }
+
+    /// A clip the worker starts after the tracks switched but before it
+    /// hears of the switch runs on: it subscribes to the new source alone,
+    /// the ring cleared at the switch, and the switch leaves the clips
+    /// alone, each running one having ended at the switch in its own
+    /// stream. Regression: the worker ended every clip `stream_changed`
+    /// when it heard of the switch, this one included.
+    #[tokio::test]
+    async fn a_clip_started_between_a_switch_and_the_worker_hearing_of_it_runs_on() {
+        let settings = settings();
+        let (mut serving, _rx) = serving(&settings);
+        serving.registries = clip_registries();
+        let (clip_tx, mut clip_rx) = mpsc::channel(16);
+        serving.clips = Clips::new(clip_tx);
+        serving.on_run_source(&spec("fake://cam/", "null")).unwrap();
+        let staging = TrackSet::staging(serving.running.as_ref().unwrap().tracks.tracks());
+        let runner = start_runner(
+            &spec("fake://cam2/", "null"),
+            &serving.registries,
+            &serving.clock,
+            &settings,
+            &serving.probes,
+            &serving.backchannels,
+            serving.standby_tx.clone(),
+            Arc::clone(&staging),
+            "standby",
+        )
+        .unwrap();
+        serving.standby = Some(Standby { runner, staging });
+        let (_reader, writer) = clip_pipe();
+        serving
+            .on_start_clip(
+                ClipSpec {
+                    clip_id: "k1".into(),
+                    before_ms: 0,
+                    after_ms: None,
+                    audio: false,
+                },
+                vec![writer],
+            )
+            .await
+            .unwrap();
+        serving.on_switched(1).await.unwrap();
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(serving.standby.is_none(), "the switch went through");
+        assert!(serving.clips.runs("k1"));
+        let report = clip_rx.try_recv();
+        assert!(report.is_err(), "the clip runs on: {report:?}");
+        serving.clips.abort_all();
     }
 
     /// A supervisor that goes away takes the clips with it: each is

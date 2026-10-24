@@ -472,10 +472,12 @@ pub fn apply_track_event(
         },
         Some(TrackEvent::SourceLost) => tracing::info!("source lost; the session waits"),
         Some(TrackEvent::SourceRestored) => tracing::info!("source restored"),
-        // A packet subscription yields no frames; a source switch is a hot
-        // swap to a session, and the epoch that follows it skips to the
-        // new source's keyframe.
-        Some(TrackEvent::Frame(_) | TrackEvent::SourceSwitched) => {}
+        // A packet subscription yields no frames and no `ControlLost`; a
+        // source switch is a hot swap to a session, and the epoch that
+        // follows it skips to the new source's keyframe.
+        Some(
+            TrackEvent::Frame(_) | TrackEvent::ControlLost { .. } | TrackEvent::SourceSwitched,
+        ) => {}
         None => engine.close(now, "stream_deleted", "the track closed".to_owned()),
     }
 }
@@ -523,7 +525,8 @@ pub fn apply_audio_event(
             | TrackEvent::SourceLost
             | TrackEvent::SourceRestored
             | TrackEvent::SourceSwitched
-            | TrackEvent::Frame(_),
+            | TrackEvent::Frame(_)
+            | TrackEvent::ControlLost { .. },
         ) => true,
         None => {
             tracing::info!("audio track closed; the session continues without it");

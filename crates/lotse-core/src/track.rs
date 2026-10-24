@@ -95,7 +95,8 @@ pub const DEFAULT_FRAME_CAPACITY: usize = 64;
 
 /// Capacity of the control-event broadcast. Control events are rare (an
 /// epoch per reconnect, a codec change, a source loss), so a subscriber
-/// that lags here is broken and is told so.
+/// that lags here is broken and is told so: a frame subscription with
+/// [`TrackEvent::ControlLost`], a packet subscription with a warning.
 const CONTROL_CAPACITY: usize = 16;
 
 /// The bounds a track enforces.
@@ -359,6 +360,19 @@ pub enum TrackEvent {
     SourceRestored,
     /// See [`TrackControlEvent::SourceSwitched`].
     SourceSwitched,
+    /// A frame subscription missed control events: it fell as many
+    /// events behind as the track's control channel holds (16), and the
+    /// oldest were overwritten. What they said (a codec change, a source switch) is
+    /// unknown, and so is where among the frames they came, so the codec
+    /// of the frames from here on is unknown too: a sink that writes
+    /// frames under a descriptor cannot go on. It comes before any frame
+    /// the track published after the events lost, the frames before them
+    /// possibly still to come. A packet subscription logs the loss instead,
+    /// its packets carrying their payload type.
+    ControlLost {
+        /// How many control events were lost.
+        skipped: u64,
+    },
 }
 
 impl TrackEvent {
@@ -441,7 +455,9 @@ impl TrackSubscription {
     /// is always written under the codec it was published with, and none of
     /// another source's frames comes before its `SourceSwitched`. A packet
     /// subscription yields the event at once. `Closed` ends a subscription
-    /// at once either way.
+    /// at once either way. Control events lost to a lag are
+    /// [`TrackEvent::ControlLost`] on a frame subscription, ahead of the
+    /// next frame, and a warning on a packet subscription.
     pub async fn next(&mut self) -> Option<TrackEvent> {
         if self.track.is_closed() {
             return None;
@@ -459,7 +475,12 @@ impl TrackSubscription {
                 // holds the track, which holds both senders; it would end
                 // the subscription like `TrackControlEvent::Closed`.
                 control = self.control.recv() => match control {
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => self.missed(skipped),
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        self.missed(skipped);
+                        if matches!(self.media, MediaSubscription::Frames(_)) {
+                            return Some(TrackEvent::ControlLost { skipped });
+                        }
+                    }
                     event => {
                         let (before, event) = event.ok()?;
                         let event = TrackEvent::from_control(event)?;
@@ -511,23 +532,27 @@ impl TrackSubscription {
     /// track published before it is queued: that event then, `event`
     /// waiting for the next call. A control event published after it waits
     /// for the frames before it ([`Self::in_order`]); `None` for `Closed`.
+    /// Control events lost to a lag may have come before it, so
+    /// [`TrackEvent::ControlLost`] comes first then, `event` waiting.
     fn behind_controls(&mut self, seq: u64, event: TrackEvent) -> Option<TrackEvent> {
-        loop {
-            match self.control.try_recv() {
-                Ok((before, control)) => {
-                    let control = TrackEvent::from_control(control)?;
-                    if before <= seq {
-                        self.after = Some((seq, event));
-                        return Some(control);
-                    }
-                    self.pending = Some((before, control));
-                    return Some(event);
+        match self.control.try_recv() {
+            Ok((before, control)) => {
+                let control = TrackEvent::from_control(control)?;
+                if before <= seq {
+                    self.after = Some((seq, event));
+                    return Some(control);
                 }
-                Err(broadcast::error::TryRecvError::Lagged(skipped)) => self.missed(skipped),
-                // As in `next`: the track holds the sender.
-                Err(
-                    broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed,
-                ) => return Some(event),
+                self.pending = Some((before, control));
+                Some(event)
+            }
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                self.missed(skipped);
+                self.after = Some((seq, event));
+                Some(TrackEvent::ControlLost { skipped })
+            }
+            // As in `next`: the track holds the sender.
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                Some(event)
             }
         }
     }
@@ -2327,7 +2352,9 @@ mod tests {
         nothing_queued(&mut frames);
 
         // Control events missed while a frame waits behind the ones before
-        // it: the frame comes, then the oldest event still held.
+        // it: their loss comes first, since one of them may have come
+        // before the frame, then the frame, then the oldest event still
+        // held.
         assert!(track.publish_frame(frame(true, 30)));
         track.set_codec(h265.clone());
         assert!(track.publish_frame(frame(true, 40)));
@@ -2340,6 +2367,10 @@ mod tests {
         for n in 0..=CONTROL_CAPACITY {
             track.set_codec(h264_with_sps(u8::try_from(n).unwrap()));
         }
+        assert_eq!(
+            queued(&mut frames),
+            Some(TrackEvent::ControlLost { skipped: 1 })
+        );
         crate::let_assert!(Some(TrackEvent::Frame(after)) = queued(&mut frames));
         assert_eq!(after.payload.len(), 40);
         crate::let_assert!(Some(TrackEvent::TrackChanged(_)) = queued(&mut frames));
@@ -2428,24 +2459,40 @@ mod tests {
         );
     }
 
+    /// A frame subscription that lost control events to a lag is told so
+    /// ahead of every frame published after them: a codec change among
+    /// them, here overwritten by epochs, leaves those frames under a codec
+    /// the sink does not know. The frame published before them may still
+    /// come; the events still held come in their place. Regression: the
+    /// loss was only logged, and the new codec's keyframe came after the
+    /// epochs as if the codec were the same.
     #[tokio::test]
-    async fn a_subscriber_that_misses_control_events_is_warned_and_continues() {
+    async fn a_frame_subscription_is_told_of_control_events_it_lost_before_the_frames_after_them() {
         let track = Arc::new(video_track(TrackLimits::default()));
         let mut sub = track.subscribe(Unit::Frames);
-        for _ in 0..(CONTROL_CAPACITY + 3) {
+        assert!(track.publish_frame(frame(true, 10)));
+        track.set_codec(Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        });
+        for _ in 0..CONTROL_CAPACITY {
             track.start_epoch();
         }
-        // The first three epochs were lost; the rest arrive in order.
-        assert_eq!(sub.next().await, Some(TrackEvent::EpochStart { epoch: 4 }));
-        let mut remaining = 0;
-        while let Some(TrackEvent::EpochStart { .. }) = sub.next().await {
-            remaining += 1;
-            if remaining == CONTROL_CAPACITY - 1 {
-                break;
-            }
+        assert!(track.publish_frame(frame(true, 20)));
+        assert_eq!(
+            sub.next().await,
+            Some(TrackEvent::ControlLost { skipped: 1 })
+        );
+        crate::let_assert!(Some(TrackEvent::Frame(old)) = sub.next().await);
+        assert_eq!(old.payload.len(), 10);
+        for epoch in 1..=CONTROL_CAPACITY {
+            let epoch = u32::try_from(epoch).unwrap();
+            assert_eq!(sub.next().await, Some(TrackEvent::EpochStart { epoch }));
         }
-        assert_eq!(remaining, CONTROL_CAPACITY - 1);
-        assert!(sub.track().gop().is_none());
+        crate::let_assert!(Some(TrackEvent::Frame(new)) = sub.next().await);
+        assert_eq!(new.payload.len(), 20);
+        nothing_queued(&mut sub);
     }
 
     #[test]

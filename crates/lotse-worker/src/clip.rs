@@ -681,6 +681,12 @@ struct Clip {
     written: u64,
     /// Whether the container started, at the first frame.
     begun: bool,
+    /// The video met its first frame captured at or after the clip's
+    /// end. In decode order the frames behind it may be B-frames
+    /// presented before the end that refer to it, and it is not in the
+    /// file, so no later video frame goes in; the audio drains on up to
+    /// its own end.
+    video_ended: bool,
     /// The furthest clip media time a frame was put at, on either track:
     /// the duration `Stopped` reports.
     reached: Duration,
@@ -745,6 +751,7 @@ impl Clip {
             pending: VecDeque::new(),
             written: 0,
             begun: false,
+            video_ended: false,
             reached: Duration::ZERO,
             holes: HashMap::new(),
             before_ms: 0,
@@ -960,12 +967,13 @@ impl Clip {
         }
     }
 
-    /// One frame: the end when it was captured at or after the clip's;
-    /// the container's start before the first; a gap when it ends a hole,
-    /// one the queue reported on its track or one the video's continuity
-    /// shows (a jump, once the frame after it settles it): from the frame
-    /// of its track before it to this one, where the
-    /// container put them. That can be later than their capture times (an
+    /// One frame: the end when it was captured at or after the clip's,
+    /// and nothing for a video frame after the video's end
+    /// ([`Self::video_ended`]); the container's start before the first; a
+    /// gap when it ends a hole, one the queue reported on its track or one
+    /// the video's continuity shows (a jump, once the frame after it
+    /// settles it): from the frame of its track before it to this one,
+    /// where the container put them. That can be later than their capture times (an
     /// epoch captured before the last frame began starts where that frame
     /// ends, and a frame that came early in its interval where the one
     /// before it ends), and a gap from capture times then disagreed with
@@ -978,8 +986,15 @@ impl Clip {
         frame: Arc<MediaFrame>,
         media: &Media,
     ) -> Result<(), EndReason> {
+        if track == Kind::Video && self.video_ended {
+            tracing::trace!(clip.id = %self.id, ts = %frame.ts, "clip: a video frame behind the video's end left out");
+            return Ok(());
+        }
         if frame.wallclock >= self.end_at {
-            tracing::debug!(clip.id = %self.id, reason = self.end_reason.name(), "clip: its end is reached");
+            if track == Kind::Video {
+                self.video_ended = true;
+            }
+            tracing::debug!(clip.id = %self.id, %track, reason = self.end_reason.name(), "clip: its end is reached");
             return Err(self.end_reason);
         }
         if !self.begun {
@@ -1074,12 +1089,14 @@ impl Clip {
     }
 
     /// A control event of `track`: a switch to another source ends the
-    /// clip, started or not, since another source is another stream; a
-    /// codec other than its sample entry's ends it once the container
-    /// started, since one file has one entry per track; before, it is the
-    /// entry the frames after it go under, or, for audio the container
-    /// cannot carry, the audio is dropped, the clip warned `audio_omitted`
-    /// as at the outset. Before the start the clip takes every item it can
+    /// clip, started or not, since another source is another stream, and
+    /// so do control events the subscription lost, since a codec change or
+    /// a switch among them leaves the frames after them under a codec the
+    /// clip does not know; a codec other than its sample entry's ends it
+    /// once the container started, since one file has one entry per track;
+    /// before, it is the entry the frames after it go under, or, for audio
+    /// the container cannot carry, the audio is dropped, the clip warned
+    /// `audio_omitted` as at the outset. Before the start the clip takes every item it can
     /// after each push, so the change leads its track then and ending the
     /// track drops no frame.
     fn control(
@@ -1089,12 +1106,17 @@ impl Clip {
         media: &mut Media,
     ) -> Result<(), EndReason> {
         tracing::debug!(clip.id = %self.id, %track, ?event, "clip: track event");
-        if *event == TrackEvent::SourceSwitched {
-            tracing::info!(clip.id = %self.id, %track, "clip: the connection switched to another source; ending");
-            return Err(EndReason::StreamChanged);
-        }
-        let TrackEvent::TrackChanged(codec) = event else {
-            return Ok(());
+        let codec = match event {
+            TrackEvent::TrackChanged(codec) => codec,
+            TrackEvent::SourceSwitched => {
+                tracing::info!(clip.id = %self.id, %track, "clip: the connection switched to another source; ending");
+                return Err(EndReason::StreamChanged);
+            }
+            TrackEvent::ControlLost { skipped } => {
+                tracing::info!(clip.id = %self.id, %track, skipped, "clip: the track's control events were lost, so the codec of its frames is unknown; ending");
+                return Err(EndReason::StreamChanged);
+            }
+            _ => return Ok(()),
         };
         let entry = match track {
             Kind::Video => Some(&mut media.entries.0),
@@ -1205,9 +1227,12 @@ impl Clip {
     /// and the pipe, frames held for the other track released at once, up
     /// to the first frame captured at or after the clip's end, for at most
     /// [`FINISH_GRACE`] of a reader taking it; what is left then is
-    /// dropped. `client_gone` when the reader went meanwhile, and what else
-    /// ends the clip on the way (a codec change, the container failing a
-    /// frame); reaching the clip's own end keeps the reason it ends for.
+    /// dropped. Once the video met its end, the video frames queued behind
+    /// that frame are left out ([`Self::frame`]), and the audio's end
+    /// stops the drain. `client_gone` when the reader went meanwhile, and
+    /// what else ends the clip on the way (a codec change, the container
+    /// failing a frame); reaching the clip's own end keeps the reason it
+    /// ends for.
     async fn drain(&mut self, media: &mut Media) -> Option<EndReason> {
         let deadline = self.clock.now().checked_add(FINISH_GRACE);
         loop {
@@ -1917,7 +1942,8 @@ mod tests {
     /// advance a millisecond and every later frame a `frames_dropped` gap.
     /// Nor is a frame that repeats the newest timestamp (it advances
     /// nothing, so it teaches no interval) or one that advances it by
-    /// exactly twice the interval: a hole is more than twice.
+    /// exactly twice the interval: a hole is more than twice. The frame
+    /// after the last settles it, which a jump needs to be a gap.
     /// Regression (found end to end: MediaMTX 1.21.1 relaying libx265, and
     /// the first seconds after a reconnect): 163 gaps in a clip whose file
     /// had none.
@@ -1937,6 +1963,7 @@ mod tests {
             (250, 6),
             // Twice the interval: not more than twice, no hole.
             (320, 8),
+            (360, 9),
         ] {
             rig.video_frame(ms, index, index == 0, 16);
             settle().await;
@@ -1945,7 +1972,7 @@ mod tests {
         rig.clips.stop("k1", EndReason::Stopped);
         let reports = rig.until_stopped().await;
         let bytes = reader.rest().await;
-        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 320, 0)]);
+        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 360, 0)]);
     }
 
     /// A reader that stops reading fills the pipe, then the clip's queue; the
@@ -3344,6 +3371,87 @@ mod tests {
             ["init video=h264", "frame v 0 0 k 32", "end"]
         );
         assert_eq!(reports, vec![stopped("stream_changed", bytes.len(), 0, 0)]);
+    }
+
+    /// Control events the clip's subscription lost to a lag end the clip
+    /// `stream_changed` before any frame published after them: here a
+    /// codec change overwritten by epochs, so the keyframe after them is of
+    /// a codec the clip's entry does not have. Regression: the loss was
+    /// only logged, and the clip wrote the H.265 keyframe under its H.264
+    /// entry, behind a `reconnect` gap.
+    #[tokio::test]
+    async fn control_events_lost_to_a_lag_end_the_clip_stream_changed() {
+        let mut rig = Rig::new(None);
+        let reader = rig.start(spec(0, None, false));
+        settle().await;
+        rig.video_frame(0, 0, true, 32);
+        settle().await;
+        assert_eq!(rig.report().await, started(0, None));
+        rig.video().set_codec(Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        });
+        // As many as the control channel holds: the change is lost.
+        for _ in 0..16 {
+            let _epoch = rig.video().start_epoch();
+        }
+        rig.video_frame(100, 1, true, 32);
+        settle().await;
+        let reports = rig.until_stopped().await;
+        let bytes = reader.rest().await;
+        assert_eq!(
+            lines(&bytes),
+            ["init video=h264", "frame v 0 0 k 32", "end"]
+        );
+        assert_eq!(reports, vec![stopped("stream_changed", bytes.len(), 0, 0)]);
+    }
+
+    /// A video frame captured at or after the clip's end ends the video,
+    /// and the frames queued behind it in decode order are left out though
+    /// presented before the end: B-frames that may refer to it, which is
+    /// not in the file. The audio before the end is written. Regression:
+    /// with `I0 P3 B1 B2` and the end between B2 and P3, P3 ended the clip
+    /// and the drain then wrote B1 and B2, an undecodable tail.
+    #[tokio::test]
+    async fn b_frames_behind_the_video_s_end_in_decode_order_are_left_out() {
+        let mut rig = Rig::new(Some(fake_aac()));
+        let reader = rig.start(spec(0, Some(290), true));
+        rig.audio_frame(0);
+        rig.video_frame(10, 0, true, 32);
+        for index in 1..=4 {
+            rig.audio_frame(index);
+        }
+        settle().await;
+        assert_eq!(rig.report().await, started(0, Some("aac_lc")));
+        // P3 (presented at 300 ms, past the end) arrives first and is held
+        // for the audio, which reached 256 ms; B1 and B2 queue behind it.
+        rig.advance_to(300);
+        for (ms, ts) in [(300, 27_000), (100, 9_000), (200, 18_000)] {
+            assert!(
+                rig.video()
+                    .publish_frame(frame_at(&rig, (ms, 300), ts, false, 16))
+            );
+        }
+        settle().await;
+        // Past the end too: releases P3, which ends the clip.
+        rig.audio_frame(5);
+        let reports = rig.until_stopped().await;
+        let bytes = reader.rest().await;
+        assert_eq!(
+            lines(&bytes),
+            [
+                "init video=h264 audio=aac_lc",
+                "frame a 0 0 k 4",
+                "frame v 0 0 k 32",
+                "frame a 0 1024 k 4",
+                "frame a 0 2048 k 4",
+                "frame a 0 3072 k 4",
+                "frame a 0 4096 k 4",
+                "end",
+            ]
+        );
+        assert_eq!(reports, vec![stopped("completed", bytes.len(), 256, 0)]);
     }
 
     /// A standby on `rig`'s tracks, of the same codec, armed: its first
