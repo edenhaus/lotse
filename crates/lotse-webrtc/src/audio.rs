@@ -1273,13 +1273,22 @@ mod tests {
                 codec: Pcmu
             }
         );
-        // Not negotiated: nothing is asked.
-        let silent = AudioPlan::new(DEDICATED, None, None, granted, &EVERY_CODEC)
-            .kept(|_| panic!("no talk-back m-line to ask for"));
+        // Not negotiated: nothing is asked; negotiated: the talk-back
+        // m-line only.
+        let mut asked = Vec::new();
+        let mut ask = |mid: &str| {
+            asked.push(mid.to_owned());
+            vec![Pcmu]
+        };
+        let silent = AudioPlan::new(DEDICATED, None, None, granted, &EVERY_CODEC).kept(&mut ask);
         assert_eq!(
             silent.talkback,
             Talkback::Off("the camera offers no backchannel")
         );
+        let talking =
+            AudioPlan::new(&offer, None, Some(&pcmu), granted, &EVERY_CODEC).kept(&mut ask);
+        assert_eq!(talking.talkback, negotiated("2", Pcmu, true));
+        assert_eq!(asked, ["2"]);
     }
 
     /// The format list and the attribute lines of an audio m-line listing

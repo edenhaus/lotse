@@ -1414,7 +1414,9 @@ async fn next_loss(talkback: Option<&mut Talkback>) -> Option<BackchannelRefused
 /// any; a refused re-offer is reported (`RenegotiateRefused`) and leaves
 /// the session as it was, a backchannel it claimed let go again. An
 /// answer without talk-back lets go of a backchannel the session still
-/// holds, declined `unsupported`: the engine may find what the output
+/// holds ([`Talkback::holds`]: not one released or lost since, whose
+/// re-offer arbitration declined already), declined `unsupported`: the
+/// engine may find what the output
 /// judged negotiable from the offer alone
 /// ([`OutputFactory::talkback_request`]) not receivable, on an m-line
 /// it answered before, and a claim for no talk-back would keep every
@@ -2648,6 +2650,118 @@ mod tests {
         assert!(poll_once(&mut b_task).await.is_pending());
         assert!(b.script.called("open backchannel=true claim=Granted"));
         assert_eq!(change(&mut feed).await, ("b".into(), "claimed"));
+    }
+
+    /// A session whose backchannel was released, or lost on the camera's
+    /// side, keeps its claim until an uplink packet or a let-go clears
+    /// it: a re-offer then is declined as arbitrated, `busy` with the
+    /// talker or `refused` with the camera's status, and one that asks
+    /// for no talk-back is not declined, not `unsupported` for a claim
+    /// the session no longer holds.
+    #[tokio::test]
+    async fn a_re_offer_after_a_release_or_a_loss_keeps_its_decline() {
+        let (arbiter, mut feed, camera, _slot) = arbiter_with();
+        let (mut a, task) = session_on(
+            "a",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut a_task = pin!(task);
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(a.events().len(), 1, "answered");
+        assert_eq!(change(&mut feed).await, ("a".into(), "claimed"));
+        // Released; b claims the backchannel, and a's re-offer is busy.
+        assert_eq!(arbiter.release(Some("a")).as_deref(), Some("a"));
+        assert_eq!(change(&mut feed).await, ("a".into(), "released"));
+        let (mut b, task) = session_on(
+            "b",
+            Script::default(),
+            false,
+            true,
+            "v=0 talk",
+            Some(Arc::clone(&arbiter)),
+        );
+        let mut b_task = pin!(task);
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert_eq!(b.events().len(), 1, "answered");
+        assert_eq!(change(&mut feed).await, ("b".into(), "claimed"));
+        a.control(reoffer("v=0 talk"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert!(a.script.called("renegotiate v=0 talk claim=Busy"));
+        assert_eq!(
+            a.events(),
+            [
+                IpcEvent::Renegotiated {
+                    sdp: "answer to v=0 talk".into(),
+                    talkback: None,
+                },
+                IpcEvent::TalkbackDeclined {
+                    reason: "busy".into(),
+                    status: None,
+                    message: "talk-back declined: session b holds the camera's backchannel".into(),
+                },
+            ]
+        );
+        // Lost; the camera refuses b's next claim with its status.
+        let on_loss = camera.losses.lock().unwrap().pop().unwrap();
+        let lost = BackchannelRefused {
+            status: Some(454),
+            message: "GET_PARAMETER: 454 Session Not Found".into(),
+        };
+        on_loss.send(lost).unwrap();
+        let mut events = Vec::new();
+        for _ in 0..10_000 {
+            assert!(poll_once(&mut b_task).await.is_pending());
+            events = b.events();
+            if !events.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(events.len(), 1, "the loss: {events:?}");
+        assert_eq!(change(&mut feed).await, ("b".into(), "refused"));
+        camera
+            .refusals
+            .lock()
+            .unwrap()
+            .push_back(BackchannelRefused {
+                status: Some(503),
+                message: "SETUP: 503 Service Unavailable".into(),
+            });
+        b.control(reoffer("v=0 talk"));
+        assert!(poll_once(&mut b_task).await.is_pending());
+        assert_eq!(change(&mut feed).await, ("b".into(), "claimed"));
+        assert_eq!(change(&mut feed).await, ("b".into(), "refused"));
+        assert!(b.script.called("renegotiate v=0 talk claim=Busy"));
+        assert_eq!(
+            b.events(),
+            [
+                IpcEvent::Renegotiated {
+                    sdp: "answer to v=0 talk".into(),
+                    talkback: None,
+                },
+                IpcEvent::TalkbackDeclined {
+                    reason: "refused".into(),
+                    status: Some(503),
+                    message:
+                        "talk-back declined: the camera's backchannel session: SETUP: 503 Service Unavailable"
+                            .into(),
+                },
+            ]
+        );
+        // a, released and not talking since, asks for no talk-back.
+        a.control(reoffer("v=0"));
+        assert!(poll_once(&mut a_task).await.is_pending());
+        assert_eq!(
+            a.events(),
+            [IpcEvent::Renegotiated {
+                sdp: "answer to v=0".into(),
+                talkback: None,
+            }]
+        );
     }
 
     /// The stream audio a session sends weighs its offer's talk-back
