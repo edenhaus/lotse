@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use crate::codec::Kind;
 use crate::media::MediaFrame;
-use crate::preroll::PrerollSnapshot;
+use crate::preroll::{PrerollSnapshot, captured};
 use crate::throttle::Throttle;
 use crate::track::TrackEvent;
 
@@ -177,9 +177,12 @@ struct Lane {
     hole: Option<Hole>,
     /// The latest capture time queued: where a hole starts.
     last: Option<Instant>,
-    /// The latest capture time seen, dropped frames included: the track
-    /// has passed it, so the other waits for nothing before it.
-    newest: Option<Instant>,
+    /// Where the track is: the capture time of the latest frame seen,
+    /// dropped frames included, a frame dated ahead of its arrival counting
+    /// by its arrival ([`captured`]), so the other waits for nothing
+    /// before it. The latest, not the greatest: a Sender Report that moves
+    /// the capture times back moves it back with the next frame.
+    reached: Option<Instant>,
     /// The pre-roll's frames, oldest first, while the live frames that
     /// repeat them may still come: those the track published after the
     /// clip subscribed, which the snapshot starting before the subscription
@@ -201,7 +204,7 @@ impl Lane {
             started: false,
             hole: None,
             last: None,
-            newest: None,
+            reached: None,
             duplicates: Vec::new(),
             lagged: false,
         }
@@ -392,7 +395,7 @@ impl ReliableQueue {
             return;
         }
         for frame in snapshot.frames() {
-            lane.newest = lane.newest.max(Some(frame.wallclock));
+            lane.reached = Some(captured(frame));
             lane.queue_frame(Arc::clone(frame), now, 0);
         }
         lane.duplicates = snapshot.frames().cloned().collect();
@@ -440,7 +443,7 @@ impl ReliableQueue {
     fn push_frame(&mut self, track: Kind, frame: Arc<MediaFrame>, now: Instant) {
         let blocked = track == Kind::Audio && self.video.blocks_audio();
         let lane = self.lane_mut(track);
-        lane.newest = lane.newest.max(Some(frame.wallclock));
+        lane.reached = Some(captured(&frame));
         let duplicate = lane.is_duplicate(&frame);
         if std::mem::take(&mut lane.lagged) {
             if duplicate {
@@ -515,12 +518,15 @@ impl ReliableQueue {
 
     /// Ends `track`: its subscription ended. What it queued still goes
     /// out; nothing more is taken, and the interleaver no longer waits for
-    /// it. An overflow hole the video ends in passes to the audio.
+    /// it. An overflow hole the video ends in passes to the audio. Ending a
+    /// track again, or one the clip lacks, does nothing, so the hole passes
+    /// once.
     pub fn end(&mut self, track: Kind) {
         let lane = self.lane_mut(track);
-        if lane.open {
-            tracing::debug!(%track, queued = lane.items.len(), "clip queue: track ended");
+        if !lane.open {
+            return;
         }
+        tracing::debug!(%track, queued = lane.items.len(), "clip queue: track ended");
         lane.open = false;
         if track == Kind::Video && self.video.overflowing() {
             // No keyframe ends the video's overflow now: the audio it
@@ -549,8 +555,10 @@ impl ReliableQueue {
 
 /// Hands a [`ReliableQueue`]'s items out in capture order: always the
 /// queued frame captured first (video on a tie), but held while the other
-/// track, still open and with nothing queued, has not passed its capture
-/// time, for at most `max_skew` after it was queued. So an audio path that
+/// track, still open and with nothing queued, has not reached its capture
+/// time with its latest frame (counted by its arrival when dated ahead of
+/// it, and taken back when a Sender Report moves the capture times back),
+/// for at most `max_skew` after it was queued. So an audio path that
 /// delivers late still lands in order, and a track that stops sending
 /// delays the other by `max_skew` at most. A gap or a control event goes
 /// out as soon as it leads its track (video's first), so a sink learns of
@@ -619,7 +627,7 @@ impl Interleaver {
             Kind::Video => Kind::Audio,
             Kind::Audio => Kind::Video,
         });
-        let held = other.open && other.items.is_empty() && other.newest < Some(at);
+        let held = other.open && other.items.is_empty() && other.reached < Some(at);
         let until = if held {
             queued.checked_add(self.max_skew)
         } else {
@@ -690,6 +698,30 @@ mod tests {
                 epoch: 0,
                 payload: Bytes::from(vec![0; bytes]),
             })
+        }
+
+        /// A frame captured `ms` after the start that arrived `arrival`
+        /// after it.
+        fn arrived(&self, ms: u64, arrival: u64, keyframe: bool) -> Arc<MediaFrame> {
+            Arc::new(MediaFrame {
+                arrival: self.at(arrival),
+                ..MediaFrame::clone(&self.frame(ms, keyframe, 10))
+            })
+        }
+
+        fn push_arrived(
+            &self,
+            queue: &mut ReliableQueue,
+            track: Kind,
+            ms: u64,
+            arrival: u64,
+            keyframe: bool,
+        ) {
+            queue.push(
+                track,
+                TrackEvent::Frame(self.arrived(ms, arrival, keyframe)),
+                self.now(),
+            );
         }
 
         fn push(&self, queue: &mut ReliableQueue, track: Kind, ms: u64, keyframe: bool) {
@@ -1533,5 +1565,92 @@ mod tests {
         queue.end(Kind::Video);
         clip.push(&mut queue, Kind::Audio, 20, true);
         assert!(drain(&mut queue, Kind::Audio, &clip).is_empty());
+    }
+
+    #[test]
+    fn ending_a_track_again_hands_no_second_overflow_hole_to_the_audio() {
+        let clip = Clip::new();
+        let mut queue = ReliableQueue::new(2 * c(10), true);
+        clip.push(&mut queue, Kind::Video, 0, true);
+        clip.push(&mut queue, Kind::Audio, 10, true);
+        clip.push(&mut queue, Kind::Video, 40, true);
+        queue.end(Kind::Video);
+        assert_eq!(drain(&mut queue, Kind::Video, &clip), ["v0"]);
+        assert_eq!(drain(&mut queue, Kind::Audio, &clip), ["a10"]);
+        clip.push(&mut queue, Kind::Audio, 60, true);
+        assert_eq!(
+            drain(&mut queue, Kind::Audio, &clip),
+            ["agap overflow 10-60", "a60"]
+        );
+        queue.end(Kind::Video);
+        clip.push(&mut queue, Kind::Audio, 80, true);
+        assert_eq!(
+            drain(&mut queue, Kind::Audio, &clip),
+            ["a80"],
+            "nothing was dropped after a60: the second end is no new hole"
+        );
+    }
+
+    #[test]
+    fn a_track_whose_capture_times_move_back_is_waited_for_from_its_latest_frame() {
+        let clip = Clip::new();
+        let mut merged = interleaver(true);
+        clip.push(merged.queue_mut(), Kind::Video, 0, true);
+        clip.push(merged.queue_mut(), Kind::Audio, 0, true);
+        clip.push(merged.queue_mut(), Kind::Video, 1000, false);
+        clip.push(merged.queue_mut(), Kind::Audio, 1000, true);
+        assert_eq!(release(&mut merged, &clip), ["v0", "a0", "v1000", "a1000"]);
+        // The mapping moves the video's capture times back, behind their
+        // arrival.
+        clip.push_arrived(merged.queue_mut(), Kind::Video, 960, 1010, false);
+        assert_eq!(release(&mut merged, &clip), ["v960"]);
+        clip.push_arrived(merged.queue_mut(), Kind::Audio, 990, 1010, true);
+        assert!(
+            release(&mut merged, &clip).is_empty(),
+            "the video is at 960 now, not at the 1000 it had passed before"
+        );
+        clip.push_arrived(merged.queue_mut(), Kind::Video, 975, 1020, false);
+        assert_eq!(release(&mut merged, &clip), ["v975"]);
+        clip.push_arrived(merged.queue_mut(), Kind::Video, 1015, 1030, false);
+        assert_eq!(
+            release(&mut merged, &clip),
+            ["a990"],
+            "v1015 waits for the audio past 990"
+        );
+    }
+
+    #[test]
+    fn a_frame_dated_ahead_of_its_arrival_does_not_end_the_wait_for_the_corrected_frames() {
+        let clip = Clip::new();
+        let mut merged = interleaver(true);
+        clip.push(merged.queue_mut(), Kind::Video, 0, true);
+        clip.push(merged.queue_mut(), Kind::Audio, 0, true);
+        // A Sender Report maps the video an hour ahead; a later one
+        // corrects it back.
+        clip.push_arrived(merged.queue_mut(), Kind::Video, 3_600_000, 40, false);
+        assert_eq!(release(&mut merged, &clip), ["v0", "a0"]);
+        clip.advance(1000);
+        assert_eq!(release(&mut merged, &clip), ["v3600000"]);
+        clip.push(merged.queue_mut(), Kind::Audio, 1040, true);
+        assert!(
+            release(&mut merged, &clip).is_empty(),
+            "the video passed its frame dated ahead's arrival only"
+        );
+        clip.advance(10);
+        clip.push(merged.queue_mut(), Kind::Video, 1020, false);
+        assert_eq!(release(&mut merged, &clip), ["v1020"], "in capture order");
+
+        // The same with the frame dated ahead in the video's pre-roll.
+        let mut merged = interleaver(true);
+        let gop = [clip.frame(0, true, 10), clip.arrived(3_600_000, 40, false)];
+        merged
+            .queue_mut()
+            .preroll(Kind::Video, &snapshot(&clip, &gop, usize::MAX), clip.now());
+        clip.advance(1000);
+        assert_eq!(release(&mut merged, &clip), ["v0", "v3600000"]);
+        clip.push(merged.queue_mut(), Kind::Audio, 1040, true);
+        assert!(release(&mut merged, &clip).is_empty());
+        clip.push(merged.queue_mut(), Kind::Video, 1020, false);
+        assert_eq!(release(&mut merged, &clip), ["v1020"]);
     }
 }
