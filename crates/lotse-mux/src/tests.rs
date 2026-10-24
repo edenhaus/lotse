@@ -941,6 +941,55 @@ fn fragments_end_at_the_latest_after_the_span() {
     );
 }
 
+/// The span is measured on the track's decode times, which only move
+/// forward, not on capture times. Regression: a frame whose Sender Report
+/// mapping put it an hour ahead ended the fragment and began the next
+/// span there; the frames after it, mapped back where they belong in the
+/// same epoch, never reached that span, and only the next keyframe ended
+/// the fragment.
+#[test]
+fn fragments_end_after_the_span_of_decode_time_whatever_the_capture_times() {
+    let base = base();
+    let frames: Vec<_> = (0..60_u8)
+        .map(|i| {
+            let key = i == 0;
+            let at = if i == 1 {
+                ms(base, 3_600_000)
+            } else {
+                ms(base, u64::from(i) * 40)
+            };
+            (
+                Kind::Video,
+                frame(at, i64::from(i) * FRAME, key, 0, h264_au(key, i)),
+            )
+        })
+        .collect();
+    let written = run(&mut Muxer::new(&policy(1000)), &h264_track(), None, &frames);
+    assert_eq!(written.cuts, [25, 50], "as if every frame were on time");
+    let dts: Vec<u64> = samples(&written.file, 1).iter().map(|s| s.dts).collect();
+    let on_time: Vec<u64> = (0..60).map(|i| i * 3600).collect();
+    assert_eq!(dts, on_time, "the epoch's timestamps time it");
+
+    // Audio's decode time ends a fragment too, while no video comes.
+    let mut frames = vec![(Kind::Video, frame(base, 0, true, 0, h264_au(true, 0)))];
+    for i in 0..60_u8 {
+        let at = ms(base, 20 * u64::from(i));
+        frames.push((
+            Kind::Audio,
+            frame(at, 960 * i64::from(i), true, 0, opus_packet(i)),
+        ));
+    }
+    let written = run(
+        &mut Muxer::new(&policy(1000)),
+        &h264_track(),
+        Some(&opus_track(1)),
+        &frames,
+    );
+    // Cut 0 is the keyframe's own push, with nothing ready; the audio
+    // frame at exactly 1 s (index 51) ends the first fragment.
+    assert_eq!(written.cuts, [51]);
+}
+
 #[test]
 fn fragments_end_once_their_media_data_reach_the_bound() {
     let base = base();
@@ -1403,8 +1452,12 @@ fn the_origin_is_the_first_frame_so_audio_captured_before_the_first_keyframe_sta
     assert_eq!(samples(&written.file, 1)[0].dts, 1440);
 }
 
+/// A track's last sample, which no frame follows, lasts its frame's own
+/// length where the codec states one, else the duration of the one
+/// before it. Regression: an Opus packet of 40 ms after one of 20 ms
+/// ended 20 ms early, at the length of the one before it.
 #[test]
-fn a_last_sample_takes_the_duration_before_it_else_its_frame_length() {
+fn rfc6716_3_1_a_last_sample_takes_its_frame_length_else_the_duration_before_it() {
     let base = base();
     let last = |video: ClipTrack, audio: Option<(ClipTrack, Vec<Bytes>)>, video_frames: u8| {
         let mut frames: Vec<_> = (0..video_frames)
@@ -1445,6 +1498,12 @@ fn a_last_sample_takes_the_duration_before_it_else_its_frame_length() {
         clock_rate: 32_000,
     };
     assert_eq!(last(h264_track(), Some((doubled, one_aac)), 1), 2048);
+    // Its own 1024 samples, not the 960 ticks to it from the one before.
+    let two_aac: Vec<Bytes> = frames(SINE_16K_MONO)[..2]
+        .iter()
+        .map(|frame| Bytes::copy_from_slice(frame))
+        .collect();
+    assert_eq!(last(h264_track(), Some((aac_track(), two_aac)), 1), 1024);
     // Opus: the packet's duration (RFC 6716 §3.1), else a fallback frame.
     assert_eq!(
         last(h264_track(), Some((opus_track(1), vec![opus_packet(0)])), 1),
@@ -1454,9 +1513,13 @@ fn a_last_sample_takes_the_duration_before_it_else_its_frame_length() {
         last(h264_track(), Some((opus_track(1), vec![Bytes::new()])), 1),
         1600
     );
-    // The one before it, when there is one.
-    let two = vec![opus_packet(0), Bytes::from_static(&[0xf8 | 1, 1, 1])];
-    assert_eq!(last(h264_track(), Some((opus_track(1), two)), 1), 960);
+    // A 40 ms packet (code 1: two 20 ms frames) after a 20 ms one: its
+    // own 1920 ticks, not the 960 before it.
+    let longer = vec![opus_packet(0), Bytes::from_static(&[0xf8 | 1, 1, 1])];
+    assert_eq!(last(h264_track(), Some((opus_track(1), longer)), 1), 1920);
+    // The one before it, when its packet states no length.
+    let unknown = vec![opus_packet(0), Bytes::new()];
+    assert_eq!(last(h264_track(), Some((opus_track(1), unknown)), 1), 960);
 }
 
 #[test]

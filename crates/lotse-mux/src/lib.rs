@@ -15,10 +15,11 @@
 //! track and `mvex`), then one movie fragment (`moof` and `mdat`) at a
 //! time. A fragment ends before every video keyframe, before a frame that
 //! begins a new epoch of its track, once the clip policy's fragment span
-//! has passed since it began, and once its media data reach
-//! [`MAX_FRAGMENT_BYTES`]; [`ClipMuxer::finish`] writes the last. The file
-//! is playable up to its last complete fragment whenever it ends. Sample
-//! payloads go out as slices of the frames' own bytes, never copied.
+//! of decode time has passed since it began, and once its media data
+//! reach [`MAX_FRAGMENT_BYTES`]; [`ClipMuxer::finish`] writes the last.
+//! The file is playable up to its last complete fragment whenever it
+//! ends. Sample payloads go out as slices of the frames' own bytes, never
+//! copied.
 //!
 //! Standards: ISO/IEC 14496-12 (ISO base media file format: the boxes,
 //! movie fragments, sample flags, composition offsets), ISO/IEC 14496-14
@@ -110,8 +111,14 @@ struct Clip {
     audio: Option<TrackWriter>,
     /// The capture time of the clip's first frame: decode time 0.
     origin: Option<Instant>,
-    /// The capture time of the current fragment's first frame.
-    began: Option<Instant>,
+    /// The decode time of the frame the current fragment began with, on
+    /// its track: the fragment's span counts from it. Decode times, not
+    /// capture times: a track's never go back (see the [`fragment`]
+    /// module), and inside an epoch they follow the timestamps, so a
+    /// capture time a Sender Report put ahead and a later one corrected
+    /// back, which the clip's interleaver takes, cannot hold the next cut
+    /// until the capture times catch up.
+    began: Option<Duration>,
     /// The sequence number of the latest fragment (ISO/IEC 14496-12
     /// §8.8.5): 0 before the first.
     sequence: u32,
@@ -139,8 +146,7 @@ impl Clip {
         fragment_bytes: u64,
     ) -> Result<Vec<Bytes>, ClipError> {
         let origin = *self.origin.get_or_insert(frame.wallclock);
-        let began = *self.began.get_or_insert(frame.wallclock);
-        let (wallclock, keyframe) = (frame.wallclock, frame.keyframe);
+        let keyframe = frame.keyframe;
         let track = match kind {
             Kind::Video => &mut self.video,
             Kind::Audio => self.audio.as_mut().ok_or_else(|| {
@@ -148,20 +154,22 @@ impl Clip {
             })?,
         };
         let anchored = track.push(frame, origin)?;
+        let at = track.decode_time();
+        let began = *self.began.get_or_insert(at);
         let ready = self
             .video
             .ready_bytes()
             .saturating_add(self.audio.as_ref().map_or(0, TrackWriter::ready_bytes));
         let cut = anchored
             || (kind == Kind::Video && keyframe)
-            || wallclock.saturating_duration_since(began) >= span
+            || at.saturating_sub(began) >= span
             || ready >= fragment_bytes;
         if !cut {
             return Ok(Vec::new());
         }
         let out = self.fragment()?;
         if !out.is_empty() {
-            self.began = Some(wallclock);
+            self.began = Some(at);
         }
         Ok(out)
     }

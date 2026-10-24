@@ -47,8 +47,10 @@
 //! (§8.8.8.1), so decode times never go back and the video stays at its
 //! capture times, in sync with the audio. Durations are the distances to
 //! the next sample's decode time; the last one of an epoch, which has no
-//! next, takes the one before it (audio without one: its frame's length),
-//! cut short so its presentation ends where the next epoch begins when
+//! next, takes its frame's own length where the codec states one (an
+//! AAC-LC frame's 1024 samples, ISO/IEC 14496-3 §4.4.1; an Opus
+//! packet's frames, RFC 6716 §3.1), else the one before it (video), cut
+//! short so its presentation ends where the next epoch begins when
 //! that is sooner and no sooner than the track's presentation so far ends,
 //! and an epoch captured before the track's presentation ends starts where
 //! it ends.
@@ -357,9 +359,21 @@ impl TrackWriter {
         duration_of(self.latest, self.clock_rate)
     }
 
-    /// Finishes the held sample, if any, with the duration of the one
-    /// before it, else its frame's length, else a frame at
-    /// [`FALLBACK_FRAME_RATE`].
+    /// The decode time of the latest frame taken, from the clip's media
+    /// time 0; zero before the first. It never goes back (see the
+    /// module), and inside an epoch it follows the frames' timestamps,
+    /// not their capture times.
+    pub(crate) fn decode_time(&self) -> Duration {
+        let dts = self.held.as_ref().map_or(0, |held| held.dts);
+        duration_of(i128::from(dts), self.clock_rate)
+    }
+
+    /// Finishes the held sample, if any, with its frame's own length
+    /// where the codec states one (audio: a frame's length is known
+    /// before the next frame comes, and a packet longer than the one
+    /// before it, an Opus packet of 40 ms after one of 20 ms, would
+    /// otherwise end early), else the duration of the one before it
+    /// (video), else a frame at [`FALLBACK_FRAME_RATE`].
     pub(crate) fn close(&mut self) {
         self.close_before(None);
     }
@@ -382,8 +396,8 @@ impl TrackWriter {
             return;
         };
         let duration = self
-            .last_duration
-            .or_else(|| self.frame_length(&held.frame))
+            .frame_length(&held.frame)
+            .or(self.last_duration)
             .unwrap_or(self.clock_rate / FALLBACK_FRAME_RATE);
         let cut = next
             .map(|next| next.max(self.shown).saturating_sub(held.pts()))
