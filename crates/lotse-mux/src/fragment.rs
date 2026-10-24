@@ -48,9 +48,10 @@
 //! capture times, in sync with the audio. Durations are the distances to
 //! the next sample's decode time; the last one of an epoch, which has no
 //! next, takes the one before it (audio without one: its frame's length),
-//! cut short where the next epoch begins when that is sooner, and an
-//! epoch captured before the track's presentation ends starts where it
-//! ends.
+//! cut short so its presentation ends where the next epoch begins when
+//! that is sooner and no sooner than the track's presentation so far ends,
+//! and an epoch captured before the track's presentation ends starts where
+//! it ends.
 //!
 //! Video whose timestamps go back in decode order is reordered
 //! (B-frames): from the first such frame on, the epoch's decode times
@@ -204,6 +205,13 @@ struct Held {
     cts: Option<i32>,
 }
 
+impl Held {
+    /// Its presentation time: its decode time plus its composition offset.
+    fn pts(&self) -> i128 {
+        i128::from(self.dts).saturating_add(self.cts.map_or(0, i128::from))
+    }
+}
+
 /// A sample ready for a fragment.
 #[derive(Debug)]
 pub(crate) struct Sample {
@@ -337,8 +345,9 @@ impl TrackWriter {
                 u32::try_from(duration).map_err(|_| out_of_range("a sample duration", duration))?;
             self.finish(&held, duration);
         }
-        self.latest = i128::from(dts).saturating_add(cts.map_or(0, i128::from));
-        self.held = Some(Held { frame, dts, cts });
+        let held = Held { frame, dts, cts };
+        self.latest = held.pts();
+        self.held = Some(held);
         Ok(anchored)
     }
 
@@ -355,13 +364,19 @@ impl TrackWriter {
         self.close_before(None);
     }
 
-    /// [`close`](Self::close), with the sample cut short to end at `next`,
-    /// where the next epoch begins, when that is after the sample began and
-    /// before its duration ends: a reconnect quicker than a frame. The
-    /// next epoch so begins at its capture time, and the track keeps its
-    /// capture times (and its sync with the other track). The cut is the
-    /// hole's, not the frame's: the duration the next epoch's last sample
-    /// inherits is the uncut one.
+    /// [`close`](Self::close), with the sample cut short so its
+    /// presentation ends at `next`, where the next epoch begins, when that
+    /// is after its presentation began and before its duration ends: a
+    /// reconnect quicker than a frame. The next epoch so begins at its
+    /// capture time, and the track keeps its capture times (and its sync
+    /// with the other track). The cut counts from the sample's presentation
+    /// time, not its decode time, which an epoch's lead or reordering puts
+    /// elsewhere (see the module), and never ends it before the track's
+    /// presentation so far ends: reordered video's last sample in decode
+    /// order may be presented before the others end, and cutting it would
+    /// not bring the next epoch sooner. The cut is the hole's, not the
+    /// frame's: the duration the next epoch's last sample inherits is the
+    /// uncut one.
     fn close_before(&mut self, next: Option<i128>) {
         let Some(held) = self.held.take() else {
             return;
@@ -371,7 +386,8 @@ impl TrackWriter {
             .or_else(|| self.frame_length(&held.frame))
             .unwrap_or(self.clock_rate / FALLBACK_FRAME_RATE);
         let cut = next
-            .and_then(|next| u32::try_from(next.saturating_sub(i128::from(held.dts))).ok())
+            .map(|next| next.max(self.shown).saturating_sub(held.pts()))
+            .and_then(|cut| u32::try_from(cut).ok())
             .filter(|cut| (1..duration).contains(cut));
         self.finish(&held, cut.unwrap_or(duration));
         self.last_duration = Some(duration);
@@ -447,7 +463,7 @@ impl TrackWriter {
         self.ready_bytes = self.ready_bytes.saturating_add(u64::from(size));
         self.last_duration = Some(duration);
         self.end = i128::from(held.dts).saturating_add(i128::from(duration));
-        let shown = self.end.saturating_add(held.cts.map_or(0, i128::from));
+        let shown = held.pts().saturating_add(i128::from(duration));
         self.shown = self.shown.max(shown);
     }
 

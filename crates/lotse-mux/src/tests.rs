@@ -1165,6 +1165,82 @@ fn iso14496_12_8_8_8_1_an_epoch_after_reordered_video_is_presented_at_its_captur
     );
 }
 
+/// Consecutive reconnects after reordered video keep the video at its
+/// capture times, in sync with the audio that goes on: an epoch captured
+/// inside the presentation of the last sample, an epoch's only frame here,
+/// cuts that sample short where its presentation, its decode time plus its
+/// composition offset (ISO/IEC 14496-12 §8.8.8.1), meets the next epoch,
+/// not its decode time, which its epoch's lead puts later. Regression: the
+/// epoch captured at 280 ms after `I0 P3 B1 B2 P6 B4 B5` at 25 fps was
+/// decoded at 400 ms, so a reconnect at 290 ms, measured against that,
+/// left its frame uncut and the next epoch presented at 320 ms, 30 ms
+/// behind the audio.
+#[test]
+fn iso14496_12_8_8_8_1_consecutive_reconnects_after_reordered_video_keep_the_capture_times() {
+    let base = base();
+    let aac = frames(SINE_16K_MONO);
+    // AAC frame `n` of `epoch`, its `i`th: 64 ms each from `first_ms` on.
+    let audio = |n: usize, epoch: u32, i: u16, first_ms: u64| {
+        let at = ms(base, first_ms + u64::from(i) * 64);
+        let payload = Bytes::copy_from_slice(aac[n]);
+        (
+            Kind::Audio,
+            frame(at, i64::from(i) * 1024, true, epoch, payload),
+        )
+    };
+    // The camera reconnects 280 ms in, sends one keyframe and reconnects
+    // again 10 ms later; the audio goes on from 320 ms.
+    let mut frames = reordered_gop(base, 0, 0, 0);
+    frames.extend((0..5).map(|i| audio(usize::from(i), 0, i, 0)));
+    frames.push((
+        Kind::Video,
+        frame(ms(base, 280), 0, true, 1, h264_au(true, 7)),
+    ));
+    frames.extend(reordered_gop(base, 290, 2, 8));
+    frames.extend((0..3).map(|i| audio(usize::from(5 + i), 1, i, 320)));
+    let written = run(
+        &mut Muxer::new(&policy(10_000)),
+        &h264_track(),
+        Some(&aac_track()),
+        &frames,
+    );
+
+    // Every sample of both tracks is presented at its capture time.
+    let captured = |kind: Kind| -> Vec<u64> {
+        frames
+            .iter()
+            .filter(|(pushed, _)| *pushed == kind)
+            .map(|(_, frame)| u64::try_from((frame.wallclock - base).as_millis()).unwrap())
+            .collect()
+    };
+    let presented = |track_id: u32, rate: i64| -> Vec<u64> {
+        samples(&written.file, track_id)
+            .iter()
+            .map(|s| {
+                let ticks = i64::try_from(s.dts).unwrap() + i64::from(s.cts);
+                u64::try_from(ticks * 1000 / rate).unwrap()
+            })
+            .collect()
+    };
+    assert_eq!(presented(1, 90_000), captured(Kind::Video));
+    assert_eq!(presented(2, 16_000), captured(Kind::Audio));
+    // The lone keyframe, decoded at 400 ms and presented at 280 ms, lasts
+    // the 10 ms until the next epoch; that epoch's I0 is decoded where the
+    // keyframe's decode ends and presented at 290 ms.
+    let video = samples(&written.file, 1);
+    let timing: Vec<(u64, u32, i32)> = video[7..9]
+        .iter()
+        .map(|s| (s.dts, s.duration, s.cts))
+        .collect();
+    assert_eq!(timing, [(36_000, 900, -10_800), (36_900, 10_800, -10_800)]);
+    // Decode times never go back.
+    assert!(
+        video
+            .windows(2)
+            .all(|pair| pair[0].dts + u64::from(pair[0].duration) <= pair[1].dts)
+    );
+}
+
 /// Where a new epoch after reordered video begins, by its capture time:
 /// the media time the muxer reports for its first frame (ISO/IEC 14496-12
 /// §8.8.12), and that frame's decode time and composition offset
@@ -1206,6 +1282,9 @@ fn iso14496_12_8_8_8_1_a_new_epoch_is_presented_no_earlier_than_the_last_frame_e
     assert_eq!(first(360), (Duration::from_millis(360), 36_000, -3600));
     // Captured inside P6: presented where it ends, not over it.
     assert_eq!(first(200), (Duration::from_millis(280), 36_000, -10_800));
+    // Captured inside B5, the last decoded, whose presentation P6 outlasts:
+    // B5 is not cut, the epoch presented where P6 ends.
+    assert_eq!(first(210), (Duration::from_millis(280), 36_000, -10_800));
     // Captured after B5's decode ends: decoded where presented.
     assert_eq!(first(1000), (Duration::from_millis(1000), 90_000, 0));
     // A frame repeating the first's timestamp is decoded a tick after it,
