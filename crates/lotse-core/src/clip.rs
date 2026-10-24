@@ -112,6 +112,13 @@ pub trait ClipMuxer: Send {
     /// any. The first video frame is a keyframe.
     fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, ClipError>;
 
+    /// Where the container put the latest frame of the `track` kind it
+    /// took: its presentation time from the clip's media time 0; zero
+    /// before the first. A container may place a frame later than its
+    /// capture time (an epoch that would begin before the one ahead of it
+    /// did), so the clip reports its gaps where the file has them by this.
+    fn media_time(&self, track: Kind) -> Duration;
+
     /// Ends the clip: the last fragment, after which the file is complete.
     fn finish(&mut self) -> Result<Vec<Bytes>, ClipError>;
 }
