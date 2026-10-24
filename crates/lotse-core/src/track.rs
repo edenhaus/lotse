@@ -11,8 +11,8 @@
 //! up to `gop_cache_bytes` of payload and `gop_cache_frames` frames, past
 //! which it is cut back to the keyframe; the keyframe itself is bounded
 //! only by `max_frame_bytes`, because a larger frame is dropped before it
-//! reaches the cache. Nothing checks `max_frame_bytes` against
-//! `gop_cache_bytes`: the cache holds at most the larger of the two, which
+//! reaches the cache (its frame subscribers take the drop as a lag).
+//! Nothing checks `max_frame_bytes` against `gop_cache_bytes`: the cache holds at most the larger of the two, which
 //! is `gop_cache_bytes` with the defaults (equal, and the only limits a
 //! worker gives its tracks). While a window is set the track also keeps a
 //! pre-roll ring ([`crate::preroll`]) of whole GOPs, bounded by
@@ -101,7 +101,8 @@ const CONTROL_CAPACITY: usize = 16;
 /// The bounds a track enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackLimits {
-    /// Frames larger than this are dropped from the side branch and counted.
+    /// Frames larger than this are dropped from the side branch and counted;
+    /// a frame subscriber takes each as a lag of one.
     pub max_frame_bytes: usize,
     /// The GOP cache keeps only the keyframe once a GOP exceeds this many
     /// payload bytes.
@@ -332,8 +333,9 @@ pub enum TrackEvent {
     /// A side-branch frame (`Unit::Frames` subscriptions).
     Frame(Arc<MediaFrame>),
     /// The subscriber missed items: `BestEffort` lag, later `Reliable`
-    /// overflow. Always explicit, never silent. A live sink skips to the
-    /// next keyframe; a recorder records a gap.
+    /// overflow, or, on a frame subscription, a frame the track dropped
+    /// over `max_frame_bytes`. Always explicit, never silent. A live sink
+    /// skips to the next keyframe; a recorder records a gap.
     Gap {
         /// How many items were missed.
         skipped: u64,
@@ -439,9 +441,10 @@ impl TrackSubscription {
 /// Why a subscription yielded no item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubscriptionError {
-    /// The subscriber fell behind and this many items were discarded; the
-    /// next receive continues at the oldest item still held. A live sink
-    /// skips to the next keyframe.
+    /// The subscriber fell behind and this many items were discarded (on a
+    /// frame subscription, also one for a frame the track dropped over
+    /// `max_frame_bytes`); the next receive continues at the oldest item
+    /// still held. A live sink skips to the next keyframe.
     #[error("subscriber lagged: {0} items skipped")]
     Lagged(u64),
     /// The track is gone.
@@ -462,23 +465,29 @@ impl From<broadcast::error::RecvError> for SubscriptionError {
 #[derive(Debug)]
 pub struct PacketSubscription(broadcast::Receiver<Arc<MediaPacket>>);
 
-/// A subscription to a track's side-branch frames, starting at the live edge.
+/// A subscription to a track's side-branch frames, starting at the live edge;
+/// a frame the track dropped over `max_frame_bytes` is a lag of one.
 #[derive(Debug)]
-pub struct FrameSubscription(broadcast::Receiver<Arc<MediaFrame>>);
+pub struct FrameSubscription(broadcast::Receiver<Option<Arc<MediaFrame>>>);
 
-/// Implements the receive side of a broadcast subscription.
+/// Implements the receive side of a broadcast subscription: `$deliver`
+/// turns what the channel carries into the `$item` a subscriber takes, or
+/// the error it is to it.
 macro_rules! subscription {
-    ($name:ident, $item:ty) => {
+    ($name:ident, $item:ty, $deliver:expr) => {
         impl $name {
             /// Waits for the next item.
             pub async fn recv(&mut self) -> Result<$item, SubscriptionError> {
-                self.0.recv().await.map_err(SubscriptionError::from)
+                match self.0.recv().await {
+                    Ok(item) => $deliver(item),
+                    Err(err) => Err(SubscriptionError::from(err)),
+                }
             }
 
             /// The next item if one is queued, `Ok(None)` if the queue is empty.
             pub fn try_recv(&mut self) -> Result<Option<$item>, SubscriptionError> {
                 match self.0.try_recv() {
-                    Ok(item) => Ok(Some(item)),
+                    Ok(item) => $deliver(item).map(Some),
                     Err(broadcast::error::TryRecvError::Empty) => Ok(None),
                     Err(broadcast::error::TryRecvError::Lagged(n)) => {
                         Err(SubscriptionError::Lagged(n))
@@ -500,8 +509,14 @@ macro_rules! subscription {
     };
 }
 
-subscription!(PacketSubscription, Arc<MediaPacket>);
-subscription!(FrameSubscription, Arc<MediaFrame>);
+subscription!(PacketSubscription, Arc<MediaPacket>, Ok);
+subscription!(FrameSubscription, Arc<MediaFrame>, dropped_as_lag);
+
+/// A frame broadcast's item as a subscriber takes it: `None`, a frame the
+/// track dropped over `max_frame_bytes`, is one item missed.
+fn dropped_as_lag(item: Option<Arc<MediaFrame>>) -> Result<Arc<MediaFrame>, SubscriptionError> {
+    item.ok_or(SubscriptionError::Lagged(1))
+}
 
 /// Which source feeds a connection's tracks: the one its live
 /// [`TrackSet`](crate::source::TrackSet) was made for (tag 0) or a standby
@@ -685,8 +700,9 @@ pub struct Track {
     codec: ArcSwap<Codec>,
     /// The live path: every packet, as read.
     packets: broadcast::Sender<Arc<MediaPacket>>,
-    /// The side branch: every accepted frame.
-    frames: broadcast::Sender<Arc<MediaFrame>>,
+    /// The side branch: every accepted frame, and `None` for one dropped
+    /// over `max_frame_bytes`, which a subscriber takes as a lag of one.
+    frames: broadcast::Sender<Option<Arc<MediaFrame>>>,
     /// The GOP cache; `None` until the first keyframe. Video only.
     gop: ArcSwapOption<GopSnapshot>,
     /// The last side-branch frame accepted, the anchor of
@@ -705,6 +721,10 @@ pub struct Track {
     /// camera with long GOPs hits on every GOP; only the source's task
     /// publishes, so the lock is never contended.
     gop_truncations: Mutex<Throttle>,
+    /// Rate-limits the line of a frame dropped over `max_frame_bytes`,
+    /// which a camera whose frames all exceed it makes on every frame;
+    /// only the source's task publishes, so the lock is never contended.
+    oversize_drops: Mutex<Throttle>,
     /// Rate-limits the line of a codec change, which a camera alternating
     /// two parameter sets makes on every frame; taken only by whoever sets
     /// the codec, the source's task.
@@ -796,6 +816,7 @@ impl Track {
             epoch_frame_pending: AtomicBool::new(false),
             lateness: Mutex::new(LatenessMeter::new(clock_rate)),
             gop_truncations: Mutex::new(Throttle::default()),
+            oversize_drops: Mutex::new(Throttle::default()),
             codec_changes: Mutex::new(Throttle::default()),
             preroll: Mutex::new(Preroll::new(id.kind() == Kind::Video)),
             preroll_floor,
@@ -1053,9 +1074,33 @@ impl Track {
     /// The pre-roll ring's frames from the newest keyframe captured at or
     /// before `target` (else the oldest held) to the newest frame; `None`
     /// when it holds nothing. On an audio track, `target` is the video
-    /// snapshot's start, and the frames start with the one playing then.
+    /// snapshot's start, and the frames start with the one playing then. A
+    /// clip takes it with [`Self::subscribe_from_preroll`], so nothing the
+    /// track publishes falls between its subscription and its pre-roll.
     pub fn preroll_snapshot(&self, target: Instant) -> Option<PrerollSnapshot> {
         self.lock_preroll().snapshot(target)
+    }
+
+    /// A frame subscription and the pre-roll ring's snapshot from `target`
+    /// (as [`Self::preroll_snapshot`] chooses it), taken together under the
+    /// ring's lock: every frame reaches the ring under that lock before it
+    /// is broadcast, so the snapshot starts at a frame published before the
+    /// subscription and the subscription yields no frame published before
+    /// the snapshot's start. It yields first, at most, the snapshot's newest
+    /// frame, when the track's source task had put it in the ring but not
+    /// yet broadcast it (a [`ReliableQueue`](crate::interleave::ReliableQueue)
+    /// drops it as the pre-roll's), then every frame published after. The
+    /// snapshot is `None` when the ring holds nothing. The lock is held for
+    /// the subscribe and the copy only.
+    pub fn subscribe_from_preroll(
+        self: &Arc<Self>,
+        target: Instant,
+    ) -> (TrackSubscription, Option<PrerollSnapshot>) {
+        let ring = self.lock_preroll();
+        let subscription = self.subscribe(Unit::Frames);
+        let snapshot = ring.snapshot(target);
+        drop(ring);
+        (subscription, snapshot)
     }
 
     /// Empties the pre-roll ring and keeps its window; whether it held
@@ -1198,8 +1243,9 @@ impl Track {
     /// Publishes a frame on the side branch, stamped with the current epoch
     /// (and `discontinuity` if it is the epoch's first): updates the GOP
     /// cache (video) and broadcasts it. Returns `false` for a frame larger
-    /// than `max_frame_bytes`, which is dropped and counted, and cuts the
-    /// pre-roll's GOP short there (until the next keyframe).
+    /// than `max_frame_bytes`, which is dropped, counted and reported to the
+    /// frame subscribers as a lag of one, and cuts the pre-roll's GOP short
+    /// there (until the next keyframe).
     pub fn publish_frame(&self, frame: MediaFrame) -> bool {
         self.touch(frame.arrival);
         if !self.feeds.admits(self.tag, self.kind(), frame.keyframe) {
@@ -1225,14 +1271,25 @@ impl Track {
             self.counters
                 .frames_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                track = %self.id,
-                bytes,
-                limit = self.limits.max_frame_bytes,
-                "frame dropped: larger than max_frame_bytes"
-            );
+            let due = self
+                .oversize_drops
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .hit(frame.arrival);
+            if let Some(count) = due {
+                tracing::debug!(
+                    track = %self.id,
+                    bytes,
+                    limit = self.limits.max_frame_bytes,
+                    count,
+                    "frame dropped: larger than max_frame_bytes"
+                );
+            }
             // The pre-roll's GOP now misses this frame: it is cut there.
             self.lock_preroll().frame_dropped();
+            // The subscribers miss it too: a lag of one, never a silent
+            // hole before the frames that may reference it.
+            let _delivered_to = self.frames.send(None);
             return false;
         }
         self.touch(frame.arrival);
@@ -1248,7 +1305,7 @@ impl Track {
         self.update_preroll(&frame);
         self.last_frame.store(Some(Arc::clone(&frame)));
         // As above: no subscriber is not an error.
-        let _delivered_to = self.frames.send(frame);
+        let _delivered_to = self.frames.send(Some(frame));
         true
     }
 
@@ -1794,13 +1851,22 @@ mod tests {
             max_frame_bytes: 100,
             ..TrackLimits::default()
         };
-        let track = video_track(limits);
+        let track = Arc::new(video_track(limits));
         let mut frames = track.subscribe_frames();
+        let mut sink = track.subscribe(Unit::Frames);
         assert!(!track.publish_frame(frame(true, 101)));
         assert!(track.gop().is_none());
+        assert_eq!(
+            frames.try_recv(),
+            Err(SubscriptionError::Lagged(1)),
+            "a frame subscriber learns of the drop as a lag of one"
+        );
+        assert_eq!(queued(&mut sink), Some(TrackEvent::Gap { skipped: 1 }));
+        assert!(!track.publish_frame(frame(false, 101)));
+        assert_eq!(frames.recv().await, Err(SubscriptionError::Lagged(1)));
         assert!(frames.is_empty());
         let stats = track.stats();
-        assert_eq!(stats.frames_dropped_oversize, 1);
+        assert_eq!(stats.frames_dropped_oversize, 2);
         assert_eq!(stats.frames, 0);
         assert!(track.publish_frame(frame(true, 100)));
         assert!(frames.recv().await.is_ok());
@@ -1808,6 +1874,41 @@ mod tests {
         assert_eq!(track.stats().frames_over_browser_limit, 0);
         track.count_frame_over_browser_limit();
         assert_eq!(track.stats().frames_over_browser_limit, 1);
+    }
+
+    #[test]
+    fn oversize_drops_are_logged_rate_limited() {
+        let (logs, _guard) = Logs::capture();
+        let track = video_track(TrackLimits {
+            max_frame_bytes: 100,
+            ..TrackLimits::default()
+        });
+        let at = SystemClock.now();
+        let oversize = |arrival| MediaFrame {
+            wallclock: arrival,
+            arrival,
+            ..frame(false, 101)
+        };
+        for _ in 0..3 {
+            assert!(!track.publish_frame(oversize(at)));
+        }
+        let message = "frame dropped: larger than max_frame_bytes";
+        let fields = |logs: &Logs| -> Vec<String> {
+            logs.lines(tracing::Level::DEBUG, message)
+                .into_iter()
+                .map(|line| line.fields)
+                .collect()
+        };
+        assert_eq!(fields(&logs), [" track=v0 bytes=101 limit=100 count=1"]);
+        assert!(!track.publish_frame(oversize(at + crate::throttle::SUMMARY_INTERVAL)));
+        assert_eq!(
+            fields(&logs),
+            [
+                " track=v0 bytes=101 limit=100 count=1",
+                " track=v0 bytes=101 limit=100 count=3"
+            ]
+        );
+        assert_eq!(track.stats().frames_dropped_oversize, 4);
     }
 
     #[test]
@@ -2435,6 +2536,35 @@ mod tests {
         assert_eq!(track.stats().preroll, None);
         assert!(track.preroll_snapshot(t0).is_none());
         assert_eq!(track.preroll_floor.get(), None);
+    }
+
+    #[test]
+    fn a_subscription_taken_with_the_pre_roll_yields_only_what_follows_it() {
+        let t0 = SystemClock.now();
+        let track = video_track_at(t0);
+        track.set_preroll(Some(Duration::from_secs(10)));
+        assert!(track.publish_frame(timed(t0, 0, true, 10)));
+        assert!(track.publish_frame(timed(t0, 40, false, 10)));
+        assert!(track.publish_frame(timed(t0, 80, true, 10)));
+        let (mut sub, snapshot) = track.subscribe_from_preroll(t0 + Duration::from_millis(80));
+        let ts: Vec<_> = snapshot
+            .unwrap()
+            .frames()
+            .map(|frame| frame.ts.ticks())
+            .collect();
+        assert_eq!(ts, [80], "the snapshot starts at the newest keyframe");
+        nothing_queued(&mut sub);
+        assert!(track.publish_frame(timed(t0, 120, false, 10)));
+        crate::let_assert!(Some(TrackEvent::Frame(frame)) = queued(&mut sub));
+        assert_eq!(frame.ts.ticks(), 120);
+        nothing_queued(&mut sub);
+
+        let track = video_track_at(t0);
+        let (mut sub, snapshot) = track.subscribe_from_preroll(t0);
+        assert!(snapshot.is_none(), "no window, no ring");
+        assert!(track.publish_frame(timed(t0, 0, true, 10)));
+        crate::let_assert!(Some(TrackEvent::Frame(frame)) = queued(&mut sub));
+        assert_eq!(frame.ts.ticks(), 0);
     }
 
     #[test]
