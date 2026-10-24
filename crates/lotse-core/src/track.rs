@@ -11,8 +11,8 @@
 //! up to `gop_cache_bytes` of payload and `gop_cache_frames` frames, past
 //! which it is cut back to the keyframe; the keyframe itself is bounded
 //! only by `max_frame_bytes`, because a larger frame is dropped before it
-//! reaches the cache. Nothing checks `max_frame_bytes` against
-//! `gop_cache_bytes`: the cache holds at most the larger of the two, which
+//! reaches the cache (its frame subscribers take the drop as a lag).
+//! Nothing checks `max_frame_bytes` against `gop_cache_bytes`: the cache holds at most the larger of the two, which
 //! is `gop_cache_bytes` with the defaults (equal, and the only limits a
 //! worker gives its tracks). While a window is set the track also keeps a
 //! pre-roll ring ([`crate::preroll`]) of whole GOPs, bounded by
@@ -101,7 +101,8 @@ const CONTROL_CAPACITY: usize = 16;
 /// The bounds a track enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackLimits {
-    /// Frames larger than this are dropped from the side branch and counted.
+    /// Frames larger than this are dropped from the side branch and counted;
+    /// a frame subscriber takes each as a lag of one.
     pub max_frame_bytes: usize,
     /// The GOP cache keeps only the keyframe once a GOP exceeds this many
     /// payload bytes.
@@ -332,8 +333,9 @@ pub enum TrackEvent {
     /// A side-branch frame (`Unit::Frames` subscriptions).
     Frame(Arc<MediaFrame>),
     /// The subscriber missed items: `BestEffort` lag, later `Reliable`
-    /// overflow. Always explicit, never silent. A live sink skips to the
-    /// next keyframe; a recorder records a gap.
+    /// overflow, or, on a frame subscription, a frame the track dropped
+    /// over `max_frame_bytes`. Always explicit, never silent. A live sink
+    /// skips to the next keyframe; a recorder records a gap.
     Gap {
         /// How many items were missed.
         skipped: u64,
@@ -439,9 +441,10 @@ impl TrackSubscription {
 /// Why a subscription yielded no item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubscriptionError {
-    /// The subscriber fell behind and this many items were discarded; the
-    /// next receive continues at the oldest item still held. A live sink
-    /// skips to the next keyframe.
+    /// The subscriber fell behind and this many items were discarded (on a
+    /// frame subscription, also one for a frame the track dropped over
+    /// `max_frame_bytes`); the next receive continues at the oldest item
+    /// still held. A live sink skips to the next keyframe.
     #[error("subscriber lagged: {0} items skipped")]
     Lagged(u64),
     /// The track is gone.
@@ -462,23 +465,29 @@ impl From<broadcast::error::RecvError> for SubscriptionError {
 #[derive(Debug)]
 pub struct PacketSubscription(broadcast::Receiver<Arc<MediaPacket>>);
 
-/// A subscription to a track's side-branch frames, starting at the live edge.
+/// A subscription to a track's side-branch frames, starting at the live edge;
+/// a frame the track dropped over `max_frame_bytes` is a lag of one.
 #[derive(Debug)]
-pub struct FrameSubscription(broadcast::Receiver<Arc<MediaFrame>>);
+pub struct FrameSubscription(broadcast::Receiver<Option<Arc<MediaFrame>>>);
 
-/// Implements the receive side of a broadcast subscription.
+/// Implements the receive side of a broadcast subscription: `$deliver`
+/// turns what the channel carries into the `$item` a subscriber takes, or
+/// the error it is to it.
 macro_rules! subscription {
-    ($name:ident, $item:ty) => {
+    ($name:ident, $item:ty, $deliver:expr) => {
         impl $name {
             /// Waits for the next item.
             pub async fn recv(&mut self) -> Result<$item, SubscriptionError> {
-                self.0.recv().await.map_err(SubscriptionError::from)
+                match self.0.recv().await {
+                    Ok(item) => $deliver(item),
+                    Err(err) => Err(SubscriptionError::from(err)),
+                }
             }
 
             /// The next item if one is queued, `Ok(None)` if the queue is empty.
             pub fn try_recv(&mut self) -> Result<Option<$item>, SubscriptionError> {
                 match self.0.try_recv() {
-                    Ok(item) => Ok(Some(item)),
+                    Ok(item) => $deliver(item).map(Some),
                     Err(broadcast::error::TryRecvError::Empty) => Ok(None),
                     Err(broadcast::error::TryRecvError::Lagged(n)) => {
                         Err(SubscriptionError::Lagged(n))
@@ -500,8 +509,14 @@ macro_rules! subscription {
     };
 }
 
-subscription!(PacketSubscription, Arc<MediaPacket>);
-subscription!(FrameSubscription, Arc<MediaFrame>);
+subscription!(PacketSubscription, Arc<MediaPacket>, Ok);
+subscription!(FrameSubscription, Arc<MediaFrame>, dropped_as_lag);
+
+/// A frame broadcast's item as a subscriber takes it: `None`, a frame the
+/// track dropped over `max_frame_bytes`, is one item missed.
+fn dropped_as_lag(item: Option<Arc<MediaFrame>>) -> Result<Arc<MediaFrame>, SubscriptionError> {
+    item.ok_or(SubscriptionError::Lagged(1))
+}
 
 /// Which source feeds a connection's tracks: the one its live
 /// [`TrackSet`](crate::source::TrackSet) was made for (tag 0) or a standby
@@ -685,8 +700,9 @@ pub struct Track {
     codec: ArcSwap<Codec>,
     /// The live path: every packet, as read.
     packets: broadcast::Sender<Arc<MediaPacket>>,
-    /// The side branch: every accepted frame.
-    frames: broadcast::Sender<Arc<MediaFrame>>,
+    /// The side branch: every accepted frame, and `None` for one dropped
+    /// over `max_frame_bytes`, which a subscriber takes as a lag of one.
+    frames: broadcast::Sender<Option<Arc<MediaFrame>>>,
     /// The GOP cache; `None` until the first keyframe. Video only.
     gop: ArcSwapOption<GopSnapshot>,
     /// The last side-branch frame accepted, the anchor of
@@ -1222,8 +1238,9 @@ impl Track {
     /// Publishes a frame on the side branch, stamped with the current epoch
     /// (and `discontinuity` if it is the epoch's first): updates the GOP
     /// cache (video) and broadcasts it. Returns `false` for a frame larger
-    /// than `max_frame_bytes`, which is dropped and counted, and cuts the
-    /// pre-roll's GOP short there (until the next keyframe).
+    /// than `max_frame_bytes`, which is dropped, counted and reported to the
+    /// frame subscribers as a lag of one, and cuts the pre-roll's GOP short
+    /// there (until the next keyframe).
     pub fn publish_frame(&self, frame: MediaFrame) -> bool {
         self.touch(frame.arrival);
         if !self.feeds.admits(self.tag, self.kind(), frame.keyframe) {
@@ -1257,6 +1274,9 @@ impl Track {
             );
             // The pre-roll's GOP now misses this frame: it is cut there.
             self.lock_preroll().frame_dropped();
+            // The subscribers miss it too: a lag of one, never a silent
+            // hole before the frames that may reference it.
+            let _delivered_to = self.frames.send(None);
             return false;
         }
         self.touch(frame.arrival);
@@ -1272,7 +1292,7 @@ impl Track {
         self.update_preroll(&frame);
         self.last_frame.store(Some(Arc::clone(&frame)));
         // As above: no subscriber is not an error.
-        let _delivered_to = self.frames.send(frame);
+        let _delivered_to = self.frames.send(Some(frame));
         true
     }
 
@@ -1818,13 +1838,22 @@ mod tests {
             max_frame_bytes: 100,
             ..TrackLimits::default()
         };
-        let track = video_track(limits);
+        let track = Arc::new(video_track(limits));
         let mut frames = track.subscribe_frames();
+        let mut sink = track.subscribe(Unit::Frames);
         assert!(!track.publish_frame(frame(true, 101)));
         assert!(track.gop().is_none());
+        assert_eq!(
+            frames.try_recv(),
+            Err(SubscriptionError::Lagged(1)),
+            "a frame subscriber learns of the drop as a lag of one"
+        );
+        assert_eq!(queued(&mut sink), Some(TrackEvent::Gap { skipped: 1 }));
+        assert!(!track.publish_frame(frame(false, 101)));
+        assert_eq!(frames.recv().await, Err(SubscriptionError::Lagged(1)));
         assert!(frames.is_empty());
         let stats = track.stats();
-        assert_eq!(stats.frames_dropped_oversize, 1);
+        assert_eq!(stats.frames_dropped_oversize, 2);
         assert_eq!(stats.frames, 0);
         assert!(track.publish_frame(frame(true, 100)));
         assert!(frames.recv().await.is_ok());

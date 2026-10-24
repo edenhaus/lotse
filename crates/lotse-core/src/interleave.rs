@@ -56,7 +56,8 @@ pub const QUEUED_FRAME_OVERHEAD: usize = size_of::<MediaFrame>()
 pub enum GapReason {
     /// The clip's queue was full: its reader is slower than the camera.
     Overflow,
-    /// The track's broadcast dropped frames before the clip took them.
+    /// The clip's subscription missed frames: it fell behind the track's
+    /// broadcast, or the track dropped one over `max_frame_bytes`.
     Lagged,
     /// The pre-roll ring cut its newest GOP short at `preroll_bytes` or
     /// lost a frame the track dropped over `max_frame_bytes`, so the live
@@ -85,15 +86,17 @@ pub enum Out {
         /// The frame.
         frame: Arc<MediaFrame>,
     },
-    /// `track` has a hole: no frame of it was captured after `from` and
-    /// before `to` that the clip holds.
+    /// `track` has a hole: frames of it were lost between the frame queued
+    /// before it and the one after it, which follows.
     Gap {
         /// The track's kind; an overflow is the video's hole while the
         /// video is open, else the audio's.
         track: Kind,
         /// Why.
         reason: GapReason,
-        /// The latest capture time the track had queued before the hole.
+        /// The capture time of the latest frame the track queued before the
+        /// hole, `to` when the capture times moved back in it, so a gap
+        /// never ends before it starts.
         from: Instant,
         /// The capture time of the frame after the hole, which follows.
         to: Instant,
@@ -157,7 +160,7 @@ impl Item {
 struct Hole {
     /// Why.
     reason: GapReason,
-    /// The latest capture time the track had queued before it.
+    /// The capture time of the latest frame the track queued before it.
     from: Instant,
 }
 
@@ -175,7 +178,11 @@ struct Lane {
     started: bool,
     /// The hole the track is in, if any.
     hole: Option<Hole>,
-    /// The latest capture time queued: where a hole starts.
+    /// The capture time of the latest frame queued: where a hole starts.
+    /// The latest, not the greatest, as for `reached`: after the capture
+    /// times moved back, a hole starts at the frame before it, not at one
+    /// dated ahead; with B-frames that can be a frame or two before the
+    /// newest captured.
     last: Option<Instant>,
     /// Where the track is: the capture time of the latest frame seen,
     /// dropped frames included, a frame dated ahead of its arrival counting
@@ -316,7 +323,7 @@ impl Lane {
     /// Queues `frame`, which counts `cost`.
     fn queue_frame(&mut self, frame: Arc<MediaFrame>, queued: Instant, cost: usize) {
         self.started = true;
-        self.last = self.last.max(Some(frame.wallclock));
+        self.last = Some(frame.wallclock);
         self.items.push_back(Item {
             entry: Entry::Frame(frame),
             queued,
@@ -467,7 +474,7 @@ impl ReliableQueue {
             lane.items.push_back(Item {
                 entry: Entry::Gap {
                     reason,
-                    from,
+                    from: from.min(frame.wallclock),
                     to: frame.wallclock,
                 },
                 queued: now,
@@ -652,7 +659,7 @@ mod tests {
     use crate::codec::Codec;
     use crate::media::MediaTime;
     use crate::preroll::Preroll;
-    use crate::track::{Track, TrackId, TrackLimits, Unit};
+    use crate::track::{Track, TrackId, TrackLimits, TrackSubscription, Unit};
 
     const SKEW: Duration = Duration::from_secs(1);
 
@@ -1410,6 +1417,59 @@ mod tests {
         assert_eq!(release(&mut merged, &clip), ["v0", "v40", "v80", "v120"]);
     }
 
+    /// What `subscription` has queued now, taken without waiting.
+    fn queued(subscription: &mut TrackSubscription) -> Vec<TrackEvent> {
+        std::iter::from_fn(|| {
+            let mut next = std::pin::pin!(subscription.next());
+            match next
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            {
+                std::task::Poll::Ready(event) => event,
+                std::task::Poll::Pending => None,
+            }
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_live_frame_the_track_drops_over_max_frame_bytes_skips_the_video_to_its_next_keyframe() {
+        let clip = Clip::new();
+        let track = Arc::new(Track::new(
+            TrackId::new(Kind::Video, 0),
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+            TrackLimits {
+                max_frame_bytes: 100,
+                ..TrackLimits::default()
+            },
+            clip.now(),
+        ));
+        let (mut subscription, snapshot) = track.subscribe_from_preroll(clip.at(0));
+        assert!(snapshot.is_none(), "no window, no pre-roll");
+        let publish = |ms: u64, keyframe: bool, bytes: usize| {
+            track.publish_frame(MediaFrame::clone(&clip.frame(ms, keyframe, bytes)))
+        };
+        assert!(publish(0, true, 10));
+        assert!(publish(40, false, 10));
+        assert!(!publish(80, true, 101), "dropped over max_frame_bytes");
+        assert!(publish(120, false, 10));
+        assert!(publish(160, true, 10));
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        for event in queued(&mut subscription) {
+            queue.push(Kind::Video, event, clip.now());
+        }
+        assert_eq!(
+            drain(&mut queue, Kind::Video, &clip),
+            ["v0", "v40", "vgap lagged 40-160", "v160"],
+            "v120 refers to the lost keyframe"
+        );
+    }
+
     #[test]
     fn a_lag_the_pre_roll_covers_opens_no_hole() {
         let (logs, _guard) = crate::test_logs::Logs::capture();
@@ -1616,6 +1676,36 @@ mod tests {
             release(&mut merged, &clip),
             ["a990"],
             "v1015 waits for the audio past 990"
+        );
+    }
+
+    #[test]
+    fn a_gap_after_the_capture_times_moved_back_starts_at_the_latest_frame_queued() {
+        let clip = Clip::new();
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        clip.push(&mut queue, Kind::Video, 0, true);
+        clip.push_arrived(&mut queue, Kind::Video, 3_600_000, 40, false);
+        clip.push(&mut queue, Kind::Video, 1020, false);
+        queue.push(Kind::Video, TrackEvent::Gap { skipped: 1 }, clip.now());
+        clip.push(&mut queue, Kind::Video, 1060, false);
+        clip.push(&mut queue, Kind::Video, 1100, true);
+        assert_eq!(
+            drain(&mut queue, Kind::Video, &clip),
+            ["v0", "v3600000", "v1020", "vgap lagged 1020-1100", "v1100"]
+        );
+    }
+
+    #[test]
+    fn a_gap_never_ends_before_it_starts_when_the_capture_times_move_back_in_the_hole() {
+        let clip = Clip::new();
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        clip.push(&mut queue, Kind::Video, 0, true);
+        clip.push_arrived(&mut queue, Kind::Video, 3_600_000, 40, false);
+        queue.push(Kind::Video, TrackEvent::Gap { skipped: 1 }, clip.now());
+        clip.push(&mut queue, Kind::Video, 1100, true);
+        assert_eq!(
+            drain(&mut queue, Kind::Video, &clip),
+            ["v0", "v3600000", "vgap lagged 1100-1100", "v1100"]
         );
     }
 
