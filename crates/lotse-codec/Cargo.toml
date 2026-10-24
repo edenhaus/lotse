@@ -1,6 +1,6 @@
 [package]
 name = "lotse-codec"
-description = "Bitstream normalizers, G.711, AAC decode, Opus, resampling and transcoders."
+description = "Bitstream normalizers, G.711, G.722 and AAC decode, Opus, resampling and transcoders."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,6 +19,7 @@ test-util = []
 adts-reader = { workspace = true }
 bytes = { workspace = true }
 h264-reader = { workspace = true }
+nanoaudio-g722 = { workspace = true }
 opus = { workspace = true }
 rubato = { workspace = true }
 symphonia-codec-aac = { workspace = true }
@@ -34,7 +35,7 @@ divan = { workspace = true } # the microbenchmarks (benches/)
 lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`, so the transcoder tests set each frame's arrival
 
 # The microbenchmarks (`mise run bench`): divan's harness, not libtest's. They build their input
-# from the hand-built parameter sets and the recorded AAC of `test-util`.
+# from the hand-built parameter sets, the recorded AAC and the G.722 encoder of `test-util`.
 [[bench]]
 name = "video"
 harness = false

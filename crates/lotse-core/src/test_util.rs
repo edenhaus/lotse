@@ -933,7 +933,7 @@ impl ClipMuxerFactory for FakeClipMuxerFactory {
 }
 
 /// A [`FakeClipMuxerFactory`]'s muxer. Its media time is the capture time
-/// from its origin, its first frame's.
+/// from its origin, the one set or its first frame's.
 #[derive(Debug)]
 struct FakeClipMuxer {
     /// Where it fails.
@@ -967,6 +967,12 @@ impl ClipMuxer for FakeClipMuxer {
         Ok(vec![
             format!("init video={}{audio}\n", video.codec.name()).into(),
         ])
+    }
+
+    /// Writes nothing; its media times count from `origin`, set before
+    /// the first frame.
+    fn set_origin(&mut self, origin: Instant) {
+        self.origin.get_or_insert(origin);
     }
 
     fn push(

@@ -3,7 +3,8 @@
 //! container into the pipe the supervisor passed, until the clip ends.
 //!
 //! A clip waits for the source's tracks, subscribes to the native video
-//! track and, when asked and the container carries its codec, the native
+//! track and, when asked and the container carries its codec or the clip
+//! can transcode it (G.711 and G.722 to Opus, [`ToOpus`]), the native
 //! audio track, and only then takes the rings' snapshots, so nothing is lost
 //! or written twice between the two: the [`ReliableQueue`] drops the live
 //! frames the pre-roll holds. It starts at the newest held keyframe
@@ -12,7 +13,11 @@
 //! track's, which the container's sample entry carries; with nothing held
 //! it starts at the next keyframe, waiting for it up to the start timeout.
 //! The frames go through the queue and the [`Interleaver`] into the
-//! [`ClipMuxer`], and the bytes into the pipe without blocking.
+//! [`ClipMuxer`], and the bytes into the pipe without blocking. Transcoded
+//! audio goes through its clip's own [`ToOpus`] on the way out of the
+//! queue, so the ring keeps the camera's frames and the pre-roll's audio is
+//! transcoded in a burst at the start, at most [`MAX_STEP_PACKETS`] packets
+//! before the task yields to the worker's other tasks.
 //!
 //! Invariants: the media path never waits for a clip. While the pipe is
 //! full the task takes nothing out of its queue but keeps draining the
@@ -40,6 +45,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use lotse_codec::transcode::clip::{ToOpus, transcodes};
 use lotse_codec::{h264, h265};
 use lotse_core::clip::{ClipError, ClipMuxer, ClipMuxerFactory, ClipPolicy, ClipTrack};
 use lotse_core::clock::Clock;
@@ -92,6 +98,13 @@ const MAX_GAP_REPORTS: u32 = 256;
 /// The most buffers one write hands the pipe: `IOV_MAX` is 1024 on Linux,
 /// and a pipe takes 64 KiB at most anyway.
 const MAX_WRITE_SLICES: usize = 64;
+
+/// The most Opus packets a clip transcodes before it lets the worker's
+/// other tasks run: half a second of audio, a few milliseconds of one
+/// core. A pre-roll's audio comes out of the queue at once; transcoded in
+/// one go, a 120 s window would hold a runtime thread for the length of
+/// 6000 packets.
+const MAX_STEP_PACKETS: usize = 25;
 
 /// What the worker's clips run under: the delivery policy and the limits
 /// of `limits.clip_*`.
@@ -549,6 +562,15 @@ fn sets_match(codec: &Codec, access_unit: &[u8]) -> bool {
     }
 }
 
+/// The transcode of audio in `codec` at `clock_rate` that the container
+/// cannot carry as it is: G.711 or G.722 to Opus, when the container takes
+/// Opus; `None` otherwise.
+fn transcoder(codec: &Codec, clock_rate: u32, factory: &dyn ClipMuxerFactory) -> Option<ToOpus> {
+    (transcodes(codec) && factory.accepts(&ToOpus::output().codec))
+        .then(|| ToOpus::new(codec, clock_rate).ok())
+        .flatten()
+}
+
 /// One clip's state.
 struct Clip {
     /// Its id.
@@ -586,13 +608,20 @@ struct Clip {
     origin: Option<Instant>,
     /// The newest capture time written.
     newest: Option<Instant>,
-    /// The codecs of the container's sample entries, video and audio,
-    /// once it started.
+    /// The tracks' codecs the container's sample entries were made from,
+    /// video and audio (the camera's, for transcoded audio), once it
+    /// started: a track that changes from it ends the clip.
     entries: Option<(Codec, Option<Codec>)>,
     /// How far before its start it begins: the start keyframe's age.
     before_ms: u32,
-    /// The audio codec left out because the container cannot carry it.
+    /// The audio codec left out because the container cannot carry it
+    /// and the clip cannot transcode it.
     omitted: Option<String>,
+    /// The audio's transcode to Opus, with the camera's codec it decodes,
+    /// for audio the container cannot carry as it is.
+    transcoder: Option<(Codec, ToOpus)>,
+    /// Opus packets transcoded since the clip last yielded.
+    step_packets: usize,
     /// Where the video continues.
     continuity: Continuity,
     /// The gaps it had.
@@ -649,6 +678,8 @@ impl Clip {
             entries: None,
             before_ms: 0,
             omitted: None,
+            transcoder: None,
+            step_packets: 0,
             continuity: Continuity::default(),
             gaps: 0,
             gap_log: Throttle::default(),
@@ -696,6 +727,9 @@ impl Clip {
                 let codec = track.codec();
                 if factory.accepts(&codec) {
                     Some(Arc::clone(track))
+                } else if let Some(chain) = transcoder(&codec, track.clock_rate(), factory) {
+                    self.transcoder = Some(((*codec).clone(), chain));
+                    Some(Arc::clone(track))
                 } else {
                     self.omitted = Some(codec.name().to_owned());
                     None
@@ -742,9 +776,10 @@ impl Clip {
         requested: &mut watch::Receiver<Option<EndReason>>,
     ) -> EndReason {
         loop {
-            if let Err(reason) = self.step(media) {
-                return reason;
-            }
+            let more = match self.step(media) {
+                Ok(more) => more,
+                Err(reason) => return reason,
+            };
             self.send_reports().await;
             let wake = self.wake(&media.interleaver);
             let sleep = self
@@ -774,6 +809,9 @@ impl Clip {
                         return reason;
                     }
                 }
+                // The step stopped with work left: the worker's other tasks
+                // run first, then the next step goes on.
+                () = tokio::task::yield_now(), if more => {}
                 () = sleep => {}
             }
         }
@@ -781,8 +819,9 @@ impl Clip {
 
     /// What can be done now: the end when a deadline passed, else the
     /// queue's items released now into the container while the pipe takes
-    /// its bytes.
-    fn step(&mut self, media: &mut Media) -> Result<(), EndReason> {
+    /// its bytes; whether it stopped at [`MAX_STEP_PACKETS`] with more to
+    /// do.
+    fn step(&mut self, media: &mut Media) -> Result<bool, EndReason> {
         let now = self.clock.now();
         if self.origin.is_none() && now >= self.start_deadline() {
             tracing::info!(clip.id = %self.id, "clip: no keyframe to start at in time");
@@ -792,13 +831,17 @@ impl Clip {
             tracing::info!(clip.id = %self.id, reason = self.end_reason.name(), "clip: no frame after its end came; ending");
             return Err(self.end_reason);
         }
+        self.step_packets = 0;
         loop {
             self.write()?;
             if !self.pending.is_empty() {
-                return Ok(());
+                return Ok(false);
+            }
+            if self.step_packets >= MAX_STEP_PACKETS {
+                return Ok(true);
             }
             let Some(out) = media.interleaver.next(now) else {
-                return Ok(());
+                return Ok(false);
             };
             self.take(out, media)?;
         }
@@ -849,13 +892,10 @@ impl Clip {
     }
 
     /// One frame: the end when it was captured at or after the clip's;
-    /// the container's start before the first; a gap when it ends a hole
-    /// of the video: from the video frame before it to this one, where the
-    /// container put them. That can be later than their capture times (an
-    /// epoch captured before the last frame began starts where that frame
-    /// ends), and a gap from capture times then disagreed with the file,
-    /// or ended before it began, a report the supervisor refuses (found
-    /// end to end, 2026-10-23: a camera reconnecting within a frame).
+    /// the container's start before the first, its origin the transcode's
+    /// delay earlier when the clip transcodes its audio (the packets are
+    /// moved back by it); then into the container, transcoded first when
+    /// the clip transcodes its track.
     fn frame(
         &mut self,
         track: Kind,
@@ -867,8 +907,33 @@ impl Clip {
             return Err(self.end_reason);
         }
         if self.origin.is_none() {
-            self.begin(frame.wallclock, media)?;
+            let lead = self
+                .transcoder
+                .as_ref()
+                .map_or(Duration::ZERO, |(_, chain)| chain.delay());
+            let origin = frame.wallclock.checked_sub(lead).unwrap_or(frame.wallclock);
+            self.begin(origin, media)?;
         }
+        let Some((_, chain)) = self.transcoder.as_mut().filter(|_| track == Kind::Audio) else {
+            return self.sample(track, frame);
+        };
+        let packets = chain.push(&frame).map_err(ClipError::from);
+        let packets = packets.map_err(self.failed("transcode"))?;
+        self.step_packets = self.step_packets.saturating_add(packets.len());
+        for packet in packets {
+            self.sample(track, packet)?;
+        }
+        Ok(())
+    }
+
+    /// One frame as the container takes it, a gap when it ends a hole of
+    /// the video: from the video frame before it to this one, where the
+    /// container put them. That can be later than their capture times (an
+    /// epoch captured before the last frame began starts where that frame
+    /// ends), and a gap from capture times then disagreed with the file,
+    /// or ended before it began, a report the supervisor refuses (found
+    /// end to end, 2026-10-23: a camera reconnecting within a frame).
+    fn sample(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<(), EndReason> {
         let hole = match track {
             Kind::Video => match self.continuity.observe(&frame) {
                 Seen::Follows => None,
@@ -879,10 +944,7 @@ impl Clip {
         };
         let from = self.muxer.media_time(Kind::Video);
         self.newest = self.newest.max(Some(frame.wallclock));
-        let bytes = self
-            .muxer
-            .push(track, frame)
-            .map_err(|err| self.failed("push", &err))?;
+        let bytes = self.muxer.push(track, frame).map_err(self.failed("push"))?;
         if let Some(reason) = hole {
             let to = self.muxer.media_time(Kind::Video);
             self.gap(reason, from, to);
@@ -892,22 +954,41 @@ impl Clip {
     }
 
     /// Starts the container with the tracks' codecs as they are now, the
-    /// newest parameter sets, at the first frame captured at `origin`, and
-    /// reports `Started` (and the omitted audio's warning).
+    /// newest parameter sets, its media time 0 at `origin`, and
+    /// reports `Started` (and the omitted audio's warning). Transcoded
+    /// audio is Opus in the container; a camera codec that changed since
+    /// the clip chose to transcode it ends the clip `stream_changed`.
     fn begin(&mut self, origin: Instant, media: &Media) -> Result<(), EndReason> {
         let video_track = media.video.track();
         let video = ClipTrack {
             codec: (*video_track.codec()).clone(),
             clock_rate: video_track.clock_rate(),
         };
-        let audio = media.audio_track.as_ref().map(|track| ClipTrack {
-            codec: (*track.codec()).clone(),
-            clock_rate: track.clock_rate(),
+        let source = media
+            .audio_track
+            .as_ref()
+            .map(|track| ((*track.codec()).clone(), track.clock_rate()));
+        if let (Some((codec, _)), Some((from, _))) = (&source, &self.transcoder)
+            && codec != from
+        {
+            tracing::info!(clip.id = %self.id, from = from.name(), codec = codec.name(), "clip: the audio changed before the clip started; ending");
+            return Err(EndReason::StreamChanged);
+        }
+        let audio = source.as_ref().map(|(codec, clock_rate)| {
+            if self.transcoder.is_some() {
+                ToOpus::output()
+            } else {
+                ClipTrack {
+                    codec: codec.clone(),
+                    clock_rate: *clock_rate,
+                }
+            }
         });
         let init = self
             .muxer
             .start(&video, audio.as_ref())
-            .map_err(|err| self.failed("start", &err))?;
+            .map_err(self.failed("start"))?;
+        self.muxer.set_origin(origin);
         self.queue(init);
         self.origin = Some(origin);
         let audio_name = audio.as_ref().map(|audio| audio.codec.name().to_owned());
@@ -917,6 +998,7 @@ impl Clip {
             before_ms = self.before_ms,
             video = video.codec.name(),
             audio = audio_name.as_deref(),
+            audio_transcoded_from = self.transcoder.as_ref().map(|(codec, _)| codec.name()),
             audio_omitted = self.omitted.as_deref(),
             "clip: started"
         );
@@ -934,14 +1016,17 @@ impl Clip {
                 ),
             });
         }
-        self.entries = Some((video.codec, audio.map(|audio| audio.codec)));
+        self.entries = Some((video.codec, source.map(|(codec, _)| codec)));
         Ok(())
     }
 
-    /// The container failed at `what`: logged, the clip ends.
-    fn failed(&self, what: &'static str, err: &ClipError) -> EndReason {
-        tracing::warn!(clip.id = %self.id, what, error = %err, "clip: the container failed");
-        EndReason::InternalError
+    /// What a failure of the container (or of the audio's transcode) at
+    /// `what` does: logged, the clip ends.
+    fn failed(&self, what: &'static str) -> impl FnOnce(ClipError) -> EndReason + '_ {
+        move |err| {
+            tracing::warn!(clip.id = %self.id, what, error = %err, "clip: the container failed");
+            EndReason::InternalError
+        }
     }
 
     /// A control event of `track`: a codec other than its sample entry's
@@ -1171,6 +1256,7 @@ mod tests {
     use std::future::Future;
     use std::os::fd::OwnedFd;
 
+    use lotse_codec::{g711, g722};
     use lotse_core::clock::{FakeClock, SystemClock};
     use lotse_core::let_assert;
     use lotse_core::source::TrackPublisher;
@@ -1240,7 +1326,7 @@ mod tests {
             let mut publisher = set.publisher();
             let video = video.map(|codec| publisher.declare(Kind::Video, codec, 90_000));
             let audio = audio.map(|codec| {
-                let rate = codec.sample_rate().unwrap_or(8_000);
+                let rate = codec.rtp_clock_rate().unwrap_or(8_000);
                 publisher.declare(Kind::Audio, codec, rate)
             });
             for track in video.iter().chain(&audio) {
@@ -1312,6 +1398,22 @@ mod tests {
                 discontinuity: false,
                 epoch: 0,
                 payload: vec![0xe0; 4].into(),
+            }));
+        }
+
+        /// A 20 ms G.711 or G.722 frame `index` (160 ticks of the 8000 Hz
+        /// clock, RFC 3551 §4.5.2, §4.5.14), captured on the 20 ms grid.
+        fn narrowband_frame(&self, index: u32, payload: &Bytes) {
+            let ms = u64::from(index) * 20;
+            self.advance_to(ms);
+            assert!(self.audio.as_ref().unwrap().publish_frame(MediaFrame {
+                ts: MediaTime::from_ticks(i64::from(index) * 160),
+                wallclock: self.at(ms),
+                arrival: self.at(ms),
+                keyframe: true,
+                discontinuity: false,
+                epoch: 0,
+                payload: payload.clone(),
             }));
         }
 
@@ -1504,14 +1606,17 @@ mod tests {
         assert_eq!(logs.count(Level::INFO, "clip: stopped"), 1);
     }
 
-    /// An audio codec the container cannot carry (G.711 until the clip
-    /// transcodes it) leaves the clip video-only with an `audio_omitted`
+    /// An audio codec the container cannot carry and the clip cannot
+    /// transcode leaves the clip video-only with an `audio_omitted`
     /// warning after `started`; a clip that asks for no audio, or a
     /// stream without any, gets none and no warning. `clip/stop` ends a
     /// clip `stopped`, its last fragment written.
     #[tokio::test]
     async fn audio_the_container_cannot_carry_is_omitted_with_a_warning() {
-        let mut rig = Rig::new(Some(Codec::Pcmu));
+        let mut rig = Rig::new(Some(Codec::Unsupported {
+            kind: Kind::Audio,
+            name: "l16".into(),
+        }));
         let reader = rig.start(spec(0, None, true));
         rig.video_frame(0, 0, true, 32);
         assert_eq!(rig.report().await, started(0, None));
@@ -1519,7 +1624,7 @@ mod tests {
             rig.report().await,
             ClipReport::Warning {
                 code: "audio_omitted".into(),
-                message: "pcmu does not fit the clip's container; the clip has no audio".into(),
+                message: "l16 does not fit the clip's container; the clip has no audio".into(),
             }
         );
         assert!(rig.clips.stop("k1", EndReason::Stopped));
@@ -1540,6 +1645,163 @@ mod tests {
             assert_eq!(rig.until_stopped().await.len(), 1, "no warning");
             assert_eq!(lines(&reader.rest().await)[0], "init video=h264");
         }
+    }
+
+    /// 20 ms of a 1 kHz tone in `codec`, G.711 or G.722.
+    fn narrowband_payload(codec: &Codec) -> Bytes {
+        let tone = g722::test_data::tone(1_000, 320);
+        match g711::Law::of(codec) {
+            Some(law) => tone
+                .iter()
+                .step_by(2)
+                .map(|sample| law.encode(*sample))
+                .collect(),
+            None => g722::test_data::encode(&tone).into(),
+        }
+    }
+
+    /// Ten seconds of 10 fps video, a keyframe each second, and a 20 ms
+    /// frame of `codec` every 20 ms: the ring holds them all.
+    fn ten_narrowband_seconds(rig: &Rig, codec: &Codec) {
+        let payload = narrowband_payload(codec);
+        let mut audio = 0;
+        for index in 0..100_u32 {
+            let ms = u64::from(index) * 100;
+            while u64::from(audio) * 20 <= ms {
+                rig.narrowband_frame(audio, &payload);
+                audio += 1;
+            }
+            rig.video_frame(
+                ms,
+                index,
+                index % 10 == 0,
+                if index % 10 == 0 { 32 } else { 16 },
+            );
+        }
+        rig.advance_to(10_000);
+    }
+
+    /// The fake container's audio lines as (epoch, timestamp, bytes).
+    fn audio_samples(lines: &[String]) -> Vec<(u32, i64, usize)> {
+        lines
+            .iter()
+            .filter(|line| line.starts_with("frame a"))
+            .map(|line| {
+                let fields: Vec<&str> = line.split(' ').collect();
+                assert_eq!(fields[4], "k", "every Opus packet is a sync sample");
+                (
+                    fields[2].parse().unwrap(),
+                    fields[3].parse().unwrap(),
+                    fields[5].parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// G.711 (PCMU, PCMA) and G.722 audio goes into the clip as Opus at
+    /// 48 kHz, without `audio_omitted`: the pre-roll's 4 s in a burst at the
+    /// start (more than one step's worth of packets) and the live frames
+    /// after them, one run of 20 ms packets (RFC 7587 §4.1) from the first
+    /// frame's timestamp less the transcode's delay, one packet per 20 ms
+    /// frame but the last, which the resampler's short start holds back.
+    /// The clip's media time starts that delay before its first frame.
+    #[tokio::test]
+    async fn rfc7587_4_1_g711_and_g722_audio_is_transcoded_to_opus_without_a_warning() {
+        let (logs, _guard) = Logs::capture();
+        for codec in [Codec::Pcmu, Codec::Pcma, Codec::G722] {
+            let mut rig = Rig::new(Some(codec.clone()));
+            ten_narrowband_seconds(&rig, &codec);
+            let reader = rig.start(spec(3_500, Some(1_000), true));
+            settle().await;
+            assert_eq!(rig.report().await, started(4_000, Some("opus")));
+            let payload = narrowband_payload(&codec);
+            let mut audio = 500;
+            for index in 100..111_u32 {
+                let ms = u64::from(index) * 100;
+                while u64::from(audio) * 20 <= ms + 200 {
+                    rig.narrowband_frame(audio, &payload);
+                    audio += 1;
+                }
+                rig.video_frame(ms, index, index % 10 == 0, 16);
+                settle().await;
+            }
+            let reports = rig.until_stopped().await;
+            let bytes = reader.rest().await;
+            let lines = lines(&bytes);
+            assert_eq!(lines[0], "init video=h264 audio=opus");
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.starts_with("frame v"))
+                    .count(),
+                50,
+                "6.0 s to 10.9 s"
+            );
+            let delay = ToOpus::new(&codec, 8_000).unwrap().delay();
+            let lead = i64::try_from(delay.as_nanos() * 48 / 1_000_000).unwrap();
+            // The frame playing at the 6 s keyframe, captured with it, to the
+            // last captured before 11 s: 250 frames.
+            let first = 6 * 48_000 - lead;
+            let expected: Vec<(u32, i64)> = (0..249).map(|k| (0, first + 960 * k)).collect();
+            let samples = audio_samples(&lines);
+            let timeline: Vec<(u32, i64)> =
+                samples.iter().map(|(epoch, ts, _)| (*epoch, *ts)).collect();
+            assert_eq!(timeline, expected, "{codec:?}");
+            assert!(samples.iter().all(|(_, _, len)| *len > 0));
+            // The last packet's capture time, 10.96 s less the delay, from the
+            // origin, 6 s less the delay.
+            assert_eq!(reports, vec![stopped("completed", bytes.len(), 4_960, 0)]);
+        }
+        let started = logs.lines(Level::INFO, "clip: started");
+        for (line, from) in started.iter().zip(["pcmu", "pcma", "g722"]) {
+            assert!(
+                line.fields.contains("audio=\"opus\"")
+                    && line
+                        .fields
+                        .contains(&format!("audio_transcoded_from=\"{from}\""))
+                    && !line.fields.contains("audio_omitted=Some"),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// The camera's audio codec changing after the clip chose to transcode
+    /// it ends the clip `stream_changed`: mid-clip as any track change does,
+    /// and before the first frame, which the container would otherwise
+    /// start with another codec's frames in the transcode.
+    #[tokio::test]
+    async fn a_transcoded_audio_codec_that_changes_ends_the_clip_stream_changed() {
+        let (logs, _guard) = Logs::capture();
+        let payload = narrowband_payload(&Codec::Pcmu);
+        let mut rig = Rig::new(Some(Codec::Pcmu));
+        let _reader = rig.start(spec(0, None, true));
+        rig.video_frame(0, 0, true, 32);
+        rig.narrowband_frame(1, &payload);
+        rig.narrowband_frame(2, &payload);
+        settle().await;
+        assert_eq!(rig.report().await, started(0, Some("opus")));
+        rig.audio.as_ref().unwrap().set_codec(Codec::Pcma);
+        rig.video_frame(100, 1, false, 16);
+        let reports = rig.until_stopped().await;
+        let_assert_reason(&reports, "stream_changed");
+
+        let mut rig = Rig::new(Some(Codec::G722));
+        let reader = rig.start(spec(0, None, true));
+        settle().await;
+        rig.audio.as_ref().unwrap().set_codec(Codec::Pcmu);
+        rig.video_frame(0, 0, true, 32);
+        // Audio past the keyframe lets the interleaver release it.
+        rig.narrowband_frame(1, &payload);
+        let reports = rig.until_stopped().await;
+        assert_eq!(reports, vec![stopped("stream_changed", 0, 0, 0)]);
+        assert!(reader.rest().await.is_empty());
+        assert_eq!(
+            logs.count(
+                Level::INFO,
+                "clip: the audio changed before the clip started; ending"
+            ),
+            1
+        );
     }
 
     /// A container that never moves a frame back: each lasts 100 ms, and a
@@ -1577,6 +1839,10 @@ mod tests {
             audio: Option<&ClipTrack>,
         ) -> Result<Vec<Bytes>, ClipError> {
             self.inner.start(video, audio)
+        }
+
+        fn set_origin(&mut self, origin: Instant) {
+            self.origin.get_or_insert(origin);
         }
 
         fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, ClipError> {

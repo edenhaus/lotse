@@ -2,10 +2,13 @@
 //! depacketizer every AAC packet of a camera passes, and the AAC-LC to
 //! Opus chain of the transcoder (ISO/IEC 14496-3 decode, resampling to
 //! 48 kHz, RFC 6716 encode), the most expensive work per frame a worker
-//! does.
+//! does; and the event clips' G.711 and G.722 to Opus transcode (ITU-T
+//! G.711 or G.722 decode, resampling to 48 kHz, RFC 6716 encode), which
+//! each clip of such a camera runs on its audio.
 //!
 //! The input is one second of a recorded 1 kHz sine from this crate's
-//! `test-util` fixtures (`aac::test_data`). Run with `mise run bench`;
+//! `test-util` fixtures (`aac::test_data`), and one second of a 1 kHz tone
+//! encoded to G.711 or G.722 in 20 ms frames. Run with `mise run bench`;
 //! divan's harness, not libtest's.
 
 #![allow(
@@ -15,14 +18,21 @@
     reason = "benchmark code, held to the tests' rules: a failed setup is a panic"
 )]
 
+use bytes::Bytes;
 use divan::Bencher;
 use divan::counter::ItemsCount;
 use lotse_codec::aac::test_data::{
     CONFIG_16K_MONO, CONFIG_48K_MONO, SINE_16K_MONO, SINE_48K_MONO, frames,
 };
 use lotse_codec::aac::{self, AacDecoder, AacDepacketizer};
+use lotse_codec::g711::Law;
+use lotse_codec::g722::test_data::{encode, tone};
 use lotse_codec::opus::{self, Encoder};
 use lotse_codec::resample::Resampler;
+use lotse_codec::transcode::clip::ToOpus;
+use lotse_core::clock::{Clock as _, FakeClock};
+use lotse_core::codec::Codec;
+use lotse_core::media::{MediaFrame, MediaTime};
 use lotse_core::track::DEFAULT_MAX_FRAME_BYTES;
 
 /// The recordings' sample rates: 16 kHz is resampled, 48 kHz (Opus's own
@@ -96,6 +106,66 @@ fn aac_to_opus(bencher: Bencher<'_, '_>, rate: u32) {
         fifo.len() < opus::FRAME_SAMPLES,
         "every whole frame is encoded"
     );
+}
+
+/// The codecs a clip transcodes, by their API names.
+const CLIP_CODECS: [&str; 3] = ["pcmu", "pcma", "g722"];
+
+/// One second of a 1 kHz tone in `codec`, as fifty 20 ms payloads.
+fn narrowband_second(codec: &Codec) -> Vec<Bytes> {
+    // A quarter of full scale at 16 kHz; every other sample at 8 kHz.
+    let pcm = tone(1_000, 16_000);
+    match Law::of(codec) {
+        Some(law) => pcm
+            .iter()
+            .step_by(2)
+            .map(|sample| law.encode(*sample))
+            .collect::<Vec<u8>>()
+            .chunks(160)
+            .map(Bytes::copy_from_slice)
+            .collect(),
+        None => encode(&pcm)
+            .chunks(160)
+            .map(Bytes::copy_from_slice)
+            .collect(),
+    }
+}
+
+/// A clip's G.711 or G.722 to Opus transcode on one second of 20 ms
+/// frames, the timeline going on from one iteration to the next as a
+/// clip's does: decode, resampling to 48 kHz and one Opus packet per
+/// 20 ms. The time for one second is the share of one core a clip of such
+/// a camera spends on its audio.
+#[divan::bench(args = CLIP_CODECS)]
+fn clip_to_opus(bencher: Bencher<'_, '_>, name: &str) {
+    let codec = match name {
+        "pcmu" => Codec::Pcmu,
+        "pcma" => Codec::Pcma,
+        _ => Codec::G722,
+    };
+    let payloads = narrowband_second(&codec);
+    let mut chain = ToOpus::new(&codec, 8_000).unwrap();
+    let at = FakeClock::default().now();
+    let mut ts = 0_i64;
+    bencher
+        .counter(ItemsCount::new(payloads.len()))
+        .bench_local(|| {
+            let mut packets = 0;
+            for payload in &payloads {
+                let frame = MediaFrame {
+                    ts: MediaTime::from_ticks(ts),
+                    wallclock: at,
+                    arrival: at,
+                    keyframe: true,
+                    discontinuity: false,
+                    epoch: 0,
+                    payload: payload.clone(),
+                };
+                ts += 160;
+                packets += chain.push(&frame).unwrap().len();
+            }
+            packets
+        });
 }
 
 /// Runs the benchmarks of this file with divan's command line (`--help`).

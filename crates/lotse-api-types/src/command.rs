@@ -347,9 +347,10 @@ pub struct ClipStart {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub after_ms: Option<u32>,
-    /// Take the stream's audio into the clip when it fits the container
-    /// (AAC-LC, Opus; any other codec is left out with an
-    /// `audio_omitted` warning); `false` makes a video-only clip.
+    /// Take the stream's audio into the clip: AAC-LC and Opus as they are,
+    /// G.711 (PCMU, PCMA) and G.722 transcoded to Opus; any other codec is
+    /// left out with an `audio_omitted` warning. `false` makes a
+    /// video-only clip.
     #[serde(default = "with_audio")]
     pub audio: bool,
 }

@@ -32,12 +32,15 @@
 //! packet is released, after the old timeline's last.
 //!
 //! The reverse instance of the same contract, uplink audio to the camera's
-//! G.711 for talk-back, is [`uplink::ToG711`].
+//! G.711 for talk-back, is [`uplink::ToG711`]. The event clips' G.711 and
+//! G.722 → Opus chain, per clip and unpaced, is [`clip::ToOpus`]; it
+//! stamps its packets by the same rule.
 //!
 //! Implements RFC 7587 (Opus RTP: 48 kHz clock §4.1, one frame per
 //! packet §4.2) over RFC 6716 frames, from RFC 3640 AAC-LC frames
 //! (ISO/IEC 14496-3 §4, 1024 samples per frame).
 
+pub mod clip;
 mod pace;
 pub mod uplink;
 
