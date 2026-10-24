@@ -914,3 +914,191 @@ fn iso14496_12_8_8_8_the_declared_samples_add_up_the_runs_of_every_track_fragmen
     ];
     assert_eq!(declared_samples(&short_run).unwrap(), 0);
 }
+
+/// `init` with `child` added as the last box of its movie box, which ends
+/// the init segment.
+fn with_movie_child(init: &[u8], child: &[u8]) -> Vec<u8> {
+    let moov = locate(init, &[(b"moov", 0)]).0;
+    let size = u32::from_be_bytes(init[moov..moov + 4].try_into().unwrap());
+    assert_eq!(moov + size as usize, init.len());
+    let grown = size + u32::try_from(child.len()).unwrap();
+    let mut out = patched(init, moov, &grown.to_be_bytes());
+    out.extend_from_slice(child);
+    out
+}
+
+/// An item reference box with one reference from `from` to items 2 and
+/// 3, encoded by mp4-atom: version 1 when `from` needs 32 bits.
+fn item_references(from: u32) -> Vec<u8> {
+    let iref = mp4_atom::Iref {
+        references: vec![mp4_atom::Reference {
+            reference_type: FourCC::new(b"dimg"),
+            from_item_id: from,
+            to_item_ids: vec![2, 3],
+        }],
+    };
+    let mut encoded = Vec::new();
+    iref.encode(&mut encoded).unwrap();
+    encoded
+}
+
+/// The error mp4-atom gives once its count of the bytes left wraps.
+fn overrun(what: &'static str) -> Fmp4Error {
+    Fmp4Error::Box {
+        what,
+        reason: "over decode: iref".to_owned(),
+    }
+}
+
+/// The `fmp4_segment` fuzz target's crash (CI, 2026-10-24): the audio
+/// rendition's run retyped as an item reference box whose references,
+/// read as mp4-atom 0.16.2 reads them, claim more than it holds. mp4-atom
+/// subtracts their sizes unchecked and panicked in a debug build.
+#[test]
+fn iso14496_12_8_11_12_an_item_reference_past_its_box_in_a_fragment_is_refused() {
+    let mut patch = b"iref".to_vec();
+    patch.extend_from_slice(&[0; 77]);
+    patch.extend_from_slice(&[0xff, 0, 0, 0, 2]);
+    let at = locate(SPLIT_AUDIO_0, &[(b"moof", 0), (b"traf", 0), (b"trun", 0)]).0 + 4;
+    let segment = patched(SPLIT_AUDIO_0, at, &patch);
+    let err = segment_error(SPLIT_AUDIO_INIT, &segment);
+    assert_eq!(err, overrun("movie fragment"));
+    assert_eq!(
+        err.to_string(),
+        "the movie fragment cannot be read: over decode: iref"
+    );
+}
+
+/// mp4-atom reads an item reference box in every box it walks (ISO/IEC
+/// 14496-12 §8.11.1 places it in a `meta`): the user data box retyped
+/// as one claims the `meta` inside as a reference's size.
+#[test]
+fn iso14496_12_8_11_12_an_item_reference_past_its_box_in_the_movie_is_refused() {
+    let udta = locate(H264_AAC_INIT, &[(b"moov", 0), (b"udta", 0)]).0;
+    let init = patched(H264_AAC_INIT, udta + 4, b"iref");
+    assert_eq!(Reader::new(&init, MAX).unwrap_err(), overrun("movie box"));
+}
+
+/// Version 1 (32-bit item IDs): its one reference one byte longer than
+/// the box.
+#[test]
+fn iso14496_12_8_11_12_a_version_1_item_reference_past_its_box_is_refused() {
+    let mut iref = item_references(1 << 16);
+    assert_eq!(iref[8], 1);
+    let size = u32::try_from(iref.len() - 12 + 1).unwrap();
+    iref[12..16].copy_from_slice(&size.to_be_bytes());
+    let init = with_movie_child(H264_AAC_INIT, &iref);
+    assert_eq!(Reader::new(&init, MAX).unwrap_err(), overrun("movie box"));
+}
+
+/// Well-formed item references are read past as before, in either
+/// version.
+#[test]
+fn iso14496_12_8_11_12_well_formed_item_references_are_read_past() {
+    let whole = Reader::new(H264_AAC_INIT, MAX).unwrap().layout().clone();
+    for from in [1, 1 << 16] {
+        let init = with_movie_child(H264_AAC_INIT, &item_references(from));
+        assert_eq!(Reader::new(&init, MAX).unwrap().layout(), &whole);
+    }
+}
+
+/// A reference of version `version` (ISO/IEC 14496-12 §8.11.12.2):
+/// `size`, then `reference_type`, `from_item_ID`, `reference_count` and
+/// the IDs, each `id_size` bytes.
+fn reference(size: u32, id_size: usize, ids: &[u32]) -> Vec<u8> {
+    let mut out = size.to_be_bytes().to_vec();
+    out.extend_from_slice(b"dimg");
+    out.extend_from_slice(&1_u32.to_be_bytes()[4 - id_size..]);
+    out.extend_from_slice(&u16::try_from(ids.len()).unwrap().to_be_bytes());
+    for id in ids {
+        out.extend_from_slice(&id.to_be_bytes()[4 - id_size..]);
+    }
+    out
+}
+
+#[test]
+fn iso14496_12_8_11_12_references_overrun_where_mp4_atom_counts_past_zero() {
+    for (version, id_size, own) in [(0_u8, 2, 14_u32), (1, 4, 18)] {
+        let body =
+            |references: &[Vec<u8>]| [&[version, 0, 0, 0][..], &references.concat()].concat();
+        // Tiled exactly: read to the end.
+        let exact = body(&[reference(own, id_size, &[2]), reference(own, id_size, &[3])]);
+        assert!(!references_overrun(&exact), "v{version}");
+        // The second reference one byte longer than the bytes left.
+        let past = body(&[
+            reference(own, id_size, &[2]),
+            reference(own + 1, id_size, &[3]),
+        ]);
+        assert!(references_overrun(&past), "v{version}");
+        // The first claims all the bytes: mp4-atom stops before the second's
+        // size, however large.
+        let all = body(&[
+            reference(2 * own, id_size, &[2]),
+            reference(u32::MAX, id_size, &[3]),
+        ]);
+        assert!(!references_overrun(&all), "v{version}");
+        // Sizes of zero count nothing: mp4-atom reads on until a field
+        // runs past the body, an ID, the count or the next size, and
+        // refuses it.
+        let zero = body(&[reference(0, id_size, &[2]), reference(0, id_size, &[3])]);
+        assert!(!references_overrun(&zero), "v{version}");
+        let second = 4 + (zero.len() - 4) / 2;
+        for end in [zero.len() - 1, 4 + 4 + 4 + id_size + 1, second + 3] {
+            assert!(!references_overrun(&zero[..end]), "v{version} {end}");
+        }
+    }
+    // A version mp4-atom refuses, a body too short for one, and no references.
+    let mut other = [&[2, 0, 0, 0][..], &reference(u32::MAX, 2, &[])].concat();
+    assert!(!references_overrun(&other));
+    other[0] = 0;
+    assert!(references_overrun(&other));
+    assert!(!references_overrun(&[0, 0, 0]));
+    assert!(!references_overrun(&[0, 0, 0, 0]));
+}
+
+/// Whether `check_item_references` refuses `body` with mp4-atom's error
+/// for an item reference box whose count wraps.
+fn refused(body: &[u8]) -> bool {
+    matches!(
+        check_item_references(body),
+        Err(mp4_atom::Error::OverDecode(kind)) if kind == IREF
+    )
+}
+
+#[test]
+fn iso14496_12_4_2_every_iref_type_is_taken_for_a_box_mp4_atom_may_read() {
+    let iref = |size: u32, reference_size: u32| {
+        [
+            &size.to_be_bytes()[..],
+            b"iref",
+            &[0; 4],
+            &reference(reference_size, 2, &[]),
+        ]
+        .concat()
+    };
+    // A reference one byte past the box, at any depth, after anything.
+    let past = iref(24, 13);
+    assert!(refused(&past));
+    assert!(refused(&[&[7; 9][..], &past].concat()));
+    // Well-formed, or running past the end of the body: not read.
+    assert!(check_item_references(&iref(24, 12)).is_ok());
+    assert!(check_item_references(&iref(25, 13)).is_ok());
+    // A size of zero runs to the end of a box not known.
+    assert!(refused(&iref(0, 12)));
+    // A size below the header's, and a type without room for a size
+    // before it: no box mp4-atom reads.
+    assert!(check_item_references(&iref(7, 13)).is_ok());
+    assert!(check_item_references(&past[4..]).is_ok());
+    // A large size (ISO/IEC 14496-12 §4.2, `largesize`), and its header
+    // cut short.
+    let large = [
+        &1_u32.to_be_bytes()[..],
+        b"iref",
+        &32_u64.to_be_bytes(),
+        &past[8..],
+    ]
+    .concat();
+    assert!(refused(&large));
+    assert!(check_item_references(&large[..15]).is_ok());
+    assert!(check_item_references(&large[..large.len() - 1]).is_ok());
+}
