@@ -2,8 +2,10 @@
 //! event clip's frames into the bytes of one file, and the policy a clip
 //! runs under.
 //!
-//! A clip joins with the track's pre-roll ring and takes its frames with
-//! reliable delivery: the worker's clip task drains the subscriptions into
+//! A clip joins with the track's pre-roll ring, taking its subscription and
+//! the snapshot together
+//! ([`Track::subscribe_from_preroll`](crate::track::Track::subscribe_from_preroll)),
+//! and takes its frames with reliable delivery: the worker's clip task drains the subscriptions into
 //! a [`ReliableQueue`](crate::interleave::ReliableQueue), merges them in
 //! capture order through an [`Interleaver`](crate::interleave::Interleaver)
 //! and hands each frame to the [`ClipMuxer`] the registered
