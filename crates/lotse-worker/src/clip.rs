@@ -2,15 +2,21 @@
 //! pre-roll ring, continues with the live frames and writes the registered
 //! container into the pipe the supervisor passed, until the clip ends.
 //!
-//! A clip waits for the source's tracks, subscribes to the native video
-//! track and, when asked and the container carries its codec, the native
-//! audio track, and only then takes the rings' snapshots, so nothing is lost
-//! or written twice between the two: the [`ReliableQueue`] drops the live
+//! A clip waits for the source's tracks, then takes the native video
+//! track's subscription and its ring's snapshot together, and the native
+//! audio track's alike when asked and the container carries its codec
+//! ([`Track::subscribe_from_preroll`]): a snapshot never starts after a
+//! frame its subscription yields, so nothing is lost, reordered or
+//! written twice between the two, and the [`ReliableQueue`] drops the live
 //! frames the pre-roll holds. It starts at the newest held keyframe
 //! captured at or before `now − before_ms` (else the oldest held),
 //! preferring a later held one whose in-band parameter sets are the
-//! track's, which the container's sample entry carries; with nothing held
-//! it starts at the next keyframe, waiting for it up to the start timeout.
+//! track's, which the container's sample entry carries (both taken again
+//! from there, together); the audio starts with the frame playing when
+//! that keyframe was captured, by the ring's measure ([`captured`]: its
+//! arrival when it is dated ahead of it), from where `before_ms` counts.
+//! With nothing held it starts at the next keyframe, waiting for it up to
+//! the start timeout.
 //! The frames go through the queue and the [`Interleaver`] into the
 //! [`ClipMuxer`], and the bytes into the pipe without blocking.
 //!
@@ -25,8 +31,14 @@
 //! up to the clip's end, for at most [`FINISH_GRACE`] of a reader taking
 //! it; any other end drops the queue. Every end but a gone reader then
 //! writes the container's last fragment, for at most [`FINISH_GRACE`],
-//! closes the pipe and reports `Stopped` last.
-//! Gaps carry clip media time: milliseconds from the clip's first frame.
+//! closes the pipe and reports `Stopped` last; a failure the drain meets
+//! (a codec change, the container failing a frame) or a reader gone while
+//! a graceful end writes its last bytes ends the clip for that instead.
+//! Gaps and the duration carry clip media time, where the container put
+//! the frames ([`ClipMuxer::media_time`]), never their capture times: a
+//! gap runs from where the frame before the hole was put to where the
+//! frame that ends it was, a hole the queue reports included; a hole the
+//! clip ends in is none.
 //!
 //! Standards: the container is the muxer's (ISO/IEC 14496-12 fragmented
 //! MP4 for the daemon's); the parameter sets a start keyframe carries in
@@ -46,11 +58,11 @@ use lotse_core::clock::Clock;
 use lotse_core::codec::{Codec, Kind};
 use lotse_core::interleave::{GapReason, Interleaver, Out, ReliableQueue};
 use lotse_core::media::{MediaFrame, MediaTime};
-use lotse_core::preroll::PrerollSnapshot;
+use lotse_core::preroll::{PrerollSnapshot, captured};
 use lotse_core::source::TrackSet;
 use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
-use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
+use lotse_core::track::{Track, TrackEvent, TrackSubscription};
 use lotse_ipc::{ClipReport, ClipSpec};
 use tokio::net::unix::pipe;
 use tokio::sync::{mpsc, watch};
@@ -493,22 +505,36 @@ impl Continuity {
         }
     }
 
-    /// The queue reported a hole: the next frame continues from nothing.
+    /// The queue reported a hole: the next frame continues from nothing,
+    /// and teaches the interval anew, since the frames lost may span a
+    /// reconnect to another frame rate whose epoch change the next frame
+    /// then passes unseen.
     const fn reset(&mut self) {
         self.last = None;
+        self.step = None;
     }
 }
 
-/// The video snapshot a clip starts from: the ring's frames from the
-/// newest keyframe captured at or before `target` (else the oldest held),
-/// or from a later held keyframe when that one carries parameter sets
-/// other than the track's and a later one does not, since the container's
-/// sample entry has the track's newest; `None` when nothing is held.
-fn start_snapshot(video: &Track, target: Instant) -> Option<PrerollSnapshot> {
-    let snapshot = video.preroll_snapshot(target)?;
+/// A clip's video subscription and the snapshot it starts from, taken
+/// together ([`Track::subscribe_from_preroll`]): the ring's frames from
+/// the newest keyframe captured at or before `target` (else the oldest
+/// held), or from a later held keyframe when that one carries parameter
+/// sets other than the track's and a later one does not, since the
+/// container's sample entry has the track's newest; no snapshot when
+/// nothing is held. The later start is taken again, with a subscription of
+/// its own: the ring moved on since the first, and a snapshot taken beside
+/// the first subscription could start after frames that one yields.
+fn start_video(
+    video: &Arc<Track>,
+    target: Instant,
+) -> (TrackSubscription, Option<PrerollSnapshot>) {
+    let (subscription, snapshot) = video.subscribe_from_preroll(target);
+    let Some(snapshot) = snapshot else {
+        return (subscription, None);
+    };
     let codec = video.codec();
     if sets_match(&codec, &snapshot.start().payload) {
-        return Some(snapshot);
+        return (subscription, Some(snapshot));
     }
     let tidy = snapshot
         .frames()
@@ -518,8 +544,11 @@ fn start_snapshot(video: &Track, target: Instant) -> Option<PrerollSnapshot> {
         later = tidy.is_some(),
         "clip: the start keyframe carries other parameter sets than the track's"
     );
-    tidy.and_then(|at| video.preroll_snapshot(at))
-        .or(Some(snapshot))
+    match tidy.map(|at| video.subscribe_from_preroll(at)) {
+        Some((later, Some(from))) => (later, Some(from)),
+        // None later, or the ring emptied since: the first pair stands.
+        _ => (subscription, Some(snapshot)),
+    }
 }
 
 /// Whether every parameter set `access_unit` (Annex B) carries in band is
@@ -581,11 +610,14 @@ struct Clip {
     pending: VecDeque<Bytes>,
     /// Bytes the pipe took.
     written: u64,
-    /// The first frame's capture time, once the container started: clip
-    /// media time counts from it.
-    origin: Option<Instant>,
-    /// The newest capture time written.
-    newest: Option<Instant>,
+    /// Whether the container started, at the first frame.
+    begun: bool,
+    /// The furthest clip media time a frame was put at, on either track:
+    /// the duration `Stopped` reports.
+    reached: Duration,
+    /// The holes the queue reported per track, by their API name, until
+    /// the frame that ends each is in the container: where they are.
+    holes: HashMap<Kind, &'static str>,
     /// The codecs of the container's sample entries, video and audio,
     /// once it started.
     entries: Option<(Codec, Option<Codec>)>,
@@ -644,8 +676,9 @@ impl Clip {
             outbox: Vec::new(),
             pending: VecDeque::new(),
             written: 0,
-            origin: None,
-            newest: None,
+            begun: false,
+            reached: Duration::ZERO,
+            holes: HashMap::new(),
             entries: None,
             before_ms: 0,
             omitted: None,
@@ -703,25 +736,27 @@ impl Clip {
             }
             _ => None,
         };
-        let video = video_track.subscribe(Unit::Frames);
-        let audio = audio_track
-            .as_ref()
-            .map(|track| track.subscribe(Unit::Frames));
-        let mut queue = ReliableQueue::new(self.settings.policy.queue_bytes, audio.is_some());
-        let now = self.clock.now();
         // Linux's monotonic clock reads as a signed timespec, so a window
         // reaching back before it started does not fail there.
         let target = self
             .started
             .checked_sub(self.before)
             .unwrap_or(self.started);
-        if let Some(snapshot) = start_snapshot(video_track, target) {
+        let (video, snapshot) = start_video(video_track, target);
+        let audio_target = snapshot
+            .as_ref()
+            .map_or(target, |snapshot| captured(snapshot.start()));
+        let (audio, audio_snapshot) = audio_track
+            .as_ref()
+            .map(|track| track.subscribe_from_preroll(audio_target))
+            .map_or((None, None), |(audio, snapshot)| (Some(audio), snapshot));
+        let mut queue = ReliableQueue::new(self.settings.policy.queue_bytes, audio.is_some());
+        let now = self.clock.now();
+        if let Some(snapshot) = snapshot {
             self.before_ms = millis(snapshot.age(self.started));
             queue.preroll(Kind::Video, &snapshot, now);
-            if let Some(audio_snapshot) = audio_track
-                .as_ref()
-                .and_then(|track| track.preroll_snapshot(snapshot.start().wallclock))
-            {
+            // An audio snapshot without a video one would only be ignored.
+            if let Some(audio_snapshot) = audio_snapshot {
                 queue.preroll(Kind::Audio, &audio_snapshot, now);
             }
         }
@@ -784,7 +819,7 @@ impl Clip {
     /// its bytes.
     fn step(&mut self, media: &mut Media) -> Result<(), EndReason> {
         let now = self.clock.now();
-        if self.origin.is_none() && now >= self.start_deadline() {
+        if !self.begun && now >= self.start_deadline() {
             tracing::info!(clip.id = %self.id, "clip: no keyframe to start at in time");
             return Err(EndReason::SourceNotLive);
         }
@@ -811,7 +846,7 @@ impl Clip {
     /// clip: its hold over would wake it at once again and again.
     fn wake(&self, interleaver: &Interleaver) -> Instant {
         let mut wake = self.late_end();
-        if self.origin.is_none() {
+        if !self.begun {
             wake = wake.min(self.start_deadline());
         }
         if self.pending.is_empty()
@@ -826,22 +861,13 @@ impl Clip {
     fn take(&mut self, out: Out, media: &Media) -> Result<(), EndReason> {
         match out {
             Out::Frame { track, frame } => self.frame(track, frame, media),
-            Out::Gap {
-                track,
-                reason,
-                from,
-                to,
-            } => {
+            // Its capture times are not where the file has it: it waits for
+            // the frame that ends it, which follows on its track.
+            Out::Gap { track, reason, .. } => {
                 if track == Kind::Video {
                     self.continuity.reset();
                 }
-                // Every hole follows a frame written, so the origin is set.
-                let origin = self.origin.unwrap_or(from);
-                let (from, to) = (
-                    from.saturating_duration_since(origin),
-                    to.saturating_duration_since(origin),
-                );
-                self.gap(gap_name(reason), from, to);
+                self.holes.insert(track, gap_name(reason));
                 Ok(())
             }
             Out::Control { track, event } => self.control(track, &event),
@@ -849,13 +875,16 @@ impl Clip {
     }
 
     /// One frame: the end when it was captured at or after the clip's;
-    /// the container's start before the first; a gap when it ends a hole
-    /// of the video: from the video frame before it to this one, where the
+    /// the container's start before the first; a gap when it ends a hole,
+    /// one the queue reported on its track or one the video's continuity
+    /// shows: from the frame of its track before it to this one, where the
     /// container put them. That can be later than their capture times (an
     /// epoch captured before the last frame began starts where that frame
-    /// ends), and a gap from capture times then disagreed with the file,
-    /// or ended before it began, a report the supervisor refuses (found
-    /// end to end, 2026-10-23: a camera reconnecting within a frame).
+    /// ends, and a frame that came early in its interval where the one
+    /// before it ends), and a gap from capture times then disagreed with
+    /// the file, or ended before it began, a report the supervisor refuses
+    /// (found end to end, 2026-10-23: a camera reconnecting within a
+    /// frame). Where it was put is how far the clip reaches.
     fn frame(
         &mut self,
         track: Kind,
@@ -866,10 +895,10 @@ impl Clip {
             tracing::debug!(clip.id = %self.id, reason = self.end_reason.name(), "clip: its end is reached");
             return Err(self.end_reason);
         }
-        if self.origin.is_none() {
-            self.begin(frame.wallclock, media)?;
+        if !self.begun {
+            self.begin(media)?;
         }
-        let hole = match track {
+        let seen = match track {
             Kind::Video => match self.continuity.observe(&frame) {
                 Seen::Follows => None,
                 Seen::Ends(reason) => Some(reason),
@@ -877,14 +906,16 @@ impl Clip {
             },
             Kind::Audio => None,
         };
-        let from = self.muxer.media_time(Kind::Video);
-        self.newest = self.newest.max(Some(frame.wallclock));
+        // The queue's hole resets the continuity, which then sees none.
+        let hole = self.holes.remove(&track).or(seen);
+        let from = self.muxer.media_time(track);
         let bytes = self
             .muxer
             .push(track, frame)
             .map_err(|err| self.failed("push", &err))?;
+        let to = self.muxer.media_time(track);
+        self.reached = self.reached.max(to);
         if let Some(reason) = hole {
-            let to = self.muxer.media_time(Kind::Video);
             self.gap(reason, from, to);
         }
         self.queue(bytes);
@@ -892,9 +923,9 @@ impl Clip {
     }
 
     /// Starts the container with the tracks' codecs as they are now, the
-    /// newest parameter sets, at the first frame captured at `origin`, and
-    /// reports `Started` (and the omitted audio's warning).
-    fn begin(&mut self, origin: Instant, media: &Media) -> Result<(), EndReason> {
+    /// newest parameter sets, at the first frame, and reports `Started`
+    /// (and the omitted audio's warning).
+    fn begin(&mut self, media: &Media) -> Result<(), EndReason> {
         let video_track = media.video.track();
         let video = ClipTrack {
             codec: (*video_track.codec()).clone(),
@@ -909,7 +940,7 @@ impl Clip {
             .start(&video, audio.as_ref())
             .map_err(|err| self.failed("start", &err))?;
         self.queue(init);
-        self.origin = Some(origin);
+        self.begun = true;
         let audio_name = audio.as_ref().map(|audio| audio.codec.name().to_owned());
         tracing::info!(
             clip.id = %self.id,
@@ -1053,7 +1084,9 @@ impl Clip {
     /// and the pipe, frames held for the other track released at once, up
     /// to the first frame captured at or after the clip's end, for at most
     /// [`FINISH_GRACE`] of a reader taking it; what is left then is
-    /// dropped. `client_gone` when the reader went meanwhile.
+    /// dropped. `client_gone` when the reader went meanwhile, and what else
+    /// ends the clip on the way (a codec change, the container failing a
+    /// frame); reaching the clip's own end keeps the reason it ends for.
     async fn drain(&mut self, media: &mut Media) -> Option<EndReason> {
         let deadline = self.clock.now().checked_add(FINISH_GRACE);
         loop {
@@ -1067,8 +1100,8 @@ impl Clip {
                     .checked_add(self.settings.policy.max_skew)
                     .unwrap_or(now);
                 let out = media.interleaver.next(release)?;
-                if self.take(out, media).is_err() {
-                    return None;
+                if let Err(end) = self.take(out, media) {
+                    return (end != self.end_reason).then_some(end);
                 }
                 continue;
             }
@@ -1091,11 +1124,13 @@ impl Clip {
 
     /// Ends the clip for `reason`: the container's last fragment and the
     /// bytes still pending go to the pipe for at most [`FINISH_GRACE`],
-    /// unless the reader is gone; the pipe closes, and `Stopped` is the
-    /// last report.
-    async fn finish(mut self, reason: EndReason) {
+    /// unless the reader is gone; a reader that goes meanwhile ends a
+    /// graceful clip `client_gone`, since its file is not whole. The pipe
+    /// closes, and `Stopped` is the last report, its duration the furthest
+    /// media time a frame was put at.
+    async fn finish(mut self, mut reason: EndReason) {
         if reason != EndReason::ClientGone {
-            if self.origin.is_some() {
+            if self.begun {
                 match self.muxer.finish() {
                     Ok(last) => self.queue(last),
                     Err(err) => {
@@ -1103,12 +1138,14 @@ impl Clip {
                     }
                 }
             }
-            self.flush().await;
+            if let Err(gone) = self.flush().await
+                && reason.is_graceful()
+            {
+                reason = gone;
+            }
         }
         self.send_reports().await;
-        let duration_ms = self.newest.zip(self.origin).map_or(0, |(newest, origin)| {
-            millis(newest.saturating_duration_since(origin))
-        });
+        let duration_ms = millis(self.reached);
         let Self {
             id,
             pipe,
@@ -1137,13 +1174,14 @@ impl Clip {
     }
 
     /// Writes the pending bytes as the pipe takes them, for at most
-    /// [`FINISH_GRACE`]; a reader that takes them not in time, or is gone,
-    /// gets the file without them.
-    async fn flush(&mut self) {
+    /// [`FINISH_GRACE`]; a reader that takes them not in time gets the
+    /// file without them, and one that is gone `client_gone`.
+    async fn flush(&mut self) -> Result<(), EndReason> {
         let deadline = self.clock.now().checked_add(FINISH_GRACE);
         loop {
-            if self.write().is_err() || self.pending.is_empty() {
-                return;
+            self.write()?;
+            if self.pending.is_empty() {
+                return Ok(());
             }
             let left = deadline.map_or(FINISH_GRACE, |deadline| {
                 deadline.saturating_duration_since(self.clock.now())
@@ -1153,7 +1191,7 @@ impl Clip {
                 () = self.clock.sleep(left) => {
                     let pending: usize = self.pending.iter().map(Bytes::len).sum();
                     tracing::warn!(clip.id = %self.id, pending, "clip: the reader did not take the last bytes in time; closing without them");
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -1323,8 +1361,19 @@ mod tests {
             factory: impl ClipMuxerFactory + 'static,
             settings: ClipSettings,
         ) -> Reader {
-            let (reader, writer) = io::pipe().unwrap();
             let clock: Arc<dyn Clock> = self.clock.clone();
+            self.start_on(spec, factory, settings, clock)
+        }
+
+        /// [`Self::start_with`], the clip reading `clock`.
+        fn start_on(
+            &mut self,
+            spec: ClipSpec,
+            factory: impl ClipMuxerFactory + 'static,
+            settings: ClipSettings,
+            clock: Arc<dyn Clock>,
+        ) -> Reader {
+            let (reader, writer) = io::pipe().unwrap();
             self.clips.start(ClipStart {
                 spec,
                 pipe: pipe::Sender::from_owned_fd(OwnedFd::from(writer)).unwrap(),
@@ -1603,10 +1652,12 @@ mod tests {
     /// A reconnect whose first frame was captured before the frame ahead of
     /// it (the new connection's clock mapped a little early): the container
     /// puts it after that frame, and the gap is where the container put the
-    /// two, so it never ends before it begins. Regression: from capture
-    /// times the gap ended 50 ms before it began, a report the supervisor
-    /// refuses, which ended the clip `internal_error` (the end-to-end clip
-    /// test's camera reconnected within a frame).
+    /// two, so it never ends before it begins, and the clip's duration
+    /// runs to there. Regression: from capture times the gap ended 50 ms
+    /// before it began, a report the supervisor refuses, which ended the
+    /// clip `internal_error` (the end-to-end clip test's camera reconnected
+    /// within a frame); and the duration was the capture times' 100 ms,
+    /// short of the gap's end.
     #[tokio::test]
     async fn a_reconnect_s_gap_is_where_the_container_put_its_frames() {
         assert!(Moving.accepts(&h264()), "what the fake container takes");
@@ -1632,7 +1683,9 @@ mod tests {
         rig.clips.stop("k1", EndReason::Stopped);
         let reports = rig.until_stopped().await;
         let bytes = reader.rest().await;
-        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 100, 1)]);
+        // The duration is where the container put the last frame, as the
+        // gap is: not its capture time, 100 ms after the first.
+        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 200, 1)]);
     }
 
     /// Frames dropped inside an epoch (the video's timestamp jumps by more
@@ -1684,9 +1737,10 @@ mod tests {
     /// `reconnect` gap ends at that keyframe. Regression (found end to end:
     /// MediaMTX 1.21.1, a publisher restarted inside a clip): the clip
     /// resumed with half a second of P-frames a decoder took the old
-    /// epoch's pictures for.
+    /// epoch's pictures for. Leaving them out is logged once per epoch.
     #[tokio::test]
     async fn a_new_epoch_s_video_starts_at_its_first_keyframe() {
+        let (logs, _guard) = Logs::capture();
         let mut rig = Rig::new(None);
         let reader = rig.start(spec(0, None, false));
         rig.video_frame(0, 0, true, 32);
@@ -1721,12 +1775,23 @@ mod tests {
             ]
         );
         assert_eq!(reports, vec![stopped("stopped", bytes.len(), 3_300, 1)]);
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "clip: the new epoch's video is left out until its first keyframe"
+            ),
+            1,
+            "once per epoch, not per frame"
+        );
     }
 
     /// Capture times that jitter while the timestamps run evenly are no
     /// hole: before a camera's first Sender Report a frame's capture time
     /// is its arrival, and two frames arriving together made the shortest
     /// advance a millisecond and every later frame a `frames_dropped` gap.
+    /// Nor is a frame that repeats the newest timestamp (it advances
+    /// nothing, so it teaches no interval) or one that advances it by
+    /// exactly twice the interval: a hole is more than twice.
     /// Regression (found end to end: MediaMTX 1.21.1 relaying libx265, and
     /// the first seconds after a reconnect): 163 gaps in a clip whose file
     /// had none.
@@ -1742,6 +1807,10 @@ mod tests {
             (160, 4),
             (161, 5),
             (240, 6),
+            // The newest timestamp again: no advance, so no interval.
+            (250, 6),
+            // Twice the interval: not more than twice, no hole.
+            (320, 8),
         ] {
             rig.video_frame(ms, index, index == 0, 16);
             settle().await;
@@ -1750,7 +1819,7 @@ mod tests {
         rig.clips.stop("k1", EndReason::Stopped);
         let reports = rig.until_stopped().await;
         let bytes = reader.rest().await;
-        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 240, 0)]);
+        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 320, 0)]);
     }
 
     /// A reader that stops reading fills the pipe, then the clip's queue; the
@@ -2496,6 +2565,403 @@ mod tests {
                 start_timeout: Duration::from_secs(10),
                 max_clips: 8,
             }
+        );
+    }
+
+    /// A clock that publishes `frames` at its `at`-th reading: a source on
+    /// another worker thread publishing between two steps of a clip's
+    /// start, which a test on one thread interleaves no other way.
+    #[derive(Debug)]
+    struct Interposing {
+        inner: Arc<FakeClock>,
+        readings: std::sync::atomic::AtomicUsize,
+        at: usize,
+        frames: std::sync::Mutex<Vec<(Arc<Track>, MediaFrame)>>,
+    }
+
+    impl Clock for Interposing {
+        fn now(&self) -> Instant {
+            let reading = self
+                .readings
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if reading + 1 == self.at {
+                for (track, frame) in self.frames.lock().unwrap().drain(..) {
+                    assert!(track.publish_frame(frame));
+                }
+            }
+            self.inner.now()
+        }
+
+        fn wall_now(&self) -> std::time::SystemTime {
+            self.inner.wall_now()
+        }
+
+        fn sleep(&self, duration: Duration) -> lotse_core::task::BoxFuture<'static, ()> {
+            self.inner.sleep(duration)
+        }
+    }
+
+    /// A frame of `rig`'s of `len` bytes, `ts` in the track's ticks,
+    /// captured at `ms` and arriving at `arrival_ms` after the start.
+    fn frame_at(
+        rig: &Rig,
+        (ms, arrival_ms): (u64, u64),
+        ts: i64,
+        keyframe: bool,
+        len: usize,
+    ) -> MediaFrame {
+        MediaFrame {
+            ts: MediaTime::from_ticks(ts),
+            wallclock: rig.at(ms),
+            arrival: rig.at(arrival_ms),
+            keyframe,
+            discontinuity: false,
+            epoch: 0,
+            payload: vec![if keyframe { 0x65 } else { 0x41 }; len].into(),
+        }
+    }
+
+    /// A frame on `track` over `max_frame_bytes`, captured at `ms`: the
+    /// track drops it, and its subscribers lag one.
+    fn oversize(rig: &Rig, track: &Track, ms: u64) {
+        rig.advance_to(ms);
+        let len = TrackLimits::default().max_frame_bytes + 1;
+        assert!(!track.publish_frame(frame_at(rig, (ms, ms), 0, false, len)));
+    }
+
+    /// Frames a source publishes while a clip starts (between its reading
+    /// of the clock and its next) come after the pre-roll, each once and in
+    /// order, on either track: the clip takes each track's subscription and
+    /// snapshot together, so the snapshot never starts after a frame its
+    /// subscription yields. Regression: subscribed first and snapshotted
+    /// after, the snapshot started at the keyframe published in between,
+    /// and the P-frame before it, and the keyframe again, were written after
+    /// it; the audio the same way.
+    #[tokio::test]
+    async fn frames_published_while_a_clip_starts_follow_its_pre_roll_once_and_in_order() {
+        let mut rig = Rig::new(Some(fake_aac()));
+        rig.video_frame(0, 0, true, 32);
+        rig.audio_frame(0);
+        rig.audio_frame(1);
+        rig.video_frame(100, 1, false, 16);
+        rig.audio_frame(2);
+        rig.advance_to(200);
+        let audio = Arc::clone(rig.audio.as_ref().unwrap());
+        let frames = vec![
+            (
+                Arc::clone(rig.video()),
+                frame_at(&rig, (150, 200), 6_000, false, 16),
+            ),
+            (
+                Arc::clone(&audio),
+                frame_at(&rig, (172, 200), 3 * 1_024, true, 4),
+            ),
+            (
+                Arc::clone(&audio),
+                frame_at(&rig, (178, 200), 4 * 1_024, true, 4),
+            ),
+            (
+                Arc::clone(rig.video()),
+                frame_at(&rig, (180, 200), 9_000, true, 32),
+            ),
+        ];
+        let clock = Arc::new(Interposing {
+            inner: Arc::clone(&rig.clock),
+            readings: std::sync::atomic::AtomicUsize::new(0),
+            // The first reading is the clip's start, the second inside it.
+            at: 2,
+            frames: std::sync::Mutex::new(frames),
+        });
+        assert_eq!(clock.wall_now(), rig.clock.wall_now());
+        let reader = rig.start_on(
+            spec(0, None, true),
+            FakeClipMuxerFactory::default(),
+            ClipSettings::default(),
+            clock,
+        );
+        settle().await;
+        assert_eq!(rig.report().await, started(200, Some("aac_lc")));
+        rig.clips.stop("k1", EndReason::Stopped);
+        let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+        let lines = lines(&bytes);
+        let video: Vec<&str> = lines
+            .iter()
+            .filter(|line| line.starts_with("frame v"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            video,
+            [
+                "frame v 0 0 k 32",
+                "frame v 0 3000 - 16",
+                "frame v 0 6000 - 16",
+                "frame v 0 9000 k 32",
+            ]
+        );
+        let audio: Vec<String> = lines
+            .iter()
+            .filter(|line| line.starts_with("frame a"))
+            .cloned()
+            .collect();
+        let expected: Vec<String> = (0..5)
+            .map(|index| format!("frame a 0 {} k 4", index * 1_024))
+            .collect();
+        assert_eq!(audio, expected);
+        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 180, 0)]);
+    }
+
+    /// The audio starts with the frame playing when the video's start
+    /// keyframe was captured by the pre-roll's measure, its arrival when it
+    /// is dated ahead of it (a Sender Report mapping off), as `before_ms`
+    /// counts it: a keyframe arriving at 500 ms dated 900 ms starts the
+    /// audio at 448 ms. Regression: the audio started at 896 ms, 400 ms
+    /// short of what `before_ms` said the clip holds.
+    #[tokio::test]
+    async fn a_keyframe_dated_ahead_of_its_arrival_starts_the_audio_at_its_arrival() {
+        let mut rig = Rig::new(Some(fake_aac()));
+        for index in 0..8 {
+            rig.audio_frame(index);
+        }
+        rig.advance_to(500);
+        assert!(
+            rig.video()
+                .publish_frame(frame_at(&rig, (900, 500), 0, true, 32))
+        );
+        for index in 8..16 {
+            rig.audio_frame(index);
+        }
+        rig.advance_to(1_000);
+        let reader = rig.start(spec(0, None, true));
+        settle().await;
+        assert_eq!(rig.report().await, started(500, Some("aac_lc")));
+        rig.clips.stop("k1", EndReason::Stopped);
+        let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+        let lines = lines(&bytes);
+        assert_eq!(lines[1], format!("frame a 0 {} k 4", 7 * 1_024), "448 ms");
+        assert_eq!(
+            lines[9], "frame v 0 0 k 32",
+            "after the audio before 900 ms"
+        );
+        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 512, 0)]);
+    }
+
+    /// A hole the queue reports (the subscription lagged: the track dropped
+    /// a frame over `max_frame_bytes`) is where the container put the frames
+    /// on either side of it, as a reconnect's is: the keyframe that ends it,
+    /// captured 60 ms after the frame before it, goes where that one ends,
+    /// at 200 ms. Regression: the gap was the capture times', 100 to 160 ms,
+    /// in a file that had it from 100 to 200 ms.
+    #[tokio::test]
+    async fn a_lag_s_gap_is_where_the_container_put_its_frames() {
+        let mut rig = Rig::new(None);
+        let reader = rig.start_with(spec(0, None, false), Moving, ClipSettings::default());
+        rig.video_frame(0, 0, true, 32);
+        rig.video_frame(100, 1, false, 16);
+        settle().await;
+        oversize(&rig, rig.video(), 130);
+        rig.video_frame(160, 3, true, 32);
+        settle().await;
+        assert_eq!(rig.report().await, started(0, None));
+        assert_eq!(rig.report().await, gap("lagged", 100, 200));
+        rig.clips.stop("k1", EndReason::Stopped);
+        let reports = rig.until_stopped().await;
+        let bytes = reader.rest().await;
+        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 200, 1)]);
+    }
+
+    /// A lag leaves the frame interval before it behind, across a reconnect
+    /// to a slower frame rate or within the epoch (a camera lowering its
+    /// rate, as many do in the dark): the frames after it teach their own,
+    /// so frames 300 ms apart after 100 ms ones are no `frames_dropped`
+    /// gap. Regression: the keyframe after the lag passed the epoch's
+    /// change unseen (the hole had cleared the newest timestamp, not the
+    /// interval), the old 100 ms interval stayed, and every later frame
+    /// was a gap.
+    #[tokio::test]
+    async fn a_lag_resumes_at_the_frame_interval_after_it_across_a_reconnect_or_not() {
+        for reconnect in [true, false] {
+            let mut rig = Rig::new(None);
+            let reader = rig.start(spec(0, None, false));
+            rig.video_frame(0, 0, true, 32);
+            rig.video_frame(100, 1, false, 16);
+            settle().await;
+            oversize(&rig, rig.video(), 150);
+            settle().await;
+            if reconnect {
+                rig.publisher.discontinuity();
+            }
+            for (ms, index, keyframe) in [(1_000, 10, true), (1_300, 13, false), (1_600, 16, false)]
+            {
+                rig.video_frame(ms, index, keyframe, if keyframe { 32 } else { 16 });
+                settle().await;
+            }
+            assert_eq!(rig.report().await, started(0, None));
+            assert_eq!(rig.report().await, gap("lagged", 100, 1_000));
+            rig.clips.stop("k1", EndReason::Stopped);
+            let reports = rig.until_stopped().await;
+            let bytes = reader.rest().await;
+            assert_eq!(
+                reports,
+                vec![stopped("stopped", bytes.len(), 1_600, 1)],
+                "reconnect: {reconnect}"
+            );
+        }
+    }
+
+    /// A container that fails the push of the frame whose timestamp is
+    /// the one it holds; the fake one otherwise.
+    #[derive(Debug)]
+    struct FailingAt(i64);
+
+    /// [`FailingAt`]'s muxer.
+    struct FailingMuxer {
+        inner: Box<dyn ClipMuxer>,
+        at: i64,
+    }
+
+    impl ClipMuxerFactory for FailingAt {
+        fn accepts(&self, codec: &Codec) -> bool {
+            FakeClipMuxerFactory::default().accepts(codec)
+        }
+
+        fn muxer(&self, policy: &ClipPolicy) -> Box<dyn ClipMuxer> {
+            Box::new(FailingMuxer {
+                inner: FakeClipMuxerFactory::default().muxer(policy),
+                at: self.0,
+            })
+        }
+    }
+
+    impl ClipMuxer for FailingMuxer {
+        fn start(
+            &mut self,
+            video: &ClipTrack,
+            audio: Option<&ClipTrack>,
+        ) -> Result<Vec<Bytes>, ClipError> {
+            self.inner.start(video, audio)
+        }
+
+        fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, ClipError> {
+            if frame.ts.ticks() == self.at {
+                return Err(ClipError::Failed("the frame it fails".into()));
+            }
+            self.inner.push(track, frame)
+        }
+
+        fn media_time(&self, track: Kind) -> Duration {
+            self.inner.media_time(track)
+        }
+
+        fn finish(&mut self) -> Result<Vec<Bytes>, ClipError> {
+            self.inner.finish()
+        }
+    }
+
+    /// A graceful end's drain that meets a codec change queued behind the
+    /// full pipe ends the clip `stream_changed`, and one whose container
+    /// fails a held frame ends it `internal_error`, not `stopped` as asked:
+    /// only the clip's own end reached keeps the reason it ends for
+    /// (`a_stop_writes_the_frames_held_for_the_other_track_up_to_the_end`).
+    /// Regression: the drain dropped what ended it and reported `stopped`.
+    #[tokio::test]
+    async fn a_codec_change_or_a_container_failure_the_drain_meets_ends_the_clip_for_it() {
+        let mut rig = Rig::new(None);
+        let reader = rig.start(spec(0, None, false));
+        stall(&rig).await;
+        assert_eq!(rig.report().await, started(0, None));
+        rig.video().set_codec(Codec::H264 {
+            profile_level_id: None,
+            sps: Some(h264::test_data::sps(640, 480).into()),
+            pps: Some(h264::test_data::pps().into()),
+        });
+        settle().await;
+        rig.clips.stop("k1", EndReason::Stopped);
+        let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+        assert_eq!(lines(&bytes).last().unwrap(), "end");
+        assert_eq!(
+            reports,
+            vec![stopped("stream_changed", bytes.len(), 500, 0)]
+        );
+
+        assert!(FailingAt(15_000).accepts(&h264()), "what the fake takes");
+        let mut rig = Rig::new(None);
+        let reader = rig.start_with(
+            spec(0, None, false),
+            FailingAt(15_000),
+            ClipSettings::default(),
+        );
+        stall(&rig).await;
+        assert_eq!(rig.report().await, started(0, None));
+        rig.clips.stop("k1", EndReason::Stopped);
+        let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+        assert_eq!(lines(&bytes).last().unwrap(), "end");
+        assert_eq!(
+            reports,
+            vec![stopped("internal_error", bytes.len(), 400, 0)]
+        );
+    }
+
+    /// A reader that closes its end while the last fragment waits for the
+    /// full pipe ends a graceful clip `client_gone`: the file it took is
+    /// not whole. Any other end keeps its reason. Regression: the failed
+    /// write was dropped and the clip reported `stopped`.
+    #[tokio::test]
+    async fn a_reader_gone_during_the_last_fragment_ends_a_graceful_clip_client_gone() {
+        for (asked, reason) in [
+            (EndReason::Stopped, "client_gone"),
+            (EndReason::ShuttingDown, "shutting_down"),
+        ] {
+            let mut rig = Rig::new(None);
+            let reader = rig.start(spec(0, None, false));
+            stall(&rig).await;
+            assert_eq!(rig.report().await, started(0, None));
+            rig.clips.stop("k1", asked);
+            settle().await;
+            if asked.is_graceful() {
+                // The drain gives up on the queue; the last fragment waits.
+                rig.clock.advance(FINISH_GRACE);
+                settle().await;
+            }
+            assert!(rig.reports.try_recv().is_err(), "the last fragment waits");
+            drop(reader);
+            let_assert_reason(&rig.until_stopped().await, reason);
+        }
+    }
+
+    /// An audio hole the queue reports is the audio's: a gap from where the
+    /// container put the audio frame before it to where it put the one
+    /// after, and the video's continuity goes on through it, so the video's
+    /// own hole after it still shows (a hole resets only its own track's).
+    #[tokio::test]
+    async fn an_audio_lag_is_the_audio_s_gap_and_leaves_the_video_s_continuity() {
+        let mut rig = Rig::new(Some(fake_aac()));
+        let reader = rig.start(spec(0, None, true));
+        for index in 0..3_u32 {
+            rig.audio_frame(index);
+            rig.video_frame(u64::from(index) * 100, index, index == 0, 16);
+        }
+        rig.audio_frame(3);
+        rig.audio_frame(4);
+        settle().await;
+        let audio = Arc::clone(rig.audio.as_ref().unwrap());
+        oversize(&rig, &audio, 300);
+        rig.audio_frame(5);
+        settle().await;
+        rig.video_frame(700, 7, false, 16);
+        settle().await;
+        assert_eq!(rig.report().await, started(0, Some("aac_lc")));
+        assert_eq!(rig.report().await, gap("lagged", 256, 320));
+        // The video frame at 700 ms waits for the audio to pass it, which
+        // the stop releases.
+        rig.clips.stop("k1", EndReason::Stopped);
+        let reports = rig.until_stopped().await;
+        let bytes = reader.rest().await;
+        assert_eq!(
+            reports,
+            vec![
+                gap("frames_dropped", 200, 700),
+                stopped("stopped", bytes.len(), 700, 2)
+            ]
         );
     }
 }

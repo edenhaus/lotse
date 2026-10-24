@@ -64,7 +64,7 @@ fn cost(frame: &MediaFrame) -> usize {
 /// time ahead of the arrival is a Sender Report mapping off, which a
 /// later report corrects back. Arrival only moves forward on a track, so
 /// a frame dated ahead cannot hold back what a trim by it drops.
-pub(crate) fn captured(frame: &MediaFrame) -> Instant {
+pub fn captured(frame: &MediaFrame) -> Instant {
     frame.wallclock.min(frame.arrival)
 }
 

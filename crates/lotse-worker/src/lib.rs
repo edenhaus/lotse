@@ -5437,13 +5437,15 @@ mod tests {
     }
 
     /// The source's `preroll_ms` gives its tracks the window once they are
-    /// live, so a clip starts in the ring, `before_ms` back as far as it
-    /// holds; `Preroll { ms: 0 }` frees the ring at once, without a
-    /// reconnect; the daemon's shutdown ends the clip `shutting_down`, its
-    /// report before the source's last.
+    /// live (`Live`: no `Stable` comes within the test), so a clip starts in
+    /// the ring, `before_ms` back as far as it holds; `Preroll { ms: 0 }`
+    /// frees the ring at once, without a reconnect; the daemon's shutdown
+    /// ends the clip `shutting_down`, its report before the source's last.
     #[tokio::test]
     async fn the_window_fills_the_ring_a_clip_starts_in_and_a_shutdown_ends_it() {
-        let mut h = start_with_settings(clip_registries(), quiet_settings());
+        let mut settings = quiet_settings();
+        settings.runner.stable_after = Duration::from_hours(24 * 365);
+        let mut h = start_with_settings(clip_registries(), settings);
         h.next().await;
         let mut source = spec("fake://cam/", r#"{"keyframes_every_ms": 100}"#);
         source.preroll_ms = 30_000;
