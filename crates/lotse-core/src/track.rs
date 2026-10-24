@@ -721,6 +721,10 @@ pub struct Track {
     /// camera with long GOPs hits on every GOP; only the source's task
     /// publishes, so the lock is never contended.
     gop_truncations: Mutex<Throttle>,
+    /// Rate-limits the line of a frame dropped over `max_frame_bytes`,
+    /// which a camera whose frames all exceed it makes on every frame;
+    /// only the source's task publishes, so the lock is never contended.
+    oversize_drops: Mutex<Throttle>,
     /// Rate-limits the line of a codec change, which a camera alternating
     /// two parameter sets makes on every frame; taken only by whoever sets
     /// the codec, the source's task.
@@ -812,6 +816,7 @@ impl Track {
             epoch_frame_pending: AtomicBool::new(false),
             lateness: Mutex::new(LatenessMeter::new(clock_rate)),
             gop_truncations: Mutex::new(Throttle::default()),
+            oversize_drops: Mutex::new(Throttle::default()),
             codec_changes: Mutex::new(Throttle::default()),
             preroll: Mutex::new(Preroll::new(id.kind() == Kind::Video)),
             preroll_floor,
@@ -1266,12 +1271,20 @@ impl Track {
             self.counters
                 .frames_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                track = %self.id,
-                bytes,
-                limit = self.limits.max_frame_bytes,
-                "frame dropped: larger than max_frame_bytes"
-            );
+            let due = self
+                .oversize_drops
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .hit(frame.arrival);
+            if let Some(count) = due {
+                tracing::debug!(
+                    track = %self.id,
+                    bytes,
+                    limit = self.limits.max_frame_bytes,
+                    count,
+                    "frame dropped: larger than max_frame_bytes"
+                );
+            }
             // The pre-roll's GOP now misses this frame: it is cut there.
             self.lock_preroll().frame_dropped();
             // The subscribers miss it too: a lag of one, never a silent
@@ -1861,6 +1874,41 @@ mod tests {
         assert_eq!(track.stats().frames_over_browser_limit, 0);
         track.count_frame_over_browser_limit();
         assert_eq!(track.stats().frames_over_browser_limit, 1);
+    }
+
+    #[test]
+    fn oversize_drops_are_logged_rate_limited() {
+        let (logs, _guard) = Logs::capture();
+        let track = video_track(TrackLimits {
+            max_frame_bytes: 100,
+            ..TrackLimits::default()
+        });
+        let at = SystemClock.now();
+        let oversize = |arrival| MediaFrame {
+            wallclock: arrival,
+            arrival,
+            ..frame(false, 101)
+        };
+        for _ in 0..3 {
+            assert!(!track.publish_frame(oversize(at)));
+        }
+        let message = "frame dropped: larger than max_frame_bytes";
+        let fields = |logs: &Logs| -> Vec<String> {
+            logs.lines(tracing::Level::DEBUG, message)
+                .into_iter()
+                .map(|line| line.fields)
+                .collect()
+        };
+        assert_eq!(fields(&logs), [" track=v0 bytes=101 limit=100 count=1"]);
+        assert!(!track.publish_frame(oversize(at + crate::throttle::SUMMARY_INTERVAL)));
+        assert_eq!(
+            fields(&logs),
+            [
+                " track=v0 bytes=101 limit=100 count=1",
+                " track=v0 bytes=101 limit=100 count=3"
+            ]
+        );
+        assert_eq!(track.stats().frames_dropped_oversize, 4);
     }
 
     #[test]

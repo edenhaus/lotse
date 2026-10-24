@@ -432,7 +432,9 @@ impl ReliableQueue {
         match event {
             TrackEvent::Frame(frame) => self.push_frame(track, frame, now),
             TrackEvent::Gap { skipped } => {
-                tracing::debug!(%track, skipped, "clip queue: the subscription lagged");
+                // Per event, which a camera over `max_frame_bytes` makes on
+                // every frame: the hole it opens is logged, rate-limited.
+                tracing::trace!(%track, skipped, "clip queue: the subscription lagged");
                 let lane = self.lane_mut(track);
                 if lane.duplicates.is_empty() {
                     self.hole(track, GapReason::Lagged, now);
@@ -1198,6 +1200,40 @@ mod tests {
         let _ = drain(&mut queue, Kind::Video, &clip);
         clip.push(&mut queue, Kind::Video, 160, true);
         queue.push(Kind::Video, TrackEvent::Gap { skipped: 1 }, clip.now());
+        assert_eq!(
+            logs.count(
+                tracing::Level::DEBUG,
+                "clip queue: dropping to the next frame the track can resume at"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_lag_on_every_frame_is_logged_at_trace_and_its_hole_once() {
+        let (logs, _guard) = crate::test_logs::Logs::capture();
+        let clip = Clip::new();
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        clip.push(&mut queue, Kind::Video, 0, true);
+        // A camera whose every other frame is over `max_frame_bytes`: each
+        // drop reaches the clip as a lag of one, all in the same hole.
+        for ms in [40, 80, 120] {
+            queue.push(Kind::Video, TrackEvent::Gap { skipped: 1 }, clip.now());
+            clip.push(&mut queue, Kind::Video, ms, false);
+        }
+        assert_eq!(
+            logs.count(tracing::Level::DEBUG, "clip queue: the subscription lagged"),
+            0,
+            "nothing per frame above trace"
+        );
+        let lines = logs.lines(tracing::Level::TRACE, "clip queue: the subscription lagged");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.fields.as_str())
+                .collect::<Vec<_>>(),
+            [" track=video skipped=1"; 3]
+        );
         assert_eq!(
             logs.count(
                 tracing::Level::DEBUG,
