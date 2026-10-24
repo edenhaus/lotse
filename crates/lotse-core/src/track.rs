@@ -14,7 +14,10 @@
 //! reaches the cache. Nothing checks `max_frame_bytes` against
 //! `gop_cache_bytes`: the cache holds at most the larger of the two, which
 //! is `gop_cache_bytes` with the defaults (equal, and the only limits a
-//! worker gives its tracks).
+//! worker gives its tracks). While a window is set the track also keeps a
+//! pre-roll ring ([`crate::preroll`]) of whole GOPs, bounded by
+//! `preroll_bytes`, which the source's task writes under a lock no one
+//! else takes but a clip's start.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -28,6 +31,7 @@ use crate::clock_map::ticks_between;
 use crate::codec::{Codec, Kind};
 use crate::lateness::LatenessMeter;
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
+use crate::preroll::{Preroll, PrerollFloor, PrerollSnapshot, PrerollStats};
 use crate::throttle::Throttle;
 
 /// The id of a track within its stream: a kind letter and an index (`v0`,
@@ -76,6 +80,10 @@ pub const DEFAULT_GOP_CACHE_BYTES: usize = 4 * 1024 * 1024;
 /// overhead it does not count.
 pub const DEFAULT_GOP_CACHE_FRAMES: usize = 1024;
 
+/// Default of `limits.preroll_bytes`: 32 MiB per track, about 60 s of a
+/// 4 Mbit/s stream; held only while a pre-roll window is set.
+pub const DEFAULT_PREROLL_BYTES: usize = 32 * 1024 * 1024;
+
 /// Default packet broadcast capacity: ~500 ms at 4000 packets/s, which is
 /// a 40 Mbit/s stream in 1200-byte packets. The capacity is only the safety
 /// bound; consumers bound their queues by age.
@@ -101,6 +109,11 @@ pub struct TrackLimits {
     /// The GOP cache keeps only the keyframe once a GOP has more frames
     /// than this, keyframe included; a keyframe alone is always kept.
     pub gop_cache_frames: usize,
+    /// The pre-roll ring holds no more than this, counted as
+    /// [`PREROLL_FRAME_OVERHEAD`](crate::preroll::PREROLL_FRAME_OVERHEAD)
+    /// plus the payload per frame; a GOP larger than this keeps only its
+    /// start, until the next keyframe drops it.
+    pub preroll_bytes: usize,
     /// Capacity of the packet broadcast, in packets. Zero is treated as one.
     pub packet_capacity: usize,
     /// Capacity of the frame broadcast, in frames. Zero is treated as one.
@@ -113,6 +126,7 @@ impl Default for TrackLimits {
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             gop_cache_bytes: DEFAULT_GOP_CACHE_BYTES,
             gop_cache_frames: DEFAULT_GOP_CACHE_FRAMES,
+            preroll_bytes: DEFAULT_PREROLL_BYTES,
             packet_capacity: DEFAULT_PACKET_CAPACITY,
             frame_capacity: DEFAULT_FRAME_CAPACITY,
         }
@@ -233,6 +247,8 @@ pub struct TrackStats {
     /// libwebrtc receivers assemble, as the source reported them
     /// ([`Track::count_frame_over_browser_limit`]).
     pub frames_over_browser_limit: u64,
+    /// The pre-roll ring, while a window is set ([`Track::set_preroll`]).
+    pub preroll: Option<PrerollStats>,
 }
 
 /// The live counters behind [`TrackStats`].
@@ -270,6 +286,7 @@ impl Counters {
             keyframes: self.keyframes.load(Ordering::Relaxed),
             frames_dropped_oversize: self.frames_dropped_oversize.load(Ordering::Relaxed),
             frames_over_browser_limit: self.frames_over_browser_limit.load(Ordering::Relaxed),
+            preroll: None,
         }
     }
 }
@@ -692,6 +709,15 @@ pub struct Track {
     /// two parameter sets makes on every frame; taken only by whoever sets
     /// the codec, the source's task.
     codec_changes: Mutex<Throttle>,
+    /// The pre-roll ring; holds nothing until a window is set. Only the
+    /// source's task publishes, and only a clip's start reads it, so the
+    /// lock is never contended.
+    preroll: Mutex<Preroll>,
+    /// The oldest keyframe of the live set's `v0` ring, which the audio
+    /// rings trim by; shared by the connection's tracks, staging ones
+    /// included, and written only by that live `v0`
+    /// ([`Self::leads_preroll`]).
+    preroll_floor: Arc<PrerollFloor>,
     /// Set by [`Track::close`]; subscriptions end and nothing is published.
     closed: AtomicBool,
     /// The instant `last_activity` counts from.
@@ -732,11 +758,13 @@ impl Track {
             Arc::new(Feeds::new(Weak::new())),
             0,
             None,
+            Arc::default(),
         )
     }
 
     /// [`Self::new`] as the source tagged `tag` of `feeds` writes it,
-    /// forwarding into `forward_to` while that source is active.
+    /// forwarding into `forward_to` while that source is active; its
+    /// audio pre-roll trims by `preroll_floor`, which only a live set's `v0` writes.
     #[expect(
         clippy::too_many_arguments,
         reason = "a constructor wiring the track into its set's feeds; called from the set alone"
@@ -750,6 +778,7 @@ impl Track {
         feeds: Arc<Feeds>,
         tag: u8,
         forward_to: Option<Arc<Self>>,
+        preroll_floor: Arc<PrerollFloor>,
     ) -> Self {
         let (packets, _no_receivers_yet) = broadcast::channel(limits.packet_capacity.max(1));
         let (frames, _no_receivers_yet) = broadcast::channel(limits.frame_capacity.max(1));
@@ -768,6 +797,8 @@ impl Track {
             lateness: Mutex::new(LatenessMeter::new(clock_rate)),
             gop_truncations: Mutex::new(Throttle::default()),
             codec_changes: Mutex::new(Throttle::default()),
+            preroll: Mutex::new(Preroll::new(id.kind() == Kind::Video)),
+            preroll_floor,
             closed: AtomicBool::new(false),
             origin,
             last_activity: AtomicU64::new(0),
@@ -854,18 +885,37 @@ impl Track {
     }
 
     /// [`Self::set_codec`] on this track itself, whoever feeds it.
+    /// Another family clears the pre-roll: nothing before it can share a
+    /// clip with what follows. On audio any change does: an audio frame
+    /// carries no decoder configuration (AAC's `AudioSpecificConfig`,
+    /// ISO/IEC 14496-3 §1.6.2.1, travels out of band, RFC 3640 §4.1; so
+    /// does Opus's channel count), so the frames before it would be read
+    /// with the new descriptor. A video keyframe carries its parameter sets
+    /// in-band ([`MediaFrame::payload`]), so a video ring keeps its GOPs.
     fn set_codec_inner(&self, codec: Codec) {
-        if *self.codec.load().as_ref() == codec {
-            return;
-        }
+        let family = {
+            let current = self.codec.load();
+            if **current == codec {
+                return;
+            }
+            current.family()
+        };
         let codec = Arc::new(codec);
+        let preroll_cleared =
+            (family != codec.family() || self.kind() == Kind::Audio) && self.clear_preroll();
         let due = self
             .codec_changes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .hit(self.activity_clock());
         if let Some(count) = due {
-            tracing::info!(track = %self.id, codec = codec.name(), count, "track codec changed");
+            tracing::info!(
+                track = %self.id,
+                codec = codec.name(),
+                preroll_cleared,
+                count,
+                "track codec changed"
+            );
         }
         self.codec.store(Arc::clone(&codec));
         self.publish_control(TrackControlEvent::TrackChanged(codec));
@@ -931,6 +981,7 @@ impl Track {
             return;
         }
         tracing::debug!(track = %self.id, "track closed");
+        self.free_preroll();
         let _delivered_to = self.control.send(TrackControlEvent::Closed);
     }
 
@@ -948,9 +999,81 @@ impl Track {
         let _delivered_to = self.control.send(event);
     }
 
-    /// The counters now.
+    /// The counters now, and the pre-roll ring's state while a window is
+    /// set.
     pub fn stats(&self) -> TrackStats {
-        self.counters.snapshot()
+        TrackStats {
+            preroll: self.lock_preroll().stats(),
+            ..self.counters.snapshot()
+        }
+    }
+
+    /// The pre-roll ring, locked.
+    fn lock_preroll(&self) -> std::sync::MutexGuard<'_, Preroll> {
+        self.preroll.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether this track's ring sets the floor the connection's audio
+    /// rings trim by: the live set's first video track (tag 0, `v0`), the
+    /// one a clip reads. A staging track never does: once its source is
+    /// active its frames and codec land on that live track, and while it is
+    /// a standby its codec changes and its close leave the live ring as it
+    /// is.
+    fn leads_preroll(&self) -> bool {
+        self.tag == 0 && self.id == TrackId::new(Kind::Video, 0)
+    }
+
+    /// Sets how far back, by arrival, the pre-roll ring holds this track's
+    /// frames; `None` frees it at once. A longer window fills forward from
+    /// now, a shorter one trims at the next keyframe (the next frame, on
+    /// audio). Neither touches the connection or the subscribers.
+    pub fn set_preroll(&self, window: Option<Duration>) {
+        let (previous, freed) = {
+            let mut ring = self.lock_preroll();
+            let freed = ring.stats().map_or(0, |stats| stats.bytes);
+            (ring.set_window(window), freed)
+        };
+        if previous == window {
+            return;
+        }
+        if let Some(window) = window {
+            tracing::info!(
+                track = %self.id,
+                window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+                "preroll: window set"
+            );
+            return;
+        }
+        if self.leads_preroll() {
+            self.preroll_floor.set(None);
+        }
+        tracing::info!(track = %self.id, freed_bytes = freed, "preroll: window removed, ring freed");
+    }
+
+    /// The pre-roll ring's frames from the newest keyframe captured at or
+    /// before `target` (else the oldest held) to the newest frame; `None`
+    /// when it holds nothing. On an audio track, `target` is the video
+    /// snapshot's start, and the frames start with the one playing then.
+    pub fn preroll_snapshot(&self, target: Instant) -> Option<PrerollSnapshot> {
+        self.lock_preroll().snapshot(target)
+    }
+
+    /// Empties the pre-roll ring and keeps its window; whether it held
+    /// anything.
+    fn clear_preroll(&self) -> bool {
+        let held = self.lock_preroll().clear();
+        if self.leads_preroll() {
+            self.preroll_floor.set(None);
+        }
+        held
+    }
+
+    /// Frees the pre-roll ring and its window, for a closed track.
+    fn free_preroll(&self) {
+        let _previous = self.lock_preroll().set_window(None);
+        if self.leads_preroll() {
+            self.preroll_floor.set(None);
+        }
     }
 
     /// The GOP cache, once a keyframe has been seen.
@@ -1075,7 +1198,8 @@ impl Track {
     /// Publishes a frame on the side branch, stamped with the current epoch
     /// (and `discontinuity` if it is the epoch's first): updates the GOP
     /// cache (video) and broadcasts it. Returns `false` for a frame larger
-    /// than `max_frame_bytes`, which is dropped and counted.
+    /// than `max_frame_bytes`, which is dropped and counted, and cuts the
+    /// pre-roll's GOP short there (until the next keyframe).
     pub fn publish_frame(&self, frame: MediaFrame) -> bool {
         self.touch(frame.arrival);
         if !self.feeds.admits(self.tag, self.kind(), frame.keyframe) {
@@ -1107,6 +1231,8 @@ impl Track {
                 limit = self.limits.max_frame_bytes,
                 "frame dropped: larger than max_frame_bytes"
             );
+            // The pre-roll's GOP now misses this frame: it is cut there.
+            self.lock_preroll().frame_dropped();
             return false;
         }
         self.touch(frame.arrival);
@@ -1119,6 +1245,7 @@ impl Track {
         if self.kind() == Kind::Video {
             self.update_gop(&frame);
         }
+        self.update_preroll(&frame);
         self.last_frame.store(Some(Arc::clone(&frame)));
         // As above: no subscriber is not an error.
         let _delivered_to = self.frames.send(frame);
@@ -1195,6 +1322,30 @@ impl Track {
             }
         };
         self.gop.store(Some(Arc::new(next)));
+    }
+
+    /// Holds `frame` in the pre-roll ring while a window is set, trims,
+    /// and moves the audio rings' floor when this is the leading ring.
+    fn update_preroll(&self, frame: &Arc<MediaFrame>) {
+        let truncation = {
+            let mut ring = self.lock_preroll();
+            let truncation = ring.push(frame, self.limits.preroll_bytes, || {
+                self.preroll_floor.get()
+            });
+            if self.leads_preroll() && ring.window().is_some() {
+                self.preroll_floor.set(ring.oldest());
+            }
+            truncation
+        };
+        if let Some(truncation) = truncation {
+            tracing::debug!(
+                track = %self.id,
+                gop_bytes = truncation.gop_bytes,
+                limit = self.limits.preroll_bytes,
+                truncations = truncation.count,
+                "preroll: GOP exceeds preroll_bytes, keeping only its start"
+            );
+        }
     }
 }
 
@@ -2056,5 +2207,537 @@ mod tests {
         );
     }
 
+    /// A frame captured and read `ms` after `t0`, labelled `ms` in its `ts`.
+    fn timed(t0: Instant, ms: u64, keyframe: bool, bytes: usize) -> MediaFrame {
+        let at = t0 + Duration::from_millis(ms);
+        MediaFrame {
+            ts: MediaTime::from_ticks(i64::try_from(ms).unwrap()),
+            wallclock: at,
+            arrival: at,
+            ..frame(keyframe, bytes)
+        }
+    }
+
+    /// The labels of the pre-roll from its oldest frame.
+    fn preroll(track: &Track, t0: Instant) -> Vec<i64> {
+        track
+            .preroll_snapshot(t0)
+            .map(|snapshot| snapshot.frames().map(|f| f.ts.ticks()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Asserts nothing is queued for `sub`: polled once, it is pending.
+    fn nothing_queued(sub: &mut TrackSubscription) {
+        let mut next = std::pin::pin!(sub.next());
+        let polled = next
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        assert!(polled.is_pending(), "{polled:?}");
+    }
+
+    fn cost(bytes: usize) -> u64 {
+        u64::try_from(bytes + PREROLL_FRAME_OVERHEAD).unwrap()
+    }
+
+    #[test]
+    fn the_pre_roll_is_bounded_to_32_mib_per_track_by_default() {
+        assert_eq!(TrackLimits::default().preroll_bytes, 33_554_432);
+    }
+
+    #[test]
+    fn the_pre_roll_holds_frames_only_while_a_window_is_set() {
+        let (logs, _guard) = Logs::capture();
+        let t0 = SystemClock.now();
+        let track = video_track(TrackLimits::default());
+        assert!(track.publish_frame(timed(t0, 0, true, 10)));
+        assert_eq!(track.stats().preroll, None);
+        assert!(track.preroll_snapshot(t0).is_none());
+
+        track.set_preroll(Some(Duration::from_secs(10)));
+        track.set_preroll(Some(Duration::from_secs(10)));
+        let set = logs.lines(tracing::Level::INFO, "preroll: window set");
+        assert_eq!(set.len(), 1, "only a change is logged: {set:?}");
+        assert_eq!(set[0].fields, " track=v0 window_ms=10000");
+        assert_eq!(
+            track.stats().preroll,
+            Some(PrerollStats::default()),
+            "fills forward from now"
+        );
+
+        assert!(track.publish_frame(timed(t0, 1000, true, 10)));
+        assert!(track.publish_frame(timed(t0, 1040, false, 20)));
+        assert_eq!(preroll(&track, t0), [1000, 1040]);
+        assert_eq!(
+            track.stats().preroll,
+            Some(PrerollStats {
+                bytes: cost(10) + cost(20),
+                held: Duration::from_millis(40),
+                truncations: 0,
+            })
+        );
+        assert_eq!(track.stats().frames, 3, "the counters as before");
+
+        track.set_preroll(None);
+        track.set_preroll(None);
+        let removed = logs.lines(tracing::Level::INFO, "preroll: window removed, ring freed");
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert_eq!(
+            removed[0].fields,
+            format!(" track=v0 freed_bytes={}", cost(10) + cost(20))
+        );
+        assert_eq!(track.stats().preroll, None);
+        assert!(track.preroll_snapshot(t0).is_none());
+        assert!(track.publish_frame(timed(t0, 2000, true, 10)));
+        assert!(track.preroll_snapshot(t0).is_none());
+    }
+
+    #[tokio::test]
+    async fn changing_the_pre_roll_window_never_reconnects() {
+        let t0 = SystemClock.now();
+        let track = Arc::new(video_track(TrackLimits::default()));
+        let mut packets = track.subscribe(Unit::Packets);
+        track.set_preroll(Some(Duration::from_secs(10)));
+        for ms in (0..3000_u64).step_by(500) {
+            assert!(track.publish_frame(timed(t0, ms, ms.is_multiple_of(1000), 10)));
+        }
+        track.set_preroll(Some(Duration::from_secs(1)));
+        assert_eq!(
+            preroll(&track, t0).first(),
+            Some(&0),
+            "a shorter window trims at the next keyframe"
+        );
+        assert!(track.publish_frame(timed(t0, 3000, true, 10)));
+        assert_eq!(preroll(&track, t0), [2000, 2500, 3000]);
+        track.set_preroll(Some(Duration::from_secs(5)));
+        assert!(track.publish_frame(timed(t0, 4000, true, 10)));
+        assert_eq!(
+            preroll(&track, t0),
+            [2000, 2500, 3000, 4000],
+            "a longer window fills forward"
+        );
+        // No epoch, no source loss: nothing a session would react to.
+        nothing_queued(&mut packets);
+        assert_eq!(track.epoch(), 0);
+    }
+
+    #[test]
+    fn a_codec_family_change_clears_the_pre_roll_and_a_change_within_it_keeps_it() {
+        let (logs, _guard) = Logs::capture();
+        let t0 = SystemClock.now();
+        let track = video_track(TrackLimits::default());
+        track.set_preroll(Some(Duration::from_secs(10)));
+        assert!(track.publish_frame(timed(t0, 0, true, 10)));
+        assert_eq!(track.preroll_floor.get(), Some(t0));
+        track.set_codec(Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        });
+        assert!(
+            preroll(&track, t0).is_empty(),
+            "nothing before shares a clip"
+        );
+        assert_eq!(track.preroll_floor.get(), None);
+        assert_eq!(
+            track.stats().preroll,
+            Some(PrerollStats::default()),
+            "the window stays"
+        );
+        let lines = logs.lines(tracing::Level::INFO, "track codec changed");
+        assert_eq!(
+            lines[0].fields,
+            " track=v0 codec=\"h265\" preroll_cleared=true count=1"
+        );
+
+        assert!(track.publish_frame(timed(t0, 1000, true, 10)));
+        track.set_codec(Codec::H265 {
+            vps: None,
+            sps: Some(Bytes::from_static(&[0x42, 0x01])),
+            pps: None,
+        });
+        assert_eq!(
+            preroll(&track, t0),
+            [1000],
+            "the same family keeps a video ring: its keyframes carry their parameter sets"
+        );
+        assert_eq!(track.preroll_floor.get(), Some(t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn an_audio_descriptor_change_within_its_family_clears_the_audio_pre_roll() {
+        let (logs, _guard) = Logs::capture();
+        let t0 = SystemClock.now();
+        let aac = |config: &'static [u8]| Codec::AacLc {
+            sample_rate: 16_000,
+            channels: 1,
+            config: Bytes::from_static(config),
+        };
+        let track = Track::new(
+            TrackId::new(Kind::Audio, 0),
+            aac(&[0x14, 0x08]),
+            16_000,
+            TrackLimits::default(),
+            t0,
+        );
+        track.set_preroll(Some(Duration::from_secs(10)));
+        for ms in [0, 64] {
+            assert!(track.publish_frame(timed(t0, ms, true, 10)));
+        }
+        track.set_codec(aac(&[0x14, 0x08]));
+        assert_eq!(
+            preroll(&track, t0),
+            [0, 64],
+            "an equal descriptor changes nothing"
+        );
+        track.set_codec(aac(&[0x11, 0x90]));
+        assert!(
+            preroll(&track, t0).is_empty(),
+            "the old frames need the old AudioSpecificConfig"
+        );
+        assert_eq!(
+            track.stats().preroll,
+            Some(PrerollStats::default()),
+            "the window stays"
+        );
+        let lines = logs.lines(tracing::Level::INFO, "track codec changed");
+        assert_eq!(
+            lines[0].fields,
+            " track=a0 codec=\"aac_lc\" preroll_cleared=true count=1"
+        );
+        assert!(track.publish_frame(timed(t0, 128, true, 10)));
+        assert_eq!(preroll(&track, t0), [128]);
+    }
+
+    #[test]
+    fn a_codec_change_without_a_pre_roll_clears_nothing() {
+        let (logs, _guard) = Logs::capture();
+        let track = video_track(TrackLimits::default());
+        track.set_codec(Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        });
+        let lines = logs.lines(tracing::Level::INFO, "track codec changed");
+        assert_eq!(
+            lines[0].fields,
+            " track=v0 codec=\"h265\" preroll_cleared=false count=1"
+        );
+    }
+
+    #[test]
+    fn closing_the_track_drops_the_pre_roll() {
+        let t0 = SystemClock.now();
+        let track = video_track(TrackLimits::default());
+        track.set_preroll(Some(Duration::from_secs(10)));
+        assert!(track.publish_frame(timed(t0, 0, true, 10)));
+        assert_eq!(track.preroll_floor.get(), Some(t0));
+        track.close();
+        assert_eq!(track.stats().preroll, None);
+        assert!(track.preroll_snapshot(t0).is_none());
+        assert_eq!(track.preroll_floor.get(), None);
+    }
+
+    #[test]
+    fn epochs_do_not_clear_the_pre_roll() {
+        let t0 = SystemClock.now();
+        let track = video_track(TrackLimits::default());
+        track.set_preroll(Some(Duration::from_secs(10)));
+        assert!(track.publish_frame(timed(t0, 0, true, 10)));
+        assert!(track.publish_frame(timed(t0, 40, false, 10)));
+        assert_eq!(track.start_epoch(), 1);
+        assert!(track.publish_frame(timed(t0, 5000, true, 10)));
+        let snapshot = track.preroll_snapshot(t0).unwrap();
+        assert_eq!(
+            snapshot
+                .frames()
+                .map(|f| (f.ts.ticks(), f.epoch, f.discontinuity))
+                .collect::<Vec<_>>(),
+            [(0, 0, false), (40, 0, false), (5000, 1, true)],
+            "the frames carry their epochs; a clip marks the boundary"
+        );
+    }
+
+    #[test]
+    fn a_gop_outgrowing_the_pre_roll_is_counted_and_logged_once_per_interval() {
+        let (logs, _guard) = Logs::capture();
+        let t0 = SystemClock.now();
+        let limit = 2 * (10 + PREROLL_FRAME_OVERHEAD);
+        let track = video_track(TrackLimits {
+            preroll_bytes: limit,
+            ..TrackLimits::default()
+        });
+        track.set_preroll(Some(Duration::from_secs(10)));
+        for gop in [0, 1000] {
+            assert!(track.publish_frame(timed(t0, gop, true, 10)));
+            assert!(track.publish_frame(timed(t0, gop + 40, false, 10)));
+            assert!(
+                track.publish_frame(timed(t0, gop + 80, false, 10)),
+                "accepted on the side branch"
+            );
+            let label = i64::try_from(gop).unwrap();
+            assert_eq!(preroll(&track, t0), [label, label + 40]);
+            assert!(track.preroll_snapshot(t0).unwrap().truncated());
+        }
+        assert_eq!(track.stats().preroll.unwrap().truncations, 2);
+        assert!(
+            track.gop().is_some_and(|gop| !gop.truncated()),
+            "the GOP cache is its own"
+        );
+        let lines = logs.lines(
+            tracing::Level::DEBUG,
+            "preroll: GOP exceeds preroll_bytes, keeping only its start",
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            lines[0].fields,
+            format!(
+                " track=v0 gop_bytes={} limit={limit} truncations=1",
+                3 * cost(10)
+            )
+        );
+    }
+
+    #[test]
+    fn the_audio_pre_roll_follows_the_connection_s_first_video_track() {
+        let t0 = SystemClock.now();
+        let set = crate::source::TrackSet::new(TrackLimits::default(), t0);
+        let mut publisher = set.publisher();
+        let h264 = Codec::H264 {
+            profile_level_id: None,
+            sps: None,
+            pps: None,
+        };
+        let video = publisher.declare(Kind::Video, h264.clone(), 90_000);
+        let audio = publisher.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        let second = publisher.declare(Kind::Video, h264, 90_000);
+        for track in [&video, &audio, &second] {
+            track.set_preroll(Some(Duration::from_secs(1)));
+        }
+        for ms in (0..=3000_u64).step_by(50) {
+            if ms.is_multiple_of(250) {
+                assert!(video.publish_frame(timed(t0, ms, ms.is_multiple_of(1000), 10)));
+            }
+            if ms.is_multiple_of(200) {
+                assert!(audio.publish_frame(timed(t0, ms, true, 10)));
+            }
+        }
+        let video_from = |target: u64| preroll(&video, t0 + Duration::from_millis(target));
+        assert_eq!(video_from(0).first(), Some(&2000));
+        assert_eq!(audio.preroll_floor.get(), Some(t0 + Duration::from_secs(2)));
+        assert_eq!(
+            preroll(&audio, t0 + Duration::from_millis(2000)),
+            (2000..=3000).step_by(200).collect::<Vec<_>>(),
+            "audio from the frame playing at the video's oldest keyframe"
+        );
+        assert!(audio.preroll_snapshot(t0).is_some());
+
+        // Another video track and the audio track never move the floor.
+        assert!(second.publish_frame(timed(t0, 3100, true, 10)));
+        assert!(audio.publish_frame(timed(t0, 3200, true, 10)));
+        assert_eq!(video.preroll_floor.get(), Some(t0 + Duration::from_secs(2)));
+
+        // Without the video's window, the audio keeps its own.
+        video.set_preroll(None);
+        assert_eq!(audio.preroll_floor.get(), None);
+        assert!(audio.publish_frame(timed(t0, 3400, true, 10)));
+        assert_eq!(preroll(&audio, t0).first(), Some(&2400));
+        // An audio track without a window never moves it either.
+        audio.set_preroll(None);
+        assert!(audio.publish_frame(timed(t0, 3600, true, 10)));
+        assert_eq!(audio.preroll_floor.get(), None);
+    }
+
+    #[test]
+    fn a_keyframe_captured_ahead_of_its_arrival_never_trims_the_audio_pre_roll() {
+        let t0 = SystemClock.now();
+        let set = crate::source::TrackSet::new(TrackLimits::default(), t0);
+        let mut publisher = set.publisher();
+        let video = publisher.declare(
+            Kind::Video,
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+        );
+        let audio = publisher.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        for track in [&video, &audio] {
+            track.set_preroll(Some(Duration::from_secs(10)));
+        }
+        // A mapping an hour ahead of the keyframe's arrival.
+        assert!(video.publish_frame(MediaFrame {
+            wallclock: t0 + Duration::from_secs(3600),
+            ..timed(t0, 0, true, 10)
+        }));
+        for ms in (0..=1000).step_by(200) {
+            assert!(audio.publish_frame(timed(t0, ms, true, 10)));
+        }
+        assert_eq!(video.preroll_floor.get(), Some(t0));
+        assert_eq!(preroll(&audio, t0), [0, 200, 400, 600, 800, 1000]);
+    }
+
+    #[test]
+    fn an_inactive_standby_never_moves_the_live_pre_roll_floor() {
+        let t0 = SystemClock.now();
+        let live = crate::source::TrackSet::new(TrackLimits::default(), t0);
+        let mut publisher = live.publisher();
+        let h264 = Codec::H264 {
+            profile_level_id: None,
+            sps: None,
+            pps: None,
+        };
+        let video = publisher.declare(Kind::Video, h264.clone(), 90_000);
+        let audio = publisher.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        let staging = crate::source::TrackSet::staging(&live);
+        let standby = staging.publisher().declare(Kind::Video, h264, 90_000);
+        assert_eq!(standby.id(), video.id(), "the standby's v0 shares the id");
+        for track in [&video, &audio] {
+            track.set_preroll(Some(Duration::from_secs(1)));
+        }
+        for ms in (0..=3200_u64).step_by(50) {
+            if ms.is_multiple_of(250) {
+                assert!(video.publish_frame(timed(t0, ms, ms.is_multiple_of(1000), 10)));
+            }
+            if ms.is_multiple_of(200) {
+                assert!(audio.publish_frame(timed(t0, ms, true, 10)));
+            }
+        }
+        let floor = Some(t0 + Duration::from_secs(2));
+        assert_eq!(video.preroll_floor.get(), floor);
+
+        // The standby changes family between live video and audio frames.
+        standby.set_codec(Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        });
+        assert_eq!(
+            standby.codec().family(),
+            CodecFamily::H265,
+            "kept for the switch"
+        );
+        assert_eq!(video.codec().family(), CodecFamily::H264);
+        assert_eq!(
+            video.preroll_floor.get(),
+            floor,
+            "the live ring is unchanged"
+        );
+        assert!(audio.publish_frame(timed(t0, 3400, true, 10)));
+        assert_eq!(
+            preroll(&audio, t0 + Duration::from_secs(2)),
+            (2000..=3400).step_by(200).collect::<Vec<_>>(),
+            "audio from the live video's oldest keyframe"
+        );
+
+        // Neither a standby's window nor its close moves it.
+        standby.set_preroll(Some(Duration::from_secs(1)));
+        standby.set_preroll(None);
+        standby.close();
+        assert_eq!(video.preroll_floor.get(), floor);
+        assert_eq!(preroll(&video, t0).first(), Some(&2000));
+    }
+
+    #[test]
+    fn an_oversize_reference_frame_cuts_the_pre_roll_gop_until_the_next_keyframe() {
+        let t0 = SystemClock.now();
+        let track = video_track(TrackLimits {
+            max_frame_bytes: 100,
+            ..TrackLimits::default()
+        });
+        track.set_preroll(Some(Duration::from_secs(10)));
+        for (ms, keyframe) in [(0, true), (250, false), (1000, true), (1250, false)] {
+            assert!(track.publish_frame(timed(t0, ms, keyframe, 10)));
+        }
+        assert!(!track.publish_frame(timed(t0, 1500, false, 101)), "dropped");
+        assert!(track.publish_frame(timed(t0, 1750, false, 10)));
+        assert_eq!(
+            preroll(&track, t0),
+            [0, 250, 1000, 1250],
+            "nothing after the lost frame"
+        );
+        assert!(track.preroll_snapshot(t0).unwrap().truncated());
+        assert!(
+            track
+                .preroll_snapshot(t0 + Duration::from_secs(1))
+                .unwrap()
+                .truncated(),
+            "a clip from the cut GOP is told"
+        );
+        let stats = track.stats();
+        assert_eq!(stats.frames_dropped_oversize, 1);
+        assert_eq!(stats.preroll.unwrap().truncations, 0, "the track counts it");
+        assert_eq!(track.preroll_floor.get(), Some(t0), "the floor stays");
+
+        assert!(track.publish_frame(timed(t0, 2000, true, 10)));
+        assert_eq!(preroll(&track, t0), [2000], "the ring starts again");
+        assert!(!track.preroll_snapshot(t0).unwrap().truncated());
+        assert_eq!(track.preroll_floor.get(), Some(t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn an_oversize_keyframe_keeps_its_gop_out_of_the_pre_roll_and_the_audio_follows() {
+        let t0 = SystemClock.now();
+        let set = crate::source::TrackSet::new(
+            TrackLimits {
+                max_frame_bytes: 100,
+                ..TrackLimits::default()
+            },
+            t0,
+        );
+        let mut publisher = set.publisher();
+        let video = publisher.declare(
+            Kind::Video,
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+        );
+        let audio = publisher.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        for track in [&video, &audio] {
+            track.set_preroll(Some(Duration::from_secs(10)));
+        }
+        assert!(video.publish_frame(timed(t0, 0, true, 10)));
+        assert!(audio.publish_frame(timed(t0, 0, true, 10)));
+        assert!(video.publish_frame(timed(t0, 250, false, 10)));
+        assert!(audio.publish_frame(timed(t0, 500, true, 10)));
+        assert!(!video.publish_frame(timed(t0, 1000, true, 101)), "dropped");
+        assert!(
+            video.publish_frame(timed(t0, 1250, false, 10)),
+            "the track takes it"
+        );
+        for ms in [1000, 1500] {
+            assert!(audio.publish_frame(timed(t0, ms, true, 10)));
+        }
+        assert_eq!(
+            preroll(&video, t0),
+            [0, 250],
+            "the lost keyframe's GOP stays out"
+        );
+        assert!(video.preroll_snapshot(t0).unwrap().truncated());
+        assert_eq!(video.preroll_floor.get(), Some(t0));
+        assert_eq!(
+            preroll(&audio, t0),
+            [0, 500, 1000, 1500],
+            "audio still from the oldest video keyframe"
+        );
+        assert!(!audio.preroll_snapshot(t0).unwrap().truncated());
+
+        assert!(video.publish_frame(timed(t0, 2000, true, 10)));
+        assert_eq!(preroll(&video, t0), [2000]);
+        assert_eq!(video.preroll_floor.get(), Some(t0 + Duration::from_secs(2)));
+        for ms in [2000, 2500] {
+            assert!(audio.publish_frame(timed(t0, ms, true, 10)));
+        }
+        assert_eq!(
+            preroll(&audio, t0),
+            [2000, 2500],
+            "audio from the frame playing at the new keyframe"
+        );
+    }
+
     use crate::codec::CodecFamily;
+    use crate::preroll::PREROLL_FRAME_OVERHEAD;
 }
