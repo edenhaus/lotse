@@ -915,16 +915,25 @@ fn iso14496_12_8_8_8_the_declared_samples_add_up_the_runs_of_every_track_fragmen
     assert_eq!(declared_samples(&short_run).unwrap(), 0);
 }
 
-/// `init` with `child` added as the last box of its movie box, which ends
-/// the init segment.
-fn with_movie_child(init: &[u8], child: &[u8]) -> Vec<u8> {
-    let moov = locate(init, &[(b"moov", 0)]).0;
-    let size = u32::from_be_bytes(init[moov..moov + 4].try_into().unwrap());
-    assert_eq!(moov + size as usize, init.len());
-    let grown = size + u32::try_from(child.len()).unwrap();
-    let mut out = patched(init, moov, &grown.to_be_bytes());
-    out.extend_from_slice(child);
+/// `data` with `child` added as the last box of the box at `path`
+/// ([`locate`]), it and the boxes around it grown by its size.
+fn with_child(data: &[u8], path: &[(&[u8; 4], usize)], child: &[u8]) -> Vec<u8> {
+    let grow = u32::try_from(child.len()).unwrap();
+    let mut out = data.to_vec();
+    let mut end = 0;
+    for depth in 1..=path.len() {
+        let start = locate(data, &path[..depth]).0;
+        let size = u32::from_be_bytes(data[start..start + 4].try_into().unwrap());
+        out[start..start + 4].copy_from_slice(&(size + grow).to_be_bytes());
+        end = start + size as usize;
+    }
+    out.splice(end..end, child.iter().copied());
     out
+}
+
+/// `init` with `child` added as the last box of its movie box.
+fn with_movie_child(init: &[u8], child: &[u8]) -> Vec<u8> {
+    with_child(init, &[(b"moov", 0)], child)
 }
 
 /// An item reference box with one reference from `from` to items 2 and
@@ -1018,87 +1027,290 @@ fn reference(size: u32, id_size: usize, ids: &[u32]) -> Vec<u8> {
 
 #[test]
 fn iso14496_12_8_11_12_references_overrun_where_mp4_atom_counts_past_zero() {
+    let overruns = |body: &[u8]| references_overrun(body, &mut 0);
     for (version, id_size, own) in [(0_u8, 2, 14_u32), (1, 4, 18)] {
         let body =
             |references: &[Vec<u8>]| [&[version, 0, 0, 0][..], &references.concat()].concat();
         // Tiled exactly: read to the end.
         let exact = body(&[reference(own, id_size, &[2]), reference(own, id_size, &[3])]);
-        assert!(!references_overrun(&exact), "v{version}");
+        let mut steps = 0;
+        assert!(!references_overrun(&exact, &mut steps), "v{version}");
+        assert_eq!(steps, 2, "v{version}");
         // The second reference one byte longer than the bytes left.
         let past = body(&[
             reference(own, id_size, &[2]),
             reference(own + 1, id_size, &[3]),
         ]);
-        assert!(references_overrun(&past), "v{version}");
+        assert!(overruns(&past), "v{version}");
         // The first claims all the bytes: mp4-atom stops before the second's
         // size, however large.
         let all = body(&[
             reference(2 * own, id_size, &[2]),
             reference(u32::MAX, id_size, &[3]),
         ]);
-        assert!(!references_overrun(&all), "v{version}");
+        assert!(!overruns(&all), "v{version}");
         // Sizes of zero count nothing: mp4-atom reads on until a field
         // runs past the body, an ID, the count or the next size, and
         // refuses it.
         let zero = body(&[reference(0, id_size, &[2]), reference(0, id_size, &[3])]);
-        assert!(!references_overrun(&zero), "v{version}");
+        assert!(!overruns(&zero), "v{version}");
         let second = 4 + (zero.len() - 4) / 2;
         for end in [zero.len() - 1, 4 + 4 + 4 + id_size + 1, second + 3] {
-            assert!(!references_overrun(&zero[..end]), "v{version} {end}");
+            assert!(!overruns(&zero[..end]), "v{version} {end}");
         }
     }
     // A version mp4-atom refuses, a body too short for one, and no references.
     let mut other = [&[2, 0, 0, 0][..], &reference(u32::MAX, 2, &[])].concat();
-    assert!(!references_overrun(&other));
+    assert!(!overruns(&other));
     other[0] = 0;
-    assert!(references_overrun(&other));
-    assert!(!references_overrun(&[0, 0, 0]));
-    assert!(!references_overrun(&[0, 0, 0, 0]));
+    assert!(overruns(&other));
+    assert!(!overruns(&[0, 0, 0]));
+    assert!(!overruns(&[0, 0, 0, 0]));
 }
 
-/// Whether `check_item_references` refuses `body` with mp4-atom's error
-/// for an item reference box whose count wraps.
+/// A box of type `kind`, four bytes, with `body` (ISO/IEC 14496-12 §4.2).
+fn boxed(kind: &[u8], body: &[u8]) -> Vec<u8> {
+    let size = u32::try_from(8 + body.len()).unwrap();
+    [&size.to_be_bytes()[..], kind, body].concat()
+}
+
+/// An item reference box whose one reference claims a byte more than
+/// the box holds.
+fn past() -> Vec<u8> {
+    boxed(b"iref", &[&[0; 4][..], &reference(13, 2, &[])].concat())
+}
+
+/// The walk of `body` as the body of a movie box.
+fn walk(body: &[u8]) -> Result<u64, Fmp4Error> {
+    check_boxes("movie box", MOOV, body)
+}
+
+/// Whether the walk of `body` refuses an item reference box in it.
 fn refused(body: &[u8]) -> bool {
-    matches!(
-        check_item_references(body),
-        Err(mp4_atom::Error::OverDecode(kind)) if kind == IREF
-    )
+    walk(body) == Err(overrun("movie box"))
+}
+
+/// The fields of an audio sample entry of `version`, its QTFF
+/// extension included.
+fn audio(version: u8) -> Vec<u8> {
+    let extension = match version {
+        1 => 16,
+        2 => 36,
+        _ => 0,
+    };
+    [&[0; 8][..], &[0, version], &[0; 18], &vec![0; extension]].concat()
+}
+
+/// Bodies of a movie box with `iref`, an item reference box, inside
+/// every box whose boxes mp4-atom 0.16.2 reads by their type, after that
+/// box's own fields.
+fn holding(iref: &[u8]) -> Vec<Vec<u8>> {
+    let mut bodies = vec![iref.to_vec()];
+    for kind in [
+        b"moov", b"trak", b"mdia", b"minf", b"stbl", b"dinf", b"edts", b"mvex", b"moof", b"traf",
+        b"mfra", b"iprp", b"ipco",
+    ] {
+        bodies.push(boxed(kind, iref));
+    }
+    // ISO/IEC 14496-12 §8.11.1: after the version and flags, unless the
+    // handler follows at once (Apple's QTFF); in a user data box too.
+    let hdlr = boxed(b"hdlr", &[0; 25]);
+    let meta = boxed(b"meta", &[&[0; 4][..], &hdlr, iref].concat());
+    bodies.push(meta.clone());
+    bodies.push(boxed(b"meta", &[&hdlr[..], iref].concat()));
+    bodies.push(boxed(b"udta", &meta));
+    // The sample entries, after their fields (§8.5.2.2, §12).
+    bodies.push(boxed(b"stsd", &[&[0; 8][..], iref].concat()));
+    for kind in [
+        b"avc1", b"avc3", b"hev1", b"hvc1", b"vp08", b"vp09", b"av01", b"jpeg", b"uncv",
+    ] {
+        bodies.push(boxed(kind, &[&[0; 78][..], iref].concat()));
+    }
+    for kind in [
+        b"mp4a", b"Opus", b"fLaC", b"ac-3", b"ec-3", b".mp3", b"sowt", b"twos", b"lpcm", b"ipcm",
+        b"fpcm", b"in24", b"in32", b"fl32", b"fl64", b"s16l",
+    ] {
+        for version in 0..=2 {
+            bodies.push(boxed(kind, &[&audio(version)[..], iref].concat()));
+        }
+    }
+    bodies.push(boxed(b"samr", &[&[0; 28][..], iref].concat()));
+    bodies.push(boxed(b"tx3g", &[&[0; 38][..], iref].concat()));
+    for kind in [b"wvtt", b"evte", b"urim", b"mebx"] {
+        bodies.push(boxed(kind, &[&[0; 8][..], iref].concat()));
+    }
+    bodies.push(boxed(b"mett", &[&[0; 8][..], b"text\0\0", iref].concat()));
+    bodies.push(boxed(b"metx", &[&[0; 8][..], b"a\0b\0c\0", iref].concat()));
+    // A `mebx`'s keys, each holding boxes.
+    let keys = boxed(b"keys", &boxed(b"key1", iref));
+    bodies.push(boxed(b"mebx", &[&[0; 8][..], &keys].concat()));
+    // A size of 0 runs to the end of the body around it; a large size
+    // (`largesize`).
+    bodies.push([&[0; 4][..], &iref[4..]].concat());
+    let large = u64::try_from(iref.len() + 8).unwrap();
+    bodies.push(
+        [
+            &1_u32.to_be_bytes()[..],
+            b"iref",
+            &large.to_be_bytes(),
+            &iref[8..],
+        ]
+        .concat(),
+    );
+    bodies
+}
+
+/// An item reference box past its box is refused wherever mp4-atom
+/// reads one, and one that fits is read past.
+#[test]
+fn iso14496_12_8_11_12_item_references_are_checked_where_mp4_atom_reads_them() {
+    for body in holding(&past()) {
+        assert!(refused(&body), "{body:?}");
+    }
+    let fits = boxed(b"iref", &[&[0; 4][..], &reference(12, 2, &[])].concat());
+    for body in holding(&fits) {
+        assert!(walk(&body).is_ok(), "{body:?}");
+    }
+}
+
+/// Bytes mp4-atom 0.16.2 reads as data, fields or padding are not boxes,
+/// whatever they hold, nor is a box it does not read.
+#[test]
+fn iso14496_12_4_2_item_reference_types_mp4_atom_reads_as_data_are_not_boxes() {
+    let past = past();
+    let mut bodies = vec![
+        // §8.1.2: padding, here holding a box header of size 0.
+        boxed(b"free", &[0, 0, 0, 0, b'i', b'r', b'e', b'f']),
+        boxed(b"free", &past),
+        boxed(b"mdat", &past),
+        boxed(b"abcd", &past),
+        // A user data box reads its other boxes as data, and `keys` hold
+        // boxes in a `mebx` alone.
+        boxed(b"udta", &past),
+        boxed(b"keys", &boxed(b"key1", &past)),
+        // Inside a sample entry's fields, or after them in a version it
+        // refuses or a body too short for one.
+        boxed(b"avc1", &[&past[..], &[0; 54]].concat()),
+        boxed(b"mp4a", &[&audio(3)[..], &past].concat()),
+        boxed(b"mp4a", &[0; 9]),
+        // The second string read to the reference's first null.
+        boxed(b"mett", &[&[0; 8][..], b"text\0", &past].concat()),
+        boxed(b"metx", &[&[0; 8][..], b"abc"].concat()),
+    ];
+    // A box past the end of its body, a size below the header's, and too
+    // few bytes for a header.
+    let mut long = past.clone();
+    long[3] += 1;
+    bodies.push(long);
+    let mut short = past.clone();
+    short[3] = 7;
+    bodies.push(short);
+    bodies.push(past[..7].to_vec());
+    for body in &bodies {
+        assert!(walk(body).is_ok(), "{body:?}");
+    }
+}
+
+/// `n` edit boxes inside one another.
+fn nested(n: usize) -> Vec<u8> {
+    (0..n).fold(Vec::new(), |inner, _| boxed(b"edts", &inner))
 }
 
 #[test]
-fn iso14496_12_4_2_every_iref_type_is_taken_for_a_box_mp4_atom_may_read() {
-    let iref = |size: u32, reference_size: u32| {
-        [
-            &size.to_be_bytes()[..],
-            b"iref",
-            &[0; 4],
-            &reference(reference_size, 2, &[]),
-        ]
-        .concat()
+fn iso14496_12_4_2_boxes_nested_past_the_deepest_are_refused() {
+    let deep = Err(Fmp4Error::TooDeep { what: "movie box" });
+    // The movie box itself is the first.
+    assert!(walk(&nested(MAX_DEPTH - 1)).is_ok());
+    assert_eq!(walk(&nested(MAX_DEPTH)), deep);
+    // A `mebx`, its keys and each key are boxes deeper.
+    let keys = |more: usize| {
+        let key = boxed(b"key1", &nested(MAX_DEPTH - 4 + more));
+        boxed(b"mebx", &[&[0; 8][..], &boxed(b"keys", &key)].concat())
     };
-    // A reference one byte past the box, at any depth, after anything.
-    let past = iref(24, 13);
-    assert!(refused(&past));
-    assert!(refused(&[&[7; 9][..], &past].concat()));
-    // Well-formed, or running past the end of the body: not read.
-    assert!(check_item_references(&iref(24, 12)).is_ok());
-    assert!(check_item_references(&iref(25, 13)).is_ok());
-    // A size of zero runs to the end of a box not known.
-    assert!(refused(&iref(0, 12)));
-    // A size below the header's, and a type without room for a size
-    // before it: no box mp4-atom reads.
-    assert!(check_item_references(&iref(7, 13)).is_ok());
-    assert!(check_item_references(&past[4..]).is_ok());
-    // A large size (ISO/IEC 14496-12 §4.2, `largesize`), and its header
-    // cut short.
-    let large = [
-        &1_u32.to_be_bytes()[..],
-        b"iref",
-        &32_u64.to_be_bytes(),
-        &past[8..],
-    ]
-    .concat();
-    assert!(refused(&large));
-    assert!(check_item_references(&large[..15]).is_ok());
-    assert!(check_item_references(&large[..large.len() - 1]).is_ok());
+    assert!(walk(&keys(0)).is_ok());
+    assert_eq!(walk(&keys(1)), deep);
+}
+
+/// mp4-atom 0.16.2 reads boxes nested in one another on the stack: a few
+/// hundred overflowed it and aborted the process. The deepest it reads
+/// is read as before.
+#[test]
+fn iso14496_12_4_2_boxes_nested_past_the_deepest_are_refused_before_mp4_atom_reads_them() {
+    let whole = Reader::new(H264_AAC_INIT, MAX).unwrap().layout().clone();
+    let init = with_movie_child(H264_AAC_INIT, &nested(MAX_DEPTH - 1));
+    assert_eq!(Reader::new(&init, MAX).unwrap().layout(), &whole);
+    for n in [MAX_DEPTH, 1_000] {
+        let init = with_movie_child(H264_AAC_INIT, &nested(n));
+        let err = Reader::new(&init, MAX).unwrap_err();
+        assert_eq!(err, Fmp4Error::TooDeep { what: "movie box" });
+        assert_eq!(
+            err.to_string(),
+            "the movie box nests boxes more than 16 deep"
+        );
+    }
+    let segment = with_child(SPLIT_AUDIO_0, &[(b"moof", 0)], &nested(1_000));
+    assert_eq!(
+        segment_error(SPLIT_AUDIO_INIT, &segment),
+        Fmp4Error::TooDeep {
+            what: "movie fragment"
+        }
+    );
+}
+
+/// Every item reference box is read once, the boxes around it too: the
+/// review's input (PR #81), whose references of size 0 each hold another
+/// box header and cost the scan of every `iref` type quadratic work, is
+/// walked in a step per reference.
+#[test]
+fn iso14496_12_8_11_12_item_references_are_read_once() {
+    for n in [256_usize, 512] {
+        let references: Vec<u8> = (0..n)
+            .flat_map(|k| {
+                let size = u32::try_from(8 + 4 + 24 * (n - 1 - k)).unwrap();
+                let ids = [&size.to_be_bytes()[..], b"iref", &[0; 4]].concat();
+                let mut reference = reference(0, 2, &[0; 6]);
+                reference[12..].copy_from_slice(&ids);
+                reference
+            })
+            .collect();
+        let body = boxed(b"iref", &[&[0; 4][..], &references].concat());
+        assert_eq!(
+            body.windows(4).filter(|kind| kind == b"iref").count(),
+            n + 1
+        );
+        // Its header, each reference, and the size the body is too short
+        // for.
+        let steps = walk(&body).unwrap();
+        assert_eq!(steps, 1 + n as u64 + 1);
+        assert!(steps <= body.len() as u64 / 4);
+    }
+}
+
+/// An item reference box past its box inside a sample entry and inside
+/// the user data box's meta box, as mp4-atom reads them; the type inside
+/// padding is read past.
+#[test]
+fn iso14496_12_8_11_12_item_references_in_the_movie_where_mp4_atom_reads_them() {
+    let avc1 = [
+        (b"moov", 0),
+        (b"trak", 0),
+        (b"mdia", 0),
+        (b"minf", 0),
+        (b"stbl", 0),
+        (b"stsd", 0),
+        (b"avc1", 0),
+    ];
+    let meta = [(b"moov", 0), (b"udta", 0), (b"meta", 0)];
+    for path in [&avc1[..], &meta] {
+        let init = with_child(H264_AAC_INIT, path, &past());
+        assert_eq!(Reader::new(&init, MAX).unwrap_err(), overrun("movie box"));
+    }
+    let whole = Reader::new(H264_AAC_INIT, MAX).unwrap().layout().clone();
+    let padding = boxed(b"free", &[0, 0, 0, 0, b'i', b'r', b'e', b'f']);
+    for init in [
+        with_movie_child(H264_AAC_INIT, &padding),
+        with_child(H264_AAC_INIT, &avc1, &boxed(b"free", &past())),
+    ] {
+        assert_eq!(Reader::new(&init, MAX).unwrap().layout(), &whole);
+    }
 }
