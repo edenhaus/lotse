@@ -1427,6 +1427,11 @@ mod tests {
         assert_eq!((v0.epoch(), live.tracks().len()), (1, 2));
         sa0.publish_packet(packet(2, false));
         assert_eq!(a0.stats().packets, 2);
+        assert!(
+            sa0.publish_frame(frame(true)),
+            "the track the switch declared takes the standby's frames"
+        );
+        assert_eq!(a0.stats().frames, 1);
         // A second standby forwards into the live tracks as well, the
         // ones the first standby brought included; the first's writes are
         // dropped.

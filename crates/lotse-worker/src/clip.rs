@@ -591,17 +591,15 @@ impl Continuity {
 /// nothing is held. The later start is taken again, with a subscription of
 /// its own: the ring moved on since the first, and a snapshot taken beside
 /// the first subscription could start after frames that one yields. The
-/// descriptor comes with the pair it was taken with.
-fn start_video(
-    video: &Arc<Track>,
-    target: Instant,
-) -> (TrackSubscription, Option<PrerollSnapshot>, Arc<Codec>) {
-    let (subscription, snapshot, codec) = video.subscribe_from_preroll(target);
+/// descriptor and the source the track takes come with the pair they were
+/// taken with.
+fn start_video(video: &Arc<Track>, target: Instant) -> TrackStart {
+    let (subscription, snapshot, codec, source) = video.subscribe_from_preroll(target);
     let Some(snapshot) = snapshot else {
-        return (subscription, None, codec);
+        return (subscription, None, codec, source);
     };
     if sets_match(&codec, &snapshot.start().payload) {
-        return (subscription, Some(snapshot), codec);
+        return (subscription, Some(snapshot), codec, source);
     }
     let tidy = snapshot
         .frames()
@@ -612,11 +610,20 @@ fn start_video(
         "clip: the start keyframe carries other parameter sets than the track's"
     );
     match tidy.map(|at| video.subscribe_from_preroll(at)) {
-        Some((later, Some(from), codec)) => (later, Some(from), codec),
+        Some((later, Some(from), codec, source)) => (later, Some(from), codec, source),
         // None later, or the ring emptied since: the first pair stands.
-        _ => (subscription, Some(snapshot), codec),
+        _ => (subscription, Some(snapshot), codec, source),
     }
 }
+
+/// A track's start as [`Track::subscribe_from_preroll`] takes it: the
+/// subscription, the snapshot, the descriptor and the source the track
+/// takes.
+type TrackStart = (TrackSubscription, Option<PrerollSnapshot>, Arc<Codec>, u8);
+
+/// A clip's audio start: the subscription, the snapshot and the sample
+/// entry.
+type AudioStart = (TrackSubscription, Option<PrerollSnapshot>, ClipTrack);
 
 /// Whether every parameter set `access_unit` (Annex B) carries in band is
 /// the one `codec` holds of its type; one that carries none qualifies, and
@@ -778,7 +785,9 @@ impl Clip {
 
     /// Waits for the tracks, picks them, subscribes and queues the
     /// pre-roll; the end instead when the tracks do not come in time, have
-    /// no video, the reader goes or the worker asks first. Each track's
+    /// no video, the reader goes or the worker asks first, and
+    /// `stream_changed` when the connection switched source between the
+    /// video's start and the audio's ([`Self::start_audio`]). Each track's
     /// descriptor is taken with its subscription, so a change after it
     /// comes to the clip as an event, after the frames before it.
     async fn open(
@@ -806,7 +815,7 @@ impl Clip {
             .started
             .checked_sub(self.before)
             .unwrap_or(self.started);
-        let (video, snapshot, codec) = start_video(video_track, target);
+        let (video, snapshot, codec, source) = start_video(video_track, target);
         let video_entry = ClipTrack {
             codec: (*codec).clone(),
             clock_rate: video_track.clock_rate(),
@@ -818,16 +827,7 @@ impl Clip {
         if let Some(track) = natives.iter().find(|track| track.kind() == Kind::Audio)
             && self.audio
         {
-            let (subscription, audio_snapshot, codec) = track.subscribe_from_preroll(audio_target);
-            if self.factory.accepts(&codec) {
-                let entry = ClipTrack {
-                    codec: (*codec).clone(),
-                    clock_rate: track.clock_rate(),
-                };
-                audio = Some((subscription, audio_snapshot, entry));
-            } else {
-                self.omitted = Some(codec.name().to_owned());
-            }
+            audio = self.start_audio(track, audio_target, source)?;
         }
         let mut queue = ReliableQueue::new(self.settings.policy.queue_bytes, audio.is_some());
         let now = self.clock.now();
@@ -847,6 +847,43 @@ impl Clip {
             entries: (video_entry, audio_entry),
             interleaver: Interleaver::new(queue, self.settings.policy.max_skew),
         })
+    }
+
+    /// The audio `track`'s start from `target`, its subscription, snapshot
+    /// and descriptor taken together ([`Track::subscribe_from_preroll`]);
+    /// `None` when the container cannot carry its codec, the clip warned
+    /// `audio_omitted`. It ends the clip `stream_changed` when the track
+    /// takes another source than `source`, the video start's: the
+    /// connection switched between the two, so the video's frames are the
+    /// old source's up to its `SourceSwitched` and the audio's the new
+    /// one's, and an audio frame captured before a video frame queued
+    /// ahead of that event would go out with it, two sources in one clip.
+    /// The video's subscription ends the clip at the switch all the same.
+    fn start_audio(
+        &mut self,
+        track: &Arc<Track>,
+        target: Instant,
+        source: u8,
+    ) -> Result<Option<AudioStart>, EndReason> {
+        let (subscription, snapshot, codec, audio_source) = track.subscribe_from_preroll(target);
+        if audio_source != source {
+            tracing::info!(
+                clip.id = %self.id,
+                video_source = source,
+                audio_source,
+                "clip: the connection switched to another source between the video's start and the audio's; ending"
+            );
+            return Err(EndReason::StreamChanged);
+        }
+        if !self.factory.accepts(&codec) {
+            self.omitted = Some(codec.name().to_owned());
+            return Ok(None);
+        }
+        let entry = ClipTrack {
+            codec: (*codec).clone(),
+            clock_rate: track.clock_rate(),
+        };
+        Ok(Some((subscription, snapshot, entry)))
     }
 
     /// Runs the clip until it ends: takes what the subscriptions yield
@@ -3529,6 +3566,65 @@ mod tests {
             ]
         );
         assert_eq!(reports, vec![stopped("stopped", bytes.len(), 100, 0)]);
+    }
+
+    /// A switch between a clip's video start and its audio start ends the
+    /// clip `stream_changed` there, before it takes a frame: the video's
+    /// start is the old source's and the audio's the new one's, whose
+    /// audio, captured before the old video frames queued ahead of the
+    /// video's `SourceSwitched`, would go out among them. Without a switch
+    /// between them, the same audio start is taken. Regression: the clip
+    /// paired the two starts and wrote the new source's audio frame
+    /// between the old source's video frames.
+    #[tokio::test]
+    async fn a_switch_between_the_video_s_start_and_the_audio_s_ends_the_clip_stream_changed() {
+        let (logs, _guard) = Logs::capture();
+        let rig = Rig::new(Some(fake_aac()));
+        rig.video_frame(0, 0, true, 32);
+        rig.audio_frame(0);
+        rig.video_frame(100, 1, false, 16);
+        let staging = TrackSet::staging(&rig.set);
+        let mut publisher = staging.publisher();
+        let standby_video = publisher.declare(Kind::Video, h264(), 90_000);
+        let standby_audio = publisher.declare(Kind::Audio, fake_aac(), 16_000);
+        publisher.ready();
+        staging.arm_switch();
+        let (_reader, writer) = io::pipe().unwrap();
+        let (reports, _) = mpsc::channel(1);
+        let mut clip = Clip::new(
+            &spec(5_000, None, true),
+            pipe::Sender::from_owned_fd(OwnedFd::from(writer)).unwrap(),
+            Arc::new(FakeClipMuxerFactory::default()),
+            ClipSettings::default(),
+            rig.clock.clone(),
+            rig.at(150),
+            reports,
+        );
+        let (_video, snapshot, _, source) = start_video(rig.video(), rig.at(0));
+        assert_eq!((snapshot.unwrap().frames().count(), source), (2, 0));
+        // The switch, then the new source's audio, captured at 50 ms,
+        // before the old P-frame at 100 the video's start holds.
+        rig.video_frame_on(&standby_video, 200, 0, true, 32);
+        assert!(standby_audio.publish_frame(MediaFrame {
+            ts: MediaTime::ZERO,
+            wallclock: rig.at(50),
+            arrival: rig.at(200),
+            keyframe: true,
+            discontinuity: false,
+            epoch: 0,
+            payload: vec![0xe1; 4].into(),
+        }));
+        let audio = rig.audio.as_ref().unwrap();
+        let_assert!(Err(EndReason::StreamChanged) = clip.start_audio(audio, rig.at(0), source));
+        let lines = logs.lines(
+            Level::INFO,
+            "clip: the connection switched to another source between the video's start and the audio's; ending",
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].fields, " clip.id=k1 video_source=0 audio_source=1");
+        let_assert!(Ok(Some((_, Some(held), entry))) = clip.start_audio(audio, rig.at(0), 1));
+        assert_eq!(held.frames().count(), 1, "the new source's frame alone");
+        assert_eq!(entry.codec, fake_aac());
     }
 
     /// A B-frame run of any length is no hole: its reference frame jumps

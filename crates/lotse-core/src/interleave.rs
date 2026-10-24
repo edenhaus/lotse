@@ -1451,7 +1451,7 @@ mod tests {
             assert!(track.publish_frame(MediaFrame::clone(&clip.frame(ms, keyframe, 10))));
         };
         publish(0, true);
-        let (mut subscription, snapshot, _) = track.subscribe_from_preroll(clip.at(80));
+        let (mut subscription, snapshot, _, _) = track.subscribe_from_preroll(clip.at(80));
         publish(40, false);
         publish(80, true);
         publish(120, false);
@@ -1498,7 +1498,7 @@ mod tests {
             },
             clip.now(),
         ));
-        let (mut subscription, snapshot, _) = track.subscribe_from_preroll(clip.at(0));
+        let (mut subscription, snapshot, _, _) = track.subscribe_from_preroll(clip.at(0));
         assert!(snapshot.is_none(), "no window, no pre-roll");
         let publish = |ms: u64, keyframe: bool, bytes: usize| {
             track.publish_frame(MediaFrame::clone(&clip.frame(ms, keyframe, bytes)))
