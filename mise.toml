@@ -161,7 +161,7 @@ description = "The TURN client against a real coturn in Docker (UDP and TCP, lon
 run = "scripts/turn-e2e.sh"
 
 [tasks.interop]
-description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS with a pinned certificate; and ffmpeg's raw MPEG-TS over HTTP (the ignored `mediamtx_` and `ffmpeg_` tests); and ffprobe reading the clip muxer's fixtures (the ignored `ffprobe_` tests)"
+description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS with a pinned certificate; and ffmpeg's raw MPEG-TS over HTTP (the ignored `mediamtx_` and `ffmpeg_` tests); event clips of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a clip) checked by ffprobe, which decodes every frame (the ignored `mediamtx_iso14496_12_clip_` tests); and ffprobe reading the clip muxer's fixtures (the ignored `ffprobe_` tests)"
 run = "scripts/nextest.sh -E 'binary_id(lotse::interop) | binary_id(lotse-mux::fixtures)' --run-ignored only --no-tests=fail mediamtx_ ffmpeg_ ffprobe_"
 
 [tasks.load]
