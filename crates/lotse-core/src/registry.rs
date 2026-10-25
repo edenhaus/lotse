@@ -1,10 +1,11 @@
 //! The factory registries the binary fills at startup: sources by scheme,
-//! outputs by kind, transcoders as a list. Nothing else in the tree names
-//! a concrete source or output.
+//! outputs by kind, transcoders as a list, the clip container in its own
+//! slot. Nothing else in the tree names a concrete source or output.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::clip::ClipMuxerFactory;
 use crate::output::OutputFactory;
 use crate::source::SourceFactory;
 use crate::transcode::{Transcoder, UplinkFactory};
@@ -123,6 +124,9 @@ pub struct Registries {
     /// never offers a viewer a talk-back conversion; `None` forwards only
     /// an uplink already in the device's codec.
     pub uplink: Option<Arc<dyn UplinkFactory>>,
+    /// The container event clips are written in, apart from `outputs`
+    /// since a clip is no session; `None` runs no clip.
+    pub clip: Option<Arc<dyn ClipMuxerFactory>>,
 }
 
 #[cfg(test)]
@@ -193,6 +197,7 @@ mod tests {
             registries.uplink.is_none(),
             "no talk-back transcoder by default"
         );
+        assert!(registries.clip.is_none(), "no clip container by default");
         assert!(registries.sources.schemes().is_empty());
         assert!(registries.outputs.kinds().is_empty());
         assert_eq!(

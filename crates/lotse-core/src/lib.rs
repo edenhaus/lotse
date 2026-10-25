@@ -1,7 +1,8 @@
 //! Protocol-blind media core: tracks, packets, frames, the source and output
 //! contracts, factory registries, source supervision (backoff, stall watchdog,
 //! hot swap), clock mapping and its skew watchdog, fan-out, the pre-roll
-//! ring, track negotiation and a session's uplink track for talk-back.
+//! ring, a clip's reliable queue and interleaver and its container
+//! contract, track negotiation and a session's uplink track for talk-back.
 //!
 //! Runs inside a worker process. Knows nothing about RTSP, WebRTC, HTTP or
 //! processes: it defines the traits the protocol crates implement and never
@@ -12,6 +13,7 @@
 //! Standards: RFC 3550 (RTP timestamps, sequence numbers, Sender Reports).
 
 pub mod backoff;
+pub mod clip;
 pub mod clock;
 pub mod clock_map;
 pub mod codec;
@@ -20,6 +22,7 @@ pub mod discontinuity;
 pub mod fingerprint;
 pub mod id;
 pub mod ingest;
+pub mod interleave;
 pub mod lateness;
 pub mod media;
 pub mod negotiate;
