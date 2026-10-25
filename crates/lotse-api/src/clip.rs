@@ -15,8 +15,10 @@
 //!
 //! Once its response begins, the connection leaves the pending upgrades
 //! and their deadline (a clip runs for minutes) and is bounded instead by
-//! the client taking the body: a chunk the client makes no room for within
-//! [`BODY_STALL_TIMEOUT`] drops the connection, and so does still sending
+//! the client taking the body: a chunk that waits for the client while the
+//! socket takes none of the response for [`BODY_STALL_TIMEOUT`] drops the
+//! connection (each write the socket takes restarts the wait, so a client
+//! reading slowly keeps it), and so does still sending
 //! [`CLOSE_TIMEOUT`] after shutdown began, or the removal of the TLS
 //! listener's client that takes it (`clients/remove`), which closes its
 //! WebSocket connections alike: the connection is registered with the
@@ -42,7 +44,9 @@
 
 use std::fmt;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use axum::Extension;
@@ -57,7 +61,7 @@ use lotse_api_types::error::ErrorCode;
 use lotse_core::clock::Clock;
 use lotse_core::id::ClipId;
 use lotse_core::task::BoxFuture;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{oneshot, watch};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
@@ -113,8 +117,9 @@ pub(crate) enum BodyState {
     /// A clip body is being sent and the client took what it was given:
     /// the body waits for more of the clip.
     Taken,
-    /// What the body handed over at this instant waits for the client to
-    /// make room for it: a chunk, or the body's end.
+    /// What the body handed over waits for the client to make room for
+    /// it, a chunk or the body's end, and the socket last took bytes of
+    /// the response at this instant (or none since the hand-over).
     Waiting(Instant),
 }
 
@@ -145,6 +150,96 @@ impl BodyWatch {
     /// A receiver of every change.
     pub(crate) fn subscribe(&self) -> watch::Receiver<BodyState> {
         self.0.subscribe()
+    }
+
+    /// The socket took bytes of the response: a wait for the client
+    /// restarts at `clock`'s now. Nobody is woken (the stall timer reads
+    /// the new instant when it fires), so a write costs no wake-up; with
+    /// no body waiting, nothing changes.
+    fn progressed(&self, clock: &dyn Clock) {
+        self.0.send_if_modified(|state| {
+            if let BodyState::Waiting(since) = state {
+                *since = clock.now();
+            }
+            false
+        });
+    }
+}
+
+/// What a connection's socket is to [`Watched`]: either listener's (a Unix
+/// stream, a TLS stream), boxed, so [`Watched`] is one type whatever the
+/// listener.
+pub(crate) trait Transport: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Transport for T {}
+
+/// A connection's socket, as hyper reads and writes it: every write that
+/// takes bytes restarts the wait of a clip body ([`BodyWatch::progressed`]),
+/// so [`BODY_STALL_TIMEOUT`] bounds a client that takes none of the body,
+/// not one that takes it slowly.
+pub(crate) struct Watched {
+    /// The socket.
+    io: Box<dyn Transport>,
+    /// The connection's body state.
+    body: BodyWatch,
+    /// Stamps the progress.
+    clock: Arc<dyn Clock>,
+}
+
+impl Watched {
+    /// `io`, reporting its writes to `body`.
+    pub(crate) fn new(io: Box<dyn Transport>, body: BodyWatch, clock: Arc<dyn Clock>) -> Self {
+        Self { io, body, clock }
+    }
+
+    /// Passes `written` on, after telling the body when it took bytes.
+    fn record(&self, written: Poll<io::Result<usize>>) -> Poll<io::Result<usize>> {
+        if let Poll::Ready(Ok(1..)) = written {
+            self.body.progressed(self.clock.as_ref());
+        }
+        written
+    }
+}
+
+impl AsyncRead for Watched {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Watched {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let written = Pin::new(&mut self.io).poll_write(cx, buf);
+        self.record(written)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let written = Pin::new(&mut self.io).poll_write_vectored(cx, bufs);
+        self.record(written)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 
@@ -449,8 +544,8 @@ pub(crate) async fn send_body(
 }
 
 /// Completes once what a body handed over has waited
-/// [`BODY_STALL_TIMEOUT`] for the client. `body`'s sender must outlive
-/// the call.
+/// [`BODY_STALL_TIMEOUT`] for the client with the socket taking none of
+/// the response meanwhile. `body`'s sender must outlive the call.
 async fn stalled(body: &mut watch::Receiver<BodyState>, clock: &dyn Clock) {
     loop {
         let state = *body.borrow_and_update();
@@ -460,9 +555,15 @@ async fn stalled(body: &mut watch::Receiver<BodyState>, clock: &dyn Clock) {
             ),
             BodyState::Idle | BodyState::Taken => None,
         };
+        if left.is_some_and(|left| left.is_zero()) {
+            return;
+        }
         let timer: OptionFuture<_> = left.map(|left| clock.sleep(left)).into();
+        // The timer firing ends nothing by itself: the socket may have
+        // taken bytes since, which restamps the wait without a change
+        // notification, and the loop reads it again.
         tokio::select! {
-            Some(()) = timer => return,
+            Some(()) = timer => {}
             _changed = body.changed() => {}
         }
     }
@@ -488,7 +589,7 @@ mod tests {
 
     use axum::http::HeaderValue;
     use lotse_core::clock::FakeClock;
-    use tokio::io::{AsyncWriteExt as _, ReadBuf};
+    use tokio::io::AsyncWriteExt as _;
 
     use super::*;
     use crate::tests::state;
@@ -1082,6 +1183,141 @@ mod tests {
             text.contains("clip body dropped: its client was removed"),
             "{text}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_wait_restarts_when_the_socket_takes_bytes_and_is_dropped_a_stall_deadline_after_the_last()
+     {
+        let (logs, _guard) = capture(tracing::Level::WARN);
+        let clock = Arc::new(FakeClock::default());
+        let (watch, _end, task) = sent_body(&clock, &CancellationToken::new());
+        watch.set(BodyState::Waiting(clock.now()));
+        settle().await;
+        clock.advance(BODY_STALL_TIMEOUT.saturating_sub(Duration::from_secs(1)));
+        settle().await;
+        // The socket takes bytes a second before the deadline: nobody is
+        // woken, and the timer that fires at the old deadline finds the
+        // new instant.
+        watch.progressed(clock.as_ref());
+        assert_eq!(*watch.subscribe().borrow(), BodyState::Waiting(clock.now()));
+        settle().await;
+        clock.advance(Duration::from_secs(1));
+        settle().await;
+        assert!(!task.is_finished(), "the old deadline passed");
+        clock.advance(
+            BODY_STALL_TIMEOUT.saturating_sub(Duration::from_secs(1) + Duration::from_millis(1)),
+        );
+        settle().await;
+        assert!(!task.is_finished(), "a millisecond before the new one");
+        clock.advance(Duration::from_millis(1));
+        task.await.unwrap();
+        let text = logs.text();
+        assert!(
+            text.contains("clip body dropped: the client made no room for it in time"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn progress_restamps_only_a_body_that_waits() {
+        let clock = FakeClock::default();
+        let watch = BodyWatch::new();
+        let mut states = watch.subscribe();
+        watch.progressed(&clock);
+        assert_eq!(*states.borrow(), BodyState::Idle);
+        watch.set(BodyState::Taken);
+        states.borrow_and_update();
+        watch.progressed(&clock);
+        assert_eq!(*states.borrow(), BodyState::Taken);
+        let handed = clock.now();
+        watch.set(BodyState::Waiting(handed));
+        states.borrow_and_update();
+        clock.advance(Duration::from_secs(3));
+        watch.progressed(&clock);
+        assert_eq!(*states.borrow(), BodyState::Waiting(clock.now()));
+        assert!(!states.has_changed().unwrap(), "no one is woken");
+    }
+
+    /// A socket that writes one byte at a time and never vectored, and
+    /// fails its flush and its shutdown, so a test sees they were asked.
+    struct Plain;
+
+    impl AsyncRead for Plain {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Plain {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len().min(1)))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("flushed")))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("shut down")))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_socket_restamps_a_waiting_body_on_each_write_that_takes_bytes() {
+        use futures_util::FutureExt as _;
+        use tokio::io::AsyncReadExt as _;
+
+        let clock = Arc::new(FakeClock::default());
+        let watch = BodyWatch::new();
+        let states = watch.subscribe();
+        let (mut peer, io) = tokio::io::duplex(4);
+        let mut socket = Watched::new(Box::new(io), watch.clone(), Arc::<FakeClock>::clone(&clock));
+        assert!(socket.is_write_vectored(), "as the socket is");
+        let handed = clock.now();
+        watch.set(BodyState::Waiting(handed));
+        clock.advance(Duration::from_secs(1));
+        // A write that takes nothing is no progress.
+        assert_eq!(socket.write(&[]).await.unwrap(), 0);
+        assert_eq!(*states.borrow(), BodyState::Waiting(handed));
+        assert_eq!(socket.write(b"ab").await.unwrap(), 2);
+        assert_eq!(*states.borrow(), BodyState::Waiting(clock.now()));
+        clock.advance(Duration::from_secs(1));
+        let bufs = [io::IoSlice::new(b"c"), io::IoSlice::new(b"d")];
+        assert_eq!(socket.write_vectored(&bufs).await.unwrap(), 2);
+        assert_eq!(*states.borrow(), BodyState::Waiting(clock.now()));
+        // Full: a write that waits for room is no progress either.
+        let full = clock.now();
+        clock.advance(Duration::from_secs(1));
+        assert!(socket.write(b"e").now_or_never().is_none());
+        assert_eq!(*states.borrow(), BodyState::Waiting(full));
+        socket.flush().await.unwrap();
+        let mut taken = [0_u8; 4];
+        peer.read_exact(&mut taken).await.unwrap();
+        assert_eq!(&taken, b"abcd");
+        // Reads pass through.
+        peer.write_all(b"GET").await.unwrap();
+        let mut read = [0_u8; 3];
+        socket.read_exact(&mut read).await.unwrap();
+        assert_eq!(&read, b"GET");
+        // A socket that does not write vectored is not made to, and its
+        // flush and shutdown are its own.
+        let mut plain = Watched::new(Box::new(Plain), watch, clock);
+        assert!(!plain.is_write_vectored());
+        assert_eq!(plain.write(b"xy").await.unwrap(), 1);
+        assert_eq!(plain.read(&mut taken).await.unwrap(), 0);
+        assert_eq!(plain.flush().await.unwrap_err().to_string(), "flushed");
+        assert_eq!(plain.shutdown().await.unwrap_err().to_string(), "shut down");
+        // The end passes through.
+        socket.shutdown().await.unwrap();
+        assert_eq!(peer.read(&mut taken).await.unwrap(), 0);
     }
 
     #[test]
