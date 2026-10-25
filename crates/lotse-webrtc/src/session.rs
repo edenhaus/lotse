@@ -1149,8 +1149,9 @@ impl Session {
     /// again ([`AudioPlan`]) for the `backchannel` the camera offers now
     /// and the worker's `claim` of it, talk-back on an m-line the engine
     /// answered before in the first codec it kept that the re-offer lists,
-    /// or not at all ([`AudioPlan::kept`], [`kept_codecs`]), the offer
-    /// rewritten for the engine
+    /// or not at all ([`AudioPlan::kept`], [`kept_codecs`]), the stream's
+    /// audio on one only in a codec it kept ([`AudioPlan::kept_downlink`]),
+    /// the offer rewritten for the engine
     /// as the first one was, and the writers follow the plan: the
     /// downlink writer stays when the stream's audio still goes down the
     /// same m-line, is parked for another, whose own writer is taken up
@@ -1190,7 +1191,8 @@ impl Session {
             claim,
             &self.order,
         )
-        .kept(offer, |mid| kept_codecs(&self.rtc, mid));
+        .kept(offer, |mid| kept_codecs(&self.rtc, mid))
+        .kept_downlink(|mid| kept_codecs(&self.rtc, mid));
         let directed = plan.engine_offer(offer);
         // The re-offer's candidates are ignored: the trickled ones reached
         // the agent already. Counted on the answer's log line.

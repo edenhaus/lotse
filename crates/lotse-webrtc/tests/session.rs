@@ -3900,6 +3900,104 @@ fn rfc3550_5_1_audio_moved_off_an_m_line_and_back_runs_its_sequence_numbers_on()
     );
 }
 
+/// `offer` with G.722 added to its talk-back m-line (its last audio
+/// m-line), after the formats it lists, as a browser re-offers a format
+/// the last answer left out of that m-line (RFC 8829 §5.2.2: formats not
+/// in the most recent answer are added after those that are); the str0m
+/// viewer re-offers only the formats answered.
+fn with_g722_up(offer: &str) -> String {
+    let (before, up) = offer.rsplit_once("m=audio ").expect("an audio m-line");
+    assert!(!up.contains("a=rtpmap:9 "), "{offer}");
+    let mut lines: Vec<String> = up.lines().map(str::to_owned).collect();
+    lines[0].push_str(" 9");
+    let at = lines
+        .iter()
+        .rposition(|line| line.starts_with("a=rtpmap:"))
+        .expect("an a=rtpmap");
+    lines.insert(at + 1, "a=rtpmap:9 G722/8000".to_owned());
+    format!("{before}m=audio {}\r\n", lines.join("\r\n"))
+}
+
+/// A re-offer that moves the stream's audio to an m-line whose first
+/// answer left the stream audio's codec out sends no audio there: str0m
+/// 0.24.0 answers that m-line with the formats of its first answer
+/// (`Media::set_remote_pts`, read 2026-10-24), and the session sends only
+/// a format the answer lists (RFC 3264 §6.1). Under G.722 stream audio,
+/// the dedicated m-line B, declined for want of a backchannel, is
+/// answered without G.722, which reaches no camera; a re-offer that
+/// lists G.722 on B again and moves the downlink there gets B answered
+/// `inactive`, the `audio_codec_unsupported` warning and the packets
+/// dropped, none sent under a second SSRC.
+#[test]
+fn rfc3264_6_1_stream_audio_moved_to_an_m_line_whose_first_answer_left_its_codec_out_is_not_sent() {
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::G722));
+    pair.connect(&answer);
+    pair.play_audio(0, 5, "on A");
+    let [a] = audio_ssrcs(&pair)[..] else {
+        panic!("one audio SSRC: {:?}", audio_ssrcs(&pair));
+    };
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            None,
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    let up = audio_sections(&answer).pop().unwrap();
+    assert!(up.contains(&"a=inactive"), "{answer}");
+    assert_eq!(
+        payload_types(&up),
+        ["111", "0", "8"],
+        "G.722 reaches no camera: {answer}"
+    );
+
+    // To B: A `inactive`, B `sendrecv` with G.722 listed again.
+    let reoffer = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let moved =
+        reoffer
+            .replacen("a=recvonly", "a=inactive", 1)
+            .replacen("a=sendonly", "a=sendrecv", 1);
+    let to_b = with_g722_up(&moved);
+    let offered = audio_sections(&to_b);
+    assert!(offered[0].contains(&"a=inactive"), "{to_b}");
+    assert!(offered[1].contains(&"a=sendrecv"), "{to_b}");
+    assert!(offered[1].contains(&"a=rtpmap:9 G722/8000"), "{to_b}");
+    pair.events.clear();
+    let answer = pair
+        .session
+        .renegotiate(pair.now, &to_b, None, TalkbackClaim::Granted)
+        .expect("answered");
+    let sections = audio_sections(&answer);
+    assert!(sections[0].contains(&"a=inactive"), "{answer}");
+    assert!(
+        sections[1].contains(&"a=inactive"),
+        "no audio on B: {answer}"
+    );
+    assert_eq!(payload_types(&sections[1]), ["111", "0", "8"], "{answer}");
+    pair.viewer
+        .accept_answer(&answer, &mut pair.to_daemon)
+        .expect("applies");
+    pair.drain();
+    assert!(
+        pair.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Warning {
+                code: "audio_codec_unsupported",
+                ..
+            }
+        )),
+        "{:?}",
+        pair.events
+    );
+    let dropped = pair.session.stats().audio_dropped;
+    write_five(&mut pair, 5);
+    assert_eq!(pair.session.stats().audio_dropped, dropped + 5);
+    assert_eq!(audio_ssrcs(&pair), [a], "nothing under a second SSRC");
+}
+
 /// `offer` with its first audio m-line stopped (RFC 3264 §8.2): port 0,
 /// its mid out of the BUNDLE group, as `RTCRtpTransceiver.stop()` offers
 /// it (RFC 8829 §5.2.2).
