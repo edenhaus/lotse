@@ -42,7 +42,13 @@
 //! then the queue up to `clip_queue_bytes`, and then costs the clip a gap,
 //! never the camera's other consumers. A clip ends at the first frame
 //! captured at or after its end, by the ring's measure as its start
-//! ([`captured`]), or [`END_GRACE`] after it when none comes.
+//! ([`captured`]), or [`END_GRACE`] after it when none comes. The
+//! interleaver orders the tracks by that measure too, so a frame at the
+//! end goes out only after the other track's frames queued ahead of that
+//! track's own first frame at the end, and a graceful end's drain, which
+//! stops at the next frame at the end, leaves none of them out. The
+//! video's frames queued behind its first at the end are left out,
+//! B-frames that may refer to it.
 //! A graceful end (`completed`, `stopped`, `max_duration`) first writes
 //! what the queue still holds, frames held for the other track included,
 //! up to the clip's end, for at most [`FINISH_GRACE`] of a reader taking
@@ -3000,7 +3006,8 @@ mod tests {
     /// keyframe was captured by the pre-roll's measure, its arrival when it
     /// is dated ahead of it (a Sender Report mapping off), as `before_ms`
     /// counts it: a keyframe arriving at 500 ms dated 900 ms starts the
-    /// audio at 448 ms. Regression: the audio started at 896 ms, 400 ms
+    /// audio at 448 ms, and goes out after it by the same measure.
+    /// Regression: the audio started at 896 ms, 400 ms
     /// short of what `before_ms` said the clip holds.
     #[tokio::test]
     async fn a_keyframe_dated_ahead_of_its_arrival_starts_the_audio_at_its_arrival() {
@@ -3025,8 +3032,8 @@ mod tests {
         let lines = lines(&bytes);
         assert_eq!(lines[1], format!("frame a 0 {} k 4", 7 * 1_024), "448 ms");
         assert_eq!(
-            lines[9], "frame v 0 0 k 32",
-            "after the audio before 900 ms"
+            lines[2], "frame v 0 0 k 32",
+            "by its arrival too: after the audio before 500 ms"
         );
         assert_eq!(reports, vec![stopped("stopped", bytes.len(), 512, 0)]);
     }
@@ -3601,6 +3608,67 @@ mod tests {
         );
         // The fake container's furthest place: 61.1 s − 61 s.
         assert_eq!(reports, vec![stopped("completed", bytes.len(), 100, 0)]);
+    }
+
+    /// The tracks go out in the order of the measure the clip ends by
+    /// ([`captured`]), so audio past the end cannot end the clip before
+    /// video captured before it: video dated ahead of its arrival by a
+    /// Sender Report mapping off (RFC 3550 §6.4.1) goes out by its
+    /// arrival. Regression: ordered by the dates, the audio at 4 s, held
+    /// for the video, went out before a P-frame arriving at 3.95 s dated
+    /// 61.95 s, ended a clip ending at 4 s, and the drain stopped at the
+    /// audio at 4.064 s queued behind it, the P-frame left out.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_audio_past_the_end_does_not_leave_out_video_dated_ahead() {
+        let mut rig = Rig::new(Some(fake_aac()));
+        let audio = Arc::clone(rig.audio.as_ref().unwrap());
+        rig.advance_to(960);
+        assert!(audio.publish_frame(frame_at(&rig, (960, 960), 15_360, true, 4)));
+        // (captured, arrived) in ms after the start: dated a minute ahead.
+        rig.advance_to(1_000);
+        assert!(
+            rig.video()
+                .publish_frame(frame_at(&rig, (61_000, 1_000), 90_000, true, 32))
+        );
+        rig.advance_to(2_000);
+        let reader = rig.start(spec(5_000, Some(2_000), true));
+        settle().await;
+        assert_eq!(rig.report().await, started(1_000, Some("aac_lc")));
+        // The keyframe goes out when its hold for the audio ends.
+        rig.advance_to(3_000);
+        settle().await;
+        // The audio at 4 s and 4.064 s, past the end, held for the video,
+        // which reached 1 s; then the P-frame that began arriving at
+        // 3.95 s, published once whole.
+        for (ms, ts) in [(4_000, 64_000), (4_064, 65_024)] {
+            rig.advance_to(ms);
+            assert!(audio.publish_frame(frame_at(&rig, (ms, ms), ts, true, 4)));
+            settle().await;
+        }
+        rig.advance_to(4_070);
+        assert!(
+            rig.video()
+                .publish_frame(frame_at(&rig, (61_950, 3_950), 175_500, false, 16))
+        );
+        settle().await;
+        // The audio's hold for the video ends: the audio at 4 s ends the
+        // clip, and the drain stops at the next.
+        rig.advance_to(5_000);
+        let reports = rig.until_stopped().await;
+        let bytes = reader.rest().await;
+        assert_eq!(
+            lines(&bytes),
+            [
+                "init video=h264 audio=aac_lc",
+                "frame a 0 15360 k 4",
+                "frame v 0 90000 k 32",
+                "frame v 0 175500 - 16",
+                "end",
+            ]
+        );
+        // The fake container's furthest place, by the dates from the
+        // first frame's: 61.95 s − 0.96 s.
+        assert_eq!(reports, vec![stopped("completed", bytes.len(), 60_990, 0)]);
     }
 
     /// A standby on `rig`'s tracks, of the same codec, armed: its first
