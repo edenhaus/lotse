@@ -2180,13 +2180,22 @@ mod tests {
             assert_eq!(on.send, Some(Pcmu), "{kept:?}");
             assert_eq!(on.answer(Some("0")), Direction::SendOnly, "{kept:?}");
         }
-        let unasked = |_: &str| -> Vec<CodecFamily> { panic!("nothing is asked") };
+        // Without a downlink or stream audio on it: nothing is asked; with
+        // both, the downlink m-line only.
+        let mut asked = Vec::new();
+        let mut ask = |mid: &str| {
+            asked.push(mid.to_owned());
+            [Pcmu]
+        };
         let no_downlink = DEDICATED.replacen("a=recvonly", "a=inactive", 1);
-        let plan = plan_for(&no_downlink, Some(&pcmu), None).kept_downlink(unasked);
+        let plan = plan_for(&no_downlink, Some(&pcmu), None).kept_downlink(&mut ask);
         assert_eq!((plan.downlink, plan.send), (None, None));
         for audio in [None, Some(&Codec::G722)] {
-            let plan = plan_for(DEDICATED, audio, None).kept_downlink(unasked);
+            let plan = plan_for(DEDICATED, audio, None).kept_downlink(&mut ask);
             assert_eq!((plan.downlink, plan.send), (Some("0"), None), "{audio:?}");
         }
+        let plan = plan_for(DEDICATED, Some(&pcmu), None).kept_downlink(&mut ask);
+        assert_eq!(plan.send, Some(Pcmu));
+        assert_eq!(asked, ["0"]);
     }
 }
