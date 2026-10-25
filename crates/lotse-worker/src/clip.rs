@@ -48,8 +48,9 @@
 //! it; any other end drops the queue. Every end but a gone reader then
 //! writes the container's last fragment, for at most [`FINISH_GRACE`],
 //! closes the pipe and reports `Stopped` last; a failure the drain meets
-//! (a codec change, the container failing a frame) or a reader gone while
-//! a graceful end writes its last bytes ends the clip for that instead.
+//! (a codec change, the container failing a frame), the container failing
+//! a graceful end's last fragment, or a reader gone while a graceful end
+//! writes its last bytes ends the clip for that instead.
 //! Gaps and the duration carry clip media time, where the container put
 //! the frames ([`ClipMuxer::media_time`]), never their capture times: a
 //! gap runs from where the frame before the hole was put to where the
@@ -1300,8 +1301,11 @@ impl Clip {
 
     /// Ends the clip for `reason`: the container's last fragment and the
     /// bytes still pending go to the pipe for at most [`FINISH_GRACE`],
-    /// unless the reader is gone; a reader that goes meanwhile ends a
-    /// graceful clip `client_gone`, since its file is not whole. The pipe
+    /// unless the reader is gone. A container that fails the last
+    /// fragment ends a graceful clip `internal_error`, and a reader that
+    /// goes meanwhile a graceful clip `client_gone`: either way its file
+    /// is not whole. Any other reason already says the clip did not end
+    /// as asked, `shutting_down` included, and stays. The pipe
     /// closes, and `Stopped` is the last report, its duration the furthest
     /// media time a frame was put at.
     async fn finish(mut self, mut reason: EndReason) {
@@ -1311,6 +1315,9 @@ impl Clip {
                     Ok(last) => self.queue(last),
                     Err(err) => {
                         tracing::warn!(clip.id = %self.id, error = %err, "clip: the container's last fragment failed");
+                        if reason.is_graceful() {
+                            reason = EndReason::InternalError;
+                        }
                     }
                 }
             }
@@ -2448,8 +2455,9 @@ mod tests {
 
     /// A container that refuses the start ends the clip `internal_error`
     /// before it started; one that fails a push ends it after `started`,
-    /// the last fragment still asked for; one whose finish fails keeps
-    /// the clip's reason and says so.
+    /// the last fragment still asked for; one whose finish fails says so
+    /// and ends a graceful clip `internal_error`, its file without the
+    /// last fragment, while any other end keeps its reason.
     #[tokio::test]
     async fn a_container_failure_ends_the_clip_internal_error_and_a_failed_finish_is_logged() {
         let (logs, _guard) = Logs::capture();
@@ -2469,25 +2477,30 @@ mod tests {
         }
         assert_eq!(logs.count(Level::WARN, "clip: the container failed"), 2);
 
-        let mut rig = Rig::new(None);
-        let reader = rig.start_with(
-            spec(0, None, false),
-            FakeClipMuxerFactory {
-                fail: Some(FakeClipFailure::Finish),
-            },
-            ClipSettings::default(),
-        );
-        rig.video_frame(0, 0, true, 32);
-        assert_eq!(rig.report().await, started(0, None));
-        rig.clips.stop("k1", EndReason::Stopped);
-        let_assert_reason(&rig.until_stopped().await, "stopped");
-        assert_eq!(
-            lines(&reader.rest().await),
-            ["init video=h264", "frame v 0 0 k 32"]
-        );
+        for (asked, ends) in [
+            (EndReason::Stopped, "internal_error"),
+            (EndReason::ShuttingDown, "shutting_down"),
+        ] {
+            let mut rig = Rig::new(None);
+            let reader = rig.start_with(
+                spec(0, None, false),
+                FakeClipMuxerFactory {
+                    fail: Some(FakeClipFailure::Finish),
+                },
+                ClipSettings::default(),
+            );
+            rig.video_frame(0, 0, true, 32);
+            assert_eq!(rig.report().await, started(0, None));
+            rig.clips.stop("k1", asked);
+            let_assert_reason(&rig.until_stopped().await, ends);
+            assert_eq!(
+                lines(&reader.rest().await),
+                ["init video=h264", "frame v 0 0 k 32"]
+            );
+        }
         assert_eq!(
             logs.count(Level::WARN, "clip: the container's last fragment failed"),
-            1
+            2
         );
     }
 
