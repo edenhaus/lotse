@@ -179,8 +179,8 @@ impl BodyWatch {
 }
 
 /// What a connection's socket is to [`Watched`]: either listener's (a Unix
-/// stream, a TLS stream), boxed, so [`Watched`] is one type whatever the
-/// listener.
+/// stream, the TCP stream under a TLS session), boxed, so [`Watched`] is
+/// one type whatever the listener.
 pub(crate) trait Transport: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Transport for T {}
@@ -192,6 +192,14 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> Transport for T {}
 /// whatever the body does meanwhile, not one that takes it slowly. A
 /// writer that holds bytes writes until the socket refuses them, as hyper
 /// does each time it flushes.
+///
+/// It wraps the kernel's socket, under the session on the TLS listener. A
+/// session takes what it is given into its own buffer and writes it to
+/// the socket whenever hyper writes, flushes or shuts the session down, so
+/// the session's own results say nothing of the client: it takes the
+/// response's end, and then only flushes (tokio-rustls 0.26.6, observed
+/// in 2026-10). The socket's flush and shutdown never wait (the kernel
+/// buffers), so they pass through.
 pub(crate) struct Watched {
     /// The socket.
     io: Box<dyn Transport>,

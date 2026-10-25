@@ -107,8 +107,12 @@ pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// its send buffer drained, about a quarter for a Unix socket and a third
 /// for TCP, as observed on Linux 6.18 in 2026-10); one that stopped
 /// reading is dropped this long after the socket first refused the
-/// response. Until then the socket holds what it took (in its buffer, and
-/// on TLS in the session's), as for a client that reads.
+/// response. On the TLS listener this is the socket under the session:
+/// the session takes what it is given into its own buffer and writes it
+/// to the socket as the response is written, flushed or ended, so the
+/// socket refuses a response the client does not take, its end included.
+/// Until then the socket holds what it took in its buffer, as for a
+/// client that reads.
 pub const BODY_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// From the end of a clip's bytes to the producer's report of how many it
@@ -406,7 +410,7 @@ impl Server {
         loop {
             tokio::select! {
                 (stream, peer) = unix.accept() => admission.admit(stream, peer),
-                Some(tls) = authenticated.recv() => admission.serve(tls.stream, tls.peer, tls.slot, tls.deadline),
+                Some(tls) = authenticated.recv() => admission.serve(tls.stream, tls.body, tls.peer, tls.slot, tls.deadline),
                 () = shutdown.cancelled() => break,
             }
         }
@@ -497,9 +501,9 @@ impl Admission {
         }
     }
 
-    /// Serves `stream`, whose peer is `peer`, up to its upgrade, unless
-    /// [`MAX_PENDING_UPGRADES`] connections are already waiting for theirs:
-    /// then it is closed without a response.
+    /// Serves the socket `stream`, whose peer is `peer`, up to its
+    /// upgrade, unless [`MAX_PENDING_UPGRADES`] connections are already
+    /// waiting for theirs: then it is closed without a response.
     fn admit<S>(&self, stream: S, peer: PeerInfo)
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -507,22 +511,26 @@ impl Admission {
         let Some(slot) = upgrade_slot(&self.pending, &peer) else {
             return;
         };
-        self.serve(stream, peer, slot, self.clock.sleep(UPGRADE_TIMEOUT));
+        let body = clip::BodyWatch::new();
+        let socket = clip::Watched::new(Box::new(stream), body.clone(), Arc::clone(&self.clock));
+        self.serve(socket, body, peer, slot, self.clock.sleep(UPGRADE_TIMEOUT));
     }
 
     /// Serves `stream`, whose peer is `peer`, up to its upgrade, in the
     /// pending `slot` it was given, and closes it at `deadline` if it has
-    /// not upgraded by then.
+    /// not upgraded by then. Its socket's writes report to `body`: the
+    /// stream is the socket in a [`clip::Watched`], or a TLS session over
+    /// one.
     fn serve<S>(
         &self,
         stream: S,
+        body: clip::BodyWatch,
         peer: PeerInfo,
         slot: OwnedSemaphorePermit,
         deadline: BoxFuture<'static, ()>,
     ) where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let body = clip::BodyWatch::new();
         let service = TowerToHyperService::new(
             self.app
                 .clone()
@@ -531,14 +539,7 @@ impl Admission {
         );
         let connection = self
             .http
-            .serve_connection(
-                TokioIo::new(clip::Watched::new(
-                    Box::new(stream),
-                    body.clone(),
-                    Arc::clone(&self.clock),
-                )),
-                service,
-            )
+            .serve_connection(TokioIo::new(stream), service)
             .with_upgrades();
         spawn_named(
             "api.handshake",
@@ -902,14 +903,13 @@ mod tests {
     /// buffer and a body's 64 KiB chunks.
     const SOCKET_BYTES: usize = 4 * 1024;
 
-    /// One connection over a [`SOCKET_BYTES`] pipe, served through the
-    /// admission both listeners use by a handler whose one clip is
-    /// `clip`, on `clock`; the client's end, and the admission, which
-    /// must outlive the connection.
-    async fn served(
+    /// The admission both listeners use, for a handler whose one clip is
+    /// `clip`, on `clock`, and its pending upgrades; the admission must
+    /// outlive the connections it serves.
+    async fn admission(
         clock: &Arc<lotse_core::clock::FakeClock>,
         clip: ClipBody,
-    ) -> (tokio::io::DuplexStream, Admission) {
+    ) -> (Admission, Arc<Semaphore>) {
         let state = state(1, false);
         let handler = OneClip(std::sync::Mutex::new(Some(clip)));
         assert_eq!(handler.hello(), Minimal.hello());
@@ -930,15 +930,20 @@ mod tests {
             serving: state.serving,
         };
         let pending = Arc::new(Semaphore::new(usize::from(MAX_PENDING_UPGRADES)));
-        let admission = Admission::new(state, Arc::clone(&pending));
+        (Admission::new(state, Arc::clone(&pending)), pending)
+    }
+
+    /// One connection over a [`SOCKET_BYTES`] pipe, served through the
+    /// admission both listeners use by a handler whose one clip is
+    /// `clip`, on `clock`; the client's end, and the admission, which
+    /// must outlive the connection.
+    async fn served(
+        clock: &Arc<lotse_core::clock::FakeClock>,
+        clip: ClipBody,
+    ) -> (tokio::io::DuplexStream, Admission) {
+        let (admission, _pending) = admission(clock, clip).await;
         let (client, server) = tokio::io::duplex(SOCKET_BYTES);
-        let peer = PeerInfo::Unix { uid: 0, pid: None };
-        admission.serve(
-            server,
-            peer,
-            Arc::clone(&pending).try_acquire_owned().unwrap(),
-            clock.sleep(UPGRADE_TIMEOUT),
-        );
+        admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
         (client, admission)
     }
 
@@ -1026,5 +1031,186 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
         assert_eq!(seen.len(), SOCKET_BYTES, "the socket's bytes, no more");
         drop((producer, admission));
+    }
+
+    /// The TLS listener's session settings (TLS 1.3, no tickets) over a
+    /// fresh self-signed certificate, without client certificates: the
+    /// acceptor, and the client configuration that pins the certificate.
+    fn tls_pair() -> (tokio_rustls::TlsAcceptor, Arc<rustls::ClientConfig>) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["lotse".to_owned()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let certificate = certificate.der().clone();
+        let pin = lotse_core::fingerprint::Fingerprint::of(&certificate);
+        let key = rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap();
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], key)
+        .unwrap();
+        config.send_tls13_tickets = 0;
+        let client = lotse_testing::control_tls::client_config(
+            pin,
+            lotse_testing::control_tls::ClientCert::None,
+            &[&rustls::version::TLS13],
+        )
+        .unwrap();
+        (tokio_rustls::TlsAcceptor::from(Arc::new(config)), client)
+    }
+
+    /// One connection over a [`SOCKET_BYTES`] pipe as the TLS listener
+    /// serves it, with a session over the socket, by a handler whose one
+    /// clip is `clip`, on `clock`; the client sends `request` and leaves
+    /// its session, so the test takes the socket's bytes as they come:
+    /// the client's end of the socket, its session, and the admission.
+    async fn served_tls(
+        clock: &Arc<lotse_core::clock::FakeClock>,
+        clip: ClipBody,
+        request: &[u8],
+    ) -> (tokio::io::DuplexStream, rustls::ClientConnection, Admission) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (admission, pending) = admission(clock, clip).await;
+        let (acceptor, config) = tls_pair();
+        let (client, server) = tokio::io::duplex(SOCKET_BYTES);
+        // As the TLS listener does: the session over the watched socket.
+        let body = clip::BodyWatch::new();
+        let server = clip::Watched::new(
+            Box::new(server),
+            body.clone(),
+            Arc::<lotse_core::clock::FakeClock>::clone(clock),
+        );
+        let name = rustls::pki_types::ServerName::try_from("lotse").unwrap();
+        let (session, client) = tokio::join!(
+            acceptor.accept(server),
+            tokio_rustls::TlsConnector::from(config).connect(name, client)
+        );
+        admission.serve(
+            session.unwrap(),
+            body,
+            PeerInfo::Unix { uid: 0, pid: None },
+            Arc::clone(&pending).try_acquire_owned().unwrap(),
+            clock.sleep(UPGRADE_TIMEOUT),
+        );
+        let mut client = client.unwrap();
+        client.write_all(request).await.unwrap();
+        client.flush().await.unwrap();
+        let (socket, session) = client.into_inner();
+        (socket, session, admission)
+    }
+
+    /// `cipher`, what the client's socket took, through its `session`:
+    /// the response, and whether the server closed the session (RFC 8446
+    /// §6.1 `close_notify`) rather than dropping the connection.
+    fn decrypt(session: &mut rustls::ClientConnection, mut cipher: &[u8]) -> (Vec<u8>, bool) {
+        use std::io::Read as _;
+
+        let mut plain = Vec::new();
+        loop {
+            let read = session.read_tls(&mut cipher).unwrap();
+            session.process_new_packets().unwrap();
+            let end = session.reader().read_to_end(&mut plain);
+            if read == 0 {
+                return (plain, end.is_ok());
+            }
+        }
+    }
+
+    /// The clip request every TLS test sends.
+    const GET_C1: &[u8] = b"GET /v0/clips/c1 HTTP/1.1\r\nHost: lotse\r\n\r\n";
+
+    /// The client reads nothing. The clip is whole and small: hyper hands
+    /// the whole response, its last chunk included, to the session, which
+    /// takes it into its own buffer; the socket takes 4 KiB of the records
+    /// and refuses the rest. Nothing is written after that, the session
+    /// only flushes, and the response waits for the client all the same.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tls_clip_body_a_client_stops_taking_is_dropped_at_the_stall_deadline_once_the_session_holds_its_end()
+     {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (logs, _guard) = pairing::test_support::capture();
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let (reader, mut producer) = tokio::io::duplex(256 * 1024);
+        let (report, written) = tokio::sync::oneshot::channel();
+        let clip = ClipBody {
+            reader: Box::new(reader),
+            written,
+        };
+        let clip_len = 2 * SOCKET_BYTES;
+        producer.write_all(&vec![7_u8; clip_len]).await.unwrap();
+        drop(producer);
+        report.send(clip_len as u64).unwrap();
+        let (mut socket, mut session, admission) = served_tls(&clock, clip, GET_C1).await;
+        settle().await;
+        let dropped = "clip body dropped: the client made no room for it in time";
+        clock.advance(BODY_STALL_TIMEOUT.saturating_sub(Duration::from_millis(1)));
+        settle().await;
+        assert!(
+            !logs.text().contains(dropped),
+            "dropped before the deadline"
+        );
+        clock.advance(Duration::from_millis(1));
+        settle().await;
+        assert!(
+            logs.text().contains(dropped),
+            "the connection is still open"
+        );
+        // The client gets what the socket held, and the session is cut.
+        let cipher = finish(&mut socket).await;
+        assert_eq!(cipher.len(), SOCKET_BYTES, "the socket's bytes, no more");
+        let (plain, closed) = decrypt(&mut session, &cipher);
+        assert!(!closed, "the session ends without close_notify");
+        assert!(!plain.ends_with(b"\r\n0\r\n\r\n"), "no last chunk");
+        drop(admission);
+    }
+
+    /// The whole clip is there at once and the client's socket takes
+    /// 4 KiB of records a second: hyper hands the last of the response to
+    /// the session some 16 s before the socket has taken it all, and the
+    /// session holds it, flushing, for that long. The socket takes bytes
+    /// every second all the while.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tls_clip_body_a_client_drains_slowly_outlives_the_stall_deadline_while_the_session_flushes()
+     {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let (reader, mut producer) = tokio::io::duplex(256 * 1024);
+        let (report, written) = tokio::sync::oneshot::channel();
+        let clip = ClipBody {
+            reader: Box::new(reader),
+            written,
+        };
+        let bytes = vec![7_u8; 128 * 1024];
+        producer.write_all(&bytes).await.unwrap();
+        drop(producer);
+        report.send(bytes.len() as u64).unwrap();
+        let (mut socket, mut session, admission) = served_tls(&clock, clip, GET_C1).await;
+        settle().await;
+        let mut cipher = Vec::new();
+        for _ in 0..30 {
+            cipher.extend(take(&mut socket, SOCKET_BYTES).await);
+            settle().await;
+            clock.advance(Duration::from_secs(1));
+            settle().await;
+        }
+        cipher.extend(finish(&mut socket).await);
+        let (plain, closed) = decrypt(&mut session, &cipher);
+        assert!(closed, "the session ends with close_notify");
+        let head = String::from_utf8_lossy(plain.get(..200).unwrap_or(&plain));
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(
+            plain.ends_with(b"\r\n0\r\n\r\n"),
+            "ended whole with its last chunk"
+        );
+        let framing = plain.iter().filter(|byte| **byte != 7).count();
+        assert_eq!(plain.len() - framing, bytes.len(), "every byte of the clip");
+        drop(admission);
     }
 }
