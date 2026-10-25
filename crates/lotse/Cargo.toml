@@ -36,7 +36,7 @@ rustix = { workspace = true, features = ["process"] } # the starting uid, the de
 serde = { workspace = true }
 serde_json = { workspace = true } # `lotse ctl` frames
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "net", "macros", "signal"] } # `lotse ctl`'s runtime and Unix socket; Ctrl-C stops `lotse ctl stream clip`'s clip, while its events and its body are read at once
+tokio = { workspace = true, features = ["rt", "net", "macros", "signal", "fs", "io-util"] } # `lotse ctl`'s runtime and Unix socket; Ctrl-C stops `lotse ctl stream clip`'s clip, while its events and its body are read at once and its file is written on the blocking pool
 tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
