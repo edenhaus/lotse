@@ -1799,6 +1799,8 @@ mod tests {
 
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
 
     use lotse_api::Event;
     use lotse_api_types::command::parse_command;
@@ -3247,40 +3249,19 @@ mod tests {
             "B gets its own answer"
         );
 
-        // The worker never answers: the daemon's clock bounds the wait.
-        // That re-offer (A) is still out: a retry is refused until the
-        // worker answers A, whose late answer goes nowhere.
-        let waiting = {
-            let s = Arc::clone(&s);
-            spawn_named("test.renegotiate", async move {
-                call_on(&s, 1, &renegotiate(9, "s1")).await
-            })
-        };
-        until_waiting(&s, "s1").await;
-        clock.advance(RENEGOTIATE_TIMEOUT);
-        let err = error(within(waiting).await.unwrap());
-        assert_eq!(
-            (err.code, err.message.as_str()),
-            (
-                ErrorCode::InternalError,
-                "the worker did not answer the re-offer"
-            )
-        );
-        assert!(s.shared.lock().sessions["s1"].renegotiating());
-        let err = error(within(call_on(&s, 1, &renegotiate(17, "s1"))).await);
-        assert_eq!(
-            err.message, "a re-offer of the session is still being answered",
-            "refused, not answered with A's answer"
-        );
+        // A second session, which keeps the connection and its worker
+        // wanted once s1 is closed.
+        let mut s2 = subscription(call_on(&s, 1, &offer(12, "front", Some("s2"))).await);
+        next(&mut s2).await;
         report(
             &s,
-            "s1",
-            Report::Renegotiated {
-                sdp: "v=0\r\na=mid:A\r\n".into(),
+            "s2",
+            Report::Answer {
+                sdp: "v=0\r\n".into(),
                 talkback: None,
             },
         );
-        assert!(!s.shared.lock().sessions["s1"].renegotiating());
+        next(&mut s2).await;
 
         // The session closes while the re-offer waits.
         let waiting = {
@@ -3302,29 +3283,85 @@ mod tests {
         assert_eq!(err.code, ErrorCode::SessionNotFound);
 
         // A full driver queue refuses the re-offer, and holds no slot.
-        let _s2 = subscription(call_on(&s, 1, &offer(12, "front", Some("s2"))).await);
-        report(
-            &s,
-            "s2",
-            Report::Answer {
-                sdp: "v=0\r\n".into(),
-                talkback: None,
-            },
-        );
         let (full, _rx) = mpsc::channel(1);
         full.try_send(DriverCommand::Candidate {
             session_id: "x".into(),
             candidate: String::new(),
         })
         .unwrap();
-        s.shared.lock().connections.get_mut("c1").unwrap().commands = full;
+        let commands = std::mem::replace(
+            &mut s.shared.lock().connections.get_mut("c1").unwrap().commands,
+            full,
+        );
         let err = error(within(call_on(&s, 1, &renegotiate(13, "s2"))).await);
         assert_eq!(
             (err.code, &err.details["limit"]),
             (ErrorCode::LimitReached, &json!("connection_queue"))
         );
         assert!(!s.shared.lock().sessions["s2"].renegotiating());
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = commands;
+
+        // The worker never answers: the daemon's clock bounds the wait.
+        // That re-offer (A) is still out: a retry is refused until the
+        // worker answers A, whose late answer goes nowhere.
+        //
+        // The fake worker sends nothing at all, and the advance that ends
+        // the wait passes its driver's `WORKER_SILENCE_LIMIT` too, which
+        // counts from the worker's start, before any advance: once the
+        // driver runs, it kills the worker and the exit closes the
+        // session. So the steps up to the late answer are polled here,
+        // each complete at once, and the driver runs only after them; the
+        // close is the last thing the test waits for.
+        worker_pid(&s).await;
+        {
+            let a = renegotiate(9, "s2");
+            let mut waiting = std::pin::pin!(call_on(&s, 1, &a));
+            assert!(poll_alone(waiting.as_mut()).is_pending());
+            assert!(s.shared.lock().sessions["s2"].renegotiating());
+            clock.advance(RENEGOTIATE_TIMEOUT);
+            let_assert!(Poll::Ready(outcome) = poll_alone(waiting));
+            let err = error(outcome);
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (
+                    ErrorCode::InternalError,
+                    "the worker did not answer the re-offer"
+                )
+            );
+        }
+        assert!(s.shared.lock().sessions["s2"].renegotiating());
+        let retry = renegotiate(17, "s2");
+        let_assert!(Poll::Ready(outcome) = poll_alone(std::pin::pin!(call_on(&s, 1, &retry))));
+        let err = error(outcome);
+        assert_eq!(
+            err.message, "a re-offer of the session is still being answered",
+            "refused, not answered with A's answer"
+        );
+        report(
+            &s,
+            "s2",
+            Report::Renegotiated {
+                sdp: "v=0\r\na=mid:A\r\n".into(),
+                talkback: None,
+            },
+        );
+        assert!(!s.shared.lock().sessions["s2"].renegotiating());
+        assert_eq!(
+            next(&mut s2).await,
+            json!({ "type": "closed", "code": "worker_crashed",
+                    "message": "the camera's worker process exited" }),
+            "the silent worker was killed"
+        );
         Arc::try_unwrap(s).unwrap().shutdown().await;
+    }
+
+    /// Polls `future` once on this task alone: unlike an `.await` that
+    /// yields, it lets no other task, no driver, act before the next step.
+    /// The poll is free of the runtime's cooperative budget, so a step
+    /// that can complete does.
+    fn poll_alone(future: Pin<&mut impl Future<Output = Outcome>>) -> Poll<Outcome> {
+        std::pin::pin!(tokio::task::unconstrained(future))
+            .poll(&mut Context::from_waker(Waker::noop()))
     }
 
     /// A session timer's task that leaves the maps as they are.
