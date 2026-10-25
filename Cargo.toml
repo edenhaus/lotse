@@ -110,8 +110,10 @@ mpeg2ts-reader = { version = "0.18", default-features = false }
 # The ISO base media file format boxes of the HTTP source's fragmented MP4 (ISO/IEC 14496-12): the
 # init segment's moov (stsd with avcC, hvcC and esds) and each media segment's moof (tfhd, tfdt,
 # trun); bounded `Vec`s for untrusted counts, no `unsafe` in the decoding. Its optional features
-# (bytes, serde, tokio) are off; num, derive_more, pastey and thiserror 1 come with it.
-mp4-atom = { version = "0.16", default-features = false }
+# (bytes, serde, tokio) are off; num, derive_more, pastey and thiserror 1 come with it. Pinned:
+# the fmp4 reader's box walk mirrors how 0.16.2 reads boxes, item references and descriptors
+# (what it counts unchecked, what it reads on the stack), so every bump re-audits those internals.
+mp4-atom = { version = "=0.16.2", default-features = false }
 # RTSP message parsing and serialization for the fake camera of the tests.
 rtsp-types = { version = "0.1", default-features = false }
 # SDP media descriptions in `lotse-rtsp`: the payload type and `a=ptime` of a camera's backchannel
