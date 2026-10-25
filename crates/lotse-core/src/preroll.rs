@@ -22,8 +22,10 @@
 //! frames hold, and a reader finds that hole in the timestamps as it does
 //! in the live frames after the snapshot; a keyframe itself is bounded
 //! only by `max_frame_bytes`, as in the GOP cache. An audio ring follows
-//! the video: it keeps the newest frame at or before the video ring's
-//! oldest keyframe and everything after it (by its own window, by
+//! the video: it keeps the newest frame at or before the floor, the oldest
+//! capture time of any keyframe the video ring holds (the oldest
+//! keyframe's, unless a Sender Report correcting the mapping back dated a
+//! later one before it), and everything after it (by its own window, by
 //! arrival, while the video ring holds nothing), and drops its oldest
 //! frames while it holds more than `preroll_bytes`, down to the newest one.
 //! Windows are measured by arrival, which only moves forward on a track,
@@ -35,7 +37,8 @@
 //! Every frame is charged its payload plus [`PREROLL_FRAME_OVERHEAD`], so a
 //! camera sending tiny frames cannot hold more memory than the bound says.
 //! Every trim drops a prefix in one pass that stops where the kept frames
-//! begin, so it costs what it drops.
+//! begin, so it costs what it drops, and the floor is kept in amortized
+//! O(1) a keyframe.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -139,21 +142,21 @@ impl fmt::Debug for PrerollSnapshot {
     }
 }
 
-/// The capture time of the oldest keyframe a connection's leading video
-/// ring holds, but never later than its arrival, which its audio rings
-/// trim by. Shared by every track of the connection; written by the video
-/// track's source task, read by the audio tracks', so the lock is never
-/// held for more than a copy.
+/// The oldest capture time of any keyframe a connection's leading video
+/// ring holds, but never later than its arrival ([`Preroll::oldest`]),
+/// which its audio rings trim by. Shared by every track of the connection;
+/// written by the video track's source task, read by the audio tracks', so
+/// the lock is never held for more than a copy.
 #[derive(Debug, Default)]
 pub(crate) struct PrerollFloor(Mutex<Option<Instant>>);
 
 impl PrerollFloor {
-    /// The oldest keyframe held, `None` while the video ring holds nothing.
+    /// The video ring's floor, `None` while it holds nothing.
     pub(crate) fn get(&self) -> Option<Instant> {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records the video ring's oldest keyframe.
+    /// Records the video ring's floor ([`Preroll::oldest`]).
     pub(crate) fn set(&self, oldest: Option<Instant>) {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner) = oldest;
     }
@@ -179,6 +182,14 @@ pub(crate) struct Preroll {
     window: Option<Duration>,
     /// The held frames, oldest first; a keyframe first on video.
     frames: VecDeque<Arc<MediaFrame>>,
+    /// The held keyframes the floor can come from ([`Self::oldest`]),
+    /// oldest first, each captured ([`captured`]) before every later one
+    /// here: a keyframe enters at the back and evicts those captured at or
+    /// after it, and leaves at the front when the ring drops it, so the
+    /// front is the keyframe held with the oldest capture time. A keyframe
+    /// is evicted at most once, so a frame costs amortized O(1). Empty on
+    /// an audio ring.
+    floor_keys: VecDeque<Arc<MediaFrame>>,
     /// What `frames` counts against `preroll_bytes`.
     bytes: usize,
     /// The newest GOP outgrew `preroll_bytes` or lost a frame the track
@@ -203,6 +214,7 @@ impl Preroll {
             video,
             window: None,
             frames: VecDeque::new(),
+            floor_keys: VecDeque::new(),
             bytes: 0,
             truncated: false,
             truncations: 0,
@@ -222,6 +234,7 @@ impl Preroll {
     pub(crate) fn set_window(&mut self, window: Option<Duration>) -> Option<Duration> {
         if window.is_none() {
             self.frames = VecDeque::new();
+            self.floor_keys = VecDeque::new();
             self.bytes = 0;
         }
         std::mem::replace(&mut self.window, window)
@@ -233,21 +246,25 @@ impl Preroll {
     pub(crate) fn clear(&mut self) -> bool {
         let held = !self.frames.is_empty();
         self.frames.clear();
+        self.floor_keys.clear();
         self.bytes = 0;
         held
     }
 
-    /// When the oldest held frame (a keyframe, on video) was captured, but
-    /// never later than it arrived, as [`PrerollSnapshot::age`] counts: a
-    /// capture time ahead of the arrival is a mapping off, and as the audio
-    /// rings' floor it would drop the audio a clip from that keyframe plays
-    /// ([`captured`]).
+    /// The oldest capture time of any keyframe held, which the audio rings
+    /// trim by ([`PrerollFloor`]): the oldest keyframe's, unless a Sender
+    /// Report correcting the mapping back (RFC 3550 §6.4.1) dated a later
+    /// one before it, whose audio a clip from it plays as well. Never later
+    /// than the keyframe arrived, as [`PrerollSnapshot::age`] counts: a
+    /// capture time ahead of the arrival is a mapping off, and as the floor
+    /// it would drop the audio a clip from that keyframe plays
+    /// ([`captured`]). `None` while nothing is held, and on an audio ring.
     pub(crate) fn oldest(&self) -> Option<Instant> {
-        self.frames.front().map(|frame| captured(frame))
+        self.floor_keys.front().map(|keyframe| captured(keyframe))
     }
 
     /// Takes `frame`, just published, and trims; `floor` is asked, on an
-    /// audio ring only, for the video ring's oldest keyframe. Nothing
+    /// audio ring only, for the video ring's floor ([`Self::oldest`]). Nothing
     /// without a window. `Some` when a GOP outgrew `cap` and its line is
     /// due.
     pub(crate) fn push(
@@ -298,6 +315,7 @@ impl Preroll {
                 self.truncated = false;
             }
             self.append(frame, cost);
+            self.push_floor_key(frame);
             let start = self.window_start(frame.arrival, window);
             self.drop_front(start);
             let start = self.fitting_start(cap, 0);
@@ -373,10 +391,33 @@ impl Preroll {
         self.bytes = self.bytes.saturating_add(cost);
     }
 
-    /// Drops the `count` oldest frames.
+    /// Takes `keyframe`, just held, into `floor_keys`: the keyframes held
+    /// before it that were captured at or after it cannot be the oldest
+    /// capture time while it is held, so they leave.
+    fn push_floor_key(&mut self, keyframe: &Arc<MediaFrame>) {
+        let at = captured(keyframe);
+        while self
+            .floor_keys
+            .back()
+            .is_some_and(|newer| captured(newer) >= at)
+        {
+            self.floor_keys.pop_back();
+        }
+        self.floor_keys.push_back(Arc::clone(keyframe));
+    }
+
+    /// Drops the `count` oldest frames, and a keyframe among them from
+    /// `floor_keys`: both are in the ring's order, so it is at the front.
     fn drop_front(&mut self, count: usize) {
         for frame in self.frames.drain(..count.min(self.frames.len())) {
             self.bytes = self.bytes.saturating_sub(cost(&frame));
+            if self
+                .floor_keys
+                .front()
+                .is_some_and(|keyframe| Arc::ptr_eq(keyframe, &frame))
+            {
+                self.floor_keys.pop_front();
+            }
         }
     }
 
@@ -862,6 +903,61 @@ mod tests {
         );
     }
 
+    /// RFC 3550 §6.4.1: a Sender Report correcting a camera's mapping
+    /// back can date a later keyframe before the oldest held, and the
+    /// audio a clip from it plays must stay too.
+    #[test]
+    fn rfc3550_6_4_1_the_floor_is_the_oldest_capture_time_of_any_keyframe_held() {
+        let clip = Clip::new();
+        let mut ring = ring(true, 2000);
+        let push = |ring: &mut Preroll, capture: u64, arrival: u64, keyframe: bool| {
+            assert_eq!(
+                ring.push(
+                    &clip.shifted(capture, arrival, keyframe),
+                    usize::MAX,
+                    || None
+                ),
+                None
+            );
+        };
+        // Labelled by arrival.
+        push(&mut ring, 10_000, 10_000, true);
+        push(&mut ring, 10_250, 10_250, false);
+        assert_eq!(ring.oldest(), Some(clip.at(10_000)));
+        push(&mut ring, 1000, 11_000, true);
+        push(&mut ring, 1250, 11_250, false);
+        assert_eq!(
+            ring.oldest(),
+            Some(clip.at(1000)),
+            "the later keyframe, dated before the oldest"
+        );
+        push(&mut ring, 5000, 12_000, true);
+        push(&mut ring, 5000, 13_000, true);
+        assert_eq!(ring.oldest(), Some(clip.at(1000)));
+        assert_eq!(
+            ring.floor_keys.len(),
+            2,
+            "a keyframe captured with a later one leaves for it"
+        );
+
+        // The window drops the first two GOPs: the floor moves to the
+        // oldest capture time of the keyframes still held.
+        push(&mut ring, 6000, 14_000, true);
+        assert_eq!(held(&ring), [12_000, 13_000, 14_000]);
+        assert_eq!(ring.oldest(), Some(clip.at(5000)));
+        push(&mut ring, 7000, 16_000, true);
+        assert_eq!(held(&ring), [14_000, 16_000]);
+        assert_eq!(ring.oldest(), Some(clip.at(6000)));
+
+        assert!(ring.clear());
+        assert_eq!(ring.oldest(), None);
+        push(&mut ring, 8000, 17_000, true);
+        assert_eq!(ring.oldest(), Some(clip.at(8000)));
+        assert_eq!(ring.set_window(None), Some(Duration::from_millis(2000)));
+        assert_eq!(ring.oldest(), None);
+        assert!(ring.floor_keys.is_empty());
+    }
+
     #[test]
     fn an_audio_ring_s_own_window_is_measured_by_arrival() {
         let clip = Clip::new();
@@ -978,7 +1074,7 @@ mod tests {
             None
         );
         assert_eq!(held(&ring), [400, 800, 1200, 1600]);
-        assert_eq!(ring.oldest(), Some(clip.at(400)));
+        assert_eq!(ring.oldest(), None, "an audio ring sets no floor");
     }
 
     #[test]
