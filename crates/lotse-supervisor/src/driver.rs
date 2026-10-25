@@ -33,23 +33,30 @@
 //! nothing reconnects; the next worker starts with the window. An event
 //! clip's start carries the write end of its pipe to the worker as the
 //! message's descriptor; one that never reached a worker before it was
-//! stopped ends here, as the worker would have ended it, one whose clip
+//! stopped ends here, as the worker would have ended it, and so does one
+//! that waited [`CLIP_START_WAIT`] for a worker (`source_not_live`: the
+//! host lookup keeps failing, or a backoff holds the next worker back),
+//! one whose clip
 //! ended meanwhile is dropped with its pipe (a start still queued when its
-//! worker exited never reaches the next one), and the clips of a worker
-//! that exits end `worker_crashed`.
+//! worker exited never reaches the next one, and one whose clip ended
+//! after it was sent is not held for the next), and the clips of a worker
+//! that exits end `worker_crashed`. A worker stopped for want of demand
+//! runs no clip, and the ids of the clips it was finishing are free once
+//! the driver lets go of it, since their reports reach no one.
 //!
 //! A worker that can no longer be told what to do is killed, so its exit
 //! runs the crash path and the machine restarts it with backoff: one whose
 //! channel ended while it runs, and one that sent nothing for
 //! [`WORKER_SILENCE_LIMIT`] (a worker sends its counters every second).
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lotse_api_types::clip::ClipStopReason;
 use lotse_api_types::session::CloseCode;
@@ -80,6 +87,14 @@ pub(crate) const COMMAND_QUEUE: usize = 256;
 /// counters once a second from the moment it runs its source, so ten
 /// missed in a row is a worker that hangs, not one that is busy.
 pub(crate) const WORKER_SILENCE_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long a clip's start waits in the driver's queue for a worker: as
+/// long as a worker gives a clip to find a keyframe to start at (its
+/// `DEFAULT_CLIP_START_TIMEOUT`). No worker runs the clip meanwhile, so
+/// none of its timeouts does, and the body's `GET` ends the only deadline
+/// the registry keeps: without this bound, a host lookup that keeps
+/// failing would hold the clip, its subscription and its pipe for good.
+pub(crate) const CLIP_START_WAIT: Duration = Duration::from_secs(10);
 
 /// Who wants a connection, as its registry counts them; the driver follows
 /// it.
@@ -397,6 +412,9 @@ enum Wake {
     SwitchConnect(SlotWake),
     /// The probe's connect slot has something for the worker.
     ProbeConnect(SlotWake),
+    /// The oldest clip start in the queue may have waited
+    /// [`CLIP_START_WAIT`].
+    ClipStartWaited,
 }
 
 /// The worker's next event, or never while there is no worker.
@@ -429,6 +447,12 @@ pub(crate) struct Driver {
     commands_tx: mpsc::Sender<DriverCommand>,
     /// Messages waiting for a worker, in order.
     queued: Vec<DriverCommand>,
+    /// When each clip start was queued, oldest first, with its clip's id
+    /// and serial; one that left the queue meanwhile is skipped.
+    clip_waits: VecDeque<(Instant, String, u64)>,
+    /// Fires when the oldest of `clip_waits` has waited
+    /// [`CLIP_START_WAIT`]; `None` while none waits.
+    clip_wait: Option<BoxFuture<'static, ()>>,
     /// The state machine.
     machine: ConnectionMachine,
     /// The running worker.
@@ -499,6 +523,8 @@ impl Driver {
             commands,
             commands_tx,
             queued: Vec::new(),
+            clip_waits: VecDeque::new(),
+            clip_wait: None,
             machine: ConnectionMachine::new(config),
             worker: None,
             linger: None,
@@ -550,6 +576,7 @@ impl Driver {
             window,
             silence,
             pending,
+            clip_wait,
             connect,
             switch_connect,
             probe_connect,
@@ -565,6 +592,7 @@ impl Driver {
             wake = switch_connect.wait() => Wake::SwitchConnect(wake),
             wake = probe_connect.wait() => Wake::ProbeConnect(wake),
             Some(command) = commands.recv() => Wake::Command(command),
+            () = timer(clip_wait) => Wake::ClipStartWaited,
             () = timer(linger) => Wake::LingerExpired,
             () = timer(crash) => Wake::CrashBackoffExpired,
             () = timer(window) => Wake::BackoffWindowExpired,
@@ -602,6 +630,7 @@ impl Driver {
                 }
                 None => self.queue(command),
             },
+            Wake::ClipStartWaited => self.end_waited_clips(),
             Wake::LingerExpired => {
                 self.linger = None;
                 self.feed(Input::LingerExpired);
@@ -1075,6 +1104,13 @@ impl Driver {
                 if let Some(worker) = self.worker.take() {
                     self.snapshot.worker = None;
                     self.talker_gone();
+                    // Its reports reach no one from here on: the clips it
+                    // was finishing hold their ids no longer. No clip it
+                    // got runs: a clip is demand, and it is stopped for
+                    // want of any.
+                    self.shared
+                        .lock()
+                        .forget_stopping_clips(&self.spec.connection_id);
                     let shared = Arc::clone(&self.shared);
                     let stop = async move {
                         let _status = worker.stop(shared.shutdown_budget, &shared.clock).await;
@@ -1148,9 +1184,28 @@ impl Driver {
     }
 
     /// Holds a message until there is a worker. A close takes its session's
-    /// messages out of the queue instead: the worker never saw it.
+    /// messages out of the queue instead: the worker never saw it. A clip's
+    /// start is held only while its clip runs ([`State::clip_start_wanted`]):
+    /// a stale one (its clip ended after it was sent, and the id may name a
+    /// later clip by now) is dropped with its pipe, so a stop behind it
+    /// finds nothing to end here and never ends the later clip.
+    ///
+    /// [`State::clip_start_wanted`]: crate::registry::State::clip_start_wanted
     fn queue(&mut self, command: DriverCommand) {
         match command {
+            DriverCommand::StartClip {
+                ref spec, serial, ..
+            } => {
+                let clip_id = spec.clip_id.clone();
+                if self.shared.lock().clip_start_wanted(&clip_id, serial) {
+                    self.clip_waits
+                        .push_back((self.shared.clock.now(), clip_id, serial));
+                    if self.clip_wait.is_none() {
+                        self.clip_wait = Some(self.shared.clock.sleep(CLIP_START_WAIT));
+                    }
+                    self.queued.push(command);
+                }
+            }
             DriverCommand::CloseSession { session_id, .. } => {
                 self.queued
                     .retain(|queued| queued.session_id() != Some(session_id.as_str()));
@@ -1173,13 +1228,12 @@ impl Driver {
     /// A clip stopped while it waits for a worker: its start leaves the
     /// queue with its pipe, and it ends here as its worker would have
     /// ended it, `stopped` with nothing written. One not queued went with
-    /// the worker that had it, which ended it.
+    /// the worker that had it, which ended it, or was dropped as stale
+    /// ([`Self::queue`]). A start the queue holds is that of the clip that
+    /// holds the id, running or ending, and a later clip's start comes
+    /// after this stop, so the end is that clip's.
     fn unqueue_clip(&mut self, clip_id: &str) {
-        let before = self.queued.len();
-        self.queued.retain(|queued| {
-            !matches!(queued, DriverCommand::StartClip { spec, .. } if spec.clip_id == clip_id)
-        });
-        if self.queued.len() == before {
+        if !self.unqueue_start(clip_id, None) {
             tracing::debug!(
                 clip.id = clip_id,
                 "clip stop without a worker for a clip none holds; dropped"
@@ -1190,8 +1244,57 @@ impl Driver {
             clip.id = clip_id,
             "clip stopped before a worker got it; ended here"
         );
+        self.end_unqueued(clip_id, ClipStopReason::Stopped);
+    }
+
+    /// The clips whose start waited [`CLIP_START_WAIT`] for a worker and
+    /// still waits end here as a worker ends one that finds no keyframe in
+    /// time, `source_not_live` with nothing written; the timer then waits
+    /// for the next oldest.
+    fn end_waited_clips(&mut self) {
+        let now = self.shared.clock.now();
+        let waited = self
+            .clip_waits
+            .iter()
+            .take_while(|(queued, ..)| now.saturating_duration_since(*queued) >= CLIP_START_WAIT)
+            .count();
+        let ended: Vec<(Instant, String, u64)> = self.clip_waits.drain(..waited).collect();
+        for (_, clip_id, serial) in ended {
+            if self.unqueue_start(&clip_id, Some(serial)) {
+                tracing::info!(
+                    clip.id = %clip_id,
+                    serial,
+                    waited_ms = u64::try_from(CLIP_START_WAIT.as_millis()).unwrap_or(u64::MAX),
+                    "no worker took the clip's start in time; ended here source_not_live"
+                );
+                self.end_unqueued(&clip_id, ClipStopReason::SourceNotLive);
+            }
+        }
+        self.clip_wait = self.clip_waits.front().map(|(queued, ..)| {
+            let left = CLIP_START_WAIT.saturating_sub(now.saturating_duration_since(*queued));
+            self.shared.clock.sleep(left)
+        });
+    }
+
+    /// Takes the start of clip `clip_id` out of the queue with its pipe,
+    /// only `serial`'s when given; whether there was one.
+    fn unqueue_start(&mut self, clip_id: &str, serial: Option<u64>) -> bool {
+        let before = self.queued.len();
+        self.queued.retain(|queued| {
+            !matches!(
+                queued,
+                DriverCommand::StartClip { spec, serial: queued, .. }
+                    if spec.clip_id == clip_id && serial.is_none_or(|serial| serial == *queued)
+            )
+        });
+        self.queued.len() < before
+    }
+
+    /// Ends clip `clip_id`, whose start no worker got, for `reason` as its
+    /// worker would have ended it: nothing written, so its body ends empty.
+    fn end_unqueued(&self, clip_id: &str, reason: ClipStopReason) {
         let stopped = ClipReport::Stopped {
-            reason: ClipStopReason::Stopped.as_str().to_owned(),
+            reason: reason.as_str().to_owned(),
             bytes: 0,
             duration_ms: 0,
             gaps: 0,
@@ -3943,10 +4046,10 @@ mod tests {
     }
 
     /// A start whose clip is gone when the driver hands it to a worker is
-    /// dropped with its pipe: one still queued when its worker exited (its
-    /// clip ended `worker_crashed`, and a new clip may have taken the id
-    /// since), and one whose clip ended while it waited, whose id is then
-    /// free. Only the start of the clip that runs reaches the worker.
+    /// dropped with its pipe: queued while its clip ran, the clip then
+    /// ended before the worker came (and a new clip may have taken the id
+    /// since), or ended holding its id, which is then free. Only the start
+    /// of the clip that runs reaches the worker.
     #[tokio::test]
     async fn a_start_whose_clip_is_gone_never_reaches_a_worker_and_frees_the_id_it_held() {
         use std::io::Read as _;
@@ -3967,12 +4070,13 @@ mod tests {
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let (mut stale, writer) = std::io::pipe().unwrap();
-        driver.queue(DriverCommand::StartClip {
+        // Queued while their clips ran: `queue` holds no other.
+        driver.queued.push(DriverCommand::StartClip {
             spec: clip_spec("k1"),
             serial: 1,
             pipe: writer.into(),
         });
-        driver.queue(DriverCommand::StartClip {
+        driver.queued.push(DriverCommand::StartClip {
             spec: clip_spec("k2"),
             serial: 2,
             pipe: fd(),
@@ -4033,6 +4137,7 @@ mod tests {
 
         let shared = shared("/bin/sh");
         let mut rx = hold_clip(&shared, "k1", 1);
+        let _k2 = hold_clip(&shared, "k2", 2);
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let (mut reader, writer) = std::io::pipe().unwrap();
@@ -4052,15 +4157,20 @@ mod tests {
             clip_id: "k1".into(),
         });
         assert_eq!(driver.queued.len(), 1, "k2 waits on");
+        // Before the read: a start still queued would keep the write end.
+        assert!(matches!(
+            driver.queued[0],
+            DriverCommand::StartClip { serial: 2, .. }
+        ));
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty(), "its pipe went with it");
-        let stopped = rx.recv().await.unwrap().payload;
+        let stopped = rx.try_recv().unwrap().payload;
         assert_eq!(
             (&stopped["reason"], &stopped["bytes"]),
             (&serde_json::json!("stopped"), &serde_json::json!(0))
         );
-        assert!(shared.lock().clips.is_empty());
+        assert!(!shared.lock().clips.contains_key("k1"));
         // One not queued went with the worker that had it.
         driver.queue(DriverCommand::StopClip {
             clip_id: "k3".into(),
@@ -4072,5 +4182,188 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A start and a stop of a clip that ended `worker_crashed` (its worker
+    /// exited with both still on their way) reach the driver after a new
+    /// clip took the id, with no worker yet: the stale start is not held,
+    /// so the stop finds nothing to end, and the new clip runs on and is
+    /// the one start the next worker gets. Regression: the stale start was
+    /// queued, and the stop took it out and ended the new clip `stopped`
+    /// with nothing written.
+    #[tokio::test]
+    async fn a_stale_start_and_stop_after_a_worker_exit_never_end_the_clip_that_reuses_the_id() {
+        use std::io::Read as _;
+
+        let shared = shared("/bin/sh");
+        let mut rx = hold_clip(&shared, "k1", 2);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let (mut stale, writer) = std::io::pipe().unwrap();
+        for command in [
+            DriverCommand::StartClip {
+                spec: clip_spec("k1"),
+                serial: 1,
+                pipe: writer.into(),
+            },
+            DriverCommand::StopClip {
+                clip_id: "k1".into(),
+            },
+            DriverCommand::StartClip {
+                spec: clip_spec("k1"),
+                serial: 2,
+                pipe: fd(),
+            },
+        ] {
+            driver.handle(Wake::Command(command)).await;
+        }
+        assert!(rx.try_recv().is_err(), "k1 got no event");
+        assert!(
+            shared
+                .lock()
+                .clips
+                .get("k1")
+                .is_some_and(|clip| clip.serial == 2)
+        );
+        assert_eq!(driver.queued.len(), 1, "k1's own start waits");
+        assert!(matches!(
+            driver.queued[0],
+            DriverCommand::StartClip { serial: 2, .. }
+        ));
+        drop(driver);
+        let mut rest = Vec::new();
+        stale.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "the stale start's pipe went with it");
+        let dropped = captured.lines("clip ended before its worker got it; its start is dropped");
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(dropped[0].contains("serial=1"), "{dropped:?}");
+        assert_eq!(
+            captured
+                .lines("clip stop without a worker for a clip none holds")
+                .len(),
+            1
+        );
+    }
+
+    /// A clip that ended while its worker ran it holds its id until that
+    /// worker's `Stopped`. When the connection loses its demand while
+    /// connecting (a `stream/put` moved the stream's source to a fallback
+    /// position, ending the clip `stream_changed`), the driver stops the
+    /// worker at once, whose reports then reach no one: the id is free,
+    /// and only this connection's. Regression: it stayed taken, and
+    /// counted toward `max_clips`, until the connection was released.
+    #[tokio::test]
+    async fn a_worker_stopped_for_want_of_demand_frees_the_ids_of_the_clips_it_was_finishing() {
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        driver.follow(Demand {
+            preloads: 0,
+            viewers: 1,
+        });
+        driver.worker = Some(dead_worker(&shared).await);
+        assert_eq!(driver.machine.state(), ConnectionState::Connecting);
+        for (clip_id, connection) in [("k1", "c1"), ("k9", "c2")] {
+            shared.lock().stopping_clips.insert(
+                clip_id.into(),
+                crate::clip::StoppingClip {
+                    connection: connection.into(),
+                    serial: 1,
+                },
+            );
+        }
+        driver.follow(Demand::default());
+        assert!(driver.worker.is_none(), "stopped");
+        assert!(!shared.lock().clip_id_in_use("k1"));
+        assert!(shared.lock().clip_id_in_use("k9"), "another connection's");
+        assert_eq!(
+            captured
+                .lines("the worker of a clip that had ended is gone; its id is free")
+                .len(),
+            1
+        );
+        drop(driver);
+        shared.tracker.close();
+        shared.tracker.wait().await;
+    }
+
+    /// A clip whose start waits for a worker that does not come (its host
+    /// lookup keeps failing, or a backoff holds the worker back) ends
+    /// `source_not_live` once it waited [`CLIP_START_WAIT`], as a worker
+    /// ends one that finds no keyframe in time: its body, fetched already,
+    /// ends empty and whole, and its pipe goes with its start. A start
+    /// queued later waits its own time, and one that left the queue meanwhile
+    /// ends nothing. Regression: with its body fetched, nothing ended such
+    /// a clip, which held its slot, subscription and pipe for good.
+    #[tokio::test]
+    async fn a_clip_start_no_worker_takes_in_time_ends_source_not_live_and_the_next_waits_its_own()
+    {
+        use std::io::Read as _;
+
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/bin/sh", clock.clone());
+        let mut k1 = hold_clip(&shared, "k1", 1);
+        let mut k2 = hold_clip(&shared, "k2", 2);
+        let _k3 = hold_clip(&shared, "k3", 3);
+        let mut body = shared.lock().take_clip_body("k1").unwrap();
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        driver.queue(DriverCommand::StartClip {
+            spec: clip_spec("k1"),
+            serial: 1,
+            pipe: writer.into(),
+        });
+        // k3's start leaves the queue with its stop.
+        driver.queue(DriverCommand::StartClip {
+            spec: clip_spec("k3"),
+            serial: 3,
+            pipe: fd(),
+        });
+        driver.queue(DriverCommand::StopClip {
+            clip_id: "k3".into(),
+        });
+        clock.advance(CLIP_START_WAIT / 2);
+        driver.queue(DriverCommand::StartClip {
+            spec: clip_spec("k2"),
+            serial: 2,
+            pipe: fd(),
+        });
+        assert!(
+            ready_wake(&mut driver).await.is_none(),
+            "none waited long enough"
+        );
+        clock.advance(CLIP_START_WAIT / 2);
+        step(&mut driver).await;
+        let stopped = k1.try_recv().unwrap().payload;
+        assert_eq!(
+            (&stopped["reason"], &stopped["bytes"]),
+            (&serde_json::json!("source_not_live"), &serde_json::json!(0))
+        );
+        assert_eq!(body.written.try_recv(), Ok(0), "the body ends whole");
+        assert!(k2.try_recv().is_err(), "k2 waits on");
+        // Before the read: a start still queued would keep the write end.
+        assert_eq!(driver.queued.len(), 1);
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "its pipe went with its start");
+        assert!(ready_wake(&mut driver).await.is_none());
+        clock.advance(CLIP_START_WAIT / 2);
+        step(&mut driver).await;
+        let stopped = k2.try_recv().unwrap().payload;
+        assert_eq!(stopped["reason"], "source_not_live");
+        assert!(driver.queued.is_empty());
+        assert!(driver.clip_wait.is_none(), "nothing left to wait for");
+        assert!(shared.lock().clips.is_empty());
+        drop(driver);
+        let ended = captured.lines("no worker took the clip's start in time");
+        assert_eq!(ended.len(), 2, "{ended:?}");
+        assert!(ended[0].contains("clip.id=k1"), "{ended:?}");
     }
 }

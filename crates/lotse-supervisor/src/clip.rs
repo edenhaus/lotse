@@ -12,8 +12,16 @@
 //!
 //! A worker's report is untrusted, as its session reports are: it is
 //! accepted only for a clip of that worker's own connection, every name is
-//! mapped onto a known one, every number is bounded, and a warning's
-//! message is made [`plain`] and capped at [`MAX_MESSAGE_BYTES`]. A report
+//! mapped onto a known one, every number is held to what the worker
+//! guarantees (a picture `tkhd` can describe, a gap that ends no earlier
+//! than it begins, at most [`MAX_GAP_EVENTS`] gaps and a `Stopped` that
+//! counts each), and a warning's message is made [`plain`] and capped at
+//! [`MAX_MESSAGE_BYTES`]. A media time (`before_ms`, a gap's ends,
+//! `duration_ms`) is passed on as the worker measured it, bounded only by
+//! its type: the ring trims by time only at keyframes
+//! (`lotse_core::preroll`), so it keeps a GOP the window reaches into
+//! however long that runs, a clip can start at a keyframe older than any
+//! limit, and its file runs from there. A report
 //! that breaks the contract is dropped, logged, and ends its clip
 //! `internal_error`, the worker told to stop it unless the report was its
 //! `Stopped`, after which it runs the clip no more; a repeated or unknown
@@ -24,7 +32,11 @@
 //! supervisor ends a clip itself (`clip/stop`, `unsubscribe`, `not_fetched`,
 //! its control connection closing) it asks the worker through a slot
 //! reserved in the driver's queue at `clip/start` and waits for that
-//! report, putting its own reason in place of the worker's `stopped`. When
+//! report, putting its own reason in place of the worker's `stopped`. A
+//! clip whose start still waits for a worker gets that report from its
+//! driver instead, which also ends one that waited too long
+//! (`source_not_live`, `crate::driver::CLIP_START_WAIT`), so a fetched
+//! clip without a worker still ends. When
 //! the worker cannot report any more (it exited, the stream was deleted or
 //! moved to another connection, shutdown, a malformed report), the clip
 //! ends at once without it: `stopped` then says 0 bytes and 0 ms, since
@@ -34,8 +46,9 @@
 //! runs, and its reports name the clip by its id alone. So a clip the
 //! supervisor ended while its worker may still run it keeps its id
 //! ([`StoppingClip`]) until that worker's `Stopped` comes, the worker
-//! exits, its connection is released, or its start turns out never to
-//! have reached a worker ([`State::clip_start_wanted`]): a new clip under
+//! exits or its driver stops it, its connection is released, or its start
+//! turns out never to have reached a worker ([`State::clip_start_wanted`]),
+//! whether queued for one or sent to one: a new clip under
 //! the id would otherwise be dropped by the worker and end with the old
 //! one's report. A start the driver still holds when its clip is gone
 //! (the clip ended while it waited for a worker, or its worker exited
@@ -78,12 +91,6 @@ pub(crate) const MAX_GAP_EVENTS: u32 = 256;
 /// have, so its own events never fill it, and none is dropped while the
 /// client reads.
 pub(crate) const CLIP_QUEUE: usize = 259;
-
-/// What a worker's report may name past the window and the clip's longest
-/// run, in milliseconds of media time: a minute, since the ring holds the
-/// GOP it cannot trim beyond the window, and a clip's end waits for the
-/// first frame after it.
-const REPORT_SLACK_MS: u32 = 60_000;
 
 /// The largest picture side `started` passes on: `tkhd`'s width and height
 /// are 16.16 fixed-point numbers (ISO/IEC 14496-12 §8.3.2.3), so a clip's
@@ -150,14 +157,6 @@ impl ClipLimits {
         max_clips: 0,
         clips_per_stream: 0,
     };
-
-    /// The most media time, in milliseconds, a worker's report may name:
-    /// the longest window, the longest clip and [`REPORT_SLACK_MS`].
-    const fn span_ms(self) -> u32 {
-        self.preroll_max_ms
-            .saturating_add(self.clip_max_ms)
-            .saturating_add(REPORT_SLACK_MS)
-    }
 }
 
 impl Default for ClipLimits {
@@ -351,14 +350,13 @@ impl ClipEntry {
         }
     }
 
-    /// Checks a report against the clip and `limits`, `at` the wall time
-    /// it came, and logs what it is: an event to pass on, the clip's end,
+    /// Checks a report against the clip, `at` the wall time it came, and
+    /// logs what it is: an event to pass on, the clip's end,
     /// nothing (a warning dropped), or the reason it breaks the contract.
     fn apply(
         &mut self,
         clip_id: &str,
         report: ClipReport,
-        limits: ClipLimits,
         at: SystemTime,
     ) -> Result<Applied, &'static str> {
         match report {
@@ -367,44 +365,35 @@ impl ClipEntry {
                 video,
                 picture,
                 audio,
-            } => self.started_event(
-                clip_id,
-                (before_ms, &video, picture, audio.as_deref()),
-                limits,
-                at,
-            ),
+            } => self.started_event(clip_id, (before_ms, &video, picture, audio.as_deref()), at),
             ClipReport::Warning { code, message } => Ok(self.warning(clip_id, &code, &message)),
             ClipReport::Gap {
                 reason,
                 from_ms,
                 to_ms,
-            } => self.gap(clip_id, &reason, (from_ms, to_ms), limits),
+            } => self.gap(clip_id, &reason, (from_ms, to_ms)),
             ClipReport::Stopped {
                 reason,
                 bytes,
                 duration_ms,
                 gaps,
             } => self
-                .stopped((&reason, bytes, duration_ms, gaps), limits)
+                .stopped((&reason, bytes, duration_ms, gaps))
                 .map(Applied::End),
         }
     }
 
     /// `started`, once, with a video codec a clip carries, audio only when
-    /// asked for and one a clip carries, and numbers it can have; the
+    /// asked for and one a clip carries, and a picture `tkhd` can hold; the
     /// supervisor stamps `at`.
     fn started_event(
         &mut self,
         clip_id: &str,
         (before_ms, video, picture, audio): (u32, &str, Option<(u32, u32)>, Option<&str>),
-        limits: ClipLimits,
         at: SystemTime,
     ) -> Result<Applied, &'static str> {
         if self.started {
             return Err("a second started");
-        }
-        if before_ms > limits.span_ms() {
-            return Err("started before_ms out of bounds");
         }
         let video = known(&CLIP_VIDEO, video).ok_or("started names an unknown video codec")?;
         let audio = match audio {
@@ -473,18 +462,17 @@ impl ClipEntry {
         Applied::Event(ClipEvent::Warning { code, message })
     }
 
-    /// A gap with a known reason, inside the span a clip can have, up to
+    /// A gap with a known reason that ends no earlier than it begins, up to
     /// [`MAX_GAP_EVENTS`].
     fn gap(
         &mut self,
         clip_id: &str,
         reason: &str,
         (from_ms, to_ms): (u32, u32),
-        limits: ClipLimits,
     ) -> Result<Applied, &'static str> {
         let reason = ClipGapReason::parse(reason).ok_or("gap names an unknown reason")?;
-        if from_ms > to_ms || to_ms > limits.span_ms() {
-            return Err("gap out of bounds");
+        if from_ms > to_ms {
+            return Err("gap ends before it begins");
         }
         if self.gaps >= MAX_GAP_EVENTS {
             return Err("more gaps than a clip reports");
@@ -511,15 +499,11 @@ impl ClipEntry {
     /// report breaks the contract: a reason the API does not know or only
     /// the supervisor gives (a malformed report, whose figures are not
     /// believed: `lotse_api_types::clip::ClipEvent::Stopped` says 0 bytes
-    /// and a cut body for one), or figures the clip cannot have.
+    /// and a cut body for one), or fewer gaps than it reported.
     fn stopped(
         &self,
         (reason, bytes, duration_ms, gaps): (&str, u64, u32, u32),
-        limits: ClipLimits,
     ) -> Result<ClipEnd, &'static str> {
-        if duration_ms > limits.span_ms() {
-            return Err("stopped duration out of bounds");
-        }
         if gaps < self.gaps {
             return Err("stopped counts fewer gaps than were reported");
         }
@@ -590,7 +574,6 @@ impl State {
         report: ClipReport,
         at: SystemTime,
     ) {
-        let limits = self.clip_limits;
         let last = matches!(report, ClipReport::Stopped { .. });
         let Some(entry) = self.clips.get_mut(clip_id) else {
             self.late_clip_report(connection, clip_id, last);
@@ -604,7 +587,7 @@ impl State {
             );
             return;
         }
-        match entry.apply(clip_id, report, limits, at) {
+        match entry.apply(clip_id, report, at) {
             Ok(Applied::Event(event)) => entry.deliver(clip_id, &event),
             Ok(Applied::End(end)) => self.end_clip(clip_id, end),
             Ok(Applied::Nothing) => {}
@@ -944,8 +927,9 @@ impl State {
     }
 
     /// The ids of the clips `connection`'s worker was finishing are free:
-    /// that worker exited, or the connection was released and stops it,
-    /// so their `Stopped` reaches no one.
+    /// that worker exited, its driver stopped it for want of demand, or the
+    /// connection was released and stops it, so their `Stopped` reaches no
+    /// one.
     pub(crate) fn forget_stopping_clips(&mut self, connection: &str) {
         self.stopping_clips.retain(|clip_id, clip| {
             let keep = clip.connection != connection;
@@ -976,8 +960,6 @@ mod tests {
 
     use super::*;
     use crate::test_support::Captured;
-
-    const LIMITS: ClipLimits = ClipLimits::DEFAULT;
 
     /// A clip `k1` of `front` on `c1` asked with `audio`, and its events.
     fn entry(audio: bool) -> (ClipEntry, mpsc::Receiver<Event>) {
@@ -1018,7 +1000,7 @@ mod tests {
     }
 
     fn applied(entry: &mut ClipEntry, report: ClipReport) -> Result<Applied, &'static str> {
-        entry.apply("k1", report, LIMITS, UNIX_EPOCH)
+        entry.apply("k1", report, UNIX_EPOCH)
     }
 
     fn passed(applied: Result<Applied, &'static str>) -> serde_json::Value {
@@ -1027,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_bound_every_report_and_the_queue_holds_every_event() {
+    fn the_defaults_are_the_worker_s_and_the_queue_holds_every_event() {
         assert_eq!(
             CLIP_QUEUE,
             usize::try_from(MAX_GAP_EVENTS).unwrap() + 3,
@@ -1042,12 +1024,6 @@ mod tests {
             (ClipLimits::NONE.max_clips, ClipLimits::NONE.preroll_max_ms),
             (0, 0)
         );
-        assert_eq!(LIMITS.span_ms(), 120_000 + 600_000 + 60_000);
-        let unbounded = ClipLimits {
-            preroll_max_ms: u32::MAX,
-            ..LIMITS
-        };
-        assert_eq!(unbounded.span_ms(), u32::MAX);
         assert!(completed(ClipStopReason::MaxDuration));
         assert!(!completed(ClipStopReason::ClientGone));
     }
@@ -1062,7 +1038,7 @@ mod tests {
             *audio = Some("aac_lc".into());
         }
         let at = UNIX_EPOCH + Duration::from_hours(489_202);
-        let event = passed(clip.apply("k1", report, LIMITS, at));
+        let event = passed(clip.apply("k1", report, at));
         assert_eq!(
             event,
             json!({ "type": "started", "clip_id": "k1", "at": "2025-10-22T10:00:00.000Z",
@@ -1116,19 +1092,57 @@ mod tests {
                 false,
                 "started has audio not asked for",
             ),
-            (
-                started(LIMITS.span_ms() + 1, "h264", None),
-                true,
-                "started before_ms out of bounds",
-            ),
         ];
         for (report, audio, reason) in cases {
             let (mut clip, _rx) = entry(audio);
             assert_eq!(applied(&mut clip, report).unwrap_err(), reason);
             assert!(!clip.started);
         }
+    }
+
+    /// A clip's media times are the worker's measure, which no limit
+    /// bounds: the ring trims by time only at keyframes, so with a
+    /// 14-minute GOP that fits `preroll_bytes` (a low-bitrate camera) the
+    /// clip starts at a keyframe 840 s old, past the longest window and
+    /// clip, and its file runs on from there. Each report passes as the
+    /// worker made it, and the clip ends with its figures, its body whole.
+    /// Regression: `before_ms` past the window, the longest clip and a
+    /// minute ended the clip `internal_error`, its body cut, and so did a
+    /// gap or a duration past them.
+    #[test]
+    fn a_clip_from_a_keyframe_older_than_any_limit_passes_its_media_times_as_measured() {
         let (mut clip, _rx) = entry(false);
-        assert!(applied(&mut clip, started(LIMITS.span_ms(), "h264", None)).is_ok());
+        let event = passed(applied(&mut clip, started(840_000, "h264", None)));
+        assert_eq!(event["before_ms"], 840_000);
+        let gap = ClipReport::Gap {
+            reason: "reconnect".into(),
+            from_ms: 900_000,
+            to_ms: u32::MAX,
+        };
+        let event = passed(applied(&mut clip, gap));
+        assert_eq!(
+            (&event["from_ms"], &event["to_ms"]),
+            (&json!(900_000), &json!(u32::MAX))
+        );
+        let stopped = ClipReport::Stopped {
+            reason: "completed".into(),
+            bytes: 7,
+            duration_ms: u32::MAX,
+            gaps: 1,
+        };
+        let_assert!(Ok(Applied::End(end)) = applied(&mut clip, stopped));
+        assert_eq!(
+            end,
+            ClipEnd::Reported {
+                reason: ClipStopReason::Completed,
+                bytes: 7,
+                duration_ms: u32::MAX,
+                gaps: 1,
+            }
+        );
+        let (mut clip, _rx) = entry(false);
+        let event = passed(applied(&mut clip, started(u32::MAX, "h265", None)));
+        assert_eq!(event["before_ms"], u32::MAX);
     }
 
     #[test]
@@ -1177,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn gaps_pass_with_a_known_reason_inside_the_span_and_up_to_the_cap() {
+    fn gaps_pass_with_a_known_reason_in_order_and_up_to_the_cap() {
         let captured = Captured::default();
         let _logs = captured.install();
         let (mut clip, _rx) = entry(false);
@@ -1193,13 +1207,12 @@ mod tests {
         );
         for (report, reason) in [
             (gap("solar_flare", 0, 1), "gap names an unknown reason"),
-            (gap("lagged", 2, 1), "gap out of bounds"),
-            (gap("lagged", 0, LIMITS.span_ms() + 1), "gap out of bounds"),
+            (gap("lagged", 2, 1), "gap ends before it begins"),
         ] {
             assert_eq!(applied(&mut clip, report).unwrap_err(), reason);
         }
-        // The span's end is inside it.
-        assert!(applied(&mut clip, gap("lagged", 0, LIMITS.span_ms())).is_ok());
+        // A gap may be empty.
+        assert!(applied(&mut clip, gap("lagged", 1, 1)).is_ok());
         for _ in 2..MAX_GAP_EVENTS {
             assert!(applied(&mut clip, gap("overflow", 1, 1)).is_ok());
         }
@@ -1261,16 +1274,6 @@ mod tests {
         assert_eq!(
             end(&mut clip, stopped("internal_error", 1, 0)),
             ClipStopReason::InternalError
-        );
-        // Figures the clip cannot have break the contract; the span's end
-        // is inside it.
-        assert_eq!(
-            applied(&mut clip, stopped("completed", LIMITS.span_ms() + 1, 0)).unwrap_err(),
-            "stopped duration out of bounds"
-        );
-        assert_eq!(
-            end(&mut clip, stopped("completed", LIMITS.span_ms(), 0)),
-            ClipStopReason::Completed
         );
         clip.gaps = 2;
         assert_eq!(
