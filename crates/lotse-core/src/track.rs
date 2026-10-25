@@ -736,7 +736,8 @@ pub struct Track {
     /// The oldest keyframe of the live set's `v0` ring, which the audio
     /// rings trim by; shared by the connection's tracks, staging ones
     /// included, and written only by that live `v0`
-    /// ([`Self::leads_preroll`]).
+    /// ([`Self::leads_preroll`]). Oldest by capture time
+    /// ([`Preroll::oldest`]), which a Sender Report can move back.
     preroll_floor: Arc<PrerollFloor>,
     /// Set by [`Track::close`]; subscriptions end and nothing is published.
     closed: AtomicBool,
@@ -2705,6 +2706,49 @@ mod tests {
         }
         assert_eq!(video.preroll_floor.get(), Some(t0));
         assert_eq!(preroll(&audio, t0), [0, 200, 400, 600, 800, 1000]);
+    }
+
+    /// RFC 3550 §6.4.1: a Sender Report correcting the mapping back dates
+    /// the second keyframe before the first; the audio playing at it stays
+    /// while both are held.
+    #[test]
+    fn rfc3550_6_4_1_the_audio_pre_roll_keeps_the_audio_of_a_keyframe_dated_before_the_oldest() {
+        let t0 = SystemClock.now();
+        let set = crate::source::TrackSet::new(TrackLimits::default(), t0);
+        let mut publisher = set.publisher();
+        let video = publisher.declare(
+            Kind::Video,
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+        );
+        let audio = publisher.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        for track in [&video, &audio] {
+            track.set_preroll(Some(Duration::from_secs(60)));
+        }
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // Labelled by arrival.
+        let dated = |capture: u64, arrival: u64, keyframe: bool| MediaFrame {
+            wallclock: at(capture),
+            ..timed(t0, arrival, keyframe, 10)
+        };
+        assert!(video.publish_frame(timed(t0, 10_000, true, 10)));
+        assert!(video.publish_frame(dated(1000, 11_000, true)));
+        for (capture, arrival) in [(1000, 11_000), (1100, 11_100), (1200, 11_200)] {
+            assert!(audio.publish_frame(dated(capture, arrival, true)));
+        }
+        assert_eq!(preroll(&video, t0), [10_000, 11_000]);
+        let start = video.preroll_snapshot(at(1000)).unwrap();
+        assert_eq!(start.start().ts.ticks(), 11_000);
+        assert_eq!(
+            preroll(&audio, start.start().wallclock),
+            [11_000, 11_100, 11_200],
+            "the audio playing at the second keyframe stays"
+        );
+        assert_eq!(video.preroll_floor.get(), Some(at(1000)));
     }
 
     #[test]

@@ -888,9 +888,9 @@ pub struct TrackSet {
     tag: u8,
     /// The live set a staging set forwards into.
     live: Option<Arc<Self>>,
-    /// The oldest keyframe of the connection's video pre-roll, which its
-    /// audio pre-roll trims by; a staging set shares the live set's, and only
-    /// the live set's `v0` writes it.
+    /// The oldest capture time of a keyframe the connection's video
+    /// pre-roll holds, which its audio pre-roll trims by; a staging set
+    /// shares the live set's, and only the live set's `v0` writes it.
     preroll_floor: Arc<PrerollFloor>,
 }
 
