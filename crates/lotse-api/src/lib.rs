@@ -17,7 +17,8 @@
 //! stops reading cannot hold a connection or its slot. Beside the upgrade
 //! it serves event clips' bytes, `GET /v0/clips/{clip_id}`, as chunked
 //! response bodies the handler hands over ([`Handler::clip_body`]),
-//! bounded by the client taking them.
+//! bounded by the client taking them and, over TLS, by its client staying
+//! enrolled.
 //!
 //! Standards: RFC 6455 (WebSocket, close codes §7.4.1, `Origin` §10.2),
 //! RFC 9110 (HTTP), RFC 9112 (HTTP/1.1, the chunked transfer coding §7.1
@@ -29,7 +30,7 @@ use std::net::SocketAddr;
 use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::routing::get;
@@ -193,8 +194,9 @@ pub trait Handler: Send + Sync + 'static {
         let _ = connection;
     }
 
-    /// `GET /v0/clips/{clip_id}`, from any peer either listener admits:
-    /// the bytes of clip `clip_id`, handed over once, so a second request
+    /// `GET /v0/clips/{clip_id}` in HTTP/1.1, from any peer either listener
+    /// admits (over TLS, one whose client is still allowed): the bytes of
+    /// clip `clip_id`, handed over once, so a second request
     /// is [`ClipBodyError::AlreadyFetched`]. The server sends them as the
     /// response body and ends it whole only when the reader ended and the
     /// report agrees with what arrived. Never waits. Without clips, every
@@ -373,15 +375,16 @@ impl Server {
             None => (None, None, None),
         };
         let serving = TaskTracker::new();
+        let next_id = Arc::new(AtomicU64::new(1));
         let state = AppState {
             handler,
             config: self.config,
             connections: Arc::new(AtomicU32::new(0)),
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id: Arc::clone(&next_id),
             shutdown: shutdown.clone(),
             clock: Arc::clone(&clock),
             pairing,
-            clients,
+            clients: clients.clone(),
             serving: serving.token(),
         };
         let serving_token = serving.token();
@@ -407,6 +410,8 @@ impl Server {
             clock,
             shutdown: shutdown.clone(),
             serving: serving_token,
+            clients,
+            next_id,
         };
         tracing::info!(event = "api_listening", "control API listening");
         loop {
@@ -459,6 +464,11 @@ struct Admission {
     /// Held by every connection's task until it ends, so the server's
     /// stop waits for a clip body still being sent.
     serving: TaskTrackerToken,
+    /// The TLS listener's clients, which a connection sending a clip's
+    /// body is registered with; `None` without a listener.
+    clients: Option<Arc<clients::ClientStore>>,
+    /// The next connection id, shared with the upgraded connections.
+    next_id: Arc<AtomicU64>,
 }
 
 impl Admission {
@@ -510,6 +520,8 @@ impl Admission {
                     body,
                     clock: Arc::clone(&self.clock),
                     serving: self.serving.clone(),
+                    clients: self.clients.clone(),
+                    next_id: Arc::clone(&self.next_id),
                 },
             ),
         );
@@ -548,14 +560,20 @@ struct Accepted {
     clock: Arc<dyn Clock>,
     /// Held until the connection ends.
     serving: TaskTrackerToken,
+    /// The TLS listener's clients, to close a clip body's connection once
+    /// its client is removed.
+    clients: Option<Arc<clients::ClientStore>>,
+    /// Numbers the connection once it sends a clip's body.
+    next_id: Arc<AtomicU64>,
 }
 
 /// Drives one connection from accept to the upgrade, after which the
 /// connection task in [`connection`] owns it. Closes it at `deadline` or
 /// on shutdown if it has not upgraded by then, and returns the pending
 /// slot either way. A connection whose response is a clip's body leaves
-/// the slot and the deadline when the body begins, and is driven until
-/// the body ends ([`clip::send_body`]).
+/// the slot and the deadline when the body begins, is registered with the
+/// TLS listener's clients as an upgraded connection is, and is driven
+/// until the body ends or its client is removed ([`clip::send_body`]).
 async fn handshake(
     mut connection: BoxFuture<'static, hyper::Result<()>>,
     deadline: BoxFuture<'static, ()>,
@@ -568,6 +586,8 @@ async fn handshake(
         body,
         clock,
         serving: _serving,
+        clients,
+        next_id,
     } = accepted;
     let mut sending = body.subscribe();
     let sends_a_clip = tokio::select! {
@@ -597,7 +617,19 @@ async fn handshake(
     };
     if sends_a_clip {
         drop(slot);
-        clip::send_body(connection, sending, clock.as_ref(), &shutdown, &peer).await;
+        // A removal since the route's check cancels the token at once.
+        let id = ConnectionId(next_id.fetch_add(1, Ordering::AcqRel));
+        let removed = connection::attach(clients.as_deref(), &peer, id);
+        clip::send_body(
+            connection,
+            sending,
+            clock.as_ref(),
+            &shutdown,
+            &removed,
+            &peer,
+        )
+        .await;
+        connection::detach(clients.as_deref(), id);
     }
     // The body's sender, which `send_body`'s receiver needs, lives until here.
     drop(body);
@@ -744,11 +776,7 @@ mod tests {
             answer_with(state, headers).await,
             (403, ErrorCode::InvalidRequest.as_str().into())
         );
-        assert_eq!(
-            connections.load(std::sync::atomic::Ordering::Acquire),
-            0,
-            "no slot taken"
-        );
+        assert_eq!(connections.load(Ordering::Acquire), 0, "no slot taken");
     }
 
     /// The upgrade handler driven directly, every check in one
@@ -762,11 +790,7 @@ mod tests {
             answer(shutting_down).await,
             (503, ErrorCode::ShuttingDown.as_str().into())
         );
-        assert_eq!(
-            connections.load(std::sync::atomic::Ordering::Acquire),
-            0,
-            "no slot taken"
-        );
+        assert_eq!(connections.load(Ordering::Acquire), 0, "no slot taken");
         assert_eq!(
             answer(state(0, false)).await,
             (503, ErrorCode::LimitReached.as_str().into())

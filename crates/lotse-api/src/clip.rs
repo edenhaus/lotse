@@ -17,16 +17,24 @@
 //! and their deadline (a clip runs for minutes) and is bounded instead by
 //! the client taking the body: a chunk the client makes no room for within
 //! [`BODY_STALL_TIMEOUT`] drops the connection, and so does still sending
-//! [`CLOSE_TIMEOUT`] after shutdown began. The server waits for it when it
+//! [`CLOSE_TIMEOUT`] after shutdown began, or the removal of the TLS
+//! listener's client that takes it (`clients/remove`), which closes its
+//! WebSocket connections alike: the connection is registered with the
+//! client store while its body is sent. The server waits for it when it
 //! stops.
 //!
-//! Refusals carry the error body of the WebSocket's results: 403 for a
-//! request carrying `Origin` (RFC 6455 §10.2, as the upgrade refuses it),
-//! 503 `shutting_down` (RFC 9110 §15.6.4), 404 `clip_not_found` (RFC 9110
-//! §15.5.5) for an id that is no open clip's, 409 `clip_already_fetched`
-//! (RFC 9110 §15.5.10) for a body another request took, and 405 with
-//! `Allow: GET` (RFC 9110 §15.5.6) for any other method, HEAD included,
-//! which would otherwise take the body.
+//! Refusals carry the error body of the WebSocket's results, and none
+//! takes the clip: 403 for a request carrying `Origin` (RFC 6455 §10.2, as
+//! the upgrade refuses it), 503 `shutting_down` (RFC 9110 §15.6.4), 403
+//! `not_permitted` (RFC 9110 §15.5.4) for a TLS client removed since its
+//! handshake, on a connection that then closes, 505 `invalid_request` (RFC
+//! 9110 §15.6.6) for a request not in HTTP/1.1, whose response could not
+//! be chunked (RFC 9112 §6.1) and so could not end cut (§6.3: it would be
+//! close-delimited), 404 `clip_not_found` (RFC 9110 §15.5.5) for an id
+//! that is no open clip's (`.` and `..` included, which no clip has), 409
+//! `clip_already_fetched` (RFC 9110 §15.5.10) for a body another request
+//! took, and 405 with `Allow: GET` (RFC 9110 §15.5.6) for any other
+//! method, HEAD included, which would otherwise take the body.
 //!
 //! [`Handler::clip_body`]: crate::Handler::clip_body
 //! [`CLIP_REPORT_TIMEOUT`]: crate::CLIP_REPORT_TIMEOUT
@@ -40,7 +48,7 @@ use std::time::Instant;
 use axum::Extension;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderName, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderName, StatusCode, Uri, Version, header};
 use axum::response::{IntoResponse as _, Response};
 use futures_util::StreamExt as _;
 use futures_util::future::OptionFuture;
@@ -141,16 +149,25 @@ impl BodyWatch {
 }
 
 /// `GET /v0/clips/{clip_id}`: the checks, then the clip's body from the
-/// handler. The peer was authenticated by its listener.
+/// handler. The peer was authenticated by its listener; a TLS client
+/// removed since then is refused here, and one removed later is dropped
+/// by its connection's task.
 pub(crate) async fn fetch<H: Handler>(
     State(state): State<AppState<H>>,
     Extension(peer): Extension<PeerInfo>,
     Extension(body): Extension<BodyWatch>,
+    version: Version,
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
+    let removed = match (state.clients.as_deref(), &peer) {
+        (Some(clients), PeerInfo::Tls { pin, .. }) => !clients.allows(pin),
+        _ => false,
+    };
     let request = Request {
         peer: &peer,
+        removed,
+        version,
         headers: &headers,
         path: uri.path(),
         shutting_down: state.shutdown.is_cancelled(),
@@ -179,6 +196,11 @@ pub(crate) async fn not_allowed() -> Response {
 struct Request<'a> {
     /// Who asks.
     peer: &'a PeerInfo,
+    /// Whether the TLS listener's client that asks was removed since its
+    /// handshake.
+    removed: bool,
+    /// The request's HTTP version.
+    version: Version,
     /// The request's header fields.
     headers: &'a HeaderMap,
     /// The request's path, `/v0/clips/{clip_id}`.
@@ -211,6 +233,31 @@ fn answer(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::ShuttingDown,
             "shutting down",
+        );
+    }
+    if request.removed {
+        tracing::warn!(%peer, "clip body refused: its client was removed");
+        let mut response = refuse(
+            StatusCode::FORBIDDEN,
+            ErrorCode::NotPermitted,
+            "the client was removed",
+        );
+        // RFC 9112 §9.6: the connection serves the removed client nothing
+        // else.
+        response.headers_mut().insert(
+            header::CONNECTION,
+            header::HeaderValue::from_static("close"),
+        );
+        return response;
+    }
+    // RFC 9112 §6.1: no chunked response to a request before HTTP/1.1, and
+    // a close-delimited one (§6.3) would end alike whole or cut.
+    if request.version != Version::HTTP_11 {
+        tracing::warn!(%peer, version = ?request.version, "clip body refused: the request is not HTTP/1.1, so the body could not be chunked");
+        return refuse(
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            ErrorCode::InvalidRequest,
+            "a clip's bytes are sent in the chunked transfer coding, which needs HTTP/1.1",
         );
     }
     // A clip id never needs percent-encoding (RFC 3986 §2.3), so the raw
@@ -372,18 +419,23 @@ impl Sending {
 }
 
 /// Drives a connection whose clip body is being sent until it ends, its
-/// client makes no room for the body within [`BODY_STALL_TIMEOUT`], or
-/// [`CLOSE_TIMEOUT`] after shutdown began; dropping it closes the socket.
+/// client makes no room for the body within [`BODY_STALL_TIMEOUT`], its
+/// client is `removed`, or [`CLOSE_TIMEOUT`] after shutdown began;
+/// dropping it closes the socket.
 pub(crate) async fn send_body(
     connection: BoxFuture<'static, hyper::Result<()>>,
     mut body: watch::Receiver<BodyState>,
     clock: &dyn Clock,
     shutdown: &CancellationToken,
+    removed: &CancellationToken,
     peer: &PeerInfo,
 ) {
     tokio::select! {
         sent = connection => {
             tracing::debug!(%peer, error = ?sent.err(), "clip body: connection closed");
+        }
+        () = removed.cancelled() => {
+            tracing::info!(%peer, "clip body dropped: its client was removed");
         }
         () = stalled(&mut body, clock) => {
             let timeout_ms = BODY_STALL_TIMEOUT.as_millis();
@@ -504,8 +556,8 @@ mod tests {
         }
     }
 
-    /// `answer` for a request to `path` with `headers`, the clip from
-    /// `lookup`.
+    /// `answer` for an HTTP/1.1 request to `path` with `headers` from a
+    /// client not removed, the clip from `lookup`.
     fn answer_to(
         path: &str,
         headers: &HeaderMap,
@@ -513,10 +565,32 @@ mod tests {
         body: &BodyWatch,
         lookup: &dyn Fn(&ClipId) -> Result<ClipBody, ClipBodyError>,
     ) -> Response {
+        answer_as(
+            (false, Version::HTTP_11),
+            path,
+            shutting_down,
+            body,
+            lookup,
+            headers,
+        )
+    }
+
+    /// `answer` for a request in `version` to `path`, from a client
+    /// `removed` or not.
+    fn answer_as(
+        (removed, version): (bool, Version),
+        path: &str,
+        shutting_down: bool,
+        body: &BodyWatch,
+        lookup: &dyn Fn(&ClipId) -> Result<ClipBody, ClipBodyError>,
+        headers: &HeaderMap,
+    ) -> Response {
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::default());
         let peer = peer();
         let request = Request {
             peer: &peer,
+            removed,
+            version,
             headers,
             path,
             shutting_down,
@@ -563,8 +637,15 @@ mod tests {
             status_and_code(refused).await,
             (503, "shutting_down".into())
         );
-        // An id no clip can have is not looked up, and never repeated.
-        for path in ["/v0/clips/a%2Fb", "/v0/clips/secret secret", "/v0/clips"] {
+        // An id no clip can have is not looked up, and never repeated: a
+        // dot segment neither (RFC 3986 §3.3), which a URL cannot keep.
+        for path in [
+            "/v0/clips/a%2Fb",
+            "/v0/clips/secret secret",
+            "/v0/clips",
+            "/v0/clips/.",
+            "/v0/clips/..",
+        ] {
             let refused = answer_to(path, &none, false, &body, &gone);
             assert_eq!(
                 status_and_code(refused).await,
@@ -653,6 +734,89 @@ mod tests {
         assert!(text.contains("clip body: sent whole"), "{text}");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_removed_client_or_a_request_before_http_1_1_is_refused_before_the_clip_is_taken() {
+        let (logs, _guard) = capture(tracing::Level::WARN);
+        let body = BodyWatch::new();
+        let none = HeaderMap::new();
+        let asked = std::cell::Cell::new(0);
+        let lookup = |_: &ClipId| {
+            asked.set(asked.get() + 1);
+            Err(ClipBodyError::NotFound)
+        };
+        // RFC 9110 §15.5.4: its client was removed since its handshake; the
+        // connection closes with the answer (RFC 9112 §9.6).
+        let refused = answer_as(
+            (true, Version::HTTP_11),
+            "/v0/clips/c1",
+            false,
+            &body,
+            &lookup,
+            &none,
+        );
+        assert_eq!(refused.headers()[header::CONNECTION], "close");
+        assert_eq!(
+            status_and_code(refused).await,
+            (403, "not_permitted".into())
+        );
+        // RFC 9110 §15.6.6, RFC 9112 §6.1: no chunked body before HTTP/1.1.
+        for version in [Version::HTTP_10, Version::HTTP_09] {
+            let refused = answer_as(
+                (false, version),
+                "/v0/clips/c1",
+                false,
+                &body,
+                &lookup,
+                &none,
+            );
+            assert_eq!(
+                status_and_code(refused).await,
+                (505, "invalid_request".into()),
+                "{version:?}"
+            );
+        }
+        assert_eq!(asked.get(), 0, "none of them was looked up");
+        assert_eq!(*body.subscribe().borrow(), BodyState::Idle, "nothing sent");
+        // The same request in HTTP/1.1 from a client still allowed is.
+        let looked_up = answer_as(
+            (false, Version::HTTP_11),
+            "/v0/clips/c1",
+            false,
+            &body,
+            &lookup,
+            &none,
+        );
+        assert_eq!(
+            status_and_code(looked_up).await,
+            (404, "clip_not_found".into())
+        );
+        assert_eq!(asked.get(), 1);
+        let text = logs.text();
+        assert!(
+            text.contains("clip body refused: its client was removed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("clip body refused: the request is not HTTP/1.1"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipe_7_a_body_reads_up_to_a_pipes_capacity_at_once() {
+        let clock = Arc::new(FakeClock::default());
+        let watch = BodyWatch::new();
+        let (reader, mut writer) = tokio::io::duplex(256 * 1024);
+        let (_report, written) = oneshot::channel();
+        let clip = ClipBody {
+            reader: Box::new(reader),
+            written,
+        };
+        let mut body = Box::pin(body_stream(sending(clip, &watch, &clock)));
+        writer.write_all(&vec![1_u8; 3 * 64 * 1024]).await.unwrap();
+        assert_eq!(body.next().await.unwrap().unwrap().len(), 64 * 1024);
+    }
+
     #[tokio::test]
     async fn rfc9110_15_5_6_any_other_method_is_answered_405_with_allow_get() {
         let response = not_allowed().await;
@@ -670,6 +834,7 @@ mod tests {
             State(state),
             Extension(peer()),
             Extension(BodyWatch::new()),
+            Version::HTTP_11,
             HeaderMap::new(),
             Uri::from_static("/v0/clips/c1"),
         )
@@ -787,10 +952,19 @@ mod tests {
     }
 
     /// `send_body` over a stand-in connection that ends when `end` sends,
-    /// with the watch it reads.
+    /// with the watch it reads, for a client never removed.
     fn sent_body(
         clock: &Arc<FakeClock>,
         shutdown: &CancellationToken,
+    ) -> (BodyWatch, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        sent_body_of(clock, shutdown, &CancellationToken::new())
+    }
+
+    /// `send_body` as [`sent_body`], for a client `removed` once cancelled.
+    fn sent_body_of(
+        clock: &Arc<FakeClock>,
+        shutdown: &CancellationToken,
+        removed: &CancellationToken,
     ) -> (BodyWatch, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         let watch = BodyWatch::new();
         let (end, ended) = oneshot::channel::<()>();
@@ -801,8 +975,17 @@ mod tests {
         let states = watch.subscribe();
         let clock = Arc::<FakeClock>::clone(clock);
         let shutdown = shutdown.clone();
+        let removed = removed.clone();
         let task = lotse_core::task::spawn_named("test.body", async move {
-            send_body(connection, states, clock.as_ref(), &shutdown, &peer()).await;
+            send_body(
+                connection,
+                states,
+                clock.as_ref(),
+                &shutdown,
+                &removed,
+                &peer(),
+            )
+            .await;
         });
         (watch, end, task)
     }
@@ -878,6 +1061,25 @@ mod tests {
             text.contains(
                 "clip body dropped: still being sent when shutdown's close timeout ran out"
             ),
+            "{text}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_whose_client_is_removed_is_dropped_at_once() {
+        let (logs, _guard) = capture(tracing::Level::INFO);
+        let clock = Arc::new(FakeClock::default());
+        let removed = CancellationToken::new();
+        let (watch, _end, task) = sent_body_of(&clock, &CancellationToken::new(), &removed);
+        watch.set(BodyState::Taken);
+        settle().await;
+        assert!(!task.is_finished());
+        // On no clock: the removal alone ends it.
+        removed.cancel();
+        task.await.unwrap();
+        let text = logs.text();
+        assert!(
+            text.contains("clip body dropped: its client was removed"),
             "{text}"
         );
     }

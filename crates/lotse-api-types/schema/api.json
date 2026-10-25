@@ -1196,8 +1196,8 @@
               "type": "integer"
             },
             "clip_id": {
-              "description": "The client's clip id, `^[A-Za-z0-9._-]{1,128}$`, unique among the\nopen clips; a ULID when absent.",
-              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "description": "The client's clip id, `^[A-Za-z0-9._-]{1,128}$` but `.` and `..`,\nwhich would be dot segments of the result's `url` (RFC 3986 §3.3),\nunique among the open clips; a ULID when absent.",
+              "pattern": "^(?:[A-Za-z0-9._-]{3,128}|[A-Za-z0-9_-][A-Za-z0-9._-]?|\\.[A-Za-z0-9_-])$",
               "type": [
                 "string",
                 "null"
@@ -1233,7 +1233,7 @@
           "properties": {
             "clip_id": {
               "description": "The clip.",
-              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "pattern": "^(?:[A-Za-z0-9._-]{3,128}|[A-Za-z0-9_-][A-Za-z0-9._-]?|\\.[A-Za-z0-9_-])$",
               "type": "string"
             },
             "id": {

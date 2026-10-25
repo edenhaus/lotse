@@ -47,11 +47,30 @@ use tokio_util::sync::CancellationToken;
 const TLS13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
 /// Answers every command with `null`, but `metrics/get` never: a command
-/// the handler is still awaiting. Its one clip, `c1`, is four bytes.
+/// the handler is still awaiting. Its clips: `c1` is four bytes, `open`
+/// four bytes and then nothing, never ending, and `kept` four bytes,
+/// counted in [`KEPT_TAKEN`] each time it is handed out.
 struct Minimal;
 
 /// Notified each time [`Minimal`] begins a `metrics/get`.
 static STALLED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// How many times [`Minimal`] handed out clip `kept`; only one test asks
+/// for it.
+static KEPT_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A clip's bytes that never end: a recording still under way.
+struct Recording;
+
+impl AsyncRead for Recording {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
 
 impl Handler for Minimal {
     fn hello(&self) -> Hello {
@@ -80,15 +99,18 @@ impl Handler for Minimal {
     }
 
     fn clip_body(&self, clip_id: &lotse_core::id::ClipId) -> Result<ClipBody, ClipBodyError> {
-        if clip_id.as_str() != "c1" {
-            return Err(ClipBodyError::NotFound);
-        }
         let (report, written) = tokio::sync::oneshot::channel();
         report.send(4).unwrap();
-        Ok(ClipBody {
-            reader: Box::new(&b"ftyp"[..]),
-            written,
-        })
+        let reader: Box<dyn AsyncRead + Send + Unpin> = match clip_id.as_str() {
+            "c1" => Box::new(&b"ftyp"[..]),
+            "open" => Box::new((&b"ftyp"[..]).chain(Recording)),
+            "kept" => {
+                KEPT_TAKEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::new(&b"ftyp"[..])
+            }
+            _ => return Err(ClipBodyError::NotFound),
+        };
+        Ok(ClipBody { reader, written })
     }
 }
 
@@ -1415,4 +1437,112 @@ async fn serving_ends_after_a_closing_connection_so_the_data_directory_binds_aga
     // Nothing holds the client store's lock (flock(2)) any more.
     within_5_s(start_in(dir, data, vec![]).finish()).await;
     drop(admin);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rfc9110_15_5_4_a_client_removed_after_its_handshake_is_refused_a_clip_and_leaves_it() {
+    let (logs, _guard) = capture();
+    let client = ClientIdentity::generate().unwrap();
+    let running = start_enrolled("clip-removed-before", vec![], &[client.pin]);
+    let mut admin = local(&running).await;
+    // Authenticated while it was enrolled, asking only after its removal.
+    let connected = connect(running.addr, running.config(ClientCert::Own(&client))).await;
+    let answer = call(&mut admin, remove(1, client.pin)).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    let (status, body) = request(connected, "GET", "/v0/clips/kept", "")
+        .await
+        .unwrap();
+    assert_eq!(status, 403, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["code"], "not_permitted", "{body}");
+    // Refused before the handler was asked: the clip is still there for
+    // a client that may take it.
+    assert_eq!(
+        KEPT_TAKEN.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the clip was not taken"
+    );
+    let text = logs.text();
+    assert!(
+        text.contains("clip body refused: its client was removed"),
+        "{text}"
+    );
+    drop(admin);
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removing_a_client_drops_the_clip_body_it_is_taking() {
+    let (logs, _guard) = capture();
+    let client = ClientIdentity::generate().unwrap();
+    let running = start_enrolled("clip-removed-during", vec![], &[client.pin]);
+    let mut admin = local(&running).await;
+    let mut stream = connect(running.addr, running.config(ClientCert::Own(&client)))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /v0/clips/open HTTP/1.1\r\nHost: lotse\r\n\r\n")
+        .await
+        .unwrap();
+    // The head and the first chunk: the body is being sent.
+    let mut seen = Vec::new();
+    while !seen.ends_with(b"4\r\nftyp\r\n") {
+        let mut buf = [0_u8; 1024];
+        let n = within_5_s(stream.read(&mut buf)).await.unwrap();
+        assert!(n > 0, "closed before the first chunk: {seen:?}");
+        seen.extend_from_slice(&buf[..n]);
+    }
+    // While it is sent, the connection is its client's.
+    let listed = call(
+        &mut admin,
+        serde_json::json!({ "id": 1, "type": "clients/list" }),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["clients"][0]["connected"], true,
+        "{listed}"
+    );
+    let answer = call(&mut admin, remove(2, client.pin)).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    // Dropped at once, on no clock: the body ends without its last chunk
+    // (RFC 9112 §8).
+    let rest = closed(&mut stream).await;
+    assert!(!rest.ends_with(b"0\r\n\r\n"), "{rest:?}");
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|line| line.contains("control client removed"))
+        .unwrap();
+    assert!(line.contains("closed=1"), "{line}");
+    assert!(
+        text.contains("clip body dropped: its client was removed"),
+        "{text}"
+    );
+    drop(admin);
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_clip_body_s_connection_is_forgotten_once_it_ends() {
+    let client = ClientIdentity::generate().unwrap();
+    let running = start("clip-forgotten", vec![client.pin]);
+    let mut admin = local(&running).await;
+    let connected = connect(running.addr, running.config(ClientCert::Own(&client))).await;
+    let answer = request(connected, "GET", "/v0/clips/c1", "").await.unwrap();
+    assert_eq!(answer, (200, "4\r\nftyp\r\n0\r\n\r\n".to_owned()));
+    let mut id = 1;
+    within_5_s(async {
+        loop {
+            let list = serde_json::json!({ "id": id, "type": "clients/list" });
+            let listed = call(&mut admin, list).await;
+            if listed["result"]["clients"][0]["connected"] == false {
+                break;
+            }
+            id += 1;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    drop(admin);
+    running.finish().await;
 }
