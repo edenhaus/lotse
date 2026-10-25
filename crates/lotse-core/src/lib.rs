@@ -1,7 +1,7 @@
 //! Protocol-blind media core: tracks, packets, frames, the source and output
 //! contracts, factory registries, source supervision (backoff, stall watchdog,
-//! hot swap), clock mapping and its skew watchdog, fan-out, track
-//! negotiation and a session's uplink track for talk-back.
+//! hot swap), clock mapping and its skew watchdog, fan-out, the pre-roll
+//! ring, track negotiation and a session's uplink track for talk-back.
 //!
 //! Runs inside a worker process. Knows nothing about RTSP, WebRTC, HTTP or
 //! processes: it defines the traits the protocol crates implement and never
@@ -25,6 +25,7 @@ pub mod media;
 pub mod negotiate;
 pub mod orientation;
 pub mod output;
+pub mod preroll;
 pub mod registry;
 pub mod runner;
 pub mod secret;
