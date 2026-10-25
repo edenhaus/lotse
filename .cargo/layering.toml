@@ -6,8 +6,8 @@
 
 [dependents]
 # crate = the workspace crates that may depend on it directly
-lotse-core = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-supervisor", "lotse-worker", "lotse-testing", "lotse"]
-lotse-codec = ["lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-worker", "lotse-testing", "lotse"] # lotse-worker: the picture size of `stream/get`, read from a track's SPS
+lotse-core = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-mux", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-supervisor", "lotse-worker", "lotse-testing", "lotse"]
+lotse-codec = ["lotse-rtsp", "lotse-http", "lotse-mux", "lotse-webrtc", "lotse-snapshot", "lotse-worker", "lotse-testing", "lotse"] # lotse-worker: the picture size of `stream/get`, read from a track's SPS
 lotse-ipc = ["lotse-supervisor", "lotse-worker", "lotse-snapshot", "lotse"] # lotse: dev-only, the talk-back tone test's in-process worker
 lotse-sandbox = ["lotse"]
 lotse-api-types = ["lotse-api", "lotse-supervisor", "lotse", "lotse-testing"] # lotse-testing: the load generator reads `metrics/get`
@@ -35,7 +35,7 @@ rtsp-types = ["lotse-rtsp", "lotse-testing"]
 sdp-types = ["lotse-rtsp", "lotse-testing"]
 m3u8-rs = ["lotse-http"]
 mpeg2ts-reader = ["lotse-http"]
-mp4-atom = ["lotse-http"]
+mp4-atom = ["lotse-http", "lotse-mux"] # reading the HTTP source's fragmented MP4; writing the event clips'
 str0m = ["lotse-webrtc", "lotse-testing"]
 dimpl = ["lotse-webrtc"] # DTLS of str0m's crypto provider
 rustls = ["lotse-tls", "lotse-api", "lotse-testing"] # the sources' TLS client; the control API's TLS listener; the fake camera's TLS mode and the TLS listener's test client

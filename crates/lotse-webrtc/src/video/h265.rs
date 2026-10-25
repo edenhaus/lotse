@@ -292,7 +292,13 @@ mod tests {
             high_tier: false,
             profile_idc,
             compatibility,
+            constraint_flags: [0; 6],
             level_idc: 120,
+            sub_layers: 1,
+            temporal_id_nesting: true,
+            chroma_format_idc: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
             width: 640,
             height: 480,
         }

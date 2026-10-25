@@ -1619,6 +1619,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lotse-mux"
+version = "0.0.0-dev"
+dependencies = [
+ "bytes",
+ "lotse-codec",
+ "lotse-core",
+ "mp4-atom",
+ "serde_json",
+]
+
+[[package]]
 name = "lotse-rtsp"
 version = "0.0.0-dev"
 dependencies = [
