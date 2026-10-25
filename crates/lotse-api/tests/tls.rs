@@ -346,6 +346,11 @@ async fn rfc9112_7_1_the_listener_serves_a_clips_chunked_body_as_the_socket_does
     // The connection ends with the body: `Connection: close`.
     let answer = request(connected, "GET", "/v0/clips/c1", "").await.unwrap();
     assert_eq!(answer, (200, "4\r\nftyp\r\n0\r\n\r\n".to_owned()));
+    // The socket's peer is no client of the listener's, so never a
+    // removed one: it is served beside the listener's clients.
+    let socket = tokio::net::UnixStream::connect(running.dir.join("lotse.sock")).await;
+    let answer = request(socket, "GET", "/v0/clips/c1", "").await.unwrap();
+    assert_eq!(answer, (200, "4\r\nftyp\r\n0\r\n\r\n".to_owned()));
     running.finish().await;
 }
 
@@ -713,11 +718,12 @@ fn secret_of(code: &str) -> &str {
     code.rsplit('-').next().unwrap()
 }
 
-/// One HTTP request on a connection whose client half of the handshake
-/// ran, and the answer's status and body: `(0, "")` when the server closed
-/// without a byte, an error when the handshake was refused.
-async fn request(
-    connected: io::Result<TlsStream<TcpStream>>,
+/// One HTTP request on `connected` (a socket connection, or a TLS one
+/// whose client half of the handshake ran), and the answer's status and
+/// body: `(0, "")` when the server closed without a byte, an error when the
+/// connection or the handshake was refused.
+async fn request<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    connected: io::Result<S>,
     method: &str,
     path: &str,
     body: &str,
