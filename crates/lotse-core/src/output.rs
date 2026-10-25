@@ -35,13 +35,15 @@ pub trait OutputFactory: fmt::Debug + Send + Sync {
         now: Instant,
     ) -> Result<(Box<dyn SessionEngine>, String), SessionOpenError>;
 
-    /// What `offer` (an offer or a re-offer) asks of the stream's
-    /// backchannel, `backchannel` as the camera offers it now, for a
-    /// session that sends the stream's audio in `audio` (`None` without
-    /// any; [`SessionRequest::audio`]): the worker claims the backchannel
-    /// for a session whose offer could receive talk-back before the
-    /// engine answers it, so the answer carries the claim's outcome. A
-    /// kind without talk-back never asks for it.
+    /// What the offer `offer` asks of the stream's backchannel,
+    /// `backchannel` as the camera offers it now, for a session that
+    /// sends the stream's audio in `audio` (`None` without any;
+    /// [`SessionRequest::audio`]): the worker claims the backchannel for
+    /// a session whose offer could receive talk-back before the engine
+    /// answers it, so the answer carries the claim's outcome. A kind
+    /// without talk-back never asks for it. A re-offer is judged by the
+    /// session it goes to ([`SessionEngine::talkback_request`]), which
+    /// knows what its earlier answers fixed.
     fn talkback_request(
         &self,
         offer: &str,
@@ -70,6 +72,13 @@ pub enum TalkbackRequest {
     /// nothing is claimed.
     Unsupported(String),
 }
+
+/// A session's judgement of what a re-offer asks of the stream's
+/// backchannel ([`SessionEngine::talkback_request`]), for the backchannel
+/// the camera offers when the worker decides, `None` when it offers none.
+/// Owned, so a decision that waits for the source's probe of the camera
+/// judges the backchannel the probe found.
+pub type TalkbackJudge = Box<dyn Fn(Option<&TalkbackTarget>) -> TalkbackRequest + Send + Sync>;
 
 /// One track a session wants.
 #[derive(Debug, Clone, PartialEq, Eq)]
