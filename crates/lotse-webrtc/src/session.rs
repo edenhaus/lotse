@@ -47,6 +47,7 @@ use lotse_codec::h264::LIBWEBRTC_MAX_FRAME_PACKETS;
 use lotse_core::codec::{Codec, CodecFamily};
 use lotse_core::media::{MediaPacket, RtpHeaderFields};
 use lotse_core::orientation::Orientation;
+use lotse_core::output::TalkbackJudge;
 use lotse_core::session::{
     RenegotiateError, SessionEngine, SessionEvent, SessionLimits, SessionOpenError, SessionOutput,
     SessionRequest, SessionStats, TalkbackClaim, TalkbackTarget, Transport,
@@ -791,17 +792,16 @@ fn talkback_rx(
 /// m-line's first answer (`Media::set_remote_pts`, read 2026-10-24) and
 /// answers it with its own codecs among them, in its order
 /// (`Media::remote_pts`); none for an m-line it has not answered.
-fn kept_codecs(rtc: &Rtc, mid: &str) -> Vec<CodecFamily> {
-    let Some(media) = rtc.media(Mid::from(mid)) else {
-        return Vec::new();
-    };
-    let kept = media.remote_pts();
+fn kept_codecs<'r>(rtc: &'r Rtc, mid: &str) -> impl Iterator<Item = CodecFamily> + use<'r> {
+    let kept = rtc
+        .media(Mid::from(mid))
+        .map(Media::remote_pts)
+        .unwrap_or_default();
     rtc.codec_config()
         .params()
         .iter()
-        .filter(|params| kept.contains(&params.pt()))
+        .filter(move |params| kept.contains(&params.pt()))
         .filter_map(|params| engine_family(params.spec().codec))
-        .collect()
 }
 
 /// Whether `datagram`, as the engine sends it, is an RTP packet of the
@@ -980,8 +980,17 @@ fn log_talkback(plan: &AudioPlan<'_>, backchannel: Option<&TalkbackTarget>) {
             );
         }
         Talkback::Off(reason) => tracing::info!(reason, "talk-back not negotiated"),
-        Talkback::Busy { .. } => {
-            tracing::info!("talk-back declined: another session holds the backchannel");
+        Talkback::Busy { mid, codec } => {
+            let backchannel = backchannel.map(|backchannel| backchannel.codec.name());
+            let codec = codec.name();
+            let mid = browser_text(mid);
+            let mid = mid.as_str();
+            tracing::info!(
+                mid,
+                codec,
+                backchannel,
+                "talk-back declined: another session holds the backchannel"
+            );
         }
         Talkback::NotRequested => tracing::debug!("talk-back not requested"),
     }
@@ -1139,8 +1148,9 @@ impl Session {
     /// ([`SessionEngine::renegotiate`]): the audio m-lines are planned
     /// again ([`AudioPlan`]) for the `backchannel` the camera offers now
     /// and the worker's `claim` of it, talk-back on an m-line the engine
-    /// answered before in the codec it kept first ([`AudioPlan::kept`],
-    /// [`kept_codecs`]), the offer rewritten for the engine
+    /// answered before in the first codec it kept that the re-offer lists,
+    /// or not at all ([`AudioPlan::kept`], [`kept_codecs`]), the offer
+    /// rewritten for the engine
     /// as the first one was, and the writers follow the plan: the
     /// downlink writer stays when the stream's audio still goes down the
     /// same m-line, is parked for another, whose own writer is taken up
@@ -1180,7 +1190,7 @@ impl Session {
             claim,
             &self.order,
         )
-        .kept(|mid| kept_codecs(&self.rtc, mid));
+        .kept(offer, |mid| kept_codecs(&self.rtc, mid));
         let directed = plan.engine_offer(offer);
         // The re-offer's candidates are ignored: the trickled ones reached
         // the agent already. Counted on the answer's log line.
@@ -1763,6 +1773,33 @@ impl SessionEngine for Session {
 
     fn talkback(&self) -> Option<UplinkCodec> {
         self.talkback.as_ref().map(|talkback| talkback.negotiated)
+    }
+
+    /// The audio plan of the re-offer for the backchannel held, as
+    /// `Session::renegotiate_offer` makes it: for the stream audio and
+    /// the codec order the session opened with, and the codecs the engine
+    /// kept on the talk-back m-line (`AudioPlan::kept`, read now: only
+    /// an answer changes them, and the worker answers no other re-offer
+    /// while it decides this one).
+    fn talkback_request(&self, offer: &str) -> TalkbackJudge {
+        let kept: Vec<CodecFamily> = audio::talkback_mid(offer)
+            .map(|mid| kept_codecs(&self.rtc, mid).collect())
+            .unwrap_or_default();
+        let offer = offer.to_owned();
+        let audio = self.stream_audio.clone();
+        let order = self.order.clone();
+        Box::new(move |backchannel| {
+            AudioPlan::new(
+                &offer,
+                audio.as_deref(),
+                backchannel,
+                TalkbackClaim::Granted,
+                &order,
+            )
+            .kept(&offer, |_| kept.iter().copied())
+            .talkback
+            .request()
+        })
     }
 
     fn renegotiate(

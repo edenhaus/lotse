@@ -389,6 +389,19 @@ pub trait SessionEngine: fmt::Debug + Send {
     /// (`session/get`'s `backchannel.codec`); `None` when talk-back is off.
     fn talkback(&self) -> Option<UplinkCodec>;
 
+    /// What the re-offer `offer` asks of the stream's backchannel, judged
+    /// as this session would answer it, holding the backchannel: the
+    /// session's [`OutputFactory::talkback_request`], for the stream
+    /// audio it opened with, but for what its earlier answers fixed that
+    /// a fresh session's would not (an engine that keeps an m-line's
+    /// codecs from its first answer cannot receive talk-back on it in a
+    /// codec it did not keep). The worker claims the backchannel only for
+    /// a re-offer the judge finds negotiable, so a claim the answer could
+    /// not carry is never made.
+    ///
+    /// [`OutputFactory::talkback_request`]: crate::output::OutputFactory::talkback_request
+    fn talkback_request(&self, offer: &str) -> crate::output::TalkbackJudge;
+
     /// A re-offer (`webrtc/renegotiate`): the answer to it, or why it was
     /// not applied, the session then going on as it was. Only the audio
     /// m-lines may change; talk-back is negotiated again from them, with

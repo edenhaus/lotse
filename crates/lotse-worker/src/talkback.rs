@@ -851,15 +851,6 @@ impl Arbiter {
         );
     }
 
-    /// Whether `claim` holds the channel: the talker's, not released,
-    /// lost or let go since.
-    fn holds(&self, claim: u64) -> bool {
-        self.lock()
-            .talker
-            .as_ref()
-            .is_some_and(|talker| talker.claim == claim)
-    }
-
     /// Frees the channel (`backchannel/release`) from whoever holds it,
     /// or, given `only`, only if that session holds it: decided under the
     /// lock a claim takes, so a release that names a session that already
@@ -1363,15 +1354,6 @@ impl Talkback {
         if let Some(id) = claim.adopt() {
             self.claim = Some(id);
         }
-    }
-
-    /// Whether the session holds the backchannel: an offer's claim was
-    /// adopted ([`Talkback::adopt`]) and is still the talker's
-    /// ([`Arbiter::holds`]). The claim the session keeps outlives a
-    /// release or a loss, which the arbiter decides alone, until its next
-    /// uplink packet or let-go clears it.
-    pub(crate) fn holds(&self) -> bool {
-        self.claim.is_some_and(|claim| self.arbiter.holds(claim))
     }
 
     /// The next loss of the session's backchannel session the arbiter

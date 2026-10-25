@@ -151,15 +151,9 @@ impl OutputFactory for WebRtcFactory {
             backchannel.map(|backchannel| backchannel.codec.family()),
             audio.map(Codec::family),
         );
-        match audio::AudioPlan::new(offer, audio, backchannel, TalkbackClaim::Granted, &order)
+        audio::AudioPlan::new(offer, audio, backchannel, TalkbackClaim::Granted, &order)
             .talkback
-        {
-            audio::Talkback::NotRequested => TalkbackRequest::NotRequested,
-            audio::Talkback::Negotiated { .. } | audio::Talkback::Busy { .. } => {
-                TalkbackRequest::Negotiable
-            }
-            audio::Talkback::Off(reason) => TalkbackRequest::Unsupported(reason.to_owned()),
-        }
+            .request()
     }
 }
 
