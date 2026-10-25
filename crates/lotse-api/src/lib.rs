@@ -98,15 +98,17 @@ pub const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 /// the Close anyway).
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long what a clip's body handed over may wait for the client while
-/// the socket takes none of the response: 10 s, after which the connection
-/// is dropped and the body ends without its last chunk. Every write the
-/// socket takes restarts the wait, so a client reading at any pace the
-/// kernel passes on keeps the body going (Linux wakes a socket's writer
-/// once part of its send buffer drained, about a quarter for a Unix
-/// socket and a third for TCP, as observed on Linux 6.18 in 2026-10); one
-/// that stopped reading cannot hold the connection, or the clip's pipe,
-/// once the clip has ended.
+/// How long a clip's response may wait for the client while the socket
+/// refuses it, taking none of it: 10 s, after which the connection is
+/// dropped and the body ends without its last chunk, whether the body
+/// waits for more of the clip meanwhile or not. Every write the socket
+/// takes ends the wait, so a client reading at any pace the kernel passes
+/// on keeps the body going (Linux wakes a socket's writer once part of
+/// its send buffer drained, about a quarter for a Unix socket and a third
+/// for TCP, as observed on Linux 6.18 in 2026-10); one that stopped
+/// reading is dropped this long after the socket first refused the
+/// response. Until then the socket holds what it took (in its buffer, and
+/// on TLS in the session's), as for a client that reads.
 pub const BODY_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// From the end of a clip's bytes to the producer's report of how many it
@@ -896,21 +898,18 @@ mod tests {
         }
     }
 
-    /// The socket here is a 4 KiB pipe the client empties 4 KiB a second:
-    /// far below hyper's buffer, so the body is asked for its next chunk
-    /// only every 12 s or so, while the socket takes bytes every second.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_clip_body_a_client_drains_slowly_outlives_the_stall_deadline() {
-        use tokio::io::AsyncWriteExt as _;
+    /// The socket of [`served`]: a 4 KiB pipe, far below hyper's 16 KiB
+    /// buffer and a body's 64 KiB chunks.
+    const SOCKET_BYTES: usize = 4 * 1024;
 
-        const SOCKET_BYTES: usize = 4 * 1024;
-        let clock = Arc::new(lotse_core::clock::FakeClock::default());
-        let (reader, mut producer) = tokio::io::duplex(256 * 1024);
-        let (report, written) = tokio::sync::oneshot::channel();
-        let clip = ClipBody {
-            reader: Box::new(reader),
-            written,
-        };
+    /// One connection over a [`SOCKET_BYTES`] pipe, served through the
+    /// admission both listeners use by a handler whose one clip is
+    /// `clip`, on `clock`; the client's end, and the admission, which
+    /// must outlive the connection.
+    async fn served(
+        clock: &Arc<lotse_core::clock::FakeClock>,
+        clip: ClipBody,
+    ) -> (tokio::io::DuplexStream, Admission) {
         let state = state(1, false);
         let handler = OneClip(std::sync::Mutex::new(Some(clip)));
         assert_eq!(handler.hello(), Minimal.hello());
@@ -925,14 +924,14 @@ mod tests {
             connections: state.connections,
             next_id: state.next_id,
             shutdown: state.shutdown,
-            clock: Arc::<lotse_core::clock::FakeClock>::clone(&clock),
+            clock: Arc::<lotse_core::clock::FakeClock>::clone(clock),
             pairing: None,
             clients: None,
             serving: state.serving,
         };
         let pending = Arc::new(Semaphore::new(usize::from(MAX_PENDING_UPGRADES)));
         let admission = Admission::new(state, Arc::clone(&pending));
-        let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+        let (client, server) = tokio::io::duplex(SOCKET_BYTES);
         let peer = PeerInfo::Unix { uid: 0, pid: None };
         admission.serve(
             server,
@@ -940,6 +939,24 @@ mod tests {
             Arc::clone(&pending).try_acquire_owned().unwrap(),
             clock.sleep(UPGRADE_TIMEOUT),
         );
+        (client, admission)
+    }
+
+    /// The socket here is a pipe the client empties 4 KiB a second, so the
+    /// body is asked for its next chunk only every 12 s or so, while the
+    /// socket takes bytes every second.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clip_body_a_client_drains_slowly_outlives_the_stall_deadline() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let (reader, mut producer) = tokio::io::duplex(256 * 1024);
+        let (report, written) = tokio::sync::oneshot::channel();
+        let clip = ClipBody {
+            reader: Box::new(reader),
+            written,
+        };
+        let (mut client, admission) = served(&clock, clip).await;
         let clip = vec![7_u8; 128 * 1024];
         producer.write_all(&clip).await.unwrap();
         client
@@ -970,5 +987,44 @@ mod tests {
         let framing = seen.iter().filter(|byte| **byte != 7).count();
         assert_eq!(seen.len() - framing, clip.len(), "every byte of the clip");
         drop(admission);
+    }
+
+    /// The client reads nothing, the socket is full and hyper holds the
+    /// rest of the clip's first chunk, which is under its buffer, so the
+    /// body is asked for more while the clip pauses: its producer neither
+    /// writes nor ends. The response waits for the client all the same.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clip_body_a_client_stops_taking_is_dropped_at_the_stall_deadline_while_the_clip_pauses()
+     {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let (reader, mut producer) = tokio::io::duplex(256 * 1024);
+        let (report, written) = tokio::sync::oneshot::channel::<u64>();
+        let clip = ClipBody {
+            reader: Box::new(reader),
+            written,
+        };
+        let (mut client, admission) = served(&clock, clip).await;
+        producer.write_all(&[7_u8; 2 * SOCKET_BYTES]).await.unwrap();
+        client
+            .write_all(b"GET /v0/clips/c1 HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .await
+            .unwrap();
+        settle().await;
+        clock.advance(BODY_STALL_TIMEOUT.saturating_sub(Duration::from_millis(1)));
+        settle().await;
+        // The body, and with it the report's receiver, lives as long as
+        // the connection.
+        assert!(!report.is_closed(), "dropped before the deadline");
+        clock.advance(Duration::from_millis(1));
+        settle().await;
+        assert!(report.is_closed(), "the connection is still open");
+        // The client gets what the socket held, and no last chunk.
+        let seen = finish(&mut client).await;
+        let head = String::from_utf8_lossy(seen.get(..200).unwrap_or(&seen));
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert_eq!(seen.len(), SOCKET_BYTES, "the socket's bytes, no more");
+        drop((producer, admission));
     }
 }

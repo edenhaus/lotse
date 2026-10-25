@@ -15,10 +15,11 @@
 //!
 //! Once its response begins, the connection leaves the pending upgrades
 //! and their deadline (a clip runs for minutes) and is bounded instead by
-//! the client taking the body: a chunk that waits for the client while the
-//! socket takes none of the response for [`BODY_STALL_TIMEOUT`] drops the
-//! connection (each write the socket takes restarts the wait, so a client
-//! reading slowly keeps it), and so does still sending
+//! the client taking the body: a socket that refuses the response, taking
+//! none of it for [`BODY_STALL_TIMEOUT`], drops the connection, whether
+//! the body waits for more of the clip meanwhile or not (each write the
+//! socket takes ends the wait, so a client reading slowly keeps it), and
+//! so does still sending
 //! [`CLOSE_TIMEOUT`] after shutdown began, or the removal of the TLS
 //! listener's client that takes it (`clients/remove`), which closes its
 //! WebSocket connections alike: the connection is registered with the
@@ -55,7 +56,6 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, StatusCode, Uri, Version, header};
 use axum::response::{IntoResponse as _, Response};
 use futures_util::StreamExt as _;
-use futures_util::future::OptionFuture;
 use lotse_api_types::CLIPS_PATH;
 use lotse_api_types::error::ErrorCode;
 use lotse_core::clock::Clock;
@@ -114,12 +114,13 @@ pub enum ClipBodyError {
 pub(crate) enum BodyState {
     /// No clip body: the connection is before its upgrade.
     Idle,
-    /// A clip body is being sent and the client took what it was given:
-    /// the body waits for more of the clip.
+    /// A clip body is being sent, and the socket took what it was last
+    /// offered, or was offered nothing yet.
     Taken,
-    /// What the body handed over waits for the client to make room for
-    /// it, a chunk or the body's end, and the socket last took bytes of
-    /// the response at this instant (or none since the hand-over).
+    /// A clip body is being sent, and the socket refused a write of the
+    /// response at this instant and took none of it since: what the
+    /// response holds waits for the client, whether the body waits for
+    /// more of the clip or not.
     Waiting(Instant),
 }
 
@@ -152,14 +153,25 @@ impl BodyWatch {
         self.0.subscribe()
     }
 
-    /// The socket took bytes of the response: a wait for the client
-    /// restarts at `clock`'s now. Nobody is woken (the stall timer reads
-    /// the new instant when it fires), so a write costs no wake-up; with
-    /// no body waiting, nothing changes.
-    fn progressed(&self, clock: &dyn Clock) {
+    /// The socket took bytes of the response: a wait for the client ends.
+    /// Nobody is woken (the stall timer finds the change when it next
+    /// fires), so a write costs no wake-up.
+    fn progressed(&self) {
         self.0.send_if_modified(|state| {
-            if let BodyState::Waiting(since) = state {
-                *since = clock.now();
+            if matches!(state, BodyState::Waiting(_)) {
+                *state = BodyState::Taken;
+            }
+            false
+        });
+    }
+
+    /// The socket refused a write: what the response holds waits for the
+    /// client from `clock`'s now, unless it already did. Nobody is woken,
+    /// as for [`Self::progressed`]; with no body sent, nothing changes.
+    fn refused(&self, clock: &dyn Clock) {
+        self.0.send_if_modified(|state| {
+            if matches!(state, BodyState::Taken) {
+                *state = BodyState::Waiting(clock.now());
             }
             false
         });
@@ -173,16 +185,19 @@ pub(crate) trait Transport: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Transport for T {}
 
-/// A connection's socket, as hyper reads and writes it: every write that
-/// takes bytes restarts the wait of a clip body ([`BodyWatch::progressed`]),
-/// so [`BODY_STALL_TIMEOUT`] bounds a client that takes none of the body,
-/// not one that takes it slowly.
+/// A connection's socket, as hyper reads and writes it: a write it refuses
+/// starts a clip body's wait for the client ([`BodyWatch::refused`]) and
+/// one that takes bytes ends it ([`BodyWatch::progressed`]), so
+/// [`BODY_STALL_TIMEOUT`] bounds a client that takes none of the response,
+/// whatever the body does meanwhile, not one that takes it slowly. A
+/// writer that holds bytes writes until the socket refuses them, as hyper
+/// does each time it flushes.
 pub(crate) struct Watched {
     /// The socket.
     io: Box<dyn Transport>,
     /// The connection's body state.
     body: BodyWatch,
-    /// Stamps the progress.
+    /// Stamps the waits.
     clock: Arc<dyn Clock>,
 }
 
@@ -192,10 +207,14 @@ impl Watched {
         Self { io, body, clock }
     }
 
-    /// Passes `written` on, after telling the body when it took bytes.
+    /// Passes `written` on, after telling the body whether the socket
+    /// took bytes or refused them; a write that took none, or failed, is
+    /// neither.
     fn record(&self, written: Poll<io::Result<usize>>) -> Poll<io::Result<usize>> {
-        if let Poll::Ready(Ok(1..)) = written {
-            self.body.progressed(self.clock.as_ref());
+        match written {
+            Poll::Ready(Ok(1..)) => self.body.progressed(),
+            Poll::Pending => self.body.refused(self.clock.as_ref()),
+            Poll::Ready(Ok(0) | Err(_)) => {}
         }
         written
     }
@@ -304,7 +323,7 @@ struct Request<'a> {
     shutting_down: bool,
     /// The connection's body state.
     body: &'a BodyWatch,
-    /// Stamps the body's waits.
+    /// Times the producer's report.
     clock: &'a Arc<dyn Clock>,
 }
 
@@ -389,7 +408,6 @@ fn answer(
                 sent: 0,
                 clip_id,
                 peer: peer.clone(),
-                watch: request.body.clone(),
                 clock: Arc::clone(request.clock),
             });
             (
@@ -427,9 +445,7 @@ struct Sending {
     clip_id: ClipId,
     /// Who takes it, for the logs.
     peer: PeerInfo,
-    /// Told when a chunk waits for the client and when it was taken.
-    watch: BodyWatch,
-    /// Stamps the waits and times the report.
+    /// Times the report.
     clock: Arc<dyn Clock>,
 }
 
@@ -442,16 +458,13 @@ fn body_stream(sending: Sending) -> impl futures_util::Stream<Item = io::Result<
 }
 
 /// The next chunk of a body, or its end: `None` ends it whole (the last
-/// chunk follows, RFC 9112 §7.1), an error cuts it (RFC 9112 §8). Being
-/// asked for a chunk means the client took the one before.
+/// chunk follows, RFC 9112 §7.1), an error cuts it (RFC 9112 §8).
 async fn next_chunk(sending: Option<Sending>) -> Option<Step> {
     let mut sending = sending?;
-    sending.watch.set(BodyState::Taken);
     match sending.chunks.next().await {
         Some(Ok(chunk)) => {
             let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
             sending.sent = sending.sent.saturating_add(len);
-            sending.watch.set(BodyState::Waiting(sending.clock.now()));
             Some((Ok(chunk), Some(sending)))
         }
         Some(Err(err)) => Some(sending.cut(err).await),
@@ -468,8 +481,6 @@ impl Sending {
             written = &mut self.written => written.ok(),
             () = report => None,
         };
-        // The end waits for the client like a chunk.
-        self.watch.set(BodyState::Waiting(self.clock.now()));
         match written {
             Some(written) if written == self.sent => {
                 tracing::info!(
@@ -543,27 +554,31 @@ pub(crate) async fn send_body(
     }
 }
 
-/// Completes once what a body handed over has waited
-/// [`BODY_STALL_TIMEOUT`] for the client with the socket taking none of
-/// the response meanwhile. `body`'s sender must outlive the call.
+/// Completes once the socket has refused the response for
+/// [`BODY_STALL_TIMEOUT`], taking none of it meanwhile. `body`'s sender
+/// must outlive the call.
 async fn stalled(body: &mut watch::Receiver<BodyState>, clock: &dyn Clock) {
     loop {
         let state = *body.borrow_and_update();
         let left = match state {
-            BodyState::Waiting(since) => Some(
-                BODY_STALL_TIMEOUT.saturating_sub(clock.now().saturating_duration_since(since)),
-            ),
-            BodyState::Idle | BodyState::Taken => None,
+            BodyState::Waiting(since) => {
+                BODY_STALL_TIMEOUT.saturating_sub(clock.now().saturating_duration_since(since))
+            }
+            // The socket starts and ends a wait without a change
+            // notification, so that a write costs no wake-up: the loop
+            // looks again a stall deadline from now, which is before any
+            // wait that starts meanwhile is due. No connection is idle
+            // here: its body began before the call.
+            BodyState::Idle | BodyState::Taken => BODY_STALL_TIMEOUT,
         };
-        if left.is_some_and(|left| left.is_zero()) {
+        if left.is_zero() {
             return;
         }
-        let timer: OptionFuture<_> = left.map(|left| clock.sleep(left)).into();
         // The timer firing ends nothing by itself: the socket may have
-        // taken bytes since, which restamps the wait without a change
+        // taken bytes since, which ends the wait without a change
         // notification, and the loop reads it again.
         tokio::select! {
-            Some(()) = timer => {}
+            () = clock.sleep(left) => {}
             _changed = body.changed() => {}
         }
     }
@@ -645,14 +660,13 @@ mod tests {
         (body, writer, report)
     }
 
-    fn sending(clip: ClipBody, watch: &BodyWatch, clock: &Arc<FakeClock>) -> Sending {
+    fn sending(clip: ClipBody, clock: &Arc<FakeClock>) -> Sending {
         Sending {
             chunks: ReaderStream::with_capacity(clip.reader, CHUNK_BYTES),
             written: clip.written,
             sent: 0,
             clip_id: ClipId::new("c1").unwrap(),
             peer: peer(),
-            watch: watch.clone(),
             clock: Arc::<FakeClock>::clone(clock),
         }
     }
@@ -906,14 +920,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn pipe_7_a_body_reads_up_to_a_pipes_capacity_at_once() {
         let clock = Arc::new(FakeClock::default());
-        let watch = BodyWatch::new();
         let (reader, mut writer) = tokio::io::duplex(256 * 1024);
         let (_report, written) = oneshot::channel();
         let clip = ClipBody {
             reader: Box::new(reader),
             written,
         };
-        let mut body = Box::pin(body_stream(sending(clip, &watch, &clock)));
+        let mut body = Box::pin(body_stream(sending(clip, &clock)));
         writer.write_all(&vec![1_u8; 3 * 64 * 1024]).await.unwrap();
         assert_eq!(body.next().await.unwrap().unwrap().len(), 64 * 1024);
     }
@@ -948,36 +961,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rfc9112_7_1_a_body_reported_whole_ends_after_its_chunks_and_each_waits_for_the_client()
-    {
+    async fn rfc9112_7_1_a_body_reported_whole_ends_after_its_chunks() {
         let clock = Arc::new(FakeClock::default());
-        let watch = BodyWatch::new();
-        let states = watch.subscribe();
         let (clip, mut writer, report) = new_clip();
-        let mut body = Box::pin(body_stream(sending(clip, &watch, &clock)));
+        let mut body = Box::pin(body_stream(sending(clip, &clock)));
         writer.write_all(b"moov").await.unwrap();
         assert_eq!(&body.next().await.unwrap().unwrap()[..], b"moov");
-        let handed = clock.now();
-        assert_eq!(*states.borrow(), BodyState::Waiting(handed));
-        clock.advance(Duration::from_secs(1));
         writer.write_all(b"moof").await.unwrap();
         drop(writer);
         assert_eq!(&body.next().await.unwrap().unwrap()[..], b"moof");
-        // Asked again: the client took it; the reader ends and the report
-        // agrees, so the body ends whole.
+        // The reader ends and the report agrees, so the body ends whole.
         report.send(8).unwrap();
         assert!(body.next().await.is_none());
-        assert_eq!(*states.borrow(), BodyState::Waiting(clock.now()));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn rfc9112_8_a_body_whose_report_disagrees_or_never_comes_is_cut() {
         let (logs, _guard) = capture(tracing::Level::WARN);
         let clock = Arc::new(FakeClock::default());
-        let watch = BodyWatch::new();
         // Fewer bytes arrived than the producer wrote.
         let (clip, mut writer, report) = new_clip();
-        let mut body = Box::pin(body_stream(sending(clip, &watch, &clock)));
+        let mut body = Box::pin(body_stream(sending(clip, &clock)));
         writer.write_all(b"ab").await.unwrap();
         drop(writer);
         report.send(3).unwrap();
@@ -990,7 +994,7 @@ mod tests {
         assert!(body.next().await.is_none());
         // The producer died: its report never comes.
         let (clip, writer, report) = new_clip();
-        let mut body = Box::pin(body_stream(sending(clip, &watch, &clock)));
+        let mut body = Box::pin(body_stream(sending(clip, &clock)));
         drop((writer, report));
         let err = body.next().await.unwrap().unwrap_err();
         assert_eq!(
@@ -999,7 +1003,7 @@ mod tests {
         );
         // The producer is alive and silent: the report's deadline.
         let (clip, writer, report) = new_clip();
-        let mut body = Box::pin(body_stream(sending(clip, &watch, &clock)));
+        let mut body = Box::pin(body_stream(sending(clip, &clock)));
         drop(writer);
         let end = lotse_core::task::spawn_named("test.end", async move { body.next().await });
         for _ in 0..8 {
@@ -1037,14 +1041,13 @@ mod tests {
     #[tokio::test]
     async fn rfc9112_8_a_body_whose_reader_fails_is_cut() {
         let clock = Arc::new(FakeClock::default());
-        let watch = BodyWatch::new();
         let (_report, written) = oneshot::channel();
         let clip = ClipBody {
             reader: Box::new(Failing),
             written,
         };
         assert_eq!(format!("{clip:?}"), "ClipBody { .. }");
-        let mut body = Box::pin(body_stream(sending(clip, &watch, &clock)));
+        let mut body = Box::pin(body_stream(sending(clip, &clock)));
         assert_eq!(
             body.next().await.unwrap().unwrap_err().to_string(),
             "pipe broke"
@@ -1186,7 +1189,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_wait_restarts_when_the_socket_takes_bytes_and_is_dropped_a_stall_deadline_after_the_last()
+    async fn a_wait_the_socket_ends_restarts_at_its_next_refusal_and_is_dropped_a_stall_deadline_after_it()
      {
         let (logs, _guard) = capture(tracing::Level::WARN);
         let clock = Arc::new(FakeClock::default());
@@ -1195,10 +1198,12 @@ mod tests {
         settle().await;
         clock.advance(BODY_STALL_TIMEOUT.saturating_sub(Duration::from_secs(1)));
         settle().await;
-        // The socket takes bytes a second before the deadline: nobody is
-        // woken, and the timer that fires at the old deadline finds the
-        // new instant.
-        watch.progressed(clock.as_ref());
+        // A second before the deadline the socket takes bytes and refuses
+        // the next write: nobody is woken, and the timer that fires at the
+        // old deadline finds the new wait.
+        watch.progressed();
+        assert_eq!(*watch.subscribe().borrow(), BodyState::Taken);
+        watch.refused(clock.as_ref());
         assert_eq!(*watch.subscribe().borrow(), BodyState::Waiting(clock.now()));
         settle().await;
         clock.advance(Duration::from_secs(1));
@@ -1218,23 +1223,61 @@ mod tests {
         );
     }
 
+    /// The body waits for more of the clip when the socket starts
+    /// refusing the response, and nothing tells the stall timer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_wait_that_begins_while_the_body_waits_for_the_clip_is_dropped_a_stall_deadline_after_it()
+     {
+        let (logs, _guard) = capture(tracing::Level::WARN);
+        let clock = Arc::new(FakeClock::default());
+        let (watch, _end, task) = sent_body(&clock, &CancellationToken::new());
+        watch.set(BodyState::Taken);
+        settle().await;
+        clock.advance(Duration::from_secs(4));
+        watch.refused(clock.as_ref());
+        settle().await;
+        // The timer looks again a stall deadline after it found the body
+        // taken, and finds the wait.
+        clock.advance(BODY_STALL_TIMEOUT.saturating_sub(Duration::from_secs(4)));
+        settle().await;
+        assert!(!task.is_finished(), "the wait is 6 s old");
+        clock.advance(Duration::from_secs(4).saturating_sub(Duration::from_millis(1)));
+        settle().await;
+        assert!(!task.is_finished(), "a millisecond before its deadline");
+        clock.advance(Duration::from_millis(1));
+        settle().await;
+        assert!(task.is_finished(), "dropped at the wait's deadline");
+        task.await.unwrap();
+        let text = logs.text();
+        assert!(
+            text.contains("clip body dropped: the client made no room for it in time"),
+            "{text}"
+        );
+    }
+
     #[test]
-    fn progress_restamps_only_a_body_that_waits() {
+    fn the_socket_starts_a_wait_only_for_a_body_and_ends_it_with_progress() {
         let clock = FakeClock::default();
         let watch = BodyWatch::new();
         let mut states = watch.subscribe();
-        watch.progressed(&clock);
+        // A connection without a clip body has nothing to wait for.
+        watch.refused(&clock);
+        assert_eq!(*states.borrow(), BodyState::Idle);
+        watch.progressed();
         assert_eq!(*states.borrow(), BodyState::Idle);
         watch.set(BodyState::Taken);
         states.borrow_and_update();
-        watch.progressed(&clock);
+        watch.progressed();
         assert_eq!(*states.borrow(), BodyState::Taken);
-        let handed = clock.now();
-        watch.set(BodyState::Waiting(handed));
-        states.borrow_and_update();
+        let refused = clock.now();
+        watch.refused(&clock);
+        assert_eq!(*states.borrow(), BodyState::Waiting(refused));
+        // The wait counts from the first refusal.
         clock.advance(Duration::from_secs(3));
-        watch.progressed(&clock);
-        assert_eq!(*states.borrow(), BodyState::Waiting(clock.now()));
+        watch.refused(&clock);
+        assert_eq!(*states.borrow(), BodyState::Waiting(refused));
+        watch.progressed();
+        assert_eq!(*states.borrow(), BodyState::Taken);
         assert!(!states.has_changed().unwrap(), "no one is woken");
     }
 
@@ -1271,7 +1314,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn the_socket_restamps_a_waiting_body_on_each_write_that_takes_bytes() {
+    async fn the_socket_starts_a_wait_with_each_write_it_refuses_and_ends_it_with_each_it_takes() {
         use futures_util::FutureExt as _;
         use tokio::io::AsyncReadExt as _;
 
@@ -1281,27 +1324,36 @@ mod tests {
         let (mut peer, io) = tokio::io::duplex(4);
         let mut socket = Watched::new(Box::new(io), watch.clone(), Arc::<FakeClock>::clone(&clock));
         assert!(socket.is_write_vectored(), "as the socket is");
-        let handed = clock.now();
-        watch.set(BodyState::Waiting(handed));
-        clock.advance(Duration::from_secs(1));
-        // A write that takes nothing is no progress.
-        assert_eq!(socket.write(&[]).await.unwrap(), 0);
-        assert_eq!(*states.borrow(), BodyState::Waiting(handed));
+        watch.set(BodyState::Taken);
         assert_eq!(socket.write(b"ab").await.unwrap(), 2);
-        assert_eq!(*states.borrow(), BodyState::Waiting(clock.now()));
-        clock.advance(Duration::from_secs(1));
+        assert_eq!(*states.borrow(), BodyState::Taken);
         let bufs = [io::IoSlice::new(b"c"), io::IoSlice::new(b"d")];
         assert_eq!(socket.write_vectored(&bufs).await.unwrap(), 2);
-        assert_eq!(*states.borrow(), BodyState::Waiting(clock.now()));
-        // Full: a write that waits for room is no progress either.
+        // Full: a write refused starts the wait.
         let full = clock.now();
-        clock.advance(Duration::from_secs(1));
         assert!(socket.write(b"e").now_or_never().is_none());
         assert_eq!(*states.borrow(), BodyState::Waiting(full));
-        socket.flush().await.unwrap();
+        clock.advance(Duration::from_secs(1));
+        let bufs = [io::IoSlice::new(b"e")];
+        assert!(socket.write_vectored(&bufs).now_or_never().is_none());
+        assert_eq!(*states.borrow(), BodyState::Waiting(full));
+        // A write that takes nothing is neither.
+        assert_eq!(socket.write(&[]).await.unwrap(), 0);
+        assert_eq!(*states.borrow(), BodyState::Waiting(full));
         let mut taken = [0_u8; 4];
+        peer.read_exact(&mut taken[..1]).await.unwrap();
+        // Room again: a vectored write that takes bytes ends the wait, and
+        // so does a plain one.
+        assert_eq!(socket.write_vectored(&bufs).await.unwrap(), 1);
+        assert_eq!(*states.borrow(), BodyState::Taken);
+        assert!(socket.write(b"f").now_or_never().is_none());
+        assert_eq!(*states.borrow(), BodyState::Waiting(clock.now()));
+        peer.read_exact(&mut taken[1..2]).await.unwrap();
+        assert_eq!(socket.write(b"f").await.unwrap(), 1);
+        assert_eq!(*states.borrow(), BodyState::Taken);
+        socket.flush().await.unwrap();
         peer.read_exact(&mut taken).await.unwrap();
-        assert_eq!(&taken, b"abcd");
+        assert_eq!(&taken, b"cdef");
         // Reads pass through.
         peer.write_all(b"GET").await.unwrap();
         let mut read = [0_u8; 3];
