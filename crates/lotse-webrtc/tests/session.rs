@@ -2134,10 +2134,11 @@ fn rfc3264_6_the_factory_finds_talk_back_negotiable_exactly_when_the_engine_take
 
 /// Each audio codec the session carries is answered `sendonly` on the
 /// downlink m-line, listed first, as its default format (RFC 8866
-/// §5.14), among every codec the browser offered that the engine carries
-/// (RFC 3264 §6.1: the answer lists formats of the offer; a re-offer may
-/// then turn the m-line `sendrecv` in any of them), and the session sends
-/// it.
+/// §5.14), among the codecs the browser offered that talk-back could
+/// arrive in, Opus and G.711, but not G.722 unless the session sends it
+/// (RFC 3264 §6.1: the answer lists formats of the offer; the engine
+/// keeps them for a re-offer that turns the m-line `sendrecv`), and the
+/// session sends it.
 #[test]
 fn rfc8866_5_14_each_carried_audio_codec_is_answered_sendonly_first_among_those_offered() {
     let now = SystemClock.now();
@@ -2155,7 +2156,13 @@ fn rfc8866_5_14_each_carried_audio_codec_is_answered_sendonly_first_among_those_
         let audio = section(&answer, "audio");
         assert!(audio.contains(&"a=sendonly"), "{answer}");
         let pts = payload_types(&audio);
-        assert_eq!(pts.len(), 4, "every codec offered: {answer}");
+        let listed = if encoding == "G722/8000" { 4 } else { 3 };
+        assert_eq!(pts.len(), listed, "{encoding}: {answer}");
+        assert_eq!(
+            audio.contains(&"a=rtpmap:9 G722/8000"),
+            encoding == "G722/8000",
+            "{answer}"
+        );
         // The codec the session sends first, the m-line's default format
         // (RFC 8866 §5.14), wherever the offer lists it.
         assert!(
@@ -2948,13 +2955,19 @@ fn rfc3264_6_a_re_offer_that_stops_talk_back_with_a_padded_port_is_answered_with
 /// (RFC 3264 §6.1): `inactive` for a dedicated m-line, `sendonly` for the
 /// downlink one offered `sendrecv`, which keeps the stream's audio; while
 /// another session holds the backchannel ([`TalkbackClaim::Busy`]) and
-/// when the camera offers none alike, with the codecs as offered. The
-/// session says nothing of it: the worker tells the client why.
+/// when the camera offers none alike. A busy one lists the codecs it
+/// would be negotiated with, those that reach the camera; one without a
+/// backchannel those any talk-back could arrive in. The session says
+/// nothing of it: the worker tells the client why.
 #[test]
 fn rfc3264_6_1_a_declined_re_offer_is_answered_inactive_or_sendonly() {
-    for (backchannel, claim) in [
-        (Some(chained(Codec::Pcmu)), TalkbackClaim::Busy),
-        (None, TalkbackClaim::Granted),
+    for (backchannel, claim, listed) in [
+        (
+            Some(chained(Codec::Pcmu)),
+            TalkbackClaim::Busy,
+            &["0", "111", "8"][..],
+        ),
+        (None, TalkbackClaim::Granted, &["0", "111", "8"][..]),
     ] {
         let what = format!("{backchannel:?} under {claim:?}");
         let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
@@ -2973,12 +2986,8 @@ fn rfc3264_6_1_a_declined_re_offer_is_answered_inactive_or_sendonly() {
         );
         let up = audio_sections(&answer).pop().unwrap();
         // The session opened without a backchannel: the stream's PCMU
-        // first, then the rest.
-        assert_eq!(
-            payload_types(&up),
-            ["0", "111", "8", "9"],
-            "{what}: as offered, in the engine's order"
-        );
+        // first, then the rest; G.722 reaches no camera.
+        assert_eq!(payload_types(&up), listed, "{what}: in the engine's order");
         assert_eq!(pair.session.talkback(), None, "{what}");
         assert_eq!(
             pair.viewer.talkback_direction(),
@@ -3027,6 +3036,234 @@ fn rfc3264_6_1_a_declined_re_offer_is_answered_inactive_or_sendonly() {
             pair.events
         );
     }
+}
+
+/// A connected pair whose viewer offers audio, for a stream without audio
+/// the engine carries and a camera that offers no backchannel yet: the
+/// engine prefers Opus, then PCMU, PCMA and G.722, as for a session that
+/// opened before the source's probe found the backchannel.
+fn opened_before_the_backchannel() -> Pair {
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_with_audio(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let (mut pair, answer) = Pair::with_request(&request(viewer.offer(), h264(None)), viewer, now);
+    pair.connect(&answer);
+    pair
+}
+
+/// A talk-back re-offer declined while another session holds the
+/// backchannel ([`TalkbackClaim::Busy`]), then granted on the same
+/// m-line, is answered with the backchannel's codec first (RFC 3264 §7),
+/// which the session reports and takes. The session opened before the
+/// camera offered a backchannel, so the engine prefers Opus: the declined
+/// answer already lists only codecs that reach the camera, the
+/// backchannel's first, since str0m 0.24.0 keeps an m-line's formats from
+/// its first answer (`Media::set_remote_pts`, read 2026-10-24) and answers
+/// every later re-offer with them, in its own order.
+#[test]
+fn rfc3264_7_a_re_offer_claimed_after_a_declined_one_names_the_backchannels_codec_first() {
+    let mut pair = opened_before_the_backchannel();
+    let target = Some(chained(Codec::Pcmu));
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            target.clone(),
+            TalkbackClaim::Busy,
+        )
+        .expect("answered");
+    let up = audio_sections(&answer).pop().unwrap();
+    assert!(up.contains(&"a=inactive"), "{answer}");
+    assert_eq!(
+        payload_types(&up),
+        ["0", "8"],
+        "Opus ranks before PCMU, G.722 never reaches: {answer}"
+    );
+    assert_eq!(pair.session.talkback(), None);
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            target,
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    assert_eq!(
+        talkback_answered(&answer),
+        ("a=recvonly".to_owned(), "PCMU/8000".to_owned()),
+        "{answer}"
+    );
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcmu));
+    talk(&mut pair, &[(0, &[0xff; 160])]);
+    let got: Vec<_> = pair
+        .uplink
+        .iter()
+        .map(|up| (up.codec, up.packet.rtp.pt))
+        .collect();
+    assert_eq!(got, [(UplinkCodec::Pcmu, 0)]);
+}
+
+/// An m-line str0m answered before keeps that answer's formats, in the
+/// engine's order (str0m 0.24.0 `Media::set_remote_pts`, read
+/// 2026-10-24): talk-back granted on it later is reported, and taken, in
+/// the codec that answer names first, which the browser sends (RFC 3264
+/// §7), not the one the plan would pick for a fresh m-line. Here the
+/// dedicated m-line was first answered while the camera offered no
+/// backchannel, every format talk-back could arrive in kept, Opus first;
+/// and the downlink m-line turned `sendrecv` keeps the formats of the
+/// session's first answer.
+#[test]
+fn rfc3264_7_talk_back_on_an_m_line_answered_before_is_received_in_the_codec_it_kept_first() {
+    // Dedicated: declined for want of a backchannel, then granted.
+    let mut pair = opened_before_the_backchannel();
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            None,
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    let up = audio_sections(&answer).pop().unwrap();
+    assert!(up.contains(&"a=inactive"), "{answer}");
+    assert_eq!(
+        payload_types(&up),
+        ["111", "0", "8"],
+        "G.722 reaches no camera: {answer}"
+    );
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            Some(chained(Codec::Pcmu)),
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    assert_eq!(
+        talkback_answered(&answer),
+        ("a=recvonly".to_owned(), "opus/48000/2".to_owned()),
+        "{answer}"
+    );
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Opus));
+    talk(&mut pair, &[(111, &[0xf8, 1, 2])]);
+    let got: Vec<_> = pair.uplink.iter().map(|up| up.codec).collect();
+    assert_eq!(got, [UplinkCodec::Opus]);
+
+    // Shared: the session opened with Opus stream audio and no
+    // backchannel, so its downlink m-line kept Opus first.
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Opus { channels: 2 }));
+    pair.connect(&answer);
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::SendRecv),
+            Some(chained(Codec::Pcmu)),
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    let shared = &audio_sections(&answer)[0];
+    assert!(shared.contains(&"a=sendrecv"), "{answer}");
+    assert_eq!(first_encoding(shared), "opus/48000/2", "{answer}");
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Opus));
+}
+
+/// The talk-back m-line of `offer` (its last audio m-line) without Opus,
+/// as a browser offers it once the page leaves Opus out
+/// (`setCodecPreferences`): its format, `a=rtpmap`, `a=fmtp` and
+/// `a=rtcp-fb` lines gone.
+fn without_opus_up(offer: &str) -> String {
+    let (before, up) = offer.rsplit_once("m=audio ").expect("an audio m-line");
+    let up: Vec<String> = up
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            !["a=rtpmap:111 ", "a=fmtp:111 ", "a=rtcp-fb:111 "]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .map(|(at, line)| {
+            if at == 0 {
+                line.replace(" 111", "")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    format!("{before}m=audio {}\r\n", up.join("\r\n"))
+}
+
+/// A talk-back m-line str0m answered before keeps that answer's formats
+/// (str0m 0.24.0 `Media::set_remote_pts`, read 2026-10-24), and answers
+/// a re-offer with them, whatever it lists. Talk-back on it is received
+/// in the first kept codec the re-offer still lists, which the browser
+/// sends (RFC 3264 §7), not one it no longer offers; and is declined,
+/// the m-line answered `inactive` (RFC 3264 §6.1), when the browser may
+/// send a kept codec the camera never gets, as a forwarded PCMU
+/// backchannel gets no PCMA. The session judges the re-offer so before
+/// the worker claims anything ([`SessionEngine::talkback_request`]),
+/// where a fresh session would find talk-back negotiable.
+#[test]
+fn rfc3264_7_talk_back_on_a_kept_m_line_is_received_in_a_codec_the_re_offer_lists_or_declined() {
+    use lotse_core::session::SessionEngine as _;
+    let mut pair = opened_before_the_backchannel();
+    pair.renegotiate(
+        Reoffer::Talkback(TalkbackOffer::Dedicated),
+        None,
+        TalkbackClaim::Granted,
+    )
+    .expect("answered");
+    let reoffer = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let narrowed = without_opus_up(&reoffer);
+    let up = audio_sections(&narrowed).pop().unwrap();
+    assert_eq!(payload_types(&up), ["0", "8"], "{narrowed}");
+    let chained_pcmu = chained(Codec::Pcmu);
+    let chained = chained_pcmu.clone();
+    let forwarded = forwarded(Codec::Pcmu);
+    // A fresh session would take both.
+    for target in [&chained, &forwarded] {
+        assert_eq!(
+            WebRtcFactory.talkback_request(&narrowed, None, Some(target)),
+            TalkbackRequest::Negotiable,
+            "{target:?}"
+        );
+    }
+    let judge = pair.session.talkback_request(&narrowed);
+    assert_eq!(judge(Some(&chained)), TalkbackRequest::Negotiable);
+    let declined = TalkbackRequest::Unsupported(
+        "the talk-back m-line keeps the codecs of its first answer, and the browser may send one that does not reach the backchannel"
+            .to_owned(),
+    );
+    assert_eq!(judge(Some(&forwarded)), declined);
+    // PCMU, the first kept codec the re-offer lists, though the answer
+    // still names Opus first.
+    let answer = pair
+        .session
+        .renegotiate(pair.now, &narrowed, Some(chained), TalkbackClaim::Granted)
+        .expect("answered");
+    let up = audio_sections(&answer).pop().unwrap();
+    assert!(up.contains(&"a=recvonly"), "{answer}");
+    assert_eq!(payload_types(&up), ["111", "0", "8"], "{answer}");
+    assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcmu));
+    // PCMA would never reach a forwarded PCMU camera: declined.
+    let answer = pair
+        .session
+        .renegotiate(
+            pair.now,
+            &narrowed,
+            Some(forwarded.clone()),
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    let up = audio_sections(&answer).pop().unwrap();
+    assert!(up.contains(&"a=inactive"), "{answer}");
+    assert_eq!(pair.session.talkback(), None);
+    // As the whole re-offer, Opus and all.
+    assert_eq!(
+        pair.session.talkback_request(&reoffer)(Some(&forwarded)),
+        declined
+    );
+    assert_eq!(
+        pair.session.talkback_request(&reoffer)(Some(&chained_pcmu)),
+        TalkbackRequest::Negotiable
+    );
 }
 
 /// A re-offer turning the downlink m-line `sendrecv` shares it: answered
@@ -3329,6 +3566,52 @@ fn rfc9143_9_1_1_a_payload_type_refusal_logs_the_browser_s_text_capped() {
         "{err:?}"
     );
     capped(&captured.text(), "re-offer refused: payload types conflict");
+}
+
+/// A payload type mapped twice in one m-line (RFC 8866 §6.6), or to two
+/// codecs in one BUNDLE group (RFC 9143 §9.1.1), is refused also where
+/// the engine is not offered it: G.722, which no talk-back arrives in, is
+/// left out of the engine's offer of a downlink that does not send it and
+/// of an m-line without talk-back (`AudioPlan::engine_offer`), and the
+/// offer and the re-offer are checked as the browser sent them, so the
+/// refusal does not hang on what the engine is offered.
+#[test]
+fn rfc9143_9_1_1_a_payload_type_conflict_where_the_engine_is_not_offered_it_is_refused() {
+    let twice = "a=rtpmap:9 G722/8000\r\na=rtpmap:9 G722/8000";
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_with_audio(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let offer = with_audio_codecs(
+        viewer.offer(),
+        "a=rtpmap:111 opus/48000/2\na=rtpmap:9 G722/8000\na=rtpmap:9 G722/8000\n",
+    );
+    assert!(offer.contains(twice), "{offer}");
+    let Err(SessionOpenError::InvalidSdp(reason)) =
+        Session::answer(&request(&offer, h264(None)), now)
+    else {
+        panic!("{offer}")
+    };
+    assert!(reason.contains("two a=rtpmap lines"), "{reason}");
+
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
+    pair.connect(&answer);
+    let reoffer = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let (before, up) = reoffer.rsplit_once("m=audio ").expect("an audio m-line");
+    let g722_up = format!(
+        "{before}m=audio {}",
+        up.replacen("a=rtpmap:0 PCMU/8000", "a=rtpmap:0 G722/8000", 1)
+    );
+    assert_ne!(g722_up, reoffer);
+    let err = pair
+        .session
+        .renegotiate(pair.now, &g722_up, None, TalkbackClaim::Granted);
+    let Err(RenegotiateError::InvalidSdp(reason)) = err else {
+        panic!("{err:?}")
+    };
+    assert!(reason.contains("one BUNDLE group"), "{reason}");
 }
 
 /// The talk-back m-line's mid, browser text of any length, reaches the
@@ -3661,6 +3944,104 @@ fn rfc3550_5_1_audio_moved_off_an_m_line_and_back_runs_its_sequence_numbers_on()
         500,
         "the viewer plays A again",
     );
+}
+
+/// `offer` with G.722 added to its talk-back m-line (its last audio
+/// m-line), after the formats it lists, as a browser re-offers a format
+/// the last answer left out of that m-line (RFC 8829 §5.2.2: formats not
+/// in the most recent answer are added after those that are); the str0m
+/// viewer re-offers only the formats answered.
+fn with_g722_up(offer: &str) -> String {
+    let (before, up) = offer.rsplit_once("m=audio ").expect("an audio m-line");
+    assert!(!up.contains("a=rtpmap:9 "), "{offer}");
+    let mut lines: Vec<String> = up.lines().map(str::to_owned).collect();
+    lines[0].push_str(" 9");
+    let at = lines
+        .iter()
+        .rposition(|line| line.starts_with("a=rtpmap:"))
+        .expect("an a=rtpmap");
+    lines.insert(at + 1, "a=rtpmap:9 G722/8000".to_owned());
+    format!("{before}m=audio {}\r\n", lines.join("\r\n"))
+}
+
+/// A re-offer that moves the stream's audio to an m-line whose first
+/// answer left the stream audio's codec out sends no audio there: str0m
+/// 0.24.0 answers that m-line with the formats of its first answer
+/// (`Media::set_remote_pts`, read 2026-10-24), and the session sends only
+/// a format the answer lists (RFC 3264 §6.1). Under G.722 stream audio,
+/// the dedicated m-line B, declined for want of a backchannel, is
+/// answered without G.722, which reaches no camera; a re-offer that
+/// lists G.722 on B again and moves the downlink there gets B answered
+/// `inactive`, the `audio_codec_unsupported` warning and the packets
+/// dropped, none sent under a second SSRC.
+#[test]
+fn rfc3264_6_1_stream_audio_moved_to_an_m_line_whose_first_answer_left_its_codec_out_is_not_sent() {
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::G722));
+    pair.connect(&answer);
+    pair.play_audio(0, 5, "on A");
+    let [a] = audio_ssrcs(&pair)[..] else {
+        panic!("one audio SSRC: {:?}", audio_ssrcs(&pair));
+    };
+    let answer = pair
+        .renegotiate(
+            Reoffer::Talkback(TalkbackOffer::Dedicated),
+            None,
+            TalkbackClaim::Granted,
+        )
+        .expect("answered");
+    let up = audio_sections(&answer).pop().unwrap();
+    assert!(up.contains(&"a=inactive"), "{answer}");
+    assert_eq!(
+        payload_types(&up),
+        ["111", "0", "8"],
+        "G.722 reaches no camera: {answer}"
+    );
+
+    // To B: A `inactive`, B `sendrecv` with G.722 listed again.
+    let reoffer = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let moved =
+        reoffer
+            .replacen("a=recvonly", "a=inactive", 1)
+            .replacen("a=sendonly", "a=sendrecv", 1);
+    let to_b = with_g722_up(&moved);
+    let offered = audio_sections(&to_b);
+    assert!(offered[0].contains(&"a=inactive"), "{to_b}");
+    assert!(offered[1].contains(&"a=sendrecv"), "{to_b}");
+    assert!(offered[1].contains(&"a=rtpmap:9 G722/8000"), "{to_b}");
+    pair.events.clear();
+    let answer = pair
+        .session
+        .renegotiate(pair.now, &to_b, None, TalkbackClaim::Granted)
+        .expect("answered");
+    let sections = audio_sections(&answer);
+    assert!(sections[0].contains(&"a=inactive"), "{answer}");
+    assert!(
+        sections[1].contains(&"a=inactive"),
+        "no audio on B: {answer}"
+    );
+    assert_eq!(payload_types(&sections[1]), ["111", "0", "8"], "{answer}");
+    pair.viewer
+        .accept_answer(&answer, &mut pair.to_daemon)
+        .expect("applies");
+    pair.drain();
+    assert!(
+        pair.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Warning {
+                code: "audio_codec_unsupported",
+                ..
+            }
+        )),
+        "{:?}",
+        pair.events
+    );
+    let dropped = pair.session.stats().audio_dropped;
+    write_five(&mut pair, 5);
+    assert_eq!(pair.session.stats().audio_dropped, dropped + 5);
+    assert_eq!(audio_ssrcs(&pair), [a], "nothing under a second SSRC");
 }
 
 /// `offer` with its first audio m-line stopped (RFC 3264 §8.2): port 0,
