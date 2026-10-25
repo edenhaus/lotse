@@ -41,7 +41,8 @@
 //! subscriptions into it, so a stalled reader fills the kernel's pipe,
 //! then the queue up to `clip_queue_bytes`, and then costs the clip a gap,
 //! never the camera's other consumers. A clip ends at the first frame
-//! captured at or after its end, or [`END_GRACE`] after it when none comes.
+//! captured at or after its end, by the ring's measure as its start
+//! ([`captured`]), or [`END_GRACE`] after it when none comes.
 //! A graceful end (`completed`, `stopped`, `max_duration`) first writes
 //! what the queue still holds, frames held for the other track included,
 //! up to the clip's end, for at most [`FINISH_GRACE`] of a reader taking
@@ -667,7 +668,8 @@ struct Clip {
     /// The clock's reading at `StartClip`: what `before_ms` and `after_ms`
     /// count from.
     started: Instant,
-    /// The capture time at which it ends.
+    /// The capture time at which it ends, by the ring's measure
+    /// ([`captured`]).
     end_at: Instant,
     /// Why it ends then: `completed`, or `max_duration` when it asked for
     /// no end or for one past `clip_max_ms`.
@@ -999,7 +1001,10 @@ impl Clip {
     }
 
     /// One frame: the end when it was captured at or after the clip's,
-    /// and nothing for a video frame after the video's end
+    /// by the ring's measure ([`captured`]: a frame dated ahead of its
+    /// arrival by a Sender Report mapping off, RFC 3550 §6.4.1, counts
+    /// from its arrival, as the clip's start and `before_ms` do), and
+    /// nothing for a video frame after the video's end
     /// ([`Self::video_ended`]); the container's start before the first; a
     /// gap when it ends a hole, one the queue reported on its track or one
     /// the video's continuity shows (a jump, once the frame after it
@@ -1021,7 +1026,7 @@ impl Clip {
             tracing::trace!(clip.id = %self.id, ts = %frame.ts, "clip: a video frame behind the video's end left out");
             return Ok(());
         }
-        if frame.wallclock >= self.end_at {
+        if captured(&frame) >= self.end_at {
             if track == Kind::Video {
                 self.video_ended = true;
             }
@@ -3550,6 +3555,52 @@ mod tests {
             ]
         );
         assert_eq!(reports, vec![stopped("completed", bytes.len(), 256, 0)]);
+    }
+
+    /// A finite clip's end is measured by when its frames were captured
+    /// by the ring's measure ([`captured`]), as its start and `before_ms`
+    /// are: before a camera's Sender Report corrects the mapping (RFC 3550
+    /// §6.4.1) a frame can be dated ahead of its arrival. Regression: a
+    /// pre-roll keyframe arriving at 1 s dated 61 s was past the 4 s end
+    /// of a clip asked at 3 s with `after_ms = 1000`, which ended
+    /// `completed` before its container started, an empty file.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_finite_clip_ends_by_capture_time_not_a_date_ahead_of_arrival() {
+        let mut rig = Rig::new(None);
+        // (captured, arrived) in ms after the start: dated a minute ahead
+        // until the report at 3.5 s corrects it.
+        for (at, ts, keyframe, len) in [
+            ((61_000, 1_000), 90_000, true, 32),
+            ((61_100, 1_100), 99_000, false, 16),
+        ] {
+            rig.advance_to(at.1);
+            assert!(
+                rig.video()
+                    .publish_frame(frame_at(&rig, at, ts, keyframe, len))
+            );
+        }
+        rig.advance_to(3_000);
+        let reader = rig.start(spec(5_000, Some(1_000), false));
+        settle().await;
+        assert_eq!(rig.report().await, started(2_000, None));
+        rig.video_frame(3_500, 105, false, 16);
+        settle().await;
+        // At the end: not written, and it ends the clip.
+        rig.video_frame(4_000, 120, false, 16);
+        let reports = rig.until_stopped().await;
+        let bytes = reader.rest().await;
+        assert_eq!(
+            lines(&bytes),
+            [
+                "init video=h264",
+                "frame v 0 90000 k 32",
+                "frame v 0 99000 - 16",
+                "frame v 0 315000 - 16",
+                "end",
+            ]
+        );
+        // The fake container's furthest place: 61.1 s − 61 s.
+        assert_eq!(reports, vec![stopped("completed", bytes.len(), 100, 0)]);
     }
 
     /// A standby on `rig`'s tracks, of the same codec, armed: its first
