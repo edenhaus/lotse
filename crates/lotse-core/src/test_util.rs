@@ -1211,6 +1211,13 @@ impl SessionEngine for EchoEngine {
         self.talkback
     }
 
+    /// Judges a re-offer as [`EchoSessionFactory`] judges an offer: the
+    /// echo fixes nothing an answer could keep.
+    fn talkback_request(&self, offer: &str) -> crate::output::TalkbackJudge {
+        let offer = offer.to_owned();
+        Box::new(move |backchannel| EchoSessionFactory.talkback_request(&offer, None, backchannel))
+    }
+
     /// Answers [`ECHO_RENEGOTIATED`] with ` backchannel=<codec>` when
     /// talk-back is negotiated now, which [`SessionEngine::talkback`]
     /// reports from then on; `refuse` is invalid SDP, `no video` has no
@@ -2227,6 +2234,17 @@ mod tests {
             TalkbackRequest::Unsupported(
                 "the backchannel takes a codec talk-back cannot feed".into()
             )
+        );
+        // A re-offer, as its session judges it: as the factory would.
+        let judge = engine.talkback_request("v=0 talk");
+        assert_eq!(judge(target), TalkbackRequest::Negotiable);
+        assert_eq!(
+            judge(None),
+            TalkbackRequest::Unsupported("the camera offers no backchannel".into())
+        );
+        assert_eq!(
+            engine.talkback_request("v=0")(target),
+            TalkbackRequest::NotRequested
         );
     }
 

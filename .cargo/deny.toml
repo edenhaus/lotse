@@ -11,7 +11,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+  # crypto-bigint 0.5.5, through elliptic-curve 0.13 (p256, p384, ecdsa) under dimpl, str0m's DTLS:
+  # the fix is 0.7.6 only, and no dimpl release (0.8.0 included, 2026-10-24) leaves p256 0.13.
+  # Delete this entry with the dimpl update that does.
+  { id = "RUSTSEC-2026-0387", reason = "no fixed crypto-bigint 0.5; dimpl, str0m's DTLS, stays on elliptic-curve 0.13" },
+]
 
 [licenses]
 version = 2
