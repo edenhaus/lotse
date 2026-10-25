@@ -99,7 +99,10 @@ fn check_info(socket: &Path) {
             .contains(&Value::from("clip")),
         cfg!(feature = "output-clip")
     );
-    assert_eq!(info["limits"]["max_clips"], 3);
+    // Without a clip output the daemon takes no clip, whatever is
+    // configured, and says so with a zero.
+    let max_clips = if cfg!(feature = "output-clip") { 3 } else { 0 };
+    assert_eq!(info["limits"]["max_clips"], max_clips);
     assert_eq!(info["sandbox"]["mode"], "off");
     assert!(!info["build"]["target"].as_str().unwrap().is_empty());
     // The fake and the RTSP source declare a backchannel (the ONVIF one,
