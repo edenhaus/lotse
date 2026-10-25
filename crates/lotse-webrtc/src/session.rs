@@ -897,6 +897,15 @@ struct Prepared<'a> {
 /// Plans `request.offer`, and refuses an offer the engine must not see
 /// ([`check_payload_types`]).
 fn prepare(request: &SessionRequest) -> Result<Prepared<'_>, SessionOpenError> {
+    // Before the engine sees it: str0m 0.24 panics on a payload type
+    // with two codec configurations, which would abort the worker. The
+    // offer as the browser sent it: the engine's offer only leaves
+    // lines out ([`AudioPlan::engine_offer`]), so it passes too, while
+    // a conflict among the formats it drops would pass unseen.
+    check_payload_types(&request.offer).map_err(|reason| {
+        tracing::debug!(reason, "offer refused: payload types conflict");
+        SessionOpenError::InvalidSdp(reason)
+    })?;
     // The audio m-lines: the stream's audio down on the first the
     // browser receives on, when it lists its codec; talk-back up on
     // the dedicated or `sendrecv` one when the stream has a
@@ -919,12 +928,6 @@ fn prepare(request: &SessionRequest) -> Result<Prepared<'_>, SessionOpenError> {
     // The offer's candidates pass the same policy as trickled ones,
     // after the answer; str0m would add every one it parses.
     let (rewritten, offered) = split_candidates(&directed);
-    // Before the engine sees it: str0m 0.24 panics on a payload type
-    // with two codec configurations, which would abort the worker.
-    check_payload_types(&rewritten).map_err(|reason| {
-        tracing::debug!(reason, "offer refused: payload types conflict");
-        SessionOpenError::InvalidSdp(reason)
-    })?;
     Ok(Prepared {
         order,
         plan,
@@ -1184,6 +1187,12 @@ impl Session {
             Some(video) => video.shape.check(offer)?,
             None => check_no_video(offer)?,
         }
+        // The re-offer as the browser sent it, as at the answer
+        // ([`prepare`]).
+        check_payload_types(offer).map_err(|reason| {
+            tracing::debug!(reason, "re-offer refused: payload types conflict");
+            RenegotiateError::InvalidSdp(reason)
+        })?;
         let plan = AudioPlan::new(
             offer,
             self.stream_audio.as_deref(),
@@ -1199,10 +1208,6 @@ impl Session {
         let (rewritten, offered) = split_candidates(&directed);
         let candidates_ignored = offered.len();
         let sdp = SdpOffer::from_sdp_string(&rewritten).map_err(invalid_sdp)?;
-        check_payload_types(&rewritten).map_err(|reason| {
-            tracing::debug!(reason, "re-offer refused: payload types conflict");
-            RenegotiateError::InvalidSdp(reason)
-        })?;
         let answer = self
             .rtc
             .sdp_api()

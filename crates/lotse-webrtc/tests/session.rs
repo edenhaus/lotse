@@ -3568,6 +3568,52 @@ fn rfc9143_9_1_1_a_payload_type_refusal_logs_the_browser_s_text_capped() {
     capped(&captured.text(), "re-offer refused: payload types conflict");
 }
 
+/// A payload type mapped twice in one m-line (RFC 8866 §6.6), or to two
+/// codecs in one BUNDLE group (RFC 9143 §9.1.1), is refused also where
+/// the engine is not offered it: G.722, which no talk-back arrives in, is
+/// left out of the engine's offer of a downlink that does not send it and
+/// of an m-line without talk-back (`AudioPlan::engine_offer`), and the
+/// offer and the re-offer are checked as the browser sent them, so the
+/// refusal does not hang on what the engine is offered.
+#[test]
+fn rfc9143_9_1_1_a_payload_type_conflict_where_the_engine_is_not_offered_it_is_refused() {
+    let twice = "a=rtpmap:9 G722/8000\r\na=rtpmap:9 G722/8000";
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new_with_audio(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let offer = with_audio_codecs(
+        viewer.offer(),
+        "a=rtpmap:111 opus/48000/2\na=rtpmap:9 G722/8000\na=rtpmap:9 G722/8000\n",
+    );
+    assert!(offer.contains(twice), "{offer}");
+    let Err(SessionOpenError::InvalidSdp(reason)) =
+        Session::answer(&request(&offer, h264(None)), now)
+    else {
+        panic!("{offer}")
+    };
+    assert!(reason.contains("two a=rtpmap lines"), "{reason}");
+
+    let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
+    pair.connect(&answer);
+    let reoffer = pair
+        .viewer
+        .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .expect("a re-offer");
+    let (before, up) = reoffer.rsplit_once("m=audio ").expect("an audio m-line");
+    let g722_up = format!(
+        "{before}m=audio {}",
+        up.replacen("a=rtpmap:0 PCMU/8000", "a=rtpmap:0 G722/8000", 1)
+    );
+    assert_ne!(g722_up, reoffer);
+    let err = pair
+        .session
+        .renegotiate(pair.now, &g722_up, None, TalkbackClaim::Granted);
+    let Err(RenegotiateError::InvalidSdp(reason)) = err else {
+        panic!("{err:?}")
+    };
+    assert!(reason.contains("one BUNDLE group"), "{reason}");
+}
+
 /// The talk-back m-line's mid, browser text of any length, reaches the
 /// `talk-back negotiated` line capped, ending in the cut mark (RFC 5888
 /// §4).
