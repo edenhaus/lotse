@@ -35,7 +35,7 @@
 //! report, putting its own reason in place of the worker's `stopped`. A
 //! clip whose start still waits for a worker gets that report from its
 //! driver instead, which also ends one that waited too long
-//! (`source_not_live`, `crate::driver::CLIP_START_WAIT`), so a fetched
+//! (`source_not_live`, after [`ClipLimits::start_timeout`]), so a fetched
 //! clip without a worker still ends. When
 //! the worker cannot report any more (it exited, the stream was deleted or
 //! moved to another connection, shutdown, a malformed report), the clip
@@ -138,7 +138,8 @@ pub struct ClipLimits {
     /// its `GET` from the `clip/start` result on.
     pub fetch_timeout: Duration,
     /// `limits.clip_start_timeout_ms`: how long a clip in the worker waits
-    /// for the tracks and a keyframe to start at.
+    /// for the tracks and a keyframe to start at, and how long its start
+    /// waits in its connection's queue for a worker.
     pub start_timeout: Duration,
     /// `limits.max_clips`: clips open at once over every stream, and in one
     /// worker.
