@@ -49,6 +49,7 @@ use lotse_core::connection::{
 };
 use lotse_core::source::SourceError;
 use lotse_core::task::{BoxFuture, spawn_named};
+use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
 use lotse_ipc::{SessionSpec, SourceSpec};
 use tokio::sync::{mpsc, watch};
@@ -58,6 +59,7 @@ use crate::net::demux::{DatagramSink, WorkerSink};
 use crate::net::turn_client::LeaseGrant;
 use crate::registry::{CloseBy, ConnectionSnapshot, Shared, WorkerProcess};
 use crate::worker::{Worker, WorkerEvent};
+use crate::worker_text::MAX_NAME_BYTES;
 
 /// Session messages a driver holds, queued or in flight, besides the
 /// close each open session reserves (`SessionEntry::close_slot`): a
@@ -262,6 +264,8 @@ impl DriverSpec {
                 attempts: backoff.attempts,
                 immediate_used: backoff.immediate_used,
             },
+            // No stream asks the supervisor for a pre-roll window.
+            preroll_ms: 0,
         }
     }
 }
@@ -833,6 +837,14 @@ impl Driver {
                     &session_id,
                     event,
                     now,
+                );
+            }
+            WorkerEvent::Clip { clip_id, .. } => {
+                // The supervisor starts no clip, so it holds none a report
+                // could be for.
+                tracing::debug!(
+                    clip.id = %plain(&clip_id, MAX_NAME_BYTES),
+                    "report for a clip the supervisor does not hold; dropped"
                 );
             }
             WorkerEvent::Talker {
@@ -1850,6 +1862,7 @@ mod tests {
                     attempts,
                     immediate_used,
                 },
+                preroll_ms: 0,
             })
         };
         demand_tx.send_replace(PRELOAD);
@@ -1939,6 +1952,7 @@ mod tests {
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:0".parse().unwrap()],
             backoff: lotse_ipc::BackoffPosition::default(),
+            preroll_ms: 0,
         });
         recorded(&dir.join("received-0"), &first).await;
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Backoff {
@@ -1979,6 +1993,7 @@ mod tests {
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:2".parse().unwrap()],
             backoff: lotse_ipc::BackoffPosition::default(),
+            preroll_ms: 0,
         });
         recorded(&dir.join("received-1"), &run).await;
         assert!(driver.worker.is_some());
@@ -2441,6 +2456,7 @@ mod tests {
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
             backoff: lotse_ipc::BackoffPosition::default(),
+            preroll_ms: 0,
         });
         let messages = recorded(&out, &want).await;
         assert_eq!(messages, [want]);
@@ -2525,6 +2541,7 @@ mod tests {
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
             backoff: lotse_ipc::BackoffPosition::default(),
+            preroll_ms: 0,
         };
         let backchannel = |options: &str, asks: bool| {
             Wake::Command(DriverCommand::Backchannel(spec(options, asks)))
@@ -2592,6 +2609,33 @@ mod tests {
         driver.start_resolving();
         driver.stop_all().await;
         assert_eq!(captured.lines("connection driver stopped").len(), 1);
+    }
+
+    /// A worker's clip report names no clip the supervisor holds: it is
+    /// dropped with a debug line whose id is plain and capped, and the
+    /// driver goes on.
+    #[tokio::test]
+    async fn a_report_for_a_clip_the_supervisor_does_not_hold_is_dropped() {
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        driver.on_worker_event(WorkerEvent::Clip {
+            clip_id: format!("k\n{}", "x".repeat(100)),
+            event: crate::worker::ClipReport::Stopped {
+                reason: "internal_error".into(),
+                bytes: 0,
+                duration_ms: 0,
+                gaps: 0,
+            },
+        });
+        assert!(driver.silence.is_some(), "a report is a sign of life");
+        drop(driver);
+        let lines = captured.lines("report for a clip the supervisor does not hold");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("clip.id=k x"), "{lines:?}");
+        assert!(!lines[0].contains(&"x".repeat(MAX_NAME_BYTES)), "{lines:?}");
     }
 
     #[tokio::test]

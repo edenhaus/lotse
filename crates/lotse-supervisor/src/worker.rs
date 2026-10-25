@@ -29,7 +29,9 @@ use lotse_core::source::SourceError;
 use lotse_core::task::spawn_named;
 use lotse_core::text::plain;
 use lotse_ipc::{Channel, IpcError, Receiver, Sender, SourceState, ToSupervisor, ToWorker};
-pub use lotse_ipc::{SessionEvent, SessionSpec, SourceSpec, TrackInfo, WorkerStats};
+pub use lotse_ipc::{
+    ClipReport, ClipSpec, SessionEvent, SessionSpec, SourceSpec, TrackInfo, WorkerStats,
+};
 use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -110,6 +112,15 @@ pub enum WorkerEvent {
         reason: TalkerReason,
         /// When, on the worker's wall clock.
         at: SystemTime,
+    },
+    /// An event clip reported something, as the worker wrote it: checked
+    /// against the clip the supervisor holds under `clip_id`, as a
+    /// session's report is against its session.
+    Clip {
+        /// The clip.
+        clip_id: String,
+        /// What happened.
+        event: ClipReport,
     },
     /// The worker closed its channel cleanly.
     ChannelClosed,
@@ -345,6 +356,7 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
         ToSupervisor::Tracks(tracks) => WorkerEvent::Tracks(declared(tracks, &mut trims.tracks)),
         ToSupervisor::Stats(stats) => WorkerEvent::Stats(counted(stats, &mut trims.stats)),
         ToSupervisor::Session { session_id, event } => WorkerEvent::Session { session_id, event },
+        ToSupervisor::Clip { clip_id, event } => WorkerEvent::Clip { clip_id, event },
         ToSupervisor::ProbeConnecting { probe } => WorkerEvent::ProbeConnecting(probe),
         ToSupervisor::ProbeEnded { probe } => WorkerEvent::ProbeEnded(probe),
         ToSupervisor::Talker(change) => match TalkerReason::parse(&change.reason) {
@@ -506,6 +518,34 @@ impl Worker {
         self.control
             .send_msg(&ToWorker::Backchannel { asks }, &[])
             .await
+    }
+
+    /// Tells the worker its connection's pre-roll window is `ms` from now
+    /// on, 0 for none: its tracks keep or free their rings, and nothing
+    /// reconnects.
+    pub async fn preroll(&mut self, ms: u32) -> Result<(), IpcError> {
+        self.control.send_msg(&ToWorker::Preroll { ms }, &[]).await
+    }
+
+    /// Starts the event clip `spec` on the worker's tracks, its bytes going
+    /// to `pipe`, the write end of the pipe whose read end the supervisor
+    /// keeps. The descriptor is closed here once sent, so the worker's is
+    /// the only write end and the reader sees the end of the clip when the
+    /// worker closes it, or dies. The reports arrive as
+    /// [`WorkerEvent::Clip`] events.
+    pub async fn start_clip(&mut self, spec: &ClipSpec, pipe: OwnedFd) -> Result<(), IpcError> {
+        self.control
+            .send_msg(&ToWorker::StartClip(spec.clone()), &[pipe.as_fd()])
+            .await
+    }
+
+    /// Ends the clip `clip_id` cleanly; the worker ignores one it does not
+    /// run.
+    pub async fn stop_clip(&mut self, clip_id: &str) -> Result<(), IpcError> {
+        let message = ToWorker::StopClip {
+            clip_id: clip_id.to_owned(),
+        };
+        self.control.send_msg(&message, &[]).await
     }
 
     /// Lets the standby's announced attempt go ahead.
@@ -962,6 +1002,7 @@ mod tests {
                         frame_bytes: 4,
                         frames_dropped_oversize: 6,
                         frames_over_browser_limit: 7,
+                        preroll: None,
                     };
                     ((*id).to_owned(), counters)
                 })
@@ -997,6 +1038,7 @@ mod tests {
             frame_bytes: 4,
             frames_dropped_oversize: 6,
             frames_over_browser_limit: 7,
+            preroll: None,
         };
         let stats = WorkerStats {
             tracks: (0..=MAX_TRACKS)
@@ -1089,6 +1131,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_clip_message_maps_onto_its_clip_s_event() {
+        let event = ClipReport::Gap {
+            reason: "overflow".into(),
+            from_ms: 1_000,
+            to_ms: 2_500,
+        };
+        assert_eq!(
+            mapped(
+                ToSupervisor::Clip {
+                    clip_id: "k1".into(),
+                    event: event.clone(),
+                },
+                None
+            ),
+            WorkerEvent::Clip {
+                clip_id: "k1".into(),
+                event
+            }
+        );
+    }
+
     #[tokio::test]
     async fn a_message_that_does_not_decode_ends_the_relay_as_a_channel_error() {
         let (ours, theirs) = Channel::pair().unwrap();
@@ -1166,22 +1230,44 @@ mod tests {
             peer_host: "cam".into(),
             peer_addrs: vec![],
             backoff: lotse_ipc::BackoffPosition::default(),
+            preroll_ms: 0,
         };
         worker.run_source(&spec).await.unwrap();
         worker.backchannel(true).await.unwrap();
         worker.grant_switch_connect().await.unwrap();
         worker.grant_probe_connect(4).await.unwrap();
+        worker.preroll(30_000).await.unwrap();
+        let clip = ClipSpec {
+            clip_id: "k1".into(),
+            before_ms: 10_000,
+            after_ms: Some(20_000),
+            audio: true,
+        };
+        let (mut clip_bytes, pipe) = io::pipe().unwrap();
+        worker.start_clip(&clip, pipe.into()).await.unwrap();
+        worker.stop_clip("k1").await.unwrap();
         assert_eq!(
-            received(&dir, 5).await,
+            received(&dir, 8).await,
             [
                 ToWorker::Sockets,
                 ToWorker::RunSource(spec),
                 ToWorker::Backchannel { asks: true },
                 ToWorker::SwitchConnectGranted,
-                ToWorker::ProbeConnectGranted { probe: 4 }
+                ToWorker::ProbeConnectGranted { probe: 4 },
+                ToWorker::Preroll { ms: 30_000 },
+                ToWorker::StartClip(clip),
+                ToWorker::StopClip {
+                    clip_id: "k1".into()
+                },
             ],
             "the sockets ride on the first message, once"
         );
+        // The pipe's write end went with the message and the supervisor
+        // kept none: once `cat` read the message and so discarded it, the
+        // read end ends.
+        let mut rest = Vec::new();
+        io::Read::read_to_end(&mut clip_bytes, &mut rest).unwrap();
+        assert!(rest.is_empty());
         let args = std::fs::read_to_string(dir.join("args")).unwrap();
         assert!(
             args.contains("--connect-ports\n554,8554\n--loopback-relay\n"),

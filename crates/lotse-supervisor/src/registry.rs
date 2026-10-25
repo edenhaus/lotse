@@ -2573,6 +2573,7 @@ mod tests {
                     frame_bytes: 200,
                     frames_dropped_oversize: 2,
                     frames_over_browser_limit: 3,
+                    preroll: None,
                 },
             )],
             sessions: 1,
