@@ -33,8 +33,10 @@
 //! nothing reconnects; the next worker starts with the window. An event
 //! clip's start carries the write end of its pipe to the worker as the
 //! message's descriptor; one that never reached a worker before it was
-//! stopped ends here, as the worker would have ended it, and the clips of
-//! a worker that exits end `worker_crashed`.
+//! stopped ends here, as the worker would have ended it, one whose clip
+//! ended meanwhile is dropped with its pipe (a start still queued when its
+//! worker exited never reaches the next one), and the clips of a worker
+//! that exits end `worker_crashed`.
 //!
 //! A worker that can no longer be told what to do is killed, so its exit
 //! runs the crash path and the machine restarts it with backoff: one whose
@@ -116,10 +118,16 @@ pub(crate) enum DriverCommand {
         /// The window, in milliseconds.
         ms: u32,
     },
-    /// Start this event clip, writing into `pipe`.
+    /// Start this event clip, writing into `pipe`; handed to a worker
+    /// only while the clip still runs ([`State::clip_start_wanted`]).
+    ///
+    /// [`State::clip_start_wanted`]: crate::registry::State::clip_start_wanted
     StartClip {
         /// The clip.
         spec: ClipSpec,
+        /// Its serial in the registry: a start of an earlier clip under the
+        /// same id is not this one.
+        serial: u64,
         /// The write end of the clip's pipe, which goes to the worker.
         pipe: OwnedFd,
     },
@@ -1010,10 +1018,7 @@ impl Driver {
             CloseBy::WorkerGone,
         );
         // The pipes' write ends died with it: the bodies are cut.
-        state.end_clips_where(
-            |clip| clip.connection == connection,
-            ClipStopReason::WorkerCrashed,
-        );
+        state.clips_worker_gone(&connection);
         drop(state);
         let crashes = self.machine.crashes();
         self.feed(Input::WorkerExited);
@@ -1199,7 +1204,8 @@ impl Driver {
 
     /// Passes a message to `worker`. An offer is registered with the demux
     /// first, with a sink whose ICE-TCP hand-offs come back on `commands`,
-    /// unless its session closed in the meantime.
+    /// unless its session closed in the meantime; a clip's start goes only
+    /// while its clip runs, else its pipe is dropped.
     async fn send(
         worker: &mut Worker,
         shared: &Shared,
@@ -1212,7 +1218,12 @@ impl Driver {
             DriverCommand::SwitchSource(_)
             | DriverCommand::Backchannel(_)
             | DriverCommand::Preroll { .. } => return,
-            DriverCommand::StartClip { spec, pipe } => worker.start_clip(&spec, pipe).await,
+            DriverCommand::StartClip { spec, serial, pipe } => {
+                if !shared.lock().clip_start_wanted(&spec.clip_id, serial) {
+                    return;
+                }
+                worker.start_clip(&spec, pipe).await
+            }
             DriverCommand::StopClip { clip_id } => worker.stop_clip(&clip_id).await,
             DriverCommand::OpenSession(spec) => {
                 let sink = Arc::new(SessionSink {
@@ -3789,6 +3800,33 @@ mod tests {
         }
     }
 
+    /// Clip `clip_id`, `serial`, of `front` on `c1` in `shared`'s registry,
+    /// and its events.
+    fn hold_clip(shared: &Shared, clip_id: &str, serial: u64) -> mpsc::Receiver<lotse_api::Event> {
+        let (events, rx) = mpsc::channel(4);
+        let (written, report) = tokio::sync::oneshot::channel();
+        let body = lotse_api::ClipBody {
+            reader: Box::new(tokio::io::empty()),
+            written: report,
+        };
+        let owner = crate::clip::ClipOwner {
+            connection: ConnectionId(1),
+            subscription: 1,
+            events,
+        };
+        shared.lock().clips.insert(
+            clip_id.into(),
+            crate::clip::ClipEntry::new(
+                serial,
+                ("front".into(), "c1".into()),
+                clip_spec(clip_id),
+                owner,
+                (body, written),
+            ),
+        );
+        rx
+    }
+
     #[tokio::test]
     async fn the_pre_roll_window_and_the_clip_messages_reach_the_worker_and_the_next_starts_with_it()
      {
@@ -3827,9 +3865,11 @@ mod tests {
             1
         );
         let (mut reader, writer) = std::io::pipe().unwrap();
+        let _events = hold_clip(&shared, "k1", 1);
         driver
             .handle(Wake::Command(DriverCommand::StartClip {
                 spec: clip_spec("k1"),
+                serial: 1,
                 pipe: writer.into(),
             }))
             .await;
@@ -3882,9 +3922,11 @@ mod tests {
         let (commands, _rx) = mpsc::channel(1);
         let worker = driver.worker.as_mut().unwrap();
         let (_reader, writer) = std::io::pipe().unwrap();
+        let _events = hold_clip(&shared, "k1", 1);
         for command in [
             DriverCommand::StartClip {
                 spec: clip_spec("k1"),
+                serial: 1,
                 pipe: writer.into(),
             },
             DriverCommand::StopClip {
@@ -3900,6 +3942,89 @@ mod tests {
         assert_eq!(captured.lines("session message could not be sent").len(), 2);
     }
 
+    /// A start whose clip is gone when the driver hands it to a worker is
+    /// dropped with its pipe: one still queued when its worker exited (its
+    /// clip ended `worker_crashed`, and a new clip may have taken the id
+    /// since), and one whose clip ended while it waited, whose id is then
+    /// free. Only the start of the clip that runs reaches the worker.
+    #[tokio::test]
+    async fn a_start_whose_clip_is_gone_never_reaches_a_worker_and_frees_the_id_it_held() {
+        use std::io::Read as _;
+
+        let dir = private_dir("driver-stale-clip");
+        let (script, out) = recording_script(&dir);
+        let shared = shared(&script);
+        // k1 runs as serial 3: serial 1's start is an earlier clip's. k2
+        // ended (serial 2) while its start waited, its id held.
+        let _events = hold_clip(&shared, "k1", 3);
+        shared.lock().stopping_clips.insert(
+            "k2".into(),
+            crate::clip::StoppingClip {
+                connection: "c1".into(),
+                serial: 2,
+            },
+        );
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        let (mut stale, writer) = std::io::pipe().unwrap();
+        driver.queue(DriverCommand::StartClip {
+            spec: clip_spec("k1"),
+            serial: 1,
+            pipe: writer.into(),
+        });
+        driver.queue(DriverCommand::StartClip {
+            spec: clip_spec("k2"),
+            serial: 2,
+            pipe: fd(),
+        });
+        driver.queue(DriverCommand::StartClip {
+            spec: clip_spec("k1"),
+            serial: 3,
+            pipe: fd(),
+        });
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let addrs = vec!["127.0.0.1:1".parse().unwrap()];
+        driver.spawn_worker(addrs.clone()).await;
+        // A stop behind the starts: once it is in, every start before it is.
+        let end = lotse_ipc::ToWorker::StopClip {
+            clip_id: "end".into(),
+        };
+        driver
+            .handle(Wake::Command(DriverCommand::StopClip {
+                clip_id: "end".into(),
+            }))
+            .await;
+        let messages = recorded(&out, &end).await;
+        assert_eq!(
+            messages[1..],
+            [lotse_ipc::ToWorker::StartClip(clip_spec("k1")), end],
+            "k1's one start"
+        );
+        let mut rest = Vec::new();
+        stale.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "the stale start's pipe went with it");
+        assert!(!shared.lock().clip_id_in_use("k2"), "no worker got k2");
+        assert!(shared.lock().clips.contains_key("k1"));
+        let dropped = captured.lines("clip ended before its worker got it; its start is dropped");
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        assert!(dropped[0].contains("serial=1"), "{dropped:?}");
+        // The id of a later clip is not freed by an earlier one's start.
+        shared.lock().stopping_clips.insert(
+            "k3".into(),
+            crate::clip::StoppingClip {
+                connection: "c1".into(),
+                serial: 5,
+            },
+        );
+        assert!(!shared.lock().clip_start_wanted("k3", 4));
+        assert!(shared.lock().clip_id_in_use("k3"));
+        let worker = driver.worker.take().unwrap();
+        drop(driver);
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A clip stopped while its start waits for a worker leaves the queue
     /// with its pipe and ends as its worker would have ended it.
     #[tokio::test]
@@ -3907,36 +4032,18 @@ mod tests {
         use std::io::Read as _;
 
         let shared = shared("/bin/sh");
-        let (events, mut rx) = mpsc::channel(4);
-        let (written, report) = tokio::sync::oneshot::channel();
-        let body = lotse_api::ClipBody {
-            reader: Box::new(tokio::io::empty()),
-            written: report,
-        };
-        let owner = crate::clip::ClipOwner {
-            connection: ConnectionId(1),
-            subscription: 1,
-            events,
-        };
-        shared.lock().clips.insert(
-            "k1".into(),
-            crate::clip::ClipEntry::new(
-                1,
-                ("front".into(), "c1".into()),
-                clip_spec("k1"),
-                owner,
-                (body, written),
-            ),
-        );
+        let mut rx = hold_clip(&shared, "k1", 1);
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let (mut reader, writer) = std::io::pipe().unwrap();
         driver.queue(DriverCommand::StartClip {
             spec: clip_spec("k1"),
+            serial: 1,
             pipe: writer.into(),
         });
         driver.queue(DriverCommand::StartClip {
             spec: clip_spec("k2"),
+            serial: 2,
             pipe: fd(),
         });
         let captured = crate::test_support::Captured::default();

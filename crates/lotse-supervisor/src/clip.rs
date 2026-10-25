@@ -15,7 +15,8 @@
 //! mapped onto a known one, every number is bounded, and a warning's
 //! message is made [`plain`] and capped at [`MAX_MESSAGE_BYTES`]. A report
 //! that breaks the contract is dropped, logged, and ends its clip
-//! `internal_error`, the worker told to stop it; a repeated or unknown
+//! `internal_error`, the worker told to stop it unless the report was its
+//! `Stopped`, after which it runs the clip no more; a repeated or unknown
 //! warning is only dropped.
 //!
 //! A clip ends with the worker's `Stopped` report, whose `bytes` go to the
@@ -29,10 +30,25 @@
 //! ends at once without it: `stopped` then says 0 bytes and 0 ms, since
 //! only the worker knew them, and the body is cut.
 //!
+//! A worker runs one clip per id, drops a second start under an id it
+//! runs, and its reports name the clip by its id alone. So a clip the
+//! supervisor ended while its worker may still run it keeps its id
+//! ([`StoppingClip`]) until that worker's `Stopped` comes, the worker
+//! exits, its connection is released, or its start turns out never to
+//! have reached a worker ([`State::clip_start_wanted`]): a new clip under
+//! the id would otherwise be dropped by the worker and end with the old
+//! one's report. A start the driver still holds when its clip is gone
+//! (the clip ended while it waited for a worker, or its worker exited
+//! with the start still queued) is dropped with its pipe, never handed to
+//! the next worker.
+//!
 //! A clip that ends before its body was fetched keeps the body until the
 //! fetch deadline (`limits.clip_fetch_timeout_ms` from the `clip/start`
 //! result), so a short clip is not lost to a `GET` that comes a moment
-//! late.
+//! late. `limits.max_clips` counts every clip that holds something: one
+//! that runs, one its worker is still finishing, and a body that waits for
+//! its `GET`, each holding a descriptor or a worker's clip
+//! ([`State::clips_held`]).
 
 use std::time::{Duration, SystemTime};
 
@@ -204,8 +220,25 @@ pub(crate) enum ClipEnd {
         gaps: u32,
     },
     /// The supervisor ends it without its worker's report, which will not
-    /// come or not be believed.
+    /// come or not be believed. Unless the worker is gone
+    /// (`worker_crashed`), it is told to stop the clip, and the id stays
+    /// taken until it says it did ([`StoppingClip`]).
     Now(ClipStopReason),
+    /// The worker's `Stopped` came but breaks the contract: the clip ends
+    /// `internal_error` without its figures, its body cut, and nothing is
+    /// asked of the worker, which runs the clip no more.
+    Rejected,
+}
+
+/// A clip that ended while its worker may still run it: the supervisor
+/// asked it to stop and holds the id until the worker's `Stopped` comes,
+/// so no new clip takes the id meanwhile ([`State::clip_id_in_use`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoppingClip {
+    /// The source connection whose worker runs it.
+    pub(crate) connection: String,
+    /// Its serial, which its start in the driver's queue carries.
+    pub(crate) serial: u64,
 }
 
 /// One clip that runs.
@@ -352,7 +385,7 @@ impl ClipEntry {
                 duration_ms,
                 gaps,
             } => self
-                .stopped(clip_id, (&reason, bytes, duration_ms, gaps), limits)
+                .stopped((&reason, bytes, duration_ms, gaps), limits)
                 .map(Applied::End),
         }
     }
@@ -473,13 +506,14 @@ impl ClipEntry {
         }))
     }
 
-    /// The end a worker's `Stopped` report makes: its reason mapped onto
-    /// the API's (one it does not know, or one only the supervisor gives,
-    /// is `internal_error`, logged), the supervisor's own for `stopped`
-    /// when it asked; or the reason the figures break the contract.
+    /// The end a worker's `Stopped` report makes: its reason as the API's,
+    /// the supervisor's own for `stopped` when it asked; or the reason the
+    /// report breaks the contract: a reason the API does not know or only
+    /// the supervisor gives (a malformed report, whose figures are not
+    /// believed: `lotse_api_types::clip::ClipEvent::Stopped` says 0 bytes
+    /// and a cut body for one), or figures the clip cannot have.
     fn stopped(
         &self,
-        clip_id: &str,
         (reason, bytes, duration_ms, gaps): (&str, u64, u32, u32),
         limits: ClipLimits,
     ) -> Result<ClipEnd, &'static str> {
@@ -489,18 +523,12 @@ impl ClipEntry {
         if gaps < self.gaps {
             return Err("stopped counts fewer gaps than were reported");
         }
-        let parsed = ClipStopReason::parse(reason).filter(|r| !SUPERVISOR_REASONS.contains(r));
-        let reason = match (parsed, self.ending) {
-            (Some(ClipStopReason::Stopped), Some(ending)) => ending,
-            (Some(reason), _) => reason,
-            (None, _) => {
-                tracing::warn!(
-                    clip.id = clip_id,
-                    reason = ?plain(reason, MAX_NAME_BYTES),
-                    "a worker ended a clip with a reason it may not give; internal_error"
-                );
-                ClipStopReason::InternalError
-            }
+        let reason = ClipStopReason::parse(reason)
+            .filter(|r| !SUPERVISOR_REASONS.contains(r))
+            .ok_or("stopped names a reason the worker may not give")?;
+        let reason = match (reason, self.ending) {
+            (ClipStopReason::Stopped, Some(ending)) => ending,
+            (reason, _) => reason,
         };
         Ok(ClipEnd::Reported {
             reason,
@@ -553,7 +581,8 @@ impl State {
     /// subscription and body are gone; a pipe nobody reads ends the
     /// worker's clip `client_gone`), one about a clip of another
     /// connection is refused, and one that breaks the contract ends the
-    /// clip `internal_error`.
+    /// clip `internal_error`. The `Stopped` of a clip that ended while its
+    /// worker still ran it frees its id ([`StoppingClip`]).
     pub(crate) fn clip_report(
         &mut self,
         connection: &str,
@@ -562,12 +591,9 @@ impl State {
         at: SystemTime,
     ) {
         let limits = self.clip_limits;
+        let last = matches!(report, ClipReport::Stopped { .. });
         let Some(entry) = self.clips.get_mut(clip_id) else {
-            tracing::debug!(
-                clip.id = %plain(clip_id, MAX_NAME_BYTES),
-                connection.id = connection,
-                "report for a clip the supervisor does not hold; dropped"
-            );
+            self.late_clip_report(connection, clip_id, last);
             return;
         };
         if entry.connection != connection {
@@ -589,9 +615,41 @@ impl State {
                     reason,
                     "a worker reported a malformed clip report; clip ended"
                 );
-                self.end_clip(clip_id, ClipEnd::Now(ClipStopReason::InternalError));
+                // After its `Stopped` the worker runs the clip no more.
+                let end = if last {
+                    ClipEnd::Rejected
+                } else {
+                    ClipEnd::Now(ClipStopReason::InternalError)
+                };
+                self.end_clip(clip_id, end);
             }
         }
+    }
+
+    /// A report from `connection`'s worker for `clip_id`, which the
+    /// supervisor does not hold: the `Stopped` (`last`) of a clip that ended
+    /// while that worker still ran it frees the id; any other report is
+    /// dropped (its subscription and body are gone; a pipe nobody reads
+    /// ends the worker's clip `client_gone`).
+    fn late_clip_report(&mut self, connection: &str, clip_id: &str, last: bool) {
+        let finishing = self
+            .stopping_clips
+            .get(clip_id)
+            .is_some_and(|clip| clip.connection == connection);
+        if last && finishing {
+            self.stopping_clips.remove(clip_id);
+            tracing::debug!(
+                clip.id = clip_id,
+                connection.id = connection,
+                "the worker finished a clip that had ended; its id is free"
+            );
+            return;
+        }
+        tracing::debug!(
+            clip.id = %plain(clip_id, MAX_NAME_BYTES),
+            connection.id = connection,
+            "report for a clip the supervisor does not hold; dropped"
+        );
     }
 
     /// Asks the worker to stop clip `clip_id` cleanly for `reason`, which
@@ -631,8 +689,9 @@ impl State {
     /// connection's demand, its stream counts it, its owner gets `stopped`
     /// and its subscription ends. With its worker's report, the body gets
     /// the bytes, and one not fetched yet is kept until the fetch
-    /// deadline; without it, the worker is told to stop the clip (unless
-    /// it is gone, or was told already) and the body is cut.
+    /// deadline; without it, the body is cut, and a worker that may still
+    /// run the clip is told to stop it (unless it was told already) and
+    /// holds its id until it did ([`StoppingClip`]).
     pub(crate) fn end_clip(&mut self, clip_id: &str, end: ClipEnd) {
         let Some(mut entry) = self.clips.remove(clip_id) else {
             return;
@@ -654,11 +713,29 @@ impl State {
                 (reason, bytes, duration_ms, gaps)
             }
             ClipEnd::Now(reason) => {
-                if reason != ClipStopReason::WorkerCrashed && entry.ending.is_none() {
+                // A worker that exited, or one whose connection was released
+                // and is stopped with it, reports nothing more.
+                if reason != ClipStopReason::WorkerCrashed
+                    && self.connections.contains_key(&connection)
+                {
+                    // A clip being stopped already used its slot.
                     entry.ask_stop(clip_id);
+                    tracing::debug!(
+                        clip.id = clip_id,
+                        connection.id = %connection,
+                        "clip ended while its worker may still run it; its id is held until the worker stops it"
+                    );
+                    self.stopping_clips.insert(
+                        clip_id.to_owned(),
+                        StoppingClip {
+                            connection: connection.clone(),
+                            serial: entry.serial,
+                        },
+                    );
                 }
                 (reason, 0, 0, entry.gaps)
             }
+            ClipEnd::Rejected => (ClipStopReason::InternalError, 0, 0, entry.gaps),
         };
         if let Some(stream) = self.streams.get_mut(&entry.stream_id) {
             let counters = &mut stream.clips;
@@ -810,10 +887,77 @@ impl State {
             .ok_or(ClipBodyError::NotFound)
     }
 
-    /// Whether `clip_id` names a clip that runs or a body still to fetch:
-    /// a new clip may not take it.
+    /// Whether `clip_id` names a clip that runs, one its worker is still
+    /// finishing, or a body still to fetch: a new clip may not take it.
     pub(crate) fn clip_id_in_use(&self, clip_id: &str) -> bool {
-        self.clips.contains_key(clip_id) || self.finished_clips.contains_key(clip_id)
+        self.clips.contains_key(clip_id)
+            || self.stopping_clips.contains_key(clip_id)
+            || self.finished_clips.contains_key(clip_id)
+    }
+
+    /// The clips `limits.max_clips` counts: those that run, those their
+    /// worker is still finishing, and the bodies that wait for their `GET`,
+    /// each holding a pipe's end in one process or the other.
+    pub(crate) fn clips_held(&self) -> usize {
+        self.clips
+            .len()
+            .saturating_add(self.stopping_clips.len())
+            .saturating_add(self.finished_clips.len())
+    }
+
+    /// Whether the start of clip `clip_id`, `serial`, which the driver is
+    /// about to hand to a worker, is still wanted: only while that clip
+    /// runs. One that ended meanwhile is dropped with its pipe, and since
+    /// no worker got it, an id its end held is free.
+    pub(crate) fn clip_start_wanted(&mut self, clip_id: &str, serial: u64) -> bool {
+        if self
+            .clips
+            .get(clip_id)
+            .is_some_and(|clip| clip.serial == serial)
+        {
+            return true;
+        }
+        if self
+            .stopping_clips
+            .get(clip_id)
+            .is_some_and(|clip| clip.serial == serial)
+        {
+            self.stopping_clips.remove(clip_id);
+        }
+        tracing::debug!(
+            clip.id = clip_id,
+            serial,
+            "clip ended before its worker got it; its start is dropped"
+        );
+        false
+    }
+
+    /// Connection `connection`'s worker exited: its clips end
+    /// `worker_crashed`, their bodies cut, and the ids of the clips it was
+    /// finishing are free, as it reports nothing more.
+    pub(crate) fn clips_worker_gone(&mut self, connection: &str) {
+        self.end_clips_where(
+            |clip| clip.connection == connection,
+            ClipStopReason::WorkerCrashed,
+        );
+        self.forget_stopping_clips(connection);
+    }
+
+    /// The ids of the clips `connection`'s worker was finishing are free:
+    /// that worker exited, or the connection was released and stops it,
+    /// so their `Stopped` reaches no one.
+    pub(crate) fn forget_stopping_clips(&mut self, connection: &str) {
+        self.stopping_clips.retain(|clip_id, clip| {
+            let keep = clip.connection != connection;
+            if !keep {
+                tracing::debug!(
+                    clip.id = %clip_id,
+                    connection.id = connection,
+                    "the worker of a clip that had ended is gone; its id is free"
+                );
+            }
+            keep
+        });
     }
 }
 
@@ -1025,9 +1169,10 @@ mod tests {
                 applied(&mut clip, warning(code, "again")),
                 Ok(Applied::Nothing)
             ));
+            // The first drop is logged, at once; the later ones are not.
+            let dropped = captured.lines("a worker repeated a clip warning");
+            assert_eq!(dropped.len(), 1, "{dropped:?}");
         }
-        let dropped = captured.lines("a worker repeated a clip warning");
-        assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert_eq!(clip.warnings_dropped, 2);
     }
 
@@ -1053,7 +1198,9 @@ mod tests {
         ] {
             assert_eq!(applied(&mut clip, report).unwrap_err(), reason);
         }
-        for _ in 1..MAX_GAP_EVENTS {
+        // The span's end is inside it.
+        assert!(applied(&mut clip, gap("lagged", 0, LIMITS.span_ms())).is_ok());
+        for _ in 2..MAX_GAP_EVENTS {
             assert!(applied(&mut clip, gap("overflow", 1, 1)).is_ok());
         }
         assert_eq!(
@@ -1068,8 +1215,6 @@ mod tests {
 
     #[test]
     fn stopped_maps_the_worker_s_reason_and_puts_the_supervisor_s_own_in_for_stopped() {
-        let captured = Captured::default();
-        let _logs = captured.install();
         let stopped = |reason: &str, duration_ms: u32, gaps: u32| ClipReport::Stopped {
             reason: reason.into(),
             bytes: 7,
@@ -1099,7 +1244,8 @@ mod tests {
             end(&mut clip, stopped("client_gone", 1, 0)),
             ClipStopReason::ClientGone
         );
-        // A reason the worker may not give is an internal error, logged.
+        // A reason the worker may not give breaks the contract: its
+        // figures are not believed.
         for reason in [
             "worker_crashed",
             "session_closed",
@@ -1107,17 +1253,24 @@ mod tests {
             "bogus\nreason",
         ] {
             assert_eq!(
-                end(&mut clip, stopped(reason, 1, 0)),
-                ClipStopReason::InternalError
+                applied(&mut clip, stopped(reason, 1, 0)).unwrap_err(),
+                "stopped names a reason the worker may not give"
             );
         }
-        let lines = captured.lines("a worker ended a clip with a reason it may not give");
-        assert_eq!(lines.len(), 4, "{lines:?}");
-        assert!(lines[3].contains("bogus reason"), "{lines:?}");
-        // Figures the clip cannot have break the contract.
+        // A worker's own internal error is one it may give.
+        assert_eq!(
+            end(&mut clip, stopped("internal_error", 1, 0)),
+            ClipStopReason::InternalError
+        );
+        // Figures the clip cannot have break the contract; the span's end
+        // is inside it.
         assert_eq!(
             applied(&mut clip, stopped("completed", LIMITS.span_ms() + 1, 0)).unwrap_err(),
             "stopped duration out of bounds"
+        );
+        assert_eq!(
+            end(&mut clip, stopped("completed", LIMITS.span_ms(), 0)),
+            ClipStopReason::Completed
         );
         clip.gaps = 2;
         assert_eq!(
