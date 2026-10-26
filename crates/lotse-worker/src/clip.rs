@@ -43,9 +43,10 @@
 //! [`ClipMuxer`], and the bytes into the pipe without blocking. Transcoded
 //! audio goes through its clip's own [`ToOpus`] on the way out of the
 //! queue, so the ring keeps the camera's frames and the pre-roll's audio is
-//! transcoded in a burst at the start, at most [`MAX_STEP_PACKETS`] packets
-//! (one item's over it, see there) before the task yields to the worker's
-//! other tasks, in its steps and its drain alike. A reader that
+//! transcoded in a burst at the start, at most [`MAX_STEP_PACKETS`] packets,
+//! a frame that completes none counting one (one item's over it, see
+//! there) before the task yields to the worker's other tasks, in its steps
+//! and its drain alike. A reader that
 //! closes its end ends the clip at once, written to or not.
 //!
 //! Invariants: the media path never waits for a clip. While the pipe is
@@ -151,11 +152,15 @@ const MAX_WRITE_SLICES: usize = 64;
 
 /// The Opus packets a clip transcodes before it lets the worker's other
 /// tasks run, in its steps and its drain alike: half a second of audio, a
-/// few milliseconds of one core. A pre-roll's audio comes out of the queue
-/// at once; transcoded in one go, a 120 s window would hold a runtime
-/// thread for the length of 6000 packets. It is checked between the
-/// queue's items, so one item goes over it by its own packets at most: one
-/// RTP packet's samples (a camera's 20 to 40 ms) and up to
+/// few milliseconds of one core. Each audio frame through the transcode
+/// counts its packets, and one at least: a frame that completes none (a
+/// timeline's first, or each of a run that re-anchors on every frame, as
+/// a camera repeating its timestamps makes) still costs its decode and
+/// resampling. A pre-roll's audio comes out of the queue at once;
+/// transcoded in one go, a 120 s window would hold a runtime thread for
+/// the length of 6000 frames. It is checked between the queue's items, so
+/// one item goes over it by its own packets at most: one RTP packet's
+/// samples (a camera's 20 to 40 ms) and up to
 /// [`MAX_SILENCE`](lotse_codec::transcode::clip::MAX_SILENCE)'s 50 packets
 /// of silence before them.
 const MAX_STEP_PACKETS: usize = 25;
@@ -772,7 +777,9 @@ struct Clip {
     /// [`Media::entries`], which stays the camera's.
     transcoder: Option<ToOpus>,
     /// Opus packets transcoded since the clip last let the worker's other
-    /// tasks run: in the current [`Self::step`], or in [`Self::drain`].
+    /// tasks run, one at least per frame through the transcode
+    /// ([`MAX_STEP_PACKETS`]): in the current [`Self::step`], or in
+    /// [`Self::drain`].
     step_packets: usize,
     /// Where the video continues.
     continuity: Continuity,
@@ -1172,7 +1179,10 @@ impl Clip {
                 self.holes.insert(track, reason);
             }
         }
-        self.step_packets = self.step_packets.saturating_add(packets.len());
+        // A frame that completes no packet still cost its decode and
+        // resample: one at least, or frames that re-anchor on every one
+        // (a camera repeating its timestamps) would never reach the budget.
+        self.step_packets = self.step_packets.saturating_add(packets.len().max(1));
         for packet in packets {
             self.sample(track, packet, seen)?;
         }
@@ -1443,7 +1453,8 @@ impl Clip {
     /// what else ends the clip on the way (a codec change, the container
     /// failing a frame); reaching the clip's own end keeps the reason it
     /// ends for. It yields after every [`MAX_STEP_PACKETS`] packets it
-    /// transcodes, as `record` does between steps.
+    /// transcodes, a frame that completes none counting one, as `record`
+    /// does between steps.
     async fn drain(&mut self, media: &mut Media) -> Option<EndReason> {
         let deadline = self.clock.now().checked_add(FINISH_GRACE);
         loop {
@@ -1741,10 +1752,15 @@ mod tests {
         /// A 20 ms G.711 or G.722 frame `index` (160 ticks of the 8000 Hz
         /// clock, RFC 3551 §4.5.2, §4.5.14), captured on the 20 ms grid.
         fn narrowband_frame(&self, index: u32, payload: &Bytes) {
+            self.narrowband_frame_stamped(index, i64::from(index) * 160, payload);
+        }
+
+        /// [`Self::narrowband_frame`] stamped `ticks`, wherever the grid has it.
+        fn narrowband_frame_stamped(&self, index: u32, ticks: i64, payload: &Bytes) {
             let ms = u64::from(index) * 20;
             self.advance_to(ms);
             assert!(self.audio.as_ref().unwrap().publish_frame(MediaFrame {
-                ts: MediaTime::from_ticks(i64::from(index) * 160),
+                ts: MediaTime::from_ticks(ticks),
                 wallclock: self.at(ms),
                 arrival: self.at(ms),
                 keyframe: true,
@@ -2010,15 +2026,21 @@ mod tests {
         }
     }
 
-    /// A container that counts the audio frames pushed into it: the fake
-    /// one otherwise.
+    /// A container that counts the frames pushed into it, audio (`.0`) and
+    /// video (`.1`): the fake one otherwise.
     #[derive(Debug, Default)]
-    struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+    struct Counting(
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
 
     /// [`Counting`]'s muxer.
     struct CountingMuxer {
         inner: Box<dyn ClipMuxer>,
+        /// Audio frames pushed.
         audio: Arc<std::sync::atomic::AtomicUsize>,
+        /// Video frames pushed.
+        video: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl ClipMuxerFactory for Counting {
@@ -2030,6 +2052,7 @@ mod tests {
             Box::new(CountingMuxer {
                 inner: FakeClipMuxerFactory::default().muxer(policy),
                 audio: Arc::clone(&self.0),
+                video: Arc::clone(&self.1),
             })
         }
     }
@@ -2048,9 +2071,11 @@ mod tests {
         }
 
         fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, ClipError> {
-            if track == Kind::Audio {
-                self.audio.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
+            let count = match track {
+                Kind::Audio => &self.audio,
+                Kind::Video => &self.video,
+            };
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.push(track, frame)
         }
 
@@ -2140,12 +2165,17 @@ mod tests {
     /// Ten seconds of 10 fps video, a keyframe each second, and a 20 ms
     /// frame of `codec` every 20 ms: the ring holds them all.
     fn ten_narrowband_seconds(rig: &Rig, codec: &Codec) {
+        ten_narrowband_seconds_stamped(rig, codec, |index| i64::from(index) * 160);
+    }
+
+    /// [`ten_narrowband_seconds`], audio frame `index` stamped `stamp(index)`.
+    fn ten_narrowband_seconds_stamped(rig: &Rig, codec: &Codec, stamp: fn(u32) -> i64) {
         let payload = narrowband_payload(codec);
         let mut audio = 0;
         for index in 0..100_u32 {
             let ms = u64::from(index) * 100;
             while u64::from(audio) * 20 <= ms {
-                rig.narrowband_frame(audio, &payload);
+                rig.narrowband_frame_stamped(audio, stamp(audio), &payload);
                 audio += 1;
             }
             rig.video_frame(
@@ -3690,7 +3720,8 @@ mod tests {
 
     /// A stop during a pre-roll's transcode burst drains the rest in steps
     /// of `MAX_STEP_PACKETS` packets, letting the worker's other tasks run
-    /// between them as the clip's steps do. Regression: the drain
+    /// between them as the clip's steps do. The timeline's first frame,
+    /// which completes none, counts one. Regression: the drain
     /// transcoded all of it in one go while the pipe took the bytes.
     #[tokio::test]
     async fn a_stop_during_a_transcode_burst_drains_it_in_steps_that_let_other_tasks_run() {
@@ -3708,6 +3739,9 @@ mod tests {
         let busy: Vec<usize> = ticks.into_iter().filter(|n| *n > 0).collect();
         let (last, full) = busy.split_last().unwrap();
         assert!(busy.len() >= 4, "{busy:?}");
+        // The timeline's first frame completes no packet but counts one.
+        let (first, full) = full.split_first().unwrap();
+        assert_eq!(*first, MAX_STEP_PACKETS - 1, "{busy:?}");
         assert!(full.iter().all(|n| *n == MAX_STEP_PACKETS), "{busy:?}");
         assert!(*last <= MAX_STEP_PACKETS, "{busy:?}");
         let (reports, rest) = tokio::join!(rig.until_stopped(), reader.rest());
@@ -3718,6 +3752,46 @@ mod tests {
             busy.iter().sum::<usize>(),
             "the file is whole"
         );
+    }
+
+    /// A transcode that re-anchors on every frame, completing no packet,
+    /// still lets the worker's other tasks run after every
+    /// `MAX_STEP_PACKETS` frames it takes, in the clip's steps and in its
+    /// drain: PCMU frames all stamped 0, as a camera repeating its
+    /// timestamps sends, each step back off the sample count. The 4 s
+    /// pre-roll goes out in steps of 25 audio frames, half a second, so at
+    /// most 6 of the 10 fps video frames between two yields. Regression:
+    /// only packets counted, and the whole pre-roll went through the
+    /// transcode in one step.
+    #[tokio::test]
+    async fn a_transcode_that_re_anchors_on_every_frame_still_yields_after_each_step() {
+        for stop in [false, true] {
+            let mut rig = Rig::new(Some(Codec::Pcmu));
+            ten_narrowband_seconds_stamped(&rig, &Codec::Pcmu, |_| 0);
+            let count = Counting::default();
+            let (audio, video) = (Arc::clone(&count.0), Arc::clone(&count.1));
+            let reader = rig.start_with(spec(3_500, None, true), count, ClipSettings::default());
+            if stop {
+                // Before the clip's first poll: the pre-roll goes out in the drain.
+                assert!(rig.clips.stop("k1", EndReason::Stopped));
+            }
+            let mut bytes = Vec::new();
+            let mut ticks = Vec::new();
+            per_tick(&video, &reader, 64, &mut ticks, &mut bytes).await;
+            let busy: Vec<usize> = ticks.into_iter().filter(|n| *n > 0).collect();
+            assert!(busy.len() >= 6, "stop {stop}: {busy:?}");
+            assert!(busy.iter().all(|n| *n <= 6), "stop {stop}: {busy:?}");
+            if !stop {
+                assert!(rig.clips.stop("k1", EndReason::Stopped));
+            }
+            let (reports, _) = tokio::join!(rig.until_stopped(), reader.rest());
+            let_assert_reason(&reports, "stopped");
+            assert_eq!(
+                audio.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "stop {stop}: no packet"
+            );
+        }
     }
 
     /// The audio starts with the frame playing when the video's start
