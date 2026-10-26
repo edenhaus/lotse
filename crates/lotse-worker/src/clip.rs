@@ -948,7 +948,9 @@ impl Clip {
 
     /// Runs the clip until it ends: takes what the subscriptions yield
     /// into the queue at once, and the queue's items into the container
-    /// and the pipe as fast as the pipe takes them.
+    /// and the pipe as fast as the pipe takes them. After a step that
+    /// stopped at [`MAX_STEP_PACKETS`] it yields before it looks at anything
+    /// else.
     async fn record(
         &mut self,
         media: &mut Media,
@@ -960,6 +962,11 @@ impl Clip {
                 Err(reason) => return reason,
             };
             self.send_reports().await;
+            if more {
+                // The step stopped at its budget with work left: the
+                // worker's other tasks run first, whatever is ready below.
+                tokio::task::yield_now().await;
+            }
             let wake = self.wake(&media.interleaver);
             let sleep = self
                 .clock
@@ -991,9 +998,9 @@ impl Clip {
                 // With nothing pending no write would tell: a stalled
                 // camera would keep the clip, and its slot, to its end.
                 () = hangup(&self.pipe) => return gone(&self.id),
-                // The step stopped with work left: the worker's other tasks
-                // run first, then the next step goes on.
-                () = tokio::task::yield_now(), if more => {}
+                // Work is left: the next step goes on at once, after the
+                // events above, without waiting for one.
+                () = std::future::ready(()), if more => {}
                 () = sleep => {}
             }
         }
@@ -1944,6 +1951,83 @@ mod tests {
 
         fn muxer(&self, policy: &ClipPolicy) -> Box<dyn ClipMuxer> {
             FakeClipMuxerFactory::default().muxer(policy)
+        }
+    }
+
+    /// A container that counts the audio frames pushed into it: the fake
+    /// one otherwise.
+    #[derive(Debug, Default)]
+    struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+
+    /// [`Counting`]'s muxer.
+    struct CountingMuxer {
+        inner: Box<dyn ClipMuxer>,
+        audio: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ClipMuxerFactory for Counting {
+        fn accepts(&self, codec: &Codec) -> bool {
+            FakeClipMuxerFactory::default().accepts(codec)
+        }
+
+        fn muxer(&self, policy: &ClipPolicy) -> Box<dyn ClipMuxer> {
+            Box::new(CountingMuxer {
+                inner: FakeClipMuxerFactory::default().muxer(policy),
+                audio: Arc::clone(&self.0),
+            })
+        }
+    }
+
+    impl ClipMuxer for CountingMuxer {
+        fn start(
+            &mut self,
+            video: &ClipTrack,
+            audio: Option<&ClipTrack>,
+        ) -> Result<Vec<Bytes>, ClipError> {
+            self.inner.start(video, audio)
+        }
+
+        fn set_origin(&mut self, origin: Instant) {
+            self.inner.set_origin(origin);
+        }
+
+        fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, ClipError> {
+            if track == Kind::Audio {
+                self.audio.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.push(track, frame)
+        }
+
+        fn media_time(&self, track: Kind) -> Duration {
+            self.inner.media_time(track)
+        }
+
+        fn finish(&mut self) -> Result<Vec<Bytes>, ClipError> {
+            self.inner.finish()
+        }
+    }
+
+    /// Yields `ticks` more times, as another task of the worker runs
+    /// between the clip's polls (on the test's one thread the clip runs
+    /// between two of them), and appends to `out` the audio frames `audio`
+    /// counted since the tick before (`out`'s sum is what it counted
+    /// before); the pipe is read empty into `bytes` at each tick so it never
+    /// fills.
+    async fn per_tick(
+        audio: &std::sync::atomic::AtomicUsize,
+        reader: &Reader,
+        ticks: usize,
+        out: &mut Vec<usize>,
+        bytes: &mut Vec<u8>,
+    ) {
+        let mut buf = vec![0; 1 << 16];
+        for _ in 0..ticks {
+            tokio::task::yield_now().await;
+            while let Ok(read @ 1..) = reader.0.try_read(&mut buf) {
+                bytes.extend_from_slice(&buf[..read]);
+            }
+            let now = audio.load(std::sync::atomic::Ordering::SeqCst);
+            out.push(now - out.iter().sum::<usize>());
         }
     }
 
@@ -3442,6 +3526,50 @@ mod tests {
             .collect();
         assert_eq!(audio, expected);
         assert_eq!(reports, vec![stopped("stopped", bytes.len(), 180, 0)]);
+    }
+
+    /// A pre-roll's transcode burst lets the worker's other tasks run after
+    /// every step of `MAX_STEP_PACKETS` packets even while frames keep
+    /// coming, so a ready subscription never skips the yield. Regression:
+    /// the yield was a branch of the biased select after the subscriptions',
+    /// and with a frame ready at each select the whole burst ran in one poll.
+    #[tokio::test]
+    async fn a_transcode_burst_lets_other_tasks_run_after_each_step_while_frames_keep_coming() {
+        let mut rig = Rig::new(Some(Codec::Pcmu));
+        ten_narrowband_seconds(&rig, &Codec::Pcmu);
+        rig.advance_to(11_000);
+        let count = Counting::default();
+        let audio = Arc::clone(&count.0);
+        let reader = rig.start_with(spec(4_500, None, true), count, ClipSettings::default());
+        // The burst starts once the pipe is known to take the container's
+        // header: until then every step ends at it, with nothing transcoded.
+        let mut bytes = Vec::new();
+        let mut ticks = Vec::new();
+        while ticks.iter().sum::<usize>() == 0 {
+            assert!(ticks.len() < 16, "no burst: {ticks:?}");
+            per_tick(&audio, &reader, 1, &mut ticks, &mut bytes).await;
+        }
+        // Frames of the live audio, fewer than a subscription holds so none
+        // lags: ready events at every select of the burst's steps.
+        let payload = narrowband_payload(&Codec::Pcmu);
+        for index in 496..544 {
+            rig.narrowband_frame(index, &payload);
+        }
+        per_tick(&audio, &reader, 128, &mut ticks, &mut bytes).await;
+        assert!(ticks.iter().all(|n| *n <= MAX_STEP_PACKETS), "{ticks:?}");
+        assert!(
+            ticks.iter().sum::<usize>() >= 4 * MAX_STEP_PACKETS,
+            "{ticks:?}"
+        );
+        rig.clips.stop("k1", EndReason::Stopped);
+        let (reports, rest) = tokio::join!(rig.until_stopped(), reader.rest());
+        bytes.extend(rest);
+        let_assert_reason(&reports, "stopped");
+        assert_eq!(
+            audio_samples(&lines(&bytes)).len(),
+            audio.load(std::sync::atomic::Ordering::SeqCst),
+            "the file is whole"
+        );
     }
 
     /// The audio starts with the frame playing when the video's start
