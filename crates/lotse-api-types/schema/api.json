@@ -100,6 +100,323 @@
       ],
       "type": "object"
     },
+    "ClipAudio": {
+      "description": "A clip's audio, as `started` reports it.",
+      "properties": {
+        "codec": {
+          "description": "The codec name (`aac_lc`, `opus`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "codec"
+      ],
+      "type": "object"
+    },
+    "ClipEvent": {
+      "description": "An event of `clip/start`, in the order they come: `started` unless\nthe clip ends first, then warnings and gaps, and `stopped` always last.\nEach variant's schema title names the Python client's class for it.",
+      "oneOf": [
+        {
+          "description": "The clip's file is under way: its first bytes are on their way to\nthe body.",
+          "properties": {
+            "at": {
+              "description": "When it started, RFC 3339 UTC: the daemon's time of the start,\nwhich `before_ms` counts back from.",
+              "type": "string"
+            },
+            "audio": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ClipAudio"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Its audio; null for a clip without audio (`audio: false`, a\nstream without audio, or `audio_omitted`)."
+            },
+            "before_ms": {
+              "description": "How far before `at` the clip begins, in milliseconds: the age\nof the keyframe it starts at, which is what the pre-roll window\nheld, not what was asked; 0 without a window.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "clip_id": {
+              "description": "The clip.",
+              "type": "string"
+            },
+            "type": {
+              "const": "started",
+              "type": "string"
+            },
+            "video": {
+              "$ref": "#/$defs/ClipVideo",
+              "description": "Its video."
+            }
+          },
+          "required": [
+            "type",
+            "clip_id",
+            "at",
+            "before_ms",
+            "video"
+          ],
+          "title": "ClipEventStarted",
+          "type": "object"
+        },
+        {
+          "description": "Non-fatal: the clip goes on.",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/ClipWarningCode",
+              "description": "The stable code."
+            },
+            "message": {
+              "description": "For humans.",
+              "type": "string"
+            },
+            "type": {
+              "const": "warning",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "code",
+            "message"
+          ],
+          "title": "ClipEventWarning",
+          "type": "object"
+        },
+        {
+          "description": "The clip has a hole: no media between `from_ms` and `to_ms`, so\nthe file's timeline has a hole of that length.",
+          "properties": {
+            "from_ms": {
+              "description": "Where the hole begins, in milliseconds of the clip's media time\n(from its first frame), as the file counts it.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reason": {
+              "$ref": "#/$defs/ClipGapReason",
+              "description": "Why."
+            },
+            "to_ms": {
+              "description": "Where it ends, likewise.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "gap",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "reason",
+            "from_ms",
+            "to_ms"
+          ],
+          "title": "ClipEventGap",
+          "type": "object"
+        },
+        {
+          "description": "The last event; the subscription ends with it, and the body ends\nonce the bytes before it are read.",
+          "properties": {
+            "bytes": {
+              "description": "The bytes of the file written to the body.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "duration_ms": {
+              "description": "The media time the file covers, in milliseconds.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "gaps": {
+              "description": "The gaps the clip had, every one counted even where not each\nwas reported as an event.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reason": {
+              "$ref": "#/$defs/ClipStopReason",
+              "description": "Why."
+            },
+            "type": {
+              "const": "stopped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "reason",
+            "bytes",
+            "duration_ms",
+            "gaps"
+          ],
+          "title": "ClipEventStopped",
+          "type": "object"
+        }
+      ]
+    },
+    "ClipGapReason": {
+      "description": "Why a clip has a hole: the `reason` of `gap`.",
+      "oneOf": [
+        {
+          "const": "reconnect",
+          "description": "The camera's connection dropped and came back, during the clip or\ninside its pre-roll: the hole is the real time between.",
+          "type": "string"
+        },
+        {
+          "const": "frames_dropped",
+          "description": "Video frames are missing inside one connection: two consecutive\nones arrived more than twice the frame interval apart (the camera\nor the network dropped them).",
+          "type": "string"
+        },
+        {
+          "const": "overflow",
+          "description": "The clip's queue ran full, since its body is read slower than the\ncamera sends, and frames were dropped up to the next keyframe; or a\npre-roll GOP larger than the window's byte cap was cut short.",
+          "type": "string"
+        },
+        {
+          "const": "lagged",
+          "description": "The clip fell behind the stream's frames and missed some; it goes\non from the next keyframe.",
+          "type": "string"
+        }
+      ]
+    },
+    "ClipStartResult": {
+      "description": "`clip/start`'s result: the clip, and where its bytes are fetched.",
+      "properties": {
+        "clip_id": {
+          "description": "The clip: the client's id, or a generated ULID.",
+          "type": "string"
+        },
+        "url": {
+          "description": "The path to `GET` its bytes from on the socket this command came\nover: `/v0/clips/{clip_id}`. One request takes them; a clip not\nfetched in time stops with `not_fetched`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "clip_id",
+        "url"
+      ],
+      "type": "object"
+    },
+    "ClipStopReason": {
+      "description": "Why a clip ended: the `reason` of `stopped`.",
+      "oneOf": [
+        {
+          "const": "completed",
+          "description": "`after_ms` reached.",
+          "type": "string"
+        },
+        {
+          "const": "stopped",
+          "description": "`clip/stop` or `unsubscribe`.",
+          "type": "string"
+        },
+        {
+          "const": "max_duration",
+          "description": "`limits.clip_max_ms` reached: an open-ended clip's end.",
+          "type": "string"
+        },
+        {
+          "const": "stream_deleted",
+          "description": "The stream was deleted.",
+          "type": "string"
+        },
+        {
+          "const": "stream_changed",
+          "description": "The stream's codec, its parameter sets or picture size changed, or\nits source was switched: a file has one sample entry per track, so\nthe client starts another clip.",
+          "type": "string"
+        },
+        {
+          "const": "no_video_track",
+          "description": "The stream had no video track when its source came up.",
+          "type": "string"
+        },
+        {
+          "const": "worker_crashed",
+          "description": "The connection's worker process died; the body ends without its\nlast chunk.",
+          "type": "string"
+        },
+        {
+          "const": "source_not_live",
+          "description": "The source sent no keyframe to start at in time.",
+          "type": "string"
+        },
+        {
+          "const": "client_gone",
+          "description": "The body's reader went away before the clip ended.",
+          "type": "string"
+        },
+        {
+          "const": "not_fetched",
+          "description": "Nobody fetched the clip's bytes in time.",
+          "type": "string"
+        },
+        {
+          "const": "session_closed",
+          "description": "The control connection that started the clip closed.",
+          "type": "string"
+        },
+        {
+          "const": "shutting_down",
+          "description": "The daemon is shutting down; the last fragment is written if the\nbody takes it in time.",
+          "type": "string"
+        },
+        {
+          "const": "internal_error",
+          "description": "An invariant failed, or a worker reported a reason the API does not\nknow; a bug, always logged with context.",
+          "type": "string"
+        }
+      ]
+    },
+    "ClipVideo": {
+      "description": "A clip's video, as `started` reports it.",
+      "properties": {
+        "codec": {
+          "description": "The codec name (`h264`, `h265`).",
+          "type": "string"
+        },
+        "height": {
+          "description": "The picture's height in pixels, present with `width`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "width": {
+          "description": "The picture's width in pixels, cropping applied (ISO/IEC 14496-10\n§7.4.2.1.1, ITU-T H.265 §7.4.3.2.1); absent when the sequence\nparameter set does not give it.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "codec"
+      ],
+      "type": "object"
+    },
+    "ClipWarningCode": {
+      "description": "The code of a clip's `warning`: every code a clip may warn with, and\nnothing else.",
+      "oneOf": [
+        {
+          "const": "audio_omitted",
+          "description": "The stream's audio does not fit the clip's container; the clip has\nno audio, and the message names the codec.",
+          "type": "string"
+        }
+      ]
+    },
     "CloseCode": {
       "description": "The code of a `closed` event: every reason a session may end, and\nnothing else. The `source_*` codes and `worker_crashed` are also the\ncodes of `stream/get`'s `last_error`.",
       "oneOf": [
@@ -401,6 +718,13 @@
               "default": false,
               "description": "Keep the source connected without viewers: connected at put and\nreconnected after failures while set, so the first viewer gets a\nframe from the warm GOP cache. Changing only this never reconnects;\nturning it off with no viewers starts the linger.",
               "type": "boolean"
+            },
+            "preroll_ms": {
+              "default": 0,
+              "description": "Keep the last `preroll_ms` milliseconds of the stream's media in\nmemory, so a `clip/start` can begin before it was asked for; 0, the\ndefault, keeps none. At most `limits.preroll_max_ms`, and each track\nholds at most `limits.preroll_bytes` of whole GOPs, so the window\nheld may be shorter (`stream/get` reports it). Not a reason to\nconnect: the window fills only while `preload` or a viewer keeps\nthe source connected. Changing only this never reconnects.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
             },
             "sources": {
               "description": "The sources, in order; the first that provides a kind wins.",
@@ -845,6 +1169,91 @@
           ],
           "title": "BackchannelReleaseCommand",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`clip/start`: records an event clip of a stream; its bytes are\nfetched with `GET /v0/clips/{clip_id}`.",
+          "properties": {
+            "after_ms": {
+              "description": "How long the clip runs after now, in milliseconds, 1 to\n`limits.clip_max_ms`; absent, it runs until `clip/stop`, at most\n`limits.clip_max_ms`.",
+              "format": "uint32",
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "audio": {
+              "default": true,
+              "description": "Take the stream's audio into the clip when it fits the container\n(AAC-LC, Opus; any other codec is left out with an\n`audio_omitted` warning); `false` makes a video-only clip.",
+              "type": "boolean"
+            },
+            "before_ms": {
+              "default": 0,
+              "description": "How far before now the clip should start, in milliseconds, up to\n`limits.preroll_max_ms`; what the window holds bounds what it gets\n(`started.before_ms`).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "clip_id": {
+              "description": "The client's clip id, `^[A-Za-z0-9._-]{1,128}$` but `.` and `..`,\nwhich would be dot segments of the result's `url` (RFC 3986 §3.3),\nunique among the open clips; a ULID when absent.",
+              "pattern": "^(?:[A-Za-z0-9._-]{3,128}|[A-Za-z0-9_-][A-Za-z0-9._-]?|\\.[A-Za-z0-9_-])$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "description": "The command id, which becomes the subscription id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "description": "The stream to record.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "clip/start",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "stream_id"
+          ],
+          "title": "ClipStartCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`clip/stop`: ends a clip cleanly; idempotent.",
+          "properties": {
+            "clip_id": {
+              "description": "The clip.",
+              "pattern": "^(?:[A-Za-z0-9._-]{3,128}|[A-Za-z0-9_-][A-Za-z0-9._-]?|\\.[A-Za-z0-9_-])$",
+              "type": "string"
+            },
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "clip/stop",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "clip_id"
+          ],
+          "title": "ClipStopCommand",
+          "type": "object"
         }
       ]
     },
@@ -1119,10 +1528,50 @@
         },
         {
           "const": "no_video_track",
-          "description": "A re-offer has no video m-line, and its session plays video.",
+          "description": "A re-offer has no video m-line, and its session plays video; or\n`clip/start` on a stream without a video track.",
+          "type": "string"
+        },
+        {
+          "const": "clip_not_found",
+          "description": "`GET /v0/clips/{clip_id}` (HTTP 404) of a clip that is not open:\nnever started, already ended, or an id that is no clip id.",
+          "type": "string"
+        },
+        {
+          "const": "clip_id_in_use",
+          "description": "`clip/start` with the id of a clip that is still open.",
+          "type": "string"
+        },
+        {
+          "const": "clip_already_fetched",
+          "description": "`GET /v0/clips/{clip_id}` (HTTP 409) of a clip whose bytes another\nrequest already took: a clip has one body.",
           "type": "string"
         }
       ]
+    },
+    "EventFrame_for_ClipEvent": {
+      "description": "An `event` of a subscription; `id` is the subscribing command's.",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/ClipEvent",
+          "description": "The event."
+        },
+        "id": {
+          "description": "The subscription's command id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/EventTag",
+          "description": "`\"event\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "event"
+      ],
+      "type": "object"
     },
     "EventFrame_for_SessionEvent": {
       "description": "An `event` of a subscription; `id` is the subscribing command's.",
@@ -1415,6 +1864,27 @@
     "Limits": {
       "description": "The limits in force.",
       "properties": {
+        "clip_max_ms": {
+          "default": 0,
+          "description": "The longest clip, in milliseconds: the most `after_ms` may ask, and\nwhere an open-ended clip ends (`max_duration`).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "clips_per_stream": {
+          "default": 0,
+          "description": "Clips open at once on one stream.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_clips": {
+          "default": 0,
+          "description": "Clips open at once on all streams; 0 when the daemon records none.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "max_connections": {
           "description": "Control connections.",
           "format": "uint32",
@@ -1435,6 +1905,20 @@
         },
         "max_streams": {
           "description": "Streams.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "preroll_bytes": {
+          "default": 0,
+          "description": "The memory one track's pre-roll ring may hold, in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "preroll_max_ms": {
+          "default": 0,
+          "description": "The longest pre-roll window `stream/put` may ask for\n(`preroll_ms`), and so the furthest back a clip can start; 0 when\nthe daemon keeps none.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -2059,6 +2543,14 @@
           },
           "description": "Who talks to the camera through its backchannel."
         },
+        "clips": {
+          "default": [],
+          "description": "Open clip ids.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "last_error": {
           "anyOf": [
             {
@@ -2073,6 +2565,13 @@
         "preload": {
           "description": "Whether the stream stays connected without viewers.",
           "type": "boolean"
+        },
+        "preroll_ms": {
+          "default": 0,
+          "description": "The pre-roll window `stream/put` asked for, in milliseconds; 0\nwithout one. What each track holds is its `preroll`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         },
         "sessions": {
           "description": "Open session ids.",
@@ -2325,6 +2824,34 @@
           "minimum": 0,
           "type": "integer"
         },
+        "clip_bytes": {
+          "default": 0,
+          "description": "Bytes of clip files written to their bodies.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "clip_gaps": {
+          "default": 0,
+          "description": "Gaps in the stream's clips.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "clips_completed": {
+          "default": 0,
+          "description": "Clips that ended with their whole file written: `completed`,\n`stopped` or `max_duration`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "clips_started": {
+          "default": 0,
+          "description": "Clips started on the stream.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "datagrams_rejected": {
           "default": 0,
           "description": "Datagrams refused before they were read (RTSP over UDP): from an\naddress other than the camera's media ports, not RTP, or from\nanother synchronization source.",
@@ -2433,6 +2960,36 @@
         },
         "result": {
           "$ref": "#/$defs/ClientList",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_ClipStartResult": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/ClipStartResult",
           "description": "The command's result."
         },
         "success": {
@@ -2909,6 +3466,18 @@
           "description": "`video` or `audio`.",
           "type": "string"
         },
+        "preroll": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TrackPreroll"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What the track's pre-roll ring holds for clips; null without a\nwindow (`stream/put`'s `preroll_ms` 0). The worker's figures,\npushed once per second."
+        },
         "profile_level_id": {
           "description": "An H.264 track's `profile-level-id` (RFC 6184 §8.1): its sequence\nparameter set's `profile_idc`, constraint flags and `level_idc` as\nsix lowercase hex digits, as an SDP `fmtp` spells them (`42e01f`).\nAbsent on other codecs, and until the camera sent its SPS.",
           "pattern": "^[0-9a-f]{6}$",
@@ -2947,6 +3516,35 @@
         "sync",
         "frames",
         "bytes"
+      ],
+      "type": "object"
+    },
+    "TrackPreroll": {
+      "description": "A track's pre-roll ring, as `stream/get` reports it: whole GOPs of the\nnewest media, kept for clips while the stream has a window.",
+      "properties": {
+        "bytes": {
+          "description": "The memory the ring holds: its frames' payloads plus a fixed cost\nper frame, at most `limits.preroll_bytes`. The open GOP is also in\nthe track's GOP cache, so the two overlap; the frames are shared,\nnot copied.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "held_ms": {
+          "description": "The window it holds, in milliseconds: from its oldest keyframe to\nits newest frame; shorter than `preroll_ms` while it fills, after\na reconnect, or when `limits.preroll_bytes` caps it.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncations": {
+          "description": "GOPs larger than `limits.preroll_bytes` the ring could keep only\nthe start of.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bytes",
+        "held_ms",
+        "truncations"
       ],
       "type": "object"
     },
@@ -3133,6 +3731,9 @@
     "$ref": "#/$defs/Command"
   },
   "events": {
+    "clip/start": {
+      "$ref": "#/$defs/EventFrame_for_ClipEvent"
+    },
     "session/adopt": {
       "$ref": "#/$defs/EventFrame_for_SessionEvent"
     },
@@ -3157,6 +3758,12 @@
       "$ref": "#/$defs/Success_for_ClientList"
     },
     "clients/remove": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "clip/start": {
+      "$ref": "#/$defs/Success_for_ClipStartResult"
+    },
+    "clip/stop": {
       "$ref": "#/$defs/Success_for_Empty"
     },
     "info": {

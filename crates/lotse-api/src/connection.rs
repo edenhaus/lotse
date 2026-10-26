@@ -64,8 +64,8 @@ const CLOSE_UNSUPPORTED_DATA: u16 = 1003;
 /// the client was removed).
 const CLOSE_POLICY_VIOLATION: u16 = 1008;
 
-/// A JSON error body for a refused upgrade.
-fn refuse(status: StatusCode, code: ErrorCode, message: &str) -> Response {
+/// A JSON error body for a refused upgrade or clip request.
+pub(crate) fn refuse(status: StatusCode, code: ErrorCode, message: &str) -> Response {
     let body = serde_json::to_string(&ApiError::new(code, message)).unwrap_or_default();
     (status, [("content-type", "application/json")], body).into_response()
 }
@@ -230,10 +230,15 @@ async fn clients_remove(
     }
 }
 
-/// The token that closes connection `id` once its client is removed:
-/// registered with the TLS listener's clients for a peer that came through
-/// it, never cancelled for a peer on the socket.
-fn attach(clients: Option<&ClientStore>, peer: &PeerInfo, id: ConnectionId) -> CancellationToken {
+/// The token that closes connection `id`, an upgraded one or one sending
+/// a clip's body, once its client is removed: registered with the TLS
+/// listener's clients for a peer that came through it, never cancelled for
+/// a peer on the socket.
+pub(crate) fn attach(
+    clients: Option<&ClientStore>,
+    peer: &PeerInfo,
+    id: ConnectionId,
+) -> CancellationToken {
     match (clients, peer) {
         (Some(clients), PeerInfo::Tls { pin, .. }) => clients.attach(id, *pin),
         _ => CancellationToken::new(),
@@ -241,7 +246,7 @@ fn attach(clients: Option<&ClientStore>, peer: &PeerInfo, id: ConnectionId) -> C
 }
 
 /// Forgets connection `id`, which closed.
-fn detach(clients: Option<&ClientStore>, id: ConnectionId) {
+pub(crate) fn detach(clients: Option<&ClientStore>, id: ConnectionId) {
     if let Some(clients) = clients {
         clients.detach(id);
     }
@@ -642,14 +647,24 @@ impl<H: Handler> Connection<H> {
                 }
                 Outcome::Subscribed(events) => {
                     self.send(Class::Signaling, &Success::new(id, Empty::default()));
-                    let forwarder = lotse_core::task::spawn_named(
-                        "api.subscription",
-                        forward(id, events, Arc::clone(&self.outbox)).in_current_span(),
-                    );
-                    self.subscriptions.insert(id, forwarder);
+                    self.subscribe(id, events);
+                }
+                Outcome::SubscribedWith { result, events } => {
+                    self.send(Class::Signaling, &Success::new(id, result));
+                    self.subscribe(id, events);
                 }
             },
         }
+    }
+
+    /// Forwards subscription `id`'s `events` as frames from now on, until
+    /// they end or the client unsubscribes.
+    fn subscribe(&mut self, id: u64, events: mpsc::Receiver<Event>) {
+        let forwarder = lotse_core::task::spawn_named(
+            "api.subscription",
+            forward(id, events, Arc::clone(&self.outbox)).in_current_span(),
+        );
+        self.subscriptions.insert(id, forwarder);
     }
 }
 
@@ -658,7 +673,10 @@ impl<H: Handler> Connection<H> {
 const fn opens_subscription(command: &Command) -> bool {
     matches!(
         command,
-        Command::StreamSubscribe(_) | Command::WebrtcOffer(_) | Command::SessionAdopt(_)
+        Command::StreamSubscribe(_)
+            | Command::WebrtcOffer(_)
+            | Command::SessionAdopt(_)
+            | Command::ClipStart(_)
     )
 }
 

@@ -65,12 +65,12 @@ use lotse_core::throttle::Throttle;
 use rustls::crypto::SecureRandom;
 use serde::Deserialize;
 use subtle::ConstantTimeEq as _;
-use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::clients::ClientStore;
+use crate::clip::Watched;
 use crate::{MAX_UPGRADE_HEADER_BYTES, MAX_UPGRADE_HEADERS};
 
 /// How long a code stays valid: 10 minutes.
@@ -404,7 +404,7 @@ impl PairContext {
 /// [`PAIR_TIMEOUT`], then closes it and waits for a redemption it began.
 /// Anything but `POST /v1/pair` is 404 (405 for another method on it).
 pub(crate) async fn serve(
-    stream: TlsStream<TcpStream>,
+    stream: TlsStream<Watched>,
     context: PairContext,
     clock: Arc<dyn Clock>,
     shutdown: CancellationToken,
