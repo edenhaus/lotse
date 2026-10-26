@@ -551,6 +551,21 @@ impl ToOpus {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
+impl ToOpus {
+    /// A chain for `codec` whose every push of a frame with samples fails:
+    /// its chunks hold no sample, which its resampler refuses
+    /// ([`ResampleError::ChunkLength`]). The path of a transcode that
+    /// fails, which real input never takes (the chain cuts its PCM in the
+    /// resampler's own chunks, and libopus takes every 20 ms of finite
+    /// PCM), for the tests of what a clip does then.
+    pub fn failing(codec: &Codec) -> Result<Self, ToOpusError> {
+        let mut chain = Self::new(codec)?;
+        chain.chunk = 0;
+        Ok(chain)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -693,6 +708,47 @@ mod tests {
                 codec: Codec::Opus { channels: 1 },
                 clock_rate: 48_000,
             }
+        );
+    }
+
+    /// The test-util chain that fails refuses every frame with samples,
+    /// its resampler taking no chunk of none, and leaves one without out
+    /// as any chain does; it is built for what `new` builds, and its error
+    /// fails a clip as a container's would.
+    #[test]
+    fn a_failing_chain_refuses_every_frame_with_samples() {
+        for codec in CODECS {
+            let t0 = t0();
+            let rate = codec.sample_rate().unwrap();
+            let expected = (rate / CHUNKS_PER_SECOND) as usize;
+            let mut chain = ToOpus::failing(&codec).unwrap();
+            assert!(
+                chain
+                    .push(&frame(TS0, 0, t0, Vec::new()))
+                    .unwrap()
+                    .is_empty()
+            );
+            for frame in frames(&codec, &onset(rate, 0, 40), t0) {
+                assert_eq!(
+                    chain.push(&frame),
+                    Err(ToOpusError::Resample(ResampleError::ChunkLength {
+                        got: 0,
+                        expected
+                    })),
+                    "{codec:?}"
+                );
+            }
+        }
+        assert_eq!(
+            ToOpus::failing(&Codec::Opus { channels: 1 }).unwrap_err(),
+            ToOpusError::Unsupported(CodecFamily::Opus)
+        );
+        assert_eq!(
+            ClipError::from(ToOpusError::Resample(ResampleError::ChunkLength {
+                got: 0,
+                expected: 160
+            })),
+            ClipError::Failed("audio transcode: 0 samples, a chunk is 160".into())
         );
     }
 

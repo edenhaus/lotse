@@ -95,7 +95,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use lotse_codec::transcode::clip::{ToOpus, transcodes};
+use lotse_codec::transcode::clip::{ToOpus, ToOpusError, transcodes};
 use lotse_codec::{h264, h265};
 use lotse_core::clip::{ClipError, ClipMuxer, ClipMuxerFactory, ClipPolicy, ClipTrack};
 use lotse_core::clock::Clock;
@@ -272,6 +272,9 @@ pub(crate) struct ClipStart {
     pub(crate) settings: ClipSettings,
     /// The injected clock.
     pub(crate) clock: Arc<dyn Clock>,
+    /// How the clip builds its audio's transcode: [`ToOpus::new`], or a
+    /// test's chain that fails.
+    pub(crate) transcode: BuildTranscode,
 }
 
 /// One running clip's handles.
@@ -458,8 +461,11 @@ async fn run(
         factory,
         settings,
         clock,
+        transcode,
     } = start;
-    let mut clip = Clip::new(&spec, pipe, factory, settings, clock, started, reports);
+    let mut clip = Clip::new(
+        &spec, pipe, factory, settings, clock, transcode, started, reports,
+    );
     tracing::debug!(
         clip.id = %clip.id,
         before_ms = spec.before_ms,
@@ -692,14 +698,23 @@ fn sets_match(codec: &Codec, access_unit: &[u8]) -> bool {
     }
 }
 
+/// How a clip builds its audio's transcode for a codec: [`ToOpus::new`];
+/// a test's chain that fails in its place (`ToOpus::failing`, lotse-codec's
+/// `test-util`).
+pub(crate) type BuildTranscode = fn(&Codec) -> Result<ToOpus, ToOpusError>;
+
 /// The transcode of audio in `codec` that the container cannot carry as
-/// it is: G.711 or G.722 to Opus, when the container takes Opus; `None`
-/// otherwise. The chain reads the frames on the codec's own RTP clock
-/// ([`ToOpus::new`]), never the track's declared rate, which a reconnect
-/// that changes the codec keeps.
-fn transcoder(codec: &Codec, factory: &dyn ClipMuxerFactory) -> Option<ToOpus> {
+/// it is: G.711 or G.722 to Opus, when the container takes Opus, built by
+/// `build`; `None` otherwise. The chain reads the frames on the codec's own
+/// RTP clock ([`ToOpus::new`]), never the track's declared rate, which a
+/// reconnect that changes the codec keeps.
+fn transcoder(
+    codec: &Codec,
+    factory: &dyn ClipMuxerFactory,
+    build: BuildTranscode,
+) -> Option<ToOpus> {
     (transcodes(codec) && factory.accepts(&ToOpus::output().codec))
-        .then(|| ToOpus::new(codec).ok())
+        .then(|| build(codec).ok())
         .flatten()
 }
 
@@ -721,6 +736,8 @@ struct Clip {
     settings: ClipSettings,
     /// The injected clock.
     clock: Arc<dyn Clock>,
+    /// How it builds its audio's transcode ([`ClipStart::transcode`]).
+    transcode: BuildTranscode,
     /// The clock's reading at `StartClip`: where the pre-roll window and
     /// `after_ms` count from (`before_ms` counts from the container's
     /// start, [`Self::begin`]).
@@ -805,6 +822,7 @@ impl Clip {
         factory: Arc<dyn ClipMuxerFactory>,
         settings: ClipSettings,
         clock: Arc<dyn Clock>,
+        transcode: BuildTranscode,
         started: Instant,
         reports: mpsc::Sender<(String, ClipReport)>,
     ) -> Self {
@@ -829,6 +847,7 @@ impl Clip {
             factory,
             settings,
             clock,
+            transcode,
             started,
             end_at,
             end_reason,
@@ -962,7 +981,7 @@ impl Clip {
             return Err(EndReason::StreamChanged);
         }
         if !self.factory.accepts(&codec) {
-            self.transcoder = transcoder(&codec, self.factory.as_ref());
+            self.transcoder = transcoder(&codec, self.factory.as_ref(), self.transcode);
             if self.transcoder.is_none() {
                 self.omitted = Some(codec.name().to_owned());
                 return Ok(None);
@@ -1359,7 +1378,7 @@ impl Clip {
             // new codec takes its place.
             self.transcoder = None;
             if !self.factory.accepts(codec) {
-                self.transcoder = transcoder(codec, self.factory.as_ref());
+                self.transcoder = transcoder(codec, self.factory.as_ref(), self.transcode);
                 if self.transcoder.is_none() {
                     tracing::info!(clip.id = %self.id, codec = codec.name(), "clip: the audio changed before the start to a codec the container cannot carry nor the clip transcode; going without");
                     self.omitted = Some(codec.name().to_owned());
@@ -1670,6 +1689,8 @@ mod tests {
         audio: Option<Arc<Track>>,
         clips: Clips,
         reports: mpsc::Receiver<(String, ClipReport)>,
+        /// How the clips it starts build their audio's transcode.
+        transcode: BuildTranscode,
     }
 
     impl Rig {
@@ -1701,6 +1722,7 @@ mod tests {
                 audio,
                 clips: Clips::new(reports_tx),
                 reports,
+                transcode: ToOpus::new,
             }
         }
 
@@ -1815,6 +1837,7 @@ mod tests {
                 factory: Arc::new(factory),
                 settings,
                 clock,
+                transcode: self.transcode,
             });
             Reader(pipe::Receiver::from_owned_fd(OwnedFd::from(reader)).unwrap())
         }
@@ -2137,16 +2160,25 @@ mod tests {
     async fn a_transcode_needs_audio_it_can_transcode_and_a_container_that_takes_opus() {
         let fake = FakeClipMuxerFactory::default();
         for codec in [Codec::Pcmu, Codec::Pcma] {
-            assert!(transcoder(&codec, &fake).is_some(), "{codec:?}");
-            assert!(transcoder(&codec, &NoOpus).is_none(), "{codec:?}");
+            assert!(
+                transcoder(&codec, &fake, ToOpus::new).is_some(),
+                "{codec:?}"
+            );
+            assert!(
+                transcoder(&codec, &NoOpus, ToOpus::new).is_none(),
+                "{codec:?}"
+            );
         }
-        assert!(transcoder(&Codec::G722, &fake).is_some());
-        assert!(transcoder(&Codec::G722, &NoOpus).is_none());
+        assert!(transcoder(&Codec::G722, &fake, ToOpus::new).is_some());
+        assert!(transcoder(&Codec::G722, &NoOpus, ToOpus::new).is_none());
         let l16 = Codec::Unsupported {
             kind: Kind::Audio,
             name: "l16".into(),
         };
-        assert!(transcoder(&l16, &fake).is_none());
+        assert!(transcoder(&l16, &fake, ToOpus::new).is_none());
+        // A chain that cannot be built: no transcode, the audio omitted.
+        let unbuilt: BuildTranscode = |codec| Err(ToOpusError::Unsupported(codec.family()));
+        assert!(transcoder(&Codec::Pcmu, &fake, unbuilt).is_none());
 
         // A G.711 clip into the container without Opus: video only, and
         // the audio omitted with a warning.
@@ -4042,6 +4074,45 @@ mod tests {
         );
     }
 
+    /// A transcode that fails ends the clip `internal_error`, the container's
+    /// failure path, while it records and in a graceful end's drain alike,
+    /// not `stopped` as asked: no Opus packet goes into the file, which
+    /// still gets its last fragment, and the failure is logged as the
+    /// transcode's. A chain that fails on every frame with samples
+    /// (`ToOpus::failing`) stands for a libopus or resampler error, which
+    /// real input never makes.
+    #[tokio::test]
+    async fn a_failed_transcode_ends_the_clip_internal_error_while_recording_and_in_the_drain() {
+        let (logs, _guard) = Logs::capture();
+        for drain in [false, true] {
+            let mut rig = Rig::new(Some(Codec::Pcmu));
+            rig.transcode = ToOpus::failing;
+            ten_narrowband_seconds(&rig, &Codec::Pcmu);
+            let reader = rig.start(spec(3_500, None, true));
+            if drain {
+                // Before the clip's first poll: the pre-roll goes out in the drain.
+                assert!(rig.clips.stop("k1", EndReason::Stopped));
+            }
+            let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+            assert_eq!(reports.len(), 2, "drain {drain}: {reports:?}");
+            // The clip starts at 10 s; its keyframe, at 6 s, is 4 s old.
+            assert_eq!(reports[0], started(4_000, Some("opus")), "drain {drain}");
+            let_assert_reason(&reports, "internal_error");
+            let file = lines(&bytes);
+            assert_eq!(file[0], "init video=h264 audio=opus", "drain {drain}");
+            assert_eq!(file.last().unwrap(), "end", "drain {drain}");
+            assert!(audio_samples(&file).is_empty(), "drain {drain}");
+        }
+        let failed = logs.lines(Level::WARN, "clip: the container failed");
+        assert_eq!(failed.len(), 2);
+        assert!(
+            failed
+                .iter()
+                .all(|line| line.fields.contains("what=\"transcode\"")),
+            "{failed:?}"
+        );
+    }
+
     /// A reader that closes its end while the last fragment waits for the
     /// full pipe ends a graceful clip `client_gone`: the file it took is
     /// not whole. Any other end keeps its reason. Regression: the failed
@@ -4941,6 +5012,7 @@ mod tests {
             Arc::new(FakeClipMuxerFactory::default()),
             ClipSettings::default(),
             rig.clock.clone(),
+            ToOpus::new,
             rig.at(150),
             reports,
         );
