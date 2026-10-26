@@ -851,10 +851,10 @@ async fn rfc9112_7_1_a_reconnect_inside_a_clip_is_one_gap_where_the_file_has_it_
     cam.stop().await;
 }
 
-/// The worker dies while its clip runs: the clip ends `worker_crashed`
-/// with no bytes counted, and its body ends without its last chunk, a cut
-/// transfer (RFC 9112 §8), after the bytes the worker wrote: the file's
-/// beginning.
+/// The worker dies while its clip runs, its body fetched: the clip ends
+/// `worker_crashed` with no bytes counted, and its body ends without its
+/// last chunk, a cut transfer (RFC 9112 §8), after the bytes the worker
+/// wrote: the file's beginning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc9112_8_a_worker_crash_ends_the_clip_worker_crashed_and_cuts_its_body() {
     let cam = camera(None).await;
@@ -873,6 +873,12 @@ async fn rfc9112_8_a_worker_crash_ends_the_clip_worker_crashed_and_cuts_its_body
     let fetch = fetch_on_socket(&socket, result["url"].as_str().unwrap()).await;
     let started = control.event(id).await;
     assert_eq!(started["type"], "started", "{started}");
+    // The supervisor handed the body to the `GET` before the worker dies:
+    // a clip that ends `worker_crashed` keeps no body nobody took, so a
+    // `GET` it beat would find no clip (404). Neither `started` nor the
+    // request leaving the test says the body was taken.
+    let handed_out = json(&daemon.wait_for("\"event\":\"clip_fetched\""));
+    assert_eq!(handed_out["clip.id"], result["clip_id"], "{handed_out}");
 
     rustix::process::kill_process(
         rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
