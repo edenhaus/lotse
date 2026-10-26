@@ -5,9 +5,11 @@
 //! [`ReliableQueue`] takes what a clip's frame subscriptions yield (its
 //! video, and its audio when it has some) the moment they yield it, and the
 //! pre-roll they start from, so a track's broadcast never lags for a slow
-//! reader. [`Interleaver`] hands the queued items out in capture
-//! (`wallclock`) order. Both are pure: no task, no lock, no clock read;
-//! every "now" is the caller's injected clock.
+//! reader. [`Interleaver`] hands the queued items out in capture order by
+//! the ring's measure ([`captured`]: a frame dated ahead of its arrival
+//! counts from its arrival), the measure a clip's start, its end and the
+//! interleaver's hold count by too. Both are pure: no task, no lock, no
+//! clock read; every "now" is the caller's injected clock.
 //!
 //! Invariants: the producer never waits, so a frame that does not fit is
 //! dropped, never held back. A live frame counts its payload plus
@@ -144,11 +146,12 @@ struct Item {
 }
 
 impl Item {
-    /// The capture time of a frame; `None` for a gap or a control event,
-    /// which go out as soon as they lead their track.
-    fn wallclock(&self) -> Option<Instant> {
+    /// The capture time of a frame by the ring's measure ([`captured`]),
+    /// what the interleaver orders by; `None` for a gap or a control
+    /// event, which go out as soon as they lead their track.
+    fn captured(&self) -> Option<Instant> {
         match &self.entry {
-            Entry::Frame(frame) => Some(frame.wallclock),
+            Entry::Frame(frame) => Some(captured(frame)),
             Entry::Gap { .. } | Entry::Control(_) => None,
         }
     }
@@ -245,8 +248,7 @@ impl Lane {
     /// duplicates are the ones the track published after the clip
     /// subscribed: with the subscription and the snapshot taken together,
     /// at most the newest, which the track's source task held in the ring
-    /// but had not broadcast yet; more for a snapshot taken again later
-    /// from a frame of the first. They come first, in order; the first
+    /// but had not broadcast yet. They come first, in order; the first
     /// frame that is none of them ends the check.
     fn is_duplicate(&mut self, frame: &Arc<MediaFrame>) -> bool {
         if let Some(at) = self
@@ -545,6 +547,19 @@ impl ReliableQueue {
         }
     }
 
+    /// The oldest frame `track` queued that is not out yet, past the gaps
+    /// and control events ahead of it: where a sink that took none of the
+    /// track's frames starts it.
+    pub fn first_frame(&self, track: Kind) -> Option<&Arc<MediaFrame>> {
+        self.lane(track)
+            .items
+            .iter()
+            .find_map(|item| match &item.entry {
+                Entry::Frame(frame) => Some(frame),
+                Entry::Gap { .. } | Entry::Control(_) => None,
+            })
+    }
+
     /// The oldest item `track` queued, taken out.
     pub fn pop(&mut self, track: Kind) -> Option<Out> {
         let item = self.lane_mut(track).items.pop_front()?;
@@ -565,13 +580,17 @@ impl ReliableQueue {
 /// Hands a [`ReliableQueue`]'s items out in capture order: always the
 /// queued frame captured first (video on a tie), but held while the other
 /// track, still open and with nothing queued, has not reached its capture
-/// time with its latest frame (counted by its arrival when dated ahead of
-/// it, and taken back when a Sender Report moves the capture times back),
-/// for at most `max_skew` after it was queued. So an audio path that
-/// delivers late still lands in order, and a track that stops sending
-/// delays the other by `max_skew` at most. A gap or a control event goes
-/// out as soon as it leads its track (video's first), so a sink learns of
-/// it before it writes the frames that follow it.
+/// time with its latest frame (taken back when a Sender Report moves the
+/// capture times back), for at most `max_skew` after it was queued. So an
+/// audio path that delivers late still lands in order, and a track that
+/// stops sending delays the other by `max_skew` at most. Capture times are
+/// the ring's measure ([`captured`]), the one a clip starts and ends by: a
+/// frame dated ahead of its arrival (RFC 3550 §6.4.1, a Sender Report
+/// mapping off) counts from its arrival, so a frame at a clip's end goes
+/// out only after the other track's frames captured before it, which by
+/// their dates went out behind it. A gap or a control event goes out as
+/// soon as it leads its track (video's first), so a sink learns of it
+/// before it writes the frames that follow it.
 #[derive(Debug)]
 pub struct Interleaver {
     /// The queue merged.
@@ -621,7 +640,7 @@ impl Interleaver {
         if let Some(lane) = lanes.iter().find(|lane| {
             lane.items
                 .front()
-                .is_some_and(|item| item.wallclock().is_none())
+                .is_some_and(|item| item.captured().is_none())
         }) {
             return Some((lane.kind, None));
         }
@@ -629,7 +648,7 @@ impl Interleaver {
             .iter()
             .filter_map(|lane| {
                 let item = lane.items.front()?;
-                Some((lane.kind, item.wallclock()?, item.queued))
+                Some((lane.kind, item.captured()?, item.queued))
             })
             .min_by_key(|(_, at, _)| *at)?;
         let other = self.queue.lane(match lead {
@@ -1438,7 +1457,7 @@ mod tests {
             assert!(track.publish_frame(MediaFrame::clone(&clip.frame(ms, keyframe, 10))));
         };
         publish(0, true);
-        let (mut subscription, snapshot) = track.subscribe_from_preroll(clip.at(80));
+        let (mut subscription, snapshot, _, _) = track.subscribe_from_preroll(clip.at(80));
         publish(40, false);
         publish(80, true);
         publish(120, false);
@@ -1485,7 +1504,7 @@ mod tests {
             },
             clip.now(),
         ));
-        let (mut subscription, snapshot) = track.subscribe_from_preroll(clip.at(0));
+        let (mut subscription, snapshot, _, _) = track.subscribe_from_preroll(clip.at(0));
         assert!(snapshot.is_none(), "no window, no pre-roll");
         let publish = |ms: u64, keyframe: bool, bytes: usize| {
             track.publish_frame(MediaFrame::clone(&clip.frame(ms, keyframe, bytes)))
@@ -1593,6 +1612,26 @@ mod tests {
             ]
         );
         assert_eq!(queue.bytes(), 0);
+    }
+
+    /// A sink that took none of a track's frames starts it at the oldest
+    /// frame its lane holds, past the control events ahead of it; none
+    /// for a track that queued none.
+    #[test]
+    fn the_first_frame_is_the_oldest_queued_past_the_events_ahead_of_it() {
+        let clip = Clip::new();
+        let mut queue = ReliableQueue::new(usize::MAX, true);
+        assert!(queue.first_frame(Kind::Video).is_none());
+        queue.push(Kind::Video, TrackEvent::EpochStart { epoch: 1 }, clip.now());
+        clip.push(&mut queue, Kind::Video, 40, true);
+        clip.push(&mut queue, Kind::Video, 80, false);
+        let first = |queue: &ReliableQueue| queue.first_frame(Kind::Video).map(|f| f.wallclock);
+        assert_eq!(first(&queue), Some(clip.at(40)));
+        assert!(queue.first_frame(Kind::Audio).is_none());
+        assert_eq!(drain(&mut queue, Kind::Video, &clip).len(), 3);
+        assert_eq!(first(&queue), None);
+        clip.push(&mut queue, Kind::Video, 120, false);
+        assert_eq!(first(&queue), Some(clip.at(120)));
     }
 
     #[test]
@@ -1742,6 +1781,26 @@ mod tests {
         assert_eq!(
             drain(&mut queue, Kind::Video, &clip),
             ["v0", "v3600000", "vgap lagged 1100-1100", "v1100"]
+        );
+    }
+
+    /// A frame dated ahead of its arrival by a Sender Report mapping off
+    /// (RFC 3550 §6.4.1) goes out by its arrival, the measure a clip ends
+    /// by, never behind the other track's frames up to its date.
+    #[test]
+    fn rfc3550_6_4_1_a_frame_dated_ahead_of_its_arrival_goes_out_by_its_arrival() {
+        let clip = Clip::new();
+        let mut merged = interleaver(true);
+        clip.push(merged.queue_mut(), Kind::Video, 0, true);
+        clip.push(merged.queue_mut(), Kind::Audio, 0, true);
+        clip.push_arrived(merged.queue_mut(), Kind::Video, 3_600_000, 40, false);
+        for ms in [20, 60] {
+            clip.push(merged.queue_mut(), Kind::Audio, ms, true);
+        }
+        assert_eq!(
+            release(&mut merged, &clip),
+            ["v0", "a0", "a20", "v3600000"],
+            "a60 waits for the video past 40 ms, its arrival, not its date"
         );
     }
 

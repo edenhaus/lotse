@@ -1239,6 +1239,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one switch followed through every track and branch"
+    )]
     async fn a_standby_source_switches_in_at_its_first_keyframe_and_the_old_one_is_dropped() {
         let (logs, _guard) = Logs::capture();
         let live = TrackSet::new(TrackLimits::default(), SystemClock.now());
@@ -1275,13 +1279,14 @@ mod tests {
         sa0.publish_packet(packet(1, false));
         sv0.publish_packet(packet(2, false));
         assert_eq!((v0.stats().packets, a0.stats().packets), (0, 0));
-        // The keyframe switches: a new epoch on every live track, the
-        // standby's codecs on them, then the keyframe itself.
+        // The keyframe switches: the boundary and a new epoch on every live
+        // track, the standby's codecs on them, then the keyframe itself.
         sv0.publish_packet(packet(3, true));
         assert_eq!(*switched.borrow_and_update(), 1);
         assert_armed_and_switched_once(&logs);
         assert!(staging.is_active() && !live.is_active());
         assert_eq!(live.feeds().active(), 1);
+        assert_eq!(video.next().await, Some(TrackEvent::SourceSwitched));
         assert_eq!(
             video.next().await,
             Some(TrackEvent::EpochStart { epoch: 1 })
@@ -1291,6 +1296,7 @@ mod tests {
             Some(TrackEvent::TrackChanged(Arc::new(h265())))
         );
         assert_eq!(next_packet(&mut video).await, (3, 1));
+        assert_eq!(audio.next().await, Some(TrackEvent::SourceSwitched));
         assert_eq!(
             audio.next().await,
             Some(TrackEvent::EpochStart { epoch: 1 })
@@ -1358,6 +1364,47 @@ mod tests {
         assert_eq!(live.ingest().packets_lost, 1);
     }
 
+    /// A switch is a stream boundary for the pre-roll and for frame
+    /// subscribers, with the same codec too: the live ring drops the old
+    /// source's frames and holds the standby's first keyframe on, and a
+    /// frame subscription yields the old source's frames queued before the
+    /// switch, then `SourceSwitched` and the new epoch, then the standby's.
+    /// Regression: the ring kept the old source's GOPs, so a clip started
+    /// after the switch began in the old source, and its subscription had
+    /// nothing in band to tell a switch from a reconnect.
+    #[tokio::test]
+    async fn a_switch_drops_the_old_source_s_pre_roll_and_comes_in_its_place_among_the_frames() {
+        let t0 = SystemClock.now();
+        let live = TrackSet::new(TrackLimits::default(), t0);
+        let v0 = live.publisher().declare(Kind::Video, h264(), 90_000);
+        v0.set_preroll(Some(Duration::from_secs(30)));
+        let mut frames = v0.subscribe(Unit::Frames);
+        assert!(v0.publish_frame(frame(true)));
+        let staging = TrackSet::staging(&live);
+        let mut standby = staging.publisher();
+        let sv0 = standby.declare(Kind::Video, h264(), 90_000);
+        standby.ready();
+        staging.arm_switch();
+        assert!(sv0.publish_frame(frame(true)));
+        assert_eq!(v0.codec().family(), CodecFamily::H264, "the same codec");
+        let held: Vec<u32> = v0
+            .preroll_snapshot(t0)
+            .unwrap()
+            .frames()
+            .map(|frame| frame.epoch)
+            .collect();
+        assert_eq!(held, [1], "only the standby's keyframe");
+        crate::let_assert!(Some(TrackEvent::Frame(old)) = frames.next().await);
+        assert_eq!(old.epoch, 0);
+        assert_eq!(frames.next().await, Some(TrackEvent::SourceSwitched));
+        assert_eq!(
+            frames.next().await,
+            Some(TrackEvent::EpochStart { epoch: 1 })
+        );
+        crate::let_assert!(Some(TrackEvent::Frame(new)) = frames.next().await);
+        assert!(new.keyframe && new.epoch == 1);
+    }
+
     #[tokio::test]
     async fn a_standby_without_video_switches_at_its_first_item_and_declares_what_the_live_set_lacks()
      {
@@ -1380,6 +1427,11 @@ mod tests {
         assert_eq!((v0.epoch(), live.tracks().len()), (1, 2));
         sa0.publish_packet(packet(2, false));
         assert_eq!(a0.stats().packets, 2);
+        assert!(
+            sa0.publish_frame(frame(true)),
+            "the track the switch declared takes the standby's frames"
+        );
+        assert_eq!(a0.stats().frames, 1);
         // A second standby forwards into the live tracks as well, the
         // ones the first standby brought included; the first's writes are
         // dropped.

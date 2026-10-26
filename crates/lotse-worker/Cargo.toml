@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+bytes = { workspace = true } # the clip container's output, written into the pipe as the frames' own slices
 libc = { workspace = true } # the layout and names of the DSCP and source-address control messages (`cmsghdr`, `IP_TOS`, `IPV6_TCLASS`, `in_pktinfo`, `in6_pktinfo`)
 rustix = { workspace = true } # moves the shared UDP socket to the descriptor number the seccomp filter names (`F_DUPFD_CLOEXEC`)
 socket2 = { workspace = true } # `sendmsg` with the audio track's DSCP and the candidate's source address as control messages

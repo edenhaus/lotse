@@ -102,6 +102,11 @@ exclude_re = [
     "clients.rs:.*replace match guard err == Errno::WOULDBLOCK with true in ClientStore::open$",
     # A directory sync shows only after a crash: skipping it changes nothing a test can see.
     "clients.rs:.*replace fsync_dir -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
+    # `Clip::queue` leaves no empty slice pending, and a write of at least one byte to a pipe
+    # writes at least one or fails (POSIX `write`, Linux `pipe(7)`): `Ok(0)` never comes, so
+    # the guard, there so it could not loop forever, picks what `true` and `>=` pick.
+    "clip.rs:.*replace match guard written > 0 with true in Clip::write$",
+    "clip.rs:.*replace > with >= in Clip::write$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
 ]

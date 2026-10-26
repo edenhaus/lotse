@@ -31,7 +31,7 @@ use crate::clock_map::ticks_between;
 use crate::codec::{Codec, Kind};
 use crate::lateness::LatenessMeter;
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
-use crate::preroll::{Preroll, PrerollFloor, PrerollSnapshot, PrerollStats};
+use crate::preroll::{Preroll, PrerollFloor, PrerollSnapshot, PrerollStats, Truncation};
 use crate::throttle::Throttle;
 
 /// The id of a track within its stream: a kind letter and an index (`v0`,
@@ -95,7 +95,8 @@ pub const DEFAULT_FRAME_CAPACITY: usize = 64;
 
 /// Capacity of the control-event broadcast. Control events are rare (an
 /// epoch per reconnect, a codec change, a source loss), so a subscriber
-/// that lags here is broken and is told so.
+/// that lags here is broken and is told so: a frame subscription with
+/// [`TrackEvent::ControlLost`], a packet subscription with a warning.
 const CONTROL_CAPACITY: usize = 16;
 
 /// The bounds a track enforces.
@@ -293,8 +294,10 @@ impl Counters {
 }
 
 /// What a track tells its subscribers besides media. Delivered on a channel
-/// of its own; media items carry their epoch, so a subscriber never needs
-/// the two channels ordered against each other.
+/// of its own, each stamped with how many frames the track had broadcast
+/// before it, so a frame subscription yields it in its place among the
+/// frames ([`TrackSubscription::next`]); a packet subscription yields it
+/// ahead of the packets still queued, which carry their epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackControlEvent {
     /// A new epoch began: a timestamp discontinuity or a reconnect. Live
@@ -310,6 +313,10 @@ pub enum TrackControlEvent {
     SourceLost,
     /// The source connection is back.
     SourceRestored,
+    /// The connection switched to another source ([`Feeds`]): another
+    /// stream from here on, whose epoch starts next. The pre-roll ring
+    /// keeps nothing from before it.
+    SourceSwitched,
     /// The track is being torn down (stream deleted, worker stopping).
     /// Subscriptions end at once; items still queued are discarded.
     Closed,
@@ -351,6 +358,21 @@ pub enum TrackEvent {
     SourceLost,
     /// See [`TrackControlEvent::SourceRestored`].
     SourceRestored,
+    /// See [`TrackControlEvent::SourceSwitched`].
+    SourceSwitched,
+    /// A frame subscription missed control events: it fell as many
+    /// events behind as the track's control channel holds (16), and the
+    /// oldest were overwritten. What they said (a codec change, a source switch) is
+    /// unknown, and so is where among the frames they came, so the codec
+    /// of the frames from here on is unknown too: a sink that writes
+    /// frames under a descriptor cannot go on. It comes before any frame
+    /// the track published after the events lost, the frames before them
+    /// possibly still to come. A packet subscription logs the loss instead,
+    /// its packets carrying their payload type.
+    ControlLost {
+        /// How many control events were lost.
+        skipped: u64,
+    },
 }
 
 impl TrackEvent {
@@ -362,6 +384,7 @@ impl TrackEvent {
             TrackControlEvent::TrackChanged(codec) => Some(Self::TrackChanged(codec)),
             TrackControlEvent::SourceLost => Some(Self::SourceLost),
             TrackControlEvent::SourceRestored => Some(Self::SourceRestored),
+            TrackControlEvent::SourceSwitched => Some(Self::SourceSwitched),
             TrackControlEvent::Closed => None,
         }
     }
@@ -377,11 +400,20 @@ enum MediaSubscription {
 }
 
 impl MediaSubscription {
-    /// Waits for the next media item as a [`TrackEvent`].
-    async fn recv(&mut self) -> Result<TrackEvent, SubscriptionError> {
+    /// Waits for the next media item as a [`TrackEvent`], with its
+    /// sequence number on a frame subscription.
+    async fn recv(&mut self) -> Result<(Option<u64>, TrackEvent), SubscriptionError> {
         match self {
-            Self::Packets(sub) => sub.recv().await.map(TrackEvent::Packet),
-            Self::Frames(sub) => sub.recv().await.map(TrackEvent::Frame),
+            Self::Packets(sub) => sub
+                .recv()
+                .await
+                .map(|packet| (None, TrackEvent::Packet(packet))),
+            Self::Frames(sub) => sub
+                .0
+                .recv()
+                .await
+                .map(|(seq, item)| (Some(seq), frame_event(item)))
+                .map_err(SubscriptionError::from),
         }
     }
 }
@@ -394,8 +426,15 @@ pub struct TrackSubscription {
     track: Arc<Track>,
     /// The media items.
     media: MediaSubscription,
-    /// The control events.
-    control: broadcast::Receiver<TrackControlEvent>,
+    /// The control events, each with the number of frames the track had
+    /// broadcast before it.
+    control: broadcast::Receiver<(u64, TrackControlEvent)>,
+    /// A control event taken while frames broadcast before it may still be
+    /// queued, with that number: it waits for them.
+    pending: Option<(u64, TrackEvent)>,
+    /// A frame item taken with its sequence number while control events
+    /// published before it may still be queued: they come first.
+    after: Option<(u64, TrackEvent)>,
     /// Rate-limits the line of a lag on the control events, which a
     /// camera changing its codec on every frame causes on every
     /// [`CONTROL_CAPACITY`]th.
@@ -410,10 +449,24 @@ impl TrackSubscription {
 
     /// The next event, or `None` once the track is closed. Control events
     /// take precedence over queued media so a sink learns about an epoch
-    /// or a codec change before it writes the items that follow.
+    /// or a codec change before it writes the items that follow. On a frame
+    /// subscription that precedence stops at the event's place: every
+    /// frame the track broadcast before the event comes first, so a frame
+    /// is always written under the codec it was published with, and none of
+    /// another source's frames comes before its `SourceSwitched`. A packet
+    /// subscription yields the event at once. `Closed` ends a subscription
+    /// at once either way. Control events lost to a lag are
+    /// [`TrackEvent::ControlLost`] on a frame subscription, ahead of the
+    /// next frame, and a warning on a packet subscription.
     pub async fn next(&mut self) -> Option<TrackEvent> {
         if self.track.is_closed() {
             return None;
+        }
+        if let Some((seq, event)) = self.after.take() {
+            return self.behind_controls(seq, event);
+        }
+        if let Some((before, event)) = self.pending.take() {
+            return Some(self.in_order(before, event));
         }
         loop {
             tokio::select! {
@@ -423,19 +476,100 @@ impl TrackSubscription {
                 // the subscription like `TrackControlEvent::Closed`.
                 control = self.control.recv() => match control {
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        if let Some(count) = self.lags.hit(self.track.activity_clock()) {
-                            tracing::warn!(track = %self.track.id, skipped, count, "subscriber missed control events");
+                        self.missed(skipped);
+                        if matches!(self.media, MediaSubscription::Frames(_)) {
+                            return Some(TrackEvent::ControlLost { skipped });
                         }
                     }
-                    event => return event.ok().and_then(TrackEvent::from_control),
+                    event => {
+                        let (before, event) = event.ok()?;
+                        let event = TrackEvent::from_control(event)?;
+                        return Some(self.in_order(before, event));
+                    }
                 },
                 media = self.media.recv() => match media {
+                    Ok((Some(seq), event)) => return self.behind_controls(seq, event),
                     Err(SubscriptionError::Lagged(skipped)) => return Some(TrackEvent::Gap { skipped }),
-                    event => return event.ok(),
+                    // A packet; `Closed` never comes, as above.
+                    media => return media.ok().map(|(_, event)| event),
                 },
             }
         }
     }
+
+    /// `event`, which the track published after its first `before` frames,
+    /// or on a frame subscription a frame queued from before it (or that
+    /// frame's drop, or a lag), `event` then waiting for the next call. A
+    /// frame broadcast after it waits for the call after `event`'s. With
+    /// nothing queued every earlier frame came already: the track
+    /// broadcast it before the event, which came through a channel after
+    /// it.
+    fn in_order(&mut self, before: u64, event: TrackEvent) -> TrackEvent {
+        let MediaSubscription::Frames(frames) = &mut self.media else {
+            return event;
+        };
+        match frames.0.try_recv() {
+            Ok((seq, item)) if seq < before => {
+                self.pending = Some((before, event));
+                frame_event(item)
+            }
+            Ok((seq, item)) => {
+                self.after = Some((seq, frame_event(item)));
+                event
+            }
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                self.pending = Some((before, event));
+                TrackEvent::Gap { skipped }
+            }
+            // The subscription holds the track, which holds the sender.
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                event
+            }
+        }
+    }
+
+    /// `event`, the frame item numbered `seq`, unless a control event the
+    /// track published before it is queued: that event then, `event`
+    /// waiting for the next call. A control event published after it waits
+    /// for the frames before it ([`Self::in_order`]); `None` for `Closed`.
+    /// Control events lost to a lag may have come before it, so
+    /// [`TrackEvent::ControlLost`] comes first then, `event` waiting.
+    fn behind_controls(&mut self, seq: u64, event: TrackEvent) -> Option<TrackEvent> {
+        match self.control.try_recv() {
+            Ok((before, control)) => {
+                let control = TrackEvent::from_control(control)?;
+                if before <= seq {
+                    self.after = Some((seq, event));
+                    return Some(control);
+                }
+                self.pending = Some((before, control));
+                Some(event)
+            }
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                self.missed(skipped);
+                self.after = Some((seq, event));
+                Some(TrackEvent::ControlLost { skipped })
+            }
+            // As in `next`: the track holds the sender.
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                Some(event)
+            }
+        }
+    }
+
+    /// The subscription missed `skipped` control events: logged,
+    /// rate-limited.
+    fn missed(&mut self, skipped: u64) {
+        if let Some(count) = self.lags.hit(self.track.activity_clock()) {
+            tracing::warn!(track = %self.track.id, skipped, count, "subscriber missed control events");
+        }
+    }
+}
+
+/// A frame broadcast's item as a [`TrackSubscription`] yields it: the
+/// frame, or for one the track dropped over `max_frame_bytes` a gap of one.
+fn frame_event(item: Option<Arc<MediaFrame>>) -> TrackEvent {
+    item.map_or(TrackEvent::Gap { skipped: 1 }, TrackEvent::Frame)
 }
 
 /// Why a subscription yielded no item.
@@ -466,9 +600,11 @@ impl From<broadcast::error::RecvError> for SubscriptionError {
 pub struct PacketSubscription(broadcast::Receiver<Arc<MediaPacket>>);
 
 /// A subscription to a track's side-branch frames, starting at the live edge;
-/// a frame the track dropped over `max_frame_bytes` is a lag of one.
+/// a frame the track dropped over `max_frame_bytes` is a lag of one. The
+/// channel carries each with its sequence number, which a
+/// [`TrackSubscription`] orders the control events by.
 #[derive(Debug)]
-pub struct FrameSubscription(broadcast::Receiver<Option<Arc<MediaFrame>>>);
+pub struct FrameSubscription(broadcast::Receiver<(u64, Option<Arc<MediaFrame>>)>);
 
 /// Implements the receive side of a broadcast subscription: `$deliver`
 /// turns what the channel carries into the `$item` a subscriber takes, or
@@ -512,9 +648,12 @@ macro_rules! subscription {
 subscription!(PacketSubscription, Arc<MediaPacket>, Ok);
 subscription!(FrameSubscription, Arc<MediaFrame>, dropped_as_lag);
 
-/// A frame broadcast's item as a subscriber takes it: `None`, a frame the
-/// track dropped over `max_frame_bytes`, is one item missed.
-fn dropped_as_lag(item: Option<Arc<MediaFrame>>) -> Result<Arc<MediaFrame>, SubscriptionError> {
+/// A frame broadcast's item as a subscriber takes it, its sequence number
+/// aside: `None`, a frame the track dropped over `max_frame_bytes`, is one
+/// item missed.
+fn dropped_as_lag(
+    (_, item): (u64, Option<Arc<MediaFrame>>),
+) -> Result<Arc<MediaFrame>, SubscriptionError> {
     item.ok_or(SubscriptionError::Lagged(1))
 }
 
@@ -528,10 +667,15 @@ fn dropped_as_lag(item: Option<Arc<MediaFrame>>) -> Result<Arc<MediaFrame>, Subs
 /// as a standby while the old one keeps streaming (make before break).
 /// Once the standby is live the worker arms it; its writes are dropped
 /// until its video's first keyframe (or its first item, without video),
-/// which switches: every live track starts a new epoch and takes the
-/// standby's codec, the live set is ready, and from then on the standby's
-/// writes reach the live tracks while the old source's are dropped.
-/// Sessions see a hot swap, as on a reconnect.
+/// which switches: every live track drops its pre-roll, takes the
+/// standby's frames and codec instead of the old source's, tells its
+/// subscribers `SourceSwitched` and starts a new epoch, the live set is
+/// ready, and from then on the standby's writes reach the live tracks
+/// while the old source's are dropped. A track takes the move under the
+/// lock its frames and codec changes land under, so one the old source
+/// wrote while the switch ran lands wholly before it or not at all.
+/// Sessions see a hot swap, as on a reconnect; a clip ends there, since
+/// another source is another stream.
 #[derive(Debug)]
 pub struct Feeds {
     /// The tag whose writes reach the live tracks.
@@ -640,9 +784,11 @@ impl Feeds {
         true
     }
 
-    /// Switches to the armed standby `tag`: a new epoch on every live
-    /// track, the standby's codecs on their counterparts, live tracks
-    /// declared for standby tracks without one, the live set ready.
+    /// Switches to the armed standby `tag`: on every live track the
+    /// switch's boundary ([`Track::switch_source`]) and a new epoch, the
+    /// standby's codecs on their counterparts, live tracks declared for
+    /// standby tracks without one (fed by the standby from the outset), the
+    /// live set ready; all before the standby's first write reaches them.
     fn switch(&self, tag: u8) {
         let staging: Vec<Arc<Track>> = std::mem::take(
             &mut *self
@@ -656,16 +802,18 @@ impl Feeds {
         let live = self.live.upgrade();
         if let Some(live) = &live {
             for track in live.tracks() {
+                track.switch_source(tag);
                 track.start_epoch_inner();
             }
         }
         for track in &staging {
             let codec = (*track.codec()).clone();
             match track.forward_to.load_full() {
-                Some(target) => target.set_codec_inner(codec),
+                Some(target) => target.set_codec_inner(tag, codec),
                 None => {
                     if let Some(live) = &live {
                         let declared = live.declare(track.id(), codec, track.clock_rate());
+                        declared.switch_source(tag);
                         track.forward_to.store(Some(declared));
                     }
                 }
@@ -686,6 +834,21 @@ impl Feeds {
     }
 }
 
+/// What a track's pre-roll lock guards together: the ring, and which
+/// source's frames and codec changes the track takes. A source switch
+/// moves `source` and clears `ring` in one critical section
+/// ([`Track::switch_source`]), and a frame or codec change checks `source`
+/// in the critical section where it reaches the ring, the descriptor and
+/// the broadcast, so each lands wholly before a switch or not at all.
+#[derive(Debug)]
+struct Fed {
+    /// The pre-roll ring.
+    ring: Preroll,
+    /// The tag ([`Feeds`]) of the source whose writes the track takes:
+    /// the track's own at first, the standby's from the switch to it on.
+    source: u8,
+}
+
 /// One media track: codec descriptor, packet broadcast, frame broadcast,
 /// GOP cache and counters. Written by the source task, read by every sink
 /// of the connection. A staging track ([`TrackSet::staging`](crate::source::TrackSet::staging))
@@ -701,15 +864,22 @@ pub struct Track {
     /// The live path: every packet, as read.
     packets: broadcast::Sender<Arc<MediaPacket>>,
     /// The side branch: every accepted frame, and `None` for one dropped
-    /// over `max_frame_bytes`, which a subscriber takes as a lag of one.
-    frames: broadcast::Sender<Option<Arc<MediaFrame>>>,
+    /// over `max_frame_bytes`, which a subscriber takes as a lag of one;
+    /// each with its sequence number.
+    frames: broadcast::Sender<(u64, Option<Arc<MediaFrame>>)>,
+    /// How many items the side branch broadcast: the next one's sequence
+    /// number, and what a control event carries, so a frame subscription
+    /// yields the event after the frames before it
+    /// ([`TrackSubscription::next`]).
+    frame_seq: AtomicU64,
     /// The GOP cache; `None` until the first keyframe. Video only.
     gop: ArcSwapOption<GopSnapshot>,
     /// The last side-branch frame accepted, the anchor of
     /// [`Track::capture_time`].
     last_frame: ArcSwapOption<MediaFrame>,
-    /// Control events: epochs, codec changes, source loss.
-    control: broadcast::Sender<TrackControlEvent>,
+    /// Control events: epochs, codec changes, source loss and switches;
+    /// each with the number of frames broadcast before it.
+    control: broadcast::Sender<(u64, TrackControlEvent)>,
     /// The current epoch, stamped on every item.
     epoch: AtomicU32,
     /// The next frame is the first of a new epoch and gets `discontinuity`.
@@ -729,10 +899,11 @@ pub struct Track {
     /// two parameter sets makes on every frame; taken only by whoever sets
     /// the codec, the source's task.
     codec_changes: Mutex<Throttle>,
-    /// The pre-roll ring; holds nothing until a window is set. Only the
-    /// source's task publishes, and only a clip's start reads it, so the
-    /// lock is never contended.
-    preroll: Mutex<Preroll>,
+    /// The pre-roll ring, which holds nothing until a window is set, and
+    /// the source the track takes. The source's task publishes under the
+    /// lock, a clip's start and a switch take it; the old source's task
+    /// only while a switch runs.
+    preroll: Mutex<Fed>,
     /// The oldest keyframe of the live set's `v0` ring, which the audio
     /// rings trim by; shared by the connection's tracks, staging ones
     /// included, and written only by that live `v0`
@@ -810,6 +981,7 @@ impl Track {
             codec: ArcSwap::from_pointee(codec),
             packets,
             frames,
+            frame_seq: AtomicU64::new(0),
             gop: ArcSwapOption::empty(),
             last_frame: ArcSwapOption::empty(),
             control,
@@ -819,7 +991,10 @@ impl Track {
             gop_truncations: Mutex::new(Throttle::default()),
             oversize_drops: Mutex::new(Throttle::default()),
             codec_changes: Mutex::new(Throttle::default()),
-            preroll: Mutex::new(Preroll::new(id.kind() == Kind::Video)),
+            preroll: Mutex::new(Fed {
+                ring: Preroll::new(id.kind() == Kind::Video),
+                source: tag,
+            }),
             preroll_floor,
             closed: AtomicBool::new(false),
             origin,
@@ -897,12 +1072,12 @@ impl Track {
     pub fn set_codec(&self, codec: Codec) {
         if self.fed() {
             match self.forwarded() {
-                Some(target) => target.set_codec_inner(codec),
-                None => self.set_codec_inner(codec),
+                Some(target) => target.set_codec_inner(self.tag, codec),
+                None => self.set_codec_inner(self.tag, codec),
             }
         } else if self.tag != 0 {
             // A standby's codec, kept for the switch.
-            self.set_codec_inner(codec);
+            self.set_codec_inner(self.tag, codec);
         }
     }
 
@@ -914,7 +1089,20 @@ impl Track {
     /// does Opus's channel count), so the frames before it would be read
     /// with the new descriptor. A video keyframe carries its parameter sets
     /// in-band ([`MediaFrame::payload`]), so a video ring keeps its GOPs.
-    fn set_codec_inner(&self, codec: Codec) {
+    /// The ring's clearing, the new descriptor and the event happen under
+    /// the ring's lock, so a clip's subscription, snapshot and descriptor
+    /// ([`Self::subscribe_from_preroll`]) are all on one side of the change.
+    /// Under the same lock, a change `writer` (a source's tag) made is
+    /// dropped once the track takes another source: the old source's,
+    /// made while a switch ran, would label the standby's frames.
+    fn set_codec_inner(&self, writer: u8, codec: Codec) {
+        let mut fed = self.lock_preroll();
+        if fed.source != writer {
+            let source = fed.source;
+            drop(fed);
+            tracing::debug!(track = %self.id, writer, source, "codec change dropped: the track takes another source");
+            return;
+        }
         let family = {
             let current = self.codec.load();
             if **current == codec {
@@ -923,8 +1111,14 @@ impl Track {
             current.family()
         };
         let codec = Arc::new(codec);
-        let preroll_cleared =
-            (family != codec.family() || self.kind() == Kind::Audio) && self.clear_preroll();
+        let clears = family != codec.family() || self.kind() == Kind::Audio;
+        let preroll_cleared = clears && fed.ring.clear();
+        self.codec.store(Arc::clone(&codec));
+        self.publish_control(TrackControlEvent::TrackChanged(Arc::clone(&codec)));
+        drop(fed);
+        if clears && self.leads_preroll() {
+            self.preroll_floor.set(None);
+        }
         let due = self
             .codec_changes
             .lock()
@@ -939,8 +1133,6 @@ impl Track {
                 "track codec changed"
             );
         }
-        self.codec.store(Arc::clone(&codec));
-        self.publish_control(TrackControlEvent::TrackChanged(codec));
     }
 
     /// The current epoch.
@@ -1004,7 +1196,8 @@ impl Track {
         }
         tracing::debug!(track = %self.id, "track closed");
         self.free_preroll();
-        let _delivered_to = self.control.send(TrackControlEvent::Closed);
+        let before = self.frame_seq.load(Ordering::Relaxed);
+        let _delivered_to = self.control.send((before, TrackControlEvent::Closed));
     }
 
     /// Whether [`Track::close`] was called.
@@ -1012,26 +1205,52 @@ impl Track {
         self.closed.load(Ordering::Relaxed)
     }
 
-    /// Sends a control event; no subscriber is not an error. Nothing after
-    /// `close`.
+    /// Sends a control event after the frames broadcast so far; no
+    /// subscriber is not an error. Nothing after `close`.
     fn publish_control(&self, event: TrackControlEvent) {
         if self.is_closed() {
             return;
         }
-        let _delivered_to = self.control.send(event);
+        let before = self.frame_seq.load(Ordering::Relaxed);
+        let _delivered_to = self.control.send((before, event));
+    }
+
+    /// The next side-branch item's sequence number, taken.
+    fn frame_seq(&self) -> u64 {
+        self.frame_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The connection switched to the source tagged `tag`: the track takes
+    /// its writes from now on, not the old source's, the ring drops what it
+    /// holds and the subscribers get `SourceSwitched`, together under the
+    /// ring's lock, so a clip's start is on one side of the switch, and so
+    /// is each frame and codec change of the old source: one it wrote
+    /// before is in the ring and the broadcast before the event (and
+    /// cleared from the ring), one after is dropped. The standby's first
+    /// keyframe, published after, is the ring's first.
+    fn switch_source(&self, tag: u8) {
+        let mut fed = self.lock_preroll();
+        fed.source = tag;
+        let _held = fed.ring.clear();
+        self.publish_control(TrackControlEvent::SourceSwitched);
+        drop(fed);
+        if self.leads_preroll() {
+            self.preroll_floor.set(None);
+        }
+        tracing::debug!(track = %self.id, "source switched: pre-roll dropped");
     }
 
     /// The counters now, and the pre-roll ring's state while a window is
     /// set.
     pub fn stats(&self) -> TrackStats {
         TrackStats {
-            preroll: self.lock_preroll().stats(),
+            preroll: self.lock_preroll().ring.stats(),
             ..self.counters.snapshot()
         }
     }
 
-    /// The pre-roll ring, locked.
-    fn lock_preroll(&self) -> std::sync::MutexGuard<'_, Preroll> {
+    /// The pre-roll ring and the source the track takes, locked.
+    fn lock_preroll(&self) -> std::sync::MutexGuard<'_, Fed> {
         self.preroll.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -1051,9 +1270,9 @@ impl Track {
     /// audio). Neither touches the connection or the subscribers.
     pub fn set_preroll(&self, window: Option<Duration>) {
         let (previous, freed) = {
-            let mut ring = self.lock_preroll();
-            let freed = ring.stats().map_or(0, |stats| stats.bytes);
-            (ring.set_window(window), freed)
+            let mut fed = self.lock_preroll();
+            let freed = fed.ring.stats().map_or(0, |stats| stats.bytes);
+            (fed.ring.set_window(window), freed)
         };
         if previous == window {
             return;
@@ -1079,44 +1298,40 @@ impl Track {
     /// clip takes it with [`Self::subscribe_from_preroll`], so nothing the
     /// track publishes falls between its subscription and its pre-roll.
     pub fn preroll_snapshot(&self, target: Instant) -> Option<PrerollSnapshot> {
-        self.lock_preroll().snapshot(target)
+        self.lock_preroll().ring.snapshot(target)
     }
 
-    /// A frame subscription and the pre-roll ring's snapshot from `target`
-    /// (as [`Self::preroll_snapshot`] chooses it), taken together under the
-    /// ring's lock: every frame reaches the ring under that lock before it
-    /// is broadcast, so the snapshot starts at a frame published before the
-    /// subscription and the subscription yields no frame published before
-    /// the snapshot's start. It yields first, at most, the snapshot's newest
-    /// frame, when the track's source task had put it in the ring but not
-    /// yet broadcast it (a [`ReliableQueue`](crate::interleave::ReliableQueue)
-    /// drops it as the pre-roll's), then every frame published after. The
-    /// snapshot is `None` when the ring holds nothing. The lock is held for
-    /// the subscribe and the copy only.
+    /// A frame subscription, the pre-roll ring's snapshot from `target`
+    /// (as [`Self::preroll_snapshot`] chooses it), the codec descriptor and
+    /// the tag of the source the track takes ([`Feeds`]), taken together
+    /// under the ring's lock: every frame reaches the ring and the
+    /// broadcast under that lock, so the snapshot holds every frame
+    /// published before the subscription, from its start, and the
+    /// subscription yields every frame published after. A codec change and
+    /// a source switch happen under the lock too, so the descriptor is the
+    /// one of the frames the subscription yields up to its first
+    /// `TrackChanged`, and of the snapshot's (which a video change of the
+    /// same family keeps, their parameter sets in band), and the source is
+    /// the one of the snapshot's frames and of those up to the first
+    /// `SourceSwitched`: two tracks' starts with the same source have no
+    /// switch between them. The snapshot is `None` when the ring holds
+    /// nothing. The lock is held for the subscribe and the copy only.
     pub fn subscribe_from_preroll(
         self: &Arc<Self>,
         target: Instant,
-    ) -> (TrackSubscription, Option<PrerollSnapshot>) {
-        let ring = self.lock_preroll();
+    ) -> (TrackSubscription, Option<PrerollSnapshot>, Arc<Codec>, u8) {
+        let fed = self.lock_preroll();
         let subscription = self.subscribe(Unit::Frames);
-        let snapshot = ring.snapshot(target);
-        drop(ring);
-        (subscription, snapshot)
-    }
-
-    /// Empties the pre-roll ring and keeps its window; whether it held
-    /// anything.
-    fn clear_preroll(&self) -> bool {
-        let held = self.lock_preroll().clear();
-        if self.leads_preroll() {
-            self.preroll_floor.set(None);
-        }
-        held
+        let snapshot = fed.ring.snapshot(target);
+        let codec = self.codec();
+        let source = fed.source;
+        drop(fed);
+        (subscription, snapshot, codec, source)
     }
 
     /// Frees the pre-roll ring and its window, for a closed track.
     fn free_preroll(&self) {
-        let _previous = self.lock_preroll().set_window(None);
+        let _previous = self.lock_preroll().ring.set_window(None);
         if self.leads_preroll() {
             self.preroll_floor.set(None);
         }
@@ -1173,6 +1388,8 @@ impl Track {
             track: Arc::clone(self),
             media,
             control: self.control.subscribe(),
+            pending: None,
+            after: None,
             lags: Throttle::default(),
         }
     }
@@ -1253,14 +1470,28 @@ impl Track {
             return false;
         }
         match self.forwarded() {
-            Some(target) => target.publish_frame_inner(frame),
-            None => self.publish_frame_inner(frame),
+            Some(target) => target.publish_frame_inner(self.tag, frame),
+            None => self.publish_frame_inner(self.tag, frame),
         }
     }
 
-    /// [`Self::publish_frame`] on this track itself, whoever feeds it.
-    fn publish_frame_inner(&self, mut frame: MediaFrame) -> bool {
+    /// [`Self::publish_frame`] on this track itself, whoever feeds it, for
+    /// a frame of the source tagged `writer`. Its source check, its
+    /// stamps, the ring and the broadcast happen under the ring's lock,
+    /// which a switch takes to move the source the track takes
+    /// ([`Self::switch_source`]): a frame the old source's task admitted
+    /// before a switch but publishes after it is dropped, never put in the
+    /// ring or the broadcast after the switch's `SourceSwitched`, nor
+    /// stamped with the new epoch.
+    fn publish_frame_inner(&self, writer: u8, mut frame: MediaFrame) -> bool {
         if self.is_closed() {
+            return false;
+        }
+        let mut fed = self.lock_preroll();
+        if fed.source != writer {
+            let source = fed.source;
+            drop(fed);
+            tracing::debug!(track = %self.id, writer, source, "frame dropped: the track takes another source");
             return false;
         }
         frame.epoch = self.epoch();
@@ -1287,10 +1518,11 @@ impl Track {
                 );
             }
             // The pre-roll's GOP now misses this frame: it is cut there.
-            self.lock_preroll().frame_dropped();
+            fed.ring.frame_dropped();
             // The subscribers miss it too: a lag of one, never a silent
             // hole before the frames that may reference it.
-            let _delivered_to = self.frames.send(None);
+            let _delivered_to = self.frames.send((self.frame_seq(), None));
+            drop(fed);
             return false;
         }
         self.touch(frame.arrival);
@@ -1303,10 +1535,20 @@ impl Track {
         if self.kind() == Kind::Video {
             self.update_gop(&frame);
         }
-        self.update_preroll(&frame);
+        let truncation = self.update_preroll(&mut fed, &frame);
         self.last_frame.store(Some(Arc::clone(&frame)));
         // As above: no subscriber is not an error.
-        let _delivered_to = self.frames.send(Some(frame));
+        let _delivered_to = self.frames.send((self.frame_seq(), Some(frame)));
+        drop(fed);
+        if let Some(truncation) = truncation {
+            tracing::debug!(
+                track = %self.id,
+                gop_bytes = truncation.gop_bytes,
+                limit = self.limits.preroll_bytes,
+                truncations = truncation.count,
+                "preroll: GOP exceeds preroll_bytes, keeping only its start"
+            );
+        }
         true
     }
 
@@ -1382,28 +1624,18 @@ impl Track {
         self.gop.store(Some(Arc::new(next)));
     }
 
-    /// Holds `frame` in the pre-roll ring while a window is set, trims,
-    /// and moves the audio rings' floor when this is the leading ring.
-    fn update_preroll(&self, frame: &Arc<MediaFrame>) {
-        let truncation = {
-            let mut ring = self.lock_preroll();
-            let truncation = ring.push(frame, self.limits.preroll_bytes, || {
-                self.preroll_floor.get()
-            });
-            if self.leads_preroll() && ring.window().is_some() {
-                self.preroll_floor.set(ring.oldest());
-            }
-            truncation
-        };
-        if let Some(truncation) = truncation {
-            tracing::debug!(
-                track = %self.id,
-                gop_bytes = truncation.gop_bytes,
-                limit = self.limits.preroll_bytes,
-                truncations = truncation.count,
-                "preroll: GOP exceeds preroll_bytes, keeping only its start"
-            );
+    /// Holds `frame` in the pre-roll ring of `fed`, this track's, locked,
+    /// while a window is set, trims, and moves the audio rings' floor when
+    /// this is the leading ring; the GOP the ring cut short, if any, for
+    /// the caller to log once the lock is released.
+    fn update_preroll(&self, fed: &mut Fed, frame: &Arc<MediaFrame>) -> Option<Truncation> {
+        let truncation = fed.ring.push(frame, self.limits.preroll_bytes, || {
+            self.preroll_floor.get()
+        });
+        if self.leads_preroll() && fed.ring.window().is_some() {
+            self.preroll_floor.set(fed.ring.oldest());
         }
+        truncation
     }
 }
 
@@ -2130,6 +2362,92 @@ mod tests {
         assert!(!next.discontinuity, "only the first frame of an epoch");
     }
 
+    /// On a frame subscription a control event comes in its place among
+    /// the frames, however late the subscriber looks: after every frame
+    /// the track broadcast before it (a frame dropped over
+    /// `max_frame_bytes` and a lag included), before every frame after it.
+    /// So a keyframe and a codec change published without a yield between
+    /// come in that order, and the keyframe is never taken for the new
+    /// codec's. Regression: control events took precedence over every
+    /// queued frame, so a clip started an H.265 sample entry for the H.264
+    /// keyframe queued before the change.
+    #[test]
+    fn a_frame_subscription_yields_a_control_event_after_the_frames_before_it() {
+        let h265 = Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        };
+        let track = Arc::new(video_track(TrackLimits {
+            max_frame_bytes: 64,
+            ..TrackLimits::default()
+        }));
+        let mut frames = track.subscribe(Unit::Frames);
+        assert!(track.publish_frame(frame(true, 10)));
+        assert!(!track.publish_frame(frame(true, 100)), "over the limit");
+        track.set_codec(h265.clone());
+        assert!(track.publish_frame(frame(true, 20)));
+        track.set_codec(h264_with_sps(1));
+        crate::let_assert!(Some(TrackEvent::Frame(old)) = queued(&mut frames));
+        assert_eq!(old.payload.len(), 10);
+        assert_eq!(queued(&mut frames), Some(TrackEvent::Gap { skipped: 1 }));
+        assert_eq!(
+            queued(&mut frames),
+            Some(TrackEvent::TrackChanged(Arc::new(h265.clone())))
+        );
+        crate::let_assert!(Some(TrackEvent::Frame(new)) = queued(&mut frames));
+        assert_eq!(new.payload.len(), 20);
+        assert_eq!(
+            queued(&mut frames),
+            Some(TrackEvent::TrackChanged(Arc::new(h264_with_sps(1))))
+        );
+        nothing_queued(&mut frames);
+
+        // Control events missed while a frame waits behind the ones before
+        // it: their loss comes first, since one of them may have come
+        // before the frame, then the frame, then the oldest event still
+        // held.
+        assert!(track.publish_frame(frame(true, 30)));
+        track.set_codec(h265.clone());
+        assert!(track.publish_frame(frame(true, 40)));
+        crate::let_assert!(Some(TrackEvent::Frame(before)) = queued(&mut frames));
+        assert_eq!(before.payload.len(), 30);
+        assert_eq!(
+            queued(&mut frames),
+            Some(TrackEvent::TrackChanged(Arc::new(h265.clone())))
+        );
+        for n in 0..=CONTROL_CAPACITY {
+            track.set_codec(h264_with_sps(u8::try_from(n).unwrap()));
+        }
+        assert_eq!(
+            queued(&mut frames),
+            Some(TrackEvent::ControlLost { skipped: 1 })
+        );
+        crate::let_assert!(Some(TrackEvent::Frame(after)) = queued(&mut frames));
+        assert_eq!(after.payload.len(), 40);
+        crate::let_assert!(Some(TrackEvent::TrackChanged(_)) = queued(&mut frames));
+
+        // A subscriber that lagged gets the lag first, then the change,
+        // then the frame after it.
+        let track = Arc::new(video_track(TrackLimits {
+            frame_capacity: 1,
+            ..TrackLimits::default()
+        }));
+        let mut frames = track.subscribe(Unit::Frames);
+        assert!(track.publish_frame(frame(true, 10)));
+        assert!(track.publish_frame(frame(false, 11)));
+        track.set_codec(h265.clone());
+        assert!(track.publish_frame(frame(true, 20)));
+        assert_eq!(queued(&mut frames), Some(TrackEvent::Gap { skipped: 2 }));
+        assert_eq!(
+            queued(&mut frames),
+            Some(TrackEvent::TrackChanged(Arc::new(h265)))
+        );
+        crate::let_assert!(Some(TrackEvent::Frame(new)) = queued(&mut frames));
+        assert_eq!(new.payload.len(), 20);
+        nothing_queued(&mut frames);
+    }
+
     #[test]
     fn packets_carry_their_frames_lateness_measured_per_epoch() {
         let track = video_track(TrackLimits::default());
@@ -2193,24 +2511,40 @@ mod tests {
         );
     }
 
+    /// A frame subscription that lost control events to a lag is told so
+    /// ahead of every frame published after them: a codec change among
+    /// them, here overwritten by epochs, leaves those frames under a codec
+    /// the sink does not know. The frame published before them may still
+    /// come; the events still held come in their place. Regression: the
+    /// loss was only logged, and the new codec's keyframe came after the
+    /// epochs as if the codec were the same.
     #[tokio::test]
-    async fn a_subscriber_that_misses_control_events_is_warned_and_continues() {
+    async fn a_frame_subscription_is_told_of_control_events_it_lost_before_the_frames_after_them() {
         let track = Arc::new(video_track(TrackLimits::default()));
         let mut sub = track.subscribe(Unit::Frames);
-        for _ in 0..(CONTROL_CAPACITY + 3) {
+        assert!(track.publish_frame(frame(true, 10)));
+        track.set_codec(Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        });
+        for _ in 0..CONTROL_CAPACITY {
             track.start_epoch();
         }
-        // The first three epochs were lost; the rest arrive in order.
-        assert_eq!(sub.next().await, Some(TrackEvent::EpochStart { epoch: 4 }));
-        let mut remaining = 0;
-        while let Some(TrackEvent::EpochStart { .. }) = sub.next().await {
-            remaining += 1;
-            if remaining == CONTROL_CAPACITY - 1 {
-                break;
-            }
+        assert!(track.publish_frame(frame(true, 20)));
+        assert_eq!(
+            sub.next().await,
+            Some(TrackEvent::ControlLost { skipped: 1 })
+        );
+        crate::let_assert!(Some(TrackEvent::Frame(old)) = sub.next().await);
+        assert_eq!(old.payload.len(), 10);
+        for epoch in 1..=CONTROL_CAPACITY {
+            let epoch = u32::try_from(epoch).unwrap();
+            assert_eq!(sub.next().await, Some(TrackEvent::EpochStart { epoch }));
         }
-        assert_eq!(remaining, CONTROL_CAPACITY - 1);
-        assert!(sub.track().gop().is_none());
+        crate::let_assert!(Some(TrackEvent::Frame(new)) = sub.next().await);
+        assert_eq!(new.payload.len(), 20);
+        nothing_queued(&mut sub);
     }
 
     #[test]
@@ -2547,7 +2881,8 @@ mod tests {
         assert!(track.publish_frame(timed(t0, 0, true, 10)));
         assert!(track.publish_frame(timed(t0, 40, false, 10)));
         assert!(track.publish_frame(timed(t0, 80, true, 10)));
-        let (mut sub, snapshot) = track.subscribe_from_preroll(t0 + Duration::from_millis(80));
+        let (mut sub, snapshot, _, _) =
+            track.subscribe_from_preroll(t0 + Duration::from_millis(80));
         let ts: Vec<_> = snapshot
             .unwrap()
             .frames()
@@ -2561,11 +2896,72 @@ mod tests {
         nothing_queued(&mut sub);
 
         let track = video_track_at(t0);
-        let (mut sub, snapshot) = track.subscribe_from_preroll(t0);
+        let (mut sub, snapshot, _, _) = track.subscribe_from_preroll(t0);
         assert!(snapshot.is_none(), "no window, no ring");
         assert!(track.publish_frame(timed(t0, 0, true, 10)));
         crate::let_assert!(Some(TrackEvent::Frame(frame)) = queued(&mut sub));
         assert_eq!(frame.ts.ticks(), 0);
+    }
+
+    /// A frame and a codec change the old source's task admitted before a
+    /// switch and makes only after it (the task paused in between, as on
+    /// another worker thread) are dropped: the ring a clip starts from
+    /// after the switch, the subscriptions and the epoch see the standby
+    /// alone after `SourceSwitched`, and the start says whose frames it
+    /// holds. Regression: the old keyframe reached the ring after the
+    /// switch cleared it, and a clip started then held it with the
+    /// standby's frames and no `SourceSwitched` between them.
+    #[test]
+    fn a_write_the_old_source_admitted_before_a_switch_and_makes_after_it_is_dropped() {
+        let (logs, _guard) = Logs::capture();
+        let t0 = SystemClock.now();
+        let live = crate::source::TrackSet::new(TrackLimits::default(), t0);
+        let v0 = live
+            .publisher()
+            .declare(Kind::Video, h264_with_sps(1), 90_000);
+        v0.set_preroll(Some(Duration::from_secs(10)));
+        assert!(v0.publish_frame(timed(t0, 0, true, 10)));
+        let (_, _, _, source) = v0.subscribe_from_preroll(t0);
+        assert_eq!(source, 0, "the live set's own source");
+        let mut before = v0.subscribe(Unit::Frames);
+        let staging = crate::source::TrackSet::staging(&live);
+        let mut standby = staging.publisher();
+        let sv0 = standby.declare(Kind::Video, h264_with_sps(1), 90_000);
+        standby.ready();
+        staging.arm_switch();
+        // The old source's task admits its next keyframe and its codec...
+        assert!(v0.feeds.admits(v0.tag, Kind::Video, true) && v0.fed());
+        // ...and pauses while the standby's first keyframe switches.
+        assert!(sv0.publish_frame(timed(t0, 1_000, true, 10)));
+        assert!(!v0.publish_frame_inner(v0.tag, timed(t0, 40, true, 10)));
+        v0.set_codec_inner(v0.tag, h264_with_sps(2));
+
+        assert_eq!(*v0.codec(), h264_with_sps(1));
+        let (mut after, snapshot, codec, source) = v0.subscribe_from_preroll(t0);
+        let held: Vec<_> = snapshot
+            .unwrap()
+            .frames()
+            .map(|frame| (frame.ts.ticks(), frame.epoch, frame.discontinuity))
+            .collect();
+        assert_eq!(held, [(1_000, 1, true)], "the standby's keyframe alone");
+        assert_eq!((*codec == h264_with_sps(1), source), (true, 1));
+        nothing_queued(&mut after);
+        assert_eq!(queued(&mut before), Some(TrackEvent::SourceSwitched));
+        assert_eq!(
+            queued(&mut before),
+            Some(TrackEvent::EpochStart { epoch: 1 })
+        );
+        crate::let_assert!(Some(TrackEvent::Frame(new)) = queued(&mut before));
+        assert_eq!(new.ts.ticks(), 1_000);
+        nothing_queued(&mut before);
+        for message in [
+            "frame dropped: the track takes another source",
+            "codec change dropped: the track takes another source",
+        ] {
+            let lines = logs.lines(tracing::Level::DEBUG, message);
+            assert_eq!(lines.len(), 1, "{message}");
+            assert_eq!(lines[0].fields, " track=v0 writer=0 source=1", "{message}");
+        }
     }
 
     #[test]

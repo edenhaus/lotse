@@ -1,7 +1,7 @@
 //! Fakes for core's own contracts, behind the `test-util` feature: a source
 //! factory and source, an output factory, a session output whose engine
-//! echoes, and a transcoder that do nothing but honor the contracts, and the
-//! tests' `let_assert!`. `lotse-testing` cannot hold them because it
+//! echoes, a transcoder and a clip container that do nothing but honor the
+//! contracts, and the tests' `let_assert!`. `lotse-testing` cannot hold them because it
 //! depends on this crate.
 
 use std::collections::VecDeque;
@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::clip::{ClipError, ClipMuxer, ClipMuxerFactory, ClipPolicy, ClipTrack};
 use crate::clock::Clock;
 use crate::codec::{Codec, CodecFamily, Kind};
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
@@ -731,7 +732,8 @@ async fn fake_probe(
 
 /// The run of a fake source without audio once it is live: until
 /// cancelled, publishing a one-packet keyframe on `video` every `every`
-/// if set, a video source a standby can switch in at.
+/// if set, and the same keyframe as a frame on the side branch, a video
+/// source a standby can switch in at and a clip can record.
 async fn video_only(ctx: &SourceCtx, video: &Track, every: Option<Duration>) -> SourceError {
     let Some(every) = every else {
         ctx.cancel.cancelled().await;
@@ -739,7 +741,17 @@ async fn video_only(ctx: &SourceCtx, video: &Track, every: Option<Duration>) -> 
     };
     let mut seq = 0_u16;
     loop {
-        video.publish_packet(keyframe_packet(ctx.time.now(), seq));
+        let now = ctx.time.now();
+        video.publish_packet(keyframe_packet(now, seq));
+        let _published = video.publish_frame(MediaFrame {
+            ts: MediaTime::from_ticks(i64::from(seq).saturating_mul(3_000)),
+            wallclock: now,
+            arrival: now,
+            keyframe: true,
+            discontinuity: false,
+            epoch: 0,
+            payload: bytes::Bytes::from_static(&FAKE_KEYFRAME),
+        });
         seq = seq.wrapping_add(1);
         tokio::select! {
             () = ctx.time.sleep(every) => {}
@@ -786,6 +798,10 @@ async fn fake_video(
     }
 }
 
+/// The keyframe a fake source without audio publishes: an IDR slice
+/// header and its padding, not decodable.
+const FAKE_KEYFRAME: [u8; 32] = [0x65; 32];
+
 /// The fake source's video packet `seq`: a whole keyframe in one packet.
 fn keyframe_packet(arrival: Instant, seq: u16) -> MediaPacket {
     MediaPacket {
@@ -801,7 +817,7 @@ fn keyframe_packet(arrival: Instant, seq: u16) -> MediaPacket {
         keyframe_start: true,
         epoch: 0,
         lateness: Duration::ZERO,
-        payload: Arc::from(&[0x65_u8; 32][..]),
+        payload: Arc::from(&FAKE_KEYFRAME[..]),
     }
 }
 
@@ -872,6 +888,123 @@ impl OutputFactory for FakeOutputFactory {
             "the fake {} output answers no offer",
             self.0
         )))
+    }
+}
+
+/// Where a [`FakeClipMuxerFactory`]'s muxers fail, if anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeClipFailure {
+    /// `start` refuses the video's codec.
+    Start,
+    /// `push` fails on the first frame.
+    Push,
+    /// `finish` fails.
+    Finish,
+}
+
+/// A clip container that writes a line a reader can parse instead of a
+/// file: `init video=<codec>[ audio=<codec>]` at the start; per frame
+/// `frame <v|a> <epoch> <ts> <k|-> <bytes>` followed by the payload
+/// itself, as a real muxer hands the frame's own bytes out; `end` at the
+/// finish (each line ends with `\n`). It carries H.264, H.265, AAC-LC and
+/// Opus whatever their parameters, so a fake source's video without
+/// parameter sets records too, and fails where it is told to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FakeClipMuxerFactory {
+    /// Where its muxers fail.
+    pub fail: Option<FakeClipFailure>,
+}
+
+impl ClipMuxerFactory for FakeClipMuxerFactory {
+    fn accepts(&self, codec: &Codec) -> bool {
+        matches!(
+            codec.family(),
+            CodecFamily::H264 | CodecFamily::H265 | CodecFamily::AacLc | CodecFamily::Opus
+        )
+    }
+
+    fn muxer(&self, _policy: &ClipPolicy) -> Box<dyn ClipMuxer> {
+        Box::new(FakeClipMuxer {
+            fail: self.fail,
+            origin: None,
+            latest: [None; 2],
+        })
+    }
+}
+
+/// A [`FakeClipMuxerFactory`]'s muxer. Its media time is the capture time
+/// from its origin, its first frame's.
+#[derive(Debug)]
+struct FakeClipMuxer {
+    /// Where it fails.
+    fail: Option<FakeClipFailure>,
+    /// Media time 0.
+    origin: Option<Instant>,
+    /// The capture time of the latest video and audio frame taken.
+    latest: [Option<Instant>; 2],
+}
+
+/// The slot of `track` in [`FakeClipMuxer::latest`].
+const fn slot(track: Kind) -> usize {
+    match track {
+        Kind::Video => 0,
+        Kind::Audio => 1,
+    }
+}
+
+impl ClipMuxer for FakeClipMuxer {
+    fn start(
+        &mut self,
+        video: &ClipTrack,
+        audio: Option<&ClipTrack>,
+    ) -> Result<Vec<bytes::Bytes>, ClipError> {
+        if self.fail == Some(FakeClipFailure::Start) {
+            return Err(ClipError::Unsupported(video.codec.family()));
+        }
+        let audio = audio.map_or(String::new(), |audio| {
+            format!(" audio={}", audio.codec.name())
+        });
+        Ok(vec![
+            format!("init video={}{audio}\n", video.codec.name()).into(),
+        ])
+    }
+
+    fn push(
+        &mut self,
+        track: Kind,
+        frame: Arc<MediaFrame>,
+    ) -> Result<Vec<bytes::Bytes>, ClipError> {
+        if self.fail == Some(FakeClipFailure::Push) {
+            return Err(ClipError::Failed("the fake muxer fails every push".into()));
+        }
+        self.origin.get_or_insert(frame.wallclock);
+        if let Some(latest) = self.latest.get_mut(slot(track)) {
+            *latest = Some(frame.wallclock);
+        }
+        let kind = if track == Kind::Video { 'v' } else { 'a' };
+        let key = if frame.keyframe { 'k' } else { '-' };
+        let line = format!(
+            "frame {kind} {} {} {key} {}\n",
+            frame.epoch,
+            frame.ts.ticks(),
+            frame.payload.len()
+        );
+        Ok(vec![line.into(), frame.payload.clone()])
+    }
+
+    fn media_time(&self, track: Kind) -> Duration {
+        let latest = self.latest.get(slot(track)).copied().flatten();
+        match (latest, self.origin) {
+            (Some(latest), Some(origin)) => latest.saturating_duration_since(origin),
+            _ => Duration::ZERO,
+        }
+    }
+
+    fn finish(&mut self) -> Result<Vec<bytes::Bytes>, ClipError> {
+        if self.fail == Some(FakeClipFailure::Finish) {
+            return Err(ClipError::Failed("the fake muxer fails its finish".into()));
+        }
+        Ok(vec![bytes::Bytes::from_static(b"end\n")])
     }
 }
 
@@ -2488,5 +2621,142 @@ mod tests {
             );
         }
         assert_eq!(engine.stats().uplink_packets, 2);
+    }
+
+    /// A frame of `track` for the fake clip container: `ts` ticks, captured
+    /// `ms` after `t0`.
+    fn clip_frame(
+        t0: Instant,
+        ms: u64,
+        ts: i64,
+        keyframe: bool,
+        payload: &'static [u8],
+    ) -> Arc<MediaFrame> {
+        let at = t0 + Duration::from_millis(ms);
+        Arc::new(MediaFrame {
+            ts: MediaTime::from_ticks(ts),
+            wallclock: at,
+            arrival: at,
+            keyframe,
+            discontinuity: false,
+            epoch: 1,
+            payload: Bytes::from_static(payload),
+        })
+    }
+
+    /// The fake clip container carries H.264, H.265, AAC-LC and Opus and
+    /// nothing else; it writes a line per call, each frame's payload after
+    /// its line, and its media time per track is the capture time of the
+    /// track's latest frame from its first frame's, zero before one.
+    #[test]
+    fn the_fake_clip_container_writes_lines_at_the_capture_times_media_time() {
+        let factory = FakeClipMuxerFactory::default();
+        for codec in [
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            Codec::H265 {
+                vps: None,
+                sps: None,
+                pps: None,
+            },
+            fake_aac(),
+            Codec::Opus { channels: 2 },
+        ] {
+            assert!(factory.accepts(&codec), "{codec:?}");
+        }
+        assert!(!factory.accepts(&Codec::Pcmu));
+        let video = ClipTrack {
+            codec: Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            clock_rate: 90_000,
+        };
+        let audio = ClipTrack {
+            codec: fake_aac(),
+            clock_rate: 16_000,
+        };
+        let mut muxer = factory.muxer(&ClipPolicy::default());
+        assert_eq!(
+            muxer.start(&video, Some(&audio)).unwrap(),
+            [Bytes::from_static(b"init video=h264 audio=aac_lc\n")]
+        );
+        assert_eq!(muxer.media_time(Kind::Video), Duration::ZERO);
+        let t0 = SystemClock.now();
+        assert_eq!(
+            muxer
+                .push(Kind::Audio, clip_frame(t0, 0, 0, true, b"aa"))
+                .unwrap(),
+            [
+                Bytes::from_static(b"frame a 1 0 k 2\n"),
+                Bytes::from_static(b"aa")
+            ]
+        );
+        assert_eq!(
+            muxer
+                .push(Kind::Video, clip_frame(t0, 40, 3_600, true, b"vvv"))
+                .unwrap(),
+            [
+                Bytes::from_static(b"frame v 1 3600 k 3\n"),
+                Bytes::from_static(b"vvv")
+            ]
+        );
+        assert_eq!(
+            muxer
+                .push(Kind::Video, clip_frame(t0, 140, 12_600, false, b"p"))
+                .unwrap(),
+            [
+                Bytes::from_static(b"frame v 1 12600 - 1\n"),
+                Bytes::from_static(b"p")
+            ]
+        );
+        assert_eq!(muxer.media_time(Kind::Video), Duration::from_millis(140));
+        assert_eq!(muxer.media_time(Kind::Audio), Duration::ZERO);
+        assert_eq!(
+            muxer
+                .push(Kind::Audio, clip_frame(t0, 64, 1_024, true, b"a"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(muxer.media_time(Kind::Audio), Duration::from_millis(64));
+        assert_eq!(muxer.finish().unwrap(), [Bytes::from_static(b"end\n")]);
+
+        let mut muxer = factory.muxer(&ClipPolicy::default());
+        assert_eq!(
+            muxer.start(&video, None).unwrap(),
+            [Bytes::from_static(b"init video=h264\n")]
+        );
+    }
+
+    /// The fake clip container fails where it is told to, and only there.
+    #[test]
+    fn the_fake_clip_container_fails_where_it_is_told() {
+        let video = ClipTrack {
+            codec: Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            clock_rate: 90_000,
+        };
+        let frame = clip_frame(SystemClock.now(), 0, 0, true, b"v");
+        let muxer = |fail| FakeClipMuxerFactory { fail: Some(fail) }.muxer(&ClipPolicy::default());
+        assert_eq!(
+            muxer(FakeClipFailure::Start).start(&video, None),
+            Err(ClipError::Unsupported(CodecFamily::H264))
+        );
+        let mut push = muxer(FakeClipFailure::Push);
+        assert!(push.start(&video, None).is_ok());
+        assert!(push.push(Kind::Video, Arc::clone(&frame)).is_err());
+        assert!(push.finish().is_ok());
+        let mut finish = muxer(FakeClipFailure::Finish);
+        assert!(finish.start(&video, None).is_ok());
+        assert!(finish.push(Kind::Video, frame).is_ok());
+        assert!(finish.finish().is_err());
     }
 }

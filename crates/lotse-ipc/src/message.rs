@@ -454,7 +454,9 @@ pub enum ClipReport {
     Stopped {
         /// Why (`completed`, `stopped`, `client_gone`, ...).
         reason: String,
-        /// The bytes written to the pipe.
+        /// The file's length: the bytes written to the pipe, and the last
+        /// ones its reader did not take in time, which the pipe never got;
+        /// a body that read fewer is cut.
         bytes: u64,
         /// The media time the clip covers, in milliseconds.
         duration_ms: u32,
