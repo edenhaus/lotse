@@ -55,7 +55,8 @@
 //! camera's encoder may have started over). The Opus encoder is never
 //! reset: its look-ahead splices the old timeline's last 2.5 ms in before
 //! the new anchor, where they belong. A clip's end leaves the PCM not yet
-//! encoded out, less than 20 ms plus the chain's delay.
+//! encoded out, less than 20 ms plus the chain's delay. A frame without
+//! samples (an RTP packet of padding only) is left out: it moves nothing.
 //!
 //! Implements RFC 7587 (Opus RTP: 48 kHz clock §4.1, one frame per packet
 //! §4.2) over RFC 6716 frames, from ITU-T G.711 (RFC 3551 §4.5.14) and
@@ -348,8 +349,18 @@ impl ToOpus {
     }
 
     /// One input frame: the Opus packets it completes, in order, each a
-    /// frame of the output track at 48 kHz.
+    /// frame of the output track at 48 kHz. A frame without samples is
+    /// none: it changes nothing.
     pub fn push(&mut self, frame: &MediaFrame) -> Result<Vec<Arc<MediaFrame>>, ToOpusError> {
+        // No samples: its timestamp says nothing of where the count stands
+        // (an RTP packet of padding only, RFC 3550 §5.1, makes one), so it
+        // neither anchors, fills, re-anchors nor crosses an epoch, and
+        // `continued` stays as the last frame with samples left it. A track
+        // flags only an epoch's first frame, whose epoch the next frame
+        // carries too, so leaving its flag out loses nothing.
+        if frame.payload.is_empty() {
+            return Ok(Vec::new());
+        }
         // A re-anchor, the first frame's included, clears it ([`Self::anchor`]).
         self.continued = true;
         if !self.anchored {
@@ -1117,18 +1128,60 @@ mod tests {
         assert!(!push(&far, 2), "a hole over a second");
     }
 
-    /// A frame without samples moves nothing and makes no packet.
+    /// A frame without samples, as an RTP packet of padding only makes (RFC
+    /// 3550 §5.1), moves nothing and makes no packet, whatever its
+    /// timestamp and epoch: before the first frame (it anchors nothing), or
+    /// on an established timeline 7840 ticks on (within the second of
+    /// silence), 15 840 on (past it), back at the start, or in a new epoch
+    /// with a discontinuity (off the count): the packets are those of the
+    /// run without it, payloads and capture times included, and
+    /// `continued` stays as the frame before left it. Regression: an empty
+    /// frame 7840 ticks on filled that much silence and the next frame
+    /// stepped back off it and re-anchored; a farther one, or the epoch,
+    /// re-anchored and dropped the PCM not yet encoded; one before the
+    /// first anchored, and the first frame was filled up to it.
     #[test]
-    fn an_empty_frame_makes_no_packet() {
-        let mut chain = ToOpus::new(&Codec::G722).unwrap();
-        assert!(
-            chain
-                .push(&frame(TS0, 0, t0(), Vec::new()))
-                .unwrap()
-                .is_empty()
-        );
-        let input = frames(&Codec::G722, &onset(16_000, 0, 40), t0());
-        let packets = run(&mut chain, &input);
-        assert_eq!(timeline(&packets), [(anchor(&chain, TS0), 0, false)]);
+    fn rfc3550_5_1_a_frame_without_samples_moves_nothing_and_makes_no_packet() {
+        for codec in CODECS {
+            let t0 = t0();
+            let rate = codec.sample_rate().unwrap();
+            let input = frames(&codec, &onset(rate, 0, 400), t0);
+            let whole = run(&mut ToOpus::new(&codec).unwrap(), &input);
+            assert_eq!(whole.len(), 19, "{codec:?}");
+            let empty = |ts: i64, epoch: u32| MediaFrame {
+                discontinuity: epoch > 0,
+                ..frame(ts, epoch, t0, Vec::new())
+            };
+            let mut chain = ToOpus::new(&codec).unwrap();
+            assert!(
+                chain
+                    .push(&empty(TS0 - 4 * FRAME_TICKS, 0))
+                    .unwrap()
+                    .is_empty(),
+                "{codec:?}: before the first frame"
+            );
+            let mut packets = Vec::new();
+            for (index, frame) in input.iter().enumerate() {
+                packets.extend(chain.push(frame).unwrap());
+                if index != 4 {
+                    continue;
+                }
+                // Frame 4 ends at TS0 + 800: 7840 on is within MAX_SILENCE, 15 840 past it.
+                let end = frame.ts.ticks() + FRAME_TICKS;
+                for (ts, epoch) in [
+                    (end + 7_840, 0),
+                    (end + 15_840, 0),
+                    (TS0, 0),
+                    (end + 7_840, 1),
+                ] {
+                    assert!(
+                        chain.push(&empty(ts, epoch)).unwrap().is_empty(),
+                        "{codec:?}: {ts} in epoch {epoch}"
+                    );
+                    assert!(chain.continued(), "{codec:?}: as frame 4 left it");
+                }
+            }
+            assert_eq!(packets, whole, "{codec:?}");
+        }
     }
 }

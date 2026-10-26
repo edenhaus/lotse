@@ -79,7 +79,8 @@
 //! gap runs from where the frame before the hole was put to where the
 //! frame that ends it was, a hole the queue reports included; a hole the
 //! clip ends in is none, and so is a hole in transcoded audio its
-//! transcode fills with silence: the file's audio goes on there.
+//! transcode fills with silence: the file's audio goes on there; an audio
+//! frame without samples is left out of the transcode.
 //!
 //! Standards: the container is the muxer's (ISO/IEC 14496-12 fragmented
 //! MP4 for the daemon's); the parameter sets a start keyframe carries in
@@ -760,8 +761,8 @@ struct Clip {
     /// Transcoded audio's come through [`Self::judging`], and only those
     /// the transcode re-anchors on.
     holes: HashMap<Kind, &'static str>,
-    /// Transcoded audio's last hole until the audio frame after it went
-    /// through the transcode, which decides whether it is one
+    /// Transcoded audio's last hole until the audio frame with samples after
+    /// it went through the transcode, which decides whether it is one
     /// ([`Self::frame`]): one it fills with silence is none and goes; one
     /// it re-anchors on moves to [`Self::holes`] for the new run's first
     /// packet, where no later hole of either kind takes it away.
@@ -1125,7 +1126,8 @@ impl Clip {
     /// continues its run with ([`ToOpus::continued`]: silence fills it, up
     /// to [`MAX_SILENCE`](lotse_codec::transcode::clip::MAX_SILENCE)) is no
     /// gap: the file has none there. Only the first frame after the hole
-    /// decides: one that re-anchors puts it in [`Self::holes`] for the
+    /// decides (the first with samples: one without is left out of the
+    /// transcode): one that re-anchors puts it in [`Self::holes`] for the
     /// first packet of the new run, where neither the frames that continue
     /// that run nor a later loss they fill with silence drop it.
     fn frame(
@@ -1163,6 +1165,14 @@ impl Clip {
         let Some(chain) = self.transcoder.as_mut().filter(|_| track == Kind::Audio) else {
             return self.sample(track, frame, seen);
         };
+        if frame.payload.is_empty() {
+            // No samples (an RTP packet of padding only, RFC 3550 §5.1):
+            // the transcode leaves it out, and a hole the queue reported
+            // waits for the frame with samples after it, which shows
+            // whether the transcode fills it.
+            tracing::trace!(clip.id = %self.id, ts = %frame.ts, "clip: an audio frame without samples left out of the transcode");
+            return Ok(());
+        }
         let packets = chain.push(&frame).map_err(ClipError::from);
         let concealed = chain.continued();
         let packets = packets.map_err(self.failed("transcode"))?;
@@ -1757,7 +1767,11 @@ mod tests {
 
         /// [`Self::narrowband_frame`] stamped `ticks`, wherever the grid has it.
         fn narrowband_frame_stamped(&self, index: u32, ticks: i64, payload: &Bytes) {
-            let ms = u64::from(index) * 20;
+            self.narrowband_frame_at(u64::from(index) * 20, ticks, payload);
+        }
+
+        /// [`Self::narrowband_frame_stamped`] captured at `ms`, off the 20 ms grid.
+        fn narrowband_frame_at(&self, ms: u64, ticks: i64, payload: &Bytes) {
             self.advance_to(ms);
             assert!(self.audio.as_ref().unwrap().publish_frame(MediaFrame {
                 ts: MediaTime::from_ticks(ticks),
@@ -4226,6 +4240,92 @@ mod tests {
             logs.count(
                 Level::DEBUG,
                 "clip: the transcode filled the audio's hole with silence; no gap"
+            ),
+            2
+        );
+    }
+
+    /// An audio frame without samples, as an RTP packet of padding only
+    /// makes (RFC 3550 §5.1), is left out of the transcode, and a hole the
+    /// queue reported before it waits for the frame with samples after it:
+    /// a lost frame that frame fills is no gap, though the empty one was
+    /// stamped 7840 ticks on (which the chain once filled with silence,
+    /// and the next frame stepped back off it); 1.02 s lost, which the
+    /// next frame with samples re-anchors on, is the gap from 160 to
+    /// 1220 ms, though the empty one was stamped on the run. Regression:
+    /// the empty frame took the hole's judgment, and the transcode's
+    /// handling of it decided the gap.
+    #[tokio::test]
+    async fn rfc3550_5_1_an_audio_frame_without_samples_leaves_a_transcoded_hole_to_the_next() {
+        let (logs, _guard) = Logs::capture();
+        let payload = narrowband_payload(&Codec::Pcmu);
+        let lead = {
+            let delay = ToOpus::new(&Codec::Pcmu).unwrap().delay();
+            i64::try_from(delay.as_nanos() * 48 / 1_000_000).unwrap()
+        };
+        // (frames lost in a row from frame 10, the empty frame's stamp)
+        for (lost, empty) in [(1_u32, 1_600 + 7_840), (51, 11 * 160)] {
+            let mut rig = Rig::new(Some(Codec::Pcmu));
+            let reader = rig.start(spec(0, None, true));
+            settle().await; // the clip subscribes before any frame
+            let audio = Arc::clone(rig.audio.as_ref().unwrap());
+            for index in 0..10 + lost + 20 {
+                let ms = u64::from(index) * 20;
+                if ms % 100 == 0 && ms <= 400 {
+                    let keyframe = ms == 0;
+                    rig.video_frame(ms, index / 5, keyframe, if keyframe { 32 } else { 16 });
+                }
+                if index == 10 {
+                    // Frame 10 is lost to a lag; an empty frame comes right after.
+                    oversize(&rig, &audio, ms);
+                    rig.narrowband_frame_at(ms, empty, &Bytes::new());
+                } else if !(11..10 + lost).contains(&index) {
+                    rig.narrowband_frame(index, &payload);
+                }
+                settle().await;
+            }
+            rig.clips.stop("k1", EndReason::Stopped);
+            let reports = rig.until_stopped().await;
+            let bytes = reader.rest().await;
+            let timeline: Vec<(u32, i64)> = audio_samples(&lines(&bytes))
+                .into_iter()
+                .map(|(epoch, ts, _)| (epoch, ts))
+                .collect();
+            if lost == 1 {
+                let run: Vec<(u32, i64)> = (0..30).map(|k| (0, 960 * k - lead)).collect();
+                assert_eq!(timeline, run);
+                assert_eq!(
+                    reports,
+                    vec![
+                        started(0, Some("opus")),
+                        stopped("stopped", bytes.len(), 580, 0)
+                    ]
+                );
+            } else {
+                let mut runs: Vec<(u32, i64)> = (0..9).map(|k| (0, 960 * k - lead)).collect();
+                runs.extend((0..19).map(|k| (1, 61 * 960 + 960 * k - lead)));
+                assert_eq!(timeline, runs);
+                assert_eq!(
+                    reports,
+                    vec![
+                        started(0, Some("opus")),
+                        gap("lagged", 160, 1_220),
+                        stopped("stopped", bytes.len(), 1_580, 1),
+                    ]
+                );
+            }
+        }
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "clip: the transcode filled the audio's hole with silence; no gap"
+            ),
+            1
+        );
+        assert_eq!(
+            logs.count(
+                Level::TRACE,
+                "clip: an audio frame without samples left out of the transcode"
             ),
             2
         );
