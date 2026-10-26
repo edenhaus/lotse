@@ -3038,6 +3038,39 @@ mod tests {
         assert_eq!(reports, vec![stopped("stopped", bytes.len(), 512, 0)]);
     }
 
+    /// A clip starts at the newest keyframe captured at or before
+    /// `now − before_ms` by the pre-roll's measure, its arrival when it is
+    /// dated ahead of it (a Sender Report mapping off, RFC 3550 §6.4.1), as
+    /// `before_ms` counts it: of keyframes arriving at 1 s and 2 s dated
+    /// 61 s and 62 s, a clip asked at 3 s with `before_ms = 0` starts at
+    /// the second, 1 s old. Regression: the ring compared their dates,
+    /// found none at or before 3 s and started at the first, 2 s old.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_clip_starts_at_the_newest_keyframe_by_when_it_was_captured() {
+        let mut rig = Rig::new(None);
+        for (index, arrival) in [(0, 1_000), (1, 2_000)] {
+            rig.advance_to(arrival);
+            assert!(rig.video().publish_frame(frame_at(
+                &rig,
+                (arrival + 60_000, arrival),
+                index * 90_000,
+                true,
+                32
+            )));
+        }
+        rig.advance_to(3_000);
+        let reader = rig.start(spec(0, None, false));
+        settle().await;
+        assert_eq!(rig.report().await, started(1_000, None));
+        rig.clips.stop("k1", EndReason::Stopped);
+        let (_, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+        let video: Vec<String> = lines(&bytes)
+            .into_iter()
+            .filter(|line| line.starts_with("frame v"))
+            .collect();
+        assert_eq!(video, ["frame v 0 90000 k 32"], "the second keyframe only");
+    }
+
     /// A hole the queue reports (the subscription lagged: the track dropped
     /// a frame over `max_frame_bytes`) is where the container put the frames
     /// on either side of it, as a reconnect's is: the keyframe that ends it,
