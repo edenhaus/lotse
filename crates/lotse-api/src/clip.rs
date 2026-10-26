@@ -83,9 +83,11 @@ pub struct ClipBody {
     /// The file's bytes, read to their end: the read end of the pipe the
     /// clip's worker writes.
     pub reader: Box<dyn AsyncRead + Send + Unpin>,
-    /// The number of bytes the producer reports having written, sent once
-    /// it wrote its last. A sender dropped without it means the clip did
-    /// not finish (its worker died): the body is then cut.
+    /// The length of the file the producer reports, sent once it closed
+    /// its end: the body ends whole only when it read that many, so a tail
+    /// the producer left out (a reader that did not take it in time) cuts
+    /// it. A sender dropped without it means the clip did not finish (its
+    /// worker died): the body is then cut.
     pub written: oneshot::Receiver<u64>,
 }
 
