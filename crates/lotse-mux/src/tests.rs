@@ -2295,7 +2295,7 @@ fn ebu_r37_transcoded_g711_and_g722_audio_keeps_sync_with_its_video() {
         }
         items.sort_by_key(|(at, order, ..)| (*at, *order));
 
-        let mut chain = ToOpus::new(&codec, 8_000).unwrap();
+        let mut chain = ToOpus::new(&codec).unwrap();
         let mut muxer = Muxer::new(&policy(1000));
         let mut file = muxer
             .start(&h264_track(), Some(&ToOpus::output()))
@@ -2386,7 +2386,7 @@ fn ebu_r37_transcoded_audio_keeps_sync_through_a_late_frame_and_a_capture_time_s
         // In the order they were captured; the late frame keeps its place in its track.
         items.sort_by_key(|(at, order, ..)| (*at, *order));
 
-        let mut chain = ToOpus::new(&codec, 8_000).unwrap();
+        let mut chain = ToOpus::new(&codec).unwrap();
         let mut muxer = Muxer::new(&policy(1000));
         let mut file = muxer
             .start(&h264_track(), Some(&ToOpus::output()))

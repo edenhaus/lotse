@@ -19,8 +19,10 @@
 //!
 //! Timestamps compensate the chain's delay, as the AAC-LC chain's do, so a
 //! decoded Opus sample carries the timestamp of the camera's sample it
-//! came from. On the first frame of a timeline (timestamp `ts` at the
-//! track's clock rate `r`), the anchor is `ts · 48000 / r` less the codec's
+//! came from. On the first frame of a timeline (timestamp `ts` on the
+//! codec's RTP clock `r`, 8000 Hz for G.711 and G.722 alike, RFC 3551
+//! §4.5.14 and §4.5.2; never the rate the track was declared with, which a
+//! reconnect that changes the codec keeps), the anchor is `ts · 48000 / r` less the codec's
 //! own delay (G.722's QMFs, [`g722::CODEC_DELAY`]; none for G.711), the
 //! resampler's filter delay and the Opus look-ahead, and the `k`th packet
 //! from there gets `anchor + 960·k` (RFC 7587 §4.1: a 48 kHz clock). The
@@ -121,9 +123,6 @@ pub enum ToOpusError {
     /// A codec other than G.711 and G.722.
     #[error("no clip transcode from {0}")]
     Unsupported(CodecFamily),
-    /// A track without a clock rate.
-    #[error("a track at 0 Hz")]
-    ClockRate,
     /// The resampler refused its parameters or a chunk.
     #[error(transparent)]
     Resample(ResampleError),
@@ -177,7 +176,7 @@ struct Timeline {
 pub struct ToOpus {
     /// The input's decoder.
     source: Source,
-    /// The input track's clock rate.
+    /// The input's RTP clock rate: its codec's, 8000 Hz ([`Self::new`]).
     clock_rate: u32,
     /// The input codec's sampling rate.
     sample_rate: u32,
@@ -216,21 +215,35 @@ pub struct ToOpus {
 }
 
 impl ToOpus {
-    /// The chain for a track of `codec` at `clock_rate`: G.711 or G.722.
-    pub fn new(codec: &Codec, clock_rate: u32) -> Result<Self, ToOpusError> {
-        let (source, sample_rate, codec_delay) = match codec {
-            Codec::Pcmu => (Source::G711(Law::Mu), g711::SAMPLE_RATE, 0),
-            Codec::Pcma => (Source::G711(Law::A), g711::SAMPLE_RATE, 0),
+    /// The chain for `codec`'s frames, G.711 or G.722, read on the codec's
+    /// own RTP clock: 8000 Hz for both, G.722's 16 kHz samples included
+    /// (RFC 3551 §4.5.14, §4.5.2; [`Codec::rtp_clock_rate`]). Not the rate a
+    /// track was declared with: a track keeps its first codec's through a
+    /// reconnect that changes the codec (48 kHz after Opus), while the
+    /// camera stamps the new codec's frames on the new codec's clock.
+    pub fn new(codec: &Codec) -> Result<Self, ToOpusError> {
+        let (source, sample_rate, clock_rate, codec_delay) = match codec {
+            // G.711's sample rate is its RTP clock rate too (RFC 3551 §4.5.14).
+            Codec::Pcmu => (
+                Source::G711(Law::Mu),
+                g711::SAMPLE_RATE,
+                g711::SAMPLE_RATE,
+                0,
+            ),
+            Codec::Pcma => (
+                Source::G711(Law::A),
+                g711::SAMPLE_RATE,
+                g711::SAMPLE_RATE,
+                0,
+            ),
             Codec::G722 => (
                 Source::G722(Box::default()),
                 g722::SAMPLE_RATE,
+                g722::CLOCK_RATE,
                 g722::CODEC_DELAY,
             ),
             other => return Err(ToOpusError::Unsupported(other.family())),
         };
-        if clock_rate == 0 {
-            return Err(ToOpusError::ClockRate);
-        }
         let chunk =
             usize::try_from(sample_rate.checked_div(CHUNKS_PER_SECOND).unwrap_or(0)).unwrap_or(0);
         let resampler = Resampler::new(sample_rate, 1, chunk).map_err(ToOpusError::Resample)?;
@@ -632,7 +645,7 @@ mod tests {
     fn only_g711_and_g722_are_transcoded() {
         for codec in CODECS {
             assert!(transcodes(&codec));
-            assert!(ToOpus::new(&codec, 8_000).is_ok());
+            assert!(ToOpus::new(&codec).is_ok());
         }
         let aac = Codec::AacLc {
             sample_rate: 16_000,
@@ -642,21 +655,16 @@ mod tests {
         assert!(!transcodes(&aac));
         assert!(!transcodes(&Codec::Opus { channels: 1 }));
         assert_eq!(
-            ToOpus::new(&aac, 16_000).unwrap_err(),
+            ToOpus::new(&aac).unwrap_err(),
             ToOpusError::Unsupported(CodecFamily::AacLc)
         );
-        assert_eq!(
-            ToOpus::new(&Codec::Pcmu, 0).unwrap_err(),
-            ToOpusError::ClockRate
-        );
-        assert_eq!(ToOpusError::ClockRate.to_string(), "a track at 0 Hz");
         assert_eq!(
             ToOpusError::Unsupported(CodecFamily::AacLc).to_string(),
             "no clip transcode from aac_lc"
         );
         assert_eq!(
-            ClipError::from(ToOpusError::ClockRate),
-            ClipError::Failed("audio transcode: a track at 0 Hz".into())
+            ClipError::from(ToOpusError::Unsupported(CodecFamily::AacLc)),
+            ClipError::Failed("audio transcode: no clip transcode from aac_lc".into())
         );
         assert_eq!(
             ToOpus::output(),
@@ -665,6 +673,20 @@ mod tests {
                 clock_rate: 48_000,
             }
         );
+    }
+
+    /// The chain reads its codec's frames on the codec's RTP clock, the
+    /// one `Codec::rtp_clock_rate` gives: 8000 Hz for G.711 and for G.722
+    /// (RFC 3551 §4.5.14, §4.5.2), whatever rate the track was declared
+    /// at; none goes in, so a track that keeps 48 kHz from Opus through a
+    /// reconnect cannot mistime a G.711 that comes back in its place.
+    #[test]
+    fn rfc3551_4_5_14_and_4_5_2_the_chain_reads_its_codec_s_8000_hz_clock() {
+        for codec in CODECS {
+            let chain = ToOpus::new(&codec).unwrap();
+            assert_eq!(Some(chain.clock_rate), codec.rtp_clock_rate(), "{codec:?}");
+            assert_eq!(chain.clock_rate, 8_000, "{codec:?}");
+        }
     }
 
     /// The delay the timestamps take back: the resampler's filter and the
@@ -686,7 +708,7 @@ mod tests {
             (Codec::Pcma, filter(8_000) + lookahead),
             (Codec::G722, filter(16_000) + lookahead + 66),
         ] {
-            let chain = ToOpus::new(&codec, 8_000).unwrap();
+            let chain = ToOpus::new(&codec).unwrap();
             assert_eq!(chain.compensation(), ticks, "{codec:?}");
             assert_eq!(
                 chain.delay(),
@@ -705,7 +727,7 @@ mod tests {
     fn rfc7587_4_2_one_packet_per_20_ms_from_the_compensated_anchor() {
         for codec in CODECS {
             let t0 = t0();
-            let mut chain = ToOpus::new(&codec, 8_000).unwrap();
+            let mut chain = ToOpus::new(&codec).unwrap();
             let rate = codec.sample_rate().unwrap();
             let input = frames(&codec, &onset(rate, 0, 1_000), t0);
             assert_eq!(input.len(), 50);
@@ -741,7 +763,7 @@ mod tests {
     #[test]
     fn rfc7587_4_1_a_tone_onset_keeps_its_timestamp_and_the_sample_count_its_length() {
         for codec in CODECS {
-            let mut chain = ToOpus::new(&codec, 8_000).unwrap();
+            let mut chain = ToOpus::new(&codec).unwrap();
             let rate = codec.sample_rate().unwrap();
             let input = frames(&codec, &onset(rate, 200, 600), t0());
             let packets = run(&mut chain, &input);
@@ -766,7 +788,7 @@ mod tests {
     fn a_camera_s_jitter_within_10_ms_keeps_the_timeline() {
         let (logs, _guard) = Logs::capture();
         let t0 = t0();
-        let mut chain = ToOpus::new(&Codec::Pcmu, 8_000).unwrap();
+        let mut chain = ToOpus::new(&Codec::Pcmu).unwrap();
         let mut input = frames(&Codec::Pcmu, &onset(8_000, 0, 200), t0);
         for (index, frame) in input.iter_mut().enumerate() {
             let jitter = [0, 79, -80, 40, -3][index % 5];
@@ -793,7 +815,7 @@ mod tests {
         let (logs, _guard) = Logs::capture();
         for codec in CODECS {
             let t0 = t0();
-            let mut chain = ToOpus::new(&codec, 8_000).unwrap();
+            let mut chain = ToOpus::new(&codec).unwrap();
             let rate = codec.sample_rate().unwrap();
             let mut input = frames(&codec, &onset(rate, 0, 2_000), t0);
             // Frames 10 and 11 (40 ms), then 30 to 79 (one second) are lost.
@@ -829,7 +851,7 @@ mod tests {
         let (logs, _guard) = Logs::capture();
         for codec in CODECS {
             let t0 = t0();
-            let mut chain = ToOpus::new(&codec, 8_000).unwrap();
+            let mut chain = ToOpus::new(&codec).unwrap();
             let rate = codec.sample_rate().unwrap();
             let pcm = onset(rate, 0, 200);
             let ten = frames(&codec, &pcm, t0);
@@ -905,7 +927,7 @@ mod tests {
         let mut input = frames(&Codec::G722, &onset(16_000, 0, 1_000), t0());
         // Stamped 80 ticks (10 ms, the tolerance) late, as a camera's stamps wobble.
         input[25].ts = MediaTime::from_ticks(input[25].ts.ticks() + 80);
-        let whole = run(&mut ToOpus::new(&Codec::G722, 8_000).unwrap(), &input);
+        let whole = run(&mut ToOpus::new(&Codec::G722).unwrap(), &input);
         assert_eq!(whole.len(), 49);
         let audio = |packets: &[Arc<MediaFrame>]| -> Vec<(i64, bytes::Bytes)> {
             packets
@@ -920,7 +942,7 @@ mod tests {
                 frame.ts = MediaTime::from_ticks(frame.ts.ticks() - wrap);
             }
             split[25].discontinuity = true;
-            let packets = run(&mut ToOpus::new(&Codec::G722, 8_000).unwrap(), &split);
+            let packets = run(&mut ToOpus::new(&Codec::G722).unwrap(), &split);
             assert_eq!(audio(&packets), audio(&whole), "wrap {wrap}");
             // Placed by the sample count, not by frame 25's late stamp: the
             // capture times go on as in the unsplit run.
@@ -967,7 +989,7 @@ mod tests {
                 frame.arrival = frame.wallclock;
             }
             input[10].discontinuity = true;
-            let mut chain = ToOpus::new(&codec, 8_000).unwrap();
+            let mut chain = ToOpus::new(&codec).unwrap();
             let packets = run(&mut chain, &input);
             let first = anchor(&chain, TS0);
             let expected: Vec<(i64, u32, bool)> = (0..19)
@@ -1028,7 +1050,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let mut chain = ToOpus::new(&codec, 8_000).unwrap();
+            let mut chain = ToOpus::new(&codec).unwrap();
             let packets = run(&mut chain, &input);
             assert_eq!(packets.len(), 18, "{codec:?}");
             for (k, packet) in packets.iter().enumerate() {
@@ -1073,7 +1095,7 @@ mod tests {
     /// the count, a step back, a hole over a second).
     #[test]
     fn continued_is_a_frame_on_the_run_before_it_not_one_that_re_anchors() {
-        let mut chain = ToOpus::new(&Codec::Pcmu, 8_000).unwrap();
+        let mut chain = ToOpus::new(&Codec::Pcmu).unwrap();
         let input = frames(&Codec::Pcmu, &onset(8_000, 0, 200), t0());
         let mut push = |frame: &MediaFrame, epoch: u32| {
             chain
@@ -1098,7 +1120,7 @@ mod tests {
     /// A frame without samples moves nothing and makes no packet.
     #[test]
     fn an_empty_frame_makes_no_packet() {
-        let mut chain = ToOpus::new(&Codec::G722, 8_000).unwrap();
+        let mut chain = ToOpus::new(&Codec::G722).unwrap();
         assert!(
             chain
                 .push(&frame(TS0, 0, t0(), Vec::new()))

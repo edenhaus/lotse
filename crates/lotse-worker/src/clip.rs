@@ -686,12 +686,14 @@ fn sets_match(codec: &Codec, access_unit: &[u8]) -> bool {
     }
 }
 
-/// The transcode of audio in `codec` at `clock_rate` that the container
-/// cannot carry as it is: G.711 or G.722 to Opus, when the container takes
-/// Opus; `None` otherwise.
-fn transcoder(codec: &Codec, clock_rate: u32, factory: &dyn ClipMuxerFactory) -> Option<ToOpus> {
+/// The transcode of audio in `codec` that the container cannot carry as
+/// it is: G.711 or G.722 to Opus, when the container takes Opus; `None`
+/// otherwise. The chain reads the frames on the codec's own RTP clock
+/// ([`ToOpus::new`]), never the track's declared rate, which a reconnect
+/// that changes the codec keeps.
+fn transcoder(codec: &Codec, factory: &dyn ClipMuxerFactory) -> Option<ToOpus> {
     (transcodes(codec) && factory.accepts(&ToOpus::output().codec))
-        .then(|| ToOpus::new(codec, clock_rate).ok())
+        .then(|| ToOpus::new(codec).ok())
         .flatten()
 }
 
@@ -952,7 +954,7 @@ impl Clip {
             return Err(EndReason::StreamChanged);
         }
         if !self.factory.accepts(&codec) {
-            self.transcoder = transcoder(&codec, track.clock_rate(), self.factory.as_ref());
+            self.transcoder = transcoder(&codec, self.factory.as_ref());
             if self.transcoder.is_none() {
                 self.omitted = Some(codec.name().to_owned());
                 return Ok(None);
@@ -1334,7 +1336,7 @@ impl Clip {
             // new codec takes its place.
             self.transcoder = None;
             if !self.factory.accepts(codec) {
-                self.transcoder = transcoder(codec, entry.clock_rate, self.factory.as_ref());
+                self.transcoder = transcoder(codec, self.factory.as_ref());
                 if self.transcoder.is_none() {
                     tracing::info!(clip.id = %self.id, codec = codec.name(), "clip: the audio changed before the start to a codec the container cannot carry nor the clip transcode; going without");
                     self.omitted = Some(codec.name().to_owned());
@@ -2093,16 +2095,16 @@ mod tests {
     async fn a_transcode_needs_audio_it_can_transcode_and_a_container_that_takes_opus() {
         let fake = FakeClipMuxerFactory::default();
         for codec in [Codec::Pcmu, Codec::Pcma] {
-            assert!(transcoder(&codec, 8_000, &fake).is_some(), "{codec:?}");
-            assert!(transcoder(&codec, 8_000, &NoOpus).is_none(), "{codec:?}");
+            assert!(transcoder(&codec, &fake).is_some(), "{codec:?}");
+            assert!(transcoder(&codec, &NoOpus).is_none(), "{codec:?}");
         }
-        assert!(transcoder(&Codec::G722, 8_000, &fake).is_some());
-        assert!(transcoder(&Codec::G722, 8_000, &NoOpus).is_none());
+        assert!(transcoder(&Codec::G722, &fake).is_some());
+        assert!(transcoder(&Codec::G722, &NoOpus).is_none());
         let l16 = Codec::Unsupported {
             kind: Kind::Audio,
             name: "l16".into(),
         };
-        assert!(transcoder(&l16, 8_000, &fake).is_none());
+        assert!(transcoder(&l16, &fake).is_none());
 
         // A G.711 clip into the container without Opus: video only, and
         // the audio omitted with a warning.
@@ -2212,7 +2214,7 @@ mod tests {
                 50,
                 "6.0 s to 10.9 s"
             );
-            let delay = ToOpus::new(&codec, 8_000).unwrap().delay();
+            let delay = ToOpus::new(&codec).unwrap().delay();
             let lead = i64::try_from(delay.as_nanos() * 48 / 1_000_000).unwrap();
             // The frame playing at the 6 s keyframe, captured with it, to the
             // last captured before 11 s: 250 frames.
@@ -2285,8 +2287,8 @@ mod tests {
         let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
         let file = lines(&bytes);
         assert_eq!(file[0], "init video=h264 audio=opus");
-        let delay = ToOpus::new(&Codec::Pcmu, 8_000).unwrap().delay();
-        assert_ne!(delay, ToOpus::new(&Codec::G722, 8_000).unwrap().delay());
+        let delay = ToOpus::new(&Codec::Pcmu).unwrap().delay();
+        assert_ne!(delay, ToOpus::new(&Codec::G722).unwrap().delay());
         let lead = i64::try_from(delay.as_nanos() * 48 / 1_000_000).unwrap();
         // Frame 1 at 960 (48 kHz) makes no packet, frames 2 and 3 one each.
         let timeline: Vec<(u32, i64)> = audio_samples(&file)
@@ -2331,6 +2333,66 @@ mod tests {
             !logged[1].fields.contains("audio_transcoded_from"),
             "{logged:?}"
         );
+    }
+
+    /// G.711 that comes back in place of Opus on a reconnect is transcoded
+    /// on its own 8000 Hz clock (RFC 3551 §4.5.14), not the 48 kHz the
+    /// track keeps from its first codec: whether the reconnect comes before
+    /// the clip starts (its start picks the transcode) or while it waits for
+    /// its first keyframe (the codec change does), its packets come out as
+    /// for a track declared PCMU. Regression: the chain read the 8000 Hz
+    /// stamps at 48 kHz, every 20 ms frame stepped back off the sample count
+    /// and re-anchored, and the clip's audio had no packet.
+    #[tokio::test]
+    async fn rfc3551_4_5_14_g711_back_after_opus_is_transcoded_on_its_8000_hz_clock() {
+        /// The camera reconnecting with PCMU where it had Opus: the track
+        /// keeps its first rate (`TrackSet::declare`).
+        fn reconnect(rig: &Rig) {
+            let audio = rig.set.publisher().declare(Kind::Audio, Codec::Pcmu, 8_000);
+            assert!(Arc::ptr_eq(&audio, rig.audio.as_ref().unwrap()));
+            assert_eq!(audio.clock_rate(), 48_000, "the track keeps its first rate");
+        }
+        let payload = narrowband_payload(&Codec::Pcmu);
+        let delay = ToOpus::new(&Codec::Pcmu).unwrap().delay();
+        let lead = i64::try_from(delay.as_nanos() * 48 / 1_000_000).unwrap();
+        for waiting in [false, true] {
+            let mut rig = Rig::new(Some(Codec::Opus { channels: 1 }));
+            if !waiting {
+                reconnect(&rig);
+            }
+            let reader = rig.start(spec(0, None, true));
+            settle().await;
+            if waiting {
+                reconnect(&rig);
+                settle().await;
+            }
+            rig.video_frame(0, 0, true, 32);
+            for index in 1..4 {
+                rig.narrowband_frame(index, &payload);
+            }
+            settle().await;
+            // The clip task first runs at 60 ms, the keyframe captured at 0.
+            assert_eq!(
+                rig.report().await,
+                started(60, Some("opus")),
+                "waiting {waiting}"
+            );
+            rig.clips.stop("k1", EndReason::Stopped);
+            let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+            let file = lines(&bytes);
+            assert_eq!(file[0], "init video=h264 audio=opus", "waiting {waiting}");
+            // Frame 1 at 960 (48 kHz) makes no packet, frames 2 and 3 one each.
+            let timeline: Vec<(u32, i64)> = audio_samples(&file)
+                .iter()
+                .map(|(epoch, ts, _)| (*epoch, *ts))
+                .collect();
+            assert_eq!(
+                timeline,
+                [(0, 960 - lead), (0, 1_920 - lead)],
+                "waiting {waiting}"
+            );
+            let_assert_reason(&reports, "stopped");
+        }
     }
 
     /// A container that never moves a frame back: each lasts 100 ms, and a
@@ -4025,7 +4087,7 @@ mod tests {
         let (logs, _guard) = Logs::capture();
         let payload = narrowband_payload(&Codec::Pcmu);
         let lead = {
-            let delay = ToOpus::new(&Codec::Pcmu, 8_000).unwrap().delay();
+            let delay = ToOpus::new(&Codec::Pcmu).unwrap().delay();
             i64::try_from(delay.as_nanos() * 48 / 1_000_000).unwrap()
         };
         // (frames lost in a row from frame 10, a second single loss)
