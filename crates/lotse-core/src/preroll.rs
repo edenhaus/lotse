@@ -485,14 +485,18 @@ impl Preroll {
 
     /// The held frames from the newest keyframe captured at or before
     /// `target` to the newest frame, or from the oldest when every
-    /// keyframe is later; `None` when nothing is held. Every audio frame
-    /// is a start, so an audio ring starts at the frame playing at
-    /// `target`.
+    /// keyframe is later; `None` when nothing is held. Captured by the
+    /// ring's measure ([`captured`]), as a clip measures its start and
+    /// `before_ms`: a keyframe dated ahead of its arrival counts from its
+    /// arrival, so a Sender Report mapping off (RFC 3550 §6.4.1) cannot
+    /// push the start back to an older one. Every audio frame is a start,
+    /// so an audio ring starts at the frame playing at `target`, by the
+    /// same measure.
     pub(crate) fn snapshot(&self, target: Instant) -> Option<PrerollSnapshot> {
         let from = self
             .frames
             .iter()
-            .rposition(|frame| self.starts_at(frame) && frame.wallclock <= target)
+            .rposition(|frame| self.starts_at(frame) && captured(frame) <= target)
             .unwrap_or(0);
         let mut frames = self.frames.range(from..).cloned();
         let start = frames.next()?;
@@ -1213,6 +1217,56 @@ mod tests {
         let mut snapshot = ring.snapshot(clip.at(1000)).unwrap();
         assert!(snapshot.advance_to_keyframe(|frame| frame.ts.ticks() == 3000));
         assert_eq!(labels(&snapshot), [3000, 3250]);
+    }
+
+    /// A snapshot measures its frames' capture times as a clip measures its
+    /// start ([`captured`]): a frame dated ahead of its arrival (a Sender
+    /// Report mapping off, RFC 3550 §6.4.1) counts from its arrival. Video
+    /// keyframes arriving at 1 s and 2 s dated 61 s and 62 s start a
+    /// snapshot for 3 s at the second, and audio frames dated a minute
+    /// ahead start one for 1 s with the frame that arrived playing then.
+    /// Regression: the ring compared their dates, found none at or before
+    /// the target and started at the oldest held.
+    #[test]
+    fn rfc3550_6_4_1_a_snapshot_starts_by_when_its_frames_were_captured_never_after_their_arrival()
+    {
+        let clip = Clip::new();
+        let mut video = ring(true, 60_000);
+        // Labelled by arrival.
+        for (capture, arrival, keyframe) in [
+            (61_000, 1000, true),
+            (61_250, 1250, false),
+            (62_000, 2000, true),
+            (62_250, 2250, false),
+        ] {
+            assert_eq!(
+                video.push(
+                    &clip.shifted(capture, arrival, keyframe),
+                    usize::MAX,
+                    || None
+                ),
+                None
+            );
+        }
+        let starts = |ring: &Preroll, target: u64| {
+            ring.snapshot(clip.at(target))
+                .unwrap()
+                .frames()
+                .map(|frame| frame.ts.ticks())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(starts(&video, 3000), [2000, 2250]);
+        assert_eq!(starts(&video, 2000), [2000, 2250], "at the arrival counts");
+        assert_eq!(starts(&video, 1999), [1000, 1250, 2000, 2250]);
+
+        let mut audio = ring(false, 60_000);
+        for ms in (0..=1600).step_by(400) {
+            assert_eq!(
+                audio.push(&clip.shifted(60_000 + ms, ms, false), usize::MAX, || None),
+                None
+            );
+        }
+        assert_eq!(starts(&audio, 1000), [800, 1200, 1600]);
     }
 
     #[test]
