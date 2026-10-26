@@ -1234,7 +1234,7 @@ impl Supervisor {
             Some(id) => ClipId::new(id).map_err(|_| {
                 ApiError::new(
                     ErrorCode::InvalidRequest,
-                    "clip_id must match ^[A-Za-z0-9._-]{1,128}$",
+                    "clip_id must match ^[A-Za-z0-9._-]{1,128}$ and not be `.` or `..`",
                 )
                 .with_detail("clip_id", id.as_str())
             })?,
@@ -5151,6 +5151,17 @@ mod tests {
             (err.code, &err.details["clip_id"]),
             (ErrorCode::InvalidRequest, &json!("a/b"))
         );
+        // A dot segment matches the characters but is refused (RFC 3986
+        // section 3.3), and the message says so.
+        let err = refused(call(&s, &clip(1, "front", Some("..")).to_string()).await);
+        assert_eq!(
+            (err.code, err.message.as_str(), &err.details["clip_id"]),
+            (
+                ErrorCode::InvalidRequest,
+                "clip_id must match ^[A-Za-z0-9._-]{1,128}$ and not be `.` or `..`",
+                &json!("..")
+            )
+        );
         let mut far = clip(1, "front", None);
         far["before_ms"] = json!(120_001);
         let err = refused(call(&s, &far.to_string()).await);
@@ -5192,7 +5203,7 @@ mod tests {
         let (_k3, _e3) = started(call(&s, &clip(5, "back", Some("k3")).to_string()).await);
         let err = refused(call(&s, &clip(6, "back", Some("k4")).to_string()).await);
         assert_eq!(err.details["limit"], "max_clips");
-        assert_eq!(captured.lines("clip/start refused").len(), 8);
+        assert_eq!(captured.lines("clip/start refused").len(), 9);
         assert_eq!(s.shared.lock().clips_held(), 3);
         assert_eq!(
             captured
