@@ -666,6 +666,30 @@ fn samples_over_the_frame_limit_empty_or_with_a_unit_past_their_end_are_dropped(
     assert_eq!(reader.stats().samples, 57);
 }
 
+/// A video sample of non-zero size whose NAL units are all empty (a
+/// length field of 0, ISO/IEC 14496-15 §5.3.2) holds no access unit: it
+/// is dropped as empty, not handed on without a payload. Regression:
+/// the length-prefixed to Annex B conversion skips empty units, so such
+/// a sample came out of it empty and was handed on (found by the
+/// `fmp4_segment` fuzz target, which asserts every unit has a payload).
+#[test]
+fn iso14496_15_5_3_2_a_video_sample_of_only_empty_nal_units_is_dropped_as_empty() {
+    let sizes = trun(H264_AAC_0, 0) + 16;
+    let size = |sample: usize| {
+        let at = sizes + 4 * sample;
+        u32::from_be_bytes(H264_AAC_0[at..at + 4].try_into().unwrap()) as usize
+    };
+    // The first video sample starts at 548; the last is the tenth.
+    let last = 548 + (0..9).map(size).sum::<usize>();
+    let segment = patched(H264_AAC_0, sizes + 9 * 4, &8_u32.to_be_bytes());
+    let segment = patched(&segment, last, &[0; 8]);
+    let (reader, units) = read(H264_AAC_INIT, &[&segment], MAX);
+    assert_eq!(reader.stats().dropped_empty, 1);
+    assert_eq!(reader.stats().dropped_malformed, 0);
+    assert_eq!(of_track(&units, 0).len(), 9);
+    assert!(units.iter().all(|unit| !unit.payload.is_empty()));
+}
+
 #[test]
 fn iso14496_12_8_8_7_1_the_base_data_offset_of_each_track_fragment() {
     let traf = |base_data_offset, default_base_is_moof| Traf {

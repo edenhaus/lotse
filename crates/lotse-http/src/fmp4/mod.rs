@@ -150,7 +150,8 @@ pub struct Fmp4Stats {
     pub samples: u64,
     /// Samples dropped as larger than `max_frame_bytes`.
     pub dropped_oversize: u64,
-    /// Samples dropped as empty.
+    /// Samples dropped as empty: of size 0, or video samples whose NAL
+    /// units are all empty.
     pub dropped_empty: u64,
     /// Samples dropped as not inside a media data box: past the end of a
     /// segment cut short, or placed wrong.
@@ -1290,6 +1291,12 @@ impl Reader {
         let mut annex_b = Vec::with_capacity(sample.len());
         if length_prefixed_to_annex_b(sample, length_size, &mut annex_b).is_err() {
             stats.dropped_malformed = stats.dropped_malformed.saturating_add(1);
+            return Ok(None);
+        }
+        // The conversion skips empty NAL units, so a sample of only those
+        // holds no access unit.
+        if annex_b.is_empty() {
+            stats.dropped_empty = stats.dropped_empty.saturating_add(1);
             return Ok(None);
         }
         Ok(Some(Bytes::from(annex_b)))
