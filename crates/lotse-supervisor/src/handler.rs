@@ -1647,7 +1647,7 @@ fn check_clip_request(
 
 /// `limit_reached` when another clip of `stream_id` would exceed
 /// `clips_per_stream`; `no_video_track` when the tracks its connection
-/// `connection` last declared have no video.
+/// `connection` declared, while its source is live, have no video.
 fn check_clip_stream(
     state: &State,
     stream_id: &str,
@@ -1665,11 +1665,17 @@ fn check_clip_stream(
                 .with_detail("limit", "clips_per_stream"),
         );
     }
-    // Before the source was ever live its tracks are unknown: the worker
-    // ends a clip without video itself.
+    // Only a live source's tracks are its own: those the connection keeps
+    // from the last time it went live may be another source's (a
+    // `stream/put` switched it in place since) or the camera's before it
+    // changed, and with nothing running a refusal here would hold back
+    // the very demand that finds out. A source that is not live takes the
+    // start; its worker ends a clip without video itself
+    // (`no_video_track`), on the tracks it declares when it comes up.
     let tracks = state
         .connections
         .get(connection)
+        .filter(|entry| entry.snapshot.state == ConnectionState::Live)
         .map(|entry| entry.snapshot.tracks.as_slice())
         .unwrap_or_default();
     if !tracks.is_empty() && !tracks.iter().any(|track| track.kind == Kind::Video.name()) {
@@ -5231,13 +5237,14 @@ mod tests {
             audio_delay_ms: None,
             params: lotse_ipc::TrackParams::default(),
         };
-        s.shared
-            .lock()
-            .connections
-            .get_mut("c1")
-            .unwrap()
-            .snapshot
-            .tracks = vec![audio.clone()];
+        // A live source's tracks without video refuse the clip.
+        {
+            let mut state = s.shared.lock();
+            let snapshot = &mut state.connections.get_mut("c1").unwrap().snapshot;
+            snapshot.tracks = vec![audio.clone()];
+            snapshot.state = ConnectionState::Live;
+            drop(state);
+        }
         let err = refused(call(&s, &clip(7, "front", Some("k4")).to_string()).await);
         assert_eq!(err.code, ErrorCode::NoVideoTrack);
         audio.kind = "video".into();
@@ -5275,6 +5282,62 @@ mod tests {
         assert!(one_free.try_recv().is_err(), "the start is not handed on");
         assert!(!s.shared.lock().clips.contains_key("k4"));
         drop(full);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A source's tracks refuse a clip `no_video_track` only while it is
+    /// live: the tracks a connection keeps from the last time it went live
+    /// may be another source's after a `stream/put` switched it in place
+    /// while idle, and the worker ends a clip without video itself.
+    /// Regression: an audio-only source switched while idle to a video one
+    /// refused every `clip/start`, and with `preload: false` none raised
+    /// the demand that would declare the video.
+    #[tokio::test]
+    async fn only_the_tracks_of_a_live_source_refuse_a_clip_no_video_track() {
+        let dir = private_dir("clip-stale-tracks");
+        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+        let captured = Captured::default();
+        let _logs = captured.install();
+        result(call(&s, &put("front", "fake://127.0.0.1:1/a", false)).await);
+        result(call(&s, &put("front", "fake://127.0.0.1:1/b", false)).await);
+        assert_eq!(
+            captured
+                .lines("the connection switches to the new source in place")
+                .len(),
+            1
+        );
+        let audio = lotse_ipc::TrackInfo {
+            id: "a0".into(),
+            kind: "audio".into(),
+            codec: "opus".into(),
+            sync: "arrival".into(),
+            derived_from: None,
+            audio_delay_ms: None,
+            params: lotse_ipc::TrackParams::default(),
+        };
+        // Held throughout, so the driver publishes nothing in between.
+        {
+            let mut state = s.shared.lock();
+            let limits = state.clip_limits;
+            // The first source's, from when it was live.
+            state.connections.get_mut("c1").unwrap().snapshot.tracks = vec![audio];
+            for idle in [
+                ConnectionState::Idle,
+                ConnectionState::Connecting,
+                ConnectionState::Backoff,
+            ] {
+                state.connections.get_mut("c1").unwrap().snapshot.state = idle;
+                assert!(
+                    check_clip_stream(&state, "front", "c1", limits).is_ok(),
+                    "{idle:?}"
+                );
+            }
+            state.connections.get_mut("c1").unwrap().snapshot.state = ConnectionState::Live;
+            let err = check_clip_stream(&state, "front", "c1", limits).unwrap_err();
+            drop(state);
+            assert_eq!(err.code, ErrorCode::NoVideoTrack);
+        }
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
