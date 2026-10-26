@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use lotse_codec::aac::test_data::{CONFIG_16K_MONO, SINE_16K_MONO, frames};
 use lotse_codec::h264::annex_b_units;
-use lotse_codec::{h264, h265};
+use lotse_codec::opus::Decoder;
+use lotse_codec::transcode::clip::ToOpus;
+use lotse_codec::{g711, g722, h264, h265};
 use lotse_core::clip::{ClipError, ClipMuxer as _, ClipMuxerFactory as _, ClipPolicy, ClipTrack};
 use lotse_core::clock::{Clock as _, FakeClock};
 use lotse_core::{Codec, CodecFamily, Kind, MediaFrame, MediaTime};
@@ -2190,4 +2192,242 @@ fn capture_times_become_ticks_rounded_down() {
         encode_failed(mp4_atom::Error::InvalidSize),
         ClipError::Failed(format!("mp4 encoding: {}", mp4_atom::Error::InvalidSize))
     );
+}
+
+#[test]
+fn an_origin_set_before_the_first_frame_is_media_time_0_and_one_set_otherwise_is_ignored() {
+    let base = base();
+    let key = || frame(ms(base, 10), 0, true, 0, h264_au(true, 0));
+    let mut muxer = Muxer::new(&policy(1000));
+    muxer.start(&h264_track(), None).unwrap();
+    muxer.set_origin(base);
+    muxer.push(Kind::Video, key()).unwrap();
+    // After the first frame: the origin stays.
+    muxer.set_origin(ms(base, 5));
+    let mut file = muxer.finish().unwrap().concat();
+    let mut init = Muxer::new(&policy(1000));
+    let mut head = init.start(&h264_track(), None).unwrap().concat();
+    head.append(&mut file);
+    // 10 ms at 90 kHz.
+    assert_eq!(samples(&head, 1)[0].dts, 900);
+
+    // Before the start: nothing to set; the first frame is the origin.
+    let mut muxer = Muxer::new(&policy(1000));
+    muxer.set_origin(base);
+    let mut file = muxer.start(&h264_track(), None).unwrap().concat();
+    file.extend(muxer.push(Kind::Video, key()).unwrap().concat());
+    file.extend(muxer.finish().unwrap().concat());
+    assert_eq!(samples(&file, 1)[0].dts, 0);
+}
+
+/// `codec`'s 20 ms payloads of one second: `silence_ms` of silence, then
+/// a 1 kHz tone at half scale.
+fn narrowband_tone(codec: &Codec, silence_ms: u32) -> Vec<Bytes> {
+    let rate = codec.sample_rate().unwrap();
+    let per_frame = usize::try_from(rate / 50).unwrap();
+    let silence = usize::try_from(rate / 1_000 * silence_ms).unwrap();
+    let pcm: Vec<i16> = (0..usize::try_from(rate).unwrap())
+        .map(|index| {
+            let Some(at) = index.checked_sub(silence) else {
+                return 0;
+            };
+            let phase = std::f64::consts::TAU * 1_000.0 * f64::from(u32::try_from(at).unwrap())
+                / f64::from(rate);
+            #[expect(clippy::cast_possible_truncation, reason = "within i16")]
+            let sample = (16_384.0 * phase.sin()) as i16;
+            sample
+        })
+        .collect();
+    pcm.chunks(per_frame)
+        .map(|chunk| match g711::Law::of(codec) {
+            Some(law) => chunk.iter().map(|sample| law.encode(*sample)).collect(),
+            None => g722::test_data::encode(chunk).into(),
+        })
+        .collect()
+}
+
+/// The media time, in seconds, where the tone in `audio`'s Opus starts:
+/// its first decoded sample over a quarter of full scale, from the decode
+/// time of the packet that holds it (each decodes to 960 samples).
+fn tone_onset(audio: &[Read]) -> f64 {
+    let mut opus = Decoder::new(48_000).unwrap();
+    let mut pcm = Vec::new();
+    for sample in audio {
+        pcm.extend_from_slice(opus.decode(&sample.bytes).unwrap());
+    }
+    let at = pcm
+        .iter()
+        .position(|sample| sample.unsigned_abs() > 8_192)
+        .unwrap();
+    let ticks = audio[at / 960].dts + u64::try_from(at % 960).unwrap();
+    #[expect(clippy::cast_precision_loss, reason = "ticks of a second")]
+    let seconds = ticks as f64 / 48_000.0;
+    seconds
+}
+
+/// Transcoded G.711 and G.722 audio keeps sync with its video (EBU R37:
+/// sound at most 40 ms before the picture, at most 60 ms after): a tone
+/// that starts at a capture time decodes from the file at the media time
+/// the video gives that capture time, within half a millisecond. The audio
+/// starts 10 ms before the first keyframe, as a pre-roll's does, and the
+/// clip's origin is the transcode's delay before it, so its first packet
+/// is not clamped; the packets are one run of 20 ms.
+#[test]
+fn ebu_r37_transcoded_g711_and_g722_audio_keeps_sync_with_its_video() {
+    for codec in [Codec::Pcmu, Codec::Pcma, Codec::G722] {
+        let base = base();
+        let mut items: Vec<(Instant, u8, Kind, Arc<MediaFrame>)> = Vec::new();
+        for (index, payload) in narrowband_tone(&codec, 300).into_iter().enumerate() {
+            let index = u32::try_from(index).unwrap();
+            let at = ms(base, u64::from(index) * 20);
+            items.push((
+                at,
+                1,
+                Kind::Audio,
+                frame(at, i64::from(index) * 160, true, 0, payload),
+            ));
+        }
+        for index in 0..25_u8 {
+            let key = index % 10 == 0;
+            let at = ms(base, 10 + u64::from(index) * 40);
+            let video = frame(at, i64::from(index) * FRAME, key, 0, h264_au(key, index));
+            items.push((at, 0, Kind::Video, video));
+        }
+        items.sort_by_key(|(at, order, ..)| (*at, *order));
+
+        let mut chain = ToOpus::new(&codec).unwrap();
+        let mut muxer = Muxer::new(&policy(1000));
+        let mut file = muxer
+            .start(&h264_track(), Some(&ToOpus::output()))
+            .unwrap()
+            .concat();
+        muxer.set_origin(base.checked_sub(chain.delay()).unwrap());
+        for (_, _, kind, frame) in items {
+            let frames = match kind {
+                Kind::Video => vec![frame],
+                Kind::Audio => chain.push(&frame).unwrap(),
+            };
+            for frame in frames {
+                file.extend(muxer.push(kind, frame).unwrap().concat());
+            }
+        }
+        file.extend(muxer.finish().unwrap().concat());
+
+        let audio = samples(&file, 2);
+        assert_eq!(audio[0].dts, 0, "{codec:?}: the first packet at the origin");
+        for pair in audio.windows(2) {
+            assert_eq!(pair[1].dts, pair[0].dts + 960, "{codec:?}: one run");
+        }
+        // The tone starts at capture 300 ms; the first keyframe, captured at
+        // 10 ms, is at its decode time, so 300 ms is 290 ms after it.
+        let video = samples(&file, 1);
+        #[expect(clippy::cast_precision_loss, reason = "ticks of a second")]
+        let picture = video[0].dts as f64 / 90_000.0 + 0.290;
+        let offset = tone_onset(&audio) - picture;
+        assert!(
+            (-0.040..=0.060).contains(&offset),
+            "{codec:?}: sound {offset} s after the picture, outside EBU R37"
+        );
+        assert!(offset.abs() <= 0.000_5, "{codec:?}: {offset} s off");
+    }
+}
+
+/// Transcoded audio keeps sync with its video (EBU R37) through a late
+/// frame and a step of the capture times. Without Sender Reports a
+/// frame's capture time is its arrival: the second audio frame comes
+/// 100 ms late, and the audio's first packet stays at media time 0, where
+/// its first frame puts it. At 400 ms the RTSP source starts a new epoch
+/// on both tracks (the video's timestamps start over) and forgets its
+/// clock mapping, so the capture times from there are a second later
+/// while the audio's timestamps go on: its packets from there are a new
+/// epoch at 1380 ms, and the tone captured at 600 ms, 1600 ms after the
+/// step, decodes at the media time the video's new epoch gives 1600 ms,
+/// within half a millisecond. Regressions: the first packet took the late
+/// frame's capture time, 100 ms on; and the audio went on in its first
+/// epoch, a second before the video.
+#[test]
+fn ebu_r37_transcoded_audio_keeps_sync_through_a_late_frame_and_a_capture_time_step() {
+    for codec in [Codec::Pcmu, Codec::Pcma, Codec::G722] {
+        let base = base();
+        // What was captured `at` ms in: its capture time, a second later from
+        // 400 ms on, and its epoch.
+        let stepped = |at: u64| {
+            if at >= 400 {
+                (ms(base, at + 1_000), 1)
+            } else {
+                (ms(base, at), 0)
+            }
+        };
+        let mut items: Vec<(u64, u8, Kind, Arc<MediaFrame>)> = Vec::new();
+        for (index, payload) in narrowband_tone(&codec, 600).into_iter().enumerate() {
+            let index = u32::try_from(index).unwrap();
+            let at = u64::from(index) * 20;
+            let (mut wallclock, epoch) = stepped(at);
+            if index == 1 {
+                wallclock += Duration::from_millis(100);
+            }
+            let audio = frame(wallclock, i64::from(index) * 160, true, epoch, payload);
+            items.push((at, 1, Kind::Audio, audio));
+        }
+        for index in 0..25_u8 {
+            let key = index % 10 == 0;
+            let at = 10 + u64::from(index) * 40;
+            let (wallclock, epoch) = stepped(at);
+            let since = if epoch == 1 { index - 10 } else { index };
+            let video = frame(
+                wallclock,
+                i64::from(since) * FRAME,
+                key,
+                epoch,
+                h264_au(key, index),
+            );
+            items.push((at, 0, Kind::Video, video));
+        }
+        // In the order they were captured; the late frame keeps its place in its track.
+        items.sort_by_key(|(at, order, ..)| (*at, *order));
+
+        let mut chain = ToOpus::new(&codec).unwrap();
+        let mut muxer = Muxer::new(&policy(1000));
+        let mut file = muxer
+            .start(&h264_track(), Some(&ToOpus::output()))
+            .unwrap()
+            .concat();
+        muxer.set_origin(base.checked_sub(chain.delay()).unwrap());
+        for (_, _, kind, frame) in items {
+            let frames = match kind {
+                Kind::Video => vec![frame],
+                Kind::Audio => chain.push(&frame).unwrap(),
+            };
+            for frame in frames {
+                file.extend(muxer.push(kind, frame).unwrap().concat());
+            }
+        }
+        file.extend(muxer.finish().unwrap().concat());
+
+        let audio = samples(&file, 2);
+        // Frame 20, the new epoch's first, completes packet 19: captured
+        // 1400 ms less 20 ms and the delay, 1380 ms after the origin.
+        let dts: Vec<u64> = audio.iter().map(|sample| sample.dts).collect();
+        let expected: Vec<u64> = (0..49)
+            .map(|k| {
+                if k < 19 {
+                    960 * k
+                } else {
+                    66_240 + 960 * (k - 19)
+                }
+            })
+            .collect();
+        assert_eq!(dts, expected, "{codec:?}");
+        // The tone at 1600 ms is 190 ms after the video's new epoch's first
+        // frame, captured at 1410 ms.
+        let video = samples(&file, 1);
+        #[expect(clippy::cast_precision_loss, reason = "ticks of a second")]
+        let picture = video[10].dts as f64 / 90_000.0 + 0.190;
+        let offset = tone_onset(&audio) - picture;
+        assert!(
+            (-0.040..=0.060).contains(&offset),
+            "{codec:?}: sound {offset} s after the picture, outside EBU R37"
+        );
+        assert!(offset.abs() <= 0.000_5, "{codec:?}: {offset} s off");
+    }
 }

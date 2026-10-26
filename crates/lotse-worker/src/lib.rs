@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
+use lotse_codec::transcode::clip::ToOpus;
 use lotse_core::backoff::{BackoffPosition, ReconnectBackoff};
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
@@ -625,6 +626,7 @@ impl Serving<'_> {
                             factory: Arc::clone(factory),
                             settings: self.settings.clip,
                             clock: Arc::clone(&self.clock),
+                            transcode: ToOpus::new,
                         });
                         return Ok(());
                     }
@@ -5715,6 +5717,7 @@ mod tests {
             factory: Arc::new(FakeClipMuxerFactory::default()),
             settings: ClipSettings::default(),
             clock: clock.clone(),
+            transcode: ToOpus::new,
         });
         let (exit, ()) = tokio::join!(serving.on_shutdown(1_000), async {
             for _ in 0..64 {
@@ -5800,6 +5803,7 @@ mod tests {
             factory: Arc::new(FakeClipMuxerFactory::default()),
             settings: ClipSettings::default(),
             clock: clock.clone(),
+            transcode: ToOpus::new,
         });
         for _ in 0..64 {
             tokio::task::yield_now().await;
