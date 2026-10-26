@@ -764,7 +764,7 @@ struct Clip {
     /// Transcoded audio's last hole until the audio frame with samples after
     /// it went through the transcode, which decides whether it is one
     /// ([`Self::frame`]): one it fills with silence is none and goes; one
-    /// it re-anchors on moves to [`Self::holes`] for the new run's first
+    /// it re-anchors on or crosses an input epoch after moves to [`Self::holes`] for the new run's first
     /// packet, where no later hole of either kind takes it away.
     judging: Option<&'static str>,
     /// How far before its start it begins: its first video frame's age
@@ -1123,11 +1123,14 @@ impl Clip {
     /// then into the container ([`Self::sample`]), audio the clip
     /// transcodes as the Opus packets its [`ToOpus`] completes with it. A
     /// hole the queue reported before an audio frame the transcode
-    /// continues its run with ([`ToOpus::continued`]: silence fills it, up
-    /// to [`MAX_SILENCE`](lotse_codec::transcode::clip::MAX_SILENCE)) is no
+    /// continues its output epoch with ([`ToOpus::continued`]: within the
+    /// tolerance, or silence fills it, up to
+    /// [`MAX_SILENCE`](lotse_codec::transcode::clip::MAX_SILENCE)) is no
     /// gap: the file has none there. Only the first frame after the hole
     /// decides (the first with samples: one without is left out of the
-    /// transcode): one that re-anchors puts it in [`Self::holes`] for the
+    /// transcode): one that re-anchors, or that crosses into an input epoch
+    /// whose new output epoch is placed at its capture time (which can
+    /// step), puts it in [`Self::holes`] for the
     /// first packet of the new run, where neither the frames that continue
     /// that run nor a later loss they fill with silence drop it.
     fn frame(
@@ -4328,6 +4331,76 @@ mod tests {
                 "clip: an audio frame without samples left out of the transcode"
             ),
             2
+        );
+    }
+
+    /// A hole the queue reported before a new input epoch whose timestamps
+    /// continue the sample count is a gap: the transcode goes on with the
+    /// decoder, but in a new output epoch placed at the epoch's capture
+    /// time, which can step (the source forgets its clock mapping with the
+    /// epoch), so no silence covers the hole in the file. A 10 ms PCMU
+    /// frame lost (80 ticks, within the tolerance, so the count goes on) as
+    /// the epoch starts with the capture times 1 s later: the gap runs from
+    /// the packet before, at 160 ms, to the new epoch's first, at 1190 ms,
+    /// and is counted. Regression: the crossing frame was `continued`, the
+    /// clip dropped the hole as one silence filled, and the file's
+    /// second-long hole had neither a gap nor a count.
+    #[tokio::test]
+    async fn a_hole_before_a_continuing_epoch_whose_capture_times_step_is_a_gap() {
+        let (logs, _guard) = Logs::capture();
+        // 10 ms of PCMU: 80 octets, 80 ticks (RFC 3551 §4.5.14).
+        let payload = narrowband_payload(&Codec::Pcmu).slice(..80);
+        let lead = {
+            let delay = ToOpus::new(&Codec::Pcmu).unwrap().delay();
+            i64::try_from(delay.as_nanos() * 48 / 1_000_000).unwrap()
+        };
+        let mut rig = Rig::new(Some(Codec::Pcmu));
+        let reader = rig.start(spec(0, None, true));
+        settle().await; // the clip subscribes before any frame
+        let audio = Arc::clone(rig.audio.as_ref().unwrap());
+        for index in 0..40_u32 {
+            // Captured every 10 ms, 1 s later from the new epoch on.
+            let ms = u64::from(index) * 10 + if index > 20 { 1_000 } else { 0 };
+            if index % 10 == 0 && index <= 20 {
+                let keyframe = index == 0;
+                rig.video_frame(ms, index / 10, keyframe, if keyframe { 32 } else { 16 });
+            }
+            if index == 20 {
+                // Frame 20 is lost to a lag, and the audio's epoch starts.
+                oversize(&rig, &audio, ms);
+                let _epoch = audio.start_epoch();
+            } else {
+                rig.narrowband_frame_at(ms, i64::from(index) * 80, &payload);
+            }
+            settle().await;
+        }
+        rig.clips.stop("k1", EndReason::Stopped);
+        let reports = rig.until_stopped().await;
+        let bytes = reader.rest().await;
+        let timeline: Vec<(u32, i64)> = audio_samples(&lines(&bytes))
+            .into_iter()
+            .map(|(epoch, ts, _)| (epoch, ts))
+            .collect();
+        // The timestamps run on; the packets from the epoch's first frame on
+        // are output epoch 1, placed at its capture time.
+        let run: Vec<(u32, i64)> = (0..18)
+            .map(|k| (u32::from(k >= 9), 960 * k - lead))
+            .collect();
+        assert_eq!(timeline, run);
+        assert_eq!(
+            reports,
+            vec![
+                started(0, Some("opus")),
+                gap("lagged", 160, 1_190),
+                stopped("stopped", bytes.len(), 1_350, 1),
+            ]
+        );
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "clip: the transcode filled the audio's hole with silence; no gap"
+            ),
+            0
         );
     }
 

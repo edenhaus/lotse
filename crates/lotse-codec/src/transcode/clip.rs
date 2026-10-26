@@ -210,8 +210,9 @@ pub struct ToOpus {
     fresh_epoch: bool,
     /// Rate-limits the lines of holes and re-anchors.
     moves: Throttle,
-    /// Whether the last frame pushed went on the timeline before it
-    /// ([`Self::continued`]); a re-anchor clears it.
+    /// Whether the last frame pushed with samples went on in the output
+    /// epoch before it ([`Self::continued`]); a re-anchor and a crossing
+    /// clear it.
     continued: bool,
 }
 
@@ -303,11 +304,15 @@ impl ToOpus {
             .saturating_add(i64::from(self.encoder.lookahead()))
     }
 
-    /// Whether the last frame pushed went on the timeline of the frames
-    /// before it, the decoder and the sample count with it: within the
-    /// tolerance, after a hole filled with silence, or across an input
-    /// epoch it continues (whose packets start a new output epoch all the
-    /// same). Not the first frame, nor one that re-anchored.
+    /// Whether the last frame pushed with samples went on in the output
+    /// epoch of the frames before it, so that its packets follow theirs in
+    /// the container with no hole: within the tolerance, or after a hole
+    /// filled with silence. Not the first frame, nor one that re-anchored,
+    /// nor one across an input epoch it continues: the decoder and the
+    /// sample count go on there, but the packets start a new output epoch
+    /// placed at that frame's capture time, which can step (`cross`),
+    /// so a hole before it can still be one in the file. A frame without
+    /// samples leaves it as it was.
     pub const fn continued(&self) -> bool {
         self.continued
     }
@@ -361,7 +366,8 @@ impl ToOpus {
         if frame.payload.is_empty() {
             return Ok(Vec::new());
         }
-        // A re-anchor, the first frame's included, clears it ([`Self::anchor`]).
+        // A re-anchor, the first frame's included ([`Self::anchor`]), and a
+        // crossing ([`Self::cross`]) clear it.
         self.continued = true;
         if !self.anchored {
             self.anchor(frame, 0, false);
@@ -462,7 +468,8 @@ impl ToOpus {
     /// takes the epoch, its timestamps moved by that multiple of 2^32, and
     /// keeps the decoder's state, the resampler's and the PCM, so the
     /// packets' timestamps go on in one run. They start a new output epoch
-    /// all the same, placed at `frame`'s capture time: the source forgets
+    /// all the same, placed at `frame`'s capture time (so it is not
+    /// [`Self::continued`]): the source forgets
     /// its clock mapping with the epoch (Sender Reports until then,
     /// arrivals after), so the capture times can step there, and the
     /// container places the video's new epoch at the new ones. Any other
@@ -489,6 +496,9 @@ impl ToOpus {
             .rebase
             .saturating_add(near.saturating_sub(offset));
         self.new_epoch();
+        // The packets go on in a new output epoch, placed at this frame's
+        // capture time, which may step: no run before it covers a hole.
+        self.continued = false;
         // The sample count, where the frame's audio goes in the run, not
         // its timestamp, which may be off it by up to the tolerance: the
         // packets follow the count, so a jittered stamp would place the new
@@ -1100,12 +1110,16 @@ mod tests {
         }
     }
 
-    /// `continued` tells a frame on the run before it (within the
-    /// tolerance, after a hole filled with silence, across an epoch it
-    /// continues) from the first and from one that re-anchors (an epoch off
-    /// the count, a step back, a hole over a second).
+    /// `continued` tells a frame in the output epoch before it (within the
+    /// tolerance, after a hole filled with silence) from one that starts
+    /// one: the first, one across an epoch it continues (the decoder goes
+    /// on, but the epoch is placed at the frame's capture time, which can
+    /// step), and one that re-anchors (an epoch off the count, a step back,
+    /// a hole over a second). Regression: a frame across an epoch it
+    /// continues was `continued`, and the clip took a hole before it, which
+    /// a capture-time step leaves in the file, for one silence filled.
     #[test]
-    fn continued_is_a_frame_on_the_run_before_it_not_one_that_re_anchors() {
+    fn continued_is_a_frame_in_the_output_epoch_before_it_not_one_that_starts_one() {
         let mut chain = ToOpus::new(&Codec::Pcmu).unwrap();
         let input = frames(&Codec::Pcmu, &onset(8_000, 0, 200), t0());
         let mut push = |frame: &MediaFrame, epoch: u32| {
@@ -1120,8 +1134,12 @@ mod tests {
         assert!(!push(&input[0], 0), "the first anchors");
         assert!(push(&input[1], 0), "the next");
         assert!(push(&input[3], 0), "after a hole filled with silence");
-        assert!(push(&input[4], 1), "across an epoch it continues");
-        assert!(!push(&input[6], 2), "a new epoch 20 ms off restarts");
+        assert!(
+            !push(&input[4], 1),
+            "across an epoch it continues: a new output epoch"
+        );
+        assert!(push(&input[5], 1), "the next in that epoch");
+        assert!(!push(&input[7], 2), "a new epoch 20 ms off restarts");
         assert!(!push(&input[0], 2), "a step back");
         let mut far = input[1].clone();
         far.ts = MediaTime::from_ticks(far.ts.ticks() + 8_160);
