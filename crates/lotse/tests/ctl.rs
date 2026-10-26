@@ -1,8 +1,8 @@
 //! The M0 exit criterion: a `lotse ctl` round trip over the socket of a
 //! real daemon. `info`, `stream put` with `preload` (a worker runs the fake
 //! source), `stream get` until it is live, `stream subscribe`, an error
-//! result, `raw`, `stream clip` (ended by Ctrl-C too), `stream delete`,
-//! and a clean stop. Needs the
+//! result, `raw`, `stream clip` (ended by Ctrl-C too, and with a stdout
+//! nobody reads), `stream delete`, and a clean stop. Needs the
 //! `source-fake` feature (on with `--all-features`).
 
 #![cfg(feature = "source-fake")]
@@ -292,6 +292,62 @@ fn check_clip_interrupted(socket: &Path, dir: &Path) {
     assert_eq!(std::fs::metadata(&file).unwrap().len(), 0);
 }
 
+/// `stream clip` with a stdout nobody reads, its pipe full before
+/// `lotse ctl` starts, so its first write never returns: Ctrl-C still stops
+/// the clip and a second still ends `lotse ctl`, with exit 1. Regression
+/// (PR #74 review): its lines were printed with `println!` on the
+/// runtime's one thread after Ctrl-C's handler had replaced SIGINT's
+/// default, and the blocked write held the clip and both presses. First of
+/// the clip checks: the daemon's first `clip_opened` is this clip's.
+#[cfg(feature = "output-clip")]
+fn check_clip_with_stdout_stalled(socket: &Path, dir: &Path, daemon: &mut Daemon) {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let (reader, mut writer) = std::io::pipe().expect("a pipe");
+    // Exactly the pipe's capacity fits, so this returns with the pipe full.
+    let size = rustix::pipe::fcntl_getpipe_size(&writer).expect("the pipe's size");
+    writer
+        .write_all(&vec![b'\n'; size])
+        .expect("the pipe filled");
+    let mut child = lotse()
+        .arg("ctl")
+        .arg("--socket")
+        .arg(socket)
+        .args(["--compact", "stream", "clip", "front", "-o"])
+        .arg(dir.join("stalled.mp4"))
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ctl runs");
+    let pid = Pid::from_child(&child);
+    let stderr = child.stderr.take().expect("piped stderr");
+    // `clip/start` is sent once Ctrl-C has its handler.
+    daemon.wait_for("\"event\":\"clip_opened\"");
+    kill_process(pid, Signal::INT).expect("SIGINT sent");
+    // The first press was heard: ctl asked for clip/stop. A second press
+    // sent before this point could be coalesced with the first.
+    let stopped = json(&daemon.wait_for("\"event\":\"clip_stopped\""));
+    assert_eq!(stopped["reason"], "stopped", "{stopped}");
+    kill_process(pid, Signal::INT).expect("SIGINT sent");
+    let (exited, exit) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _gone = exited.send(child.wait());
+    });
+    let Ok(status) = exit.recv_timeout(Duration::from_secs(10)) else {
+        let _gone = kill_process(pid, Signal::KILL);
+        panic!("ctl did not leave on the second Ctrl-C with stdout stalled");
+    };
+    let status = status.expect("ctl exits");
+    let stderr = std::io::read_to_string(stderr).expect("stderr");
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("interrupted again"), "{stderr}");
+    drop(reader);
+}
+
 /// `raw` prints every frame up to the result, as sent.
 fn check_raw(socket: &Path) {
     let raw = ctl(socket, &["--compact", "raw", r#"{"type":"ping"}"#]);
@@ -364,6 +420,7 @@ fn ctl_round_trips_over_the_socket_of_a_running_daemon() {
     check_raw(&socket);
     #[cfg(feature = "output-clip")]
     {
+        check_clip_with_stdout_stalled(&socket, &dir, &mut daemon);
         check_clip(&socket, &dir);
         check_clip_interrupted(&socket, &dir);
     }
