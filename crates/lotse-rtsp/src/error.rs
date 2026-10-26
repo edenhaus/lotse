@@ -158,6 +158,47 @@ mod tests {
         ));
     }
 
+    /// The scrub prints a URL in a camera's text as the `url` crate parsed
+    /// it: its scheme, and a special scheme's host, lowercase (WHATWG URL
+    /// Standard §4.4 scheme state, §3.5 host parsing, UTS #46 mapping
+    /// fullwidth forms to ASCII). So camera text can come back as text the
+    /// camera never sent, though from nothing but that text: no secret of
+    /// the source goes into it. The `rtsp_session` fuzz target's
+    /// `WWW-Authenticate` (2026-10-26) came back holding its then
+    /// all-lowercase password; its password is mixed case since.
+    #[test]
+    fn whatwg_url_4_4_a_url_in_camera_text_prints_its_scheme_and_special_host_lowercase() {
+        let url = SourceUrl::parse("rtsp://user:Pw-4E2d81@cam/stream").unwrap();
+        let retina = "401 response to DESCRIBE CSeq=1: Can't understand WWW-Authenticate header: \
+            invalid byte at byte 10: iiiiiiiiii(HERE-->)?iiiiiiiiii)iiii%Eiiipw-4E2d81tt://T%\"%@";
+        assert_eq!(
+            classify_text(retina, Some(401), &url),
+            SourceError::AuthFailed(
+                "401 response to DESCRIBE CSeq=1: Can't understand WWW-Authenticate header: \
+                 invalid byte at byte 10: iiiiiiiiii(HERE-->)?iiiiiiiiii)iiii%eiiipw-4e2d81tt://T%\"%@"
+                    .into()
+            )
+        );
+        for (text, printed) in [
+            (
+                "HTTP://PW-4E2D81.example/x y",
+                "http://pw-4e2d81.example/**** y",
+            ),
+            (
+                "http://\u{ff50}\u{ff57}\u{ff0d}\u{ff14}\u{ff45}\u{ff12}\u{ff44}\u{ff18}\u{ff11}.example y",
+                "http://pw-4e2d81.example/ y",
+            ),
+            // Not special: the host as the camera wrote it.
+            ("Pw-4E2d81tt://Pw-4E2d81 y", "pw-4e2d81tt://Pw-4E2d81 y"),
+        ] {
+            assert_eq!(
+                classify_text(text, Some(400), &url),
+                SourceError::Protocol(printed.into()),
+                "{text}"
+            );
+        }
+    }
+
     /// A camera that echoes the path without a scheme, where the message
     /// is cut: scrubbed after the cut, the path's first bytes would show.
     /// The scrubbed path's start fills the cap up to the cut mark.
