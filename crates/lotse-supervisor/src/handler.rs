@@ -5404,6 +5404,24 @@ mod tests {
             s.clip_body(&ClipId::new("k4").unwrap()).unwrap_err(),
             ClipBodyError::NotFound
         );
+        // A full pipe: nobody read the body, so the stop could not write
+        // the file's last bytes in time and the worker ends it
+        // `client_gone`, the tail counted in its bytes; the clip still
+        // ends `not_fetched`, a file not whole.
+        let (_r8, mut k8) = started(call(&s, &clip(8, "front", Some("k8")).to_string()).await);
+        let before = front_stats(&s);
+        clock.advance(Duration::from_secs(10));
+        settle().await;
+        clip_report(&s, "k8", stopped_report("client_gone", 70_000));
+        let end = next(&mut k8).await;
+        assert_eq!(
+            (&end["reason"], &end["bytes"]),
+            (&json!("not_fetched"), &json!(70_000))
+        );
+        let after = front_stats(&s);
+        assert_eq!(after.1, before.1, "not a whole file");
+        assert_eq!(after.3, before.3 + 70_000, "the tail counted");
+        assert!(!s.shared.lock().clip_id_in_use("k8"), "no body kept");
         // A clip whose deadline passed while it was being stopped keeps
         // no body.
         let (_r6, _k6) = started(call(&s, &clip(6, "front", Some("k6")).to_string()).await);
