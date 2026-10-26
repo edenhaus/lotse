@@ -44,7 +44,8 @@
 //! audio goes through its clip's own [`ToOpus`] on the way out of the
 //! queue, so the ring keeps the camera's frames and the pre-roll's audio is
 //! transcoded in a burst at the start, at most [`MAX_STEP_PACKETS`] packets
-//! before the task yields to the worker's other tasks. A reader that
+//! (one item's over it, see there) before the task yields to the worker's
+//! other tasks, in its steps and its drain alike. A reader that
 //! closes its end ends the clip at once, written to or not.
 //!
 //! Invariants: the media path never waits for a clip. While the pipe is
@@ -147,11 +148,15 @@ const MAX_GAP_REPORTS: u32 = 256;
 /// and a pipe takes 64 KiB at most anyway.
 const MAX_WRITE_SLICES: usize = 64;
 
-/// The most Opus packets a clip transcodes before it lets the worker's
-/// other tasks run: half a second of audio, a few milliseconds of one
-/// core. A pre-roll's audio comes out of the queue at once; transcoded in
-/// one go, a 120 s window would hold a runtime thread for the length of
-/// 6000 packets.
+/// The Opus packets a clip transcodes before it lets the worker's other
+/// tasks run, in its steps and its drain alike: half a second of audio, a
+/// few milliseconds of one core. A pre-roll's audio comes out of the queue
+/// at once; transcoded in one go, a 120 s window would hold a runtime
+/// thread for the length of 6000 packets. It is checked between the
+/// queue's items, so one item goes over it by its own packets at most: one
+/// RTP packet's samples (a camera's 20 to 40 ms) and up to
+/// [`MAX_SILENCE`](lotse_codec::transcode::clip::MAX_SILENCE)'s 50 packets
+/// of silence before them.
 const MAX_STEP_PACKETS: usize = 25;
 
 /// What the worker's clips run under: the delivery policy and the limits
@@ -755,7 +760,8 @@ struct Clip {
     /// carry as it is: the chain for the codec of the audio's entry in
     /// [`Media::entries`], which stays the camera's.
     transcoder: Option<ToOpus>,
-    /// Opus packets transcoded in the current [`Self::step`].
+    /// Opus packets transcoded since the clip last let the worker's other
+    /// tasks run: in the current [`Self::step`], or in [`Self::drain`].
     step_packets: usize,
     /// Where the video continues.
     continuity: Continuity,
@@ -1393,7 +1399,8 @@ impl Clip {
     /// stops the drain. `client_gone` when the reader went meanwhile, and
     /// what else ends the clip on the way (a codec change, the container
     /// failing a frame); reaching the clip's own end keeps the reason it
-    /// ends for.
+    /// ends for. It yields after every [`MAX_STEP_PACKETS`] packets it
+    /// transcodes, as `record` does between steps.
     async fn drain(&mut self, media: &mut Media) -> Option<EndReason> {
         let deadline = self.clock.now().checked_add(FINISH_GRACE);
         loop {
@@ -1401,6 +1408,12 @@ impl Clip {
                 return Some(reason);
             }
             if self.pending.is_empty() {
+                if self.step_packets >= MAX_STEP_PACKETS {
+                    // As between the steps of `record`: the worker's other
+                    // tasks run first, then the drain goes on.
+                    self.step_packets = 0;
+                    tokio::task::yield_now().await;
+                }
                 // Every item was queued by now, so its hold ends by then.
                 let now = self.clock.now();
                 let release = now
@@ -3568,6 +3581,38 @@ mod tests {
         assert_eq!(
             audio_samples(&lines(&bytes)).len(),
             audio.load(std::sync::atomic::Ordering::SeqCst),
+            "the file is whole"
+        );
+    }
+
+    /// A stop during a pre-roll's transcode burst drains the rest in steps
+    /// of `MAX_STEP_PACKETS` packets, letting the worker's other tasks run
+    /// between them as the clip's steps do. Regression: the drain
+    /// transcoded all of it in one go while the pipe took the bytes.
+    #[tokio::test]
+    async fn a_stop_during_a_transcode_burst_drains_it_in_steps_that_let_other_tasks_run() {
+        let mut rig = Rig::new(Some(Codec::Pcmu));
+        ten_narrowband_seconds(&rig, &Codec::Pcmu);
+        let count = Counting::default();
+        let audio = Arc::clone(&count.0);
+        let reader = rig.start_with(spec(3_500, None, true), count, ClipSettings::default());
+        // Before the clip's first poll: it opens, takes its first step and
+        // yields, then ends at the stop and drains what is left.
+        assert!(rig.clips.stop("k1", EndReason::Stopped));
+        let mut bytes = Vec::new();
+        let mut ticks = Vec::new();
+        per_tick(&audio, &reader, 64, &mut ticks, &mut bytes).await;
+        let busy: Vec<usize> = ticks.into_iter().filter(|n| *n > 0).collect();
+        let (last, full) = busy.split_last().unwrap();
+        assert!(busy.len() >= 4, "{busy:?}");
+        assert!(full.iter().all(|n| *n == MAX_STEP_PACKETS), "{busy:?}");
+        assert!(*last <= MAX_STEP_PACKETS, "{busy:?}");
+        let (reports, rest) = tokio::join!(rig.until_stopped(), reader.rest());
+        bytes.extend(rest);
+        let_assert_reason(&reports, "stopped");
+        assert_eq!(
+            audio_samples(&lines(&bytes)).len(),
+            busy.iter().sum::<usize>(),
             "the file is whole"
         );
     }
