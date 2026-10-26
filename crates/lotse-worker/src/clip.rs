@@ -749,14 +749,15 @@ struct Clip {
     /// the duration `Stopped` reports.
     reached: Duration,
     /// The holes the queue reported per track, by their API name, until
-    /// the frame that ends each is in the container: where they are. A
-    /// hole in transcoded audio that the transcode fills with silence is
-    /// none, and goes ([`Self::frame`]).
+    /// the frame that ends each is in the container: where they are.
+    /// Transcoded audio's come through [`Self::judging`], and only those
+    /// the transcode re-anchors on.
     holes: HashMap<Kind, &'static str>,
-    /// The audio's last hole until the audio frame after it went through
-    /// the transcode, which decides whether it is one ([`Self::frame`]):
-    /// the frames after that continue the run the hole re-anchored, which
-    /// does not make it go.
+    /// Transcoded audio's last hole until the audio frame after it went
+    /// through the transcode, which decides whether it is one
+    /// ([`Self::frame`]): one it fills with silence is none and goes; one
+    /// it re-anchors on moves to [`Self::holes`] for the new run's first
+    /// packet, where no later hole of either kind takes it away.
     judging: Option<&'static str>,
     /// How far before its start it begins: its first video frame's age
     /// when the container starts, set then.
@@ -1091,9 +1092,11 @@ impl Clip {
                 if track == Kind::Video {
                     self.continuity.reset();
                 }
-                self.holes.insert(track, gap_name(reason));
-                if track == Kind::Audio {
+                if track == Kind::Audio && self.transcoder.is_some() {
+                    // The transcode decides at the next frame ([`Self::frame`]).
                     self.judging = Some(gap_name(reason));
+                } else {
+                    self.holes.insert(track, gap_name(reason));
                 }
                 Ok(())
             }
@@ -1113,8 +1116,9 @@ impl Clip {
     /// continues its run with ([`ToOpus::continued`]: silence fills it, up
     /// to [`MAX_SILENCE`](lotse_codec::transcode::clip::MAX_SILENCE)) is no
     /// gap: the file has none there. Only the first frame after the hole
-    /// decides: one that re-anchors keeps the hole for the first packet of
-    /// the new run, and the frames that continue that run do not drop it.
+    /// decides: one that re-anchors puts it in [`Self::holes`] for the
+    /// first packet of the new run, where neither the frames that continue
+    /// that run nor a later loss they fill with silence drop it.
     fn frame(
         &mut self,
         track: Kind,
@@ -1153,13 +1157,17 @@ impl Clip {
         let packets = chain.push(&frame).map_err(ClipError::from);
         let concealed = chain.continued();
         let packets = packets.map_err(self.failed("transcode"))?;
-        let judging = self.judging.take();
-        if concealed && let Some(reason) = judging {
-            // Silence fills it: the file's audio goes on in one run, no
-            // hole there, so no gap.
-            self.holes.remove(&track);
-            if let Some(count) = self.concealed_log.hit(self.clock.now()) {
-                tracing::debug!(clip.id = %self.id, reason, count, "clip: the transcode filled the audio's hole with silence; no gap");
+        if let Some(reason) = self.judging.take() {
+            if concealed {
+                // Silence fills it: the file's audio goes on in one run, no
+                // hole there, so no gap. A hole decided before it, waiting
+                // in `holes` for its run's first packet, stays.
+                if let Some(count) = self.concealed_log.hit(self.clock.now()) {
+                    tracing::debug!(clip.id = %self.id, reason, count, "clip: the transcode filled the audio's hole with silence; no gap");
+                }
+            } else {
+                // A hole in the file: it ends at the new run's first packet.
+                self.holes.insert(track, reason);
             }
         }
         self.step_packets = self.step_packets.saturating_add(packets.len());
@@ -4006,7 +4014,12 @@ mod tests {
     /// Only the frame after the hole decides: the frames that continue a
     /// re-anchored run, as the next one does here, do not drop its gap.
     /// A second lost frame 200 ms after the first covers the rate limit of
-    /// the line that says so: one line, both holes dropped.
+    /// the line that says so: one line, both holes dropped. After the
+    /// 1.02 s, a frame lost right after the one that re-anchors, which the
+    /// transcode fills, leaves the long gap as it was: reported once and
+    /// counted. Regression: filling it dropped the hole the re-anchor kept
+    /// for the new run's first packet, and the file's 1.02 s hole had
+    /// neither a gap nor a count.
     #[tokio::test]
     async fn a_transcoded_audio_hole_is_a_gap_only_where_the_file_has_one() {
         let (logs, _guard) = Logs::capture();
@@ -4015,7 +4028,8 @@ mod tests {
             let delay = ToOpus::new(&Codec::Pcmu, 8_000).unwrap().delay();
             i64::try_from(delay.as_nanos() * 48 / 1_000_000).unwrap()
         };
-        for lost in [1_u32, 51] {
+        // (frames lost in a row from frame 10, a second single loss)
+        for (lost, again) in [(1_u32, Some(20_u32)), (51, None), (51, Some(62))] {
             let mut rig = Rig::new(Some(Codec::Pcmu));
             let reader = rig.start(spec(0, None, true));
             settle().await; // the clip subscribes before any frame
@@ -4027,10 +4041,10 @@ mod tests {
                     rig.video_frame(ms, index / 5, keyframe, if keyframe { 32 } else { 16 });
                 }
                 let skipped = (11..10 + lost).contains(&index);
-                if index == 10 || (lost == 1 && index == 20) {
+                if index == 10 || again == Some(index) {
                     // Frame 10 is lost to a lag; the camera's next `lost - 1` never came.
-                    // A single loss has a second one, 200 ms on, whose line the clip's
-                    // rate limit holds back.
+                    // A second single loss: 200 ms on, whose line the clip's rate limit
+                    // holds back; or right after the frame that re-anchors after 1.02 s.
                     oversize(&rig, &audio, ms);
                 } else if !skipped {
                     rig.narrowband_frame(index, &payload);
@@ -4057,7 +4071,8 @@ mod tests {
                 );
             } else {
                 // Frames 0..=9, the 10th's packet dropped with the re-anchor; then
-                // frames 61..=80 from 61 * 960 less the delay.
+                // frames 61..=80 from 61 * 960 less the delay (also with frame 62
+                // lost: frame 63 fills its 20 ms, and the packets are the same).
                 let mut runs: Vec<(u32, i64)> = (0..9).map(|k| (0, 960 * k - lead)).collect();
                 runs.extend((0..19).map(|k| (1, 61 * 960 + 960 * k - lead)));
                 assert_eq!(timeline, runs);
@@ -4076,7 +4091,7 @@ mod tests {
                 Level::DEBUG,
                 "clip: the transcode filled the audio's hole with silence; no gap"
             ),
-            1
+            2
         );
     }
 
