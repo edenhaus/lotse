@@ -1951,8 +1951,8 @@ mod tests {
     /// container takes what comes out (Opus, RFC 7587): a container
     /// without Opus gets no transcode, so that audio is omitted, and a
     /// codec the clip cannot transcode gets none either.
-    #[test]
-    fn a_transcode_needs_audio_it_can_transcode_and_a_container_that_takes_opus() {
+    #[tokio::test]
+    async fn a_transcode_needs_audio_it_can_transcode_and_a_container_that_takes_opus() {
         let fake = FakeClipMuxerFactory::default();
         for codec in [Codec::Pcmu, Codec::Pcma] {
             assert!(transcoder(&codec, 8_000, &fake).is_some(), "{codec:?}");
@@ -1965,6 +1965,23 @@ mod tests {
             name: "l16".into(),
         };
         assert!(transcoder(&l16, 8_000, &fake).is_none());
+
+        // A G.711 clip into the container without Opus: video only, and
+        // the audio omitted with a warning.
+        let mut rig = Rig::new(Some(Codec::Pcmu));
+        let reader = rig.start_with(spec(0, None, true), NoOpus, ClipSettings::default());
+        rig.video_frame(0, 0, true, 32);
+        assert_eq!(rig.report().await, started(0, None));
+        assert_eq!(
+            rig.report().await,
+            ClipReport::Warning {
+                code: "audio_omitted".into(),
+                message: "pcmu does not fit the clip's container; the clip has no audio".into(),
+            }
+        );
+        assert!(rig.clips.stop("k1", EndReason::Stopped));
+        rig.until_stopped().await;
+        assert_eq!(lines(&reader.rest().await)[0], "init video=h264");
     }
 
     /// 20 ms of a 1 kHz tone in `codec`, G.711 or G.722.
