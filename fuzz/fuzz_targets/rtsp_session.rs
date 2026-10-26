@@ -47,7 +47,9 @@
 //! The URL carries credentials, as a camera's does, and the attempt's
 //! error never shows its password unless the camera sent it: the camera
 //! records every byte it writes, as it writes them (headers without their
-//! CR and LF), and only a password among them may come back quoted.
+//! CR and LF), and only a password among them may come back quoted. The
+//! password is one the scrub of the error cannot print from camera text
+//! without it ([`PASSWORD`]).
 //! Flag bit 5
 //! makes the camera challenge first (RFC 2326 §7.1.1, RFC 7235 §3.1): the
 //! first request on each connection, the source's, the backchannel
@@ -92,7 +94,15 @@ use tokio_util::sync::CancellationToken;
 const IDLE: Duration = Duration::from_millis(50);
 
 /// The password of the camera URL's credentials; no error may show it.
-const PASSWORD: &str = "pw-4e2d81";
+/// Mixed case, with a capital that is no hex digit: the error's scrub
+/// prints a URL in the camera's text as the `url` crate parsed it, its
+/// scheme and a special scheme's host in lowercase (WHATWG URL Standard
+/// §4.4 scheme state, §3.5 host parsing with UTS #46 mapping, which also
+/// folds fullwidth forms to ASCII) and what it percent-encodes as `%` and
+/// uppercase hex digits, so no camera text that lacks this password
+/// prints as it. An all-lowercase one did: `pw-4E2d81tt://` in a
+/// `WWW-Authenticate` came back as `pw-4e2d81tt://` (found 2026-10-26).
+const PASSWORD: &str = "Pw-4E2d81";
 
 /// The challenge of flag bit 5 when bit 6 leaves it to the camera: a
 /// Digest one (RFC 7616 §3.3) with the fields retina answers.
