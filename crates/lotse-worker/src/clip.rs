@@ -1932,6 +1932,41 @@ mod tests {
         }
     }
 
+    /// A container that takes what the fake one takes but Opus.
+    #[derive(Debug)]
+    struct NoOpus;
+
+    impl ClipMuxerFactory for NoOpus {
+        fn accepts(&self, codec: &Codec) -> bool {
+            codec.family() != lotse_core::codec::CodecFamily::Opus
+                && FakeClipMuxerFactory::default().accepts(codec)
+        }
+
+        fn muxer(&self, policy: &ClipPolicy) -> Box<dyn ClipMuxer> {
+            FakeClipMuxerFactory::default().muxer(policy)
+        }
+    }
+
+    /// A clip transcodes audio only when it can (G.711 or G.722) and the
+    /// container takes what comes out (Opus, RFC 7587): a container
+    /// without Opus gets no transcode, so that audio is omitted, and a
+    /// codec the clip cannot transcode gets none either.
+    #[test]
+    fn a_transcode_needs_audio_it_can_transcode_and_a_container_that_takes_opus() {
+        let fake = FakeClipMuxerFactory::default();
+        for codec in [Codec::Pcmu, Codec::Pcma] {
+            assert!(transcoder(&codec, 8_000, &fake).is_some(), "{codec:?}");
+            assert!(transcoder(&codec, 8_000, &NoOpus).is_none(), "{codec:?}");
+        }
+        assert!(transcoder(&Codec::G722, 8_000, &fake).is_some());
+        assert!(transcoder(&Codec::G722, 8_000, &NoOpus).is_none());
+        let l16 = Codec::Unsupported {
+            kind: Kind::Audio,
+            name: "l16".into(),
+        };
+        assert!(transcoder(&l16, 8_000, &fake).is_none());
+    }
+
     /// 20 ms of a 1 kHz tone in `codec`, G.711 or G.722.
     fn narrowband_payload(codec: &Codec) -> Bytes {
         let tone = g722::test_data::tone(1_000, 320);
