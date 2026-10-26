@@ -177,7 +177,9 @@ pub(crate) struct ClipCounters {
     /// Gaps in the stream's clips, every one the workers counted, added
     /// as each clip ends.
     pub(crate) gaps: u64,
-    /// Bytes of clip files the workers wrote to their bodies.
+    /// The length of the stream's clip files, as their workers report
+    /// them ([`ClipEnd::Reported`]), a tail a body did not take in time
+    /// included.
     pub(crate) bytes: u64,
 }
 
