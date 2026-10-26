@@ -4509,7 +4509,9 @@ mod tests {
     /// their `after_ms`, which counts from `clip/start`; an open-ended one
     /// is unchanged; one whose end passed while it waited never reaches the
     /// worker and ends `source_not_live` with its pipe and an empty body;
-    /// a stale one (its clip ended, a later one holds the id) ends nothing.
+    /// a stale one (its clip ended, a later one holds the id) ends nothing;
+    /// a later start that took a stale one's id counts its own wait from
+    /// when it was queued.
     /// Regression: the worker counted `after_ms` from the handoff, so a
     /// clip queued behind a backoff ran its whole `after_ms` after it.
     #[tokio::test]
@@ -4546,10 +4548,21 @@ mod tests {
                 pipe,
             });
         }
-        // k4's clip ended while its start waited, and a later one took the id.
+        // k4's clip ended while its start waited, and a later one took the id
+        // and queued its own start 4 s on: it counts its own wait, not the
+        // stale start's.
         drop(k4);
         let mut k4_later = hold_clip(&shared, "k4", 5);
-        clock.advance(Duration::from_secs(5));
+        clock.advance(Duration::from_secs(4));
+        driver.queue(DriverCommand::StartClip {
+            spec: ClipSpec {
+                after_ms: Some(2_000),
+                ..clip_spec("k4")
+            },
+            serial: 5,
+            pipe: fd(),
+        });
+        clock.advance(Duration::from_secs(1));
         let addrs = vec!["127.0.0.1:1".parse().unwrap()];
         driver.spawn_worker(addrs).await;
         let end = lotse_ipc::ToWorker::StopClip {
@@ -4569,9 +4582,13 @@ mod tests {
                     ..clip_spec("k1")
                 }),
                 lotse_ipc::ToWorker::StartClip(clip_spec("k3")),
+                lotse_ipc::ToWorker::StartClip(ClipSpec {
+                    after_ms: Some(1_000),
+                    ..clip_spec("k4")
+                }),
                 end,
             ],
-            "k1 runs the rest, k3 is unchanged, k2 and k4 never reach the worker"
+            "k1 and the later k4 run the rest, k3 is unchanged, k2 and the stale k4 never reach the worker"
         );
         let stopped = k2.try_recv().unwrap().payload;
         assert_eq!(
@@ -4591,9 +4608,12 @@ mod tests {
         assert_eq!(passed.len(), 1, "{passed:?}");
         assert!(passed[0].contains("clip.id=k2"), "{passed:?}");
         let left = captured.lines("it runs what is left of after_ms");
-        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left.len(), 2, "{left:?}");
         assert!(left[0].contains("clip.id=k1"), "{left:?}");
         assert!(left[0].contains("after_ms=1000"), "{left:?}");
+        assert!(left[1].contains("clip.id=k4"), "{left:?}");
+        assert!(left[1].contains("serial=5"), "{left:?}");
+        assert!(left[1].contains("after_ms=1000"), "{left:?}");
         assert!(driver.clip_waits.is_empty());
         assert!(driver.clip_wait.is_none());
         let worker = driver.worker.take().unwrap();
