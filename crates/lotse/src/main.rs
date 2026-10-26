@@ -11,12 +11,14 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _};
 use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
 use lotse_codec::transcode::AacToOpus;
 use lotse_codec::transcode::uplink::ToG711Factory;
+use lotse_core::clip::ClipPolicy;
 use lotse_core::clock::SystemClock;
 use lotse_core::registry::Registries;
 use lotse_core::runner::RunnerConfig;
@@ -91,6 +93,11 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
             .outputs
             .register(Arc::new(lotse_webrtc::WebRtcFactory)),
     );
+    // The event clips' container: fragmented MP4.
+    #[cfg(feature = "output-clip")]
+    {
+        registries.clip = Some(Arc::new(lotse_mux::Factory));
+    }
     #[cfg(feature = "source-rtsp")]
     registered(
         "rtsp source",
@@ -171,18 +178,41 @@ fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
     let _report = lotse_sandbox::apply(&profile, &sandbox).context("sandbox")?;
     let settings = lotse_worker::Settings {
         worker_threads: args.worker_threads,
-        limits: TrackLimits::default(),
+        limits: track_limits(args),
         runner: RunnerConfig::default(),
         session: lotse_core::session::SessionLimits::default(),
         max_sessions: args.max_sessions,
         // The filter keeps the shared socket to sending at this number; the
         // control channel stays on standard input, `WORKER_CONTROL_FD`.
         shared_udp_fd: Some(lotse_sandbox::WORKER_SHARED_UDP_FD),
-        clip: lotse_worker::ClipSettings::default(),
+        clip: clip_settings(args),
     };
     let reason = lotse_worker::run(&settings, registries(relay), memory).context("worker")?;
     tracing::info!(reason = ?reason, "worker exited");
     Ok(())
+}
+
+/// The worker's track limits: the pre-roll ring's bound from the flag its
+/// supervisor passed, the rest the defaults.
+fn track_limits(args: &WorkerArgs) -> TrackLimits {
+    TrackLimits {
+        preroll_bytes: args.preroll_bytes,
+        ..TrackLimits::default()
+    }
+}
+
+/// The worker's clip limits from the flags its supervisor passed, the
+/// values the supervisor checks clips against.
+fn clip_settings(args: &WorkerArgs) -> lotse_worker::ClipSettings {
+    lotse_worker::ClipSettings {
+        policy: ClipPolicy {
+            queue_bytes: args.clip_queue_bytes,
+            ..ClipPolicy::default()
+        },
+        max_duration: Duration::from_millis(args.clip_max_ms),
+        start_timeout: Duration::from_millis(args.clip_start_timeout_ms),
+        max_clips: args.max_clips,
+    }
 }
 
 /// The supervisor process, in the documented startup order: configuration,
@@ -237,6 +267,7 @@ fn serve(args: &ServeArgs, matches: &ArgMatches) -> anyhow::Result<()> {
             worker_threads: limits.worker_threads,
             worker_address_space: limits.worker_address_space,
             max_sessions: limits.max_sessions,
+            clips: limits.clips,
         },
         udp: None,
         front_door: None,
@@ -310,6 +341,55 @@ mod tests {
             "{}",
             env!("LOTSE_RUSTC")
         );
+    }
+
+    #[test]
+    fn a_worker_runs_its_clips_under_the_limits_its_flags_pass() {
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "lotse",
+                "worker",
+                "--preroll-bytes",
+                "1048576",
+                "--clip-max-ms",
+                "45000",
+                "--clip-queue-bytes",
+                "65536",
+                "--clip-start-timeout-ms",
+                "2500",
+                "--max-clips",
+                "3",
+            ])
+            .unwrap();
+        let args =
+            WorkerArgs::from_arg_matches(matches.subcommand_matches("worker").unwrap()).unwrap();
+        assert_eq!(
+            clip_settings(&args),
+            lotse_worker::ClipSettings {
+                policy: ClipPolicy {
+                    queue_bytes: 1 << 16,
+                    ..ClipPolicy::default()
+                },
+                max_duration: Duration::from_secs(45),
+                start_timeout: Duration::from_millis(2_500),
+                max_clips: 3,
+            }
+        );
+        assert_eq!(track_limits(&args).preroll_bytes, 1 << 20);
+    }
+
+    /// The registries of a build with every feature hold the clip container.
+    #[cfg(feature = "output-clip")]
+    #[test]
+    fn the_clip_output_is_registered_behind_its_feature() {
+        let registries = registries(None);
+        let clip = registries.clip.expect("a clip output");
+        let h264 = lotse_core::codec::Codec::H264 {
+            profile_level_id: None,
+            sps: None,
+            pps: None,
+        };
+        assert!(!clip.accepts(&h264), "fMP4 needs the parameter sets");
     }
 
     #[cfg(any(

@@ -97,6 +97,7 @@ fn front_door_with(sandbox: &str, ports: &[u16]) -> FrontDoor {
             worker_threads: 2,
             worker_address_space: 1 << 30,
             max_sessions: 256,
+            clips: lotse_supervisor::ClipLimits::DEFAULT,
         },
         Some(bound.socket),
     );
@@ -921,6 +922,7 @@ async fn two_sessions_on_one_stream_send_every_datagram() {
             worker_threads: 2,
             worker_address_space: 1 << 30,
             max_sessions: 256,
+            clips: lotse_supervisor::ClipLimits::DEFAULT,
         },
         Some(bound.socket),
     );

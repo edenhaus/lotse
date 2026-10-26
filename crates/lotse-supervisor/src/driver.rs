@@ -34,7 +34,8 @@
 //! clip's start carries the write end of its pipe to the worker as the
 //! message's descriptor; one that never reached a worker before it was
 //! stopped ends here, as the worker would have ended it, and so does one
-//! that waited [`CLIP_START_WAIT`] for a worker (`source_not_live`: the
+//! that waited `limits.clip_start_timeout_ms` for a worker
+//! ([`Driver::clip_start_wait`]; `source_not_live`: the
 //! host lookup keeps failing, or a backoff holds the next worker back),
 //! one whose clip
 //! ended meanwhile is dropped with its pipe (a start still queued when its
@@ -92,14 +93,6 @@ pub(crate) const COMMAND_QUEUE: usize = 256;
 /// counters once a second from the moment it runs its source, so ten
 /// missed in a row is a worker that hangs, not one that is busy.
 pub(crate) const WORKER_SILENCE_LIMIT: Duration = Duration::from_secs(10);
-
-/// How long a clip's start waits in the driver's queue for a worker: as
-/// long as a worker gives a clip to find a keyframe to start at (its
-/// `DEFAULT_CLIP_START_TIMEOUT`). No worker runs the clip meanwhile, so
-/// none of its timeouts does, and the body's `GET` ends the only deadline
-/// the registry keeps: without this bound, a host lookup that keeps
-/// failing would hold the clip, its subscription and its pipe for good.
-pub(crate) const CLIP_START_WAIT: Duration = Duration::from_secs(10);
 
 /// What is left of a clip's `after_ms` once its start waited `waited`
 /// for a worker: the API counts it from `clip/start` ("how long the
@@ -431,7 +424,7 @@ enum Wake {
     /// The probe's connect slot has something for the worker.
     ProbeConnect(SlotWake),
     /// The oldest clip start in the queue may have waited
-    /// [`CLIP_START_WAIT`].
+    /// [`Driver::clip_start_wait`].
     ClipStartWaited,
 }
 
@@ -471,7 +464,7 @@ pub(crate) struct Driver {
     /// of its `after_ms`.
     clip_waits: VecDeque<(Instant, String, u64)>,
     /// Fires when the oldest of `clip_waits` has waited
-    /// [`CLIP_START_WAIT`]; `None` while none waits.
+    /// [`Self::clip_start_wait`]; `None` while none waits.
     clip_wait: Option<BoxFuture<'static, ()>>,
     /// The state machine.
     machine: ConnectionMachine,
@@ -1228,7 +1221,7 @@ impl Driver {
                     self.clip_waits
                         .push_back((self.shared.clock.now(), clip_id, serial));
                     if self.clip_wait.is_none() {
-                        self.clip_wait = Some(self.shared.clock.sleep(CLIP_START_WAIT));
+                        self.clip_wait = Some(self.shared.clock.sleep(self.clip_start_wait()));
                     }
                     self.queued.push(command);
                 }
@@ -1274,16 +1267,30 @@ impl Driver {
         self.end_unqueued(clip_id, ClipStopReason::Stopped);
     }
 
-    /// The clips whose start waited [`CLIP_START_WAIT`] for a worker and
-    /// still waits end here as a worker ends one that finds no keyframe in
-    /// time, `source_not_live` with nothing written; the timer then waits
-    /// for the next oldest.
+    /// How long a clip's start waits in the queue for a worker: the
+    /// configured `limits.clip_start_timeout_ms` ([`ClipLimits::start_timeout`]),
+    /// as long as a worker gives a clip to find a keyframe to start at. No
+    /// worker runs the clip meanwhile, so none of its timeouts does, and the
+    /// body's `GET` ends the only deadline the registry keeps: without this
+    /// bound, a host lookup that keeps failing would hold the clip, its
+    /// subscription and its pipe for good.
+    ///
+    /// [`ClipLimits::start_timeout`]: crate::ClipLimits::start_timeout
+    fn clip_start_wait(&self) -> Duration {
+        self.shared.lock().clip_limits.start_timeout
+    }
+
+    /// The clips whose start waited [`Self::clip_start_wait`] for a worker
+    /// and still waits end here as a worker ends one that finds no keyframe
+    /// in time, `source_not_live` with nothing written; the timer then
+    /// waits for the next oldest.
     fn end_waited_clips(&mut self) {
         let now = self.shared.clock.now();
+        let wait = self.clip_start_wait();
         let waited = self
             .clip_waits
             .iter()
-            .take_while(|(queued, ..)| now.saturating_duration_since(*queued) >= CLIP_START_WAIT)
+            .take_while(|(queued, ..)| now.saturating_duration_since(*queued) >= wait)
             .count();
         let ended: Vec<(Instant, String, u64)> = self.clip_waits.drain(..waited).collect();
         for (_, clip_id, serial) in ended {
@@ -1291,14 +1298,14 @@ impl Driver {
                 tracing::info!(
                     clip.id = %clip_id,
                     serial,
-                    waited_ms = u64::try_from(CLIP_START_WAIT.as_millis()).unwrap_or(u64::MAX),
+                    waited_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
                     "no worker took the clip's start in time; ended here source_not_live"
                 );
                 self.end_unqueued(&clip_id, ClipStopReason::SourceNotLive);
             }
         }
         self.clip_wait = self.clip_waits.front().map(|(queued, ..)| {
-            let left = CLIP_START_WAIT.saturating_sub(now.saturating_duration_since(*queued));
+            let left = wait.saturating_sub(now.saturating_duration_since(*queued));
             self.shared.clock.sleep(left)
         });
     }
@@ -4418,7 +4425,7 @@ mod tests {
 
     /// A clip whose start waits for a worker that does not come (its host
     /// lookup keeps failing, or a backoff holds the worker back) ends
-    /// `source_not_live` once it waited [`CLIP_START_WAIT`], as a worker
+    /// `source_not_live` once it waited [`Driver::clip_start_wait`], as a worker
     /// ends one that finds no keyframe in time: its body, fetched already,
     /// ends empty and whole, and its pipe goes with its start. A start
     /// queued later waits its own time, and one that left the queue meanwhile
@@ -4437,6 +4444,7 @@ mod tests {
         let mut body = shared.lock().take_clip_body("k1").unwrap();
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
+        let wait = shared.lock().clip_limits.start_timeout;
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
         let (mut reader, writer) = std::io::pipe().unwrap();
@@ -4454,7 +4462,7 @@ mod tests {
         driver.queue(DriverCommand::StopClip {
             clip_id: "k3".into(),
         });
-        clock.advance(CLIP_START_WAIT / 2);
+        clock.advance(wait / 2);
         driver.queue(DriverCommand::StartClip {
             spec: clip_spec("k2"),
             serial: 2,
@@ -4464,7 +4472,7 @@ mod tests {
             ready_wake(&mut driver).await.is_none(),
             "none waited long enough"
         );
-        clock.advance(CLIP_START_WAIT / 2);
+        clock.advance(wait / 2);
         step(&mut driver).await;
         let stopped = k1.try_recv().unwrap().payload;
         assert_eq!(
@@ -4479,7 +4487,7 @@ mod tests {
         reader.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty(), "its pipe went with its start");
         assert!(ready_wake(&mut driver).await.is_none());
-        clock.advance(CLIP_START_WAIT / 2);
+        clock.advance(wait / 2);
         step(&mut driver).await;
         let stopped = k2.try_recv().unwrap().payload;
         assert_eq!(stopped["reason"], "source_not_live");
@@ -4490,6 +4498,41 @@ mod tests {
         let ended = captured.lines("no worker took the clip's start in time");
         assert_eq!(ended.len(), 2, "{ended:?}");
         assert!(ended[0].contains("clip.id=k1"), "{ended:?}");
+    }
+
+    /// A queued clip start waits as long as the configured
+    /// `limits.clip_start_timeout_ms`, not the default: one longer than
+    /// 10 s holds the clip past 10 s and ends it at its own end.
+    /// Regression: the driver waited a fixed 10 s, cutting such a clip
+    /// short of what its worker would have given it.
+    #[tokio::test]
+    async fn a_clip_start_waits_the_configured_start_timeout() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/bin/sh", clock.clone());
+        shared.lock().clip_limits.start_timeout = Duration::from_secs(25);
+        let mut k1 = hold_clip(&shared, "k1", 1);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver.queue(DriverCommand::StartClip {
+            spec: clip_spec("k1"),
+            serial: 1,
+            pipe: fd(),
+        });
+        clock.advance(Duration::from_secs(10));
+        assert!(ready_wake(&mut driver).await.is_none(), "10 s is not 25 s");
+        clock.advance(Duration::from_secs(15) - Duration::from_millis(1));
+        assert!(ready_wake(&mut driver).await.is_none(), "nor is a ms short");
+        clock.advance(Duration::from_millis(1));
+        step(&mut driver).await;
+        let stopped = k1.try_recv().unwrap().payload;
+        assert_eq!(stopped["reason"], "source_not_live");
+        assert!(driver.queued.is_empty());
+        drop(driver);
+        let ended = captured.lines("no worker took the clip's start in time");
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert!(ended[0].contains("waited_ms=25000"), "{ended:?}");
     }
 
     /// What a worker gets of a clip's `after_ms` is what the wait for it

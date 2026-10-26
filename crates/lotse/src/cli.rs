@@ -91,6 +91,29 @@ pub(crate) struct WorkerArgs {
     /// sandbox, and allow connecting to its port.
     #[arg(long)]
     pub(crate) loopback_relay: bool,
+
+    /// What one track's pre-roll ring may hold: the daemon's
+    /// `limits.preroll_bytes`.
+    #[arg(long, value_name = "BYTES", default_value_t = lotse_core::track::DEFAULT_PREROLL_BYTES)]
+    pub(crate) preroll_bytes: usize,
+
+    /// The longest a clip runs: the daemon's `limits.clip_max_ms`.
+    #[arg(long, value_name = "MS", default_value_t = 600_000)]
+    pub(crate) clip_max_ms: u64,
+
+    /// What one clip's queue holds before it drops to the next keyframe:
+    /// the daemon's `limits.clip_queue_bytes`.
+    #[arg(long, value_name = "BYTES", default_value_t = lotse_core::clip::DEFAULT_CLIP_QUEUE_BYTES)]
+    pub(crate) clip_queue_bytes: usize,
+
+    /// How long a clip waits for its first keyframe: the daemon's
+    /// `limits.clip_start_timeout_ms`.
+    #[arg(long, value_name = "MS", default_value_t = 10_000)]
+    pub(crate) clip_start_timeout_ms: u64,
+
+    /// The most clips at once: the daemon's `limits.max_clips`.
+    #[arg(long, value_name = "N", default_value_t = lotse_worker::DEFAULT_MAX_CLIPS)]
+    pub(crate) max_clips: usize,
 }
 
 /// `lotse serve`. Every flag has a `LOTSE_*` variable; both override the
@@ -189,6 +212,41 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "LOTSE_LINGER_MS", value_name = "MS")]
     pub(crate) linger_ms: Option<u64>,
 
+    /// What one track's pre-roll ring may hold, in bytes; allocated only
+    /// while a stream asks for a window.
+    #[arg(long, env = "LOTSE_PREROLL_BYTES", value_name = "BYTES")]
+    pub(crate) preroll_bytes: Option<u64>,
+
+    /// The longest pre-roll window a stream may ask for, and the furthest
+    /// back a clip may start.
+    #[arg(long, env = "LOTSE_PREROLL_MAX_MS", value_name = "MS")]
+    pub(crate) preroll_max_ms: Option<u32>,
+
+    /// The longest a clip runs after its start.
+    #[arg(long, env = "LOTSE_CLIP_MAX_MS", value_name = "MS")]
+    pub(crate) clip_max_ms: Option<u32>,
+
+    /// What one clip's queue holds, in bytes, while its reader is slower
+    /// than the camera; beyond it the clip skips to the next keyframe.
+    #[arg(long, env = "LOTSE_CLIP_QUEUE_BYTES", value_name = "BYTES")]
+    pub(crate) clip_queue_bytes: Option<u64>,
+
+    /// How long a clip's file waits for its `GET`; then the clip stops.
+    #[arg(long, env = "LOTSE_CLIP_FETCH_TIMEOUT_MS", value_name = "MS")]
+    pub(crate) clip_fetch_timeout_ms: Option<u64>,
+
+    /// How long a clip waits for the stream and a keyframe to start at.
+    #[arg(long, env = "LOTSE_CLIP_START_TIMEOUT_MS", value_name = "MS")]
+    pub(crate) clip_start_timeout_ms: Option<u64>,
+
+    /// Clips at once, over every stream.
+    #[arg(long, env = "LOTSE_MAX_CLIPS", value_name = "N")]
+    pub(crate) max_clips: Option<u32>,
+
+    /// Clips at once on one stream.
+    #[arg(long, env = "LOTSE_CLIPS_PER_STREAM", value_name = "N")]
+    pub(crate) clips_per_stream: Option<u32>,
+
     /// Source connection attempts at once, across every camera; at least 1.
     #[arg(long, env = "LOTSE_CONNECT_CONCURRENCY", value_name = "N")]
     pub(crate) connect_concurrency: Option<NonZeroUsize>,
@@ -217,6 +275,8 @@ mod tests {
         clippy::missing_docs_in_private_items,
         reason = "test code"
     )]
+
+    use std::time::Duration;
 
     use clap::{CommandFactory as _, FromArgMatches};
 
@@ -296,6 +356,50 @@ mod tests {
         assert!(!bare.loopback_relay);
         assert_eq!(bare.sandbox, Mode::On);
         assert_eq!(bare.max_sessions, 256);
+        // A worker started by hand holds the daemon's default clip limits.
+        assert_eq!(
+            (bare.preroll_bytes, bare.clip_queue_bytes, bare.max_clips),
+            (
+                lotse_core::track::DEFAULT_PREROLL_BYTES,
+                lotse_core::clip::DEFAULT_CLIP_QUEUE_BYTES,
+                lotse_worker::DEFAULT_MAX_CLIPS
+            )
+        );
+        assert_eq!(
+            Duration::from_millis(bare.clip_max_ms),
+            lotse_worker::DEFAULT_CLIP_MAX
+        );
+        assert_eq!(
+            Duration::from_millis(bare.clip_start_timeout_ms),
+            lotse_worker::DEFAULT_CLIP_START_TIMEOUT
+        );
+        let clips: WorkerArgs = args_of(
+            &[
+                "lotse",
+                "worker",
+                "--preroll-bytes",
+                "1048576",
+                "--clip-max-ms",
+                "45000",
+                "--clip-queue-bytes",
+                "65536",
+                "--clip-start-timeout-ms",
+                "2500",
+                "--max-clips",
+                "3",
+            ],
+            "worker",
+        );
+        assert_eq!(
+            (
+                clips.preroll_bytes,
+                clips.clip_max_ms,
+                clips.clip_queue_bytes,
+                clips.clip_start_timeout_ms,
+                clips.max_clips
+            ),
+            (1 << 20, 45_000, 1 << 16, 2_500, 3)
+        );
     }
 
     #[test]
@@ -334,6 +438,7 @@ mod tests {
                         options,
                         preload: true,
                         audio,
+                        preroll: None,
                     },
                 } if stream_id == "front"
                     && urls == &["fake://cam/"]
@@ -404,6 +509,83 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let err = put(&["--url", "fake://cam/", "--url-file", "-"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn ctl_stream_clip_and_put_take_durations_with_their_unit() {
+        use crate::ctl::{CtlCommand, StreamCommand};
+        let args: CtlArgs = args_of(
+            &[
+                "lotse",
+                "ctl",
+                "--socket",
+                "/s",
+                "stream",
+                "clip",
+                "front",
+                "--before",
+                "10s",
+                "--after",
+                "500ms",
+                "--no-audio",
+                "-o",
+                "clip.mp4",
+            ],
+            "ctl",
+        );
+        assert!(
+            matches!(
+                &args.command,
+                CtlCommand::Stream {
+                    command: StreamCommand::Clip {
+                        stream_id,
+                        before: 10_000,
+                        after: Some(500),
+                        no_audio: true,
+                        output,
+                    },
+                } if stream_id == "front" && output == std::path::Path::new("clip.mp4")
+            ),
+            "{:?}",
+            args.command
+        );
+        let args: CtlArgs = args_of(
+            &[
+                "lotse", "ctl", "--socket", "/s", "stream", "clip", "front", "--output", "c.mp4",
+            ],
+            "ctl",
+        );
+        let shown = format!("{:?}", args.command);
+        assert!(
+            shown.contains("before: 0, after: None, no_audio: false"),
+            "open-ended with audio by default: {shown}"
+        );
+        let args: CtlArgs = args_of(
+            &[
+                "lotse",
+                "ctl",
+                "--socket",
+                "/s",
+                "stream",
+                "put",
+                "front",
+                "--url",
+                "fake://cam/",
+                "--preroll",
+                "2m",
+            ],
+            "ctl",
+        );
+        let shown = format!("{:?}", args.command);
+        assert!(shown.contains("preroll: Some(120000)"), "{shown}");
+        let clip = |extra: &[&str]| {
+            let base = ["lotse", "ctl", "--socket", "/s", "stream", "clip", "front"];
+            Cli::try_parse_from(base.iter().chain(extra))
+        };
+        let err = clip(&[]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let err = clip(&["-o", "c.mp4", "--before", "10"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

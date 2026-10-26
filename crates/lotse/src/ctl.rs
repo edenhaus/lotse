@@ -4,22 +4,36 @@
 //! command, its `result`, and for a subscription the events after it.
 //! Results and events are printed as JSON on stdout, which only this and
 //! `lotse identity` write to; a failed result prints its `error` and exits 1.
+//! `stream clip` writes its lines through tokio's stdout, on the blocking
+//! pool, so a stdout that takes no bytes holds back its lines, never Ctrl-C
+//! or the clip's body.
+//! `stream clip` also fetches the clip's file over HTTP on a second
+//! connection to the same socket (`GET /v0/clips/{clip_id}`), as any client
+//! does.
 
 #![expect(
     clippy::print_stdout,
     reason = "`lotse ctl` output is one of the binary's two stdout writers, with `lotse identity` (Cargo.toml lints)"
 )]
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::{Args, Subcommand};
-use futures_util::{SinkExt as _, StreamExt as _};
+use futures_util::{SinkExt as _, Stream, StreamExt as _};
+use http_body_util::{BodyExt as _, Empty, Limited};
+use hyper::StatusCode;
+use hyper::body::Bytes;
+use hyper_util::rt::TokioIo;
 use lotse_api_types::{API_VERSION, ApiVersion, WS_PATH};
 use serde_json::{Map, Value, json};
+use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::net::UnixStream;
+use tokio::signal::unix::SignalKind;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -108,6 +122,33 @@ pub(crate) enum StreamCommand {
         /// Audio handling: `auto` or `off`.
         #[arg(long, value_name = "auto|off", default_value = "auto")]
         audio: String,
+        /// Keep this much of the stream's last media in memory for event
+        /// clips (`30s`, `500ms`, `2m`); none when not given. It fills only
+        /// while the stream is connected for `--preload` or a viewer.
+        #[arg(long, value_name = "DURATION", value_parser = duration_ms)]
+        preroll: Option<u32>,
+    },
+    /// Record an event clip into a file: start it, write its fragmented MP4
+    /// as it comes and print its events, one per line. Ctrl-C stops the
+    /// clip and its file ends whole; a second Ctrl-C leaves at once. Exits 0
+    /// when the file is whole and the clip ended as asked.
+    Clip {
+        /// The stream.
+        stream_id: String,
+        /// How far back the clip starts, out of the stream's pre-roll
+        /// window (`10s`, `500ms`, `2m`).
+        #[arg(long, value_name = "DURATION", default_value = "0s", value_parser = duration_ms)]
+        before: u32,
+        /// How long the clip runs from now on; without it, until Ctrl-C or
+        /// the daemon's `limits.clip_max_ms`.
+        #[arg(long, value_name = "DURATION", value_parser = duration_ms)]
+        after: Option<u32>,
+        /// Leave the audio out.
+        #[arg(long)]
+        no_audio: bool,
+        /// The file the clip is written to; created, or emptied first.
+        #[arg(short, long, value_name = "PATH")]
+        output: PathBuf,
     },
     /// Delete a stream; succeeds when it does not exist.
     Delete {
@@ -148,13 +189,18 @@ pub(crate) struct PairArgs {
     pub(crate) socket: PathBuf,
 }
 
-/// `future` on a small runtime of its own.
+/// `future` on a small runtime of its own. The runtime is left without
+/// waiting for its blocking threads: a write to the clip's file that never
+/// returns (a FIFO nobody reads) would otherwise hold the process after a
+/// second Ctrl-C gave up on it.
 fn on_runtime<T>(future: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("runtime")?;
-    runtime.block_on(future)
+    let out = runtime.block_on(future);
+    runtime.shutdown_background();
+    out
 }
 
 /// Asks the daemon for a pairing code (`pairing/create`) and prints the
@@ -192,6 +238,28 @@ pub(crate) fn run(args: &CtlArgs) -> anyhow::Result<ExitCode> {
             CtlCommand::Stream {
                 command: StreamCommand::Subscribe { stream_id, limit },
             } => client.subscribe(stream_id.as_deref(), *limit).await,
+            CtlCommand::Stream {
+                command:
+                    StreamCommand::Clip {
+                        stream_id,
+                        before,
+                        after,
+                        no_audio,
+                        output,
+                    },
+            } => {
+                // Opened before Ctrl-C has a handler, so one still ends an
+                // open that blocks (a FIFO without its reader).
+                let file = create(output)?;
+                let interrupts = interrupts()?;
+                let command = clip_command(stream_id, *before, *after, *no_audio);
+                let out = ClipOutput {
+                    file,
+                    stdout: Box::pin(tokio::io::stdout()),
+                    compact: args.compact,
+                };
+                client.clip(&args.socket, command, out, interrupts).await
+            }
             other => {
                 let command = command_of(other, std::io::stdin().lock())?;
                 let frame = client.call(command).await?;
@@ -227,6 +295,7 @@ fn command_of(command: &CtlCommand, stdin: impl Read) -> anyhow::Result<Value> {
                 options,
                 preload,
                 audio,
+                preroll,
             } => {
                 let urls = source_urls(urls, url_file.as_deref(), stdin)?;
                 anyhow::ensure!(
@@ -243,10 +312,15 @@ fn command_of(command: &CtlCommand, stdin: impl Read) -> anyhow::Result<Value> {
                     .iter()
                     .map(|url| json!({ "url": url, "options": options }))
                     .collect();
-                json!({ "type": "stream/put", "stream_id": stream_id, "sources": sources,
-                        "preload": preload, "audio": audio })
+                let mut put = json!({ "type": "stream/put", "stream_id": stream_id,
+                                      "sources": sources, "preload": preload, "audio": audio });
+                if let (Some(ms), Some(object)) = (preroll, put.as_object_mut()) {
+                    object.insert("preroll_ms".to_owned(), json!(ms));
+                }
+                put
             }
             StreamCommand::Subscribe { .. } => anyhow::bail!("subscribe is streamed, not called"),
+            StreamCommand::Clip { .. } => anyhow::bail!("clip is streamed, not called"),
         },
         CtlCommand::Raw { .. } => anyhow::bail!("raw is sent as written"),
     })
@@ -282,14 +356,258 @@ fn source_urls(
     Ok(urls)
 }
 
-/// Prints one JSON value.
-fn print(value: &Value, compact: bool) {
-    if compact {
-        println!("{value}");
-    } else {
-        // The alternate form is serde_json's pretty printer.
-        println!("{value:#}");
+/// A duration on the command line in milliseconds: a whole number with
+/// the unit `ms`, `s` or `m`, at most `u32::MAX` ms.
+fn duration_ms(text: &str) -> Result<u32, String> {
+    let invalid = || format!("{text:?} is not a duration like 500ms, 10s or 2m");
+    let at = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at_checked(at).ok_or_else(invalid)?;
+    let scale: u64 = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        _ => return Err(invalid()),
+    };
+    let number: u64 = number.parse().map_err(|_| invalid())?;
+    number
+        .checked_mul(scale)
+        .and_then(|ms| u32::try_from(ms).ok())
+        .ok_or_else(invalid)
+}
+
+/// The `clip/start` of `stream clip`; `after_ms` only when given, so the
+/// clip is open-ended without it.
+fn clip_command(stream_id: &str, before_ms: u32, after_ms: Option<u32>, no_audio: bool) -> Value {
+    let mut command = json!({ "type": "clip/start", "stream_id": stream_id,
+                              "before_ms": before_ms, "audio": !no_audio });
+    if let (Some(ms), Some(object)) = (after_ms, command.as_object_mut()) {
+        object.insert("after_ms".to_owned(), json!(ms));
     }
+    command
+}
+
+/// The stop reasons of a clip that ended as asked: its file is what was
+/// asked for.
+const CLIP_ENDED_AS_ASKED: [&str; 3] = ["completed", "stopped", "max_duration"];
+
+/// The most of a refused `GET`'s error body `stream clip` reads and prints.
+const MAX_ERROR_BODY: usize = 64 * 1024;
+
+/// What stops `stream clip`: one item per Ctrl-C in the binary, a scripted
+/// stream in the tests. One type, not a generic, so the code that takes it
+/// is compiled once.
+type Interrupts = Pin<Box<dyn Stream<Item = ()> + Send>>;
+
+/// Where `stream clip` writes: the clip's file ([`create`]) and stdout
+/// (tokio's), each on tokio's blocking pool in the binary, and scripted
+/// writers in the tests. Asynchronous, so a write that blocks (a full FIFO
+/// or pipe, a stalled network filesystem) holds back that output alone,
+/// never the runtime that reads the clip's events, its body and Ctrl-C.
+type Output = Pin<Box<dyn AsyncWrite + Send>>;
+
+/// Where `stream clip` writes.
+struct ClipOutput {
+    /// The clip's file ([`create`]).
+    file: Output,
+    /// Its result and events, through a [`Printer`]: tokio's stdout in the
+    /// binary.
+    stdout: Output,
+    /// The result on one line; events are always one per line.
+    compact: bool,
+}
+
+/// What `stream clip` prints, on its way to stdout. Lines are queued as
+/// they come and written by the loop that also reads the clip's body, its
+/// events and Ctrl-C, so a stdout that takes no bytes (a full pipe whose
+/// reader stopped, a stalled network filesystem) holds back the lines
+/// alone. Regression (PR #74 review): they were printed with `println!` on
+/// the runtime's one thread after Ctrl-C's handler had replaced SIGINT's
+/// default, and a write that blocked held the body and both presses.
+struct Printer {
+    /// Where the lines go.
+    out: Output,
+    /// The bytes `out` has not taken yet, oldest first. It grows only while
+    /// `out` takes none, and only by the clip's result and events.
+    queued: VecDeque<u8>,
+    /// A line was queued that no flush has seen land yet.
+    pending: bool,
+}
+
+impl Printer {
+    /// Nothing queued yet.
+    fn new(out: Output) -> Self {
+        Self {
+            out,
+            queued: VecDeque::new(),
+            pending: false,
+        }
+    }
+
+    /// Queues `value` ([`render`]) and a newline.
+    fn push(&mut self, value: &Value, compact: bool) {
+        self.queued.extend(render(value, compact).bytes());
+        self.queued.push_back(b'\n');
+        self.pending = true;
+    }
+
+    /// Writes what is queued and flushes it; done once `out` has it all.
+    /// Cancel-safe, as a `select!` branch must be: `write_all_buf` takes
+    /// from `queued` only what `out` took, and a flush cut short starts
+    /// again the next time.
+    async fn write(&mut self) -> anyhow::Result<()> {
+        self.out
+            .write_all_buf(&mut self.queued)
+            .await
+            .context("writing stdout")?;
+        self.out.flush().await.context("writing stdout")?;
+        self.pending = false;
+        Ok(())
+    }
+
+    /// Waits until `out` has every queued line, while Ctrl-C counts. When
+    /// `stopping` (a press already stopped the clip, or came before a
+    /// refused start), the next press gives up; otherwise the first is
+    /// noted and the second gives up. A stdout that takes no bytes holds
+    /// `lotse ctl` until then.
+    async fn finish(
+        &mut self,
+        interrupts: &mut Interrupts,
+        mut stopping: bool,
+    ) -> anyhow::Result<()> {
+        while self.pending {
+            tokio::select! {
+                biased;
+                written = self.write() => written?,
+                Some(()) = interrupts.next() => {
+                    anyhow::ensure!(!stopping, "interrupted again; stdout has not taken every line");
+                    stopping = true;
+                    tracing::debug!("Ctrl-C while stdout takes the last lines; a second one gives up");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The clip's file at `path`, created or emptied, written through tokio's
+/// blocking pool one write at a time: at most one write is in flight, so
+/// a file that takes no bytes holds back the body, not the process.
+fn create(path: &Path) -> anyhow::Result<Output> {
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("creating the clip's file {}", path.display()))?;
+    Ok(Box::pin(tokio::fs::File::from_std(file)))
+}
+
+/// Ctrl-C (`SIGINT`), one item per press. The handler is in place once
+/// this returns, so a press after it never ends the process.
+fn interrupts() -> anyhow::Result<Interrupts> {
+    let signal =
+        tokio::signal::unix::signal(SignalKind::interrupt()).context("listening for Ctrl-C")?;
+    let presses = futures_util::stream::unfold(signal, |mut signal| async move {
+        signal.recv().await.map(|()| ((), signal))
+    });
+    Ok(Box::pin(presses.fuse()))
+}
+
+/// `GET url` of a clip's body on a connection of its own to `socket`
+/// (HTTP/1.1, RFC 9112), written to `file` as it comes; the bytes written.
+/// An error when the daemon refuses (its status and error body), or when
+/// the body ends without its last chunk (RFC 9112 §7.1): the clip's file is
+/// then cut, and holds what came. The bytes count once `file` has them all.
+async fn fetch(socket: &Path, url: &str, file: &mut Output) -> anyhow::Result<u64> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connecting for the clip's file")?;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .context("the clip's HTTP connection")?;
+    let request = hyper::Request::get(url)
+        .header(hyper::header::HOST, "lotse")
+        .body(Empty::<Bytes>::new())
+        .context("the clip's request")?;
+    let body = async move {
+        let response = sender
+            .send_request(request)
+            .await
+            .context("asking for the clip's file")?;
+        let status = response.status();
+        let mut body = response.into_body();
+        if status != StatusCode::OK {
+            let text = Limited::new(body, MAX_ERROR_BODY).collect().await;
+            let text = text
+                .map(http_body_util::Collected::to_bytes)
+                .unwrap_or_default();
+            anyhow::bail!("GET {url}: {status} {}", String::from_utf8_lossy(&text));
+        }
+        let mut written = 0_u64;
+        while let Some(frame) = body.frame().await {
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(err) => {
+                    // What came is kept: the write still in flight lands
+                    // first. Its own error would hide the cut, so it goes.
+                    let _landed = file.flush().await;
+                    return Err(err).context("the clip's file is cut");
+                }
+            };
+            // A data frame; trailers, which the route never sends, write
+            // nothing.
+            let data = frame.into_data().unwrap_or_default();
+            file.write_all(&data)
+                .await
+                .context("writing the clip's file")?;
+            written = written.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+        }
+        // The last write may still be in flight; its error shows here.
+        file.flush().await.context("writing the clip's file")?;
+        Ok(written)
+    };
+    // The connection ends with the body: the daemon closes it after one.
+    let (written, _connection) = tokio::join!(body, connection);
+    written
+}
+
+/// How the events of `stream clip`'s clip ended.
+enum ClipEnd {
+    /// Its `stopped`, with the reason (empty without one).
+    Stopped(String),
+    /// The connection closed or the daemon shut down first.
+    Gone,
+}
+
+/// What `frame`, read on `stream clip`'s connection, says of the clip
+/// subscribed as `id`: an event of it is queued on `printer`; the end once
+/// there is one, `None` while the clip runs on.
+fn clip_end(frame: &Value, id: u64, printer: &mut Printer) -> Option<ClipEnd> {
+    match kind(frame) {
+        Some("event") if id_of(frame) == Some(id) => {
+            let event = frame.get("event").unwrap_or(&Value::Null);
+            printer.push(event, true);
+            (kind(event) == Some("stopped")).then(|| {
+                let reason = event.get("reason").and_then(Value::as_str);
+                ClipEnd::Stopped(reason.unwrap_or_default().to_owned())
+            })
+        }
+        Some("shutdown") => Some(ClipEnd::Gone),
+        _ => None,
+    }
+}
+
+/// One JSON value as `lotse ctl` prints it, without the newline: one line
+/// when `compact`, else `serde_json`'s pretty printer (the alternate form).
+fn render(value: &Value, compact: bool) -> String {
+    if compact {
+        value.to_string()
+    } else {
+        format!("{value:#}")
+    }
+}
+
+/// Prints one JSON value ([`render`]) and a newline.
+fn print(value: &Value, compact: bool) {
+    println!("{}", render(value, compact));
 }
 
 /// The `type` of a frame.
@@ -302,23 +620,31 @@ fn id_of(frame: &Value) -> Option<u64> {
     frame.get("id").and_then(Value::as_u64)
 }
 
-/// Prints a command's outcome: the `result` on success, `{ "error": ... }`
-/// on failure, a `pong` as is. The exit code follows.
-fn report(frame: &Value, compact: bool) -> ExitCode {
+/// A command's outcome as printed: the `result` on success,
+/// `{ "error": ... }` on failure, a `pong` as is; and the exit code that
+/// follows.
+fn outcome(frame: &Value) -> (Value, ExitCode) {
     if kind(frame) == Some("pong") {
-        print(frame, compact);
-        return ExitCode::SUCCESS;
+        return (frame.clone(), ExitCode::SUCCESS);
     }
     if frame.get("success").and_then(Value::as_bool) == Some(true) {
-        print(frame.get("result").unwrap_or(&Value::Null), compact);
-        ExitCode::SUCCESS
+        (
+            frame.get("result").cloned().unwrap_or(Value::Null),
+            ExitCode::SUCCESS,
+        )
     } else {
-        print(
-            &json!({ "error": frame.get("error").cloned().unwrap_or(Value::Null) }),
-            compact,
-        );
-        ExitCode::FAILURE
+        (
+            json!({ "error": frame.get("error").cloned().unwrap_or(Value::Null) }),
+            ExitCode::FAILURE,
+        )
     }
+}
+
+/// Prints a command's outcome ([`outcome`]); the exit code follows.
+fn report(frame: &Value, compact: bool) -> ExitCode {
+    let (value, code) = outcome(frame);
+    print(&value, compact);
+    code
 }
 
 /// One control connection.
@@ -470,6 +796,112 @@ impl Client {
         Ok(ExitCode::SUCCESS)
     }
 
+    /// `stream clip`: sends `command`, a `clip/start`, prints its result,
+    /// then writes the clip's body to `output.file` while the clip's events
+    /// print, one per line, until both have ended, in whichever order. The
+    /// first of `interrupts` stops the clip (`clip/stop`, unless it has
+    /// ended; one before the result is sent with it once the clip has an
+    /// id), the second gives up, whether the result, the events or the body
+    /// is still awaited. A refused or cut body is an error and ends the
+    /// connection, which stops the clip; the exit code is 0 when the file is
+    /// whole and the clip ended as asked. The result and the events are
+    /// queued and written to `output.stdout` as it takes them; `lotse ctl`
+    /// leaves once stdout has every line, and a Ctrl-C there counts as
+    /// anywhere else. An error returns at once and does not wait for
+    /// stdout, nor does a stdout that fails (a reader gone), which ends the
+    /// connection and so the clip.
+    async fn clip(
+        &mut self,
+        socket: &Path,
+        command: Value,
+        output: ClipOutput,
+        mut interrupts: Interrupts,
+    ) -> anyhow::Result<ExitCode> {
+        let ClipOutput {
+            mut file,
+            stdout,
+            compact,
+        } = output;
+        let mut printer = Printer::new(stdout);
+        // Ctrl-C counts from the start on: a daemon that leaves `clip/start`
+        // unanswered holds the result, never the process.
+        let mut stopping = false;
+        let (id, frame) = {
+            let start = async {
+                let id = self.send(command).await?;
+                self.call_result(id).await.map(|frame| (id, frame))
+            };
+            tokio::pin!(start);
+            loop {
+                tokio::select! {
+                    biased;
+                    started = &mut start => break started?,
+                    Some(()) = interrupts.next() => {
+                        anyhow::ensure!(!stopping, "interrupted again before the clip/start result");
+                        stopping = true;
+                        tracing::debug!("Ctrl-C before the clip/start result; the clip is stopped once it has one");
+                    }
+                }
+            }
+        };
+        if frame.get("success").and_then(Value::as_bool) != Some(true) {
+            let (value, code) = outcome(&frame);
+            printer.push(&value, compact);
+            printer.finish(&mut interrupts, stopping).await?;
+            return Ok(code);
+        }
+        let result = frame.get("result").unwrap_or(&Value::Null);
+        printer.push(result, compact);
+        let field = |name: &str| {
+            let value = result.get(name).and_then(Value::as_str).map(str::to_owned);
+            value.with_context(|| format!("the clip/start result has no {name}"))
+        };
+        let (clip_id, url) = (field("clip_id")?, field("url")?);
+        let stop = json!({ "type": "clip/stop", "clip_id": clip_id });
+        if stopping {
+            self.send(stop.clone()).await?;
+        }
+        let body = fetch(socket, &url, &mut file);
+        tokio::pin!(body);
+        // The body and the events run on separate connections, so either
+        // may end first; Ctrl-C counts across both, and the start.
+        let (mut whole, mut ended) = (false, None);
+        while !whole || ended.is_none() {
+            tokio::select! {
+                biased;
+                written = &mut body, if !whole => {
+                    // A refused or cut body ends it at once.
+                    written?;
+                    whole = true;
+                }
+                frame = self.next(), if ended.is_none() => {
+                    ended = match frame? {
+                        Some(frame) => clip_end(&frame, id, &mut printer),
+                        None => Some(ClipEnd::Gone),
+                    };
+                }
+                flushed = printer.write(), if printer.pending => flushed?,
+                Some(()) = interrupts.next() => {
+                    anyhow::ensure!(!stopping, "interrupted again; the clip's file may be cut");
+                    stopping = true;
+                    if ended.is_none() {
+                        self.send(stop.clone()).await?;
+                    } else {
+                        tracing::debug!(clip.id = %clip_id, "the clip has ended; its body is still coming");
+                    }
+                }
+            }
+        }
+        printer.finish(&mut interrupts, stopping).await?;
+        let as_asked = matches!(&ended, Some(ClipEnd::Stopped(reason))
+                                if CLIP_ENDED_AS_ASKED.contains(&reason.as_str()));
+        Ok(if as_asked {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        })
+    }
+
     /// The `result` of the command already sent as `id`.
     async fn call_result(&mut self, id: u64) -> anyhow::Result<Value> {
         loop {
@@ -496,6 +928,7 @@ mod tests {
     )]
 
     use super::*;
+    use tokio::io::AsyncReadExt as _;
 
     #[test]
     fn hello_is_accepted_only_at_a_compatible_api_version() {
@@ -588,6 +1021,7 @@ mod tests {
                 options: options.map(str::to_owned),
                 preload: true,
                 audio: audio.into(),
+                preroll: None,
             })
         };
         assert_eq!(
@@ -627,6 +1061,7 @@ mod tests {
                 options: None,
                 preload: false,
                 audio: "auto".into(),
+                preroll: None,
             },
         };
         let urls = |frame: Value| -> Vec<Value> {
@@ -691,6 +1126,21 @@ mod tests {
         Send(Message),
         /// Drop the connection without a closing handshake.
         Drop,
+        /// Serve the next connection on the socket as HTTP: read the
+        /// request's head (kept as a string), write `response`, then close
+        /// at once when `cut`, else wait for the client to close.
+        Http { response: Vec<u8>, cut: bool },
+        /// As [`Step::Http`], but hold the connection open and go on with
+        /// the script: the body has more to come.
+        HttpHold(Vec<u8>),
+        /// Write this on the connection [`Step::HttpHold`] holds, then wait
+        /// for the client to close it.
+        HttpRest(Vec<u8>),
+        /// Let the client run before the next step: what was sent so far
+        /// reaches it first.
+        Yield,
+        /// Press Ctrl-C: one item on the client's interrupts ([`pressed`]).
+        Press(tokio::sync::mpsc::UnboundedSender<()>),
     }
 
     /// A text frame of `value`.
@@ -701,8 +1151,8 @@ mod tests {
     /// A daemon that accepts one connection on `listener` and upgrades it,
     /// sends `hello` when `greet` and plays `script`; unless that ends in
     /// [`Step::Drop`], it then reads on until the client is gone, so the
-    /// client answers a ping or reads to the end without a broken pipe.
-    /// Returns the commands it read.
+    /// client answers a ping or reads to the end without a broken pipe, and
+    /// keeps the commands among what it reads. Returns the commands it read.
     async fn daemon(
         listener: tokio::net::UnixListener,
         greet: bool,
@@ -715,6 +1165,7 @@ mod tests {
             ws.send(Message::text(hello.to_string())).await.unwrap();
         }
         let mut read = Vec::new();
+        let mut held = None;
         for step in script {
             match step {
                 Step::Read => {
@@ -726,10 +1177,45 @@ mod tests {
                     let _client_gone = ws.send(message).await;
                 }
                 Step::Drop => return read,
+                Step::Http { response, cut } => {
+                    let mut http = serve_head(&listener, &mut read).await;
+                    http.write_all(&response).await.unwrap();
+                    if !cut {
+                        let _until_closed = http.read_to_end(&mut Vec::new()).await;
+                    }
+                }
+                Step::HttpHold(response) => {
+                    let mut http = serve_head(&listener, &mut read).await;
+                    http.write_all(&response).await.unwrap();
+                    held = Some(http);
+                }
+                Step::HttpRest(rest) => {
+                    let mut http = held.take().unwrap();
+                    http.write_all(&rest).await.unwrap();
+                    let _until_closed = http.read_to_end(&mut Vec::new()).await;
+                }
+                Step::Yield => tokio::task::yield_now().await,
+                Step::Press(press) => press.send(()).unwrap(),
             }
         }
-        while let Some(Ok(_frame)) = ws.next().await {}
+        while let Some(Ok(frame)) = ws.next().await {
+            if let Ok(command) = serde_json::from_str(frame.to_text().unwrap_or_default()) {
+                read.push(command);
+            }
+        }
         read
+    }
+
+    /// Accepts the next connection on `listener` and reads an HTTP request's
+    /// head off it into `read`, as a string.
+    async fn serve_head(listener: &tokio::net::UnixListener, read: &mut Vec<Value>) -> UnixStream {
+        let (mut http, _addr) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(http.read_u8().await.unwrap());
+        }
+        read.push(Value::String(String::from_utf8(head).unwrap()));
+        http
     }
 
     /// Runs `client` against a [`daemon`] playing `script` on a fresh
@@ -746,9 +1232,27 @@ mod tests {
         let socket = dir.join("lotse.sock");
         let _stale = std::fs::remove_file(&socket);
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let (out, read) = tokio::join!(client(&socket), daemon(listener, greet, script));
+        let (out, read) =
+            bounded(async { tokio::join!(client(&socket), daemon(listener, greet, script)) }).await;
         std::fs::remove_dir_all(&dir).unwrap();
         (out, read)
+    }
+
+    /// The bound on a client and its scripted daemon, generous for a loaded
+    /// CI runner: past it a client that waits for something that never
+    /// comes (a regression of a Ctrl-C or stdout test) fails the test
+    /// instead of holding the job.
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// `future`, or a panic once it has taken [`BOUND`].
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a real-time bound on a test that would otherwise hang; no injected clock here"
+    )]
+    async fn bounded<T>(future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(BOUND, future)
+            .await
+            .expect("the client and its scripted daemon did not finish in time")
     }
 
     /// Connects and runs `command` through [`Client::call`].
@@ -995,5 +1499,890 @@ mod tests {
             code.unwrap_err().to_string(),
             "the daemon closed the connection before the result"
         );
+    }
+
+    #[test]
+    fn durations_take_a_unit_and_fit_in_milliseconds() {
+        assert_eq!(duration_ms("500ms"), Ok(500));
+        assert_eq!(duration_ms("10s"), Ok(10_000));
+        assert_eq!(duration_ms("2m"), Ok(120_000));
+        assert_eq!(duration_ms("0s"), Ok(0));
+        assert_eq!(duration_ms("4294967295ms"), Ok(u32::MAX));
+        for bad in [
+            "10",
+            "s",
+            "1.5s",
+            "10h",
+            "-1s",
+            "4294968s",
+            "99999999999999999999ms",
+        ] {
+            assert_eq!(
+                duration_ms(bad),
+                Err(format!("{bad:?} is not a duration like 500ms, 10s or 2m")),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_clip_and_put_with_a_window_map_onto_their_commands() {
+        assert_eq!(
+            clip_command("front", 10_000, Some(30_000), true),
+            json!({ "type": "clip/start", "stream_id": "front", "before_ms": 10_000,
+                    "after_ms": 30_000, "audio": false })
+        );
+        assert_eq!(
+            clip_command("front", 0, None, false),
+            json!({ "type": "clip/start", "stream_id": "front", "before_ms": 0, "audio": true })
+        );
+        let put = CtlCommand::Stream {
+            command: StreamCommand::Put {
+                stream_id: "front".into(),
+                urls: vec!["rtsp://cam/a".into()],
+                url_file: None,
+                options: None,
+                preload: true,
+                audio: "auto".into(),
+                preroll: Some(30_000),
+            },
+        };
+        assert_eq!(
+            command_of(&put, b"".as_slice()).unwrap()["preroll_ms"],
+            json!(30_000)
+        );
+        let clip = CtlCommand::Stream {
+            command: StreamCommand::Clip {
+                stream_id: "front".into(),
+                before: 0,
+                after: None,
+                no_audio: false,
+                output: PathBuf::from("clip.mp4"),
+            },
+        };
+        assert!(command_of(&clip, b"".as_slice()).is_err());
+    }
+
+    /// The `clip/start` result of clip `k1`.
+    fn clip_started() -> Step {
+        text(&json!({ "type": "result", "id": 1, "success": true,
+                      "result": { "clip_id": "k1", "url": "/v0/clips/k1" } }))
+    }
+
+    /// The event `event` of the clip's subscription.
+    fn clip_event(event: &Value) -> Step {
+        text(&json!({ "type": "event", "id": 1, "event": event }))
+    }
+
+    /// `stopped` with `reason`.
+    fn stopped(reason: &str) -> Step {
+        clip_event(&json!({ "type": "stopped", "reason": reason, "bytes": 8 }))
+    }
+
+    /// A `200` whose chunked body is `chunks`, ended by the last chunk
+    /// unless `cut` (RFC 9112 §7.1), on a connection that closes after it.
+    fn clip_body(chunks: &[&str], cut: bool) -> Step {
+        let mut response = String::from(
+            "HTTP/1.1 200 OK\r\ncontent-type: video/mp4\r\ntransfer-encoding: chunked\r\n\
+             connection: close\r\n\r\n",
+        );
+        for chunk in chunks {
+            std::fmt::Write::write_fmt(
+                &mut response,
+                format_args!("{:x}\r\n{chunk}\r\n", chunk.len()),
+            )
+            .unwrap();
+        }
+        if !cut {
+            response.push_str("0\r\n\r\n");
+        }
+        Step::Http {
+            response: response.into_bytes(),
+            cut,
+        }
+    }
+
+    /// `stream clip` of `front` (`command`, from [`clip_command`]) with
+    /// `interrupts` presses ready at once against a daemon that plays
+    /// `script`; what the client returned, the file it wrote and what the
+    /// daemon read.
+    async fn record(
+        test: &str,
+        command: Value,
+        interrupts: usize,
+        script: Vec<Step>,
+    ) -> (anyhow::Result<ExitCode>, Vec<u8>, Vec<Value>) {
+        let interrupts = Box::pin(futures_util::stream::iter(vec![(); interrupts]));
+        record_with(test, command, interrupts, script).await
+    }
+
+    /// Ctrl-C as the script presses it ([`Step::Press`]): the sender for
+    /// the script, the interrupts for the client, which end once every
+    /// sender is gone and stay ended (fused, as [`interrupts`]).
+    fn pressed() -> (tokio::sync::mpsc::UnboundedSender<()>, Interrupts) {
+        let (press, heard) = tokio::sync::mpsc::unbounded_channel();
+        let interrupts = futures_util::stream::unfold(heard, |mut heard| async move {
+            heard.recv().await.map(|()| ((), heard))
+        });
+        (press, Box::pin(interrupts.fuse()))
+    }
+
+    /// As [`record`], with `interrupts` as given and stdout a sink.
+    async fn record_with(
+        test: &str,
+        command: Value,
+        interrupts: Interrupts,
+        script: Vec<Step>,
+    ) -> (anyhow::Result<ExitCode>, Vec<u8>, Vec<Value>) {
+        let stdout: Output = Box::pin(tokio::io::sink());
+        record_into(test, command, (stdout, true), interrupts, script).await
+    }
+
+    /// As [`record_with`], with `stdout` (and whether the result prints
+    /// `compact`) as given.
+    async fn record_into(
+        test: &str,
+        command: Value,
+        (stdout, compact): (Output, bool),
+        interrupts: Interrupts,
+        script: Vec<Step>,
+    ) -> (anyhow::Result<ExitCode>, Vec<u8>, Vec<Value>) {
+        let dir =
+            std::env::temp_dir().join(format!("lotse-ctl-file-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("clip.mp4");
+        let (code, read) = against(test, true, script, async |socket| {
+            let mut client = Client::connect(socket).await.unwrap();
+            let output = ClipOutput {
+                file: create(&file).unwrap(),
+                stdout,
+                compact,
+            };
+            client.clip(socket, command, output, interrupts).await
+        })
+        .await;
+        let written = std::fs::read(&file).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (code, written, read)
+    }
+
+    #[tokio::test]
+    async fn stream_clip_writes_the_whole_file_and_prints_the_events_until_stopped() {
+        let command = clip_command("front", 10_000, Some(20_000), false);
+        let script = vec![
+            Step::Read,
+            // Another subscription's events, even its `stopped`, are not
+            // the clip's.
+            text(&json!({ "type": "event", "id": 7, "event": {} })),
+            clip_started(),
+            text(&json!({ "type": "event", "id": 7,
+                          "event": { "type": "stopped", "reason": "internal_error" } })),
+            clip_event(&json!({ "type": "started", "clip_id": "k1" })),
+            text(&json!({ "type": "pong", "id": 3 })),
+            clip_body(&["ftyp", "moov"], false),
+            stopped("completed"),
+        ];
+        let (code, file, read) = record("whole", command.clone(), 0, script).await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(file, b"ftypmoov");
+        let mut sent = command;
+        sent["id"] = json!(1);
+        assert_eq!(read[0], sent);
+        let head = read[1].as_str().unwrap();
+        assert!(head.starts_with("GET /v0/clips/k1 HTTP/1.1\r\n"), "{head}");
+        assert!(head.contains("host: lotse\r\n"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn stream_clip_stops_on_the_first_interrupt_and_gives_up_on_the_second() {
+        let command = clip_command("front", 0, None, true);
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            Step::Read,
+            clip_body(&["ftyp"], false),
+            stopped("stopped"),
+        ];
+        let (code, file, read) = record("interrupt", command.clone(), 1, script).await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(file, b"ftyp");
+        assert_eq!(
+            read[1],
+            json!({ "type": "clip/stop", "clip_id": "k1", "id": 2 })
+        );
+        // Both presses once the body is asked for: the first stops the
+        // clip, the second gives up on its body.
+        let (press, interrupts) = pressed();
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            Step::HttpHold(CHUNKED.into()),
+            Step::Press(press.clone()),
+            Step::Press(press),
+        ];
+        let (code, file, read) = record_with("interrupt-twice", command, interrupts, script).await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            "interrupted again; the clip's file may be cut"
+        );
+        assert!(file.is_empty());
+        assert_eq!(
+            read[2],
+            json!({ "type": "clip/stop", "clip_id": "k1", "id": 2 })
+        );
+    }
+
+    /// Ctrl-C counts while `clip/start` waits for its result: a daemon that
+    /// never answers is left on the second press. Regression: the result
+    /// was awaited with Ctrl-C's handler in place and no press heard, so
+    /// nothing but `kill` ended `lotse ctl`.
+    #[tokio::test]
+    async fn stream_clip_gives_up_on_a_clip_start_left_unanswered() {
+        let (press, interrupts) = pressed();
+        let script = vec![
+            Step::Read,
+            Step::Press(press.clone()),
+            Step::Yield,
+            Step::Press(press),
+        ];
+        let command = clip_command("front", 0, None, false);
+        let (code, file, read) = record_with("unanswered", command, interrupts, script).await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            "interrupted again before the clip/start result"
+        );
+        assert!(file.is_empty());
+        assert_eq!(
+            read.len(),
+            1,
+            "clip/start alone, no clip/stop or GET: {read:?}"
+        );
+    }
+
+    /// A Ctrl-C before the `clip/start` result stops the clip as soon as it
+    /// has an id, and its file still ends whole; a refused start has
+    /// nothing to stop.
+    #[tokio::test]
+    async fn stream_clip_stops_once_started_after_a_ctrl_c_before_the_result() {
+        let (press, interrupts) = pressed();
+        let script = vec![
+            Step::Read,
+            Step::Press(press),
+            Step::Yield,
+            clip_started(),
+            Step::Read,
+            clip_body(&["ftyp"], false),
+            stopped("stopped"),
+        ];
+        let command = || clip_command("front", 0, None, false);
+        let (code, file, read) = record_with("early", command(), interrupts, script).await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(file, b"ftyp");
+        assert_eq!(
+            read[1],
+            json!({ "type": "clip/stop", "clip_id": "k1", "id": 2 })
+        );
+
+        let (press, interrupts) = pressed();
+        let refused = json!({ "type": "result", "id": 1, "success": false,
+                              "error": { "code": "stream_not_found", "message": "no" } });
+        let script = vec![Step::Read, Step::Press(press), Step::Yield, text(&refused)];
+        let (code, _file, read) = record_with("early-refused", command(), interrupts, script).await;
+        assert_eq!(code.unwrap(), ExitCode::FAILURE);
+        assert_eq!(read.len(), 1, "no clip/stop, no GET: {read:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_clip_fails_when_the_daemon_refuses_or_the_file_is_cut() {
+        let command = || clip_command("front", 0, Some(1_000), true);
+        let refused = json!({ "type": "result", "id": 1, "success": false,
+                              "error": { "code": "limit_reached", "message": "no" } });
+        let (code, _file, read) =
+            record("refused", command(), 0, vec![Step::Read, text(&refused)]).await;
+        assert_eq!(code.unwrap(), ExitCode::FAILURE);
+        assert_eq!(read.len(), 1, "no GET");
+
+        let no_url = json!({ "type": "result", "id": 1, "success": true,
+                             "result": { "clip_id": "k1" } });
+        let (code, _file, _read) =
+            record("no-url", command(), 0, vec![Step::Read, text(&no_url)]).await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            "the clip/start result has no url"
+        );
+
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            clip_body(&["ftyp"], true),
+            stopped("worker_crashed"),
+        ];
+        let (code, file, _read) = record("cut", command(), 0, script).await;
+        assert_eq!(code.unwrap_err().to_string(), "the clip's file is cut");
+        assert_eq!(file, b"ftyp", "what came is kept");
+
+        let error = r#"{"code":"clip_already_fetched","message":"taken"}"#;
+        let response = format!(
+            "HTTP/1.1 409 Conflict\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{error}",
+            error.len()
+        );
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            Step::Http {
+                response: response.into_bytes(),
+                cut: false,
+            },
+        ];
+        let (code, _file, _read) = record("conflict", command(), 0, script).await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            format!("GET /v0/clips/k1: 409 Conflict {error}")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_clip_exits_1_unless_the_clip_ended_as_asked() {
+        let cases = [
+            ("internal-error", vec![stopped("internal_error")]),
+            ("shutdown", vec![text(&json!({ "type": "shutdown" }))]),
+            ("closed", vec![Step::Send(Message::Close(None))]),
+            (
+                "reasonless",
+                vec![clip_event(&json!({ "type": "stopped" }))],
+            ),
+        ];
+        for (test, last) in cases {
+            let mut script = vec![Step::Read, clip_started()];
+            script.extend(last);
+            script.push(clip_body(&[], false));
+            let command = clip_command("front", 0, Some(1_000), true);
+            let (code, file, _read) = record(test, command, 0, script).await;
+            assert_eq!(code.unwrap(), ExitCode::FAILURE, "{test}");
+            assert!(file.is_empty(), "{test}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_clip_needs_a_file_it_can_create() {
+        let err = create(Path::new("/nonexistent/clip.mp4")).err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "creating the clip's file /nonexistent/clip.mp4"
+        );
+    }
+
+    /// The daemon's error body is printed up to [`MAX_ERROR_BODY`], so a
+    /// long one is printed whole.
+    #[tokio::test]
+    async fn stream_clip_prints_a_long_error_body_whole() {
+        let error = format!(
+            r#"{{"code":"internal_error","message":"{}"}}"#,
+            "x".repeat(4_096)
+        );
+        let response = format!(
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{error}",
+            error.len()
+        );
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            Step::Http {
+                response: response.into_bytes(),
+                cut: false,
+            },
+        ];
+        let command = clip_command("front", 0, Some(1_000), false);
+        let (code, _file, _read) = record("long-error", command, 0, script).await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            format!("GET /v0/clips/k1: 500 Internal Server Error {error}")
+        );
+    }
+
+    /// A writer (the clip's file, or stdout) as the test scripts it: each write sends `presses`
+    /// interrupts, then either takes its bytes into `taken` or, when
+    /// `stall`, never completes, as a full FIFO, and sends no more. Its
+    /// flush and shutdown fail, as on a full disk.
+    struct Scripted {
+        /// Where the interrupts go.
+        interrupt: tokio::sync::mpsc::UnboundedSender<()>,
+        /// The interrupts each write sends.
+        presses: usize,
+        /// No write completes.
+        stall: bool,
+        /// What the writer took.
+        taken: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for Scripted {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            for _ in 0..this.presses {
+                this.interrupt.send(()).unwrap();
+            }
+            if this.stall {
+                this.presses = 0;
+                return std::task::Poll::Pending;
+            }
+            this.taken.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("no space left")))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("no space left")))
+        }
+    }
+
+    /// `stream clip` against a daemon playing `script`, writing into a
+    /// [`Scripted`] writer (`presses` per write, `stall`) whose writes are
+    /// the only interrupts; what the client returned, what the writer took
+    /// and what the daemon read.
+    async fn record_scripted(
+        test: &str,
+        (presses, stall): (usize, bool),
+        script: Vec<Step>,
+    ) -> (anyhow::Result<ExitCode>, Vec<u8>, Vec<Value>) {
+        let (interrupt, interrupts) = pressed();
+        let taken = std::sync::Arc::default();
+        let writer = Scripted {
+            interrupt,
+            presses,
+            stall,
+            taken: std::sync::Arc::clone(&taken),
+        };
+        let command = clip_command("front", 0, None, false);
+        let (code, read) = against(test, true, script, async |socket| {
+            let mut client = Client::connect(socket).await.unwrap();
+            let output = ClipOutput {
+                file: Box::pin(writer),
+                stdout: Box::pin(tokio::io::sink()),
+                compact: true,
+            };
+            client.clip(socket, command, output, interrupts).await
+        })
+        .await;
+        let taken = taken.lock().unwrap().clone();
+        (code, taken, read)
+    }
+
+    /// A file that takes no bytes (a full FIFO, a stalled network
+    /// filesystem) holds the body alone: the first Ctrl-C still stops the
+    /// clip and the second still gives up. Regression: the file was written
+    /// on the runtime's one thread, and a write that blocked held the
+    /// events and Ctrl-C with it.
+    #[tokio::test]
+    async fn stream_clip_stops_and_gives_up_while_its_file_takes_no_bytes() {
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            clip_body(&["ftyp"], false),
+            Step::Read,
+        ];
+        let (code, taken, read) = record_scripted("stalled", (2, true), script).await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            "interrupted again; the clip's file may be cut"
+        );
+        assert!(taken.is_empty());
+        assert_eq!(
+            read[2],
+            json!({ "type": "clip/stop", "clip_id": "k1", "id": 2 })
+        );
+    }
+
+    /// The last write's error, which a file written on the blocking pool
+    /// reports at the flush, fails the clip as a refused write does.
+    #[tokio::test]
+    async fn stream_clip_fails_when_its_file_fails_the_last_write() {
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            clip_body(&["ftyp"], false),
+            stopped("completed"),
+        ];
+        let (code, taken, _read) = record_scripted("flush", (0, false), script).await;
+        let err = code.unwrap_err();
+        assert_eq!(err.to_string(), "writing the clip's file");
+        assert_eq!(err.root_cause().to_string(), "no space left");
+        assert_eq!(taken, b"ftyp");
+        let (interrupt, _heard) = tokio::sync::mpsc::unbounded_channel();
+        let mut writer = Scripted {
+            interrupt,
+            presses: 0,
+            stall: false,
+            taken: std::sync::Arc::default(),
+        };
+        assert!(writer.shutdown().await.is_err(), "as its flush");
+    }
+
+    /// A writer whose writes land only at the flush, as with tokio's `File`
+    /// and stdout, which report a write done once the blocking pool has it.
+    struct Lagging {
+        /// Written, not yet landed.
+        in_flight: Vec<u8>,
+        /// What landed.
+        landed: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for Lagging {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.get_mut().in_flight.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let landed = std::mem::take(&mut this.in_flight);
+            this.landed.lock().unwrap().extend(landed);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    /// A cut body keeps what came, the write still in flight included.
+    /// Regression: the cut was reported while the last write was still on
+    /// the blocking pool, and the file could be left without it.
+    #[tokio::test]
+    async fn stream_clip_lands_the_write_in_flight_when_the_body_is_cut() {
+        let landed = std::sync::Arc::default();
+        let writer = Lagging {
+            in_flight: Vec::new(),
+            landed: std::sync::Arc::clone(&landed),
+        };
+        let script = vec![Step::Read, clip_started(), clip_body(&["ftyp"], true)];
+        let command = clip_command("front", 0, None, false);
+        let (code, _read) = against("lagging", true, script, async |socket| {
+            let mut client = Client::connect(socket).await.unwrap();
+            let interrupts = Box::pin(futures_util::stream::empty());
+            let output = ClipOutput {
+                file: Box::pin(writer),
+                stdout: Box::pin(tokio::io::sink()),
+                compact: true,
+            };
+            client.clip(socket, command, output, interrupts).await
+        })
+        .await;
+        assert_eq!(code.unwrap_err().to_string(), "the clip's file is cut");
+        assert_eq!(*landed.lock().unwrap(), b"ftyp");
+        let mut writer = Lagging {
+            in_flight: b"moov".to_vec(),
+            landed: std::sync::Arc::default(),
+        };
+        writer.shutdown().await.unwrap();
+        assert_eq!(*writer.landed.lock().unwrap(), b"moov", "as its flush");
+    }
+
+    /// The head of a chunked `200` whose chunks come later.
+    const CHUNKED: &str = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+
+    /// `stopped` may come before the body's end, on its own connection:
+    /// Ctrl-C still counts while the body is awaited, and a clip that has
+    /// ended is not stopped. The yield lets the client read `stopped`
+    /// before the chunk that presses Ctrl-C arrives. Regression: once
+    /// `stopped` had come, Ctrl-C was taken and dropped, and a body that
+    /// never ended held `lotse ctl` for good.
+    #[tokio::test]
+    async fn stream_clip_gives_up_on_a_body_that_outlasts_stopped() {
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            Step::HttpHold(CHUNKED.into()),
+            stopped("stopped"),
+            Step::Yield,
+            // A chunk, and with it two presses.
+            Step::HttpRest(b"4\r\nftyp\r\n".to_vec()),
+        ];
+        let (code, taken, read) = record_scripted("event-first", (2, false), script).await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            "interrupted again; the clip's file may be cut"
+        );
+        assert_eq!(taken, b"ftyp");
+        assert_eq!(read.len(), 2, "clip/start and GET, no clip/stop: {read:?}");
+    }
+
+    /// The Ctrl-C that stopped the clip counts when the next comes after
+    /// `stopped`, while the body is still awaited: that one gives up.
+    #[tokio::test]
+    async fn stream_clip_counts_the_ctrl_c_before_stopped_with_the_one_after() {
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            // The first chunk is the first press: the clip is stopped.
+            Step::HttpHold(format!("{CHUNKED}4\r\nftyp\r\n").into_bytes()),
+            Step::Read,
+            stopped("stopped"),
+            Step::Yield,
+            // The second chunk, after `stopped`, is the second press.
+            Step::HttpRest(b"4\r\nmoov\r\n".to_vec()),
+        ];
+        let (code, taken, read) = record_scripted("count", (1, false), script).await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            "interrupted again; the clip's file may be cut"
+        );
+        assert_eq!(taken, b"ftypmoov");
+        assert_eq!(read.len(), 3, "clip/start, GET, one clip/stop: {read:?}");
+        assert_eq!(
+            read[2],
+            json!({ "type": "clip/stop", "clip_id": "k1", "id": 2 })
+        );
+    }
+
+    /// A [`Scripted`] stdout that presses no Ctrl-C (its sender's receiver
+    /// is gone), stalled or not, and what it takes.
+    fn quiet_stdout(stall: bool) -> (Scripted, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        let (interrupt, _heard) = tokio::sync::mpsc::unbounded_channel();
+        let taken = std::sync::Arc::<std::sync::Mutex<Vec<u8>>>::default();
+        let writer = Scripted {
+            interrupt,
+            presses: 0,
+            stall,
+            taken: std::sync::Arc::clone(&taken),
+        };
+        (writer, taken)
+    }
+
+    /// The result and the events are printed through stdout, in order and
+    /// flushed, the result pretty unless `--compact` and the events one per
+    /// line; so is a refused start.
+    #[tokio::test]
+    async fn stream_clip_prints_its_result_and_events_once_stdout_has_them() {
+        let landed = std::sync::Arc::<std::sync::Mutex<Vec<u8>>>::default();
+        let stdout = Lagging {
+            in_flight: Vec::new(),
+            landed: std::sync::Arc::clone(&landed),
+        };
+        let started = json!({ "type": "started", "clip_id": "k1" });
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            clip_event(&started),
+            clip_body(&["ftyp"], false),
+            stopped("completed"),
+        ];
+        let command = clip_command("front", 0, None, false);
+        let interrupts = Box::pin(futures_util::stream::empty());
+        let (code, file, _read) = record_into(
+            "prints",
+            command.clone(),
+            (Box::pin(stdout), false),
+            interrupts,
+            script,
+        )
+        .await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(file, b"ftyp");
+        let result = json!({ "clip_id": "k1", "url": "/v0/clips/k1" });
+        let stopped = json!({ "type": "stopped", "reason": "completed", "bytes": 8 });
+        let expected = format!("{result:#}\n{started}\n{stopped}\n");
+        assert_eq!(
+            String::from_utf8(landed.lock().unwrap().clone()).unwrap(),
+            expected
+        );
+
+        let landed = std::sync::Arc::<std::sync::Mutex<Vec<u8>>>::default();
+        let stdout = Lagging {
+            in_flight: Vec::new(),
+            landed: std::sync::Arc::clone(&landed),
+        };
+        let error = json!({ "code": "stream_not_found", "message": "no" });
+        let refused = json!({ "type": "result", "id": 1, "success": false, "error": error });
+        let interrupts = Box::pin(futures_util::stream::empty());
+        let (code, _file, _read) = record_into(
+            "prints-refused",
+            command,
+            (Box::pin(stdout), true),
+            interrupts,
+            vec![Step::Read, text(&refused)],
+        )
+        .await;
+        assert_eq!(code.unwrap(), ExitCode::FAILURE);
+        let expected = format!("{}\n", json!({ "error": error }));
+        assert_eq!(
+            String::from_utf8(landed.lock().unwrap().clone()).unwrap(),
+            expected
+        );
+    }
+
+    /// A stdout that takes no bytes (a full pipe whose reader stopped, a
+    /// stalled network filesystem) holds back its lines alone: the first
+    /// Ctrl-C still stops the clip and the second still gives up.
+    /// Regression (PR #74 review): the lines were printed with `println!`
+    /// on the runtime's one thread after Ctrl-C's handler had replaced
+    /// SIGINT's default, and a write that blocked held the body and both
+    /// presses; here that is a client that never hears them and waits for
+    /// ever, which [`bounded`] fails.
+    #[tokio::test]
+    async fn stream_clip_stops_and_gives_up_while_stdout_takes_no_bytes() {
+        let (interrupt, interrupts) = pressed();
+        let stdout = Scripted {
+            interrupt,
+            presses: 2,
+            stall: true,
+            taken: std::sync::Arc::default(),
+        };
+        // No `Http` step: the body's `GET` waits in the listener's backlog.
+        let script = vec![Step::Read, clip_started(), Step::Read];
+        let command = clip_command("front", 0, None, false);
+        let (code, file, read) = record_into(
+            "stdout-stalled",
+            command,
+            (Box::pin(stdout), true),
+            interrupts,
+            script,
+        )
+        .await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            "interrupted again; the clip's file may be cut"
+        );
+        assert!(file.is_empty());
+        assert_eq!(
+            read[1],
+            json!({ "type": "clip/stop", "clip_id": "k1", "id": 2 })
+        );
+        assert_eq!(read.len(), 2, "clip/start and clip/stop, no GET: {read:?}");
+    }
+
+    /// Once the clip and its body have ended, `lotse ctl` waits for stdout
+    /// to take the last lines, Ctrl-C counts there, and the second press
+    /// gives up. No `clip/stop`: the clip had ended. The file is a
+    /// [`Lagging`] one, not a file on the blocking pool, so the body is
+    /// whole once the daemon sees its connection close, before the presses.
+    #[tokio::test]
+    async fn stream_clip_waits_for_stdout_once_the_clip_ended_and_gives_up_on_the_second_ctrl_c() {
+        let (press, interrupts) = pressed();
+        let (stdout, _taken) = quiet_stdout(true);
+        let landed = std::sync::Arc::<std::sync::Mutex<Vec<u8>>>::default();
+        let file = Lagging {
+            in_flight: Vec::new(),
+            landed: std::sync::Arc::clone(&landed),
+        };
+        let script = vec![
+            Step::Read,
+            clip_started(),
+            stopped("completed"),
+            Step::Yield,
+            clip_body(&["ftyp"], false),
+            Step::Yield,
+            Step::Press(press.clone()),
+            Step::Yield,
+            Step::Press(press),
+        ];
+        let command = clip_command("front", 0, None, false);
+        let (code, read) = against("stdout-last", true, script, async |socket| {
+            let mut client = Client::connect(socket).await.unwrap();
+            let output = ClipOutput {
+                file: Box::pin(file),
+                stdout: Box::pin(stdout),
+                compact: true,
+            };
+            client.clip(socket, command, output, interrupts).await
+        })
+        .await;
+        assert_eq!(
+            code.unwrap_err().to_string(),
+            "interrupted again; stdout has not taken every line"
+        );
+        assert_eq!(
+            *landed.lock().unwrap(),
+            b"ftyp",
+            "the body is written while stdout is stalled"
+        );
+        assert_eq!(read.len(), 2, "clip/start and GET, no clip/stop: {read:?}");
+    }
+
+    /// `finish` has nothing to wait for without a queued line, and after a
+    /// stop the next press gives up.
+    #[tokio::test]
+    async fn printer_finish_waits_for_nothing_unqueued_and_after_a_stop_gives_up_on_the_next_press()
+    {
+        let (stdout, _taken) = quiet_stdout(true);
+        let mut printer = Printer::new(Box::pin(stdout));
+        let mut never: Interrupts = Box::pin(futures_util::stream::pending());
+        bounded(printer.finish(&mut never, false)).await.unwrap();
+        printer.push(&json!({}), true);
+        let mut once: Interrupts = Box::pin(futures_util::stream::iter([()]));
+        let err = bounded(printer.finish(&mut once, true)).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "interrupted again; stdout has not taken every line"
+        );
+    }
+
+    /// A stdout that fails (a reader gone: `EPIPE`) fails the clip with the
+    /// error. Regression: `println!` panicked on it, and `panic = "abort"`
+    /// killed `lotse ctl` mid-clip.
+    #[tokio::test]
+    async fn stream_clip_fails_when_stdout_fails() {
+        let (stdout, taken) = quiet_stdout(false);
+        let script = vec![Step::Read, clip_started()];
+        let command = clip_command("front", 0, None, false);
+        let interrupts = Box::pin(futures_util::stream::empty());
+        let (code, _file, _read) = record_into(
+            "stdout-fails",
+            command,
+            (Box::pin(stdout), true),
+            interrupts,
+            script,
+        )
+        .await;
+        let err = code.unwrap_err();
+        assert_eq!(err.to_string(), "writing stdout");
+        assert_eq!(err.root_cause().to_string(), "no space left");
+        assert_eq!(
+            *taken.lock().unwrap(),
+            b"{\"clip_id\":\"k1\",\"url\":\"/v0/clips/k1\"}\n"
+        );
+    }
+
+    /// The runtime is left without waiting for a blocking thread that does
+    /// not return, as one writing into a FIFO nobody reads. Regression:
+    /// dropping it waited for that thread for good.
+    #[test]
+    fn the_runtime_leaves_a_blocking_thread_that_does_not_return() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let out = on_runtime(async move {
+            let (started, running) = tokio::sync::oneshot::channel();
+            let _stuck = lotse_core::task::spawn_blocking_named("test.stuck", move || {
+                started.send(()).unwrap();
+                blocked.recv()
+            });
+            running.await.unwrap();
+            Ok(7)
+        });
+        assert_eq!(out.unwrap(), 7);
+        drop(release);
     }
 }

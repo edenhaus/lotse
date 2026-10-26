@@ -5,9 +5,10 @@
 //! through the loopback relay it bound before the sandbox; an `rtsp`
 //! camera whose media takes UDP, received under the same sandbox; and an
 //! HLS stream over `http` and over `https` with a pinned certificate,
-//! fetched by a sandboxed worker from the server's port alone; and a
-//! clip's pipe passed to a sandboxed worker. Needs the
-//! `source-fake` feature (on with `--all-features`).
+//! fetched by a sandboxed worker from the server's port alone; a clip's
+//! pipe passed to a sandboxed worker; and a clip of that HLS stream
+//! recorded into its pipe under the sandbox. Needs the `source-fake`
+//! feature (on with `--all-features`).
 
 #![cfg(feature = "source-fake")]
 #![allow(
@@ -46,6 +47,7 @@ fn manager_with_sandbox(sandbox: &str) -> WorkerManager {
             worker_threads: 1,
             worker_address_space: 1 << 30,
             max_sessions: 256,
+            clips: lotse_supervisor::ClipLimits::DEFAULT,
         },
         Some(Arc::new(udp)),
     )
@@ -161,8 +163,10 @@ async fn a_worker_crash_is_observed_and_contained() {
 }
 
 /// A clip's pipe crosses into a worker under its sandbox with its
-/// `StartClip`, and the worker, which runs no clips, refuses the clip and
-/// closes the pipe: the reader sees its end, with nothing written.
+/// `StartClip`, and the worker refuses the clip and closes the pipe: the
+/// reader sees its end, with nothing written. It runs no source, so the
+/// refusal is `source_not_live`; a build without `output-clip` has no clip
+/// container and refuses every clip `internal_error` first.
 #[tokio::test]
 async fn a_sandboxed_worker_takes_a_clip_s_pipe_and_closes_it() {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -193,7 +197,12 @@ async fn a_sandboxed_worker_takes_a_clip_s_pipe_and_closes_it() {
         WorkerEvent::Clip {
             clip_id: "k1".into(),
             event: ClipReport::Stopped {
-                reason: "internal_error".into(),
+                reason: if cfg!(feature = "output-clip") {
+                    "source_not_live"
+                } else {
+                    "internal_error"
+                }
+                .into(),
                 bytes: 0,
                 duration_ms: 0,
                 gaps: 0,
@@ -442,5 +451,115 @@ async fn a_sandboxed_worker_plays_hls_over_https_with_a_pinned_certificate() {
         format!("{{\"tls_fingerprint\": \"{pin}\"}}"),
     )
     .await;
+    server.stop().await;
+}
+
+/// A clip recorded under the sandbox, the first time a worker writes into a
+/// clip's pipe: taking it (`fstat`, `fcntl`), waiting for it to take bytes
+/// (epoll) and writing them (`writev`) must pass seccomp and Landlock. The
+/// HLS fixtures carry the H.264 parameter sets and the AAC configuration
+/// the clip's container needs; the stream's window holds what the clip
+/// starts from. On macOS the sandbox is a no-op and this checks the clip
+/// path of a real worker.
+#[cfg(all(feature = "source-http", feature = "output-clip"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sandboxed_worker_records_a_clip_into_its_pipe() {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let server = lotse_testing::fake_http::FakeHttp::start()
+        .await
+        .expect("server binds");
+    serve_live(&server);
+    let port = server.addr().port();
+    let mut worker = manager_with_sandbox("on")
+        .spawn(&[port], false)
+        .expect("spawns");
+    assert!(matches!(
+        worker.next_event().await,
+        WorkerEvent::Ready { .. }
+    ));
+    let spec = SourceSpec {
+        connection_id: "c1".into(),
+        url: format!("http://camera.test:{port}/live/index.m3u8"),
+        options: "null".into(),
+        peer_host: "camera.test".into(),
+        peer_addrs: vec![server.addr()],
+        backoff: lotse_ipc::BackoffPosition::default(),
+        preroll_ms: 10_000,
+    };
+    worker.run_source(&spec).await.expect("run source");
+    assert_eq!(
+        worker.next_event().await,
+        WorkerEvent::Report(WorkerReport::Connecting)
+    );
+    worker.grant_connect().await.expect("grant");
+    assert!(matches!(worker.next_event().await, WorkerEvent::Tracks(_)));
+    assert_eq!(
+        worker.next_event().await,
+        WorkerEvent::Report(WorkerReport::Live)
+    );
+    // The clip starts from the window once it holds a keyframe and what
+    // follows it, as the once-per-second counters say.
+    loop {
+        if let WorkerEvent::Stats(stats) = worker.next_event().await
+            && stats.tracks.iter().any(|(id, track)| {
+                id == "v0" && track.preroll.as_ref().is_some_and(|ring| ring.held_ms > 0)
+            })
+        {
+            break;
+        }
+    }
+    // The pipe is read as the worker writes: a reader that waited for the
+    // end would hold the clip at the pipe's 64 KiB.
+    let (mut reader, writer) = std::io::pipe().expect("a pipe");
+    let reading = std::thread::spawn(move || {
+        let mut file = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut file).map(|_| file)
+    });
+    let clip = ClipSpec {
+        clip_id: "k1".into(),
+        before_ms: 10_000,
+        after_ms: Some(1_000),
+        audio: true,
+    };
+    worker
+        .start_clip(&clip, writer.into())
+        .await
+        .expect("start clip");
+    let mut reports = Vec::new();
+    loop {
+        match worker.next_event().await {
+            WorkerEvent::Clip { clip_id, event } => {
+                assert_eq!(clip_id, "k1");
+                let stopped = matches!(event, ClipReport::Stopped { .. });
+                reports.push(event);
+                if stopped {
+                    break;
+                }
+            }
+            WorkerEvent::Stats(_) | WorkerEvent::Report(_) | WorkerEvent::Tracks(_) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let file = reading
+        .join()
+        .expect("the reader")
+        .expect("reads to the end");
+    assert!(
+        matches!(
+            &reports[0],
+            ClipReport::Started { video, audio: Some(audio), .. }
+                if video == "h264" && audio == "aac_lc"
+        ),
+        "{reports:?}"
+    );
+    let Some(ClipReport::Stopped { reason, bytes, .. }) = reports.last() else {
+        panic!("stopped last: {reports:?}");
+    };
+    assert_eq!(reason, "completed", "{reports:?}");
+    assert_eq!(*bytes, u64::try_from(file.len()).unwrap());
+    // ISO/IEC 14496-12 §4.3: the file begins with its `ftyp` box.
+    assert_eq!(file.get(4..8), Some(&b"ftyp"[..]), "{} bytes", file.len());
+    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    assert!(exit.success(), "clean exit, got {exit:?}");
     server.stop().await;
 }

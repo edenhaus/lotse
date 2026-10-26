@@ -40,7 +40,7 @@
 //! the bytes. A
 //! clip whose start still waits for a worker gets that report from its
 //! driver instead, which also ends one that waited too long
-//! (`source_not_live`, `crate::driver::CLIP_START_WAIT`) or whose end
+//! (`source_not_live`, after [`ClipLimits::start_timeout`]) or whose end
 //! passed before a worker came, so a fetched clip without a worker still
 //! ends. When
 //! the worker cannot report any more (it exited, the stream was deleted or
@@ -117,54 +117,76 @@ const SUPERVISOR_REASONS: [ClipStopReason; 3] = [
     ClipStopReason::SessionClosed,
 ];
 
-/// The limits on clips and the pre-roll window. Until the configuration
-/// names them, a supervisor with a clip output takes
-/// [`ClipLimits::DEFAULT`], one without takes [`ClipLimits::NONE`].
+/// The limits on clips and the pre-roll window, `limits.preroll_*` and
+/// `limits.clip_*` as the binary resolves them ([`Limits::clips`]). A
+/// supervisor with a clip output keeps them; one without keeps
+/// [`ClipLimits::NONE`], and its workers refuse every clip. The worker's
+/// share (`preroll_bytes`, `clip_max_ms`, `clip_queue_bytes`, `start_timeout`,
+/// `max_clips`) reaches each worker as its flags, so both processes hold the
+/// same bounds.
+///
+/// [`Limits::clips`]: crate::Limits::clips
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ClipLimits {
+pub struct ClipLimits {
     /// `limits.preroll_max_ms`: the longest window `stream/put` may ask
     /// for, and the furthest back a clip's `before_ms` may ask.
-    pub(crate) preroll_max_ms: u32,
+    pub preroll_max_ms: u32,
     /// `limits.preroll_bytes`: what one track's ring may hold; the
     /// worker's bound, which `info` reports.
-    pub(crate) preroll_bytes: u64,
+    pub preroll_bytes: u64,
     /// `limits.clip_max_ms`: the most `after_ms` may ask, and the worker's
     /// end of an open-ended clip.
-    pub(crate) clip_max_ms: u32,
+    pub clip_max_ms: u32,
+    /// `limits.clip_queue_bytes`: what one clip's queue in the worker holds
+    /// before it drops to the next keyframe and reports the gap.
+    pub clip_queue_bytes: u64,
     /// `limits.clip_fetch_timeout_ms`: how long a clip's body waits for
     /// its `GET` from the `clip/start` result on.
-    pub(crate) fetch_timeout: Duration,
-    /// `limits.max_clips`: clips open at once over every stream.
-    pub(crate) max_clips: u32,
+    pub fetch_timeout: Duration,
+    /// `limits.clip_start_timeout_ms`: how long a clip in the worker waits
+    /// for the tracks and a keyframe to start at, and how long its start
+    /// waits in its connection's queue for a worker.
+    pub start_timeout: Duration,
+    /// `limits.max_clips`: clips open at once over every stream, and in one
+    /// worker.
+    pub max_clips: u32,
     /// `limits.clips_per_stream`: clips open at once on one stream.
-    pub(crate) clips_per_stream: u32,
+    pub clips_per_stream: u32,
 }
 
 impl ClipLimits {
-    /// The defaults: a 2-minute window at most, 32 MiB per track (the
-    /// worker's `DEFAULT_PREROLL_BYTES`), 10-minute clips (the worker's
-    /// `DEFAULT_CLIP_MAX`), 10 s to fetch, 8 clips, 2 per stream.
-    pub(crate) const DEFAULT: Self = Self {
+    /// The defaults: a 2-minute window at most, 32 MiB per track (core's
+    /// `DEFAULT_PREROLL_BYTES`), 10-minute clips (the worker's
+    /// `DEFAULT_CLIP_MAX`), an 8 MiB queue (core's
+    /// `DEFAULT_CLIP_QUEUE_BYTES`), 10 s to fetch, 10 s to start (the
+    /// worker's `DEFAULT_CLIP_START_TIMEOUT`), 8 clips, 2 per stream.
+    pub const DEFAULT: Self = Self {
         preroll_max_ms: 120_000,
         preroll_bytes: 32 * 1024 * 1024,
         clip_max_ms: 600_000,
+        clip_queue_bytes: 8 * 1024 * 1024,
         fetch_timeout: Duration::from_secs(10),
+        start_timeout: Duration::from_secs(10),
         max_clips: 8,
         clips_per_stream: 2,
     };
 
     /// No window and no clip: a supervisor without a clip output, whose
     /// workers refuse every clip, says so with these zeros.
-    pub(crate) const NONE: Self = Self {
+    pub const NONE: Self = Self {
         preroll_max_ms: 0,
         preroll_bytes: 0,
         clip_max_ms: 0,
+        clip_queue_bytes: 0,
         fetch_timeout: Self::DEFAULT.fetch_timeout,
+        start_timeout: Self::DEFAULT.start_timeout,
         max_clips: 0,
         clips_per_stream: 0,
     };
 }
 
+/// [`ClipLimits::NONE`]: what a supervisor holds until it knows it has a
+/// clip output.
 impl Default for ClipLimits {
     fn default() -> Self {
         Self::NONE
@@ -1042,6 +1064,10 @@ mod tests {
         assert_eq!(
             usize::try_from(ClipLimits::DEFAULT.preroll_bytes).unwrap(),
             lotse_core::track::DEFAULT_PREROLL_BYTES
+        );
+        assert_eq!(
+            usize::try_from(ClipLimits::DEFAULT.clip_queue_bytes).unwrap(),
+            lotse_core::clip::DEFAULT_CLIP_QUEUE_BYTES
         );
         assert_eq!(ClipLimits::default(), ClipLimits::NONE);
         assert_eq!(

@@ -1,7 +1,8 @@
 //! The M0 exit criterion: a `lotse ctl` round trip over the socket of a
 //! real daemon. `info`, `stream put` with `preload` (a worker runs the fake
 //! source), `stream get` until it is live, `stream subscribe`, an error
-//! result, `raw`, `stream delete`, and a clean stop. Needs the
+//! result, `raw`, `stream clip` (ended by Ctrl-C too, and with a stdout
+//! nobody reads), `stream delete`, and a clean stop. Needs the
 //! `source-fake` feature (on with `--all-features`).
 
 #![cfg(feature = "source-fake")]
@@ -90,6 +91,18 @@ fn check_info(socket: &Path) {
             "{scheme} in {schemes:?}"
         );
     }
+    // The clip container follows its feature, with the limits of clips.
+    assert_eq!(
+        info["outputs"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("clip")),
+        cfg!(feature = "output-clip")
+    );
+    // Without a clip output the daemon takes no clip, whatever is
+    // configured, and says so with a zero.
+    let max_clips = if cfg!(feature = "output-clip") { 3 } else { 0 };
+    assert_eq!(info["limits"]["max_clips"], max_clips);
     assert_eq!(info["sandbox"]["mode"], "off");
     assert!(!info["build"]["target"].as_str().unwrap().is_empty());
     // The fake and the RTSP source declare a backchannel (the ONVIF one,
@@ -190,6 +203,151 @@ fn check_errors(socket: &Path) {
     assert!(String::from_utf8_lossy(&raw.stderr).contains("not JSON"));
 }
 
+/// `stream clip` of the fake source: the daemon takes the clip and hands
+/// its file over, but the fake source sends no frame, so the clip never
+/// starts and ends `source_not_live` without a byte once its end has
+/// passed; `lotse ctl` prints its events and exits 1.
+#[cfg(feature = "output-clip")]
+fn check_clip(socket: &Path, dir: &Path) {
+    let file = dir.join("clip.mp4");
+    let path = file.to_str().unwrap();
+    let clip = ctl(
+        socket,
+        &[
+            "--compact",
+            "stream",
+            "clip",
+            "front",
+            "--after",
+            "1s",
+            "-o",
+            path,
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&clip.stdout);
+    assert_eq!(
+        clip.status.code(),
+        Some(1),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&clip.stderr)
+    );
+    let lines: Vec<Value> = stdout.lines().map(json).collect();
+    let clip_id = lines[0]["clip_id"].as_str().unwrap();
+    assert_eq!(lines[0]["url"], format!("/v0/clips/{clip_id}"));
+    let stopped = lines.last().unwrap();
+    assert_eq!(
+        (&stopped["type"], &stopped["reason"], &stopped["bytes"]),
+        (
+            &Value::from("stopped"),
+            &Value::from("source_not_live"),
+            &Value::from(0)
+        ),
+        "{stdout}"
+    );
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), 0);
+}
+
+/// An open-ended `stream clip` stopped by Ctrl-C: `lotse ctl` asks for
+/// `clip/stop`, and the clip ends `stopped` with its (here empty) file
+/// whole, which exits 0.
+#[cfg(feature = "output-clip")]
+fn check_clip_interrupted(socket: &Path, dir: &Path) {
+    use std::io::{BufRead as _, BufReader};
+    use std::process::Stdio;
+
+    let file = dir.join("open.mp4");
+    let mut child = lotse()
+        .arg("ctl")
+        .arg("--socket")
+        .arg(socket)
+        .args(["--compact", "stream", "clip", "front", "-o"])
+        .arg(&file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ctl runs");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut result = String::new();
+    stdout.read_line(&mut result).expect("the result line");
+    assert!(json(result.trim())["url"].is_string(), "{result}");
+    // Its handler is in place before the result is printed.
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&child),
+        rustix::process::Signal::INT,
+    )
+    .expect("SIGINT sent");
+    let rest: Vec<String> = stdout.lines().map(Result::unwrap).collect();
+    let output = child.wait_with_output().expect("ctl exits");
+    assert!(
+        output.status.success(),
+        "{rest:?}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stopped = json(rest.last().expect("a stopped event"));
+    assert_eq!(
+        (&stopped["type"], &stopped["reason"]),
+        (&Value::from("stopped"), &Value::from("stopped")),
+        "{rest:?}"
+    );
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), 0);
+}
+
+/// `stream clip` with a stdout nobody reads, its pipe full before
+/// `lotse ctl` starts, so its first write never returns: Ctrl-C still stops
+/// the clip and a second still ends `lotse ctl`, with exit 1. Regression
+/// (PR #74 review): its lines were printed with `println!` on the
+/// runtime's one thread after Ctrl-C's handler had replaced SIGINT's
+/// default, and the blocked write held the clip and both presses. First of
+/// the clip checks: the daemon's first `clip_opened` is this clip's.
+#[cfg(feature = "output-clip")]
+fn check_clip_with_stdout_stalled(socket: &Path, dir: &Path, daemon: &mut Daemon) {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let (reader, mut writer) = std::io::pipe().expect("a pipe");
+    // Exactly the pipe's capacity fits, so this returns with the pipe full.
+    let size = rustix::pipe::fcntl_getpipe_size(&writer).expect("the pipe's size");
+    writer
+        .write_all(&vec![b'\n'; size])
+        .expect("the pipe filled");
+    let mut child = lotse()
+        .arg("ctl")
+        .arg("--socket")
+        .arg(socket)
+        .args(["--compact", "stream", "clip", "front", "-o"])
+        .arg(dir.join("stalled.mp4"))
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ctl runs");
+    let pid = Pid::from_child(&child);
+    let stderr = child.stderr.take().expect("piped stderr");
+    // `clip/start` is sent once Ctrl-C has its handler.
+    daemon.wait_for("\"event\":\"clip_opened\"");
+    kill_process(pid, Signal::INT).expect("SIGINT sent");
+    // The first press was heard: ctl asked for clip/stop. A second press
+    // sent before this point could be coalesced with the first.
+    let stopped = json(&daemon.wait_for("\"event\":\"clip_stopped\""));
+    assert_eq!(stopped["reason"], "stopped", "{stopped}");
+    kill_process(pid, Signal::INT).expect("SIGINT sent");
+    let (exited, exit) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _gone = exited.send(child.wait());
+    });
+    let Ok(status) = exit.recv_timeout(Duration::from_secs(10)) else {
+        let _gone = kill_process(pid, Signal::KILL);
+        panic!("ctl did not leave on the second Ctrl-C with stdout stalled");
+    };
+    let status = status.expect("ctl exits");
+    let stderr = std::io::read_to_string(stderr).expect("stderr");
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("interrupted again"), "{stderr}");
+    drop(reader);
+}
+
 /// `raw` prints every frame up to the result, as sent.
 fn check_raw(socket: &Path) {
     let raw = ctl(socket, &["--compact", "raw", r#"{"type":"ping"}"#]);
@@ -235,7 +393,12 @@ fn ctl_round_trips_over_the_socket_of_a_running_daemon() {
             "--log-format",
             "json",
         ],
-        &[],
+        &[("LOTSE_MAX_CLIPS", "3")],
+    );
+    let max_clips = json(&daemon.wait_for("\"setting\":\"limits.max_clips\""));
+    assert_eq!(
+        (&max_clips["value"], &max_clips["source"]),
+        (&Value::from("3"), &Value::from("env"))
     );
     daemon.wait_for("\"event\":\"ready\"");
 
@@ -255,6 +418,12 @@ fn ctl_round_trips_over_the_socket_of_a_running_daemon() {
     assert!(metrics["streams"].get("front").is_some(), "{metrics}");
     check_errors(&socket);
     check_raw(&socket);
+    #[cfg(feature = "output-clip")]
+    {
+        check_clip_with_stdout_stalled(&socket, &dir, &mut daemon);
+        check_clip(&socket, &dir);
+        check_clip_interrupted(&socket, &dir);
+    }
     let schema = ok(&socket, &["schema"]);
     assert_eq!(schema["api"], lotse_api_types::API_VERSION);
 

@@ -17,22 +17,26 @@ categories.workspace = true
 # --each-feature` keeps every combination building. A feature gains its `dep:` the moment the
 # factory registration exists.
 [features]
-default = ["source-rtsp", "source-http", "output-webrtc"]
+default = ["source-rtsp", "source-http", "output-webrtc", "output-clip"]
 source-rtsp = ["dep:lotse-rtsp"] # the RTSP source factory
 source-http = ["dep:lotse-http"] # the HTTP source factory: HLS and MPEG-TS over `http` and `https`
 output-webrtc = ["dep:lotse-webrtc"] # the WebRTC session output factory
+output-clip = ["dep:lotse-mux"] # the event clips' fragmented MP4 container
 source-fake = ["lotse-core/test-util"] # the `fake://` source of lotse-core's fakes, for tests and development only
 
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true } # the WebSocket halves of `lotse ctl`
+http-body-util = { workspace = true } # `lotse ctl stream clip`: the empty GET body and the clip's body read frame by frame
+hyper = { workspace = true, features = ["client"] } # `lotse ctl stream clip`: the GET of the clip's body over the control socket (`client::conn::http1`), which tells a whole chunked body from a cut one
+hyper-util = { workspace = true } # `TokioIo` between the Unix stream of that request and hyper
 log = { workspace = true } # the logger that bridges the `log` records of the crates below
 rustix = { workspace = true, features = ["process"] } # the starting uid, the default of `allow_uid`
 serde = { workspace = true }
 serde_json = { workspace = true } # `lotse ctl` frames
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "net"] } # `lotse ctl`'s runtime and Unix socket
+tokio = { workspace = true, features = ["rt", "net", "macros", "signal", "fs", "io-util", "io-std"] } # `lotse ctl`'s runtime and Unix socket; Ctrl-C stops `lotse ctl stream clip`'s clip, while its events and its body are read at once and its file and stdout are written on the blocking pool
 tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
@@ -42,6 +46,7 @@ lotse-api-types = { workspace = true }
 lotse-codec = { workspace = true } # the AAC-LC → Opus transcoder, registered in every build
 lotse-core = { workspace = true }
 lotse-http = { workspace = true, optional = true }
+lotse-mux = { workspace = true, optional = true }
 lotse-rtsp = { workspace = true, optional = true }
 lotse-sandbox = { workspace = true }
 lotse-supervisor = { workspace = true }
@@ -50,8 +55,8 @@ lotse-worker = { workspace = true }
 
 [dev-dependencies]
 lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`: the `log` bridge's throttle
-rustix = { workspace = true, features = ["process"] } # SIGTERM to the daemon under test
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync"] } # the worker-manager and session tests drive a worker; the ICE-TCP viewer frames its connection; the session viewer reads its socket on a task of its own
+rustix = { workspace = true, features = ["process", "pipe"] } # SIGTERM to the daemon under test, SIGINT to ctl; the size of the stdout pipe the stalled-stdout check fills
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] } # `time`: the bound that fails a hung ctl unit test; the worker-manager and session tests drive a worker; the ICE-TCP viewer frames its connection; the session viewer reads its socket on a task of its own
 tokio-util = { workspace = true } # the cancellation token of the ICE-TCP acceptor the signaling test runs
 lotse-ipc = { workspace = true } # the talk-back tone test serves a worker in-process and speaks the supervisor's end of its channel
 lotse-testing = { workspace = true } # the fake camera and the headless viewer of the session test
