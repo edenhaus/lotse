@@ -2602,13 +2602,26 @@ mod tests {
     /// Waits until worker `pid` under `dir` received `needle`; five
     /// seconds without it fail the test.
     async fn wait_received(dir: &std::path::Path, pid: u64, needle: &[u8]) {
+        wait_received_any(dir, pid, &[needle.to_vec()]).await;
+    }
+
+    /// Waits until worker `pid` under `dir` received one of `needles`; five
+    /// seconds without any fail the test.
+    async fn wait_received_any(dir: &std::path::Path, pid: u64, needles: &[Vec<u8>]) {
         let file = dir.join(format!("received.{pid}"));
         for attempt in 0_u32.. {
             let received = std::fs::read(&file).unwrap_or_default();
-            if received.windows(needle.len()).any(|w| w == needle) {
+            if needles.iter().any(|needle| {
+                received
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_slice())
+            }) {
                 return;
             }
-            assert!(attempt < 500, "worker {pid} never received {needle:?}");
+            assert!(
+                attempt < 500,
+                "worker {pid} never received any of {needles:?}"
+            );
             SystemClock.sleep(Duration::from_millis(10)).await;
         }
     }
@@ -5117,18 +5130,21 @@ mod tests {
         // A clip is a viewer: the idle stream connects for it.
         assert_eq!(demand(&s).viewers, 1);
         let pid = worker_pid(&s).await;
-        let spec = ClipSpec {
-            clip_id: "k1".into(),
-            before_ms: 5_000,
-            after_ms: Some(20_000),
-            audio: true,
-        };
-        wait_received(
-            &dir,
-            pid,
-            &lotse_ipc::encode(&lotse_ipc::ToWorker::StartClip(spec)).unwrap(),
-        )
-        .await;
+        // The start waits in the driver's queue while the worker spawns,
+        // and that wait comes off its `after_ms` (`driver::after_left`):
+        // on the real clock, a millisecond or more of the 20 s.
+        let starts: Vec<Vec<u8>> = (19_000..=20_000)
+            .map(|after_ms| {
+                let spec = ClipSpec {
+                    clip_id: "k1".into(),
+                    before_ms: 5_000,
+                    after_ms: Some(after_ms),
+                    audio: true,
+                };
+                lotse_ipc::encode(&lotse_ipc::ToWorker::StartClip(spec)).unwrap()
+            })
+            .collect();
+        wait_received_any(&dir, pid, &starts).await;
         let front = result_of(&s, "front").await;
         assert_eq!(front["clips"], json!(["k1"]));
         // The write end went to the worker, which discarded it with the
@@ -5454,6 +5470,24 @@ mod tests {
             s.clip_body(&ClipId::new("k4").unwrap()).unwrap_err(),
             ClipBodyError::NotFound
         );
+        // A full pipe: nobody read the body, so the stop could not write
+        // the file's last bytes in time and the worker ends it
+        // `client_gone`, the tail counted in its bytes; the clip still
+        // ends `not_fetched`, a file not whole.
+        let (_r8, mut k8) = started(call(&s, &clip(8, "front", Some("k8")).to_string()).await);
+        let before = front_stats(&s);
+        clock.advance(Duration::from_secs(10));
+        settle().await;
+        clip_report(&s, "k8", stopped_report("client_gone", 70_000));
+        let end = next(&mut k8).await;
+        assert_eq!(
+            (&end["reason"], &end["bytes"]),
+            (&json!("not_fetched"), &json!(70_000))
+        );
+        let after = front_stats(&s);
+        assert_eq!(after.1, before.1, "not a whole file");
+        assert_eq!(after.3, before.3 + 70_000, "the tail counted");
+        assert!(!s.shared.lock().clip_id_in_use("k8"), "no body kept");
         // A clip whose deadline passed while it was being stopped keeps
         // no body.
         let (_r6, _k6) = started(call(&s, &clip(6, "front", Some("k6")).to_string()).await);
