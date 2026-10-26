@@ -56,8 +56,11 @@
 //! writes the container's last fragment, for at most [`FINISH_GRACE`],
 //! closes the pipe and reports `Stopped` last; a failure the drain meets
 //! (a codec change, the container failing a frame), the container failing
-//! a graceful end's last fragment, or a reader gone while a graceful end
-//! writes its last bytes ends the clip for that instead.
+//! a graceful end's last fragment, or a reader gone, or not taking the
+//! last bytes within [`FINISH_GRACE`], while a graceful end writes them
+//! ends the clip for that instead (`client_gone`). `Stopped`'s `bytes` is
+//! the file's length, the bytes left out included, so the body, which ends
+//! whole only when it read that many, is cut when any were.
 //! Gaps and the duration carry clip media time, where the container put
 //! the frames ([`ClipMuxer::media_time`]), never their capture times: a
 //! gap runs from where the frame before the hole was put to where the
@@ -110,7 +113,8 @@ pub const DEFAULT_CLIP_START_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_MAX_CLIPS: usize = 8;
 
 /// How long an ending clip waits for its reader to take the container's
-/// last bytes before it closes the pipe without them.
+/// last bytes before it closes the pipe without them; they still count in
+/// `Stopped`'s `bytes`, so the body is cut.
 const FINISH_GRACE: Duration = Duration::from_secs(1);
 
 /// How long the worker's shutdown waits for its clips to finish: their
@@ -175,7 +179,9 @@ pub(crate) enum EndReason {
     NoVideoTrack,
     /// No tracks, or no keyframe, within the start timeout.
     SourceNotLive,
-    /// The reader closed its end of the pipe.
+    /// The reader closed its end of the pipe, or at the end did not take
+    /// the last bytes within [`FINISH_GRACE`]: either way its file is not
+    /// whole.
     ClientGone,
     /// The worker is stopping.
     ShuttingDown,
@@ -688,6 +694,12 @@ struct Clip {
     pending: VecDeque<Bytes>,
     /// Bytes the pipe took.
     written: u64,
+    /// The bytes the reader did not take within [`FINISH_GRACE`] of the
+    /// end, which the pipe never got: never 0 once set, since only bytes
+    /// still pending are left out. `Stopped` counts them in the file's
+    /// length, so a body that read only what the pipe took is cut, not
+    /// ended whole.
+    left_out: u64,
     /// Whether the container started, at the first frame.
     begun: bool,
     /// The video met its first frame captured at or after the clip's
@@ -759,6 +771,7 @@ impl Clip {
             outbox: Vec::new(),
             pending: VecDeque::new(),
             written: 0,
+            left_out: 0,
             begun: false,
             video_ended: false,
             reached: Duration::ZERO,
@@ -1314,11 +1327,13 @@ impl Clip {
     /// bytes still pending go to the pipe for at most [`FINISH_GRACE`],
     /// unless the reader is gone. A container that fails the last
     /// fragment ends a graceful clip `internal_error`, and a reader that
-    /// goes meanwhile a graceful clip `client_gone`: either way its file
-    /// is not whole. Any other reason already says the clip did not end
-    /// as asked, `shutting_down` included, and stays. The pipe
-    /// closes, and `Stopped` is the last report, its duration the furthest
-    /// media time a frame was put at.
+    /// goes meanwhile, or does not take the last bytes in time, a
+    /// graceful clip `client_gone`: either way its file is not whole. Any
+    /// other reason already says the clip did not end as asked,
+    /// `shutting_down` included, and stays. The pipe closes, and `Stopped`
+    /// is the last report, its duration the furthest media time a frame
+    /// was put at. Its `bytes` is the file's length: the bytes the pipe
+    /// took and those it did not take in time.
     async fn finish(mut self, mut reason: EndReason) {
         if reason != EndReason::ClientGone {
             if self.begun {
@@ -1345,21 +1360,26 @@ impl Clip {
             pipe,
             reports,
             written,
+            left_out,
             gaps,
             ..
         } = self;
         drop(pipe);
+        // The file's length: what the pipe took and the tail it did not
+        // take in time, so the body, which read only the former, is cut.
+        let bytes = written.saturating_add(left_out);
         tracing::info!(
             clip.id = %id,
             reason = reason.name(),
-            bytes = written,
+            bytes,
+            left_out,
             duration_ms,
             gaps,
             "clip: stopped"
         );
         let stopped = ClipReport::Stopped {
             reason: reason.name().to_owned(),
-            bytes: written,
+            bytes,
             duration_ms,
             gaps,
         };
@@ -1368,8 +1388,10 @@ impl Clip {
     }
 
     /// Writes the pending bytes as the pipe takes them, for at most
-    /// [`FINISH_GRACE`]; a reader that takes them not in time gets the
-    /// file without them, and one that is gone `client_gone`.
+    /// [`FINISH_GRACE`]. A reader that takes them not in time gets the
+    /// file without them, counted in `left_out`, and one that is gone
+    /// gets nothing more: either way the file is not whole,
+    /// `client_gone`.
     async fn flush(&mut self) -> Result<(), EndReason> {
         let deadline = self.clock.now().checked_add(FINISH_GRACE);
         loop {
@@ -1384,8 +1406,9 @@ impl Clip {
                 _ = self.pipe.writable() => {}
                 () = self.clock.sleep(left) => {
                     let pending: usize = self.pending.iter().map(Bytes::len).sum();
+                    self.left_out = u64::try_from(pending).unwrap_or(u64::MAX);
                     tracing::warn!(clip.id = %self.id, pending, "clip: the reader did not take the last bytes in time; closing without them");
-                    return Ok(());
+                    return Err(EndReason::ClientGone);
                 }
             }
         }
@@ -2303,6 +2326,24 @@ mod tests {
         assert_eq!(logs.count(Level::INFO, "clip: the reader is gone"), 1);
     }
 
+    /// The bytes the clip left out, as its warning logged them.
+    fn left_out(logs: &Logs) -> usize {
+        let lines = logs.lines(
+            Level::WARN,
+            "clip: the reader did not take the last bytes in time; closing without them",
+        );
+        let fields = &lines.last().unwrap().fields;
+        fields
+            .split(" pending=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
     /// Fills `rig`'s clip's pipe and leaves bytes pending: six 16 KiB
     /// frames, never read.
     async fn stall(rig: &Rig) {
@@ -2384,7 +2425,9 @@ mod tests {
     /// A stalled reader bounds a graceful end: the queue's drain waits
     /// `FINISH_GRACE` for the pipe, then the clip ends without what is
     /// left; the last fragment gets `FINISH_GRACE` too and goes without
-    /// as well. The reader gets what `bytes` says.
+    /// as well. The reader, which resumes after both, gets the file without
+    /// its tail: the clip ends `client_gone`, and `bytes` counts the tail
+    /// too, so the body is cut.
     #[tokio::test]
     async fn a_stalled_reader_bounds_the_drain_and_the_last_fragment_of_a_graceful_end() {
         let (logs, _guard) = Logs::capture();
@@ -2406,7 +2449,12 @@ mod tests {
         assert!(!bytes.ends_with(b"end\n"));
         // The frames the container took: the queued fifth goes when the
         // drain's grace runs out, the sixth with the overflow.
-        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 300, 0)]);
+        let left = left_out(&logs);
+        assert!(left > 0);
+        assert_eq!(
+            reports,
+            vec![stopped("client_gone", bytes.len() + left, 300, 0)]
+        );
         for line in [
             "clip: the reader did not take the queued frames in time; ending without them",
             "clip: the reader did not take the last bytes in time; closing without them",
@@ -3251,6 +3299,53 @@ mod tests {
             assert!(rig.reports.try_recv().is_err(), "the last fragment waits");
             drop(reader);
             let_assert_reason(&rig.until_stopped().await, reason);
+        }
+    }
+
+    /// A reader that stalls past the last fragment's `FINISH_GRACE` and then
+    /// resumes reads the file without its tail, and `Stopped` counts the
+    /// file's length, tail included, so the body (which ends whole only on
+    /// an equal count, RFC 9112 section 7.1) is cut (section 8). A graceful
+    /// end becomes `client_gone`; any other end keeps its reason.
+    /// Regression: the clip reported only what the pipe took, and the body
+    /// ended whole.
+    #[tokio::test]
+    async fn a_reader_that_resumes_after_the_last_bytes_were_left_out_reads_fewer_than_stopped_counts()
+     {
+        for (asked, reason) in [
+            (EndReason::Stopped, "client_gone"),
+            (EndReason::ShuttingDown, "shutting_down"),
+        ] {
+            let (logs, _guard) = Logs::capture();
+            let mut rig = Rig::new(None);
+            let reader = rig.start(spec(0, None, false));
+            stall(&rig).await;
+            assert_eq!(rig.report().await, started(0, None));
+            rig.clips.stop("k1", asked);
+            settle().await;
+            if asked.is_graceful() {
+                // The drain gives up on the queue; the last fragment waits.
+                rig.clock.advance(FINISH_GRACE);
+                settle().await;
+            }
+            assert!(rig.reports.try_recv().is_err(), "the last fragment waits");
+            rig.clock.advance(FINISH_GRACE);
+            let reports = rig.until_stopped().await;
+            // The reader resumes and reads to the end of the pipe.
+            let bytes = reader.rest().await;
+            assert!(!bytes.ends_with(b"end\n"));
+            let left = left_out(&logs);
+            assert!(left > 0);
+            let_assert!(
+                Some(ClipReport::Stopped {
+                    reason: got,
+                    bytes: counted,
+                    ..
+                }) = reports.last()
+            );
+            assert_eq!(got, reason, "{reports:?}");
+            assert_eq!(*counted, (bytes.len() + left) as u64, "{reports:?}");
+            assert_eq!(logs.count(Level::INFO, "clip: stopped"), 1);
         }
     }
 
