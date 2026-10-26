@@ -35,8 +35,9 @@
 //! report, putting its own reason in place of the worker's `stopped`. A
 //! clip whose start still waits for a worker gets that report from its
 //! driver instead, which also ends one that waited too long
-//! (`source_not_live`, after [`ClipLimits::start_timeout`]), so a fetched
-//! clip without a worker still ends. When
+//! (`source_not_live`, after [`ClipLimits::start_timeout`]) or whose end
+//! passed before a worker came, so a fetched clip without a worker still
+//! ends. When
 //! the worker cannot report any more (it exited, the stream was deleted or
 //! moved to another connection, shutdown, a malformed report), the clip
 //! ends at once without it: `stopped` then says 0 bytes and 0 ms, since
@@ -199,7 +200,9 @@ pub(crate) struct ClipCounters {
     /// Gaps in the stream's clips, every one the workers counted, added
     /// as each clip ends.
     pub(crate) gaps: u64,
-    /// Bytes of clip files the workers wrote to their bodies.
+    /// The length of the stream's clip files, as their workers report
+    /// them ([`ClipEnd::Reported`]), a tail a body did not take in time
+    /// included.
     pub(crate) bytes: u64,
 }
 
@@ -407,8 +410,11 @@ impl ClipEntry {
     }
 
     /// `started`, once, with a video codec a clip carries, audio only when
-    /// asked for and one a clip carries, and a picture `tkhd` can hold; the
-    /// supervisor stamps `at`.
+    /// asked for and one a clip carries, and a picture `tkhd` can hold.
+    /// `at` is when the report arrived ([`State::clip_report`]): the worker
+    /// measures `before_ms` back from the container's start and sends
+    /// `Started` then, so `at − before_ms` is the first keyframe's capture
+    /// time, within the report's transit time.
     fn started_event(
         &mut self,
         clip_id: &str,
@@ -583,7 +589,8 @@ const fn completed(reason: ClipStopReason) -> bool {
 }
 
 impl State {
-    /// A worker's report about one of its clips, at `at` on the wall clock.
+    /// A worker's report about one of its clips, at `at` on the wall clock:
+    /// its arrival, which a `Started`'s `before_ms` counts back from.
     /// One about a clip the supervisor does not hold is dropped (its
     /// subscription and body are gone; a pipe nobody reads ends the
     /// worker's clip `client_gone`), one about a clip of another

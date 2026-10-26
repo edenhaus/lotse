@@ -41,7 +41,12 @@
 //! ended meanwhile is dropped with its pipe (a start still queued when its
 //! worker exited never reaches the next one, and one whose clip ended
 //! after it was sent is not held for the next), and the clips of a worker
-//! that exits end `worker_crashed`. A worker stopped for want of demand
+//! that exits end `worker_crashed`. A start a worker gets after waiting
+//! runs only what is left of its `after_ms`, which counts from
+//! `clip/start` ([`after_left`]), and one whose end passed meanwhile ends
+//! here `source_not_live`, as a worker ends one whose source showed
+//! nothing before its end; its `before_ms` stays, since the new worker's
+//! ring holds nothing from before it. A worker stopped for want of demand
 //! runs no clip, and the ids of the clips it was finishing are free once
 //! the driver lets go of it, since their reports reach no one.
 //!
@@ -89,6 +94,18 @@ pub(crate) const COMMAND_QUEUE: usize = 256;
 /// missed in a row is a worker that hangs, not one that is busy.
 pub(crate) const WORKER_SILENCE_LIMIT: Duration = Duration::from_secs(10);
 
+/// What is left of a clip's `after_ms` once its start waited `waited`
+/// for a worker: the API counts it from `clip/start` ("how long the
+/// clip runs after now", `lotse_api_types::command::ClipStart`), a
+/// worker from when it gets the start, so the worker gets the rest;
+/// `None` when none is, the clip's end passed before a worker could
+/// record it. Whole milliseconds are taken off, so the end comes at
+/// most a millisecond late, never early.
+fn after_left(after_ms: u32, waited: Duration) -> Option<u32> {
+    let waited_ms = u32::try_from(waited.as_millis()).unwrap_or(u32::MAX);
+    after_ms.checked_sub(waited_ms).filter(|left| *left > 0)
+}
+
 /// Who wants a connection, as its registry counts them; the driver follows
 /// it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -127,7 +144,8 @@ pub(crate) enum DriverCommand {
         ms: u32,
     },
     /// Start this event clip, writing into `pipe`; handed to a worker
-    /// only while the clip still runs ([`State::clip_start_wanted`]).
+    /// only while the clip still runs ([`State::clip_start_wanted`]). Its
+    /// `after_ms` counts from `clip/start` ([`after_left`]).
     ///
     /// [`State::clip_start_wanted`]: crate::registry::State::clip_start_wanted
     StartClip {
@@ -441,7 +459,9 @@ pub(crate) struct Driver {
     /// Messages waiting for a worker, in order.
     queued: Vec<DriverCommand>,
     /// When each clip start was queued, oldest first, with its clip's id
-    /// and serial; one that left the queue meanwhile is skipped.
+    /// and serial; one that left the queue meanwhile is skipped. Taken
+    /// with the queue when a worker comes, each start running what is left
+    /// of its `after_ms`.
     clip_waits: VecDeque<(Instant, String, u64)>,
     /// Fires when the oldest of `clip_waits` has waited
     /// [`Self::clip_start_wait`]; `None` while none waits.
@@ -1163,7 +1183,14 @@ impl Driver {
                     started: self.shared.clock.now(),
                     memory: None,
                 });
+                // The queued starts leave with their waits: each runs what is left.
+                let waits = std::mem::take(&mut self.clip_waits);
+                self.clip_wait = None;
+                let now = self.shared.clock.now();
                 for command in std::mem::take(&mut self.queued) {
+                    let Some(command) = self.after_the_wait(command, &waits, now) else {
+                        continue;
+                    };
                     Self::send(&mut worker, &self.shared, &self.commands_tx, command).await;
                 }
                 self.worker = Some(worker);
@@ -1281,6 +1308,71 @@ impl Driver {
             let left = wait.saturating_sub(now.saturating_duration_since(*queued));
             self.shared.clock.sleep(left)
         });
+    }
+
+    /// Prepares a queued `command` for the worker that now comes, `now`
+    /// being when it does and `waits` the queue's record of when each clip
+    /// start was queued. Any command but a clip's start with an `after_ms`
+    /// comes back unchanged. That start comes back with `after_ms` set to
+    /// what is left of it ([`after_left`]), the wait being the one `waits`
+    /// holds for its clip id and serial (none: no wait). With nothing left
+    /// its end passed while it waited: it is dropped with its pipe, and if
+    /// its clip still runs (`clip_start_wanted`, asked here only, since
+    /// its false branch logs and frees the id) the clip ends here
+    /// `source_not_live`, as a worker ends one whose source showed nothing
+    /// before its end. A stale start (its clip ended while queued, the id
+    /// possibly taken by a later serial) must not end that later clip,
+    /// which a report matches by id alone: hence the guard. `before_ms` is
+    /// left alone: the new worker's ring holds nothing captured before it
+    /// gets the start, so the clip begins at the first keyframe either
+    /// way (`ClipStart`'s "the source not live yet").
+    fn after_the_wait(
+        &self,
+        command: DriverCommand,
+        waits: &VecDeque<(Instant, String, u64)>,
+        now: Instant,
+    ) -> Option<DriverCommand> {
+        let DriverCommand::StartClip {
+            mut spec,
+            serial,
+            pipe,
+        } = command
+        else {
+            return Some(command);
+        };
+        let Some(after_ms) = spec.after_ms else {
+            return Some(DriverCommand::StartClip { spec, serial, pipe });
+        };
+        let waited = waits
+            .iter()
+            .find(|(_, clip_id, queued)| *clip_id == spec.clip_id && *queued == serial)
+            .map_or(Duration::ZERO, |(queued, ..)| {
+                now.saturating_duration_since(*queued)
+            });
+        let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+        if let Some(left) = after_left(after_ms, waited) {
+            spec.after_ms = Some(left);
+            tracing::debug!(
+                clip.id = %spec.clip_id,
+                serial,
+                waited_ms,
+                after_ms = left,
+                "clip start handed to the new worker; it runs what is left of after_ms"
+            );
+            return Some(DriverCommand::StartClip { spec, serial, pipe });
+        }
+        drop(pipe);
+        if self.shared.lock().clip_start_wanted(&spec.clip_id, serial) {
+            tracing::info!(
+                clip.id = %spec.clip_id,
+                serial,
+                waited_ms,
+                after_ms,
+                "the clip's end passed while its start waited for a worker; ended here source_not_live"
+            );
+            self.end_unqueued(&spec.clip_id, ClipStopReason::SourceNotLive);
+        }
+        None
     }
 
     /// Takes the start of clip `clip_id` out of the queue with its pipe,
@@ -3937,6 +4029,39 @@ mod tests {
         rx
     }
 
+    /// A worker's `Started` is stamped on the wall clock when it reaches the
+    /// driver, not when the clip was asked for: the worker counts
+    /// `before_ms` back from the moment it sends it, so `at − before_ms` is
+    /// the first keyframe's capture time.
+    #[tokio::test]
+    async fn a_started_report_is_stamped_on_its_arrival_which_before_ms_counts_back_from() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let mut rx = hold_clip(&shared, "k1", 1);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        clock.advance(Duration::from_millis(1_100));
+        let arrival = clock.wall_now();
+        driver.on_worker_event(WorkerEvent::Clip {
+            clip_id: "k1".into(),
+            event: ClipReport::Started {
+                before_ms: 400,
+                video: "h264".into(),
+                picture: None,
+                audio: None,
+            },
+        });
+        drop(driver);
+        let started = rx.try_recv().unwrap().payload;
+        assert_eq!(
+            (&started["at"], &started["before_ms"]),
+            (
+                &serde_json::json!(lotse_api_types::time::rfc3339(arrival)),
+                &serde_json::json!(400)
+            )
+        );
+    }
+
     #[tokio::test]
     async fn the_pre_roll_window_and_the_clip_messages_reach_the_worker_and_the_next_starts_with_it()
      {
@@ -4408,5 +4533,117 @@ mod tests {
         let ended = captured.lines("no worker took the clip's start in time");
         assert_eq!(ended.len(), 1, "{ended:?}");
         assert!(ended[0].contains("waited_ms=25000"), "{ended:?}");
+    }
+
+    /// What a worker gets of a clip's `after_ms` is what the wait for it
+    /// left (`ClipStart`: "how long the clip runs after now"): the wait
+    /// taken off in whole milliseconds, and nothing once none is left.
+    #[test]
+    fn after_left_takes_off_the_wait_and_none_once_the_clip_s_end_passed() {
+        assert_eq!(after_left(1_000, Duration::ZERO), Some(1_000));
+        assert_eq!(after_left(6_000, Duration::from_secs(5)), Some(1_000));
+        assert_eq!(after_left(1_000, Duration::from_micros(999_900)), Some(1));
+        assert_eq!(after_left(1_000, Duration::from_secs(1)), None, "the end");
+        assert_eq!(after_left(1_000, Duration::from_secs(5)), None);
+        assert_eq!(after_left(u32::MAX, Duration::MAX), None, "saturated");
+    }
+
+    /// The starts a new worker gets from the queue run what is left of
+    /// their `after_ms`, which counts from `clip/start`; an open-ended one
+    /// is unchanged; one whose end passed while it waited never reaches the
+    /// worker and ends `source_not_live` with its pipe and an empty body;
+    /// a stale one (its clip ended, a later one holds the id) ends nothing.
+    /// Regression: the worker counted `after_ms` from the handoff, so a
+    /// clip queued behind a backoff ran its whole `after_ms` after it.
+    #[tokio::test]
+    async fn a_queued_clip_start_runs_what_is_left_of_after_ms_and_one_whose_end_passed_ends_source_not_live()
+     {
+        use std::io::Read as _;
+
+        let dir = private_dir("driver-clip-wait");
+        let (script, out) = recording_script(&dir);
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with(&script, clock.clone());
+        let _k1 = hold_clip(&shared, "k1", 1);
+        let mut k2 = hold_clip(&shared, "k2", 2);
+        let _k3 = hold_clip(&shared, "k3", 3);
+        let k4 = hold_clip(&shared, "k4", 4);
+        let mut body = shared.lock().take_clip_body("k2").unwrap();
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        for (clip_id, serial, after_ms, pipe) in [
+            ("k1", 1, Some(6_000), fd()),
+            ("k2", 2, Some(1_000), writer.into()),
+            ("k3", 3, None, fd()),
+            ("k4", 4, Some(1_000), fd()),
+        ] {
+            driver.queue(DriverCommand::StartClip {
+                spec: ClipSpec {
+                    after_ms,
+                    ..clip_spec(clip_id)
+                },
+                serial,
+                pipe,
+            });
+        }
+        // k4's clip ended while its start waited, and a later one took the id.
+        drop(k4);
+        let mut k4_later = hold_clip(&shared, "k4", 5);
+        clock.advance(Duration::from_secs(5));
+        let addrs = vec!["127.0.0.1:1".parse().unwrap()];
+        driver.spawn_worker(addrs).await;
+        let end = lotse_ipc::ToWorker::StopClip {
+            clip_id: "end".into(),
+        };
+        driver
+            .handle(Wake::Command(DriverCommand::StopClip {
+                clip_id: "end".into(),
+            }))
+            .await;
+        let messages = recorded(&out, &end).await;
+        assert_eq!(
+            messages[1..],
+            [
+                lotse_ipc::ToWorker::StartClip(ClipSpec {
+                    after_ms: Some(1_000),
+                    ..clip_spec("k1")
+                }),
+                lotse_ipc::ToWorker::StartClip(clip_spec("k3")),
+                end,
+            ],
+            "k1 runs the rest, k3 is unchanged, k2 and k4 never reach the worker"
+        );
+        let stopped = k2.try_recv().unwrap().payload;
+        assert_eq!(
+            (&stopped["reason"], &stopped["bytes"]),
+            (&serde_json::json!("source_not_live"), &serde_json::json!(0))
+        );
+        assert_eq!(body.written.try_recv(), Ok(0), "the body ends whole");
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "k2's pipe went with its start");
+        assert!(k4_later.try_recv().is_err(), "the later k4 is not ended");
+        assert_eq!(shared.lock().clips.get("k4").unwrap().serial, 5);
+        let dropped = captured.lines("clip ended before its worker got it; its start is dropped");
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(dropped[0].contains("serial=4"), "{dropped:?}");
+        let passed = captured.lines("the clip's end passed while its start waited for a worker");
+        assert_eq!(passed.len(), 1, "{passed:?}");
+        assert!(passed[0].contains("clip.id=k2"), "{passed:?}");
+        let left = captured.lines("it runs what is left of after_ms");
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].contains("clip.id=k1"), "{left:?}");
+        assert!(left[0].contains("after_ms=1000"), "{left:?}");
+        assert!(driver.clip_waits.is_empty());
+        assert!(driver.clip_wait.is_none());
+        let worker = driver.worker.take().unwrap();
+        drop(driver);
+        // The shared clock is fake: the stop's budget needs a real one.
+        let real: Arc<dyn Clock> = Arc::new(SystemClock);
+        let _status = worker.stop(Duration::from_millis(200), &real).await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
