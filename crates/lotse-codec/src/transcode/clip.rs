@@ -33,14 +33,19 @@
 //! timeline, as a camera's stamps wobble. A hole up to [`MAX_SILENCE`]
 //! ahead (frames lost) is filled with silence, so the track stays one run
 //! of packets and what follows sits where its timestamps say. A longer
-//! hole, a step back, a new input epoch or a `discontinuity` re-anchors on
-//! the frame: the PCM not yet encoded (less than a chunk and a packet) is
-//! dropped, the resampler forgets its history, and the packets start a new
-//! output epoch, which the container places by its capture time. A new
-//! input epoch or a `discontinuity` also resets the G.722 decoder (the
-//! camera's encoder started over); the Opus encoder is never reset: its
-//! look-ahead splices the old timeline's last 2.5 ms in before the new
-//! anchor, where they belong. A clip's end leaves the PCM not yet encoded
+//! hole or a step back re-anchors on the frame: the PCM not yet encoded
+//! (less than a chunk and a packet) is dropped, the resampler forgets its
+//! history, and the packets start a new output epoch, which the container
+//! places by its capture time. A new input epoch or a `discontinuity`
+//! whose timestamp continues the sample count, within the tolerance and
+//! modulo 2^32 (RFC 3550 §5.1), is the same audio going on (the RTSP
+//! source starts every track's epoch together when one track's timestamps
+//! jump, and unwraps them afresh), so the timeline goes on, moved by that
+//! multiple of 2^32, the G.722 decoder's state and all. One anywhere else
+//! re-anchors and also resets the G.722 decoder (the camera's encoder may
+//! have started over). The Opus encoder is never reset: its look-ahead
+//! splices the old timeline's last 2.5 ms in before the new anchor, where
+//! they belong. A clip's end leaves the PCM not yet encoded
 //! out, less than 20 ms plus the chain's delay.
 //!
 //! Implements RFC 7587 (Opus RTP: 48 kHz clock §4.1, one frame per packet
@@ -96,6 +101,13 @@ pub const fn transcodes(codec: &Codec) -> bool {
     matches!(codec, Codec::Pcmu | Codec::Pcma | Codec::G722)
 }
 
+/// `ticks` as a distance of 32-bit RTP timestamps (RFC 3550 §5.1): of
+/// `ticks + k·2^32`, the one within ±2^31 of zero.
+fn wrapped(ticks: i64) -> i64 {
+    let low = u32::try_from(ticks & 0xFFFF_FFFF).unwrap_or_default();
+    i64::from(i32::from_ne_bytes(low.to_ne_bytes()))
+}
+
 /// Why the chain could not be built or a frame not transcoded.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ToOpusError {
@@ -140,6 +152,10 @@ struct Timeline {
     samples: i64,
     /// The 48 kHz timestamp of the next packet.
     next_packet: i64,
+    /// Added to a frame's timestamp to put it on this timeline: a multiple
+    /// of 2^32 once an input epoch the audio went on through had its
+    /// timestamps unwrapped afresh ([`ToOpus::cross`]); 0 otherwise.
+    rebase: i64,
 }
 
 /// One clip's G.711 or G.722 → Opus chain.
@@ -179,6 +195,9 @@ pub struct ToOpus {
     fresh_epoch: bool,
     /// Rate-limits the lines of holes and re-anchors.
     moves: Throttle,
+    /// Whether the last frame pushed went on the run before it
+    /// ([`Self::continued`]).
+    continued: bool,
 }
 
 impl ToOpus {
@@ -227,6 +246,7 @@ impl ToOpus {
             epoch: 0,
             fresh_epoch: false,
             moves: Throttle::default(),
+            continued: false,
         })
     }
 
@@ -254,6 +274,19 @@ impl ToOpus {
             .saturating_add(i64::from(self.encoder.lookahead()))
     }
 
+    /// Whether the last frame pushed went on the timeline of the frames
+    /// before it: within the tolerance, after a hole filled with silence,
+    /// or across an input epoch it continues. Not the first frame, nor one
+    /// that re-anchored: its packets start a new output epoch.
+    pub const fn continued(&self) -> bool {
+        self.continued
+    }
+
+    /// `frame`'s timestamp on the timeline ([`Timeline::rebase`]).
+    fn ts(&self, frame: &MediaFrame) -> i64 {
+        frame.ts.ticks().saturating_add(self.timeline.rebase)
+    }
+
     /// The input timestamp where the timeline's sample count is, rounded
     /// down.
     fn position(&self) -> i64 {
@@ -269,13 +302,13 @@ impl ToOpus {
     /// One input frame: the Opus packets it completes, in order, each a
     /// frame of the output track at 48 kHz.
     pub fn push(&mut self, frame: &MediaFrame) -> Result<Vec<Arc<MediaFrame>>, ToOpusError> {
-        let ts = frame.ts.ticks();
+        let before = self.anchored.then_some(self.epoch);
         if !self.anchored {
             self.anchor(frame, 0, false);
         } else if self.timeline.input_epoch != frame.epoch || frame.discontinuity {
-            self.anchor(frame, 0, true);
+            self.cross(frame);
         } else {
-            let offset = ts.saturating_sub(self.position());
+            let offset = self.ts(frame).saturating_sub(self.position());
             if offset.saturating_abs() > self.tolerance {
                 if offset > 0 && offset <= self.max_silence {
                     self.fill(offset, frame);
@@ -284,9 +317,11 @@ impl ToOpus {
                 }
             }
         }
+        // A re-anchor moves the output epoch; nothing else does.
+        self.continued = before == Some(self.epoch);
         self.decode(&frame.payload);
         let mut packets = Vec::new();
-        let frame_ts = to_48k(ts, self.clock_rate);
+        let frame_ts = to_48k(self.ts(frame), self.clock_rate);
         let mut start = 0_usize;
         while let Some(chunk) = self.pcm.get(start..start.saturating_add(self.chunk)) {
             let resampled = self
@@ -361,10 +396,42 @@ impl ToOpus {
         self.count(samples);
     }
 
+    /// A new input epoch or a discontinuity at `frame`. A timestamp that
+    /// continues the sample count within the tolerance, read modulo 2^32
+    /// ([`wrapped`]), is the same audio going on: the RTSP source starts
+    /// every track's epoch together when one track's timestamps jump, and
+    /// unwraps every track's timestamps afresh with it. The timeline then
+    /// takes the epoch, its timestamps moved by that multiple of 2^32, and
+    /// keeps the decoder's state, the resampler's and the PCM, so the
+    /// packets go on in one run. Any other timestamp may be the camera's
+    /// encoder starting over: a re-anchor that resets the decoder.
+    fn cross(&mut self, frame: &MediaFrame) {
+        let offset = self.ts(frame).saturating_sub(self.position());
+        let near = wrapped(offset);
+        if near.saturating_abs() > self.tolerance {
+            self.anchor(frame, 0, true);
+            return;
+        }
+        if let Some(count) = self.moves.hit(frame.arrival) {
+            tracing::debug!(
+                input_epoch = frame.epoch,
+                offset_ticks = near,
+                count,
+                "clip audio: a new input epoch continues the sample count; the timeline goes on"
+            );
+        }
+        self.timeline.input_epoch = frame.epoch;
+        self.timeline.rebase = self
+            .timeline
+            .rebase
+            .saturating_add(near.saturating_sub(offset));
+    }
+
     /// Starts a timeline at `frame`, `offset` ticks off the old one's
     /// sample count (0 for a new input epoch or a first frame); a new
     /// output epoch unless it is the first. `restart` (a new input epoch or
-    /// a discontinuity) resets the decoder.
+    /// a discontinuity off the sample count, [`Self::cross`]) resets the
+    /// decoder.
     fn anchor(&mut self, frame: &MediaFrame, offset: i64, restart: bool) {
         if self.anchored {
             let reason = if restart {
@@ -398,6 +465,7 @@ impl ToOpus {
             origin: ts,
             samples: 0,
             next_packet: to_48k(ts, self.clock_rate).saturating_sub(self.compensation()),
+            rebase: 0,
         };
     }
 }
@@ -703,10 +771,12 @@ mod tests {
         );
     }
 
-    /// A hole longer than a second, a step back past the tolerance, a new
-    /// input epoch and a discontinuity each re-anchor on the frame: the
-    /// next packet starts a new output epoch at the frame's timestamp less
-    /// the delay, and the chain logs why, once in 10 s at most.
+    /// A hole longer than a second, a step back past the tolerance, and a
+    /// new input epoch or a discontinuity off the sample count (even by
+    /// less than a second, which inside one epoch would be silence) each
+    /// re-anchor on the frame: the next packet starts a new output epoch at
+    /// the frame's timestamp less the delay, and the chain logs why, once
+    /// in 10 s at most.
     #[test]
     fn a_long_hole_a_step_back_and_a_restart_re_anchor_in_a_new_epoch() {
         let (logs, _guard) = Logs::capture();
@@ -734,10 +804,11 @@ mod tests {
             packets.extend(run(&mut chain, &shifted(hole, 0, 1)));
             // Back to the first frame's timestamp, past the tolerance.
             packets.extend(run(&mut chain, &shifted(0, 0, 2)));
-            // The camera restarted: a new epoch at a timestamp that fits.
-            packets.extend(run(&mut chain, &shifted(1_600, 1, 3)));
-            // A discontinuity in the same epoch.
-            let mut again = shifted(3_200, 1, 3);
+            // The camera restarted: a new epoch 100 ms off the count (inside
+            // one epoch, silence).
+            packets.extend(run(&mut chain, &shifted(2_400, 1, 3)));
+            // A discontinuity in the same epoch, off the count again.
+            let mut again = shifted(4_800, 1, 3);
             again[0].discontinuity = true;
             packets.extend(run(&mut chain, &again));
             let mut expected = Vec::new();
@@ -745,8 +816,8 @@ mod tests {
                 (0, TS0),
                 (1, TS0 + hole),
                 (2, TS0),
-                (3, TS0 + 1_600),
-                (4, TS0 + 3_200),
+                (3, TS0 + 2_400),
+                (4, TS0 + 4_800),
             ] {
                 let first = anchor(&chain, ts);
                 expected.extend((0..9).map(|k| (first + 960 * k, epoch, k == 0 && epoch > 0)));
@@ -770,6 +841,86 @@ mod tests {
                 "reason=\"restart\"",
             ]
         );
+    }
+
+    /// A new input epoch with a discontinuity whose timestamp continues the
+    /// sample count, within the tolerance, is the same audio going on: the
+    /// RTSP source starts every track's epoch when another track's
+    /// timestamps jump, and unwraps the timestamps afresh, k·2^32 lower
+    /// after a wrap (RFC 3550 §5.1). The G.722 decoder keeps its state and
+    /// the packets their run: the same packets as without the epoch.
+    /// Regression: the epoch reset the decoder, dropped the PCM not yet
+    /// encoded and started a new output epoch, in audio that went on.
+    #[test]
+    fn a_new_epoch_that_continues_the_sample_count_keeps_the_decoder_and_the_run() {
+        let (logs, _guard) = Logs::capture();
+        let mut input = frames(&Codec::G722, &onset(16_000, 0, 1_000), t0());
+        // Stamped 80 ticks (10 ms, the tolerance) late, as a camera's stamps wobble.
+        input[25].ts = MediaTime::from_ticks(input[25].ts.ticks() + 80);
+        let whole = run(&mut ToOpus::new(&Codec::G722, 8_000).unwrap(), &input);
+        assert_eq!(whole.len(), 49);
+        for wrap in [0, 1_i64 << 32] {
+            let mut split = input.clone();
+            for frame in &mut split[25..] {
+                frame.epoch = 1;
+                frame.ts = MediaTime::from_ticks(frame.ts.ticks() - wrap);
+            }
+            split[25].discontinuity = true;
+            let packets = run(&mut ToOpus::new(&Codec::G722, 8_000).unwrap(), &split);
+            assert_eq!(packets, whole, "wrap {wrap}");
+        }
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "clip audio: a new input epoch continues the sample count; the timeline goes on"
+            ),
+            2
+        );
+    }
+
+    /// A timestamp distance reads modulo 2^32, the nearest way: what a
+    /// source's unwrapping started afresh moves by.
+    #[test]
+    fn rfc3550_5_1_a_timestamp_distance_reads_modulo_2_32() {
+        for (ticks, near) in [
+            (80, 80),
+            (-80, -80),
+            (80 - (1_i64 << 32), 80),
+            ((1_i64 << 32) - 80, -80),
+            (3 << 32, 0),
+            (1 << 31, -(1 << 31)),
+            ((1 << 31) - 1, (1 << 31) - 1),
+        ] {
+            assert_eq!(wrapped(ticks), near, "{ticks}");
+        }
+    }
+
+    /// `continued` tells a frame on the run before it (within the
+    /// tolerance, after a hole filled with silence, across an epoch it
+    /// continues) from the first and from one that re-anchors (an epoch off
+    /// the count, a step back, a hole over a second).
+    #[test]
+    fn continued_is_a_frame_on_the_run_before_it_not_one_that_re_anchors() {
+        let mut chain = ToOpus::new(&Codec::Pcmu, 8_000).unwrap();
+        let input = frames(&Codec::Pcmu, &onset(8_000, 0, 200), t0());
+        let mut push = |frame: &MediaFrame, epoch: u32| {
+            chain
+                .push(&MediaFrame {
+                    epoch,
+                    ..frame.clone()
+                })
+                .unwrap();
+            chain.continued()
+        };
+        assert!(!push(&input[0], 0), "the first anchors");
+        assert!(push(&input[1], 0), "the next");
+        assert!(push(&input[3], 0), "after a hole filled with silence");
+        assert!(push(&input[4], 1), "across an epoch it continues");
+        assert!(!push(&input[6], 2), "a new epoch 20 ms off restarts");
+        assert!(!push(&input[0], 2), "a step back");
+        let mut far = input[1].clone();
+        far.ts = MediaTime::from_ticks(far.ts.ticks() + 8_160);
+        assert!(!push(&far, 2), "a hole over a second");
     }
 
     /// A frame without samples moves nothing and makes no packet.
