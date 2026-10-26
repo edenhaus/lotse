@@ -891,11 +891,16 @@ pub mod clip {
     /// time, before it calls the clip stuck.
     const STUCK: Duration = Duration::from_secs(5);
 
-    /// What the clip gave the container.
+    /// What the clip gave the container, and what the container made of
+    /// it.
     #[derive(Debug, Default)]
     struct Record {
         /// The frames, in order: capture time and timestamp.
         frames: Vec<(Instant, i64, bool)>,
+        /// Every byte the container handed the clip, in order: [`HEAD`],
+        /// each frame's payload, [`TAIL`] once finished. The pipe must
+        /// carry exactly these.
+        made: Vec<u8>,
         /// Whether the clip finished the container.
         finished: bool,
     }
@@ -929,6 +934,7 @@ pub mod clip {
             _video: &ClipTrack,
             _audio: Option<&ClipTrack>,
         ) -> Result<Vec<Bytes>, ClipError> {
+            self.with(|record| record.made.extend_from_slice(HEAD));
             Ok(vec![Bytes::from_static(HEAD)])
         }
 
@@ -939,6 +945,7 @@ pub mod clip {
                 record
                     .frames
                     .push((frame.wallclock, frame.ts.ticks(), frame.keyframe));
+                record.made.extend_from_slice(&frame.payload);
             });
             Ok(vec![frame.payload.clone()])
         }
@@ -955,7 +962,10 @@ pub mod clip {
         }
 
         fn finish(&mut self) -> Result<Vec<Bytes>, ClipError> {
-            self.with(|record| record.finished = true);
+            self.with(|record| {
+                record.finished = true;
+                record.made.extend_from_slice(TAIL);
+            });
             Ok(vec![Bytes::from_static(TAIL)])
         }
     }
@@ -1123,7 +1133,8 @@ pub mod clip {
     }
 
     /// A `Stopped` with `reason` whose bytes are what the pipe carried,
-    /// [`TAIL`] last: the container finished.
+    /// and the pipe carried what the container made, in order, none lost,
+    /// none twice, [`TAIL`] last: the container finished.
     fn finished(
         found: &mut Found,
         recorder: &Recorder,
@@ -1138,6 +1149,14 @@ pub mod clip {
         found.ensure(
             u64::try_from(carried).ok() == Some(written),
             format!("the clip reported {written} bytes, the pipe carried {carried}"),
+        );
+        let made = recorder.with(|record| record.made.clone());
+        found.ensure(
+            bytes == made.as_slice(),
+            format!(
+                "the pipe carried {carried} bytes, not the {} the container made, in order",
+                made.len()
+            ),
         );
         found.ensure(
             recorder.with(|record| record.finished) && bytes.ends_with(TAIL),
@@ -1166,7 +1185,10 @@ pub mod clip {
     /// keyframe each second, starts at the keyframe captured at 6 s, the
     /// newest at or before 6.5 s, and says it is 4 s old; it gives the
     /// container every frame from it on with the camera's own timestamps,
-    /// the window's and then the live ones, none lost or twice at the seam.
+    /// the window's and then the live ones, none lost or twice at the seam,
+    /// and the pipe carries exactly the bytes the container made of them:
+    /// a clip that dropped or repeated a frame's bytes on the way out would
+    /// still report the bytes it wrote.
     pub async fn a_preroll_clip_starts_where_it_says_with_the_original_timestamps(
         clip: &mut dyn ClipUnderTest,
     ) -> Check {

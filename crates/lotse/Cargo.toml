@@ -36,7 +36,7 @@ rustix = { workspace = true, features = ["process"] } # the starting uid, the de
 serde = { workspace = true }
 serde_json = { workspace = true } # `lotse ctl` frames
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "net", "macros", "signal"] } # `lotse ctl`'s runtime and Unix socket; Ctrl-C stops `lotse ctl stream clip`'s clip, while its events and its body are read at once
+tokio = { workspace = true, features = ["rt", "net", "macros", "signal", "fs", "io-util", "io-std"] } # `lotse ctl`'s runtime and Unix socket; Ctrl-C stops `lotse ctl stream clip`'s clip, while its events and its body are read at once and its file and stdout are written on the blocking pool
 tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
@@ -56,8 +56,8 @@ lotse-worker = { workspace = true }
 [dev-dependencies]
 lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`: the `log` bridge's throttle
 mp4-atom = { workspace = true } # the clip test reads the daemon's clips back, as a reader independent of the muxer
-rustix = { workspace = true, features = ["process"] } # SIGTERM to the daemon under test, SIGKILL to the worker of a clip
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync"] } # the worker-manager and session tests drive a worker; the ICE-TCP viewer frames its connection; the session viewer reads its socket on a task of its own
+rustix = { workspace = true, features = ["process", "pipe"] } # SIGTERM to the daemon under test, SIGINT to ctl, SIGKILL to the worker of a clip; the size of the stdout pipe the stalled-stdout check fills
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] } # `time`: the bound that fails a hung ctl unit test; the worker-manager and session tests drive a worker; the ICE-TCP viewer frames its connection; the session viewer reads its socket on a task of its own
 tokio-util = { workspace = true } # the cancellation token of the ICE-TCP acceptor the signaling test runs
 lotse-ipc = { workspace = true } # the talk-back tone test serves a worker in-process and speaks the supervisor's end of its channel
 lotse-testing = { workspace = true } # the fake camera and the headless viewer of the session test; the TLS listener's client of the clip test

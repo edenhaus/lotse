@@ -1,9 +1,13 @@
 # cargo-mutants configuration.
 # `mise run mutants` runs the changed lines; the nightly job runs the whole workspace.
 test_tool = "nextest"
-# Test infrastructure: exercised by the other crates' tests and left out of
-# the coverage gate for the same reason (mise.toml `coverage-musl`).
-exclude_globs = ["crates/lotse-testing/**", "crates/lotse-codec/src/aac/test_data.rs"]
+# Test infrastructure: lotse-testing, and the codecs' test data behind lotse-codec's
+# `test-util` feature, exercised by the other crates' tests.
+exclude_globs = [
+    "crates/lotse-testing/**",
+    "crates/lotse-codec/src/aac/test_data.rs",
+    "crates/lotse-codec/src/g722/test_data.rs",
+]
 # Equivalent mutants: mutations that cannot change behavior, each with its reason.
 # Keep this list short and delete entries with the code they refer to.
 exclude_re = [
@@ -69,6 +73,13 @@ exclude_re = [
     # G.711's sign (0x80), segment (0x70) and step (0x0f) bits are disjoint, so `|` and `^`
     # produce the same code.
     "g711.rs:.*replace \\| with \\^ in (mu|a)_encode$",
+    # A re-anchor that is no restart comes from a frame more than `JITTER_TOLERANCE` (>= 0) off
+    # the sample count, so its offset is never 0: `>` and `>=` pick the same log reason.
+    "transcode/clip.rs:\\d+:30: replace > with >= in ToOpus::anchor$",
+    # Inside the branch the offset is more than `JITTER_TOLERANCE` (>= 0) either way, so never 0:
+    # `offset > 0` and `offset >= 0` pick the same, a hole to fill.
+    # (Column 27 is `offset > 0`; the rest of the condition stays mutated.)
+    "transcode/clip.rs:\\d+:27: replace > with >= in ToOpus::push$",
     # The seconds shifted up 32 bits and the fraction below 2^32 occupy disjoint bits.
     "replace \\| with \\^ in ntp_timestamp",
     # The CVO flip bit and the rotation bits are disjoint, so `|` and `^` produce the same byte.
@@ -102,6 +113,11 @@ exclude_re = [
     "clients.rs:.*replace match guard err == Errno::WOULDBLOCK with true in ClientStore::open$",
     # A directory sync shows only after a crash: skipping it changes nothing a test can see.
     "clients.rs:.*replace fsync_dir -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
+    # `Clip::queue` leaves no empty slice pending, and a write of at least one byte to a pipe
+    # writes at least one or fails (POSIX `write`, Linux `pipe(7)`): `Ok(0)` never comes, so
+    # the guard, there so it could not loop forever, picks what `true` and `>=` pick.
+    "clip.rs:.*replace match guard written > 0 with true in Clip::write$",
+    "clip.rs:.*replace > with >= in Clip::write$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
 ]

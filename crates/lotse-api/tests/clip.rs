@@ -317,7 +317,7 @@ async fn rfc9112_8_a_clip_cut_short_ends_without_the_last_chunk() {
     let mut crashed = running.open("crashed");
     let mut client = request(&running.socket, "GET", "/v0/clips/crashed").await;
     crashed.write(b"ftyp").await.unwrap();
-    crashed.crash();
+    drop(crashed);
     let response = Response::parse(&read_all(&mut client).await);
     assert_eq!(response.status(), "200");
     assert_eq!(response.body, b"ftyp");
@@ -464,6 +464,37 @@ async fn a_client_that_takes_none_of_a_body_is_dropped_at_the_stall_deadline() {
         "{text}"
     );
     drop(client);
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rfc9112_6_1_an_http_1_0_request_is_refused_505_and_leaves_the_clip() {
+    let (logs, _guard) = capture(tracing::Level::WARN);
+    let running = start("http10");
+    let writer = running.open("c1");
+    // RFC 9112 §6.3: a body to HTTP/1.0 could only be close-delimited, and
+    // a cut one would read as whole.
+    let mut old = UnixStream::connect(&running.socket).await.unwrap();
+    old.write_all(b"GET /v0/clips/c1 HTTP/1.0\r\nHost: lotse\r\n\r\n")
+        .await
+        .unwrap();
+    let mut raw = read_head(&mut old).await;
+    let head = Response::parse(&raw);
+    assert_eq!(head.status(), "505", "{}", head.head);
+    raw.extend(read_all(&mut old).await);
+    let response = Response::parse(&raw);
+    assert_eq!(response.error_code(), "invalid_request");
+    // The clip was not taken: a request in HTTP/1.1 gets it whole.
+    let mut client = request(&running.socket, "GET", "/v0/clips/c1").await;
+    writer.finish();
+    let response = Response::parse(&read_all(&mut client).await);
+    assert_eq!(response.status(), "200");
+    assert!(response.last_chunk);
+    let text = logs.text();
+    assert!(
+        text.contains("clip body refused: the request is not HTTP/1.1"),
+        "{text}"
+    );
     running.finish().await;
 }
 

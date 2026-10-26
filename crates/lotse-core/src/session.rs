@@ -389,6 +389,19 @@ pub trait SessionEngine: fmt::Debug + Send {
     /// (`session/get`'s `backchannel.codec`); `None` when talk-back is off.
     fn talkback(&self) -> Option<UplinkCodec>;
 
+    /// What the re-offer `offer` asks of the stream's backchannel, judged
+    /// as this session would answer it, holding the backchannel: the
+    /// session's [`OutputFactory::talkback_request`], for the stream
+    /// audio it opened with, but for what its earlier answers fixed that
+    /// a fresh session's would not (an engine that keeps an m-line's
+    /// codecs from its first answer cannot receive talk-back on it in a
+    /// codec it did not keep). The worker claims the backchannel only for
+    /// a re-offer the judge finds negotiable, so a claim the answer could
+    /// not carry is never made.
+    ///
+    /// [`OutputFactory::talkback_request`]: crate::output::OutputFactory::talkback_request
+    fn talkback_request(&self, offer: &str) -> crate::output::TalkbackJudge;
+
     /// A re-offer (`webrtc/renegotiate`): the answer to it, or why it was
     /// not applied, the session then going on as it was. Only the audio
     /// m-lines may change; talk-back is negotiated again from them, with
@@ -421,6 +434,7 @@ pub trait SessionEngine: fmt::Debug + Send {
 ///   browser follows parameter-set changes in band;
 /// - `SourceLost` and `SourceRestored` keep the session: the stream
 ///   reconnects, and media resumes with the new epoch's keyframe;
+///   `SourceSwitched` too: a switch is a hot swap, its epoch follows;
 /// - the track's end closes with `stream_deleted`.
 pub fn apply_track_event(
     engine: &mut dyn SessionEngine,
@@ -458,8 +472,12 @@ pub fn apply_track_event(
         },
         Some(TrackEvent::SourceLost) => tracing::info!("source lost; the session waits"),
         Some(TrackEvent::SourceRestored) => tracing::info!("source restored"),
-        // A packet subscription yields no frames.
-        Some(TrackEvent::Frame(_)) => {}
+        // A packet subscription yields no frames and no `ControlLost`; a
+        // source switch is a hot swap to a session, and the epoch that
+        // follows it skips to the new source's keyframe.
+        Some(
+            TrackEvent::Frame(_) | TrackEvent::ControlLost { .. } | TrackEvent::SourceSwitched,
+        ) => {}
         None => engine.close(now, "stream_deleted", "the track closed".to_owned()),
     }
 }
@@ -473,7 +491,7 @@ pub fn apply_track_event(
 ///   offset follows each packet's epoch;
 /// - a `TrackChanged` closes with `stream_changed` only when the family
 ///   changed, since the answer named the old codec's payload type;
-/// - `SourceLost` and `SourceRestored` keep the session;
+/// - `SourceLost`, `SourceRestored` and `SourceSwitched` keep the session;
 /// - the track's end stops the audio; the video track's end closes a
 ///   session that plays video.
 pub fn apply_audio_event(
@@ -506,7 +524,9 @@ pub fn apply_audio_event(
             | TrackEvent::TrackChanged(_)
             | TrackEvent::SourceLost
             | TrackEvent::SourceRestored
-            | TrackEvent::Frame(_),
+            | TrackEvent::SourceSwitched
+            | TrackEvent::Frame(_)
+            | TrackEvent::ControlLost { .. },
         ) => true,
         None => {
             tracing::info!("audio track closed; the session continues without it");

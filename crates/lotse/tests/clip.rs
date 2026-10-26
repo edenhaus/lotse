@@ -4,12 +4,12 @@
 //! /v0/clips/{clip_id}`. Every file is read back with mp4-atom, an
 //! independent reader of ISO/IEC 14496-12: the first sample is a keyframe
 //! as old as `started.before_ms` says, the audio starts with the video
-//! (EBU R37, on the container's timestamps), a camera reconnect inside a
-//! clip is one `gap` event where the file's timeline has it, `clip/stop`
-//! ends the body with its last chunk, a worker crash cuts it, a clip nobody
-//! fetches ends `not_fetched`, two clips run on one stream, and the mTLS
-//! listener serves the route as the socket does. Needs the `source-rtsp`
-//! and `output-clip` features (the defaults).
+//! (EBU R37, on the container's timestamps) and runs to its end, a camera
+//! reconnect inside a clip is one `gap` event where the file's timeline
+//! has it, `clip/stop` ends the body with its last chunk, a worker crash
+//! cuts it, a clip nobody fetches ends `not_fetched`, two clips run on one
+//! stream, and the mTLS listener serves the route as the socket does.
+//! Needs the `source-rtsp` and `output-clip` features (the defaults).
 
 #![cfg(all(feature = "source-rtsp", feature = "output-clip"))]
 #![allow(
@@ -451,8 +451,11 @@ fn assert_ended_whole(fetched: &Fetched, clip_id: &str, events: &[Value], reason
 /// that keyframe's age, so at least what was asked and less than a GOP
 /// more, and the file's video starts at it with its IDR and covers its age
 /// and `after_ms`. The audio starts with the video on the file's timeline
-/// (EBU R37: within 40 ms): AAC-LC as the camera sends it, starting with
-/// the frame playing at the keyframe, and PCMU transcoded to Opus.
+/// (EBU R37: within 40 ms) and runs to the video's end, each track's last
+/// sample the last captured before the clip's end: AAC-LC as the camera
+/// sends it, starting with the frame playing at the keyframe, and PCMU
+/// transcoded to Opus, whose last PCM short of a packet the end leaves
+/// out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ebu_r37_a_preloaded_clip_starts_at_a_keyframe_before_ms_old_with_its_audio() {
     let aac = camera(Some(CameraAudio::Aac)).await;
@@ -519,7 +522,9 @@ async fn ebu_r37_a_preloaded_clip_starts_at_a_keyframe_before_ms_old_with_its_au
         assert_eq!(holes(&audio), [], "the audio runs without a hole");
         let video_start = ms(video[0].dts, video_rate);
         let audio_start = ms(audio[0].dts, audio_rate);
-        match entry {
+        // Each arm: the audio packet's length, and what the end leaves
+        // out of the audio besides, in milliseconds.
+        let (packet_ms, held_ms) = match entry {
             SampleEntry::Mp4a(_) => {
                 assert_eq!(audio_rate, 16_000);
                 assert!(audio.iter().all(|sample| sample.duration == 1_024));
@@ -529,6 +534,8 @@ async fn ebu_r37_a_preloaded_clip_starts_at_a_keyframe_before_ms_old_with_its_au
                     audio_start <= video_start + 1 && video_start <= audio_start + 64,
                     "audio at {audio_start} ms, video at {video_start} ms"
                 );
+                // The camera's frames as they came: 1024 samples at 16 kHz.
+                (64, 0)
             }
             SampleEntry::Opus(_) => {
                 assert_eq!(audio_rate, 48_000);
@@ -538,9 +545,27 @@ async fn ebu_r37_a_preloaded_clip_starts_at_a_keyframe_before_ms_old_with_its_au
                     audio_start.abs_diff(video_start) <= 40,
                     "audio at {audio_start} ms, video at {video_start} ms"
                 );
+                // The end leaves out the PCM not yet encoded: less than a
+                // packet plus the chain's delay, the encoder's 2.5 ms
+                // look-ahead and the resampler's (under 5 ms together).
+                (20, 20 + 5)
             }
             other => panic!("audio {other:?}"),
-        }
+        };
+        // The audio runs to the video's end: each track's last sample is
+        // the last captured before the clip's end, so the audio ends at
+        // most a packet after the video and at most a video frame, and what
+        // the end leaves out, before it. 5 ms of slack: each track's ticks
+        // rounded down, and the capture times the end goes by against the
+        // file's timestamps.
+        let last_audio = audio.last().unwrap();
+        let audio_end = ms(last_audio.dts + last_audio.duration, audio_rate);
+        let video_end = ms(last.dts + last.duration, video_rate);
+        assert!(
+            audio_end <= video_end + packet_ms + 5
+                && video_end <= audio_end + FRAME_MS + held_ms + 5,
+            "the audio ends at {audio_end} ms, the video at {video_end} ms"
+        );
     }
     let (code, rest) = daemon.terminate();
     assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
@@ -757,10 +782,10 @@ async fn rfc9112_7_1_a_reconnect_inside_a_clip_is_one_gap_where_the_file_has_it_
     cam.stop().await;
 }
 
-/// The worker dies while its clip runs: the clip ends `worker_crashed`
-/// with no bytes counted, and its body ends without its last chunk, a cut
-/// transfer (RFC 9112 §8), after the bytes the worker wrote: the file's
-/// beginning.
+/// The worker dies while its clip runs, its body fetched: the clip ends
+/// `worker_crashed` with no bytes counted, and its body ends without its
+/// last chunk, a cut transfer (RFC 9112 §8), after the bytes the worker
+/// wrote: the file's beginning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc9112_8_a_worker_crash_ends_the_clip_worker_crashed_and_cuts_its_body() {
     let cam = camera(None).await;
@@ -779,6 +804,12 @@ async fn rfc9112_8_a_worker_crash_ends_the_clip_worker_crashed_and_cuts_its_body
     let fetch = fetch_on_socket(&socket, result["url"].as_str().unwrap()).await;
     let started = control.event(id).await;
     assert_eq!(started["type"], "started", "{started}");
+    // The supervisor handed the body to the `GET` before the worker dies:
+    // a clip that ends `worker_crashed` keeps no body nobody took, so a
+    // `GET` it beat would find no clip (404). Neither `started` nor the
+    // request leaving the test says the body was taken.
+    let handed_out = json(&daemon.wait_for("\"event\":\"clip_fetched\""));
+    assert_eq!(handed_out["clip.id"], result["clip_id"], "{handed_out}");
 
     rustix::process::kill_process(
         rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
@@ -802,7 +833,8 @@ async fn rfc9112_8_a_worker_crash_ends_the_clip_worker_crashed_and_cuts_its_body
 }
 
 /// A clip of an idle stream is demand: the stream connects for it, and it
-/// starts at the first keyframe, `before_ms` 0. Nobody fetches its body
+/// starts at the first keyframe as it arrives (`before_ms` under a frame:
+/// the time it took to reach the container). Nobody fetches its body
 /// within `limits.clip_fetch_timeout_ms`, so it ends `not_fetched`, and a
 /// `GET` afterwards finds no clip (404 `clip_not_found`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -822,7 +854,11 @@ async fn rfc9110_15_5_5_a_clip_nobody_fetches_ends_not_fetched_and_its_body_is_g
         .await;
     let events = control.until_stopped(id).await;
     assert_eq!(events[0]["type"], "started", "{events:?}");
-    assert_eq!(events[0]["before_ms"], 0, "nothing held: {events:?}");
+    let before_ms = events[0]["before_ms"].as_u64().unwrap();
+    assert!(
+        before_ms < FRAME_MS,
+        "nothing held: the first keyframe as it arrived, {before_ms} ms old: {events:?}"
+    );
     assert_eq!(
         events.last().unwrap()["reason"],
         "not_fetched",

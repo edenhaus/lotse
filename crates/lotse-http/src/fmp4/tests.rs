@@ -666,6 +666,30 @@ fn samples_over_the_frame_limit_empty_or_with_a_unit_past_their_end_are_dropped(
     assert_eq!(reader.stats().samples, 57);
 }
 
+/// A video sample of non-zero size whose NAL units are all empty (a
+/// length field of 0, ISO/IEC 14496-15 §5.3.2) holds no access unit: it
+/// is dropped as empty, not handed on without a payload. Regression:
+/// the length-prefixed to Annex B conversion skips empty units, so such
+/// a sample came out of it empty and was handed on (found by the
+/// `fmp4_segment` fuzz target, which asserts every unit has a payload).
+#[test]
+fn iso14496_15_5_3_2_a_video_sample_of_only_empty_nal_units_is_dropped_as_empty() {
+    let sizes = trun(H264_AAC_0, 0) + 16;
+    let size = |sample: usize| {
+        let at = sizes + 4 * sample;
+        u32::from_be_bytes(H264_AAC_0[at..at + 4].try_into().unwrap()) as usize
+    };
+    // The first video sample starts at 548; the last is the tenth.
+    let last = 548 + (0..9).map(size).sum::<usize>();
+    let segment = patched(H264_AAC_0, sizes + 9 * 4, &8_u32.to_be_bytes());
+    let segment = patched(&segment, last, &[0; 8]);
+    let (reader, units) = read(H264_AAC_INIT, &[&segment], MAX);
+    assert_eq!(reader.stats().dropped_empty, 1);
+    assert_eq!(reader.stats().dropped_malformed, 0);
+    assert_eq!(of_track(&units, 0).len(), 9);
+    assert!(units.iter().all(|unit| !unit.payload.is_empty()));
+}
+
 #[test]
 fn iso14496_12_8_8_7_1_the_base_data_offset_of_each_track_fragment() {
     let traf = |base_data_offset, default_base_is_moof| Traf {
@@ -904,13 +928,688 @@ fn unreadable_media_segments_are_refused_and_the_next_one_read() {
 
 #[test]
 fn iso14496_12_8_8_8_the_declared_samples_add_up_the_runs_of_every_track_fragment() {
-    assert_eq!(declared_samples(&[]).unwrap(), 0);
+    let declared = |body: &[u8]| check_boxes("movie fragment", body).unwrap();
+    assert_eq!(declared(&[]), 0);
     let moof = locate(H264_AAC_0, &[(b"moof", 0)]);
     let body = &H264_AAC_0[moof.1..moof.0 + 412];
-    assert_eq!(declared_samples(body).unwrap(), 58);
+    assert_eq!(declared(body), 58);
     // A run too short for its count adds nothing: mp4-atom refuses it.
     let short_run = [
         0, 0, 0, 20, b't', b'r', b'a', b'f', 0, 0, 0, 12, b't', b'r', b'u', b'n', 0, 0, 0, 0,
     ];
-    assert_eq!(declared_samples(&short_run).unwrap(), 0);
+    assert_eq!(declared(&short_run), 0);
+    // Only the runs of the fragment's own track fragments give units: not
+    // one in a track fragment inside another, nor one outside them.
+    let run = boxed(b"trun", &[&[0; 4][..], &5_u32.to_be_bytes()].concat());
+    assert_eq!(declared(&boxed(b"traf", &run)), 5);
+    assert_eq!(declared(&boxed(b"traf", &boxed(b"traf", &run))), 0);
+    assert_eq!(declared(&run), 0);
+    // A run past the end of its track fragment is not read.
+    let mut past_end = boxed(b"traf", &run);
+    past_end[11] += 1;
+    assert_eq!(declared(&past_end), 0);
+}
+
+/// `data` with `child` added as the last box of the box at `path`
+/// ([`locate`]), it and the boxes around it grown by its size.
+fn with_child(data: &[u8], path: &[(&[u8; 4], usize)], child: &[u8]) -> Vec<u8> {
+    let grow = u32::try_from(child.len()).unwrap();
+    let mut out = data.to_vec();
+    let mut end = 0;
+    for depth in 1..=path.len() {
+        let start = locate(data, &path[..depth]).0;
+        let size = u32::from_be_bytes(data[start..start + 4].try_into().unwrap());
+        out[start..start + 4].copy_from_slice(&(size + grow).to_be_bytes());
+        end = start + size as usize;
+    }
+    out.splice(end..end, child.iter().copied());
+    out
+}
+
+/// `init` with `child` added as the last box of its movie box.
+fn with_movie_child(init: &[u8], child: &[u8]) -> Vec<u8> {
+    with_child(init, &[(b"moov", 0)], child)
+}
+
+/// An item reference box with one reference from `from` to items 2 and
+/// 3, encoded by mp4-atom: version 1 when `from` needs 32 bits.
+fn item_references(from: u32) -> Vec<u8> {
+    let iref = Iref {
+        references: vec![mp4_atom::Reference {
+            reference_type: FourCC::new(b"dimg"),
+            from_item_id: from,
+            to_item_ids: vec![2, 3],
+        }],
+    };
+    let mut encoded = Vec::new();
+    iref.encode(&mut encoded).unwrap();
+    encoded
+}
+
+/// The error mp4-atom gives once its count of the bytes left wraps.
+fn overrun(what: &'static str) -> Fmp4Error {
+    Fmp4Error::Box {
+        what,
+        reason: "over decode: iref".to_owned(),
+    }
+}
+
+/// The `fmp4_segment` fuzz target's crash (CI, 2026-10-24): the audio
+/// rendition's run retyped as an item reference box whose references,
+/// read as mp4-atom 0.16.2 reads them, claim more than it holds. mp4-atom
+/// subtracts their sizes unchecked and panicked in a debug build.
+#[test]
+fn iso14496_12_8_11_12_an_item_reference_past_its_box_in_a_fragment_is_refused() {
+    let mut patch = b"iref".to_vec();
+    patch.extend_from_slice(&[0; 77]);
+    patch.extend_from_slice(&[0xff, 0, 0, 0, 2]);
+    let at = locate(SPLIT_AUDIO_0, &[(b"moof", 0), (b"traf", 0), (b"trun", 0)]).0 + 4;
+    let segment = patched(SPLIT_AUDIO_0, at, &patch);
+    let err = segment_error(SPLIT_AUDIO_INIT, &segment);
+    assert_eq!(err, overrun("movie fragment"));
+    assert_eq!(
+        err.to_string(),
+        "the movie fragment cannot be read: over decode: iref"
+    );
+}
+
+/// mp4-atom reads an item reference box in every box it walks (ISO/IEC
+/// 14496-12 §8.11.1 places it in a `meta`): the user data box retyped
+/// as one claims the `meta` inside as a reference's size.
+#[test]
+fn iso14496_12_8_11_12_an_item_reference_past_its_box_in_the_movie_is_refused() {
+    let udta = locate(H264_AAC_INIT, &[(b"moov", 0), (b"udta", 0)]).0;
+    let init = patched(H264_AAC_INIT, udta + 4, b"iref");
+    assert_eq!(Reader::new(&init, MAX).unwrap_err(), overrun("movie box"));
+}
+
+/// Version 1 (32-bit item IDs): its one reference one byte longer than
+/// the box.
+#[test]
+fn iso14496_12_8_11_12_a_version_1_item_reference_past_its_box_is_refused() {
+    let mut iref = item_references(1 << 16);
+    assert_eq!(iref[8], 1);
+    let size = u32::try_from(iref.len() - 12 + 1).unwrap();
+    iref[12..16].copy_from_slice(&size.to_be_bytes());
+    let init = with_movie_child(H264_AAC_INIT, &iref);
+    assert_eq!(Reader::new(&init, MAX).unwrap_err(), overrun("movie box"));
+}
+
+/// Well-formed item references are read past as before, in either
+/// version.
+#[test]
+fn iso14496_12_8_11_12_well_formed_item_references_are_read_past() {
+    let whole = Reader::new(H264_AAC_INIT, MAX).unwrap().layout().clone();
+    for from in [1, 1 << 16] {
+        let init = with_movie_child(H264_AAC_INIT, &item_references(from));
+        assert_eq!(Reader::new(&init, MAX).unwrap().layout(), &whole);
+    }
+}
+
+/// A reference of version `version` (ISO/IEC 14496-12 §8.11.12.2):
+/// `size`, then `reference_type`, `from_item_ID`, `reference_count` and
+/// the IDs, each `id_size` bytes.
+fn reference(size: u32, id_size: usize, ids: &[u32]) -> Vec<u8> {
+    let mut out = size.to_be_bytes().to_vec();
+    out.extend_from_slice(b"dimg");
+    out.extend_from_slice(&1_u32.to_be_bytes()[4 - id_size..]);
+    out.extend_from_slice(&u16::try_from(ids.len()).unwrap().to_be_bytes());
+    for id in ids {
+        out.extend_from_slice(&id.to_be_bytes()[4 - id_size..]);
+    }
+    out
+}
+
+#[test]
+fn iso14496_12_8_11_12_references_overrun_where_mp4_atom_counts_past_zero() {
+    let overruns = |body: &[u8]| references_overrun(body);
+    for (version, id_size, own) in [(0_u8, 2, 14_u32), (1, 4, 18)] {
+        let body =
+            |references: &[Vec<u8>]| [&[version, 0, 0, 0][..], &references.concat()].concat();
+        // Tiled exactly: read to the end.
+        let exact = body(&[reference(own, id_size, &[2]), reference(own, id_size, &[3])]);
+        let steps = steps_of(|| assert!(!references_overrun(&exact), "v{version}"));
+        assert_eq!(steps, 2, "v{version}");
+        // The second reference one byte longer than the bytes left.
+        let past = body(&[
+            reference(own, id_size, &[2]),
+            reference(own + 1, id_size, &[3]),
+        ]);
+        assert!(overruns(&past), "v{version}");
+        // The first claims all the bytes: mp4-atom stops before the second's
+        // size, however large.
+        let all = body(&[
+            reference(2 * own, id_size, &[2]),
+            reference(u32::MAX, id_size, &[3]),
+        ]);
+        assert!(!overruns(&all), "v{version}");
+        // Sizes of zero count nothing: mp4-atom reads on until a field
+        // runs past the body, an ID, the count or the next size, and
+        // refuses it.
+        let zero = body(&[reference(0, id_size, &[2]), reference(0, id_size, &[3])]);
+        assert!(!overruns(&zero), "v{version}");
+        let second = 4 + (zero.len() - 4) / 2;
+        for end in [zero.len() - 1, 4 + 4 + 4 + id_size + 1, second + 3] {
+            assert!(!overruns(&zero[..end]), "v{version} {end}");
+        }
+    }
+    // A version mp4-atom refuses, a body too short for one, and no references.
+    let mut other = [&[2, 0, 0, 0][..], &reference(u32::MAX, 2, &[])].concat();
+    assert!(!overruns(&other));
+    other[0] = 0;
+    assert!(overruns(&other));
+    assert!(!overruns(&[0, 0, 0]));
+    assert!(!overruns(&[0, 0, 0, 0]));
+}
+
+/// A box of type `kind`, four bytes, with `body` (ISO/IEC 14496-12 §4.2).
+fn boxed(kind: &[u8], body: &[u8]) -> Vec<u8> {
+    let size = u32::try_from(8 + body.len()).unwrap();
+    [&size.to_be_bytes()[..], kind, body].concat()
+}
+
+/// An item reference box whose one reference claims a byte more than
+/// the box holds.
+fn past() -> Vec<u8> {
+    boxed(b"iref", &[&[0; 4][..], &reference(13, 2, &[])].concat())
+}
+
+/// The walk of `body` as the body of a movie box.
+fn walk(body: &[u8]) -> Result<u64, Fmp4Error> {
+    check_boxes("movie box", body)
+}
+
+/// The steps of the walks `run` takes ([`step`]).
+fn steps_of(run: impl FnOnce()) -> u64 {
+    let before = STEPS.with(std::cell::Cell::get);
+    run();
+    STEPS.with(std::cell::Cell::get) - before
+}
+
+/// Whether the walk of `body` refuses an item reference box in it.
+fn refused(body: &[u8]) -> bool {
+    walk(body) == Err(overrun("movie box"))
+}
+
+/// The fields of an audio sample entry of `version`, its QTFF
+/// extension included.
+fn audio(version: u8) -> Vec<u8> {
+    let extension = match version {
+        1 => 16,
+        2 => 36,
+        _ => 0,
+    };
+    [&[0; 8][..], &[0, version], &[0; 18], &vec![0; extension]].concat()
+}
+
+/// Bodies of a movie box with `iref`, an item reference box, inside
+/// every box whose boxes mp4-atom 0.16.2 reads by their type, after that
+/// box's own fields.
+fn holding(iref: &[u8]) -> Vec<Vec<u8>> {
+    let mut bodies = vec![iref.to_vec()];
+    for kind in [
+        b"moov", b"trak", b"mdia", b"minf", b"stbl", b"dinf", b"edts", b"mvex", b"moof", b"traf",
+        b"mfra", b"iprp", b"ipco",
+    ] {
+        bodies.push(boxed(kind, iref));
+    }
+    // ISO/IEC 14496-12 §8.11.1: after the version and flags, unless the
+    // handler follows at once (Apple's QTFF); in a user data box too.
+    let hdlr = boxed(b"hdlr", &[0; 25]);
+    let meta = boxed(b"meta", &[&[0; 4][..], &hdlr, iref].concat());
+    bodies.push(meta.clone());
+    bodies.push(boxed(b"meta", &[&hdlr[..], iref].concat()));
+    bodies.push(boxed(b"udta", &meta));
+    // The sample entries, after their fields (§8.5.2.2, §12).
+    bodies.push(boxed(b"stsd", &[&[0; 8][..], iref].concat()));
+    for kind in [
+        b"avc1", b"avc3", b"hev1", b"hvc1", b"vp08", b"vp09", b"av01", b"jpeg", b"uncv",
+    ] {
+        bodies.push(boxed(kind, &[&[0; 78][..], iref].concat()));
+    }
+    for kind in [
+        b"mp4a", b"Opus", b"fLaC", b"ac-3", b"ec-3", b".mp3", b"sowt", b"twos", b"lpcm", b"ipcm",
+        b"fpcm", b"in24", b"in32", b"fl32", b"fl64", b"s16l",
+    ] {
+        for version in 0..=2 {
+            bodies.push(boxed(kind, &[&audio(version)[..], iref].concat()));
+        }
+    }
+    bodies.push(boxed(b"samr", &[&[0; 28][..], iref].concat()));
+    bodies.push(boxed(b"tx3g", &[&[0; 38][..], iref].concat()));
+    for kind in [b"wvtt", b"evte", b"mebx"] {
+        bodies.push(boxed(kind, &[&[0; 8][..], iref].concat()));
+    }
+    // After the label, whatever its type (§12.3.3.2).
+    let label = boxed(b"uri ", &[0; 5]);
+    bodies.push(boxed(b"urim", &[&[0; 8][..], &label, iref].concat()));
+    bodies.push(boxed(b"mett", &[&[0; 8][..], b"text\0\0", iref].concat()));
+    bodies.push(boxed(b"metx", &[&[0; 8][..], b"a\0b\0c\0", iref].concat()));
+    // A `mebx`'s keys, each holding boxes.
+    let keys = boxed(b"keys", &boxed(b"key1", iref));
+    bodies.push(boxed(b"mebx", &[&[0; 8][..], &keys].concat()));
+    // A size of 0 runs to the end of the body around it; a large size
+    // (`largesize`).
+    bodies.push([&[0; 4][..], &iref[4..]].concat());
+    let large = u64::try_from(iref.len() + 8).unwrap();
+    bodies.push(
+        [
+            &1_u32.to_be_bytes()[..],
+            b"iref",
+            &large.to_be_bytes(),
+            &iref[8..],
+        ]
+        .concat(),
+    );
+    bodies
+}
+
+/// An item reference box past its box is refused wherever mp4-atom
+/// reads one, and one that fits is read past.
+#[test]
+fn iso14496_12_8_11_12_item_references_are_checked_where_mp4_atom_reads_them() {
+    for body in holding(&past()) {
+        assert!(refused(&body), "{body:?}");
+    }
+    let fits = boxed(b"iref", &[&[0; 4][..], &reference(12, 2, &[])].concat());
+    for body in holding(&fits) {
+        assert!(walk(&body).is_ok(), "{body:?}");
+    }
+}
+
+/// Bytes mp4-atom 0.16.2 reads as data, fields or padding are not boxes,
+/// whatever they hold, nor is a box it does not read.
+#[test]
+fn iso14496_12_4_2_item_reference_types_mp4_atom_reads_as_data_are_not_boxes() {
+    let past = past();
+    let mut bodies = vec![
+        // §8.1.2: padding, here holding a box header of size 0.
+        boxed(b"free", &[0, 0, 0, 0, b'i', b'r', b'e', b'f']),
+        boxed(b"free", &past),
+        boxed(b"mdat", &past),
+        boxed(b"abcd", &past),
+        // A user data box reads its other boxes as data, and `keys` hold
+        // boxes in a `mebx` alone.
+        boxed(b"udta", &past),
+        boxed(b"keys", &boxed(b"key1", &past)),
+        // Inside a sample entry's fields, or after them in a version it
+        // refuses or a body too short for one.
+        boxed(b"avc1", &[&past[..], &[0; 54]].concat()),
+        boxed(b"mp4a", &[&audio(3)[..], &past].concat()),
+        boxed(b"mp4a", &[0; 9]),
+        // The second string read to the reference's first null.
+        boxed(b"mett", &[&[0; 8][..], b"text\0", &past].concat()),
+        boxed(b"metx", &[&[0; 8][..], b"abc"].concat()),
+    ];
+    // A box past the end of its body, a size below the header's, and too
+    // few bytes for a header.
+    let mut long = past.clone();
+    long[3] += 1;
+    bodies.push(long);
+    let mut short = past.clone();
+    short[3] = 7;
+    bodies.push(short);
+    bodies.push(past[..7].to_vec());
+    for body in &bodies {
+        assert!(walk(body).is_ok(), "{body:?}");
+    }
+}
+
+/// `n` edit boxes inside one another.
+fn nested(n: usize) -> Vec<u8> {
+    (0..n).fold(Vec::new(), |inner, _| boxed(b"edts", &inner))
+}
+
+#[test]
+fn iso14496_12_4_2_boxes_nested_past_the_deepest_are_refused() {
+    let deep = Err(Fmp4Error::TooDeep { what: "movie box" });
+    // The movie box itself is the first.
+    assert!(walk(&nested(MAX_DEPTH - 1)).is_ok());
+    assert_eq!(walk(&nested(MAX_DEPTH)), deep);
+    // A `mebx`, its keys and each key are boxes deeper.
+    let keys = |more: usize| {
+        let key = boxed(b"key1", &nested(MAX_DEPTH - 4 + more));
+        boxed(b"mebx", &[&[0; 8][..], &boxed(b"keys", &key)].concat())
+    };
+    assert!(walk(&keys(0)).is_ok());
+    assert_eq!(walk(&keys(1)), deep);
+}
+
+/// mp4-atom 0.16.2 reads boxes nested in one another on the stack: a few
+/// hundred overflowed it and aborted the process. The deepest it reads
+/// is read as before.
+#[test]
+fn iso14496_12_4_2_boxes_nested_past_the_deepest_are_refused_before_mp4_atom_reads_them() {
+    let whole = Reader::new(H264_AAC_INIT, MAX).unwrap().layout().clone();
+    let init = with_movie_child(H264_AAC_INIT, &nested(MAX_DEPTH - 1));
+    assert_eq!(Reader::new(&init, MAX).unwrap().layout(), &whole);
+    for n in [MAX_DEPTH, 1_000] {
+        let init = with_movie_child(H264_AAC_INIT, &nested(n));
+        let err = Reader::new(&init, MAX).unwrap_err();
+        assert_eq!(err, Fmp4Error::TooDeep { what: "movie box" });
+        assert_eq!(
+            err.to_string(),
+            "the movie box nests boxes more than 16 deep"
+        );
+    }
+    let segment = with_child(SPLIT_AUDIO_0, &[(b"moof", 0)], &nested(1_000));
+    assert_eq!(
+        segment_error(SPLIT_AUDIO_INIT, &segment),
+        Fmp4Error::TooDeep {
+            what: "movie fragment"
+        }
+    );
+}
+
+/// Every item reference box is read once, the boxes around it too: the
+/// review's input (PR #81), whose references of size 0 each hold another
+/// box header and cost the scan of every `iref` type quadratic work, is
+/// walked in a step per reference.
+#[test]
+fn iso14496_12_8_11_12_item_references_are_read_once() {
+    for n in [256_usize, 512] {
+        let references: Vec<u8> = (0..n)
+            .flat_map(|k| {
+                let size = u32::try_from(8 + 4 + 24 * (n - 1 - k)).unwrap();
+                let ids = [&size.to_be_bytes()[..], b"iref", &[0; 4]].concat();
+                let mut reference = reference(0, 2, &[0; 6]);
+                reference[12..].copy_from_slice(&ids);
+                reference
+            })
+            .collect();
+        let body = boxed(b"iref", &[&[0; 4][..], &references].concat());
+        assert_eq!(
+            body.windows(4).filter(|kind| kind == b"iref").count(),
+            n + 1
+        );
+        // Its header, each reference, and the size the body is too short
+        // for.
+        let steps = steps_of(|| assert_eq!(walk(&body), Ok(0)));
+        assert_eq!(steps, 1 + n as u64 + 1);
+        assert!(steps <= body.len() as u64 / 4);
+    }
+}
+
+/// An item reference box past its box inside a sample entry and inside
+/// the user data box's meta box, as mp4-atom reads them; the type inside
+/// padding is read past.
+#[test]
+fn iso14496_12_8_11_12_item_references_in_the_movie_where_mp4_atom_reads_them() {
+    let avc1 = [
+        (b"moov", 0),
+        (b"trak", 0),
+        (b"mdia", 0),
+        (b"minf", 0),
+        (b"stbl", 0),
+        (b"stsd", 0),
+        (b"avc1", 0),
+    ];
+    let meta = [(b"moov", 0), (b"udta", 0), (b"meta", 0)];
+    for path in [&avc1[..], &meta] {
+        let init = with_child(H264_AAC_INIT, path, &past());
+        assert_eq!(Reader::new(&init, MAX).unwrap_err(), overrun("movie box"));
+    }
+    let whole = Reader::new(H264_AAC_INIT, MAX).unwrap().layout().clone();
+    let padding = boxed(b"free", &[0, 0, 0, 0, b'i', b'r', b'e', b'f']);
+    for init in [
+        with_movie_child(H264_AAC_INIT, &padding),
+        with_child(H264_AAC_INIT, &avc1, &boxed(b"free", &past())),
+    ] {
+        assert_eq!(Reader::new(&init, MAX).unwrap().layout(), &whole);
+    }
+}
+
+/// The audio sample entry of [`H264_AAC_INIT`].
+const MP4A: [(&[u8; 4], usize); 7] = [
+    (b"moov", 0),
+    (b"trak", 1),
+    (b"mdia", 0),
+    (b"minf", 0),
+    (b"stbl", 0),
+    (b"stsd", 0),
+    (b"mp4a", 0),
+];
+
+/// A descriptor's `sizeOfInstance` (ISO/IEC 14496-1 §8.3.3) in as few
+/// bytes as it takes, most significant first.
+fn size_of_instance(size: usize) -> Vec<u8> {
+    let mut out = vec![u8::try_from(size & 0x7f).unwrap()];
+    let mut rest = size >> 7;
+    while rest > 0 {
+        out.insert(0, u8::try_from(rest & 0x7f).unwrap() | 0x80);
+        rest >>= 7;
+    }
+    out
+}
+
+/// `n` descriptors with `tag` inside one another, each after `fields`
+/// bytes of fields, built from the inside out.
+fn nested_descriptors(n: usize, tag: u8, fields: usize) -> Vec<u8> {
+    let mut bodies = Vec::with_capacity(n);
+    let mut inner = 0;
+    for _ in 0..n {
+        let body = fields + inner;
+        bodies.push(body);
+        inner = 1 + size_of_instance(body).len() + body;
+    }
+    let mut out = Vec::with_capacity(inner);
+    for body in bodies.into_iter().rev() {
+        out.push(tag);
+        out.extend(size_of_instance(body));
+        out.extend(std::iter::repeat_n(0, fields));
+    }
+    out
+}
+
+/// An `esds` holding `descriptors` after its version and flags (ISO/IEC
+/// 14496-14 §3.1.2).
+fn esds(descriptors: &[u8]) -> Vec<u8> {
+    boxed(b"esds", &[&[0; 4][..], descriptors].concat())
+}
+
+#[test]
+fn iso14496_1_8_3_3_descriptor_sizes_are_read_as_mp4_atom_reads_them() {
+    fn read(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        descriptor(data).map(|it| (it.tag, it.body, it.after))
+    }
+    // One byte of size, and two of seven bits, most significant first.
+    assert_eq!(read(&[5, 1, 9, 7]), Some((5, &[9][..], &[7][..])));
+    let long = [&[4, 0x81, 0x00][..], &[0; 128], &[6]].concat();
+    assert_eq!(read(&long), Some((4, &[0; 128][..], &[6][..])));
+    assert_eq!(size_of_instance(128), [0x81, 0x00]);
+    // At most four bytes, whatever the top bit of the fourth.
+    assert_eq!(
+        read(&[3, 0x80, 0x80, 0x80, 0x80, 6]),
+        Some((3, &[][..], &[6][..]))
+    );
+    assert_eq!(
+        read(&[3, 0x80, 0x80, 0x80, 0x81, 6]),
+        Some((3, &[6][..], &[][..]))
+    );
+    // No tag, no size, a size cut short, a body past the end.
+    for cut in [&[][..], &[3], &[3, 0x81], &[3, 2, 0]] {
+        assert_eq!(read(cut), None, "{cut:?}");
+    }
+}
+
+/// mp4-atom 0.16.2 reads an `ES_Descriptor` or a `DecoderConfigDescriptor`
+/// wherever it finds one, the descriptors in each on the stack: nested
+/// past the deepest, boxes and descriptors counted alike, they are
+/// refused; other descriptors are read as data.
+#[test]
+fn iso14496_1_7_2_6_5_descriptors_nested_past_the_deepest_are_refused() {
+    let deep = Err(Fmp4Error::TooDeep { what: "movie box" });
+    // The movie box and the `esds` are the first two.
+    for (tag, fields) in [(0x03, 3), (0x04, 13)] {
+        let fits = nested_descriptors(MAX_DEPTH - 2, tag, fields);
+        assert_eq!(walk(&esds(&fits)), Ok(0));
+        let past = nested_descriptors(MAX_DEPTH - 1, tag, fields);
+        assert_eq!(walk(&esds(&past)), deep);
+        // After another descriptor.
+        assert_eq!(walk(&esds(&[&fits[..], &past].concat())), deep);
+        // A `DecoderSpecificInfo`, an `SLConfigDescriptor` or a descriptor
+        // mp4-atom does not know holds data.
+        for data in [0x05, 0x06, 0x7f] {
+            let wrapped = [&[data][..], &size_of_instance(past.len()), &past].concat();
+            assert_eq!(walk(&esds(&wrapped)), Ok(0));
+        }
+    }
+    // An `esds` too short for its version and flags.
+    assert_eq!(walk(&boxed(b"esds", &[0; 3])), Ok(0));
+}
+
+/// The review's input (PR #81): an `esds` of 100 000 `ES_Descriptor`s one
+/// inside another, some 700 KiB, which mp4-atom 0.16.2 reads on the
+/// stack: it overflowed and aborted the process. Refused before mp4-atom
+/// reads it, wherever it reads one: in the movie box, in an `mp4a`, and
+/// in a QTFF `wave` there.
+#[test]
+fn iso14496_1_7_2_6_5_descriptors_nested_past_the_deepest_are_refused_before_mp4_atom_reads_them() {
+    let deep = esds(&nested_descriptors(100_000, 0x03, 3));
+    assert!(deep.len() > 600 << 10);
+    for init in [
+        with_movie_child(H264_AAC_INIT, &deep),
+        with_child(H264_AAC_INIT, &MP4A, &deep),
+        with_child(H264_AAC_INIT, &MP4A, &boxed(b"wave", &deep)),
+    ] {
+        let err = Reader::new(&init, MAX).unwrap_err();
+        assert_eq!(err, Fmp4Error::TooDeep { what: "movie box" });
+    }
+    // The stream's own `esds`, in a `wave`, is read as before: the
+    // deepest sample entries nest.
+    let whole = Reader::new(H264_AAC_INIT, MAX).unwrap().layout().clone();
+    let at = find(H264_AAC_INIT, b"esds") - 4;
+    let size = u32::from_be_bytes(H264_AAC_INIT[at..at + 4].try_into().unwrap());
+    let own = &H264_AAC_INIT[at..at + size as usize];
+    let init = with_child(H264_AAC_INIT, &MP4A, &boxed(b"wave", own));
+    assert_eq!(Reader::new(&init, MAX).unwrap().layout(), &whole);
+}
+
+/// mp4-atom 0.16.2 reads a QTFF `wave` in an `mp4a` for its `esds` alone
+/// (its `decode_wave`), and none of size 0; a `wave` elsewhere is data.
+#[test]
+fn qtff_a_wave_in_an_mp4a_is_read_for_its_esds_alone() {
+    let deep = esds(&nested_descriptors(MAX_DEPTH, 0x03, 3));
+    let mp4a = |wave: &[u8]| boxed(b"mp4a", &[&audio(0)[..], &boxed(b"wave", wave)].concat());
+    let frma = boxed(b"frma", b"mp4a");
+    assert_eq!(
+        walk(&mp4a(&[&frma[..], &deep].concat())),
+        Err(Fmp4Error::TooDeep { what: "movie box" })
+    );
+    let mut size_0 = deep.clone();
+    size_0[..4].copy_from_slice(&[0; 4]);
+    for body in [
+        mp4a(&nested(MAX_DEPTH)),
+        mp4a(&past()),
+        mp4a(&size_0),
+        boxed(b"wave", &deep),
+        boxed(b"Opus", &[&audio(0)[..], &boxed(b"wave", &deep)].concat()),
+    ] {
+        assert_eq!(walk(&body), Ok(0), "{body:?}");
+    }
+}
+
+/// Each descriptor is read once: a step per two bytes at most.
+#[test]
+fn iso14496_1_8_3_3_descriptors_are_read_once() {
+    for n in [1_000_u64, 2_000] {
+        let flat: Vec<u8> = (0..n).flat_map(|_| [0x05, 0]).collect();
+        let body = esds(&flat);
+        let steps = steps_of(|| assert_eq!(walk(&body), Ok(0)));
+        assert_eq!(steps, 1 + n);
+        assert!(steps <= body.len() as u64 / 2);
+    }
+}
+
+/// mp4-atom 0.16.2 reads the first box of a meta box as its handler
+/// (ISO/IEC 14496-12 §8.11.1, its `Hdlr::decode`) and the label of a
+/// `urim` as its URI box (§12.3.3.2, its `Uri::decode`), whatever their
+/// type: not by it. An item reference box past its box there, or edit
+/// boxes nested past the deepest, are read as data.
+#[test]
+fn iso14496_12_8_11_1_and_12_3_3_2_a_box_read_as_a_fixed_type_is_not_read_by_its_own() {
+    // As an item reference box, a reference past its body; as a handler
+    // or a URI box, fields and a null-terminated string.
+    let body = [&[0; 4][..], &[0x7f; 4], b"dimg", &[1; 16], &[0]].concat();
+    assert!(references_overrun(&body));
+    let iref = boxed(b"iref", &body);
+    let edits = nested(1_000);
+    let whole = Ok(Reader::new(H264_AAC_INIT, MAX).unwrap().layout().clone());
+    // The edit boxes' sizes hold a null: mp4-atom's URI ends there, short
+    // of its box, which it refuses.
+    let short = Err(Fmp4Error::Box {
+        what: "movie box",
+        reason: "under decode: uri ".to_owned(),
+    });
+    for (label, urim_read) in [(&iref, &whole), (&edits, &short)] {
+        let meta = boxed(b"meta", &[&[0; 4][..], label].concat());
+        let urim = boxed(b"urim", &[&[0; 8][..], label].concat());
+        for (child, expected) in [(meta, &whole), (urim, urim_read)] {
+            assert_eq!(walk(&child), Ok(0));
+            let init = with_movie_child(H264_AAC_INIT, &child);
+            let read = Reader::new(&init, MAX).map(|reader| reader.layout().clone());
+            assert_eq!(&read, expected);
+        }
+    }
+    // Without one, mp4-atom refuses the box and reads nothing after it.
+    for child in [
+        boxed(b"meta", &[0; 4]),
+        boxed(b"urim", &[&[0; 8][..], &past()[..9]].concat()),
+    ] {
+        assert_eq!(walk(&child), Ok(0));
+    }
+}
+
+/// A `keys` holds keys in a `mebx` alone (ISO/IEC 14496-12 §12.8, as
+/// mp4-atom 0.16.2 cites it): in a key, even one whose `local_key_id` is
+/// `mebx`, it is the flat keys table mp4-atom reads as fields; a `mebx`
+/// in a key is read as one.
+#[test]
+fn iso14496_12_12_8_keys_hold_keys_in_a_mebx_alone() {
+    let keyd = boxed(b"keyd", b"mdtax");
+    let mebx = |key: &[u8]| boxed(b"mebx", &[&[0; 8][..], &boxed(b"keys", key)].concat());
+    // As a keys table: an entry count of 1, and the item reference box's
+    // header and body as its one entry.
+    let table = boxed(b"keys", &boxed(&[0, 0, 0, 1], &past()));
+    let in_key = mebx(&boxed(b"mebx", &[&keyd[..], &table].concat()));
+    assert_eq!(walk(&in_key), Ok(0));
+    let whole = Reader::new(H264_AAC_INIT, MAX).unwrap().layout().clone();
+    let init = with_movie_child(H264_AAC_INIT, &in_key);
+    assert_eq!(Reader::new(&init, MAX).unwrap().layout(), &whole);
+    let inner = mebx(&boxed(b"key1", &past()));
+    assert!(refused(&mebx(&boxed(
+        b"mebx",
+        &[&keyd[..], &inner].concat()
+    ))));
+}
+
+/// Every movie fragment of a segment is walked before mp4-atom reads the
+/// first: one it would refuse to read comes before a fragment whose
+/// boxes nest too deep or whose item references overrun, and the walk's
+/// refusal is the error.
+#[test]
+fn iso14496_12_4_2_every_movie_fragment_is_walked_before_mp4_atom_reads_one() {
+    let mfhd = locate(H264_AAC_0, &[(b"moof", 0), (b"mfhd", 0)]).0;
+    let first = patched(H264_AAC_0, mfhd + 4, b"free");
+    let err = segment_error(H264_AAC_INIT, &first);
+    assert_eq!(
+        err,
+        Fmp4Error::Box {
+            what: "movie fragment",
+            reason: "missing box: mfhd".to_owned()
+        }
+    );
+    for (child, expected) in [
+        (
+            nested(1_000),
+            Fmp4Error::TooDeep {
+                what: "movie fragment",
+            },
+        ),
+        (past(), overrun("movie fragment")),
+    ] {
+        let second = with_child(H264_AAC_0, &[(b"moof", 0)], &child);
+        let segment = [&first[..], &second].concat();
+        assert_eq!(segment_error(H264_AAC_INIT, &segment), expected);
+    }
 }

@@ -14,6 +14,15 @@
 /// The shape of a stream or session id, as `lotse_core::id` checks it.
 pub const ID_PATTERN: &str = "^[A-Za-z0-9._-]{1,128}$";
 
+/// The shape of a clip id, as `lotse_core::id::ClipId` checks it:
+/// [`ID_PATTERN`] but `.` and `..`, the dot segments (RFC 3986 §3.3) that
+/// URL resolution would remove from the clip's route (§5.2.4). Three
+/// characters or more, two not starting with a dot, one not a dot, or a
+/// dot and one that is not: no lookahead, which not every client's regex
+/// engine has.
+pub const CLIP_ID_PATTERN: &str =
+    "^(?:[A-Za-z0-9._-]{3,128}|[A-Za-z0-9_-][A-Za-z0-9._-]?|\\.[A-Za-z0-9_-])$";
+
 /// The longest stream or session id, `lotse_core::id::MAX_LEN`.
 pub const MAX_ID_CHARS: usize = 128;
 
