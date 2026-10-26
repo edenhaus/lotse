@@ -422,8 +422,11 @@ pub enum ToSupervisor {
 pub enum ClipReport {
     /// The clip's first fragment is under way.
     Started {
-        /// How far before the start the clip begins, in milliseconds:
-        /// the age of the keyframe it starts at.
+        /// How far before this report the clip begins, in milliseconds:
+        /// the age, when the container started (which is when the worker
+        /// sends this), of the keyframe it starts at. The supervisor
+        /// stamps the API's `at` on the report's arrival, so
+        /// `at − before_ms` is that keyframe's capture time.
         before_ms: u32,
         /// The video codec by its API name (`h264`, `h265`).
         video: String,

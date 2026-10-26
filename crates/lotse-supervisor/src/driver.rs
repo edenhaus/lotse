@@ -3930,6 +3930,39 @@ mod tests {
         rx
     }
 
+    /// A worker's `Started` is stamped on the wall clock when it reaches the
+    /// driver, not when the clip was asked for: the worker counts
+    /// `before_ms` back from the moment it sends it, so `at − before_ms` is
+    /// the first keyframe's capture time.
+    #[tokio::test]
+    async fn a_started_report_is_stamped_on_its_arrival_which_before_ms_counts_back_from() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let mut rx = hold_clip(&shared, "k1", 1);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        clock.advance(Duration::from_millis(1_100));
+        let arrival = clock.wall_now();
+        driver.on_worker_event(WorkerEvent::Clip {
+            clip_id: "k1".into(),
+            event: ClipReport::Started {
+                before_ms: 400,
+                video: "h264".into(),
+                picture: None,
+                audio: None,
+            },
+        });
+        drop(driver);
+        let started = rx.try_recv().unwrap().payload;
+        assert_eq!(
+            (&started["at"], &started["before_ms"]),
+            (
+                &serde_json::json!(lotse_api_types::time::rfc3339(arrival)),
+                &serde_json::json!(400)
+            )
+        );
+    }
+
     #[tokio::test]
     async fn the_pre_roll_window_and_the_clip_messages_reach_the_worker_and_the_next_starts_with_it()
      {

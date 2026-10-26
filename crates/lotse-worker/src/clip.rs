@@ -19,7 +19,11 @@
 //! With nothing held it starts at the next keyframe, waiting for it up to
 //! the start timeout, which a keyframe queued meets even while the
 //! interleaver holds it for the audio. `before_ms` is the age of the first
-//! video frame, the start keyframe, by the ring's measure, held or live.
+//! video frame, the start keyframe, by the ring's measure, held or live,
+//! when the container starts: the clip sends `Started` then, and the
+//! supervisor stamps the API event's `at` on its arrival, so
+//! `at − before_ms` is that keyframe's capture time whatever the start
+//! waited for (a keyframe held for the audio, one that arrived late).
 //! The container's sample entries are the codecs each track's frames were
 //! taken with: the descriptor taken with its subscription and snapshot,
 //! under the ring's lock, moved on by each change the queue hands out
@@ -677,8 +681,9 @@ struct Clip {
     settings: ClipSettings,
     /// The injected clock.
     clock: Arc<dyn Clock>,
-    /// The clock's reading at `StartClip`: what `before_ms` and `after_ms`
-    /// count from.
+    /// The clock's reading at `StartClip`: where the pre-roll window and
+    /// `after_ms` count from (`before_ms` counts from the container's
+    /// start, [`Self::begin`]).
     started: Instant,
     /// The capture time at which it ends, by the ring's measure
     /// ([`captured`]).
@@ -714,8 +719,8 @@ struct Clip {
     /// The holes the queue reported per track, by their API name, until
     /// the frame that ends each is in the container: where they are.
     holes: HashMap<Kind, &'static str>,
-    /// How far before its start it begins: its first video frame's age,
-    /// set when the container starts.
+    /// How far before its start it begins: its first video frame's age
+    /// when the container starts, set then.
     before_ms: u32,
     /// The audio codec left out because the container cannot carry it.
     omitted: Option<String>,
@@ -1088,8 +1093,11 @@ impl Clip {
 
     /// Starts the container with `media`'s sample entries at the first
     /// frame, `frame` of `track`, and reports `Started` (and the omitted
-    /// audio's warning), `before_ms` the first video frame's age: this one,
-    /// or the keyframe queued behind an audio frame captured before it.
+    /// audio's warning), `before_ms` the first video frame's age now, as
+    /// `Started` goes out: this one, or the keyframe queued behind an audio
+    /// frame captured before it. Counted from `StartClip` instead, it would
+    /// disagree with the `at` the supervisor stamps on arrival by however
+    /// long the start waited.
     fn begin(
         &mut self,
         track: Kind,
@@ -1101,7 +1109,7 @@ impl Clip {
             Kind::Audio => media.interleaver.queue().first_frame(Kind::Video),
         };
         self.before_ms = first.map_or(0, |first| {
-            millis(self.started.saturating_duration_since(captured(first)))
+            millis(self.clock.now().saturating_duration_since(captured(first)))
         });
         let (video, audio) = &media.entries;
         let init = self
@@ -1900,7 +1908,8 @@ mod tests {
             payload: vec![0x65; 32].into(),
         }));
         settle().await;
-        assert_eq!(rig.report().await, started(0, None));
+        // The clip task first runs at 100 ms, the keyframe captured at 0: 100 ms.
+        assert_eq!(rig.report().await, started(100, None));
         assert_eq!(rig.report().await, gap("reconnect", 100, 200));
         rig.clips.stop("k1", EndReason::Stopped);
         let reports = rig.until_stopped().await;
@@ -1978,7 +1987,8 @@ mod tests {
             rig.video_frame(ms, index, keyframe, if keyframe { 32 } else { 16 });
         }
         settle().await;
-        assert_eq!(rig.report().await, started(0, None));
+        // The clip task first runs at 100 ms, the keyframe captured at 0: 100 ms.
+        assert_eq!(rig.report().await, started(100, None));
         assert_eq!(rig.report().await, gap("reconnect", 100, 3_200));
         rig.clips.stop("k1", EndReason::Stopped);
         let reports = rig.until_stopped().await;
@@ -2139,7 +2149,8 @@ mod tests {
             rig.video_frame(1_000, 1, false, 16);
             rig.video_frame(2_000, 2, false, 16);
             settle().await;
-            assert_eq!(rig.report().await, started(0, None));
+            // The clip task first runs at 2 s, the keyframe captured at 0: 2 s.
+            assert_eq!(rig.report().await, started(2_000, None));
             let reports = rig.until_stopped().await;
             let bytes = reader.rest().await;
             assert_eq!(lines(&bytes).len(), 4, "the frame at 2 s is past the end");
@@ -2209,10 +2220,11 @@ mod tests {
         rig.video_frame(10, 0, true, 32);
         rig.audio_frame(1);
         settle().await;
+        // Audio frame 1 at 64 ms releases the keyframe captured at 10 ms: 54 ms.
         assert_eq!(
             rig.report().await,
             ClipReport::Started {
-                before_ms: 0,
+                before_ms: 54,
                 video: "h264".into(),
                 picture: Some((640, 480)),
                 audio: Some("aac_lc".into()),
@@ -2265,7 +2277,8 @@ mod tests {
         rig.video_frame(10, 0, true, 32);
         rig.audio_frame(1);
         settle().await;
-        assert_eq!(rig.report().await, started(0, Some("aac_lc")));
+        // Audio frame 1 at 64 ms releases the keyframe captured at 10 ms: 54 ms.
+        assert_eq!(rig.report().await, started(54, Some("aac_lc")));
         rig.audio.as_ref().unwrap().close();
         settle().await;
         rig.video_frame(100, 1, false, 16);
@@ -2295,7 +2308,8 @@ mod tests {
         rig.video_frame(10, 0, true, 32);
         rig.audio_frame(1);
         settle().await;
-        assert_eq!(rig.report().await, started(0, Some("aac_lc")));
+        // Audio frame 1 at 64 ms releases the keyframe captured at 10 ms: 54 ms.
+        assert_eq!(rig.report().await, started(54, Some("aac_lc")));
         rig.audio
             .as_ref()
             .unwrap()
@@ -2369,7 +2383,8 @@ mod tests {
             rig.audio_frame(2 * index + 1);
             settle().await;
         }
-        assert_eq!(rig.report().await, started(0, Some("aac_lc")));
+        // Audio frame 1 at 64 ms releases the keyframe captured at 10 ms: 54 ms.
+        assert_eq!(rig.report().await, started(54, Some("aac_lc")));
         // The audio frame at 320 ms is held for the video, past its hold.
         rig.clock.advance(Duration::from_secs(2));
         settle().await;
@@ -2489,7 +2504,8 @@ mod tests {
             rig.video_frame(10, 0, true, 32);
             rig.audio_frame(1);
             settle().await;
-            assert_eq!(rig.report().await, started(0, Some("aac_lc")));
+            // Audio frame 1 at 64 ms releases the keyframe captured at 10 ms: 54 ms.
+            assert_eq!(rig.report().await, started(54, Some("aac_lc")));
             if after.is_some() {
                 // Releases the audio frame; the video frame, past the end,
                 // is held in its place.
@@ -3135,7 +3151,8 @@ mod tests {
         oversize(&rig, rig.video(), 130);
         rig.video_frame(160, 3, true, 32);
         settle().await;
-        assert_eq!(rig.report().await, started(0, None));
+        // The clip task first runs at 100 ms, the keyframe captured at 0: 100 ms.
+        assert_eq!(rig.report().await, started(100, None));
         assert_eq!(rig.report().await, gap("lagged", 100, 200));
         rig.clips.stop("k1", EndReason::Stopped);
         let reports = rig.until_stopped().await;
@@ -3169,7 +3186,8 @@ mod tests {
                 rig.video_frame(ms, index, keyframe, if keyframe { 32 } else { 16 });
                 settle().await;
             }
-            assert_eq!(rig.report().await, started(0, None));
+            // The clip task first runs at 100 ms, the keyframe captured at 0: 100 ms.
+            assert_eq!(rig.report().await, started(100, None));
             assert_eq!(rig.report().await, gap("lagged", 100, 1_000));
             rig.clips.stop("k1", EndReason::Stopped);
             let reports = rig.until_stopped().await;
@@ -3371,7 +3389,8 @@ mod tests {
         rig.video_frame(700, 7, false, 16);
         rig.video_frame(800, 8, false, 16);
         settle().await;
-        assert_eq!(rig.report().await, started(0, Some("aac_lc")));
+        // The clip task first runs at 256 ms (audio frame 4), the keyframe captured at 0: 256 ms.
+        assert_eq!(rig.report().await, started(256, Some("aac_lc")));
         assert_eq!(rig.report().await, gap("lagged", 256, 320));
         // The video frames at 700 and 800 ms wait for the audio to pass
         // them, which the stop releases; the one at 800 ms makes the jump
@@ -3419,13 +3438,17 @@ mod tests {
         }
     }
 
-    /// `Started.before_ms` is the age of the clip's first video frame, its
-    /// keyframe, when the clip starts live too: a keyframe captured 300 ms
-    /// before `StartClip` that arrives after it, and also when an audio
-    /// frame captured before it starts the container. Regression: 0, as if
-    /// the clip began at its start.
+    /// `Started.before_ms` counts back from the report, the moment the
+    /// container starts, not from `StartClip`: a keyframe captured at 700 ms
+    /// that arrives at 1100 ms, after a `StartClip` at 1000 ms, is 400 ms old
+    /// when the clip starts (also when an audio frame captured before it
+    /// starts the container), so the supervisor's `at`, stamped on the
+    /// report's arrival, less `before_ms` is the keyframe's capture time.
+    /// Regression: counted from `StartClip` it was 300, and the `at` the
+    /// supervisor stamps on the report's arrival (1100 ms) less 300 put the
+    /// keyframe at 800 ms.
     #[tokio::test]
-    async fn a_live_start_s_before_ms_is_its_first_keyframe_s_age() {
+    async fn a_delayed_start_s_before_ms_counts_back_from_its_started_report() {
         for audio in [false, true] {
             let mut rig = Rig::new(audio.then(fake_aac));
             rig.advance_to(1_000);
@@ -3450,8 +3473,15 @@ mod tests {
             }
             assert_eq!(
                 rig.report().await,
-                started(300, audio.then_some("aac_lc")),
+                started(400, audio.then_some("aac_lc")),
                 "audio: {audio}"
+            );
+            assert_eq!(
+                rig.at(1_100)
+                    .checked_sub(Duration::from_millis(400))
+                    .unwrap(),
+                rig.at(700),
+                "at − before_ms is the keyframe's capture, audio: {audio}"
             );
             rig.clips.stop("k1", EndReason::Stopped);
             let (_, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
@@ -3514,7 +3544,8 @@ mod tests {
         rig.video_frame(10, 0, true, 32);
         rig.audio_frame(1);
         settle().await;
-        assert_eq!(rig.report().await, started(0, None));
+        // Audio frame 1 at 64 ms releases the keyframe captured at 10 ms: 54 ms.
+        assert_eq!(rig.report().await, started(54, None));
         assert_eq!(
             rig.report().await,
             ClipReport::Warning {
@@ -3541,7 +3572,8 @@ mod tests {
         rig.video_frame(10, 0, true, 32);
         rig.audio_frame(1);
         settle().await;
-        assert_eq!(rig.report().await, started(0, Some("opus")));
+        // Audio frame 1 at 64 ms releases the keyframe captured at 10 ms: 54 ms.
+        assert_eq!(rig.report().await, started(54, Some("opus")));
         rig.clips.stop("k1", EndReason::Stopped);
         let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
         assert_eq!(lines(&bytes)[0], "init video=h264 audio=opus");
@@ -3559,7 +3591,8 @@ mod tests {
         rig.video_frame(10, 0, true, 32);
         rig.audio_frame(1);
         settle().await;
-        assert_eq!(rig.report().await, started(0, Some("aac_lc")));
+        // Audio frame 1 at 64 ms releases the keyframe captured at 10 ms: 54 ms.
+        assert_eq!(rig.report().await, started(54, Some("aac_lc")));
         // Held for the audio, which reached 64 ms; the changes queue behind.
         rig.video_frame(100, 1, false, 16);
         settle().await;
@@ -3601,7 +3634,8 @@ mod tests {
         });
         rig.video_frame(100, 1, true, 32);
         settle().await;
-        assert_eq!(rig.report().await, started(0, None));
+        // The clip task first runs at 100 ms, the keyframe captured at 0: 100 ms.
+        assert_eq!(rig.report().await, started(100, None));
         let reports = rig.until_stopped().await;
         let bytes = reader.rest().await;
         assert_eq!(
@@ -3661,7 +3695,8 @@ mod tests {
             rig.audio_frame(index);
         }
         settle().await;
-        assert_eq!(rig.report().await, started(0, Some("aac_lc")));
+        // The audio at 256 ms releases the keyframe captured at 10 ms: 246 ms.
+        assert_eq!(rig.report().await, started(246, Some("aac_lc")));
         // P3 (presented at 300 ms, past the end) arrives first and is held
         // for the audio, which reached 256 ms; B1 and B2 queue behind it.
         rig.advance_to(300);
@@ -3826,7 +3861,8 @@ mod tests {
         rig.video_frame_on(&standby, 200, 0, true, 32);
         rig.video_frame_on(&standby, 300, 1, false, 16);
         settle().await;
-        assert_eq!(rig.report().await, started(0, None));
+        // The container starts at 300 ms, when the frames published before the clip task ran are all in; the keyframe was captured at 0: 300 ms.
+        assert_eq!(rig.report().await, started(300, None));
         let reports = rig.until_stopped().await;
         let bytes = reader.rest().await;
         assert_eq!(
@@ -3974,7 +4010,12 @@ mod tests {
         settle().await;
         rig.advance_to(10_500);
         settle().await;
-        assert_eq!(rig.report().await, started(0, Some("aac_lc")));
+        // The keyframe was captured at 9.5 s, after `StartClip` at 0, and
+        // `max_skew` (1 s) releases it at 10.5 s, when the container
+        // starts: 10.5 s − 9.5 s. Counted from `StartClip` this saturated
+        // to 0, so `at − before_ms` put the keyframe at the start of the
+        // wait, not at its capture.
+        assert_eq!(rig.report().await, started(1_000, Some("aac_lc")));
         rig.clips.stop("k1", EndReason::Stopped);
         let reports = rig.until_stopped().await;
         let bytes = reader.rest().await;

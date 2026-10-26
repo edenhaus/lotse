@@ -385,8 +385,11 @@ impl ClipEntry {
     }
 
     /// `started`, once, with a video codec a clip carries, audio only when
-    /// asked for and one a clip carries, and a picture `tkhd` can hold; the
-    /// supervisor stamps `at`.
+    /// asked for and one a clip carries, and a picture `tkhd` can hold.
+    /// `at` is when the report arrived ([`State::clip_report`]): the worker
+    /// measures `before_ms` back from the container's start and sends
+    /// `Started` then, so `at − before_ms` is the first keyframe's capture
+    /// time, within the report's transit time.
     fn started_event(
         &mut self,
         clip_id: &str,
@@ -561,7 +564,8 @@ const fn completed(reason: ClipStopReason) -> bool {
 }
 
 impl State {
-    /// A worker's report about one of its clips, at `at` on the wall clock.
+    /// A worker's report about one of its clips, at `at` on the wall clock:
+    /// its arrival, which a `Started`'s `before_ms` counts back from.
     /// One about a clip the supervisor does not hold is dropped (its
     /// subscription and body are gone; a pipe nobody reads ends the
     /// worker's clip `client_gone`), one about a clip of another
