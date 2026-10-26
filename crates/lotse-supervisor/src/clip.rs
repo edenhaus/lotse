@@ -211,7 +211,8 @@ pub(crate) enum ClipEnd {
     Reported {
         /// Why.
         reason: ClipStopReason,
-        /// The bytes written to the pipe.
+        /// The file's length the worker reports, which the body checks
+        /// what it read against.
         bytes: u64,
         /// The media time the file covers.
         duration_ms: u32,
