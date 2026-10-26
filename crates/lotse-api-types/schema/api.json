@@ -225,7 +225,7 @@
           "description": "The last event; the subscription ends with it, and the body ends\nonce the bytes before it are read.",
           "properties": {
             "bytes": {
-              "description": "The bytes of the file written to the body; 0 when the clip\nended without its worker's last word (`worker_crashed`,\n`stream_deleted`, `stream_changed` by a move to another\nconnection, `shutting_down`, `internal_error` for a malformed\nreport), whose body is then cut.",
+              "description": "The file's length, as its worker made it: the bytes written for\nthe body, and a last tail the body did not take in time, which it\nthen ends without, cut; 0 when the clip ended without its worker's\nlast word (`worker_crashed`, `stream_deleted`, `stream_changed` by\na move to another connection, `shutting_down`, `internal_error`\nfor a malformed report), whose body is then cut.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -1196,8 +1196,8 @@
               "type": "integer"
             },
             "clip_id": {
-              "description": "The client's clip id, `^[A-Za-z0-9._-]{1,128}$`, unique among the\nopen clips; a ULID when absent.",
-              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "description": "The client's clip id, `^[A-Za-z0-9._-]{1,128}$` but `.` and `..`,\nwhich would be dot segments of the result's `url` (RFC 3986 §3.3),\nunique among the open clips; a ULID when absent.",
+              "pattern": "^(?:[A-Za-z0-9._-]{3,128}|[A-Za-z0-9_-][A-Za-z0-9._-]?|\\.[A-Za-z0-9_-])$",
               "type": [
                 "string",
                 "null"
@@ -1233,7 +1233,7 @@
           "properties": {
             "clip_id": {
               "description": "The clip.",
-              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "pattern": "^(?:[A-Za-z0-9._-]{3,128}|[A-Za-z0-9_-][A-Za-z0-9._-]?|\\.[A-Za-z0-9_-])$",
               "type": "string"
             },
             "id": {
@@ -2826,7 +2826,7 @@
         },
         "clip_bytes": {
           "default": 0,
-          "description": "Bytes of clip files written to their bodies.",
+          "description": "The length of the stream's clip files, as their workers report\nthem (`stopped`'s `bytes`): a last tail a body did not take in time\nis counted, though it never reached the body.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorCode};
 #[cfg(feature = "schema")]
-use crate::limits::ID_PATTERN;
+use crate::limits::{CLIP_ID_PATTERN, ID_PATTERN};
 use crate::limits::{
     MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_SDP_CHARS, MAX_SOURCES,
     MAX_TEXT_CHARS, MAX_URL_CHARS,
@@ -331,10 +331,11 @@ pub struct ClipStart {
     /// The stream to record.
     #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub stream_id: String,
-    /// The client's clip id, `^[A-Za-z0-9._-]{1,128}$`, unique among the
-    /// open clips; a ULID when absent.
+    /// The client's clip id, `^[A-Za-z0-9._-]{1,128}$` but `.` and `..`,
+    /// which would be dot segments of the result's `url` (RFC 3986 §3.3),
+    /// unique among the open clips; a ULID when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = CLIP_ID_PATTERN)))]
     pub clip_id: Option<String>,
     /// How far before now the clip should start, in milliseconds, up to
     /// `limits.preroll_max_ms`; what the window holds bounds what it gets
@@ -370,7 +371,7 @@ pub struct ClipStop {
     /// The command id.
     pub id: u64,
     /// The clip.
-    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = CLIP_ID_PATTERN)))]
     pub clip_id: String,
 }
 

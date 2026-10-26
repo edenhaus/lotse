@@ -60,7 +60,8 @@ impl FakeClips {
     }
 }
 
-/// The producer's end of a [`FakeClips`] clip.
+/// The producer's end of a [`FakeClips`] clip. Dropped unfinished, it ends
+/// the clip as a crashed worker does: its bytes end and no report comes.
 #[derive(Debug)]
 pub struct FakeClipWriter {
     /// Where the clip's bytes go.
@@ -72,9 +73,9 @@ pub struct FakeClipWriter {
 }
 
 impl FakeClipWriter {
-    /// Writes `bytes` to the clip, waiting while [`BUFFERED`] bytes wait
-    /// for the reader; fails once the reader is gone, as a pipe whose read
-    /// end closed does (`EPIPE`).
+    /// Writes `bytes` to the clip, waiting while 64 KiB, a pipe's capacity,
+    /// wait for the reader; fails once the reader is gone, as a pipe whose
+    /// read end closed does (`EPIPE`).
     pub async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.writer.write_all(bytes).await?;
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -94,10 +95,55 @@ impl FakeClipWriter {
         drop(self.writer);
         let _reported = self.report.send(bytes);
     }
+}
 
-    /// Ends the clip as a crashed worker does: its bytes end and no report
-    /// comes.
-    pub fn crash(self) {
-        drop(self);
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::arithmetic_side_effects,
+        clippy::missing_docs_in_private_items,
+        reason = "test code"
+    )]
+
+    use futures_util::FutureExt as _;
+    use tokio::io::AsyncReadExt as _;
+
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipe_7_a_fake_clip_holds_64_kib_unread_and_its_producer_waits_past_that() {
+        let clips = FakeClips::default();
+        let mut writer = clips.open("c1");
+        let full = vec![1_u8; 64 * 1024];
+        assert!(
+            writer
+                .write(&full)
+                .now_or_never()
+                .is_some_and(|written| written.is_ok()),
+            "a pipe's capacity is written without a reader"
+        );
+        assert!(
+            writer.write(b"x").now_or_never().is_none(),
+            "one byte more waits for the reader"
+        );
+        let mut body = clips.take(&ClipId::new("c1").unwrap()).unwrap();
+        let mut read = vec![0_u8; 64 * 1024];
+        body.reader.read_exact(&mut read).await.unwrap();
+        assert_eq!(read, full);
+        writer.finish();
+        assert_eq!(body.written.await.unwrap(), 64 * 1024);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fake_clip_dropped_unfinished_ends_its_bytes_without_a_report() {
+        let clips = FakeClips::default();
+        let mut writer = clips.open("c1");
+        writer.write(b"ftyp").await.unwrap();
+        drop(writer);
+        let mut body = clips.take(&ClipId::new("c1").unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        body.reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"ftyp");
+        assert!(body.written.await.is_err(), "no report");
     }
 }

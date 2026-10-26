@@ -144,7 +144,7 @@ fn clip_to_opus(bencher: Bencher<'_, '_>, name: &str) {
         _ => Codec::G722,
     };
     let payloads = narrowband_second(&codec);
-    let mut chain = ToOpus::new(&codec, 8_000).unwrap();
+    let mut chain = ToOpus::new(&codec).unwrap();
     let at = FakeClock::default().now();
     let mut ts = 0_i64;
     bencher

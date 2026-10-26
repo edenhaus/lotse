@@ -21,7 +21,8 @@ use crate::version::CLIPS_PATH;
 
 /// The path of clip `clip_id`'s bytes, `/v0/clips/{clip_id}`: the `url` of
 /// `clip/start`'s result. The id matches `^[A-Za-z0-9._-]{1,128}$`, so it
-/// needs no percent-encoding (RFC 3986 §2.3).
+/// needs no percent-encoding (RFC 3986 §2.3), and is never `.` or `..`, so
+/// resolving the path keeps it whole (RFC 3986 §5.2.4).
 pub fn clip_path(clip_id: &str) -> String {
     format!("{CLIPS_PATH}/{clip_id}")
 }
@@ -116,11 +117,12 @@ pub enum ClipEvent {
     Stopped {
         /// Why.
         reason: ClipStopReason,
-        /// The bytes of the file written to the body; 0 when the clip
-        /// ended without its worker's last word (`worker_crashed`,
-        /// `stream_deleted`, `stream_changed` by a move to another
-        /// connection, `shutting_down`, `internal_error` for a malformed
-        /// report), whose body is then cut.
+        /// The file's length, as its worker made it: the bytes written for
+        /// the body, and a last tail the body did not take in time, which it
+        /// then ends without, cut; 0 when the clip ended without its worker's
+        /// last word (`worker_crashed`, `stream_deleted`, `stream_changed` by
+        /// a move to another connection, `shutting_down`, `internal_error`
+        /// for a malformed report), whose body is then cut.
         bytes: u64,
         /// The media time the file covers, in milliseconds; 0 for the
         /// same ends.

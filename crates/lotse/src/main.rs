@@ -178,10 +178,7 @@ fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
     let _report = lotse_sandbox::apply(&profile, &sandbox).context("sandbox")?;
     let settings = lotse_worker::Settings {
         worker_threads: args.worker_threads,
-        limits: TrackLimits {
-            preroll_bytes: args.preroll_bytes,
-            ..TrackLimits::default()
-        },
+        limits: track_limits(args),
         runner: RunnerConfig::default(),
         session: lotse_core::session::SessionLimits::default(),
         max_sessions: args.max_sessions,
@@ -193,6 +190,15 @@ fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
     let reason = lotse_worker::run(&settings, registries(relay), memory).context("worker")?;
     tracing::info!(reason = ?reason, "worker exited");
     Ok(())
+}
+
+/// The worker's track limits: the pre-roll ring's bound from the flag its
+/// supervisor passed, the rest the defaults.
+fn track_limits(args: &WorkerArgs) -> TrackLimits {
+    TrackLimits {
+        preroll_bytes: args.preroll_bytes,
+        ..TrackLimits::default()
+    }
 }
 
 /// The worker's clip limits from the flags its supervisor passed, the
@@ -369,6 +375,7 @@ mod tests {
                 max_clips: 3,
             }
         );
+        assert_eq!(track_limits(&args).preroll_bytes, 1 << 20);
     }
 
     /// The registries of a build with every feature hold the clip container.

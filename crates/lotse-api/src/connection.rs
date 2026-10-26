@@ -230,10 +230,15 @@ async fn clients_remove(
     }
 }
 
-/// The token that closes connection `id` once its client is removed:
-/// registered with the TLS listener's clients for a peer that came through
-/// it, never cancelled for a peer on the socket.
-fn attach(clients: Option<&ClientStore>, peer: &PeerInfo, id: ConnectionId) -> CancellationToken {
+/// The token that closes connection `id`, an upgraded one or one sending
+/// a clip's body, once its client is removed: registered with the TLS
+/// listener's clients for a peer that came through it, never cancelled for
+/// a peer on the socket.
+pub(crate) fn attach(
+    clients: Option<&ClientStore>,
+    peer: &PeerInfo,
+    id: ConnectionId,
+) -> CancellationToken {
     match (clients, peer) {
         (Some(clients), PeerInfo::Tls { pin, .. }) => clients.attach(id, *pin),
         _ => CancellationToken::new(),
@@ -241,7 +246,7 @@ fn attach(clients: Option<&ClientStore>, peer: &PeerInfo, id: ConnectionId) -> C
 }
 
 /// Forgets connection `id`, which closed.
-fn detach(clients: Option<&ClientStore>, id: ConnectionId) {
+pub(crate) fn detach(clients: Option<&ClientStore>, id: ConnectionId) {
     if let Some(clients) = clients {
         clients.detach(id);
     }

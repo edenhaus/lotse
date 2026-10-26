@@ -45,7 +45,7 @@ fuzz_target!(|data: &[u8]| {
         1 => Codec::Pcma,
         _ => Codec::G722,
     };
-    let mut chain = ToOpus::new(&codec, 8_000).expect("a transcoded codec");
+    let mut chain = ToOpus::new(&codec).expect("a transcoded codec");
     let t0 = SystemClock.now();
     let mut ts = 0_i64;
     let mut epoch = 0_u32;

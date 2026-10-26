@@ -163,9 +163,10 @@ async fn a_worker_crash_is_observed_and_contained() {
 }
 
 /// A clip's pipe crosses into a worker under its sandbox with its
-/// `StartClip`, and the worker, which runs no source, refuses the clip
-/// `source_not_live` and closes the pipe: the reader sees its end, with
-/// nothing written.
+/// `StartClip`, and the worker refuses the clip and closes the pipe: the
+/// reader sees its end, with nothing written. It runs no source, so the
+/// refusal is `source_not_live`; a build without `output-clip` has no clip
+/// container and refuses every clip `internal_error` first.
 #[tokio::test]
 async fn a_sandboxed_worker_takes_a_clip_s_pipe_and_closes_it() {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -196,7 +197,12 @@ async fn a_sandboxed_worker_takes_a_clip_s_pipe_and_closes_it() {
         WorkerEvent::Clip {
             clip_id: "k1".into(),
             event: ClipReport::Stopped {
-                reason: "source_not_live".into(),
+                reason: if cfg!(feature = "output-clip") {
+                    "source_not_live"
+                } else {
+                    "internal_error"
+                }
+                .into(),
                 bytes: 0,
                 duration_ms: 0,
                 gaps: 0,

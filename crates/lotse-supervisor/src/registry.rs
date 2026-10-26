@@ -34,7 +34,7 @@ use lotse_ipc::{
 use tokio::sync::{mpsc, watch};
 use tokio_util::task::TaskTracker;
 
-use crate::clip::{ClipCounters, ClipEntry, ClipLimits, FinishedClip};
+use crate::clip::{ClipCounters, ClipEntry, ClipLimits, FinishedClip, StoppingClip};
 use crate::connect::ConnectPermits;
 use crate::driver::{Demand, DriverCommand, DriverSpec};
 use crate::gather::Relayed;
@@ -323,6 +323,9 @@ pub(crate) struct State {
     pub(crate) last_session: u64,
     /// Event clips that run, by id.
     pub(crate) clips: BTreeMap<String, ClipEntry>,
+    /// Clips that ended while their worker may still run them, by id,
+    /// until it says it stopped them: their ids stay taken.
+    pub(crate) stopping_clips: BTreeMap<String, StoppingClip>,
     /// The bodies of clips that ended before they were fetched, by id,
     /// until their fetch deadline.
     pub(crate) finished_clips: BTreeMap<String, FinishedClip>,
@@ -500,6 +503,7 @@ impl State {
         if entry.streams.is_empty() {
             tracing::info!(connection.id = id, "connection released");
             self.connections.remove(id);
+            self.forget_stopping_clips(id);
             return;
         }
         let preloads = entry
