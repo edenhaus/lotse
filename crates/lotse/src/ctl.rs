@@ -451,7 +451,15 @@ async fn fetch(socket: &Path, url: &str, file: &mut Output) -> anyhow::Result<u6
         }
         let mut written = 0_u64;
         while let Some(frame) = body.frame().await {
-            let frame = frame.context("the clip's file is cut")?;
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(err) => {
+                    // What came is kept: the write still in flight lands
+                    // first. Its own error would hide the cut, so it goes.
+                    let _landed = file.flush().await;
+                    return Err(err).context("the clip's file is cut");
+                }
+            };
             // A data frame; trailers, which the route never sends, write
             // nothing.
             let data = frame.into_data().unwrap_or_default();
@@ -1867,6 +1875,73 @@ mod tests {
             taken: std::sync::Arc::default(),
         };
         assert!(writer.shutdown().await.is_err(), "as its flush");
+    }
+
+    /// A file whose writes land only at the flush, as with tokio's `File`,
+    /// which reports a write done once the blocking pool has it.
+    struct Lagging {
+        /// Written, not yet landed.
+        in_flight: Vec<u8>,
+        /// What landed.
+        landed: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for Lagging {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.get_mut().in_flight.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let landed = std::mem::take(&mut this.in_flight);
+            this.landed.lock().unwrap().extend(landed);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    /// A cut body keeps what came, the write still in flight included.
+    /// Regression: the cut was reported while the last write was still on
+    /// the blocking pool, and the file could be left without it.
+    #[tokio::test]
+    async fn stream_clip_lands_the_write_in_flight_when_the_body_is_cut() {
+        let landed = std::sync::Arc::default();
+        let writer = Lagging {
+            in_flight: Vec::new(),
+            landed: std::sync::Arc::clone(&landed),
+        };
+        let script = vec![Step::Read, clip_started(), clip_body(&["ftyp"], true)];
+        let command = clip_command("front", 0, None, false);
+        let (code, _read) = against("lagging", true, script, async |socket| {
+            let mut client = Client::connect(socket).await.unwrap();
+            let interrupts = Box::pin(futures_util::stream::empty());
+            client
+                .clip(socket, command, (Box::pin(writer), true), interrupts)
+                .await
+        })
+        .await;
+        assert_eq!(code.unwrap_err().to_string(), "the clip's file is cut");
+        assert_eq!(*landed.lock().unwrap(), b"ftyp");
+        let mut writer = Lagging {
+            in_flight: b"moov".to_vec(),
+            landed: std::sync::Arc::default(),
+        };
+        writer.shutdown().await.unwrap();
+        assert_eq!(*writer.landed.lock().unwrap(), b"moov", "as its flush");
     }
 
     /// The head of a chunked `200` whose chunks come later.
