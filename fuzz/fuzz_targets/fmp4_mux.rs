@@ -5,7 +5,8 @@
 //! fragment's `mdat`, the `mdat`s hold exactly the samples, each track's
 //! samples are its pushed frames, in order, as their length-prefixed
 //! units (ISO/IEC 14496-15 §5.3.2; H.265 without the sets of its
-//! `hvc1` entry, §8.4.1.1.2), and each track's
+//! `hvc1` entry, §8.4.1.1.2, until a frame brings a set the entry lacks,
+//! the muxer's SPEC-DEVIATION), and each track's
 //! fragments start no earlier than the one before ended; the HTTP
 //! source's fragmented MP4 reader takes the init segment and the
 //! fragments and hands on every non-empty H.264, H.265 and AAC sample as
@@ -101,40 +102,62 @@ fn audio_track(selector: u8) -> Option<ClipTrack> {
     }
 }
 
-/// The units of a video frame its sample keeps: all but the H.265 sets
-/// equal to the sample entry's (`out_of_band`).
-fn kept<'a>(payload: &'a [u8], out_of_band: &[Vec<u8>]) -> Vec<&'a [u8]> {
-    annex_b_units(payload)
-        .into_iter()
-        .filter(|unit| !out_of_band.iter().any(|set| set == unit))
+/// The units each video frame's sample keeps, in push order: all but
+/// the H.265 sets equal to the sample entry's (`out_of_band`), until a
+/// frame brings a parameter set the entry lacks; every unit from that
+/// frame on.
+fn kept(pushed: &[(Kind, Vec<u8>)], mut out_of_band: Vec<Vec<u8>>) -> Vec<Vec<&[u8]>> {
+    let mut kept = Vec::new();
+    for (_, payload) in pushed.iter().filter(|(kind, _)| *kind == Kind::Video) {
+        let units = annex_b_units(payload);
+        if units.iter().any(|unit| {
+            !out_of_band.is_empty()
+                && h265::nal::unit_type(unit).is_some_and(h265::nal::is_parameter_set)
+                && !out_of_band.iter().any(|set| set == unit)
+        }) {
+            out_of_band.clear();
+        }
+        kept.push(
+            units
+                .into_iter()
+                .filter(|unit| !out_of_band.iter().any(|set| set == unit))
+                .collect(),
+        );
+    }
+    kept
+}
+
+/// The track's frames as the muxer's samples (video's kept units behind
+/// 4-byte lengths) or, with `start_codes`, as the HTTP reader hands them
+/// on (behind 4-byte start codes), in push order.
+fn expected(
+    kind: Kind,
+    pushed: &[(Kind, Vec<u8>)],
+    video: &[Vec<&[u8]>],
+    start_codes: bool,
+) -> Vec<Vec<u8>> {
+    if kind == Kind::Audio {
+        return pushed
+            .iter()
+            .filter(|(pushed, _)| *pushed == Kind::Audio)
+            .map(|(_, payload)| payload.clone())
+            .collect();
+    }
+    video
+        .iter()
+        .map(|units| {
+            let mut out = Vec::new();
+            for unit in units {
+                if start_codes {
+                    out.extend([0, 0, 0, 1]);
+                } else {
+                    out.extend(u32::try_from(unit.len()).unwrap().to_be_bytes());
+                }
+                out.extend(*unit);
+            }
+            out
+        })
         .collect()
-}
-
-/// A sample as the frame becomes one: video's units behind 4-byte lengths.
-fn sample(kind: Kind, payload: &[u8], out_of_band: &[Vec<u8>]) -> Vec<u8> {
-    if kind == Kind::Audio {
-        return payload.to_vec();
-    }
-    let mut out = Vec::new();
-    for unit in kept(payload, out_of_band) {
-        out.extend(u32::try_from(unit.len()).unwrap().to_be_bytes());
-        out.extend(unit);
-    }
-    out
-}
-
-/// The frame as the HTTP reader hands it on: video's units behind 4-byte
-/// start codes.
-fn unit(kind: Kind, payload: &[u8], out_of_band: &[Vec<u8>]) -> Vec<u8> {
-    if kind == Kind::Audio {
-        return payload.to_vec();
-    }
-    let mut out = Vec::new();
-    for unit in kept(payload, out_of_band) {
-        out.extend([0, 0, 0, 1]);
-        out.extend(unit);
-    }
-    out
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -268,12 +291,9 @@ fuzz_target!(|data: &[u8]| {
             "the mdat holds exactly the samples"
         );
     }
+    let video_units = kept(&pushed, out_of_band);
     for (track, kind) in [Kind::Video, Kind::Audio].into_iter().enumerate() {
-        let expected: Vec<Vec<u8>> = pushed
-            .iter()
-            .filter(|(pushed, _)| *pushed == kind)
-            .map(|(_, payload)| sample(kind, payload, &out_of_band))
-            .collect();
+        let expected = expected(kind, &pushed, &video_units, false);
         assert_eq!(read[track], expected, "the {kind} samples are the frames");
     }
 
@@ -289,12 +309,13 @@ fuzz_target!(|data: &[u8]| {
         if !declared.codec.is_supported() {
             continue;
         }
-        let expected: Vec<Vec<u8>> = pushed
-            .iter()
-            .filter(|(pushed, payload)| {
-                *pushed == kind && !sample(kind, payload, &out_of_band).is_empty()
-            })
-            .map(|(_, payload)| unit(kind, payload, &out_of_band))
+        // The reader hands on no empty sample.
+        let samples = expected(kind, &pushed, &video_units, false);
+        let expected: Vec<Vec<u8>> = expected(kind, &pushed, &video_units, true)
+            .into_iter()
+            .zip(&samples)
+            .filter(|(_, sample)| !sample.is_empty())
+            .map(|(unit, _)| unit)
             .collect();
         let got: Vec<&lotse_http::media::Unit> =
             units.iter().filter(|unit| unit.track == track).collect();

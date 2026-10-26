@@ -2,8 +2,10 @@
 //! event clip's frames into the bytes of one file, and the policy a clip
 //! runs under.
 //!
-//! A clip joins with the track's pre-roll ring and takes its frames with
-//! reliable delivery: the worker's clip task drains the subscriptions into
+//! A clip joins with the track's pre-roll ring, taking its subscription and
+//! the snapshot together
+//! ([`Track::subscribe_from_preroll`](crate::track::Track::subscribe_from_preroll)),
+//! and takes its frames with reliable delivery: the worker's clip task drains the subscriptions into
 //! a [`ReliableQueue`](crate::interleave::ReliableQueue), merges them in
 //! capture order through an [`Interleaver`](crate::interleave::Interleaver)
 //! and hands each frame to the [`ClipMuxer`] the registered
@@ -14,7 +16,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -104,13 +106,6 @@ pub trait ClipMuxer: Send {
         video: &ClipTrack,
         audio: Option<&ClipTrack>,
     ) -> Result<Vec<Bytes>, ClipError>;
-
-    /// Puts the clip's media time 0 at capture time `origin` instead of
-    /// at its first frame's: a clip whose audio is transcoded moves the
-    /// packets back by the transcode's delay and so starts that much
-    /// before its first frame, where the first packets belong. Called
-    /// after `start`, before the first `push`; ignored otherwise.
-    fn set_origin(&mut self, origin: Instant);
 
     /// Takes the next frame of the `track` kind, in the order the
     /// interleaver hands them out; returns the fragment it completed, if

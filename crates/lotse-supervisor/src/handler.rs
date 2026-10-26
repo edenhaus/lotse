@@ -467,7 +467,17 @@ impl Supervisor {
                     .with_detail("limit", "max_streams"),
             );
         }
-        if existing.is_some_and(|entry| unchanged(entry, put, &validated)) {
+        if let Some(entry) = existing.filter(|entry| unchanged(entry, put, &validated)) {
+            // A window a full driver queue kept from a connection reaches it
+            // now: the put is the same, the connection's window may not be.
+            let connections: Vec<String> = entry
+                .sources
+                .iter()
+                .map(|source| source.connection.clone())
+                .collect();
+            for connection in &connections {
+                state.follow_preroll(connection, stream_id.as_str());
+            }
             tracing::debug!(stream.id = %stream_id, "stream/put: unchanged");
             return Outcome::Result(
                 serde_json::to_value(StreamPutResult { created: false }).unwrap_or_default(),
@@ -1230,7 +1240,7 @@ impl Supervisor {
             Some(id) => ClipId::new(id).map_err(|_| {
                 ApiError::new(
                     ErrorCode::InvalidRequest,
-                    "clip_id must match ^[A-Za-z0-9._-]{1,128}$",
+                    "clip_id must match ^[A-Za-z0-9._-]{1,128}$ and not be `.` or `..`",
                 )
                 .with_detail("clip_id", id.as_str())
             })?,
@@ -1265,9 +1275,9 @@ impl Supervisor {
             after_ms: start.after_ms,
             audio: start.audio,
         };
-        let stop_slot = hand_over_clip(&commands, spec.clone(), writer.into())?;
-        state.last_clip = state.last_clip.saturating_add(1);
-        let serial = state.last_clip;
+        let serial = state.last_clip.saturating_add(1);
+        let stop_slot = hand_over_clip(&commands, (spec.clone(), serial), writer.into())?;
+        state.last_clip = serial;
         let (events, rx) = mpsc::channel(CLIP_QUEUE);
         let (written, report) = oneshot::channel();
         let body = ClipBody {
@@ -1606,7 +1616,9 @@ fn check_session_limits(
 
 /// `invalid_request` when `start` asks further back than the longest
 /// window or longer than the longest clip, `limit_reached` when another
-/// clip would exceed `max_clips`.
+/// clip would exceed `max_clips`, which counts the clips their workers are
+/// still finishing and the bodies that wait for their `GET` besides those
+/// that run ([`State::clips_held`]): each holds a pipe's end.
 fn check_clip_request(
     state: &State,
     start: &ClipStart,
@@ -1632,7 +1644,7 @@ fn check_clip_request(
         )
         .with_detail("field", "after_ms"));
     }
-    if state.clips.len() >= usize::try_from(limits.max_clips).unwrap_or(usize::MAX) {
+    if state.clips_held() >= usize::try_from(limits.max_clips).unwrap_or(usize::MAX) {
         return Err(ApiError::new(ErrorCode::LimitReached, "too many clips")
             .with_detail("limit", "max_clips"));
     }
@@ -1641,7 +1653,7 @@ fn check_clip_request(
 
 /// `limit_reached` when another clip of `stream_id` would exceed
 /// `clips_per_stream`; `no_video_track` when the tracks its connection
-/// `connection` last declared have no video.
+/// `connection` declared, while its source is live, have no video.
 fn check_clip_stream(
     state: &State,
     stream_id: &str,
@@ -1659,11 +1671,17 @@ fn check_clip_stream(
                 .with_detail("limit", "clips_per_stream"),
         );
     }
-    // Before the source was ever live its tracks are unknown: the worker
-    // ends a clip without video itself.
+    // Only a live source's tracks are its own: those the connection keeps
+    // from the last time it went live may be another source's (a
+    // `stream/put` switched it in place since) or the camera's before it
+    // changed, and with nothing running a refusal here would hold back
+    // the very demand that finds out. A source that is not live takes the
+    // start; its worker ends a clip without video itself
+    // (`no_video_track`), on the tracks it declares when it comes up.
     let tracks = state
         .connections
         .get(connection)
+        .filter(|entry| entry.snapshot.state == ConnectionState::Live)
         .map(|entry| entry.snapshot.tracks.as_slice())
         .unwrap_or_default();
     if !tracks.is_empty() && !tracks.iter().any(|track| track.kind == Kind::Video.name()) {
@@ -1676,12 +1694,13 @@ fn check_clip_stream(
     Ok(())
 }
 
-/// Hands the start of clip `spec`, with `pipe`, the write end of its pipe,
-/// to its connection's driver, and returns the slot reserved behind it for
-/// the clip's stop; a queue without room for both is `limit_reached`.
+/// Hands the start of clip `spec`, `serial`, with `pipe`, the write end of
+/// its pipe, to its connection's driver, and returns the slot reserved
+/// behind it for the clip's stop; a queue without room for both is
+/// `limit_reached`.
 fn hand_over_clip(
     commands: &mpsc::Sender<DriverCommand>,
-    spec: ClipSpec,
+    (spec, serial): (ClipSpec, u64),
     pipe: std::os::fd::OwnedFd,
 ) -> Result<mpsc::OwnedPermit<DriverCommand>, ApiError> {
     let busy = |_| {
@@ -1690,7 +1709,7 @@ fn hand_over_clip(
     };
     let start = commands.clone().try_reserve_owned().map_err(busy)?;
     let stop = commands.clone().try_reserve_owned().map_err(busy)?;
-    drop(start.send(DriverCommand::StartClip { spec, pipe }));
+    drop(start.send(DriverCommand::StartClip { spec, serial, pipe }));
     Ok(stop)
 }
 
@@ -1792,6 +1811,8 @@ mod tests {
 
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
 
     use lotse_api::Event;
     use lotse_api_types::command::parse_command;
@@ -2581,13 +2602,26 @@ mod tests {
     /// Waits until worker `pid` under `dir` received `needle`; five
     /// seconds without it fail the test.
     async fn wait_received(dir: &std::path::Path, pid: u64, needle: &[u8]) {
+        wait_received_any(dir, pid, &[needle.to_vec()]).await;
+    }
+
+    /// Waits until worker `pid` under `dir` received one of `needles`; five
+    /// seconds without any fail the test.
+    async fn wait_received_any(dir: &std::path::Path, pid: u64, needles: &[Vec<u8>]) {
         let file = dir.join(format!("received.{pid}"));
         for attempt in 0_u32.. {
             let received = std::fs::read(&file).unwrap_or_default();
-            if received.windows(needle.len()).any(|w| w == needle) {
+            if needles.iter().any(|needle| {
+                received
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_slice())
+            }) {
                 return;
             }
-            assert!(attempt < 500, "worker {pid} never received {needle:?}");
+            assert!(
+                attempt < 500,
+                "worker {pid} never received any of {needles:?}"
+            );
             SystemClock.sleep(Duration::from_millis(10)).await;
         }
     }
@@ -3240,40 +3274,19 @@ mod tests {
             "B gets its own answer"
         );
 
-        // The worker never answers: the daemon's clock bounds the wait.
-        // That re-offer (A) is still out: a retry is refused until the
-        // worker answers A, whose late answer goes nowhere.
-        let waiting = {
-            let s = Arc::clone(&s);
-            spawn_named("test.renegotiate", async move {
-                call_on(&s, 1, &renegotiate(9, "s1")).await
-            })
-        };
-        until_waiting(&s, "s1").await;
-        clock.advance(RENEGOTIATE_TIMEOUT);
-        let err = error(within(waiting).await.unwrap());
-        assert_eq!(
-            (err.code, err.message.as_str()),
-            (
-                ErrorCode::InternalError,
-                "the worker did not answer the re-offer"
-            )
-        );
-        assert!(s.shared.lock().sessions["s1"].renegotiating());
-        let err = error(within(call_on(&s, 1, &renegotiate(17, "s1"))).await);
-        assert_eq!(
-            err.message, "a re-offer of the session is still being answered",
-            "refused, not answered with A's answer"
-        );
+        // A second session, which keeps the connection and its worker
+        // wanted once s1 is closed.
+        let mut s2 = subscription(call_on(&s, 1, &offer(12, "front", Some("s2"))).await);
+        next(&mut s2).await;
         report(
             &s,
-            "s1",
-            Report::Renegotiated {
-                sdp: "v=0\r\na=mid:A\r\n".into(),
+            "s2",
+            Report::Answer {
+                sdp: "v=0\r\n".into(),
                 talkback: None,
             },
         );
-        assert!(!s.shared.lock().sessions["s1"].renegotiating());
+        next(&mut s2).await;
 
         // The session closes while the re-offer waits.
         let waiting = {
@@ -3295,29 +3308,85 @@ mod tests {
         assert_eq!(err.code, ErrorCode::SessionNotFound);
 
         // A full driver queue refuses the re-offer, and holds no slot.
-        let _s2 = subscription(call_on(&s, 1, &offer(12, "front", Some("s2"))).await);
-        report(
-            &s,
-            "s2",
-            Report::Answer {
-                sdp: "v=0\r\n".into(),
-                talkback: None,
-            },
-        );
         let (full, _rx) = mpsc::channel(1);
         full.try_send(DriverCommand::Candidate {
             session_id: "x".into(),
             candidate: String::new(),
         })
         .unwrap();
-        s.shared.lock().connections.get_mut("c1").unwrap().commands = full;
+        let commands = std::mem::replace(
+            &mut s.shared.lock().connections.get_mut("c1").unwrap().commands,
+            full,
+        );
         let err = error(within(call_on(&s, 1, &renegotiate(13, "s2"))).await);
         assert_eq!(
             (err.code, &err.details["limit"]),
             (ErrorCode::LimitReached, &json!("connection_queue"))
         );
         assert!(!s.shared.lock().sessions["s2"].renegotiating());
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = commands;
+
+        // The worker never answers: the daemon's clock bounds the wait.
+        // That re-offer (A) is still out: a retry is refused until the
+        // worker answers A, whose late answer goes nowhere.
+        //
+        // The fake worker sends nothing at all, and the advance that ends
+        // the wait passes its driver's `WORKER_SILENCE_LIMIT` too, which
+        // counts from the worker's start, before any advance: once the
+        // driver runs, it kills the worker and the exit closes the
+        // session. So the steps up to the late answer are polled here,
+        // each complete at once, and the driver runs only after them; the
+        // close is the last thing the test waits for.
+        worker_pid(&s).await;
+        {
+            let a = renegotiate(9, "s2");
+            let mut waiting = std::pin::pin!(call_on(&s, 1, &a));
+            assert!(poll_alone(waiting.as_mut()).is_pending());
+            assert!(s.shared.lock().sessions["s2"].renegotiating());
+            clock.advance(RENEGOTIATE_TIMEOUT);
+            let_assert!(Poll::Ready(outcome) = poll_alone(waiting));
+            let err = error(outcome);
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (
+                    ErrorCode::InternalError,
+                    "the worker did not answer the re-offer"
+                )
+            );
+        }
+        assert!(s.shared.lock().sessions["s2"].renegotiating());
+        let retry = renegotiate(17, "s2");
+        let_assert!(Poll::Ready(outcome) = poll_alone(std::pin::pin!(call_on(&s, 1, &retry))));
+        let err = error(outcome);
+        assert_eq!(
+            err.message, "a re-offer of the session is still being answered",
+            "refused, not answered with A's answer"
+        );
+        report(
+            &s,
+            "s2",
+            Report::Renegotiated {
+                sdp: "v=0\r\na=mid:A\r\n".into(),
+                talkback: None,
+            },
+        );
+        assert!(!s.shared.lock().sessions["s2"].renegotiating());
+        assert_eq!(
+            next(&mut s2).await,
+            json!({ "type": "closed", "code": "worker_crashed",
+                    "message": "the camera's worker process exited" }),
+            "the silent worker was killed"
+        );
         Arc::try_unwrap(s).unwrap().shutdown().await;
+    }
+
+    /// Polls `future` once on this task alone: unlike an `.await` that
+    /// yields, it lets no other task, no driver, act before the next step.
+    /// The poll is free of the runtime's cooperative budget, so a step
+    /// that can complete does.
+    fn poll_alone(future: Pin<&mut impl Future<Output = Outcome>>) -> Poll<Outcome> {
+        std::pin::pin!(tokio::task::unconstrained(future))
+            .poll(&mut Context::from_waker(Waker::noop()))
     }
 
     /// A session timer's task that leaves the maps as they are.
@@ -5061,18 +5130,21 @@ mod tests {
         // A clip is a viewer: the idle stream connects for it.
         assert_eq!(demand(&s).viewers, 1);
         let pid = worker_pid(&s).await;
-        let spec = ClipSpec {
-            clip_id: "k1".into(),
-            before_ms: 5_000,
-            after_ms: Some(20_000),
-            audio: true,
-        };
-        wait_received(
-            &dir,
-            pid,
-            &lotse_ipc::encode(&lotse_ipc::ToWorker::StartClip(spec)).unwrap(),
-        )
-        .await;
+        // The start waits in the driver's queue while the worker spawns,
+        // and that wait comes off its `after_ms` (`driver::after_left`):
+        // on the real clock, a millisecond or more of the 20 s.
+        let starts: Vec<Vec<u8>> = (19_000..=20_000)
+            .map(|after_ms| {
+                let spec = ClipSpec {
+                    clip_id: "k1".into(),
+                    before_ms: 5_000,
+                    after_ms: Some(after_ms),
+                    audio: true,
+                };
+                lotse_ipc::encode(&lotse_ipc::ToWorker::StartClip(spec)).unwrap()
+            })
+            .collect();
+        wait_received_any(&dir, pid, &starts).await;
         let front = result_of(&s, "front").await;
         assert_eq!(front["clips"], json!(["k1"]));
         // The write end went to the worker, which discarded it with the
@@ -5151,6 +5223,17 @@ mod tests {
             (err.code, &err.details["clip_id"]),
             (ErrorCode::InvalidRequest, &json!("a/b"))
         );
+        // A dot segment matches the characters but is refused (RFC 3986
+        // section 3.3), and the message says so.
+        let err = refused(call(&s, &clip(1, "front", Some("..")).to_string()).await);
+        assert_eq!(
+            (err.code, err.message.as_str(), &err.details["clip_id"]),
+            (
+                ErrorCode::InvalidRequest,
+                "clip_id must match ^[A-Za-z0-9._-]{1,128}$ and not be `.` or `..`",
+                &json!("..")
+            )
+        );
         let mut far = clip(1, "front", None);
         far["before_ms"] = json!(120_001);
         let err = refused(call(&s, &far.to_string()).await);
@@ -5163,7 +5246,12 @@ mod tests {
         long["after_ms"] = json!(600_001);
         let err = refused(call(&s, &long.to_string()).await);
         assert_eq!(err.details["field"], "after_ms");
-        let err = refused(call(&s, &clip(1, "front", None).to_string()).await);
+        // The longest window and the longest clip are allowed: what refuses
+        // this one is the stream.
+        let mut longest = clip(1, "front", None);
+        longest["before_ms"] = json!(120_000);
+        longest["after_ms"] = json!(600_000);
+        let err = refused(call(&s, &longest.to_string()).await);
         assert_eq!(err.code, ErrorCode::StreamNotFound);
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
@@ -5187,7 +5275,8 @@ mod tests {
         let (_k3, _e3) = started(call(&s, &clip(5, "back", Some("k3")).to_string()).await);
         let err = refused(call(&s, &clip(6, "back", Some("k4")).to_string()).await);
         assert_eq!(err.details["limit"], "max_clips");
-        assert_eq!(captured.lines("clip/start refused").len(), 8);
+        assert_eq!(captured.lines("clip/start refused").len(), 9);
+        assert_eq!(s.shared.lock().clips_held(), 3);
         assert_eq!(
             captured
                 .lines("clip opened; handed to the connection")
@@ -5214,13 +5303,14 @@ mod tests {
             audio_delay_ms: None,
             params: lotse_ipc::TrackParams::default(),
         };
-        s.shared
-            .lock()
-            .connections
-            .get_mut("c1")
-            .unwrap()
-            .snapshot
-            .tracks = vec![audio.clone()];
+        // A live source's tracks without video refuse the clip.
+        {
+            let mut state = s.shared.lock();
+            let snapshot = &mut state.connections.get_mut("c1").unwrap().snapshot;
+            snapshot.tracks = vec![audio.clone()];
+            snapshot.state = ConnectionState::Live;
+            drop(state);
+        }
         let err = refused(call(&s, &clip(7, "front", Some("k4")).to_string()).await);
         assert_eq!(err.code, ErrorCode::NoVideoTrack);
         audio.kind = "video".into();
@@ -5258,6 +5348,62 @@ mod tests {
         assert!(one_free.try_recv().is_err(), "the start is not handed on");
         assert!(!s.shared.lock().clips.contains_key("k4"));
         drop(full);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A source's tracks refuse a clip `no_video_track` only while it is
+    /// live: the tracks a connection keeps from the last time it went live
+    /// may be another source's after a `stream/put` switched it in place
+    /// while idle, and the worker ends a clip without video itself.
+    /// Regression: an audio-only source switched while idle to a video one
+    /// refused every `clip/start`, and with `preload: false` none raised
+    /// the demand that would declare the video.
+    #[tokio::test]
+    async fn only_the_tracks_of_a_live_source_refuse_a_clip_no_video_track() {
+        let dir = private_dir("clip-stale-tracks");
+        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+        let captured = Captured::default();
+        let _logs = captured.install();
+        result(call(&s, &put("front", "fake://127.0.0.1:1/a", false)).await);
+        result(call(&s, &put("front", "fake://127.0.0.1:1/b", false)).await);
+        assert_eq!(
+            captured
+                .lines("the connection switches to the new source in place")
+                .len(),
+            1
+        );
+        let audio = lotse_ipc::TrackInfo {
+            id: "a0".into(),
+            kind: "audio".into(),
+            codec: "opus".into(),
+            sync: "arrival".into(),
+            derived_from: None,
+            audio_delay_ms: None,
+            params: lotse_ipc::TrackParams::default(),
+        };
+        // Held throughout, so the driver publishes nothing in between.
+        {
+            let mut state = s.shared.lock();
+            let limits = state.clip_limits;
+            // The first source's, from when it was live.
+            state.connections.get_mut("c1").unwrap().snapshot.tracks = vec![audio];
+            for idle in [
+                ConnectionState::Idle,
+                ConnectionState::Connecting,
+                ConnectionState::Backoff,
+            ] {
+                state.connections.get_mut("c1").unwrap().snapshot.state = idle;
+                assert!(
+                    check_clip_stream(&state, "front", "c1", limits).is_ok(),
+                    "{idle:?}"
+                );
+            }
+            state.connections.get_mut("c1").unwrap().snapshot.state = ConnectionState::Live;
+            let err = check_clip_stream(&state, "front", "c1", limits).unwrap_err();
+            drop(state);
+            assert_eq!(err.code, ErrorCode::NoVideoTrack);
+        }
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -5324,6 +5470,24 @@ mod tests {
             s.clip_body(&ClipId::new("k4").unwrap()).unwrap_err(),
             ClipBodyError::NotFound
         );
+        // A full pipe: nobody read the body, so the stop could not write
+        // the file's last bytes in time and the worker ends it
+        // `client_gone`, the tail counted in its bytes; the clip still
+        // ends `not_fetched`, a file not whole.
+        let (_r8, mut k8) = started(call(&s, &clip(8, "front", Some("k8")).to_string()).await);
+        let before = front_stats(&s);
+        clock.advance(Duration::from_secs(10));
+        settle().await;
+        clip_report(&s, "k8", stopped_report("client_gone", 70_000));
+        let end = next(&mut k8).await;
+        assert_eq!(
+            (&end["reason"], &end["bytes"]),
+            (&json!("not_fetched"), &json!(70_000))
+        );
+        let after = front_stats(&s);
+        assert_eq!(after.1, before.1, "not a whole file");
+        assert_eq!(after.3, before.3 + 70_000, "the tail counted");
+        assert!(!s.shared.lock().clip_id_in_use("k8"), "no body kept");
         // A clip whose deadline passed while it was being stopped keeps
         // no body.
         let (_r6, _k6) = started(call(&s, &clip(6, "front", Some("k6")).to_string()).await);
@@ -5399,7 +5563,9 @@ mod tests {
         let dir = private_dir("clip-end");
         let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
         let (_r1, mut k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
+        let (_r9, _k9) = started(call(&s, &clip(9, "back", Some("k9")).to_string()).await);
         let mut body = s.clip_body(&ClipId::new("k1").unwrap()).unwrap();
         clip_report(
             &s,
@@ -5420,6 +5586,10 @@ mod tests {
         );
         assert!(within(&mut body.written).await.is_err(), "the body is cut");
         assert_eq!(front_stats(&s), (1, 0, 1, 0), "kept over the put");
+        // Its old worker stops with its connection: the id is free at once.
+        assert!(!s.shared.lock().clip_id_in_use("k1"));
+        // Another stream's clip, on another connection, runs on.
+        assert!(s.shared.lock().clips.contains_key("k9"));
         let (_r2, mut k2) = started(call(&s, &clip(2, "front", Some("k2")).to_string()).await);
         result(call(&s, r#"{"id":3,"type":"stream/delete","stream_id":"front"}"#).await);
         assert_eq!(next(&mut k2).await["reason"], "stream_deleted");
@@ -5485,7 +5655,7 @@ mod tests {
             "{lines:?}"
         );
         assert_eq!(next(&mut events).await["reason"], "internal_error");
-        let_assert!(Some(DriverCommand::StopClip { clip_id }) = commands.recv().await);
+        let_assert!(Ok(DriverCommand::StopClip { clip_id }) = commands.try_recv());
         assert_eq!(clip_id, "k1");
         assert!(s.shared.lock().clips.is_empty());
         // Ending a clip that is gone changes nothing.
@@ -5550,6 +5720,189 @@ mod tests {
                 .len(),
             1
         );
+        // The same put again, with room in the queue, passes the window on
+        // although the stream has it already; once there, a repeat sends
+        // nothing.
+        let mut commands = intercept(&s, 4);
+        let unchanged = result(call(&s, &windowed(0, true)).await);
+        assert_eq!(unchanged["created"], false);
+        let_assert!(Ok(DriverCommand::Preroll { ms: 0 }) = commands.try_recv());
+        assert_eq!(s.shared.lock().connections["c1"].preroll_ms, 0);
+        result(call(&s, &windowed(0, true)).await);
+        assert!(commands.try_recv().is_err());
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn gap_report(reason: &str) -> lotse_ipc::ClipReport {
+        lotse_ipc::ClipReport::Gap {
+            reason: reason.into(),
+            from_ms: 0,
+            to_ms: 1,
+        }
+    }
+
+    /// A worker runs one clip per id and drops a second start under an id
+    /// it runs, and its reports name the clip by id alone: a clip the
+    /// supervisor ended while its worker still runs it keeps its id until
+    /// that worker's `Stopped`, or a new clip under it would be dropped by
+    /// the worker and end with the old one's figures.
+    #[tokio::test]
+    async fn a_clip_ended_while_its_worker_runs_it_holds_its_id_until_the_worker_stopped_it() {
+        let dir = private_dir("clip-reuse");
+        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 8);
+        let (_r1, mut k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
+        let_assert!(Some(DriverCommand::StartClip { serial, .. }) = commands.recv().await);
+        let captured = Captured::default();
+        let _logs = captured.install();
+        // A malformed report ends it here; its worker is told to stop it.
+        clip_report(&s, "k1", gap_report("solar\nflare"));
+        assert_eq!(next(&mut k1).await["reason"], "internal_error");
+        let_assert!(Ok(DriverCommand::StopClip { clip_id }) = commands.try_recv());
+        assert_eq!(clip_id, "k1");
+        assert!(s.shared.lock().clips.is_empty());
+        let held = captured.lines("clip ended while its worker may still run it");
+        assert_eq!(held.len(), 1, "{held:?}");
+        // Until the worker stopped it, the id is taken and the clip counts.
+        let err = error(call(&s, &clip(2, "front", Some("k1")).to_string()).await);
+        assert_eq!(err.code, ErrorCode::ClipIdInUse);
+        s.shared.lock().clip_limits.max_clips = 1;
+        let err = error(call(&s, &clip(3, "front", Some("k2")).to_string()).await);
+        assert_eq!(err.details["limit"], "max_clips");
+        s.shared.lock().clip_limits.max_clips = 8;
+        // Another worker's `Stopped`, or a report that is not one, frees
+        // nothing.
+        let at = s.shared.clock.wall_now();
+        s.shared
+            .lock()
+            .clip_report("c9", "k1", stopped_report("stopped", 7), at);
+        clip_report(&s, "k1", gap_report("lagged"));
+        assert!(s.shared.lock().clip_id_in_use("k1"));
+        // Its worker's `Stopped` frees it, and goes to no one.
+        let stats = front_stats(&s);
+        clip_report(&s, "k1", stopped_report("stopped", 7));
+        assert!(!s.shared.lock().clip_id_in_use("k1"));
+        assert_eq!(front_stats(&s), stats, "the clip was counted as it ended");
+        assert_eq!(
+            captured
+                .lines("the worker finished a clip that had ended; its id is free")
+                .len(),
+            1
+        );
+        let (_r4, _k1) = started(call(&s, &clip(4, "front", Some("k1")).to_string()).await);
+        let_assert!(Some(DriverCommand::StartClip { serial: again, .. }) = commands.recv().await);
+        assert!(again > serial);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A held id is free once nothing can report on it: its worker exited,
+    /// or its connection was released, which stops the worker. A clip whose
+    /// worker is gone holds none.
+    #[tokio::test]
+    async fn a_held_clip_id_is_free_once_its_worker_or_its_connection_is_gone() {
+        let dir = private_dir("clip-held");
+        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
+        let mut commands = intercept(&s, 8);
+        let (_r1, _k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
+        let (_r2, _k2) = started(call(&s, &clip(2, "back", Some("k2")).to_string()).await);
+        let at = s.shared.clock.wall_now();
+        clip_report(&s, "k1", gap_report("bogus"));
+        s.shared
+            .lock()
+            .clip_report("c2", "k2", gap_report("bogus"), at);
+        assert!(s.shared.lock().clip_id_in_use("k1") && s.shared.lock().clip_id_in_use("k2"));
+        let captured = Captured::default();
+        let _logs = captured.install();
+        // `c1`'s worker exited: k1 is free, `c2`'s k2 is not.
+        s.shared.lock().clips_worker_gone("c1");
+        assert!(!s.shared.lock().clip_id_in_use("k1"));
+        assert!(s.shared.lock().clip_id_in_use("k2"));
+        // Deleting `back` releases `c2`, whose worker stops with it.
+        result(call(&s, r#"{"id":3,"type":"stream/delete","stream_id":"back"}"#).await);
+        assert!(!s.shared.lock().clip_id_in_use("k2"));
+        let freed = captured.lines("the worker of a clip that had ended is gone; its id is free");
+        assert_eq!(freed.len(), 2, "{freed:?}");
+        // A clip whose worker exited holds no id and asks it nothing.
+        let (_r4, _k4) = started(call(&s, &clip(4, "front", Some("k4")).to_string()).await);
+        while commands.try_recv().is_ok() {}
+        s.shared.lock().end_clip(
+            "k4",
+            crate::clip::ClipEnd::Now(ClipStopReason::WorkerCrashed),
+        );
+        assert!(!s.shared.lock().clip_id_in_use("k4"));
+        assert!(
+            commands.try_recv().is_err(),
+            "no stop for a worker that is gone"
+        );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Each body that waits for its `GET` holds the read end of its pipe
+    /// until the fetch deadline: `max_clips` counts it, or short clips that
+    /// nobody fetches would pile up descriptors without bound.
+    #[tokio::test]
+    async fn a_body_that_waits_for_its_get_counts_toward_max_clips() {
+        let dir = private_dir("clip-held-bodies");
+        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let _commands = intercept(&s, 8);
+        s.shared.lock().clip_limits.max_clips = 1;
+        let (_r1, mut k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
+        clip_report(&s, "k1", stopped_report("completed", 0));
+        assert_eq!(next(&mut k1).await["reason"], "completed");
+        assert!(s.shared.lock().clips.is_empty());
+        let err = error(call(&s, &clip(2, "front", Some("k2")).to_string()).await);
+        assert_eq!(
+            (err.code, &err.details["limit"]),
+            (ErrorCode::LimitReached, &json!("max_clips"))
+        );
+        // Fetched, it holds nothing here any more.
+        drop(s.clip_body(&ClipId::new("k1").unwrap()).unwrap());
+        let (_r3, _k2) = started(call(&s, &clip(3, "front", Some("k2")).to_string()).await);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A `Stopped` naming a reason the worker may not give is a malformed
+    /// report: its figures are not believed, so `stopped` says 0 bytes and
+    /// the body is cut (`ClipEvent::Stopped`); the worker, which ended the
+    /// clip with it, is asked nothing and holds no id.
+    #[tokio::test]
+    async fn a_stopped_with_a_reason_the_worker_may_not_give_cuts_the_body_and_says_nothing_written()
+     {
+        let dir = private_dir("clip-bad-stop");
+        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 8);
+        let (_r1, mut k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
+        let _start = commands.recv().await;
+        let mut body = s.clip_body(&ClipId::new("k1").unwrap()).unwrap();
+        let captured = Captured::default();
+        let _logs = captured.install();
+        clip_report(&s, "k1", stopped_report("worker_crashed", 4_096));
+        assert_eq!(
+            next(&mut k1).await,
+            json!({ "type": "stopped", "reason": "internal_error", "bytes": 0,
+                    "duration_ms": 0, "gaps": 0 })
+        );
+        assert!(within(&mut body.written).await.is_err(), "the body is cut");
+        assert_eq!(front_stats(&s), (1, 0, 0, 0));
+        let lines = captured.lines("a worker reported a malformed clip report; clip ended");
+        assert!(
+            lines[0].contains("stopped names a reason the worker may not give"),
+            "{lines:?}"
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "no stop for a clip that ended"
+        );
+        assert!(!s.shared.lock().clip_id_in_use("k1"));
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }

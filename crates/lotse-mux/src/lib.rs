@@ -14,11 +14,13 @@
 //! The file: an init segment (`ftyp`, `moov` with one track per clip
 //! track and `mvex`), then one movie fragment (`moof` and `mdat`) at a
 //! time. A fragment ends before every video keyframe, before a frame that
-//! begins a new epoch of its track, once the clip policy's fragment span
-//! has passed since it began, and once its media data reach
-//! [`MAX_FRAGMENT_BYTES`]; [`ClipMuxer::finish`] writes the last. The file
-//! is playable up to its last complete fragment whenever it ends. Sample
-//! payloads go out as slices of the frames' own bytes, never copied.
+//! begins a new epoch of its track, once a track's decode time has
+//! advanced by the clip policy's fragment span in it, and once what its
+//! samples hold, their frames' bytes and what describes them, reaches
+//! [`MAX_FRAGMENT_BYTES`]; [`ClipMuxer::finish`] writes the last.
+//! The file is playable up to its last complete fragment whenever it
+//! ends. Sample payloads go out as slices of the frames' own bytes, never
+//! copied.
 //!
 //! Standards: ISO/IEC 14496-12 (ISO base media file format: the boxes,
 //! movie fragments, sample flags, composition offsets), ISO/IEC 14496-14
@@ -48,8 +50,11 @@ use crate::init::{AUDIO_TRACK_ID, VIDEO_TRACK_ID};
 /// (ISO/IEC 14496-12 §8.8.8, `sample_size`).
 pub const MAX_SAMPLE_BYTES: usize = 256 * 1024 * 1024;
 
-/// The media data after which a fragment ends early. One more sample of
-/// each track may follow it, so the run's data offset, a signed 32-bit
+/// What a fragment's samples hold after which it ends early: their
+/// frames' bytes, their NAL units' lengths and the descriptors of their
+/// pieces, so a frame of many tiny NAL units counts the memory it takes,
+/// not only its media data. The media data are less, and one more sample
+/// of each track may follow, so the run's data offset, a signed 32-bit
 /// count from the `moof` (ISO/IEC 14496-12 §8.8.8, `data_offset`), always
 /// fits.
 pub const MAX_FRAGMENT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -86,7 +91,7 @@ impl ClipMuxerFactory for Factory {
 struct Limits {
     /// The largest frame a sample takes.
     sample_bytes: usize,
-    /// The media data after which a fragment ends.
+    /// What a fragment's samples hold after which it ends.
     fragment_bytes: u64,
 }
 
@@ -108,11 +113,13 @@ struct Clip {
     video: TrackWriter,
     /// The audio track, when the clip has one.
     audio: Option<TrackWriter>,
-    /// Decode time 0: the capture time [`ClipMuxer::set_origin`] gave, else
-    /// the clip's first frame's.
+    /// The capture time of the clip's first frame: decode time 0.
     origin: Option<Instant>,
-    /// The capture time of the current fragment's first frame.
-    began: Option<Instant>,
+    /// Where the current fragment's span counts from on the video track:
+    /// see [`Clip::began`].
+    video_began: Option<Duration>,
+    /// Where it counts from on the audio track.
+    audio_began: Option<Duration>,
     /// The sequence number of the latest fragment (ISO/IEC 14496-12
     /// §8.8.5): 0 before the first.
     sequence: u32,
@@ -125,8 +132,33 @@ impl Clip {
             video: TrackWriter::new(VIDEO_TRACK_ID, Kind::Video, video),
             audio: audio.map(|audio| TrackWriter::new(AUDIO_TRACK_ID, Kind::Audio, audio)),
             origin: None,
-            began: None,
+            video_began: None,
+            audio_began: None,
             sequence: 0,
+        }
+    }
+
+    /// Where the current fragment's span counts from on the `kind` track:
+    /// the decode time of the track's first frame taken since the fragment
+    /// began, the frame that began it on its own track; `None` before it.
+    /// Each track's span counts on its own decode times, not on capture
+    /// times: a track's never go back (see the [`fragment`] module), and
+    /// inside an epoch they follow the timestamps, so a capture time a
+    /// Sender Report put ahead and a later one corrected back, which the
+    /// clip's interleaver takes, cannot hold the next cut until the capture
+    /// times catch up. Nor on the other track's: the two timelines are
+    /// anchored apart, at their epochs' capture times, and a track whose
+    /// epoch a Sender Report put an hour ahead would otherwise hold the
+    /// other track's cuts for that hour, or end a fragment at each of its
+    /// own frames. The other track's frame held at a cut, captured before
+    /// the frame that cut, is not counted: its span would end before the
+    /// cutting track's, a frame short of a keyframe, so the track whose
+    /// frame cut keeps pacing the fragments, and the other's run in one
+    /// spans at most a frame more.
+    const fn began(&mut self, kind: Kind) -> &mut Option<Duration> {
+        match kind {
+            Kind::Video => &mut self.video_began,
+            Kind::Audio => &mut self.audio_began,
         }
     }
 
@@ -140,8 +172,7 @@ impl Clip {
         fragment_bytes: u64,
     ) -> Result<Vec<Bytes>, ClipError> {
         let origin = *self.origin.get_or_insert(frame.wallclock);
-        let began = *self.began.get_or_insert(frame.wallclock);
-        let (wallclock, keyframe) = (frame.wallclock, frame.keyframe);
+        let keyframe = frame.keyframe;
         let track = match kind {
             Kind::Video => &mut self.video,
             Kind::Audio => self.audio.as_mut().ok_or_else(|| {
@@ -149,20 +180,24 @@ impl Clip {
             })?,
         };
         let anchored = track.push(frame, origin)?;
+        let at = track.decode_time();
+        let began = *self.began(kind).get_or_insert(at);
         let ready = self
             .video
             .ready_bytes()
             .saturating_add(self.audio.as_ref().map_or(0, TrackWriter::ready_bytes));
         let cut = anchored
             || (kind == Kind::Video && keyframe)
-            || wallclock.saturating_duration_since(began) >= span
+            || at.saturating_sub(began) >= span
             || ready >= fragment_bytes;
         if !cut {
             return Ok(Vec::new());
         }
         let out = self.fragment()?;
         if !out.is_empty() {
-            self.began = Some(wallclock);
+            self.video_began = None;
+            self.audio_began = None;
+            *self.began(kind) = Some(at);
         }
         Ok(out)
     }
@@ -231,14 +266,6 @@ impl ClipMuxer for Muxer {
         let init = init::init_segment(video, audio)?;
         self.state = State::Running(Box::new(Clip::new(video, audio)));
         Ok(vec![init])
-    }
-
-    fn set_origin(&mut self, origin: Instant) {
-        if let State::Running(clip) = &mut self.state
-            && clip.origin.is_none()
-        {
-            clip.origin = Some(origin);
-        }
     }
 
     fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, ClipError> {

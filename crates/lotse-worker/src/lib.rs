@@ -692,28 +692,61 @@ impl Serving<'_> {
         refuse_renegotiation(&mut self.tx, session_id, message).await
     }
 
-    /// `Shutdown`: closes every session, stops the standby and the source
-    /// within `deadline_ms`.
+    /// `Shutdown`: ends the clips, closes every session, stops the standby
+    /// and the source within `deadline_ms`, past which the supervisor
+    /// kills the worker. The clips end beside the rest, never ahead of it,
+    /// and by that deadline at the latest, so a clip whose reader stalls
+    /// costs the source's teardown nothing.
     async fn on_shutdown(&mut self, deadline_ms: u32) -> Result<ExitReason, Error> {
         let sessions = self.sessions.as_mut().map_or(0, SessionManager::len);
         let clips = self.clips.len();
         tracing::info!(deadline_ms, sessions, clips, "shutdown requested");
-        // First, while the tracks still run: each clip writes its last
-        // fragment, and its report waits for the flush.
-        self.clips.shutdown(&self.clock).await;
-        if let Some(mut manager) = self.sessions.take() {
-            manager
-                .close_all("shutting_down", "the daemon is stopping")
-                .await;
-        }
-        stop_standby(self.standby.take(), &self.clock).await;
-        stop_source(
-            self.running.take(),
-            &self.clock,
-            Duration::from_millis(u64::from(deadline_ms)),
-        )
-        .await?;
-        close_backchannels(&self.backchannels, &self.clock).await;
+        let budget = Duration::from_millis(u64::from(deadline_ms));
+        let now = self.clock.now();
+        let deadline = now.checked_add(budget).unwrap_or(now);
+        let Self {
+            tx,
+            clock,
+            clips,
+            clip_rx,
+            sessions,
+            standby,
+            running,
+            backchannels,
+            ..
+        } = self;
+        // Each clip writes its last fragment, and its report waits for the
+        // flush. Their reports go on meanwhile: a clip waiting for room in
+        // their channel would be aborted at the deadline, its `Stopped`
+        // lost.
+        let ending = async {
+            let ending = clips.shutdown(clock, deadline);
+            tokio::pin!(ending);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut ending => return Ok::<(), Error>(()),
+                    // `self` holds the clips' sender, so the reports never end.
+                    Some((clip_id, event)) = clip_rx.recv() => {
+                        tx.send_msg(&ToSupervisor::Clip { clip_id, event }, &[]).await?;
+                    }
+                }
+            }
+        };
+        let teardown = async {
+            if let Some(mut manager) = sessions.take() {
+                manager
+                    .close_all("shutting_down", "the daemon is stopping")
+                    .await;
+            }
+            stop_standby(standby.take(), clock).await;
+            stop_source(running.take(), clock, budget).await?;
+            close_backchannels(backchannels, clock).await;
+            Ok::<(), Error>(())
+        };
+        let (ended, torn_down) = tokio::join!(ending, teardown);
+        ended?;
+        torn_down?;
         Ok(ExitReason::Shutdown)
     }
 
@@ -775,7 +808,11 @@ impl Serving<'_> {
 
     /// The tracks switched to the standby `tag`: the old source is
     /// stopped, the standby becomes the source, and the supervisor hears
-    /// of the switch and the tracks as they are now.
+    /// of the switch and the tracks as they are now. The clips are left
+    /// alone: each ended at the switch itself, in its place among its
+    /// frames (`SourceSwitched`, or `ControlLost` when its subscription
+    /// lost that to a lag), and one started since runs on the new source
+    /// alone, the ring cleared at the switch.
     async fn on_switched(&mut self, tag: u8) -> Result<(), Error> {
         let Some(standby) = self.standby.take() else {
             tracing::warn!(tag, "tracks switched without a standby; ignored");
@@ -787,10 +824,8 @@ impl Serving<'_> {
         tracing::info!(
             tag,
             clips = self.clips.len(),
-            "tracks switched to the standby; stopping the old source and the clips"
+            "tracks switched to the standby; stopping the old source"
         );
-        // Another source is another stream: a clip's file ends here.
-        self.clips.stop_all(EndReason::StreamChanged);
         running.cancel.cancel();
         let old = Runner {
             cancel: std::mem::replace(&mut running.cancel, standby.runner.cancel),
@@ -5437,13 +5472,15 @@ mod tests {
     }
 
     /// The source's `preroll_ms` gives its tracks the window once they are
-    /// live, so a clip starts in the ring, `before_ms` back as far as it
-    /// holds; `Preroll { ms: 0 }` frees the ring at once, without a
-    /// reconnect; the daemon's shutdown ends the clip `shutting_down`, its
-    /// report before the source's last.
+    /// live (`Live`: no `Stable` comes within the test), so a clip starts in
+    /// the ring, `before_ms` back as far as it holds; `Preroll { ms: 0 }`
+    /// frees the ring at once, without a reconnect; the daemon's shutdown
+    /// ends the clip `shutting_down`, its report before the source's last.
     #[tokio::test]
     async fn the_window_fills_the_ring_a_clip_starts_in_and_a_shutdown_ends_it() {
-        let mut h = start_with_settings(clip_registries(), quiet_settings());
+        let mut settings = quiet_settings();
+        settings.runner.stable_after = Duration::from_hours(24 * 365);
+        let mut h = start_with_settings(clip_registries(), settings);
         h.next().await;
         let mut source = spec("fake://cam/", r#"{"keyframes_every_ms": 100}"#);
         source.preroll_ms = 30_000;
@@ -5531,14 +5568,20 @@ mod tests {
         h.tx.send_msg(&ToWorker::SwitchSource(standby), &[])
             .await
             .unwrap();
-        let seen = messages_until(&mut h, |seen| stop_reason(seen, "k1").is_some()).await;
+        // The clip ends at the switch itself, before or after the worker
+        // hears of it.
+        let seen = messages_until(&mut h, |seen| {
+            stop_reason(seen, "k1").is_some() && seen.contains(&ToSupervisor::Switched)
+        })
+        .await;
         assert_eq!(stop_reason(&seen, "k1").unwrap(), "stream_changed");
-        assert!(seen.contains(&ToSupervisor::Switched), "{seen:?}");
-        let switched = logs.lines(
-            Level::INFO,
-            "tracks switched to the standby; stopping the old source and the clips",
+        assert_eq!(
+            logs.count(
+                Level::INFO,
+                "tracks switched to the standby; stopping the old source",
+            ),
+            1
         );
-        assert!(switched[0].fields.contains("clips=1"), "{switched:?}");
         assert!(clip_bytes(reader).await.ends_with(b"end\n"));
         messages_until(&mut h, |seen| {
             seen.iter().any(|message| {
@@ -5553,6 +5596,58 @@ mod tests {
             ended(h.worker).await.unwrap().unwrap(),
             ExitReason::Shutdown
         );
+    }
+
+    /// A clip the worker starts after the tracks switched but before it
+    /// hears of the switch runs on: it subscribes to the new source alone,
+    /// the ring cleared at the switch, and the switch leaves the clips
+    /// alone, each running one having ended at the switch in its own
+    /// stream. Regression: the worker ended every clip `stream_changed`
+    /// when it heard of the switch, this one included.
+    #[tokio::test]
+    async fn a_clip_started_between_a_switch_and_the_worker_hearing_of_it_runs_on() {
+        let settings = settings();
+        let (mut serving, _rx) = serving(&settings);
+        serving.registries = clip_registries();
+        let (clip_tx, mut clip_rx) = mpsc::channel(16);
+        serving.clips = Clips::new(clip_tx);
+        serving.on_run_source(&spec("fake://cam/", "null")).unwrap();
+        let staging = TrackSet::staging(serving.running.as_ref().unwrap().tracks.tracks());
+        let runner = start_runner(
+            &spec("fake://cam2/", "null"),
+            &serving.registries,
+            &serving.clock,
+            &settings,
+            &serving.probes,
+            &serving.backchannels,
+            serving.standby_tx.clone(),
+            Arc::clone(&staging),
+            "standby",
+        )
+        .unwrap();
+        serving.standby = Some(Standby { runner, staging });
+        let (_reader, writer) = clip_pipe();
+        serving
+            .on_start_clip(
+                ClipSpec {
+                    clip_id: "k1".into(),
+                    before_ms: 0,
+                    after_ms: None,
+                    audio: false,
+                },
+                vec![writer],
+            )
+            .await
+            .unwrap();
+        serving.on_switched(1).await.unwrap();
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(serving.standby.is_none(), "the switch went through");
+        assert!(serving.clips.runs("k1"));
+        let report = clip_rx.try_recv();
+        assert!(report.is_err(), "the clip runs on: {report:?}");
+        serving.clips.abort_all();
     }
 
     /// A supervisor that goes away takes the clips with it: each is
@@ -5583,5 +5678,158 @@ mod tests {
         let bytes = clip_bytes(reader).await;
         assert!(bytes.starts_with(b"init video=h264\n"), "{bytes:?}");
         assert!(!bytes.ends_with(b"end\n"), "{bytes:?}");
+    }
+
+    /// The shutdown passes the clips' reports on while it waits for them:
+    /// a full report channel (here one slot, filled by a report the loop
+    /// had not passed on yet) never blocks a clip's `Stopped` until its
+    /// grace runs out. Regression: the shutdown took no report while it
+    /// waited, so the clip waited for room until it was aborted, its
+    /// `Stopped` lost.
+    #[tokio::test]
+    async fn a_shutdown_passes_the_clips_reports_on_while_it_waits_for_them() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let clock = Arc::new(FakeClock::default());
+        serving.clock = clock.clone();
+        let (clip_tx, clip_rx) = mpsc::channel(1);
+        let queued = ClipReport::Warning {
+            code: "audio_omitted".into(),
+            message: "queued before the shutdown".into(),
+        };
+        clip_tx.try_send(("k0".into(), queued.clone())).unwrap();
+        serving.clips = Clips::new(clip_tx);
+        serving.clip_rx = clip_rx;
+        let (reader, writer) = clip_pipe();
+        serving.clips.start(ClipStart {
+            spec: ClipSpec {
+                clip_id: "k1".into(),
+                before_ms: 0,
+                after_ms: None,
+                audio: false,
+            },
+            pipe: tokio::net::unix::pipe::Sender::from_owned_fd(writer).unwrap(),
+            // Never ready: the clip waits for its tracks.
+            tracks: TrackSet::new(TrackLimits::default(), clock.now()),
+            factory: Arc::new(FakeClipMuxerFactory::default()),
+            settings: ClipSettings::default(),
+            clock: clock.clone(),
+        });
+        let (exit, ()) = tokio::join!(serving.on_shutdown(1_000), async {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            // Past the shutdown's grace: a clip still waiting is aborted.
+            clock.advance(Duration::from_secs(2));
+        });
+        assert_eq!(exit.unwrap(), ExitReason::Shutdown);
+        let mut session_rx = mpsc::channel(1).1;
+        serving
+            .flush(ExitReason::Shutdown, &mut session_rx)
+            .await
+            .unwrap();
+        drop(serving);
+        let mut seen = Vec::new();
+        while let Some((message, _)) = within(rx.recv_msg::<ToSupervisor>()).await.unwrap() {
+            seen.push(message);
+        }
+        assert_eq!(
+            seen,
+            [
+                ToSupervisor::Clip {
+                    clip_id: "k0".into(),
+                    event: queued,
+                },
+                ToSupervisor::Clip {
+                    clip_id: "k1".into(),
+                    event: ClipReport::Stopped {
+                        reason: "shutting_down".into(),
+                        bytes: 0,
+                        duration_ms: 0,
+                        gaps: 0,
+                    },
+                },
+            ]
+        );
+        assert_eq!(
+            logs.count(Level::WARN, "clip still finishing at shutdown; aborted"),
+            0
+        );
+        assert!(clip_bytes(reader).await.is_empty());
+    }
+
+    /// A clip whose reader stalls ends by the shutdown's deadline, aborted
+    /// then, and its wait runs beside the sources' teardown rather than
+    /// ahead of it, so the worker is done within the deadline the
+    /// supervisor kills it at. Regression: the clips had their whole grace
+    /// (1.5 s) first, whatever the deadline, and the source its whole
+    /// deadline after it.
+    #[tokio::test]
+    async fn a_shutdown_ends_a_stalled_clip_by_its_deadline() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, _rx) = serving(&settings);
+        let clock = Arc::new(FakeClock::default());
+        serving.clock = clock.clone();
+        let (clip_tx, clip_rx) = mpsc::channel(16);
+        serving.clips = Clips::new(clip_tx);
+        serving.clip_rx = clip_rx;
+        let tracks = TrackSet::new(TrackLimits::default(), clock.now());
+        let mut publisher = tracks.publisher();
+        let video = publisher.declare(
+            Kind::Video,
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+        );
+        publisher.ready();
+        let (_reader, writer) = clip_pipe();
+        serving.clips.start(ClipStart {
+            spec: ClipSpec {
+                clip_id: "k1".into(),
+                before_ms: 0,
+                after_ms: None,
+                audio: false,
+            },
+            pipe: tokio::net::unix::pipe::Sender::from_owned_fd(writer).unwrap(),
+            tracks,
+            factory: Arc::new(FakeClipMuxerFactory::default()),
+            settings: ClipSettings::default(),
+            clock: clock.clone(),
+        });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        // More than the pipe takes: the reader never reads, so bytes stay
+        // pending.
+        assert!(video.publish_frame(lotse_core::media::MediaFrame {
+            ts: lotse_core::media::MediaTime::ZERO,
+            wallclock: clock.now(),
+            arrival: clock.now(),
+            keyframe: true,
+            discontinuity: false,
+            epoch: 0,
+            payload: vec![0x65; 256 * 1024].into(),
+        }));
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let (exit, ()) = within(async {
+            tokio::join!(serving.on_shutdown(500), async {
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+                clock.advance(Duration::from_millis(500));
+            })
+        })
+        .await;
+        assert_eq!(exit.unwrap(), ExitReason::Shutdown);
+        let aborted = logs.lines(Level::WARN, "clip still finishing at shutdown; aborted");
+        assert_eq!(aborted.len(), 1);
+        assert!(aborted[0].fields.contains("grace_ms=500"), "{aborted:?}");
     }
 }

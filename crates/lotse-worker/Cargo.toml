@@ -21,7 +21,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "net", "io-util"] } # the worker's runtime, channels, the datagram channel and ICE-TCP framing
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-lotse-codec = { workspace = true } # a video track's picture size, read from its SPS for `stream/get`; the clips' G.711 and G.722 transcode to Opus
+lotse-codec = { workspace = true } # a video track's picture size, read from its SPS for `stream/get`
 lotse-core = { workspace = true }
 lotse-ipc = { workspace = true }
 

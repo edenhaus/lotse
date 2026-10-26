@@ -933,7 +933,7 @@ impl ClipMuxerFactory for FakeClipMuxerFactory {
 }
 
 /// A [`FakeClipMuxerFactory`]'s muxer. Its media time is the capture time
-/// from its origin, the one set or its first frame's.
+/// from its origin, its first frame's.
 #[derive(Debug)]
 struct FakeClipMuxer {
     /// Where it fails.
@@ -967,12 +967,6 @@ impl ClipMuxer for FakeClipMuxer {
         Ok(vec![
             format!("init video={}{audio}\n", video.codec.name()).into(),
         ])
-    }
-
-    /// Writes nothing; its media times count from `origin`, set before
-    /// the first frame.
-    fn set_origin(&mut self, origin: Instant) {
-        self.origin.get_or_insert(origin);
     }
 
     fn push(
@@ -1348,6 +1342,13 @@ impl SessionEngine for EchoEngine {
 
     fn talkback(&self) -> Option<UplinkCodec> {
         self.talkback
+    }
+
+    /// Judges a re-offer as [`EchoSessionFactory`] judges an offer: the
+    /// echo fixes nothing an answer could keep.
+    fn talkback_request(&self, offer: &str) -> crate::output::TalkbackJudge {
+        let offer = offer.to_owned();
+        Box::new(move |backchannel| EchoSessionFactory.talkback_request(&offer, None, backchannel))
     }
 
     /// Answers [`ECHO_RENEGOTIATED`] with ` backchannel=<codec>` when
@@ -2367,6 +2368,17 @@ mod tests {
                 "the backchannel takes a codec talk-back cannot feed".into()
             )
         );
+        // A re-offer, as its session judges it: as the factory would.
+        let judge = engine.talkback_request("v=0 talk");
+        assert_eq!(judge(target), TalkbackRequest::Negotiable);
+        assert_eq!(
+            judge(None),
+            TalkbackRequest::Unsupported("the camera offers no backchannel".into())
+        );
+        assert_eq!(
+            engine.talkback_request("v=0")(target),
+            TalkbackRequest::NotRequested
+        );
     }
 
     #[test]
@@ -2609,5 +2621,142 @@ mod tests {
             );
         }
         assert_eq!(engine.stats().uplink_packets, 2);
+    }
+
+    /// A frame of `track` for the fake clip container: `ts` ticks, captured
+    /// `ms` after `t0`.
+    fn clip_frame(
+        t0: Instant,
+        ms: u64,
+        ts: i64,
+        keyframe: bool,
+        payload: &'static [u8],
+    ) -> Arc<MediaFrame> {
+        let at = t0 + Duration::from_millis(ms);
+        Arc::new(MediaFrame {
+            ts: MediaTime::from_ticks(ts),
+            wallclock: at,
+            arrival: at,
+            keyframe,
+            discontinuity: false,
+            epoch: 1,
+            payload: Bytes::from_static(payload),
+        })
+    }
+
+    /// The fake clip container carries H.264, H.265, AAC-LC and Opus and
+    /// nothing else; it writes a line per call, each frame's payload after
+    /// its line, and its media time per track is the capture time of the
+    /// track's latest frame from its first frame's, zero before one.
+    #[test]
+    fn the_fake_clip_container_writes_lines_at_the_capture_times_media_time() {
+        let factory = FakeClipMuxerFactory::default();
+        for codec in [
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            Codec::H265 {
+                vps: None,
+                sps: None,
+                pps: None,
+            },
+            fake_aac(),
+            Codec::Opus { channels: 2 },
+        ] {
+            assert!(factory.accepts(&codec), "{codec:?}");
+        }
+        assert!(!factory.accepts(&Codec::Pcmu));
+        let video = ClipTrack {
+            codec: Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            clock_rate: 90_000,
+        };
+        let audio = ClipTrack {
+            codec: fake_aac(),
+            clock_rate: 16_000,
+        };
+        let mut muxer = factory.muxer(&ClipPolicy::default());
+        assert_eq!(
+            muxer.start(&video, Some(&audio)).unwrap(),
+            [Bytes::from_static(b"init video=h264 audio=aac_lc\n")]
+        );
+        assert_eq!(muxer.media_time(Kind::Video), Duration::ZERO);
+        let t0 = SystemClock.now();
+        assert_eq!(
+            muxer
+                .push(Kind::Audio, clip_frame(t0, 0, 0, true, b"aa"))
+                .unwrap(),
+            [
+                Bytes::from_static(b"frame a 1 0 k 2\n"),
+                Bytes::from_static(b"aa")
+            ]
+        );
+        assert_eq!(
+            muxer
+                .push(Kind::Video, clip_frame(t0, 40, 3_600, true, b"vvv"))
+                .unwrap(),
+            [
+                Bytes::from_static(b"frame v 1 3600 k 3\n"),
+                Bytes::from_static(b"vvv")
+            ]
+        );
+        assert_eq!(
+            muxer
+                .push(Kind::Video, clip_frame(t0, 140, 12_600, false, b"p"))
+                .unwrap(),
+            [
+                Bytes::from_static(b"frame v 1 12600 - 1\n"),
+                Bytes::from_static(b"p")
+            ]
+        );
+        assert_eq!(muxer.media_time(Kind::Video), Duration::from_millis(140));
+        assert_eq!(muxer.media_time(Kind::Audio), Duration::ZERO);
+        assert_eq!(
+            muxer
+                .push(Kind::Audio, clip_frame(t0, 64, 1_024, true, b"a"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(muxer.media_time(Kind::Audio), Duration::from_millis(64));
+        assert_eq!(muxer.finish().unwrap(), [Bytes::from_static(b"end\n")]);
+
+        let mut muxer = factory.muxer(&ClipPolicy::default());
+        assert_eq!(
+            muxer.start(&video, None).unwrap(),
+            [Bytes::from_static(b"init video=h264\n")]
+        );
+    }
+
+    /// The fake clip container fails where it is told to, and only there.
+    #[test]
+    fn the_fake_clip_container_fails_where_it_is_told() {
+        let video = ClipTrack {
+            codec: Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            clock_rate: 90_000,
+        };
+        let frame = clip_frame(SystemClock.now(), 0, 0, true, b"v");
+        let muxer = |fail| FakeClipMuxerFactory { fail: Some(fail) }.muxer(&ClipPolicy::default());
+        assert_eq!(
+            muxer(FakeClipFailure::Start).start(&video, None),
+            Err(ClipError::Unsupported(CodecFamily::H264))
+        );
+        let mut push = muxer(FakeClipFailure::Push);
+        assert!(push.start(&video, None).is_ok());
+        assert!(push.push(Kind::Video, Arc::clone(&frame)).is_err());
+        assert!(push.finish().is_ok());
+        let mut finish = muxer(FakeClipFailure::Finish);
+        assert!(finish.start(&video, None).is_ok());
+        assert!(finish.push(Kind::Video, frame).is_ok());
+        assert!(finish.finish().is_err());
     }
 }

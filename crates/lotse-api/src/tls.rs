@@ -63,6 +63,7 @@ use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::clients::ClientStore;
+use crate::clip::{BodyWatch, Watched};
 use crate::identity::ServerIdentity;
 use crate::listener::{BindError, PeerInfo, accept_retrying};
 use crate::pairing::{self, CODE_LIFETIME, PairContext, Pairing, Unpaired};
@@ -480,7 +481,9 @@ async fn first_code_expired(
 /// the upgrade's slot and deadline it took when it authenticated.
 pub(crate) struct Authenticated {
     /// The authenticated stream.
-    pub(crate) stream: TlsStream<TcpStream>,
+    pub(crate) stream: TlsStream<Watched>,
+    /// What its socket reports its writes to.
+    pub(crate) body: BodyWatch,
     /// Who it is.
     pub(crate) peer: PeerInfo,
     /// Its place among the connections awaiting the upgrade.
@@ -548,8 +551,13 @@ pub(crate) async fn accept_loop(listener: TcpListener, handshakes: Handshakes) {
 async fn handshake(tcp: TcpStream, addr: SocketAddr, ticket: Ticket, h: Handshakes) {
     // Control frames are small and wait on each other: no Nagle delay.
     let _nodelay = tcp.set_nodelay(true);
+    // The session goes over the watched socket: it takes what it is given
+    // into its own buffer, so only the socket says whether the client
+    // takes a clip's body.
+    let body = BodyWatch::new();
+    let socket = Watched::new(Box::new(tcp), body.clone(), Arc::clone(&h.clock));
     let accepted = tokio::select! {
-        accepted = h.acceptor.accept(tcp) => accepted,
+        accepted = h.acceptor.accept(socket) => accepted,
         () = h.clock.sleep(HANDSHAKE_TIMEOUT) => {
             if let Some(refused) = h.gate.failed(h.clock.now()) {
                 let timeout_ms = HANDSHAKE_TIMEOUT.as_millis();
@@ -589,6 +597,7 @@ async fn handshake(tcp: TcpStream, addr: SocketAddr, ticket: Ticket, h: Handshak
             let deadline = h.clock.sleep(UPGRADE_TIMEOUT);
             let tls = Authenticated {
                 stream,
+                body,
                 peer,
                 slot,
                 deadline,
@@ -615,7 +624,7 @@ async fn handshake(tcp: TcpStream, addr: SocketAddr, ticket: Ticket, h: Handshak
 
 /// The pin of the certificate the client authenticated with; always
 /// there after a handshake, which requires one.
-fn pin_of(stream: &TlsStream<TcpStream>) -> Option<Fingerprint> {
+fn pin_of(stream: &TlsStream<Watched>) -> Option<Fingerprint> {
     let certificate = stream.get_ref().1.peer_certificates()?.first()?;
     Some(Fingerprint::of(certificate))
 }

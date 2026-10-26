@@ -112,8 +112,10 @@ mpeg2ts-reader = { version = "0.18", default-features = false }
 # trun); bounded `Vec`s for untrusted counts, no `unsafe` in the decoding. Also the encoder of the
 # event clips' fragmented MP4 (lotse-mux): the same boxes, with `mp4a`/`Opus` sample entries. Its
 # optional features (bytes, serde, tokio) are off; num, derive_more, pastey and thiserror 1 come
-# with it.
-mp4-atom = { version = "0.16", default-features = false }
+# with it. Pinned: the fmp4 reader's box walk mirrors how 0.16.2 reads boxes, item references and
+# descriptors (what it counts unchecked, what it reads on the stack), so every bump re-audits
+# those internals.
+mp4-atom = { version = "=0.16.2", default-features = false }
 # RTSP message parsing and serialization for the fake camera of the tests.
 rtsp-types = { version = "0.1", default-features = false }
 # SDP media descriptions in `lotse-rtsp`: the payload type and `a=ptime` of a camera's backchannel
@@ -193,12 +195,6 @@ adts-reader = { version = "0.4", default-features = false }
 # The resampler of the transcoder, AAC rates to Opus's 48 kHz: pure Rust windowed-sinc, without the
 # FFT resampler.
 rubato = { version = "5", default-features = false }
-# The ITU-T G.722 decoder of the clips' G.722 → Opus transcode: pure Rust without `unsafe` of its
-# own (its QMF's SIMD goes through `wide`), infallible on any octet, and bit-exact with the ITU-T
-# reference decoder (the G.191 STL's `g722demo`, mode 1) and ffmpeg 9.0.2's. No features;
-# nanoaudio-core (no dependencies) and `wide` (bytemuck, in the tree already, and on x86
-# safe_arch) come with it.
-nanoaudio-g722 = { version = "0.1.1", default-features = false }
 
 # Workspace crates; the allowed edges are in .cargo/layering.toml.
 lotse-api = { path = "crates/lotse-api" }

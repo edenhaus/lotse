@@ -239,10 +239,3 @@ path = "fuzz_targets/hls_session.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "clip_audio"
-path = "fuzz_targets/clip_audio.rs"
-test = false
-doc = false
-bench = false

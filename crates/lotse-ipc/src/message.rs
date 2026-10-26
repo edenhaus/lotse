@@ -168,8 +168,10 @@ pub struct ClipSpec {
     /// How far before now the clip should start, in milliseconds; what
     /// the pre-roll window holds bounds what it gets.
     pub before_ms: u32,
-    /// How long it runs after now, in milliseconds; `None` until it is
-    /// stopped, bounded by the worker's longest clip.
+    /// How long it runs after the worker gets it, in milliseconds: what
+    /// is left of the client's `after_ms`, the supervisor taking off what
+    /// the start waited for a worker; `None` until it is stopped, bounded
+    /// by the worker's longest clip.
     pub after_ms: Option<u32>,
     /// Take the stream's audio into the clip when it has one that fits.
     pub audio: bool,
@@ -422,8 +424,11 @@ pub enum ToSupervisor {
 pub enum ClipReport {
     /// The clip's first fragment is under way.
     Started {
-        /// How far before the start the clip begins, in milliseconds:
-        /// the age of the keyframe it starts at.
+        /// How far before this report the clip begins, in milliseconds:
+        /// the age, when the container started (which is when the worker
+        /// sends this), of the keyframe it starts at. The supervisor
+        /// stamps the API's `at` on the report's arrival, so
+        /// `at − before_ms` is that keyframe's capture time.
         before_ms: u32,
         /// The video codec by its API name (`h264`, `h265`).
         video: String,
@@ -454,7 +459,9 @@ pub enum ClipReport {
     Stopped {
         /// Why (`completed`, `stopped`, `client_gone`, ...).
         reason: String,
-        /// The bytes written to the pipe.
+        /// The file's length: the bytes written to the pipe, and the last
+        /// ones its reader did not take in time, which the pipe never got;
+        /// a body that read fewer is cut.
         bytes: u64,
         /// The media time the clip covers, in milliseconds.
         duration_ms: u32,

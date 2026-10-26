@@ -233,6 +233,16 @@ impl Mic {
         Self::new(MicCodec::Opus(Box::new(Encoder::new(1).expect("libopus"))))
     }
 
+    /// Its `a=rtpmap` encoding (RFC 8866 §6.6; RFC 3551 §4.5.14, RFC
+    /// 7587 §7).
+    const fn encoding(&self) -> &'static str {
+        match self.codec {
+            MicCodec::G711(Law::Mu) => "PCMU/8000",
+            MicCodec::G711(Law::A) => "PCMA/8000",
+            MicCodec::Opus(_) => "opus/48000/2",
+        }
+    }
+
     /// The sampling rate of its timestamps.
     const fn rate(&self) -> u32 {
         match self.codec {
@@ -274,6 +284,8 @@ struct Peer {
     offer: String,
     /// The payload type the answer named first on the talk-back m-line.
     pt: Option<u8>,
+    /// Its encoding, as the answer's `a=rtpmap` names it.
+    encoding: Option<String>,
     /// The microphone, while talking.
     mic: Option<Mic>,
     out: Vec<Outgoing>,
@@ -300,6 +312,7 @@ impl Peer {
             socket,
             offer,
             pt: None,
+            encoding: None,
             mic: None,
             out: Vec::new(),
         }
@@ -318,6 +331,7 @@ impl Peer {
             socket,
             offer,
             pt: None,
+            encoding: None,
             mic: None,
             out: Vec::new(),
         }
@@ -336,6 +350,7 @@ impl Peer {
             socket,
             offer,
             pt: None,
+            encoding: None,
             mic: None,
             out: Vec::new(),
         }
@@ -356,6 +371,7 @@ impl Peer {
             .accept_answer(sdp, &mut self.out)
             .expect("the answer applies");
         self.pt = talkback_pt(sdp);
+        self.encoding = self.pt.and_then(|pt| talkback_encoding(sdp, pt));
     }
 
     fn on_candidate(&mut self, candidate: &str) {
@@ -400,6 +416,16 @@ impl Peer {
         if let (Some(mic), Some(pt)) = (self.mic.as_mut(), self.pt)
             && mic.next <= now
         {
+            // A browser sends the codec the answer names first (RFC 3264
+            // §7), never one codec's bytes under another's payload type:
+            // a mismatch is the daemon's answer, which fails here, not as
+            // talk-back that never arrives.
+            let named = self.encoding.as_deref().unwrap_or("no codec");
+            assert!(
+                named.eq_ignore_ascii_case(mic.encoding()),
+                "the answer names {named} first on the talk-back m-line; the mic sends {}",
+                mic.encoding()
+            );
             let (payload, step) = mic.encode();
             if !mic.lost.contains(&mic.index) {
                 self.viewer
@@ -441,6 +467,17 @@ fn talkback_pt(sdp: &str) -> Option<u8> {
         .find_map(|line| line.strip_prefix("m=audio "))
         .and_then(|rest| rest.split(' ').nth(2))
         .and_then(|pt| pt.trim().parse().ok())
+}
+
+/// The encoding of the payload type `pt` on an answer's last audio m-line
+/// (its `a=rtpmap`, RFC 8866 §6.6).
+fn talkback_encoding(sdp: &str, pt: u8) -> Option<String> {
+    let (_, section) = sdp.rsplit_once("m=audio ")?;
+    let prefix = format!("a=rtpmap:{pt} ");
+    section
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(|encoding| encoding.trim().to_owned())
 }
 
 /// The root mean square of `samples`, of full scale.
