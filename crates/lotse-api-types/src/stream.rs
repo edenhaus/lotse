@@ -364,7 +364,9 @@ pub struct StreamStats {
     /// Gaps in the stream's clips.
     #[serde(default)]
     pub clip_gaps: u64,
-    /// Bytes of clip files written to their bodies.
+    /// The length of the stream's clip files, as their workers report
+    /// them (`stopped`'s `bytes`): a last tail a body did not take in time
+    /// is counted, though it never reached the body.
     #[serde(default)]
     pub clip_bytes: u64,
 }
