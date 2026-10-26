@@ -465,8 +465,11 @@ impl ToOpus {
             .rebase
             .saturating_add(near.saturating_sub(offset));
         self.new_epoch();
-        // After the rebase: the frame's timestamp on the timeline.
-        self.timeline.placed = Some((to_48k(self.ts(frame), self.clock_rate), frame.wallclock));
+        // The sample count, where the frame's audio goes in the run, not
+        // its timestamp, which may be off it by up to the tolerance: the
+        // packets follow the count, so a jittered stamp would place the new
+        // epoch that far off and overlap or leave a hole after the last.
+        self.timeline.placed = Some((to_48k(self.position(), self.clock_rate), frame.wallclock));
     }
 
     /// Starts a timeline at `frame`, placed at its capture time, `offset`
@@ -919,6 +922,12 @@ mod tests {
             split[25].discontinuity = true;
             let packets = run(&mut ToOpus::new(&Codec::G722, 8_000).unwrap(), &split);
             assert_eq!(audio(&packets), audio(&whole), "wrap {wrap}");
+            // Placed by the sample count, not by frame 25's late stamp: the
+            // capture times go on as in the unsplit run.
+            let captured = |packets: &[Arc<MediaFrame>]| -> Vec<Instant> {
+                packets.iter().map(|packet| packet.wallclock).collect()
+            };
+            assert_eq!(captured(&packets), captured(&whole), "wrap {wrap}");
             // Frame 25 completes packet 24: the new output epoch starts there.
             let epochs: Vec<(u32, bool)> = packets
                 .iter()
