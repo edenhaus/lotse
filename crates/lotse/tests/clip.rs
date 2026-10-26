@@ -902,7 +902,8 @@ async fn rfc9112_8_a_worker_crash_ends_the_clip_worker_crashed_and_cuts_its_body
 }
 
 /// A clip of an idle stream is demand: the stream connects for it, and it
-/// starts at the first keyframe, `before_ms` 0. Nobody fetches its body
+/// starts at the first keyframe as it arrives (`before_ms` under a frame:
+/// the time it took to reach the container). Nobody fetches its body
 /// within `limits.clip_fetch_timeout_ms`, so it ends `not_fetched`, and a
 /// `GET` afterwards finds no clip (404 `clip_not_found`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -922,7 +923,11 @@ async fn rfc9110_15_5_5_a_clip_nobody_fetches_ends_not_fetched_and_its_body_is_g
         .await;
     let events = control.until_stopped(id).await;
     assert_eq!(events[0]["type"], "started", "{events:?}");
-    assert_eq!(events[0]["before_ms"], 0, "nothing held: {events:?}");
+    let before_ms = events[0]["before_ms"].as_u64().unwrap();
+    assert!(
+        before_ms < FRAME_MS,
+        "nothing held: the first keyframe as it arrived, {before_ms} ms old: {events:?}"
+    );
     assert_eq!(
         events.last().unwrap()["reason"],
         "not_fetched",
