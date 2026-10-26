@@ -168,8 +168,10 @@ pub struct ClipSpec {
     /// How far before now the clip should start, in milliseconds; what
     /// the pre-roll window holds bounds what it gets.
     pub before_ms: u32,
-    /// How long it runs after now, in milliseconds; `None` until it is
-    /// stopped, bounded by the worker's longest clip.
+    /// How long it runs after the worker gets it, in milliseconds: what
+    /// is left of the client's `after_ms`, the supervisor taking off what
+    /// the start waited for a worker; `None` until it is stopped, bounded
+    /// by the worker's longest clip.
     pub after_ms: Option<u32>,
     /// Take the stream's audio into the clip when it has one that fits.
     pub audio: bool,

@@ -35,8 +35,9 @@
 //! report, putting its own reason in place of the worker's `stopped`. A
 //! clip whose start still waits for a worker gets that report from its
 //! driver instead, which also ends one that waited too long
-//! (`source_not_live`, `crate::driver::CLIP_START_WAIT`), so a fetched
-//! clip without a worker still ends. When
+//! (`source_not_live`, `crate::driver::CLIP_START_WAIT`) or whose end
+//! passed before a worker came, so a fetched clip without a worker still
+//! ends. When
 //! the worker cannot report any more (it exited, the stream was deleted or
 //! moved to another connection, shutdown, a malformed report), the clip
 //! ends at once without it: `stopped` then says 0 bytes and 0 ms, since
