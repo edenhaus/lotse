@@ -2653,7 +2653,9 @@ mod tests {
     /// The fake clip container carries H.264, H.265, AAC-LC and Opus and
     /// nothing else; it writes a line per call, each frame's payload after
     /// its line, and its media time per track is the capture time of the
-    /// track's latest frame from its first frame's, zero before one.
+    /// track's latest frame from its origin, the one set before its first
+    /// frame or else that frame's (one set later is ignored), zero before
+    /// one.
     #[test]
     fn the_fake_clip_container_writes_lines_at_the_capture_times_media_time() {
         let factory = FakeClipMuxerFactory::default();
@@ -2737,6 +2739,26 @@ mod tests {
             muxer.start(&video, None).unwrap(),
             [Bytes::from_static(b"init video=h264\n")]
         );
+        // Media time 0 at the origin set before the first frame, not at that
+        // frame's capture time; one set after it is ignored.
+        muxer.set_origin(t0);
+        assert_eq!(
+            muxer
+                .push(Kind::Video, clip_frame(t0, 100, 9_000, true, b"v"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(muxer.media_time(Kind::Video), Duration::from_millis(100));
+        muxer.set_origin(t0 + Duration::from_millis(100));
+        assert_eq!(
+            muxer
+                .push(Kind::Video, clip_frame(t0, 140, 12_600, false, b"p"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(muxer.media_time(Kind::Video), Duration::from_millis(140));
     }
 
     /// The fake clip container fails where it is told to, and only there.
