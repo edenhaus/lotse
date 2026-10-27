@@ -16,7 +16,9 @@
 //! there, by position, never by capture time); the audio starts with the
 //! frame playing when that keyframe was captured, by the ring's measure
 //! ([`captured`]: its arrival when it is dated ahead of it), from where
-//! `before_ms` counts.
+//! `before_ms` counts. The container's media time 0 is the earlier capture
+//! time of the two tracks' first frames, so neither starts later than it
+//! was captured.
 //! With nothing held it starts at the next keyframe, waiting for it up to
 //! the start timeout, which a keyframe queued meets even while the
 //! interleaver holds it for the audio. `before_ms` is the age of the first
@@ -1259,20 +1261,30 @@ impl Clip {
     /// `Started` goes out: this one, or the keyframe queued behind an audio
     /// frame captured before it. Counted from `StartClip` instead, it would
     /// disagree with the `at` the supervisor stamps on arrival by however
-    /// long the start waited. Transcoded audio is Opus in the container
-    /// ([`ToOpus::output`]), and the container's media time 0 is the
-    /// transcode's delay before `frame`'s capture time, since its packets
-    /// are moved back by it ([`ToOpus::delay`]); `before_ms` still counts
-    /// to the keyframe, the first video frame.
+    /// long the start waited. The container's media time 0 is the capture
+    /// time of the earlier of `frame` and the other track's first frame
+    /// queued: the interleaver hands frames out by the ring's measure,
+    /// which counts a frame dated ahead of its arrival from its arrival, so
+    /// the first one out can be dated after the other track's first, which
+    /// the container would otherwise start late, out of sync by the
+    /// difference. Transcoded audio is Opus in the container
+    /// ([`ToOpus::output`]), and media time 0 is then the transcode's delay
+    /// before that, since its packets are moved back by it
+    /// ([`ToOpus::delay`]); `before_ms` still counts to the keyframe, the
+    /// first video frame.
     fn begin(
         &mut self,
         track: Kind,
         frame: &Arc<MediaFrame>,
         media: &Media,
     ) -> Result<(), EndReason> {
+        let other = media.interleaver.queue().first_frame(match track {
+            Kind::Video => Kind::Audio,
+            Kind::Audio => Kind::Video,
+        });
         let first = match track {
             Kind::Video => Some(frame),
-            Kind::Audio => media.interleaver.queue().first_frame(Kind::Video),
+            Kind::Audio => other,
         };
         self.before_ms = first.map_or(0, |first| {
             millis(self.clock.now().saturating_duration_since(captured(first)))
@@ -1289,7 +1301,10 @@ impl Clip {
             .transcoder
             .as_ref()
             .map_or(Duration::ZERO, ToOpus::delay);
-        let origin = frame.wallclock.checked_sub(lead).unwrap_or(frame.wallclock);
+        let earliest = other.map_or(frame.wallclock, |other| {
+            other.wallclock.min(frame.wallclock)
+        });
+        let origin = earliest.checked_sub(lead).unwrap_or(earliest);
         self.muxer.set_origin(origin);
         self.queue(init);
         self.begun = true;
@@ -3877,6 +3892,150 @@ mod tests {
             "by its arrival too: after the audio before 500 ms"
         );
         assert_eq!(reports, vec![stopped("stopped", bytes.len(), 512, 0)]);
+    }
+
+    /// What a clip's container was given to place its start: the origin
+    /// set, and the capture times of the first frame pushed of each track.
+    #[derive(Debug, Clone, Default)]
+    struct Placing(Arc<std::sync::Mutex<[Option<Instant>; 3]>>);
+
+    impl Placing {
+        /// Where the container put the first video and the first audio
+        /// frame from its media time 0, in µs: negative before it, where
+        /// it cannot put them, so it starts them there, late.
+        fn starts(&self) -> (i128, i128) {
+            let [origin, video, audio] = *self.0.lock().unwrap();
+            let micros = |at: Option<Instant>| {
+                let (at, origin) = (at.unwrap(), origin.unwrap());
+                let after =
+                    i128::try_from(at.saturating_duration_since(origin).as_micros()).unwrap();
+                let before =
+                    i128::try_from(origin.saturating_duration_since(at).as_micros()).unwrap();
+                after - before
+            };
+            (micros(video), micros(audio))
+        }
+    }
+
+    /// [`Placing`]'s muxer: the fake one, recording.
+    struct PlacingMuxer {
+        inner: Box<dyn ClipMuxer>,
+        seen: Placing,
+    }
+
+    impl ClipMuxerFactory for Placing {
+        fn accepts(&self, codec: &Codec) -> bool {
+            FakeClipMuxerFactory::default().accepts(codec)
+        }
+
+        fn muxer(&self, policy: &ClipPolicy) -> Box<dyn ClipMuxer> {
+            Box::new(PlacingMuxer {
+                inner: FakeClipMuxerFactory::default().muxer(policy),
+                seen: self.clone(),
+            })
+        }
+    }
+
+    impl ClipMuxer for PlacingMuxer {
+        fn start(
+            &mut self,
+            video: &ClipTrack,
+            audio: Option<&ClipTrack>,
+        ) -> Result<Vec<Bytes>, ClipError> {
+            self.inner.start(video, audio)
+        }
+
+        fn set_origin(&mut self, origin: Instant) {
+            self.seen.0.lock().unwrap()[0].get_or_insert(origin);
+            self.inner.set_origin(origin);
+        }
+
+        fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, ClipError> {
+            let slot = if track == Kind::Video { 1 } else { 2 };
+            self.seen.0.lock().unwrap()[slot].get_or_insert(frame.wallclock);
+            self.inner.push(track, frame)
+        }
+
+        fn media_time(&self, track: Kind) -> Duration {
+            self.inner.media_time(track)
+        }
+
+        fn finish(&mut self) -> Result<Vec<Bytes>, ClipError> {
+            self.inner.finish()
+        }
+    }
+
+    /// The container's media time 0 is the earlier capture time of the two
+    /// tracks' first frames, whichever the interleaver hands out first: of
+    /// audio dated after its arrival (a Sender Report fit, RFC 3550
+    /// §6.4.1), the frame that arrived before the keyframe can be dated
+    /// after it and goes out first, by the ring's measure, and the video
+    /// still starts at its own capture time. AAC dated 8 ms after its
+    /// arrival every 64 ms, the keyframe captured at 1.027 s: the audio
+    /// frame that arrived at 1.024 s, dated 1.032 s, starts 5 ms after the
+    /// video. G.711 and G.722 dated 3 ms after their arrival every 20 ms,
+    /// the keyframe captured at 1.001 s: the frame that arrived at 1 s,
+    /// dated 1.003 s, starts its Opus 2 ms after the video, which starts at
+    /// the transcode's delay. Regression (interop with MediaMTX 1.21.1,
+    /// 2026-10-26: G.722 transcoded with its video 0.9 and 2.2 ms short of
+    /// the transcode's delay): media time 0 was the first frame out's, the
+    /// audio's, and the video started late, out of sync by those 5 and
+    /// 2 ms.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_clip_starts_at_the_earlier_of_its_tracks_first_capture_times() {
+        let mut rig = Rig::new(Some(fake_aac()));
+        for index in 0..=16_u32 {
+            let ms = u64::from(index) * 64;
+            rig.advance_to(ms);
+            let mut frame = frame_at(&rig, (ms + 8, ms), i64::from(index) * 1_024, true, 4);
+            frame.payload = vec![0xe0; 4].into();
+            assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
+        }
+        rig.video_frame(1_027, 0, true, 32);
+        rig.advance_to(1_100);
+        let placing = Placing::default();
+        let reader = rig.start_with(
+            spec(73, None, true),
+            placing.clone(),
+            ClipSettings::default(),
+        );
+        settle().await;
+        assert_eq!(rig.report().await, started(73, Some("aac_lc")));
+        rig.clips.stop("k1", EndReason::Stopped);
+        let (_, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+        assert_eq!(
+            lines(&bytes)[1],
+            format!("frame a 0 {} k 4", 16 * 1_024),
+            "out first"
+        );
+        assert_eq!(placing.starts(), (0, 5_000), "aac");
+
+        for codec in [Codec::Pcmu, Codec::G722] {
+            let payload = narrowband_payload(&codec);
+            let mut rig = Rig::new(Some(codec.clone()));
+            for index in 40..=55_u32 {
+                let ms = u64::from(index) * 20;
+                rig.advance_to(ms);
+                let mut frame = frame_at(&rig, (ms + 3, ms), i64::from(index) * 160, true, 0);
+                frame.payload = payload.clone();
+                assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
+                if ms == 1_000 {
+                    rig.video_frame(1_001, 0, true, 32);
+                }
+            }
+            let placing = Placing::default();
+            let reader = rig.start_with(
+                spec(99, None, true),
+                placing.clone(),
+                ClipSettings::default(),
+            );
+            settle().await;
+            let _started = rig.report().await;
+            rig.clips.stop("k1", EndReason::Stopped);
+            let (_, _bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+            let delay = i128::try_from(ToOpus::new(&codec).unwrap().delay().as_micros()).unwrap();
+            assert_eq!(placing.starts(), (delay, 2_000), "{codec:?}");
+        }
     }
 
     /// A clip starts at the newest keyframe captured at or before
