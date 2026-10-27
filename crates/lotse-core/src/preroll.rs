@@ -33,7 +33,10 @@
 //! and back; only the floor, the audio frames trimmed by it and a
 //! snapshot's start, which line audio up with video, use capture time, and
 //! neither the floor nor an audio frame compared with it counts from after
-//! it arrived.
+//! it arrived. An audio snapshot starts by the frames' capture times as
+//! they are, as a clip's container places them: its target is the video
+//! start's capture time, and the frame playing then is the one the file
+//! plays with that keyframe.
 //! Every frame is charged its payload plus [`PREROLL_FRAME_OVERHEAD`], so a
 //! camera sending tiny frames cannot hold more memory than the bound says.
 //! Every trim drops a prefix in one pass that stops where the kept frames
@@ -410,6 +413,23 @@ impl Preroll {
         frame.keyframe || !self.video
     }
 
+    /// When `frame` was captured, as a snapshot's start counts it: by the
+    /// ring's measure ([`captured`]) on video, whose target is a moment on
+    /// the worker's clock (`now − before_ms`); as dated on audio, whose
+    /// target is the video start's capture time and whose frames a clip's
+    /// container places by their capture times as well. Counted from its
+    /// arrival, an audio frame dated after the keyframe would start a clip
+    /// whose container then puts it after the keyframe, and an audio frame
+    /// that arrived before a keyframe dated ahead of its own arrival would
+    /// start the audio that much before the video.
+    fn start_time(&self, frame: &MediaFrame) -> Instant {
+        if self.video {
+            captured(frame)
+        } else {
+            frame.wallclock
+        }
+    }
+
     /// Holds `frame`, which counts `cost`.
     fn append(&mut self, frame: &Arc<MediaFrame>, cost: usize) {
         self.frames.push_back(Arc::clone(frame));
@@ -490,13 +510,14 @@ impl Preroll {
     /// `before_ms`: a keyframe dated ahead of its arrival counts from its
     /// arrival, so a Sender Report mapping off (RFC 3550 §6.4.1) cannot
     /// push the start back to an older one. Every audio frame is a start,
-    /// so an audio ring starts at the frame playing at `target`, by the
-    /// same measure.
+    /// so an audio ring starts at the frame playing at `target`, the video
+    /// start's capture time, by the frames' capture times as they are
+    /// ([`Self::start_time`]).
     pub(crate) fn snapshot(&self, target: Instant) -> Option<PrerollSnapshot> {
         let from = self
             .frames
             .iter()
-            .rposition(|frame| self.starts_at(frame) && captured(frame) <= target)
+            .rposition(|frame| self.starts_at(frame) && self.start_time(frame) <= target)
             .unwrap_or(0);
         let mut frames = self.frames.range(from..).cloned();
         let start = frames.next()?;
@@ -1219,14 +1240,15 @@ mod tests {
         assert_eq!(labels(&snapshot), [3000, 3250]);
     }
 
-    /// A snapshot measures its frames' capture times as a clip measures its
-    /// start ([`captured`]): a frame dated ahead of its arrival (a Sender
-    /// Report mapping off, RFC 3550 §6.4.1) counts from its arrival. Video
-    /// keyframes arriving at 1 s and 2 s dated 61 s and 62 s start a
-    /// snapshot for 3 s at the second, and audio frames dated a minute
-    /// ahead start one for 1 s with the frame that arrived playing then.
-    /// Regression: the ring compared their dates, found none at or before
-    /// the target and started at the oldest held.
+    /// A video snapshot measures its keyframes' capture times as a clip
+    /// measures its start ([`captured`]): a keyframe dated ahead of its
+    /// arrival (a Sender Report mapping off, RFC 3550 §6.4.1) counts from
+    /// its arrival. Video keyframes arriving at 1 s and 2 s dated 61 s and
+    /// 62 s start a snapshot for 3 s at the second. Regression: the ring
+    /// compared their dates, found none at or before the target and
+    /// started at the oldest held. An audio snapshot's target is such a
+    /// keyframe's date, and audio frames dated a minute ahead as well start
+    /// one for 61 s with the frame dated playing then.
     #[test]
     fn rfc3550_6_4_1_a_snapshot_starts_by_when_its_frames_were_captured_never_after_their_arrival()
     {
@@ -1266,7 +1288,32 @@ mod tests {
                 None
             );
         }
-        assert_eq!(starts(&audio, 1000), [800, 1200, 1600]);
+        assert_eq!(starts(&audio, 61_000), [800, 1200, 1600]);
+    }
+
+    /// An audio snapshot starts with the frame playing at its target, the
+    /// video start's capture time, by the frames' capture times as dated,
+    /// where a clip's container places them: of audio frames dated 3 ms
+    /// after their arrival every 20 ms, the one for a keyframe captured at
+    /// 1.001 s is the one dated 0.983 s, which arrived at 0.98 s. Regression
+    /// (interop with MediaMTX 1.21.1, 2026-10-26: G.722 transcoded with its
+    /// video 0.9 and 2.2 ms short of the transcode's delay): the ring
+    /// counted each from its arrival and started with the one that arrived
+    /// at 1 s, dated 1.003 s, after the keyframe.
+    #[test]
+    fn rfc3550_6_4_1_an_audio_snapshot_starts_with_the_frame_dated_at_its_target() {
+        let clip = Clip::new();
+        let mut audio = ring(false, 60_000);
+        for ms in (900..=1100).step_by(20) {
+            assert_eq!(
+                audio.push(&clip.shifted(ms + 3, ms, false), usize::MAX, || None),
+                None
+            );
+        }
+        let start = |target: u64| audio.snapshot(clip.at(target)).unwrap().start().ts.ticks();
+        assert_eq!(start(1001), 980);
+        assert_eq!(start(1003), 1000, "at the date counts");
+        assert_eq!(start(902), 900, "before every date, the oldest held");
     }
 
     #[test]
