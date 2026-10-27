@@ -833,21 +833,6 @@ mod clip {
     /// The G.722 to Opus transcode's delay, 282 ticks at 48 kHz.
     const G722_DELAY_US: u64 = 5_875;
 
-    /// How far after the keyframe the audio frame a clip starts with may be
-    /// dated. The ring starts the audio with the frame playing at the
-    /// keyframe by its measure (`lotse_core::preroll::captured`: the
-    /// capture time, never later than the arrival), but the container
-    /// places every frame by its capture time: a frame whose Sender Report
-    /// fit dates it after its arrival counts from its arrival, so the one
-    /// that arrived by the keyframe's capture time can be dated after it,
-    /// by at most how far its date runs ahead of its arrival. The clip's
-    /// origin, that frame's date less the transcode's delay, then lies
-    /// less than the delay before the keyframe. Observed 0.9 ms (`x86_64`)
-    /// and 2.2 ms (aarch64) with MediaMTX 1.21.1 and ffmpeg 9.0.2,
-    /// 2026-10-26; 5 ms still has the origin before the keyframe for both
-    /// delays.
-    const DATED_AHEAD_US: u64 = 5_000;
-
     /// A daemon on a socket of its own with its control connection.
     async fn daemon(test: &str) -> (Daemon, Arc<Control>, SocketDir) {
         let dir = socket_dir(&format!("interop-clip-{test}"));
@@ -1187,8 +1172,7 @@ mod clip {
     /// falls inside the first audio frame. A transcoded clip's origin lies
     /// the transcode's delay before its first frame, so its video starts at
     /// that delay, plus the lead of the audio frame playing at the keyframe
-    /// when that one was captured before it and so came first, or less up
-    /// to [`DATED_AHEAD_US`] when that frame is dated after the keyframe.
+    /// when that one was captured before it and so came first.
     fn check_audio(audio: Audio, video: &Probed, sound: Option<&Probed>) {
         let Some(sound) = sound else {
             assert_eq!(audio, Audio::None, "an audio stream");
@@ -1240,11 +1224,10 @@ mod clip {
             // frame playing at the keyframe began less than its 20 ms before
             // it (observed 10 to 20 ms with MediaMTX 1.21.1 and ffmpeg 9.0.2,
             // 2026-10-23), give or take a millisecond of the two tracks'
-            // Sender Report fits, or was dated after it by up to
-            // [`DATED_AHEAD_US`].
+            // Sender Report fits.
             assert!(
-                video_us + 12 + DATED_AHEAD_US >= delay_us && video_us < delay_us + 21_000,
-                "video at {video_us} us, audio at {audio_us} us, the delay {delay_us} us"
+                video_us + 12 >= delay_us && video_us < delay_us + 21_000,
+                "video at {video_us} us, the delay {delay_us} us"
             );
         }
         // Give or take a frame at each end, and the 20 ms a transcode keeps.
