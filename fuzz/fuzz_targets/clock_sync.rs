@@ -1,11 +1,17 @@
 //! `clock_sync`: the camera's timing as the RTSP source hands it to core,
 //! RTCP Sender Reports into the clock mapper and RTP timestamps through the
 //! discontinuity guard, never panics on arbitrary values and keeps its
-//! promises: a track without a mapping is mapped by its arrival; one
-//! report moves a mapping, at its own timestamp, by at most the slew limit
-//! of the fit plus that of the offset unless it re-anchors the connection
-//! (a rejected report moves nothing); and the guard reports only jumps
-//! beyond [`MAX_TIMESTAMP_JUMP`] (RFC 3550 §5.1, §6.4.1).
+//! promises: a track without a mapping is mapped by its arrival; an
+//! accepted report's own timestamp maps no later than its arrival plus the
+//! fit's error, at most [`MAX_RESIDUAL`] and the fit's slew limit, since
+//! the offset is never above the report's own arrival minus NTP time; one
+//! report moves a mapping, at its own timestamp, later by at most the slew
+//! limit of the fit plus that of the offset, and earlier by more than the
+//! fit's only when the offset drops to that report's own arrival minus NTP
+//! time, which maps it to within that error of its arrival (a rejected
+//! report or a re-anchor of the connection is not judged); and the guard
+//! reports only jumps beyond [`MAX_TIMESTAMP_JUMP`] (RFC 3550 §5.1,
+//! §6.4.1).
 //! Run with `cargo +nightly fuzz run clock_sync` from the repository root.
 
 #![no_main]
@@ -13,7 +19,7 @@
 use std::time::{Duration, Instant};
 
 use libfuzzer_sys::fuzz_target;
-use lotse_core::clock_map::{ClockMapper, MAX_SLEW, SyncMode};
+use lotse_core::clock_map::{ClockMapper, MAX_RESIDUAL, MAX_SLEW, SyncMode};
 use lotse_core::codec::Kind;
 use lotse_core::discontinuity::{MAX_TIMESTAMP_JUMP, TimestampGuard};
 use lotse_core::source::{ClockReport, SyncHint};
@@ -75,17 +81,35 @@ fuzz_target!(|data: &[u8]| {
                 });
                 let after = mapped(&mapper, track, rtp, t0);
                 if mapper.hints_rejected(track) == rejected
-                    && let (Some(before), Some(after)) = (before, after)
+                    && let Some(after) = after
                 {
-                    let moved = if after > before {
-                        after - before
-                    } else {
-                        before - after
-                    };
+                    // The fit's error at the report: the residual it was
+                    // accepted within, plus the fit's slew toward the new
+                    // line (none on a track's first report).
+                    let error = MAX_RESIDUAL + MAX_SLEW;
                     assert!(
-                        moved <= MAX_SLEW * 2,
-                        "one report moved the mapping by {moved:?}"
+                        after <= now + error,
+                        "a report mapped {:?} after its arrival",
+                        after - now
                     );
+                    if let Some(before) = before {
+                        if after > before {
+                            let moved = after - before;
+                            assert!(
+                                moved <= MAX_SLEW * 2,
+                                "one report moved the mapping later by {moved:?}"
+                            );
+                        } else if before - after > MAX_SLEW {
+                            // Only the offset dropping, to this report's own
+                            // arrival minus NTP time, moves it this far.
+                            let early = now.saturating_duration_since(after);
+                            assert!(
+                                early <= error,
+                                "a report that moved the mapping earlier by {:?} mapped {early:?} before its arrival",
+                                before - after
+                            );
+                        }
+                    }
                 }
             }
             1 => {
