@@ -63,7 +63,8 @@
 //! end, as the audio starts with the frame dated at the start keyframe; an
 //! audio frame captured before the clip's end goes in whatever its date,
 //! while the video's end is not known yet. The clip ends at the audio's
-//! end (at the video's when it has no audio). The audio waits for its end
+//! end (at the video's when it has no audio); one whose first keyframe
+//! comes after its end has no video to write and starts nothing. The audio waits for its end
 //! frame at most `max_skew` after the video's end frame arrived
 //! (`ClipPolicy::max_skew`), one rule at both ends of a clip: a track waits
 //! at most that long for the other. A clip whose end no frame shows ends
@@ -783,8 +784,9 @@ struct Clip {
     /// own end ([`Self::audio_end`]) or [`Self::end_deadline`].
     video_ended: bool,
     /// The capture time of the video's end frame as dated, set when the
-    /// video met it while the clip has audio: the audio ends at its first
-    /// frame dated at or after it ([`Self::at_end`]).
+    /// video met it while the clip has audio and its container started:
+    /// the audio ends at its first frame dated at or after it
+    /// ([`Self::at_end`]).
     audio_end: Option<Instant>,
     /// When the audio's wait for its end frame is over, set with
     /// [`Self::audio_end`]: `max_skew` after the video's end frame arrived,
@@ -1179,7 +1181,8 @@ impl Clip {
     }
 
     /// One frame: the end when it is at the clip's end
-    /// ([`Self::at_end`]), except the video's while the clip has audio,
+    /// ([`Self::at_end`]), except the video's while the clip has audio and
+    /// its container started (before, no video goes in, so nothing does),
     /// which then runs on to the video end's date ([`Self::audio_end`]) for
     /// `max_skew` at most ([`Self::end_deadline`]), and nothing for a video frame after the video's end
     /// ([`Self::video_ended`]); the container's start before the first;
@@ -1209,7 +1212,7 @@ impl Clip {
         if self.at_end(track, &frame, media) {
             if track == Kind::Video {
                 self.video_ended = true;
-                if media.audio.is_some() {
+                if self.begun && media.audio.is_some() {
                     let wait = frame
                         .arrival
                         .checked_add(self.settings.policy.max_skew)
@@ -1287,6 +1290,9 @@ impl Clip {
     /// an audio frame captured at or after the clip's end goes out before
     /// it. Before that, an audio frame is at the end when it was captured
     /// at or after the clip's end: the video stalled past `max_skew`.
+    /// Before the container started, an audio frame is at the end once the
+    /// video's first frame is: a clip whose first keyframe comes after its
+    /// end has no video to write and starts nothing, not the audio alone.
     fn at_end(&self, track: Kind, frame: &MediaFrame, media: &Media) -> bool {
         match track {
             Kind::Video => captured(frame) >= self.end_at,
@@ -1300,6 +1306,9 @@ impl Clip {
                         .map(|video| video.wallclock)
                 });
                 match video_end {
+                    // The video's first frame is at the end: none of the
+                    // video goes in, so neither does the audio alone.
+                    Some(_) if !self.begun => true,
                     Some(end) => frame.wallclock >= end,
                     None => captured(frame) >= self.end_at,
                 }
@@ -5312,6 +5321,57 @@ mod tests {
             .rfind(|line| line.starts_with("frame a"))
             .unwrap();
         assert_eq!(last, format!("frame a 0 {} k 4", 2_752 * 16));
+    }
+
+    /// A clip whose first keyframe comes after its end has no video to
+    /// write, so it starts nothing, not the audio alone: neither with the
+    /// audio that goes out after that keyframe dated before it (the
+    /// keyframe arriving at 1.05 s for a clip ending at 1 s, dated 400 ms
+    /// after its arrival, a camera whose Sender Reports date it so, RFC
+    /// 3550 §6.4.1), nor with an audio frame captured before the clip's
+    /// end, at 0.99 s, that goes out before it, delivered after it at
+    /// 1.06 s. Either way the clip ends `completed` without a byte, as one
+    /// without audio does, at the keyframe, not waiting for the audio.
+    /// Regression: the first ran the audio on to the keyframe's date and
+    /// the second started the container with the audio frame, a file whose
+    /// video track had no sample.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_clip_whose_first_keyframe_comes_after_its_end_starts_nothing() {
+        let (logs, _guard) = Logs::capture();
+        // (captured, arrived) of each AAC frame, in ms, after the keyframe.
+        let after: Vec<(u64, u64)> = every_64_ms(25)
+            .into_iter()
+            .skip(17)
+            .map(|at| (at, at))
+            .collect();
+        let mut late = vec![(990, 1_060)];
+        late.extend(after.clone());
+        for audio in [after, late] {
+            let mut rig = Rig::new(Some(fake_aac()));
+            let reader = rig.start(spec(0, Some(1_000), true));
+            rig.advance_to(1_050);
+            let keyframe = frame_at(&rig, (1_450, 1_050), 0, true, 16);
+            assert!(rig.video().publish_frame(keyframe));
+            settle().await;
+            for (date, arrival) in audio {
+                rig.advance_to(arrival);
+                let ticks = i64::try_from(date).unwrap() * 16;
+                let mut frame = frame_at(&rig, (date, arrival), ticks, true, 4);
+                frame.payload = vec![0xe0; 4].into();
+                assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
+                settle().await;
+            }
+            let reports = rig.until_stopped().await;
+            assert_eq!(reports, vec![stopped("completed", 0, 0, 0)]);
+            assert!(reader.rest().await.is_empty());
+        }
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "clip: the video's end is reached; the audio runs on to its date, for max_skew at most"
+            ),
+            0
+        );
     }
 
     /// A finite clip's end is measured by when its frames were captured
