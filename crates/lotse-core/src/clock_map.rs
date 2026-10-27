@@ -7,8 +7,14 @@
 //! clock by least squares over a 30 s window, and one NTP-to-local offset,
 //! the smallest arrival-minus-NTP of the connection's reports, puts every
 //! track on the same local base: the camera's capture clock decides A/V
-//! sync. Every update is slew-limited, so one bad report moves the mapping
-//! by at most [`MAX_SLEW`]. A report that contradicts the fit by more than
+//! sync. Every update of a track's fit is slew-limited, so one bad report
+//! moves the mapping by at most [`MAX_SLEW`]. The offset is never above
+//! that smallest arrival-minus-NTP: it drops to a smaller one at once,
+//! since a report that arrived sooner after its NTP time than the offset
+//! says shows the offset dating its track's frames after they arrived (a
+//! frame cannot be captured after it arrives), and rises toward a larger
+//! one, once the smaller ones leave the window, by at most [`MAX_SLEW`] a
+//! report. A report that contradicts the fit by more than
 //! [`MAX_RESIDUAL`] is rejected, and a camera that keeps contradicting it
 //! (an NTP step) re-anchors the whole connection, all tracks together.
 //! A camera chooses how often it reports, so the lines of rejections,
@@ -37,8 +43,8 @@ use crate::track::TrackId;
 /// The window of Sender Reports a fit and the offset are computed over.
 pub const FIT_WINDOW: Duration = Duration::from_secs(30);
 
-/// How far one report may move a track's mapping or the connection's
-/// offset.
+/// How far one report may move a track's mapping, or raise the
+/// connection's offset.
 pub const MAX_SLEW: Duration = Duration::from_millis(5);
 
 /// A report further than this from the fit's prediction contradicts it
@@ -228,7 +234,9 @@ struct State {
     /// Arrival minus NTP, in nanoseconds on those bases, of the reports in
     /// the window, all tracks together, oldest first.
     offsets: Vec<(Instant, i64)>,
-    /// The offset in use, slewed toward the window's minimum.
+    /// The offset in use: never above the window's minimum, it drops to a
+    /// smaller one at once and rises toward a larger one by at most
+    /// [`MAX_SLEW`] a report.
     offset: Option<i64>,
     /// Judges the skew the mapping errors add up to; outlives re-anchors
     /// and epochs.
@@ -330,8 +338,8 @@ impl State {
         self.offset_report(base_arrival, report);
     }
 
-    /// Adds `report` to the offset window and slews the offset toward the
-    /// window's minimum.
+    /// Adds `report` to the offset window and moves the offset to the
+    /// window's minimum: down at once, up by at most [`MAX_SLEW`].
     fn offset_report(&mut self, base_arrival: Instant, report: Report) {
         let since_base = report.arrival.saturating_duration_since(base_arrival);
         let local = i64::try_from(since_base.as_nanos()).unwrap_or(i64::MAX);
@@ -344,7 +352,15 @@ impl State {
         }
         // The report just added is in the window, so there is a minimum.
         let target = self.offsets.iter().map(|(_, o)| *o).min().unwrap_or(offset);
-        self.offset = Some(self.offset.map_or(target, |from| slew(from, target)));
+        // An offset above the minimum maps that report's NTP time to after
+        // its arrival, and every frame of its track as late: with a report
+        // a track every 10 s (gortsplib v5.6.6's `senderReportPeriod`, which
+        // MediaMTX 1.21.1 serves with), a slew down from a late first report
+        // would date the other tracks ahead of their arrival for minutes.
+        self.offset = Some(
+            self.offset
+                .map_or(target, |from| slew(from, target).min(target)),
+        );
     }
 
     /// Forgets every report and fit: the connection maps by arrival until
@@ -704,27 +720,54 @@ mod tests {
     }
 
     #[test]
-    fn the_offset_is_the_smallest_transit_and_moves_by_the_slew_limit() {
+    fn the_offset_is_the_smallest_transit_at_once_and_rises_by_the_slew_limit() {
         let mapper = ClockMapper::new();
         let t0 = SystemClock.now();
         // The first report was delayed by 20 ms on the way.
         mapper.ingest(sr(V0, 90_000, 0, 0, t0 + ms(20)));
         assert_eq!(mapper.map(V0, 0, t0), t0 + ms(20));
         mapper.ingest(sr(V0, 90_000, 1_000, 90_000, t0 + ms(1_000)));
-        assert_eq!(
-            mapper.map(V0, 0, t0),
-            t0 + ms(15),
-            "5 ms toward the better transit"
-        );
-        mapper.ingest(sr(V0, 90_000, 2_000, 180_000, t0 + ms(2_000)));
-        mapper.ingest(sr(V0, 90_000, 3_000, 270_000, t0 + ms(3_000)));
-        mapper.ingest(sr(V0, 90_000, 4_000, 360_000, t0 + ms(4_000)));
-        assert_eq!(mapper.map(V0, 0, t0), t0, "converged, and no further");
-        // Reports older than the window leave it.
-        mapper.ingest(sr(V0, 90_000, 40_000, 3_600_000, t0 + ms(40_000)));
+        assert_eq!(mapper.map(V0, 0, t0), t0, "the better transit at once");
+        mapper.ingest(sr(V0, 90_000, 2_000, 180_000, t0 + ms(2_010)));
+        assert_eq!(mapper.map(V0, 0, t0), t0, "and no worse one");
+        // Once the better transits leave the window, the offset rises toward
+        // the 10 ms the reports in it take, 5 ms a report.
+        mapper.ingest(sr(V0, 90_000, 40_000, 3_600_000, t0 + ms(40_010)));
         let state = mapper.state.load();
         assert_eq!(state.offsets.len(), 1);
         assert_eq!(state.tracks[&V0].reports.len(), 1);
+        assert_eq!(mapper.map(V0, 0, t0), t0 + ms(5));
+        mapper.ingest(sr(V0, 90_000, 41_000, 3_690_000, t0 + ms(41_010)));
+        assert_eq!(mapper.map(V0, 0, t0), t0 + ms(10));
+        mapper.ingest(sr(V0, 90_000, 42_000, 3_780_000, t0 + ms(42_010)));
+        assert_eq!(
+            mapper.map(V0, 0, t0),
+            t0 + ms(10),
+            "converged, and no further"
+        );
+    }
+
+    /// The first report, the audio's, took 60 ms longer to arrive after its
+    /// NTP time than the video's (a camera whose audio comes 60 ms after
+    /// its video; MediaMTX 1.21.1's reports differed so by 16 to 22 ms on
+    /// `x86_64` and, by the clips they made, by 60 and about 575 ms on a
+    /// loaded aarch64 runner, 2026-10-26): the offset drops to the video's
+    /// transit at once, so no video frame is dated after it arrived and the
+    /// audio is dated 60 ms before it arrived, both at their capture times
+    /// on the camera's clock. Regression: the offset slewed 5 ms toward it,
+    /// and dated every video frame 55 ms after its arrival until 11 more
+    /// reports had come, nearly a minute at one a track every 10 s.
+    #[test]
+    fn rfc3550_6_4_1_a_late_first_report_dates_no_track_after_its_arrival() {
+        let mapper = ClockMapper::new();
+        let t0 = SystemClock.now();
+        // Captured at 0, arriving at 60 ms; captured and arriving at 1 s.
+        mapper.ingest(sr(A0, 16_000, 0, 0, t0 + ms(60)));
+        mapper.ingest(sr(V0, 90_000, 1_000, 90_000, t0 + ms(1_000)));
+        // A video frame captured and arriving at 2 s, and the audio
+        // captured with it, arriving 60 ms later.
+        assert_eq!(mapper.map(V0, 180_000, t0 + ms(2_000)), t0 + ms(2_000));
+        assert_eq!(mapper.map(A0, 32_000, t0 + ms(2_060)), t0 + ms(2_000));
     }
 
     #[test]
