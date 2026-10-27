@@ -770,6 +770,44 @@ mod tests {
         assert_eq!(mapper.map(A0, 32_000, t0 + ms(2_060)), t0 + ms(2_000));
     }
 
+    /// The `clock_sync` fuzz target's input (CI run 40482052038,
+    /// 2026-10-27): two reports of one track arriving together, the
+    /// second's NTP time 179.6875 ms after the first's and its timestamp
+    /// 179.2 ms after it at 90 kHz. The second came 179.6875 ms sooner
+    /// after its NTP time, so the offset drops by that at once and maps the
+    /// second's timestamp 179.2 ms earlier than the first report did, to
+    /// its arrival: far beyond the slew limits, which bound how much later
+    /// one report moves a mapping but, of a move earlier, only the fit's
+    /// part. Regression: the offset slewed 5 ms toward it and mapped the
+    /// timestamp 174.6875 ms after its arrival.
+    #[test]
+    fn rfc3550_6_4_1_a_report_sooner_after_its_ntp_time_maps_it_to_its_arrival_at_once() {
+        let mapper = ClockMapper::new();
+        let t0 = SystemClock.now();
+        mapper.ingest(sr(V0, 90_000, 0, 0, t0));
+        assert_eq!(
+            mapper.map(V0, 16_128, t0),
+            t0 + Duration::from_micros(179_200)
+        );
+        mapper.ingest(ClockReport {
+            track: V0,
+            clock_rate: 90_000,
+            hint: SyncHint::RtcpSenderReport {
+                // 0x2e00_0000 / 2^32 s.
+                ntp: ntp(0) + (0x2e << 24),
+                rtp_ts: 16_128,
+            },
+            arrival: t0,
+        });
+        assert_eq!(mapper.hints_rejected(V0), 0);
+        assert_eq!(mapper.map(V0, 16_128, t0 + ms(1)), t0);
+        assert_eq!(
+            mapper.map(V0, 0, t0),
+            t0.checked_sub(Duration::from_nanos(179_687_500)).unwrap(),
+            "the first report, at the fitted line's start"
+        );
+    }
+
     #[test]
     fn the_windows_keep_a_bounded_number_of_reports() {
         let mapper = ClockMapper::new();
