@@ -28,20 +28,25 @@
 //! later one before it), and everything after it (by its own window, by
 //! arrival, while the video ring holds nothing), and drops its oldest
 //! frames while it holds more than `preroll_bytes`, down to the newest one.
+//! Of the frames captured at or before the floor by the ring's measure,
+//! the one it keeps is the newest dated at or before the floor, where a
+//! snapshot from any held keyframe can start its audio, else the newest.
 //! Windows are measured by arrival, which only moves forward on a track,
 //! never by capture time, which a camera's Sender Reports can move ahead
 //! and back; only the floor, the audio frames trimmed by it and a
 //! snapshot's start, which line audio up with video, use capture time, and
-//! neither the floor nor an audio frame compared with it counts from after
-//! it arrived. An audio snapshot starts by the frames' capture times as
-//! they are, as a clip's container places them: its target is the video
-//! start's capture time, and the frame playing then is the one the file
-//! plays with that keyframe.
+//! neither the floor nor the end of the audio frames it trims counts from
+//! after it arrived; of those, the one kept counts by its date. An audio
+//! snapshot starts by the frames' capture times as they are, as a clip's
+//! container places them: its target is the video start's capture time,
+//! and the frame playing then is the one the file plays with that
+//! keyframe.
 //! Every frame is charged its payload plus [`PREROLL_FRAME_OVERHEAD`], so a
 //! camera sending tiny frames cannot hold more memory than the bound says.
 //! Every trim drops a prefix in one pass that stops where the kept frames
-//! begin, so it costs what it drops, and the floor is kept in amortized
-//! O(1) a keyframe.
+//! begin, so it costs what it drops (an audio ring's trim by the floor
+//! also what it keeps of the frames that arrived before the floor, dated
+//! after it), and the floor is kept in amortized O(1) a keyframe.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -370,15 +375,13 @@ impl Preroll {
         None
     }
 
-    /// [`Self::push`] on an audio ring: keeps the newest frame captured at
-    /// or before `floor`, a frame dated ahead of its arrival counting by
-    /// its arrival as the floor does ([`captured`]), else the newest that
-    /// arrived at least the window before this one, and what follows. A
-    /// capture time that moves back while behind its arrival still ends the
-    /// stale run at the frame before it: the ring holds what follows until
-    /// the floor passes that frame or `preroll_bytes` drops it, and a
-    /// snapshot still starts at the newest frame captured at or before its
-    /// target.
+    /// [`Self::push`] on an audio ring: keeps from where `floor` starts it
+    /// ([`Self::floor_start`]), else from the newest frame that arrived at
+    /// least the window before this one, and what follows. A capture time
+    /// that moves back while behind its arrival still ends the stale run at
+    /// the frame before it: the ring holds what follows until the floor
+    /// passes that frame or `preroll_bytes` drops it, and a snapshot still
+    /// starts at the newest frame dated at or before its target.
     fn push_audio(
         &mut self,
         frame: &Arc<MediaFrame>,
@@ -388,12 +391,7 @@ impl Preroll {
     ) {
         self.append(frame, cost(frame));
         let stale = match floor {
-            Some(floor) => self
-                .frames
-                .iter()
-                .skip(1)
-                .take_while(|next| captured(next) <= floor)
-                .count(),
+            Some(floor) => self.floor_start(floor),
             None => frame.arrival.checked_sub(window).map_or(0, |cutoff| {
                 self.frames
                     .iter()
@@ -405,6 +403,44 @@ impl Preroll {
         self.drop_front(stale);
         let start = self.fitting_start(cap, 0);
         self.drop_front(start);
+    }
+
+    /// Where an audio ring starts by the video ring's `floor`: the stale
+    /// run is the frames captured at or before it by the ring's measure
+    /// ([`captured`]), up to the first captured after it, so a frame dated
+    /// ahead of its arrival counts by its arrival and cannot hold the ring
+    /// back. Of that run the ring keeps the newest frame dated at or before
+    /// the floor, else the run's last frame. A snapshot starts its audio at
+    /// the newest frame dated at or before the keyframe's date
+    /// ([`Self::start_time`]), never before the floor: one that arrived
+    /// before a later frame captured at or before the floor by its arrival
+    /// but dated after it (AAC dated 8 ms after its arrival, a keyframe at
+    /// 1.027 s and the next frame arriving at 1.024 s, dated 1.032 s) would
+    /// otherwise be gone, and the audio start after the keyframe. The run
+    /// kept beyond the ring's measure is the frames that arrived before the
+    /// floor dated after it: the audio's own dating ahead of its arrival,
+    /// at most `preroll_bytes` as all a ring holds, and walked again by each
+    /// push while held.
+    fn floor_start(&self, floor: Instant) -> usize {
+        let mut dated = self
+            .frames
+            .front()
+            .is_some_and(|front| front.wallclock <= floor)
+            .then_some(0);
+        let mut last = 0;
+        for (index, next) in self
+            .frames
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take_while(|(_, next)| captured(next) <= floor)
+        {
+            last = index;
+            if next.wallclock <= floor {
+                dated = Some(index);
+            }
+        }
+        dated.unwrap_or(last)
     }
 
     /// Whether a clip can start at `frame`: a keyframe, or any audio
@@ -1106,6 +1142,43 @@ mod tests {
             );
         }
         assert_eq!(held(&late), [1300, 1600]);
+    }
+
+    /// An audio ring keeps the frame dated at the floor, which a snapshot
+    /// from the oldest keyframe starts its audio with, when the frames
+    /// after it arrived before the floor but are dated after it. AAC dated
+    /// 8 ms after its arrival every 64 ms, the keyframe captured at
+    /// 1.027 s, and the next frame after it arriving at 1.088 s: the frame
+    /// dated 0.968 s stays. Opus dated 43 ms after its arrival every 20 ms
+    /// (MediaMTX 1.21.1, 2026-10-26), the keyframe at 0.983 s: the frame
+    /// dated then stays, at the floor, as do the two after it, dated after
+    /// it, through the pushes after.
+    /// Regression (Copilot on #77): the ring trimmed by the next frame's
+    /// arrival alone, dropped the frame dated 0.968 s and the snapshot
+    /// started the audio with the one dated 1.032 s, after the keyframe.
+    #[test]
+    fn rfc3550_6_4_1_an_audio_ring_keeps_the_frame_dated_at_the_floor() {
+        let clip = Clip::new();
+        for (every, ahead, keyframe, last, kept) in
+            [(64, 8, 1_027, 1_088, 960), (20, 43, 983, 1_060, 940)]
+        {
+            let mut ring = ring(false, 60_000);
+            for arrival in (0..=last).step_by(every) {
+                let floor = (arrival >= keyframe).then(|| clip.at(keyframe));
+                assert_eq!(
+                    ring.push(
+                        &clip.shifted(arrival + ahead, arrival, false),
+                        usize::MAX,
+                        || floor
+                    ),
+                    None
+                );
+            }
+            assert_eq!(held(&ring)[0], kept, "{every} ms");
+            let start = ring.snapshot(clip.at(keyframe)).unwrap();
+            assert_eq!(start.start().ts.ticks(), kept);
+            assert!(start.start().wallclock <= clip.at(keyframe));
+        }
     }
 
     #[test]
