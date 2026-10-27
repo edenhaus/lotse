@@ -1097,6 +1097,7 @@ mod clip {
         let (daemon, control, dir) = daemon(&format!("{}-{}", video.name(), audio.name())).await;
         put_and_fill(&control, &camera, BEFORE_MS + 1_000, &*clock).await;
 
+        let asked = clock.now();
         let (_id, result, mut events) = control
             .subscribe(json!({
                 "type": "clip/start",
@@ -1107,7 +1108,13 @@ mod clip {
             .await
             .expect("clip/start");
         let fetch = fetch_on_socket(&dir.join("lotse.sock"), result["url"].as_str().unwrap()).await;
-        let events = until_stopped(&mut events, &*clock).await;
+        let first = next_event(&mut events, &*clock).await;
+        // At least how long after the command the clip started (`at`,
+        // which `before_ms` counts back from), while `after_ms` counts from
+        // the command.
+        let start_delay =
+            u64::try_from(clock.now().saturating_duration_since(asked).as_millis()).unwrap();
+        let events = [vec![first], until_stopped(&mut events, &*clock).await].concat();
         let fetched = fetch.await.expect("the fetch");
         check_whole(&fetched, &events, "completed");
         assert_eq!(
@@ -1140,12 +1147,17 @@ mod clip {
         std::fs::write(&file, &fetched.bytes).unwrap();
         let (video_frames, audio_frames) = ffprobe(&file);
         check_video(&video_frames, video);
-        // From the keyframe `before_ms` ago to the first frame at or after
-        // `after_ms` from the start, which the clip leaves out.
+        // From the keyframe `before_ms` before the clip started to the
+        // first frame at or after `after_ms` from the command, which the
+        // clip leaves out: `before_ms + AFTER_MS` less however long after
+        // the command the clip started, which the round trip bounds.
         let span = video_frames.span_ms();
+        let asked_span = before_ms + AFTER_MS;
         assert!(
-            span.abs_diff(before_ms + AFTER_MS) <= 2 * FRAME_MS,
-            "the video covers {span} ms, the clip {before_ms} + {AFTER_MS} ms"
+            (asked_span.saturating_sub(start_delay + 2 * FRAME_MS)..=asked_span + 2 * FRAME_MS)
+                .contains(&span),
+            "the video covers {span} ms, the clip {before_ms} + {AFTER_MS} ms, \
+             started at most {start_delay} ms after it was asked"
         );
         let stopped = events.last().unwrap();
         assert!(
