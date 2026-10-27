@@ -3973,42 +3973,76 @@ mod tests {
     /// still starts at its own capture time. AAC dated 8 ms after its
     /// arrival every 64 ms, the keyframe captured at 1.027 s: the audio
     /// frame that arrived at 1.024 s, dated 1.032 s, starts 5 ms after the
-    /// video. G.711 and G.722 dated 3 ms after their arrival every 20 ms,
-    /// the keyframe captured at 1.001 s: the frame that arrived at 1 s,
-    /// dated 1.003 s, starts its Opus 2 ms after the video, which starts at
-    /// the transcode's delay. Regression (interop with MediaMTX 1.21.1,
+    /// video. The mirror, a keyframe dated 1.030 s that arrived at 0.96 s
+    /// with the audio frame dated 0.968 s: the video goes out first, on the
+    /// tie of their arrivals, and the audio still starts 62 ms before it.
+    /// G.711 and G.722 dated 3 ms after their arrival every 20 ms, the
+    /// keyframe captured at 1.001 s: the frame that arrived at 1 s, dated
+    /// 1.003 s, starts its Opus 2 ms after the video, which starts at the
+    /// transcode's delay. Regression (interop with MediaMTX 1.21.1,
     /// 2026-10-26: G.722 transcoded with its video 0.9 and 2.2 ms short of
-    /// the transcode's delay): media time 0 was the first frame out's, the
-    /// audio's, and the video started late, out of sync by those 5 and
-    /// 2 ms.
+    /// the transcode's delay): media time 0 was the first frame out's, and
+    /// the track out second started late, out of sync: the video by those 5
+    /// and 2 ms, the audio by 62 ms.
     #[tokio::test]
     async fn rfc3550_6_4_1_a_clip_starts_at_the_earlier_of_its_tracks_first_capture_times() {
-        let mut rig = Rig::new(Some(fake_aac()));
-        for index in 0..=16_u32 {
-            let ms = u64::from(index) * 64;
-            rig.advance_to(ms);
-            let mut frame = frame_at(&rig, (ms + 8, ms), i64::from(index) * 1_024, true, 4);
-            frame.payload = vec![0xe0; 4].into();
-            assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
+        for (ahead, keyframe, first, video_first, starts) in [
+            (8, (1_027, 1_027), 16, false, (0, 5_000)),
+            (8, (1_030, 960), 15, true, (62_000, 0)),
+        ] {
+            let mut rig = Rig::new(Some(fake_aac()));
+            // AAC every 64 ms, dated `ahead` ms after its arrival, and the
+            // keyframe, in the order they arrive.
+            let mut sent: Vec<(u64, Option<u32>)> = (0..=16_u32)
+                .map(|index| (u64::from(index) * 64, Some(index)))
+                .collect();
+            sent.push((keyframe.1, None));
+            sent.sort_by_key(|(at, _)| *at);
+            for (at, audio) in sent {
+                rig.advance_to(at);
+                let frame = match audio {
+                    Some(index) => {
+                        let ts = i64::from(index) * 1_024;
+                        let mut frame = frame_at(&rig, (at + ahead, at), ts, true, 4);
+                        frame.payload = vec![0xe0; 4].into();
+                        frame
+                    }
+                    None => frame_at(&rig, keyframe, 0, true, 32),
+                };
+                let track = if audio.is_some() {
+                    rig.audio.as_ref().unwrap()
+                } else {
+                    rig.video()
+                };
+                assert!(track.publish_frame(frame));
+            }
+            rig.advance_to(1_100);
+            let before_ms = u32::try_from(1_100 - keyframe.1).unwrap();
+            let placing = Placing::default();
+            let reader = rig.start_with(
+                spec(before_ms, None, true),
+                placing.clone(),
+                ClipSettings::default(),
+            );
+            settle().await;
+            assert_eq!(rig.report().await, started(before_ms, Some("aac_lc")));
+            rig.clips.stop("k1", EndReason::Stopped);
+            let (_, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+            let lines = lines(&bytes);
+            let audio = format!("frame a 0 {} k 4", first * 1_024);
+            assert_eq!(
+                lines.iter().find(|line| line.starts_with("frame a")),
+                Some(&audio),
+                "keyframe {keyframe:?}"
+            );
+            let out_first = if video_first {
+                "frame v 0 0 k 32"
+            } else {
+                &audio
+            };
+            assert_eq!(lines[1], out_first, "out first, keyframe {keyframe:?}");
+            assert_eq!(placing.starts(), starts, "aac, keyframe {keyframe:?}");
         }
-        rig.video_frame(1_027, 0, true, 32);
-        rig.advance_to(1_100);
-        let placing = Placing::default();
-        let reader = rig.start_with(
-            spec(73, None, true),
-            placing.clone(),
-            ClipSettings::default(),
-        );
-        settle().await;
-        assert_eq!(rig.report().await, started(73, Some("aac_lc")));
-        rig.clips.stop("k1", EndReason::Stopped);
-        let (_, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
-        assert_eq!(
-            lines(&bytes)[1],
-            format!("frame a 0 {} k 4", 16 * 1_024),
-            "out first"
-        );
-        assert_eq!(placing.starts(), (0, 5_000), "aac");
 
         for codec in [Codec::Pcmu, Codec::G722] {
             let payload = narrowband_payload(&codec);
