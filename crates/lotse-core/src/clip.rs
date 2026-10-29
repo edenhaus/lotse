@@ -133,18 +133,21 @@ pub trait ClipMuxer: Send {
     /// video short of the audio. Called once the video's last frame went
     /// in, at most once, and before `finish`.
     ///
-    /// Returns how far before `end`'s presentation time the video's
-    /// presentation ends, which the clip ends its audio that much before
-    /// `end`'s date by: zero when the video lasts until `end`, and more for
-    /// reordered video, whose last frame in decode order is not its last
-    /// presented and whose pictures presented between its last and `end`
-    /// are decoded after `end`, so left out with it (`I0 P3 B1 B2 P6 B4 B5`
-    /// at 25 fps ended at `P9` is presented until 280 ms, where `P7` would
-    /// begin, 80 ms before `P9`). The default does nothing and returns
-    /// zero, for a container that does not time a frame by the next.
-    fn end_video(&mut self, end: &MediaFrame) -> Duration {
-        let _ = end;
-        Duration::ZERO
+    /// Returns the date the video's presentation then ends, on `end`'s
+    /// date, where the clip ends its audio: `end`'s own when the video
+    /// lasts until `end`. Reordered video's last frame in decode order is
+    /// not its last presented, so its presentation can end before `end`'s
+    /// presentation time or after it. Before, when the pictures presented
+    /// between its last presented and `end` are decoded after `end`, so
+    /// left out with it: `I0 P3 B1 B2 P6 B4 B5` at 25 fps ended at `P9` is
+    /// presented until 280 ms, where `P7` would begin, 80 ms before `P9`.
+    /// After, when `end` is a picture presented before ones that went in,
+    /// which an end by arrival leaves out: `I0 P3 B1 B2 P6 B4` ended at
+    /// `B5` is presented until 280 ms too, where `P6` ends, 80 ms after
+    /// `B5`. The default does nothing and returns `end`'s date, for a
+    /// container that does not time a frame by the next.
+    fn end_video(&mut self, end: &MediaFrame) -> Instant {
+        end.wallclock
     }
 
     /// Where the file's media ends so far, from the clip's media time 0:

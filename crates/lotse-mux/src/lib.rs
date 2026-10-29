@@ -304,10 +304,10 @@ impl ClipMuxer for Muxer {
         }
     }
 
-    fn end_video(&mut self, end: &MediaFrame) -> Duration {
+    fn end_video(&mut self, end: &MediaFrame) -> Instant {
         // Outside a running clip there is no video to end.
         let State::Running(clip) = &mut self.state else {
-            return Duration::ZERO;
+            return end.wallclock;
         };
         clip.video.close_at(end)
     }

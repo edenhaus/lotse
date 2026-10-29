@@ -15,8 +15,6 @@ exclude_re = [
     "replace Handler::unsubscribed -> Option<Event> with None",
     # The default body already returns an empty list.
     "replace OutputFactory::session_tracks -> Vec<TrackRequest> with vec!\\[\\]",
-    # The default body already does nothing and returns zero.
-    "replace ClipMuxer::end_video -> Duration with Default::default\\(\\)",
     # The clip takes the later of it and the media times it saw, the default's value.
     "replace ClipMuxer::media_end -> Duration with Default::default\\(\\)",
     # The arms only pick the log level; the fallback arm logs the same event at debug.
