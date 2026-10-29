@@ -13,12 +13,13 @@
 //! captured at or before `now − before_ms` (else the oldest held),
 //! preferring a later held one whose in-band parameter sets are the
 //! track's, which the container's sample entry carries (the snapshot cut
-//! there, by position, never by capture time); the audio starts with the
-//! frame playing when that keyframe was captured, by the ring's measure
-//! ([`captured`]: its arrival when it is dated ahead of it), from where
-//! `before_ms` counts. The container's media time 0 is the earlier capture
-//! time of the two tracks' first frames, so neither starts later than it
-//! was captured.
+//! there, by position, never by capture time), from where `before_ms`
+//! counts, by the ring's measure ([`captured`]: its arrival when it is
+//! dated ahead of it); the audio starts with the frame playing when that
+//! keyframe was captured, by their capture times as dated, where the
+//! container places them. The container's media time 0 is the earlier
+//! capture time of the two tracks' first frames, so neither starts later
+//! than it was captured.
 //! With nothing held it starts at the next keyframe, waiting for it up to
 //! the start timeout, which a keyframe queued meets even while the
 //! interleaver holds it for the audio. `before_ms` is the age of the first
@@ -925,9 +926,11 @@ impl Clip {
             codec: (*codec).clone(),
             clock_rate: video_track.clock_rate(),
         };
+        // The keyframe's capture time as dated, where the container puts
+        // it: the audio frame playing then plays with it in the file.
         let audio_target = snapshot
             .as_ref()
-            .map_or(target, |snapshot| captured(snapshot.start()));
+            .map_or(target, |snapshot| snapshot.start().wallclock);
         let mut audio = None;
         if let Some(track) = natives.iter().find(|track| track.kind() == Kind::Audio)
             && self.audio
@@ -3859,14 +3862,17 @@ mod tests {
     }
 
     /// The audio starts with the frame playing when the video's start
-    /// keyframe was captured by the pre-roll's measure, its arrival when it
-    /// is dated ahead of it (a Sender Report mapping off), as `before_ms`
-    /// counts it: a keyframe arriving at 500 ms dated 900 ms starts the
-    /// audio at 448 ms, and goes out after it by the same measure.
-    /// Regression: the audio started at 896 ms, 400 ms
-    /// short of what `before_ms` said the clip holds.
+    /// keyframe was captured, by their capture times as dated, where the
+    /// container places them, though `before_ms` counts from the keyframe's
+    /// arrival when it is dated ahead of it (a Sender Report mapping off):
+    /// a keyframe arriving at 500 ms dated 900 ms starts the audio at
+    /// 896 ms, and goes out before it, by the ring's measure, at its
+    /// arrival. Regression (interop with MediaMTX 1.21.1, 2026-10-26: Opus
+    /// starting 60 ms before the video): the audio started with the frame
+    /// playing at the keyframe's arrival, 448 ms, and the file played
+    /// 452 ms of audio before its first picture.
     #[tokio::test]
-    async fn a_keyframe_dated_ahead_of_its_arrival_starts_the_audio_at_its_arrival() {
+    async fn a_keyframe_dated_ahead_of_its_arrival_starts_the_audio_at_its_date() {
         let mut rig = Rig::new(Some(fake_aac()));
         for index in 0..8 {
             rig.audio_frame(index);
@@ -3886,12 +3892,10 @@ mod tests {
         rig.clips.stop("k1", EndReason::Stopped);
         let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
         let lines = lines(&bytes);
-        assert_eq!(lines[1], format!("frame a 0 {} k 4", 7 * 1_024), "448 ms");
-        assert_eq!(
-            lines[2], "frame v 0 0 k 32",
-            "by its arrival too: after the audio before 500 ms"
-        );
-        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 512, 0)]);
+        assert_eq!(lines[1], "frame v 0 0 k 32", "out at its arrival");
+        assert_eq!(lines[2], format!("frame a 0 {} k 4", 14 * 1_024), "896 ms");
+        // From 896 ms to the last audio frame, 960 ms.
+        assert_eq!(reports, vec![stopped("stopped", bytes.len(), 64, 0)]);
     }
 
     /// What a clip's container was given to place its start: the origin
@@ -3965,35 +3969,38 @@ mod tests {
         }
     }
 
-    /// The container's media time 0 is the earlier capture time of the two
-    /// tracks' first frames, whichever the interleaver hands out first: of
-    /// audio dated after its arrival (a Sender Report fit, RFC 3550
-    /// §6.4.1), the frame that arrived before the keyframe can be dated
-    /// after it and goes out first, by the ring's measure, and the video
-    /// still starts at its own capture time. AAC dated 8 ms after its
-    /// arrival every 64 ms, the keyframe captured at 1.027 s: the audio
-    /// frame that arrived at 1.024 s, dated 1.032 s, starts 5 ms after the
-    /// video. The mirror, a keyframe dated 1.030 s that arrived at 0.96 s
-    /// with the audio frame dated 0.968 s: the video goes out first, on the
-    /// tie of their arrivals, and the audio still starts 62 ms before it.
-    /// G.711 and G.722 dated 3 ms after their arrival every 20 ms, the
-    /// keyframe captured at 1.001 s: the frame that arrived at 1 s, dated
-    /// 1.003 s, starts its Opus 2 ms after the video, which starts at the
-    /// transcode's delay. Regression (interop with MediaMTX 1.21.1,
-    /// 2026-10-26: G.722 transcoded with its video 0.9 and 2.2 ms short of
-    /// the transcode's delay): media time 0 was the first frame out's, and
-    /// the track out second started late, out of sync: the video by those 5
-    /// and 2 ms, the audio by 62 ms.
+    /// The audio starts with the frame dated at or before the keyframe, and
+    /// the container's media time 0 is the earlier capture time of the two
+    /// tracks' first frames, whichever the interleaver hands out first. AAC
+    /// dated 8 ms after its arrival every 64 ms, the keyframe captured at
+    /// 1.027 s: the audio starts with the frame dated 0.968 s, 59 ms before
+    /// the video, though the one that arrived at 1.024 s, dated 1.032 s,
+    /// was playing then by its arrival, and the frame after the keyframe,
+    /// arriving at 1.088 s, trims the ring. A keyframe dated 1.030 s that
+    /// arrived at 0.96 s with the audio frame dated 0.968 s: the video goes
+    /// out first, on the tie of their arrivals, and the audio still starts
+    /// 62 ms before it. A keyframe dated 1.030 s that arrived at 0.995 s
+    /// goes out before the audio frame dated and arriving at 1.024 s, by
+    /// the ring's measure, and the video still starts 6 ms after it. G.711
+    /// and G.722 dated 3 ms after their arrival every 20 ms, the keyframe
+    /// captured at 1.001 s: the audio starts with the frame dated 0.983 s,
+    /// the video 18 ms after the transcode's delay. Regression (interop
+    /// with MediaMTX 1.21.1, 2026-10-26: G.722 transcoded with its video
+    /// 0.9 and 2.2 ms short of the transcode's delay): the audio started
+    /// with the frame dated after the keyframe; media time 0 was the first
+    /// frame out's, and the track out second started late, out of sync.
     #[tokio::test]
     async fn rfc3550_6_4_1_a_clip_starts_at_the_earlier_of_its_tracks_first_capture_times() {
         for (ahead, keyframe, first, video_first, starts) in [
-            (8, (1_027, 1_027), 16, false, (0, 5_000)),
+            (8, (1_027, 1_027), 15, false, (59_000, 0)),
             (8, (1_030, 960), 15, true, (62_000, 0)),
+            (0, (1_030, 995), 16, true, (6_000, 0)),
         ] {
             let mut rig = Rig::new(Some(fake_aac()));
             // AAC every 64 ms, dated `ahead` ms after its arrival, and the
-            // keyframe, in the order they arrive.
-            let mut sent: Vec<(u64, Option<u32>)> = (0..=16_u32)
+            // keyframe, in the order they arrive: the audio ring trims by
+            // that keyframe at the frame after it, at 1.088 s.
+            let mut sent: Vec<(u64, Option<u32>)> = (0..=17_u32)
                 .map(|index| (u64::from(index) * 64, Some(index)))
                 .collect();
             sent.push((keyframe.1, None));
@@ -4047,6 +4054,9 @@ mod tests {
         for codec in [Codec::Pcmu, Codec::G722] {
             let payload = narrowband_payload(&codec);
             let mut rig = Rig::new(Some(codec.clone()));
+            // An older keyframe holds the audio before the clip's (the ring
+            // trims its audio by the oldest keyframe held, by its measure).
+            rig.video_frame(500, 0, true, 32);
             for index in 40..=55_u32 {
                 let ms = u64::from(index) * 20;
                 rig.advance_to(ms);
@@ -4054,7 +4064,7 @@ mod tests {
                 frame.payload = payload.clone();
                 assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
                 if ms == 1_000 {
-                    rig.video_frame(1_001, 0, true, 32);
+                    rig.video_frame(1_001, 15, true, 32);
                 }
             }
             let placing = Placing::default();
@@ -4068,7 +4078,7 @@ mod tests {
             rig.clips.stop("k1", EndReason::Stopped);
             let (_, _bytes) = tokio::join!(rig.until_stopped(), reader.rest());
             let delay = i128::try_from(ToOpus::new(&codec).unwrap().delay().as_micros()).unwrap();
-            assert_eq!(placing.starts(), (delay, 2_000), "{codec:?}");
+            assert_eq!(placing.starts(), (delay + 18_000, 0), "{codec:?}");
         }
     }
 
