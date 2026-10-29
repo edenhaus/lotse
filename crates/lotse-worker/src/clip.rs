@@ -810,8 +810,8 @@ struct Clip {
     /// The furthest clip media time a frame was put at, on either track,
     /// and at the end where the container says the file's media ends
     /// ([`ClipMuxer::media_end`]: the video's last frame lasting until its
-    /// end frame, [`ClipMuxer::end_video`]): the duration `Stopped`
-    /// reports.
+    /// end frame, [`ClipMuxer::end_video`], and the audio's last its
+    /// length): the duration `Stopped` reports.
     reached: Duration,
     /// The holes the queue reported per track, by their API name, until
     /// the frame that ends each is in the container: where they are.

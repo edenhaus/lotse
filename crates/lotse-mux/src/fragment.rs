@@ -478,11 +478,20 @@ impl TrackWriter {
     /// Where the track's presentation reaches, from the clip's media time
     /// 0: where its finished samples' presentation ends
     /// ([`Self::presented`]: the video's last too once
-    /// [`close_at`](Self::close_at) ended it), or the latest frame's
-    /// start, whose length is not known yet, if later; zero before the
-    /// first.
+    /// [`close_at`](Self::close_at) ended it), or where the latest frame
+    /// ends, if later: its start plus its length where the codec states
+    /// one (an audio frame's, [`Self::frame_length`], which the finish
+    /// gives the held sample), else its start, whose length is not known
+    /// yet (video's); zero before the first.
     pub(crate) fn reach(&self) -> Duration {
-        duration_of(self.presented().max(self.latest), self.clock_rate)
+        // The held sample is the latest frame, `latest` its start.
+        let length = self
+            .held
+            .as_ref()
+            .and_then(|held| self.frame_length(&held.frame))
+            .unwrap_or_default();
+        let latest = self.latest.saturating_add(i128::from(length));
+        duration_of(self.presented().max(latest), self.clock_rate)
     }
 
     /// The decode time of the latest frame taken, from the clip's media

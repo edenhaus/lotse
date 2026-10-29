@@ -1963,9 +1963,14 @@ fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() 
 /// 0 to 0.9 s and the end frame at 1.4 s (a camera that stalled), 1.4 s.
 /// Before the end, the latest frame's start; reordered video, where its
 /// last presented picture ends (`P6` of `I0 P3 B1 B2 P6 B4 B5` at 25 fps,
-/// 280 ms, after `B5`'s start); audio, its latest frame's start when later;
-/// outside a running clip, zero. Regression: the clip reported 900 ms, the
-/// last frame's start, for the file of 1.4 s.
+/// 280 ms, after `B5`'s start); audio, where its latest frame ends when
+/// later, its length known before the finish writes it (ISO/IEC 14496-3
+/// §4.4.1: an AAC-LC frame's 1024 samples; RFC 6716 §3.1: an Opus packet's
+/// frames): an Opus packet of 20 ms at 300 ms, 320 ms, where the file's
+/// audio ends; AAC from 960 ms with the video ending at 1 s, 1.024 s;
+/// outside a running clip, zero. Regressions: the clip reported 900 ms, the
+/// last frame's start, for the file of 1.4 s; and 300 ms and 1 s, the
+/// audio's last frame left out before the finish.
 #[test]
 fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_frame() {
     let base = base();
@@ -1995,11 +2000,15 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
     assert_eq!(muxer.media_end(), Duration::ZERO, "finished");
 
     let mut reordered = Muxer::new(&policy(10_000));
-    reordered
+    let mut file = Vec::new();
+    for piece in reordered
         .start(&h264_track(), Some(&opus_track(1)))
-        .unwrap();
+        .unwrap()
+    {
+        file.extend_from_slice(&piece);
+    }
     for (kind, frame) in reordered_gop(base, 0, 0, 0) {
-        reordered.push(kind, frame).unwrap();
+        assert!(reordered.push(kind, frame).unwrap().is_empty());
     }
     assert_eq!(
         reordered.media_end(),
@@ -2007,11 +2016,37 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
         "P6's end"
     );
     let audio = frame(ms(base, 300), 0, true, 0, opus_packet(0));
-    reordered.push(Kind::Audio, audio).unwrap();
+    assert!(reordered.push(Kind::Audio, audio).unwrap().is_empty());
     assert_eq!(
         reordered.media_end(),
-        Duration::from_millis(300),
-        "the audio's"
+        Duration::from_millis(320),
+        "the audio's, its 20 ms packet held"
+    );
+    // The file's media ends there too, once its last fragment is out.
+    for piece in reordered.finish().unwrap() {
+        file.extend_from_slice(&piece);
+    }
+    let opus = samples(&file, 2).pop().unwrap();
+    assert_eq!((opus.dts, opus.duration), (14_400, 960));
+
+    // AAC-LC at 16 kHz: video to 1 s, its last frame of 1024 samples from
+    // 960 ms, the file's media to 1.024 s.
+    let mut aac = Muxer::new(&policy(10_000));
+    aac.start(&h264_track(), Some(&aac_track())).unwrap();
+    for i in 0..10_u8 {
+        let key = i == 0;
+        let at = ms(base, 100 * u64::from(i));
+        let video = frame(at, tenth * i64::from(i), key, 0, h264_au(key, i));
+        aac.push(Kind::Video, video).unwrap();
+    }
+    let end = frame(ms(base, 1_000), 10 * tenth, false, 0, h264_au(false, 10));
+    assert_eq!(aac.end_video(&end), end.wallclock);
+    let audio = frame(ms(base, 960), 0, true, 0, Bytes::from_static(&[0x21; 8]));
+    aac.push(Kind::Audio, audio).unwrap();
+    assert_eq!(
+        aac.media_end(),
+        Duration::from_millis(1_024),
+        "the AAC's, its 1024 samples held"
     );
 }
 
