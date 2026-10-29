@@ -63,7 +63,10 @@
 //! to the next sample's decode time; the last one of an epoch, which has
 //! no next, takes its frame's own length where the codec states one (an
 //! AAC-LC frame's 1024 samples, ISO/IEC 14496-3 §4.4.1; an Opus packet's
-//! frames, RFC 6716 §3.1), else the one before it (video), cut short so
+//! frames, RFC 6716 §3.1), else, for the video's last, until the frame the
+//! clip ended the video at would be decoded when that is of its epoch
+//! ([`ClipMuxer::end_video`](lotse_core::clip::ClipMuxer::end_video)), else
+//! the one before it (video), cut short so
 //! its presentation ends where the next epoch begins when that is sooner
 //! and no sooner than the track's presentation so far ends, and an epoch
 //! captured before the track's presentation ends starts where it ends.
@@ -483,6 +486,35 @@ impl TrackWriter {
     /// (video), else a frame at [`FALLBACK_FRAME_RATE`].
     pub(crate) fn close(&mut self) {
         self.close_before(None);
+    }
+
+    /// [`close`](Self::close), with the held video sample lasting until
+    /// `next`, the frame after it that the clip leaves out, would be
+    /// decoded, as [`push`](Self::push) would time it, when `next` is of its
+    /// epoch: a sample before a hole in the frames (the camera skipped some,
+    /// or slowed down) lasts until the next picture, where the clip ends its
+    /// audio, not as long as the one before it. A `next` of another epoch
+    /// leaves the hole between them, as a reconnect does: the sample ends
+    /// as [`close`](Self::close) ends it, and so does one whose duration
+    /// would not fit its field.
+    pub(crate) fn close_at(&mut self, next: &MediaFrame) {
+        let ts = i128::from(next.ts.ticks());
+        let video = self.video;
+        let until = self
+            .epoch
+            .as_mut()
+            .filter(|epoch| epoch.number == next.epoch)
+            .map(|epoch| epoch.next(ts, video).0);
+        let duration = until
+            .zip(self.held.as_ref())
+            .and_then(|(dts, held)| u32::try_from(dts.saturating_sub(i128::from(held.dts))).ok());
+        match (self.held.take(), duration) {
+            (Some(held), Some(duration)) => self.finish(&held, duration),
+            (held, _) => {
+                self.held = held;
+                self.close();
+            }
+        }
     }
 
     /// [`close`](Self::close), with the sample cut short so its

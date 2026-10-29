@@ -126,6 +126,17 @@ pub trait ClipMuxer: Send {
     /// did), so the clip reports its gaps where the file has them by this.
     fn media_time(&self, track: Kind) -> Duration;
 
+    /// Ends the video before `end`, the frame the clip ends it at, which
+    /// stays out of the file: the video's last frame lasts until `end`
+    /// would have been put, where the clip ends its audio too, not as long
+    /// as a frame before it, which after a hole in the frames ends the
+    /// video short of the audio. Called once the video's last frame went
+    /// in, at most once, and before `finish`. The default does nothing,
+    /// for a container that does not time a frame by the next.
+    fn end_video(&mut self, end: &MediaFrame) {
+        let _ = end;
+    }
+
     /// Ends the clip: the last fragment, after which the file is complete.
     fn finish(&mut self) -> Result<Vec<Bytes>, ClipError>;
 }

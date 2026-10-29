@@ -15,6 +15,8 @@ exclude_re = [
     "replace Handler::unsubscribed -> Option<Event> with None",
     # The default body already returns an empty list.
     "replace OutputFactory::session_tracks -> Vec<TrackRequest> with vec!\\[\\]",
+    # The default body already does nothing.
+    "replace ClipMuxer::end_video with \\(\\)",
     # The arms only pick the log level; the fallback arm logs the same event at debug.
     "delete match arm SessionEvent::(Answer|State|Warning)\\{.*\\} in State::deliver_session",
     # The shifted-in low byte is zero, so `|` and `^` produce the same value.
