@@ -1315,6 +1315,20 @@ impl Clip {
     /// Before the container started, an audio frame is at the end once the
     /// video's first frame is: a clip whose first keyframe comes after its
     /// end has no video to write and starts nothing, not the audio alone.
+    ///
+    /// Known limit: the audio's end compares the dates the frames have now,
+    /// while the container anchors each epoch of a track once, at its first
+    /// frame's date, and places the frames after it by their timestamps. A
+    /// change of one track's mapping relative to the other's inside the
+    /// clip's epoch so leaves the audio's end off the file's video end by
+    /// that change. In practice that is a track's first Sender Report
+    /// arriving inside the clip (RFC 3550 §6.4.1), on a connection younger
+    /// than one report interval or in a clip that spans a reconnect: the
+    /// error is then the difference of the tracks' leads over their arrival.
+    /// Changes common to both tracks, the connection's offset, cancel, and a
+    /// track's own fit moves at most
+    /// [`MAX_SLEW`](lotse_core::clock_map::MAX_SLEW) per report. Comparing on
+    /// the container's timeline instead is a follow-up.
     fn at_end(&self, track: Kind, frame: &MediaFrame, media: &Media) -> bool {
         match track {
             Kind::Video => captured(frame) >= self.end_at,
