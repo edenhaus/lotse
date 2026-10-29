@@ -1895,6 +1895,67 @@ fn rfc6716_3_1_a_last_sample_takes_its_frame_length_else_the_duration_before_it(
     assert_eq!(last(h264_track(), Some((opus_track(1), unknown)), 1), 960);
 }
 
+/// The video's last sample lasts until the frame the clip ends the video
+/// at, which stays out of the file, would be decoded, where the clip ends
+/// its audio: after a hole in the frames (every 100 ms through 0.9 s, the
+/// next at 1.4 s) the video ends at 1.4 s, not a frame after 0.9 s
+/// (ISO/IEC 14496-12 §8.8.8: a sample lasts until the next one's decode
+/// time). A frame of another epoch, a reconnect, leaves the hole as the
+/// finish does, and so does one whose duration would not fit its field;
+/// outside a running clip nothing happens. Regression: the video ended at
+/// 1 s, the last frame's length the one before it, and the audio the
+/// clip ran on to 1.4 s played 0.4 s past the video's end.
+#[test]
+fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() {
+    let base = base();
+    let tenth = 9_000;
+    let video: Vec<_> = (0..10_u8)
+        .map(|i| {
+            let key = i == 0;
+            let at = ms(base, 100 * u64::from(i));
+            (
+                Kind::Video,
+                frame(at, tenth * i64::from(i), key, 0, h264_au(key, i)),
+            )
+        })
+        .collect();
+    let last = |end: Option<Arc<MediaFrame>>| {
+        let mut muxer = Muxer::new(&policy(10_000));
+        let mut file = Vec::new();
+        for piece in muxer.start(&h264_track(), None).unwrap() {
+            file.extend_from_slice(&piece);
+        }
+        for (kind, frame) in &video {
+            for piece in muxer.push(*kind, Arc::clone(frame)).unwrap() {
+                file.extend_from_slice(&piece);
+            }
+        }
+        if let Some(end) = end {
+            muxer.end_video(&end);
+        }
+        for piece in muxer.finish().unwrap() {
+            file.extend_from_slice(&piece);
+        }
+        let last = samples(&file, 1).pop().unwrap();
+        (last.dts, last.duration)
+    };
+    let at_1400 =
+        |ts: i64, epoch: u32| frame(ms(base, 1_400), ts, false, epoch, h264_au(false, 10));
+    assert_eq!(last(None), (81_000, 9_000), "a frame after 0.9 s");
+    assert_eq!(
+        last(Some(at_1400(14 * tenth, 0))),
+        (81_000, 45_000),
+        "until 1.4 s"
+    );
+    assert_eq!(last(Some(at_1400(0, 1))), (81_000, 9_000), "another epoch");
+    let far = 9 * tenth + (1 << 33);
+    assert_eq!(last(Some(at_1400(far, 0))), (81_000, 9_000), "past 32 bits");
+
+    let mut idle = Muxer::new(&policy(1000));
+    idle.end_video(&at_1400(0, 0));
+    assert!(matches!(idle.state, State::Idle));
+}
+
 #[test]
 fn calls_out_of_order_fail() {
     let base = base();

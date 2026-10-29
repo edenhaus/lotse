@@ -304,6 +304,13 @@ impl ClipMuxer for Muxer {
         }
     }
 
+    fn end_video(&mut self, end: &MediaFrame) {
+        // Outside a running clip there is no video to end.
+        if let State::Running(clip) = &mut self.state {
+            clip.video.close_at(end);
+        }
+    }
+
     fn finish(&mut self) -> Result<Vec<Bytes>, ClipError> {
         let State::Running(mut clip) = std::mem::replace(&mut self.state, State::Finished) else {
             return Err(Self::out_of_order("finish"));
