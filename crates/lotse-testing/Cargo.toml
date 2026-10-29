@@ -34,14 +34,13 @@ tracing = { workspace = true }
 url = { workspace = true } # the dev viewer: the browser test page's `api` parameter, parsed as the browser parses it
 lotse-api-types = { workspace = true } # the load generator reads `metrics/get` through its type
 lotse-codec = { workspace = true, features = ["test-util"] } # hand-built parameter sets for the fake camera's stream
-lotse-core = { workspace = true }
+lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`: the clip checks of the output suite run on it, and MediaMTX's start times out on it without waiting
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true } # the control buffer's size for `recv_marked` (`cmsg_space!`)
 nix = { workspace = true, features = ["net", "socket", "uio"] } # `recv_marked`: `recvmsg` with the `IP_TOS`/`IPV6_TCLASS` control messages, which safe Rust gets nowhere else
 
 [dev-dependencies]
-lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`: MediaMTX's start timing out without waiting
 lotse-webrtc = { workspace = true } # the session engine the Safari ICE reproduction (`tests/t7_safari_ice.rs`) drives; the crypto provider of the `lotse-load` example's viewers
 tokio = { workspace = true, features = ["rt-multi-thread"] } # the `lotse-load` example's runtime
 

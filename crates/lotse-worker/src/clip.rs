@@ -2714,6 +2714,100 @@ mod tests {
         assert_eq!(reports, vec![stopped("stopped", bytes.len(), 360, 0)]);
     }
 
+    /// The clip task behind the output suite's seam: one clip at a time,
+    /// each with its own `Clips` and report channel, under the default
+    /// settings but the queue's bound the check asks.
+    #[derive(Default)]
+    struct SuiteClip {
+        running: Option<(Clips, mpsc::Receiver<(String, ClipReport)>)>,
+    }
+
+    impl lotse_testing::output_suite::clip::ClipUnderTest for SuiteClip {
+        fn start(
+            &mut self,
+            tracks: &Arc<TrackSet>,
+            factory: Arc<dyn ClipMuxerFactory>,
+            clock: Arc<dyn Clock>,
+            ask: lotse_testing::output_suite::clip::ClipAsk,
+            pipe: OwnedFd,
+        ) {
+            let (reports_tx, reports) = mpsc::channel(1024);
+            let mut clips = Clips::new(reports_tx);
+            clips.start(ClipStart {
+                spec: spec(millis(ask.before), None, false),
+                pipe: pipe::Sender::from_owned_fd(pipe).unwrap(),
+                tracks: Arc::clone(tracks),
+                factory,
+                settings: ClipSettings {
+                    policy: ClipPolicy {
+                        queue_bytes: ask.queue_bytes,
+                        ..ClipPolicy::default()
+                    },
+                    ..ClipSettings::default()
+                },
+                clock,
+                transcode: ToOpus::new,
+            });
+            self.running = Some((clips, reports));
+        }
+
+        fn stop(&mut self) {
+            let (clips, _) = self.running.as_ref().unwrap();
+            assert!(clips.stop("k1", EndReason::Stopped));
+        }
+
+        fn report(&mut self) -> lotse_testing::output_suite::clip::NextNote<'_> {
+            Box::pin(async move {
+                let (_, reports) = self.running.as_mut()?;
+                let (_, report) = reports.recv().await?;
+                Some(note(report))
+            })
+        }
+    }
+
+    /// A report as the output suite reads it.
+    fn note(report: ClipReport) -> lotse_testing::output_suite::clip::ClipNote {
+        use lotse_testing::output_suite::clip::ClipNote;
+        match report {
+            ClipReport::Started { before_ms, .. } => ClipNote::Started {
+                before: Duration::from_millis(u64::from(before_ms)),
+            },
+            ClipReport::Gap { reason, .. } => ClipNote::Gap { reason },
+            ClipReport::Stopped {
+                reason,
+                bytes,
+                gaps,
+                ..
+            } => ClipNote::Stopped {
+                reason,
+                bytes,
+                gaps,
+            },
+            ClipReport::Warning { .. } => ClipNote::Other,
+        }
+    }
+
+    /// The clip task passes the output suite's `Reliable` and `Preroll`
+    /// checks: a pre-roll start where it says with the camera's
+    /// timestamps, overflow as a counted gap, a stalled reader that never
+    /// slows the track, and a stop that finishes the container within
+    /// 100 ms.
+    #[tokio::test]
+    async fn the_clip_task_passes_the_output_suite_s_clip_checks() {
+        let mut clip = SuiteClip::default();
+        let violations = lotse_testing::output_suite::clip::check_all(&mut clip).await;
+        assert_eq!(violations, []);
+        // A warning is none of the reports the checks read.
+        let warning = ClipReport::Warning {
+            code: "audio_omitted".into(),
+            message: "pcmu".into(),
+        };
+        assert_eq!(
+            note(warning),
+            lotse_testing::output_suite::clip::ClipNote::Other
+        );
+    }
+
     /// A reader that stops reading fills the pipe, then the clip's queue; the
     /// frame that does not fit drops the video to its next keyframe that fits,
     /// which the clip writes behind an `overflow` gap once the reader takes the
