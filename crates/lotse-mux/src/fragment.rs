@@ -474,6 +474,16 @@ impl TrackWriter {
         duration_of(self.latest, self.clock_rate)
     }
 
+    /// Where the track's presentation reaches, from the clip's media time
+    /// 0: where its finished samples' presentation ends
+    /// ([`Self::presented`]: the video's last too once
+    /// [`close_at`](Self::close_at) ended it), or the latest frame's
+    /// start, whose length is not known yet, if later; zero before the
+    /// first.
+    pub(crate) fn reach(&self) -> Duration {
+        duration_of(self.presented().max(self.latest), self.clock_rate)
+    }
+
     /// The decode time of the latest frame taken, from the clip's media
     /// time 0; zero before the first. It never goes back (see the
     /// module), and inside an epoch it follows the frames' timestamps,

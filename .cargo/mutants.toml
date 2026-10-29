@@ -17,6 +17,8 @@ exclude_re = [
     "replace OutputFactory::session_tracks -> Vec<TrackRequest> with vec!\\[\\]",
     # The default body already does nothing and returns zero.
     "replace ClipMuxer::end_video -> Duration with Default::default\\(\\)",
+    # The clip takes the later of it and the media times it saw, the default's value.
+    "replace ClipMuxer::media_end -> Duration with Default::default\\(\\)",
     # The arms only pick the log level; the fallback arm logs the same event at debug.
     "delete match arm SessionEvent::(Answer|State|Warning)\\{.*\\} in State::deliver_session",
     # The shifted-in low byte is zero, so `|` and `^` produce the same value.

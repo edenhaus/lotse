@@ -147,6 +147,19 @@ pub trait ClipMuxer: Send {
         Duration::ZERO
     }
 
+    /// Where the file's media ends so far, from the clip's media time 0:
+    /// the furthest a track's presentation reaches, counting each
+    /// sample's length where the container knows it (the video's last
+    /// once [`end_video`](Self::end_video) ended it there), else its
+    /// frame's start; zero before the first. The clip reports it as the
+    /// file's duration. The default is the later of the tracks'
+    /// [`media_time`](Self::media_time), for a container that knows no
+    /// more.
+    fn media_end(&self) -> Duration {
+        self.media_time(Kind::Video)
+            .max(self.media_time(Kind::Audio))
+    }
+
     /// Ends the clip: the last fragment, after which the file is complete.
     fn finish(&mut self) -> Result<Vec<Bytes>, ClipError>;
 }

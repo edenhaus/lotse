@@ -312,6 +312,16 @@ impl ClipMuxer for Muxer {
         clip.video.close_at(end)
     }
 
+    fn media_end(&self) -> Duration {
+        let State::Running(clip) = &self.state else {
+            return Duration::ZERO;
+        };
+        clip.audio
+            .as_ref()
+            .map_or(Duration::ZERO, TrackWriter::reach)
+            .max(clip.video.reach())
+    }
+
     fn finish(&mut self) -> Result<Vec<Bytes>, ClipError> {
         let State::Running(mut clip) = std::mem::replace(&mut self.state, State::Finished) else {
             return Err(Self::out_of_order("finish"));

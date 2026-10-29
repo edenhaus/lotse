@@ -93,7 +93,9 @@
 //! the file's length, the bytes left out included, so the body, which ends
 //! whole only when it read that many, is cut when any were.
 //! Gaps and the duration carry clip media time, where the container put
-//! the frames ([`ClipMuxer::media_time`]), never their capture times: a
+//! the frames ([`ClipMuxer::media_time`]) and, for the duration, where it
+//! says the file's media ends ([`ClipMuxer::media_end`]), never their
+//! capture times: a
 //! gap runs from where the frame before the hole was put to where the
 //! frame that ends it was, a hole the queue reports included; a hole the
 //! clip ends in is none, and so is a hole in transcoded audio its
@@ -805,8 +807,11 @@ struct Clip {
     /// other (`ClipPolicy::max_skew`), as the interleaver holds a frame for
     /// it ([`Self::end_deadline`]).
     audio_wait_ends: Option<Instant>,
-    /// The furthest clip media time a frame was put at, on either track:
-    /// the duration `Stopped` reports.
+    /// The furthest clip media time a frame was put at, on either track,
+    /// and at the end where the container says the file's media ends
+    /// ([`ClipMuxer::media_end`]: the video's last frame lasting until its
+    /// end frame, [`ClipMuxer::end_video`]): the duration `Stopped`
+    /// reports.
     reached: Duration,
     /// The holes the queue reported per track, by their API name, until
     /// the frame that ends each is in the container: where they are.
@@ -1710,10 +1715,11 @@ impl Clip {
     /// graceful clip `client_gone`: either way its file is not whole. Any
     /// other reason already says the clip did not end as asked,
     /// `shutting_down` included, and stays. The pipe closes, and `Stopped`
-    /// is the last report, its duration the furthest media time a frame
-    /// was put at. Its `bytes` is the file's length: the bytes the pipe
-    /// took and those it did not take in time.
+    /// is the last report, its duration where the file's media ends
+    /// ([`Self::reached`]). Its `bytes` is the file's length: the bytes the
+    /// pipe took and those it did not take in time.
     async fn finish(mut self, mut reason: EndReason) {
+        self.reached = self.reached.max(self.muxer.media_end());
         if reason != EndReason::ClientGone {
             if self.begun {
                 match self.muxer.finish() {
@@ -4058,9 +4064,14 @@ mod tests {
     /// set, and the capture times of the first frame pushed of each track;
     /// and to place its video's end: the capture time of the frame it ended
     /// the video at ([`ClipMuxer::end_video`]), and how far before that
-    /// frame it says the video ends.
+    /// frame it says the video ends, and the latest it says the file's
+    /// media ends.
     #[derive(Debug, Clone, Default)]
-    struct Placing(Arc<std::sync::Mutex<[Option<Instant>; 4]>>, Duration);
+    struct Placing(
+        Arc<std::sync::Mutex<[Option<Instant>; 4]>>,
+        Duration,
+        Duration,
+    );
 
     impl Placing {
         /// Where the container put the first video and the first audio
@@ -4132,6 +4143,10 @@ mod tests {
         fn end_video(&mut self, end: &MediaFrame) -> Duration {
             self.seen.0.lock().unwrap()[3] = Some(end.wallclock);
             self.inner.end_video(end).max(self.seen.1)
+        }
+
+        fn media_end(&self) -> Duration {
+            self.inner.media_end().max(self.seen.2)
         }
 
         fn finish(&mut self) -> Result<Vec<Bytes>, ClipError> {
@@ -5543,7 +5558,7 @@ mod tests {
     #[tokio::test]
     async fn rfc3550_6_4_1_a_clip_ends_its_audio_where_the_container_s_video_ends() {
         let mut rig = Rig::new(Some(fake_aac()));
-        let placing = Placing(Arc::default(), Duration::from_millis(300));
+        let placing = Placing(Arc::default(), Duration::from_millis(300), Duration::ZERO);
         let reader = rig.start_with(
             spec(0, Some(1_000), true),
             placing.clone(),
@@ -5586,6 +5601,39 @@ mod tests {
             reports.last(),
             Some(ClipReport::Stopped { reason, .. }) if reason == "completed"
         ));
+    }
+
+    /// `Stopped`'s duration is where the container says the file's media
+    /// ends ([`ClipMuxer::media_end`]), not only where it put the latest
+    /// frame: a video-only clip's video every 100 ms from 0 to 0.9 s and
+    /// the next, its end frame, at 1.4 s (a camera that stalled), whose
+    /// container times the last frame until that one, 1.4 s. Regression:
+    /// it reported 900 ms, the last frame's start, though the file covers
+    /// 1.4 s.
+    #[tokio::test]
+    async fn iso14496_12_8_8_8_the_stopped_duration_is_where_the_container_says_the_media_ends() {
+        let mut rig = Rig::new(None);
+        let placing = Placing(Arc::default(), Duration::ZERO, Duration::from_millis(1_400));
+        let reader = rig.start_with(
+            spec(0, Some(1_000), true),
+            placing.clone(),
+            ClipSettings::default(),
+        );
+        for at in every_100_ms_from_50(9).into_iter().chain([1_450]) {
+            rig.advance_to(at);
+            let ts = i64::try_from(at - 50).unwrap() * 90;
+            assert!(
+                rig.video()
+                    .publish_frame(frame_at(&rig, (at, at), ts, at == 50, 16))
+            );
+            settle().await;
+        }
+        let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+        assert_eq!(placing.video_end(), Some(rig.at(1_450)));
+        assert_eq!(
+            reports.last(),
+            Some(&stopped("completed", bytes.len(), 1_400, 0))
+        );
     }
 
     /// A clip whose first keyframe comes after its end has no video to

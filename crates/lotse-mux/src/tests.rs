@@ -1957,6 +1957,64 @@ fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() 
     assert!(matches!(idle.state, State::Idle));
 }
 
+/// Where the file's media ends counts the video's last sample until the
+/// frame the clip ended the video at (ISO/IEC 14496-12 §8.8.8: a sample
+/// lasts until the next one's decode time): video-only, every 100 ms from
+/// 0 to 0.9 s and the end frame at 1.4 s (a camera that stalled), 1.4 s.
+/// Before the end, the latest frame's start; reordered video, where its
+/// last presented picture ends (`P6` of `I0 P3 B1 B2 P6 B4 B5` at 25 fps,
+/// 280 ms, after `B5`'s start); audio, its latest frame's start when later;
+/// outside a running clip, zero. Regression: the clip reported 900 ms, the
+/// last frame's start, for the file of 1.4 s.
+#[test]
+fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_frame() {
+    let base = base();
+    let tenth = 9_000;
+    let mut muxer = Muxer::new(&policy(10_000));
+    assert_eq!(muxer.media_end(), Duration::ZERO, "idle");
+    muxer.start(&h264_track(), None).unwrap();
+    for i in 0..10_u8 {
+        let key = i == 0;
+        let at = ms(base, 100 * u64::from(i));
+        let video = frame(at, tenth * i64::from(i), key, 0, h264_au(key, i));
+        muxer.push(Kind::Video, video).unwrap();
+    }
+    assert_eq!(
+        muxer.media_end(),
+        Duration::from_millis(900),
+        "before the end"
+    );
+    let end = frame(ms(base, 1_400), 14 * tenth, false, 0, h264_au(false, 10));
+    assert_eq!(muxer.end_video(&end), Duration::ZERO);
+    assert_eq!(
+        muxer.media_end(),
+        Duration::from_millis(1_400),
+        "until 1.4 s"
+    );
+    muxer.finish().unwrap();
+    assert_eq!(muxer.media_end(), Duration::ZERO, "finished");
+
+    let mut reordered = Muxer::new(&policy(10_000));
+    reordered
+        .start(&h264_track(), Some(&opus_track(1)))
+        .unwrap();
+    for (kind, frame) in reordered_gop(base, 0, 0, 0) {
+        reordered.push(kind, frame).unwrap();
+    }
+    assert_eq!(
+        reordered.media_end(),
+        Duration::from_millis(280),
+        "P6's end"
+    );
+    let audio = frame(ms(base, 300), 0, true, 0, opus_packet(0));
+    reordered.push(Kind::Audio, audio).unwrap();
+    assert_eq!(
+        reordered.media_end(),
+        Duration::from_millis(300),
+        "the audio's"
+    );
+}
+
 /// Reordered video ended at a frame is presented until its last presented
 /// picture ends, short of that frame by the pictures presented between
 /// them, which are decoded after it and so left out with it, and the muxer
