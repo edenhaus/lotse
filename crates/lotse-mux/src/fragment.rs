@@ -71,10 +71,11 @@
 //! and no sooner than the track's presentation so far ends, and an epoch
 //! captured before the track's presentation ends starts where it ends.
 //! Reordered video so ended is presented until its last presented picture
-//! ends, short of the frame it ended at by the pictures between them, which
-//! are decoded after that frame and so left out; the muxer says by how much
-//! ([`TrackWriter::close_at`]), and the clip ends its audio that much before
-//! that frame's date.
+//! ends: short of the frame it ended at by the pictures between them, which
+//! are decoded after that frame and so left out, or past it when that frame
+//! is presented before pictures that went in; the muxer says where, on that
+//! frame's date ([`TrackWriter::close_at`]), and the clip ends its audio
+//! there.
 //!
 //! Video whose timestamps go back in decode order is reordered
 //! (B-frames): from the first such frame on, the epoch's decode times
@@ -477,11 +478,20 @@ impl TrackWriter {
     /// Where the track's presentation reaches, from the clip's media time
     /// 0: where its finished samples' presentation ends
     /// ([`Self::presented`]: the video's last too once
-    /// [`close_at`](Self::close_at) ended it), or the latest frame's
-    /// start, whose length is not known yet, if later; zero before the
-    /// first.
+    /// [`close_at`](Self::close_at) ended it), or where the latest frame
+    /// ends, if later: its start plus its length where the codec states
+    /// one (an audio frame's, [`Self::frame_length`], which the finish
+    /// gives the held sample), else its start, whose length is not known
+    /// yet (video's); zero before the first.
     pub(crate) fn reach(&self) -> Duration {
-        duration_of(self.presented().max(self.latest), self.clock_rate)
+        // The held sample is the latest frame, `latest` its start.
+        let length = self
+            .held
+            .as_ref()
+            .and_then(|held| self.frame_length(&held.frame))
+            .unwrap_or_default();
+        let latest = self.latest.saturating_add(i128::from(length));
+        duration_of(self.presented().max(latest), self.clock_rate)
     }
 
     /// The decode time of the latest frame taken, from the clip's media
@@ -513,20 +523,25 @@ impl TrackWriter {
     /// as [`close`](Self::close) ends it, and so does one whose duration
     /// would not fit its field.
     ///
-    /// Returns how far before `next`'s presentation time the track's
-    /// presentation then ends ([`Self::shown`], which it settles): zero in
-    /// order, where the sample's end is `next`'s presentation time, and
-    /// for the fallbacks, whose `next` has no place on the epoch's
-    /// timeline. Reordered video's last sample in decode order is not its
-    /// last presented, and the pictures between its last presented and
-    /// `next` are decoded after `next`, so left out: `I0 P3 B1 B2 P6 B4 B5`
-    /// at 25 fps ended at `P9` (360 ms) is presented until 280 ms, where
-    /// `P6`, a frame long, ends ([`Epoch::shown`]), 80 ms short. `B5` lasts
-    /// its step of the decode times, as a sample after it would time it:
-    /// longer, it would stretch the track's decode past `next` and still
-    /// not show `P6` longer, whose duration is a step of the decode times
-    /// already written.
-    pub(crate) fn close_at(&mut self, next: &MediaFrame) -> Duration {
+    /// Returns the date the track's presentation then ends ([`Self::shown`],
+    /// which it settles), on `next`'s date: `next`'s own in order, where
+    /// the sample's end is `next`'s presentation time, and for the
+    /// fallbacks, whose `next` has no place on the epoch's timeline.
+    /// Reordered video's last sample in decode order is not its last
+    /// presented, so its presentation ends before `next`'s presentation
+    /// time or after it. Before, when the pictures between its last
+    /// presented and `next` are decoded after `next`, so left out:
+    /// `I0 P3 B1 B2 P6 B4 B5` at 25 fps ended at `P9` (360 ms) is presented
+    /// until 280 ms, where `P6`, a frame long, ends ([`Epoch::shown`]),
+    /// 80 ms before `P9`. After, when `next` is presented before pictures
+    /// that went in, as a clip that ends by the frames' arrival leaves out
+    /// the first to arrive after its end: `I0 P3 B1 B2 P6 B4` ended at `B5`
+    /// (200 ms) is presented until 280 ms too, 80 ms after `B5`. `B5` in
+    /// the first, `B4` in the second, lasts its step of the decode times,
+    /// as a sample after it would time it: longer, it would stretch the
+    /// track's decode past `next` and still not show `P6` longer, whose
+    /// duration is a step of the decode times already written.
+    pub(crate) fn close_at(&mut self, next: &MediaFrame) -> Instant {
         let ts = i128::from(next.ts.ticks());
         let video = self.video;
         let until = self
@@ -545,12 +560,18 @@ impl TrackWriter {
                 self.finish(&held, duration);
                 let end = held.pts().saturating_add(i128::from(duration));
                 self.shown = self.presented().max(end);
-                duration_of(pts.saturating_sub(self.shown), self.clock_rate)
+                // One of the two is zero: `duration_of` counts no negative.
+                let after = duration_of(self.shown.saturating_sub(pts), self.clock_rate);
+                let before = duration_of(pts.saturating_sub(self.shown), self.clock_rate);
+                next.wallclock
+                    .checked_add(after)
+                    .and_then(|at| at.checked_sub(before))
+                    .unwrap_or(next.wallclock)
             }
             (held, _) => {
                 self.held = held;
                 self.close();
-                Duration::ZERO
+                next.wallclock
             }
         }
     }

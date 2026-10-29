@@ -1930,9 +1930,9 @@ fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() 
                 file.extend_from_slice(&piece);
             }
         }
-        // Not short of it: in order, or not on its timeline.
+        // Ends at its date: in order, or not on its timeline.
         if let Some(end) = end {
-            assert_eq!(muxer.end_video(&end), Duration::ZERO);
+            assert_eq!(muxer.end_video(&end), end.wallclock);
         }
         for piece in muxer.finish().unwrap() {
             file.extend_from_slice(&piece);
@@ -1953,7 +1953,7 @@ fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() 
     assert_eq!(last(Some(at_1400(far, 0))), (81_000, 9_000), "past 32 bits");
 
     let mut idle = Muxer::new(&policy(1000));
-    assert_eq!(idle.end_video(&at_1400(0, 0)), Duration::ZERO);
+    assert_eq!(idle.end_video(&at_1400(0, 0)), ms(base, 1_400));
     assert!(matches!(idle.state, State::Idle));
 }
 
@@ -1963,9 +1963,14 @@ fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() 
 /// 0 to 0.9 s and the end frame at 1.4 s (a camera that stalled), 1.4 s.
 /// Before the end, the latest frame's start; reordered video, where its
 /// last presented picture ends (`P6` of `I0 P3 B1 B2 P6 B4 B5` at 25 fps,
-/// 280 ms, after `B5`'s start); audio, its latest frame's start when later;
-/// outside a running clip, zero. Regression: the clip reported 900 ms, the
-/// last frame's start, for the file of 1.4 s.
+/// 280 ms, after `B5`'s start); audio, where its latest frame ends when
+/// later, its length known before the finish writes it (ISO/IEC 14496-3
+/// §4.4.1: an AAC-LC frame's 1024 samples; RFC 6716 §3.1: an Opus packet's
+/// frames): an Opus packet of 20 ms at 300 ms, 320 ms, where the file's
+/// audio ends; AAC from 960 ms with the video ending at 1 s, 1.024 s;
+/// outside a running clip, zero. Regressions: the clip reported 900 ms, the
+/// last frame's start, for the file of 1.4 s; and 300 ms and 1 s, the
+/// audio's last frame left out before the finish.
 #[test]
 fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_frame() {
     let base = base();
@@ -1985,7 +1990,7 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
         "before the end"
     );
     let end = frame(ms(base, 1_400), 14 * tenth, false, 0, h264_au(false, 10));
-    assert_eq!(muxer.end_video(&end), Duration::ZERO);
+    assert_eq!(muxer.end_video(&end), end.wallclock);
     assert_eq!(
         muxer.media_end(),
         Duration::from_millis(1_400),
@@ -1995,11 +2000,15 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
     assert_eq!(muxer.media_end(), Duration::ZERO, "finished");
 
     let mut reordered = Muxer::new(&policy(10_000));
-    reordered
+    let mut file = Vec::new();
+    for piece in reordered
         .start(&h264_track(), Some(&opus_track(1)))
-        .unwrap();
+        .unwrap()
+    {
+        file.extend_from_slice(&piece);
+    }
     for (kind, frame) in reordered_gop(base, 0, 0, 0) {
-        reordered.push(kind, frame).unwrap();
+        assert!(reordered.push(kind, frame).unwrap().is_empty());
     }
     assert_eq!(
         reordered.media_end(),
@@ -2007,27 +2016,59 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
         "P6's end"
     );
     let audio = frame(ms(base, 300), 0, true, 0, opus_packet(0));
-    reordered.push(Kind::Audio, audio).unwrap();
+    assert!(reordered.push(Kind::Audio, audio).unwrap().is_empty());
     assert_eq!(
         reordered.media_end(),
-        Duration::from_millis(300),
-        "the audio's"
+        Duration::from_millis(320),
+        "the audio's, its 20 ms packet held"
+    );
+    // The file's media ends there too, once its last fragment is out.
+    for piece in reordered.finish().unwrap() {
+        file.extend_from_slice(&piece);
+    }
+    let opus = samples(&file, 2).pop().unwrap();
+    assert_eq!((opus.dts, opus.duration), (14_400, 960));
+
+    // AAC-LC at 16 kHz: video to 1 s, its last frame of 1024 samples from
+    // 960 ms, the file's media to 1.024 s.
+    let mut aac = Muxer::new(&policy(10_000));
+    aac.start(&h264_track(), Some(&aac_track())).unwrap();
+    for i in 0..10_u8 {
+        let key = i == 0;
+        let at = ms(base, 100 * u64::from(i));
+        let video = frame(at, tenth * i64::from(i), key, 0, h264_au(key, i));
+        aac.push(Kind::Video, video).unwrap();
+    }
+    let end = frame(ms(base, 1_000), 10 * tenth, false, 0, h264_au(false, 10));
+    assert_eq!(aac.end_video(&end), end.wallclock);
+    let audio = frame(ms(base, 960), 0, true, 0, Bytes::from_static(&[0x21; 8]));
+    aac.push(Kind::Audio, audio).unwrap();
+    assert_eq!(
+        aac.media_end(),
+        Duration::from_millis(1_024),
+        "the AAC's, its 1024 samples held"
     );
 }
 
 /// Reordered video ended at a frame is presented until its last presented
-/// picture ends, short of that frame by the pictures presented between
-/// them, which are decoded after it and so left out with it, and the muxer
-/// says by how much, so the clip ends its audio there too (ISO/IEC
-/// 14496-12 §8.8.8.1: a sample is presented at its decode time plus its
-/// composition offset; its duration is a step of the decode times). `I0 P3
-/// B1 B2 P6 B4 B5` at 25 fps ended at `P9`, captured at 360 ms: `P6`, the
-/// last presented, ends at 280 ms, 80 ms short; the Opus captured before
-/// 280 ms ends there with it. In order, `I0 P1 .. P6` ended at `P9` after
-/// a hole, the video lasts until it (nothing short). Regression: the clip
-/// ended the audio at 360 ms, 80 ms past the video, told nothing.
+/// picture ends, which is not where that frame is presented, and the muxer
+/// says where on that frame's date, so the clip ends its audio there too
+/// (ISO/IEC 14496-12 §8.8.8.1: a sample is presented at its decode time
+/// plus its composition offset; its duration is a step of the decode
+/// times). Short of it by the pictures presented between them, decoded
+/// after it and so left out with it: `I0 P3 B1 B2 P6 B4 B5` at 25 fps
+/// ended at `P9`, captured at 360 ms, is presented until 280 ms, where
+/// `P6`, the last presented, ends. Past it when that frame is presented
+/// before pictures that went in, as an end by arrival leaves out the first
+/// to arrive after the clip's end: `I0 P3 B1 B2 P6 B4` ended at `B5`,
+/// captured at 200 ms, is presented until 280 ms too. Either way the Opus
+/// captured before 280 ms ends there with it. In order, `I0 P1 .. P6` ended
+/// at `P9` after a hole, the video lasts until it, 360 ms. Regressions: the
+/// clip ended the audio at 360 ms, 80 ms past the video, told nothing; and
+/// at 200 ms for the excluded `B5`, 80 ms before the video, told only how
+/// far before its end frame the video ends.
 #[test]
-fn iso14496_12_8_8_8_1_reordered_video_s_end_short_of_its_end_frame_ends_the_audio_with_it() {
+fn iso14496_12_8_8_8_1_reordered_video_ends_the_audio_where_its_presentation_ends() {
     let base = base();
     // Where the file's samples of `track_id` at `rate` are presented, in
     // ms: from the first one's start to where the last presented ends, as
@@ -2044,9 +2085,16 @@ fn iso14496_12_8_8_8_1_reordered_video_s_end_short_of_its_end_frame_ends_the_aud
         let (_, end) = starts.iter().max().unwrap();
         (first * 1000 / rate, end * 1000 / rate)
     };
-    let clip = |order: &[u8]| {
+    let clip = |order: &[u8], end: u8| {
         let video = gop(order, base, 0, 0, 0);
-        let p9 = frame(ms(base, 360), 9 * FRAME, false, 0, h264_au(false, 9));
+        let end_ms = u64::from(end) * 40;
+        let end = frame(
+            ms(base, end_ms),
+            i64::from(end) * FRAME,
+            false,
+            0,
+            h264_au(false, end),
+        );
         let mut muxer = Muxer::new(&policy(10_000));
         let mut file = Vec::new();
         let mut put = |pieces: Vec<Bytes>| {
@@ -2058,9 +2106,9 @@ fn iso14496_12_8_8_8_1_reordered_video_s_end_short_of_its_end_frame_ends_the_aud
         for (kind, frame) in video {
             put(muxer.push(kind, frame).unwrap());
         }
-        let short = muxer.end_video(&p9);
-        // The audio the clip lets in: captured before P9, less the short.
-        let end = 360 - u64::try_from(short.as_millis()).unwrap();
+        // The audio the clip lets in: captured before where the video ends.
+        let end = muxer.end_video(&end).duration_since(base).as_millis();
+        let end = u64::try_from(end).unwrap();
         for i in (0..).take_while(|i| i * 20 < end) {
             let at = ms(base, i * 20);
             let n = u8::try_from(i).unwrap();
@@ -2071,20 +2119,25 @@ fn iso14496_12_8_8_8_1_reordered_video_s_end_short_of_its_end_frame_ends_the_aud
         }
         put(muxer.finish().unwrap());
         (
-            short,
+            end,
             presented(&file, 1, 90_000),
             presented(&file, 2, 48_000),
         )
     };
     assert_eq!(
-        clip(&[0, 3, 1, 2, 6, 4, 5]),
-        (Duration::from_millis(80), (0, 280), (0, 280)),
+        clip(&[0, 3, 1, 2, 6, 4, 5], 9),
+        (280, (0, 280), (0, 280)),
         "reordered"
     );
     assert_eq!(
-        clip(&[0, 1, 2, 3, 4, 5, 6]),
-        (Duration::ZERO, (0, 360), (0, 360)),
+        clip(&[0, 1, 2, 3, 4, 5, 6], 9),
+        (360, (0, 360), (0, 360)),
         "in order"
+    );
+    assert_eq!(
+        clip(&[0, 3, 1, 2, 6, 4], 5),
+        (280, (0, 280), (0, 280)),
+        "B5 excluded"
     );
 }
 
