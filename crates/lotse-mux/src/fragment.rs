@@ -70,6 +70,11 @@
 //! its presentation ends where the next epoch begins when that is sooner
 //! and no sooner than the track's presentation so far ends, and an epoch
 //! captured before the track's presentation ends starts where it ends.
+//! Reordered video so ended is presented until its last presented picture
+//! ends, short of the frame it ended at by the pictures between them, which
+//! are decoded after that frame and so left out; the muxer says by how much
+//! ([`TrackWriter::close_at`]), and the clip ends its audio that much before
+//! that frame's date.
 //!
 //! Video whose timestamps go back in decode order is reordered
 //! (B-frames): from the first such frame on, the epoch's decode times
@@ -469,6 +474,16 @@ impl TrackWriter {
         duration_of(self.latest, self.clock_rate)
     }
 
+    /// Where the track's presentation reaches, from the clip's media time
+    /// 0: where its finished samples' presentation ends
+    /// ([`Self::presented`]: the video's last too once
+    /// [`close_at`](Self::close_at) ended it), or the latest frame's
+    /// start, whose length is not known yet, if later; zero before the
+    /// first.
+    pub(crate) fn reach(&self) -> Duration {
+        duration_of(self.presented().max(self.latest), self.clock_rate)
+    }
+
     /// The decode time of the latest frame taken, from the clip's media
     /// time 0; zero before the first. It never goes back (see the
     /// module), and inside an epoch it follows the frames' timestamps,
@@ -497,22 +512,45 @@ impl TrackWriter {
     /// leaves the hole between them, as a reconnect does: the sample ends
     /// as [`close`](Self::close) ends it, and so does one whose duration
     /// would not fit its field.
-    pub(crate) fn close_at(&mut self, next: &MediaFrame) {
+    ///
+    /// Returns how far before `next`'s presentation time the track's
+    /// presentation then ends ([`Self::shown`], which it settles): zero in
+    /// order, where the sample's end is `next`'s presentation time, and
+    /// for the fallbacks, whose `next` has no place on the epoch's
+    /// timeline. Reordered video's last sample in decode order is not its
+    /// last presented, and the pictures between its last presented and
+    /// `next` are decoded after `next`, so left out: `I0 P3 B1 B2 P6 B4 B5`
+    /// at 25 fps ended at `P9` (360 ms) is presented until 280 ms, where
+    /// `P6`, a frame long, ends ([`Epoch::shown`]), 80 ms short. `B5` lasts
+    /// its step of the decode times, as a sample after it would time it:
+    /// longer, it would stretch the track's decode past `next` and still
+    /// not show `P6` longer, whose duration is a step of the decode times
+    /// already written.
+    pub(crate) fn close_at(&mut self, next: &MediaFrame) -> Duration {
         let ts = i128::from(next.ts.ticks());
         let video = self.video;
         let until = self
             .epoch
             .as_mut()
             .filter(|epoch| epoch.number == next.epoch)
-            .map(|epoch| epoch.next(ts, video).0);
-        let duration = until
+            .map(|epoch| (epoch.next(ts, video).0, epoch.pts(ts)));
+        let timed = until
             .zip(self.held.as_ref())
-            .and_then(|(dts, held)| u32::try_from(dts.saturating_sub(i128::from(held.dts))).ok());
-        match (self.held.take(), duration) {
-            (Some(held), Some(duration)) => self.finish(&held, duration),
+            .and_then(|((dts, pts), held)| {
+                let duration = u32::try_from(dts.saturating_sub(i128::from(held.dts))).ok()?;
+                Some((duration, pts))
+            });
+        match (self.held.take(), timed) {
+            (Some(held), Some((duration, pts))) => {
+                self.finish(&held, duration);
+                let end = held.pts().saturating_add(i128::from(duration));
+                self.shown = self.presented().max(end);
+                duration_of(pts.saturating_sub(self.shown), self.clock_rate)
+            }
             (held, _) => {
                 self.held = held;
                 self.close();
+                Duration::ZERO
             }
         }
     }

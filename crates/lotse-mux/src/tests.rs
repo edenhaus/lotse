@@ -1930,8 +1930,9 @@ fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() 
                 file.extend_from_slice(&piece);
             }
         }
+        // Not short of it: in order, or not on its timeline.
         if let Some(end) = end {
-            muxer.end_video(&end);
+            assert_eq!(muxer.end_video(&end), Duration::ZERO);
         }
         for piece in muxer.finish().unwrap() {
             file.extend_from_slice(&piece);
@@ -1952,8 +1953,139 @@ fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() 
     assert_eq!(last(Some(at_1400(far, 0))), (81_000, 9_000), "past 32 bits");
 
     let mut idle = Muxer::new(&policy(1000));
-    idle.end_video(&at_1400(0, 0));
+    assert_eq!(idle.end_video(&at_1400(0, 0)), Duration::ZERO);
     assert!(matches!(idle.state, State::Idle));
+}
+
+/// Where the file's media ends counts the video's last sample until the
+/// frame the clip ended the video at (ISO/IEC 14496-12 §8.8.8: a sample
+/// lasts until the next one's decode time): video-only, every 100 ms from
+/// 0 to 0.9 s and the end frame at 1.4 s (a camera that stalled), 1.4 s.
+/// Before the end, the latest frame's start; reordered video, where its
+/// last presented picture ends (`P6` of `I0 P3 B1 B2 P6 B4 B5` at 25 fps,
+/// 280 ms, after `B5`'s start); audio, its latest frame's start when later;
+/// outside a running clip, zero. Regression: the clip reported 900 ms, the
+/// last frame's start, for the file of 1.4 s.
+#[test]
+fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_frame() {
+    let base = base();
+    let tenth = 9_000;
+    let mut muxer = Muxer::new(&policy(10_000));
+    assert_eq!(muxer.media_end(), Duration::ZERO, "idle");
+    muxer.start(&h264_track(), None).unwrap();
+    for i in 0..10_u8 {
+        let key = i == 0;
+        let at = ms(base, 100 * u64::from(i));
+        let video = frame(at, tenth * i64::from(i), key, 0, h264_au(key, i));
+        muxer.push(Kind::Video, video).unwrap();
+    }
+    assert_eq!(
+        muxer.media_end(),
+        Duration::from_millis(900),
+        "before the end"
+    );
+    let end = frame(ms(base, 1_400), 14 * tenth, false, 0, h264_au(false, 10));
+    assert_eq!(muxer.end_video(&end), Duration::ZERO);
+    assert_eq!(
+        muxer.media_end(),
+        Duration::from_millis(1_400),
+        "until 1.4 s"
+    );
+    muxer.finish().unwrap();
+    assert_eq!(muxer.media_end(), Duration::ZERO, "finished");
+
+    let mut reordered = Muxer::new(&policy(10_000));
+    reordered
+        .start(&h264_track(), Some(&opus_track(1)))
+        .unwrap();
+    for (kind, frame) in reordered_gop(base, 0, 0, 0) {
+        reordered.push(kind, frame).unwrap();
+    }
+    assert_eq!(
+        reordered.media_end(),
+        Duration::from_millis(280),
+        "P6's end"
+    );
+    let audio = frame(ms(base, 300), 0, true, 0, opus_packet(0));
+    reordered.push(Kind::Audio, audio).unwrap();
+    assert_eq!(
+        reordered.media_end(),
+        Duration::from_millis(300),
+        "the audio's"
+    );
+}
+
+/// Reordered video ended at a frame is presented until its last presented
+/// picture ends, short of that frame by the pictures presented between
+/// them, which are decoded after it and so left out with it, and the muxer
+/// says by how much, so the clip ends its audio there too (ISO/IEC
+/// 14496-12 §8.8.8.1: a sample is presented at its decode time plus its
+/// composition offset; its duration is a step of the decode times). `I0 P3
+/// B1 B2 P6 B4 B5` at 25 fps ended at `P9`, captured at 360 ms: `P6`, the
+/// last presented, ends at 280 ms, 80 ms short; the Opus captured before
+/// 280 ms ends there with it. In order, `I0 P1 .. P6` ended at `P9` after
+/// a hole, the video lasts until it (nothing short). Regression: the clip
+/// ended the audio at 360 ms, 80 ms past the video, told nothing.
+#[test]
+fn iso14496_12_8_8_8_1_reordered_video_s_end_short_of_its_end_frame_ends_the_audio_with_it() {
+    let base = base();
+    // Where the file's samples of `track_id` at `rate` are presented, in
+    // ms: from the first one's start to where the last presented ends, as
+    // a reader shows them (each its composition time for its duration).
+    let presented = |file: &[u8], track_id: u32, rate: i64| -> (i64, i64) {
+        let starts: Vec<(i64, i64)> = samples(file, track_id)
+            .iter()
+            .map(|s| {
+                let pts = i64::try_from(s.dts).unwrap() + i64::from(s.cts);
+                (pts, pts + i64::from(s.duration))
+            })
+            .collect();
+        let first = starts.iter().map(|(pts, _)| *pts).min().unwrap();
+        let (_, end) = starts.iter().max().unwrap();
+        (first * 1000 / rate, end * 1000 / rate)
+    };
+    let clip = |order: &[u8]| {
+        let video = gop(order, base, 0, 0, 0);
+        let p9 = frame(ms(base, 360), 9 * FRAME, false, 0, h264_au(false, 9));
+        let mut muxer = Muxer::new(&policy(10_000));
+        let mut file = Vec::new();
+        let mut put = |pieces: Vec<Bytes>| {
+            for piece in pieces {
+                file.extend_from_slice(&piece);
+            }
+        };
+        put(muxer.start(&h264_track(), Some(&opus_track(1))).unwrap());
+        for (kind, frame) in video {
+            put(muxer.push(kind, frame).unwrap());
+        }
+        let short = muxer.end_video(&p9);
+        // The audio the clip lets in: captured before P9, less the short.
+        let end = 360 - u64::try_from(short.as_millis()).unwrap();
+        for i in (0..).take_while(|i| i * 20 < end) {
+            let at = ms(base, i * 20);
+            let n = u8::try_from(i).unwrap();
+            let ts = 960 * i64::from(n);
+            put(muxer
+                .push(Kind::Audio, frame(at, ts, true, 0, opus_packet(n)))
+                .unwrap());
+        }
+        put(muxer.finish().unwrap());
+        (
+            short,
+            presented(&file, 1, 90_000),
+            presented(&file, 2, 48_000),
+        )
+    };
+    assert_eq!(
+        clip(&[0, 3, 1, 2, 6, 4, 5]),
+        (Duration::from_millis(80), (0, 280), (0, 280)),
+        "reordered"
+    );
+    assert_eq!(
+        clip(&[0, 1, 2, 3, 4, 5, 6]),
+        (Duration::ZERO, (0, 360), (0, 360)),
+        "in order"
+    );
 }
 
 #[test]
