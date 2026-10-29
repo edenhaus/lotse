@@ -304,11 +304,12 @@ impl ClipMuxer for Muxer {
         }
     }
 
-    fn end_video(&mut self, end: &MediaFrame) {
+    fn end_video(&mut self, end: &MediaFrame) -> Duration {
         // Outside a running clip there is no video to end.
-        if let State::Running(clip) = &mut self.state {
-            clip.video.close_at(end);
-        }
+        let State::Running(clip) = &mut self.state else {
+            return Duration::ZERO;
+        };
+        clip.video.close_at(end)
     }
 
     fn finish(&mut self) -> Result<Vec<Bytes>, ClipError> {
