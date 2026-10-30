@@ -79,15 +79,18 @@ pub const STREAM: Stream = Stream {
 
 /// The synthetic camera's stream with `audio`: [`STREAM`] with the
 /// audio codec's SDP name (RFC 3551 §6 `PCMU`, RFC 3640 §4.1
-/// `MPEG4-GENERIC`, RFC 7587 §7 `opus`). The browser receives 50 audio
-/// packets a second either way: PCMU as the camera sends it, AAC as the
-/// transcoder's 20 ms Opus frames, Opus in ffmpeg's 20 ms frames.
+/// `MPEG4-GENERIC`, RFC 7587 §7 `opus`, RFC 3551 §4.5.2 `G722`). The
+/// browser receives 50 audio packets a second either way: PCMU as the
+/// camera sends it, AAC as the transcoder's 20 ms Opus frames, Opus in
+/// ffmpeg's 20 ms frames. The browser test plays no G.722 (its `--audio`
+/// takes `pcmu`, `aac` or `opus`).
 pub const fn stream(audio: Audio) -> Stream {
     let audio_codec = match audio {
         Audio::None => "none",
         Audio::Pcmu => STREAM.audio_codec,
         Audio::Aac => "MPEG4-GENERIC",
         Audio::Opus => "opus",
+        Audio::G722 => "G722",
     };
     Stream {
         audio_codec,
@@ -234,6 +237,7 @@ mod tests {
         assert_eq!(stream(Audio::Aac).audio_codec, "MPEG4-GENERIC");
         assert_eq!(stream(Audio::Opus).audio_codec, "opus");
         assert_eq!(stream(Audio::None).audio_codec, "none");
+        assert_eq!(stream(Audio::G722).audio_codec, "G722");
         assert_eq!(stream(Audio::Aac).audio_packets_per_second, 50);
         // The beep's peak is the filter graph's: a sine of 1/8 doubled.
         assert!(mediamtx::filter_graph(Some(8_000)).contains("volume=volume='2*"));

@@ -11,15 +11,17 @@
 //!
 //! The picture is black, 640×480 at 30 fps, white for the first 100 ms (3
 //! frames) of every second, with a keyframe forced on each flash and a
-//! group of pictures of one second; the sound, when there is any, is a
-//! 1 kHz sine at -12 dBFS over the same 100 ms, on the same `lavfi` clock:
-//! the A/V sync marks the browser test's page measures.
+//! group of pictures of one second, in H.264 or H.265 ([`Video`]); the
+//! sound, when there is any, is a 1 kHz sine at -12 dBFS over the same
+//! 100 ms, on the same `lavfi` clock: the A/V sync marks the browser test's
+//! page measures.
 //!
 //! [`Camera::start`] runs `mediamtx` with the committed
 //! `crates/lotse-testing/mediamtx.yml` on free loopback ports and
 //! `ffmpeg` with [`ffmpeg_args`], both from `PATH` (`mise.toml` pins
 //! them), waits until MediaMTX's API reports the path ready with every
-//! track, and stops both when dropped; [`Camera::restart_publisher`]
+//! track, and stops both when dropped; [`Camera::start_video`] does the
+//! same with the video codec asked for; [`Camera::restart_publisher`]
 //! restarts ffmpeg, a camera that reboots.
 //!
 //! [`Camera::start_hls`] has MediaMTX serve the same path over HLS
@@ -88,6 +90,78 @@ const POLL: Duration = Duration::from_millis(100);
 /// The largest API answer read.
 const MAX_ANSWER: u64 = 1 << 20;
 
+/// The video ffmpeg publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Video {
+    /// H.264 from libx264, Baseline, as RFC 6184 packetizes it.
+    H264,
+    /// H.265 from libx265, Main, as RFC 7798 packetizes it.
+    H265,
+}
+
+impl Video {
+    /// The variant's name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::H265 => "h265",
+        }
+    }
+
+    /// The encoder's arguments: low latency (`ultrafast`, `zerolatency`: no
+    /// B-frames, no lookahead), a group of pictures of one second and no
+    /// keyframe from a scene cut, so only [`encoder_args`]' forced keyframes
+    /// start one. libx265 makes each forced keyframe an IDR picture
+    /// (`-forced-idr`, closed groups of pictures) and repeats its VPS, SPS
+    /// and PPS before each (`repeat-headers`), as cameras send them; its
+    /// default would be a CRA picture with the sets only at the start.
+    fn encoder(self) -> Vec<String> {
+        let gop = FPS.to_string();
+        let common = ["-preset", "ultrafast", "-tune", "zerolatency"];
+        match self {
+            Self::H264 => ["-c:v", "libx264"]
+                .into_iter()
+                .chain(common)
+                .chain([
+                    "-profile:v",
+                    "baseline",
+                    "-g",
+                    &gop,
+                    "-keyint_min",
+                    &gop,
+                    "-sc_threshold",
+                    "0",
+                ])
+                .map(str::to_owned)
+                .collect(),
+            Self::H265 => {
+                let params = format!(
+                    "log-level=warning:keyint={FPS}:min-keyint={FPS}:scenecut=0:open-gop=0:repeat-headers=1"
+                );
+                ["-c:v", "libx265"]
+                    .into_iter()
+                    .chain(common)
+                    .chain(["-forced-idr", "1", "-x265-params", &params])
+                    .map(str::to_owned)
+                    .collect()
+            }
+        }
+    }
+
+    /// The codec MediaMTX's API names the track (`tracks2[].codec`).
+    pub const fn mediamtx_codec(self) -> &'static str {
+        match self {
+            Self::H264 => "H264",
+            Self::H265 => "H265",
+        }
+    }
+
+    /// The codec the daemon reports for the track in `stream/get`.
+    pub const fn lotse_codec(self) -> &'static str {
+        self.name()
+    }
+}
+
 /// The audio track ffmpeg publishes beside the video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Audio {
@@ -100,13 +174,16 @@ pub enum Audio {
     Pcmu,
     /// Opus from libopus, 48 kHz mono, 20 ms frames (RFC 7587).
     Opus,
+    /// G.722 from ffmpeg's native encoder, 16 kHz mono at 64 kbit/s,
+    /// payload type 9 with its 8000 Hz RTP clock (RFC 3551 §4.5.2).
+    G722,
 }
 
 impl Audio {
     /// Every variant, video-only first.
-    pub const ALL: [Self; 4] = [Self::None, Self::Aac, Self::Pcmu, Self::Opus];
+    pub const ALL: [Self; 5] = [Self::None, Self::Aac, Self::Pcmu, Self::Opus, Self::G722];
 
-    /// The variant named `name`: `none`, `aac`, `pcmu` or `opus`.
+    /// The variant named `name`: `none`, `aac`, `pcmu`, `opus` or `g722`.
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|audio| audio.name() == name)
     }
@@ -118,6 +195,7 @@ impl Audio {
             Self::Aac => "aac",
             Self::Pcmu => "pcmu",
             Self::Opus => "opus",
+            Self::G722 => "g722",
         }
     }
 
@@ -125,7 +203,7 @@ impl Audio {
     pub const fn sample_rate(self) -> Option<u32> {
         match self {
             Self::None => None,
-            Self::Aac => Some(16_000),
+            Self::Aac | Self::G722 => Some(16_000),
             Self::Pcmu => Some(8_000),
             Self::Opus => Some(48_000),
         }
@@ -154,6 +232,7 @@ impl Audio {
                 "-application",
                 "lowdelay",
             ],
+            Self::G722 => &["-c:a", "g722", "-ac", "1"],
         }
     }
 
@@ -164,6 +243,7 @@ impl Audio {
             Self::Aac => Some("MPEG-4 Audio"),
             Self::Pcmu => Some("G711"),
             Self::Opus => Some("Opus"),
+            Self::G722 => Some("G722"),
         }
     }
 
@@ -174,6 +254,7 @@ impl Audio {
             Self::Aac => Some("aac_lc"),
             Self::Pcmu => Some("pcmu"),
             Self::Opus => Some("opus"),
+            Self::G722 => Some("g722"),
         }
     }
 
@@ -181,7 +262,7 @@ impl Audio {
     pub const fn tracks(self) -> usize {
         match self {
             Self::None => 1,
-            Self::Aac | Self::Pcmu | Self::Opus => 2,
+            Self::Aac | Self::Pcmu | Self::Opus | Self::G722 => 2,
         }
     }
 }
@@ -210,28 +291,27 @@ pub fn filter_graph(sample_rate: Option<u32>) -> String {
 
 /// ffmpeg's arguments: [`encoder_args`], published to `url` over RTSP
 /// with RTP interleaved on TCP.
-pub fn ffmpeg_args(audio: Audio, url: &str) -> Vec<String> {
-    let mut args = encoder_args(audio);
+pub fn ffmpeg_args(video: Video, audio: Audio, url: &str) -> Vec<String> {
+    let mut args = encoder_args(video, audio);
     args.extend(["-f", "rtsp", "-rtsp_transport", "tcp", url].map(str::to_owned));
     args
 }
 
-/// ffmpeg's arguments as an HTTP server: [`encoder_args`], muxed into
-/// MPEG-TS (ISO/IEC 13818-1) and served as one response body at `url` to
-/// the first client that asks (`-listen 1`, ffmpeg-protocols "http").
+/// ffmpeg's arguments as an HTTP server: [`encoder_args`] with H.264,
+/// muxed into MPEG-TS (ISO/IEC 13818-1) and served as one response body at
+/// `url` to the first client that asks (`-listen 1`, ffmpeg-protocols
+/// "http").
 pub fn ts_server_args(audio: Audio, url: &str) -> Vec<String> {
-    let mut args = encoder_args(audio);
+    let mut args = encoder_args(Video::H264, audio);
     args.extend(["-f", "mpegts", "-listen", "1", url].map(str::to_owned));
     args
 }
 
 /// ffmpeg's input and encoder arguments: read the graph in real time
-/// (`-re`), encode the video with libx264 for low latency (`ultrafast`,
-/// `zerolatency`: no B-frames, no lookahead), Baseline, a keyframe forced
+/// (`-re`), encode the video with [`Video`]'s encoder, a keyframe forced
 /// on every flash and none between, and the audio with [`Audio`]'s
 /// encoder.
-pub fn encoder_args(audio: Audio) -> Vec<String> {
-    let gop = FPS.to_string();
+pub fn encoder_args(video: Video, audio: Audio) -> Vec<String> {
     let mut args: Vec<String> = [
         "-hide_banner",
         "-loglevel",
@@ -245,25 +325,7 @@ pub fn encoder_args(audio: Audio) -> Vec<String> {
     .map(str::to_owned)
     .to_vec();
     args.push(filter_graph(audio.sample_rate()));
-    args.extend(
-        [
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-tune",
-            "zerolatency",
-            "-profile:v",
-            "baseline",
-            "-g",
-            &gop,
-            "-keyint_min",
-            &gop,
-            "-sc_threshold",
-            "0",
-        ]
-        .map(str::to_owned),
-    );
+    args.extend(video.encoder());
     args.push("-force_key_frames".to_owned());
     args.push(format!("expr:eq(mod(n,{FPS}),0)"));
     args.extend(audio.encoder().iter().map(|arg| (*arg).to_owned()));
@@ -429,6 +491,8 @@ pub struct Camera {
     ffmpeg: Option<Child>,
     /// Where it listens.
     ports: Ports,
+    /// The video ffmpeg publishes.
+    video: Video,
     /// What ffmpeg publishes.
     audio: Audio,
     /// The HLS URL's scheme, when MediaMTX serves HLS.
@@ -439,10 +503,19 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// Starts MediaMTX and ffmpeg with `audio`, and waits until the path
-    /// is ready with all its tracks.
+    /// Starts MediaMTX and ffmpeg with H.264 and `audio`, and waits until
+    /// the path is ready with all its tracks.
     pub async fn start(audio: Audio, clock: Arc<dyn Clock>) -> Result<Self, String> {
-        let mut camera = Self::start_mediamtx(audio, &*clock, |_ports| {
+        Self::start_video(Video::H264, audio, clock).await
+    }
+
+    /// As [`Self::start`], with `video`.
+    pub async fn start_video(
+        video: Video,
+        audio: Audio,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, String> {
+        let mut camera = Self::start_mediamtx(video, audio, &*clock, |_ports| {
             let mut mediamtx = command("mediamtx")?;
             mediamtx.arg(CONFIG);
             Ok(mediamtx)
@@ -490,7 +563,7 @@ impl Camera {
         tls_dir: Option<PathBuf>,
         clock: &dyn Clock,
     ) -> Result<Self, String> {
-        let started = Self::start_mediamtx(audio, clock, |_ports| {
+        let started = Self::start_mediamtx(Video::H264, audio, clock, |_ports| {
             let mut mediamtx = command("mediamtx")?;
             mediamtx.arg(CONFIG).envs(env.iter().cloned());
             Ok(mediamtx)
@@ -517,6 +590,7 @@ impl Camera {
     /// [`START_ATTEMPTS`] times, while it exits before then. One that is
     /// still running when its API times out is not started again.
     async fn start_mediamtx(
+        video: Video,
         audio: Audio,
         clock: &dyn Clock,
         mut mediamtx: impl FnMut(&Ports) -> io::Result<Command>,
@@ -530,6 +604,7 @@ impl Camera {
                 mediamtx: spawn(mediamtx)?,
                 ffmpeg: None,
                 ports,
+                video,
                 audio,
                 hls: None,
                 tls_dir: None,
@@ -552,7 +627,7 @@ impl Camera {
     /// Starts ffmpeg publishing and waits until the path is ready.
     async fn publish(&mut self, clock: &dyn Clock) -> Result<(), String> {
         let mut ffmpeg = command("ffmpeg").map_err(|err| format!("ffmpeg: {err}"))?;
-        ffmpeg.args(ffmpeg_args(self.audio, &self.url()));
+        ffmpeg.args(ffmpeg_args(self.video, self.audio, &self.url()));
         self.ffmpeg = Some(spawn(ffmpeg)?);
         self.wait_ready(clock).await
     }
@@ -604,6 +679,11 @@ impl Camera {
     /// Where it listens.
     pub fn ports(&self) -> Ports {
         self.ports
+    }
+
+    /// The video ffmpeg publishes.
+    pub fn video(&self) -> Video {
+        self.video
     }
 
     /// What ffmpeg publishes.
@@ -678,7 +758,7 @@ impl Camera {
             self.check_running()?;
             let path = self.path().await?;
             if let Some(path) = &path
-                && ready_with(path, self.audio)
+                && ready_with(path, self.video, self.audio)
             {
                 return Ok(());
             }
@@ -795,8 +875,8 @@ impl Drop for TsServer {
     }
 }
 
-/// Whether the API's `path` is ready with H.264 and `audio`'s track.
-pub fn ready_with(path: &Value, audio: Audio) -> bool {
+/// Whether the API's `path` is ready with `video`'s and `audio`'s tracks.
+pub fn ready_with(path: &Value, video: Video, audio: Audio) -> bool {
     let codecs: Vec<&str> = path
         .get("tracks2")
         .and_then(Value::as_array)
@@ -807,7 +887,7 @@ pub fn ready_with(path: &Value, audio: Audio) -> bool {
                 .collect()
         })
         .unwrap_or_default();
-    let wanted: Vec<&str> = std::iter::once("H264")
+    let wanted: Vec<&str> = std::iter::once(video.mediamtx_codec())
         .chain(audio.mediamtx_codec())
         .collect();
     path.get("ready").and_then(Value::as_bool) == Some(true) && codecs == wanted
@@ -883,6 +963,12 @@ mod tests {
         assert_eq!(Audio::Opus.mediamtx_codec(), Some("Opus"));
         assert_eq!((Audio::None.tracks(), Audio::Pcmu.tracks()), (1, 2));
         assert_eq!(Audio::None.lotse_codec(), None);
+        assert_eq!(Audio::G722.sample_rate(), Some(16_000));
+        assert_eq!(
+            (Audio::G722.mediamtx_codec(), Audio::G722.lotse_codec()),
+            (Some("G722"), Some("g722"))
+        );
+        assert_eq!(Audio::G722.tracks(), 2);
     }
 
     #[test]
@@ -905,25 +991,56 @@ mod tests {
 
     #[test]
     fn ffmpeg_publishes_x264_with_a_keyframe_on_each_flash_and_the_audio_encoder() {
-        let args = ffmpeg_args(Audio::Pcmu, "rtsp://127.0.0.1:1/cam");
+        let args = ffmpeg_args(Video::H264, Audio::Pcmu, "rtsp://127.0.0.1:1/cam");
         let line = args.join(" ");
         assert!(line.starts_with("-hide_banner -loglevel warning -nostdin -re -f lavfi -i color="));
         assert!(line.contains(
             "-c:v libx264 -preset ultrafast -tune zerolatency -profile:v baseline -g 30 -keyint_min 30 -sc_threshold 0 -force_key_frames expr:eq(mod(n,30),0) -c:a pcm_mulaw -ac 1"
         ), "{line}");
         assert!(line.ends_with("-f rtsp -rtsp_transport tcp rtsp://127.0.0.1:1/cam"));
-        let video_only = ffmpeg_args(Audio::None, "rtsp://x/cam").join(" ");
+        let video_only = ffmpeg_args(Video::H264, Audio::None, "rtsp://x/cam").join(" ");
         assert!(!video_only.contains("-c:a") && !video_only.contains("sine="));
         assert!(
-            ffmpeg_args(Audio::Aac, "u")
+            ffmpeg_args(Video::H264, Audio::Aac, "u")
                 .join(" ")
                 .contains("-c:a aac -b:a 32k -ac 1 -muxdelay 0 -f rtsp")
         );
         assert!(
-            ffmpeg_args(Audio::Opus, "u")
+            ffmpeg_args(Video::H264, Audio::Opus, "u")
                 .join(" ")
                 .contains("-c:a libopus -b:a 32k -ac 1 -frame_duration 20")
         );
+        assert!(
+            ffmpeg_args(Video::H264, Audio::G722, "u")
+                .join(" ")
+                .contains("samples_per_frame=320,")
+        );
+        assert!(
+            ffmpeg_args(Video::H264, Audio::G722, "u")
+                .join(" ")
+                .contains("-c:a g722 -ac 1 -f rtsp")
+        );
+    }
+
+    #[test]
+    fn h265_forces_idr_keyframes_with_their_parameter_sets() {
+        let line = ffmpeg_args(Video::H265, Audio::None, "rtsp://x/cam").join(" ");
+        assert!(
+            line.contains(
+                "-c:v libx265 -preset ultrafast -tune zerolatency -forced-idr 1 -x265-params \
+             log-level=warning:keyint=30:min-keyint=30:scenecut=0:open-gop=0:repeat-headers=1 \
+             -force_key_frames expr:eq(mod(n,30),0) -f rtsp"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("libx264"), "{line}");
+        assert_eq!(
+            [Video::H264, Video::H265].map(Video::name),
+            ["h264", "h265"]
+        );
+        assert_eq!(Video::H265.mediamtx_codec(), "H265");
+        assert_eq!(Video::H265.lotse_codec(), "h265");
+        assert_eq!(Video::H264.mediamtx_codec(), "H264");
     }
 
     #[test]
@@ -983,13 +1100,16 @@ mod tests {
     #[test]
     fn a_path_is_ready_with_exactly_its_tracks() {
         let path = json!({ "ready": true, "tracks2": [{ "codec": "H264" }, { "codec": "G711" }] });
-        assert!(ready_with(&path, Audio::Pcmu));
-        assert!(!ready_with(&path, Audio::Opus));
-        assert!(!ready_with(&path, Audio::None));
+        assert!(ready_with(&path, Video::H264, Audio::Pcmu));
+        assert!(!ready_with(&path, Video::H265, Audio::Pcmu));
+        assert!(!ready_with(&path, Video::H264, Audio::Opus));
+        assert!(!ready_with(&path, Video::H264, Audio::None));
+        let h265 = json!({ "ready": true, "tracks2": [{ "codec": "H265" }, { "codec": "G722" }] });
+        assert!(ready_with(&h265, Video::H265, Audio::G722));
         let mut waiting = path;
         waiting["ready"] = json!(false);
-        assert!(!ready_with(&waiting, Audio::Pcmu));
-        assert!(!ready_with(&json!({}), Audio::None));
+        assert!(!ready_with(&waiting, Video::H264, Audio::Pcmu));
+        assert!(!ready_with(&json!({}), Video::H264, Audio::None));
     }
 
     #[test]
@@ -1026,6 +1146,7 @@ mod tests {
             let camera = Camera {
                 mediamtx: spawn(command("true").unwrap()).unwrap(),
                 ffmpeg: None,
+                video: Video::H264,
                 ports: Ports {
                     rtsp: 1,
                     rtp: 2,
@@ -1041,6 +1162,7 @@ mod tests {
                 Some("https://127.0.0.1:3/cam/index.m3u8")
             );
             assert_eq!(camera.url(), "rtsp://127.0.0.1:1/cam");
+            assert_eq!((camera.video(), camera.audio()), (Video::H264, Audio::None));
             assert_eq!(camera.path().await.unwrap(), Some(json!({ "ready": true })));
             assert_eq!(camera.path().await.unwrap(), None);
             assert!(camera.path().await.unwrap_err().contains("HTTP 500"));
@@ -1076,6 +1198,7 @@ mod tests {
             let mut camera = Camera {
                 mediamtx: spawn(sleep).unwrap(),
                 ffmpeg: None,
+                video: Video::H264,
                 ports: Ports {
                     rtsp: 1,
                     rtp: 2,
@@ -1109,6 +1232,7 @@ mod tests {
         let mut camera = Camera {
             mediamtx: spawn(command("true").unwrap()).unwrap(),
             ffmpeg: None,
+            video: Video::H264,
             ports: Ports::free().unwrap(),
             audio: Audio::Pcmu,
             hls: None,
@@ -1125,10 +1249,15 @@ mod tests {
     #[tokio::test]
     async fn a_mediamtx_that_exits_at_start_is_started_again_on_new_ports() {
         let mut starts = 0;
-        let err = Camera::start_mediamtx(Audio::Pcmu, &lotse_core::clock::SystemClock, |_| {
-            starts += 1;
-            command("false")
-        })
+        let err = Camera::start_mediamtx(
+            Video::H264,
+            Audio::Pcmu,
+            &lotse_core::clock::SystemClock,
+            |_| {
+                starts += 1;
+                command("false")
+            },
+        )
         .await
         .unwrap_err();
         assert!(err.contains("mediamtx exited"), "{err}");
@@ -1140,18 +1269,23 @@ mod tests {
         let (listening, listener) = tokio::sync::oneshot::channel();
         let mut listening = Some(listening);
         let mut starts = 0;
-        let start = Camera::start_mediamtx(Audio::Pcmu, &lotse_core::clock::SystemClock, |ports| {
-            starts += 1;
-            if starts == 1 {
-                return command("false");
-            }
-            // The second one stays up, and its API answers.
-            let api = TcpListener::bind((Ipv4Addr::LOCALHOST, ports.api))?;
-            listening.take().unwrap().send(api).unwrap();
-            let mut sleep = command("sleep")?;
-            sleep.arg("5");
-            Ok(sleep)
-        });
+        let start = Camera::start_mediamtx(
+            Video::H264,
+            Audio::Pcmu,
+            &lotse_core::clock::SystemClock,
+            |ports| {
+                starts += 1;
+                if starts == 1 {
+                    return command("false");
+                }
+                // The second one stays up, and its API answers.
+                let api = TcpListener::bind((Ipv4Addr::LOCALHOST, ports.api))?;
+                listening.take().unwrap().send(api).unwrap();
+                let mut sleep = command("sleep")?;
+                sleep.arg("5");
+                Ok(sleep)
+            },
+        );
         let serve = async {
             let api = listener.await.unwrap();
             api.set_nonblocking(true).unwrap();
@@ -1178,7 +1312,7 @@ mod tests {
         let clock = lotse_core::clock::FakeClock::default();
         let mut starts = 0;
         // Nothing answers on the API's port, and the process stays up.
-        let start = Camera::start_mediamtx(Audio::Pcmu, &clock, |_| {
+        let start = Camera::start_mediamtx(Video::H264, Audio::Pcmu, &clock, |_| {
             starts += 1;
             let mut sleep = command("sleep")?;
             sleep.arg("5");
