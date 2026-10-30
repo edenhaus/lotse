@@ -1137,10 +1137,13 @@ mod clip {
             ),
             "{started}"
         );
+        // The keyframe's age when the container starts (`Clip::begin`),
+        // which can be up to `start_delay` after the command chose it.
         let before_ms = started["before_ms"].as_u64().unwrap();
         assert!(
-            (BEFORE_MS..BEFORE_MS + 1_000 + FRAME_MS).contains(&before_ms),
-            "the newest keyframe {BEFORE_MS} ms ago or more, a second apart: {before_ms}"
+            (BEFORE_MS..BEFORE_MS + 1_000 + FRAME_MS + start_delay).contains(&before_ms),
+            "the newest keyframe {BEFORE_MS} ms ago or more, a second apart, \
+             started at most {start_delay} ms after it was asked: {before_ms}"
         );
 
         let file = dir.join("clip.mp4");
@@ -1159,10 +1162,17 @@ mod clip {
             "the video covers {span} ms, the clip {before_ms} + {AFTER_MS} ms, \
              started at most {start_delay} ms after it was asked"
         );
+        // The duration counts from the file's media time 0 to where its
+        // media ends: the later of its tracks' ends.
+        let end_ms = |probed: &Probed| probed.start_us() / 1_000 + probed.span_ms();
+        let media_end = audio_frames
+            .as_ref()
+            .map_or(0, end_ms)
+            .max(end_ms(&video_frames));
         let stopped = events.last().unwrap();
         assert!(
-            stopped["duration_ms"].as_u64().unwrap().abs_diff(span) <= 2 * FRAME_MS,
-            "{stopped} for {span} ms of video"
+            stopped["duration_ms"].as_u64().unwrap().abs_diff(media_end) <= 2 * FRAME_MS,
+            "{stopped} for media to {media_end} ms"
         );
 
         check_audio(audio, &video_frames, audio_frames.as_ref());
@@ -1191,9 +1201,10 @@ mod clip {
             return;
         };
         let (codec, rate, frame_ticks, channels) = match audio {
+            Audio::None => panic!("no audio stream in a video-only clip: {}", sound.stream),
             Audio::Aac => ("aac", 16_000, 1_024, 1),
             Audio::Opus => ("opus", 48_000, 960, 2),
-            _ => ("opus", 48_000, 960, 1),
+            Audio::Pcmu | Audio::G722 => ("opus", 48_000, 960, 1),
         };
         assert_eq!(
             (
