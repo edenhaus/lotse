@@ -1294,7 +1294,8 @@ impl Track {
     /// The pre-roll ring's frames from the newest keyframe captured at or
     /// before `target` (else the oldest held) to the newest frame; `None`
     /// when it holds nothing. On an audio track, `target` is the video
-    /// snapshot's start, and the frames start with the one playing then. A
+    /// snapshot's start's capture time, and the frames start with the one
+    /// playing then by their capture times as dated. A
     /// clip takes it with [`Self::subscribe_from_preroll`], so nothing the
     /// track publishes falls between its subscription and its pre-roll.
     pub fn preroll_snapshot(&self, target: Instant) -> Option<PrerollSnapshot> {
