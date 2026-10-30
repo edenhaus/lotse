@@ -56,15 +56,32 @@
 //! full the task takes nothing out of its queue but keeps draining the
 //! subscriptions into it, so a stalled reader fills the kernel's pipe,
 //! then the queue up to `clip_queue_bytes`, and then costs the clip a gap,
-//! never the camera's other consumers. A clip ends at the first frame
-//! captured at or after its end, by the ring's measure as its start
-//! ([`captured`]), or [`END_GRACE`] after it when none comes. The
-//! interleaver orders the tracks by that measure too, so a frame at the
-//! end goes out only after the other track's frames queued ahead of that
-//! track's own first frame at the end, and a graceful end's drain, which
-//! stops at the next frame at the end, leaves none of them out. The
-//! video's frames queued behind its first at the end are left out,
-//! B-frames that may refer to it.
+//! never the camera's other consumers. The video ends at its first frame
+//! captured at or after the clip's end, by the ring's measure as its
+//! start ([`captured`]), and the audio at its first frame dated at or
+//! after that frame's capture time, where the container puts the video's
+//! end (its last frame lasts until there, [`ClipMuxer::end_video`], not a
+//! frame's length, which after a hole in the frames would end it short of
+//! the audio; reordered video, whose last presented picture need not end
+//! where that frame is presented, ends where the container says, before
+//! that frame or after it, and the audio with it), as the audio starts with the
+//! frame dated at the start keyframe; an
+//! audio frame captured before the clip's end goes in whatever its date,
+//! while the video's end is not known yet. The clip ends at the audio's
+//! end (at the video's when it has no audio); one whose first keyframe
+//! comes after its end has no video to write and starts nothing. The audio waits for its end
+//! frame at most `max_skew` after the video's end frame arrived
+//! (`ClipPolicy::max_skew`), one rule at both ends of a clip: a track waits
+//! at most that long for the other. A clip whose end no frame shows ends
+//! [`END_GRACE`] after its end. The interleaver orders the tracks by the ring's
+//! measure, so a frame at the end goes out only after the other track's
+//! frames queued ahead of that track's own first frame at the end, and a
+//! graceful end's drain, which stops at the next frame at the end, leaves
+//! none of them out. The video's frames queued behind its first at the
+//! end are left out, B-frames that may refer to it, and the audio waits
+//! for no video frame after it; nor does a video track event queued behind
+//! it (a codec change, a source switch, lost control events) end the clip:
+//! the file's video is complete, and the audio runs on to its end.
 //! A graceful end (`completed`, `stopped`, `max_duration`) first writes
 //! what the queue still holds, frames held for the other track included,
 //! up to the clip's end, for at most [`FINISH_GRACE`] of a reader taking
@@ -78,7 +95,9 @@
 //! the file's length, the bytes left out included, so the body, which ends
 //! whole only when it read that many, is cut when any were.
 //! Gaps and the duration carry clip media time, where the container put
-//! the frames ([`ClipMuxer::media_time`]), never their capture times: a
+//! the frames ([`ClipMuxer::media_time`]) and, for the duration, where it
+//! says the file's media ends ([`ClipMuxer::media_end`]), never their
+//! capture times: a
 //! gap runs from where the frame before the hole was put to where the
 //! frame that ends it was, a hole the queue reports included; a hole the
 //! clip ends in is none, and so is a hole in transcoded audio its
@@ -768,13 +787,34 @@ struct Clip {
     /// Whether the container started, at the first frame.
     begun: bool,
     /// The video met its first frame captured at or after the clip's
-    /// end. In decode order the frames behind it may be B-frames
+    /// end, or that frame, still queued, ended the audio
+    /// ([`Self::frame`]). In decode order the frames behind it may be B-frames
     /// presented before the end that refer to it, and it is not in the
-    /// file, so no later video frame goes in; the audio drains on up to
-    /// its own end.
+    /// file, so no later video frame goes in, and no later video track event
+    /// ends the clip ([`Self::control`]); the audio runs on up to its
+    /// own end ([`Self::audio_end`]) or [`Self::end_deadline`].
     video_ended: bool,
-    /// The furthest clip media time a frame was put at, on either track:
-    /// the duration `Stopped` reports.
+    /// Where the container's video ends, on the date of the video's end
+    /// frame ([`ClipMuxer::end_video`]: that frame's capture time as dated,
+    /// or before or after it for reordered video), set as the container's
+    /// video ends ([`Self::end_video`]): when the video meets that frame, or
+    /// an audio frame goes out before it while it is queued. The audio ends at
+    /// its first frame dated at or after it ([`Self::at_end`]), whether the
+    /// audio track is still open, or
+    /// closed with frames still queued, which a graceful end's drain then
+    /// writes up to it ([`Self::drain`]).
+    audio_end: Option<Instant>,
+    /// When the audio's wait for its end frame is over, set with
+    /// [`Self::audio_end`] while the audio track is open: `max_skew` after
+    /// the video's end frame arrived, the longest a track waits for the
+    /// other (`ClipPolicy::max_skew`), as the interleaver holds a frame for
+    /// it ([`Self::end_deadline`]).
+    audio_wait_ends: Option<Instant>,
+    /// The furthest clip media time a frame was put at, on either track,
+    /// and at the end where the container says the file's media ends
+    /// ([`ClipMuxer::media_end`]: the video's last frame lasting until its
+    /// end frame, [`ClipMuxer::end_video`], and the audio's last its
+    /// length): the duration `Stopped` reports.
     reached: Duration,
     /// The holes the queue reported per track, by their API name, until
     /// the frame that ends each is in the container: where they are.
@@ -861,6 +901,8 @@ impl Clip {
             left_out: 0,
             begun: false,
             video_ended: false,
+            audio_end: None,
+            audio_wait_ends: None,
             reached: Duration::ZERO,
             holes: HashMap::new(),
             judging: None,
@@ -887,6 +929,18 @@ impl Clip {
     /// When a clip whose end no frame showed ends anyway.
     fn late_end(&self) -> Instant {
         self.end_at.checked_add(END_GRACE).unwrap_or(self.end_at)
+    }
+
+    /// When the clip ends for want of a frame: its late end
+    /// ([`Self::late_end`]), or, once the video met its end and the clip
+    /// has audio, the end of the audio's wait for its own end frame
+    /// ([`Self::audio_wait_ends`]) when that comes first. One rule at both
+    /// ends of a clip: a track waits at most `max_skew` for the other, as
+    /// the interleaver holds a frame for it, and it starts with the video's
+    /// end frame, the one the audio's end is dated by.
+    fn end_deadline(&self) -> Instant {
+        self.audio_wait_ends
+            .map_or_else(|| self.late_end(), |ends| ends.min(self.late_end()))
     }
 
     /// Waits for the tracks, picks them, subscribes and queues the
@@ -1077,7 +1131,7 @@ impl Clip {
             tracing::info!(clip.id = %self.id, "clip: no keyframe to start at in time");
             return Err(EndReason::SourceNotLive);
         }
-        if now >= self.late_end() {
+        if now >= self.end_deadline() {
             tracing::info!(clip.id = %self.id, reason = self.end_reason.name(), "clip: no frame after its end came; ending");
             return Err(self.end_reason);
         }
@@ -1098,13 +1152,13 @@ impl Clip {
     }
 
     /// When to look again with nothing pushed: the start timeout while it
-    /// runs, the late end, or, while the pipe takes everything, when a
+    /// runs, the end deadline ([`Self::end_deadline`]), or, while the pipe takes everything, when a
     /// frame the interleaver holds goes out, whichever comes first. A
     /// frame held behind a full pipe waits for the pipe, whose readiness
     /// wakes the clip: its hold over would wake it at once again and
     /// again, and so would a start timeout `step` no longer ends at.
     fn wake(&self, interleaver: &Interleaver) -> Instant {
-        let mut wake = self.late_end();
+        let mut wake = self.end_deadline();
         if self.awaits_keyframe(interleaver) {
             wake = wake.min(self.start_deadline());
         }
@@ -1119,7 +1173,15 @@ impl Clip {
     /// One item of the queue.
     fn take(&mut self, out: Out, media: &mut Media) -> Result<(), EndReason> {
         match out {
-            Out::Frame { track, frame } => self.frame(track, frame, media),
+            Out::Frame { track, frame } => {
+                let taken = self.frame(track, frame, media);
+                if self.video_ended {
+                    // Nothing the video sends after its end goes in, so
+                    // the audio running on to it waits for none.
+                    media.interleaver.queue_mut().end(Kind::Video);
+                }
+                taken
+            }
             // Its capture times are not where the file has it: it waits for
             // the frame that ends it, which follows on its track.
             Out::Gap { track, reason, .. } => {
@@ -1138,12 +1200,16 @@ impl Clip {
         }
     }
 
-    /// One frame: the end when it was captured at or after the clip's,
-    /// by the ring's measure ([`captured`]: a frame dated ahead of its
-    /// arrival by a Sender Report mapping off, RFC 3550 §6.4.1, counts
-    /// from its arrival, as the clip's start and `before_ms` do), and
-    /// nothing for a video frame after the video's end
-    /// ([`Self::video_ended`]); the container's start before the first;
+    /// One frame: the end when it is at the clip's end
+    /// ([`Self::at_end`]), except the video's while the clip's audio track
+    /// is open and its container started (before, no video goes in, so
+    /// nothing does), which then runs on to the video end's date
+    /// ([`Self::audio_end`]) for `max_skew` at most
+    /// ([`Self::end_deadline`]), and nothing for a video frame after the
+    /// video's end ([`Self::video_ended`]); the video's end frame, met or
+    /// still queued behind an audio frame, ends the container's video
+    /// ([`Self::end_video`]) before the frame that finds it is judged; the
+    /// container's start before the first;
     /// then into the container ([`Self::sample`]), audio the clip
     /// transcodes as the Opus packets its [`ToOpus`] completes with it. A
     /// hole the queue reported before an audio frame the transcode
@@ -1167,8 +1233,33 @@ impl Clip {
             tracing::trace!(clip.id = %self.id, ts = %frame.ts, "clip: a video frame behind the video's end left out");
             return Ok(());
         }
-        if captured(&frame) >= self.end_at {
+        if track == Kind::Audio
+            && self.audio_end.is_none()
+            && let Some(end) = self.queued_video_end(media).cloned()
+        {
+            // The video's end frame still queued, behind this audio frame:
+            // every video frame before it went in, so the video ends there,
+            // and this frame and the audio after it by it.
+            self.end_video(&end);
+        }
+        if self.at_end(track, &frame) {
             if track == Kind::Video {
+                if self.audio_end.is_none() {
+                    self.end_video(&frame);
+                }
+                self.video_ended = true;
+                if self.begun && media.audio.is_some() {
+                    let wait = frame
+                        .arrival
+                        .checked_add(self.settings.policy.max_skew)
+                        .unwrap_or(frame.arrival);
+                    self.audio_wait_ends = Some(wait);
+                    tracing::debug!(clip.id = %self.id, wait_ms = self.settings.policy.max_skew.as_millis(), "clip: the video's end is reached; the audio runs on to its date, for max_skew at most");
+                    return Ok(());
+                }
+            } else if self.audio_end.is_some() {
+                // The video's end frame still queued ends the audio: it
+                // stays out, and so does the video behind it.
                 self.video_ended = true;
             }
             tracing::debug!(clip.id = %self.id, %track, reason = self.end_reason.name(), "clip: its end is reached");
@@ -1224,6 +1315,85 @@ impl Clip {
             self.sample(track, packet, seen)?;
         }
         Ok(())
+    }
+
+    /// Ends the container's video at `end`, its frame at the clip's end,
+    /// met or still queued behind an audio frame, after every video frame
+    /// before it went in: there once the container started
+    /// ([`ClipMuxer::end_video`]), or where the container says its video
+    /// ends, before it or after it for reordered video, where the audio
+    /// ends too ([`Self::audio_end`]).
+    fn end_video(&mut self, end: &MediaFrame) {
+        let at = if self.begun {
+            self.muxer.end_video(end)
+        } else {
+            end.wallclock
+        };
+        tracing::debug!(
+            clip.id = %self.id,
+            before_ms = end.wallclock.saturating_duration_since(at).as_millis(),
+            after_ms = at.saturating_duration_since(end.wallclock).as_millis(),
+            "clip: the video ends; the audio ends with it"
+        );
+        // What audio the queue still holds ends by it too, after the audio
+        // track closed as well, in the drain.
+        self.audio_end = Some(at);
+    }
+
+    /// Whether `frame` of `track` is at the clip's end. The video's end is
+    /// its first frame captured at or after the clip's by the ring's
+    /// measure ([`captured`]: a frame dated ahead of its arrival by a
+    /// Sender Report mapping off, RFC 3550 §6.4.1, counts from its
+    /// arrival), as the clip's start and `before_ms` count. The audio's
+    /// is its first frame dated at or after where the container's video
+    /// ends, on that video frame's date (its capture time as dated, or
+    /// before or after it for reordered video, [`ClipMuxer::end_video`]),
+    /// as the audio's start follows the start keyframe's date
+    /// ([`Self::audio_end`]): once the video met it, or once it was the
+    /// first video frame queued as an
+    /// audio frame went out, which it is when one captured at or after the
+    /// clip's end goes out before it ([`Self::frame`] ends the container's
+    /// video there first). Before that, an audio frame is at the end when
+    /// it was captured
+    /// at or after the clip's end: the video stalled past `max_skew`.
+    /// Before the container started, an audio frame is at the end once the
+    /// video's first frame is: a clip whose first keyframe comes after its
+    /// end has no video to write and starts nothing, not the audio alone.
+    ///
+    /// Known limit: the audio's end compares the dates the frames have now,
+    /// while the container anchors each epoch of a track once, at its first
+    /// frame's date, and places the frames after it by their timestamps. A
+    /// change of one track's mapping relative to the other's inside the
+    /// clip's epoch so leaves the audio's end off the file's video end by
+    /// that change. In practice that is a track's first Sender Report
+    /// arriving inside the clip (RFC 3550 §6.4.1), on a connection younger
+    /// than one report interval or in a clip that spans a reconnect: the
+    /// error is then the difference of the tracks' leads over their arrival.
+    /// Changes common to both tracks, the connection's offset, cancel, and a
+    /// track's own fit moves at most
+    /// [`MAX_SLEW`](lotse_core::clock_map::MAX_SLEW) per report. Comparing on
+    /// the container's timeline instead is a follow-up.
+    fn at_end(&self, track: Kind, frame: &MediaFrame) -> bool {
+        match track {
+            Kind::Video => captured(frame) >= self.end_at,
+            Kind::Audio => match self.audio_end {
+                // The video's first frame is at the end: none of the
+                // video goes in, so neither does the audio alone.
+                Some(_) if !self.begun => true,
+                Some(end) => frame.wallclock >= end,
+                None => captured(frame) >= self.end_at,
+            },
+        }
+    }
+
+    /// The video's end frame while it is still queued: the first video
+    /// frame queued, when it is at the clip's end ([`Self::at_end`]).
+    fn queued_video_end<'a>(&self, media: &'a Media) -> Option<&'a Arc<MediaFrame>> {
+        media
+            .interleaver
+            .queue()
+            .first_frame(Kind::Video)
+            .filter(|video| captured(video) >= self.end_at)
     }
 
     /// One frame as the container takes it, `seen` by the video's
@@ -1360,7 +1530,9 @@ impl Clip {
     /// cannot carry nor the clip transcode, the audio is dropped, the clip
     /// warned `audio_omitted` as at the outset. Before the start the clip
     /// takes every item it can after each push, so the change leads its
-    /// track then and ending the track drops no frame.
+    /// track then and ending the track drops no frame. A video track event
+    /// after the video's end ([`Self::video_ended`]) changes nothing: no
+    /// video goes into the file after it, as no frame does.
     fn control(
         &mut self,
         track: Kind,
@@ -1368,6 +1540,12 @@ impl Clip {
         media: &mut Media,
     ) -> Result<(), EndReason> {
         tracing::debug!(clip.id = %self.id, %track, ?event, "clip: track event");
+        if track == Kind::Video && self.video_ended {
+            // The file's video is complete: nothing the video track sends
+            // after its end goes in, its events no more than its frames.
+            tracing::debug!(clip.id = %self.id, ?event, "clip: a video track event behind the video's end left out");
+            return Ok(());
+        }
         let codec = match event {
             TrackEvent::TrackChanged(codec) => codec,
             TrackEvent::SourceSwitched => {
@@ -1554,10 +1732,11 @@ impl Clip {
     /// graceful clip `client_gone`: either way its file is not whole. Any
     /// other reason already says the clip did not end as asked,
     /// `shutting_down` included, and stays. The pipe closes, and `Stopped`
-    /// is the last report, its duration the furthest media time a frame
-    /// was put at. Its `bytes` is the file's length: the bytes the pipe
-    /// took and those it did not take in time.
+    /// is the last report, its duration where the file's media ends
+    /// ([`Self::reached`]). Its `bytes` is the file's length: the bytes the
+    /// pipe took and those it did not take in time.
     async fn finish(mut self, mut reason: EndReason) {
+        self.reached = self.reached.max(self.muxer.media_end());
         if reason != EndReason::ClientGone {
             if self.begun {
                 match self.muxer.finish() {
@@ -3994,16 +4173,20 @@ mod tests {
     }
 
     /// What a clip's container was given to place its start: the origin
-    /// set, and the capture times of the first frame pushed of each track.
+    /// set, and the capture times of the first frame pushed of each track;
+    /// and to place its video's end: the capture time of the frame it ended
+    /// the video at ([`ClipMuxer::end_video`]), and how far after that
+    /// frame it says the video ends, in ms (negative: before it), and the
+    /// latest it says the file's media ends.
     #[derive(Debug, Clone, Default)]
-    struct Placing(Arc<std::sync::Mutex<[Option<Instant>; 3]>>);
+    struct Placing(Arc<std::sync::Mutex<[Option<Instant>; 4]>>, i64, Duration);
 
     impl Placing {
         /// Where the container put the first video and the first audio
         /// frame from its media time 0, in µs: negative before it, where
         /// it cannot put them, so it starts them there, late.
         fn starts(&self) -> (i128, i128) {
-            let [origin, video, audio] = *self.0.lock().unwrap();
+            let [origin, video, audio, _] = *self.0.lock().unwrap();
             let micros = |at: Option<Instant>| {
                 let (at, origin) = (at.unwrap(), origin.unwrap());
                 let after =
@@ -4013,6 +4196,12 @@ mod tests {
                 after - before
             };
             (micros(video), micros(audio))
+        }
+
+        /// The capture time of the frame the container ended the video
+        /// at, if it was told one: the latest.
+        fn video_end(&self) -> Option<Instant> {
+            self.0.lock().unwrap()[3]
         }
     }
 
@@ -4057,6 +4246,21 @@ mod tests {
 
         fn media_time(&self, track: Kind) -> Duration {
             self.inner.media_time(track)
+        }
+
+        fn end_video(&mut self, end: &MediaFrame) -> Instant {
+            self.seen.0.lock().unwrap()[3] = Some(end.wallclock);
+            let at = self.inner.end_video(end);
+            let by = Duration::from_millis(self.seen.1.unsigned_abs());
+            if self.seen.1 < 0 {
+                at.checked_sub(by).unwrap()
+            } else {
+                at + by
+            }
+        }
+
+        fn media_end(&self) -> Duration {
+            self.inner.media_end().max(self.seen.2)
         }
 
         fn finish(&mut self) -> Result<Vec<Bytes>, ClipError> {
@@ -5249,6 +5453,599 @@ mod tests {
             ]
         );
         assert_eq!(reports, vec![stopped("completed", bytes.len(), 256, 0)]);
+    }
+
+    /// The arrivals, in ms, of video frames 0 to `last`, 100 ms apart from 50.
+    fn every_100_ms_from_50(last: u64) -> Vec<u64> {
+        (0..=last).map(|index| index * 100 + 50).collect()
+    }
+
+    /// The arrivals, in ms, of AAC frames 0 to `last`, 64 ms apart from 0.
+    fn every_64_ms(last: u64) -> Vec<u64> {
+        (0..=last).map(|index| index * 64).collect()
+    }
+
+    /// Sends `rig`'s video, a frame of `video_len` bytes arriving at each
+    /// of `video_at` (ms, a keyframe every 10th), each dated `lead_ms`
+    /// after its arrival (a camera whose Sender Reports date it so, RFC 3550
+    /// §6.4.1), and an AAC frame (1 024 ticks per 64 ms) dated at each of
+    /// `audio_at`, in arrival order, the clock at each arrival.
+    async fn send_video_dated_ahead_and_aac(
+        rig: &Rig,
+        lead_ms: u64,
+        video_len: usize,
+        video_at: &[u64],
+        audio_at: &[u64],
+    ) {
+        let mut sent: Vec<(u64, Kind, u32)> = (0..)
+            .zip(video_at)
+            .map(|(index, at)| (*at, Kind::Video, index))
+            .chain(
+                (0..)
+                    .zip(audio_at)
+                    .map(|(index, at)| (*at, Kind::Audio, index)),
+            )
+            .collect();
+        sent.sort_by_key(|(at, kind, _)| (*at, *kind == Kind::Audio));
+        for (at, kind, index) in sent {
+            rig.advance_to(at);
+            if kind == Kind::Video {
+                let frame = frame_at(
+                    rig,
+                    (at + lead_ms, at),
+                    i64::from(index) * 9_000,
+                    index % 10 == 0,
+                    video_len,
+                );
+                assert!(rig.video().publish_frame(frame));
+            } else {
+                let ticks = i64::try_from(at).unwrap() * 16;
+                let mut frame = frame_at(rig, (at, at), ticks, true, 4);
+                frame.payload = vec![0xe0; 4].into();
+                assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
+            }
+            settle().await;
+        }
+    }
+
+    /// The audio ends with the video's end as dated, where the container
+    /// puts both: video dated 400 ms after its arrival (a camera whose
+    /// Sender Reports date it so, RFC 3550 §6.4.1), every 100 ms from
+    /// 50 ms, and AAC dated at its arrival every 64 ms, a clip ending at
+    /// 1 s. The video ends at its frame that arrived at 1.05 s, dated
+    /// 1.45 s; the audio frame that arrived at 1.024 s goes out before it,
+    /// by the ring's measure, and in, and the audio runs on to the frame
+    /// dated 1.408 s, playing then. Regression (interop with MediaMTX
+    /// 1.21.1 under load, 2026-10-27: video dated 443 to 477 ms after its
+    /// arrival and AAC 377 ms shorter than the video; G.722 on CI 100 ms
+    /// shorter): the audio ended at its first frame captured at or after
+    /// 1 s, 0.45 s before the video's end.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_clip_ends_its_audio_with_the_video_s_end_as_dated() {
+        let mut rig = Rig::new(Some(fake_aac()));
+        let reader = rig.start(spec(0, Some(1_000), true));
+        send_video_dated_ahead_and_aac(&rig, 400, 16, &every_100_ms_from_50(16), &every_64_ms(25))
+            .await;
+        let reports = rig.until_stopped().await;
+        let bytes = reader.rest().await;
+        let lines = lines(&bytes);
+        let last = |prefix: &str| {
+            lines
+                .iter()
+                .rfind(|line| line.starts_with(prefix))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(last("frame v"), "frame v 0 81000 - 16", "arrived at 0.95 s");
+        assert_eq!(last("frame a"), format!("frame a 0 {} k 4", 22 * 1_024));
+        // From the audio frame dated 64 ms to the one dated 1.408 s.
+        assert_eq!(
+            reports.last(),
+            Some(&stopped("completed", bytes.len(), 1_344, 0))
+        );
+    }
+
+    /// A video track event queued behind the video's end frame leaves the
+    /// clip to its end, as a video frame behind it does: the file's video is
+    /// complete. Video dated 400 ms after its arrival (RFC 3550 §6.4.1) every
+    /// 100 ms from 50 ms, AAC dated at its arrival every 64 ms, a clip ending
+    /// at 1 s: the video ends at its frame that arrived at 1.05 s (dated
+    /// 1.45 s), and the audio runs on to the frame dated 1.408 s. A video
+    /// codec change right behind that frame changes nothing; an audio codec
+    /// change after it (behind the AAC frame dated 1.088 s) still ends the
+    /// clip `stream_changed`, its audio still going in. Regression: the video's
+    /// codec change, going out ahead of the audio, ended the clip
+    /// `stream_changed` with the audio cut at 1.024 s.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_video_track_event_behind_the_video_s_end_leaves_the_audio_to_its_end()
+    {
+        // (which track changes its codec, after which arrival, the report, the last AAC's ticks, the duration)
+        for (changed, after, reason, last_audio, duration) in [
+            (Kind::Video, 1_050, "completed", 22 * 1_024, 1_344),
+            (Kind::Audio, 1_088, "stream_changed", 17 * 1_024, 1_286),
+        ] {
+            let case = format!("{changed} after {after}");
+            let mut rig = Rig::new(Some(fake_aac()));
+            let reader = rig.start(spec(0, Some(1_000), true));
+            let mut sent: Vec<(u64, Kind, u32)> = (0..)
+                .zip(every_100_ms_from_50(16))
+                .map(|(index, at)| (at, Kind::Video, index))
+                .chain(
+                    (0..)
+                        .zip(every_64_ms(25))
+                        .map(|(index, at)| (at, Kind::Audio, index)),
+                )
+                .collect();
+            sent.sort_by_key(|(at, kind, _)| (*at, *kind == Kind::Audio));
+            for (at, kind, index) in sent {
+                rig.advance_to(at);
+                if kind == Kind::Video {
+                    let ts = i64::from(index) * 9_000;
+                    let frame = frame_at(&rig, (at + 400, at), ts, index % 10 == 0, 16);
+                    assert!(rig.video().publish_frame(frame));
+                } else {
+                    let ticks = i64::try_from(at).unwrap() * 16;
+                    let mut frame = frame_at(&rig, (at, at), ticks, true, 4);
+                    frame.payload = vec![0xe0; 4].into();
+                    assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
+                }
+                if kind == changed && at == after {
+                    match changed {
+                        Kind::Video => rig.video().set_codec(Codec::H265 {
+                            vps: None,
+                            sps: None,
+                            pps: None,
+                        }),
+                        Kind::Audio => rig
+                            .audio
+                            .as_ref()
+                            .unwrap()
+                            .set_codec(Codec::Opus { channels: 2 }),
+                    }
+                }
+                settle().await;
+            }
+            let reports = rig.until_stopped().await;
+            let bytes = reader.rest().await;
+            let lines = lines(&bytes);
+            let last = lines
+                .iter()
+                .rfind(|line| line.starts_with("frame a"))
+                .unwrap();
+            assert_eq!(*last, format!("frame a 0 {last_audio} k 4"), "{case}");
+            assert_eq!(
+                reports.last(),
+                Some(&stopped(reason, bytes.len(), duration, 0)),
+                "{case}"
+            );
+        }
+    }
+
+    /// `ClipSettings` whose `max_skew` is 400 ms, below the 1 s default and
+    /// the 2 s late end, so a clip's end shows which of them ended it.
+    fn skew_400() -> ClipSettings {
+        ClipSettings {
+            policy: ClipPolicy {
+                max_skew: Duration::from_millis(400),
+                ..ClipPolicy::default()
+            },
+            ..ClipSettings::default()
+        }
+    }
+
+    /// The reports `rig`'s clip sent so far, none waited for.
+    fn reported(rig: &mut Rig) -> Vec<ClipReport> {
+        let mut seen = Vec::new();
+        while let Ok((_, report)) = rig.reports.try_recv() {
+            seen.push(report);
+        }
+        seen
+    }
+
+    /// The audio waits for its end frame at most `max_skew` after the video's
+    /// end frame arrived, the one rule at both ends of a clip (a track waits
+    /// at most that for the other, `ClipPolicy::max_skew`), not [`END_GRACE`]:
+    /// video dated 400 ms after its arrival, its end frame (captured and
+    /// arrived at 1.05 s, dated 1.45 s) taken as AAC frame 17 (1.088 s)
+    /// arrives, and then the audio stops sending, so no frame dated at or
+    /// after 1.45 s comes. With `max_skew` 400 ms the clip ends at 1.45 s,
+    /// 1.55 s before its late end at 3 s, with the audio up to its last
+    /// frame.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_the_audio_waits_at_most_max_skew_for_its_end_after_the_video_s() {
+        let mut rig = Rig::new(Some(fake_aac()));
+        let reader = rig.start_with(
+            spec(0, Some(1_000), true),
+            FakeClipMuxerFactory::default(),
+            skew_400(),
+        );
+        send_video_dated_ahead_and_aac(&rig, 400, 16, &every_100_ms_from_50(10), &every_64_ms(17))
+            .await;
+        rig.advance_to(1_449);
+        settle().await;
+        let mut reports = reported(&mut rig);
+        assert!(
+            !reports
+                .iter()
+                .any(|report| matches!(report, ClipReport::Stopped { .. })),
+            "not before max_skew after the video's end: {reports:?}"
+        );
+        rig.advance_to(1_450);
+        reports.extend(rig.until_stopped().await);
+        let bytes = reader.rest().await;
+        let lines = lines(&bytes);
+        let last = |prefix: &str| {
+            lines
+                .iter()
+                .rfind(|line| line.starts_with(prefix))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(last("frame v"), "frame v 0 81000 - 16", "arrived at 0.95 s");
+        assert_eq!(last("frame a"), format!("frame a 0 {} k 4", 17 * 1_024));
+        // From the audio frame dated 64 ms to the video frame dated 1.35 s,
+        // the audio's frame 17 (1.088 s) the last it sent.
+        assert_eq!(
+            reports.last(),
+            Some(&stopped("completed", bytes.len(), 1_286, 0))
+        );
+    }
+
+    /// The audio's end frame within `max_skew` of the video's end ends the
+    /// clip then, not at the wait's end: video dated 200 ms after its
+    /// arrival, its end frame dated 1.25 s, and the AAC frame dated 1.28 s,
+    /// arriving then, 170 ms before the wait for it ends at 1.45 s, ends it
+    /// with frame 19 (1.216 s) the last in the file.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_the_audio_end_frame_within_max_skew_ends_the_clip_then() {
+        let mut rig = Rig::new(Some(fake_aac()));
+        let reader = rig.start_with(
+            spec(0, Some(1_000), true),
+            FakeClipMuxerFactory::default(),
+            skew_400(),
+        );
+        send_video_dated_ahead_and_aac(&rig, 200, 16, &every_100_ms_from_50(10), &every_64_ms(20))
+            .await;
+        // The clock is at 1.28 s, short of 1.45 s: only that frame ends it.
+        let reports = rig.until_stopped().await;
+        let bytes = reader.rest().await;
+        let lines = lines(&bytes);
+        let last = |prefix: &str| {
+            lines
+                .iter()
+                .rfind(|line| line.starts_with(prefix))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(last("frame a"), format!("frame a 0 {} k 4", 19 * 1_024));
+        // From the audio frame dated 64 ms to the one dated 1.216 s.
+        assert_eq!(
+            reports.last(),
+            Some(&stopped("completed", bytes.len(), 1_152, 0))
+        );
+    }
+
+    /// The wait for the audio's end frame is bounded by the clip's late end
+    /// ([`END_GRACE`] after its end) too: a video end frame that arrives
+    /// late, at 2.7 s for a clip ending at 1 s, would put the wait's end at
+    /// 3.1 s with `max_skew` 400 ms, past the late end at 3 s, where the
+    /// clip ends.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_the_wait_for_the_audio_end_stays_within_the_late_end() {
+        let mut rig = Rig::new(Some(fake_aac()));
+        let reader = rig.start_with(
+            spec(0, Some(1_000), true),
+            FakeClipMuxerFactory::default(),
+            skew_400(),
+        );
+        // The audio's frame at 2.752 s releases the video's end frame from
+        // the hold, which dated 3.1 s is not the audio's end.
+        send_video_dated_ahead_and_aac(&rig, 400, 16, &[50, 2_700], &[0, 64, 2_752]).await;
+        rig.advance_to(2_999);
+        settle().await;
+        let mut reports = reported(&mut rig);
+        assert!(
+            !reports
+                .iter()
+                .any(|report| matches!(report, ClipReport::Stopped { .. })),
+            "not before its late end: {reports:?}"
+        );
+        rig.advance_to(3_000);
+        reports.extend(rig.until_stopped().await);
+        let bytes = reader.rest().await;
+        assert!(matches!(
+            reports.last(),
+            Some(ClipReport::Stopped { reason, .. }) if reason == "completed"
+        ));
+        let last = lines(&bytes)
+            .into_iter()
+            .rfind(|line| line.starts_with("frame a"))
+            .unwrap();
+        assert_eq!(last, format!("frame a 0 {} k 4", 2_752 * 16));
+    }
+
+    /// The audio a stalled reader left in the queue ends with the video's
+    /// end as dated even once the audio track closed: video of 16 KiB
+    /// frames that fill the pipe, dated 400 ms after its arrival (a camera
+    /// whose Sender Reports date it so, RFC 3550 §6.4.1), its end frame
+    /// arriving at 1.05 s dated 1.45 s, and AAC dated at its arrival up to
+    /// 1.408 s, all queued when the audio track closes. Once the reader
+    /// reads, the audio goes in up to the frame dated 1.408 s, playing at
+    /// the video's end, as with the track open. Regression: the clip ended
+    /// at the video's end frame and its drain stopped the audio at its
+    /// first frame captured at or after the clip's end, 1.088 s.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_queued_audio_ends_with_the_video_s_end_as_dated_after_its_track_closed()
+    {
+        let mut rig = Rig::new(Some(fake_aac()));
+        let reader = rig.start(spec(0, Some(1_000), true));
+        send_video_dated_ahead_and_aac(
+            &rig,
+            400,
+            16 * 1024,
+            &every_100_ms_from_50(10),
+            &every_64_ms(22),
+        )
+        .await;
+        rig.audio.as_ref().unwrap().close();
+        settle().await;
+        let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+        let lines = lines(&bytes);
+        let last = |prefix: &str| {
+            lines
+                .iter()
+                .rfind(|line| line.starts_with(prefix))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            last("frame v"),
+            "frame v 0 81000 - 16384",
+            "arrived at 0.95 s"
+        );
+        assert_eq!(last("frame a"), format!("frame a 0 {} k 4", 22 * 1_024));
+        // From the audio frame dated 64 ms to the one dated 1.408 s.
+        assert_eq!(
+            reports.last(),
+            Some(&stopped("completed", bytes.len(), 1_344, 0))
+        );
+    }
+
+    /// The container's video lasts until the frame the clip ends it at,
+    /// where the clip ends its audio, after a hole in the frames too: video
+    /// every 100 ms through 0.95 s and the next at 1.45 s, each dated at its
+    /// arrival, a clip ending at 1 s. Met by the video, that frame ends it
+    /// and the AAC dated at arrival runs on to the frame dated 1.408 s; still
+    /// queued, it ends the AAC dated 500 ms after its arrival at its frame
+    /// dated 1.46 s (arrived at 0.96 s), which goes out before it, the frame
+    /// dated 1.396 s the last in. Either way the container is told that
+    /// frame ([`ClipMuxer::end_video`]), and nothing of it goes in; so is it
+    /// when a stalled reader left a video frame after it queued (at 1.55 s,
+    /// 16 KiB frames filling the pipe), which the audio's end frame does not
+    /// take for the video's end. Regression: told nothing, the daemon's
+    /// muxer gave the video's last frame the length of the one before it,
+    /// ending the video at 1.05 s and the audio 0.4 s after it.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_the_container_s_video_lasts_until_the_frame_the_clip_ends_it_at() {
+        for (audio_lead, video_len, video_end, last_audio) in [
+            (0, 16, 1_450, 1_408),
+            (500, 16, 1_450, 1_396),
+            (0, 16 * 1024, 1_550, 1_408),
+        ] {
+            let case = format!("audio lead {audio_lead}, video of {video_len}");
+            let mut rig = Rig::new(Some(fake_aac()));
+            let placing = Placing::default();
+            let reader = rig.start_with(
+                spec(0, Some(1_000), true),
+                placing.clone(),
+                ClipSettings::default(),
+            );
+            let mut sent: Vec<(u64, Kind)> = every_100_ms_from_50(9)
+                .into_iter()
+                .chain((1_450..=video_end).step_by(100))
+                .map(|at| (at, Kind::Video))
+                .chain(every_64_ms(23).into_iter().map(|at| (at, Kind::Audio)))
+                .collect();
+            sent.sort_by_key(|(at, kind)| (*at, *kind == Kind::Audio));
+            for (at, kind) in sent {
+                rig.advance_to(at);
+                if kind == Kind::Video {
+                    let ts = i64::try_from(at - 50).unwrap() * 90;
+                    let frame = frame_at(&rig, (at, at), ts, at == 50, video_len);
+                    assert!(rig.video().publish_frame(frame));
+                } else {
+                    let date = at + audio_lead;
+                    let ticks = i64::try_from(date).unwrap() * 16;
+                    let mut frame = frame_at(&rig, (date, at), ticks, true, 4);
+                    frame.payload = vec![0xe0; 4].into();
+                    assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
+                }
+                settle().await;
+            }
+            let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+            let lines = lines(&bytes);
+            let last = |prefix: &str| {
+                lines
+                    .iter()
+                    .rfind(|line| line.starts_with(prefix))
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(
+                last("frame v"),
+                format!("frame v 0 81000 - {video_len}"),
+                "{case}"
+            );
+            assert_eq!(
+                last("frame a"),
+                format!("frame a 0 {} k 4", last_audio * 16),
+                "{case}"
+            );
+            assert_eq!(placing.video_end(), Some(rig.at(1_450)), "{case}");
+            assert!(matches!(
+                reports.last(),
+                Some(ClipReport::Stopped { reason, .. }) if reason == "completed"
+            ));
+        }
+    }
+
+    /// The clip ends its audio where the container says its video ends,
+    /// on the video's end frame's date ([`ClipMuxer::end_video`]):
+    /// reordered video ended at a frame is presented until its last
+    /// presented picture ends, before that frame when the pictures
+    /// presented between them are decoded after it and so left out with
+    /// it, after it when that frame is presented before pictures that went
+    /// in. Video every 100 ms through 0.95 s and the next at 1.45 s, a clip
+    /// ending at 1 s. A container that says its video ends 300 ms before
+    /// the frame at 1.45 s: the AAC dated at arrival ends at its frame
+    /// dated 1.152 s, the one dated 1.088 s the last in, playing at the
+    /// video's end. One that says 80 ms after it: the AAC ends at its frame
+    /// dated 1.536 s, the one dated 1.472 s the last in. Regressions: the
+    /// AAC ran on to 1.408 s, 300 ms past the video (80 ms past `I0 P3 B1
+    /// B2 P6 B4 B5` at 25 fps ended at `P9`); and, the container able to
+    /// say only "before", ended at 1.408 s, 80 ms before the video (`I0 P3
+    /// B1 B2 P6 B4` ended at `B5`, the first to arrive after the clip's
+    /// end).
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_clip_ends_its_audio_where_the_container_s_video_ends() {
+        for (after_ms, last_audio) in [(-300, 1_088), (80, 1_472)] {
+            let mut rig = Rig::new(Some(fake_aac()));
+            let placing = Placing(Arc::default(), after_ms, Duration::ZERO);
+            let reader = rig.start_with(
+                spec(0, Some(1_000), true),
+                placing.clone(),
+                ClipSettings::default(),
+            );
+            let mut sent: Vec<(u64, Kind)> = every_100_ms_from_50(9)
+                .into_iter()
+                .chain([1_450])
+                .map(|at| (at, Kind::Video))
+                .chain(every_64_ms(25).into_iter().map(|at| (at, Kind::Audio)))
+                .collect();
+            sent.sort_by_key(|(at, kind)| (*at, *kind == Kind::Audio));
+            for (at, kind) in sent {
+                rig.advance_to(at);
+                if kind == Kind::Video {
+                    let ts = i64::try_from(at - 50).unwrap() * 90;
+                    let frame = frame_at(&rig, (at, at), ts, at == 50, 16);
+                    assert!(rig.video().publish_frame(frame));
+                } else {
+                    let ticks = i64::try_from(at).unwrap() * 16;
+                    let mut frame = frame_at(&rig, (at, at), ticks, true, 4);
+                    frame.payload = vec![0xe0; 4].into();
+                    assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
+                }
+                settle().await;
+            }
+            let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+            let lines = lines(&bytes);
+            let last = |prefix: &str| {
+                lines
+                    .iter()
+                    .rfind(|line| line.starts_with(prefix))
+                    .unwrap()
+                    .clone()
+            };
+            let case = format!("{after_ms} ms after");
+            assert_eq!(last("frame v"), "frame v 0 81000 - 16", "{case}");
+            assert_eq!(
+                last("frame a"),
+                format!("frame a 0 {} k 4", last_audio * 16),
+                "{case}"
+            );
+            assert_eq!(placing.video_end(), Some(rig.at(1_450)), "{case}");
+            assert!(
+                matches!(
+                    reports.last(),
+                    Some(ClipReport::Stopped { reason, .. }) if reason == "completed"
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    /// `Stopped`'s duration is where the container says the file's media
+    /// ends ([`ClipMuxer::media_end`]), not only where it put the latest
+    /// frame: a video-only clip's video every 100 ms from 0 to 0.9 s and
+    /// the next, its end frame, at 1.4 s (a camera that stalled), whose
+    /// container times the last frame until that one, 1.4 s. Regression:
+    /// it reported 900 ms, the last frame's start, though the file covers
+    /// 1.4 s.
+    #[tokio::test]
+    async fn iso14496_12_8_8_8_the_stopped_duration_is_where_the_container_says_the_media_ends() {
+        let mut rig = Rig::new(None);
+        let placing = Placing(Arc::default(), 0, Duration::from_millis(1_400));
+        let reader = rig.start_with(
+            spec(0, Some(1_000), true),
+            placing.clone(),
+            ClipSettings::default(),
+        );
+        for at in every_100_ms_from_50(9).into_iter().chain([1_450]) {
+            rig.advance_to(at);
+            let ts = i64::try_from(at - 50).unwrap() * 90;
+            assert!(
+                rig.video()
+                    .publish_frame(frame_at(&rig, (at, at), ts, at == 50, 16))
+            );
+            settle().await;
+        }
+        let (reports, bytes) = tokio::join!(rig.until_stopped(), reader.rest());
+        assert_eq!(placing.video_end(), Some(rig.at(1_450)));
+        assert_eq!(
+            reports.last(),
+            Some(&stopped("completed", bytes.len(), 1_400, 0))
+        );
+    }
+
+    /// A clip whose first keyframe comes after its end has no video to
+    /// write, so it starts nothing, not the audio alone: neither with the
+    /// audio that goes out after that keyframe dated before it (the
+    /// keyframe arriving at 1.05 s for a clip ending at 1 s, dated 400 ms
+    /// after its arrival, a camera whose Sender Reports date it so, RFC
+    /// 3550 §6.4.1), nor with an audio frame captured before the clip's
+    /// end, at 0.99 s, that goes out before it, delivered after it at
+    /// 1.06 s. Either way the clip ends `completed` without a byte, as one
+    /// without audio does, at the keyframe, not waiting for the audio.
+    /// Regression: the first ran the audio on to the keyframe's date and
+    /// the second started the container with the audio frame, a file whose
+    /// video track had no sample.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_clip_whose_first_keyframe_comes_after_its_end_starts_nothing() {
+        let (logs, _guard) = Logs::capture();
+        // (captured, arrived) of each AAC frame, in ms, after the keyframe.
+        let after: Vec<(u64, u64)> = every_64_ms(25)
+            .into_iter()
+            .skip(17)
+            .map(|at| (at, at))
+            .collect();
+        let mut late = vec![(990, 1_060)];
+        late.extend(after.clone());
+        for audio in [after, late] {
+            let mut rig = Rig::new(Some(fake_aac()));
+            let reader = rig.start(spec(0, Some(1_000), true));
+            rig.advance_to(1_050);
+            let keyframe = frame_at(&rig, (1_450, 1_050), 0, true, 16);
+            assert!(rig.video().publish_frame(keyframe));
+            settle().await;
+            for (date, arrival) in audio {
+                rig.advance_to(arrival);
+                let ticks = i64::try_from(date).unwrap() * 16;
+                let mut frame = frame_at(&rig, (date, arrival), ticks, true, 4);
+                frame.payload = vec![0xe0; 4].into();
+                assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
+                settle().await;
+            }
+            let reports = rig.until_stopped().await;
+            assert_eq!(reports, vec![stopped("completed", 0, 0, 0)]);
+            assert!(reader.rest().await.is_empty());
+        }
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "clip: the video's end is reached; the audio runs on to its date, for max_skew at most"
+            ),
+            0
+        );
     }
 
     /// A finite clip's end is measured by when its frames were captured

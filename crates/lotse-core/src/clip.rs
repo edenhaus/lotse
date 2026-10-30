@@ -126,6 +126,46 @@ pub trait ClipMuxer: Send {
     /// did), so the clip reports its gaps where the file has them by this.
     fn media_time(&self, track: Kind) -> Duration;
 
+    /// Ends the video before `end`, the frame the clip ends it at, which
+    /// stays out of the file: the video's last frame lasts until `end`
+    /// would have been put, where the clip ends its audio too, not as long
+    /// as a frame before it, which after a hole in the frames ends the
+    /// video short of the audio. Called once the video's last frame went
+    /// in, at most once, and before `finish`.
+    ///
+    /// Returns the date the video's presentation then ends, on `end`'s
+    /// date, where the clip ends its audio: `end`'s own when the video
+    /// lasts until `end`. Reordered video's last frame in decode order is
+    /// not its last presented, so its presentation can end before `end`'s
+    /// presentation time or after it. Before, when the pictures presented
+    /// between its last presented and `end` are decoded after `end`, so
+    /// left out with it: `I0 P3 B1 B2 P6 B4 B5` at 25 fps ended at `P9` is
+    /// presented until 280 ms, where `P7` would begin, 80 ms before `P9`.
+    /// After, when `end` is a picture presented before ones that went in,
+    /// which an end by arrival leaves out: `I0 P3 B1 B2 P6 B4` ended at
+    /// `B5` is presented until 280 ms too, where `P6` ends, 80 ms after
+    /// `B5`. `I0 P3 B1 B2` ended at `P6` is presented until 200 ms, where
+    /// `P3`'s written duration ends, 40 ms before `P6`. The default does
+    /// nothing and returns `end`'s date, for a
+    /// container that does not time a frame by the next.
+    fn end_video(&mut self, end: &MediaFrame) -> Instant {
+        end.wallclock
+    }
+
+    /// Where the file's media ends so far, from the clip's media time 0:
+    /// the furthest a track's presentation reaches, counting each
+    /// sample's length where the container knows it (an audio frame's,
+    /// which its codec states, the latest's too before the finish writes
+    /// it; the video's last once [`end_video`](Self::end_video) ended it
+    /// there), else its frame's start; zero before the first. The clip reports it as the
+    /// file's duration. The default is the later of the tracks'
+    /// [`media_time`](Self::media_time), for a container that knows no
+    /// more.
+    fn media_end(&self) -> Duration {
+        self.media_time(Kind::Video)
+            .max(self.media_time(Kind::Audio))
+    }
+
     /// Ends the clip: the last fragment, after which the file is complete.
     fn finish(&mut self) -> Result<Vec<Bytes>, ClipError>;
 }
