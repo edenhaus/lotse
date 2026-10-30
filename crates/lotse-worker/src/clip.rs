@@ -1819,10 +1819,11 @@ mod tests {
 
     use lotse_codec::{g711, g722};
     use lotse_core::clock::{FakeClock, SystemClock};
+    use lotse_core::clock_map::ClockMapper;
     use lotse_core::let_assert;
-    use lotse_core::source::TrackPublisher;
+    use lotse_core::source::{ClockReport, SyncHint, TrackPublisher};
     use lotse_core::test_util::{FakeClipFailure, FakeClipMuxerFactory, fake_aac};
-    use lotse_core::track::TrackLimits;
+    use lotse_core::track::{TrackId, TrackLimits};
     use tokio::io::AsyncReadExt as _;
     use tracing::Level;
 
@@ -2897,6 +2898,100 @@ mod tests {
         let reports = rig.until_stopped().await;
         let bytes = reader.rest().await;
         assert_eq!(reports, vec![stopped("stopped", bytes.len(), 360, 0)]);
+    }
+
+    /// The clip task behind the output suite's seam: one clip at a time,
+    /// each with its own `Clips` and report channel, under the default
+    /// settings but the queue's bound the check asks.
+    #[derive(Default)]
+    struct SuiteClip {
+        running: Option<(Clips, mpsc::Receiver<(String, ClipReport)>)>,
+    }
+
+    impl lotse_testing::output_suite::clip::ClipUnderTest for SuiteClip {
+        fn start(
+            &mut self,
+            tracks: &Arc<TrackSet>,
+            factory: Arc<dyn ClipMuxerFactory>,
+            clock: Arc<dyn Clock>,
+            ask: lotse_testing::output_suite::clip::ClipAsk,
+            pipe: OwnedFd,
+        ) {
+            let (reports_tx, reports) = mpsc::channel(1024);
+            let mut clips = Clips::new(reports_tx);
+            clips.start(ClipStart {
+                spec: spec(millis(ask.before), None, false),
+                pipe: pipe::Sender::from_owned_fd(pipe).unwrap(),
+                tracks: Arc::clone(tracks),
+                factory,
+                settings: ClipSettings {
+                    policy: ClipPolicy {
+                        queue_bytes: ask.queue_bytes,
+                        ..ClipPolicy::default()
+                    },
+                    ..ClipSettings::default()
+                },
+                clock,
+                transcode: ToOpus::new,
+            });
+            self.running = Some((clips, reports));
+        }
+
+        fn stop(&mut self) {
+            let (clips, _) = self.running.as_ref().unwrap();
+            assert!(clips.stop("k1", EndReason::Stopped));
+        }
+
+        fn report(&mut self) -> lotse_testing::output_suite::clip::NextNote<'_> {
+            Box::pin(async move {
+                let (_, reports) = self.running.as_mut()?;
+                let (_, report) = reports.recv().await?;
+                Some(note(report))
+            })
+        }
+    }
+
+    /// A report as the output suite reads it.
+    fn note(report: ClipReport) -> lotse_testing::output_suite::clip::ClipNote {
+        use lotse_testing::output_suite::clip::ClipNote;
+        match report {
+            ClipReport::Started { before_ms, .. } => ClipNote::Started {
+                before: Duration::from_millis(u64::from(before_ms)),
+            },
+            ClipReport::Gap { reason, .. } => ClipNote::Gap { reason },
+            ClipReport::Stopped {
+                reason,
+                bytes,
+                gaps,
+                ..
+            } => ClipNote::Stopped {
+                reason,
+                bytes,
+                gaps,
+            },
+            ClipReport::Warning { .. } => ClipNote::Other,
+        }
+    }
+
+    /// The clip task passes the output suite's `Reliable` and `Preroll`
+    /// checks: a pre-roll start where it says with the camera's
+    /// timestamps, overflow as a counted gap, a stalled reader that never
+    /// slows the track, and a stop that finishes the container within
+    /// 100 ms.
+    #[tokio::test]
+    async fn the_clip_task_passes_the_output_suite_s_clip_checks() {
+        let mut clip = SuiteClip::default();
+        let violations = lotse_testing::output_suite::clip::check_all(&mut clip).await;
+        assert_eq!(violations, []);
+        // A warning is none of the reports the checks read.
+        let warning = ClipReport::Warning {
+            code: "audio_omitted".into(),
+            message: "pcmu".into(),
+        };
+        assert_eq!(
+            note(warning),
+            lotse_testing::output_suite::clip::ClipNote::Other
+        );
     }
 
     /// A reader that stops reading fills the pipe, then the clip's queue; the
@@ -4306,6 +4401,161 @@ mod tests {
             .filter(|line| line.starts_with("frame v"))
             .collect();
         assert_eq!(video, ["frame v 0 90000 k 32"], "the second keyframe only");
+    }
+
+    /// What a camera sends that delivers its audio `lag` ms after its
+    /// video, in the order it arrives: its first Sender Report (RFC 3550
+    /// §6.4.1), the audio's, of capture time 0, arriving `lag` ms later;
+    /// the video's, of 1 s, arriving at once; 10 fps video from 0, a
+    /// keyframe each second, arriving as captured; and AAC every 64 ms
+    /// from 0, arriving `lag` ms after it was captured.
+    #[derive(Debug, Clone, Copy)]
+    enum Sent {
+        /// The audio's Sender Report.
+        AudioReport,
+        /// The video's Sender Report.
+        VideoReport,
+        /// Video frame `index`, captured at `index` × 100 ms.
+        Video(u32),
+        /// Audio frame `index`, captured at `index` × 64 ms.
+        Audio(u32),
+    }
+
+    /// The first `until` ms of [`Sent`], each with its arrival in ms.
+    fn late_audio(lag: u64, until: u64) -> Vec<(u64, Sent)> {
+        let mut sent = vec![(lag, Sent::AudioReport), (1_000, Sent::VideoReport)];
+        sent.extend(
+            (0..)
+                .map(|index| (u64::from(index) * 100, Sent::Video(index)))
+                .take_while(|(at, _)| *at < until),
+        );
+        sent.extend(
+            (0..)
+                .map(|index| (u64::from(index) * 64 + lag, Sent::Audio(index)))
+                .take_while(|(at, _)| *at < until),
+        );
+        // A report goes before a frame arriving with it: stable by arrival.
+        sent.sort_by_key(|(at, _)| *at);
+        sent
+    }
+
+    /// Hands `sent` to `rig`'s tracks at its arrival, each frame dated by
+    /// `mapper` as the connection's source dates it then, the reports
+    /// ingested into it.
+    fn send(rig: &Rig, mapper: &ClockMapper, sent: &[(u64, Sent)]) {
+        const VIDEO: TrackId = TrackId::new(Kind::Video, 0);
+        const AUDIO: TrackId = TrackId::new(Kind::Audio, 0);
+        // An NTP timestamp (RFC 3550 §4, 32.32) `ms` after an arbitrary start.
+        let ntp = |ms: u64| (3_900_000_000_u64 << 32) + (ms << 32) / 1_000;
+        let report = |track, clock_rate, ms: u64, rtp_ts, arrival| ClockReport {
+            track,
+            clock_rate,
+            hint: SyncHint::RtcpSenderReport {
+                ntp: ntp(ms),
+                rtp_ts,
+            },
+            arrival,
+        };
+        for (at, what) in sent {
+            rig.advance_to(*at);
+            let arrival = rig.at(*at);
+            let frame = |track, ts: i64, keyframe, payload: Vec<u8>| MediaFrame {
+                ts: MediaTime::from_ticks(ts),
+                wallclock: mapper.map(track, u32::try_from(ts).unwrap(), arrival),
+                arrival,
+                keyframe,
+                discontinuity: false,
+                epoch: 0,
+                payload: payload.into(),
+            };
+            match *what {
+                Sent::AudioReport => mapper.ingest(report(AUDIO, 16_000, 0, 0, arrival)),
+                Sent::VideoReport => mapper.ingest(report(VIDEO, 90_000, 1_000, 90_000, arrival)),
+                Sent::Video(index) => {
+                    let keyframe = index % 10 == 0;
+                    let payload = if keyframe {
+                        vec![0x65; 32]
+                    } else {
+                        vec![0x41; 16]
+                    };
+                    let ts = i64::from(index) * 9_000;
+                    assert!(
+                        rig.video()
+                            .publish_frame(frame(VIDEO, ts, keyframe, payload))
+                    );
+                }
+                Sent::Audio(index) => {
+                    let ts = i64::from(index) * 1_024;
+                    let audio = rig.audio.as_ref().unwrap();
+                    assert!(audio.publish_frame(frame(AUDIO, ts, true, vec![0xe0; 4])));
+                }
+            }
+        }
+    }
+
+    /// A camera whose audio arrives 60 ms, or 575 ms, after its video,
+    /// whose audio's first Sender Report came first and so that much later
+    /// after its NTP time than the video's (RFC 3550 §6.4.1): the clip's
+    /// audio starts with the frame playing at its keyframe (captured at
+    /// 1.984 s for the keyframe of 2 s) and ends with the one playing at
+    /// its last video frame (captured at 4.992 s for the end at 5 s), both
+    /// by their capture times on the camera's clock, where the container
+    /// puts them; the duration runs from the first to the last
+    /// (4.992 s − 1.984 s), within an audio frame of the video's.
+    /// Regression (interop with MediaMTX 1.21.1 on a loaded runner,
+    /// 2026-10-26: Opus starting 60 ms before the video, G.722 552 ms, its
+    /// `duration_ms` that much over the video's): the clock map's offset
+    /// slewed 5 ms from the audio's report toward the video's, so every
+    /// video frame was dated `lag` − 5 ms after it arrived; the ring counts
+    /// a frame from its arrival then, and the audio started and ended
+    /// that much before the video.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_clip_starts_and_ends_its_audio_with_its_video_when_the_audio_s_first_report_came_late()
+     {
+        for lag in [60, 575] {
+            let mut rig = Rig::new(Some(fake_aac()));
+            let mapper = ClockMapper::new();
+            let sent = late_audio(lag, 5_700);
+            let (before, after): (Vec<_>, Vec<_>) =
+                sent.into_iter().partition(|(at, _)| *at <= 4_000);
+            send(&rig, &mapper, &before);
+            let reader = rig.start(spec(1_500, Some(1_000), true));
+            settle().await;
+            assert_eq!(
+                rig.report().await,
+                started(2_000, Some("aac_lc")),
+                "{lag} ms"
+            );
+            for event in after {
+                send(&rig, &mapper, &[event]);
+                settle().await;
+            }
+            let reports = rig.until_stopped().await;
+            let bytes = reader.rest().await;
+            let lines = lines(&bytes);
+            assert_eq!(
+                lines[1..3],
+                [
+                    format!("frame a 0 {} k 4", 31 * 1_024),
+                    "frame v 0 180000 k 32".to_owned()
+                ],
+                "{lag} ms"
+            );
+            let last_audio = lines
+                .iter()
+                .rfind(|line| line.starts_with("frame a"))
+                .unwrap();
+            assert_eq!(
+                *last_audio,
+                format!("frame a 0 {} k 4", 78 * 1_024),
+                "{lag} ms"
+            );
+            assert_eq!(
+                reports,
+                vec![stopped("completed", bytes.len(), 3_008, 0)],
+                "{lag} ms"
+            );
+        }
     }
 
     /// A hole the queue reports (the subscription lagged: the track dropped

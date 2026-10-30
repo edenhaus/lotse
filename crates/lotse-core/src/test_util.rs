@@ -71,7 +71,7 @@ macro_rules! let_assert {
 /// session of it at once (whose packets go into the factory's
 /// [`BackchannelCapture`], if it has one, else nowhere),
 /// `{"video": true}` to publish 30 fps H.264 on the video track
-/// ([`video_packet`]), or both of the last two together, the doorbell a
+/// (`video_packet`), or both of the last two together, the doorbell a
 /// talk-back test watches while it talks; anything else is rejected, so
 /// tests can see the validation error path. Beside any of these,
 /// `{"talk": true}` has the source ask for the device's backchannel
@@ -540,7 +540,7 @@ pub fn fake_aac() -> Codec {
 /// live. It offers the backchannel in the slot once granted (20 ms
 /// frames), whose sessions take what arrives on them into its capture, if
 /// any, stamped with its arrival on the injected clock; the offer stands
-/// when its run ends. With video it publishes a [`video_packet`] every
+/// when its run ends. With video it publishes a `video_packet` every
 /// [`VIDEO_FRAME`] on the injected clock while it runs.
 #[derive(Debug)]
 pub struct FakeSource {
