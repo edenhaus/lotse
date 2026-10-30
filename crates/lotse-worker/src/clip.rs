@@ -79,7 +79,9 @@
 //! graceful end's drain, which stops at the next frame at the end, leaves
 //! none of them out. The video's frames queued behind its first at the
 //! end are left out, B-frames that may refer to it, and the audio waits
-//! for no video frame after it.
+//! for no video frame after it; nor does a video track event queued behind
+//! it (a codec change, a source switch, lost control events) end the clip:
+//! the file's video is complete, and the audio runs on to its end.
 //! A graceful end (`completed`, `stopped`, `max_duration`) first writes
 //! what the queue still holds, frames held for the other track included,
 //! up to the clip's end, for at most [`FINISH_GRACE`] of a reader taking
@@ -788,7 +790,8 @@ struct Clip {
     /// end, or that frame, still queued, ended the audio
     /// ([`Self::frame`]). In decode order the frames behind it may be B-frames
     /// presented before the end that refer to it, and it is not in the
-    /// file, so no later video frame goes in; the audio runs on up to its
+    /// file, so no later video frame goes in, and no later video track event
+    /// ends the clip ([`Self::control`]); the audio runs on up to its
     /// own end ([`Self::audio_end`]) or [`Self::end_deadline`].
     video_ended: bool,
     /// Where the container's video ends, on the date of the video's end
@@ -1527,7 +1530,9 @@ impl Clip {
     /// cannot carry nor the clip transcode, the audio is dropped, the clip
     /// warned `audio_omitted` as at the outset. Before the start the clip
     /// takes every item it can after each push, so the change leads its
-    /// track then and ending the track drops no frame.
+    /// track then and ending the track drops no frame. A video track event
+    /// after the video's end ([`Self::video_ended`]) changes nothing: no
+    /// video goes into the file after it, as no frame does.
     fn control(
         &mut self,
         track: Kind,
@@ -1535,6 +1540,12 @@ impl Clip {
         media: &mut Media,
     ) -> Result<(), EndReason> {
         tracing::debug!(clip.id = %self.id, %track, ?event, "clip: track event");
+        if track == Kind::Video && self.video_ended {
+            // The file's video is complete: nothing the video track sends
+            // after its end goes in, its events no more than its frames.
+            tracing::debug!(clip.id = %self.id, ?event, "clip: a video track event behind the video's end left out");
+            return Ok(());
+        }
         let codec = match event {
             TrackEvent::TrackChanged(codec) => codec,
             TrackEvent::SourceSwitched => {
@@ -5532,6 +5543,82 @@ mod tests {
             reports.last(),
             Some(&stopped("completed", bytes.len(), 1_344, 0))
         );
+    }
+
+    /// A video track event queued behind the video's end frame leaves the
+    /// clip to its end, as a video frame behind it does: the file's video is
+    /// complete. Video dated 400 ms after its arrival (RFC 3550 §6.4.1) every
+    /// 100 ms from 50 ms, AAC dated at its arrival every 64 ms, a clip ending
+    /// at 1 s: the video ends at its frame that arrived at 1.05 s (dated
+    /// 1.45 s), and the audio runs on to the frame dated 1.408 s. A video
+    /// codec change right behind that frame changes nothing; an audio codec
+    /// change after it (behind the AAC frame dated 1.088 s) still ends the
+    /// clip `stream_changed`, its audio still going in. Regression: the video's
+    /// codec change, going out ahead of the audio, ended the clip
+    /// `stream_changed` with the audio cut at 1.024 s.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_a_video_track_event_behind_the_video_s_end_leaves_the_audio_to_its_end()
+    {
+        // (which track changes its codec, after which arrival, the report, the last AAC's ticks, the duration)
+        for (changed, after, reason, last_audio, duration) in [
+            (Kind::Video, 1_050, "completed", 22 * 1_024, 1_344),
+            (Kind::Audio, 1_088, "stream_changed", 17 * 1_024, 1_286),
+        ] {
+            let case = format!("{changed} after {after}");
+            let mut rig = Rig::new(Some(fake_aac()));
+            let reader = rig.start(spec(0, Some(1_000), true));
+            let mut sent: Vec<(u64, Kind, u32)> = (0..)
+                .zip(every_100_ms_from_50(16))
+                .map(|(index, at)| (at, Kind::Video, index))
+                .chain(
+                    (0..)
+                        .zip(every_64_ms(25))
+                        .map(|(index, at)| (at, Kind::Audio, index)),
+                )
+                .collect();
+            sent.sort_by_key(|(at, kind, _)| (*at, *kind == Kind::Audio));
+            for (at, kind, index) in sent {
+                rig.advance_to(at);
+                if kind == Kind::Video {
+                    let ts = i64::from(index) * 9_000;
+                    let frame = frame_at(&rig, (at + 400, at), ts, index % 10 == 0, 16);
+                    assert!(rig.video().publish_frame(frame));
+                } else {
+                    let ticks = i64::try_from(at).unwrap() * 16;
+                    let mut frame = frame_at(&rig, (at, at), ticks, true, 4);
+                    frame.payload = vec![0xe0; 4].into();
+                    assert!(rig.audio.as_ref().unwrap().publish_frame(frame));
+                }
+                if kind == changed && at == after {
+                    match changed {
+                        Kind::Video => rig.video().set_codec(Codec::H265 {
+                            vps: None,
+                            sps: None,
+                            pps: None,
+                        }),
+                        Kind::Audio => rig
+                            .audio
+                            .as_ref()
+                            .unwrap()
+                            .set_codec(Codec::Opus { channels: 2 }),
+                    }
+                }
+                settle().await;
+            }
+            let reports = rig.until_stopped().await;
+            let bytes = reader.rest().await;
+            let lines = lines(&bytes);
+            let last = lines
+                .iter()
+                .rfind(|line| line.starts_with("frame a"))
+                .unwrap();
+            assert_eq!(*last, format!("frame a 0 {last_audio} k 4"), "{case}");
+            assert_eq!(
+                reports.last(),
+                Some(&stopped(reason, bytes.len(), duration, 0)),
+                "{case}"
+            );
+        }
     }
 
     /// `ClipSettings` whose `max_skew` is 400 ms, below the 1 s default and

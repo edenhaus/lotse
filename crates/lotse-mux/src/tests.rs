@@ -1967,8 +1967,10 @@ fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() 
 /// later, its length known before the finish writes it (ISO/IEC 14496-3
 /// §4.4.1: an AAC-LC frame's 1024 samples; RFC 6716 §3.1: an Opus packet's
 /// frames): an Opus packet of 20 ms at 300 ms, 320 ms, where the file's
-/// audio ends; AAC from 960 ms with the video ending at 1 s, 1.024 s;
-/// outside a running clip, zero. Regressions: the clip reported 900 ms, the
+/// audio ends; AAC from 960 ms with the video ending at 1 s, 1.024 s; a
+/// GOP cut short, where its last presented sample's written duration ends
+/// (`P3` of `I0 P3 B1 B2` ended at `P6`, 200 ms, not 160 ms); outside a
+/// running clip, zero. Regressions: the clip reported 900 ms, the
 /// last frame's start, for the file of 1.4 s; and 300 ms and 1 s, the
 /// audio's last frame left out before the finish.
 #[test]
@@ -2048,6 +2050,20 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
         Duration::from_millis(1_024),
         "the AAC's, its 1024 samples held"
     );
+
+    // A GOP cut short: P3 written 80 ms long, so the video ends at 200 ms.
+    let mut cut = Muxer::new(&policy(10_000));
+    cut.start(&h264_track(), None).unwrap();
+    for (kind, frame) in gop(&[0, 3, 1, 2], base, 0, 0, 0) {
+        cut.push(kind, frame).unwrap();
+    }
+    let p6 = frame(ms(base, 240), 6 * FRAME, false, 0, h264_au(false, 6));
+    assert_eq!(cut.end_video(&p6), ms(base, 200));
+    assert_eq!(
+        cut.media_end(),
+        Duration::from_millis(200),
+        "P3's written end"
+    );
 }
 
 /// Reordered video ended at a frame is presented until its last presented
@@ -2063,10 +2079,16 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
 /// to arrive after the clip's end: `I0 P3 B1 B2 P6 B4` ended at `B5`,
 /// captured at 200 ms, is presented until 280 ms too. Either way the Opus
 /// captured before 280 ms ends there with it. In order, `I0 P1 .. P6` ended
-/// at `P9` after a hole, the video lasts until it, 360 ms. Regressions: the
+/// at `P9` after a hole, the video lasts until it, 360 ms. Past it too when
+/// the GOP is cut short: `I0 P3 B1 B2` ended at `P6` (240 ms) is presented
+/// until 200 ms, where `P3`'s written duration (80 ms, a step of the decode
+/// times) ends, not 160 ms, a frame after it, and the audio ends there
+/// (ISO/IEC 14496-12 §8.6.1.4: the track's composition end is its last
+/// presented sample's composition time plus duration). Regressions: the
 /// clip ended the audio at 360 ms, 80 ms past the video, told nothing; and
 /// at 200 ms for the excluded `B5`, 80 ms before the video, told only how
-/// far before its end frame the video ends.
+/// far before its end frame the video ends; and at 160 ms for the GOP cut
+/// short at `P6`, 40 ms before the video.
 #[test]
 fn iso14496_12_8_8_8_1_reordered_video_ends_the_audio_where_its_presentation_ends() {
     let base = base();
@@ -2138,6 +2160,16 @@ fn iso14496_12_8_8_8_1_reordered_video_ends_the_audio_where_its_presentation_end
         clip(&[0, 3, 1, 2, 6, 4], 5),
         (280, (0, 280), (0, 280)),
         "B5 excluded"
+    );
+    assert_eq!(
+        clip(&[0, 3, 1, 2], 6),
+        (200, (0, 200), (0, 200)),
+        "a GOP cut short at P6"
+    );
+    assert_eq!(
+        clip(&[0, 4, 2, 1, 3], 8),
+        (240, (0, 240), (0, 240)),
+        "a pyramid cut short at P8"
     );
 }
 

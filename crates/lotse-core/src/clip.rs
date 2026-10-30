@@ -144,7 +144,9 @@ pub trait ClipMuxer: Send {
     /// After, when `end` is a picture presented before ones that went in,
     /// which an end by arrival leaves out: `I0 P3 B1 B2 P6 B4` ended at
     /// `B5` is presented until 280 ms too, where `P6` ends, 80 ms after
-    /// `B5`. The default does nothing and returns `end`'s date, for a
+    /// `B5`. `I0 P3 B1 B2` ended at `P6` is presented until 200 ms, where
+    /// `P3`'s written duration ends, 40 ms before `P6`. The default does
+    /// nothing and returns `end`'s date, for a
     /// container that does not time a frame by the next.
     fn end_video(&mut self, end: &MediaFrame) -> Instant {
         end.wallclock
