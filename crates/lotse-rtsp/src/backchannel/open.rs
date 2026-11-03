@@ -330,8 +330,7 @@ async fn forward(
             Some(packet) = uplink.recv() => {
                 let BackchannelPacket { rtp, payload } = packetizer.packetize(&packet);
                 let sending = SendingPacket::new(index, rtp.ts, Bytes::from_owner(payload))
-                    .mark(rtp.marker)
-                    .payload_type(rtp.pt);
+                    .mark(rtp.marker);
                 // Closed while the send waits: `None`, as for any close.
                 if let Err(err) = send(&mut sink, sending, close).await? {
                     return Some(refusal(err.status_code(), &classify(&err, &camera.url)));

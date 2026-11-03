@@ -28,7 +28,11 @@
 //! across silence, and never ahead of the wall clock by more than a
 //! lead) and §8.1 (a random SSRC); RFC 3551 §4.1 (the marker on
 //! the first packet of a talkspurt); ONVIF Streaming Specification §5.3 (the
-//! backchannel media whose format this is).
+//! backchannel media whose format this is). SPEC-DEVIATION: ONVIF §5.3.2
+//! lets the client choose any format a backchannel `m=` line lists, but
+//! retina stamps a sending stream's packets with the line's first format,
+//! so [`session::offer`] takes only a media whose first format the chain
+//! produces, until the sender's payload type is caller-chosen.
 
 pub(crate) mod camera;
 pub(crate) mod open;
