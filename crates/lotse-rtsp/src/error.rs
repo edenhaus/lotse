@@ -39,8 +39,7 @@ pub(crate) fn camera_text(text: &str) -> String {
 /// that failed or ended mid-request, a keepalive unanswered) and `Error
 /// writing to RTSP peer` (a keepalive retina could not flush), besides
 /// the status and protocol errors. `Unable to connect` is retina's tokio
-/// session failing to reach the relay (`transport: "udp"`, the
-/// backchannel). `Timeout` is only retina's `TEARDOWN` retries', which
+/// session failing to reach the relay (`transport: "udp"`). `Timeout` is only retina's `TEARDOWN` retries', which
 /// are never classified, and `Error receiving UDP packet` is retina's own
 /// UDP sockets', which lotse does not use yet: both are kept for the
 /// paths that will take them.

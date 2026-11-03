@@ -93,6 +93,14 @@ pub(crate) const TEARDOWN_BUDGET: Duration = Duration::from_millis(100);
 /// so the next connection, only in that case.
 const FRESH_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
+/// The teardown budget of every session the source drives on retina's
+/// core: the TCP interleaved session's and the backchannel's
+/// ([`crate::backchannel::camera::Camera::tear_down`]).
+pub(crate) const TEARDOWN: Budget = Budget {
+    own: TEARDOWN_BUDGET,
+    fresh: FRESH_TEARDOWN_BUDGET,
+};
+
 /// One validated `rtsp://` or `rtsps://` source.
 #[derive(Debug)]
 pub struct RtspSource {
@@ -800,15 +808,16 @@ const UNKNOWN_LOCAL: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
     0,
 ));
 
-/// How the source reaches the camera: TCP to the address the supervisor
-/// resolved, with Nagle's algorithm off ([`relay::tcp`]), and for `rtsps`
-/// the TLS handshake on it (RFC 7826 §19.2).
+/// How the source and its backchannel's connections reach the camera: TCP
+/// to the address the supervisor resolved, with Nagle's algorithm off
+/// ([`relay::tcp`]), and for `rtsps` the TLS handshake on it (RFC 7826
+/// §19.2).
 #[derive(Debug, Clone)]
-struct Dialer {
+pub(crate) struct Dialer {
     /// The camera's address.
-    addr: SocketAddr,
+    pub(crate) addr: SocketAddr,
     /// For `rtsps`: the server name and the certificate check.
-    tls: Option<TlsTarget>,
+    pub(crate) tls: Option<TlsTarget>,
 }
 
 impl Dialer {
@@ -823,7 +832,7 @@ impl Dialer {
 
     /// A connection to the camera, with the addresses of its ends; an
     /// unknown local address is [`UNKNOWN_LOCAL`].
-    async fn dial(self) -> Result<Connection, SourceError> {
+    pub(crate) async fn dial(self) -> Result<Connection, SourceError> {
         let tcp = relay::tcp(self.addr).await?;
         let local = tcp.local_addr().unwrap_or(UNKNOWN_LOCAL);
         let stream: Box<dyn Duplex> = match &self.tls {
@@ -838,7 +847,7 @@ impl Dialer {
     }
 
     /// [`Dialer::dial`] as the driver's teardown dials.
-    fn boxed(&self) -> BoxFuture<'static, Result<Connection, SourceError>> {
+    pub(crate) fn boxed(&self) -> BoxFuture<'static, Result<Connection, SourceError>> {
         Box::pin(self.clone().dial())
     }
 }
@@ -870,11 +879,7 @@ async fn run_core(dialer: &Dialer, ask: &Ask, ctx: &mut SourceCtx) -> SourceErro
     let exit = exit.scrubbed(url);
     let dial = || dialer.boxed();
     tracing::debug!(why = %exit, "rtsp: tearing down");
-    let budget = Budget {
-        own: TEARDOWN_BUDGET,
-        fresh: FRESH_TEARDOWN_BUDGET,
-    };
-    driver.teardown(&dial, budget).await;
+    driver.teardown(&dial, TEARDOWN).await;
     exit
 }
 

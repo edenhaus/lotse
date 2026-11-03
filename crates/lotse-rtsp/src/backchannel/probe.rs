@@ -32,14 +32,12 @@ use lotse_core::runner::PROBE_TIMEOUT;
 use lotse_core::source::{
     Asks, BackchannelOffer, BackchannelRefused, BackchannelSlot, ProbeMark, SourceError,
 };
-use retina::client::{Session, SessionGroup};
 use tokio_util::sync::CancellationToken;
 
 use super::BackchannelFormat;
 use super::camera::{Camera, backchannel_stream};
 use super::open::Opener;
 use super::session::{Probed, refusal};
-use crate::error::classify;
 use crate::factory::BACKCHANNEL;
 use crate::source::within_on;
 
@@ -260,34 +258,28 @@ async fn describe(
     .map_err(unanswered)?
 }
 
-/// [`describe`]'s steps, each within the source's `timeout_ms`.
+/// [`describe`]'s steps, each within the source's `timeout_ms`: the
+/// connection, then the `DESCRIBE` on it, whose answer's SDP is read and
+/// whose refusal keeps the camera's status. Nothing is set up, so nothing
+/// is torn down: the connection closes when the driver is dropped.
 async fn ask(
     camera: &Camera,
     cancel: &CancellationToken,
 ) -> Result<Option<BackchannelFormat>, BackchannelRefused> {
     let deadline = camera.deadline();
-    let (stream, listening, target) = camera
+    let mut driver = camera
         .connect("backchannel probe", deadline, cancel)
         .await
         .map_err(unanswered)?;
-    // Nothing is set up, so nothing is torn down: the group stays empty.
-    let group = Arc::new(SessionGroup::default());
-    let options = camera.session_options(&group);
-    let describe = async {
-        tracing::info!("rtsp: probe: DESCRIBE with the backchannel's Require header");
-        let request = Session::describe(target, options).map(Ok::<_, SourceError>);
-        let answered = within_on(&*camera.time, cancel, deadline, "probe DESCRIBE", request)
-            .await
-            .map_err(unanswered)?;
-        let session =
-            answered.map_err(|err| refusal(err.status_code(), &classify(&err, &camera.url)))?;
-        Ok(backchannel_stream(&session).map(|(_, offer)| offer.format))
-    };
-    let probed = Box::pin(camera.relayed(stream, listening, describe))
+    tracing::info!("rtsp: probe: DESCRIBE with the backchannel's Require header");
+    let request = driver.describe(camera.target()).map(Ok::<_, SourceError>);
+    let answered = within_on(&*camera.time, cancel, deadline, "probe DESCRIBE", request)
         .await
         .map_err(unanswered)?;
+    answered.map_err(|err| refusal(err.status_code(), &err.source_error(&camera.url)))?;
+    let probed = backchannel_stream(&driver).map(|(_, offer)| offer.format);
     tracing::debug!("rtsp: probe over; its connection closes");
-    probed
+    Ok(probed)
 }
 
 #[cfg(test)]

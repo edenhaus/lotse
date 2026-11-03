@@ -306,6 +306,11 @@ async fn onvif_5_3_a_probe_and_a_claimed_backchannel_session_beside_the_viewing_
     assert_eq!(logs[2].describes, [true]);
     assert_eq!(logs[2].setups, ["backchannel"]);
     assert!(logs[2].played && logs[2].backchannel_only());
+    // RFC 2326 §6.1: the probe and the session send the source URL itself
+    // as their Request-URI, as the viewing session does.
+    for connection in &logs {
+        assert_eq!(connection.describe_uris, [cam.url()], "{connection:?}");
+    }
     assert_eq!(count(&cam.stats().backchannel_playing), 1);
     assert_eq!(count(&cam.stats().playing), 1, "the viewing session alone");
     let recorded = talk(&session, &cam, 6, (320, 320)).await;
@@ -594,6 +599,46 @@ async fn rfc2326_10_12_a_lost_backchannel_session_says_why_and_a_viewing_reconne
     cam.stop().await;
 }
 
+/// RFC 2326 §10.7: a live555 camera, whose stale TCP sessions retina's
+/// `Auto` policy tears down on a fresh connection, drops the
+/// backchannel's connection: the session's `TEARDOWN`, with `Require`
+/// (ONVIF Streaming Specification §5.3.1), goes on a fresh connection the
+/// source dials as it dialed the first, within the source's 2 s budget
+/// for that case, which the session's task waits for: once it ended, the
+/// camera has answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_7_a_lost_live555_backchannel_session_is_torn_down_on_a_fresh_connection() {
+    let mut config = config(None, BackchannelCodec::Pcmu, |_| {});
+    config.sdp_session_lines = "a=tool:LIVE555 Streaming Media v2016.11.28\r\n".into();
+    let cam = camera(config).await;
+    let source = source(&cam, &serde_json::Value::Null);
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(harness.wait_ready().await, "ready");
+    let slot = harness.backchannel.clone();
+    probed(&cam, 2, &slot).await;
+    let mut session = open(&slot).await.unwrap();
+    assert!(log(&cam)[2].backchannel_only(), "{:?}", log(&cam));
+    cam.hang_up_backchannel();
+    let hung_up = clock().now();
+    let why = lost(&mut session).await;
+    assert_eq!(why.status, None, "{why:?}");
+    bounded(slot.tasks().ended()).await;
+    assert!(
+        clock().now().saturating_duration_since(hung_up) < Duration::from_secs(2),
+        "within the fresh connection's budget"
+    );
+    let logs = log(&cam);
+    let fresh = &logs[3];
+    assert_eq!(fresh.teardown, Some(true), "{logs:?}");
+    assert!(
+        fresh.describes.is_empty() && fresh.setups.is_empty(),
+        "{fresh:?}"
+    );
+    drop(session);
+    finish(harness).await;
+    cam.stop().await;
+}
+
 /// A camera that is gone when the claim comes: refused without a
 /// status, saying the connection failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -612,11 +657,11 @@ async fn rfc2326_10_4_a_camera_gone_before_the_claim_refuses_without_a_status() 
 }
 
 /// RFC 7826 §19.2: an `rtsps` camera's probe and backchannel session take
-/// TLS too, through the same pre-bound relay listener as the session that
-/// plays the stream, one connection at a time from its bind to its
-/// accept.
+/// TLS too, each on its own connection, and send the source URL itself as
+/// their `DESCRIBE`'s Request-URI (RFC 2326 §6.1), `rtsps` scheme and host
+/// name included; no loopback relay is needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc7826_19_2_over_rtsps_the_backchannel_takes_tls_through_the_shared_relay() {
+async fn rfc7826_19_2_over_rtsps_the_backchannel_takes_tls_on_its_own_connection() {
     let tls = CameraTls::self_signed(&["camera.test"]).unwrap();
     let pin = tls.fingerprint();
     let cam = camera(CameraConfig {
@@ -624,11 +669,10 @@ async fn rfc7826_19_2_over_rtsps_the_backchannel_takes_tls_through_the_shared_re
         ..config(None, BackchannelCodec::Pcmu, |_| {})
     })
     .await;
-    let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let source = RtspFactory::new(Some(relay))
+    let url = format!("rtsps://camera.test:{}/stream", cam.addr().port());
+    let source = RtspFactory::default()
         .validate(
-            &SourceUrl::parse(&format!("rtsps://camera.test:{}/stream", cam.addr().port()))
-                .unwrap(),
+            &SourceUrl::parse(&url).unwrap(),
             &json!({ "tls_fingerprint": pin, "backchannel": true }),
         )
         .unwrap();
@@ -650,6 +694,14 @@ async fn rfc7826_19_2_over_rtsps_the_backchannel_takes_tls_through_the_shared_re
     );
     assert_eq!(log(&cam)[2].teardown, Some(true));
     assert_eq!(count(&cam.stats().tls_failures), 0);
+    // The viewing session's, the probe's and the backchannel session's.
+    for connection in log(&cam) {
+        assert_eq!(
+            connection.describe_uris,
+            std::slice::from_ref(&url),
+            "{connection:?}"
+        );
+    }
     finish(harness).await;
     cam.stop().await;
 }
@@ -831,8 +883,8 @@ async fn an_unanswered_probe_gives_its_permit_back_within_the_probe_timeout() {
 
 /// RFC 1122 §4.2.3.4: the backchannel's packets, handed over every 20 ms,
 /// reach the camera as evenly. Nagle's algorithm holds a small write until
-/// the last is acknowledged: neither retina's connection to the relay nor
-/// the relay's to the camera may hold one.
+/// the last is acknowledged: the backchannel's connection to the camera,
+/// dialed with it off, may hold none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc1122_4_2_3_4_the_backchannels_packets_reach_the_camera_as_evenly_as_handed_over() {
     for transport in ["tcp", "udp"] {

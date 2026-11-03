@@ -3,11 +3,9 @@
 //! them with (`retina::rtsp::parse`, public but unstable, pinned by
 //! `Cargo.lock`), so the relay finds the same messages retina does.
 //!
-//! The UDP side ([`crate::udp`]) frames both directions with it, the TCP
-//! relay what retina writes, so a receiver report ([`crate::rtcp`]) goes
-//! to the camera between whole requests, and the camera's interleaved
-//! stream ([`crate::tap`]) its RTSP messages between the frames. It holds
-//! at most one message of [`MAX_MESSAGE`] bytes.
+//! The UDP side ([`crate::udp`]) frames both directions with it, so a
+//! receiver report ([`crate::rtcp`]) goes to the camera between whole
+//! requests. It holds at most one message of [`MAX_MESSAGE`] bytes.
 
 use std::fmt;
 

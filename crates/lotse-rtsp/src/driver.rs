@@ -372,6 +372,33 @@ impl Driver {
         self.core.sdp()
     }
 
+    /// Queues `packet` on the stream at `index`, one the session sends on
+    /// (the ONVIF backchannel, ONVIF Streaming Specification §5.3), on its
+    /// interleaved RTP channel (RFC 2326 §10.12); [`Driver::next_item`]
+    /// writes it. Nothing bounds the queue: the caller checks
+    /// [`Driver::queued_len`] first. retina's error, nothing queued, when
+    /// the session does not play or the stream takes no data.
+    pub(crate) fn queue_rtp(
+        &mut self,
+        index: usize,
+        packet: &retina::rtp::OutgoingPacketRef<'_>,
+    ) -> Result<(), Error> {
+        self.core.queue_rtp(index, packet).map_err(Error::Session)
+    }
+
+    /// Queues the RTCP compound `packet` (RFC 3550 §6.1), a Sender Report,
+    /// on the RTCP channel of the stream at `index` the session sends on,
+    /// as [`Driver::queue_rtp`] does.
+    pub(crate) fn queue_rtcp(&mut self, index: usize, packet: &[u8]) -> Result<(), Error> {
+        self.core.queue_rtcp(index, packet).map_err(Error::Session)
+    }
+
+    /// How many bytes wait for the camera to take them: requests and
+    /// queued packets alike.
+    pub(crate) fn queued_len(&self) -> usize {
+        self.core.queued_len()
+    }
+
     /// `DESCRIBE` of `url`, which carries no credentials (RFC 2326 §10.2).
     pub(crate) async fn describe(&mut self, url: Url) -> Result<(), Error> {
         self.core.describe(url).map_err(Error::Session)?;
@@ -1344,6 +1371,86 @@ mod tests {
         let dial = dial_with(&dialer);
         tokio::join!(driver.teardown(&dial, GENEROUS), camera);
         assert_eq!(dialer.calls(), 0);
+    }
+
+    /// A camera's answer with an ONVIF backchannel: PCMU the client sends
+    /// (ONVIF Streaming Specification §5.3.2).
+    const BACKCHANNEL_SDP: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+        m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:track0\r\n\
+        m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendonly\r\na=control:back\r\n";
+
+    #[tokio::test]
+    async fn onvif_5_3_packets_queued_on_the_sending_stream_go_out_on_its_channels() {
+        let _logs = traced();
+        let clock = Arc::new(FakeClock::from_system());
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let time: Arc<dyn Clock> = Arc::<FakeClock>::clone(&clock);
+        let options = SessionOptions::default().backchannel(true);
+        let mut driver = Driver::new(connection(ours), options, time);
+        let mut cam = Cam::new(theirs);
+        let camera = cam.ok(
+            "DESCRIBE",
+            "Content-Base: rtsp://cam/stream/\r\nContent-Type: application/sdp\r\n",
+            BACKCHANNEL_SDP,
+        );
+        let (described, describe) = tokio::join!(driver.describe(url()), camera);
+        described.unwrap();
+        assert!(
+            describe.contains("Require: www.onvif.org/ver20/backchannel"),
+            "{describe}"
+        );
+        let sending = driver.streams()[1].rtp_payload_type();
+        let mut sender = retina::rtp::Sender::new(sending, retina::rtp::SenderOptions::default());
+        let rate = std::num::NonZeroU32::new(8_000).unwrap();
+        let ts = retina::Timestamp::new(0, rate, 0).unwrap();
+        // Before `PLAY`, nothing is queued.
+        let early = driver.queue_rtp(1, &sender.packet(ts, true, &[&[0xff; 4]]));
+        assert!(matches!(early, Err(Error::Session(_))), "{early:?}");
+        let early = driver.queue_rtcp(1, &[0x80, 200, 0, 0]);
+        assert!(matches!(early, Err(Error::Session(_))), "{early:?}");
+        assert_eq!(driver.queued_len(), 0);
+        let session = async {
+            driver.setup(1).await.unwrap();
+            driver.play(play_options()).await.unwrap();
+        };
+        let camera = async {
+            cam.ok(
+                "SETUP",
+                "Session: 12345678;timeout=60\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n",
+                "",
+            )
+            .await;
+            cam.ok("PLAY", "Session: 12345678\r\n", "").await;
+        };
+        tokio::join!(session, camera);
+        // A packet on the stream index past the session's last is retina's
+        // error, nothing queued.
+        let past = driver.queue_rtp(2, &sender.packet(ts, false, &[&[0xff; 4]]));
+        assert!(matches!(past, Err(Error::Session(_))), "{past:?}");
+        let packet = sender.packet(ts, true, &[&[0xff; 160]]);
+        driver.queue_rtp(1, &packet).unwrap();
+        let report = sender.sender_report(retina::NtpTimestamp(0), ts, "cname");
+        driver.queue_rtcp(1, &report).unwrap();
+        assert_eq!(driver.queued_len(), 4 + 12 + 160 + 4 + report.len());
+        // Polled, the session writes them; the camera reads both and closes.
+        let camera = async {
+            let mut frames = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while cam.buf.len() < 4 + 12 + 160 + 4 + report.len() {
+                let n = cam.io.read(&mut chunk).await.unwrap();
+                cam.buf.extend_from_slice(&chunk[..n]);
+            }
+            frames.push(cam.frame());
+            frames.push(cam.frame());
+            drop(cam);
+            frames
+        };
+        let (item, frames) = tokio::join!(driver.next_item(), camera);
+        assert!(matches!(item, Err(Error::Closed)), "{item:?}");
+        assert_eq!(frames[0].0, 0, "RTP on the stream's first channel");
+        assert_eq!(frames[0].1[1], 0x80, "the marker, payload type 0");
+        assert_eq!(frames[1], (1, report), "the SR on its RTCP channel");
+        assert_eq!(driver.queued_len(), 0);
     }
 
     #[tokio::test]
