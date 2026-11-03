@@ -702,12 +702,16 @@ fn setup_error(error: SourceError, status: Option<u16>, udp: bool) -> SourceErro
 /// A camera that answers a UDP `SETUP` with `interleaved=` (it chose TCP
 /// after all, RFC 2326 §12.39) ends here too (retina 0.5 prototype
 /// `97153f6`, its source read 2026-11-03, no camera seen doing it yet):
-/// the loopback relay
-/// lotse ran until then passed such an answer on as TCP, but retina's
-/// `parse_setup` does not tell it from a UDP answer without
-/// `server_port`, so the camera's media comes interleaved on a channel
-/// the session never assigned and no datagram arrives. The hint to set
-/// the transport to tcp is the repair either way; reported upstream.
+/// the loopback relay lotse ran until then passed such an answer on as
+/// TCP, but retina's `parse_setup` does not tell it from a UDP answer
+/// without `server_port`, so the camera's media comes interleaved on a
+/// channel the session never assigned. retina logs one warning with up to
+/// 128 bytes of the frame in hex (which [`crate::retina_log`] caps), and
+/// no datagram arrives. When the camera's `a=tool` or `Server` names a
+/// live555 version with the stale TCP session bug, retina's
+/// `UnassignedChannelDataPolicy::Auto` ends the session at once with its
+/// stale-session error instead. The hint to set the transport to tcp is
+/// the repair either way; reported upstream.
 fn no_udp_media(deadline: Duration, rejected: u64) -> SourceError {
     tracing::warn!(
         deadline_ms = deadline.as_millis(),

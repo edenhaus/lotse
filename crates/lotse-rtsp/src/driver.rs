@@ -390,7 +390,7 @@ fn poll_media(
     }
     let received = udp.poll_recv(cx, core, time.now());
     if let Poll::Ready(Err(err)) = received {
-        return Poll::Ready(Err(Error::Session(err)));
+        return Poll::Ready(Err(err));
     }
     if exchanged.is_ready() || received.is_ready() {
         Poll::Ready(Ok(()))
@@ -1166,8 +1166,15 @@ mod tests {
     async fn rfc2326_10_4_a_setup_of_a_stream_the_description_lacks_is_refused() {
         let _logs = traced();
         let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
-        played(&mut driver, &mut cam).await;
-        // One stream described: index 1 would be past retina's streams.
+        let camera = cam.ok(
+            "DESCRIBE",
+            "Content-Base: rtsp://cam/stream/\r\nContent-Type: application/sdp\r\n",
+            SDP,
+        );
+        let (described, _) = tokio::join!(driver.describe(url()), camera);
+        described.unwrap();
+        // Between DESCRIBE and PLAY retina indexes its streams unchecked:
+        // one stream described, index 1 would be past them.
         let err = driver.setup(1).await.unwrap_err();
         assert!(matches!(err, Error::UnknownStream(1)), "{err:?}");
         assert_eq!(err.status_code(), None);
@@ -1178,7 +1185,15 @@ mod tests {
         let pair = Pair::bind(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).unwrap();
         let err = driver.setup_udp(5, pair).await.unwrap_err();
         assert!(matches!(err, Error::UnknownStream(5)), "{err:?}");
-        // A stream already set up is retina's refusal.
+        // The stream that is there sets up; a second time is retina's
+        // refusal, the stream already set up.
+        let camera = cam.ok(
+            "SETUP",
+            "Session: 12345678;timeout=60\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n",
+            "",
+        );
+        let (set_up, _) = tokio::join!(driver.setup(0), camera);
+        set_up.unwrap();
         let err = driver.setup(0).await.unwrap_err();
         assert!(matches!(err, Error::Session(_)), "{err:?}");
     }
@@ -1984,6 +1999,34 @@ mod tests {
             ),
             (4, 2, 0),
             "{stats:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rfc3550_8_2_a_camera_that_changes_its_synchronization_source_ends_the_attempt() {
+        let _logs = traced();
+        let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let camera = CamUdp::bind();
+        let client = set_up_udp(&mut driver, &mut cam, answered(Some(camera.port)))
+            .await
+            .unwrap();
+        play_udp(&mut driver, &mut cam).await;
+        let restarted = |seq: u16| {
+            let mut packet = rtp(seq, 0, true, &[0x65]);
+            packet[8..12].copy_from_slice(&0x0bad_cafe_u32.to_be_bytes());
+            packet
+        };
+        for packet in [rtp(1, 0, true, &[0x65]), restarted(500), restarted(501)] {
+            camera.rtp.send_to(&packet, to(client)).await.unwrap();
+        }
+        assert_eq!(next(&mut driver).await.unwrap().rtp().unwrap().seq, 1);
+        let err = next(&mut driver).await.unwrap_err();
+        let source = err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap());
+        assert_eq!(
+            source,
+            SourceError::Protocol(
+                "the camera changed its RTP synchronization source from 12345678 to 0badcafe (RFC 3550 §8.2): a new session".into()
+            )
         );
     }
 

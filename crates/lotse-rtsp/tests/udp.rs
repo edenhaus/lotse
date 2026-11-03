@@ -412,6 +412,38 @@ async fn datagrams_that_never_arrive_end_the_attempt_with_a_repair_hint() {
     cam.stop().await;
 }
 
+/// RFC 2326 §12.39: a camera that answers a UDP `SETUP` with TCP
+/// interleaved channels after all sends its media on a channel the
+/// session never assigned: no datagram ever comes, and the attempt ends
+/// with the repair hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_12_39_an_interleaved_answer_to_a_udp_setup_ends_with_the_tcp_hint() {
+    let cam = camera(CameraConfig {
+        udp: CameraUdp {
+            answer_interleaved: true,
+            ..CameraUdp::default()
+        },
+        ..CameraConfig::default()
+    })
+    .await;
+    let source = udp_source(&cam, &json!({ "timeout_ms": 300 }));
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(!harness.wait_ready().await);
+    let exit = harness.finish().await;
+    let SourceError::Timeout(message) = exit else {
+        panic!("a timeout, not {exit:?}");
+    };
+    assert!(message.contains("within 300 ms of PLAY"), "{message}");
+    assert!(
+        message.contains("set the stream's transport to tcp"),
+        "{message}"
+    );
+    let counters = cam.stats();
+    assert_eq!(Stats::get(&counters.udp_setups), 0);
+    assert!(Stats::get(&counters.packets) > 0, "media on the connection");
+    cam.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_12_37_keepalives_flow_on_the_control_connection_while_media_takes_udp() {
     // A 2 s session timeout: retina keeps it alive every second.

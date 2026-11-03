@@ -47,6 +47,16 @@
 //!   it cannot read for the session's error, as over TCP, where its
 //!   framing would be lost with it; a datagram is one packet, so here it
 //!   is refused and counted instead, and the session goes on.
+//! - Another synchronization source is refused and counted too, until it
+//!   sends [`MIN_SEQUENTIAL`] packets in a row (RFC 3550 §A.1 probation):
+//!   then the camera restarted its RTP session (§8.2, after its BYE or a
+//!   reboot), and the attempt ends with a protocol error, so the source
+//!   reconnects at once, as retina's own wrong-source error over TCP
+//!   would have it, rather than refuse every packet until the stall
+//!   watchdog. One stray never switches the stream; a stray that came
+//!   first and took the lock is replaced the same way. retina checks the
+//!   source a `SETUP` answer's `ssrc=` names itself, and ends the session
+//!   on a packet from another.
 //!
 //! No reorder buffer: retina's is its reorderer's `max_delay`
 //! ([`udp_options`]), off by decision. Over TCP retina reorders with no
@@ -57,7 +67,15 @@
 //! [`MAX_MISORDER`] behind the highest sequence number passed (RFC 3550
 //! §A.1), still reaches the core, which counts it as received for its
 //! reports (§6.4.1) and drops it; here it is counted as out of order. Its
-//! gap was counted as loss when the later packet passed.
+//! gap was counted as loss when the later packet passed. A jump further
+//! back, or [`MAX_DROPOUT`] or more ahead, is a stray that leaves the
+//! highest sequence number where it is, unless the next packet follows
+//! it: the sender restarted, as retina's reorderer takes it too.
+//!
+//! retina reads a `SETUP` answer's `Transport` more strictly than the
+//! relay lotse ran before did: a `server_port` of one port, or spaces
+//! around the parameters' `;`, are not taken as the relay took them; the
+//! fork lotse pins is to accept both.
 //!
 //! The core is read only while the session plays: before the answer to
 //! `PLAY` the camera's datagrams wait in the sockets' buffers. A session
@@ -83,10 +101,21 @@ use retina::rtp::{PacketHeader, ReorderOptions};
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
+use crate::driver::Error;
+
 /// RFC 3550 §A.1 `MAX_MISORDER`: a packet at most this many sequence
 /// numbers behind the highest one is reordered (or a duplicate at 0), not
 /// a new sequence; retina's reorderer draws the line at the same place.
 const MAX_MISORDER: u16 = 100;
+
+/// RFC 3550 §A.1 `MAX_DROPOUT`: a jump ahead of less than this many is
+/// loss; a larger jump either way is a stray, or the sender's restart once
+/// the next packet follows it, as retina's reorderer takes it.
+const MAX_DROPOUT: u16 = 3000;
+
+/// RFC 3550 §A.1 `MIN_SEQUENTIAL`: sequential packets a new synchronization
+/// source sends before it counts as the camera's.
+const MIN_SEQUENTIAL: u8 = 2;
 
 /// The receive buffer: the largest UDP payload there is, so a datagram is
 /// never cut, and its length always fits the core's 16 bits.
@@ -317,6 +346,14 @@ enum Verdict {
     Late,
     /// Refused before the core read it, and why.
     Refused(&'static str),
+    /// A new synchronization source, [`MIN_SEQUENTIAL`] packets in a row:
+    /// the camera restarted its session (RFC 3550 §8.2).
+    SsrcChanged {
+        /// The one the stream had.
+        from: u32,
+        /// The one it sends now.
+        to: u32,
+    },
 }
 
 /// The checks on one stream's datagrams.
@@ -331,8 +368,14 @@ struct Check {
     ports: Option<(u16, u16)>,
     /// The synchronization source of the first RTP packet that passed.
     ssrc: Option<u32>,
+    /// Another synchronization source heard since the last packet of
+    /// `ssrc`: its last sequence number and how many came in a row.
+    newcomer: Option<(u32, u16, u8)>,
     /// The highest sequence number passed.
     highest: Option<u16>,
+    /// One past the sequence number of the last stray (RFC 3550 §A.1
+    /// `bad_seq`): a packet with it restarts the sequence.
+    stray: Option<u16>,
 }
 
 impl Check {
@@ -343,7 +386,9 @@ impl Check {
             source: source.to_canonical(),
             ports: server_port.map(|port| (port, port.saturating_add(1))),
             ssrc: None,
+            newcomer: None,
             highest: None,
+            stray: None,
         }
     }
 
@@ -378,17 +423,54 @@ impl Check {
             return Verdict::Refused("not an RTP packet");
         };
         let (seq, ssrc) = (packet.header.sequence_number(), packet.header.ssrc());
-        if self.ssrc.is_some_and(|locked| locked != ssrc) {
-            return Verdict::Refused("from another synchronization source");
+        if let Some(locked) = self.ssrc.filter(|&locked| locked != ssrc) {
+            return self.newcomer(locked, ssrc, seq);
         }
         self.ssrc = Some(ssrc);
-        if self
-            .highest
-            .is_some_and(|highest| highest.wrapping_sub(seq) < MAX_MISORDER)
-        {
+        self.newcomer = None;
+        self.sequence(seq)
+    }
+
+    /// A packet of `ssrc`, `seq`, while the stream's is `locked`: refused,
+    /// and once [`MIN_SEQUENTIAL`] came in a row, the camera's new source.
+    fn newcomer(&mut self, locked: u32, ssrc: u32, seq: u16) -> Verdict {
+        let run = match self.newcomer {
+            Some((last_ssrc, last_seq, run))
+                if last_ssrc == ssrc && last_seq.wrapping_add(1) == seq =>
+            {
+                run.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.newcomer = Some((ssrc, seq, run));
+        if run < MIN_SEQUENTIAL {
+            Verdict::Refused("from another synchronization source")
+        } else {
+            Verdict::SsrcChanged {
+                from: locked,
+                to: ssrc,
+            }
+        }
+    }
+
+    /// Where `seq` falls behind the highest passed (RFC 3550 §A.1): late
+    /// up to [`MAX_MISORDER`] behind (a duplicate at 0), the new highest
+    /// up to [`MAX_DROPOUT`] ahead, else a stray that leaves the highest
+    /// where it is, unless it follows the last stray: the sender restarted.
+    fn sequence(&mut self, seq: u16) -> Verdict {
+        let Some(highest) = self.highest else {
+            self.highest = Some(seq);
+            return Verdict::Pass;
+        };
+        if highest.wrapping_sub(seq) < MAX_MISORDER {
             return Verdict::Late;
         }
-        self.highest = Some(seq);
+        if seq.wrapping_sub(highest) < MAX_DROPOUT || self.stray == Some(seq) {
+            self.highest = Some(seq);
+            self.stray = None;
+        } else {
+            self.stray = Some(seq.wrapping_add(1));
+        }
         Verdict::Pass
     }
 }
@@ -456,6 +538,9 @@ pub(crate) struct Streams {
     late: Throttle,
     /// The rate limit of the line about a datagram not sent.
     unsent: Throttle,
+    /// Why the stream ends, once a check said so: handed out on the next
+    /// receive, after what the core took in before it.
+    ended: Option<Error>,
 }
 
 impl Streams {
@@ -469,6 +554,7 @@ impl Streams {
             refused: Throttle::default(),
             late: Throttle::default(),
             unsent: Throttle::default(),
+            ended: None,
         }
     }
 
@@ -555,13 +641,18 @@ impl Streams {
     /// Hands `core`, which plays, what the sockets of its UDP streams
     /// received, RTCP before RTP, at most [`MAX_READS`] datagrams per
     /// socket, at `now`: ready when one arrived, pending while none did,
-    /// and the core's error for a socket that failed.
+    /// and the core's error for a socket that failed; a new
+    /// synchronization source ends the stream on the receive after
+    /// ([`Verdict::SsrcChanged`]).
     pub(crate) fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
         core: &mut SessionCore,
         now: Instant,
-    ) -> Poll<Result<(), retina::client::Error>> {
+    ) -> Poll<Result<(), Error>> {
+        if let Some(ended) = self.ended.take() {
+            return Poll::Ready(Err(ended));
+        }
         let mut received = false;
         for (index, stream) in &mut self.pairs {
             let index = *index;
@@ -574,7 +665,9 @@ impl Streams {
                     let from = match stream.pair.socket(channel).poll_recv_from(cx, &mut buf) {
                         Poll::Pending => break,
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(core.udp_recv_error(index, err)));
+                            return Poll::Ready(Err(Error::Session(
+                                core.udp_recv_error(index, err),
+                            )));
                         }
                         Poll::Ready(Ok(from)) => from,
                     };
@@ -592,6 +685,19 @@ impl Streams {
                                     "rtsp udp: duplicate or late RTP packet; retina drops it"
                                 );
                             }
+                        }
+                        Verdict::SsrcChanged { from, to } => {
+                            tracing::warn!(
+                                stream = index,
+                                from = format_args!("{from:08x}"),
+                                to = format_args!("{to:08x}"),
+                                "rtsp udp: the camera changed its synchronization source; ending the attempt"
+                            );
+                            // What came before is handed out first.
+                            self.ended = Some(Error::Refused(SourceError::Protocol(format!(
+                                "the camera changed its RTP synchronization source from {from:08x} to {to:08x} (RFC 3550 §8.2): a new session"
+                            ))));
+                            return Poll::Ready(Ok(()));
                         }
                         Verdict::Refused(reason) => {
                             self.ingest.count_rejected();
@@ -872,7 +978,7 @@ mod tests {
             Verdict::Pass,
             "a gap"
         );
-        // MAX_MISORDER behind is a new sequence, not a reordering.
+        // MAX_MISORDER behind is a stray, not a reordering.
         assert_eq!(
             check.judge(false, camera, &rtp(500 - MAX_MISORDER + 1, 7)),
             Verdict::Late
@@ -886,6 +992,53 @@ mod tests {
         assert_eq!(check.judge(false, camera, &rtp(0xffff, 1)), Verdict::Pass);
         assert_eq!(check.judge(false, camera, &rtp(0, 1)), Verdict::Pass);
         assert_eq!(check.judge(false, camera, &rtp(0xfffe, 1)), Verdict::Late);
+    }
+
+    #[test]
+    fn rfc3550_a_1_a_stray_leaves_the_highest_and_two_in_a_row_restart_the_sequence() {
+        let mut check = Check::new(ip("127.0.0.1"), None);
+        let camera = from("127.0.0.1:6970");
+        let mut judge = |seq| check.judge(false, camera, &rtp(seq, 7));
+        assert_eq!(judge(1000), Verdict::Pass);
+        // Far behind: a stray, and the highest stays 1000.
+        assert_eq!(judge(500), Verdict::Pass);
+        assert_eq!(judge(999), Verdict::Late, "still behind 1000");
+        // Far ahead: a stray too.
+        assert_eq!(judge(1000 + MAX_DROPOUT), Verdict::Pass);
+        assert_eq!(judge(1001), Verdict::Pass, "the highest moved on from 1000");
+        // A stray, then the packet that follows it: the sender restarted.
+        assert_eq!(judge(100), Verdict::Pass);
+        assert_eq!(judge(101), Verdict::Pass);
+        assert_eq!(judge(100), Verdict::Late, "behind the restarted sequence");
+        assert_eq!(
+            judge(1001),
+            Verdict::Pass,
+            "the old sequence is a stray now"
+        );
+    }
+
+    #[test]
+    fn rfc3550_8_2_a_new_source_two_packets_in_a_row_ends_the_stream_one_stray_does_not() {
+        let mut check = Check::new(ip("127.0.0.1"), None);
+        let camera = from("127.0.0.1:6970");
+        let refused = Verdict::Refused("from another synchronization source");
+        assert_eq!(
+            check.judge(false, camera, &rtp(10, 7)),
+            Verdict::Pass,
+            "locks 7"
+        );
+        // One stray, then the camera's own again: no switch, and the run
+        // starts over.
+        assert_eq!(check.judge(false, camera, &rtp(500, 8)), refused);
+        assert_eq!(check.judge(false, camera, &rtp(11, 7)), Verdict::Pass);
+        assert_eq!(check.judge(false, camera, &rtp(501, 8)), refused);
+        // Not in a row: no switch either.
+        assert_eq!(check.judge(false, camera, &rtp(503, 8)), refused);
+        // Two in a row from the new source.
+        assert_eq!(
+            check.judge(false, camera, &rtp(504, 8)),
+            Verdict::SsrcChanged { from: 7, to: 8 }
+        );
     }
 
     #[test]
@@ -1032,5 +1185,52 @@ mod tests {
         let now = SystemClock.now();
         let polled = poll_fn(|cx| Poll::Ready(streams.poll_recv(cx, &mut core, now))).await;
         assert!(polled.is_pending());
+        // Once it plays, the datagram that waited reaches it.
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+            m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:track0\r\n";
+        core.describe(url::Url::parse("rtsp://127.0.0.1:554/").unwrap())
+            .unwrap();
+        answer(
+            &mut core,
+            &format!(
+                "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Base: rtsp://127.0.0.1:554/\r\n\
+                 Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+                sdp.len()
+            ),
+        );
+        let transport = retina::client::SetupTransport::Udp {
+            client_rtp_port: port,
+            options: udp_options(),
+        };
+        core.setup(0, transport).unwrap();
+        answer(
+            &mut core,
+            &format!(
+                "RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: 1;timeout=60\r\n\
+                 Transport: RTP/AVP/UDP;unicast;client_port={port}-{}\r\n\r\n",
+                port + 1
+            ),
+        );
+        core.play(crate::source::play_options()).unwrap();
+        answer(
+            &mut core,
+            "RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: 1\r\n\r\n",
+        );
+        let polled = poll_fn(|cx| streams.poll_recv(cx, &mut core, now)).await;
+        assert!(polled.is_ok());
+        let item = core.poll_item(now).unwrap().unwrap();
+        assert!(
+            matches!(item, retina::client::PlayingItem::Rtp(ref packet) if packet.packet().meta.sequence_number == 1),
+            "{item:?}"
+        );
+    }
+
+    /// Hands `core` the camera's `response` to the request it wrote.
+    fn answer(core: &mut SessionCore, response: &str) {
+        let (first, second) = core.transmit_buf();
+        let written = first.len() + second.len();
+        core.advance_transmit(written);
+        core.read_buf().extend(response.as_bytes());
+        core.poll_event(SystemClock.now()).unwrap().unwrap();
     }
 }

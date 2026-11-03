@@ -765,6 +765,9 @@ pub struct CameraUdp {
     pub service: UdpService,
     /// Leave `server_port` out of the answer.
     pub omit_server_port: bool,
+    /// Answer with TCP interleaved channels after all (`interleaved=0-1`,
+    /// RFC 2326 §12.39), and send the media on the connection.
+    pub answer_interleaved: bool,
     /// Name this address as `source` in the answer, the camera's own or
     /// another one it never sends from.
     pub announce_source: Option<IpAddr>,
@@ -2016,10 +2019,15 @@ impl Connection {
             Some(BackchannelSetup::Silent) if backchannel => self.answering = Answering::Hung,
             _ => {}
         }
-        if transport.contains("client_port=") && self.config.udp.service != UdpService::Refuse {
+        let udp = &self.config.udp;
+        if transport.contains("client_port=")
+            && udp.service != UdpService::Refuse
+            && !udp.answer_interleaved
+        {
             return self.setup_udp(request, &transport, cseq);
         }
-        if !transport.contains("RTP/AVP/TCP") || self.config.udp.service == UdpService::Only {
+        let interleaved = transport.contains("RTP/AVP/TCP") || udp.answer_interleaved;
+        if !interleaved || udp.service == UdpService::Only {
             return reply(cseq, StatusCode::UnsupportedTransport).build(Vec::new());
         }
         Stats::bump(&self.stats.setups);
