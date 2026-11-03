@@ -27,6 +27,10 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 # Structured logs and spans; every event carries its stream, session and task.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# The callsite, metadata and event types `tracing` builds its macros on: the RTSP source writes
+# retina's events as events of its own, with static metadata, to the layer that writes the lines.
+# Already in the tree under `tracing`.
+tracing-core = { version = "0.1", default-features = false, features = ["std"] }
 # RFC 3986 parsing of source URLs, so credentials are split off and redacted at the type level.
 url = { version = "2", default-features = false, features = ["std"] }
 # Percent-decoding of the userinfo in source URLs (RFC 3986 §3.2.1); already in the tree via `url`.

@@ -11,18 +11,17 @@
 //! same subscriber through tracing-log, under the same filter, each call
 //! site throttled like lotse's own repeating media-path conditions.
 //!
-//! retina logs through `tracing` itself, and no retina span or event that
-//! has a `url` field reaches the lines ([`without_retina_urls`]): that URL
-//! carries the source URL's path and query, which lotse logs only redacted.
+//! retina logs through `tracing` itself: its events reach the lines
+//! throttled per call site the same way, scrubbed of URLs and capped, and
+//! its spans, which carry the request's URL, are never created
+//! ([`retina`], [`spans`]).
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use lotse_core::clock::Clock;
-use lotse_core::throttle::Throttle;
+use lotse_core::throttle::{CallSites, summary};
 use tracing_log::{AsLog as _, LogTracer};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -59,16 +58,14 @@ type CallSite = (Option<&'static str>, Option<&'static str>, Option<u32>);
 /// and output of lotse's own events apply to it. Several of these crates
 /// log once per packet a camera, server or browser sent (an unknown RTCP
 /// SSRC, an SCTP packet that does not parse, a damaged MPEG-TS packet), so
-/// every call site is throttled: its first record is logged, then at most
-/// one per [`lotse_core::throttle::SUMMARY_INTERVAL`] with the count.
+/// every call site is throttled ([`CallSites`]): its first record is
+/// logged, then at most one per [`lotse_core::throttle::SUMMARY_INTERVAL`]
+/// with the count.
 struct Bridge {
     /// Applies the subscriber's filter to a record and forwards it.
     tracer: LogTracer,
-    /// The time each record is counted at.
-    clock: Arc<dyn Clock>,
-    /// One throttle per call site; call sites are fixed in the code, so it
-    /// stays small.
-    throttles: Mutex<HashMap<CallSite, Throttle>>,
+    /// One throttle per call site.
+    sites: CallSites<CallSite>,
 }
 
 impl Bridge {
@@ -76,8 +73,7 @@ impl Bridge {
     fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             tracer: LogTracer::new(),
-            clock,
-            throttles: Mutex::default(),
+            sites: CallSites::new(clock),
         }
     }
 }
@@ -98,29 +94,21 @@ impl log::Log for Bridge {
             record.file_static(),
             record.line(),
         );
-        let now = self.clock.now();
-        let due = self
-            .throttles
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(site)
-            .or_default()
-            .hit(now);
-        match due {
+        match self.sites.hit(site) {
             None => {}
             Some(1) => self.tracer.log(record),
-            Some(count) => self.tracer.log(
-                &log::Record::builder()
-                    .metadata(record.metadata().clone())
-                    .module_path(record.module_path())
-                    .file(record.file())
-                    .line(record.line())
-                    .args(format_args!(
-                        "{} ({count} occurrences since the last line)",
-                        record.args()
-                    ))
-                    .build(),
-            ),
+            Some(count) => {
+                let text = summary(record.args(), count);
+                self.tracer.log(
+                    &log::Record::builder()
+                        .metadata(record.metadata().clone())
+                        .module_path(record.module_path())
+                        .file(record.file())
+                        .line(record.line())
+                        .args(format_args!("{text}"))
+                        .build(),
+                );
+            }
         }
     }
 
@@ -128,14 +116,16 @@ impl log::Log for Bridge {
 }
 
 /// The subscriber [`init`] installs: `filter` as a layer of its own, then
-/// JSON or text lines to `writer`. As its own layer the filter answers
-/// `enabled`, which the [`Bridge`] asks with a record's target before it
-/// counts the record; a per-layer filter would answer `true` there and drop
-/// the event only later, so a filtered-out `log` record would still count.
+/// JSON or text lines to `writer`, retina's through [`retina`] on
+/// `clock`. As its own layer the filter answers `enabled`, which the
+/// [`Bridge`] asks with a record's target before it counts the record; a
+/// per-layer filter would answer `true` there and drop the event only
+/// later, so a filtered-out `log` record would still count.
 fn subscriber<W>(
     format: LogFormat,
     filter: EnvFilter,
     writer: W,
+    clock: Arc<dyn Clock>,
 ) -> Box<dyn tracing::Subscriber + Send + Sync>
 where
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
@@ -143,37 +133,50 @@ where
     let lines = tracing_subscriber::fmt::layer()
         .with_writer(writer)
         .with_target(false);
-    let registry = tracing_subscriber::registry().with(filter);
-    let no_urls = filter_fn(without_retina_urls);
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(filter_fn(spans));
     match format {
         LogFormat::Json => Box::new(
-            registry.with(
+            registry.with(retina(
                 lines
                     .json()
                     .flatten_event(true)
                     .with_current_span(false)
-                    .with_span_list(true)
-                    .with_filter(no_urls),
-            ),
+                    .with_span_list(true),
+                clock,
+            )),
         ),
-        LogFormat::Text => Box::new(registry.with(lines.with_filter(no_urls))),
+        LogFormat::Text => Box::new(registry.with(retina(lines, clock))),
     }
 }
 
-/// Whether a span or event of `metadata` may reach the log lines: with the
-/// RTSP source, none of retina's that carries a URL
-/// ([`lotse_rtsp::log_filter`]). A filter of the line layer alone, so the
-/// level filter still answers the bridge's `enabled`.
+/// With the RTSP source, the global filter that keeps retina's spans,
+/// which carry the request's URL, from being created
+/// ([`lotse_rtsp::retina_log::no_retina_spans`]).
 #[cfg(feature = "source-rtsp")]
-fn without_retina_urls(metadata: &tracing::Metadata<'_>) -> bool {
-    lotse_rtsp::log_filter::loggable(metadata)
+fn spans(metadata: &tracing::Metadata<'_>) -> bool {
+    lotse_rtsp::retina_log::no_retina_spans(metadata)
 }
 
-/// Whether a span or event of `metadata` may reach the log lines: without
-/// the RTSP source, retina is not in the build, and every one may.
+/// Without the RTSP source retina is not in the build: every span may be.
 #[cfg(not(feature = "source-rtsp"))]
-fn without_retina_urls(_metadata: &tracing::Metadata<'_>) -> bool {
+fn spans(_metadata: &tracing::Metadata<'_>) -> bool {
     true
+}
+
+/// With the RTSP source, `lines` with retina's events throttled on
+/// `clock`, scrubbed and capped on their way to it
+/// ([`lotse_rtsp::retina_log::RetinaLog`]).
+#[cfg(feature = "source-rtsp")]
+fn retina<L>(lines: L, clock: Arc<dyn Clock>) -> lotse_rtsp::retina_log::RetinaLog<L> {
+    lotse_rtsp::retina_log::RetinaLog::new(lines, clock)
+}
+
+/// Without the RTSP source retina is not in the build: `lines` as they are.
+#[cfg(not(feature = "source-rtsp"))]
+fn retina<L>(lines: L, _clock: Arc<dyn Clock>) -> L {
+    lines
 }
 
 /// Installs the global subscriber: log lines filtered by `level`, and the
@@ -189,7 +192,7 @@ pub(crate) fn init(
         level: level.to_owned(),
         source,
     })?;
-    subscriber(format, filter, std::io::stderr)
+    subscriber(format, filter, std::io::stderr, Arc::clone(&clock))
         .try_init()
         .map_err(|_already| LoggingError::AlreadySet)?;
     log::set_boxed_logger(Box::new(Bridge::new(clock)))
@@ -323,6 +326,7 @@ mod tests {
             LogFormat::Text,
             EnvFilter::new("info,retina=error"),
             std::io::sink,
+            clock(),
         );
         tracing::subscriber::with_default(filtered, || {
             assert!(!bridge.enabled(&metadata(Level::Warn, "retina::client")));
@@ -373,18 +377,24 @@ mod tests {
         tracing::info!("still logs after the hook is installed");
     }
 
-    /// retina's spans and events with a `url` field never reach the lines,
-    /// in either format, and the events inside such a span still do;
-    /// retina's other events, and another crate's `url`, are logged.
+    /// In either format, retina's events reach the lines through the RTSP
+    /// source's layer: scrubbed of URLs, without their `url` field, with
+    /// their target in `retina`, inside lotse's spans but never retina's,
+    /// which are not created. Another crate's `url` is its own business.
     #[cfg(feature = "source-rtsp")]
     #[test]
-    fn retinas_spans_and_events_with_a_url_are_left_out_of_the_lines() {
+    fn retinas_events_reach_the_lines_scrubbed_and_its_spans_never() {
         for format in [LogFormat::Text, LogFormat::Json] {
             let (mut reader, writer) = std::io::pipe().unwrap();
-            let lines = subscriber(format, EnvFilter::new("trace"), move || {
-                writer.try_clone().unwrap()
-            });
+            let lines = subscriber(
+                format,
+                EnvFilter::new("trace"),
+                move || writer.try_clone().unwrap(),
+                clock(),
+            );
             tracing::subscriber::with_default(lines, || {
+                let attempt = tracing::info_span!("attempt", stream = "door");
+                let _attempt = attempt.enter();
                 let span = tracing::info_span!(
                     target: "retina::client::session_core",
                     "rtsp_request",
@@ -392,26 +402,25 @@ mod tests {
                     url = "rtsp://127.0.0.1:41000/camkey7f3a?token=tok9d2e"
                 );
                 let _entered = span.enter();
-                tracing::warn!(target: "retina::client::parse", "ignoring invalid fmtp attribute value");
                 tracing::warn!(
                     target: "retina::client::parse",
                     url = "rtsp://127.0.0.1:41000/camkey7f3a?token=tok9d2e",
-                    "DESCRIBE response has no content type; trying sdp anyway"
+                    "DESCRIBE response at rtsp://127.0.0.1:41000/camkey7f3a has no content type"
                 );
-                tracing::debug!(target: "retina", url = "rtsp://cam/camkey7f3a", "TEARDOWN starting");
                 tracing::info!(target: "retinal", url = "rtsp://cam/****", "not retina's");
             });
             let mut logs = String::new();
             std::io::Read::read_to_string(&mut reader, &mut logs).unwrap();
             assert!(!logs.contains("camkey7f3a"), "{logs}");
             assert!(!logs.contains("rtsp_request"), "{logs}");
-            assert!(!logs.contains("no content type"), "{logs}");
-            assert!(!logs.contains("TEARDOWN starting"), "{logs}");
             assert!(
-                logs.contains("ignoring invalid fmtp attribute value"),
+                logs.contains(
+                    "DESCRIBE response at rtsp://127.0.0.1:41000/**** has no content type"
+                ),
                 "{logs}"
             );
-            assert!(logs.contains("not retina's"), "{logs}");
+            assert!(logs.contains("retina::client::parse"), "{logs}");
+            assert!(logs.contains("door"), "lotse's span: {logs}");
             assert!(logs.contains("rtsp://cam/****"), "{logs}");
         }
     }

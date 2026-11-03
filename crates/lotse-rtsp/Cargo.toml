@@ -14,7 +14,7 @@ categories.workspace = true
 [dependencies]
 bytes = { workspace = true }
 futures-util = { workspace = true } # `FutureExt`: a request's future mapped into its deadline's result
-retina = { workspace = true }
+retina = { workspace = true } # the RTSP client: `DESCRIBE`, `SETUP`, `PLAY` and the keepalives through the relay, the stream's RTP, and the backchannel's `rtp::Sender`
 serde = { workspace = true }
 serde_json = { workspace = true }
 sdp-types = { workspace = true } # the camera's backchannel media: payload type and `a=ptime`
@@ -22,6 +22,8 @@ socket2 = { workspace = true } # `TCP_QUICKACK` on the relay's side of retina's 
 tokio = { workspace = true, features = ["macros", "net", "io-util", "sync"] } # `select!` over packets and cancellation; the `rtsps` relay's sockets and copy loop; `sync`: the TCP relay's wake-up when a receiver report is first scheduled, the relay listener's turn, and the backchannel's queue
 tokio-util = { workspace = true } # the backchannel session's close: dropping the talker's session cancels its task
 tracing = { workspace = true }
+tracing-core = { workspace = true } # retina's events written as events of the source's own (`retina_log`)
+tracing-subscriber = { workspace = true } # `retina_log`: the layer between retina's events and the one that writes the lines
 url = { workspace = true } # the URL retina connects to, host replaced by the resolved address
 lotse-codec = { workspace = true }
 lotse-core = { workspace = true }
@@ -31,7 +33,6 @@ lotse-tls = { workspace = true } # `rtsps`: the certificate check and the TLS st
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] } # the end-to-end tests against the fake camera
 lotse-core = { workspace = true, features = ["test-util"] } # the fake clock
 lotse-testing = { workspace = true } # the fake camera and the source harness
-tracing-subscriber = { workspace = true } # captures the `insecure_tls` and `frame_over_browser_limit` warnings; runs the UDP tests at `trace`
 
 [lints]
 workspace = true

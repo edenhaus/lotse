@@ -1063,29 +1063,48 @@ async fn libwebrtc_max_frame_packets_a_larger_keyframe_is_counted_and_warned_abo
     );
 }
 
+/// The most bytes of camera text one value of a log line carries
+/// (`lotse_rtsp`'s `CAMERA_TEXT_BYTES`).
+const CAMERA_TEXT_BYTES: usize = 200;
+
 /// A camera key in the path, a token in the query and a password: none
-/// of them in any log line (down to `trace`, retina's included, through
-/// the filter every subscriber of the daemon applies,
-/// [`lotse_rtsp::log_filter::loggable`]), in the exit of a failed or a
-/// cancelled session, or in the description.
+/// of them in any log line (down to `trace`, in text and in JSON with the
+/// span list), in the exit of a failed or a cancelled session, or in the
+/// description. retina's lines go through the layer the daemon writes
+/// them with ([`lotse_rtsp::retina_log::RetinaLog`]), and the camera makes
+/// it say what echoes the request URL: an `RTP-Info` whose `rtptime` is no
+/// number (the header in the warning), a media line retina cannot parse
+/// with an absolute control URL (the whole SDP in the warning), and the
+/// head of each `SETUP` answer (`{:#?}`, at `debug`). Each is logged on
+/// one line, its camera text capped.
 #[tokio::test(flavor = "current_thread")]
 async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
-    use tracing_subscriber::Layer as _;
+    use lotse_rtsp::retina_log::{RetinaLog, no_retina_spans};
+    use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     const SECRETS: [&str; 3] = ["camkey7f3a", "tok9d2e", "pw5b1c"];
-    let captured = Captured::default();
-    let writer = captured.clone();
+    let (captured, json) = (Captured::default(), Captured::default());
+    let (writer, objects) = (captured.clone(), json.clone());
+    let time: Arc<dyn Clock> = Arc::new(SystemClock);
     let lines = tracing_subscriber::fmt::layer()
         .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_filter(tracing_subscriber::filter::filter_fn(
-            lotse_rtsp::log_filter::loggable,
-        ));
-    let subscriber = tracing_subscriber::registry().with(lines);
+        .with_ansi(false);
+    let lines_json = tracing_subscriber::fmt::layer()
+        .with_writer(move || objects.clone())
+        .json()
+        .with_span_list(true);
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_fn(no_retina_spans))
+        .with(RetinaLog::new(lines, Arc::clone(&time)))
+        .with(RetinaLog::new(lines_json, time));
     let _logs = tracing::subscriber::set_default(subscriber);
     let cam = camera(CameraConfig {
         auth: Some(("admin".into(), "pw5b1c".into())),
+        rtptime: Some("tok9d2e".into()),
+        sdp_media_lines: "m=video 0 RTP/AVP 200\r\n\
+             a=control:rtsp://cam.example/camkey7f3a/live?token=tok9d2e/track9\r\n"
+            .into(),
         ..CameraConfig::default()
     })
     .await;
@@ -1115,11 +1134,31 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
     }
     cam.stop().await;
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let json = String::from_utf8(json.0.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("rtsp: describing"), "{logs}");
+    // retina's three, each on one line, its camera text capped.
+    for said in [
+        "Unparseable rtptime in RTP-Info header",
+        "Ignoring unparseable stream raw SDP:",
+        "SETUP response:",
+    ] {
+        let line = logs.lines().find(|line| line.contains(said));
+        let line = line.unwrap_or_else(|| panic!("{said}: {logs}"));
+        let text = line.split_once(said).unwrap().1;
+        let text = text.split(" retina=").next().unwrap();
+        assert!(
+            text.len() <= 2 * CAMERA_TEXT_BYTES,
+            "{said}: {} bytes: {line}",
+            text.len()
+        );
+        assert!(json.contains(said), "{said}: {json}");
+    }
+    assert!(!logs.contains("rtsp_request"), "{logs}");
     let printed = printed.join("\n");
     assert!(printed.contains("AuthFailed"), "{printed}");
     for (index, secret) in SECRETS.iter().enumerate() {
         assert!(!logs.contains(secret), "SECRETS[{index}] logged:\n{logs}");
+        assert!(!json.contains(secret), "SECRETS[{index}] logged:\n{json}");
         assert!(
             !printed.contains(secret),
             "SECRETS[{index}] printed:\n{printed}"
