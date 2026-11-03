@@ -64,8 +64,8 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
 # JSON (or text) log lines on stderr with `RUST_LOG` filtering.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
-# The `log` facade that crates below lotse still log through (retina, dimpl, sctp-proto,
-# mpeg2ts-reader, symphonia, tungstenite): the binary installs the logger that bridges it.
+# The `log` facade that crates below lotse still log through (dimpl, sctp-proto, mpeg2ts-reader,
+# symphonia, tungstenite): the binary installs the logger that bridges it.
 log = { version = "0.4", default-features = false, features = ["std"] }
 # Forwards those `log` records to the `tracing` subscriber with their target, module, file and line,
 # so the same filter and output apply to them.
@@ -93,11 +93,15 @@ http-body-util = { version = "0.1", default-features = false }
 http-auth = { version = "0.1", default-features = false, features = ["basic-scheme", "digest-scheme"] }
 # `Stream`/`Sink` adapters for the WebSocket halves; the WebSocket types come from axum.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-# The RTSP client with the camera quirk history the design chose; packets are taken as RTP, so the
-# H.265 depacketizer feature is off. Pinned to upstream main until a crates.io release carries the
-# ONVIF backchannel (`SessionOptions::backchannel`, a sending stream, `SendingPacket`) and the
-# receiver reports.
-retina = { git = "https://github.com/scottlamb/retina", rev = "e38c1565ba27afad12f574d70c6d895129705e12", default-features = false }
+# The RTSP client with the camera quirk history the design chose; packets are taken as RTP, so its
+# depacketizers are not used. Pinned to the `unstable-0.5.x-prototype` branch of scottlamb/retina
+# plus two commits awaiting upstream review (an `rtsps` URL accepted by the sans-I/O core; a UDP
+# `SETUP` answer without `server_port`), until a crates.io release carries the ONVIF backchannel and
+# the receiver reports. `tokio`: the tokio `client::Session`; `unstable-send`: the backchannel's
+# `rtp::Sender` and `Session::queue_rtp`; `h264`, `h265`: `Stream::parameters`, the parameter sets
+# of an H.264 (RFC 6184 §8.1 `sprop-parameter-sets`) or H.265 (RFC 7798 §7.1 `sprop-vps`,
+# `sprop-sps`, `sprop-pps`) camera's SDP, which retina reads only with the codec's feature.
+retina = { git = "https://github.com/edenhaus/retina", rev = "f65065fea7272fa9afc4468bd8f7058b43f7b2f1", default-features = false, features = ["tokio", "unstable-send", "h264", "h265"] }
 # The HLS playlist parser of the HTTP source (RFC 8216 §4); only the parser feature, whose nom 7
 # is already in the tree via rtsp-types; chrono comes with it, for `EXT-X-PROGRAM-DATE-TIME`.
 m3u8-rs = { version = "6", default-features = false, features = ["parser"] }

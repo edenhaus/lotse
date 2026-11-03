@@ -3,7 +3,9 @@
 //! sends.
 //!
 //! retina 0.4.20 sends no RTCP at all (its own documentation of
-//! `Transport::Udp` says so), while RFC 3550 §6 says the reception
+//! `Transport::Udp` says so), and its 0.5 prototype sends receiver
+//! reports only when asked (`SessionOptions::receiver_reports`, which the
+//! source leaves at its default, never), while RFC 3550 §6 says the reception
 //! feedback "SHOULD be used in all environments". retina speaks plain RTSP
 //! to the loopback relay,
 //! which owns the camera's side and sees every RTP and RTCP packet first,

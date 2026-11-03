@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures_util::{FutureExt as _, StreamExt as _};
+use futures_util::FutureExt as _;
 use lotse_codec::aac::AacDepacketizer;
 use lotse_codec::h264::{
     DEFAULT_MAX_PAYLOAD, Depacketizer, FrameOverLimit, LIBWEBRTC_MAX_FRAME_PACKETS,
@@ -56,11 +56,12 @@ use lotse_core::throttle::Throttle;
 use lotse_core::track::Track;
 use lotse_tls::TlsTarget;
 use retina::client::{
-    Credentials, InitialSequenceNumberPolicy, InitialTimestampPolicy, PacketItem, PlayOptions,
-    Playing, Session, SessionGroup, SessionOptions, SetupOptions, Stream, TcpTransportOptions,
-    TeardownPolicy, Transport,
+    Credentials, InitialSequenceNumberPolicy, InitialTimestampPolicy, PlayOptions, Playing,
+    PlayingItem, RtpPacket, Session, SessionGroup, SessionOptions, SetupOptions, Stream,
+    TcpTransportOptions, TeardownPolicy, Transport,
 };
-use retina::codec::{ParametersRef, VideoParametersCodec};
+use retina::codec::{FrameFormat, ParametersRef};
+use retina::rtp::Continuity;
 
 use crate::backchannel::camera::Camera;
 use crate::backchannel::probe;
@@ -326,26 +327,37 @@ fn parameters(stream: &Stream) -> (Sprop, Vec<u8>) {
     let mut sets = Sprop::None;
     let mut extra = Vec::new();
     match stream.parameters() {
-        Some(ParametersRef::Video(video)) => sets = video_sets(video.codec_params()),
-        Some(ParametersRef::Audio(audio)) => extra.extend_from_slice(audio.extra_data()),
+        Some(ParametersRef::Video(video)) => {
+            let units: Vec<&[u8]> = video.parameter_sets().collect();
+            sets = video_sets(stream.encoding_name(), &units);
+        }
+        // The raw `AudioSpecificConfig` of AAC (ISO/IEC 14496-3 §1.6.2.1),
+        // as the MP4 framing has it, not ADTS's empty extra data.
+        Some(ParametersRef::Audio(audio)) => {
+            extra.extend_from_slice(audio.extra_data(FrameFormat::MP4));
+        }
         Some(ParametersRef::Message(_)) | None => {}
     }
     (sets, extra)
 }
 
-/// The parameter sets retina read from a video stream's `fmtp`.
-fn video_sets(codec: &VideoParametersCodec) -> Sprop {
-    match codec {
-        VideoParametersCodec::H264 { sps, pps } => {
+/// The parameter sets retina read from a video stream's `fmtp`, raw NAL
+/// units, as the sprop of the stream's `encoding` (retina's lowercase
+/// encoding name): each set is recognized by its NAL unit header, so
+/// their order does not matter.
+fn video_sets(encoding: &str, units: &[&[u8]]) -> Sprop {
+    match encoding {
+        "h264" => {
             let mut sets = ParameterSets::default();
-            sets.observe(sps);
-            sets.observe(pps);
+            for unit in units {
+                sets.observe(unit);
+            }
             Sprop::H264(sets)
         }
-        VideoParametersCodec::H265 { vps, sps, pps } => {
+        "h265" => {
             let mut sets = h265::ParameterSets::default();
-            for set in [vps, sps, pps] {
-                sets.observe(set);
+            for unit in units {
+                sets.observe(unit);
             }
             Sprop::H265(sets)
         }
@@ -536,7 +548,7 @@ async fn bounded<T>(
     url: &SourceUrl,
     deadline: Duration,
     what: &str,
-    future: impl Future<Output = Result<T, retina::Error>>,
+    future: impl Future<Output = Result<T, retina::client::Error>>,
 ) -> Result<T, SourceError> {
     within(ctx, deadline, what, async {
         future.await.map_err(|err| classify(&err, url))
@@ -647,13 +659,12 @@ async fn connect(
     Ok(Connected { playing, carried })
 }
 
-/// The options of a `PLAY`. Timestamps are not enforced by retina, which
-/// would end the session on any backward step (B-frames included): core's
-/// guard turns a real jump into an epoch instead. `rtptime` in `RTP-Info`
-/// (RFC 2326 §12.33, RFC 7826 §18.45) maps RTP time to normal play time,
-/// which only retina's NPT uses; lotse reads the raw RTP timestamps and
-/// maps them to the wall clock from Sender Reports (RFC 3550 §6.4.1), else
-/// by arrival. So it is ignored: retina's default refuses a `PLAY` answer
+/// The options of a `PLAY`. retina does not enforce timestamps (it no
+/// longer can be asked to): core's guard turns a real jump into an epoch
+/// instead. `rtptime` in `RTP-Info` (RFC 2326 §12.33, RFC 7826 §18.45)
+/// maps RTP time to normal play time, which only retina's NPT uses; lotse
+/// reads the raw RTP timestamps and maps them to the wall clock from
+/// Sender Reports (RFC 3550 §6.4.1), else by arrival. So it is ignored: retina's default refuses a `PLAY` answer
 /// without it for more than one stream, as MediaMTX 1.21.1 gives a
 /// path's first reader (observed 2026-10-06).
 pub(crate) fn play_options() -> PlayOptions {
@@ -668,7 +679,7 @@ const UNSUPPORTED_TRANSPORT: u16 = 461;
 /// A failed `SETUP` as a source error: a camera that refuses RTP over UDP
 /// says how to repair it; nothing falls back to TCP on its own, because
 /// the transport is part of the stream's options and its connection key.
-fn setup_error(error: &retina::Error, url: &SourceUrl, udp: bool) -> SourceError {
+fn setup_error(error: &retina::client::Error, url: &SourceUrl, udp: bool) -> SourceError {
     match classify(error, url) {
         SourceError::Protocol(message)
             if udp && error.status_code() == Some(UNSUPPORTED_TRANSPORT) =>
@@ -884,23 +895,26 @@ async fn play(connected: Connected, ask: &Ask, ctx: &SourceCtx) -> SourceError {
     let mut normalized = Vec::new();
     loop {
         let item = tokio::select! {
-            item = packets.next() => item,
+            item = packets.next_item() => item,
             () = &mut first_media, if !live => break no_udp_media(deadline, ingest.snapshot().datagrams_rejected),
             () = ctx.cancel.cancelled() => break SourceError::Ended("cancelled".into()),
         };
         match item {
             None => break SourceError::Ended("the camera closed the session".into()),
             Some(Err(err)) => break classify(&err, url),
-            Some(Ok(PacketItem::Rtp(packet))) => {
+            Some(Ok(PlayingItem::Rtp(packet))) => {
+                // Copied out of retina's receive buffer, which the item
+                // borrows until the session is polled again.
+                let packet = Received::new(&packet);
                 if !live {
                     live = true;
                     ctx.tracks.ready();
                     tracing::info!("rtsp: playing; RTP arrives over UDP");
                 }
                 let arrival = ctx.time.now();
-                count_loss(&ingest, &mut loss_log, packet.loss(), arrival);
-                let index = packet.stream_id();
-                let ts = raw_timestamp(packet.timestamp());
+                count_loss(&ingest, &mut loss_log, packet.loss, arrival);
+                let index = packet.stream;
+                let ts = packet.ts;
                 let jumped = carried
                     .get_mut(index)
                     .and_then(Option::as_mut)
@@ -918,7 +932,7 @@ async fn play(connected: Connected, ask: &Ask, ctx: &SourceCtx) -> SourceError {
             // RTCP, or an item kind retina may add, none of which carries
             // media.
             Some(Ok(item)) => {
-                if let PacketItem::Rtcp(compound) = item
+                if let PlayingItem::Rtcp(compound) = item
                     && let Some(Some(entry)) = carried.get(compound.stream_id())
                 {
                     on_rtcp(entry, ctx, ctx.time.now(), &compound);
@@ -1233,19 +1247,65 @@ fn on_video(
     }
 }
 
+/// One RTP packet as the play loop keeps it: the header fields it reads
+/// and the payload, copied out of retina's receive buffer, which a
+/// [`PlayingItem`] borrows only until the session is polled again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Received {
+    /// The index of its stream among the session's.
+    stream: usize,
+    /// The RTP timestamp, as sent (RFC 3550 §5.1).
+    ts: u32,
+    /// The sequence number.
+    seq: u16,
+    /// The synchronization source.
+    ssrc: u32,
+    /// The marker bit.
+    marker: bool,
+    /// The packets the sequence numbers say were lost just before it (RFC
+    /// 3550 §6.4.1); none after a sequence restart, which retina warns
+    /// about and whose loss nobody can count.
+    loss: u16,
+    /// The payload.
+    payload: Bytes,
+}
+
+impl Received {
+    /// What the play loop keeps of `packet`.
+    fn new(packet: &RtpPacket<'_>) -> Self {
+        let meta = &packet.packet().meta;
+        let loss = match meta.continuity {
+            Continuity::Lost(lost) => lost.get(),
+            Continuity::Contiguous | Continuity::Discontinuity => 0,
+        };
+        Self {
+            stream: packet.stream_id(),
+            ts: raw_timestamp(meta.timestamp),
+            seq: meta.sequence_number,
+            ssrc: meta.ssrc,
+            marker: meta.mark,
+            loss,
+            payload: Bytes::from(packet.packet().payload().to_vec()),
+        }
+    }
+}
+
 /// One RTP packet: cut through, and depacketized on the side branch.
 fn on_rtp(
     entry: &mut Carried,
     ctx: &SourceCtx,
     arrival: Instant,
-    packet: retina::rtp::ReceivedPacket,
+    packet: Received,
     normalized: &mut Vec<NormalizedPacket>,
 ) {
-    let ts = raw_timestamp(packet.timestamp());
-    let marker = packet.mark();
-    let seq = packet.sequence_number();
-    let ssrc = packet.ssrc();
-    let payload = packet.into_payload_bytes();
+    let Received {
+        ts,
+        seq,
+        ssrc,
+        marker,
+        payload,
+        ..
+    } = packet;
     let rtp = RtpHeaderFields {
         pt: entry.pt,
         seq,
@@ -1455,10 +1515,8 @@ mod tests {
             Bytes::from_static(&[0x67, 1]),
             Bytes::from_static(&[0x68, 2]),
         );
-        let sets = video_sets(&VideoParametersCodec::H264 {
-            sps: sps.clone(),
-            pps: pps.clone(),
-        });
+        // In any order: each set is told by its NAL unit header.
+        let sets = video_sets("h264", &[&pps[..], &sps[..]]);
         assert!(
             matches!(&sets, Sprop::H264(sets) if (&sets.sps, &sets.pps) == (&Some(sps), &Some(pps))),
             "{sets:?}"
@@ -1466,16 +1524,12 @@ mod tests {
         let vps = Bytes::from(h265::test_data::vps());
         let sps = Bytes::from(h265::test_data::sps(640, 480));
         let pps = Bytes::from(h265::test_data::pps());
-        let sets = video_sets(&VideoParametersCodec::H265 {
-            vps: vps.clone(),
-            sps: sps.clone(),
-            pps: pps.clone(),
-        });
+        let sets = video_sets("h265", &[&vps[..], &sps[..], &pps[..]]);
         assert!(
             matches!(&sets, Sprop::H265(sets) if sets.units() == Some([&vps[..], &sps[..], &pps[..]])),
             "{sets:?}"
         );
-        assert_eq!(video_sets(&VideoParametersCodec::Jpeg), Sprop::None);
+        assert_eq!(video_sets("jpeg", &[]), Sprop::None);
     }
 
     #[test]

@@ -734,7 +734,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1479,7 +1479,6 @@ version = "0.0.0-dev"
 dependencies = [
  "bytes",
  "futures-util",
- "getrandom 0.3.4",
  "lotse-codec",
  "lotse-core",
  "lotse-tls",
@@ -1939,26 +1938,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "pin-project"
-version = "1.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
-dependencies = [
- "pin-project-internal",
-]
-
-[[package]]
-name = "pin-project-internal"
-version = "1.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2080,8 +2059,8 @@ checksum = "47091c86514c2e11452cb228dee77037334b99d92a23e4c69aa5982261f39247"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.5.10",
- "windows-sys 0.52.0",
+ "socket2 0.6.5",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2187,7 +2166,7 @@ checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 [[package]]
 name = "retina"
 version = "0.4.21"
-source = "git+https://github.com/scottlamb/retina?rev=e38c1565ba27afad12f574d70c6d895129705e12#e38c1565ba27afad12f574d70c6d895129705e12"
+source = "git+https://github.com/edenhaus/retina?rev=f65065fea7272fa9afc4468bd8f7058b43f7b2f1#f65065fea7272fa9afc4468bd8f7058b43f7b2f1"
 dependencies = [
  "base64 0.22.1",
  "bitstream-io",
@@ -2198,15 +2177,14 @@ dependencies = [
  "hex",
  "http-auth",
  "jiff",
- "log",
  "memchr",
- "pin-project",
  "pretty-hex",
  "rand 0.8.8",
  "sdp-types",
  "smallvec",
  "socket2 0.5.10",
  "tokio",
+ "tracing",
  "url",
 ]
 
@@ -2304,7 +2282,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

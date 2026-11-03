@@ -17,6 +17,7 @@ pub mod error;
 mod factory;
 mod fmtp;
 mod framer;
+pub mod log_filter;
 pub mod options;
 mod relay;
 mod rtcp;

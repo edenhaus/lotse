@@ -13,9 +13,8 @@ categories.workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-futures-util = { workspace = true } # the session's packet stream
-getrandom = { workspace = true } # the backchannel stream's random SSRC, sequence number and timestamp
-retina = { workspace = true, features = ["h265"] } # `h265`: the RFC 7798 §7.1 `sprop-vps`, `sprop-sps` and `sprop-pps` of an H.265 camera's SDP
+futures-util = { workspace = true } # `FutureExt`: a request's future mapped into its deadline's result
+retina = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sdp-types = { workspace = true } # the camera's backchannel media: payload type and `a=ptime`

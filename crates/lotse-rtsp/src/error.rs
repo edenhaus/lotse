@@ -26,10 +26,11 @@ pub(crate) fn camera_text(text: &str) -> String {
     lotse_core::text::plain(text, CAMERA_TEXT_BYTES)
 }
 
-/// Classifies a retina error of the session for `url`. retina keeps its
-/// variants private, so the status code (public) and the message text
-/// (stable prefixes per variant) decide.
-pub fn classify(error: &retina::Error, url: &SourceUrl) -> SourceError {
+/// Classifies a retina client error of the session for `url`. retina
+/// keeps its variants private, so the status code (public) and the
+/// message text (stable prefixes per variant, its `ErrorInt` display
+/// formats) decide.
+pub fn classify(error: &retina::client::Error, url: &SourceUrl) -> SourceError {
     classify_text(&error.to_string(), error.status_code(), url)
 }
 
@@ -107,7 +108,52 @@ mod tests {
         assert_eq!(
             classify(&err, &url),
             SourceError::Protocol(
-                "Invalid argument: Bad URL rtspx://cam/****?**** only scheme rtsp supported".into()
+                "Invalid argument: Bad URL rtspx://cam/****?**** only schemes rtsp and rtsps supported"
+                    .into()
+            )
+        );
+    }
+
+    /// retina's own texts for two kinds [`classify`] tells by their
+    /// prefix, from real failures: a connection refused, and a peer that
+    /// closes the connection while its answer to `DESCRIBE` is awaited.
+    #[tokio::test]
+    async fn retinas_texts_for_a_refused_connection_and_a_hang_up_keep_their_kinds() {
+        use tokio::io::AsyncReadExt as _;
+
+        let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = SourceUrl::parse(&format!("rtsp://{}/", free.local_addr().unwrap())).unwrap();
+        drop(free);
+        let options = retina::client::SessionOptions::default;
+        let refused = retina::client::Session::describe(url.expose_url().clone(), options())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(classify(&refused, &url), SourceError::Unreachable(ref m)
+                if m.starts_with("Unable to connect to RTSP server: ")),
+            "{refused}"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = SourceUrl::parse(&format!("rtsp://{}/", listener.local_addr().unwrap())).unwrap();
+        let describe = retina::client::Session::describe(url.expose_url().clone(), options());
+        let peer_side = async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0_u8];
+                peer.read_exact(&mut byte).await.unwrap();
+                request.extend_from_slice(&byte);
+            }
+        };
+        let (closed, ()) = tokio::join!(describe, peer_side);
+        let closed = closed.err().unwrap();
+        assert_eq!(
+            classify(&closed, &url),
+            SourceError::Ended(
+                "Error reading from RTSP peer: EOF while expecting response to DESCRIBE CSeq 1"
+                    .into()
             )
         );
     }

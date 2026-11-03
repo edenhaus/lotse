@@ -12,10 +12,15 @@
 //! [`BACKCHANNEL_OPEN_LIMIT`]. The connection bypasses the connect gate
 //! (`sources.connect_concurrency`): a talker waits for it, and there is at
 //! most one per camera being talked to. Then every packet the talker's
-//! route hands over is stamped ([`Packetizer`]) and sent on the
-//! backchannel's channel between retina's requests (RFC 2326 §10.12), with
-//! retina's own SSRC, sequence numbers, Sender Reports (RFC 3550 §5.1,
-//! §6.4.1) and keepalives. The release drops the session: retina sends its
+//! route hands over is stamped ([`Packetizer`], with retina's
+//! `rtp::Sender`: payload type, SSRC and sequence numbers, RFC 3550 §5.1)
+//! and queued on the backchannel's channel, with the Sender Reports (RFC
+//! 3550 §6.4.1), and retina writes them between its requests (RFC 2326
+//! §10.12) and keepalives as the session is polled. Queueing never waits:
+//! while more than [`MAX_QUEUED`] bytes wait for the camera to take them,
+//! a packet is dropped, its sequence number skipped, rather than queued,
+//! so the talk-back stays near real time and the session keeps reading.
+//! The release drops the session: retina sends its
 //! `TEARDOWN` with `Require`, and the connection closes, as a camera may
 //! stay in two-way mode until it does. Should the camera end the session
 //! first (its connection lost, a request refused), the loss is reported
@@ -28,9 +33,8 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures_util::stream::SplitSink;
-use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
+use futures_util::FutureExt as _;
+use lotse_core::clock::Clock;
 use lotse_core::codec::Codec;
 use lotse_core::media::MediaPacket;
 use lotse_core::source::{
@@ -38,31 +42,28 @@ use lotse_core::source::{
     BackchannelSession, BackchannelTasks, SourceError,
 };
 use lotse_core::task::BoxFuture;
+use lotse_core::throttle::Throttle;
 use retina::client::{
     Playing, Session, SessionGroup, SetupOptions, TcpTransportOptions, Transport,
 };
-use retina::rtp::SendingPacket;
+use retina::rtp::SenderOptions;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::camera::{Camera, backchannel_stream};
 use super::probe::unanswered;
 use super::session::{QUEUE, refusal};
-use super::{BackchannelFormat, BackchannelPacket, Initial, Packetizer};
+use super::{BackchannelFormat, Packetizer};
 use crate::error::classify;
 use crate::source::{play_options, tear_down, within_on};
 
-/// Where a backchannel session's [`Packetizer`] starts: retina assigns the
-/// SSRC and the sequence numbers itself and adds a random offset to the
-/// timestamps (RFC 3550 §5.1, §8.1), so a random start of the
-/// packetizer's own ([`Initial::random`]) would add nothing. Its
-/// timestamps count from zero, a starting point [`SendingPacket::new`]
-/// leaves to the caller.
-const FROM_ZERO: Initial = Initial {
-    ssrc: 0,
-    seq: 0,
-    ts: 0,
-};
+/// Above this many bytes queued for the camera, a talker's packet is
+/// dropped rather than queued: 4 KiB, a quarter second of 128 kbit/s,
+/// twice G.711's rate (RFC 3551 §4.5.14) with room for its headers. A
+/// camera that takes data that slowly would hear the talk-back fall ever
+/// further behind; dropping keeps it near real time, and waiting for
+/// room would stop the session reading what the camera sends.
+const MAX_QUEUED: usize = 4 * 1024;
 
 /// What an open backchannel session hands its claim: the codec and frame
 /// the camera takes on it, and where the talker's packets go.
@@ -256,7 +257,8 @@ async fn handshake(
     target: url::Url,
     group: &std::sync::Arc<SessionGroup>,
 ) -> Result<(Session<Playing>, usize, BackchannelFormat), BackchannelRefused> {
-    let refused = |err: &retina::Error| refusal(err.status_code(), &classify(err, &camera.url));
+    let refused =
+        |err: &retina::client::Error| refusal(err.status_code(), &classify(err, &camera.url));
     tracing::info!("rtsp: backchannel session: DESCRIBE with the backchannel's Require header");
     let options = camera.session_options(group);
     let mut session = Session::describe(target, options)
@@ -309,67 +311,83 @@ fn as_probed(probed: &Codec, described: &Codec) -> Result<(), BackchannelRefused
 }
 
 /// Sends the talker's packets from `uplink` on retina's stream `index`,
-/// stamped for the camera's `format` (RFC 3550 §5.1; retina sets the SSRC
-/// and the sequence numbers), and keeps reading the session, which keeps
-/// it alive and notices its loss: `None` once closed, else why it ended.
-/// A send waits while the camera takes no data (its TCP buffers full);
-/// the close ends that wait too, so a release always reaches the
-/// session's bounded `TEARDOWN` ([`tear_down`]).
+/// stamped for the camera's `format` (RFC 3550 §5.1, with a random SSRC,
+/// sequence start and timestamp offset), and keeps reading the session,
+/// which writes what is queued, keeps it alive and notices its loss:
+/// `None` once closed, else why it ended. Nothing here waits for the
+/// camera to take data ([`queue`]), so a release always reaches the
+/// session's bounded `TEARDOWN` ([`tear_down`]). The session is polled
+/// before the uplink, so what was queued is written before more is.
 async fn forward(
-    playing: Session<Playing>,
+    mut playing: Session<Playing>,
     index: usize,
     format: &BackchannelFormat,
     mut uplink: mpsc::Receiver<MediaPacket>,
     close: &CancellationToken,
     camera: &Camera,
 ) -> Option<BackchannelRefused> {
-    let (mut sink, mut items) = playing.split();
-    let mut packetizer = Packetizer::new(format, FROM_ZERO);
+    let mut packetizer = Packetizer::new(format, SenderOptions::default());
+    let mut dropped = Throttle::default();
     loop {
-        tokio::select! {
-            Some(packet) = uplink.recv() => {
-                let BackchannelPacket { rtp, payload } = packetizer.packetize(&packet);
-                let sending = SendingPacket::new(index, rtp.ts, Bytes::from_owner(payload))
-                    .mark(rtp.marker);
-                // Closed while the send waits: `None`, as for any close.
-                if let Err(err) = send(&mut sink, sending, close).await? {
-                    return Some(refusal(err.status_code(), &classify(&err, &camera.url)));
-                }
-            }
-            item = items.next() => match item {
+        // `Some` once the session ended: with retina's error, if any.
+        let ended = tokio::select! {
+            biased;
+            () = close.cancelled() => return None,
+            item = playing.next_item() => match item {
                 // The camera's RTCP, or what else retina hands up: nothing
                 // the backchannel uses.
-                Some(Ok(_)) => {}
-                ended => return Some(lost(ended.and_then(Result::err).as_ref(), camera)),
+                Some(Ok(_)) => None,
+                ended => Some(ended.and_then(Result::err)),
             },
-            () = close.cancelled() => return None,
+            Some(packet) = uplink.recv() => {
+                queue(&mut playing, index, &mut packetizer, &packet, &*camera.time, &mut dropped)
+                    .err()
+                    .map(Some)
+            }
+        };
+        if let Some(error) = ended {
+            return Some(lost(error.as_ref(), camera));
         }
     }
 }
 
-/// Sends `sending` on `sink`, retina's way to the camera: the send's
-/// result, or `None` once `close` is cancelled while the send waits for
-/// the camera to take data (its TCP buffers full), so a release still
-/// reaches the session's bounded `TEARDOWN` ([`tear_down`]).
-async fn send(
-    sink: &mut SplitSink<Session<Playing>, SendingPacket>,
-    sending: SendingPacket,
-    close: &CancellationToken,
-) -> Option<Result<(), retina::Error>> {
-    tokio::select! {
-        sent = sink.send(sending) => Some(sent),
-        () = close.cancelled() => {
-            tracing::info!(
-                "rtsp: backchannel session closed while a packet waited for the camera to take data"
+/// Queues `packet` on `playing`'s stream `index`, stamped by
+/// `packetizer`, and a Sender Report when one is due; or, while more than
+/// [`MAX_QUEUED`] bytes wait for the camera, drops it, its sequence number
+/// skipped (RFC 3550 §5.1), counted in `dropped`'s rate-limited line. The
+/// error is retina's when the stream takes no data.
+fn queue(
+    playing: &mut Session<Playing>,
+    index: usize,
+    packetizer: &mut Packetizer,
+    packet: &MediaPacket,
+    time: &dyn Clock,
+    dropped: &mut Throttle,
+) -> Result<(), retina::client::Error> {
+    let queued = playing.queued_len();
+    if queued > MAX_QUEUED {
+        packetizer.skip(packet);
+        if let Some(count) = dropped.hit(packet.arrival) {
+            tracing::warn!(
+                queued,
+                count,
+                "rtsp: backchannel packet dropped: the camera takes data slower than the talker sends it"
             );
-            None
         }
+        return Ok(());
+    }
+    packetizer
+        .packetize(packet, |rtp| playing.queue_rtp(index, rtp))
+        .unwrap_or(Ok(()))?;
+    match packetizer.sender_report(time.now(), time.wall_now()) {
+        Some(report) => playing.queue_rtcp(index, &report),
+        None => Ok(()),
     }
 }
 
 /// Why the session ended on the camera's side: `error`, or without one
 /// the camera closed it.
-fn lost(error: Option<&retina::Error>, camera: &Camera) -> BackchannelRefused {
+fn lost(error: Option<&retina::client::Error>, camera: &Camera) -> BackchannelRefused {
     match error {
         Some(err) => refusal(err.status_code(), &classify(err, &camera.url)),
         None => BackchannelRefused {
@@ -390,7 +408,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use lotse_core::clock::{Clock as _, SystemClock};
+    use lotse_core::clock::SystemClock;
     use lotse_core::source_url::SourceUrl;
     use lotse_core::task::spawn_named;
     use lotse_testing::fake_camera::{
@@ -620,13 +638,13 @@ mod tests {
     }
 
     /// A camera that stops taking data once its backchannel plays: the
-    /// talker's packets fill the TCP buffers until retina's send waits,
-    /// and the release still ends the session within the teardown budget
-    /// (RFC 2326 §10.7), its connection closed, rather than leaving the
-    /// task waiting with the camera's connection open.
+    /// talker's packets fill the TCP buffers, and those beyond
+    /// [`MAX_QUEUED`] are dropped rather than queued, so the forwarding
+    /// never waits on the camera, and the release ends the session within
+    /// the teardown budget (RFC 2326 §10.7), its connection closed, rather
+    /// than leaving the task waiting with the camera's connection open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rfc2326_10_7_a_release_while_a_send_waits_on_a_camera_taking_no_data_ends_the_session()
-    {
+    async fn rfc2326_10_7_a_release_while_the_camera_takes_no_data_ends_the_session() {
         let cam = FakeCamera::start(
             CameraConfig {
                 backchannel: Some(CameraBackchannel {
@@ -647,26 +665,19 @@ mod tests {
             run(camera_at(&cam), Codec::Pcmu, close.clone(), opened, on_loss),
         );
         let (_codec, _frame, sender) = open.await.unwrap().unwrap();
-        // Packets as large as interleaved data carries (RFC 2326 §10.12)
-        // until the queue stays full: the forwarding waits in its send.
-        let deadline = SystemClock.now() + Duration::from_secs(20);
-        let mut full_since = None;
-        for ts in 0_u32.. {
-            assert!(SystemClock.now() < deadline, "the send never waited");
-            if sender.try_send(large(ts)).is_ok() {
-                full_since = None;
-                continue;
+        // 60 MB, packets as large as interleaved data carries (RFC 2326
+        // §10.12): far more than the TCP buffers between retina and the
+        // camera hold, and each is still taken at once.
+        for ts in 0_u32..1_000 {
+            tokio::select! {
+                sent = sender.send(large(ts)) => sent.unwrap(),
+                () = SystemClock.sleep(Duration::from_secs(1)) => panic!("the forwarding waited on the camera"),
             }
-            let since = *full_since.get_or_insert_with(|| SystemClock.now());
-            if SystemClock.now().duration_since(since) >= Duration::from_millis(300) {
-                break;
-            }
-            SystemClock.sleep(Duration::from_millis(10)).await;
         }
         close.cancel();
         tokio::select! {
             ended = &mut session => ended.unwrap(),
-            () = SystemClock.sleep(Duration::from_secs(2)) => panic!("the send outlived the release"),
+            () = SystemClock.sleep(Duration::from_secs(2)) => panic!("the session outlived the release"),
         }
         let log = cam.stats().connection_log();
         assert!(log[0].played, "{log:?}");
@@ -674,9 +685,52 @@ mod tests {
         cam.stop().await;
     }
 
+    /// A packet retina refuses to queue (here on a stream past the
+    /// session's last) ends the forwarding with retina's error as the
+    /// session's loss, as any other failure of the session does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_packet_retina_refuses_to_queue_ends_the_session_with_why() {
+        let cam = FakeCamera::start(
+            CameraConfig {
+                backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let camera = camera_at(&cam);
+        let group = Arc::new(SessionGroup::default());
+        let target = url::Url::parse(&cam.url()).unwrap();
+        let (playing, _index, format) = handshake(&camera, &Codec::Pcmu, target, &group)
+            .await
+            .unwrap();
+        let streams = playing.streams().len();
+        let (sender, uplink) = mpsc::channel(1);
+        sender.send(large(0)).await.unwrap();
+        let close = CancellationToken::new();
+        let refused = forward(playing, streams, &format, uplink, &close, &camera)
+            .await
+            .unwrap();
+        assert_eq!(refused.status, None);
+        assert!(
+            refused.message.ends_with(&format!(
+                "Invalid argument: can't send on stream {streams}: presentation has only {streams} streams"
+            )),
+            "{refused:?}"
+        );
+        tear_down(&group, &SystemClock, &"the test ended").await;
+        cam.stop().await;
+    }
+
     /// A PCMU packet whose payload is as large as one interleaved frame
     /// carries after its RTP header.
     fn large(ts: u32) -> MediaPacket {
+        pcmu(ts, 60_000)
+    }
+
+    /// The `ts`th 20 ms PCMU packet, with `len` bytes of payload.
+    fn pcmu(ts: u32, len: usize) -> MediaPacket {
         MediaPacket {
             arrival: SystemClock.now(),
             rtp: lotse_core::media::RtpHeaderFields {
@@ -690,8 +744,59 @@ mod tests {
             keyframe_start: false,
             epoch: 0,
             lateness: Duration::ZERO,
-            payload: Arc::from(vec![0xff_u8; 60_000]),
+            payload: Arc::from(vec![0xff_u8; len]),
         }
+    }
+
+    /// While more than [`MAX_QUEUED`] bytes wait for the camera, a packet
+    /// is dropped rather than queued: the session, never polled here,
+    /// writes nothing, and its queue stops growing at the first packet
+    /// past the bound, while the dropped packets keep their sequence
+    /// numbers, so the camera sees the gap (RFC 3550 §5.1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc3550_5_1_past_the_queue_bound_packets_are_dropped_with_their_sequence_numbers() {
+        let cam = FakeCamera::start(
+            CameraConfig {
+                backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let camera = camera_at(&cam);
+        let group = Arc::new(SessionGroup::default());
+        let target = url::Url::parse(&cam.url()).unwrap();
+        let (mut playing, index, format) = handshake(&camera, &Codec::Pcmu, target, &group)
+            .await
+            .unwrap();
+        let options = SenderOptions::default().initial_sequence_number(0);
+        let mut packetizer = Packetizer::new(&format, options);
+        let mut dropped = Throttle::default();
+        let mut queued = Vec::new();
+        for ts in 0..100 {
+            queue(
+                &mut playing,
+                index,
+                &mut packetizer,
+                &pcmu(ts, 160),
+                &SystemClock,
+                &mut dropped,
+            )
+            .unwrap();
+            queued.push(playing.queued_len());
+        }
+        let over = queued.iter().position(|len| *len > MAX_QUEUED).unwrap();
+        assert!(over > 10, "{queued:?}");
+        assert!(
+            queued[over..].iter().all(|len| *len == queued[over]),
+            "{queued:?}"
+        );
+        let next = packetizer.packetize(&pcmu(100, 160), |rtp| rtp.header().sequence_number());
+        assert_eq!(next, Some(100));
+        drop(playing);
+        tear_down(&group, &SystemClock, &"the test ended").await;
+        cam.stop().await;
     }
 
     /// What `cam` logged of its first connection once `done` holds for

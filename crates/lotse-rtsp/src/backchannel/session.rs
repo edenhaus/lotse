@@ -111,9 +111,9 @@ pub struct Offer {
     /// The first payload type of its `m=` line: the `rtp_payload_type` of
     /// the retina stream that carries it, by which the source finds that
     /// stream, since retina's stream indices skip media it cannot parse.
-    /// It is also the payload type retina stamps on every packet sent on
-    /// that stream, so it equals `format.payload_type` ([`offer`] takes no
-    /// other).
+    /// The packets sent on it carry `format.payload_type`, which the
+    /// sender chooses (retina's `rtp::Sender`), so a format listed after
+    /// the first is sent as the camera named it (§5.3.2).
     pub first_payload_type: u8,
     /// The format the talk-back chain sends it.
     pub format: BackchannelFormat,
@@ -136,17 +136,8 @@ fn direction(attributes: &[sdp_types::Attribute]) -> Option<&str> {
 /// RFC 8866 §6.7: its own direction attribute, else the session's), is
 /// audio and has a format the talk-back chain produces
 /// ([`backchannel_format`]). Of the backchannels a camera lists, the client
-/// chooses which one it uses (§5.3.2), and talk-back uses audio.
-///
-/// SPEC-DEVIATION: ONVIF §5.3.2 lets the client send any format an `m=`
-/// line lists, but retina stamps a sending stream's packets with the
-/// stream's `rtp_payload_type`, the line's first format, and the caller
-/// cannot choose it. Until it can, only a media whose first format the
-/// chain produces is taken; one that lists such a format later is no
-/// backchannel (logged at info, the probe reports none), since its packets
-/// would carry the first format's payload type over the chain's bytes. retina's
-/// proposed `StreamDirection::Sending` reads the same direction
-/// attributes. `None` also for an SDP that does not parse; the relay's
+/// chooses which one it uses (§5.3.2), and talk-back uses audio. retina's
+/// `StreamDirection::Sending` reads the same direction attributes. `None` also for an SDP that does not parse; the relay's
 /// guard has refused one retina could not read.
 pub fn offer(sdp: &[u8]) -> Option<Offer> {
     let session = match sdp_types::Session::parse(sdp) {
@@ -166,21 +157,10 @@ pub fn offer(sdp: &[u8]) -> Option<Offer> {
         .filter(|(_, media)| media.media.eq_ignore_ascii_case("audio") && sendonly(media))
         .find_map(|(index, media)| {
             let first_payload_type = media.fmt.split_ascii_whitespace().next()?.parse().ok()?;
-            let format = backchannel_format(media)?;
-            if format.payload_type != first_payload_type {
-                tracing::info!(
-                    media = index,
-                    first_payload_type,
-                    payload_type = format.payload_type,
-                    codec = format.codec.name(),
-                    "rtsp: the camera's backchannel is not usable: retina sends the m-line's first payload type; the chain's format is listed later"
-                );
-                return None;
-            }
             Some(Offer {
                 media: index,
                 first_payload_type,
-                format,
+                format: backchannel_format(media)?,
             })
         });
     match &offer {
@@ -379,30 +359,15 @@ mod tests {
     }
 
     #[test]
-    fn rfc8866_5_14_a_chain_format_listed_after_the_first_payload_type_is_no_backchannel() {
-        // G.722 first: retina would stamp 9 on the chain's PCMU bytes.
-        let later = sdp(&[
+    fn rfc8866_5_14_the_first_payload_type_is_the_m_lines_even_when_another_is_sent() {
+        // G.722 first: retina's stream says 9, the chain sends PCMU.
+        let answer = sdp(&[
             "m=video 0 RTP/AVP 96",
             "m=audio 0 RTP/AVP 9 0",
             "a=sendonly",
         ]);
-        let log = logged(|| assert_eq!(offer(&later), None));
-        assert!(
-            log.contains(
-                "retina sends the m-line's first payload type; the chain's format is listed later"
-            ),
-            "{log}"
-        );
-        // The next media is still looked at, and a first format the chain
-        // produces is taken as before.
-        let next = sdp(&[
-            "m=audio 0 RTP/AVP 9 0",
-            "a=sendonly",
-            "m=audio 0 RTP/AVP 0 9",
-            "a=sendonly",
-        ]);
-        let offer = offer(&next).unwrap();
-        assert_eq!((offer.media, offer.first_payload_type), (1, 0));
+        let offer = offer(&answer).unwrap();
+        assert_eq!(offer.first_payload_type, 9);
         assert_eq!(offer.format, pcmu(0));
     }
 

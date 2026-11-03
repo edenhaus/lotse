@@ -313,7 +313,7 @@ async fn onvif_5_3_a_probe_and_a_claimed_backchannel_session_beside_the_viewing_
     assert!(recorded.iter().all(|packet| packet.connection == 2));
     assert!(
         eventually(100, || count(&cam.stats().backchannel_rtcp) > 0).await,
-        "retina's Sender Reports"
+        "the backchannel's Sender Reports"
     );
     // The release: `TEARDOWN` with `Require`, and the source closes the
     // connection, which the camera keeps open.
@@ -544,8 +544,9 @@ async fn rfc2326_10_4_a_refused_backchannel_session_says_why() {
     cam.stop().await;
 }
 
-/// The backchannel session's connection drops while it is held, or a
-/// packet retina cannot send ends it: its loss says why. A viewing
+/// The backchannel session's connection drops while it is held, or the
+/// camera sends what is no RTSP: its loss says why. A packet too long for
+/// an interleaved frame is dropped and the session goes on. A viewing
 /// session that reconnects leaves it alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_10_12_a_lost_backchannel_session_says_why_and_a_viewing_reconnect_leaves_it() {
@@ -571,11 +572,18 @@ async fn rfc2326_10_12_a_lost_backchannel_session_says_why_and_a_viewing_reconne
     assert_eq!(why.status, None, "{why:?}");
     drop(session);
     // RFC 2326 §10.12: an interleaved frame's length has 16 bits; a
-    // packet longer ends the session, with why.
-    let mut session = open(&slot).await.unwrap();
+    // packet longer is dropped, its marker left to the next one sent
+    // (RFC 3551 §4.1), and the session goes on.
+    let session = open(&slot).await.unwrap();
+    let before = cam.stats().backchannel().len();
     session.sender.try_send(uplink(0, 160, 70_000)).unwrap();
-    let why = lost(&mut session).await;
-    assert!(why.message.contains("70000"), "{why:?}");
+    session.sender.try_send(uplink(1, 160, 160)).unwrap();
+    assert!(eventually(250, || cam.stats().backchannel().len() > before).await);
+    let recorded = cam.stats().backchannel()[before..].to_vec();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].payload, vec![1; 160]);
+    assert!(recorded[0].marker, "{recorded:?}");
+    drop(session);
     // A camera that sends what is no RTSP ends it too, with why.
     cam.set_backchannel_setup(BackchannelSetup::Unreadable);
     let mut session = open(&slot).await.unwrap();

@@ -7,9 +7,13 @@
 //! location before `panic = "abort"` ends the process.
 //!
 //! The crates that log through the `log` facade instead of `tracing`
-//! (retina, dimpl, sctp-proto, mpeg2ts-reader, symphonia, tungstenite) reach
-//! the same subscriber through tracing-log, under the same filter, each call
+//! (dimpl, sctp-proto, mpeg2ts-reader, symphonia, tungstenite) reach the
+//! same subscriber through tracing-log, under the same filter, each call
 //! site throttled like lotse's own repeating media-path conditions.
+//!
+//! retina logs through `tracing` itself, and no retina span or event that
+//! has a `url` field reaches the lines ([`without_retina_urls`]): that URL
+//! carries the source URL's path and query, which lotse logs only redacted.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,6 +22,8 @@ use lotse_core::clock::Clock;
 use lotse_core::throttle::Throttle;
 use tracing_log::{AsLog as _, LogTracer};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -138,6 +144,7 @@ where
         .with_writer(writer)
         .with_target(false);
     let registry = tracing_subscriber::registry().with(filter);
+    let no_urls = filter_fn(without_retina_urls);
     match format {
         LogFormat::Json => Box::new(
             registry.with(
@@ -145,11 +152,28 @@ where
                     .json()
                     .flatten_event(true)
                     .with_current_span(false)
-                    .with_span_list(true),
+                    .with_span_list(true)
+                    .with_filter(no_urls),
             ),
         ),
-        LogFormat::Text => Box::new(registry.with(lines)),
+        LogFormat::Text => Box::new(registry.with(lines.with_filter(no_urls))),
     }
+}
+
+/// Whether a span or event of `metadata` may reach the log lines: with the
+/// RTSP source, none of retina's that carries a URL
+/// ([`lotse_rtsp::log_filter`]). A filter of the line layer alone, so the
+/// level filter still answers the bridge's `enabled`.
+#[cfg(feature = "source-rtsp")]
+fn without_retina_urls(metadata: &tracing::Metadata<'_>) -> bool {
+    lotse_rtsp::log_filter::loggable(metadata)
+}
+
+/// Whether a span or event of `metadata` may reach the log lines: without
+/// the RTSP source, retina is not in the build, and every one may.
+#[cfg(not(feature = "source-rtsp"))]
+fn without_retina_urls(_metadata: &tracing::Metadata<'_>) -> bool {
+    true
 }
 
 /// Installs the global subscriber: log lines filtered by `level`, and the
@@ -250,7 +274,8 @@ mod tests {
     }
 
     /// Logs `message` at `level` through `bridge`, from `line` of a stand-in
-    /// for retina's RTP module, the way the `log` macros build a record.
+    /// module (retina's RTP module, as it logged through `log` before 0.5),
+    /// the way the `log` macros build a record.
     fn log_at(bridge: &Bridge, level: Level, line: u32, message: &str) {
         bridge.log(
             &log::Record::builder()
@@ -346,6 +371,49 @@ mod tests {
         ensure_fallback();
         install_panic_hook();
         tracing::info!("still logs after the hook is installed");
+    }
+
+    /// retina's spans and events with a `url` field never reach the lines,
+    /// in either format, and the events inside such a span still do;
+    /// retina's other events, and another crate's `url`, are logged.
+    #[cfg(feature = "source-rtsp")]
+    #[test]
+    fn retinas_spans_and_events_with_a_url_are_left_out_of_the_lines() {
+        for format in [LogFormat::Text, LogFormat::Json] {
+            let (mut reader, writer) = std::io::pipe().unwrap();
+            let lines = subscriber(format, EnvFilter::new("trace"), move || {
+                writer.try_clone().unwrap()
+            });
+            tracing::subscriber::with_default(lines, || {
+                let span = tracing::info_span!(
+                    target: "retina::client::session_core",
+                    "rtsp_request",
+                    method = "DESCRIBE",
+                    url = "rtsp://127.0.0.1:41000/camkey7f3a?token=tok9d2e"
+                );
+                let _entered = span.enter();
+                tracing::warn!(target: "retina::client::parse", "ignoring invalid fmtp attribute value");
+                tracing::warn!(
+                    target: "retina::client::parse",
+                    url = "rtsp://127.0.0.1:41000/camkey7f3a?token=tok9d2e",
+                    "DESCRIBE response has no content type; trying sdp anyway"
+                );
+                tracing::debug!(target: "retina", url = "rtsp://cam/camkey7f3a", "TEARDOWN starting");
+                tracing::info!(target: "retinal", url = "rtsp://cam/****", "not retina's");
+            });
+            let mut logs = String::new();
+            std::io::Read::read_to_string(&mut reader, &mut logs).unwrap();
+            assert!(!logs.contains("camkey7f3a"), "{logs}");
+            assert!(!logs.contains("rtsp_request"), "{logs}");
+            assert!(!logs.contains("no content type"), "{logs}");
+            assert!(!logs.contains("TEARDOWN starting"), "{logs}");
+            assert!(
+                logs.contains("ignoring invalid fmtp attribute value"),
+                "{logs}"
+            );
+            assert!(logs.contains("not retina's"), "{logs}");
+            assert!(logs.contains("rtsp://cam/****"), "{logs}");
+        }
     }
 
     #[test]

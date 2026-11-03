@@ -37,10 +37,14 @@
 //!   version 2 header (RFC 3550 §6.4).
 //! - A duplicate, or a packet up to [`MAX_MISORDER`] behind the highest
 //!   sequence number passed (RFC 3550 §A.1), is dropped and counted as out
-//!   of order: retina, reading TCP, ends the session on a backward step,
-//!   and waiting for a reordered packet would be a reorder buffer. Its gap
-//!   was counted as loss when the later packet passed. A larger step back
-//!   is a new sequence, passed for retina to judge as over TCP.
+//!   of order: retina, reading TCP, reorders with no delay, so it would
+//!   drop a packet arriving after a later one too (its reorderer's
+//!   `Pushed::Late`), and waiting for a reordered packet would be a
+//!   reorder buffer. Its gap was counted as loss when the later packet
+//!   passed. A larger step back is a new sequence, passed for retina to
+//!   judge as over TCP: its reorderer drops the new sequence's first
+//!   packet and takes the sender as restarted once the next one follows
+//!   it (`Pushed::Stray`).
 //!
 //! The pairs listen on the wildcard address of the camera's family, so the
 //! kernel answers on whichever interface the camera reaches; the address

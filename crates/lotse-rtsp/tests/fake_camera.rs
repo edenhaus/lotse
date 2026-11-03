@@ -1064,18 +1064,25 @@ async fn libwebrtc_max_frame_packets_a_larger_keyframe_is_counted_and_warned_abo
 }
 
 /// A camera key in the path, a token in the query and a password: none
-/// of them in any log line (down to `trace`), in the exit of a failed or a
+/// of them in any log line (down to `trace`, retina's included, through
+/// the filter every subscriber of the daemon applies,
+/// [`lotse_rtsp::log_filter::loggable`]), in the exit of a failed or a
 /// cancelled session, or in the description.
 #[tokio::test(flavor = "current_thread")]
 async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
     const SECRETS: [&str; 3] = ["camkey7f3a", "tok9d2e", "pw5b1c"];
     let captured = Captured::default();
     let writer = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
+    let lines = tracing_subscriber::fmt::layer()
         .with_writer(move || writer.clone())
-        .with_max_level(tracing::Level::TRACE)
         .with_ansi(false)
-        .finish();
+        .with_filter(tracing_subscriber::filter::filter_fn(
+            lotse_rtsp::log_filter::loggable,
+        ));
+    let subscriber = tracing_subscriber::registry().with(lines);
     let _logs = tracing::subscriber::set_default(subscriber);
     let cam = camera(CameraConfig {
         auth: Some(("admin".into(), "pw5b1c".into())),
