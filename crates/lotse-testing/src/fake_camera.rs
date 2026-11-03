@@ -755,6 +755,19 @@ pub enum UdpService {
     Only,
 }
 
+/// How a camera's UDP `SETUP` answer names its ports (RFC 2326 §12.39).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ServerPort {
+    /// `server_port=P-Q`, the pair.
+    #[default]
+    Pair,
+    /// `server_port=P`, the RTP port alone, RTCP then on the next one
+    /// (RFC 3550 §11).
+    Single,
+    /// No `server_port` at all.
+    Omitted,
+}
+
 /// How the camera serves a `SETUP` that asks for RTP over UDP with
 /// `client_port` (RFC 2326 §12.39): from its own RTP/RTCP port pair to the
 /// client's, with these faults. Counted in sent order over every RTP
@@ -763,8 +776,11 @@ pub enum UdpService {
 pub struct CameraUdp {
     /// Whether it is served at all.
     pub service: UdpService,
-    /// Leave `server_port` out of the answer.
-    pub omit_server_port: bool,
+    /// How the answer names the camera's ports.
+    pub server_port: ServerPort,
+    /// Put spaces around the `;` and `=` of the answer's `Transport`
+    /// parameters (RFC 2326 §4 linear white space).
+    pub spaced_transport: bool,
     /// Answer with TCP interleaved channels after all (`interleaved=0-1`,
     /// RFC 2326 §12.39), and send the media on the connection.
     pub answer_interleaved: bool,
@@ -2122,20 +2138,24 @@ impl Connection {
             SocketAddr::new(self.peer, client_port.saturating_add(1)),
         );
         let ssrc = if audio { AUDIO_SSRC } else { SSRC };
-        let server_port = if self.config.udp.omit_server_port {
-            String::new()
-        } else {
-            format!(";server_port={}-{}", udp.port, udp.port.saturating_add(1))
+        let faults = &self.config.udp;
+        let server_port = match faults.server_port {
+            ServerPort::Omitted => String::new(),
+            ServerPort::Single => format!(";server_port={}", udp.port),
+            ServerPort::Pair => {
+                format!(";server_port={}-{}", udp.port, udp.port.saturating_add(1))
+            }
         };
-        let source = self
-            .config
-            .udp
+        let source = faults
             .announce_source
             .map_or_else(String::new, |source| format!(";source={source}"));
-        let answer = format!(
+        let mut answer = format!(
             "RTP/AVP/UDP;unicast;client_port={client_port}-{}{server_port}{source};ssrc={ssrc:08X}",
             client_port.saturating_add(1)
         );
+        if faults.spaced_transport {
+            answer = answer.replace(';', " ; ").replace('=', " = ");
+        }
         let session = "12345678".to_owned();
         self.session = Some(session.clone());
         reply(cseq, StatusCode::Ok)

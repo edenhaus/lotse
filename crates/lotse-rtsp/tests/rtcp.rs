@@ -24,7 +24,7 @@ use lotse_core::clock::{Clock, FakeClock, SystemClock};
 use lotse_core::source::{ResolvedPeer, SourceFactory as _};
 use lotse_core::source_url::SourceUrl;
 use lotse_rtsp::RtspFactory;
-use lotse_testing::fake_camera::{CameraAudio, CameraUdp, ClientRtcp, SSRC, Stats};
+use lotse_testing::fake_camera::{CameraAudio, CameraUdp, ClientRtcp, SSRC, ServerPort, Stats};
 use lotse_testing::{CameraConfig, FakeCamera, Harness};
 use serde_json::json;
 
@@ -278,7 +278,7 @@ async fn rfc4961_3_over_udp_without_server_port_reports_go_where_the_cameras_rtc
     let config = CameraConfig {
         fps: FPS,
         udp: CameraUdp {
-            omit_server_port: true,
+            server_port: ServerPort::Omitted,
             ..CameraUdp::default()
         },
         ..CameraConfig::default()

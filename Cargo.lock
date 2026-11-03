@@ -2379,7 +2379,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "retina"
 version = "0.4.21"
-source = "git+https://github.com/edenhaus/retina?rev=97153f6573225ba0918c2b305f3e9420b32c14c7#97153f6573225ba0918c2b305f3e9420b32c14c7"
+source = "git+https://github.com/edenhaus/retina?rev=a3440569ed6711947e2f8ad56f0fe483e5e535ba#a3440569ed6711947e2f8ad56f0fe483e5e535ba"
 dependencies = [
  "base64 0.22.1",
  "bitstream-io",

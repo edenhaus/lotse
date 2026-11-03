@@ -72,10 +72,11 @@
 //! highest sequence number where it is, unless the next packet follows
 //! it: the sender restarted, as retina's reorderer takes it too.
 //!
-//! retina reads a `SETUP` answer's `Transport` more strictly than the
-//! relay lotse ran before did: a `server_port` of one port, or spaces
-//! around the parameters' `;`, are not taken as the relay took them; the
-//! fork lotse pins is to accept both.
+//! retina reads a `SETUP` answer's `Transport` as the relay lotse ran
+//! before did: a `server_port` of one port is the RTP port, RTCP on the
+//! next (RFC 2326 §12.39, RFC 3550 §11), and spaces around the parameters'
+//! `;` and `=` are linear white space (RFC 2326 §4), both since the fork
+//! lotse pins accepts them.
 //!
 //! The core is read only while the session plays: before the answer to
 //! `PLAY` the camera's datagrams wait in the sockets' buffers. A session

@@ -32,7 +32,7 @@ use lotse_core::source::{ResolvedPeer, SourceError, SourceFactory as _};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::track::{SubscriptionError, Track};
 use lotse_rtsp::RtspFactory;
-use lotse_testing::fake_camera::{CameraAudio, CameraUdp, Stats, UdpService};
+use lotse_testing::fake_camera::{CameraAudio, CameraUdp, ServerPort, Stats, UdpService};
 use lotse_testing::{CameraConfig, FakeCamera, Harness};
 use serde_json::json;
 
@@ -227,10 +227,10 @@ async fn datagrams_from_another_port_are_refused_and_counted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_12_39_answers_without_server_port_or_naming_the_source_play() {
     let named = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    for (omit_server_port, announce_source) in [(true, None), (false, named)] {
+    for (server_port, announce_source) in [(ServerPort::Omitted, None), (ServerPort::Pair, named)] {
         let (cam, frames, stats) = play(CameraConfig {
             udp: CameraUdp {
-                omit_server_port,
+                server_port,
                 announce_source,
                 ..CameraUdp::default()
             },
@@ -239,7 +239,7 @@ async fn rfc2326_12_39_answers_without_server_port_or_naming_the_source_play() {
         .await;
         assert!(frames > 0);
         assert_eq!(stats, IngestStats::default());
-        if omit_server_port {
+        if server_port == ServerPort::Omitted {
             // Nowhere to punch a hole to: nothing on the camera's RTP
             // port, and on its RTCP port only the receiver reports that
             // follow its own RTCP, never the 8-byte punch.
@@ -253,6 +253,84 @@ async fn rfc2326_12_39_answers_without_server_port_or_naming_the_source_play() {
         }
         cam.stop().await;
     }
+}
+
+/// RFC 2326 §12.39: `server_port=P` alone names the RTP port, RTCP on
+/// the next (RFC 3550 §11): the media plays, and the receiver reports
+/// reach the camera's RTCP port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_12_39_a_single_server_port_names_rtp_and_rtcp_on_the_next() {
+    let cam = camera(CameraConfig {
+        udp: CameraUdp {
+            server_port: ServerPort::Single,
+            ..CameraUdp::default()
+        },
+        ..CameraConfig::default()
+    })
+    .await;
+    let source = udp_source(&cam, &json!({}));
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(harness.wait_ready().await, "live over UDP");
+    let v0 = harness.tracks.tracks()[0].clone();
+    let (frames, _) = count_frames(&v0, 1).await;
+    assert!(frames > 0);
+    // RFC 3550 §6.4.2: within 3.1 s of the first packet, from the RTCP
+    // port to the camera's, the one after its RTP port.
+    let counters = cam.stats();
+    assert!(
+        eventually(250, || counters
+            .rtcp_received()
+            .iter()
+            .any(|r| r.udp && r.channel == Some(1) && r.packet.len() > 8))
+        .await,
+        "a receiver report on the camera's RTCP port: {:?}",
+        counters.rtcp_received()
+    );
+    assert_eq!(harness.tracks.ingest(), IngestStats::default());
+    harness.cancel();
+    harness.finish().await;
+    cam.stop().await;
+}
+
+/// RFC 2326 §4: spaces around the `Transport` parameters' `;` and `=`
+/// are linear white space: the named `source` is honoured, and its
+/// datagrams pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_4_a_transport_with_spaces_around_its_parameters_is_read_whole() {
+    let (cam, frames, stats) = play(CameraConfig {
+        udp: CameraUdp {
+            spaced_transport: true,
+            announce_source: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..CameraUdp::default()
+        },
+        ..CameraConfig::default()
+    })
+    .await;
+    assert!(frames > 0);
+    assert_eq!(stats, IngestStats::default(), "no strays");
+    // The punches went to the `server_port` read through the spaces.
+    assert!(Stats::get(&cam.stats().datagrams_received) > 0);
+    cam.stop().await;
+    // A spaced `source` the camera never sends from is honoured too: its
+    // datagrams from the endpoint, ::1, are refused.
+    let cam = camera(CameraConfig {
+        ip: Ipv6Addr::LOCALHOST.into(),
+        udp: CameraUdp {
+            spaced_transport: true,
+            announce_source: Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into()),
+            ..CameraUdp::default()
+        },
+        ..CameraConfig::default()
+    })
+    .await;
+    let source = udp_source(&cam, &json!({ "timeout_ms": 300 }));
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(!harness.wait_ready().await);
+    let stats = harness.tracks.ingest();
+    let exit = harness.finish().await;
+    assert!(matches!(exit, SourceError::Timeout(_)), "{exit:?}");
+    assert!(stats.datagrams_rejected > 0, "{stats:?}");
+    cam.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
