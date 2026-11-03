@@ -426,3 +426,25 @@ async fn rfc2326_12_37_keepalives_flow_on_the_control_connection_while_media_tak
     harness.finish().await;
     cam.stop().await;
 }
+
+/// RFC 2326 §12.33: `RTP-Info`'s `seq` is not read, as lotse reads the raw
+/// stream from its first packet. A camera whose header names a sequence
+/// number 90 ahead of its stream's first, within what retina's reorderer
+/// takes for reordering, and that hangs up before its stream gets there,
+/// still goes live with its first packet: read, the header would have
+/// every packet dropped as late, and the attempt would end without media.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_12_33_an_rtp_info_seq_ahead_of_the_stream_is_ignored() {
+    let cam = camera(CameraConfig {
+        rtp_info_seq_offset: 90,
+        packets_before_close: Some(60),
+        ..CameraConfig::default()
+    })
+    .await;
+    let source = udp_source(&cam, &json!({}));
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(harness.wait_ready().await, "live from the first packet");
+    harness.cancel();
+    let _exit = harness.finish().await;
+    cam.stop().await;
+}

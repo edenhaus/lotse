@@ -659,17 +659,21 @@ async fn connect(
     Ok(Connected { playing, carried })
 }
 
-/// The options of a `PLAY`. retina does not enforce timestamps (it no
-/// longer can be asked to): core's guard turns a real jump into an epoch
-/// instead. `rtptime` in `RTP-Info` (RFC 2326 §12.33, RFC 7826 §18.45)
-/// maps RTP time to normal play time, which only retina's NPT uses; lotse
-/// reads the raw RTP timestamps and maps them to the wall clock from
-/// Sender Reports (RFC 3550 §6.4.1), else by arrival. So it is ignored: retina's default refuses a `PLAY` answer
-/// without it for more than one stream, as MediaMTX 1.21.1 gives a
-/// path's first reader (observed 2026-10-06).
+/// The options of a `PLAY`: nothing of `RTP-Info` (RFC 2326 §12.33, RFC
+/// 7826 §18.45) is used, since lotse reads the raw stream from its first
+/// packet on. retina does not enforce timestamps (it no longer can be
+/// asked to): core's guard turns a real jump into an epoch instead.
+/// `rtptime` maps RTP time to normal play time, which only retina's NPT
+/// uses; lotse maps the raw RTP timestamps to the wall clock from Sender
+/// Reports (RFC 3550 §6.4.1), else by arrival. So it is ignored: retina's
+/// default refuses a `PLAY` answer without it for more than one stream,
+/// as MediaMTX 1.21.1 gives a path's first reader (observed 2026-10-06).
+/// `seq` is ignored too: retina's reorderer would otherwise drop every
+/// packet before it as late, so a camera whose `seq` is ahead of its
+/// stream would play nothing until the stream caught up.
 pub(crate) fn play_options() -> PlayOptions {
     PlayOptions::default()
-        .initial_seq(InitialSequenceNumberPolicy::IgnoreSuspiciousValues)
+        .initial_seq(InitialSequenceNumberPolicy::Ignore)
         .initial_timestamp(InitialTimestampPolicy::Ignore)
 }
 
