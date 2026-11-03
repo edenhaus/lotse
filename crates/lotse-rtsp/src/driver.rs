@@ -31,6 +31,9 @@
 //! A teardown runs under a [`Budget`]: the attempt on the session's own
 //! connection is bounded tightly, and only when retina retries on a fresh
 //! connection does the bound grow, so that a dial and a TLS handshake fit.
+//! retina retries on a fresh connection only once the session's own one
+//! closed or failed; one that stalls silently keeps the tight bound, and
+//! the session is left to expire on the camera, by design.
 //!
 //! RTP over UDP plugs in beside [`Driver::next_item`]'s exchange on the
 //! connection: [`Driver::setup_udp`] asks for it with a pair the source
@@ -38,8 +41,8 @@
 //! punches right after the `SETUP` answer, the receiver reports while
 //! playing) and hands the core what they receive, once [`crate::udp`]'s
 //! checks passed it, in the same poll as the connection's bytes. The ONVIF
-//! backchannel (`queue_rtp`) plugs in beside it, on the same core and
-//! connection.
+//! backchannel's packets go out the same way, on the same core and
+//! connection ([`Driver::queue_rtp`]).
 
 use std::fmt;
 use std::future::poll_fn;
@@ -124,6 +127,9 @@ pub(crate) enum Error {
     /// The camera's answer was refused here: a UDP `source` no camera can
     /// send from ([`crate::udp`]).
     Refused(SourceError),
+    /// A `SETUP` named a stream the description does not have (none before
+    /// `DESCRIBE`): retina would index past its streams.
+    UnknownStream(usize),
 }
 
 impl Error {
@@ -136,6 +142,9 @@ impl Error {
             Self::Closed => SourceError::Ended("the camera closed the session".into()),
             Self::NotPlaying => SourceError::Protocol("rtsp: no packets before PLAY".into()),
             Self::Refused(err) => err.clone(),
+            Self::UnknownStream(index) => SourceError::Protocol(format!(
+                "rtsp: no stream {index} in the camera's description"
+            )),
         }
     }
 
@@ -143,7 +152,11 @@ impl Error {
     pub(crate) fn status_code(&self) -> Option<u16> {
         match self {
             Self::Session(err) => err.status_code(),
-            Self::Write(_) | Self::Closed | Self::NotPlaying | Self::Refused(_) => None,
+            Self::Write(_)
+            | Self::Closed
+            | Self::NotPlaying
+            | Self::Refused(_)
+            | Self::UnknownStream(_) => None,
         }
     }
 }
@@ -473,6 +486,7 @@ impl Driver {
     /// `SETUP` of the stream at `index` among [`Driver::streams`], TCP
     /// interleaved (RFC 2326 §10.4, §10.12).
     pub(crate) async fn setup(&mut self, index: usize) -> Result<(), Error> {
+        self.described(index)?;
         self.core
             .setup(index, SetupTransport::Tcp)
             .map_err(Error::Session)?;
@@ -491,6 +505,7 @@ impl Driver {
             client_rtp_port: pair.port(),
             options: udp_options(),
         };
+        self.described(index)?;
         self.core.setup(index, transport).map_err(Error::Session)?;
         let peer = udp_peer(&self.request().await?);
         self.udp
@@ -498,6 +513,15 @@ impl Driver {
             .map_err(Error::Refused)?;
         self.send_udp();
         Ok(())
+    }
+
+    /// [`Error::UnknownStream`] unless the description has a stream at
+    /// `index`: retina's `setup` indexes its streams unchecked.
+    fn described(&self, index: usize) -> Result<(), Error> {
+        self.streams()
+            .get(index)
+            .map(|_| ())
+            .ok_or(Error::UnknownStream(index))
     }
 
     /// Sends every datagram the core queued for the pairs.
@@ -1130,11 +1154,33 @@ mod tests {
             err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap()),
             SourceError::Protocol(m) if m.starts_with("404")
         ));
-        // A request retina refuses to start is its error too.
+        // Without a description there is no stream to set up, and a
+        // request retina refuses to start is its error.
         let refused = driver.setup(0).await.unwrap_err();
-        assert!(matches!(refused, Error::Session(_)), "{refused:?}");
+        assert!(matches!(refused, Error::UnknownStream(0)), "{refused:?}");
         let refused = driver.play(play_options()).await.unwrap_err();
         assert!(matches!(refused, Error::Session(_)), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn rfc2326_10_4_a_setup_of_a_stream_the_description_lacks_is_refused() {
+        let _logs = traced();
+        let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        played(&mut driver, &mut cam).await;
+        // One stream described: index 1 would be past retina's streams.
+        let err = driver.setup(1).await.unwrap_err();
+        assert!(matches!(err, Error::UnknownStream(1)), "{err:?}");
+        assert_eq!(err.status_code(), None);
+        assert_eq!(
+            err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap()),
+            SourceError::Protocol("rtsp: no stream 1 in the camera's description".into())
+        );
+        let pair = Pair::bind(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).unwrap();
+        let err = driver.setup_udp(5, pair).await.unwrap_err();
+        assert!(matches!(err, Error::UnknownStream(5)), "{err:?}");
+        // A stream already set up is retina's refusal.
+        let err = driver.setup(0).await.unwrap_err();
+        assert!(matches!(err, Error::Session(_)), "{err:?}");
     }
 
     /// How a [`Faulty`] connection fails.

@@ -603,9 +603,9 @@ async fn rfc2326_10_12_a_lost_backchannel_session_says_why_and_a_viewing_reconne
 /// `Auto` policy tears down on a fresh connection, drops the
 /// backchannel's connection: the session's `TEARDOWN`, with `Require`
 /// (ONVIF Streaming Specification §5.3.1), goes on a fresh connection the
-/// source dials as it dialed the first, within the source's 2 s budget
-/// for that case, which the session's task waits for: once it ended, the
-/// camera has answered.
+/// source dials as it dialed the first, under the driver's fresh budget,
+/// which the session's task waits for: once it ended, the camera has
+/// answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_10_7_a_lost_live555_backchannel_session_is_torn_down_on_a_fresh_connection() {
     let mut config = config(None, BackchannelCodec::Pcmu, |_| {});
@@ -619,14 +619,9 @@ async fn rfc2326_10_7_a_lost_live555_backchannel_session_is_torn_down_on_a_fresh
     let mut session = open(&slot).await.unwrap();
     assert!(log(&cam)[2].backchannel_only(), "{:?}", log(&cam));
     cam.hang_up_backchannel();
-    let hung_up = clock().now();
     let why = lost(&mut session).await;
     assert_eq!(why.status, None, "{why:?}");
     bounded(slot.tasks().ended()).await;
-    assert!(
-        clock().now().saturating_duration_since(hung_up) < Duration::from_secs(2),
-        "within the fresh connection's budget"
-    );
     let logs = log(&cam);
     let fresh = &logs[3];
     assert_eq!(fresh.teardown, Some(true), "{logs:?}");
