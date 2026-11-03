@@ -9,7 +9,10 @@
 //! TCP the session ends with its connection, except on a camera whose
 //! SDP names a live555 version with the stale TCP session bug, which
 //! retina's `Auto` policy tears down on fresh connections too, as the
-//! source dials them.
+//! source dials them, within the source's budget for that case (2 s). The
+//! source's attempt ends only once its teardown is over, so what the camera
+//! counted is final when the harness has the exit; the retries' timing is
+//! the driver's unit tests', on a fake clock.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -257,7 +260,8 @@ async fn rfc2326_10_7_a_camera_that_hangs_up_is_torn_down_on_a_fresh_connection_
 /// A live555 server before 2017.06.04 keeps an interleaved session whose
 /// connection is gone (observed by retina, which names it in its
 /// `Tool::has_live555_tcp_bug`), so retina's `Auto` policy retries the
-/// `TEARDOWN` on a fresh connection, which the source dials.
+/// `TEARDOWN` on a fresh connection, which the source dials. The attempt's
+/// exit comes after its teardown, so the counts are final by then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_10_7_a_live555_camera_that_hangs_up_is_torn_down_on_a_fresh_connection_over_tcp() {
     let cam = camera(CameraConfig {

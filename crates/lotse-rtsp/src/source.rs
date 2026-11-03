@@ -70,7 +70,7 @@ use retina::codec::{FrameFormat, ParametersRef};
 use crate::backchannel::camera::Camera;
 use crate::backchannel::probe;
 use crate::backchannel::session::Probed;
-use crate::driver::{self, Connection, Driver, Duplex, Item, Received};
+use crate::driver::{self, Budget, Connection, Driver, Duplex, Item, Received};
 use crate::error::{camera_text, classify};
 use crate::factory::PROTOCOL;
 use crate::framer::MAX_MESSAGE;
@@ -84,6 +84,14 @@ use tokio_util::sync::CancellationToken;
 
 /// How long the teardown may take once the connection is cancelled.
 pub(crate) const TEARDOWN_BUDGET: Duration = Duration::from_millis(100);
+
+/// How long the TCP interleaved session's teardown may take, from its
+/// start, once retina retries it on a fresh connection, as its `Auto`
+/// policy does for a live555 camera with the stale TCP session bug: a
+/// dial and, for `rtsps`, a TLS handshake do not fit in
+/// [`TEARDOWN_BUDGET`] beyond loopback. It delays the attempt's end, and
+/// so the next connection, only in that case.
+const FRESH_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
 /// One validated `rtsp://` or `rtsps://` source.
 #[derive(Debug)]
@@ -838,10 +846,11 @@ impl Dialer {
 /// One connection attempt TCP interleaved: dials the camera under the read
 /// deadline, drives retina's core on that connection through `DESCRIBE`,
 /// `SETUP` and `PLAY`, plays until the camera or core ends it, then tears
-/// down within the budget, however it ended: a session the camera set up
-/// gets its `TEARDOWN` (RFC 2326 §10.7, RFC 7826 §13.7) after a failed or
-/// cancelled `SETUP` or `PLAY` too, on fresh connections when retina's
-/// policy retries.
+/// down, however it ended: a session the camera set up gets its
+/// `TEARDOWN` (RFC 2326 §10.7, RFC 7826 §13.7) after a failed or
+/// cancelled `SETUP` or `PLAY` too, within [`TEARDOWN_BUDGET`] on its own
+/// connection and, when retina's policy retries on fresh connections,
+/// within [`FRESH_TEARDOWN_BUDGET`].
 async fn run_core(dialer: &Dialer, ask: &Ask, ctx: &mut SourceCtx) -> SourceError {
     let url = &ask.camera.url;
     let deadline = Duration::from_millis(ask.camera.options.timeout_ms);
@@ -860,12 +869,12 @@ async fn run_core(dialer: &Dialer, ask: &Ask, ctx: &mut SourceCtx) -> SourceErro
     // connection) are scrubbed here too, should one echo the URL.
     let exit = exit.scrubbed(url);
     let dial = || dialer.boxed();
-    tokio::select! {
-        () = driver.teardown(&dial) => tracing::debug!(why = %exit, "rtsp: teardown over"),
-        () = ctx.time.sleep(TEARDOWN_BUDGET) => {
-            tracing::debug!(why = %exit, "rtsp: teardown still pending after the budget");
-        }
-    }
+    tracing::debug!(why = %exit, "rtsp: tearing down");
+    let budget = Budget {
+        own: TEARDOWN_BUDGET,
+        fresh: FRESH_TEARDOWN_BUDGET,
+    };
+    driver.teardown(&dial, budget).await;
     exit
 }
 

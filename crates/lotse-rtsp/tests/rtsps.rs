@@ -132,7 +132,9 @@ async fn rtsps_plays_with_a_pinned_certificate_rfc7826_19_2() {
 /// A live555 camera with the stale TCP session bug that hangs up over
 /// TLS: retina's `Auto` policy retries the `TEARDOWN` on a fresh
 /// connection, which the source dials with its TLS handshake again (RFC
-/// 7826 §19.2).
+/// 7826 §19.2), within the source's 2 s budget for that case. The
+/// attempt's exit comes after its teardown, so the counts are final by
+/// then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_10_7_a_live555_camera_that_hangs_up_is_torn_down_on_a_fresh_tls_connection() {
     let tls = CameraTls::self_signed(&["elsewhere.test"]).unwrap();
@@ -156,12 +158,6 @@ async fn rfc2326_10_7_a_live555_camera_that_hangs_up_is_torn_down_on_a_fresh_tls
         "{exit:?}"
     );
     let stats = cam.stats();
-    for _ in 0..50 {
-        if Stats::get(&stats.teardowns) > 0 {
-            break;
-        }
-        clock().sleep(Duration::from_millis(20)).await;
-    }
     assert_eq!(Stats::get(&stats.teardowns), 1);
     assert_eq!(Stats::get(&stats.connections), 2, "a fresh connection");
     assert_eq!(Stats::get(&stats.tls_failures), 0);

@@ -13,7 +13,7 @@ categories.workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-futures-util = { workspace = true } # `FutureExt`: a request's future mapped into its deadline's result
+futures-util = { workspace = true } # `FutureExt`: a request's future mapped into its deadline's result; the driver's read of what already waits before its timers (`now_or_never`)
 retina = { workspace = true } # the RTSP client: `DESCRIBE`, `SETUP`, `PLAY` and the keepalives, its sans-I/O core on the source's own TCP connection and its tokio session through the relay, the stream's RTP, and the backchannel's `rtp::Sender`
 serde = { workspace = true }
 serde_json = { workspace = true }

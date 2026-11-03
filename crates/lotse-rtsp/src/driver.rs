@@ -21,6 +21,16 @@
 //! retina schedules (RFC 2326 §10.8 and §12.37, RFC 3550 §6.4.2) when
 //! they are due.
 //!
+//! Nothing here caps an outgoing request: retina writes the request whole,
+//! and what bounds it is what goes into it, the source URL (the control
+//! API's `MAX_URL_CHARS`, 4096 characters) and the `user_agent`
+//! ([`crate::options::MAX_USER_AGENT_LEN`]). Only the relayed paths frame
+//! retina's requests against [`crate::framer::MAX_MESSAGE`].
+//!
+//! A teardown runs under a [`Budget`]: the attempt on the session's own
+//! connection is bounded tightly, and only when retina retries on a fresh
+//! connection does the bound grow, so that a dial and a TLS handshake fit.
+//!
 //! The core is built for more than this one path: RTP over UDP (the core's
 //! UDP buffers and transmits, sockets the caller binds) and the ONVIF
 //! backchannel (`queue_rtp`) plug in beside [`Driver::next_item`]'s one
@@ -33,8 +43,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::FutureExt as _;
 use lotse_core::clock::Clock;
 use lotse_core::source::SourceError;
 use lotse_core::source_url::SourceUrl;
@@ -85,6 +97,10 @@ pub(crate) type Dial<'a> =
     dyn Fn() -> BoxFuture<'static, Result<Connection, SourceError>> + Sync + 'a;
 
 /// Why the driven session failed.
+///
+/// A TLS stream takes a write once rustls buffered its plaintext, so a
+/// camera that stopped reading surfaces as a keepalive it never answered
+/// (`Session`), seldom as `Write`.
 #[derive(Debug)]
 pub(crate) enum Error {
     /// retina's: a refused or unreadable answer, a read that failed or
@@ -93,8 +109,11 @@ pub(crate) enum Error {
     /// Writing to the camera failed.
     Write(io::Error),
     /// The camera closed the connection, and every packet before its
-    /// close was handed out.
+    /// close was handed out. A TLS camera that drops its TCP connection
+    /// without `close_notify` (RFC 8446 §6.1) ends here too.
     Closed,
+    /// [`Driver::next_item`] was asked before `PLAY` was answered.
+    NotPlaying,
 }
 
 impl Error {
@@ -105,6 +124,7 @@ impl Error {
             Self::Session(err) => classify(err, url),
             Self::Write(err) => SourceError::Ended(format!("writing to the camera failed: {err}")),
             Self::Closed => SourceError::Ended("the camera closed the session".into()),
+            Self::NotPlaying => SourceError::Protocol("rtsp: no packets before PLAY".into()),
         }
     }
 
@@ -112,7 +132,7 @@ impl Error {
     pub(crate) fn status_code(&self) -> Option<u16> {
         match self {
             Self::Session(err) => err.status_code(),
-            Self::Write(_) | Self::Closed => None,
+            Self::Write(_) | Self::Closed | Self::NotPlaying => None,
         }
     }
 }
@@ -300,6 +320,12 @@ fn poll_exchange(
             }
             Poll::Ready(Ok(()))
         }
+        // A TLS peer that closed TCP without `close_notify` (RFC 8446
+        // §6.1): the camera is gone all the same.
+        Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            core.handle_eof();
+            Poll::Ready(Ok(()))
+        }
         Poll::Ready(Err(err)) => Poll::Ready(Err(Failed::Read(err))),
         Poll::Pending => Poll::Pending,
     }
@@ -391,35 +417,62 @@ impl Driver {
         }
     }
 
-    /// The next item of a playing session, once one arrived; keepalives
-    /// and receiver reports go out when retina has them due, and the
-    /// camera's bytes are read meanwhile. [`Error::Closed`] once the
-    /// camera closed the connection and every item before was handed out.
-    /// Only while playing: before, the session has no timers and this
-    /// spins on its reads.
+    /// The next item of a playing session, once one arrived: every item
+    /// already buffered first (a keepalive's answer among them, which the
+    /// core takes in), then what already waits on the connection, then the
+    /// timers, as retina's own driver does, so an answer that arrived by
+    /// its deadline still counts; keepalives and
+    /// receiver reports go out when retina has them due, and the camera's
+    /// bytes are read meanwhile. [`Error::Closed`] once the camera closed
+    /// the connection and every item before was handed out;
+    /// [`Error::NotPlaying`] before `PLAY` was answered.
     pub(crate) async fn next_item(&mut self) -> Result<Item, Error> {
+        if !self.core.is_playing() {
+            return Err(Error::NotPlaying);
+        }
         loop {
             let now = self.time.now();
-            let due = self.core.poll_timeout().unwrap_or(now);
-            if due <= now {
-                self.core.handle_timeout(now).map_err(Error::Session)?;
+            // An item kind a later retina may add carries nothing the
+            // source reads: the next one is parsed.
+            let mut item = None;
+            let mut polled = true;
+            while item.is_none() && polled {
+                let next = self
+                    .core
+                    .poll_item(now)
+                    .transpose()
+                    .map_err(Error::Session)?;
+                polled = next.is_some();
+                item = copied(next);
             }
-            let item = self
-                .core
-                .poll_item(now)
-                .transpose()
-                .map_err(Error::Session)?;
-            if let Some(item) = copied(item) {
+            if let Some(item) = item {
                 return Ok(item);
             }
             if self.core.is_closed() {
                 return Err(Error::Closed);
             }
-            let next = self.core.poll_timeout().unwrap_or(now);
-            let wait = self.time.sleep(next.saturating_duration_since(now));
-            let exchanged = tokio::select! {
-                exchanged = exchange(&mut *self.conn, &mut self.core) => exchanged,
-                () = wait => Ok(()),
+            // What already arrived is taken in before the timers, as
+            // retina's own driver reads until nothing is left first: a
+            // keepalive's answer waiting in the socket at its deadline
+            // still counts.
+            let due = self.core.poll_timeout().unwrap_or(now) <= now;
+            let ready = if due {
+                exchange(&mut *self.conn, &mut self.core).now_or_never()
+            } else {
+                None
+            };
+            let exchanged = if let Some(exchanged) = ready {
+                exchanged
+            } else {
+                if due {
+                    self.core.handle_timeout(now).map_err(Error::Session)?;
+                }
+                let next = self.core.poll_timeout().unwrap_or(now);
+                let wait = self.time.sleep(next.saturating_duration_since(now));
+                tokio::select! {
+                    exchanged = exchange(&mut *self.conn, &mut self.core) => exchanged,
+                    () = wait => Ok(()),
+                }
             };
             if let Err(failed) = exchanged {
                 return Err(self.failure(failed));
@@ -430,20 +483,35 @@ impl Driver {
     /// Ends the session on the camera as retina's teardown policy says
     /// (RFC 2326 §10.7, RFC 7826 §13.7): first on the session's own
     /// connection, then, when the policy retries, on fresh ones from
-    /// `dial`, until the camera answered, retina gives up, or the caller,
-    /// which bounds it, drops it. Nothing when no `SETUP` succeeded.
-    pub(crate) async fn teardown(self, dial: &Dial<'_>) {
+    /// `dial`, until the camera answered, retina gives up, or `budget`
+    /// runs out, which leaves the session to expire on the camera. Nothing
+    /// when no `SETUP` succeeded. retina words a write that failed during
+    /// it as a read from the peer; the attempt's failure is only logged
+    /// at `debug`, by retina.
+    pub(crate) async fn teardown(self, dial: &Dial<'_>, budget: Budget) {
         let Self { core, conn, time } = self;
-        let Some(mut teardown) = core.into_teardown(time.now()) else {
+        let start = time.now();
+        let Some(mut teardown) = core.into_teardown(start) else {
             tracing::debug!("rtsp: no session to tear down");
             return;
         };
+        let mut limit = start.checked_add(budget.own).unwrap_or(start);
         let mut conn = conn;
+        let mut fresh = 0_u32;
         loop {
             let now = time.now();
+            if now >= limit {
+                tracing::debug!(
+                    fresh,
+                    budget_ms = limit.saturating_duration_since(start).as_millis(),
+                    "rtsp: TEARDOWN still pending after its budget; the session is left to expire"
+                );
+                return;
+            }
             match teardown.poll(now) {
                 TeardownAction::Io { deadline } => {
-                    let wait = time.sleep(deadline.saturating_duration_since(now));
+                    let until = deadline.min(limit);
+                    let wait = time.sleep(until.saturating_duration_since(now));
                     let failed = tokio::select! {
                         exchanged = exchange(&mut *conn, &mut teardown) => exchanged.err().map(Failed::into_io),
                         () = wait => None,
@@ -454,18 +522,25 @@ impl Driver {
                 }
                 TeardownAction::Connect { deadline } => {
                     conn = closed();
-                    tracing::debug!("rtsp: TEARDOWN on a fresh connection");
-                    let wait = time.sleep(deadline.saturating_duration_since(now));
+                    fresh = fresh.saturating_add(1);
+                    limit = limit.max(start.checked_add(budget.fresh).unwrap_or(start));
+                    tracing::debug!(
+                        fresh,
+                        deadline_ms = deadline.saturating_duration_since(now).as_millis(),
+                        "rtsp: TEARDOWN on a fresh connection"
+                    );
+                    let wait = time.sleep(deadline.min(limit).saturating_duration_since(now));
                     let dialed = tokio::select! {
                         dialed = dial() => Some(dialed),
                         () = wait => None,
                     };
                     match dialed {
-                        Some(Ok(fresh)) => {
-                            teardown.connected(fresh.local, fresh.peer, time.now());
-                            conn = fresh.stream;
+                        Some(Ok(dialed)) => {
+                            teardown.connected(dialed.local, dialed.peer, time.now());
+                            conn = dialed.stream;
                         }
                         Some(Err(err)) => {
+                            tracing::debug!(fresh, error = %err, "rtsp: TEARDOWN connection failed");
                             teardown.handle_io_error(io::Error::other(err.to_string()), time.now());
                         }
                         // At its deadline: the next poll fails the attempt
@@ -475,17 +550,30 @@ impl Driver {
                 }
                 TeardownAction::Wait { until } => {
                     conn = closed();
+                    let until = until.min(limit);
                     time.sleep(until.saturating_duration_since(now)).await;
                 }
                 // Done, or an action a later retina may add, which this
                 // driver cannot follow.
                 _ => {
-                    tracing::debug!("rtsp: teardown over");
+                    tracing::debug!(fresh, "rtsp: TEARDOWN over");
                     return;
                 }
             }
         }
     }
+}
+
+/// How long a teardown may take: `own` while it tries the session's own
+/// connection, `fresh` (from its start, never less than `own`) once retina
+/// retries on fresh connections, which take a dial and, for `rtsps`, a
+/// TLS handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Budget {
+    /// The bound while the session's own connection is tried.
+    pub(crate) own: Duration,
+    /// The bound once a fresh connection is dialed.
+    pub(crate) fresh: Duration,
 }
 
 /// What stands in for a connection the teardown closed (by dropping it)
@@ -505,7 +593,7 @@ mod tests {
 
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use lotse_core::clock::FakeClock;
@@ -700,6 +788,19 @@ mod tests {
         };
         let ((), describe) = tokio::join!(session, cam.serve_until_playing());
         describe
+    }
+
+    /// A budget no test's teardown reaches.
+    const GENEROUS: Budget = Budget {
+        own: Duration::from_secs(600),
+        fresh: Duration::from_secs(600),
+    };
+
+    /// Lets every other future of the test's task run until it waits.
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Yields until `done`.
@@ -913,6 +1014,9 @@ mod tests {
         WriteZero,
         /// Flushes fail.
         Flush,
+        /// Reads end as a TLS stream that lost its TCP connection without
+        /// `close_notify`.
+        Truncated,
     }
 
     /// A connection that fails as its fault says, else passes through.
@@ -933,8 +1037,10 @@ mod tests {
             cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            if self.fault() == Fault::Read {
-                return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+            match self.fault() {
+                Fault::Read => return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+                Fault::Truncated => return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into())),
+                _ => {}
             }
             Pin::new(&mut self.inner).poll_read(cx, buf)
         }
@@ -1094,7 +1200,7 @@ mod tests {
         described.unwrap();
         let dialer = Dialer::new([]);
         let dial = dial_with(&dialer);
-        driver.teardown(&dial).await;
+        driver.teardown(&dial, GENEROUS).await;
         assert_eq!(dialer.calls(), 0);
     }
 
@@ -1109,7 +1215,7 @@ mod tests {
             assert!(head.contains("Session: 12345678"), "{head}");
         };
         let dial = dial_with(&dialer);
-        tokio::join!(driver.teardown(&dial), camera);
+        tokio::join!(driver.teardown(&dial, GENEROUS), camera);
         assert_eq!(dialer.calls(), 0);
     }
 
@@ -1119,16 +1225,85 @@ mod tests {
         let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
         played(&mut driver, &mut cam).await;
         let dialer = Dialer::new([]);
+        let dial = dial_with(&dialer);
+        let over = AtomicBool::new(false);
+        let teardown = async {
+            driver.teardown(&dial, GENEROUS).await;
+            over.store(true, Ordering::SeqCst);
+        };
         let camera = async {
             let head = cam.request().await;
             assert!(head.starts_with("TEARDOWN"), "{head}");
             // retina waits 5 s for the answer on the session's connection,
             // and its `Auto` policy tries no more over TCP.
-            clock.advance(Duration::from_secs(5));
+            clock.advance(Duration::from_millis(4_999));
+            settle().await;
+            assert!(!over.load(Ordering::SeqCst), "given up before its deadline");
+            clock.advance(Duration::from_millis(1));
+            until(|| over.load(Ordering::SeqCst)).await;
         };
-        let dial = dial_with(&dialer);
-        tokio::join!(driver.teardown(&dial), camera);
+        tokio::join!(teardown, camera);
         assert_eq!(dialer.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn rfc2326_10_7_a_teardown_on_the_sessions_own_connection_stops_at_its_budget() {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        played(&mut driver, &mut cam).await;
+        let dialer = Dialer::new([]);
+        let dial = dial_with(&dialer);
+        let over = AtomicBool::new(false);
+        let budget = Budget {
+            own: Duration::from_millis(100),
+            fresh: Duration::from_secs(2),
+        };
+        let teardown = async {
+            driver.teardown(&dial, budget).await;
+            over.store(true, Ordering::SeqCst);
+        };
+        let camera = async {
+            cam.request().await;
+            clock.advance(Duration::from_millis(99));
+            settle().await;
+            assert!(!over.load(Ordering::SeqCst), "stopped before its budget");
+            clock.advance(Duration::from_millis(1));
+            until(|| over.load(Ordering::SeqCst)).await;
+        };
+        tokio::join!(teardown, camera);
+        assert_eq!(dialer.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn rfc2326_10_7_a_teardown_on_fresh_connections_gets_the_fresh_budget_and_no_more() {
+        let _logs = traced();
+        let (clock, mut driver, faults, mut cam) = faulty(TeardownPolicy::Always);
+        played(&mut driver, &mut cam).await;
+        *faults.lock().unwrap() = Fault::Write;
+        let dialer = Dialer::new([Dialed::Hangs, Dialed::Hangs]);
+        let dial = dial_with(&dialer);
+        let over = AtomicBool::new(false);
+        let budget = Budget {
+            own: Duration::from_millis(100),
+            fresh: Duration::from_secs(2),
+        };
+        let teardown = async {
+            driver.teardown(&dial, budget).await;
+            over.store(true, Ordering::SeqCst);
+        };
+        let camera = async {
+            // The first fresh dial hangs past its 1 s deadline, beyond the
+            // 100 ms of the session's own connection: dialed again.
+            until(|| dialer.calls() == 1).await;
+            clock.advance(Duration::from_secs(1));
+            until(|| dialer.calls() == 2).await;
+            assert!(!over.load(Ordering::SeqCst));
+            // The second one is cut at the 2 s of the fresh budget.
+            clock.advance(Duration::from_secs(1));
+            until(|| over.load(Ordering::SeqCst)).await;
+        };
+        tokio::join!(teardown, camera);
+        assert_eq!(dialer.calls(), 2);
     }
 
     #[tokio::test]
@@ -1151,7 +1326,7 @@ mod tests {
             assert!(head.contains("Session: 12345678"), "{head}");
         };
         let dial = dial_with(&dialer);
-        tokio::join!(driver.teardown(&dial), camera);
+        tokio::join!(driver.teardown(&dial, GENEROUS), camera);
         assert_eq!(dialer.calls(), 3);
     }
 
@@ -1167,7 +1342,7 @@ mod tests {
             drop(cam);
         };
         let dial = dial_with(&dialer);
-        tokio::join!(driver.teardown(&dial), camera);
+        tokio::join!(driver.teardown(&dial, GENEROUS), camera);
         assert_eq!(dialer.calls(), 0);
     }
 
@@ -1180,6 +1355,63 @@ mod tests {
         };
         stream.shutdown().await.unwrap();
         assert_eq!(theirs.read(&mut [0_u8; 1]).await.unwrap(), 0);
+    }
+
+    /// retina's own driver parses what arrived before it checks its
+    /// timers: a keepalive's answer in the buffer when its deadline comes
+    /// is an answer.
+    #[tokio::test]
+    async fn rfc2326_10_8_a_keepalive_answer_buffered_at_its_deadline_counts() {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        played(&mut driver, &mut cam).await;
+        let camera = async {
+            clock.advance(Duration::from_secs(30));
+            let keepalive = cam.request().await;
+            // The receiver report the keepalive came with.
+            assert_eq!(cam.frame().0, 1);
+            cam.answer(&keepalive, "200 OK", "", "").await;
+            cam.send(&interleaved(0, &rtp(1, 0, true, &[0x65]))).await;
+            // The answer waits unread while the next deadline passes.
+            clock.advance(Duration::from_secs(30));
+        };
+        let (item, ()) = tokio::join!(driver.next_item(), camera);
+        assert!(item.unwrap().rtp().is_some());
+        // The session goes on: the next keepalive goes out.
+        let camera = async {
+            let keepalive = cam.request().await;
+            cam.answer(&keepalive, "200 OK", "", "").await;
+            cam.send(&interleaved(0, &rtp(2, 3000, true, &[0x41])))
+                .await;
+        };
+        let (item, ()) = tokio::join!(driver.next_item(), camera);
+        assert!(item.unwrap().rtp().is_some());
+    }
+
+    #[tokio::test]
+    async fn no_item_before_play() {
+        let _logs = traced();
+        let (_clock, mut driver, _cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let err = driver.next_item().await.unwrap_err();
+        assert!(matches!(err, Error::NotPlaying), "{err:?}");
+        assert_eq!(err.status_code(), None);
+        let source = err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap());
+        assert_eq!(
+            source,
+            SourceError::Protocol("rtsp: no packets before PLAY".into())
+        );
+    }
+
+    /// RFC 8446 §6.1: a TLS camera that drops its TCP connection without
+    /// `close_notify` has closed the session all the same.
+    #[tokio::test]
+    async fn rfc8446_6_1_a_read_cut_short_while_playing_is_a_close() {
+        let _logs = traced();
+        let (_clock, mut driver, faults, mut cam) = faulty(TeardownPolicy::Auto);
+        played(&mut driver, &mut cam).await;
+        *faults.lock().unwrap() = Fault::Truncated;
+        let err = driver.next_item().await.unwrap_err();
+        assert!(matches!(err, Error::Closed), "{err:?}");
     }
 
     #[test]
@@ -1201,7 +1433,15 @@ mod tests {
             shown,
             "Connection { local: 127.0.0.1:50000, peer: 127.0.0.1:554, .. }"
         );
+    }
+
+    #[test]
+    fn a_failed_exchange_gives_its_io_error_whichever_side() {
         let kind = Failed::Read(io::ErrorKind::Other.into()).into_io().kind();
         assert_eq!(kind, io::ErrorKind::Other);
+        let kind = Failed::Write(io::ErrorKind::BrokenPipe.into())
+            .into_io()
+            .kind();
+        assert_eq!(kind, io::ErrorKind::BrokenPipe);
     }
 }
