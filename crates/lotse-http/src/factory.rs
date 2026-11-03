@@ -15,7 +15,7 @@ pub const DEFAULT_PORT: u16 = 80;
 pub const DEFAULT_TLS_PORT: u16 = 443;
 
 /// The factory. It holds nothing: an HTTP source connects to its server
-/// directly, without a loopback relay.
+/// directly.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HttpFactory;
 
@@ -108,9 +108,6 @@ mod tests {
         let factory = HttpFactory;
         assert_eq!(factory.schemes(), ["http", "https"]);
         assert!(!factory.capabilities().backchannel);
-        for scheme in ["http", "https"] {
-            assert!(!factory.loopback_relay(scheme), "{scheme}");
-        }
     }
 
     #[test]

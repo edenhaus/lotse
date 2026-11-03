@@ -5,10 +5,11 @@
 //! punched, loss, reordering and duplicates counted without ending the
 //! session, a foreign sender refused, a `461` refusal and a camera whose
 //! datagrams never arrive ending with a repair hint, answers without
-//! `server_port` or with `source`, the sender taken from the RTSP
-//! endpoint without `source` and never in place of a silent one, a
-//! `source` no camera can send from ending the attempt, and keepalives
-//! on the control connection while the media takes UDP.
+//! `server_port` (nothing punched, the ports learned from the camera's
+//! datagrams) or with `source`, the sender taken from the RTSP endpoint
+//! without `source` and never in place of a silent one, a `source` no
+//! camera can send from ending the attempt, and keepalives on the control
+//! connection while the media takes UDP.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -71,7 +72,7 @@ fn udp_source(
     if let (Some(options), Some(extra)) = (options.as_object_mut(), extra.as_object()) {
         options.extend(extra.clone());
     }
-    RtspFactory::default()
+    RtspFactory
         .validate(&SourceUrl::parse(&camera.url()).unwrap(), &options)
         .expect("valid source")
 }
@@ -239,8 +240,16 @@ async fn rfc2326_12_39_answers_without_server_port_or_naming_the_source_play() {
         assert!(frames > 0);
         assert_eq!(stats, IngestStats::default());
         if omit_server_port {
-            // Nowhere to punch a hole to.
-            assert_eq!(Stats::get(&cam.stats().datagrams_received), 0);
+            // Nowhere to punch a hole to: nothing on the camera's RTP
+            // port, and on its RTCP port only the receiver reports that
+            // follow its own RTCP, never the 8-byte punch.
+            let counters = cam.stats();
+            let rtcp = counters.rtcp_received();
+            assert_eq!(
+                Stats::get(&counters.datagrams_received),
+                u64::try_from(rtcp.len()).unwrap()
+            );
+            assert!(rtcp.iter().all(|r| r.packet.len() > 8), "{rtcp:?}");
         }
         cam.stop().await;
     }
@@ -248,8 +257,8 @@ async fn rfc2326_12_39_answers_without_server_port_or_naming_the_source_play() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_12_39_without_source_the_media_comes_from_the_rtsp_endpoint_address() {
-    // The camera's endpoint is ::1 and the relay's own side 127.0.0.1:
-    // its datagrams pass only if the sender is the endpoint the relay
+    // The camera's endpoint is ::1, the pairs on IPv6's wildcard address:
+    // its datagrams pass only if the sender is the endpoint the source
     // connected to.
     let (cam, frames, stats) = play(CameraConfig {
         ip: Ipv6Addr::LOCALHOST.into(),
@@ -340,7 +349,7 @@ async fn rfc2326_11_3_11_a_camera_that_refuses_udp_fails_with_a_repair_hint() {
         "{message}"
     );
     // The same camera plays over TCP.
-    let source = RtspFactory::default()
+    let source = RtspFactory
         .validate(&SourceUrl::parse(&cam.url()).unwrap(), &json!({}))
         .unwrap();
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
@@ -360,7 +369,7 @@ async fn rfc2326_11_3_11_a_udp_only_camera_plays_over_udp_and_refuses_tcp_withou
         ..CameraConfig::default()
     })
     .await;
-    let source = RtspFactory::default()
+    let source = RtspFactory
         .validate(&SourceUrl::parse(&cam.url()).unwrap(), &json!({}))
         .unwrap();
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());

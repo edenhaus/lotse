@@ -73,8 +73,6 @@ fn front_door() -> FrontDoor {
 }
 
 /// [`front_door`] with a worker in `sandbox` mode, allowed TCP to `ports`.
-/// A sandboxed worker gets its loopback relay, as the supervisor gives an
-/// `rtsp` source one: Landlock lets it bind no other port.
 fn front_door_with(sandbox: &str, ports: &[u16]) -> FrontDoor {
     let bound = bind_udp("127.0.0.1:0".parse().unwrap()).expect("the shared socket");
     let demux = Demux::start(
@@ -101,7 +99,7 @@ fn front_door_with(sandbox: &str, ports: &[u16]) -> FrontDoor {
         },
         Some(bound.socket),
     );
-    let worker = manager.spawn(ports, sandbox != "off").expect("spawns");
+    let worker = manager.spawn(ports).expect("spawns");
     FrontDoor {
         local: bound.local,
         demux,
@@ -926,7 +924,7 @@ async fn two_sessions_on_one_stream_send_every_datagram() {
         },
         Some(bound.socket),
     );
-    let worker = manager.spawn(&[], false).expect("spawns");
+    let worker = manager.spawn(&[]).expect("spawns");
     let mut door = FrontDoor {
         local: bound.local,
         demux,

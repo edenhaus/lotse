@@ -1,12 +1,11 @@
 //! The RTSP source's RTCP Receiver Reports (RFC 3550 §6.4.2) against the
 //! fake camera of `lotse-testing`, which records the RTCP a client sends:
 //! over TCP on each stream's interleaved RTCP channel (RFC 2326 §10.12),
-//! which retina's sans-I/O core sends on the source's connection, and
-//! with `transport: "udp"` from each stream's RTCP port, which the relay
-//! sends, with the
-//! loss, jitter, LSR and DLSR of §6.4.1 and the interval of §6.2 and
-//! §6.3.1, all on the injected clock, which the test moves one frame at a
-//! time.
+//! and with `transport: "udp"` from each stream's RTCP port, to the
+//! camera's `server_port` or, without one, to the port its RTCP came from
+//! (RFC 4961 §3), all sent by retina's sans-I/O core, with the loss,
+//! jitter, LSR and DLSR of §6.4.1 and the interval of §6.2 and §6.3.1, all
+//! on the injected clock, which the test moves one frame at a time.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -102,7 +101,7 @@ impl Rig {
         let camera = FakeCamera::start(config, Arc::clone(&time))
             .await
             .expect("camera binds");
-        let source = RtspFactory::default()
+        let source = RtspFactory
             .validate(
                 &SourceUrl::parse(&camera.url()).unwrap(),
                 &json!({ "transport": transport }),
@@ -123,7 +122,7 @@ impl Rig {
 
     /// Waits, up to 5 s of real time, for the camera to see `PLAY`, then
     /// moves the clock a frame at a time, with a moment of real time for
-    /// the camera and the relay after each, until `done` holds for the
+    /// the camera and the source after each, until `done` holds for the
     /// recorded RTCP, or fails after `limit` of fake time.
     async fn run_until(
         &mut self,
@@ -270,6 +269,31 @@ async fn rfc3550_6_4_2_over_udp_receiver_reports_count_the_loss_from_the_rtcp_po
         block.lost > 0 && next.lost > block.lost,
         "{block:?} {next:?}"
     );
+    check_lsr(&rig.clock, first, *block);
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc4961_3_over_udp_without_server_port_reports_go_where_the_cameras_rtcp_came_from() {
+    let config = CameraConfig {
+        fps: FPS,
+        udp: CameraUdp {
+            omit_server_port: true,
+            ..CameraUdp::default()
+        },
+        ..CameraConfig::default()
+    };
+    let mut rig = Rig::start(config, "udp").await;
+    let rtcp = rig
+        .run_until(Duration::from_secs(20), |rtcp| {
+            !reports_on(rtcp, 1).is_empty()
+        })
+        .await;
+    // Only reports reach the camera's RTCP port: no hole punch, which
+    // would need its port (RFC 3550 §6.4.2's empty RR of 8 bytes).
+    assert!(rtcp.iter().all(|r| r.udp && r.packet.len() > 8), "{rtcp:?}");
+    let (first, block) = &reports_on(&rtcp, 1)[0];
+    assert_eq!((block.ssrc, block.lost), (SSRC, 0));
     check_lsr(&rig.clock, first, *block);
     rig.stop().await;
 }

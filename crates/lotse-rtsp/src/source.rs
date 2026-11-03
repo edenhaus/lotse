@@ -1,7 +1,7 @@
-//! The RTSP source: one retina session per connection attempt, TCP
-//! interleaved on the source's own connection to the camera or, opt-in,
-//! RTP over UDP through the relay, the H.264 and H.265 normalizers of
-//! `lotse-codec` on its packets, RTCP Sender Reports as sync hints.
+//! The RTSP source: one retina session per connection attempt on the
+//! source's own connection to the camera, its media TCP interleaved or,
+//! opt-in, RTP over UDP, the H.264 and H.265 normalizers of `lotse-codec`
+//! on its packets, RTCP Sender Reports as sync hints.
 //!
 //! Implements RFC 2326 (RTSP 1.0: DESCRIBE, SETUP, PLAY, TEARDOWN through
 //! retina), RFC 3550 §5.1 (packet header fields kept) and §6.4.1 (Sender
@@ -13,15 +13,15 @@
 //! static audio payload types), RFC 7587 (Opus), RFC 3640 (AAC), and
 //! RFC 7826 §19.2 for `rtsps` (the TLS stream from `lotse_tls`), and
 //! RFC 2326 §12.39 with RFC 3550 §11 for RTP over UDP ([`crate::udp`]).
-//! TCP interleaved (RFC 2326 §10.12), `rtsp` and `rtsps`, the source dials
-//! the camera and drives retina's sans-I/O core on that connection
-//! ([`crate::driver`]): the camera sees the source URL itself as the
-//! Request-URI (RFC 2326 §6.1, RFC 7826 §19.2), and retina sends the
-//! receiver reports (RFC 3550 §6.4.2). RTP over UDP still reaches retina
-//! through [`crate::relay`], which sends them there. retina reads at most
-//! [`MAX_MESSAGE`] bytes of each RTSP message. The camera host is never
-//! resolved here: the source connects to the first address the supervisor
-//! resolved.
+//! The source dials the camera, `rtsp` or `rtsps`, and drives retina's
+//! sans-I/O core on that connection ([`crate::driver`]): the camera sees
+//! the source URL itself as the Request-URI (RFC 2326 §6.1, RFC 7826
+//! §19.2), and retina sends the receiver reports (RFC 3550 §6.4.2), TCP
+//! interleaved (RFC 2326 §10.12) on the connection, over UDP from each
+//! stream's RTCP port, the pairs the source binds and the driver reads.
+//! retina reads at most [`MAX_MESSAGE`] bytes of each RTSP message. The
+//! camera host is never resolved here: the source connects to the first
+//! address the supervisor resolved.
 //!
 //! The ONVIF backchannel (ONVIF Streaming Specification §5.3) never rides
 //! in this session, which never carries its `Require` header and never
@@ -35,14 +35,12 @@
 //! this session noticing.
 
 use std::collections::VecDeque;
-use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures_util::FutureExt as _;
 use lotse_codec::aac::AacDepacketizer;
 use lotse_codec::h264::{
     DEFAULT_MAX_PAYLOAD, Depacketizer, FrameOverLimit, LIBWEBRTC_MAX_FRAME_PACKETS,
@@ -61,24 +59,19 @@ use lotse_core::throttle::Throttle;
 use lotse_core::track::Track;
 use lotse_tls::TlsTarget;
 use retina::client::{
-    Credentials, InitialSequenceNumberPolicy, InitialTimestampPolicy, PlayOptions, Playing,
-    ReceiverReportPolicy, Session, SessionGroup, SessionOptions, SetupOptions, Stream,
-    TcpTransportOptions, TeardownPolicy, Transport,
+    Credentials, InitialSequenceNumberPolicy, InitialTimestampPolicy, PlayOptions,
+    ReceiverReportPolicy, SessionOptions, Stream, TeardownPolicy,
 };
 use retina::codec::{FrameFormat, ParametersRef};
 
 use crate::backchannel::camera::Camera;
 use crate::backchannel::probe;
 use crate::backchannel::session::Probed;
-use crate::driver::{self, Budget, Connection, Driver, Duplex, Item, Received};
-use crate::error::{camera_text, classify};
+use crate::driver::{Budget, Connection, Driver, Duplex, Item, Received};
+use crate::error::camera_text;
 use crate::factory::PROTOCOL;
-use crate::framer::MAX_MESSAGE;
 use crate::options::{RtspOptions, Transport as MediaTransport};
-use crate::relay;
-use crate::relay::{First, Listener, Media};
-use crate::rtcp::{ReceiverReports, Seed, SetupRates};
-use crate::udp::UdpRelay;
+use crate::udp::Pair;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
@@ -110,8 +103,6 @@ pub struct RtspSource {
     options: RtspOptions,
     /// For `rtsps`: the server name and the certificate check.
     tls: Option<TlsTarget>,
-    /// Where the relays of its connections listen.
-    relay: Listener,
     /// Whether the camera answered the backchannel's probe with `551`,
     /// remembered across the connection's attempts and its streams' opt-ins.
     probed: Probed,
@@ -119,17 +110,11 @@ pub struct RtspSource {
 
 impl RtspSource {
     /// A source for `url` with `options`; `tls` is set exactly for `rtsps`.
-    pub(crate) fn new(
-        url: SourceUrl,
-        options: RtspOptions,
-        tls: Option<TlsTarget>,
-        relay: Listener,
-    ) -> Self {
+    pub(crate) fn new(url: SourceUrl, options: RtspOptions, tls: Option<TlsTarget>) -> Self {
         Self {
             url,
             options,
             tls,
-            relay,
             probed: Probed::default(),
         }
     }
@@ -156,7 +141,6 @@ impl Source for RtspSource {
         let url = self.url.clone();
         let options = self.options.clone();
         let tls = self.tls.clone();
-        let relay = self.relay.clone();
         let probed = self.probed.clone();
         Box::pin(async move {
             let mut ctx = ctx;
@@ -171,7 +155,6 @@ impl Source for RtspSource {
                     url,
                     options,
                     tls,
-                    relay,
                     addr,
                     time: Arc::clone(&ctx.time),
                 },
@@ -183,13 +166,6 @@ impl Source for RtspSource {
             };
             let tls = dialer.tls.is_some();
             tracing::info!(host = %ctx.peer.host, %addr, tls, transport = ?ask.camera.options.transport, "rtsp: connecting");
-            if ask.camera.options.transport == MediaTransport::Udp {
-                // `rtsps` with UDP is refused at validation: plain
-                // datagrams would carry what the TLS session protects.
-                // The relay's state makes the attempt large: on the heap.
-                let attempt = UdpAttempt::new(ask, addr, &ctx);
-                return Box::pin(attempt.run(&mut ctx, || relay::tcp(addr))).await;
-            }
             // The driver's buffers make the attempt large: on the heap.
             Box::pin(run_core(&dialer, &ask, &mut ctx)).await
         })
@@ -555,21 +531,6 @@ impl Carried {
     }
 }
 
-/// Runs one RTSP request under the read deadline and cancellation; a
-/// retina error is classified, scrubbed of `url`.
-async fn bounded<T>(
-    ctx: &SourceCtx,
-    url: &SourceUrl,
-    deadline: Duration,
-    what: &str,
-    future: impl Future<Output = Result<T, retina::client::Error>>,
-) -> Result<T, SourceError> {
-    within(ctx, deadline, what, async {
-        future.await.map_err(|err| classify(&err, url))
-    })
-    .await
-}
-
 /// Runs `future` under the read deadline and cancellation.
 async fn within<T>(
     ctx: &SourceCtx,
@@ -596,14 +557,6 @@ pub(crate) async fn within_on<T>(
         ))),
         () = cancel.cancelled() => Err(SourceError::Ended("cancelled".into())),
     }
-}
-
-/// A playing session through the relay with the streams it carries.
-struct Connected {
-    /// The session, a stream of packets.
-    playing: Session<Playing>,
-    /// What each retina stream index maps to, if carried.
-    carried: Vec<Option<Carried>>,
 }
 
 /// The streams of the `DESCRIBE` answer to set up ([`select`]), or a
@@ -655,51 +608,11 @@ fn session_options(ask: &Ask) -> SessionOptions {
         .max_message_size(MAX_MESSAGE)
 }
 
-/// DESCRIBE, SETUP of the chosen streams, the track declarations and
-/// PLAY, with retina connecting to `target`, the relay, and asking it for
-/// RTP over UDP. A session that ends here, after a `SETUP`, joins `group`
-/// for its `TEARDOWN`. The `DESCRIBE` never carries the backchannel's
-/// `Require` header: the backchannel has sessions of its own
-/// ([`crate::backchannel`]).
-async fn connect_relayed(
-    target: url::Url,
-    ask: &Ask,
-    ctx: &mut SourceCtx,
-    group: &Arc<SessionGroup>,
-    rates: &SetupRates,
-) -> Result<Connected, SourceError> {
-    let url = &ask.camera.url;
-    let deadline = Duration::from_millis(ask.camera.options.timeout_ms);
-    let session_options = session_options(ask).session_group(Arc::clone(group));
-    tracing::info!(host = %ctx.peer.host, addrs = ?ctx.peer.addrs, "rtsp: describing");
-    let describe = Session::describe(target, session_options);
-    let mut session = bounded(ctx, url, deadline, "DESCRIBE", describe).await?;
-    let chosen = choose(session.streams(), session.sdp())?;
-    for (index, declared) in &chosen {
-        // The relay takes it at this stream's `SETUP` answer, which
-        // retina waits for before the next `SETUP`.
-        rates.push(declared.clock_rate);
-        // retina speaks TCP interleaved to the relay, which asks the
-        // camera for UDP ([`crate::udp`]).
-        let setup = session.setup(
-            *index,
-            SetupOptions::default().transport(Transport::Tcp(TcpTransportOptions::default())),
-        );
-        within(ctx, deadline, "SETUP", async {
-            setup
-                .await
-                .map_err(|err| setup_error(classify(&err, url), err.status_code(), true))
-        })
-        .await?;
-    }
-    let carried = carry(session.streams(), &chosen, ctx);
-    let playing = bounded(ctx, url, deadline, "PLAY", session.play(play_options())).await?;
-    Ok(Connected { playing, carried })
-}
-
 /// DESCRIBE of the source URL itself, SETUP of the chosen streams TCP
-/// interleaved, the track declarations and PLAY, on `driver`, each under
-/// the read deadline: what each stream index maps to, if carried. The
+/// interleaved or, with `transport: "udp"`, RTP over UDP to a pair bound
+/// for each, the track declarations and PLAY, on `driver`, each under the
+/// read deadline: what each stream index maps to, if carried. A camera
+/// that refuses UDP is not asked for TCP instead ([`setup_error`]). The
 /// `DESCRIBE` never carries the backchannel's `Require` header: the
 /// backchannel has sessions of its own ([`crate::backchannel`]).
 async fn set_up(
@@ -719,12 +632,18 @@ async fn set_up(
     })
     .await?;
     let chosen = choose(driver.streams(), driver.sdp())?;
+    // `rtsps` with UDP is refused at validation: plain datagrams would
+    // carry what the TLS session protects.
+    let udp = ask.camera.options.transport == MediaTransport::Udp;
     for (index, _) in &chosen {
         within(ctx, deadline, "SETUP", async {
-            driver
-                .setup(*index)
-                .await
-                .map_err(|err| setup_error(err.source_error(url), err.status_code(), false))
+            let set_up = if udp {
+                let pair = Pair::bind(ask.camera.addr.ip())?;
+                driver.setup_udp(*index, pair).await
+            } else {
+                driver.setup(*index).await
+            };
+            set_up.map_err(|err| setup_error(err.source_error(url), err.status_code(), udp))
         })
         .await?;
     }
@@ -779,6 +698,16 @@ fn setup_error(error: SourceError, status: Option<u16>, udp: bool) -> SourceErro
 
 /// No RTP datagram reached retina within the read deadline after `PLAY`:
 /// the camera's media does not reach the daemon over UDP.
+///
+/// A camera that answers a UDP `SETUP` with `interleaved=` (it chose TCP
+/// after all, RFC 2326 §12.39) ends here too (retina 0.5 prototype
+/// `97153f6`, its source read 2026-11-03, no camera seen doing it yet):
+/// the loopback relay
+/// lotse ran until then passed such an answer on as TCP, but retina's
+/// `parse_setup` does not tell it from a UDP answer without
+/// `server_port`, so the camera's media comes interleaved on a channel
+/// the session never assigned and no datagram arrives. The hint to set
+/// the transport to tcp is the repair either way; reported upstream.
 fn no_udp_media(deadline: Duration, rejected: u64) -> SourceError {
     tracing::warn!(
         deadline_ms = deadline.as_millis(),
@@ -801,6 +730,26 @@ struct Ask {
     probed: Probed,
 }
 
+/// The most bytes of one RTSP message from the camera, head and body,
+/// retina reads (`SessionOptions::max_message_size`), on every connection
+/// of the source: the bound on an answer and its SDP. Interleaved frames
+/// are bounded by their 16-bit length (RFC 2326 §10.12) instead, and the
+/// requests by what goes into them ([`crate::driver`]).
+pub(crate) const MAX_MESSAGE: usize = 65_536;
+
+/// Connects to the camera at `addr`, with Nagle's algorithm off
+/// (`TCP_NODELAY`): every connection the crate dials ([`Dialer`]); a
+/// failure is `unreachable`, worded as retina words its own. With Nagle
+/// (RFC 1122 §4.2.3.4) a small write waits while an earlier one is
+/// unacknowledged: the backchannel's packets, a few hundred bytes every
+/// 20 ms, would wait for the camera's ACK, which a camera sending video
+/// piggybacks on its next frame, tens of milliseconds late.
+async fn connect_tcp(addr: SocketAddr) -> Result<TcpStream, SourceError> {
+    let connected = TcpStream::connect(addr).await;
+    let stream = connected.and_then(|stream| stream.set_nodelay(true).map(|()| stream));
+    stream.map_err(|err| SourceError::Unreachable(format!("Unable to connect to {addr}: {err}")))
+}
+
 /// The local address retina names in its errors when the socket cannot
 /// say its own: the unspecified one.
 const UNKNOWN_LOCAL: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -810,7 +759,7 @@ const UNKNOWN_LOCAL: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
 
 /// How the source and its backchannel's connections reach the camera: TCP
 /// to the address the supervisor resolved, with Nagle's algorithm off
-/// ([`relay::tcp`]), and for `rtsps` the TLS handshake on it (RFC 7826
+/// ([`connect_tcp`]), and for `rtsps` the TLS handshake on it (RFC 7826
 /// §19.2).
 #[derive(Debug, Clone)]
 pub(crate) struct Dialer {
@@ -833,7 +782,7 @@ impl Dialer {
     /// A connection to the camera, with the addresses of its ends; an
     /// unknown local address is [`UNKNOWN_LOCAL`].
     pub(crate) async fn dial(self) -> Result<Connection, SourceError> {
-        let tcp = relay::tcp(self.addr).await?;
+        let tcp = connect_tcp(self.addr).await?;
         let local = tcp.local_addr().unwrap_or(UNKNOWN_LOCAL);
         let stream: Box<dyn Duplex> = match &self.tls {
             None => Box::new(tcp),
@@ -852,14 +801,15 @@ impl Dialer {
     }
 }
 
-/// One connection attempt TCP interleaved: dials the camera under the read
-/// deadline, drives retina's core on that connection through `DESCRIBE`,
-/// `SETUP` and `PLAY`, plays until the camera or core ends it, then tears
-/// down, however it ended: a session the camera set up gets its
-/// `TEARDOWN` (RFC 2326 §10.7, RFC 7826 §13.7) after a failed or
-/// cancelled `SETUP` or `PLAY` too, within [`TEARDOWN_BUDGET`] on its own
-/// connection and, when retina's policy retries on fresh connections,
-/// within [`FRESH_TEARDOWN_BUDGET`].
+/// One connection attempt: dials the camera under the read deadline,
+/// drives retina's core on that connection through `DESCRIBE`, `SETUP`
+/// and `PLAY`, plays until the camera or core ends it, then tears down,
+/// however it ended: a session the camera set up gets its `TEARDOWN` (RFC
+/// 2326 §10.7, RFC 7826 §13.7) after a failed or cancelled `SETUP` or
+/// `PLAY` too, within [`TEARDOWN_BUDGET`] on its own connection and, when
+/// retina's policy retries on fresh connections, as it does for a UDP
+/// session whose connection is gone (RFC 2326 §1.1), within
+/// [`FRESH_TEARDOWN_BUDGET`].
 async fn run_core(dialer: &Dialer, ask: &Ask, ctx: &mut SourceCtx) -> SourceError {
     let url = &ask.camera.url;
     let deadline = Duration::from_millis(ask.camera.options.timeout_ms);
@@ -867,11 +817,12 @@ async fn run_core(dialer: &Dialer, ask: &Ask, ctx: &mut SourceCtx) -> SourceErro
         Ok(conn) => conn,
         Err(err) => return err,
     };
-    // retina sends the receiver reports on this path (RFC 3550 §6.4.2).
+    // retina sends the receiver reports (RFC 3550 §6.4.2).
     let options = session_options(ask).receiver_reports(ReceiverReportPolicy::Always);
     let mut driver = Driver::new(conn, options, Arc::clone(&ctx.time));
+    driver.count_udp_into(ctx.tracks.ingest());
     let exit = match set_up(&mut driver, ask, ctx).await {
-        Ok(carried) => play(Packets::Core(&mut driver), carried, ask, ctx).await,
+        Ok(carried) => play(&mut driver, carried, ask, ctx).await,
         Err(err) => err,
     };
     // `classify` scrubbed retina's errors; the attempt's others (TLS, the
@@ -883,175 +834,12 @@ async fn run_core(dialer: &Dialer, ask: &Ask, ctx: &mut SourceCtx) -> SourceErro
     exit
 }
 
-/// One connection attempt with `transport: "udp"` before it reaches the
-/// camera, which goes through the loopback relay's UDP side.
-struct UdpAttempt {
-    /// What it asks.
-    ask: Ask,
-    /// The relay's UDP side.
-    media: Media,
-    /// The clock rates `connect_relayed` hands the relay's receiver
-    /// reports.
-    rates: Arc<SetupRates>,
-}
-
-impl UdpAttempt {
-    /// An attempt for `ask` on the camera at `addr`, with a relay state
-    /// and receiver reports of its own.
-    fn new(ask: Ask, addr: SocketAddr, ctx: &SourceCtx) -> Self {
-        // The relay reports to the camera (RFC 3550 §6.4.2), with the
-        // clock rates `connect_relayed` hands over in `SETUP` order.
-        let rates = Arc::new(SetupRates::default());
-        let reports = ReceiverReports::new(Arc::clone(&rates), Seed::random());
-        // `addr` is the endpoint the relay connects to, the media's sender
-        // unless an answer names a `source` (RFC 2326 §12.39), never the
-        // relay's own loopback side.
-        let media = Media::Udp(Box::new(UdpRelay::new(
-            addr.ip(),
-            ctx.tracks.ingest(),
-            Arc::clone(&ctx.time),
-            reports,
-        )));
-        Self { ask, media, rates }
-    }
-
-    /// Connects to the camera with `connect` under the read deadline, then
-    /// runs the RTSP session through the loopback relay, which lives
-    /// exactly as long as the session and its teardown. The relay refusing
-    /// what a side sent ends the attempt with its error; so does the
-    /// camera's connection going away, and the session, cancelled, still
-    /// sends its `TEARDOWN`, which the relay carries on a fresh connection
-    /// from `connect`. Otherwise the session decides the exit. `ctx` is the
-    /// source's, its cancellation the source's again once the attempt is
-    /// over.
-    async fn run<F>(self, ctx: &mut SourceCtx, connect: impl Fn() -> F + Send + Sync) -> SourceError
-    where
-        F: Future<Output = Result<TcpStream, SourceError>> + Send,
-    {
-        let Self { ask, media, rates } = self;
-        let deadline = Duration::from_millis(ask.camera.options.timeout_ms);
-        let opened = within(ctx, deadline, "TCP connect", async {
-            let camera = connect().await?;
-            let listener = relay::listen(&ask.camera.relay).await?;
-            Ok((camera, listener))
-        })
-        .await;
-        let (camera, (listener, local)) = match opened {
-            Ok(opened) => opened,
-            Err(err) => return err,
-        };
-        let target = relay::relay_url(&ask.camera.url, local);
-        // The session's own stop, for a relay that ends it first.
-        let stop = ctx.cancel.child_token();
-        let cancel = std::mem::replace(&mut ctx.cancel, stop.clone());
-        let end = {
-            let session = run_relayed(target, &ask, ctx, rates);
-            tokio::pin!(session);
-            // The relay runs through the teardown; once the copy is over it
-            // stays pending while retina's next read sees the closed
-            // connection. A refusal is the exit: the session cannot see the
-            // connection the refusal closes before the relay's end is seen.
-            let pump = relay::pump(listener, camera, media);
-            match relay::beside(pump, &mut session).await {
-                First::Session(end) => end,
-                First::Relay(ended) => {
-                    if let Some(orphan) = ended.orphan {
-                        stop.cancel();
-                        // Carried until the session's teardown is over: done
-                        // or not, the relay's side is pending from then on.
-                        let forward = relay::teardown(orphan, &connect)
-                            .then(|()| std::future::pending::<Infallible>());
-                        tokio::select! {
-                            biased;
-                            never = forward => match never {},
-                            _torn_down = session => {}
-                        }
-                    }
-                    ended.error
-                }
-            }
-        };
-        ctx.cancel = cancel;
-        end
-    }
-}
-
-/// One connection attempt through the relay: connect, go live, pump
-/// packets until the camera or core ends it, then tear down within the
-/// budget, however it ended: a session the camera set up gets its
-/// `TEARDOWN` (RFC 2326 §10.7, RFC 7826 §13.7) after a failed or cancelled
-/// `SETUP` or `PLAY` too.
-async fn run_relayed(
-    target: url::Url,
-    ask: &Ask,
-    ctx: &mut SourceCtx,
-    rates: Arc<SetupRates>,
-) -> SourceError {
-    let group = Arc::new(SessionGroup::default());
-    let exit = match connect_relayed(target, ask, ctx, &group, &rates).await {
-        Ok(Connected { playing, carried }) => {
-            play(Packets::Relayed(playing), carried, ask, ctx).await
-        }
-        Err(err) => err,
-    };
-    // `classify` scrubbed retina's errors; the attempt's others (the
-    // relay) are scrubbed here too, should one echo the URL.
-    let exit = exit.scrubbed(&ask.camera.url);
-    tear_down(&group, &*ctx.time, &exit).await;
-    exit
-}
-
-/// Waits, at most [`TEARDOWN_BUDGET`] on `time`, for the `TEARDOWN` of
-/// every session in `group`, which retina sends when a session is dropped;
-/// nothing when the camera set none up. `why` is the session's end, for
-/// the log.
-pub(crate) async fn tear_down(
-    group: &SessionGroup,
-    time: &dyn Clock,
-    why: &(dyn std::fmt::Display + Sync),
-) {
-    tokio::select! {
-        result = group.await_teardown() => tracing::debug!(?result, %why, "rtsp: teardown over"),
-        () = time.sleep(TEARDOWN_BUDGET) => {
-            tracing::debug!(%why, "rtsp: teardown still pending after the budget");
-        }
-    }
-}
-
-/// Where a playing session's packets come from: retina's core on the
-/// source's own connection, or retina's tokio session through the relay.
-enum Packets<'a> {
-    /// TCP interleaved, on the driver.
-    Core(&'a mut Driver),
-    /// RTP over UDP, through the relay; dropped, it starts its `TEARDOWN`.
-    Relayed(Session<Playing>),
-}
-
-impl Packets<'_> {
-    /// The next item, copied out of retina's buffer;
-    /// [`driver::Error::Closed`] once the camera closed the session.
-    async fn next(&mut self) -> Result<Item, driver::Error> {
-        match self {
-            Self::Core(driver) => driver.next_item().await,
-            Self::Relayed(session) => {
-                let mut copied = None;
-                while copied.is_none() {
-                    let item = session.next_item().await.ok_or(driver::Error::Closed)?;
-                    copied = driver::copied(Some(item.map_err(driver::Error::Session)?));
-                }
-                copied.ok_or(driver::Error::Closed)
-            }
-        }
-    }
-}
-
 /// Plays a connected session until the camera or core ends it: why it
-/// ended, with the relayed session dropped, which starts its `TEARDOWN`.
-/// Beside it, a connection that asks for the camera's backchannel has it
-/// probed on a connection of its own, at once and whenever a stream opts
-/// in again ([`probe::start`]), which ends with the session.
+/// ended. Beside it, a connection that asks for the camera's backchannel
+/// has it probed on a connection of its own, at once and whenever a
+/// stream opts in again ([`probe::start`]), which ends with the session.
 async fn play(
-    mut packets: Packets<'_>,
+    driver: &mut Driver,
     mut carried: Vec<Option<Carried>>,
     ask: &Ask,
     ctx: &SourceCtx,
@@ -1079,7 +867,7 @@ async fn play(
     let mut normalized = Vec::new();
     loop {
         let item = tokio::select! {
-            item = packets.next() => item,
+            item = driver.next_item() => item,
             () = &mut first_media, if !live => break no_udp_media(deadline, ingest.snapshot().datagrams_rejected),
             () = ctx.cancel.cancelled() => break SourceError::Ended("cancelled".into()),
         };
@@ -1551,10 +1339,35 @@ mod tests {
         reason = "test code"
     )]
 
+    use futures_util::FutureExt as _;
     use lotse_core::source::ResolvedPeer;
     use lotse_core::text::CUT_MARK;
 
     use super::*;
+
+    #[tokio::test]
+    async fn rfc1122_4_2_3_4_the_cameras_connection_has_nagle_off() {
+        // With Nagle on, the backchannel's packets to the camera waited
+        // for its ACK: 29 ms off their 20 ms grid at the 95th percentile
+        // (Linux 7.0, 2026-10-11).
+        let camera = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connected = connect_tcp(camera.local_addr().unwrap()).await.unwrap();
+        assert!(connected.nodelay().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_camera_that_cannot_be_reached_is_unreachable() {
+        // A port nothing listens on: bound, then closed.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let err = connect_tcp(addr).await.unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Unreachable(message) if message.starts_with("Unable to connect to")),
+            "{err:?}"
+        );
+    }
 
     #[test]
     fn credentials_come_from_the_userinfo() {

@@ -75,16 +75,6 @@ pub trait SourceFactory: fmt::Debug + Send + Sync {
         None
     }
 
-    /// Whether a connection of `scheme` needs a loopback TCP listener that
-    /// the worker binds before its sandbox and may connect to afterwards:
-    /// for a protocol client that only speaks plain TCP behind a local
-    /// relay (`rtsp` and `rtsps` through retina and its guard). The
-    /// supervisor asks the worker for one; Landlock could not allow the
-    /// port once the sandbox is on.
-    fn loopback_relay(&self, _scheme: &str) -> bool {
-        false
-    }
-
     /// Checks `url` and the untyped `options` against the scheme's typed
     /// options (unknown fields rejected) and builds the source. Pure: no
     /// I/O, so it can run inside `stream/put`.

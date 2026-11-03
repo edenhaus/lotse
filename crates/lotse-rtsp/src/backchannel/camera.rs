@@ -29,10 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::session::{Offer, offer};
 use crate::driver::Driver;
-use crate::framer::MAX_MESSAGE;
 use crate::options::RtspOptions;
-use crate::relay::Listener;
-use crate::source::{Dialer, TEARDOWN, credentials, within_on};
+use crate::source::{Dialer, MAX_MESSAGE, TEARDOWN, credentials, within_on};
 
 /// The camera of one source, as its backchannel's connections reach it.
 /// Cloned into the probe and the opener; holds no connection itself.
@@ -44,9 +42,6 @@ pub(crate) struct Camera {
     pub(crate) options: RtspOptions,
     /// For `rtsps`: the server name and the certificate check.
     pub(crate) tls: Option<TlsTarget>,
-    /// Where the relays of the source's `transport: "udp"` attempts
-    /// listen; the backchannel's connections take none.
-    pub(crate) relay: Listener,
     /// The camera's address, the one the source's attempt connects to.
     pub(crate) addr: SocketAddr,
     /// The clock of the deadlines.

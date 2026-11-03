@@ -87,11 +87,6 @@ pub(crate) struct WorkerArgs {
     #[arg(long, value_name = "PORT,...", value_delimiter = ',')]
     pub(crate) connect_ports: Vec<u16>,
 
-    /// Bind a loopback listener for the source's relay (`rtsps`) before the
-    /// sandbox, and allow connecting to its port.
-    #[arg(long)]
-    pub(crate) loopback_relay: bool,
-
     /// What one track's pre-roll ring may hold: the daemon's
     /// `limits.preroll_bytes`.
     #[arg(long, value_name = "BYTES", default_value_t = lotse_core::track::DEFAULT_PREROLL_BYTES)]
@@ -336,7 +331,6 @@ mod tests {
                 "32",
                 "--connect-ports",
                 "554,80",
-                "--loopback-relay",
             ],
             "worker",
         );
@@ -350,10 +344,8 @@ mod tests {
             lotse_sandbox::DEFAULT_WORKER_ADDRESS_SPACE
         );
         assert_eq!(args.connect_ports, [554, 80]);
-        assert!(args.loopback_relay);
         let bare: WorkerArgs = args_of(&["lotse", "worker"], "worker");
         assert!(bare.connect_ports.is_empty());
-        assert!(!bare.loopback_relay);
         assert_eq!(bare.sandbox, Mode::On);
         assert_eq!(bare.max_sessions, 256);
         // A worker started by hand holds the daemon's default clip limits.

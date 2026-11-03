@@ -14,17 +14,17 @@ categories.workspace = true
 [dependencies]
 bytes = { workspace = true }
 futures-util = { workspace = true } # `FutureExt`: a request's future mapped into its deadline's result; the driver's read of what already waits before its timers (`now_or_never`)
-retina = { workspace = true } # the RTSP client: `DESCRIBE`, `SETUP`, `PLAY` and the keepalives, its sans-I/O core on the source's own TCP connection and its tokio session through the relay, the stream's RTP, and the backchannel's `rtp::Sender`
+retina = { workspace = true } # the RTSP client: `DESCRIBE`, `SETUP`, `PLAY` and the keepalives, its sans-I/O core on the source's own connections and UDP pairs, the stream's RTP and RTCP, and the backchannel's `rtp::Sender`
 serde = { workspace = true }
 serde_json = { workspace = true }
 sdp-types = { workspace = true } # the camera's backchannel media: payload type and `a=ptime`
-socket2 = { workspace = true } # `TCP_QUICKACK` on the relay's side of retina's connection, whose Nagle would hold the backchannel's packets
-tokio = { workspace = true, features = ["macros", "net", "io-util", "sync"] } # `select!` over packets and cancellation; the `rtsps` relay's sockets and copy loop; `sync`: the TCP relay's wake-up when a receiver report is first scheduled, the relay listener's turn, and the backchannel's queue
+socket2 = { workspace = true } # the UDP pairs' sends, straight to the kernel
+tokio = { workspace = true, features = ["macros", "net", "io-util", "sync"] } # `select!` over packets and cancellation; the connections to the camera and the UDP pairs; `io-util`: the stand-in for a connection the teardown closed; `sync`: the backchannel's queue
 tokio-util = { workspace = true } # the backchannel session's close: dropping the talker's session cancels its task
 tracing = { workspace = true }
 tracing-core = { workspace = true } # retina's events written as events of the source's own (`retina_log`)
 tracing-subscriber = { workspace = true } # `retina_log`: the layer between retina's events and the one that writes the lines
-url = { workspace = true } # the URL of retina's requests: the source URL itself, or through the relay its host replaced by the relay's address
+url = { workspace = true } # the URL of retina's requests: the source URL itself
 lotse-codec = { workspace = true }
 lotse-core = { workspace = true }
 lotse-tls = { workspace = true } # `rtsps`: the certificate check and the TLS stream to the camera

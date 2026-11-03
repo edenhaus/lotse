@@ -31,18 +31,18 @@ pub(crate) fn camera_text(text: &str) -> String {
 /// message text (stable prefixes per variant, its `ErrorInt` display
 /// formats) decide.
 ///
-/// Which prefixes occur depends on the path. On the TCP interleaved
-/// session, which drives retina's sans-I/O core on a connection the
-/// source dialed (the crate's `driver`), the connection's own failures are
-/// the driver's (a refused connect is `relay::tcp`'s, a failed write the
-/// driver's), and retina's are `Error reading from RTSP peer` (a read
-/// that failed or ended mid-request, a keepalive unanswered) and `Error
-/// writing to RTSP peer` (a keepalive retina could not flush), besides
-/// the status and protocol errors. `Unable to connect` is retina's tokio
-/// session failing to reach the relay (`transport: "udp"`). `Timeout` is only retina's `TEARDOWN` retries', which
-/// are never classified, and `Error receiving UDP packet` is retina's own
-/// UDP sockets', which lotse does not use yet: both are kept for the
-/// paths that will take them.
+/// Every connection of the source, its backchannel's included, drives
+/// retina's sans-I/O core on a connection the source dialed and on the UDP
+/// pairs it bound (the crate's `driver`): the connection's own failures
+/// are the source's (a refused connect is its dial's, worded as retina's
+/// `Unable to connect`, a failed write the driver's), and retina's are
+/// `Error reading from RTSP peer` (a read that failed or ended
+/// mid-request, a keepalive unanswered), `Error writing to RTSP peer` (a
+/// keepalive retina could not flush) and `Error receiving UDP packet` (a
+/// pair's receive that failed), besides the status and protocol errors.
+/// retina's own `Unable to connect` and `Timeout` come from its tokio
+/// session and its `TEARDOWN` retries, which lotse no longer runs; they
+/// stay classified for a path that will take them.
 pub fn classify(error: &retina::client::Error, url: &SourceUrl) -> SourceError {
     classify_text(&error.to_string(), error.status_code(), url)
 }
@@ -100,9 +100,9 @@ mod tests {
         SourceUrl::parse("rtsp://cam/").unwrap()
     }
 
-    /// retina names the URL it was given in an `InvalidArgument`; the
-    /// relay URL it is given carries the source URL's path and query,
-    /// which the attempt's scrub removes.
+    /// retina names the URL it was given in an `InvalidArgument`, the
+    /// source URL's path and query included, which the attempt's scrub
+    /// removes.
     #[tokio::test]
     async fn a_url_retina_echoes_loses_its_path_and_query() {
         let url =

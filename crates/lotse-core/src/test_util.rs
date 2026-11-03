@@ -1466,9 +1466,8 @@ mod tests {
     #[tokio::test]
     async fn fake_source_declares_a_video_track_and_ends_on_cancel() {
         let factory = FakeSourceFactory::new(&["fake"]);
-        // The contract's defaults: no default port, no loopback relay.
+        // The contract's default: no default port.
         assert_eq!(factory.default_port("fake"), None);
-        assert!(!factory.loopback_relay("fake"));
         let url = SourceUrl::parse("fake://cam/").unwrap();
         let source = factory.validate(&url, &serde_json::Value::Null).unwrap();
         assert_eq!(source.describe().protocol, "fake");

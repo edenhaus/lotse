@@ -161,9 +161,6 @@ struct ValidatedSource {
     protocol: &'static str,
     /// The scheme's default port.
     default_port: Option<u16>,
-    /// The worker needs a loopback relay listener bound before its sandbox
-    /// ([`SourceFactory::loopback_relay`](lotse_core::source::SourceFactory::loopback_relay)).
-    loopback_relay: bool,
     /// The source asks for the camera's backchannel
     /// ([`Source::wants_backchannel`](lotse_core::source::Source::wants_backchannel)).
     backchannel: bool,
@@ -415,7 +412,6 @@ impl Supervisor {
         let described = built.describe();
         let backchannel = built.wants_backchannel();
         let default_port = factory.default_port(url.scheme());
-        let loopback_relay = factory.loopback_relay(url.scheme());
         Ok(ValidatedSource {
             key: ConnectionKey {
                 url: url.clone(),
@@ -427,7 +423,6 @@ impl Supervisor {
             described: described.options,
             protocol: described.protocol,
             default_port,
-            loopback_relay,
             backchannel,
         })
     }
@@ -643,7 +638,6 @@ impl Supervisor {
             ConnectionEntry {
                 key: source.key.clone(),
                 port: source.url.port().or(source.default_port),
-                loopback_relay: source.loopback_relay,
                 backchannel: source.backchannel,
                 preroll_ms,
                 demand,
@@ -1549,25 +1543,23 @@ fn driver_spec(id: &str, source: &ValidatedSource) -> DriverSpec {
         options: serde_json::Value::Object(source.options.clone()).to_string(),
         host: source.url.host().to_owned(),
         port: source.url.port().or(source.default_port),
-        loopback_relay: source.loopback_relay,
         backchannel: source.backchannel,
     }
 }
 
 /// Whether connection `id` can switch to `source` in place, keeping its
 /// worker and so its sessions: the worker's sandbox is pinned to the port
-/// it may connect to and to whether it relays loopback, so a source that
-/// differs in either needs a new worker.
+/// it may connect to, so a source on another port needs a new worker.
 fn switchable(state: &State, id: &str, source: &ValidatedSource) -> bool {
-    state.connections.get(id).is_some_and(|entry| {
-        entry.port == source.url.port().or(source.default_port)
-            && entry.loopback_relay == source.loopback_relay
-    })
+    state
+        .connections
+        .get(id)
+        .is_some_and(|entry| entry.port == source.url.port().or(source.default_port))
 }
 
 /// Closes the sessions and ends the clips of `stream_id` that are not on
 /// its first source's connection any more: a `stream/put` changed the
-/// source's port or loopback relay, so it moved to a new worker.
+/// source's port, so it moved to a new worker.
 fn close_moved_sessions(state: &mut State, stream_id: &str) {
     let current = state
         .streams

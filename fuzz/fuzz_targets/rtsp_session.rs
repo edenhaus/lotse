@@ -428,7 +428,7 @@ fuzz_target!(|data: &[u8]| {
         } else {
             "tcp"
         };
-        let source = RtspFactory::default()
+        let source = RtspFactory
             .validate(
                 &url,
                 &serde_json::json!({ "timeout_ms": 2_000, "transport": transport, "backchannel": true }),

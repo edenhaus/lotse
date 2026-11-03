@@ -304,8 +304,6 @@ pub(crate) struct DriverSpec {
     pub(crate) host: String,
     /// The port, from the URL or the scheme's default.
     pub(crate) port: Option<u16>,
-    /// The worker binds a loopback relay listener before its sandbox.
-    pub(crate) loopback_relay: bool,
     /// The source asks the camera for its backchannel
     /// ([`Source::wants_backchannel`](lotse_core::source::Source::wants_backchannel)),
     /// as its options say.
@@ -353,7 +351,6 @@ impl fmt::Debug for DriverSpec {
         };
         out.field("host", &self.host)
             .field("port", &self.port)
-            .field("loopback_relay", &self.loopback_relay)
             .field("backchannel", &self.backchannel)
             .finish()
     }
@@ -1169,7 +1166,7 @@ impl Driver {
     /// a crash, so the machine retries with its backoff.
     async fn spawn_worker(&mut self, addrs: Vec<SocketAddr>) {
         let ports: Vec<u16> = self.spec.port.into_iter().collect();
-        match self.shared.manager.spawn(&ports, self.spec.loopback_relay) {
+        match self.shared.manager.spawn(&ports) {
             Ok(mut worker) => {
                 // The schedule continues where the last worker's left off.
                 let spec =
@@ -1679,7 +1676,6 @@ mod tests {
             options: r#"{"user_agent":"secret/1"}"#.into(),
             host: "cam".into(),
             port: Some(322),
-            loopback_relay: true,
             backchannel: false,
         };
         let logged = format!("{spec:?}");
@@ -1687,10 +1683,7 @@ mod tests {
             assert!(!logged.contains(secret), "{logged}");
         }
         assert!(logged.contains(r#"options: ["user_agent"]"#), "{logged}");
-        assert!(
-            logged.contains("port: Some(322)") && logged.contains("loopback_relay: true"),
-            "{logged}"
-        );
+        assert!(logged.contains("port: Some(322)"), "{logged}");
     }
 
     #[test]
@@ -1701,7 +1694,6 @@ mod tests {
             options: options.into(),
             host: "cam".into(),
             port: None,
-            loopback_relay: false,
             backchannel: false,
         };
         let logged = format!(
@@ -1730,7 +1722,6 @@ mod tests {
                     options: "{}".into(),
                     host: "h".into(),
                     port: None,
-                    loopback_relay: false,
                     backchannel: false,
                 },
                 0,
@@ -1788,7 +1779,7 @@ mod tests {
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let shared = shared(script.to_str().unwrap());
-        let mut worker = shared.manager.spawn(&[], false).unwrap();
+        let mut worker = shared.manager.spawn(&[]).unwrap();
         let (commands, _rx) = mpsc::channel(4);
         let (events, _events) = mpsc::channel(1);
         shared.lock().sessions.insert(
@@ -1871,7 +1862,7 @@ mod tests {
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let shared = shared(script.to_str().unwrap());
-        let mut worker = shared.manager.spawn(&[], false).unwrap();
+        let mut worker = shared.manager.spawn(&[]).unwrap();
         let (commands, _rx) = mpsc::channel(1);
         Driver::send(
             &mut worker,
@@ -1934,7 +1925,7 @@ mod tests {
     #[tokio::test]
     async fn sends_register_live_offers_only_and_survive_a_dead_worker() {
         let shared = shared("/usr/bin/true");
-        let mut worker = shared.manager.spawn(&[], false).unwrap();
+        let mut worker = shared.manager.spawn(&[]).unwrap();
         while !matches!(worker.next_event().await, WorkerEvent::Exited(_)) {}
         let (commands, _rx) = mpsc::channel(4);
         // A session that closed before its worker got it is not registered.
@@ -2018,7 +2009,6 @@ mod tests {
                 "c1".into(),
                 crate::registry::ConnectionEntry {
                     port: None,
-                    loopback_relay: false,
                     backchannel: false,
                     preroll_ms: 0,
                     key: crate::registry::ConnectionKey {
@@ -2140,7 +2130,6 @@ mod tests {
                     options: "{}".into(),
                     host: "127.0.0.1".into(),
                     port: None,
-                    loopback_relay: false,
                     backchannel: false,
                 },
                 0,
@@ -2300,7 +2289,6 @@ mod tests {
                 options: "{}".into(),
                 host: "127.0.0.1".into(),
                 port: Some(2),
-                loopback_relay: false,
                 backchannel: false,
             })))
             .await;
@@ -2584,7 +2572,7 @@ mod tests {
         let shared = shared(script.to_str().unwrap());
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        driver.worker = Some(shared.manager.spawn(&[], false).unwrap());
+        driver.worker = Some(shared.manager.spawn(&[]).unwrap());
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Connecting));
         // Bounded: a report the driver drops never wakes it.
         let wake = tokio::select! {
@@ -2680,7 +2668,7 @@ mod tests {
         let in_flight = || shared.connects.in_flight();
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        driver.worker = Some(shared.manager.spawn(&[], false).unwrap());
+        driver.worker = Some(shared.manager.spawn(&[]).unwrap());
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Connecting));
         let wake = next_wake(&mut driver).await;
         assert!(matches!(wake, Wake::Connect(SlotWake::Grant)));
@@ -2741,7 +2729,6 @@ mod tests {
             options: "{}".into(),
             host: host.into(),
             port: Some(1),
-            loopback_relay: false,
             backchannel: false,
         };
         // Without a worker the spec is taken for the next one, nothing more.
@@ -2768,7 +2755,7 @@ mod tests {
         ));
         driver.pending = Pending::Nothing;
         // With a worker: the new host resolves, then the worker is told.
-        driver.worker = Some(shared.manager.spawn(&[], false).unwrap());
+        driver.worker = Some(shared.manager.spawn(&[]).unwrap());
         driver
             .handle(Wake::Command(DriverCommand::SwitchSource(switch(
                 "fake://127.0.0.1:1/c",
@@ -2860,7 +2847,6 @@ mod tests {
             options: options.into(),
             host: "127.0.0.1".into(),
             port: Some(1),
-            loopback_relay: false,
             backchannel,
         };
         let source = |options: &str| SourceSpec {
@@ -3030,7 +3016,7 @@ mod tests {
         let shared = shared("/usr/bin/true");
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        let mut worker = shared.manager.spawn(&[], false).unwrap();
+        let mut worker = shared.manager.spawn(&[]).unwrap();
         while !matches!(worker.next_event().await, WorkerEvent::Exited(_)) {}
         driver.worker = Some(worker);
         driver.handle(Wake::Connect(SlotWake::Grant)).await;
@@ -3163,7 +3149,7 @@ mod tests {
 
     /// A worker that has exited, as the driver still holds it.
     async fn dead_worker(shared: &Shared) -> Worker {
-        let mut worker = shared.manager.spawn(&[], false).unwrap();
+        let mut worker = shared.manager.spawn(&[]).unwrap();
         while !matches!(worker.next_event().await, WorkerEvent::Exited(_)) {}
         worker
     }
@@ -3175,7 +3161,6 @@ mod tests {
             options: "{}".into(),
             host: "127.0.0.1".into(),
             port: Some(1),
-            loopback_relay: false,
             backchannel: false,
         }
     }
@@ -3507,7 +3492,6 @@ mod tests {
                     options: serde_json::json!({}),
                 },
                 port: None,
-                loopback_relay: false,
                 backchannel: false,
                 preroll_ms: 0,
                 demand: watch::channel(Demand {
@@ -3559,7 +3543,6 @@ mod tests {
                     options: "{}".into(),
                     host: "cam.example".into(),
                     port: None,
-                    loopback_relay: false,
                     backchannel: false,
                 },
                 0,
@@ -3887,7 +3870,6 @@ mod tests {
                     options: "{}".into(),
                     host: "127.0.0.1".into(),
                     port: None,
-                    loopback_relay: false,
                     backchannel: false,
                 },
                 0,

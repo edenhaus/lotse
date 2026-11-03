@@ -398,7 +398,6 @@ mod tests {
 
     use super::*;
     use crate::options::RtspOptions;
-    use crate::relay::Listener;
 
     fn camera_at(cam: &FakeCamera) -> Camera {
         Camera {
@@ -408,7 +407,6 @@ mod tests {
                 ..RtspOptions::default()
             },
             tls: None,
-            relay: Listener::default(),
             addr: cam.addr(),
             time: Arc::new(SystemClock),
         }
@@ -420,7 +418,6 @@ mod tests {
             url: SourceUrl::parse("rtsp://127.0.0.1:1/stream").unwrap(),
             options: RtspOptions::default(),
             tls: None,
-            relay: Listener::default(),
             addr: "127.0.0.1:1".parse().unwrap(),
             time: Arc::new(SystemClock),
         };
