@@ -290,6 +290,9 @@ pub struct Packetizer {
     /// The first packet's timestamp and arrival: where the wall clock sits
     /// on the output timeline. `None` before the first packet.
     anchor: Option<(u32, Instant)>,
+    /// The timestamp and arrival of the last packet sent, for the Sender
+    /// Reports. `None` before one was.
+    last_sent: Option<(u32, Instant)>,
     /// [`MAX_LEAD`] in ticks of the clock rate.
     lead: u32,
     /// Timestamps held to the wall clock, for the log.
@@ -322,6 +325,7 @@ impl Packetizer {
             last: None,
             step: 0,
             anchor: None,
+            last_sent: None,
             lead: ticks(MAX_LEAD, format.clock_rate),
             held: Throttle::default(),
             talkspurts: Throttle::default(),
@@ -401,6 +405,7 @@ impl Packetizer {
             return None;
         }
         let marker = marker || std::mem::take(&mut self.unsent_marker);
+        self.last_sent = Some((ts, packet.arrival));
         let seq = self.sender.next_sequence_number();
         tracing::trace!(seq, ts, marker, "backchannel: packet");
         // Never `None`: retina refuses only a timestamp whose distance from
@@ -424,18 +429,19 @@ impl Packetizer {
 
     /// The RTCP compound packet to send now, if a Sender Report is due
     /// (RFC 3550 §6.4.1; retina schedules them as §6.3.1 describes, the
-    /// first right after the first packet): the SR pairs `wall`, the wall
-    /// clock, with the timestamp where `now` sits on the stream's timeline,
-    /// the first packet's advanced by the time since it arrived, with the
-    /// packet and octet counts; then the source description with the
-    /// CNAME (§6.1). `None` before the first packet, which places the
-    /// timeline on the wall clock.
+    /// first right after the first packet sent): the SR pairs `wall`, the
+    /// wall clock, with the timestamp where `now` sits on the timeline of
+    /// what went on the wire, the last packet sent's advanced by the time
+    /// since it arrived, with the packet and octet counts; then the source
+    /// description with the CNAME (§6.1). `None` while no packet was sent,
+    /// dropped ones aside: a report would count nothing and place no
+    /// timeline.
     pub fn sender_report(&mut self, now: Instant, wall: SystemTime) -> Option<Vec<u8>> {
-        let (first, since) = self.anchor?;
+        let (last, since) = self.last_sent?;
         if !self.sender.report_due(now) {
             return None;
         }
-        let ts = first.wrapping_add(ticks(now.saturating_duration_since(since), self.clock_rate));
+        let ts = last.wrapping_add(ticks(now.saturating_duration_since(since), self.clock_rate));
         // Never `None`, as in `packetize`.
         let report = Timestamp::new(i64::from(ts), self.rate, 0).map(|ts| {
             self.sender
@@ -993,8 +999,14 @@ mod tests {
         let start = SystemClock.now();
         let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         assert_eq!(p.sender_report(start, wall), None, "no packet yet");
-        sent(&mut p, &packet(start, 0, 1, false));
+        // A dropped packet sends nothing to report.
+        let mut over = packet(start, 0, 1, false);
+        over.payload = Arc::from(vec![0xff_u8; MAX_PAYLOAD + 1]);
+        assert_eq!(p.packetize(&over, |_| ()), None);
+        assert_eq!(p.sender_report(start, wall), None, "no packet sent yet");
         sent(&mut p, &packet(start + ms(20), 160, 1, false));
+        // 250 ms ahead of the wall clock, as far as the lead lets it.
+        sent(&mut p, &packet(start + ms(40), 160 + 2_000, 1, false));
         let report = p.sender_report(start + ms(500), wall).unwrap();
         // RFC 3550 §6.4.1: V=2, no report blocks, PT=SR, six more words.
         assert_eq!(report[..4], [0x80, 200, 0, 6]);
@@ -1002,10 +1014,11 @@ mod tests {
         assert_eq!(word(4), 0x1234_5678, "our SSRC");
         let ntp = u64::from_be_bytes(report[8..16].try_into().unwrap());
         assert_eq!(ntp, NtpTimestamp::from(wall).0);
-        // Half a second after the first packet: 4,000 ticks on from it.
+        // 460 ms after the last packet sent: 3,680 ticks on from it, not
+        // from the first, which went out 250 ms behind it.
         assert_eq!(
             word(16),
-            1_000 + 4_000,
+            1_000 + 160 + 2_000 + 3_680,
             "the RTP timestamp of the wall clock"
         );
         assert_eq!((word(20), word(24)), (2, 320), "packets and payload octets");
