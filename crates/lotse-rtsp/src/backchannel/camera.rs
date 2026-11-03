@@ -1,7 +1,8 @@
 //! The camera as the backchannel's connections reach it: the probe's and
 //! each talker's session, every one on a TCP connection of its own (and
-//! its TLS session for `rtsps`), through a loopback relay of its own, as
-//! the session that plays the stream reaches it ([`crate::relay`]).
+//! its TLS session for `rtsps`), through a loopback relay of its own
+//! ([`crate::relay`]), as the session that plays the stream did before it
+//! drove retina's sans-I/O core on its own connection ([`crate::driver`]).
 //!
 //! The backchannel is always set up TCP interleaved, whatever the stream's
 //! `transport`: retina sends on no other path, so these connections never
@@ -24,10 +25,10 @@ use lotse_tls::TlsTarget;
 use retina::client::{
     Described, Session, SessionGroup, SessionOptions, StreamDirection, TeardownPolicy,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
 use super::session::{Offer, offer};
+use crate::driver::Duplex;
 use crate::framer::MAX_MESSAGE;
 use crate::options::RtspOptions;
 use crate::relay::{self, Listener, Listening, Media};
@@ -51,11 +52,6 @@ pub(crate) struct Camera {
     /// The clock of the deadlines.
     pub(crate) time: Arc<dyn Clock>,
 }
-
-/// A connection to the camera, plain TCP or TLS over it.
-pub(crate) trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
 
 /// A connection to the camera with its relay ready for retina: the
 /// camera's side, the relay's listener, and the URL retina connects to.

@@ -6,7 +6,10 @@
 //! deadline, a camera the relay refuses and one that hangs up. Over UDP
 //! the session outlives its control connection (RFC 2326 §1.1), so when
 //! that connection is gone the `TEARDOWN` goes out on a fresh one; over
-//! TCP the session ends with its connection.
+//! TCP the session ends with its connection, except on a camera whose
+//! SDP names a live555 version with the stale TCP session bug, which
+//! retina's `Auto` policy tears down on fresh connections too, as the
+//! source dials them.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -249,4 +252,31 @@ async fn rfc2326_10_7_a_camera_that_hangs_up_is_torn_down_on_a_fresh_connection_
         }
         cam.stop().await;
     }
+}
+
+/// A live555 server before 2017.06.04 keeps an interleaved session whose
+/// connection is gone (observed by retina, which names it in its
+/// `Tool::has_live555_tcp_bug`), so retina's `Auto` policy retries the
+/// `TEARDOWN` on a fresh connection, which the source dials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_7_a_live555_camera_that_hangs_up_is_torn_down_on_a_fresh_connection_over_tcp() {
+    let cam = camera(CameraConfig {
+        packets_before_close: Some(20),
+        sdp_session_lines: "a=tool:LIVE555 Streaming Media v2016.11.28\r\n".into(),
+        ..CameraConfig::default()
+    })
+    .await;
+    let harness = start(&cam, "tcp");
+    let exit = harness.finish().await;
+    assert!(
+        matches!(exit, SourceError::Ended(ref m) if m == "the camera closed the session"),
+        "{exit:?}"
+    );
+    torn_down_once(&cam, "tcp").await;
+    assert_eq!(
+        Stats::get(&cam.stats().connections),
+        2,
+        "a fresh connection"
+    );
+    cam.stop().await;
 }

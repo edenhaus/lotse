@@ -32,8 +32,8 @@
 //! chooses which media it sets up), whose RTP after `PLAY` it
 //! parses (RFC 3550 §5.1) and records ([`Stats::backchannel`]), RTCP on the
 //! odd channel counted. Every connection is logged
-//! ([`Stats::connection_log`]): its `DESCRIBE`s and whether they asked for
-//! the backchannel, its `SETUP`s, its `PLAY`, its `TEARDOWN` and whether
+//! ([`Stats::connection_log`]): its `DESCRIBE`s, their Request-URI and
+//! whether they asked for the backchannel, its `SETUP`s, its `PLAY`, its `TEARDOWN` and whether
 //! that carried `Require`, the backchannel RTP it took, and its close.
 //! Other modes: the `Require` tag refused with `551` (RFC 2326 §11.3.13,
 //! ONVIF Streaming Specification §5.3.2) or never answered, only the
@@ -897,6 +897,9 @@ pub struct ConnectionLog {
     /// Its `DESCRIBE`s, in order: whether each asked for the backchannel
     /// with `Require` (ONVIF Streaming Specification §5.3.1).
     pub describes: Vec<bool>,
+    /// The Request-URI of each of its `DESCRIBE`s, in order (RFC 2326
+    /// §6.1).
+    pub describe_uris: Vec<String>,
     /// The last segment of each `SETUP`'s control URL it answered:
     /// `track0`, `track1`, `backchannel`.
     pub setups: Vec<String>,
@@ -1890,7 +1893,14 @@ impl Connection {
     /// Specification §5.3.1, §5.3.2), or its refusal with `551` (§5.3.2).
     fn describe(&mut self, request: &Request<Vec<u8>>, cseq: &str) -> Response<Vec<u8>> {
         let asked = asks_backchannel(request);
-        self.stats.log(self.index, |log| log.describes.push(asked));
+        let uri = request
+            .request_uri()
+            .map(|uri| uri.as_str().to_owned())
+            .unwrap_or_default();
+        self.stats.log(self.index, |log| {
+            log.describes.push(asked);
+            log.describe_uris.push(uri);
+        });
         if asked && let Some(BackchannelSetup::RefuseDescribe(status)) = self.backchannel_setup() {
             return reply(cseq, status_code(status)).build(Vec::new());
         }

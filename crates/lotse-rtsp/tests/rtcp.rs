@@ -1,7 +1,9 @@
 //! The RTSP source's RTCP Receiver Reports (RFC 3550 §6.4.2) against the
 //! fake camera of `lotse-testing`, which records the RTCP a client sends:
-//! over TCP on each stream's interleaved RTCP channel (RFC 2326 §10.12)
-//! and with `transport: "udp"` from each stream's RTCP port, with the
+//! over TCP on each stream's interleaved RTCP channel (RFC 2326 §10.12),
+//! which retina's sans-I/O core sends on the source's connection, and
+//! with `transport: "udp"` from each stream's RTCP port, which the relay
+//! sends, with the
 //! loss, jitter, LSR and DLSR of §6.4.1 and the interval of §6.2 and
 //! §6.3.1, all on the injected clock, which the test moves one frame at a
 //! time.

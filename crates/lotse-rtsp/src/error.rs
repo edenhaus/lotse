@@ -30,6 +30,20 @@ pub(crate) fn camera_text(text: &str) -> String {
 /// keeps its variants private, so the status code (public) and the
 /// message text (stable prefixes per variant, its `ErrorInt` display
 /// formats) decide.
+///
+/// Which prefixes occur depends on the path. On the TCP interleaved
+/// session, which drives retina's sans-I/O core on a connection the
+/// source dialed (the crate's `driver`), the connection's own failures are
+/// the driver's (a refused connect is `relay::tcp`'s, a failed write the
+/// driver's), and retina's are `Error reading from RTSP peer` (a read
+/// that failed or ended mid-request, a keepalive unanswered) and `Error
+/// writing to RTSP peer` (a keepalive retina could not flush), besides
+/// the status and protocol errors. `Unable to connect` is retina's tokio
+/// session failing to reach the relay (`transport: "udp"`, the
+/// backchannel). `Timeout` is only retina's `TEARDOWN` retries', which
+/// are never classified, and `Error receiving UDP packet` is retina's own
+/// UDP sockets', which lotse does not use yet: both are kept for the
+/// paths that will take them.
 pub fn classify(error: &retina::client::Error, url: &SourceUrl) -> SourceError {
     classify_text(&error.to_string(), error.status_code(), url)
 }

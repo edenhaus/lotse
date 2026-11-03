@@ -2,7 +2,8 @@
 //! spawn, run the fake source, see its reports, stop it within the budget;
 //! and the M0 exit criterion, a worker crash that the supervisor observes
 //! and survives; an `rtsps` camera played by a worker under its sandbox
-//! through the loopback relay it bound before the sandbox; an `rtsp`
+//! on its own TLS connection, beside the loopback relay it bound before
+//! the sandbox for the paths that still take it; an `rtsp`
 //! camera whose media takes UDP, received under the same sandbox; and an
 //! HLS stream over `http` and over `https` with a pinned certificate,
 //! fetched by a sandboxed worker from the server's port alone; a clip's
@@ -218,11 +219,13 @@ async fn a_sandboxed_worker_takes_a_clip_s_pipe_and_closes_it() {
 
 /// On Linux the worker's Landlock rules allow TCP only to the camera's port
 /// and the relay port bound before the sandbox, and seccomp has to allow
-/// what TLS needs (`getrandom`); on macOS the sandbox is a no-op and this
-/// checks the relay path of a real worker.
+/// what TLS needs (`getrandom`): the stream plays on the worker's own TLS
+/// connection to the camera, the relay bound beside it for the backchannel
+/// and RTP over UDP. On macOS the sandbox is a no-op and this checks the
+/// TLS path of a real worker.
 #[cfg(feature = "source-rtsp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sandboxed_worker_plays_rtsps_through_its_loopback_relay() {
+async fn a_sandboxed_worker_plays_rtsps_beside_its_loopback_relay() {
     use lotse_testing::fake_camera::CameraTls;
     use lotse_testing::{CameraConfig, FakeCamera};
 
