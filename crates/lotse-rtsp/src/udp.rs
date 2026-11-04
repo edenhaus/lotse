@@ -2,15 +2,16 @@
 //! translates between retina, which keeps speaking TCP interleaved to the
 //! loopback relay, and a camera that sends its media as UDP datagrams.
 //!
-//! retina 0.4's own UDP transport cannot be used behind the relay: it binds
-//! its ports on the local address of its connection, which is the
-//! relay's `127.0.0.1`, so the camera could never reach them, and its
-//! datagrams would bypass the relay's checks below. So the relay rewrites the two messages
-//! that carry the transport (RFC 2326 §12.39): retina's `SETUP` asks for
-//! `interleaved=N-M`, the camera sees `client_port=P-Q` instead, a fresh
-//! RTP/RTCP pair this module bound (RFC 3550 §11: RTP on the even port,
-//! RTCP on the next); the camera's answer with `server_port` (and
-//! `source`) reaches retina as `interleaved=N-M`. Every datagram that
+//! retina's own UDP transport cannot be used behind the relay: its tokio
+//! `Session` binds its ports on the local address of its connection,
+//! which is the relay's `127.0.0.1` (0.5's `SessionOptions::bind` names
+//! another address, but its datagrams would still bypass the relay's
+//! checks below), so the camera could never reach them. So the relay
+//! rewrites the two messages that carry the transport (RFC 2326 §12.39):
+//! retina's `SETUP` asks for `interleaved=N-M`, the camera sees
+//! `client_port=P-Q` instead, a fresh RTP/RTCP pair this module bound (RFC
+//! 3550 §11: RTP on the even port, RTCP on the next); the camera's answer
+//! with `server_port` (and `source`) reaches retina as `interleaved=N-M`. Every datagram that
 //! passes then goes to retina as an interleaved frame on that channel
 //! (RFC 2326 §10.12), after the answer to `PLAY`, so retina reads the
 //! media exactly as it reads a TCP camera's.
@@ -37,10 +38,14 @@
 //!   version 2 header (RFC 3550 §6.4).
 //! - A duplicate, or a packet up to [`MAX_MISORDER`] behind the highest
 //!   sequence number passed (RFC 3550 §A.1), is dropped and counted as out
-//!   of order: retina, reading TCP, ends the session on a backward step,
-//!   and waiting for a reordered packet would be a reorder buffer. Its gap
-//!   was counted as loss when the later packet passed. A larger step back
-//!   is a new sequence, passed for retina to judge as over TCP.
+//!   of order: retina, reading TCP, reorders with no delay, so it would
+//!   drop a packet arriving after a later one too (its reorderer's
+//!   `Pushed::Late`), and waiting for a reordered packet would be a
+//!   reorder buffer. Its gap was counted as loss when the later packet
+//!   passed. A larger step back is a new sequence, passed for retina to
+//!   judge as over TCP: its reorderer drops the new sequence's first
+//!   packet and takes the sender as restarted once the next one follows
+//!   it (`Pushed::Stray`).
 //!
 //! The pairs listen on the wildcard address of the camera's family, so the
 //! kernel answers on whichever interface the camera reaches; the address
@@ -103,7 +108,8 @@ pub(crate) const MAX_DATAGRAM: usize = 65_535;
 /// An RTP header with nothing to say (version 2, payload type 0,
 /// synchronization source 0), sent once to the camera's RTP port so a
 /// connection-tracking firewall between lets its datagrams back in; the
-/// camera discards it. retina 0.4 sends the same.
+/// camera discards it. retina sends the same (0.4, and the 0.5
+/// prototype's `HOLE_PUNCH_RTP`).
 const HOLE_PUNCH_RTP: [u8; 12] = [0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
 /// An empty RTCP Receiver Report (RFC 3550 §6.4.2, packet type 201) for

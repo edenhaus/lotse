@@ -120,6 +120,9 @@ exclude_re = [
     # the guard, there so it could not loop forever, picks what `true` and `>=` pick.
     "clip.rs:.*replace match guard written > 0 with true in Clip::write$",
     "clip.rs:.*replace > with >= in Clip::write$",
+    # Built only without the RTSP source, and the mutants are tested with every feature on:
+    # no test of the run reaches it. (With the source, `retina` returns a `RetinaLog`.)
+    "logging.rs:.*replace retina -> L with Default::default\\(\\)$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
 ]

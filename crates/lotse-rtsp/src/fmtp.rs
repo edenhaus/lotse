@@ -2,9 +2,10 @@
 //! RFC 7798 §7.1 `sprop-max-don-diff` of an H.265 format, which says
 //! whether its payloads carry decoding order numbers (DONL, DOND) that the
 //! `lotse-codec` normalizers do not read.
-//! retina 0.4.20 reads an H.265 `fmtp` for its own depacketizer, which the
-//! source bypasses, and exposes only the parameter sets, so the raw SDP
-//! of the `DESCRIBE` answer is scanned here.
+//! retina (0.4.20, and the 0.5 prototype pinned at `f65065f`) reads an
+//! H.265 `fmtp` for its own depacketizer, which the source bypasses, and
+//! exposes only the parameter sets (`VideoParameters::parameter_sets`), so
+//! the raw SDP of the `DESCRIBE` answer is scanned here.
 //!
 //! Implements RFC 8866 §5.14 (`m=` lines start a media description), §6.6
 //! (`rtpmap`) and §6.15 (`fmtp`), and RFC 7798 §4.4.1 (DONL present when

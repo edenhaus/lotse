@@ -38,8 +38,9 @@ fn is_valid_user_agent(value: &str) -> bool {
 
 /// Deserializes `user_agent`, refusing a value [`is_valid_user_agent`]
 /// rejects, so it fails at `stream/put` as `invalid_request` instead of
-/// when the worker builds its first request: retina 0.4 unwraps the
-/// header value there, and the panic aborts the worker on every attempt.
+/// when the worker builds its first request: retina (0.4, and the 0.5
+/// prototype pinned at `f65065f`) unwraps the header value there, and the
+/// panic aborts the worker on every attempt.
 fn deserialize_user_agent<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {

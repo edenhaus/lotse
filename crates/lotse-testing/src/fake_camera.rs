@@ -661,6 +661,14 @@ pub struct CameraConfig {
     /// With `timestamp_jump`, the jump repeats at every frame from its
     /// first on: a camera whose clock leaves its timeline on every frame.
     pub timestamp_jump_repeats: bool,
+    /// From this frame on, add this much to the video's sequence numbers,
+    /// wrapping: past RFC 3550 §A.1's `MAX_DROPOUT` (3000), a camera that
+    /// restarted them mid-stream, as after an encoder restart.
+    pub seq_jump: Option<(u32, u16)>,
+    /// Send every n-th video RTP packet a second time, after the one that
+    /// follows it: a late duplicate, behind the stream (RFC 3550 §A.1).
+    /// Counted in sent order over the connection's video packets, from 1.
+    pub late_every: Option<u64>,
     /// Stamp every access unit with its send time since this origin, in a
     /// leading SEI NAL unit ([`crate::latency`]); H.264 only.
     pub stamp_origin: Option<Instant>,
@@ -690,6 +698,9 @@ pub struct CameraConfig {
     /// Parameters appended to the video's `fmtp`, each led by `;`: a
     /// camera's own format parameters (RFC 8866 §6.15).
     pub video_fmtp: String,
+    /// Media descriptions appended to the SDP after the camera's own, each
+    /// line ending in CRLF: media a client may not parse.
+    pub sdp_media_lines: String,
     /// The session timeout the `SETUP` answer announces, in seconds
     /// (RFC 2326 §12.37); clients keep the session alive within it.
     pub session_timeout_s: u32,
@@ -699,6 +710,12 @@ pub struct CameraConfig {
     /// (RFC 2326 §12.33, where both are optional), as MediaMTX 1.21.1
     /// answers a path's first reader (observed 2026-10-06).
     pub omit_rtptime: bool,
+    /// The `rtptime` value `RTP-Info` carries instead of the stream's,
+    /// when set: a camera's mistakes, such as one that is no number.
+    pub rtptime: Option<String>,
+    /// Added to the video's `seq` in `RTP-Info`, wrapping: nonzero, the
+    /// header names another first sequence number than the stream's.
+    pub rtp_info_seq_offset: u16,
     /// How `PLAY` is answered.
     pub play: PlayAnswer,
     /// The address it listens on and sends its datagrams from: a loopback
@@ -786,6 +803,8 @@ impl Default for CameraConfig {
             packets_before_close: None,
             timestamp_jump: None,
             timestamp_jump_repeats: false,
+            seq_jump: None,
+            late_every: None,
             stamp_origin: None,
             packet_spacing: Duration::ZERO,
             audio: None,
@@ -796,9 +815,12 @@ impl Default for CameraConfig {
             tls: None,
             sdp_session_lines: String::new(),
             video_fmtp: String::new(),
+            sdp_media_lines: String::new(),
             session_timeout_s: 60,
             udp: CameraUdp::default(),
             omit_rtptime: false,
+            rtptime: None,
+            rtp_info_seq_offset: 0,
             play: PlayAnswer::Play,
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             backchannel: None,
@@ -1197,18 +1219,18 @@ async fn accept_loop(
 }
 
 /// The SDP for the stream, with `session_lines` after `t=`, `video_fmtp`
-/// at the end of the video's `fmtp` and the backchannel media last.
+/// at the end of the video's `fmtp`, the backchannel media and then
+/// `media_lines` last.
 fn sdp(
     base: &str,
     video: CameraVideo,
     audio: Option<CameraAudio>,
-    session_lines: &str,
-    video_fmtp: &str,
+    (session_lines, video_fmtp, media_lines): (&str, &str, &str),
     backchannel: Option<&CameraBackchannel>,
 ) -> String {
     format!(
         "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=fake camera\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
-         {session_lines}a=control:{base}\r\n{}{}{}",
+         {session_lines}a=control:{base}\r\n{}{}{}{media_lines}",
         video.sdp(base, video_fmtp),
         audio.map(|audio| audio.sdp(base)).unwrap_or_default(),
         backchannel
@@ -1226,8 +1248,11 @@ impl CameraConfig {
             base,
             self.video,
             self.audio,
-            &self.sdp_session_lines,
-            &self.video_fmtp,
+            (
+                &self.sdp_session_lines,
+                &self.video_fmtp,
+                &self.sdp_media_lines,
+            ),
             self.backchannel.as_ref().filter(|_| backchannel),
         )
     }
@@ -1286,6 +1311,9 @@ struct Connection {
     set_up: SetUp,
     /// The client closed it.
     client_closed: bool,
+    /// A video packet [`CameraConfig::late_every`] sends again after the
+    /// next one.
+    late: Option<Vec<u8>>,
 }
 
 /// What a connection's `SETUP`s set up.
@@ -1481,6 +1509,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         index,
         set_up: SetUp::default(),
         client_closed: false,
+        late: None,
     };
     let frame_interval = Duration::from_secs(1)
         .checked_div(connection.config.fps.max(1))
@@ -2134,6 +2163,8 @@ impl Connection {
         let rtptime = |ts: u32| {
             if self.config.omit_rtptime {
                 String::new()
+            } else if let Some(rtptime) = &self.config.rtptime {
+                format!(";rtptime={rtptime}")
             } else {
                 format!(";rtptime={ts}")
             }
@@ -2141,7 +2172,7 @@ impl Connection {
         let video = format!(
             "url={}track0;seq={}{}",
             self.base,
-            self.seq,
+            self.seq.wrapping_add(self.config.rtp_info_seq_offset),
             rtptime(FIRST_TIMESTAMP)
         );
         let rtp_info = if self.audio_channel.is_some() {
@@ -2177,6 +2208,11 @@ impl Connection {
         let ts = FIRST_TIMESTAMP
             .wrapping_add(index.wrapping_mul(ticks_per_frame))
             .wrapping_add(jump);
+        if let Some((from, by)) = self.config.seq_jump
+            && index == from
+        {
+            self.seq = self.seq.wrapping_add(by);
+        }
         let mut payloads: Vec<Bytes> = Vec::new();
         if let Some(origin) = self.config.stamp_origin
             && self.config.video == CameraVideo::H264
@@ -2193,10 +2229,18 @@ impl Connection {
         }
         for (i, payload) in payloads.into_iter().enumerate() {
             let marker = self.config.marker_bit && i.saturating_add(1) == count;
-            out.push((0, rtp(self.seq, ts, marker, &payload)));
+            let packet = rtp(self.seq, ts, marker, &payload);
             self.seq = self.seq.wrapping_add(1);
             self.sent = self.sent.saturating_add(1);
             Stats::bump(&self.stats.packets);
+            let late = self
+                .config
+                .late_every
+                .is_some_and(|n| n > 0 && self.sent.is_multiple_of(n))
+                .then(|| packet.clone());
+            out.push((0, packet));
+            out.extend(self.late.take().map(|late| (0, late)));
+            self.late = late;
         }
         out
     }
@@ -2367,8 +2411,7 @@ mod tests {
             "rtsp://127.0.0.1:1/stream/",
             CameraVideo::H264,
             None,
-            "",
-            "",
+            ("", "", ""),
             None,
         );
         assert!(text.contains("sprop-parameter-sets="));
@@ -2377,8 +2420,7 @@ mod tests {
             "rtsp://127.0.0.1:1/stream/",
             CameraVideo::H264,
             Some(CameraAudio::Pcmu),
-            "",
-            ";x-own=1",
+            ("", ";x-own=1", ""),
             None,
         );
         assert!(with_audio.contains(";x-own=1\r\na=control:rtsp://127.0.0.1:1/stream/track0"));
@@ -2388,10 +2430,10 @@ mod tests {
             "rtsp://127.0.0.1:1/stream/",
             CameraVideo::H264,
             Some(CameraAudio::Aac),
-            "a=x-own:1\r\n",
-            "",
+            ("a=x-own:1\r\n", "", "m=video 0 RTP/AVP 200\r\n"),
             None,
         );
+        assert!(with_aac.ends_with("\r\nm=video 0 RTP/AVP 200\r\n"));
         assert!(with_aac.contains("t=0 0\r\na=x-own:1\r\na=control:"));
         assert!(with_aac.contains("a=rtpmap:97 MPEG4-GENERIC/16000/1"));
         assert!(
@@ -2409,8 +2451,7 @@ mod tests {
             "rtsp://127.0.0.1:1/stream/",
             CameraVideo::H265,
             None,
-            "",
-            ";sprop-max-don-diff=2",
+            ("", ";sprop-max-don-diff=2", ""),
             None,
         );
         assert!(h265.contains("a=rtpmap:96 H265/90000\r\na=fmtp:96 profile-id=1;sprop-vps="));
@@ -2434,8 +2475,7 @@ mod tests {
             "rtsp://127.0.0.1:1/stream/",
             CameraVideo::H265HighTier,
             None,
-            "",
-            "",
+            ("", "", ""),
             None,
         );
         assert!(high.contains("a=fmtp:96 profile-id=1;tier-flag=1;sprop-vps="));

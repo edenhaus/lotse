@@ -8,10 +8,11 @@
 //! [`backchannel_format`] reads one SDP media description, and a
 //! [`Packetizer`] turns the packets a talker's backchannel session receives
 //! (the talk-back transcoder's G.711 frames, or a browser's Opus packets
-//! forwarded as they are) into [`BackchannelPacket`]s, the RTP header
-//! fields and the payload, without a wire format: retina serializes them
-//! on the backchannel's interleaved channel with its own SSRC and sequence
-//! numbers. [`session`] holds the decisions: the `Require` header, which
+//! forwarded as they are) into RTP packets: it decides the timestamps and
+//! the marker, and retina's `rtp::Sender`, which it owns, writes the header
+//! with the camera's payload type, the SSRC and the sequence numbers, and
+//! the RTCP Sender Reports, for the session to queue on the backchannel's
+//! interleaved channel. [`session`] holds the decisions: the `Require` header, which
 //! media of a `DESCRIBE` answer is the backchannel, what a probe's `551`
 //! means for the source, and what a refusal says. The crate's `probe`
 //! module asks the camera, once the stream's session plays, on a
@@ -24,27 +25,26 @@
 //! case-insensitively (RFC 4855 §3); RFC 3551 Table 4 (the static payload
 //! types 0 and 8) and §4.5.14 (G.711 at 8 kHz); RFC 7587 §7 (`opus/48000/2`);
 //! RFC 3550 §5.1 (sequence numbers that count packets from a random start,
-//! timestamps from a random offset that advance with the sampling clock
-//! across silence, and never ahead of the wall clock by more than a
-//! lead) and §8.1 (a random SSRC); RFC 3551 §4.1 (the marker on
-//! the first packet of a talkspurt); ONVIF Streaming Specification §5.3 (the
-//! backchannel media whose format this is). SPEC-DEVIATION: ONVIF §5.3.2
-//! lets the client choose any format a backchannel `m=` line lists, but
-//! retina stamps a sending stream's packets with the line's first format,
-//! so [`session::offer`] takes only a media whose first format the chain
-//! produces, until the sender's payload type is caller-chosen.
+//! one skipped for a packet dropped, timestamps from a random offset that
+//! advance with the sampling clock across silence, and never ahead of the
+//! wall clock by more than a lead), §6.4.1 (Sender Reports pairing the
+//! wall clock with the stream's timeline) and §8.1 (a random SSRC); RFC
+//! 3551 §4.1 (the marker on the first packet of a talkspurt); ONVIF Streaming Specification §5.3 (the
+//! backchannel media whose format this is).
 
 pub(crate) mod camera;
 pub(crate) mod open;
 pub(crate) mod probe;
 pub mod session;
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::num::NonZeroU32;
+use std::time::{Duration, Instant, SystemTime};
 
 use lotse_core::codec::Codec;
-use lotse_core::media::{MediaPacket, RtpHeaderFields};
+use lotse_core::media::MediaPacket;
 use lotse_core::throttle::Throttle;
+use retina::rtp::{OutgoingPacketRef, Sender, SenderOptions};
+use retina::{NtpTimestamp, Timestamp};
 use sdp_types::Media;
 
 use crate::error::camera_text;
@@ -206,47 +206,10 @@ fn parse_ptime(value: &str) -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
-/// The first values of one backchannel session's RTP stream: random, as
-/// RFC 3550 §5.1 (sequence number, timestamp) and §8.1 (SSRC) ask, so a
-/// camera never takes a new session's packets for an old one's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Initial {
-    /// The synchronization source.
-    pub ssrc: u32,
-    /// The first packet's sequence number.
-    pub seq: u16,
-    /// The first packet's timestamp.
-    pub ts: u32,
-}
-
-impl Initial {
-    /// Fresh values from the operating system's entropy source.
-    ///
-    /// # Errors
-    ///
-    /// When the entropy source fails.
-    pub fn random() -> Result<Self, getrandom::Error> {
-        let mut bytes = [0_u8; 10];
-        getrandom::fill(&mut bytes)?;
-        let [s0, s1, s2, s3, q0, q1, t0, t1, t2, t3] = bytes;
-        Ok(Self {
-            ssrc: u32::from_be_bytes([s0, s1, s2, s3]),
-            seq: u16::from_be_bytes([q0, q1]),
-            ts: u32::from_be_bytes([t0, t1, t2, t3]),
-        })
-    }
-}
-
-/// One packet for the camera's backchannel: the RTP header fields (RFC 3550
-/// §5.1) and the payload, for whatever send path serializes them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackchannelPacket {
-    /// The header: the camera's payload type, the session's SSRC, sequence
-    /// number and timestamp, the marker on a talkspurt's first packet.
-    pub rtp: RtpHeaderFields,
-    /// The RTP payload, as the backchannel handle received it.
-    pub payload: Arc<[u8]>,
-}
+/// The largest payload one interleaved frame carries after the 12-byte
+/// RTP header: its length field has 16 bits (RFC 2326 §10.12), and
+/// retina's sender takes no larger packet.
+const MAX_PAYLOAD: usize = 65_535 - 12;
 
 /// What a [`Packetizer`] keeps of the last packet: the talkspurt it
 /// belongs to and where it was sent.
@@ -276,7 +239,11 @@ const MAX_LEAD: Duration = Duration::from_millis(250);
 /// Stamps a backchannel session's packets: the camera's payload type, one
 /// SSRC, a sequence number one past the previous packet's, and timestamps
 /// that advance with the sampling clock across silence (RFC 3550 §5.1),
-/// whatever the input.
+/// whatever the input. The timestamps and the marker are decided here;
+/// retina's [`Sender`] writes the header (the payload type, the SSRC and
+/// the sequence numbers, from a random start and SSRC unless its
+/// [`SenderOptions`] name them, and the timestamps from a random offset,
+/// RFC 3550 §5.1 and §8.1) and the Sender Reports.
 ///
 /// Within a talkspurt the output timestamps follow the input's at a fixed
 /// offset, so the sender's timing (the transcoder's frames, a browser's
@@ -297,19 +264,25 @@ const MAX_LEAD: Duration = Duration::from_millis(250);
 /// restarted on top of each other) moves the camera's timeline no further
 /// than the wall clock. This is the one bound every route to the camera
 /// meets: the talk-back chain's frames and Opus forwarded as received.
-#[derive(Debug, Clone)]
+///
+/// A packet that is not sent ([`Packetizer::skip`], or one too large for
+/// an interleaved frame) still moves the timeline on and skips its
+/// sequence number, so the camera sees the loss (RFC 3550 §5.1); its
+/// marker goes with the next packet sent.
+#[derive(Debug)]
 pub struct Packetizer {
-    /// The payload type every packet carries.
-    payload_type: u8,
+    /// The RTP session state of what is sent: payload type, SSRC,
+    /// sequence numbers, timestamp offset and the Sender Reports' counts
+    /// and schedule.
+    sender: Sender,
+    /// The CNAME of the Sender Reports' source description (RFC 3550
+    /// §6.5.1), one per session.
+    cname: String,
     /// The RTP clock rate, for timestamps from elapsed time.
     clock_rate: u32,
-    /// The SSRC every packet carries.
-    ssrc: u32,
-    /// The next packet's sequence number.
-    seq: u16,
-    /// The first packet's timestamp.
-    first_ts: u32,
-    /// The last packet, once one was sent.
+    /// The RTP clock rate as retina's timestamps take it.
+    rate: NonZeroU32,
+    /// The last packet, once one was stamped.
     last: Option<Last>,
     /// The last forward timestamp step inside a talkspurt: the packet
     /// duration, as far as the input shows it; zero before one was seen.
@@ -317,30 +290,47 @@ pub struct Packetizer {
     /// The first packet's timestamp and arrival: where the wall clock sits
     /// on the output timeline. `None` before the first packet.
     anchor: Option<(u32, Instant)>,
+    /// The timestamp and arrival of the last packet sent, for the Sender
+    /// Reports. `None` before one was.
+    last_sent: Option<(u32, Instant)>,
     /// [`MAX_LEAD`] in ticks of the clock rate.
     lead: u32,
     /// Timestamps held to the wall clock, for the log.
     held: Throttle,
     /// Talkspurts started, for the log: a sender can start one a packet.
     talkspurts: Throttle,
+    /// Packets too large to send, for the log.
+    oversized: Throttle,
+    /// Whether a packet left unsent carried the marker: the next one sent
+    /// carries it instead, as the first of its talkspurt the camera sees
+    /// (RFC 3551 §4.1).
+    unsent_marker: bool,
 }
 
 impl Packetizer {
-    /// A packetizer for a camera's backchannel `format` whose stream starts
-    /// at `initial`.
-    pub fn new(format: &BackchannelFormat, initial: Initial) -> Self {
+    /// A packetizer for a camera's backchannel `format` whose sender takes
+    /// `options`: [`SenderOptions::default`] draws the SSRC, the first
+    /// sequence number and the timestamp offset at random. Its own
+    /// timeline starts at zero, to which the sender adds that offset.
+    ///
+    /// [`backchannel_format`] gives no payload type past the field's seven
+    /// bits and no clock rate of zero; a format built by hand with one is
+    /// cut to seven bits and run at 1 Hz rather than panic retina's sender.
+    pub fn new(format: &BackchannelFormat, options: SenderOptions) -> Self {
         Self {
-            payload_type: format.payload_type,
+            sender: Sender::new(format.payload_type & MAX_PAYLOAD_TYPE, options),
+            cname: retina::rtcp::random_cname(),
             clock_rate: format.clock_rate,
-            ssrc: initial.ssrc,
-            seq: initial.seq,
-            first_ts: initial.ts,
+            rate: NonZeroU32::new(format.clock_rate).unwrap_or(NonZeroU32::MIN),
             last: None,
             step: 0,
             anchor: None,
+            last_sent: None,
             lead: ticks(MAX_LEAD, format.clock_rate),
             held: Throttle::default(),
             talkspurts: Throttle::default(),
+            oversized: Throttle::default(),
+            unsent_marker: false,
         }
     }
 
@@ -382,9 +372,90 @@ impl Packetizer {
         limit
     }
 
-    /// The backchannel packet for `packet`, one of the handle's input in
-    /// the camera's codec.
-    pub fn packetize(&mut self, packet: &MediaPacket) -> BackchannelPacket {
+    /// Stamps `packet`, one of the handle's input in the camera's codec,
+    /// and hands the RTP packet (header and the payload, not copied) to
+    /// `send`: what `send` returns, or `None` when the payload is larger
+    /// than an interleaved frame carries after the RTP header (65,523
+    /// bytes, RFC 2326 §10.12), which is dropped as [`Packetizer::skip`]
+    /// drops a packet.
+    pub fn packetize<R>(
+        &mut self,
+        packet: &MediaPacket,
+        send: impl FnOnce(&OutgoingPacketRef<'_>) -> R,
+    ) -> Option<R> {
+        let (ts, marker) = self.ready(packet)?;
+        let data = [&packet.payload[..]];
+        Some(send(&self.sender.packet(ts, marker, &data)))
+    }
+
+    /// The timestamp and marker `packet` is sent with, or `None` when it
+    /// is too large to send and dropped: [`Packetizer::packetize`] apart
+    /// from the send, so none of it is generic.
+    fn ready(&mut self, packet: &MediaPacket) -> Option<(Timestamp, bool)> {
+        let (ts, marker) = self.stamp(packet);
+        if packet.payload.len() > MAX_PAYLOAD {
+            self.unsent(marker);
+            if let Some(count) = self.oversized.hit(packet.arrival) {
+                tracing::debug!(
+                    bytes = packet.payload.len(),
+                    count,
+                    "backchannel: packet larger than an interleaved frame carries; dropped"
+                );
+            }
+            return None;
+        }
+        // Taken on every packet sent, marked or not: the one after it is
+        // no first of a talkspurt (RFC 3551 §4.1).
+        let pending = std::mem::take(&mut self.unsent_marker);
+        let marker = marker || pending;
+        self.last_sent = Some((ts, packet.arrival));
+        let seq = self.sender.next_sequence_number();
+        tracing::trace!(seq, ts, marker, "backchannel: packet");
+        // Never `None`: retina refuses only a timestamp whose distance from
+        // its start (here zero) overflows an `i64`, and a `u32` cannot.
+        Timestamp::new(i64::from(ts), self.rate, 0).map(|ts| (ts, marker))
+    }
+
+    /// Drops `packet` unsent: its time still passes on the timeline, its
+    /// sequence number is skipped, so the camera sees the loss (RFC 3550
+    /// §5.1), and its marker goes with the next packet sent.
+    pub fn skip(&mut self, packet: &MediaPacket) {
+        let (_ts, marker) = self.stamp(packet);
+        self.unsent(marker);
+    }
+
+    /// A stamped packet left unsent, with `marker`.
+    fn unsent(&mut self, marker: bool) {
+        self.unsent_marker |= marker;
+        self.sender.skip();
+    }
+
+    /// The RTCP compound packet to send now, if a Sender Report is due
+    /// (RFC 3550 §6.4.1; retina schedules them as §6.3.1 describes, the
+    /// first right after the first packet sent): the SR pairs `wall`, the
+    /// wall clock, with the timestamp where `now` sits on the timeline of
+    /// what went on the wire, the last packet sent's advanced by the time
+    /// since it arrived, with the packet and octet counts; then the source
+    /// description with the CNAME (§6.1). `None` while no packet was sent,
+    /// dropped ones aside: a report would count nothing and place no
+    /// timeline.
+    pub fn sender_report(&mut self, now: Instant, wall: SystemTime) -> Option<Vec<u8>> {
+        let (last, since) = self.last_sent?;
+        if !self.sender.report_due(now) {
+            return None;
+        }
+        let ts = last.wrapping_add(ticks(now.saturating_duration_since(since), self.clock_rate));
+        // Never `None`, as in `packetize`.
+        let report = Timestamp::new(i64::from(ts), self.rate, 0).map(|ts| {
+            self.sender
+                .sender_report(NtpTimestamp::from(wall), ts, &self.cname)
+        });
+        self.sender.report_sent(now);
+        report
+    }
+
+    /// The output timestamp and marker of `packet`.
+    fn stamp(&mut self, packet: &MediaPacket) -> (u32, bool) {
         let input = packet.rtp;
         let (ts, marker) = match self.last {
             Some(last)
@@ -419,11 +490,11 @@ impl Packetizer {
             }
             None => {
                 tracing::debug!(
-                    payload_type = self.payload_type,
-                    ssrc = self.ssrc,
+                    ssrc = self.sender.ssrc(),
+                    seq = self.sender.next_sequence_number(),
                     "backchannel: first talkspurt"
                 );
-                (self.first_ts, true)
+                (0, true)
             }
         };
         let ts = self.hold(ts, packet.arrival);
@@ -435,19 +506,7 @@ impl Packetizer {
             ts,
             arrival: packet.arrival,
         });
-        let seq = self.seq;
-        self.seq = seq.wrapping_add(1);
-        tracing::trace!(seq, ts, marker, "backchannel: packet");
-        BackchannelPacket {
-            rtp: RtpHeaderFields {
-                pt: self.payload_type,
-                seq,
-                ts,
-                marker,
-                ssrc: self.ssrc,
-            },
-            payload: Arc::clone(&packet.payload),
-        }
+        (ts, marker)
     }
 }
 
@@ -470,7 +529,10 @@ mod tests {
         reason = "test code"
     )]
 
+    use std::sync::Arc;
+
     use lotse_core::clock::{Clock as _, SystemClock};
+    use lotse_core::media::RtpHeaderFields;
 
     use super::*;
 
@@ -766,14 +828,34 @@ mod tests {
         );
     }
 
-    const INITIAL: Initial = Initial {
-        ssrc: 0x1234_5678,
-        seq: 65_534,
-        ts: 1_000,
-    };
+    /// The timestamp offset the tests' sender adds to the packetizer's
+    /// timeline, which starts at zero.
+    const OFFSET: u32 = 1_000;
+
+    fn options() -> SenderOptions {
+        SenderOptions::default()
+            .ssrc(0x1234_5678)
+            .initial_sequence_number(65_534)
+            .timestamp_offset(OFFSET)
+    }
 
     fn packetizer(format: &BackchannelFormat) -> Packetizer {
-        Packetizer::new(format, INITIAL)
+        Packetizer::new(format, options())
+    }
+
+    /// The header fields of the packet `p` sends for `input`.
+    fn sent(p: &mut Packetizer, input: &MediaPacket) -> RtpHeaderFields {
+        p.packetize(input, |rtp| {
+            let header = rtp.header();
+            RtpHeaderFields {
+                pt: header.payload_type(),
+                seq: header.sequence_number(),
+                ts: header.timestamp(),
+                marker: header.mark(),
+                ssrc: header.ssrc(),
+            }
+        })
+        .unwrap()
     }
 
     fn packet(arrival: Instant, ts: u32, ssrc: u32, marker: bool) -> MediaPacket {
@@ -832,19 +914,139 @@ mod tests {
     fn rfc3550_5_1_the_first_packet_carries_the_initial_values_and_the_camera_pt() {
         let mut p = packetizer(&g711(Codec::Pcmu, 97));
         let input = packet(SystemClock.now(), 0, 0x4737_3131, false);
-        let out = p.packetize(&input);
+        let (rtp, data) = p
+            .packetize(&input, |rtp| {
+                let data: Vec<*const u8> = rtp.data().iter().map(|part| part.as_ptr()).collect();
+                (*rtp.header().as_bytes(), data)
+            })
+            .unwrap();
+        // Version 2 and the marker (RFC 3551 §4.1: the first packet starts
+        // a talkspurt), payload type 97, the sequence number, timestamp
+        // and SSRC the sender was given.
+        let mut header = vec![0x80, 0x80 | 0x61, 0xff, 0xfe];
+        header.extend_from_slice(&1_000_u32.to_be_bytes());
+        header.extend_from_slice(&0x1234_5678_u32.to_be_bytes());
+        assert_eq!(rtp[..], header[..]);
+        assert_eq!(data, [input.payload.as_ptr()], "the payload, not a copy");
+    }
+
+    #[test]
+    fn rfc3550_5_1_a_payload_type_has_seven_bits_and_a_clock_rate_is_never_zero() {
+        let mut format = g711(Codec::Pcmu, 0x80 | 0x61);
+        format.clock_rate = 0;
+        let mut p = Packetizer::new(&format, options());
+        let start = SystemClock.now();
+        sent(&mut p, &packet(start, 0, 1, false));
+        let out = sent(&mut p, &packet(start + ms(20), 160, 1, false));
+        // A clock that does not run lets the timeline lead the wall clock
+        // by nothing: held at the first packet's timestamp.
+        assert_eq!((out.pt, out.ts), (97, 1_000));
+    }
+
+    #[test]
+    fn rfc3550_5_1_a_skipped_packet_leaves_a_gap_in_the_sequence_numbers_not_the_timeline() {
+        let mut p = packetizer(&g711(Codec::Pcmu, 0));
+        let start = SystemClock.now();
+        let first = sent(&mut p, &packet(start, 0, 1, false));
+        p.skip(&packet(start + ms(20), 160, 1, false));
+        let next = sent(&mut p, &packet(start + ms(40), 320, 1, false));
+        assert_eq!((first.seq, first.ts), (65_534, 1_000));
+        assert_eq!((next.seq, next.ts, next.marker), (0, 1_000 + 320, false));
+        // RFC 3551 §4.1: a skipped first packet of a talkspurt leaves its
+        // marker to the first one sent, once.
+        let mut p = packetizer(&g711(Codec::Pcmu, 0));
+        p.skip(&packet(start, 0, 1, true));
+        let after = sent(&mut p, &packet(start + ms(20), 160, 1, false));
         assert_eq!(
-            out.rtp,
-            RtpHeaderFields {
-                pt: 97,
-                seq: 65_534,
-                ts: 1_000,
-                marker: true,
-                ssrc: 0x1234_5678,
-            },
-            "RFC 3551 §4.1: the first packet starts a talkspurt"
+            (after.seq, after.ts, after.marker),
+            (65_535, 1_000 + 160, true)
         );
-        assert!(Arc::ptr_eq(&out.payload, &input.payload), "no copy");
+        let then = sent(&mut p, &packet(start + ms(40), 320, 1, false));
+        assert!(!then.marker);
+    }
+
+    #[test]
+    fn rfc3551_4_1_a_skipped_marker_is_spent_by_a_marked_packet_sent_after_it() {
+        let mut p = packetizer(&g711(Codec::Pcmu, 0));
+        let start = SystemClock.now();
+        p.skip(&packet(start, 0, 1, true));
+        let marked = sent(&mut p, &packet(start + ms(20), 160, 1, true));
+        let next = sent(&mut p, &packet(start + ms(40), 320, 1, false));
+        assert!(marked.marker);
+        // The marker left over was the same talkspurt's: the packet after
+        // its first one sent starts none.
+        assert!(!next.marker);
+        assert_eq!(next.seq, marked.seq.wrapping_add(1));
+    }
+
+    #[test]
+    fn rfc2326_10_12_a_payload_larger_than_an_interleaved_frame_is_dropped_its_number_skipped() {
+        let mut p = packetizer(&g711(Codec::Pcmu, 0));
+        let start = SystemClock.now();
+        let mut fits = packet(start, 0, 1, false);
+        fits.payload = Arc::from(vec![0xff_u8; MAX_PAYLOAD]);
+        assert_eq!(p.packetize(&fits, |rtp| rtp.to_vec().len()), Some(65_535));
+        let mut over = packet(start + ms(20), 160, 1, false);
+        over.payload = Arc::from(vec![0xff_u8; MAX_PAYLOAD + 1]);
+        let mut again = packet(start + ms(40), 320, 1, false);
+        again.payload = Arc::clone(&over.payload);
+        let mut called = false;
+        let logs = logged(|| {
+            assert_eq!(p.packetize(&over, |_| called = true), None);
+            assert_eq!(p.packetize(&again, |_| called = true), None);
+        });
+        assert!(!called);
+        // Rate-limited: one line for the two.
+        assert_eq!(
+            logs.matches("interleaved frame carries").count(),
+            1,
+            "{logs}"
+        );
+        assert!(
+            logs.contains("interleaved frame carries; dropped bytes=65524 count=1"),
+            "{logs}"
+        );
+        let next = sent(&mut p, &packet(start + ms(60), 480, 1, false));
+        assert_eq!((next.seq, next.ts), (1, 1_000 + 480));
+    }
+
+    #[test]
+    fn rfc3550_6_4_1_a_sender_report_pairs_the_wall_clock_with_the_timeline_once_due() {
+        let mut p = packetizer(&g711(Codec::Pcmu, 0));
+        let start = SystemClock.now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(p.sender_report(start, wall), None, "no packet yet");
+        // A dropped packet sends nothing to report.
+        let mut over = packet(start, 0, 1, false);
+        over.payload = Arc::from(vec![0xff_u8; MAX_PAYLOAD + 1]);
+        assert_eq!(p.packetize(&over, |_| ()), None);
+        assert_eq!(p.sender_report(start, wall), None, "no packet sent yet");
+        sent(&mut p, &packet(start + ms(20), 160, 1, false));
+        // 250 ms ahead of the wall clock, as far as the lead lets it.
+        sent(&mut p, &packet(start + ms(40), 160 + 2_000, 1, false));
+        let report = p.sender_report(start + ms(500), wall).unwrap();
+        // RFC 3550 §6.4.1: V=2, no report blocks, PT=SR, six more words.
+        assert_eq!(report[..4], [0x80, 200, 0, 6]);
+        let word = |at: usize| u32::from_be_bytes(report[at..at + 4].try_into().unwrap());
+        assert_eq!(word(4), 0x1234_5678, "our SSRC");
+        let ntp = u64::from_be_bytes(report[8..16].try_into().unwrap());
+        assert_eq!(ntp, NtpTimestamp::from(wall).0);
+        // 460 ms after the last packet sent: 3,680 ticks on from it, not
+        // from the first, which went out 250 ms behind it.
+        assert_eq!(
+            word(16),
+            1_000 + 160 + 2_000 + 3_680,
+            "the RTP timestamp of the wall clock"
+        );
+        assert_eq!((word(20), word(24)), (2, 320), "packets and payload octets");
+        // §6.1: the compound packet goes on with the SDES CNAME.
+        assert_eq!(report[29], 202);
+        // §6.3.1: the next one is due seconds later, not at once.
+        assert_eq!(p.sender_report(start + ms(500), wall), None);
+        assert!(
+            p.sender_report(start + Duration::from_secs(10), wall)
+                .is_some()
+        );
     }
 
     #[test]
@@ -853,9 +1055,11 @@ mod tests {
         let start = SystemClock.now();
         let seqs: Vec<u16> = (0_u32..4)
             .map(|k| {
-                p.packetize(&packet(start + ms(20 * u64::from(k)), 160 * k, 1, false))
-                    .rtp
-                    .seq
+                sent(
+                    &mut p,
+                    &packet(start + ms(20 * u64::from(k)), 160 * k, 1, false),
+                )
+                .seq
             })
             .collect();
         assert_eq!(seqs, [65_534, 65_535, 0, 1]);
@@ -865,19 +1069,14 @@ mod tests {
     fn rfc3550_5_1_timestamps_follow_the_input_within_a_talkspurt_and_wrap() {
         let mut p = Packetizer::new(
             &g711(Codec::Pcmu, 0),
-            Initial {
-                ts: u32::MAX - 159,
-                ..INITIAL
-            },
+            options().timestamp_offset(u32::MAX - 159),
         );
         let start = SystemClock.now();
         // Arrival jitter does not move the timestamps: the input's timing is kept.
         let out: Vec<(u32, bool)> = [(0, 0), (160, 25), (320, 38), (640, 80)]
             .into_iter()
             .map(|(ts, at)| {
-                let rtp = p
-                    .packetize(&packet(start + ms(at), 5_000 + ts, 1, false))
-                    .rtp;
+                let rtp = sent(&mut p, &packet(start + ms(at), 5_000 + ts, 1, false));
                 (rtp.ts, rtp.marker)
             })
             .collect();
@@ -896,11 +1095,11 @@ mod tests {
     fn rfc3551_4_1_a_marked_input_starts_a_talkspurt_advanced_by_the_time_that_passed() {
         let mut p = packetizer(&g711(Codec::Pcmu, 0));
         let start = SystemClock.now();
-        p.packetize(&packet(start, 0, 1, false));
-        p.packetize(&packet(start + ms(20), 160, 1, false));
+        sent(&mut p, &packet(start, 0, 1, false));
+        sent(&mut p, &packet(start + ms(20), 160, 1, false));
         // A restarted chain: timestamps from zero again, 500 ms later.
         let mut out = None;
-        let logs = logged(|| out = Some(p.packetize(&packet(start + ms(520), 0, 1, true)).rtp));
+        let logs = logged(|| out = Some(sent(&mut p, &packet(start + ms(520), 0, 1, true))));
         assert!(
             logs.contains("talkspurt marker=true sender_changed=false"),
             "{logs}"
@@ -910,7 +1109,7 @@ mod tests {
         assert!(out.marker);
         assert_eq!(out.ts, 1_000 + 160 + 4_000, "RFC 3550 §5.1");
         // The new talkspurt's offset carries on.
-        let next = p.packetize(&packet(start + ms(540), 160, 1, false)).rtp;
+        let next = sent(&mut p, &packet(start + ms(540), 160, 1, false));
         assert_eq!((next.ts, next.marker), (1_000 + 160 + 4_000 + 160, false));
     }
 
@@ -918,9 +1117,9 @@ mod tests {
     fn rfc3551_4_1_another_sender_starts_a_talkspurt() {
         let mut p = packetizer(&g711(Codec::Pcma, 8));
         let start = SystemClock.now();
-        p.packetize(&packet(start, 90_000, 1, false));
+        sent(&mut p, &packet(start, 90_000, 1, false));
         let mut out = None;
-        let logs = logged(|| out = Some(p.packetize(&packet(start + ms(1_000), 3, 2, false)).rtp));
+        let logs = logged(|| out = Some(sent(&mut p, &packet(start + ms(1_000), 3, 2, false))));
         assert!(
             logs.contains("talkspurt marker=false sender_changed=true"),
             "{logs}"
@@ -934,13 +1133,13 @@ mod tests {
     fn a_talkspurt_soon_after_the_last_packet_does_not_overlap_it() {
         let mut p = packetizer(&g711(Codec::Pcmu, 0));
         let start = SystemClock.now();
-        p.packetize(&packet(start, 0, 1, false));
-        p.packetize(&packet(start + ms(20), 160, 1, false));
+        sent(&mut p, &packet(start, 0, 1, false));
+        sent(&mut p, &packet(start + ms(20), 160, 1, false));
         // 5 ms later is 40 ticks, inside the last 160-sample packet.
-        let out = p.packetize(&packet(start + ms(25), 0, 2, true)).rtp;
+        let out = sent(&mut p, &packet(start + ms(25), 0, 2, true));
         assert_eq!(out.ts, 1_000 + 160 + 160);
         // An arrival before the last packet's counts as no time.
-        let back = p.packetize(&packet(start, 0, 3, true)).rtp;
+        let back = sent(&mut p, &packet(start, 0, 3, true));
         assert_eq!(back.ts, 1_000 + 160 + 160 + 160);
     }
 
@@ -949,11 +1148,11 @@ mod tests {
         let mut p = packetizer(&g711(Codec::Pcmu, 0));
         let start = SystemClock.now();
         for ts in [0, 320, 160, 160] {
-            p.packetize(&packet(start, ts, 1, false));
+            sent(&mut p, &packet(start, ts, 1, false));
         }
         // The spacing is 0 → 320; 320 → 160 runs back and 160 → 160 stands
         // still, so neither is a packet duration.
-        let out = p.packetize(&packet(start, 0, 2, false)).rtp;
+        let out = sent(&mut p, &packet(start, 0, 2, false));
         assert_eq!(out.ts, 1_000 + 160 + 320);
     }
 
@@ -961,15 +1160,15 @@ mod tests {
     fn rfc3550_5_1_a_step_of_half_the_range_is_backwards() {
         let mut p = packetizer(&g711(Codec::Pcmu, 0));
         let start = SystemClock.now();
-        p.packetize(&packet(start, 0, 1, false));
-        p.packetize(&packet(start, 160, 1, false));
+        sent(&mut p, &packet(start, 0, 1, false));
+        sent(&mut p, &packet(start, 160, 1, false));
         // Behind the last packet's on the nearer reading, by more than the
         // lead: no packet spacing, and no reordering but a discontinuity,
         // a talkspurt one spacing on.
-        let back = p.packetize(&packet(start, 160 + HALF_RANGE, 1, false)).rtp;
+        let back = sent(&mut p, &packet(start, 160 + HALF_RANGE, 1, false));
         assert_eq!((back.ts, back.marker), (1_000 + 160 + 160, true));
         // The next talkspurt steps the spacing before the jump on again.
-        let out = p.packetize(&packet(start, 0, 2, false)).rtp;
+        let out = sent(&mut p, &packet(start, 0, 2, false));
         assert_eq!(out.ts, 1_000 + 160 + 160 + 160);
     }
 
@@ -983,8 +1182,8 @@ mod tests {
         };
         let mut p = packetizer(&opus);
         let start = SystemClock.now();
-        p.packetize(&packet(start, 0, 1, false));
-        let out = p.packetize(&packet(start + ms(100), 0, 2, false)).rtp;
+        sent(&mut p, &packet(start, 0, 1, false));
+        let out = sent(&mut p, &packet(start + ms(100), 0, 2, false));
         assert_eq!((out.pt, out.ts), (111, 1_000 + 4_800));
     }
 
@@ -993,7 +1192,7 @@ mod tests {
     fn leads(out: &[(u32, Instant)], start: Instant, rate: u32) -> Vec<u32> {
         out.iter()
             .map(|(ts, at)| {
-                ts.wrapping_sub(INITIAL.ts)
+                ts.wrapping_sub(OFFSET)
                     .saturating_sub(ticks(at.saturating_duration_since(start), rate))
             })
             .collect()
@@ -1011,7 +1210,7 @@ mod tests {
         let logs = logged(|| {
             for k in 0..50_u32 {
                 let at = start + ms(20 * u64::from(k));
-                let rtp = p.packetize(&packet(at, 800 * k, 1, k % 2 == 1)).rtp;
+                let rtp = sent(&mut p, &packet(at, 800 * k, 1, k % 2 == 1));
                 out.push((rtp.ts, at));
             }
         });
@@ -1045,7 +1244,7 @@ mod tests {
         let out: Vec<(u32, Instant)> = (0..50_u32)
             .map(|k| {
                 let at = start + ms(20 * u64::from(k));
-                (p.packetize(&packet(at, 4_800 * k, 1, false)).rtp.ts, at)
+                (sent(&mut p, &packet(at, 4_800 * k, 1, false)).ts, at)
             })
             .collect();
         let leads = leads(&out, start, 48_000);
@@ -1070,7 +1269,7 @@ mod tests {
         let logs = logged(|| {
             for (ts, at) in [(0, 0), (HALF_RANGE, 20), (480_000, 40)] {
                 let at = start + ms(at);
-                out.push((p.packetize(&packet(at, ts, 1, false)).rtp.ts, at));
+                out.push((sent(&mut p, &packet(at, ts, 1, false)).ts, at));
             }
         });
         assert!(
@@ -1103,7 +1302,7 @@ mod tests {
             (480, 60),
         ]
         .into_iter()
-        .map(|(ts, at)| p.packetize(&packet(start + ms(at), ts, 1, false)).rtp.ts)
+        .map(|(ts, at)| sent(&mut p, &packet(start + ms(at), ts, 1, false)).ts)
         .collect();
         assert_eq!(out, [1_000, 1_160, 1_480, 1_320, 1_640]);
     }
@@ -1112,17 +1311,15 @@ mod tests {
     fn rfc3550_5_1_a_step_back_of_the_lead_is_reordering_a_tick_more_a_discontinuity() {
         let mut p = packetizer(&g711(Codec::Pcmu, 0));
         let start = SystemClock.now();
-        p.packetize(&packet(start, 2_000, 1, false));
+        sent(&mut p, &packet(start, 2_000, 1, false));
         // Exactly MAX_LEAD (2,000 ticks) back: reordering, in place.
-        let reordered = p.packetize(&packet(start, 0, 1, false)).rtp;
+        let reordered = sent(&mut p, &packet(start, 0, 1, false));
         assert_eq!(
             (reordered.ts, reordered.marker),
             (1_000_u32.wrapping_sub(2_000), false)
         );
         // A tick more back from that one: a discontinuity, a talkspurt.
-        let jumped = p
-            .packetize(&packet(start, 0_u32.wrapping_sub(2_001), 1, false))
-            .rtp;
+        let jumped = sent(&mut p, &packet(start, 0_u32.wrapping_sub(2_001), 1, false));
         assert!(jumped.marker);
     }
 
@@ -1130,15 +1327,13 @@ mod tests {
     fn rfc3550_5_1_exactly_the_lead_ahead_stands_a_tick_more_is_held() {
         let mut p = packetizer(&g711(Codec::Pcmu, 0));
         let start = SystemClock.now();
-        p.packetize(&packet(start, 0, 1, false));
-        let at_lead = p.packetize(&packet(start, 2_000, 1, false)).rtp;
+        sent(&mut p, &packet(start, 0, 1, false));
+        let at_lead = sent(&mut p, &packet(start, 2_000, 1, false));
         assert_eq!(at_lead.ts, 1_000 + 2_000, "exactly MAX_LEAD ahead");
-        let past = p.packetize(&packet(start, 2_001, 1, false)).rtp;
+        let past = sent(&mut p, &packet(start, 2_001, 1, false));
         assert_eq!(past.ts, 1_000 + 2_000, "held at the wall clock's limit");
         // The talkspurt follows on from where it was held.
-        let next = p
-            .packetize(&packet(start + ms(20), 2_001 + 160, 1, false))
-            .rtp;
+        let next = sent(&mut p, &packet(start + ms(20), 2_001 + 160, 1, false));
         assert_eq!((next.ts, next.marker), (1_000 + 2_000 + 160, false));
     }
 
@@ -1153,9 +1348,12 @@ mod tests {
 
     #[test]
     fn rfc3550_8_1_initial_values_are_random() {
-        let a = Initial::random().unwrap();
-        let b = Initial::random().unwrap();
+        let first = || {
+            let mut p = Packetizer::new(&g711(Codec::Pcmu, 0), SenderOptions::default());
+            let out = sent(&mut p, &packet(SystemClock.now(), 0, 1, false));
+            (out.ssrc, out.seq, out.ts)
+        };
         // 80 random bits: equal only once in 2⁸⁰.
-        assert_ne!(a, b);
+        assert_ne!(first(), first());
     }
 }

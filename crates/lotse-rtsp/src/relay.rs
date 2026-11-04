@@ -2,11 +2,15 @@
 //! plain RTSP to a listener on `127.0.0.1`, and the relay carries it to the
 //! camera, over TCP for `rtsp` and the TLS stream for `rtsps`.
 //!
-//! retina 0.4 opens its own `TcpStream` from the URL and has no way to be
-//! handed a stream or to speak TLS. So the source connects to the camera
-//! itself (and completes the TLS handshake for `rtsps`), then lets retina
-//! connect to the relay's listener and copies bytes both ways between that
-//! one connection and the camera. retina's requests go on whole; what the
+//! retina's tokio `Session`, which the source drives, opens its own
+//! `TcpStream` from the URL and has no way to be handed a stream or to
+//! speak TLS. retina 0.5's sans-I/O `SessionCore` would take any stream,
+//! `rtsps` included, but the UDP media and the backchannel still go
+//! through the tokio `Session` here, so the relay stays until they move to
+//! the core. So the source connects to the camera itself (and completes
+//! the TLS handshake for `rtsps`), then lets retina connect to the relay's
+//! listener and copies bytes both ways between that one connection and
+//! the camera. retina's requests go on whole; what the
 //! camera sends goes on as it arrives, interleaved RTP included.
 //!
 //! In a sandboxed worker Landlock allows TCP `bind` and `connect` only on

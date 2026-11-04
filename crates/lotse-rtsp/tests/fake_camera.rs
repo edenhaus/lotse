@@ -32,6 +32,7 @@ use lotse_core::backoff::ReconnectBackoff;
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::clock_map::{ClockMapper, SyncMode};
 use lotse_core::codec::Codec;
+use lotse_core::ingest::IngestStats;
 use lotse_core::media::{MediaFrame, MediaPacket};
 use lotse_core::runner::{ConnectGate, RunnerConfig, RunnerEvent, SourceRunner};
 use lotse_core::source::{
@@ -680,6 +681,78 @@ async fn next_event(sub: &mut TrackSubscription) -> TrackEvent {
     }
 }
 
+/// Plays `config` over TCP until `keyframes` keyframes went by after the
+/// source went live, then cancels: the frames seen, and the ingest
+/// counters. The attempt must still be running when cancelled.
+async fn play_tcp(config: CameraConfig, keyframes: usize) -> (usize, IngestStats) {
+    let cam = camera(config).await;
+    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(harness.wait_ready().await, "live over TCP");
+    let v0 = harness.tracks.tracks()[0].clone();
+    let mut frames = v0.subscribe_frames();
+    let (mut seen, mut keys) = (0, 0);
+    let deadline = clock().now() + Duration::from_secs(10);
+    while clock().now() < deadline && keys < keyframes {
+        loop {
+            match frames.try_recv() {
+                Ok(Some(frame)) => {
+                    seen += 1;
+                    keys += usize::from(frame.keyframe);
+                }
+                Ok(None) | Err(SubscriptionError::Closed) => break,
+                Err(SubscriptionError::Lagged(_)) => {}
+            }
+        }
+        clock().sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(keys, keyframes, "{seen} frames");
+    let stats = harness.tracks.ingest();
+    harness.cancel();
+    let exit = harness.finish().await;
+    assert!(
+        matches!(exit, SourceError::Ended(ref m) if m == "cancelled"),
+        "the attempt went on until cancelled: {exit:?}"
+    );
+    cam.stop().await;
+    (seen, stats)
+}
+
+/// RFC 3550 §A.1: over TCP, a packet behind the stream (here a copy of
+/// one already received) is dropped by retina's reorderer; the session
+/// goes on, and nothing reads as lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3550_a_1_a_late_packet_over_tcp_is_dropped_and_the_session_goes_on() {
+    let (frames, stats) = play_tcp(
+        CameraConfig {
+            late_every: Some(5),
+            ..CameraConfig::default()
+        },
+        6,
+    )
+    .await;
+    assert!(frames >= 50, "{frames} frames");
+    assert_eq!(stats, IngestStats::default());
+}
+
+/// RFC 3550 §A.1: over TCP, sequence numbers that jump past
+/// `MAX_DROPOUT` and go on from there are a sender restart: media resumes
+/// after it, and the jump is no loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3550_a_1_a_sequence_restart_over_tcp_resumes_the_media_without_counting_loss() {
+    // At frame 40, 1.3 s in, the numbers move 20 000 ahead.
+    let (frames, stats) = play_tcp(
+        CameraConfig {
+            seq_jump: Some((40, 20_000)),
+            ..CameraConfig::default()
+        },
+        6,
+    )
+    .await;
+    assert!(frames >= 50, "past the restart: {frames} frames");
+    assert_eq!(stats, IngestStats::default());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_timestamp_reset_starts_one_epoch_and_forgets_the_clock_fit() {
     // Mid-GOP, 2 s in, the camera's clock jumps by 0x9000_0000 ticks: back
@@ -1063,22 +1136,51 @@ async fn libwebrtc_max_frame_packets_a_larger_keyframe_is_counted_and_warned_abo
     );
 }
 
+/// The most bytes of camera text one value of a log line carries
+/// (`lotse_rtsp`'s `CAMERA_TEXT_BYTES`).
+const CAMERA_TEXT_BYTES: usize = 200;
+
 /// A camera key in the path, a token in the query and a password: none
-/// of them in any log line (down to `trace`), in the exit of a failed or a
-/// cancelled session, or in the description.
+/// of them in any log line (down to `trace`, in text and in JSON with the
+/// span list), in the exit of a failed or a cancelled session, or in the
+/// description. retina's lines go through the layer the daemon writes
+/// them with ([`lotse_rtsp::retina_log::RetinaLog`]), and the camera makes
+/// it say what echoes the request URL: an `RTP-Info` whose `rtptime` is no
+/// number (the header in the warning), a media line retina cannot parse
+/// with an absolute control URL (the whole SDP in the warning), and the
+/// head of each `SETUP` answer (`{:#?}`, at `debug`). Each is logged on
+/// one line, its camera text capped.
 #[tokio::test(flavor = "current_thread")]
 async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
+    use lotse_rtsp::retina_log::{RetinaLog, no_retina_spans};
+    use tracing_subscriber::filter::filter_fn;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
     const SECRETS: [&str; 3] = ["camkey7f3a", "tok9d2e", "pw5b1c"];
-    let captured = Captured::default();
-    let writer = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
+    let (captured, json) = (Captured::default(), Captured::default());
+    let (writer, objects) = (captured.clone(), json.clone());
+    let time: Arc<dyn Clock> = Arc::new(SystemClock);
+    let lines = tracing_subscriber::fmt::layer()
         .with_writer(move || writer.clone())
-        .with_max_level(tracing::Level::TRACE)
-        .with_ansi(false)
-        .finish();
+        .with_ansi(false);
+    let lines_json = tracing_subscriber::fmt::layer()
+        .with_writer(move || objects.clone())
+        .json()
+        .with_span_list(true);
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_fn(no_retina_spans))
+        .with(RetinaLog::new(lines, Arc::clone(&time)))
+        .with(RetinaLog::new(lines_json, time));
     let _logs = tracing::subscriber::set_default(subscriber);
     let cam = camera(CameraConfig {
         auth: Some(("admin".into(), "pw5b1c".into())),
+        rtptime: Some("tok9d2e".into()),
+        // A relative control early in the SDP, which no scheme marks as a
+        // URL (RFC 2326 §C.1.1), and retina's own `a=control` after it.
+        sdp_session_lines: "a=control:/camkey7f3a/live?token=tok9d2e\r\n".into(),
+        sdp_media_lines: "m=video 0 RTP/AVP 200\r\n\
+             a=control:rtsp://cam.example/camkey7f3a/live?token=tok9d2e/track9\r\n"
+            .into(),
         ..CameraConfig::default()
     })
     .await;
@@ -1108,11 +1210,31 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
     }
     cam.stop().await;
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let json = String::from_utf8(json.0.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("rtsp: describing"), "{logs}");
+    // retina's three, each on one line, its camera text capped.
+    for said in [
+        "Unparseable rtptime in RTP-Info header",
+        "Ignoring unparseable stream",
+        "SETUP response:",
+    ] {
+        let line = logs.lines().find(|line| line.contains(said));
+        let line = line.unwrap_or_else(|| panic!("{said}: {logs}"));
+        let text = line.split_once(said).unwrap().1;
+        let text = text.split(" retina=").next().unwrap();
+        assert!(
+            text.len() <= 2 * CAMERA_TEXT_BYTES,
+            "{said}: {} bytes: {line}",
+            text.len()
+        );
+        assert!(json.contains(said), "{said}: {json}");
+    }
+    assert!(!logs.contains("rtsp_request"), "{logs}");
     let printed = printed.join("\n");
     assert!(printed.contains("AuthFailed"), "{printed}");
     for (index, secret) in SECRETS.iter().enumerate() {
         assert!(!logs.contains(secret), "SECRETS[{index}] logged:\n{logs}");
+        assert!(!json.contains(secret), "SECRETS[{index}] logged:\n{json}");
         assert!(
             !printed.contains(secret),
             "SECRETS[{index}] printed:\n{printed}"

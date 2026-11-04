@@ -19,6 +19,7 @@ mod fmtp;
 mod framer;
 pub mod options;
 mod relay;
+pub mod retina_log;
 mod rtcp;
 mod source;
 mod tap;
