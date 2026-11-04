@@ -108,15 +108,56 @@ pub fn refusal(status: Option<u16>, error: &SourceError) -> BackchannelRefused {
 pub struct Offer {
     /// Its position among the SDP's media descriptions.
     pub media: usize,
+    /// How many media descriptions the SDP has: when retina parsed them
+    /// all, its stream indices are the SDP's, and the stream at `media` is
+    /// the backchannel's.
+    pub medias: usize,
     /// The first payload type of its `m=` line: the `rtp_payload_type` of
-    /// the retina stream that carries it, by which the source finds that
-    /// stream, since retina's stream indices skip media it cannot parse.
+    /// the retina stream that carries it, by which the source checks that
+    /// stream, and finds it when retina skipped media it cannot parse.
     /// It is also the payload type retina stamps on every packet sent on
     /// that stream, so it equals `format.payload_type` ([`offer`] takes no
     /// other).
     pub first_payload_type: u8,
     /// The format the talk-back chain sends it.
     pub format: BackchannelFormat,
+}
+
+impl Offer {
+    /// The index of the retina stream that carries this backchannel among
+    /// `streams`, one entry per retina stream in its order: whether its
+    /// direction is `Sending`, and its `rtp_payload_type`. When retina
+    /// parsed every media description, its indices are the SDP's, and the
+    /// stream is the one at [`Offer::media`] if it sends with the first
+    /// payload type; when it skipped some, the one stream that sends with
+    /// that payload type, since of several, another media's could come
+    /// first. `None` when there is none, or several.
+    pub fn stream(&self, streams: &[(bool, u8)]) -> Option<usize> {
+        let carries = |&(sending, payload_type): &(bool, u8)| {
+            sending && payload_type == self.first_payload_type
+        };
+        if streams.len() == self.medias {
+            return streams
+                .get(self.media)
+                .filter(|stream| carries(stream))
+                .map(|_| self.media);
+        }
+        let mut carrying = streams
+            .iter()
+            .enumerate()
+            .filter(|(_, stream)| carries(stream))
+            .map(|(index, _)| index);
+        let first = carrying.next()?;
+        if carrying.next().is_some() {
+            tracing::info!(
+                media = self.media,
+                payload_type = self.first_payload_type,
+                "rtsp: retina skipped a media description and sends on several streams with the backchannel's payload type; no backchannel"
+            );
+            return None;
+        }
+        Some(first)
+    }
 }
 
 /// The direction attributes (RFC 8866 §6.7).
@@ -159,6 +200,7 @@ pub fn offer(sdp: &[u8]) -> Option<Offer> {
     let default = direction(&session.attributes);
     let sendonly =
         |media: &sdp_types::Media| direction(&media.attributes).or(default) == Some("sendonly");
+    let medias = session.medias.len();
     let offer = session
         .medias
         .iter()
@@ -179,6 +221,7 @@ pub fn offer(sdp: &[u8]) -> Option<Offer> {
             }
             Some(Offer {
                 media: index,
+                medias,
                 first_payload_type,
                 format,
             })
@@ -368,6 +411,7 @@ mod tests {
             offer(&answer),
             Some(Offer {
                 media: 2,
+                medias: 4,
                 first_payload_type: 97,
                 format: BackchannelFormat {
                     codec: Codec::Pcma,
@@ -375,6 +419,36 @@ mod tests {
                     ..pcmu(97)
                 },
             })
+        );
+    }
+
+    /// The backchannel's retina stream is its media's, not the first that
+    /// sends with its payload type: two `sendonly` media may share one.
+    #[test]
+    fn onvif_5_3_2_the_backchannels_stream_is_its_medias_not_the_first_with_its_payload_type() {
+        // G.722 at 96 first is no backchannel; PCMU at 96 after it is.
+        let answer = sdp(&[
+            "m=audio 0 RTP/AVP 96 0",
+            "a=rtpmap:96 G722/8000",
+            "a=sendonly",
+            "m=audio 0 RTP/AVP 96",
+            "a=rtpmap:96 PCMU/8000",
+            "a=sendonly",
+        ]);
+        let offer = offer(&answer).unwrap();
+        assert_eq!((offer.media, offer.medias), (1, 2));
+        // retina parsed both: the stream at the media's index.
+        assert_eq!(offer.stream(&[(true, 96), (true, 96)]), Some(1));
+        assert_eq!(offer.stream(&[(true, 96), (false, 96)]), None);
+        assert_eq!(offer.stream(&[(true, 96), (true, 97)]), None);
+        // retina skipped one: the one stream that sends with 96, else none.
+        assert_eq!(offer.stream(&[(true, 96)]), Some(0));
+        assert_eq!(offer.stream(&[(false, 96)]), None);
+        let three = Offer { medias: 3, ..offer };
+        let log = logged(|| assert_eq!(three.stream(&[(true, 96), (true, 96)]), None));
+        assert!(
+            log.contains("sends on several streams with the backchannel's payload type"),
+            "{log}"
         );
     }
 
