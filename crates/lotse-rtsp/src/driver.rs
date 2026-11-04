@@ -30,6 +30,9 @@
 //! A teardown runs under a [`Budget`]: the attempt on the session's own
 //! connection is bounded tightly, and only when retina retries on a fresh
 //! connection does the bound grow, so that a dial and a TLS handshake fit.
+//! A cancellation, before the teardown or during it, bounds what is left
+//! at the tight bound from then on, fresh connections included, so the
+//! source honors its cancel within the source contract's 100 ms.
 //!
 //! The core is built for more than this one path: RTP over UDP (the core's
 //! UDP buffers and transmits, sockets the caller binds) and the ONVIF
@@ -43,7 +46,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::FutureExt as _;
@@ -58,6 +61,7 @@ use retina::client::{
 };
 use retina::rtp::Continuity;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::error::classify;
@@ -484,11 +488,20 @@ impl Driver {
     /// (RFC 2326 §10.7, RFC 7826 §13.7): first on the session's own
     /// connection, then, when the policy retries, on fresh ones from
     /// `dial`, until the camera answered, retina gives up, or `budget`
-    /// runs out, which leaves the session to expire on the camera. Nothing
-    /// when no `SETUP` succeeded. retina words a write that failed during
-    /// it as a read from the peer; the attempt's failure is only logged
-    /// at `debug`, by retina.
-    pub(crate) async fn teardown(self, dial: &Dial<'_>, budget: Budget) {
+    /// runs out, which leaves the session to expire on the camera (RFC
+    /// 2326 §12.37). Once `cancel` fires, before the teardown or during
+    /// it, at most `budget.own` is left from then on and the fresh budget
+    /// no longer applies: a dial in progress may finish within it, a
+    /// retry beyond it is not waited for. Nothing when no `SETUP`
+    /// succeeded. retina words a write that failed during it as a read
+    /// from the peer; the attempt's failure is only logged at `debug`, by
+    /// retina.
+    pub(crate) async fn teardown(
+        self,
+        dial: &Dial<'_>,
+        budget: Budget,
+        cancel: &CancellationToken,
+    ) {
         let Self { core, conn, time } = self;
         let start = time.now();
         let Some(mut teardown) = core.into_teardown(start) else {
@@ -498,11 +511,25 @@ impl Driver {
         let mut limit = start.checked_add(budget.own).unwrap_or(start);
         let mut conn = conn;
         let mut fresh = 0_u32;
+        // Whether a cancellation has bounded the teardown.
+        let mut cut = false;
+        // The fresh connection being dialed, kept across a cancellation.
+        let mut pending: Option<BoxFuture<'static, Result<Connection, SourceError>>> = None;
         loop {
             let now = time.now();
+            if !cut && cancel.is_cancelled() {
+                cut = true;
+                limit = limit.min(now.checked_add(budget.own).unwrap_or(now));
+                tracing::debug!(
+                    fresh,
+                    budget_ms = budget.own.as_millis(),
+                    "rtsp: cancelled; the TEARDOWN gets the cancellation's budget and no fresh one, so the source honors its cancel"
+                );
+            }
             if now >= limit {
                 tracing::debug!(
                     fresh,
+                    cancelled = cut,
                     budget_ms = limit.saturating_duration_since(start).as_millis(),
                     "rtsp: TEARDOWN still pending after its budget; the session is left to expire"
                 );
@@ -510,8 +537,7 @@ impl Driver {
             }
             match teardown.poll(now) {
                 TeardownAction::Io { deadline } => {
-                    let until = deadline.min(limit);
-                    let wait = time.sleep(until.saturating_duration_since(now));
+                    let wait = pause(&*time, cancel, cut, now, deadline.min(limit));
                     let failed = tokio::select! {
                         exchanged = exchange(&mut *conn, &mut teardown) => exchanged.err().map(Failed::into_io),
                         () = wait => None,
@@ -521,37 +547,48 @@ impl Driver {
                     }
                 }
                 TeardownAction::Connect { deadline } => {
-                    conn = closed();
-                    fresh = fresh.saturating_add(1);
-                    limit = limit.max(start.checked_add(budget.fresh).unwrap_or(start));
-                    tracing::debug!(
-                        fresh,
-                        deadline_ms = deadline.saturating_duration_since(now).as_millis(),
-                        "rtsp: TEARDOWN on a fresh connection"
-                    );
-                    let wait = time.sleep(deadline.min(limit).saturating_duration_since(now));
+                    if pending.is_none() {
+                        conn = closed();
+                        fresh = fresh.saturating_add(1);
+                        if !cut {
+                            limit = limit.max(start.checked_add(budget.fresh).unwrap_or(start));
+                        }
+                        tracing::debug!(
+                            fresh,
+                            deadline_ms = deadline.saturating_duration_since(now).as_millis(),
+                            "rtsp: TEARDOWN on a fresh connection"
+                        );
+                    }
+                    let dialing = pending.get_or_insert_with(dial);
+                    let wait = pause(&*time, cancel, cut, now, deadline.min(limit));
                     let dialed = tokio::select! {
-                        dialed = dial() => Some(dialed),
+                        dialed = dialing => Some(dialed),
                         () = wait => None,
                     };
                     match dialed {
                         Some(Ok(dialed)) => {
+                            pending = None;
                             teardown.connected(dialed.local, dialed.peer, time.now());
                             conn = dialed.stream;
                         }
                         Some(Err(err)) => {
+                            pending = None;
                             tracing::debug!(fresh, error = %err, "rtsp: TEARDOWN connection failed");
                             teardown.handle_io_error(io::Error::other(err.to_string()), time.now());
                         }
-                        // At its deadline: the next poll fails the attempt
-                        // as timed out.
-                        None => {}
+                        // At its deadline the next poll fails the attempt as
+                        // timed out, and a retry dials anew; cut short by a
+                        // cancellation, the dial goes on within its budget.
+                        None => {
+                            if time.now() >= deadline {
+                                pending = None;
+                            }
+                        }
                     }
                 }
                 TeardownAction::Wait { until } => {
                     conn = closed();
-                    let until = until.min(limit);
-                    time.sleep(until.saturating_duration_since(now)).await;
+                    pause(&*time, cancel, cut, now, until.min(limit)).await;
                 }
                 // Done, or an action a later retina may add, which this
                 // driver cannot follow.
@@ -561,6 +598,23 @@ impl Driver {
                 }
             }
         }
+    }
+}
+
+/// Sleeps on `time` from `now` until `until`, or until `cancel` fires
+/// unless a cancellation already bounded the teardown (`cut`): the
+/// teardown's waits, cut short by a cancel so that its budget shrinks at
+/// once.
+async fn pause(
+    time: &dyn Clock,
+    cancel: &CancellationToken,
+    cut: bool,
+    now: Instant,
+    until: Instant,
+) {
+    tokio::select! {
+        () = time.sleep(until.saturating_duration_since(now)) => {}
+        () = cancel.cancelled(), if !cut => {}
     }
 }
 
@@ -789,6 +843,10 @@ mod tests {
         let ((), describe) = tokio::join!(session, cam.serve_until_playing());
         describe
     }
+
+    /// The cancellation of a teardown no test cancels.
+    static NEVER: std::sync::LazyLock<CancellationToken> =
+        std::sync::LazyLock::new(CancellationToken::new);
 
     /// A budget no test's teardown reaches.
     const GENEROUS: Budget = Budget {
@@ -1200,7 +1258,7 @@ mod tests {
         described.unwrap();
         let dialer = Dialer::new([]);
         let dial = dial_with(&dialer);
-        driver.teardown(&dial, GENEROUS).await;
+        driver.teardown(&dial, GENEROUS, &NEVER).await;
         assert_eq!(dialer.calls(), 0);
     }
 
@@ -1215,7 +1273,7 @@ mod tests {
             assert!(head.contains("Session: 12345678"), "{head}");
         };
         let dial = dial_with(&dialer);
-        tokio::join!(driver.teardown(&dial, GENEROUS), camera);
+        tokio::join!(driver.teardown(&dial, GENEROUS, &NEVER), camera);
         assert_eq!(dialer.calls(), 0);
     }
 
@@ -1228,7 +1286,7 @@ mod tests {
         let dial = dial_with(&dialer);
         let over = AtomicBool::new(false);
         let teardown = async {
-            driver.teardown(&dial, GENEROUS).await;
+            driver.teardown(&dial, GENEROUS, &NEVER).await;
             over.store(true, Ordering::SeqCst);
         };
         let camera = async {
@@ -1259,7 +1317,7 @@ mod tests {
             fresh: Duration::from_secs(2),
         };
         let teardown = async {
-            driver.teardown(&dial, budget).await;
+            driver.teardown(&dial, budget, &NEVER).await;
             over.store(true, Ordering::SeqCst);
         };
         let camera = async {
@@ -1288,7 +1346,7 @@ mod tests {
             fresh: Duration::from_secs(2),
         };
         let teardown = async {
-            driver.teardown(&dial, budget).await;
+            driver.teardown(&dial, budget, &NEVER).await;
             over.store(true, Ordering::SeqCst);
         };
         let camera = async {
@@ -1304,6 +1362,82 @@ mod tests {
         };
         tokio::join!(teardown, camera);
         assert_eq!(dialer.calls(), 2);
+    }
+
+    /// The source contract's 100 ms to honor a cancel: a teardown that
+    /// starts cancelled gets [`Budget::own`] in all, its fresh connections
+    /// included, never the fresh budget.
+    #[tokio::test]
+    async fn rfc2326_10_7_a_cancelled_teardown_gets_its_own_budget_on_fresh_connections_too() {
+        let _logs = traced();
+        let (clock, mut driver, faults, mut cam) = faulty(TeardownPolicy::Always);
+        played(&mut driver, &mut cam).await;
+        *faults.lock().unwrap() = Fault::Write;
+        let dialer = Dialer::new([Dialed::Hangs]);
+        let dial = dial_with(&dialer);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let over = AtomicBool::new(false);
+        let budget = Budget {
+            own: Duration::from_millis(100),
+            fresh: Duration::from_secs(2),
+        };
+        let teardown = async {
+            driver.teardown(&dial, budget, &cancel).await;
+            over.store(true, Ordering::SeqCst);
+        };
+        let camera = async {
+            until(|| dialer.calls() == 1).await;
+            clock.advance(Duration::from_millis(99));
+            settle().await;
+            assert!(!over.load(Ordering::SeqCst), "stopped before its budget");
+            clock.advance(Duration::from_millis(1));
+            until(|| over.load(Ordering::SeqCst)).await;
+        };
+        tokio::join!(teardown, camera);
+        assert_eq!(dialer.calls(), 1);
+    }
+
+    /// A cancel while a retry dials a fresh connection leaves the teardown
+    /// [`Budget::own`] from then on, the dial in progress kept rather than
+    /// dialed again, and then the session is left to expire (RFC 2326
+    /// §12.37).
+    #[tokio::test]
+    async fn rfc2326_10_7_a_cancel_during_a_fresh_connection_retry_stops_it_within_its_own_budget()
+    {
+        let _logs = traced();
+        let (clock, mut driver, faults, mut cam) = faulty(TeardownPolicy::Always);
+        played(&mut driver, &mut cam).await;
+        *faults.lock().unwrap() = Fault::Write;
+        let dialer = Dialer::new([Dialed::Hangs, Dialed::Hangs]);
+        let dial = dial_with(&dialer);
+        let cancel = CancellationToken::new();
+        let over = AtomicBool::new(false);
+        let budget = Budget {
+            own: Duration::from_millis(100),
+            fresh: Duration::from_secs(2),
+        };
+        let teardown = async {
+            driver.teardown(&dial, budget, &cancel).await;
+            over.store(true, Ordering::SeqCst);
+        };
+        let camera = async {
+            // The first fresh dial hangs past its 1 s deadline: the retry
+            // dials again, its budget up to 2 s.
+            until(|| dialer.calls() == 1).await;
+            clock.advance(Duration::from_secs(1));
+            until(|| dialer.calls() == 2).await;
+            cancel.cancel();
+            settle().await;
+            assert!(!over.load(Ordering::SeqCst), "the cancellation's budget");
+            clock.advance(Duration::from_millis(99));
+            settle().await;
+            assert!(!over.load(Ordering::SeqCst), "stopped before its budget");
+            clock.advance(Duration::from_millis(1));
+            until(|| over.load(Ordering::SeqCst)).await;
+        };
+        tokio::join!(teardown, camera);
+        assert_eq!(dialer.calls(), 2, "the dial in progress, not a new one");
     }
 
     #[tokio::test]
@@ -1326,7 +1460,7 @@ mod tests {
             assert!(head.contains("Session: 12345678"), "{head}");
         };
         let dial = dial_with(&dialer);
-        tokio::join!(driver.teardown(&dial, GENEROUS), camera);
+        tokio::join!(driver.teardown(&dial, GENEROUS, &NEVER), camera);
         assert_eq!(dialer.calls(), 3);
     }
 
@@ -1342,7 +1476,7 @@ mod tests {
             drop(cam);
         };
         let dial = dial_with(&dialer);
-        tokio::join!(driver.teardown(&dial, GENEROUS), camera);
+        tokio::join!(driver.teardown(&dial, GENEROUS, &NEVER), camera);
         assert_eq!(dialer.calls(), 0);
     }
 
