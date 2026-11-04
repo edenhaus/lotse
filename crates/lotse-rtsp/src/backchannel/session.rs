@@ -130,6 +130,14 @@ pub struct Offer {
     /// no longer the SDP's. It is the camera's text, compared and never
     /// logged.
     pub control: Option<String>,
+    /// The `a=control` values, as [`Offer::control`] reads them, of the
+    /// other media descriptions whose first payload type is this one's:
+    /// their retina streams would look like the backchannel's but for
+    /// their control URL. When retina skipped media, the stream on the
+    /// backchannel's control is taken only if none of these could be on the
+    /// same URL, since the base URL retina resolves
+    /// them against is not the source's to see.
+    pub rivals: Vec<Option<String>>,
     /// The format the talk-back chain sends it.
     pub format: BackchannelFormat,
 }
@@ -162,6 +170,40 @@ fn resolves_to(url: &str, control: &str) -> bool {
             .is_some_and(|base| base.ends_with('/'))
 }
 
+/// Whether a relative `control` reads the same once retina appends it to
+/// the base URL and the `url` crate parses the result (WHATWG URL Standard,
+/// path state: no percent-encoding, no dot segments to remove): not empty,
+/// not `*`, of RFC 3986 §2.3's unreserved characters and §3.3's
+/// sub-delimiters, `:`, `@` and `/` alone, with no `.` or `..` segment.
+fn is_plain(control: &str) -> bool {
+    !control.is_empty()
+        && control != AGGREGATE_CONTROL
+        && control
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&byte))
+        && control
+            .split('/')
+            .all(|segment| segment != "." && segment != "..")
+}
+
+/// Whether retina could have resolved `control`, another media's
+/// `a=control` value, to `url` against some base URL: `false` only when it
+/// provably could not. A media without a control value has a stream
+/// without a control URL; an absolute control is its URL as the `url` crate
+/// writes it, as retina parses it (its `join_control`); a plain relative one
+/// ([`is_plain`]) ends the URL after a `/` ([`resolves_to`]), whatever the
+/// base. `*`, an empty control and one the URL parser rewrites could be on
+/// any URL, as far as the source can tell.
+fn could_resolve_to(url: &str, control: Option<&str>) -> bool {
+    let Some(control) = control else {
+        return false;
+    };
+    if let Ok(absolute) = url::Url::parse(control) {
+        return absolute.as_str() == url;
+    }
+    !is_plain(control) || resolves_to(url, control)
+}
+
 impl Offer {
     /// The index of the retina stream that carries this backchannel among
     /// `streams`, one [`Candidate`] per retina stream in its order.
@@ -175,9 +217,13 @@ impl Offer {
     /// each media of an aggregate presentation has its own), so that the
     /// chain's bytes never go out on another media's stream. `None` when
     /// the media has no control of its own (none, an empty one, or `*`),
-    /// when no stream or several match it, or when retina's URL parser
+    /// when no stream or several match it, when retina's URL parser
     /// rewrote the control so that it no longer reads as the camera wrote
-    /// it: an uncertain mapping is no backchannel, logged at info.
+    /// it, or when another media with the same payload type could be on
+    /// the stream's URL ([`Offer::rivals`]; `track2` and `other/track2`
+    /// both end `…/other/track2` against different bases, and retina may
+    /// have dropped the backchannel's): an uncertain mapping is no
+    /// backchannel, logged at info.
     pub fn stream(&self, streams: &[Candidate<'_>]) -> Option<usize> {
         let carries = |stream: &Candidate<'_>| {
             stream.sending && stream.payload_type == self.first_payload_type
@@ -199,14 +245,11 @@ impl Offer {
             );
             return None;
         };
-        let mut carrying = streams
-            .iter()
-            .enumerate()
-            .filter(|(_, stream)| {
-                carries(stream) && stream.control.is_some_and(|url| resolves_to(url, control))
-            })
-            .map(|(index, _)| index);
-        let Some(first) = carrying.next() else {
+        let mut carrying = streams.iter().enumerate().filter_map(|(index, stream)| {
+            let url = stream.control?;
+            (carries(stream) && resolves_to(url, control)).then_some((index, url))
+        });
+        let Some((first, url)) = carrying.next() else {
             tracing::info!(
                 media = self.media,
                 payload_type = self.first_payload_type,
@@ -219,6 +262,18 @@ impl Offer {
                 media = self.media,
                 payload_type = self.first_payload_type,
                 "rtsp: retina skipped a media description, and several streams it sends on with the backchannel's payload type have its media's control URL; no backchannel"
+            );
+            return None;
+        }
+        if self
+            .rivals
+            .iter()
+            .any(|rival| could_resolve_to(url, rival.as_deref()))
+        {
+            tracing::info!(
+                media = self.media,
+                payload_type = self.first_payload_type,
+                "rtsp: retina skipped a media description, and another media with the backchannel's payload type could be on the stream's control URL; no backchannel"
             );
             return None;
         }
@@ -250,6 +305,13 @@ fn control(media: &sdp_types::Media) -> Option<String> {
         .and_then(|attribute| attribute.value.clone())
 }
 
+/// The first format of `media`'s `m=` line as a payload type (RFC 8866
+/// §5.14), the `rtp_payload_type` of its retina stream; `None` when it is no
+/// number that fits one.
+fn first_payload_type(media: &sdp_types::Media) -> Option<u8> {
+    media.fmt.split_ascii_whitespace().next()?.parse().ok()
+}
+
 /// The backchannel of a `DESCRIBE` answer's SDP `sdp`, sent with the
 /// `Require` header: the first media description that is `sendonly` (media
 /// the client sends to the camera, ONVIF Streaming Specification §5.3.2;
@@ -277,12 +339,22 @@ pub fn offer(sdp: &[u8]) -> Option<Offer> {
         .enumerate()
         .filter(|(_, media)| media.media.eq_ignore_ascii_case("audio") && sendonly(media))
         .find_map(|(index, media)| {
-            let first_payload_type = media.fmt.split_ascii_whitespace().next()?.parse().ok()?;
+            let first_payload_type = first_payload_type(media)?;
             Some(Offer {
                 media: index,
                 medias,
                 first_payload_type,
                 control: control(media),
+                rivals: session
+                    .medias
+                    .iter()
+                    .enumerate()
+                    .filter(|&(other, other_media)| {
+                        other != index
+                            && self::first_payload_type(other_media) == Some(first_payload_type)
+                    })
+                    .map(|(_, other_media)| control(other_media))
+                    .collect(),
                 format: backchannel_format(media)?,
             })
         });
@@ -468,14 +540,19 @@ mod tests {
             "a=sendonly",
             "m=audio 0 RTP/AVP 0",
             "a=sendonly",
+            "m=application 0 RTP/AVP 97",
+            "a=control:trackID=5",
+            "m=video 0 RTP/AVP 97 96",
         ]);
         assert_eq!(
             offer(&answer),
             Some(Offer {
                 media: 2,
-                medias: 4,
+                medias: 6,
                 first_payload_type: 97,
                 control: None,
+                // The other media whose first payload type is 97.
+                rivals: vec![Some("trackID=5".into()), None],
                 format: BackchannelFormat {
                     codec: Codec::Pcma,
                     ptime: Some(Duration::from_millis(40)),
@@ -543,6 +620,8 @@ mod tests {
         let offer = offer(&answer).unwrap();
         assert_eq!((offer.media, offer.medias), (1, 2));
         assert_eq!(offer.control.as_deref(), Some("track2"));
+        // The G.722 media's `track1` cannot be on `…/track2`.
+        assert_eq!(offer.rivals, [Some("track1".to_owned())]);
         let three = Offer { medias: 3, ..offer };
         // The backchannel's media is the one skipped: no stream.
         let log = logged(|| assert_eq!(three.stream(&[sends(96, Some(TRACK1))]), None));
@@ -598,6 +677,76 @@ mod tests {
         );
     }
 
+    /// RFC 2326 §C.3: retina resolves relative controls against a base URL
+    /// the source does not see, so `track2` and `other/track2` can be on one
+    /// URL. When retina dropped the backchannel's media, the G.722 stream
+    /// on `…/other/track2` is not its stream: no backchannel, rather than
+    /// the chain's PCMU on it.
+    #[test]
+    fn rfc2326_c_3_no_backchannel_when_another_medias_control_could_be_on_its_streams_url() {
+        let answer = sdp(&[
+            "m=audio 0 RTP/AVP 96",
+            "a=rtpmap:96 G722/8000",
+            "a=sendonly",
+            "a=control:other/track2",
+            "m=audio 0 RTP/AVP 96",
+            "a=rtpmap:96 PCMU/8000",
+            "a=fmtp",
+            "a=sendonly",
+            "a=control:track2",
+        ]);
+        let offer = offer(&answer).unwrap();
+        assert_eq!(offer.media, 1);
+        assert_eq!(offer.rivals, [Some("other/track2".to_owned())]);
+        // retina kept only the G.722 media.
+        let other = "rtsp://127.0.0.1:1/stream/other/track2";
+        let log = logged(|| assert_eq!(offer.stream(&[sends(96, Some(other))]), None));
+        assert!(
+            log.contains("rtsp: retina skipped a media description, and another media with the backchannel's payload type could be on the stream's control URL; no backchannel media=1 payload_type=96"),
+            "{log}"
+        );
+    }
+
+    /// Whether another media's control could be on a stream's URL, for a
+    /// base URL the source does not see: only when it provably cannot is
+    /// the stream taken.
+    #[test]
+    fn rfc2326_c_1_1_another_medias_control_could_be_on_any_url_unless_it_provably_is_not() {
+        let url = TRACK2;
+        // No control value: retina's stream has no control URL.
+        assert!(!could_resolve_to(url, None));
+        // Absolute: the URL itself, as the `url` crate writes it.
+        assert!(could_resolve_to(url, Some(TRACK2)));
+        assert!(could_resolve_to(
+            url,
+            Some("RTSP://127.0.0.1:1/stream/track2")
+        ));
+        assert!(!could_resolve_to(url, Some(TRACK1)));
+        // Plain relative: the URL's end, after a `/`.
+        for control in ["track2", "stream/track2", "trackID=2"] {
+            assert_eq!(
+                could_resolve_to(url, Some(control)),
+                control != "trackID=2",
+                "{control}"
+            );
+        }
+        assert!(!could_resolve_to(url, Some("track1")));
+        // The presentation's URL, an empty control, and ones the URL
+        // parser rewrites could be anything.
+        for control in [
+            "*",
+            "",
+            "./track1",
+            "a/../track1",
+            "track 1",
+            "track%31",
+            "x/./y",
+        ] {
+            assert!(could_resolve_to(url, Some(control)), "{control:?}");
+        }
+        assert!(is_plain("a.b/c-d_e~!$&'()*+,;=:@"));
+    }
+
     /// RFC 2326 §C.1.1: `*` is the presentation's own URL and names no one
     /// media; without a control of its own, a media cannot be found once
     /// retina's indices shifted.
@@ -610,6 +759,7 @@ mod tests {
                 medias: 3,
                 first_payload_type: 0,
                 control: control.map(str::to_owned),
+                rivals: vec![],
                 format: pcmu(0),
             };
             let streams = [
