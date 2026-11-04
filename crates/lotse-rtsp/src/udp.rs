@@ -1018,6 +1018,29 @@ mod tests {
         );
     }
 
+    /// RFC 3550 §A.1 counts a jump ahead as loss while `udelta <
+    /// MAX_DROPOUT`: one less than [`MAX_DROPOUT`] ahead is the new highest,
+    /// exactly [`MAX_DROPOUT`] ahead a stray that leaves the highest where
+    /// it is.
+    #[test]
+    fn rfc3550_a_1_a_jump_of_max_dropout_is_a_stray_and_one_less_is_loss() {
+        let mut check = Check::new(ip("127.0.0.1"), None);
+        let camera = from("127.0.0.1:6970");
+        let mut judge = |seq| check.judge(false, camera, &rtp(seq, 7));
+        assert_eq!(judge(1000), Verdict::Pass);
+        assert_eq!(judge(1000 + MAX_DROPOUT), Verdict::Pass);
+        assert_eq!(
+            judge(1000 + MAX_DROPOUT - 1),
+            Verdict::Pass,
+            "the stray left the highest at 1000, so this one is ahead of it"
+        );
+        assert_eq!(
+            judge(1000 + MAX_DROPOUT - 2),
+            Verdict::Late,
+            "the jump of one less than MAX_DROPOUT moved the highest"
+        );
+    }
+
     #[test]
     fn rfc3550_8_2_a_new_source_two_packets_in_a_row_ends_the_stream_one_stray_does_not() {
         let mut check = Check::new(ip("127.0.0.1"), None);
