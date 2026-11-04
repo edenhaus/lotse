@@ -1388,6 +1388,36 @@ mod tests {
         assert!(item.unwrap().rtp().is_some());
     }
 
+    /// A packet waiting on the connection when the keepalive falls due is
+    /// read and handed out before the keepalive goes out, which the next
+    /// call sends: the state is set up before `next_item` runs, so no
+    /// `select!` between the read and the timer decides it.
+    #[tokio::test]
+    async fn rfc2326_10_8_a_packet_waiting_at_the_keepalives_deadline_is_handed_out_first() {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        played(&mut driver, &mut cam).await;
+        cam.send(&interleaved(0, &rtp(1, 0, true, &[0x65]))).await;
+        clock.advance(Duration::from_secs(30));
+        let item = driver.next_item().await.unwrap();
+        assert_eq!(item.rtp().unwrap().seq, 1);
+        let mut byte = [0_u8; 1];
+        let sent = cam.io.read(&mut byte).now_or_never();
+        assert!(sent.is_none(), "nothing sent before the packet: {sent:?}");
+        let camera = async {
+            let keepalive = cam.request().await;
+            assert!(
+                keepalive.starts_with("OPTIONS rtsp://cam/stream/"),
+                "{keepalive}"
+            );
+            cam.answer(&keepalive, "200 OK", "", "").await;
+            cam.send(&interleaved(0, &rtp(2, 3000, true, &[0x41])))
+                .await;
+        };
+        let (item, ()) = tokio::join!(driver.next_item(), camera);
+        assert_eq!(item.unwrap().rtp().unwrap().seq, 2);
+    }
+
     #[tokio::test]
     async fn no_item_before_play() {
         let _logs = traced();
