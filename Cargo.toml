@@ -94,11 +94,10 @@ http-auth = { version = "0.1", default-features = false, features = ["basic-sche
 # `Stream`/`Sink` adapters for the WebSocket halves; the WebSocket types come from axum.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # The RTSP client with the camera quirk history the design chose; packets are taken as RTP, so the
-# H.265 depacketizer feature is off. Pinned to the fork's ONVIF backchannel branch until that lands
-# upstream: the backchannel (`SessionOptions::backchannel`, a sending stream, `SendingPacket`) on
-# top of main's fixes for camera input: no panic on an `m=` line without a format, sdp-types 0.2,
-# the response size limit (`SessionOptions::max_message_size`) and a validated `Session` id.
-retina = { git = "https://github.com/edenhaus/retina", rev = "ef3f0097a2f5be8849d08a4375f3c8a062effcdb", default-features = false }
+# H.265 depacketizer feature is off. Pinned to upstream main until a crates.io release carries the
+# ONVIF backchannel (`SessionOptions::backchannel`, a sending stream, `SendingPacket`) and the
+# receiver reports.
+retina = { git = "https://github.com/scottlamb/retina", rev = "e38c1565ba27afad12f574d70c6d895129705e12", default-features = false }
 # The HLS playlist parser of the HTTP source (RFC 8216 §4); only the parser feature, whose nom 7
 # is already in the tree via rtsp-types; chrono comes with it, for `EXT-X-PROGRAM-DATE-TIME`.
 m3u8-rs = { version = "6", default-features = false, features = ["parser"] }
