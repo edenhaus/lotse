@@ -8,12 +8,11 @@
 //! RFC 3550 §6 says the reception feedback "SHOULD be used in all
 //! environments". The source's TCP interleaved session, which drives
 //! retina's sans-I/O core on its own connection ([`crate::driver`]), asks
-//! retina for them. Where retina still speaks plain RTSP to the loopback
-//! relay (`transport: "udp"`, and the backchannel's sessions), the relay
-//! owns the camera's side and sees every RTP and RTCP packet first, so the
-//! relay reports: over TCP on the stream's RTCP channel between whole
-//! requests (RFC 2326 §10.12), over UDP from the stream's RTCP port to
-//! the camera's (RFC 3550 §11).
+//! retina for them; the backchannel's sessions receive no media to report
+//! on. Where retina still speaks plain RTSP to the loopback relay
+//! (`transport: "udp"`), the relay owns the camera's side and sees every
+//! RTP and RTCP packet first, so the relay reports, from the stream's
+//! RTCP port to the camera's (RFC 3550 §11).
 //!
 //! Per stream this keeps, sans I/O and with every time passed in:
 //!

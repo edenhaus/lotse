@@ -2,15 +2,15 @@
 //! through: retina speaks plain RTSP to a listener on `127.0.0.1`, and the
 //! relay carries it to the camera, over TCP for `rtsp` and the TLS stream
 //! for `rtsps`. Those are the source's connections with `transport:
-//! "udp"` and the backchannel's (its probe and talkers' sessions); the
-//! source's TCP interleaved session drives retina's sans-I/O core on its
-//! own connection instead ([`crate::driver`]).
+//! "udp"`; the source's TCP interleaved session and the backchannel's
+//! connections (its probe and talkers' sessions) drive retina's sans-I/O
+//! core on their own connections instead ([`crate::driver`]).
 //!
 //! retina's tokio `Session` opens its own `TcpStream` from the URL and
 //! has no way to be handed a stream or to speak TLS. retina 0.5's sans-I/O
-//! `SessionCore` takes any stream, `rtsps` included, but the UDP media and
-//! the backchannel still go through the tokio `Session`, so the relay
-//! stays until they move to the core. So the source connects to the camera
+//! `SessionCore` takes any stream, `rtsps` included, but the UDP media
+//! still goes through the tokio `Session`, so the relay stays until it
+//! moves to the core. So the source connects to the camera
 //! itself (and completes the TLS handshake for `rtsps`), then lets retina
 //! connect to the relay's listener and copies bytes both ways between that
 //! one connection and the camera. retina's requests go on whole; what the
@@ -21,10 +21,7 @@
 //! sandbox and passes it to the factory (`--loopback-relay`); without one,
 //! the relay binds an ephemeral port per attempt (tests, `--sandbox off`).
 //! A pre-bound listener is shared by every relayed connection of the
-//! worker: the UDP attempts of its source, the probes of the camera's
-//! backchannel and the talkers' backchannel sessions, which run beside
-//! each other. One at a
-//! time takes it from binding to accepting ([`Listener`]): connections
+//! worker: the UDP attempts of its source. One at a time takes it from binding to accepting ([`Listener`]): connections
 //! left in its backlog by an earlier one are dropped before retina
 //! connects, and each accepts exactly one, its own.
 //!
@@ -35,22 +32,17 @@
 //! connection (RFC 2326 §1.1), so once the camera's connection is gone
 //! (closed, failed or refused), the relay keeps retina's side and sends
 //! the session's `TEARDOWN` (§10.7, RFC 7826 §13.7) on a fresh one
-//! ([`teardown`]), as retina's own teardown policy does for UDP; over
-//! TCP the interleaved session ends with its connection.
+//! ([`teardown`]), as retina's own teardown policy does for UDP.
 //!
 //! The relay also sends the camera RTCP Receiver Reports, which retina
-//! does not send there ([`crate::rtcp`]): over TCP (the backchannel's
-//! sessions) a [`Tap`] reads along the camera's
-//! interleaved frames and the reports go on each stream's RTCP channel
-//! between retina's whole requests, which the relay frames for that
-//! (RFC 2326 §10.12); over UDP [`crate::udp`] keeps the statistics and
-//! sends them from each stream's RTCP port.
+//! does not send there ([`crate::rtcp`]): [`crate::udp`] keeps the
+//! statistics and sends them from each stream's RTCP port.
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdListener};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Instant;
 
 use lotse_core::clock::Clock;
@@ -60,11 +52,8 @@ use lotse_core::task::BoxFuture;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-use crate::framer::Framer;
-use crate::rtcp::ReceiverReports;
-use crate::tap::Tap;
 use crate::udp::{self, MAX_DATAGRAM, UdpRelay};
 
 /// How much the relay reads from the camera at once: 16 KiB.
@@ -156,14 +145,14 @@ async fn bind(pre_bound: Option<&StdListener>) -> io::Result<TcpListener> {
 
 /// The URL retina connects to: scheme `rtsp`, which is all retina accepts,
 /// and the relay's address, with the camera's path and query.
-// SPEC-DEVIATION(RFC 7826 §19.2, RFC 2326 §6.1): on the relayed
-// connections, the source's with `transport: "udp"` and the backchannel's,
-// the Request-URI the camera sees says `rtsp://127.0.0.1:<relay port>`
-// instead of `rtsps://<host>` or `rtsp://<host>`, because retina sends the
-// URL it connected to; cameras route by path. The source's TCP interleaved
-// session sends the real one. gates:
+// SPEC-DEVIATION(RFC 2326 §6.1): on the relayed connections, the
+// source's with `transport: "udp"` (never `rtsps`, which refuses UDP), the
+// Request-URI the camera sees says `rtsp://127.0.0.1:<relay port>` instead
+// of `rtsp://<host>`, because retina sends the URL it connected to;
+// cameras route by path. The source's TCP interleaved session and the
+// backchannel's connections send the real one. gates:
 // rfc2326_12_39_video_audio_and_sender_reports_flow_over_udp_then_tear_down,
-// rfc7826_19_2_over_rtsps_the_backchannel_takes_tls_through_the_shared_relay
+// rfc2326_6_1_tcp_sends_the_source_url_as_the_request_uri_and_udp_the_relays
 pub(crate) fn relay_url(url: &SourceUrl, local: SocketAddr) -> url::Url {
     let mut target = url.expose_url().clone();
     // Neither can fail: `rtsps` and `rtsp` are both non-special schemes, and
@@ -174,13 +163,12 @@ pub(crate) fn relay_url(url: &SourceUrl, local: SocketAddr) -> url::Url {
     target
 }
 
-/// How the media of one attempt takes: interleaved on the camera's
-/// connection, with the receiver reports and the time they keep, or as
-/// datagrams through the UDP side, which keeps both itself.
+/// How the media of one attempt takes: as datagrams through the UDP side,
+/// which keeps the receiver reports and their time itself. Every TCP
+/// interleaved connection, the source's and the backchannel's, drives
+/// retina's core on its own connection instead ([`crate::driver`]).
 #[derive(Debug)]
 pub(crate) enum Media {
-    /// TCP interleaved: the backchannel's sessions.
-    Interleaved(ReceiverReports, Arc<dyn Clock>),
     /// RTP over UDP.
     Udp(Box<UdpRelay>),
 }
@@ -225,22 +213,28 @@ pub(crate) struct Orphan {
     udp: UdpRelay,
 }
 
-/// Accepts retina's connection and copies between it and the camera until
-/// both sides closed, or with `udp` translates between them and adds the
-/// camera's datagrams. Ends when a side sends what the relay cannot frame,
-/// with why, and over UDP also when the camera's
-/// connection is gone, with retina's side for the `TEARDOWN`; otherwise it
-/// stays pending once the copy is over, and the source, which keeps
-/// polling the session, notices the closed relay as an ended connection.
+/// Accepts retina's connection and translates between it and the camera,
+/// adding the camera's datagrams ([`crate::udp`]). Ends when a side sends
+/// what the relay cannot frame, with why, and when the camera's connection
+/// is gone, with retina's side for the `TEARDOWN`; otherwise it stays
+/// pending once the copy is over, and the source, which keeps polling the
+/// session, notices the closed relay as an ended connection.
 pub(crate) async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
     listener: Listening,
     camera: S,
     media: Media,
 ) -> RelayEnd {
     let copied = match media {
-        Media::Interleaved(reports, clock) => relay(listener, camera, reports, clock).await,
         Media::Udp(udp) => relay_udp(listener, camera, *udp).await,
     };
+    settled(copied).await
+}
+
+/// How the copy `copied` ended the relay: a refusal or a camera gone end
+/// it, with why; a copy that is over or failed leaves it pending. Apart
+/// from [`pump`], which is compiled once per camera stream type, so every
+/// way it ends is one function's.
+async fn settled(copied: Result<(u64, u64), Ended>) -> RelayEnd {
     let end = match copied {
         Ok((to_camera, from_camera)) => {
             tracing::debug!(to_camera, from_camera, "rtsp relay: closed");
@@ -272,16 +266,6 @@ pub(crate) enum First<R, S> {
     Relay(R),
     /// The session, with its exit.
     Session(S),
-}
-
-impl<S> First<RelayEnd, S> {
-    /// The session's output, or why the relay ended first.
-    pub(crate) fn session(self) -> Result<S, SourceError> {
-        match self {
-            Self::Session(out) => Ok(out),
-            Self::Relay(ended) => Err(ended.error),
-        }
-    }
 }
 
 /// Runs the relay's `pump` beside the `session` it carries, in the
@@ -369,11 +353,11 @@ where
 
 /// Acknowledges at once what retina sent on `from` (`TCP_QUICKACK`):
 /// retina leaves Nagle's algorithm on (RFC 1122 §4.2.3.4), so its next
-/// small write, a backchannel packet every 20 ms, waits until this side
-/// acknowledged the last, which the kernel delays (§4.2.3.2) or sends with
-/// the camera's next media, up to a video frame later: 33 ms off the
-/// packets' 20 ms grid at the 95th percentile without it (Linux 7.0,
-/// 2026-10-11). The mode is not sticky, so it is set after every read; it
+/// small write waits until this side acknowledged the last, which the
+/// kernel delays (§4.2.3.2) or sends with the camera's next media, up to a
+/// video frame later: the backchannel's packets every 20 ms, when they
+/// still went through the relay, were 33 ms off their grid at the 95th
+/// percentile without it (Linux 7.0, 2026-10-11). The mode is not sticky, so it is set after every read; it
 /// fails only on a socket that is gone, whose ACKs no longer matter.
 #[cfg(target_os = "linux")]
 fn ack_now(from: &OwnedReadHalf) {
@@ -402,83 +386,6 @@ async fn accept(listening: Listening) -> io::Result<TcpStream> {
     let (plain, _) = accepted?;
     plain.set_nodelay(true)?;
     Ok(plain)
-}
-
-/// [`pump`] until it ends: the bytes copied each way. retina's requests
-/// go on whole, with the receiver reports due between them; the camera's
-/// side goes on as it arrives, read along by the tap.
-async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
-    listener: Listening,
-    camera: S,
-    reports: ReceiverReports,
-    clock: Arc<dyn Clock>,
-) -> Result<(u64, u64), Ended> {
-    let plain = accept(listener).await.map_err(Ended::Io)?;
-    let (mut from_retina, mut to_retina) = plain.into_split();
-    let (mut from_camera, mut to_camera) = tokio::io::split(camera);
-    // Both directions run in this one task and never hold the lock across
-    // an await: it is never contended.
-    let reports = Mutex::new(reports);
-    let locked = || reports.lock().unwrap_or_else(PoisonError::into_inner);
-    // The camera's side moved a report earlier.
-    let rescheduled = Notify::new();
-    let up = async {
-        let mut framer = Framer::default();
-        let mut buf = vec![0_u8; READ_CHUNK];
-        let mut out = Vec::new();
-        let mut copied = 0_u64;
-        loop {
-            // A report round awaits nothing that waits: the runtime's
-            // cooperative budget keeps the loop from holding its worker.
-            tokio::task::coop::consume_budget().await;
-            let mut due = sleep_until(&*clock, locked().due());
-            out.clear();
-            tokio::select! {
-                biased;
-                read = from_retina.read(&mut buf) => {
-                    let n = read.map_err(Ended::Io)?;
-                    let Some(bytes) = buf.get(..n).filter(|read| !read.is_empty()) else {
-                        to_camera.shutdown().await.map_err(Ended::Io)?;
-                        return Ok(copied);
-                    };
-                    ack_now(&from_retina);
-                    framer.pending.extend_from_slice(bytes);
-                    while let Some(framed) = framer.next().map_err(|why| {
-                        Ended::Refused(SourceError::Protocol(format!("rtsp relay: retina's request is unreadable: {why}")))
-                    })? {
-                        out.extend_from_slice(&framed.raw);
-                    }
-                }
-                () = rescheduled.notified() => continue,
-                () = async { if let Some(due) = &mut due { due.await } }, if due.is_some() => {
-                    let reports = locked().take_due(clock.now());
-                    for report in reports {
-                        report.interleave(&mut out);
-                    }
-                }
-            }
-            to_camera.write_all(&out).await.map_err(Ended::Io)?;
-            copied = copied.saturating_add(u64::try_from(out.len()).unwrap_or(u64::MAX));
-        }
-    };
-    let down = async {
-        let mut tap = Tap::default();
-        let mut buf = vec![0_u8; READ_CHUNK];
-        let mut copied = 0_u64;
-        loop {
-            let n = from_camera.read(&mut buf).await.map_err(Ended::Io)?;
-            let Some(read) = buf.get(..n).filter(|read| !read.is_empty()) else {
-                to_retina.shutdown().await.map_err(Ended::Io)?;
-                return Ok(copied);
-            };
-            if tap.feed(read, clock.now(), &mut locked()) {
-                rescheduled.notify_one();
-            }
-            to_retina.write_all(read).await.map_err(Ended::Io)?;
-            copied = copied.saturating_add(u64::try_from(read.len()).unwrap_or(u64::MAX));
-        }
-    };
-    tokio::try_join!(up, down)
 }
 
 /// Why one step of the UDP relay stopped it.
@@ -683,19 +590,7 @@ mod tests {
     use tokio::net::TcpStream;
 
     use super::*;
-
-    #[test]
-    fn the_first_to_end_is_the_session_s_output_or_the_relay_s_error() {
-        assert_eq!(First::<RelayEnd, u8>::Session(7).session(), Ok(7));
-        let ended = RelayEnd {
-            error: SourceError::Protocol("refused".into()),
-            orphan: None,
-        };
-        assert_eq!(
-            First::<RelayEnd, u8>::Relay(ended).session(),
-            Err(SourceError::Protocol("refused".into()))
-        );
-    }
+    use crate::rtcp::ReceiverReports;
 
     #[test]
     fn the_relay_url_keeps_path_and_query_and_drops_the_credentials() {
@@ -757,12 +652,6 @@ mod tests {
         ReceiverReports::new(Arc::new(SetupRates::default()), Seed::random())
     }
 
-    fn tcp_media() -> Media {
-        use lotse_core::clock::SystemClock;
-
-        Media::Interleaved(reports(), Arc::new(SystemClock))
-    }
-
     /// `future`, or a failed test after 5 s rather than a hung one.
     async fn bounded<T>(future: impl Future<Output = T>) -> T {
         use lotse_core::clock::{Clock as _, SystemClock};
@@ -800,35 +689,6 @@ mod tests {
         assert!(matches!(ended, First::Relay(7)), "{ended:?}");
     }
 
-    #[tokio::test]
-    async fn the_pump_copies_both_ways_and_outlives_the_close() {
-        let (listener, local) = listen(&Listener::default()).await.unwrap();
-        let (camera, mut far) = tokio::io::duplex(1024);
-        let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
-        let mut plain = TcpStream::connect(local).await.unwrap();
-        let request = b"DESCRIBE rtsp://127.0.0.1/ RTSP/1.0\r\nCSeq: 1\r\n\r\n";
-        plain.write_all(request).await.unwrap();
-        let mut got = vec![0_u8; request.len()];
-        bounded(far.read_exact(&mut got)).await.unwrap();
-        assert_eq!(got, request);
-        // The answer in two pieces, then media, all as they arrive.
-        let answer =
-            b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 10\r\n\r\nv=0\r\ns=-\r\n$\x00\x00\x01z";
-        far.write_all(&answer[..20]).await.unwrap();
-        far.write_all(&answer[20..]).await.unwrap();
-        let mut got = vec![0_u8; answer.len()];
-        bounded(plain.read_exact(&mut got)).await.unwrap();
-        assert_eq!(got, answer);
-        // Both sides close; the relay stays, for the session to decide.
-        drop(far);
-        plain.shutdown().await.unwrap();
-        let mut rest = Vec::new();
-        assert_eq!(bounded(plain.read_to_end(&mut rest)).await.unwrap(), 0);
-        settle().await;
-        assert!(!relay.is_finished());
-        relay.abort();
-    }
-
     /// The read half of a camera connection that fails.
     struct Broken;
 
@@ -843,26 +703,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failing_camera_ends_the_copy_and_retina_sees_the_close() {
-        let (listener, local) = listen(&Listener::default()).await.unwrap();
-        let camera = tokio::io::join(Broken, tokio::io::sink());
-        let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
-        let mut plain = TcpStream::connect(local).await.unwrap();
-        let mut rest = Vec::new();
-        // The copy fails and drops retina's side: EOF or a reset.
-        let _closed = bounded(plain.read_to_end(&mut rest)).await;
-        assert!(rest.is_empty());
-        settle().await;
-        assert!(!relay.is_finished(), "a failure is the session's to report");
-        relay.abort();
-    }
-
-    #[tokio::test]
     async fn a_relay_whose_listener_fails_stays_for_the_session_to_decide() {
         let (listener, _local) = listen(&Listener::default()).await.unwrap();
         // A listener that never sees retina: the attempt's deadline ends it.
         let (camera, _far) = tokio::io::duplex(16);
-        let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
+        let relay = spawn_named(
+            "test.pump",
+            pump(listener, camera, Media::Udp(Box::new(udp_relay()))),
+        );
         settle().await;
         assert!(!relay.is_finished());
         relay.abort();
@@ -1237,66 +1085,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfc3550_6_4_2_over_tcp_reports_go_on_the_rtcp_channel_between_whole_requests() {
-        use lotse_core::clock::FakeClock;
-
-        let clock = Arc::new(FakeClock::from_system());
-        let (reports, time) = reports_on(&clock);
-        let (listener, local) = listen(&Listener::default()).await.unwrap();
-        let (camera, mut far) = tokio::io::duplex(4096);
-        let relay = spawn_named(
-            "test.pump",
-            pump(listener, camera, Media::Interleaved(reports, time)),
-        );
-        let mut plain = TcpStream::connect(local).await.unwrap();
-        let mut stream = b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: 5\r\n\r\nv=0\r\nRTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\nRTSP/1.0 200 OK\r\nCSeq: 4\r\nSession: 1\r\n\r\n".to_vec();
-        for seq in [1, 2, 3, 5] {
-            stream.extend_from_slice(&rtp_frame(seq));
-        }
-        far.write_all(&stream).await.unwrap();
-        let mut got = vec![0_u8; stream.len()];
-        bounded(plain.read_exact(&mut got)).await.unwrap();
-        assert_eq!(got, stream, "the camera's side is forwarded unchanged");
-        // Half a keepalive: the report may not go inside it.
-        let keepalive =
-            b"GET_PARAMETER rtsp://127.0.0.1/s/ RTSP/1.0\r\nCSeq: 5\r\nSession: 1\r\n\r\n";
-        plain.write_all(&keepalive[..10]).await.unwrap();
-        settle().await;
-        // The first report is due within 2.5 s × 1.5 / 1.21828 of the
-        // first packet.
-        clock.advance(std::time::Duration::from_millis(3100));
-        let mut header = [0_u8; 4];
-        bounded(far.read_exact(&mut header)).await.unwrap();
-        assert_eq!(header[..2], [b'$', 1], "on the RTCP channel");
-        let mut report = vec![0_u8; usize::from(u16::from_be_bytes([header[2], header[3]]))];
-        bounded(far.read_exact(&mut report)).await.unwrap();
-        assert_eq!(report[..2], [0x81, 201]);
-        // Extended highest 5, one lost (seq 4), of 2..=5 after probation.
-        assert_eq!(report[16..20], 5_u32.to_be_bytes());
-        assert_eq!(report[13..16], [0, 0, 1]);
-        plain.write_all(&keepalive[10..]).await.unwrap();
-        let mut got = vec![0_u8; keepalive.len()];
-        bounded(far.read_exact(&mut got)).await.unwrap();
-        assert_eq!(got, keepalive);
-        relay.abort();
-    }
-
-    #[tokio::test]
-    async fn over_tcp_retina_writing_what_no_parser_reads_ends_the_pump() {
-        let (listener, local) = listen(&Listener::default()).await.unwrap();
-        let (camera, _far) = tokio::io::duplex(64);
-        let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
-        let mut plain = TcpStream::connect(local).await.unwrap();
-        plain.write_all(b"\x01\x02 junk\r\n\r\n").await.unwrap();
-        let end = bounded(relay).await.unwrap();
-        assert!(
-            matches!(end.error, SourceError::Protocol(ref m) if m.contains("retina's request is unreadable")),
-            "{end:?}"
-        );
-        assert!(end.orphan.is_none());
-    }
-
-    #[tokio::test]
     async fn rfc3550_6_4_2_over_udp_the_pump_reports_when_due() {
         use lotse_core::clock::FakeClock;
         use tokio::net::UdpSocket;
@@ -1374,27 +1162,6 @@ mod tests {
             matches!(&err, SourceError::Unreachable(message) if message.starts_with("rtsp relay: ")),
             "{err:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn a_reset_from_retina_ends_the_copy_and_the_relay_stays_for_the_session() {
-        let (listener, local) = listen(&Listener::default()).await.unwrap();
-        let (camera, mut far) = tokio::io::duplex(1024);
-        let relay = spawn_named("test.pump", pump(listener, camera, tcp_media()));
-        let mut plain = TcpStream::connect(local).await.unwrap();
-        let request = b"OPTIONS rtsp://127.0.0.1/ RTSP/1.0\r\nCSeq: 1\r\n\r\n";
-        plain.write_all(request).await.unwrap();
-        let mut got = vec![0_u8; request.len()];
-        bounded(far.read_exact(&mut got)).await.unwrap();
-        // retina's connection resets: the read fails, the copy ends and
-        // the camera's side closes with it.
-        plain.set_zero_linger().unwrap();
-        drop(plain);
-        let mut rest = Vec::new();
-        assert_eq!(bounded(far.read_to_end(&mut rest)).await.unwrap(), 0);
-        settle().await;
-        assert!(!relay.is_finished(), "a failure is the session's to report");
-        relay.abort();
     }
 
     #[tokio::test]

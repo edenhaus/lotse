@@ -2,7 +2,8 @@
 //! release closes it, and the session that plays the stream never carries
 //! it, so the camera's one backchannel is free whenever nobody talks.
 //!
-//! The session runs on a connection of its own: `DESCRIBE` with `Require:
+//! The session runs on a connection of its own, retina's sans-I/O core
+//! driven on it ([`crate::driver`]): `DESCRIBE` with `Require:
 //! www.onvif.org/ver20/backchannel` (ONVIF Streaming Specification §5.3.1),
 //! `SETUP` of the answer's `a=sendonly` audio media alone, TCP interleaved
 //! on its own channel pair (§5.3.2; RFC 2326 §10.4: the client chooses
@@ -20,11 +21,11 @@
 //! while more than [`MAX_QUEUED`] bytes wait for the camera to take them,
 //! a packet is dropped, its sequence number skipped, rather than queued,
 //! so the talk-back stays near real time and the session keeps reading.
-//! The release drops the session: retina sends its
-//! `TEARDOWN` with `Require`, and the connection closes, as a camera may
-//! stay in two-way mode until it does. Should the camera end the session
-//! first (its connection lost, a request refused), the loss is reported
-//! with why; nothing is opened again until the next claim. A session
+//! The release ends the session: its `TEARDOWN` with `Require` goes out
+//! within the source's teardown budget ([`Camera::tear_down`]), and the
+//! connection closes, as a camera may stay in two-way mode until it does.
+//! Should the camera end the session first (its connection lost, a
+//! request refused), the loss is reported with why; nothing is opened again until the next claim. A session
 //! opens only once the one before it closed on the camera, its bounded
 //! `TEARDOWN` included ([`BackchannelTasks::spawn`]): a camera with one
 //! backchannel refuses a `SETUP` of it while another session holds it
@@ -43,9 +44,6 @@ use lotse_core::source::{
 };
 use lotse_core::task::BoxFuture;
 use lotse_core::throttle::Throttle;
-use retina::client::{
-    Playing, Session, SessionGroup, SetupOptions, TcpTransportOptions, Transport,
-};
 use retina::rtp::SenderOptions;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -54,8 +52,8 @@ use super::camera::{Camera, backchannel_stream};
 use super::probe::unanswered;
 use super::session::{QUEUE, refusal};
 use super::{BackchannelFormat, Packetizer};
-use crate::error::classify;
-use crate::source::{play_options, tear_down, within_on};
+use crate::driver::{self, Driver};
+use crate::source::{play_options, within_on};
 
 /// Above this many bytes queued for the camera, a talker's packet is
 /// dropped rather than queued: 4 KiB, a quarter second of 128 kbit/s,
@@ -178,7 +176,9 @@ fn hold(camera: &Camera) -> Duration {
 
 /// Connects, opens the session in `codec` and forwards until it is closed
 /// (`None`) or fails: why, sent by [`run`] to `opened` while it is still
-/// there, else reported as the session's loss.
+/// there, else reported as the session's loss. However it ended, a
+/// session the camera set up gets its `TEARDOWN` within the budget, and
+/// the connection closes ([`Camera::tear_down`]).
 async fn session(
     camera: &Camera,
     codec: &Codec,
@@ -187,42 +187,40 @@ async fn session(
 ) -> Option<BackchannelRefused> {
     let hold = hold(camera);
     let start = camera.time.now();
-    let (stream, listening, target) = match camera.connect("backchannel session", hold, close).await
-    {
-        Ok(connected) => connected,
+    let mut driver = match camera.connect("backchannel session", hold, close).await {
+        Ok(driver) => driver,
         Err(err) => return Some(unanswered(err)),
     };
     let left = hold.saturating_sub(camera.time.now().saturating_duration_since(start));
-    let talk = talk(camera, codec, target, left, close, opened);
-    let relayed = Box::pin(camera.relayed(stream, listening, talk)).await;
-    relayed.map_err(unanswered).unwrap_or_else(Some)
+    let ended = talk(camera, codec, &mut driver, left, close, opened).await;
+    let why: &(dyn std::fmt::Display + Sync) = match &ended {
+        Some(why) => why,
+        None => &"the backchannel session closed",
+    };
+    camera.tear_down(driver, why).await;
+    ended
 }
 
-/// retina's side of the session: the handshake in `codec` within `left`,
-/// the session handed to `opened`, the talker's packets forwarded until
-/// the close or the loss, and the `TEARDOWN` awaited within its budget.
+/// The session on `driver`: the handshake in `codec` within `left`, the
+/// session handed to `opened`, and the talker's packets forwarded until
+/// the close or the loss.
 async fn talk(
     camera: &Camera,
     codec: &Codec,
-    target: url::Url,
+    driver: &mut Driver,
     left: Duration,
     close: &CancellationToken,
     opened: &mut Option<oneshot::Sender<Result<Opened, BackchannelRefused>>>,
 ) -> Option<BackchannelRefused> {
-    let group = std::sync::Arc::new(SessionGroup::default());
-    let handshake = handshake(camera, codec, target, &group).map(Ok::<_, SourceError>);
+    let handshake = handshake(camera, codec, driver).map(Ok::<_, SourceError>);
     let shaken = within_on(&*camera.time, close, left, "backchannel session", handshake).await;
     let shaken = match shaken {
         Ok(shaken) => shaken,
         Err(err) => Err(unanswered(err)),
     };
-    let (playing, index, format) = match shaken {
+    let (index, format) = match shaken {
         Ok(playing) => playing,
-        Err(why) => {
-            // A session the camera set up gets its `TEARDOWN`.
-            tear_down(&group, &*camera.time, &why).await;
-            return Some(why);
-        }
+        Err(why) => return Some(why),
     };
     let (sender, uplink) = mpsc::channel(QUEUE);
     let frame = format.ptime.unwrap_or(BackchannelOffer::DEFAULT_FRAME);
@@ -239,32 +237,25 @@ async fn talk(
         frame_ms = frame.as_millis(),
         "rtsp: backchannel session playing; the talker's packets go to the camera"
     );
-    let ended = forward(playing, index, &format, uplink, close, camera).await;
-    tear_down(&group, &*camera.time, &"the backchannel session ended").await;
-    ended
+    forward(driver, index, &format, uplink, close, camera).await
 }
 
 /// `DESCRIBE` with `Require`, `SETUP` of the backchannel media alone, TCP
-/// interleaved, and `PLAY` with `Require`: the playing session, the index
-/// of the retina stream it sends on and the camera's format, or why not,
-/// with the camera's status when it refused. A `DESCRIBE` whose answer
-/// offers the backchannel in another codec than `codec`, the probe's, is
-/// refused before the `SETUP`: the claim's answer is negotiated for the
-/// probe's codec, and the talker's uplink would reach no other.
+/// interleaved, and `PLAY` with `Require`, on `driver`: the index of the
+/// retina stream it sends on and the camera's format, or why not, with
+/// the camera's status when it refused. A `DESCRIBE` whose answer offers
+/// the backchannel in another codec than `codec`, the probe's, is refused
+/// before the `SETUP`: the claim's answer is negotiated for the probe's
+/// codec, and the talker's uplink would reach no other.
 async fn handshake(
     camera: &Camera,
     codec: &Codec,
-    target: url::Url,
-    group: &std::sync::Arc<SessionGroup>,
-) -> Result<(Session<Playing>, usize, BackchannelFormat), BackchannelRefused> {
-    let refused =
-        |err: &retina::client::Error| refusal(err.status_code(), &classify(err, &camera.url));
+    driver: &mut Driver,
+) -> Result<(usize, BackchannelFormat), BackchannelRefused> {
+    let refused = |err: driver::Error| refusal(err.status_code(), &err.source_error(&camera.url));
     tracing::info!("rtsp: backchannel session: DESCRIBE with the backchannel's Require header");
-    let options = camera.session_options(group);
-    let mut session = Session::describe(target, options)
-        .await
-        .map_err(|err| refused(&err))?;
-    let Some((index, offer)) = backchannel_stream(&session) else {
+    driver.describe(camera.target()).await.map_err(refused)?;
+    let Some((index, offer)) = backchannel_stream(driver) else {
         return Err(BackchannelRefused {
             status: None,
             message: "the camera's answer offers no backchannel the talk-back chain can feed"
@@ -276,17 +267,10 @@ async fn handshake(
         index,
         "rtsp: backchannel session: SETUP of the backchannel alone, TCP interleaved"
     );
-    let setup = SetupOptions::default().transport(Transport::Tcp(TcpTransportOptions::default()));
-    session
-        .setup(index, setup)
-        .await
-        .map_err(|err| refused(&err))?;
+    driver.setup(index).await.map_err(refused)?;
     tracing::info!("rtsp: backchannel session: PLAY with the backchannel's Require header");
-    let playing = session
-        .play(play_options())
-        .await
-        .map_err(|err| refused(&err))?;
-    Ok((playing, index, offer.format))
+    driver.play(play_options()).await.map_err(refused)?;
+    Ok((index, offer.format))
 }
 
 /// Whether a session's `DESCRIBE` offers the backchannel in `described`,
@@ -312,14 +296,15 @@ fn as_probed(probed: &Codec, described: &Codec) -> Result<(), BackchannelRefused
 
 /// Sends the talker's packets from `uplink` on retina's stream `index`,
 /// stamped for the camera's `format` (RFC 3550 §5.1, with a random SSRC,
-/// sequence start and timestamp offset), and keeps reading the session,
-/// which writes what is queued, keeps it alive and notices its loss:
-/// `None` once closed, else why it ended. Nothing here waits for the
-/// camera to take data ([`queue`]), so a release always reaches the
-/// session's bounded `TEARDOWN` ([`tear_down`]). The session is polled
-/// before the uplink, so what was queued is written before more is.
+/// sequence start and timestamp offset), and keeps polling the session,
+/// which writes what is queued, sends the keepalives (RFC 2326 §10.8) and
+/// notices its loss: `None` once closed, else why it ended. Nothing here
+/// waits for the camera to take data ([`queue`]), so a release always
+/// reaches the session's bounded `TEARDOWN` ([`Camera::tear_down`]). The
+/// session is polled before the uplink, so what was queued is written
+/// before more is.
 async fn forward(
-    mut playing: Session<Playing>,
+    driver: &mut Driver,
     index: usize,
     format: &BackchannelFormat,
     mut uplink: mpsc::Receiver<MediaPacket>,
@@ -329,42 +314,37 @@ async fn forward(
     let mut packetizer = Packetizer::new(format, SenderOptions::default());
     let mut dropped = Throttle::default();
     loop {
-        // `Some` once the session ended: with retina's error, if any.
+        // `Some` once the session ended, with why.
         let ended = tokio::select! {
             biased;
             () = close.cancelled() => return None,
-            item = playing.next_item() => match item {
-                // The camera's RTCP, or what else retina hands up: nothing
-                // the backchannel uses.
-                Some(Ok(_)) => None,
-                ended => Some(ended.and_then(Result::err)),
-            },
+            // The camera's RTCP, or what else retina hands up: nothing the
+            // backchannel uses.
+            item = driver.next_item() => item.err(),
             Some(packet) = uplink.recv() => {
-                queue(&mut playing, index, &mut packetizer, &packet, &*camera.time, &mut dropped)
-                    .err()
-                    .map(Some)
+                queue(driver, index, &mut packetizer, &packet, &*camera.time, &mut dropped).err()
             }
         };
         if let Some(error) = ended {
-            return Some(lost(error.as_ref(), camera));
+            return Some(lost(&error, camera));
         }
     }
 }
 
-/// Queues `packet` on `playing`'s stream `index`, stamped by
-/// `packetizer`, and a Sender Report when one is due; or, while more than
+/// Queues `packet` on `driver`'s stream `index`, stamped by `packetizer`,
+/// and a Sender Report when one is due; or, while more than
 /// [`MAX_QUEUED`] bytes wait for the camera, drops it, its sequence number
 /// skipped (RFC 3550 §5.1), counted in `dropped`'s rate-limited line. The
 /// error is retina's when the stream takes no data.
 fn queue(
-    playing: &mut Session<Playing>,
+    driver: &mut Driver,
     index: usize,
     packetizer: &mut Packetizer,
     packet: &MediaPacket,
     time: &dyn Clock,
     dropped: &mut Throttle,
-) -> Result<(), retina::client::Error> {
-    let queued = playing.queued_len();
+) -> Result<(), driver::Error> {
+    let queued = driver.queued_len();
     if queued > MAX_QUEUED {
         packetizer.skip(packet);
         if let Some(count) = dropped.hit(packet.arrival) {
@@ -377,23 +357,23 @@ fn queue(
         return Ok(());
     }
     packetizer
-        .packetize(packet, |rtp| playing.queue_rtp(index, rtp))
+        .packetize(packet, |rtp| driver.queue_rtp(index, rtp))
         .unwrap_or(Ok(()))?;
     match packetizer.sender_report(time.now(), time.wall_now()) {
-        Some(report) => playing.queue_rtcp(index, &report),
+        Some(report) => driver.queue_rtcp(index, &report),
         None => Ok(()),
     }
 }
 
-/// Why the session ended on the camera's side: `error`, or without one
-/// the camera closed it.
-fn lost(error: Option<&retina::client::Error>, camera: &Camera) -> BackchannelRefused {
+/// Why the session ended on the camera's side: the camera closed it, or
+/// `error` says why.
+fn lost(error: &driver::Error, camera: &Camera) -> BackchannelRefused {
     match error {
-        Some(err) => refusal(err.status_code(), &classify(err, &camera.url)),
-        None => BackchannelRefused {
+        driver::Error::Closed => BackchannelRefused {
             status: None,
             message: "the camera closed the backchannel session".to_owned(),
         },
+        err => refusal(err.status_code(), &err.source_error(&camera.url)),
     }
 }
 
@@ -445,7 +425,7 @@ mod tests {
             time: Arc::new(SystemClock),
         };
         assert_eq!(
-            lost(None, &camera),
+            lost(&driver::Error::Closed, &camera),
             BackchannelRefused {
                 status: None,
                 message: "the camera closed the backchannel session".into(),
@@ -700,16 +680,13 @@ mod tests {
         .await
         .unwrap();
         let camera = camera_at(&cam);
-        let group = Arc::new(SessionGroup::default());
-        let target = url::Url::parse(&cam.url()).unwrap();
-        let (playing, _index, format) = handshake(&camera, &Codec::Pcmu, target, &group)
-            .await
-            .unwrap();
-        let streams = playing.streams().len();
+        let mut driver = connected(&camera).await;
+        let (_index, format) = handshake(&camera, &Codec::Pcmu, &mut driver).await.unwrap();
+        let streams = driver.streams().len();
         let (sender, uplink) = mpsc::channel(1);
         sender.send(large(0)).await.unwrap();
         let close = CancellationToken::new();
-        let refused = forward(playing, streams, &format, uplink, &close, &camera)
+        let refused = forward(&mut driver, streams, &format, uplink, &close, &camera)
             .await
             .unwrap();
         assert_eq!(refused.status, None);
@@ -719,8 +696,16 @@ mod tests {
             )),
             "{refused:?}"
         );
-        tear_down(&group, &SystemClock, &"the test ended").await;
+        camera.tear_down(driver, &"the test ended").await;
         cam.stop().await;
+    }
+
+    /// A driver connected to `camera`.
+    async fn connected(camera: &Camera) -> Driver {
+        camera
+            .connect("test", Duration::from_secs(5), &CancellationToken::new())
+            .await
+            .unwrap()
     }
 
     /// A PCMU packet whose payload is as large as one interleaved frame
@@ -765,18 +750,15 @@ mod tests {
         .await
         .unwrap();
         let camera = camera_at(&cam);
-        let group = Arc::new(SessionGroup::default());
-        let target = url::Url::parse(&cam.url()).unwrap();
-        let (mut playing, index, format) = handshake(&camera, &Codec::Pcmu, target, &group)
-            .await
-            .unwrap();
+        let mut driver = connected(&camera).await;
+        let (index, format) = handshake(&camera, &Codec::Pcmu, &mut driver).await.unwrap();
         let options = SenderOptions::default().initial_sequence_number(0);
         let mut packetizer = Packetizer::new(&format, options);
         let mut dropped = Throttle::default();
         let mut queued = Vec::new();
         for ts in 0..100 {
             queue(
-                &mut playing,
+                &mut driver,
                 index,
                 &mut packetizer,
                 &pcmu(ts, 160),
@@ -784,7 +766,7 @@ mod tests {
                 &mut dropped,
             )
             .unwrap();
-            queued.push(playing.queued_len());
+            queued.push(driver.queued_len());
         }
         let over = queued.iter().position(|len| *len > MAX_QUEUED).unwrap();
         assert!(over > 10, "{queued:?}");
@@ -794,8 +776,7 @@ mod tests {
         );
         let next = packetizer.packetize(&pcmu(100, 160), |rtp| rtp.header().sequence_number());
         assert_eq!(next, Some(100));
-        drop(playing);
-        tear_down(&group, &SystemClock, &"the test ended").await;
+        camera.tear_down(driver, &"the test ended").await;
         cam.stop().await;
     }
 
@@ -814,17 +795,14 @@ mod tests {
         .await
         .unwrap();
         let camera = camera_at(&cam);
-        let group = Arc::new(SessionGroup::default());
-        let target = url::Url::parse(&cam.url()).unwrap();
-        let (mut playing, index, format) = handshake(&camera, &Codec::Pcmu, target, &group)
-            .await
-            .unwrap();
+        let mut driver = connected(&camera).await;
+        let (index, format) = handshake(&camera, &Codec::Pcmu, &mut driver).await.unwrap();
         let mut packetizer = Packetizer::new(&format, SenderOptions::default());
         let mut dropped = Throttle::default();
         let clock = FakeClock::from_system();
         let mut send = |ts: u32, len: usize| {
             queue(
-                &mut playing,
+                &mut driver,
                 index,
                 &mut packetizer,
                 &pcmu(ts, len),
@@ -832,7 +810,7 @@ mod tests {
                 &mut dropped,
             )
             .unwrap();
-            playing.queued_len()
+            driver.queued_len()
         };
         let first = send(0, 160);
         let second = send(1, 160);
@@ -841,8 +819,7 @@ mod tests {
         let past = send(3, 160);
         assert_eq!(past, MAX_QUEUED + header + 160);
         assert_eq!(send(4, 160), past);
-        drop(playing);
-        tear_down(&group, &SystemClock, &"the test ended").await;
+        camera.tear_down(driver, &"the test ended").await;
         cam.stop().await;
     }
 

@@ -319,8 +319,8 @@ fn first_payload_type(media: &sdp_types::Media) -> Option<u8> {
 /// audio and has a format the talk-back chain produces
 /// ([`backchannel_format`]). Of the backchannels a camera lists, the client
 /// chooses which one it uses (§5.3.2), and talk-back uses audio. retina's
-/// `StreamDirection::Sending` reads the same direction attributes. `None` also for an SDP that does not parse; the relay's
-/// guard has refused one retina could not read.
+/// `StreamDirection::Sending` reads the same direction attributes. `None` also for an SDP that does not parse, which
+/// retina's `DESCRIBE` has refused already.
 pub fn offer(sdp: &[u8]) -> Option<Offer> {
     let session = match sdp_types::Session::parse(sdp) {
         Ok(session) => session,
