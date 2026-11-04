@@ -26,9 +26,12 @@
 //!   with the target [`TARGET`] (which no `retina` filter matches, so it
 //!   is never taken for one of retina's) and the original target in its
 //!   `retina` field; its message and every field value, `name=value`
-//!   after it, go through [`retina_text`]: each `rtsp://` and `rtsps://`
-//!   URL cut to scheme, host and port ([`scrub_urls`]), then one line,
-//!   control characters replaced, capped like any camera text;
+//!   after it, go through [`retina_text`]: cut to its first line, which
+//!   drops what retina dumps of the camera's protocol after a line break
+//!   (the SDP, a request, a response head, buffered bytes) with whatever
+//!   URLs it holds, relative ones too; each `rtsp://` and
+//!   `rtsps://` URL cut to scheme, host and port ([`scrub_urls`]); then
+//!   control characters replaced and capped like any camera text;
 //! - the fields named `url`, `rtp_info` and `value` are dropped outright.
 //!
 //! retina's spans carry the request URL in their fields, which every event
@@ -243,12 +246,26 @@ fn in_host(c: char) -> bool {
         )
 }
 
-/// retina's `text` as a log line carries it: its URLs cut to scheme,
-/// host and port ([`scrub_urls`]), then as any camera text (one line,
-/// control characters replaced, capped). The scrub comes first, so a cut
-/// never leaves part of a URL it would have removed.
+/// The first line of `text`, to its first CR or LF. retina writes what it
+/// dumps of the camera's protocol after a line break (edenhaus/retina
+/// `f65065f`, read 2026-11-04: `Ignoring unparseable stream\nraw SDP:
+/// {:#?}` in `src/client/parse.rs`, `Received RTSP request in Playing
+/// state. Responding unimplemented.\n{:#?}` in `src/client/playing.rs`,
+/// `buffered:\n{:#?}` in `src/rtsp/reader.rs`, and the `{:#?}` of a
+/// response head, which starts its fields on the next line), and that text
+/// holds URLs no scheme marks, such as a relative `a=control` (RFC 2326
+/// §C.1.1), which [`scrub_urls`] cannot find: none of it is kept.
+fn first_line(text: &str) -> &str {
+    text.split(['\r', '\n']).next().unwrap_or_default()
+}
+
+/// retina's `text` as a log line carries it: its first line
+/// (`first_line`), its URLs cut to scheme, host and port
+/// ([`scrub_urls`]), then as any camera text (control characters
+/// replaced, capped). The scrub comes before the cap, so a cut never
+/// leaves part of a URL it would have removed.
 pub fn retina_text(text: &str) -> String {
-    camera_text(&scrub_urls(text))
+    camera_text(&scrub_urls(first_line(text)))
 }
 
 /// The text of one of retina's events: its message, then each field but
@@ -462,18 +479,45 @@ mod tests {
     }
 
     #[test]
-    fn retinas_text_is_scrubbed_before_it_is_cut_to_one_capped_line() {
+    fn retinas_text_is_scrubbed_before_it_is_capped() {
         // Cut first, the cap would keep the path's first bytes; scrubbed
         // first, the URL is short enough to stay whole.
         let lead = "x".repeat(CAMERA_TEXT_BYTES - 20);
-        let text = format!("{lead}\nrtsp://cam/camkey7f3a/live?token=tok9d2e");
+        let text = format!("{lead} rtsp://cam/camkey7f3a/live?token=tok9d2e");
         assert_eq!(retina_text(&text), format!("{lead} rtsp://cam/****"));
-        // Longer than the cap once scrubbed: one line, cut and marked.
-        let long = format!("{}\r\n{text}", "y".repeat(CAMERA_TEXT_BYTES));
+        // Longer than the cap once scrubbed: cut and marked.
+        let long = format!("{} {text}", "y".repeat(CAMERA_TEXT_BYTES));
         let line = retina_text(&long);
         assert_eq!(line.len(), CAMERA_TEXT_BYTES, "{line}");
         assert!(line.ends_with(CUT_MARK), "{line}");
-        assert!(!line.contains('\n') && !line.contains("camkey"), "{line}");
+        assert!(!line.contains("camkey"), "{line}");
+        // Control characters within the line are replaced.
+        assert_eq!(retina_text("a\tb\u{1b}[2J"), "a b\u{fffd}[2J");
+    }
+
+    /// What retina dumps of the camera's protocol after a line break is
+    /// dropped, with the URLs it holds that no scheme marks: a relative
+    /// `a=control` (RFC 2326 §C.1.1) early in an SDP would fit under the
+    /// cap.
+    #[test]
+    fn rfc2326_c_1_1_retinas_dump_after_a_line_break_is_dropped_with_its_relative_urls() {
+        let sdp = "\"v=0\\r\\na=control:/camkey7f3a/live?token=tok9d2e\\r\\n\"";
+        for (text, line) in [
+            (
+                format!("Ignoring unparseable stream\nraw SDP: {sdp}"),
+                "Ignoring unparseable stream",
+            ),
+            (
+                format!("SETUP response: Head {{\r    sdp: {sdp}"),
+                "SETUP response: Head {",
+            ),
+            (format!("\n{sdp}"), ""),
+            ("one line".to_owned(), "one line"),
+        ] {
+            assert_eq!(retina_text(&text), line, "{text}");
+        }
+        assert_eq!(first_line("a\r\nb"), "a");
+        assert_eq!(first_line(""), "");
     }
 
     #[test]
@@ -555,12 +599,10 @@ mod tests {
         });
         for (level, message) in [
             ("ERROR", "an error"),
-            (
-                "WARN",
-                "Unparseable rtptime in RTP-Info header error=bad rtsp://cam/****",
-            ),
+            ("WARN", "Unparseable rtptime in RTP-Info header error=bad"),
             ("INFO", "an info stream=1 method=DESCRIBE"),
-            ("DEBUG", "SETUP response: (     \"Transport\",     \"x\", )"),
+            // The `{:#?}` after its first line is dropped.
+            ("DEBUG", "SETUP response: ( retina=retina::b"),
             ("TRACE", "a trace"),
         ] {
             assert!(
