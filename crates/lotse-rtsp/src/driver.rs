@@ -345,6 +345,11 @@ pub(crate) struct Driver {
     /// The clock every instant the core is given comes from, and its
     /// timers.
     time: Arc<dyn Clock>,
+    /// The one read that comes before due timers was made: the timers run
+    /// at the next call that finds nothing buffered, whether the
+    /// connection has more or not. Cleared once they ran, or are no longer
+    /// due.
+    read_before_timers: bool,
 }
 
 impl fmt::Debug for Driver {
@@ -363,6 +368,7 @@ impl Driver {
             core: SessionCore::new(conn.local, conn.peer, options),
             conn: conn.stream,
             time,
+            read_before_timers: false,
         }
     }
 
@@ -466,16 +472,19 @@ impl Driver {
             if self.core.is_closed() {
                 return Err(Error::Closed);
             }
-            // What already arrived is taken in before the timers, as
-            // retina's own driver reads until nothing is left first: a
+            // What already arrived is taken in before the timers: a
             // keepalive's answer waiting in the socket at its deadline
-            // still counts.
+            // still counts. One read only, and what it parsed handed out:
+            // a camera whose connection never runs dry would otherwise
+            // hold the keepalive and the receiver reports off for good
+            // (retina's own driver reads until nothing is left first).
             let due = self.core.poll_timeout().unwrap_or(now) <= now;
-            let ready = if due {
+            let ready = if due && !self.read_before_timers {
                 exchange(&mut *self.conn, &mut self.core).now_or_never()
             } else {
                 None
             };
+            self.read_before_timers = ready.is_some();
             let exchanged = if let Some(exchanged) = ready {
                 exchanged
             } else {
@@ -513,7 +522,9 @@ impl Driver {
         budget: Budget,
         cancel: &CancellationToken,
     ) {
-        let Self { core, conn, time } = self;
+        let Self {
+            core, conn, time, ..
+        } = self;
         let start = time.now();
         let Some(mut teardown) = core.into_teardown(start) else {
             tracing::debug!("rtsp: no session to tear down");
@@ -1589,6 +1600,39 @@ mod tests {
         };
         let (item, ()) = tokio::join!(driver.next_item(), camera);
         assert_eq!(item.unwrap().rtp().unwrap().seq, 2);
+    }
+
+    /// A camera whose connection never runs dry (a packet waiting at every
+    /// call) still gets its keepalive and receiver report once they fall
+    /// due: one read comes before the due timers, not every read.
+    #[tokio::test]
+    async fn rfc2326_10_8_an_always_readable_camera_still_gets_its_keepalive_when_due() {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        played(&mut driver, &mut cam).await;
+        clock.advance(Duration::from_secs(30));
+        let mut seq = 0_u16;
+        let mut byte = [0_u8; 1];
+        let sent = loop {
+            seq += 1;
+            assert!(seq <= 8, "no keepalive in {} calls", seq - 1);
+            cam.send(&interleaved(0, &rtp(seq, 0, true, &[0x41]))).await;
+            let item = driver.next_item().await.unwrap();
+            assert_eq!(item.rtp().unwrap().seq, seq);
+            if let Some(read) = cam.io.read(&mut byte).now_or_never() {
+                break read.unwrap();
+            }
+        };
+        assert_eq!(sent, 1);
+        assert!(seq <= 2, "the keepalive went out on call {seq}");
+        cam.buf.push(byte[0]);
+        let keepalive = cam.request().await;
+        assert!(
+            keepalive.starts_with("OPTIONS rtsp://cam/stream/"),
+            "{keepalive}"
+        );
+        // The receiver report the keepalive came with.
+        assert_eq!(cam.frame().0, 1);
     }
 
     #[tokio::test]
