@@ -189,15 +189,13 @@ impl WorkerManager {
         self
     }
 
-    /// Starts a worker that may connect to `connect_ports` on its camera
-    /// and, with `loopback_relay`, binds a loopback relay listener before
-    /// its sandbox ([`SourceFactory::loopback_relay`](lotse_core::source::SourceFactory::loopback_relay)).
+    /// Starts a worker that may connect to `connect_ports` on its camera.
     /// Must run inside the runtime.
     #[expect(
         clippy::disallowed_methods,
         reason = "the one place that spawns a process"
     )]
-    pub fn spawn(&self, connect_ports: &[u16], loopback_relay: bool) -> Result<Worker, SpawnError> {
+    pub fn spawn(&self, connect_ports: &[u16]) -> Result<Worker, SpawnError> {
         let (channel, theirs) = Channel::pair().map_err(SpawnError::Channel)?;
         let (datagrams_ours, datagrams_theirs) =
             lotse_ipc::datagram::datagram_pair().map_err(SpawnError::Datagrams)?;
@@ -246,9 +244,6 @@ impl WorkerManager {
             let ports: Vec<String> = connect_ports.iter().map(u16::to_string).collect();
             command.arg("--connect-ports").arg(ports.join(","));
         }
-        if loopback_relay {
-            command.arg("--loopback-relay");
-        }
         command
             .env_clear()
             .stdin(Stdio::from(theirs))
@@ -270,7 +265,7 @@ impl WorkerManager {
                 uplink(turn, ours, relay_owner),
             ))
         });
-        tracing::info!(pid, connect_ports = ?connect_ports, loopback_relay, "worker spawned");
+        tracing::info!(pid, connect_ports = ?connect_ports, "worker spawned");
         Ok(Worker {
             pid,
             child,
@@ -1247,7 +1242,7 @@ mod tests {
         };
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
         let manager = WorkerManager::new(config, Some(udp));
-        let mut worker = manager.spawn(&[554, 8554], true).unwrap();
+        let mut worker = manager.spawn(&[554, 8554]).unwrap();
         let spec = SourceSpec {
             connection_id: "c1".into(),
             url: "fake://cam/".into(),
@@ -1294,10 +1289,7 @@ mod tests {
         io::Read::read_to_end(&mut clip_bytes, &mut rest).unwrap();
         assert!(rest.is_empty());
         let args = std::fs::read_to_string(dir.join("args")).unwrap();
-        assert!(
-            args.contains("--connect-ports\n554,8554\n--loopback-relay\n"),
-            "{args}"
-        );
+        assert!(args.contains("--connect-ports\n554,8554\n"), "{args}");
         assert!(
             args.contains(
                 "--preroll-bytes\n1048576\n--clip-max-ms\n45000\n--clip-queue-bytes\n65536\n\
@@ -1352,7 +1344,7 @@ mod tests {
         config.binary = script;
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
         let manager = WorkerManager::new(config, Some(udp));
-        let worker = manager.spawn(&[554], true).unwrap();
+        let worker = manager.spawn(&[554]).unwrap();
         let proc = PathBuf::from(format!("/proc/{}", worker.pid()));
         // The shell holds its script open until it `exec`s `sleep`: look
         // every 10 ms for up to five seconds.
@@ -1435,7 +1427,7 @@ mod tests {
             crate::test_support::environment("/usr/bin/true").worker,
             None,
         );
-        let mut worker = manager.spawn(&[], false).unwrap();
+        let mut worker = manager.spawn(&[]).unwrap();
         // Reaped before the runtime looks: its wait fails with `ECHILD`.
         let pid = Pid::from_raw(i32::try_from(worker.pid()).unwrap()).unwrap();
         let (reaped, _status) = waitpid(Some(pid), WaitOptions::empty()).unwrap().unwrap();
@@ -1478,7 +1470,7 @@ mod tests {
             },
             None,
         );
-        let err = manager.spawn(&[554], false).unwrap_err();
+        let err = manager.spawn(&[554]).unwrap_err();
         assert!(matches!(err, SpawnError::Spawn { .. }), "{err}");
         assert!(err.to_string().contains("/nonexistent/lotse"));
         assert_eq!(

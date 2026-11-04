@@ -299,7 +299,6 @@ mod tests {
 
     use super::*;
     use crate::options::RtspOptions;
-    use crate::relay::Listener;
 
     fn camera_at(addr: std::net::SocketAddr, timeout_ms: u64) -> Camera {
         timed(addr, timeout_ms, Arc::new(SystemClock))
@@ -314,7 +313,6 @@ mod tests {
                 ..RtspOptions::default()
             },
             tls: None,
-            relay: Listener::default(),
             addr,
             time,
         }

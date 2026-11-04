@@ -55,12 +55,15 @@ use super::{BackchannelFormat, Packetizer};
 use crate::driver::{self, Driver};
 use crate::source::{play_options, within_on};
 
-/// Above this many bytes queued for the camera, a talker's packet is
-/// dropped rather than queued: 4 KiB, a quarter second of 128 kbit/s,
-/// twice G.711's rate (RFC 3551 §4.5.14) with room for its headers. A
-/// camera that takes data that slowly would hear the talk-back fall ever
-/// further behind; dropping keeps it near real time, and waiting for
-/// room would stop the session reading what the camera sends.
+/// Above this many bytes queued in the driver for the camera, a talker's
+/// packet is dropped rather than queued: 4 KiB, a quarter second of
+/// 128 kbit/s, twice G.711's rate (RFC 3551 §4.5.14) with room for its
+/// headers. The driver's queue (`queued_len`) holds only what the
+/// connection refused; the kernel's send buffer, and for `rtsps` rustls's
+/// plaintext buffer, sit in front of it and fill first. So the bound
+/// limits what lotse holds for a camera that takes data too slowly, not
+/// how far behind the talk-back can fall end to end; waiting for room
+/// instead would stop the session reading what the camera sends.
 const MAX_QUEUED: usize = 4 * 1024;
 
 /// What an open backchannel session hands its claim: the codec and frame
@@ -398,7 +401,6 @@ mod tests {
 
     use super::*;
     use crate::options::RtspOptions;
-    use crate::relay::Listener;
 
     fn camera_at(cam: &FakeCamera) -> Camera {
         Camera {
@@ -408,7 +410,6 @@ mod tests {
                 ..RtspOptions::default()
             },
             tls: None,
-            relay: Listener::default(),
             addr: cam.addr(),
             time: Arc::new(SystemClock),
         }
@@ -420,7 +421,6 @@ mod tests {
             url: SourceUrl::parse("rtsp://127.0.0.1:1/stream").unwrap(),
             options: RtspOptions::default(),
             tls: None,
-            relay: Listener::default(),
             addr: "127.0.0.1:1".parse().unwrap(),
             time: Arc::new(SystemClock),
         };

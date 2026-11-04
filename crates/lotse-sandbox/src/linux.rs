@@ -478,21 +478,19 @@ const STATE_ACCESS: BitFlags<AccessFs> = landlock::make_bitflags!(AccessFs::{
 
 /// The TCP ports a profile's ruleset still allows, and for what.
 ///
-/// The supervisor may bind port 0 only, which the kernel maps onto the
-/// ephemeral range (landlock(7), `struct landlock_net_port_attr`: a rule
-/// for port 0 with `LANDLOCK_ACCESS_NET_BIND_TCP` allows `bind(2)` to port
-/// 0). Its sockets are bound before the sandbox; the rule exists for the
-/// workers, which inherit its domain and bind their loopback relay on
-/// `127.0.0.1:0` before applying their own. No fixed port becomes
-/// bindable. A worker may connect to its camera's ports and its relay.
+/// No profile may bind a TCP port: the supervisor binds its sockets
+/// before the sandbox, and neither it nor the workers that inherit its
+/// domain bind one after (the workers' loopback relay, which bound
+/// `127.0.0.1:0` under it, is gone since the RTSP source drives retina's
+/// core on its own connections). A worker may connect to its camera's
+/// ports only.
 fn net_rules(profile: &Profile) -> Vec<(u16, BitFlags<AccessNet>)> {
     match profile {
-        Profile::Supervisor { .. } => vec![(0, AccessNet::BindTcp.into())],
         Profile::Worker { connect_ports } => connect_ports
             .iter()
             .map(|&port| (port, AccessNet::ConnectTcp.into()))
             .collect(),
-        Profile::Decoder => Vec::new(),
+        Profile::Supervisor { .. } | Profile::Decoder => Vec::new(),
     }
 }
 
@@ -1136,7 +1134,7 @@ mod tests {
         );
         assert!(fs_rules(&worker).is_empty());
         assert!(fs_rules(&Profile::Decoder).is_empty());
-        assert_eq!(net_rules(&supervisor), [(0, AccessNet::BindTcp.into())]);
+        assert!(net_rules(&supervisor).is_empty(), "no TCP port bindable");
         assert_eq!(
             net_rules(&worker),
             [

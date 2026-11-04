@@ -1,15 +1,11 @@
 //! The `rtsp` and `rtsps` schemes' factory: options checked, the source
 //! built.
 
-use std::net::TcpListener;
-use std::sync::Arc;
-
 use lotse_core::source::{Source, SourceCapabilities, SourceConfigError, SourceFactory};
 use lotse_core::source_url::SourceUrl;
 use lotse_tls::{TlsTarget, Trust};
 
 use crate::options::{RtspOptions, Transport};
-use crate::relay::Listener;
 use crate::source::RtspSource;
 
 /// The protocol name reported for every scheme of this factory.
@@ -31,24 +27,10 @@ pub const DEFAULT_TLS_PORT: u16 = 322;
 /// packets go out through retina's send path ([`crate::backchannel`]).
 pub const BACKCHANNEL: bool = true;
 
-/// The factory, with the loopback listener a sandboxed worker bound for
-/// the relay before its sandbox, if any.
+/// The factory: every source it builds dials the camera itself, on the
+/// connect ports the worker is given ([`SourceFactory::default_port`]).
 #[derive(Debug, Default)]
-pub struct RtspFactory {
-    /// Where the relays of its sources' connections listen: the pre-bound
-    /// listener, or one bound per connection.
-    relay: Listener,
-}
-
-impl RtspFactory {
-    /// A factory whose sources relay through `relay` when given
-    /// ([`SourceFactory::loopback_relay`]).
-    pub fn new(relay: Option<TcpListener>) -> Self {
-        Self {
-            relay: Listener::new(relay.map(Arc::new)),
-        }
-    }
-}
+pub struct RtspFactory;
 
 /// The `rtsps` target for `url` and `options`; `None` for `rtsp`. The TLS
 /// options are refused on `rtsp`, and the pin and `insecure_tls` together.
@@ -102,12 +84,6 @@ impl SourceFactory for RtspFactory {
         })
     }
 
-    /// Both schemes: every connection reaches retina through the relay,
-    /// which also sends the camera its receiver reports.
-    fn loopback_relay(&self, _scheme: &str) -> bool {
-        true
-    }
-
     fn validate(
         &self,
         url: &SourceUrl,
@@ -125,12 +101,7 @@ impl SourceFactory for RtspFactory {
                 message: "transport udp is not available for rtsps://: the media would leave the TLS session as plain RTP (SRTP is not supported); use tcp".to_owned(),
             });
         }
-        Ok(Box::new(RtspSource::new(
-            url.clone(),
-            options,
-            tls,
-            self.relay.clone(),
-        )))
+        Ok(Box::new(RtspSource::new(url.clone(), options, tls)))
     }
 }
 
@@ -150,7 +121,7 @@ mod tests {
 
     #[test]
     fn the_factory_validates_scheme_and_options() {
-        let factory = RtspFactory::default();
+        let factory = RtspFactory;
         assert_eq!(factory.schemes(), ["rtsp", "rtsps"]);
         assert!(factory.capabilities().backchannel, "the ONVIF backchannel");
         let url = SourceUrl::parse("rtsp://user:pass@192.168.1.10/h264").unwrap();
@@ -201,19 +172,14 @@ mod tests {
 
     #[test]
     fn rtsps_defaults_to_port_322_and_rtsp_to_554_rfc7826_4_2() {
-        let factory = RtspFactory::default();
+        let factory = RtspFactory;
         assert_eq!(factory.default_port("rtsp"), Some(554));
         assert_eq!(factory.default_port("rtsps"), Some(322));
-        assert!(factory.loopback_relay("rtsps"));
-        assert!(
-            factory.loopback_relay("rtsp"),
-            "the receiver reports need the relay for rtsp too"
-        );
     }
 
     #[test]
     fn rtsps_options_are_checked_at_put() {
-        let factory = RtspFactory::new(None);
+        let factory = RtspFactory;
         let rtsps = SourceUrl::parse("rtsps://cam.local/").unwrap();
         let rtsp = SourceUrl::parse("rtsp://cam.local/").unwrap();
         for options in [

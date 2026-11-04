@@ -17,13 +17,9 @@ mod driver;
 pub mod error;
 mod factory;
 mod fmtp;
-mod framer;
 pub mod options;
-mod relay;
 pub mod retina_log;
-mod rtcp;
 mod source;
-mod tap;
 mod udp;
 
 pub use factory::{BACKCHANNEL, DEFAULT_PORT, DEFAULT_TLS_PORT, PROTOCOL, RtspFactory};

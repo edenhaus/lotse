@@ -452,7 +452,7 @@ fn ctl_round_trips_over_the_socket_of_a_running_daemon() {
 /// and denied every TCP `bind`, so no `rtsp` worker could bind its loopback
 /// relay; its seccomp filter killed the supervisor at `pidfd_open` and,
 /// inherited, the worker at its first Landlock call. A fake source, an
-/// `rtsp` camera over TCP (through the relay) and the same camera over UDP
+/// `rtsp` camera over TCP and the same camera over UDP
 /// go live through workers of a sandboxed supervisor. Needs a static binary: Landlock's `execute` right is checked
 /// on a dynamic binary's loader too, and the supervisor grants it on its
 /// own binary alone, so this runs on the musl target (`mise run test-musl`).

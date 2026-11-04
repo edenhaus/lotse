@@ -75,9 +75,8 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
 
 /// The sources, outputs and transcoders this build carries: the only place
 /// that names a concrete one. Sources and outputs sit behind their Cargo
-/// feature; the transcoders are always there. `relay` is a worker's
-/// pre-bound loopback listener for the `rtsps` relay.
-fn registries(relay: Option<std::net::TcpListener>) -> Registries {
+/// feature; the transcoders are always there.
+fn registries() -> Registries {
     let mut registries = Registries::default();
     // AAC-LC → Opus: pure computation on the side branch, in every build.
     registries
@@ -103,10 +102,8 @@ fn registries(relay: Option<std::net::TcpListener>) -> Registries {
         "rtsp source",
         registries
             .sources
-            .register(Arc::new(lotse_rtsp::RtspFactory::new(relay))),
+            .register(Arc::new(lotse_rtsp::RtspFactory)),
     );
-    #[cfg(not(feature = "source-rtsp"))]
-    drop(relay);
     #[cfg(feature = "source-http")]
     registered(
         "http source",
@@ -154,20 +151,9 @@ fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
         gid: lotse_sandbox::DEFAULT_GID,
         worker_address_space: args.worker_address_space,
     };
-    // The relay listener is bound before the sandbox: Landlock allows
-    // `bind` and `connect` only on the ports it is given now. Until then the
-    // supervisor's inherited domain applies, which allows `bind` to port 0.
-    let relay = args
-        .loopback_relay
-        .then(|| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)))
-        .transpose()
-        .context("loopback relay")?;
-    let mut connect_ports = args.connect_ports.clone();
-    if let Some(listener) = &relay {
-        let port = listener.local_addr().context("loopback relay")?.port();
-        tracing::info!(port, "loopback relay bound");
-        connect_ports.push(port);
-    }
+    // Landlock allows `connect` only on the camera's ports, the ones the
+    // supervisor passed; the worker binds no TCP port.
+    let connect_ports = args.connect_ports.clone();
     // The supervisor reads the worker's memory through this descriptor:
     // once the worker is not dumpable, its `/proc` entries are closed to
     // the supervisor. There is no `/proc` on macOS.
@@ -187,7 +173,7 @@ fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
         shared_udp_fd: Some(lotse_sandbox::WORKER_SHARED_UDP_FD),
         clip: clip_settings(args),
     };
-    let reason = lotse_worker::run(&settings, registries(relay), memory).context("worker")?;
+    let reason = lotse_worker::run(&settings, registries(), memory).context("worker")?;
     tracing::info!(reason = ?reason, "worker exited");
     Ok(())
 }
@@ -256,7 +242,7 @@ fn serve(args: &ServeArgs, matches: &ArgMatches) -> anyhow::Result<()> {
 
     let limits = &settings.supervisor.limits;
     let environment = Environment {
-        registries: registries(None),
+        registries: registries(),
         worker: WorkerConfig {
             binary,
             log_format: settings.log.format.name().to_owned(),
@@ -382,7 +368,7 @@ mod tests {
     #[cfg(feature = "output-clip")]
     #[test]
     fn the_clip_output_is_registered_behind_its_feature() {
-        let registries = registries(None);
+        let registries = registries();
         let clip = registries.clip.expect("a clip output");
         let h264 = lotse_core::codec::Codec::H264 {
             profile_level_id: None,

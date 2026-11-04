@@ -24,20 +24,28 @@
 //! Nothing here caps an outgoing request: retina writes the request whole,
 //! and what bounds it is what goes into it, the source URL (the control
 //! API's `MAX_URL_CHARS`, 4096 characters) and the `user_agent`
-//! ([`crate::options::MAX_USER_AGENT_LEN`]). Only the relayed paths frame
-//! retina's requests against [`crate::framer::MAX_MESSAGE`].
+//! ([`crate::options::MAX_USER_AGENT_LEN`]). What the camera sends is
+//! bounded by retina, at most [`crate::source::MAX_MESSAGE`] bytes of one
+//! message (`SessionOptions::max_message_size`).
 //!
 //! A teardown runs under a [`Budget`]: the attempt on the session's own
 //! connection is bounded tightly, and only when retina retries on a fresh
 //! connection does the bound grow, so that a dial and a TLS handshake fit.
-//! A cancellation, before the teardown or during it, bounds what is left
-//! at the tight bound from then on, fresh connections included, so the
+//! retina retries on a fresh connection only once the session's own one
+//! closed or failed; one that stalls silently keeps the tight bound, and
+//! the session is left to expire on the camera, by design. A
+//! cancellation, before the teardown or during it, bounds what is left at
+//! the tight bound from then on, fresh connections included, so the
 //! source honors its cancel within the source contract's 100 ms.
 //!
-//! The core is built for more than this one path: RTP over UDP (the core's
-//! UDP buffers and transmits, sockets the caller binds) and the ONVIF
-//! backchannel (`queue_rtp`) plug in beside [`Driver::next_item`]'s one
-//! exchange per round, on the same core and connection.
+//! RTP over UDP plugs in beside [`Driver::next_item`]'s exchange on the
+//! connection: [`Driver::setup_udp`] asks for it with a pair the source
+//! bound, the driver sends what the core queues for the pairs (the hole
+//! punches right after the `SETUP` answer, the receiver reports while
+//! playing) and hands the core what they receive, once [`crate::udp`]'s
+//! checks passed it, in the same poll as the connection's bytes. The ONVIF
+//! backchannel's packets go out the same way, on the same core and
+//! connection ([`Driver::queue_rtp`]).
 
 use std::fmt;
 use std::future::poll_fn;
@@ -51,13 +59,14 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::FutureExt as _;
 use lotse_core::clock::Clock;
+use lotse_core::ingest::IngestCounters;
 use lotse_core::source::SourceError;
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::BoxFuture;
 use retina::buf::MarkBuf;
 use retina::client::{
     PlayOptions, PlayingItem, RtpPacket, SessionCore, SessionEvent, SessionOptions, SetupTransport,
-    Stream, TeardownAction, TeardownCore,
+    Stream, TeardownAction, TeardownCore, UdpPeer,
 };
 use retina::rtp::Continuity;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -65,9 +74,10 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::error::classify;
+use crate::udp::{Pair, Streams, udp_options};
 
 /// How much free space a read from the camera asks of retina's buffer at
-/// least: 16 KiB, as the relay reads.
+/// least: 16 KiB.
 const READ_RESERVE: usize = 16_384;
 
 /// The reads, at most, of what is already waiting on the connection before
@@ -126,6 +136,12 @@ pub(crate) enum Error {
     Closed,
     /// [`Driver::next_item`] was asked before `PLAY` was answered.
     NotPlaying,
+    /// The camera's answer was refused here: a UDP `source` no camera can
+    /// send from ([`crate::udp`]).
+    Refused(SourceError),
+    /// A `SETUP` named a stream the description does not have (none before
+    /// `DESCRIBE`): retina would index past its streams.
+    UnknownStream(usize),
 }
 
 impl Error {
@@ -137,6 +153,10 @@ impl Error {
             Self::Write(err) => SourceError::Ended(format!("writing to the camera failed: {err}")),
             Self::Closed => SourceError::Ended("the camera closed the session".into()),
             Self::NotPlaying => SourceError::Protocol("rtsp: no packets before PLAY".into()),
+            Self::Refused(err) => err.clone(),
+            Self::UnknownStream(index) => SourceError::Protocol(format!(
+                "rtsp: no stream {index} in the camera's description"
+            )),
         }
     }
 
@@ -144,7 +164,11 @@ impl Error {
     pub(crate) fn status_code(&self) -> Option<u16> {
         match self {
             Self::Session(err) => err.status_code(),
-            Self::Write(_) | Self::Closed | Self::NotPlaying => None,
+            Self::Write(_)
+            | Self::Closed
+            | Self::NotPlaying
+            | Self::Refused(_)
+            | Self::UnknownStream(_) => None,
         }
     }
 }
@@ -343,6 +367,50 @@ fn poll_exchange(
     }
 }
 
+/// The camera's media address a `SETUP` answer names for a UDP stream;
+/// none for any other event.
+fn udp_peer(event: &SessionEvent) -> Option<UdpPeer> {
+    match event {
+        SessionEvent::SetUp { udp_peer, .. } => *udp_peer,
+        _ => None,
+    }
+}
+
+/// The session's error for a failed exchange of `core` on the clock `time`:
+/// a read as retina words it, with the connection's context.
+fn failure(core: &SessionCore, time: &dyn Clock, failed: Failed) -> Error {
+    match failed {
+        Failed::Read(err) => Error::Session(core.read_error(err, time.now())),
+        Failed::Write(err) => Error::Write(err),
+    }
+}
+
+/// One round of a playing session's I/O: [`poll_exchange`] on `conn`,
+/// then the datagrams of the UDP streams ([`Streams::poll_recv`]), each
+/// time both, so neither waits for the other; ready once either made
+/// progress or failed.
+fn poll_media(
+    cx: &mut Context<'_>,
+    conn: &mut dyn Duplex,
+    core: &mut SessionCore,
+    udp: &mut Streams,
+    time: &dyn Clock,
+) -> Poll<Result<(), Error>> {
+    let exchanged = poll_exchange(cx, conn, core);
+    if let Poll::Ready(Err(failed)) = exchanged {
+        return Poll::Ready(Err(failure(core, time, failed)));
+    }
+    let received = udp.poll_recv(cx, core, time.now());
+    if let Poll::Ready(Err(err)) = received {
+        return Poll::Ready(Err(err));
+    }
+    if exchanged.is_ready() || received.is_ready() {
+        Poll::Ready(Ok(()))
+    } else {
+        Poll::Pending
+    }
+}
+
 /// retina's [`SessionCore`] on one connection to the camera, on the
 /// injected clock.
 pub(crate) struct Driver {
@@ -353,6 +421,8 @@ pub(crate) struct Driver {
     /// The clock every instant the core is given comes from, and its
     /// timers.
     time: Arc<dyn Clock>,
+    /// The pairs of the streams set up over UDP.
+    udp: Streams,
     /// The reads that come before due timers were made
     /// ([`Driver::read_ready`]): the timers run at the next call that finds
     /// nothing buffered, whether the connection has more or not. Cleared
@@ -374,10 +444,17 @@ impl Driver {
     pub(crate) fn new(conn: Connection, options: SessionOptions, time: Arc<dyn Clock>) -> Self {
         Self {
             core: SessionCore::new(conn.local, conn.peer, options),
+            udp: Streams::new(conn.peer.ip()),
             conn: conn.stream,
             time,
             read_before_timers: false,
         }
+    }
+
+    /// Counts the datagrams refused, and the packets that came late, of the
+    /// streams set up over UDP into `ingest`.
+    pub(crate) fn count_udp_into(&mut self, ingest: Arc<IngestCounters>) {
+        self.udp.count_into(ingest);
     }
 
     /// The streams the `DESCRIBE` answer described; none before it.
@@ -427,11 +504,50 @@ impl Driver {
     /// `SETUP` of the stream at `index` among [`Driver::streams`], TCP
     /// interleaved (RFC 2326 §10.4, §10.12).
     pub(crate) async fn setup(&mut self, index: usize) -> Result<(), Error> {
+        self.described(index)?;
         self.core
             .setup(index, SetupTransport::Tcp)
             .map_err(Error::Session)?;
         self.request().await?;
         Ok(())
+    }
+
+    /// `SETUP` of the stream at `index` among [`Driver::streams`], RTP over
+    /// UDP to `pair` (RFC 2326 §10.4, §12.39), without a reorder buffer
+    /// ([`udp_options`]). Once answered, the source the answer names is
+    /// checked before anything is sent there ([`Error::Refused`]), then the
+    /// hole punches retina queued go out; the pair receives once the
+    /// session plays.
+    pub(crate) async fn setup_udp(&mut self, index: usize, pair: Pair) -> Result<(), Error> {
+        let transport = SetupTransport::Udp {
+            client_rtp_port: pair.port(),
+            options: udp_options(),
+        };
+        self.described(index)?;
+        self.core.setup(index, transport).map_err(Error::Session)?;
+        let peer = udp_peer(&self.request().await?);
+        self.udp
+            .set_up(index, pair, peer.as_ref())
+            .map_err(Error::Refused)?;
+        self.send_udp();
+        Ok(())
+    }
+
+    /// [`Error::UnknownStream`] unless the description has a stream at
+    /// `index`: retina's `setup` indexes its streams unchecked.
+    fn described(&self, index: usize) -> Result<(), Error> {
+        self.streams()
+            .get(index)
+            .map(|_| ())
+            .ok_or(Error::UnknownStream(index))
+    }
+
+    /// Sends every datagram the core queued for the pairs.
+    fn send_udp(&mut self) {
+        let now = self.time.now();
+        while let Some(transmit) = self.core.poll_transmit_udp() {
+            self.udp.send(&transmit, now);
+        }
     }
 
     /// `PLAY` of the whole presentation (RFC 2326 §10.5) with `options`.
@@ -456,22 +572,34 @@ impl Driver {
     /// The session's error for a failed exchange: a read as retina words
     /// it, with the connection's context.
     fn failure(&self, failed: Failed) -> Error {
-        match failed {
-            Failed::Read(err) => Error::Session(self.core.read_error(err, self.time.now())),
-            Failed::Write(err) => Error::Write(err),
-        }
+        failure(&self.core, &*self.time, failed)
+    }
+
+    /// One round of the playing session's I/O ([`poll_media`]): the
+    /// connection's exchange and the pairs' datagrams.
+    fn media(&mut self) -> impl Future<Output = Result<(), Error>> + '_ {
+        let Self {
+            core,
+            conn,
+            time,
+            udp,
+            ..
+        } = self;
+        poll_fn(move |cx| poll_media(cx, &mut **conn, core, udp, &**time))
     }
 
     /// The next item of a playing session, once one arrived: every item
     /// already buffered first (a keepalive's answer among them, which the
-    /// core takes in), then what already waits on the connection, then the
-    /// timers, as retina's own driver does, so an answer that arrived by
-    /// its deadline still counts; keepalives and
-    /// receiver reports go out when retina has them due, and the camera's
-    /// bytes are read meanwhile. Each item handed out spends a unit of
-    /// tokio's task budget, so a burst yields to the runtime as reads
-    /// would. [`Error::Closed`] once the camera closed the connection and
-    /// every item before was handed out; [`Error::NotPlaying`] before
+    /// core takes in), then what already waits on the connection, at most
+    /// [`READS_BEFORE_TIMERS`] reads, then the timers, so an answer that
+    /// arrived by its deadline still counts and neither the connection nor
+    /// the UDP pairs can hold the timers off; keepalives and receiver
+    /// reports go out when retina has them due, and the camera's bytes and
+    /// datagrams are read meanwhile. Each item handed out spends
+    /// a unit of tokio's task budget, so a burst yields to the runtime as
+    /// reads would. [`Error::Closed`] once the camera closed the
+    /// connection and every item before was handed out, its datagrams
+    /// still arriving or not; [`Error::NotPlaying`] before
     /// `PLAY` was answered.
     pub(crate) async fn next_item(&mut self) -> Result<Item, Error> {
         if !self.core.is_playing() {
@@ -507,13 +635,15 @@ impl Driver {
             if self.core.is_closed() {
                 return Err(Error::Closed);
             }
-            // What already arrived is taken in before the timers: a
-            // keepalive's answer waiting in the socket at its deadline
-            // still counts. Bounded reads only, and what they parsed
-            // handed out: a camera whose connection never runs dry would
-            // otherwise hold the keepalive and the receiver reports off
-            // for good (retina's own driver reads until nothing is left
-            // first).
+            // What already arrived on the connection is taken in before
+            // the timers: a keepalive's answer waiting in the socket at its
+            // deadline still counts. Bounded reads only, and what they
+            // parsed handed out: a camera whose connection never runs dry
+            // would otherwise hold the keepalive and the receiver reports
+            // off for good (retina's own driver reads until nothing is left
+            // first). The UDP pairs carry no answer, so their datagrams
+            // wait until the timers ran: a stream that never pauses would
+            // hold them off too.
             let due = self.core.poll_timeout().unwrap_or(now) <= now;
             let ready = if due && !self.read_before_timers {
                 self.read_ready()
@@ -521,22 +651,21 @@ impl Driver {
                 None
             };
             self.read_before_timers = ready.is_some();
-            let exchanged = if let Some(exchanged) = ready {
-                exchanged
+            let io = if let Some(exchanged) = ready {
+                exchanged.map_err(|failed| self.failure(failed))
             } else {
                 if due {
                     self.core.handle_timeout(now).map_err(Error::Session)?;
+                    self.send_udp();
                 }
                 let next = self.core.poll_timeout().unwrap_or(now);
                 let wait = self.time.sleep(next.saturating_duration_since(now));
                 tokio::select! {
-                    exchanged = exchange(&mut *self.conn, &mut self.core) => exchanged,
+                    io = self.media() => io,
                     () = wait => Ok(()),
                 }
             };
-            if let Err(failed) = exchanged {
-                return Err(self.failure(failed));
-            }
+            io?;
         }
     }
 
@@ -575,8 +704,15 @@ impl Driver {
         cancel: &CancellationToken,
     ) {
         let Self {
-            core, conn, time, ..
+            core,
+            conn,
+            time,
+            udp,
+            ..
         } = self;
+        // The camera sends to the pairs no more once torn down, and before
+        // nothing reads them.
+        drop(udp);
         let start = time.now();
         let Some(mut teardown) = core.into_teardown(start) else {
             tracing::debug!("rtsp: no session to tear down");
@@ -724,7 +860,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use std::net::IpAddr;
+
     use lotse_core::clock::FakeClock;
+    use lotse_core::ingest::IngestStats;
     use retina::client::{ReceiverReportPolicy, TeardownPolicy};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
 
@@ -1153,11 +1292,48 @@ mod tests {
             err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap()),
             SourceError::Protocol(m) if m.starts_with("404")
         ));
-        // A request retina refuses to start is its error too.
+        // Without a description there is no stream to set up, and a
+        // request retina refuses to start is its error.
         let refused = driver.setup(0).await.unwrap_err();
-        assert!(matches!(refused, Error::Session(_)), "{refused:?}");
+        assert!(matches!(refused, Error::UnknownStream(0)), "{refused:?}");
         let refused = driver.play(play_options()).await.unwrap_err();
         assert!(matches!(refused, Error::Session(_)), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn rfc2326_10_4_a_setup_of_a_stream_the_description_lacks_is_refused() {
+        let _logs = traced();
+        let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let camera = cam.ok(
+            "DESCRIBE",
+            "Content-Base: rtsp://cam/stream/\r\nContent-Type: application/sdp\r\n",
+            SDP,
+        );
+        let (described, _) = tokio::join!(driver.describe(url()), camera);
+        described.unwrap();
+        // Between DESCRIBE and PLAY retina indexes its streams unchecked:
+        // one stream described, index 1 would be past them.
+        let err = driver.setup(1).await.unwrap_err();
+        assert!(matches!(err, Error::UnknownStream(1)), "{err:?}");
+        assert_eq!(err.status_code(), None);
+        assert_eq!(
+            err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap()),
+            SourceError::Protocol("rtsp: no stream 1 in the camera's description".into())
+        );
+        let pair = Pair::bind(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).unwrap();
+        let err = driver.setup_udp(5, pair).await.unwrap_err();
+        assert!(matches!(err, Error::UnknownStream(5)), "{err:?}");
+        // The stream that is there sets up; a second time is retina's
+        // refusal, the stream already set up.
+        let camera = cam.ok(
+            "SETUP",
+            "Session: 12345678;timeout=60\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n",
+            "",
+        );
+        let (set_up, _) = tokio::join!(driver.setup(0), camera);
+        set_up.unwrap();
+        let err = driver.setup(0).await.unwrap_err();
+        assert!(matches!(err, Error::Session(_)), "{err:?}");
     }
 
     /// How a [`Faulty`] connection fails.
@@ -1826,6 +2002,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_already_arrived_is_handed_out_before_an_overdue_timer_fires() {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        played(&mut driver, &mut cam).await;
+        // A packet waits unread while the keepalive's deadline passes.
+        cam.send(&interleaved(0, &rtp(1, 0, true, &[0x65]))).await;
+        clock.advance(Duration::from_secs(31));
+        let item = driver.next_item().await.unwrap();
+        assert_eq!(item.rtp().unwrap().seq, 1);
+        // The keepalive goes out with the next round.
+        let camera = async {
+            let keepalive = cam.request().await;
+            assert!(keepalive.starts_with("OPTIONS"), "{keepalive}");
+            cam.answer(&keepalive, "200 OK", "", "").await;
+            cam.send(&interleaved(0, &rtp(2, 3000, true, &[0x41])))
+                .await;
+        };
+        let (item, ()) = tokio::join!(driver.next_item(), camera);
+        assert_eq!(item.unwrap().rtp().unwrap().seq, 2);
+    }
+
+    #[tokio::test]
     async fn no_item_before_play() {
         let _logs = traced();
         let (_clock, mut driver, _cam) = rig(64 * 1024, TeardownPolicy::Auto);
@@ -1880,5 +2078,574 @@ mod tests {
             .into_io()
             .kind();
         assert_eq!(kind, io::ErrorKind::BrokenPipe);
+    }
+
+    /// The SDP of a camera with video and audio.
+    const SDP_AV: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+        m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:track0\r\n\
+        m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=control:track1\r\n";
+
+    /// The camera's RTP/RTCP pair on loopback, RTP on an even port.
+    struct CamUdp {
+        rtp: tokio::net::UdpSocket,
+        rtcp: tokio::net::UdpSocket,
+        port: u16,
+    }
+
+    impl CamUdp {
+        fn bind() -> Self {
+            let (media, control) =
+                crate::udp::bind_pair(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).unwrap();
+            let port = media.local_addr().unwrap().port();
+            for socket in [&media, &control] {
+                socket.set_nonblocking(true).unwrap();
+            }
+            Self {
+                rtp: tokio::net::UdpSocket::from_std(media).unwrap(),
+                rtcp: tokio::net::UdpSocket::from_std(control).unwrap(),
+                port,
+            }
+        }
+
+        /// The next datagram on `socket` and its sender, within 5 s.
+        async fn recv(socket: &tokio::net::UdpSocket) -> (Vec<u8>, SocketAddr) {
+            let mut buf = vec![0_u8; 2048];
+            let (n, from) = within_5s(socket.recv_from(&mut buf)).await.unwrap();
+            buf.truncate(n);
+            (buf, from)
+        }
+
+        /// Whether nothing arrived on `socket` yet.
+        fn quiet(socket: &tokio::net::UdpSocket) -> bool {
+            let mut buf = [0_u8; 64];
+            matches!(socket.try_recv_from(&mut buf), Err(err) if err.kind() == io::ErrorKind::WouldBlock)
+        }
+    }
+
+    /// The `client_port` a `SETUP`'s head names.
+    fn client_port(head: &str) -> u16 {
+        let at = head.find("client_port=").unwrap() + "client_port=".len();
+        head[at..].split('-').next().unwrap().parse().unwrap()
+    }
+
+    impl Cam {
+        /// The camera's half of `DESCRIBE` of `sdp`, then a `SETUP` over
+        /// UDP for each of its `streams`, answered with what `transport`
+        /// makes of the `client_port` it names; the client ports.
+        async fn serve_udp_setups(
+            &mut self,
+            sdp: &str,
+            streams: usize,
+            transport: impl Fn(u16) -> String,
+        ) -> Vec<u16> {
+            self.ok(
+                "DESCRIBE",
+                "Content-Base: rtsp://cam/stream/\r\nContent-Type: application/sdp\r\n",
+                sdp,
+            )
+            .await;
+            let mut ports = Vec::new();
+            for _ in 0..streams {
+                let head = self.request().await;
+                assert!(head.starts_with("SETUP"), "{head}");
+                let port = client_port(&head);
+                assert!(
+                    head.contains(&format!(
+                        "Transport: RTP/AVP/UDP;unicast;client_port={port}-{}\r\n",
+                        port + 1
+                    )),
+                    "{head}"
+                );
+                let headers = format!(
+                    "Session: 12345678;timeout=60\r\nTransport: {}\r\n",
+                    transport(port)
+                );
+                self.answer(&head, "200 OK", &headers, "").await;
+                ports.push(port);
+            }
+            ports
+        }
+    }
+
+    /// The answer's `Transport` for the camera's pair at `server`, or
+    /// without `server_port` for none.
+    fn answered(server: Option<u16>) -> impl Fn(u16) -> String {
+        move |client| {
+            let server = server.map_or_else(String::new, |port| {
+                format!(";server_port={port}-{}", port + 1)
+            });
+            format!(
+                "RTP/AVP/UDP;unicast;client_port={client}-{}{server}",
+                client + 1
+            )
+        }
+    }
+
+    /// `DESCRIBE` of [`SDP`] and its stream set up over UDP on a pair
+    /// bound for it, the camera answering with `transport`; the client
+    /// port.
+    async fn set_up_udp(
+        driver: &mut Driver,
+        cam: &mut Cam,
+        transport: impl Fn(u16) -> String,
+    ) -> Result<u16, Error> {
+        let session = async {
+            driver.describe(url()).await.unwrap();
+            let pair = Pair::bind(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).unwrap();
+            driver.setup_udp(0, pair).await
+        };
+        let (set_up, ports) = tokio::join!(session, cam.serve_udp_setups(SDP, 1, transport));
+        set_up.map(|()| ports[0])
+    }
+
+    /// `PLAY` on `driver` against `cam`.
+    async fn play_udp(driver: &mut Driver, cam: &mut Cam) {
+        let session = driver.play(play_options());
+        let camera = cam.ok("PLAY", "Session: 12345678\r\n", "");
+        let (played, _) = tokio::join!(session, camera);
+        played.unwrap();
+    }
+
+    /// `future`'s output within 5 s of real time, or a failed test rather
+    /// than a hung one.
+    async fn within_5s<T>(future: impl Future<Output = T>) -> T {
+        use lotse_core::clock::SystemClock;
+
+        tokio::select! {
+            out = future => out,
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("nothing within 5 s"),
+        }
+    }
+
+    /// `next_item`, within 5 s.
+    async fn next(driver: &mut Driver) -> Result<Item, Error> {
+        within_5s(driver.next_item()).await
+    }
+
+    fn to(port: u16) -> SocketAddr {
+        addr(port)
+    }
+
+    #[tokio::test]
+    async fn rfc2326_12_39_hole_punches_follow_the_setup_answer_and_media_and_reports_flow_over_udp()
+     {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let ingest = Arc::new(IngestCounters::default());
+        driver.count_udp_into(Arc::clone(&ingest));
+        let camera = CamUdp::bind();
+        let client = set_up_udp(&mut driver, &mut cam, answered(Some(camera.port)))
+            .await
+            .unwrap();
+        // Before PLAY: one punch from each of the pair's ports to the
+        // camera's (RFC 3550 §5.1 and §6.4.2 packets with nothing to say).
+        let (punch, from) = CamUdp::recv(&camera.rtp).await;
+        assert_eq!((punch.len(), punch[0], from.port()), (12, 0x80, client));
+        let (punch, from) = CamUdp::recv(&camera.rtcp).await;
+        assert_eq!(
+            (punch, from.port()),
+            (vec![0x80, 201, 0, 1, 0, 0, 0, 0], client + 1)
+        );
+        play_udp(&mut driver, &mut cam).await;
+        camera
+            .rtp
+            .send_to(&rtp(1, 90_000, true, &[0x65, 1]), to(client))
+            .await
+            .unwrap();
+        let item = next(&mut driver).await.unwrap();
+        assert_eq!(item.rtp().unwrap().payload, Bytes::from_static(&[0x65, 1]));
+        camera
+            .rtcp
+            .send_to(&sender_report(), to(client + 1))
+            .await
+            .unwrap();
+        let item = next(&mut driver).await.unwrap();
+        assert_eq!(item.rtcp().unwrap().stream_id(), 0);
+        // RFC 3550 §6.4.2: the first report is due within 3.1 s of the
+        // first packet; it leaves from the RTCP port for the camera's.
+        clock.advance(Duration::from_secs(4));
+        camera
+            .rtp
+            .send_to(&rtp(2, 93_000, true, &[0x41, 2]), to(client))
+            .await
+            .unwrap();
+        assert!(next(&mut driver).await.unwrap().rtp().is_some());
+        let (report, from) = CamUdp::recv(&camera.rtcp).await;
+        assert_eq!((report[1], from.port()), (201, client + 1));
+        assert!(report.len() > 8, "a block and an SDES: {report:?}");
+        assert_eq!(ingest.snapshot(), IngestStats::default());
+    }
+
+    /// A camera whose UDP stream never pauses still gets its keepalive once
+    /// it falls due: more datagrams wait than one poll takes (the socket
+    /// stays readable), but the pairs carry no answer, so they wait until
+    /// the timers ran.
+    #[tokio::test]
+    async fn rfc2326_10_8_an_always_readable_udp_stream_still_gets_its_keepalive_when_due() {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let camera = CamUdp::bind();
+        let client = set_up_udp(&mut driver, &mut cam, answered(Some(camera.port)))
+            .await
+            .unwrap();
+        play_udp(&mut driver, &mut cam).await;
+        // Twice as many datagrams as a poll takes, and the next two at
+        // every call: the socket is never drained.
+        let reads = u16::try_from(crate::udp::MAX_READS).unwrap();
+        let mut sent = 0_u16;
+        for _ in 0..2 * reads {
+            sent += 1;
+            camera
+                .rtp
+                .send_to(&rtp(sent, 0, true, &[0x41]), to(client))
+                .await
+                .unwrap();
+        }
+        assert_eq!(next(&mut driver).await.unwrap().rtp().unwrap().seq, 1);
+        clock.advance(Duration::from_secs(30));
+        let mut byte = [0_u8; 1];
+        let mut calls = 0_u16;
+        let read = loop {
+            calls += 1;
+            assert!(calls <= 3 * reads, "no keepalive in {} calls", calls - 1);
+            for _ in 0..2 {
+                sent += 1;
+                camera
+                    .rtp
+                    .send_to(&rtp(sent, 0, true, &[0x41]), to(client))
+                    .await
+                    .unwrap();
+            }
+            let item = next(&mut driver).await.unwrap();
+            assert_eq!(item.rtp().unwrap().seq, calls + 1);
+            if let Some(read) = cam.io.read(&mut byte).now_or_never() {
+                break read.unwrap();
+            }
+        };
+        assert_eq!(read, 1);
+        // Once what one poll took is handed out.
+        assert!(calls <= reads, "the keepalive went out on call {calls}");
+        cam.buf.push(byte[0]);
+        let keepalive = cam.request().await;
+        assert!(
+            keepalive.starts_with("OPTIONS rtsp://cam/stream/"),
+            "{keepalive}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rfc7362_strays_are_refused_and_counted_and_late_packets_go_on_to_be_dropped() {
+        let _logs = traced();
+        let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let ingest = Arc::new(IngestCounters::default());
+        driver.count_udp_into(Arc::clone(&ingest));
+        let camera = CamUdp::bind();
+        let client = set_up_udp(&mut driver, &mut cam, answered(Some(camera.port)))
+            .await
+            .unwrap();
+        play_udp(&mut driver, &mut cam).await;
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other_ssrc = {
+            let mut packet = rtp(11, 0, false, &[0x41]);
+            packet[8..12].copy_from_slice(&7_u32.to_be_bytes());
+            packet
+        };
+        let mut not_rtp = rtp(11, 0, false, &[0x41]);
+        not_rtp[0] = 0x40;
+        // From another port, then what is no RTP, then the stream, two
+        // duplicates (the second one's line held for the summary), another
+        // source, and the stream again.
+        stranger
+            .send_to(&rtp(10, 0, false, &[0x41]), to(client))
+            .await
+            .unwrap();
+        for packet in [
+            not_rtp,
+            rtp(10, 0, false, &[0x41, 10]),
+            rtp(10, 0, false, &[0x41, 10]),
+            rtp(10, 0, false, &[0x41, 10]),
+            other_ssrc,
+            rtp(11, 3000, true, &[0x41, 11]),
+        ] {
+            camera.rtp.send_to(&packet, to(client)).await.unwrap();
+        }
+        // RTCP that is no compound packet.
+        camera
+            .rtcp
+            .send_to(&[0x80, 200], to(client + 1))
+            .await
+            .unwrap();
+        let first = next(&mut driver).await.unwrap();
+        let second = next(&mut driver).await.unwrap();
+        assert_eq!(
+            (first.rtp().unwrap().seq, second.rtp().unwrap().seq),
+            (10, 11)
+        );
+        assert_eq!(second.rtp().unwrap().loss, 0);
+        let stats = ingest.snapshot();
+        assert_eq!(
+            (
+                stats.datagrams_rejected,
+                stats.packets_out_of_order,
+                stats.packets_lost
+            ),
+            (4, 2, 0),
+            "{stats:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rfc3550_8_2_a_camera_that_changes_its_synchronization_source_ends_the_attempt() {
+        let _logs = traced();
+        let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let camera = CamUdp::bind();
+        let client = set_up_udp(&mut driver, &mut cam, answered(Some(camera.port)))
+            .await
+            .unwrap();
+        play_udp(&mut driver, &mut cam).await;
+        let restarted = |seq: u16| {
+            let mut packet = rtp(seq, 0, true, &[0x65]);
+            packet[8..12].copy_from_slice(&0x0bad_cafe_u32.to_be_bytes());
+            packet
+        };
+        for packet in [rtp(1, 0, true, &[0x65]), restarted(500), restarted(501)] {
+            camera.rtp.send_to(&packet, to(client)).await.unwrap();
+        }
+        assert_eq!(next(&mut driver).await.unwrap().rtp().unwrap().seq, 1);
+        let err = next(&mut driver).await.unwrap_err();
+        let source = err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap());
+        assert_eq!(
+            source,
+            SourceError::Protocol(
+                "the camera changed its RTP synchronization source from 12345678 to 0badcafe (RFC 3550 §8.2): a new session".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn rfc1122_3_2_1_3_a_source_no_camera_can_send_from_ends_the_setup_before_any_punch() {
+        let _logs = traced();
+        let clock = Arc::new(FakeClock::from_system());
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let conn = Connection {
+            stream: Box::new(ours),
+            local: addr(50_000),
+            peer: "192.0.2.10:554".parse().unwrap(),
+        };
+        let time: Arc<dyn Clock> = Arc::<FakeClock>::clone(&clock);
+        let mut driver = Driver::new(conn, options(TeardownPolicy::Auto), time);
+        let mut cam = Cam::new(theirs);
+        let camera = CamUdp::bind();
+        let server = camera.port;
+        let err = set_up_udp(&mut driver, &mut cam, move |client| {
+            format!(
+                "RTP/AVP/UDP;unicast;client_port={client}-{};source=127.0.0.1;server_port={server}-{}",
+                client + 1,
+                server + 1
+            )
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.status_code(), None);
+        let source = err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap());
+        assert!(
+            matches!(&source, SourceError::Protocol(m) if m.contains("source 127.0.0.1") && m.contains("loopback")),
+            "{source:?}"
+        );
+        // The punches would have gone out before `setup_udp` returned.
+        assert!(CamUdp::quiet(&camera.rtp) && CamUdp::quiet(&camera.rtcp));
+    }
+
+    #[tokio::test]
+    async fn rfc4961_without_server_port_nothing_is_punched_and_the_core_learns_the_ports() {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let camera = CamUdp::bind();
+        let client = set_up_udp(&mut driver, &mut cam, answered(None))
+            .await
+            .unwrap();
+        assert!(CamUdp::quiet(&camera.rtp) && CamUdp::quiet(&camera.rtcp));
+        play_udp(&mut driver, &mut cam).await;
+        camera
+            .rtp
+            .send_to(&rtp(1, 0, true, &[0x65]), to(client))
+            .await
+            .unwrap();
+        assert!(next(&mut driver).await.unwrap().rtp().is_some());
+        // The reports wait for the camera's RTCP, then go where it came
+        // from.
+        camera
+            .rtcp
+            .send_to(&sender_report(), to(client + 1))
+            .await
+            .unwrap();
+        assert!(next(&mut driver).await.unwrap().rtcp().is_some());
+        clock.advance(Duration::from_secs(4));
+        camera
+            .rtp
+            .send_to(&rtp(2, 3000, true, &[0x41]), to(client))
+            .await
+            .unwrap();
+        assert!(next(&mut driver).await.unwrap().rtp().is_some());
+        let (report, from) = CamUdp::recv(&camera.rtcp).await;
+        assert_eq!((report[1], from.port()), (201, client + 1));
+        assert!(CamUdp::quiet(&camera.rtp), "no punch, ever");
+    }
+
+    #[tokio::test]
+    async fn a_closed_rtcp_port_refuses_its_hole_punch_and_the_media_still_flows() {
+        let _logs = traced();
+        let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let CamUdp {
+            rtp: camera,
+            rtcp,
+            port,
+        } = CamUdp::bind();
+        // Nothing listens on the camera's RTCP port: the punch there is
+        // answered with ICMP port unreachable, which an unconnected socket
+        // never reports.
+        drop(rtcp);
+        let client = set_up_udp(&mut driver, &mut cam, answered(Some(port)))
+            .await
+            .unwrap();
+        CamUdp::recv(&camera).await;
+        play_udp(&mut driver, &mut cam).await;
+        for seq in 1..=3 {
+            camera
+                .send_to(&rtp(seq, 0, true, &[0x65]), to(client))
+                .await
+                .unwrap();
+            assert_eq!(next(&mut driver).await.unwrap().rtp().unwrap().seq, seq);
+        }
+    }
+
+    #[tokio::test]
+    async fn rfc2326_1_1_a_udp_session_whose_connection_closes_is_torn_down_on_a_fresh_one() {
+        let _logs = traced();
+        let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let camera = CamUdp::bind();
+        let client = set_up_udp(&mut driver, &mut cam, answered(Some(camera.port)))
+            .await
+            .unwrap();
+        play_udp(&mut driver, &mut cam).await;
+        camera
+            .rtp
+            .send_to(&rtp(1, 0, true, &[0x65]), to(client))
+            .await
+            .unwrap();
+        assert!(next(&mut driver).await.unwrap().rtp().is_some());
+        // The camera closes the control connection: the session ends with
+        // it, while the camera's media goes on.
+        drop(cam);
+        let err = next(&mut driver).await.unwrap_err();
+        assert!(matches!(err, Error::Closed), "{err:?}");
+        camera
+            .rtp
+            .send_to(&rtp(2, 3000, true, &[0x65]), to(client))
+            .await
+            .unwrap();
+        let (fresh, theirs) = tokio::io::duplex(64 * 1024);
+        let dialer = Dialer::new([Dialed::Camera(fresh)]);
+        let mut fresh_cam = Cam::new(theirs);
+        let camera_side = async {
+            let head = fresh_cam.ok("TEARDOWN", "", "").await;
+            assert!(head.contains("Session: 12345678"), "{head}");
+        };
+        let dial = dial_with(&dialer);
+        tokio::join!(driver.teardown(&dial, GENEROUS, &NEVER), camera_side);
+        assert_eq!(dialer.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_busy_stream_does_not_starve_another() {
+        let _logs = traced();
+        let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let camera = CamUdp::bind();
+        let session = async {
+            driver.describe(url()).await.unwrap();
+            for index in 0..2 {
+                let pair = Pair::bind(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).unwrap();
+                driver.setup_udp(index, pair).await.unwrap();
+            }
+        };
+        let ((), clients) = tokio::join!(
+            session,
+            cam.serve_udp_setups(SDP_AV, 2, answered(Some(camera.port)))
+        );
+        play_udp(&mut driver, &mut cam).await;
+        // A hundred video packets queue before the one audio packet.
+        let flood = 100;
+        for seq in 1..=flood {
+            camera
+                .rtp
+                .send_to(&rtp(seq, 0, false, &[0x41]), to(clients[0]))
+                .await
+                .unwrap();
+        }
+        camera
+            .rtp
+            .send_to(&rtp(1, 0, true, &[0x7f]), to(clients[1]))
+            .await
+            .unwrap();
+        let mut streams = Vec::new();
+        while streams.len() <= usize::from(flood) {
+            streams.push(next(&mut driver).await.unwrap().rtp().unwrap().stream);
+        }
+        let audio = streams.iter().position(|&stream| stream == 1).unwrap();
+        assert!(
+            audio < usize::from(flood),
+            "the audio waited for the flood: {audio}"
+        );
+    }
+
+    /// A socket whose receives and sends fail.
+    #[derive(Debug)]
+    struct Failing;
+
+    impl crate::udp::Socket for Failing {
+        fn poll_recv_from(
+            &self,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<SocketAddr>> {
+            Poll::Ready(Err(io::Error::other("receive failed")))
+        }
+
+        fn send_to(&self, _data: &[u8], _to: SocketAddr) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+    }
+
+    #[test]
+    fn only_an_answered_setup_names_a_udp_peer() {
+        assert_eq!(udp_peer(&SessionEvent::Playing), None);
+        assert_eq!(
+            udp_peer(&SessionEvent::SetUp {
+                stream_i: 0,
+                udp_peer: None
+            }),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_that_fails_is_dropped_and_a_receive_that_fails_ends_the_session() {
+        let _logs = traced();
+        let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let session = async {
+            driver.describe(url()).await.unwrap();
+            let pair = Pair::of(Box::new(Failing), Box::new(Failing), 50_000);
+            driver.setup_udp(0, pair).await
+        };
+        let (set_up, _) = tokio::join!(session, cam.serve_udp_setups(SDP, 1, answered(Some(6970))));
+        // The punches could not go out: logged, nothing more.
+        set_up.unwrap();
+        play_udp(&mut driver, &mut cam).await;
+        let err = next(&mut driver).await.unwrap_err();
+        let source = err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap());
+        assert!(
+            matches!(&source, SourceError::Ended(m) if m.starts_with("Error receiving UDP packet: receive failed")),
+            "{source:?}"
+        );
     }
 }

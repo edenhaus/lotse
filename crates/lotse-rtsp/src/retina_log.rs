@@ -9,11 +9,9 @@
 //! camera chooses to send. And retina names URLs in it: the URL of each
 //! request (on its `rtsp_request` and `rtsp_teardown` spans, in `url`
 //! fields), and the camera's own (`RTP-Info`, `a=control`, `Content-Base`).
-//! The URL retina is given is the source URL itself on the source's TCP
-//! interleaved session and the backchannel's connections, and on the
-//! relayed ones (`transport: "udp"`) the source URL with the address of
-//! the crate's loopback relay for its host: the credentials
-//! are gone either way, but the path and query stay, which may hold a camera key or a token and which
+//! The URL retina is given is the source URL itself, on every connection
+//! of the source: the credentials are gone, but the path and query stay,
+//! which may hold a camera key or a token and which
 //! lotse logs only redacted (`lotse_core::secret::RedactedUrl`), and the
 //! camera echoes them.
 //!

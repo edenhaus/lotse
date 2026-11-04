@@ -2,9 +2,8 @@
 //! spawn, run the fake source, see its reports, stop it within the budget;
 //! and the M0 exit criterion, a worker crash that the supervisor observes
 //! and survives; an `rtsps` camera played by a worker under its sandbox
-//! on its own TLS connection, beside the loopback relay it bound before
-//! the sandbox for the paths that still take it; an `rtsp`
-//! camera whose media takes UDP, received under the same sandbox; and an
+//! on its own TLS connection; an `rtsp` camera whose media takes UDP,
+//! received under the same sandbox; and an
 //! HLS stream over `http` and over `https` with a pinned certificate,
 //! fetched by a sandboxed worker from the server's port alone; a clip's
 //! pipe passed to a sandboxed worker; and a clip of that HLS stream
@@ -69,7 +68,7 @@ fn spec(options: &str) -> SourceSpec {
 #[tokio::test]
 async fn a_worker_runs_the_fake_source_and_stops_within_the_budget() {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let mut worker = manager().spawn(&[554], false).expect("spawns");
+    let mut worker = manager().spawn(&[554]).expect("spawns");
     let pid = worker.pid();
     let WorkerEvent::Ready { pid: ready, memory } = worker.next_event().await else {
         panic!("ready expected");
@@ -103,24 +102,9 @@ async fn a_worker_runs_the_fake_source_and_stops_within_the_budget() {
     assert!(exit.success(), "clean exit, got {exit:?}");
 }
 
-/// A worker asked for a loopback relay binds it before its sandbox and
-/// still starts and stops cleanly; here without a sandbox, the relay path
-/// the sandboxed `rtsps` test below takes under one.
-#[tokio::test]
-async fn a_worker_with_a_loopback_relay_starts_and_stops_cleanly() {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let mut worker = manager().spawn(&[], true).expect("spawns");
-    assert!(matches!(
-        worker.next_event().await,
-        WorkerEvent::Ready { .. }
-    ));
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
-    assert!(exit.success(), "clean exit, got {exit:?}");
-}
-
 #[tokio::test]
 async fn a_worker_crash_is_observed_and_contained() {
-    let mut worker = manager().spawn(&[], false).expect("spawns");
+    let mut worker = manager().spawn(&[]).expect("spawns");
     assert!(matches!(
         worker.next_event().await,
         WorkerEvent::Ready { .. }
@@ -158,7 +142,7 @@ async fn a_worker_crash_is_observed_and_contained() {
     assert_eq!(status.signal(), Some(6), "SIGABRT, got {status:?}");
     // The supervisor side is unaffected: it can start another worker.
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let mut next = manager().spawn(&[], false).expect("spawns again");
+    let mut next = manager().spawn(&[]).expect("spawns again");
     assert!(matches!(next.next_event().await, WorkerEvent::Ready { .. }));
     assert!(next.stop(Duration::from_secs(5), &clock).await.success());
 }
@@ -171,9 +155,7 @@ async fn a_worker_crash_is_observed_and_contained() {
 #[tokio::test]
 async fn a_sandboxed_worker_takes_a_clip_s_pipe_and_closes_it() {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let mut worker = manager_with_sandbox("on")
-        .spawn(&[], false)
-        .expect("spawns");
+    let mut worker = manager_with_sandbox("on").spawn(&[]).expect("spawns");
     assert!(matches!(
         worker.next_event().await,
         WorkerEvent::Ready { .. }
@@ -217,15 +199,13 @@ async fn a_sandboxed_worker_takes_a_clip_s_pipe_and_closes_it() {
     assert!(exit.success(), "clean exit, got {exit:?}");
 }
 
-/// On Linux the worker's Landlock rules allow TCP only to the camera's port
-/// and the relay port bound before the sandbox, and seccomp has to allow
-/// what TLS needs (`getrandom`): the stream plays on the worker's own TLS
-/// connection to the camera, the relay bound beside it for the backchannel
-/// and RTP over UDP. On macOS the sandbox is a no-op and this checks the
-/// TLS path of a real worker.
+/// On Linux the worker's Landlock rules allow TCP only to the camera's
+/// port, and seccomp has to allow what TLS needs (`getrandom`): the stream
+/// plays on the worker's own TLS connection to the camera. On macOS the
+/// sandbox is a no-op and this checks the TLS path of a real worker.
 #[cfg(feature = "source-rtsp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sandboxed_worker_plays_rtsps_beside_its_loopback_relay() {
+async fn a_sandboxed_worker_plays_rtsps_on_its_own_connection() {
     use lotse_testing::fake_camera::CameraTls;
     use lotse_testing::{CameraConfig, FakeCamera};
 
@@ -242,9 +222,7 @@ async fn a_sandboxed_worker_plays_rtsps_beside_its_loopback_relay() {
     .await
     .expect("camera binds");
     let port = cam.addr().port();
-    let mut worker = manager_with_sandbox("on")
-        .spawn(&[port], true)
-        .expect("spawns");
+    let mut worker = manager_with_sandbox("on").spawn(&[port]).expect("spawns");
     let pid = worker.pid();
     let WorkerEvent::Ready { pid: ready, memory } = worker.next_event().await else {
         panic!("ready expected");
@@ -307,9 +285,7 @@ async fn a_sandboxed_worker_receives_rtsp_media_over_udp() {
         .await
         .expect("camera binds");
     let port = cam.addr().port();
-    let mut worker = manager_with_sandbox("on")
-        .spawn(&[port], true)
-        .expect("spawns");
+    let mut worker = manager_with_sandbox("on").spawn(&[port]).expect("spawns");
     assert!(matches!(
         worker.next_event().await,
         WorkerEvent::Ready { .. }
@@ -368,7 +344,7 @@ fn serve_live(server: &lotse_testing::fake_http::FakeHttp) {
 }
 
 /// Plays `url` with `options` in a worker under the sandbox, allowed to
-/// connect to the server's port only and without a loopback relay, until
+/// connect to the server's port only, until
 /// it is live with the fixtures' H.264 and AAC tracks.
 #[cfg(feature = "source-http")]
 async fn play_http_in_sandbox(
@@ -378,7 +354,7 @@ async fn play_http_in_sandbox(
 ) {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut worker = manager_with_sandbox("on")
-        .spawn(&[server.addr().port()], false)
+        .spawn(&[server.addr().port()])
         .expect("spawns");
     assert!(matches!(
         worker.next_event().await,
@@ -473,9 +449,7 @@ async fn a_sandboxed_worker_records_a_clip_into_its_pipe() {
         .expect("server binds");
     serve_live(&server);
     let port = server.addr().port();
-    let mut worker = manager_with_sandbox("on")
-        .spawn(&[port], false)
-        .expect("spawns");
+    let mut worker = manager_with_sandbox("on").spawn(&[port]).expect("spawns");
     assert!(matches!(
         worker.next_event().await,
         WorkerEvent::Ready { .. }

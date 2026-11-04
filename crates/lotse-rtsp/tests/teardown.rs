@@ -3,20 +3,21 @@
 //! interleaved and over UDP, against the fake camera of `lotse-testing`,
 //! which counts them: a refused or unanswered `PLAY`, a cancel while
 //! `PLAY` is pending or while playing, no datagram within the read
-//! deadline, a camera the relay refuses and one that hangs up. Over UDP
-//! the session outlives its control connection (RFC 2326 §1.1), so when
-//! that connection is gone the `TEARDOWN` goes out on a fresh one; over
-//! TCP the session ends with its connection, except on a camera whose
-//! SDP names a live555 version with the stale TCP session bug, which
-//! retina's `Auto` policy tears down on fresh connections too, as the
-//! source dials them, within the source's budget for that case (2 s),
-//! unless the attempt is cancelled: then, through the runner on a fake
-//! clock, within the source contract's 100 ms of the cancel, before the
-//! runner's stop grace drops it, whether the cancel comes while playing or
-//! while a retry is under way. The source's attempt ends only once its
-//! teardown is over, so what the camera counted is final when the harness
-//! has the exit; the retries' timing is the driver's unit tests', on a
-//! fake clock.
+//! deadline, a `PLAY` answer followed by what no RTSP parser reads over
+//! UDP, and a camera that hangs up. Over UDP the session outlives its
+//! control connection (RFC 2326 §1.1), so when that connection is gone,
+//! or cannot carry the answer, retina's `Auto` policy sends the
+//! `TEARDOWN` on a fresh one, which the source dials; over TCP the
+//! session ends with its connection, except on a camera whose SDP names a
+//! live555 version with the stale TCP session bug, which that policy
+//! tears down on fresh connections too, within the source's budget for
+//! that case (2 s), unless the attempt is cancelled: then, through the
+//! runner on a fake clock, within the source contract's 100 ms of the
+//! cancel, before the runner's stop grace drops it, whether the cancel
+//! comes while playing or while a retry is under way. The source's
+//! attempt ends only once its teardown is over, so what the camera
+//! counted is final when the harness has the exit; the retries' timing is
+//! the driver's unit tests', on a fake clock.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -81,7 +82,7 @@ async fn camera(config: CameraConfig) -> FakeCamera {
 
 /// A source for `camera` over `transport` with a 300 ms read deadline.
 fn start(camera: &FakeCamera, transport: &str) -> Harness {
-    let source = RtspFactory::default()
+    let source = RtspFactory
         .validate(
             &SourceUrl::parse(&camera.url()).unwrap(),
             &json!({ "transport": transport, "timeout_ms": 300 }),
@@ -220,9 +221,11 @@ async fn rfc2326_10_7_no_datagram_within_the_read_deadline_tears_down_over_udp()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc2326_10_7_a_camera_the_relay_refuses_is_torn_down_on_a_fresh_connection_over_udp() {
+async fn rfc2326_10_7_an_unreadable_play_answer_is_torn_down_on_a_fresh_connection_over_udp() {
     // RFC 2326 §1.1: the session is not tied to its connection, so the
-    // camera would keep sending datagrams after the relay closed it.
+    // camera would keep sending datagrams. retina reads past the PLAY
+    // answer what no RTSP parser reads, so the session's own connection
+    // cannot carry the TEARDOWN's answer: it goes on a fresh one.
     let cam = camera(CameraConfig {
         play: PlayAnswer::Unreadable,
         ..CameraConfig::default()
@@ -230,10 +233,7 @@ async fn rfc2326_10_7_a_camera_the_relay_refuses_is_torn_down_on_a_fresh_connect
     .await;
     let harness = start(&cam, "udp");
     let exit = harness.finish().await;
-    assert!(
-        matches!(exit, SourceError::Protocol(ref m) if m.contains("unreadable")),
-        "{exit:?}"
-    );
+    assert!(matches!(exit, SourceError::Protocol(_)), "{exit:?}");
     torn_down_once(&cam, "udp").await;
     assert_eq!(
         Stats::get(&cam.stats().connections),
@@ -335,7 +335,7 @@ async fn cancelled_live555_teardown(at: CancelAt) -> (u64, u64) {
     )
     .await
     .expect("camera binds");
-    let source = RtspFactory::default()
+    let source = RtspFactory
         .validate(
             &SourceUrl::parse(&cam.url()).unwrap(),
             &json!({ "transport": "tcp" }),

@@ -249,8 +249,6 @@ pub(crate) struct ConnectionEntry {
     /// The source's port, which the worker's sandbox is pinned to: a
     /// source on another port needs another connection.
     pub(crate) port: Option<u16>,
-    /// The worker binds a loopback relay listener before its sandbox.
-    pub(crate) loopback_relay: bool,
     /// Whether the spec its driver last got asks for the camera's
     /// backchannel ([`State::follow_backchannel`]).
     pub(crate) backchannel: bool,
@@ -1644,7 +1642,6 @@ mod tests {
             options: "{}".into(),
             host: "127.0.0.1".into(),
             port: None,
-            loopback_relay: false,
             backchannel,
         }
     }
@@ -1734,7 +1731,6 @@ mod tests {
             "c1".into(),
             ConnectionEntry {
                 port: None,
-                loopback_relay: false,
                 backchannel: false,
                 preroll_ms: 0,
                 key: ConnectionKey {
@@ -1820,7 +1816,6 @@ mod tests {
             "c1".into(),
             ConnectionEntry {
                 port: None,
-                loopback_relay: false,
                 backchannel: false,
                 preroll_ms: 0,
                 key: ConnectionKey {
@@ -2072,7 +2067,6 @@ mod tests {
             "c1".into(),
             ConnectionEntry {
                 port: None,
-                loopback_relay: false,
                 backchannel: false,
                 preroll_ms: 0,
                 key: ConnectionKey {
@@ -2135,7 +2129,6 @@ mod tests {
             "c1".into(),
             ConnectionEntry {
                 port: None,
-                loopback_relay: false,
                 backchannel: false,
                 preroll_ms: 0,
                 key: ConnectionKey {
@@ -2282,7 +2275,6 @@ mod tests {
             "c1".into(),
             ConnectionEntry {
                 port: None,
-                loopback_relay: false,
                 backchannel: false,
                 preroll_ms: 0,
                 key: key.clone(),
@@ -2382,7 +2374,6 @@ mod tests {
             options: "{}".into(),
             host: "127.0.0.1".into(),
             port: None,
-            loopback_relay: false,
             backchannel: false,
         };
         state.switch_connection(
@@ -2463,7 +2454,6 @@ mod tests {
             "c1".into(),
             ConnectionEntry {
                 port: None,
-                loopback_relay: false,
                 backchannel: false,
                 preroll_ms: 0,
                 key: ConnectionKey {

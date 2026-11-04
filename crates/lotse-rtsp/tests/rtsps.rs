@@ -106,10 +106,8 @@ async fn rtsps_plays_with_a_pinned_certificate_rfc7826_19_2() {
     let tls = CameraTls::self_signed(&["elsewhere.test"]).unwrap();
     let pin = tls.fingerprint();
     let cam = tls_camera(tls).await;
-    // A pre-bound relay listener, as a sandboxed worker has, serves two
-    // attempts in a row.
-    let relay = StdListener::bind("127.0.0.1:0").unwrap();
-    let factory = RtspFactory::new(Some(relay));
+    // Two attempts in a row, each on a connection of its own.
+    let factory = RtspFactory;
     let options = json!({ "tls_fingerprint": pin });
     let source = source(&factory, &url(&cam), &options);
     assert_eq!(
@@ -150,7 +148,7 @@ async fn rfc2326_10_7_a_live555_camera_that_hangs_up_is_torn_down_on_a_fresh_tls
     )
     .await
     .expect("camera binds");
-    let source = source(&RtspFactory::default(), &url(&cam), &options);
+    let source = source(&RtspFactory, &url(&cam), &options);
     let harness = Harness::start(source.as_ref(), peer(&cam), clock());
     let exit = harness.finish().await;
     assert!(
@@ -169,7 +167,7 @@ async fn a_tls_1_2_only_camera_plays_rfc5246() {
     let tls = CameraTls::tls12_only(&["elsewhere.test"]).unwrap();
     let options = json!({ "tls_fingerprint": tls.fingerprint() });
     let cam = tls_camera(tls).await;
-    let source = source(&RtspFactory::default(), &url(&cam), &options);
+    let source = source(&RtspFactory, &url(&cam), &options);
     plays(source.as_ref(), peer(&cam)).await;
     assert_eq!(Stats::get(&cam.stats().plays), 1);
     cam.stop().await;
@@ -182,7 +180,7 @@ async fn a_wrong_pin_is_auth_failed_before_any_request() {
     let cam = tls_camera(tls).await;
     let wrong = Fingerprint::of(b"another certificate").to_string();
     let source = source(
-        &RtspFactory::default(),
+        &RtspFactory,
         &url(&cam),
         &json!({ "tls_fingerprint": wrong }),
     );
@@ -204,7 +202,7 @@ async fn a_self_signed_camera_without_a_pin_is_not_trusted() {
     let tls = CameraTls::self_signed(&["camera.test"]).unwrap();
     let presented = tls.fingerprint().to_lowercase();
     let cam = tls_camera(tls).await;
-    let source = source(&RtspFactory::default(), &url(&cam), &json!({}));
+    let source = source(&RtspFactory, &url(&cam), &json!({}));
     let SourceError::AuthFailed(message) = fails(source.as_ref(), peer(&cam)).await else {
         panic!("auth_failed");
     };
@@ -244,11 +242,7 @@ async fn insecure_tls_plays_and_warns() {
     let tls = CameraTls::self_signed(&["camera.test"]).unwrap();
     let presented = tls.fingerprint().to_lowercase();
     let cam = tls_camera(tls).await;
-    let source = source(
-        &RtspFactory::default(),
-        &url(&cam),
-        &json!({ "insecure_tls": true }),
-    );
+    let source = source(&RtspFactory, &url(&cam), &json!({ "insecure_tls": true }));
     plays(source.as_ref(), peer(&cam)).await;
     cam.stop().await;
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
@@ -275,7 +269,7 @@ async fn a_camera_without_tls_fails_the_handshake_and_a_silent_one_times_out() {
         .await
         .unwrap();
     let options = json!({ "insecure_tls": true });
-    let hangs_up = source(&RtspFactory::default(), &url(&plain), &options);
+    let hangs_up = source(&RtspFactory, &url(&plain), &options);
     let err = fails(hangs_up.as_ref(), peer(&plain)).await;
     assert!(
         matches!(err, SourceError::Unreachable(ref m) if m.starts_with("tls: handshake failed")),
@@ -288,7 +282,7 @@ async fn a_camera_without_tls_fails_the_handshake_and_a_silent_one_times_out() {
     let addr = quiet.local_addr().unwrap();
     let options = json!({ "insecure_tls": true, "timeout_ms": 300 });
     let silent = source(
-        &RtspFactory::default(),
+        &RtspFactory,
         &format!("rtsps://camera.test:{}/stream", addr.port()),
         &options,
     );
@@ -320,7 +314,7 @@ async fn a_camera_without_tls_fails_the_handshake_and_a_silent_one_times_out() {
             .unwrap();
     });
     let not_tls = source(
-        &RtspFactory::default(),
+        &RtspFactory,
         &format!("rtsps://camera.test:{}/stream", addr.port()),
         &json!({ "insecure_tls": true }),
     );
@@ -342,7 +336,7 @@ async fn a_camera_without_tls_fails_the_handshake_and_a_silent_one_times_out() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_an_address_or_a_listening_camera_rtsps_is_unreachable() {
     let source = source(
-        &RtspFactory::default(),
+        &RtspFactory,
         "rtsps://camera.test/stream",
         &json!({ "insecure_tls": true }),
     );
@@ -385,7 +379,7 @@ async fn a_pin_mismatch_waits_for_the_reconnect_backoff() {
     let cancel = CancellationToken::new();
     let runner = SourceRunner::new(
         source(
-            &RtspFactory::default(),
+            &RtspFactory,
             &url(&cam),
             &json!({ "tls_fingerprint": wrong }),
         ),

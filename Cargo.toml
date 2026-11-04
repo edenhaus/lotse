@@ -99,15 +99,16 @@ http-auth = { version = "0.1", default-features = false, features = ["basic-sche
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # The RTSP client with the camera quirk history the design chose; packets are taken as RTP, so its
 # depacketizers are not used. Pinned to the `unstable-0.5.x-prototype` branch of scottlamb/retina
-# plus three commits awaiting upstream review (an `rtsps` URL accepted by the sans-I/O core; a UDP
-# `SETUP` answer without `server_port`; a UDP port learned only from a datagram that validates),
-# until a crates.io release carries the ONVIF backchannel and the receiver reports. `tokio`: the
-# tokio `client::Session` of the relayed paths; `unstable-sans-io`: `client::SessionCore`, which the
-# source drives on its own connection to the camera; `unstable-send`: the backchannel's
-# `rtp::Sender` and `Session::queue_rtp`; `h264`, `h265`: `Stream::parameters`, the parameter sets
+# plus four commits awaiting upstream review (an `rtsps` URL accepted by the sans-I/O core; a UDP
+# `SETUP` answer without `server_port`; a UDP port learned only from a datagram that validates; a
+# single `server_port` and whitespace around `Transport` parameters accepted, RFC 2326 §12.39, §4),
+# until a crates.io release carries the ONVIF backchannel and the receiver reports. Without its
+# `tokio` feature: lotse drives the sans-I/O core itself. `unstable-sans-io`: `client::SessionCore`
+# and `client::TeardownCore`, which the source drives on its own connections to the camera and
+# its UDP pairs; `unstable-send`: the backchannel's `rtp::Sender` and `SessionCore::queue_rtp`; `h264`, `h265`: `Stream::parameters`, the parameter sets
 # of an H.264 (RFC 6184 §8.1 `sprop-parameter-sets`) or H.265 (RFC 7798 §7.1 `sprop-vps`,
 # `sprop-sps`, `sprop-pps`) camera's SDP, which retina reads only with the codec's feature.
-retina = { git = "https://github.com/edenhaus/retina", rev = "97153f6573225ba0918c2b305f3e9420b32c14c7", default-features = false, features = ["tokio", "unstable-sans-io", "unstable-send", "h264", "h265"] }
+retina = { git = "https://github.com/edenhaus/retina", rev = "13a0114e9b16271b5796dac5343076d5bf0bfb37", default-features = false, features = ["unstable-sans-io", "unstable-send", "h264", "h265"] }
 # The HLS playlist parser of the HTTP source (RFC 8216 §4); only the parser feature, whose nom 7
 # is already in the tree via rtsp-types; chrono comes with it, for `EXT-X-PROGRAM-DATE-TIME`.
 m3u8-rs = { version = "6", default-features = false, features = ["parser"] }

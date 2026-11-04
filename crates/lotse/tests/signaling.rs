@@ -124,7 +124,7 @@ fn supervisor_with(linger: Duration) -> Daemon {
         .unwrap();
     registries
         .sources
-        .register(Arc::new(lotse_rtsp::RtspFactory::default()))
+        .register(Arc::new(lotse_rtsp::RtspFactory))
         .unwrap();
     let environment = Environment {
         registries,

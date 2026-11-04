@@ -69,9 +69,7 @@ fn peer(camera: &FakeCamera) -> ResolvedPeer {
 
 fn make_source(url: &str, options: &serde_json::Value) -> Box<dyn lotse_core::source::Source> {
     let url = SourceUrl::parse(url).expect("url");
-    RtspFactory::default()
-        .validate(&url, options)
-        .expect("valid source")
+    RtspFactory.validate(&url, options).expect("valid source")
 }
 
 /// Waits up to `steps` × 20 ms for `done`.
@@ -361,8 +359,8 @@ async fn credentials_are_checked_and_never_reported() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closed_port_is_unreachable_and_a_silent_camera_times_out() {
-    // TCP interleaved on the source's own connection, and through the
-    // relay with `transport: "udp"`.
+    // TCP interleaved, and with `transport: "udp"`, which takes the same
+    // connection for its control.
     for transport in ["tcp", "udp"] {
         let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = free.local_addr().unwrap();
@@ -536,35 +534,11 @@ async fn rfc8866_5_14_of_two_video_streams_the_first_plays() {
     cam.stop().await;
 }
 
-/// A URL whose request outgrows the relay's bound (64 KiB, as retina
-/// reads) before it is whole, with `transport: "udp"`, which goes through
-/// the relay: the relay refuses retina's `DESCRIBE`, a protocol error
-/// before the camera sees it.
+/// RFC 2326 §6.1, RFC 7826 §19.2: TCP interleaved and with `transport:
+/// "udp"` alike, the camera sees the source URL itself as the
+/// `DESCRIBE`'s Request-URI, credentials left out (RFC 2326 §10.2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_request_over_64_kib_is_refused_by_the_relay_as_protocol() {
-    let cam = camera(CameraConfig::default()).await;
-    let url = format!("{}/{}", cam.url(), "x".repeat(200_000));
-    let source = make_source(&url, &serde_json::json!({ "transport": "udp" }));
-    let harness = Harness::start(source.as_ref(), peer(&cam), clock());
-    let exit = harness.finish().await;
-    assert!(
-        matches!(exit, SourceError::Protocol(ref m) if m.contains("retina's request is unreadable")),
-        "{exit:?}"
-    );
-    assert_eq!(
-        lotse_testing::fake_camera::Stats::get(&cam.stats().describes),
-        0
-    );
-    cam.stop().await;
-}
-
-/// RFC 2326 §6.1, RFC 7826 §19.2: TCP interleaved, the camera sees the
-/// source URL itself as the `DESCRIBE`'s Request-URI, credentials left
-/// out (RFC 2326 §10.2); with `transport: "udp"`, which still goes
-/// through the loopback relay, it sees the relay's address with the
-/// path and query (the `SPEC-DEVIATION` of the relay's URL).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc2326_6_1_tcp_sends_the_source_url_as_the_request_uri_and_udp_the_relays() {
+async fn rfc2326_6_1_the_source_url_is_the_request_uri_over_tcp_and_udp() {
     for transport in ["tcp", "udp"] {
         let cam = camera(CameraConfig {
             auth: Some(("admin".into(), "pw5b1c".into())),
@@ -579,16 +553,11 @@ async fn rfc2326_6_1_tcp_sends_the_source_url_as_the_request_uri_and_udp_the_rel
         harness.finish().await;
         let uris = &cam.stats().connection_log()[0].describe_uris;
         let path = "/stream?token=tok9d2e";
-        if transport == "tcp" {
-            assert_eq!(uris, &[format!("rtsp://{}{path}", cam.addr())]);
-        } else {
-            assert_eq!(uris.len(), 1);
-            assert!(
-                uris[0].starts_with("rtsp://127.0.0.1:") && uris[0].ends_with(path),
-                "{uris:?}"
-            );
-            assert_ne!(uris[0], format!("rtsp://{}{path}", cam.addr()));
-        }
+        assert_eq!(
+            uris,
+            &[format!("rtsp://{}{path}", cam.addr())],
+            "{transport}"
+        );
         cam.stop().await;
     }
 }

@@ -144,13 +144,13 @@ fn checked_state(state: &Path) -> PathBuf {
 
 /// The supervisor probe child: sandbox itself as the supervisor, print the
 /// report, then try what spawning a worker needs from the inherited domain
-/// (`/dev/null` for its stdout, a pidfd to reap it, a TCP listener on port
-/// 0 for its relay) and what it does not (reading `/dev/null`, a fixed TCP
-/// port). It writes in the state directory it opened, which was swapped
-/// for another before the sandbox, and in the one at its path now. Last,
-/// it does what a worker does under the supervisor's inherited filter and
-/// domain: bind its relay, apply the worker profile, and connect to the
-/// relay.
+/// (`/dev/null` for its stdout, a pidfd to reap it) and what it does not
+/// (reading `/dev/null`, a TCP listener on port 0 or on a fixed port). It
+/// writes in the state directory it opened, which was swapped for another
+/// before the sandbox, and in the one at its path now. Last, it does what
+/// a worker does under the supervisor's inherited filter and domain: apply
+/// the worker profile and connect to its camera's port, a listener bound
+/// before the sandbox.
 #[test]
 #[expect(
     clippy::disallowed_methods,
@@ -172,6 +172,9 @@ fn supervisor_probe_child() {
     let checked = checked_state(&state);
     std::fs::rename(&state, &checked).expect("swapped out");
     open_to_all(&state);
+    // The worker's camera, listening before the sandbox.
+    let camera = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("camera");
+    let camera_port = camera.local_addr().expect("camera address").port();
     // A port that was free a moment ago, found before the sandbox.
     let fixed = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .and_then(|listener| listener.local_addr())
@@ -215,10 +218,8 @@ fn supervisor_probe_child() {
     .map(drop);
     println!("pidfd:{pidfd:?}");
 
-    let relay = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("relay");
-    let relay_port = relay.local_addr().expect("relay address").port();
     let worker = Profile::Worker {
-        connect_ports: vec![relay_port],
+        connect_ports: vec![camera_port],
     };
     let report = lotse_sandbox::apply(&worker, &SandboxConfig::default())
         .expect("worker profile applies under the supervisor's");
@@ -226,8 +227,9 @@ fn supervisor_probe_child() {
         "worker:{}",
         serde_json::to_string(&report).expect("report serializes")
     );
-    let relayed = kind(std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, relay_port)).map(drop));
-    println!("relay_connect:{relayed:?}");
+    let connected =
+        kind(std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, camera_port)).map(drop));
+    println!("camera_connect:{connected:?}");
 }
 
 /// The escape probe child: learn the parent's pid, sandbox itself as a
@@ -475,13 +477,14 @@ fn finished(status: ExitStatus, stdout: &str) -> ExitStatus {
 
 /// Regression for SBX-1 (reproduced 2026-10-07 on Linux 7.0): the
 /// supervisor's domain, which every worker inherits, denied the
-/// `/dev/null` a worker's spawn opens and every TCP `bind`, so no worker
-/// started and none could bind its loopback relay; its seccomp filter,
-/// also inherited, killed the supervisor at `pidfd_open` and a worker at
-/// its first Landlock call. The supervisor writes in the state directory
-/// it was given open, never in one swapped in at its path.
+/// `/dev/null` a worker's spawn opens, so no worker started; its seccomp
+/// filter, also inherited, killed the supervisor at `pidfd_open` and a
+/// worker at its first Landlock call. The supervisor writes in the state
+/// directory it was given open, never in one swapped in at its path. No
+/// TCP port is bindable under its domain since the workers' loopback relay
+/// is gone (2026-11-03), and a worker still connects to its camera.
 #[test]
-fn a_supervisor_can_spawn_and_its_workers_bind_an_ephemeral_port_only() {
+fn a_supervisor_can_spawn_and_neither_it_nor_its_workers_bind_a_tcp_port() {
     let state = std::env::temp_dir().join(format!("lotse-probe-state-{}", std::process::id()));
     let checked = checked_state(&state);
     for dir in [&state, &checked] {
@@ -500,10 +503,6 @@ fn a_supervisor_can_spawn_and_its_workers_bind_an_ephemeral_port_only() {
     assert!(report.no_new_privs);
     assert!(
         stdout.contains("null_write:Ok(())"),
-        "stdout: {stdout}\nstderr: {stderr}"
-    );
-    assert!(
-        stdout.contains("bind_any:Ok(())"),
         "stdout: {stdout}\nstderr: {stderr}"
     );
     let denied = |probe: &str, enforced: bool| {
@@ -525,6 +524,7 @@ fn a_supervisor_can_spawn_and_its_workers_bind_an_ephemeral_port_only() {
         "stdout: {stdout}\nstderr: {stderr}"
     );
     denied("swapped_write", report.landlock.fs == LayerStatus::Enforced);
+    denied("bind_any", report.landlock.net == LayerStatus::Enforced);
     denied("bind_fixed", report.landlock.net == LayerStatus::Enforced);
     assert!(
         stdout.contains("pidfd:Ok(())"),
@@ -541,7 +541,7 @@ fn a_supervisor_can_spawn_and_its_workers_bind_an_ephemeral_port_only() {
         "the worker enforces what the supervisor does"
     );
     assert!(
-        stdout.contains("relay_connect:Ok(())"),
+        stdout.contains("camera_connect:Ok(())"),
         "stdout: {stdout}\nstderr: {stderr}"
     );
 }

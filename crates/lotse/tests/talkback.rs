@@ -540,7 +540,7 @@ impl InProcess {
     /// its backchannel.
     #[cfg(feature = "source-rtsp")]
     async fn rtsp(camera: &FakeCamera) -> Self {
-        let factory = Arc::new(lotse_rtsp::RtspFactory::default());
+        let factory = Arc::new(lotse_rtsp::RtspFactory);
         Self::start_with(
             factory,
             &camera.url(),
@@ -1685,7 +1685,7 @@ async fn onvif_5_3_every_release_tears_the_backchannel_session_down_and_closes_i
 async fn rfc2326_10_7_a_worker_process_tears_the_backchannel_session_down_before_it_exits() {
     let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
     let mut api = Api::start_with(
-        Arc::new(lotse_rtsp::RtspFactory::default()),
+        Arc::new(lotse_rtsp::RtspFactory),
         &camera.url(),
         &json!({ "backchannel": true }),
         "off",
@@ -1726,7 +1726,7 @@ async fn rfc2326_10_7_a_worker_process_tears_the_backchannel_session_down_before
 async fn onvif_5_3_a_sandboxed_worker_process_transcodes_an_opus_tone_onto_the_rtsp_backchannel() {
     let camera = rtsp_camera(None, BackchannelCodec::Pcmu, 20).await;
     let mut api = Api::start_with(
-        Arc::new(lotse_rtsp::RtspFactory::default()),
+        Arc::new(lotse_rtsp::RtspFactory),
         &camera.url(),
         &json!({ "backchannel": true }),
         "on",
@@ -2788,7 +2788,7 @@ async fn onvif_5_3_1_opting_in_and_out_leaves_the_video_alone_and_frees_the_talk
                 "sources": [{ "url": camera.url(), "options": options }] })
     };
     let mut api = Api::start_with(
-        Arc::new(lotse_rtsp::RtspFactory::default()),
+        Arc::new(lotse_rtsp::RtspFactory),
         &camera.url(),
         &json!({}),
         "off",

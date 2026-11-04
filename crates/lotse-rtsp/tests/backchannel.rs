@@ -90,7 +90,7 @@ fn source(camera: &FakeCamera, options: &serde_json::Value) -> Box<dyn Source> {
 
 /// The RTSP source of `camera` with `options` as they are.
 fn as_given(camera: &FakeCamera, options: &serde_json::Value) -> Box<dyn Source> {
-    RtspFactory::default()
+    RtspFactory
         .validate(&SourceUrl::parse(&camera.url()).unwrap(), options)
         .expect("valid source")
 }
@@ -603,9 +603,9 @@ async fn rfc2326_10_12_a_lost_backchannel_session_says_why_and_a_viewing_reconne
 /// `Auto` policy tears down on a fresh connection, drops the
 /// backchannel's connection: the session's `TEARDOWN`, with `Require`
 /// (ONVIF Streaming Specification §5.3.1), goes on a fresh connection the
-/// source dials as it dialed the first, within the source's 2 s budget
-/// for that case, which the session's task waits for: once it ended, the
-/// camera has answered.
+/// source dials as it dialed the first, under the driver's fresh budget,
+/// which the session's task waits for: once it ended, the camera has
+/// answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_10_7_a_lost_live555_backchannel_session_is_torn_down_on_a_fresh_connection() {
     let mut config = config(None, BackchannelCodec::Pcmu, |_| {});
@@ -619,14 +619,9 @@ async fn rfc2326_10_7_a_lost_live555_backchannel_session_is_torn_down_on_a_fresh
     let mut session = open(&slot).await.unwrap();
     assert!(log(&cam)[2].backchannel_only(), "{:?}", log(&cam));
     cam.hang_up_backchannel();
-    let hung_up = clock().now();
     let why = lost(&mut session).await;
     assert_eq!(why.status, None, "{why:?}");
     bounded(slot.tasks().ended()).await;
-    assert!(
-        clock().now().saturating_duration_since(hung_up) < Duration::from_secs(2),
-        "within the fresh connection's budget"
-    );
     let logs = log(&cam);
     let fresh = &logs[3];
     assert_eq!(fresh.teardown, Some(true), "{logs:?}");
@@ -659,7 +654,7 @@ async fn rfc2326_10_4_a_camera_gone_before_the_claim_refuses_without_a_status() 
 /// RFC 7826 §19.2: an `rtsps` camera's probe and backchannel session take
 /// TLS too, each on its own connection, and send the source URL itself as
 /// their `DESCRIBE`'s Request-URI (RFC 2326 §6.1), `rtsps` scheme and host
-/// name included; no loopback relay is needed.
+/// name included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc7826_19_2_over_rtsps_the_backchannel_takes_tls_on_its_own_connection() {
     let tls = CameraTls::self_signed(&["camera.test"]).unwrap();
@@ -670,7 +665,7 @@ async fn rfc7826_19_2_over_rtsps_the_backchannel_takes_tls_on_its_own_connection
     })
     .await;
     let url = format!("rtsps://camera.test:{}/stream", cam.addr().port());
-    let source = RtspFactory::default()
+    let source = RtspFactory
         .validate(
             &SourceUrl::parse(&url).unwrap(),
             &json!({ "tls_fingerprint": pin, "backchannel": true }),
@@ -706,7 +701,7 @@ async fn rfc7826_19_2_over_rtsps_the_backchannel_takes_tls_on_its_own_connection
     cam.stop().await;
 }
 
-/// Over UDP the viewing session takes the UDP relay, while the
+/// Over UDP the viewing session's media takes UDP pairs, while the
 /// backchannel's session is set up TCP interleaved on a connection of its
 /// own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
