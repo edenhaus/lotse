@@ -14,7 +14,7 @@
 //! to be exercised. Knobs model camera habits: no marker bits, a large
 //! MTU, credentials, hanging up, never answering, a `PLAY` answer
 //! without `rtptime` (RFC 2326 §12.33), a refused or unanswered `PLAY`,
-//! or bytes that are not RTSP after it; over UDP (RFC 2326
+//! bytes that are not RTSP after it, or a `TEARDOWN` hung up on; over UDP (RFC 2326
 //! §12.39, RFC 3550 §11) a `461` refusal, datagrams that never arrive, and
 //! loss, reordering, duplicates and a foreign sender. It records the RTCP
 //! a client sends it, interleaved or as datagrams, so tests can read its
@@ -720,6 +720,10 @@ pub struct CameraConfig {
     /// Keep a connection open after answering its `TEARDOWN`, so that its
     /// close is the client's ([`ConnectionLog::closed_by_client`]).
     pub keep_open_on_teardown: bool,
+    /// Close the connection instead of answering its `TEARDOWN` (still
+    /// counted), on every connection, fresh ones included: a teardown that
+    /// retries on fresh connections never succeeds.
+    pub hang_up_on_teardown: bool,
 }
 
 /// How the camera answers `PLAY`; every other request is answered as
@@ -834,6 +838,7 @@ impl Default for CameraConfig {
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             backchannel: None,
             keep_open_on_teardown: false,
+            hang_up_on_teardown: false,
         }
     }
 }
@@ -1280,7 +1285,7 @@ enum Answering {
     /// `Require` ([`RequireAnswer::Silent`]) and answers nothing.
     Hung,
     /// It closes the connection instead of the next answer
-    /// ([`BackchannelSetup::HangUp`]).
+    /// ([`BackchannelSetup::HangUp`], [`CameraConfig::hang_up_on_teardown`]).
     HangUp,
 }
 
@@ -1828,6 +1833,9 @@ impl Connection {
                     self.answering = Answering::Hung;
                 } else {
                     self.release_backchannel();
+                }
+                if self.config.hang_up_on_teardown {
+                    self.answering = Answering::HangUp;
                 }
                 (
                     reply(&cseq, StatusCode::Ok).build(Vec::new()),

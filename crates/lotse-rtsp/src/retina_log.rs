@@ -28,7 +28,7 @@
 //!   after it, go through [`retina_text`]: each `rtsp://` and `rtsps://`
 //!   URL cut to scheme, host and port ([`scrub_urls`]), then one line,
 //!   control characters replaced, capped like any camera text;
-//! - the fields named `url` and `rtp_info` are dropped outright.
+//! - the fields named `url`, `rtp_info` and `value` are dropped outright.
 //!
 //! retina's spans carry the request URL in their fields, which every event
 //! inside them would print: [`no_retina_spans`], a global filter, keeps
@@ -62,8 +62,13 @@ pub const TARGET: &str = "lotse_rtsp::retina";
 const FIELDS: &[&str] = &["message", "retina"];
 
 /// The fields of retina's events that are dropped outright: they hold a
-/// URL (the request's) or a header that names one (`RTP-Info`).
-const DROPPED: [&str; 2] = ["url", "rtp_info"];
+/// URL (the request's) or a header that names one (`RTP-Info`), or one
+/// [`scrub_urls`] cannot find: retina (edenhaus/retina `f65065f`,
+/// `src/client/parse.rs`, read 2026-11-04) logs a `Content-Base` or
+/// `Content-Location` header without a scheme, which it repaired, as
+/// the `value` of its warning, path and query as the camera sent them.
+/// The `value` of an invalid `fmtp` attribute, its one other, goes too.
+const DROPPED: [&str; 3] = ["url", "rtp_info", "value"];
 
 /// The schemes [`scrub_urls`] finds, lowercase; a URL's scheme is
 /// case-insensitive (RFC 3986 §3.1).
@@ -149,12 +154,16 @@ pub fn no_retina_spans(metadata: &Metadata<'_>) -> bool {
 
 /// `text` with every `rtsp://` and `rtsps://` URL in it (the scheme in any
 /// case) cut to its scheme, host and port: a userinfo becomes `****@`,
-/// and a path, query or fragment `/****`. A URL runs to the first
-/// whitespace or character no URL holds unescaped (RFC 3986 §2: quotes,
-/// `<`, `>`, `` ` ``, `\`, `{`, `}`, `|`, `^`, controls), so whatever text
-/// follows it within that (another `RTP-Info` entry, a `;seq=`) goes with
-/// the path. Its authority ends at the first `/` or `?` and its host
-/// after the last `@` before that; a `#` ends the host.
+/// and whatever follows the host `/****`. A URL runs to the first
+/// whitespace or control character, which no URL holds (RFC 3986 §2), so
+/// whatever text follows it within that goes with the path: another
+/// `RTP-Info` entry, a `;seq=`, the quote or bracket that closes a quoted
+/// URL. Any other character is no sure end: an apostrophe is a
+/// sub-delimiter (§2.2), and a URL as retina prints it may hold a `|` or
+/// a `{` its writer left unescaped. Its authority ends at the first `/`,
+/// `?` or `#` (§3.2), its host follows the last `@` before that, and its
+/// host and port run as far as the characters they hold (§3.2.2, §3.2.3):
+/// what follows them (a closing quote) goes with the path.
 pub fn scrub_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -165,7 +174,7 @@ pub fn scrub_urls(text: &str) -> String {
         let (url, tail) = after.split_at_checked(end).unwrap_or((after, ""));
         out.push_str(before);
         out.push_str(scheme);
-        let path_at = url.find(['/', '?']).unwrap_or(url.len());
+        let path_at = url.find(['/', '?', '#']).unwrap_or(url.len());
         let (authority, path) = url.split_at_checked(path_at).unwrap_or((url, ""));
         let host = match authority.rsplit_once('@') {
             Some((_, host)) => {
@@ -175,9 +184,10 @@ pub fn scrub_urls(text: &str) -> String {
             }
             None => authority,
         };
-        let (host, fragment) = host.split_once('#').unwrap_or((host, ""));
+        let host_end = host.find(|c| !in_host(c)).unwrap_or(host.len());
+        let (host, after_host) = host.split_at_checked(host_end).unwrap_or((host, ""));
         out.push_str(host);
-        if !path.is_empty() || !fragment.is_empty() {
+        if !path.is_empty() || !after_host.is_empty() {
             out.push('/');
             out.push_str(REDACTED);
         }
@@ -197,14 +207,38 @@ fn next_url(text: &str) -> Option<(usize, usize)> {
         .min()
 }
 
-/// Whether `c` ends a URL in text: whitespace, or a character no URL holds
-/// unescaped (RFC 3986 §2).
+/// Whether `c` ends a URL in text: whitespace or a control character,
+/// which no URL holds (RFC 3986 §2).
 fn ends_url(c: char) -> bool {
-    c.is_whitespace()
-        || c.is_control()
+    c.is_whitespace() || c.is_control()
+}
+
+/// Whether `c` is one a host and its port hold: unreserved, a
+/// sub-delimiter, a `%` of an escape (a reg-name, RFC 3986 §3.2.2), the
+/// `[`, `]` and `:` of an IP literal, and the `:` before the port
+/// (§3.2.3).
+fn in_host(c: char) -> bool {
+    c.is_ascii_alphanumeric()
         || matches!(
             c,
-            '"' | '\'' | '<' | '>' | '`' | '\\' | '{' | '}' | '|' | '^'
+            '-' | '.'
+                | '_'
+                | '~'
+                | '%'
+                | '!'
+                | '$'
+                | '&'
+                | '\''
+                | '('
+                | ')'
+                | '*'
+                | '+'
+                | ','
+                | ';'
+                | '='
+                | ':'
+                | '['
+                | ']'
         )
 }
 
@@ -366,6 +400,9 @@ mod tests {
             ("rtsp://cam/x?token=tok9d2e", "rtsp://cam/****"),
             ("rtsp://cam?token=tok9d2e", "rtsp://cam/****"),
             ("rtsp://cam#frag", "rtsp://cam/****"),
+            // The authority ends at a `#`: an `@` after it is no userinfo's.
+            ("rtsp://cam#note@secret", "rtsp://cam/****"),
+            ("rtsp://cam:554#a@b/c", "rtsp://cam:554/****"),
             ("rtsp://admin:pw5b1c@cam/x", "rtsp://****@cam/****"),
             // The host follows the last `@` of the authority.
             ("rtsp://a@b:p@w@cam:8554", "rtsp://****@cam:8554"),
@@ -381,15 +418,43 @@ mod tests {
                 "url=rtsp://cam/s/track0;seq=1;rtptime=x,url=rtsp://cam/s/track1",
                 "url=rtsp://cam/****",
             ),
-            // As `{:?}` quotes it, and across lines.
-            (
-                "Request { url: \"rtsp://cam/camkey7f3a\" }\nCSeq: 5",
-                "Request { url: \"rtsp://cam/****\" }\nCSeq: 5",
-            ),
             (
                 "a=control:rtsp://cam/x\r\na=y",
                 "a=control:rtsp://cam/****\r\na=y",
             ),
+            (
+                "rtsp://cam/x\u{1b}[0m tail",
+                "rtsp://cam/****\u{1b}[0m tail",
+            ),
+        ] {
+            assert_eq!(scrub_urls(text), scrubbed, "{text}");
+        }
+    }
+
+    #[test]
+    fn rfc3986_2_2_a_url_runs_past_apostrophes_and_quotes_to_whitespace() {
+        for (text, scrubbed) in [
+            // An apostrophe is a sub-delimiter: what follows it is the URL's.
+            ("rtsp://cam/path'part?token=secret-token", "rtsp://cam/****"),
+            ("'rtsp://cam/camkey7f3a' and", "'rtsp://cam/**** and"),
+            ("'rtsp://cam' and", "'rtsp://cam' and"),
+            // As `{:?}` quotes it, and across lines: the closing quote goes
+            // with the path, and so would a secret after an escaped one.
+            (
+                "Request { url: \"rtsp://cam/camkey7f3a\" }\nCSeq: 5",
+                "Request { url: \"rtsp://cam/**** }\nCSeq: 5",
+            ),
+            ("\"rtsp://cam/a\\\"tok9d2e\"", "\"rtsp://cam/****"),
+            // A quote after the host: it and the rest go with the path.
+            ("\"rtsp://cam\" }", "\"rtsp://cam/**** }"),
+            ("\"rtsp://cam\"tok9d2e@x\"", "\"rtsp://****@x/****"),
+            ("<rtsp://u:pw5b1c@cam>", "<rtsp://****@cam/****"),
+            // Characters a URL should escape and its writer left as they
+            // are end nothing.
+            ("rtsp://cam/a|tok9d2e{b}^c`d", "rtsp://cam/****"),
+            ("rtsp://cam/x?t=a\\tok9d2e", "rtsp://cam/****"),
+            // A userinfo is wholly redacted, whatever it holds.
+            ("rtsp://us\u{e4}r:pw5b1c@cam/x", "rtsp://****@cam/****"),
         ] {
             assert_eq!(scrub_urls(text), scrubbed, "{text}");
         }
@@ -513,6 +578,33 @@ mod tests {
             json.contains("\"retina\":\"retina::client::parse\""),
             "{json}"
         );
+    }
+
+    #[test]
+    fn a_repaired_schemeless_content_base_is_logged_without_its_value() {
+        // retina (edenhaus/retina `f65065f`, `src/client/parse.rs`, read
+        // 2026-11-04) logs the header it repaired as it came, no scheme
+        // for the scrub to find.
+        let clock = Arc::new(FakeClock::from_system());
+        let (text, json) = logged(&clock, || {
+            let value = "cam.example/camkey7f3a?token=tok9d2e";
+            let url = format!("rtsp://{value}");
+            tracing::warn!(
+                target: "retina::client::parse",
+                header = %"Content-Base",
+                value = ?value,
+                %url,
+                "repaired schemeless URL"
+            );
+        });
+        assert!(
+            text.contains("repaired schemeless URL header=Content-Base retina="),
+            "{text}"
+        );
+        for logs in [&text, &json] {
+            assert!(!logs.contains("camkey7f3a"), "{logs}");
+            assert!(!logs.contains("tok9d2e"), "{logs}");
+        }
     }
 
     #[test]

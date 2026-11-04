@@ -11,10 +11,13 @@
 //! session ends with its connection, except on a camera whose SDP names a
 //! live555 version with the stale TCP session bug, which that policy
 //! tears down on fresh connections too, within the source's budget for
-//! that case (2 s). The source's attempt ends only once its teardown is
-//! over, so what the camera counted is final when the harness has the
-//! exit; the retries' timing is the driver's unit tests', on a fake
-//! clock.
+//! that case (2 s), unless the attempt is cancelled: then, through the
+//! runner on a fake clock, within the source contract's 100 ms of the
+//! cancel, before the runner's stop grace drops it, whether the cancel
+//! comes while playing or while a retry is under way. The source's
+//! attempt ends only once its teardown is over, so what the camera
+//! counted is final when the harness has the exit; the retries' timing is
+//! the driver's unit tests', on a fake clock.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -29,13 +32,23 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lotse_core::clock::{Clock, SystemClock};
-use lotse_core::source::{ResolvedPeer, SourceError, SourceFactory as _};
+use lotse_core::backoff::ReconnectBackoff;
+use lotse_core::clock::{Clock, FakeClock, SystemClock};
+use lotse_core::clock_map::ClockMapper;
+use lotse_core::runner::{ConnectGate, RunnerConfig, RunnerEvent, SourceRunner};
+use lotse_core::source::{
+    BackchannelSlot, ResolvedPeer, SourceError, SourceFactory as _, TrackSet,
+};
 use lotse_core::source_url::SourceUrl;
+use lotse_core::task::spawn_named;
+use lotse_core::track::TrackLimits;
 use lotse_rtsp::RtspFactory;
 use lotse_testing::fake_camera::{CameraAudio, CameraUdp, PlayAnswer, Stats, UdpService};
 use lotse_testing::{CameraConfig, FakeCamera, Harness};
 use serde_json::json;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio_util::sync::CancellationToken;
 
 fn clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock)
@@ -284,4 +297,137 @@ async fn rfc2326_10_7_a_live555_camera_that_hangs_up_is_torn_down_on_a_fresh_con
         "a fresh connection"
     );
     cam.stop().await;
+}
+
+/// When the runner is stopped during [`cancelled_live555_teardown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelAt {
+    /// While the stream plays: the teardown starts cancelled.
+    Playing,
+    /// Once the camera hung up and retina's retry on a fresh connection is
+    /// under way, with the 2 s budget of that case.
+    Retrying,
+}
+
+/// A live555 camera with the stale TCP session bug (retina's
+/// `Tool::has_live555_tcp_bug`) that hangs up on every `TEARDOWN`, so
+/// retina's `Auto` policy retries on fresh connections that never succeed,
+/// run by a [`SourceRunner`] on a fake clock and stopped `at`. Once the
+/// camera counted what comes before the cancel, the fake clock moves 5 ms
+/// at a time, with real time for the sockets after each: the runner must
+/// report `Stopped` within the source contract's 100 ms of the cancel
+/// (`Source::run`), long before its stop grace would drop the source and
+/// end the attempt as a timeout. The session is left to expire on the
+/// camera (RFC 2326 §12.37). Returns the camera's `TEARDOWN`s and
+/// connections.
+async fn cancelled_live555_teardown(at: CancelAt) -> (u64, u64) {
+    traced();
+    let clock = Arc::new(FakeClock::from_system());
+    let time: Arc<dyn Clock> = Arc::<FakeClock>::clone(&clock);
+    let cam = FakeCamera::start(
+        CameraConfig {
+            packets_before_close: (at == CancelAt::Retrying).then_some(1),
+            sdp_session_lines: "a=tool:LIVE555 Streaming Media v2016.11.28\r\n".into(),
+            hang_up_on_teardown: true,
+            ..CameraConfig::default()
+        },
+        Arc::clone(&time),
+    )
+    .await
+    .expect("camera binds");
+    let source = RtspFactory
+        .validate(
+            &SourceUrl::parse(&cam.url()).unwrap(),
+            &json!({ "transport": "tcp" }),
+        )
+        .expect("valid source");
+    let peer = ResolvedPeer {
+        host: "127.0.0.1".into(),
+        addrs: vec![cam.addr()],
+    };
+    let (tx, mut events) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let runner = SourceRunner::new(
+        source,
+        peer,
+        TrackSet::new(TrackLimits::default(), time.now()),
+        Arc::new(ClockMapper::new()),
+        BackchannelSlot::default(),
+        Arc::clone(&time),
+        RunnerConfig::default(),
+        ReconnectBackoff::new(1),
+        tx,
+        ConnectGate::open(),
+        cancel.clone(),
+    );
+    let runner = spawn_named("test.runner", runner.run());
+    assert_eq!(
+        events.recv().await,
+        Some(RunnerEvent::Connecting { attempt: 1 })
+    );
+    assert_eq!(events.recv().await, Some(RunnerEvent::Live));
+    let stats = cam.stats();
+    if at == CancelAt::Retrying {
+        // The session's own connection is gone with the camera's hang-up,
+        // so the one TEARDOWN went out on a fresh connection, and retina
+        // waits out that attempt's deadline (1 s) before the next.
+        assert!(
+            eventually(250, || Stats::get(&stats.teardowns) == 1).await,
+            "a TEARDOWN on a fresh connection"
+        );
+    }
+    cancel.cancel();
+    if at == CancelAt::Playing {
+        // The TEARDOWN on the session's own connection, hung up on, then
+        // the one on a fresh connection, hung up on too.
+        assert!(
+            eventually(250, || Stats::get(&stats.teardowns) == 2).await,
+            "a TEARDOWN on a fresh connection"
+        );
+    }
+    let step = Duration::from_millis(5);
+    let grace = RunnerConfig::default().stop_grace;
+    let mut advanced = Duration::ZERO;
+    loop {
+        match events.try_recv() {
+            Ok(RunnerEvent::Stopped) => break,
+            Ok(_) | Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => panic!("the runner ended without Stopped"),
+        }
+        assert!(
+            advanced < grace,
+            "{at:?}: still running {advanced:?} after its cancel"
+        );
+        clock.advance(step);
+        advanced += step;
+        SystemClock.sleep(Duration::from_millis(3)).await;
+    }
+    assert!(
+        advanced <= Duration::from_millis(100) + step,
+        "{at:?}: stopped {advanced:?} after its cancel"
+    );
+    runner.await.unwrap();
+    let counted = (Stats::get(&stats.teardowns), Stats::get(&stats.connections));
+    cam.stop().await;
+    counted
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_7_a_cancel_while_playing_bounds_a_live555_teardown_on_fresh_connections() {
+    let (teardowns, connections) = cancelled_live555_teardown(CancelAt::Playing).await;
+    assert_eq!(
+        (teardowns, connections),
+        (2, 2),
+        "no retry beyond the cancellation's budget"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_7_a_cancel_during_a_live555_teardown_retry_stops_it() {
+    let (teardowns, connections) = cancelled_live555_teardown(CancelAt::Retrying).await;
+    assert_eq!(
+        (teardowns, connections),
+        (1, 2),
+        "no retry beyond the cancellation's budget"
+    );
 }
