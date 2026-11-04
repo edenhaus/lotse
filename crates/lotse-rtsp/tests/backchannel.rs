@@ -672,6 +672,38 @@ async fn rfc2326_10_7_a_lost_session_is_reported_before_its_teardown_on_fresh_co
     cam.stop().await;
 }
 
+/// A session that did not open is refused to its claim before its
+/// `TEARDOWN` (RFC 2326 §10.7), not after: the camera set the backchannel
+/// up, refused its `PLAY` (RFC 2326 §7.1.1), and, a live555 camera that
+/// hangs up on every `TEARDOWN`, keeps the session's task retrying for
+/// the driver's whole fresh budget, 2 s, while the claim has its refusal
+/// at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_7_a_refused_play_is_refused_to_the_claim_before_its_teardown() {
+    let mut config = config(None, BackchannelCodec::Pcmu, |backchannel| {
+        backchannel.setup = BackchannelSetup::RefusePlay(503);
+    });
+    config.sdp_session_lines = "a=tool:LIVE555 Streaming Media v2016.11.28\r\n".into();
+    config.hang_up_on_teardown = true;
+    let cam = camera(config).await;
+    let source = source(&cam, &serde_json::Value::Null);
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(harness.wait_ready().await, "ready");
+    let slot = harness.backchannel.clone();
+    probed(&cam, 2, &slot).await;
+    let offer = offered(&slot).await;
+    let start = clock().now();
+    let refused = bounded(offer.opener.open()).await.unwrap_err();
+    let told = clock().now().saturating_duration_since(start);
+    assert_eq!(refused.status, Some(503), "{refused:?}");
+    assert!(told < Duration::from_millis(500), "refused after {told:?}");
+    assert_eq!(slot.tasks().running(), 1, "the teardown still retries");
+    bounded(slot.tasks().ended()).await;
+    assert_eq!(log(&cam)[2].teardown, Some(true), "{:?}", log(&cam));
+    finish(harness).await;
+    cam.stop().await;
+}
+
 /// A camera that is gone when the claim comes: refused without a
 /// status, saying the connection failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
