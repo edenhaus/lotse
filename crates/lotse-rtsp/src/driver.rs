@@ -427,9 +427,11 @@ impl Driver {
     /// timers, as retina's own driver does, so an answer that arrived by
     /// its deadline still counts; keepalives and
     /// receiver reports go out when retina has them due, and the camera's
-    /// bytes are read meanwhile. [`Error::Closed`] once the camera closed
-    /// the connection and every item before was handed out;
-    /// [`Error::NotPlaying`] before `PLAY` was answered.
+    /// bytes are read meanwhile. Each item handed out spends a unit of
+    /// tokio's task budget, so a burst yields to the runtime as reads
+    /// would. [`Error::Closed`] once the camera closed the connection and
+    /// every item before was handed out; [`Error::NotPlaying`] before
+    /// `PLAY` was answered.
     pub(crate) async fn next_item(&mut self) -> Result<Item, Error> {
         if !self.core.is_playing() {
             return Err(Error::NotPlaying);
@@ -450,6 +452,15 @@ impl Driver {
                 item = copied(next);
             }
             if let Some(item) = item {
+                // An item already buffered needs no read, so a burst
+                // that arrived at once (a keyframe of thousands of
+                // packets) would be handed out without an await point
+                // that yields: one unit of tokio's budget per item lets
+                // the runtime's other tasks run as often as a task doing
+                // real I/O does (tokio 1.54.1,
+                // `tokio::task::consume_budget`), the session that
+                // takes the packets from the track among them.
+                tokio::task::consume_budget().await;
                 return Ok(item);
             }
             if self.core.is_closed() {
@@ -930,6 +941,34 @@ mod tests {
             fourth.rtp().unwrap().payload,
             Bytes::from_static(&[0x41, 4])
         );
+    }
+
+    #[tokio::test]
+    async fn a_burst_already_buffered_lets_the_runtimes_other_tasks_run_while_it_is_handed_out() {
+        let _logs = traced();
+        let (_clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        played(&mut driver, &mut cam).await;
+        // Three times tokio's budget of 128 in a few reads: the
+        // connection's own budget use cannot force a yield.
+        let count = 3 * 128_u16;
+        let burst: Vec<u8> = (1..=count)
+            .flat_map(|seq| interleaved(0, &rtp(seq, 0, false, &[0x41])))
+            .collect();
+        cam.send(&burst).await;
+        // The test's own task and one beside it on this thread.
+        let beside = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&beside);
+        let _beside = lotse_core::task::spawn_named("test.beside", async move {
+            ran.store(true, Ordering::SeqCst);
+        });
+        let mut handed = 0_u16;
+        while !beside.load(Ordering::SeqCst) {
+            let item = driver.next_item().await.unwrap();
+            handed += 1;
+            assert_eq!(item.rtp().unwrap().seq, handed);
+            assert!(handed < count, "no other task ran during the burst");
+        }
+        assert!(handed <= 128, "{handed} items before another task ran");
     }
 
     #[tokio::test]
