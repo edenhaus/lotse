@@ -634,6 +634,44 @@ async fn rfc2326_10_7_a_lost_live555_backchannel_session_is_torn_down_on_a_fresh
     cam.stop().await;
 }
 
+/// A lost session is reported to its talker before its `TEARDOWN`
+/// (RFC 2326 §10.7), not after: a live555 camera that hangs up on every
+/// `TEARDOWN`, fresh connections included, keeps the session's task
+/// retrying for the driver's whole fresh budget, 2 s, while the talker
+/// hears of the loss at once and stops feeding a session that is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_7_a_lost_session_is_reported_before_its_teardown_on_fresh_connections() {
+    let mut config = config(None, BackchannelCodec::Pcmu, |_| {});
+    config.sdp_session_lines = "a=tool:LIVE555 Streaming Media v2016.11.28\r\n".into();
+    config.hang_up_on_teardown = true;
+    let cam = camera(config).await;
+    let source = source(&cam, &serde_json::Value::Null);
+    let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    assert!(harness.wait_ready().await, "ready");
+    let slot = harness.backchannel.clone();
+    probed(&cam, 2, &slot).await;
+    let mut session = open(&slot).await.unwrap();
+    let start = clock().now();
+    cam.hang_up_backchannel();
+    let why = lost(&mut session).await;
+    assert_eq!(why.status, None, "{why:?}");
+    let told = clock().now().saturating_duration_since(start);
+    assert!(told < Duration::from_millis(500), "told after {told:?}");
+    assert_eq!(slot.tasks().running(), 1, "the teardown still retries");
+    drop(session);
+    bounded(slot.tasks().ended()).await;
+    assert!(
+        log(&cam)
+            .iter()
+            .skip(3)
+            .any(|log| log.teardown == Some(true)),
+        "{:?}",
+        log(&cam)
+    );
+    finish(harness).await;
+    cam.stop().await;
+}
+
 /// A camera that is gone when the claim comes: refused without a
 /// status, saying the connection failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
