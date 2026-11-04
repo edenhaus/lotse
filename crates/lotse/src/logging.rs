@@ -14,7 +14,7 @@
 //! retina logs through `tracing` itself: its events reach the lines
 //! throttled per call site the same way, scrubbed of URLs and capped, and
 //! its spans, which carry the request's URL, are never created
-//! ([`retina`], [`spans`]).
+//! ([`retina`], and the global filter of [`subscriber`]).
 
 use std::sync::Arc;
 
@@ -22,7 +22,6 @@ use lotse_core::clock::Clock;
 use lotse_core::throttle::{CallSites, summary};
 use tracing_log::{AsLog as _, LogTracer};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -115,9 +114,11 @@ impl log::Log for Bridge {
     fn flush(&self) {}
 }
 
-/// The subscriber [`init`] installs: `filter` as a layer of its own, then
-/// JSON or text lines to `writer`, retina's through [`retina`] on
-/// `clock`. As its own layer the filter answers `enabled`, which the
+/// The subscriber [`init`] installs: `filter` as a layer of its own, with
+/// the RTSP source the global filter that keeps retina's spans, which
+/// carry the request's URL, from being created
+/// (`lotse_rtsp::retina_log::no_retina_spans`), then JSON or text lines
+/// to `writer`, retina's through [`retina`] on `clock`. As its own layer the filter answers `enabled`, which the
 /// [`Bridge`] asks with a record's target before it counts the record; a
 /// per-layer filter would answer `true` there and drop the event only
 /// later, so a filtered-out `log` record would still count.
@@ -133,9 +134,11 @@ where
     let lines = tracing_subscriber::fmt::layer()
         .with_writer(writer)
         .with_target(false);
-    let registry = tracing_subscriber::registry()
-        .with(filter)
-        .with(filter_fn(spans));
+    let registry = tracing_subscriber::registry().with(filter);
+    #[cfg(feature = "source-rtsp")]
+    let registry = registry.with(tracing_subscriber::filter::filter_fn(
+        lotse_rtsp::retina_log::no_retina_spans,
+    ));
     match format {
         LogFormat::Json => Box::new(
             registry.with(retina(
@@ -149,20 +152,6 @@ where
         ),
         LogFormat::Text => Box::new(registry.with(retina(lines, clock))),
     }
-}
-
-/// With the RTSP source, the global filter that keeps retina's spans,
-/// which carry the request's URL, from being created
-/// ([`lotse_rtsp::retina_log::no_retina_spans`]).
-#[cfg(feature = "source-rtsp")]
-fn spans(metadata: &tracing::Metadata<'_>) -> bool {
-    lotse_rtsp::retina_log::no_retina_spans(metadata)
-}
-
-/// Without the RTSP source retina is not in the build: every span may be.
-#[cfg(not(feature = "source-rtsp"))]
-fn spans(_metadata: &tracing::Metadata<'_>) -> bool {
-    true
 }
 
 /// With the RTSP source, `lines` with retina's events throttled on
