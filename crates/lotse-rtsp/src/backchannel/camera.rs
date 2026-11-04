@@ -120,21 +120,28 @@ impl Camera {
 
 /// The camera's backchannel in the `DESCRIBE` answer `session` holds
 /// (ONVIF Streaming Specification §5.3.2): the media [`offer`] finds in
-/// the raw SDP, and the retina stream that sends on it, the one whose
-/// direction is `Sending` with that media's first payload type (RFC 8866
-/// §5.14), since retina's stream indices skip media it cannot parse.
-/// `None` when there is none.
+/// the raw SDP, and the retina stream that sends on it ([`Offer::stream`]:
+/// the one at that media's index, whose direction is `Sending` with that
+/// media's first payload type, RFC 8866 §5.14), not merely the first such
+/// stream, which another media could carry. `None` when there is none.
 pub(crate) fn backchannel_stream(session: &Session<Described>) -> Option<(usize, Offer)> {
     let offer = offer(session.sdp())?;
-    let index = session.streams().iter().position(|stream| {
-        stream.direction() == StreamDirection::Sending
-            && stream.rtp_payload_type() == offer.first_payload_type
-    });
+    let streams: Vec<(bool, u8)> = session
+        .streams()
+        .iter()
+        .map(|stream| {
+            (
+                stream.direction() == StreamDirection::Sending,
+                stream.rtp_payload_type(),
+            )
+        })
+        .collect();
+    let index = offer.stream(&streams);
     if index.is_none() {
         tracing::info!(
             media = offer.media,
             payload_type = offer.first_payload_type,
-            "rtsp: no stream retina sends on has the backchannel's payload type; no backchannel"
+            "rtsp: no stream retina sends on carries the backchannel's media; no backchannel"
         );
     }
     index.map(|index| (index, offer))
