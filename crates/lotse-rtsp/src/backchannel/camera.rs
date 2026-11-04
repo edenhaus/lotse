@@ -27,7 +27,7 @@ use retina::client::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::session::{Offer, offer};
+use super::session::{Candidate, Offer, offer};
 use crate::driver::Duplex;
 use crate::framer::MAX_MESSAGE;
 use crate::options::RtspOptions;
@@ -120,20 +120,22 @@ impl Camera {
 
 /// The camera's backchannel in the `DESCRIBE` answer `session` holds
 /// (ONVIF Streaming Specification §5.3.2): the media [`offer`] finds in
-/// the raw SDP, and the retina stream that sends on it ([`Offer::stream`]:
-/// the one at that media's index, whose direction is `Sending` with that
-/// media's first payload type, RFC 8866 §5.14), not merely the first such
-/// stream, which another media could carry. `None` when there is none.
+/// the raw SDP, and the retina stream that sends on it ([`Offer::stream`],
+/// from each stream's direction, payload type and control URL: the one at
+/// that media's index, whose direction is `Sending` with that media's
+/// first payload type, RFC 8866 §5.14; when retina skipped media, the one
+/// on that media's control URL, RFC 2326 §C.3), not merely the first such
+/// stream, which another media could carry. `None` when there is none, or
+/// the mapping is uncertain.
 pub(crate) fn backchannel_stream(session: &Session<Described>) -> Option<(usize, Offer)> {
     let offer = offer(session.sdp())?;
-    let streams: Vec<(bool, u8)> = session
+    let streams: Vec<Candidate<'_>> = session
         .streams()
         .iter()
-        .map(|stream| {
-            (
-                stream.direction() == StreamDirection::Sending,
-                stream.rtp_payload_type(),
-            )
+        .map(|stream| Candidate {
+            sending: stream.direction() == StreamDirection::Sending,
+            payload_type: stream.rtp_payload_type(),
+            control: stream.control().map(url::Url::as_str),
         })
         .collect();
     let index = offer.stream(&streams);
