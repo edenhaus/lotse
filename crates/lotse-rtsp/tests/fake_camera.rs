@@ -1102,6 +1102,9 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
     let cam = camera(CameraConfig {
         auth: Some(("admin".into(), "pw5b1c".into())),
         rtptime: Some("tok9d2e".into()),
+        // A relative control early in the SDP, which no scheme marks as a
+        // URL (RFC 2326 §C.1.1), and retina's own `a=control` after it.
+        sdp_session_lines: "a=control:/camkey7f3a/live?token=tok9d2e\r\n".into(),
         sdp_media_lines: "m=video 0 RTP/AVP 200\r\n\
              a=control:rtsp://cam.example/camkey7f3a/live?token=tok9d2e/track9\r\n"
             .into(),
@@ -1139,7 +1142,7 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
     // retina's three, each on one line, its camera text capped.
     for said in [
         "Unparseable rtptime in RTP-Info header",
-        "Ignoring unparseable stream raw SDP:",
+        "Ignoring unparseable stream",
         "SETUP response:",
     ] {
         let line = logs.lines().find(|line| line.contains(said));
