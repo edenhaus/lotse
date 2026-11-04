@@ -126,7 +126,7 @@ const MAX_DATAGRAM: usize = 65_535;
 /// stream cannot starve the others, nor the control connection, which the
 /// driver reads in the same poll. A keyframe of a few hundred packets
 /// takes a few wake-ups.
-const MAX_READS: usize = 64;
+pub(crate) const MAX_READS: usize = 64;
 
 /// What the core's UDP streams are set up with: no reorder buffer
 /// (`max_delay` zero), so a late packet is dropped at once, as over TCP.

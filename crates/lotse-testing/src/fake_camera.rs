@@ -661,6 +661,14 @@ pub struct CameraConfig {
     /// With `timestamp_jump`, the jump repeats at every frame from its
     /// first on: a camera whose clock leaves its timeline on every frame.
     pub timestamp_jump_repeats: bool,
+    /// From this frame on, add this much to the video's sequence numbers,
+    /// wrapping: past RFC 3550 §A.1's `MAX_DROPOUT` (3000), a camera that
+    /// restarted them mid-stream, as after an encoder restart.
+    pub seq_jump: Option<(u32, u16)>,
+    /// Send every n-th video RTP packet a second time, after the one that
+    /// follows it: a late duplicate, behind the stream (RFC 3550 §A.1).
+    /// Counted in sent order over the connection's video packets, from 1.
+    pub late_every: Option<u64>,
     /// Stamp every access unit with its send time since this origin, in a
     /// leading SEI NAL unit ([`crate::latency`]); H.264 only.
     pub stamp_origin: Option<Instant>,
@@ -818,6 +826,8 @@ impl Default for CameraConfig {
             packets_before_close: None,
             timestamp_jump: None,
             timestamp_jump_repeats: false,
+            seq_jump: None,
+            late_every: None,
             stamp_origin: None,
             packet_spacing: Duration::ZERO,
             audio: None,
@@ -1328,6 +1338,9 @@ struct Connection {
     set_up: SetUp,
     /// The client closed it.
     client_closed: bool,
+    /// A video packet [`CameraConfig::late_every`] sends again after the
+    /// next one.
+    late: Option<Vec<u8>>,
 }
 
 /// What a connection's `SETUP`s set up.
@@ -1523,6 +1536,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         index,
         set_up: SetUp::default(),
         client_closed: false,
+        late: None,
     };
     let frame_interval = Duration::from_secs(1)
         .checked_div(connection.config.fps.max(1))
@@ -2240,6 +2254,11 @@ impl Connection {
         let ts = FIRST_TIMESTAMP
             .wrapping_add(index.wrapping_mul(ticks_per_frame))
             .wrapping_add(jump);
+        if let Some((from, by)) = self.config.seq_jump
+            && index == from
+        {
+            self.seq = self.seq.wrapping_add(by);
+        }
         let mut payloads: Vec<Bytes> = Vec::new();
         if let Some(origin) = self.config.stamp_origin
             && self.config.video == CameraVideo::H264
@@ -2256,10 +2275,18 @@ impl Connection {
         }
         for (i, payload) in payloads.into_iter().enumerate() {
             let marker = self.config.marker_bit && i.saturating_add(1) == count;
-            out.push((0, rtp(self.seq, ts, marker, &payload)));
+            let packet = rtp(self.seq, ts, marker, &payload);
             self.seq = self.seq.wrapping_add(1);
             self.sent = self.sent.saturating_add(1);
             Stats::bump(&self.stats.packets);
+            let late = self
+                .config
+                .late_every
+                .is_some_and(|n| n > 0 && self.sent.is_multiple_of(n))
+                .then(|| packet.clone());
+            out.push((0, packet));
+            out.extend(self.late.take().map(|late| (0, late)));
+            self.late = late;
         }
         out
     }

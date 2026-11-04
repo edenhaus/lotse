@@ -80,6 +80,14 @@ use crate::udp::{Pair, Streams, udp_options};
 /// least: 16 KiB.
 const READ_RESERVE: usize = 16_384;
 
+/// The reads, at most, of what is already waiting on the connection before
+/// due timers run ([`Driver::read_ready`]): a read gets the free space of
+/// retina's ring up to its end only, which at its wrap may be a few bytes;
+/// the second then starts at the ring's beginning, with at least
+/// [`READ_RESERVE`] in one piece. Bounded, so a camera whose connection
+/// never runs dry cannot hold the timers off.
+const READS_BEFORE_TIMERS: usize = 2;
+
 /// A connection to the camera, plain TCP or TLS over it.
 pub(crate) trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -415,6 +423,11 @@ pub(crate) struct Driver {
     time: Arc<dyn Clock>,
     /// The pairs of the streams set up over UDP.
     udp: Streams,
+    /// The reads that come before due timers were made
+    /// ([`Driver::read_ready`]): the timers run at the next call that finds
+    /// nothing buffered, whether the connection has more or not. Cleared
+    /// once they ran, or are no longer due.
+    read_before_timers: bool,
 }
 
 impl fmt::Debug for Driver {
@@ -434,6 +447,7 @@ impl Driver {
             udp: Streams::new(conn.peer.ip()),
             conn: conn.stream,
             time,
+            read_before_timers: false,
         }
     }
 
@@ -569,17 +583,19 @@ impl Driver {
             conn,
             time,
             udp,
+            ..
         } = self;
         poll_fn(move |cx| poll_media(cx, &mut **conn, core, udp, &**time))
     }
 
     /// The next item of a playing session, once one arrived: every item
     /// already buffered first (a keepalive's answer among them, which the
-    /// core takes in), then what already waits on the connection and the
-    /// UDP pairs, then the timers, as retina's own driver does, so an
-    /// answer that arrived by its deadline still counts; keepalives and
-    /// receiver reports go out when retina has them due, and the camera's
-    /// bytes and datagrams are read meanwhile. Each item handed out spends
+    /// core takes in), then what already waits on the connection, at most
+    /// [`READS_BEFORE_TIMERS`] reads, then the timers, so an answer that
+    /// arrived by its deadline still counts and neither the connection nor
+    /// the UDP pairs can hold the timers off; keepalives and receiver
+    /// reports go out when retina has them due, and the camera's bytes and
+    /// datagrams are read meanwhile. Each item handed out spends
     /// a unit of tokio's task budget, so a burst yields to the runtime as
     /// reads would. [`Error::Closed`] once the camera closed the
     /// connection and every item before was handed out, its datagrams
@@ -619,30 +635,54 @@ impl Driver {
             if self.core.is_closed() {
                 return Err(Error::Closed);
             }
-            // What already arrived is taken in before the timers, as
-            // retina's own driver reads until nothing is left first: a
-            // keepalive's answer waiting in the socket at its deadline
-            // still counts.
+            // What already arrived on the connection is taken in before
+            // the timers: a keepalive's answer waiting in the socket at its
+            // deadline still counts. Bounded reads only, and what they
+            // parsed handed out: a camera whose connection never runs dry
+            // would otherwise hold the keepalive and the receiver reports
+            // off for good (retina's own driver reads until nothing is left
+            // first). The UDP pairs carry no answer, so their datagrams
+            // wait until the timers ran: a stream that never pauses would
+            // hold them off too.
             let due = self.core.poll_timeout().unwrap_or(now) <= now;
-            let mut io = if due {
-                self.media().now_or_never()
+            let ready = if due && !self.read_before_timers {
+                self.read_ready()
             } else {
                 None
             };
-            if io.is_none() {
+            self.read_before_timers = ready.is_some();
+            let io = if let Some(exchanged) = ready {
+                exchanged.map_err(|failed| self.failure(failed))
+            } else {
                 if due {
                     self.core.handle_timeout(now).map_err(Error::Session)?;
                     self.send_udp();
                 }
                 let next = self.core.poll_timeout().unwrap_or(now);
                 let wait = self.time.sleep(next.saturating_duration_since(now));
-                io = Some(tokio::select! {
+                tokio::select! {
                     io = self.media() => io,
                     () = wait => Ok(()),
-                });
-            }
-            io.unwrap_or(Ok(()))?;
+                }
+            };
+            io?;
         }
+    }
+
+    /// Reads what is already waiting on the connection, without waiting:
+    /// at most [`READS_BEFORE_TIMERS`] reads, each written and flushed
+    /// first, as [`exchange`] does. `None` when nothing was waiting; the
+    /// first failure ends the reads.
+    fn read_ready(&mut self) -> Option<Result<(), Failed>> {
+        let mut read = None;
+        for _ in 0..READS_BEFORE_TIMERS {
+            match exchange(&mut *self.conn, &mut self.core).now_or_never() {
+                None => break,
+                Some(Err(failed)) => return Some(Err(failed)),
+                Some(Ok(())) => read = Some(Ok(())),
+            }
+        }
+        read
     }
 
     /// Ends the session on the camera as retina's teardown policy says
@@ -668,6 +708,7 @@ impl Driver {
             conn,
             time,
             udp,
+            ..
         } = self;
         // The camera sends to the pairs no more once torn down, and before
         // nothing reads them.
@@ -1424,17 +1465,24 @@ mod tests {
     #[tokio::test]
     async fn a_read_that_fails_while_playing_ends_the_session_as_ended() {
         let _logs = traced();
-        let (_clock, mut driver, faults, mut cam) = faulty(TeardownPolicy::Auto);
-        played(&mut driver, &mut cam).await;
-        *faults.lock().unwrap() = Fault::Read;
-        let err = driver.next_item().await.unwrap_err();
-        assert!(
-            matches!(
-                err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap()),
-                SourceError::Ended(m) if m.starts_with("Error reading from RTSP peer: connection reset")
-            ),
-            "{err:?}"
-        );
+        // With the keepalive due, the read fails among those made before
+        // the timers.
+        for due in [false, true] {
+            let (clock, mut driver, faults, mut cam) = faulty(TeardownPolicy::Auto);
+            played(&mut driver, &mut cam).await;
+            *faults.lock().unwrap() = Fault::Read;
+            if due {
+                clock.advance(Duration::from_secs(30));
+            }
+            let err = driver.next_item().await.unwrap_err();
+            assert!(
+                matches!(
+                    err.source_error(&SourceUrl::parse("rtsp://cam/").unwrap()),
+                    SourceError::Ended(m) if m.starts_with("Error reading from RTSP peer: connection reset")
+                ),
+                "due {due}: {err:?}"
+            );
+        }
     }
 
     /// What one dial of the teardown gives.
@@ -1869,6 +1917,90 @@ mod tests {
         assert_eq!(item.unwrap().rtp().unwrap().seq, 2);
     }
 
+    /// A camera whose connection never runs dry (a packet waiting at every
+    /// call) still gets its keepalive and receiver report once they fall
+    /// due: one read comes before the due timers, not every read.
+    #[tokio::test]
+    async fn rfc2326_10_8_an_always_readable_camera_still_gets_its_keepalive_when_due() {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        played(&mut driver, &mut cam).await;
+        clock.advance(Duration::from_secs(30));
+        let mut seq = 0_u16;
+        let mut byte = [0_u8; 1];
+        let sent = loop {
+            seq += 1;
+            assert!(seq <= 8, "no keepalive in {} calls", seq - 1);
+            cam.send(&interleaved(0, &rtp(seq, 0, true, &[0x41]))).await;
+            let item = driver.next_item().await.unwrap();
+            assert_eq!(item.rtp().unwrap().seq, seq);
+            if let Some(read) = cam.io.read(&mut byte).now_or_never() {
+                break read.unwrap();
+            }
+        };
+        assert_eq!(sent, 1);
+        assert!(seq <= 2, "the keepalive went out on call {seq}");
+        cam.buf.push(byte[0]);
+        let keepalive = cam.request().await;
+        assert!(
+            keepalive.starts_with("OPTIONS rtsp://cam/stream/"),
+            "{keepalive}"
+        );
+        // The receiver report the keepalive came with.
+        assert_eq!(cam.frame().0, 1);
+    }
+
+    /// The free space of retina's ring up to its end: what the next read
+    /// from the camera can take at most.
+    fn before_wrap(driver: &mut Driver) -> usize {
+        driver.core.read_buf().spare_capacity(READ_RESERVE).0.len()
+    }
+
+    /// A keepalive's answer waiting at its deadline counts even when the
+    /// first read before the timers is cut short at the wrap of retina's
+    /// ring, which leaves the answer's rest in the socket: a second read
+    /// takes it in before the timers run.
+    #[tokio::test]
+    async fn rfc2326_10_8_a_keepalive_answer_split_by_the_rings_wrap_still_counts() {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        played(&mut driver, &mut cam).await;
+        // The keepalive goes out at 30 s, and waits for its answer.
+        let mut seq = 1_u16;
+        let camera = async {
+            clock.advance(Duration::from_secs(30));
+            let keepalive = cam.request().await;
+            assert_eq!(cam.frame().0, 1, "the receiver report");
+            cam.send(&interleaved(0, &rtp(seq, 0, true, &[0x41]))).await;
+            keepalive
+        };
+        let (item, keepalive) = tokio::join!(driver.next_item(), camera);
+        assert!(item.unwrap().rtp().is_some());
+        // Packets that leave 8 bytes of the ring before its end, wrapping
+        // it first when less than a packet is left.
+        for _ in 0..2 {
+            let left = before_wrap(&mut driver);
+            let len = if left < 64 { left } else { left - 8 };
+            seq += 1;
+            let payload = vec![0x41; len - 16];
+            cam.send(&interleaved(0, &rtp(seq, 0, true, &payload)))
+                .await;
+            assert_eq!(driver.next_item().await.unwrap().rtp().unwrap().seq, seq);
+            if before_wrap(&mut driver) == 8 {
+                break;
+            }
+        }
+        assert_eq!(before_wrap(&mut driver), 8);
+        // The answer, longer than that, and a packet wait while the next
+        // deadline passes.
+        cam.answer(&keepalive, "200 OK", "", "").await;
+        cam.send(&interleaved(0, &rtp(seq + 1, 0, true, &[0x41])))
+            .await;
+        clock.advance(Duration::from_secs(30));
+        let item = driver.next_item().await.unwrap();
+        assert_eq!(item.rtp().unwrap().seq, seq + 1);
+    }
+
     #[tokio::test]
     async fn what_already_arrived_is_handed_out_before_an_overdue_timer_fires() {
         let _logs = traced();
@@ -2142,6 +2274,63 @@ mod tests {
         assert_eq!((report[1], from.port()), (201, client + 1));
         assert!(report.len() > 8, "a block and an SDES: {report:?}");
         assert_eq!(ingest.snapshot(), IngestStats::default());
+    }
+
+    /// A camera whose UDP stream never pauses still gets its keepalive once
+    /// it falls due: more datagrams wait than one poll takes (the socket
+    /// stays readable), but the pairs carry no answer, so they wait until
+    /// the timers ran.
+    #[tokio::test]
+    async fn rfc2326_10_8_an_always_readable_udp_stream_still_gets_its_keepalive_when_due() {
+        let _logs = traced();
+        let (clock, mut driver, mut cam) = rig(64 * 1024, TeardownPolicy::Auto);
+        let camera = CamUdp::bind();
+        let client = set_up_udp(&mut driver, &mut cam, answered(Some(camera.port)))
+            .await
+            .unwrap();
+        play_udp(&mut driver, &mut cam).await;
+        // Twice as many datagrams as a poll takes, and the next two at
+        // every call: the socket is never drained.
+        let reads = u16::try_from(crate::udp::MAX_READS).unwrap();
+        let mut sent = 0_u16;
+        for _ in 0..2 * reads {
+            sent += 1;
+            camera
+                .rtp
+                .send_to(&rtp(sent, 0, true, &[0x41]), to(client))
+                .await
+                .unwrap();
+        }
+        assert_eq!(next(&mut driver).await.unwrap().rtp().unwrap().seq, 1);
+        clock.advance(Duration::from_secs(30));
+        let mut byte = [0_u8; 1];
+        let mut calls = 0_u16;
+        let read = loop {
+            calls += 1;
+            assert!(calls <= 3 * reads, "no keepalive in {} calls", calls - 1);
+            for _ in 0..2 {
+                sent += 1;
+                camera
+                    .rtp
+                    .send_to(&rtp(sent, 0, true, &[0x41]), to(client))
+                    .await
+                    .unwrap();
+            }
+            let item = next(&mut driver).await.unwrap();
+            assert_eq!(item.rtp().unwrap().seq, calls + 1);
+            if let Some(read) = cam.io.read(&mut byte).now_or_never() {
+                break read.unwrap();
+            }
+        };
+        assert_eq!(read, 1);
+        // Once what one poll took is handed out.
+        assert!(calls <= reads, "the keepalive went out on call {calls}");
+        cam.buf.push(byte[0]);
+        let keepalive = cam.request().await;
+        assert!(
+            keepalive.starts_with("OPTIONS rtsp://cam/stream/"),
+            "{keepalive}"
+        );
     }
 
     #[tokio::test]
