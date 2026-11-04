@@ -2,8 +2,10 @@
 //! self-signed camera plays over TLS 1.3 and TLS 1.2, a wrong pin and an
 //! untrusted certificate are `auth_failed` before any RTSP request,
 //! `insecure_tls` plays and warns, a camera that does not speak TLS fails
-//! the handshake, a silent one times out in it, and a pin mismatch is
-//! retried only after the reconnect backoff.
+//! the handshake, a silent one times out in it, a pin mismatch is
+//! retried only after the reconnect backoff, the camera sees the source
+//! URL as the Request-URI, and a live555 camera that hangs up is torn
+//! down on a fresh TLS connection.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -118,6 +120,46 @@ async fn rtsps_plays_with_a_pinned_certificate_rfc7826_19_2() {
     plays(source.as_ref(), peer(&cam)).await;
     let stats = cam.stats();
     assert_eq!(Stats::get(&stats.plays), 2);
+    assert_eq!(Stats::get(&stats.tls_failures), 0);
+    // RFC 7826 §19.2, RFC 2326 §6.1: the camera sees the source URL as
+    // the Request-URI, `rtsps` scheme and host name included.
+    for log in stats.connection_log() {
+        assert_eq!(log.describe_uris, [url(&cam)]);
+    }
+    cam.stop().await;
+}
+
+/// A live555 camera with the stale TCP session bug that hangs up over
+/// TLS: retina's `Auto` policy retries the `TEARDOWN` on a fresh
+/// connection, which the source dials with its TLS handshake again (RFC
+/// 7826 §19.2), within the source's 2 s budget for that case. The
+/// attempt's exit comes after its teardown, so the counts are final by
+/// then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc2326_10_7_a_live555_camera_that_hangs_up_is_torn_down_on_a_fresh_tls_connection() {
+    let tls = CameraTls::self_signed(&["elsewhere.test"]).unwrap();
+    let options = json!({ "tls_fingerprint": tls.fingerprint() });
+    let cam = FakeCamera::start(
+        CameraConfig {
+            tls: Some(tls),
+            packets_before_close: Some(20),
+            sdp_session_lines: "a=tool:LIVE555 Streaming Media v2016.11.28\r\n".into(),
+            ..CameraConfig::default()
+        },
+        clock(),
+    )
+    .await
+    .expect("camera binds");
+    let source = source(&RtspFactory::default(), &url(&cam), &options);
+    let harness = Harness::start(source.as_ref(), peer(&cam), clock());
+    let exit = harness.finish().await;
+    assert!(
+        matches!(exit, SourceError::Ended(ref m) if m == "the camera closed the session"),
+        "{exit:?}"
+    );
+    let stats = cam.stats();
+    assert_eq!(Stats::get(&stats.teardowns), 1);
+    assert_eq!(Stats::get(&stats.connections), 2, "a fresh connection");
     assert_eq!(Stats::get(&stats.tls_failures), 0);
     cam.stop().await;
 }

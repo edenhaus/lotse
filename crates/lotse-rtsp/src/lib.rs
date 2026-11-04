@@ -13,6 +13,7 @@
 //! Specification §5.3.
 
 pub mod backchannel;
+mod driver;
 pub mod error;
 mod factory;
 mod fmtp;

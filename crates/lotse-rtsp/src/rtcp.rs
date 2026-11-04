@@ -4,14 +4,16 @@
 //!
 //! retina 0.4.20 sends no RTCP at all (its own documentation of
 //! `Transport::Udp` says so), and its 0.5 prototype sends receiver
-//! reports only when asked (`SessionOptions::receiver_reports`, which the
-//! source leaves at its default, never), while RFC 3550 §6 says the reception
-//! feedback "SHOULD be used in all environments". retina speaks plain RTSP
-//! to the loopback relay,
-//! which owns the camera's side and sees every RTP and RTCP packet first,
-//! so the relay reports: over TCP on the stream's RTCP channel between
-//! whole requests (RFC 2326 §10.12), over UDP from the stream's RTCP port
-//! to the camera's (RFC 3550 §11).
+//! reports only when asked (`SessionOptions::receiver_reports`), while
+//! RFC 3550 §6 says the reception feedback "SHOULD be used in all
+//! environments". The source's TCP interleaved session, which drives
+//! retina's sans-I/O core on its own connection ([`crate::driver`]), asks
+//! retina for them. Where retina still speaks plain RTSP to the loopback
+//! relay (`transport: "udp"`, and the backchannel's sessions), the relay
+//! owns the camera's side and sees every RTP and RTCP packet first, so the
+//! relay reports: over TCP on the stream's RTCP channel between whole
+//! requests (RFC 2326 §10.12), over UDP from the stream's RTCP port to
+//! the camera's (RFC 3550 §11).
 //!
 //! Per stream this keeps, sans I/O and with every time passed in:
 //!

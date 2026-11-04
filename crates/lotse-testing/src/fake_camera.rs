@@ -14,7 +14,7 @@
 //! to be exercised. Knobs model camera habits: no marker bits, a large
 //! MTU, credentials, hanging up, never answering, a `PLAY` answer
 //! without `rtptime` (RFC 2326 §12.33), a refused or unanswered `PLAY`,
-//! or bytes that are not RTSP after it; over UDP (RFC 2326
+//! bytes that are not RTSP after it, or a `TEARDOWN` hung up on; over UDP (RFC 2326
 //! §12.39, RFC 3550 §11) a `461` refusal, datagrams that never arrive, and
 //! loss, reordering, duplicates and a foreign sender. It records the RTCP
 //! a client sends it, interleaved or as datagrams, so tests can read its
@@ -32,8 +32,8 @@
 //! chooses which media it sets up), whose RTP after `PLAY` it
 //! parses (RFC 3550 §5.1) and records ([`Stats::backchannel`]), RTCP on the
 //! odd channel counted. Every connection is logged
-//! ([`Stats::connection_log`]): its `DESCRIBE`s and whether they asked for
-//! the backchannel, its `SETUP`s, its `PLAY`, its `TEARDOWN` and whether
+//! ([`Stats::connection_log`]): its `DESCRIBE`s, their Request-URI and
+//! whether they asked for the backchannel, its `SETUP`s, its `PLAY`, its `TEARDOWN` and whether
 //! that carried `Require`, the backchannel RTP it took, and its close.
 //! Other modes: the `Require` tag refused with `551` (RFC 2326 §11.3.13,
 //! ONVIF Streaming Specification §5.3.2) or never answered, only the
@@ -728,6 +728,10 @@ pub struct CameraConfig {
     /// Keep a connection open after answering its `TEARDOWN`, so that its
     /// close is the client's ([`ConnectionLog::closed_by_client`]).
     pub keep_open_on_teardown: bool,
+    /// Close the connection instead of answering its `TEARDOWN` (still
+    /// counted), on every connection, fresh ones included: a teardown that
+    /// retries on fresh connections never succeeds.
+    pub hang_up_on_teardown: bool,
 }
 
 /// How the camera answers `PLAY`; every other request is answered as
@@ -825,6 +829,7 @@ impl Default for CameraConfig {
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             backchannel: None,
             keep_open_on_teardown: false,
+            hang_up_on_teardown: false,
         }
     }
 }
@@ -907,6 +912,9 @@ pub struct ConnectionLog {
     /// Its `DESCRIBE`s, in order: whether each asked for the backchannel
     /// with `Require` (ONVIF Streaming Specification §5.3.1).
     pub describes: Vec<bool>,
+    /// The Request-URI of each of its `DESCRIBE`s, in order (RFC 2326
+    /// §6.1).
+    pub describe_uris: Vec<String>,
     /// The last segment of each `SETUP`'s control URL it answered:
     /// `track0`, `track1`, `backchannel`.
     pub setups: Vec<String>,
@@ -1268,7 +1276,7 @@ enum Answering {
     /// `Require` ([`RequireAnswer::Silent`]) and answers nothing.
     Hung,
     /// It closes the connection instead of the next answer
-    /// ([`BackchannelSetup::HangUp`]).
+    /// ([`BackchannelSetup::HangUp`], [`CameraConfig::hang_up_on_teardown`]).
     HangUp,
 }
 
@@ -1821,6 +1829,9 @@ impl Connection {
                 } else {
                     self.release_backchannel();
                 }
+                if self.config.hang_up_on_teardown {
+                    self.answering = Answering::HangUp;
+                }
                 (
                     reply(&cseq, StatusCode::Ok).build(Vec::new()),
                     !self.config.keep_open_on_teardown,
@@ -1904,7 +1915,14 @@ impl Connection {
     /// Specification §5.3.1, §5.3.2), or its refusal with `551` (§5.3.2).
     fn describe(&mut self, request: &Request<Vec<u8>>, cseq: &str) -> Response<Vec<u8>> {
         let asked = asks_backchannel(request);
-        self.stats.log(self.index, |log| log.describes.push(asked));
+        let uri = request
+            .request_uri()
+            .map(|uri| uri.as_str().to_owned())
+            .unwrap_or_default();
+        self.stats.log(self.index, |log| {
+            log.describes.push(asked);
+            log.describe_uris.push(uri);
+        });
         if asked && let Some(BackchannelSetup::RefuseDescribe(status)) = self.backchannel_setup() {
             return reply(cseq, status_code(status)).build(Vec::new());
         }

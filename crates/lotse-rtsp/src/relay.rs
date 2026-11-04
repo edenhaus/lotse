@@ -1,25 +1,29 @@
-//! The loopback relay every RTSP connection goes through: retina speaks
-//! plain RTSP to a listener on `127.0.0.1`, and the relay carries it to the
-//! camera, over TCP for `rtsp` and the TLS stream for `rtsps`.
+//! The loopback relay the RTSP connections retina's tokio session opens go
+//! through: retina speaks plain RTSP to a listener on `127.0.0.1`, and the
+//! relay carries it to the camera, over TCP for `rtsp` and the TLS stream
+//! for `rtsps`. Those are the source's connections with `transport:
+//! "udp"` and the backchannel's (its probe and talkers' sessions); the
+//! source's TCP interleaved session drives retina's sans-I/O core on its
+//! own connection instead ([`crate::driver`]).
 //!
-//! retina's tokio `Session`, which the source drives, opens its own
-//! `TcpStream` from the URL and has no way to be handed a stream or to
-//! speak TLS. retina 0.5's sans-I/O `SessionCore` would take any stream,
-//! `rtsps` included, but the UDP media and the backchannel still go
-//! through the tokio `Session` here, so the relay stays until they move to
-//! the core. So the source connects to the camera itself (and completes
-//! the TLS handshake for `rtsps`), then lets retina connect to the relay's
-//! listener and copies bytes both ways between that one connection and
-//! the camera. retina's requests go on whole; what the
+//! retina's tokio `Session` opens its own `TcpStream` from the URL and
+//! has no way to be handed a stream or to speak TLS. retina 0.5's sans-I/O
+//! `SessionCore` takes any stream, `rtsps` included, but the UDP media and
+//! the backchannel still go through the tokio `Session`, so the relay
+//! stays until they move to the core. So the source connects to the camera
+//! itself (and completes the TLS handshake for `rtsps`), then lets retina
+//! connect to the relay's listener and copies bytes both ways between that
+//! one connection and the camera. retina's requests go on whole; what the
 //! camera sends goes on as it arrives, interleaved RTP included.
 //!
 //! In a sandboxed worker Landlock allows TCP `bind` and `connect` only on
 //! the ports listed at startup, so the worker binds the listener before its
 //! sandbox and passes it to the factory (`--loopback-relay`); without one,
 //! the relay binds an ephemeral port per attempt (tests, `--sandbox off`).
-//! A pre-bound listener is shared by every connection of the worker: the
-//! attempts of its source, the probes of the camera's backchannel and the
-//! talkers' backchannel sessions, which run beside each other. One at a
+//! A pre-bound listener is shared by every relayed connection of the
+//! worker: the UDP attempts of its source, the probes of the camera's
+//! backchannel and the talkers' backchannel sessions, which run beside
+//! each other. One at a
 //! time takes it from binding to accepting ([`Listener`]): connections
 //! left in its backlog by an earlier one are dropped before retina
 //! connects, and each accepts exactly one, its own.
@@ -35,7 +39,8 @@
 //! TCP the interleaved session ends with its connection.
 //!
 //! The relay also sends the camera RTCP Receiver Reports, which retina
-//! does not ([`crate::rtcp`]): over TCP a [`Tap`] reads along the camera's
+//! does not send there ([`crate::rtcp`]): over TCP (the backchannel's
+//! sessions) a [`Tap`] reads along the camera's
 //! interleaved frames and the reports go on each stream's RTCP channel
 //! between retina's whole requests, which the relay frames for that
 //! (RFC 2326 §10.12); over UDP [`crate::udp`] keeps the statistics and
@@ -66,8 +71,9 @@ use crate::udp::{self, MAX_DATAGRAM, UdpRelay};
 const READ_CHUNK: usize = 16_384;
 
 /// Connects to the camera at `addr`, with Nagle's algorithm off
-/// (`TCP_NODELAY`); a failure is `unreachable`, worded as retina words its
-/// own. With Nagle (RFC 1122 §4.2.3.4) a small write waits while an
+/// (`TCP_NODELAY`): every connection the crate dials, relayed or driven
+/// ([`crate::driver`]); a failure is `unreachable`, worded as retina words
+/// its own. With Nagle (RFC 1122 §4.2.3.4) a small write waits while an
 /// earlier one is unacknowledged: the backchannel's packets, a few hundred
 /// bytes every 20 ms, would wait for the camera's ACK, which a camera
 /// sending video piggybacks on its next frame, tens of milliseconds late.
@@ -150,12 +156,14 @@ async fn bind(pre_bound: Option<&StdListener>) -> io::Result<TcpListener> {
 
 /// The URL retina connects to: scheme `rtsp`, which is all retina accepts,
 /// and the relay's address, with the camera's path and query.
-// SPEC-DEVIATION(RFC 7826 §19.2, RFC 2326 §6.1): the Request-URI the
-// camera sees says `rtsp://127.0.0.1:<relay port>` instead of
-// `rtsps://<host>` or `rtsp://<host>`, because retina sends the URL it
-// connected to; cameras route by path. gates:
-// rtsps_plays_with_a_pinned_certificate_rfc7826_19_2,
-// an_sdp_retina_cannot_parse_is_refused_as_protocol_rfc8866_5
+// SPEC-DEVIATION(RFC 7826 §19.2, RFC 2326 §6.1): on the relayed
+// connections, the source's with `transport: "udp"` and the backchannel's,
+// the Request-URI the camera sees says `rtsp://127.0.0.1:<relay port>`
+// instead of `rtsps://<host>` or `rtsp://<host>`, because retina sends the
+// URL it connected to; cameras route by path. The source's TCP interleaved
+// session sends the real one. gates:
+// rfc2326_12_39_video_audio_and_sender_reports_flow_over_udp_then_tear_down,
+// rfc7826_19_2_over_rtsps_the_backchannel_takes_tls_through_the_shared_relay
 pub(crate) fn relay_url(url: &SourceUrl, local: SocketAddr) -> url::Url {
     let mut target = url.expose_url().clone();
     // Neither can fail: `rtsps` and `rtsp` are both non-special schemes, and
@@ -171,7 +179,7 @@ pub(crate) fn relay_url(url: &SourceUrl, local: SocketAddr) -> url::Url {
 /// datagrams through the UDP side, which keeps both itself.
 #[derive(Debug)]
 pub(crate) enum Media {
-    /// TCP interleaved.
+    /// TCP interleaved: the backchannel's sessions.
     Interleaved(ReceiverReports, Arc<dyn Clock>),
     /// RTP over UDP.
     Udp(Box<UdpRelay>),
