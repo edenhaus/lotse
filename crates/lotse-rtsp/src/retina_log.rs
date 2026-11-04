@@ -484,7 +484,8 @@ mod tests {
                 error = %"bad\nrtsp://cam/camkey7f3a",
                 "Unparseable rtptime in RTP-Info header"
             );
-            tracing::info!(target: "retina", stream = 1, "an info");
+            // A `&str` field as it is, not quoted as `{:?}` would.
+            tracing::info!(target: "retina", stream = 1, method = "DESCRIBE", "an info");
             tracing::debug!(target: "retina::b", "SETUP response: {:#?}", ("Transport", "x"));
             tracing::trace!(target: "retina::c", "a trace");
         });
@@ -494,7 +495,7 @@ mod tests {
                 "WARN",
                 "Unparseable rtptime in RTP-Info header error=bad rtsp://cam/****",
             ),
-            ("INFO", "an info stream=1"),
+            ("INFO", "an info stream=1 method=DESCRIBE"),
             ("DEBUG", "SETUP response: (     \"Transport\",     \"x\", )"),
             ("TRACE", "a trace"),
         ] {
@@ -542,6 +543,55 @@ mod tests {
                 "sender restarted RTP sequence numbers seq=7 (5 occurrences since the last line)"
             ),
             "{text}"
+        );
+    }
+
+    /// A layer that records which of a span's calls reach it.
+    #[derive(Clone, Default)]
+    struct Calls(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Calls {
+        fn push(&self, call: &'static str) {
+            self.0.lock().unwrap().push(call);
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for Calls {
+        fn on_new_span(&self, _attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            self.push("new");
+        }
+
+        fn on_record(&self, _id: &Id, _values: &Record<'_>, _ctx: Context<'_, S>) {
+            self.push("record");
+        }
+
+        fn on_enter(&self, _id: &Id, _ctx: Context<'_, S>) {
+            self.push("enter");
+        }
+
+        fn on_exit(&self, _id: &Id, _ctx: Context<'_, S>) {
+            self.push("exit");
+        }
+
+        fn on_close(&self, _id: Id, _ctx: Context<'_, S>) {
+            self.push("close");
+        }
+    }
+
+    #[test]
+    fn every_call_of_a_span_reaches_the_wrapped_layer() {
+        let calls = Calls::default();
+        let clock = Arc::new(FakeClock::from_system());
+        let subscriber = tracing_subscriber::registry().with(RetinaLog::new(calls.clone(), clock));
+        tracing::subscriber::with_default(subscriber, || {
+            let attempt = tracing::info_span!("attempt", state = tracing::field::Empty);
+            attempt.record("state", "playing");
+            attempt.in_scope(|| {});
+            drop(attempt);
+        });
+        assert_eq!(
+            *calls.0.lock().unwrap(),
+            ["new", "record", "enter", "exit", "close"]
         );
     }
 

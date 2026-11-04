@@ -388,7 +388,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use lotse_core::clock::SystemClock;
+    use lotse_core::clock::{FakeClock, SystemClock};
     use lotse_core::source_url::SourceUrl;
     use lotse_core::task::spawn_named;
     use lotse_testing::fake_camera::{
@@ -776,6 +776,49 @@ mod tests {
         );
         let next = packetizer.packetize(&pcmu(100, 160), |rtp| rtp.header().sequence_number());
         assert_eq!(next, Some(100));
+        camera.tear_down(driver, &"the test ended").await;
+        cam.stop().await;
+    }
+
+    /// The bound is exceeded only past it: a packet is still queued while
+    /// exactly [`MAX_QUEUED`] bytes wait, and the next is dropped. The
+    /// clock stands still, so no Sender Report after the first is due.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_packet_is_queued_while_exactly_the_bound_waits() {
+        let cam = FakeCamera::start(
+            CameraConfig {
+                backchannel: Some(CameraBackchannel::new(BackchannelCodec::Pcmu)),
+                ..CameraConfig::default()
+            },
+            Arc::new(SystemClock),
+        )
+        .await
+        .unwrap();
+        let camera = camera_at(&cam);
+        let mut driver = connected(&camera).await;
+        let (index, format) = handshake(&camera, &Codec::Pcmu, &mut driver).await.unwrap();
+        let mut packetizer = Packetizer::new(&format, SenderOptions::default());
+        let mut dropped = Throttle::default();
+        let clock = FakeClock::from_system();
+        let mut send = |ts: u32, len: usize| {
+            queue(
+                &mut driver,
+                index,
+                &mut packetizer,
+                &pcmu(ts, len),
+                &clock,
+                &mut dropped,
+            )
+            .unwrap();
+            driver.queued_len()
+        };
+        let first = send(0, 160);
+        let second = send(1, 160);
+        let header = second - first - 160;
+        assert_eq!(send(2, MAX_QUEUED - second - header), MAX_QUEUED);
+        let past = send(3, 160);
+        assert_eq!(past, MAX_QUEUED + header + 160);
+        assert_eq!(send(4, 160), past);
         camera.tear_down(driver, &"the test ended").await;
         cam.stop().await;
     }
