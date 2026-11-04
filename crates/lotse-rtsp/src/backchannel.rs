@@ -404,7 +404,10 @@ impl Packetizer {
             }
             return None;
         }
-        let marker = marker || std::mem::take(&mut self.unsent_marker);
+        // Taken on every packet sent, marked or not: the one after it is
+        // no first of a talkspurt (RFC 3551 §4.1).
+        let pending = std::mem::take(&mut self.unsent_marker);
+        let marker = marker || pending;
         self.last_sent = Some((ts, packet.arrival));
         let seq = self.sender.next_sequence_number();
         tracing::trace!(seq, ts, marker, "backchannel: packet");
@@ -960,6 +963,20 @@ mod tests {
         );
         let then = sent(&mut p, &packet(start + ms(40), 320, 1, false));
         assert!(!then.marker);
+    }
+
+    #[test]
+    fn rfc3551_4_1_a_skipped_marker_is_spent_by_a_marked_packet_sent_after_it() {
+        let mut p = packetizer(&g711(Codec::Pcmu, 0));
+        let start = SystemClock.now();
+        p.skip(&packet(start, 0, 1, true));
+        let marked = sent(&mut p, &packet(start + ms(20), 160, 1, true));
+        let next = sent(&mut p, &packet(start + ms(40), 320, 1, false));
+        assert!(marked.marker);
+        // The marker left over was the same talkspurt's: the packet after
+        // its first one sent starts none.
+        assert!(!next.marker);
+        assert_eq!(next.seq, marked.seq.wrapping_add(1));
     }
 
     #[test]
