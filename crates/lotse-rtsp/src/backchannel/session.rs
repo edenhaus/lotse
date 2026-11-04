@@ -15,7 +15,10 @@
 //! Specification §5.1.1.3 (a device *should* take RTP over RTSP over TCP
 //! interleaved, the one transport lotse sends the backchannel on); RFC 8866
 //! §5.14 (the first payload type of an `m=` line) and §6.7 (the direction
-//! attribute, at media level, else at session level, else `sendrecv`).
+//! attribute, at media level, else at session level, else `sendrecv`); RFC
+//! 2326 §C.1.1 and §C.3 (each media's `a=control`, the URL its `SETUP`
+//! names, by which the backchannel's retina stream is found when retina
+//! skipped media).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,27 +117,70 @@ pub struct Offer {
     pub medias: usize,
     /// The first payload type of its `m=` line: the `rtp_payload_type` of
     /// the retina stream that carries it, by which the source checks that
-    /// stream, and finds it when retina skipped media it cannot parse.
-    /// The packets sent on it carry `format.payload_type`, which the
-    /// sender chooses (retina's `rtp::Sender`), so a format listed after
-    /// the first is sent as the camera named it (§5.3.2).
+    /// stream when retina parsed every media description. The packets
+    /// sent on it carry `format.payload_type`, which the sender chooses
+    /// (retina's `rtp::Sender`), so a format listed after the first is
+    /// sent as the camera named it (§5.3.2).
     pub first_payload_type: u8,
+    /// The value of its `a=control` attribute as the camera wrote it (RFC
+    /// 2326 §C.1.1: the URL a `SETUP` of this media names, relative to the
+    /// presentation's, or absolute), the last one as retina reads it; `None`
+    /// when it has none or one without a value. By it the source finds the
+    /// media's retina stream when retina skipped media and its indices are
+    /// no longer the SDP's. It is the camera's text, compared and never
+    /// logged.
+    pub control: Option<String>,
     /// The format the talk-back chain sends it.
     pub format: BackchannelFormat,
 }
 
+/// One retina stream as [`Offer::stream`] looks at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Candidate<'a> {
+    /// Whether retina sends on it: its direction is `Sending`.
+    pub sending: bool,
+    /// Its `rtp_payload_type`.
+    pub payload_type: u8,
+    /// Its control URL as retina resolved it (`Stream::control`), `None`
+    /// when its media had none.
+    pub control: Option<&'a str>,
+}
+
+/// The `a=control` value `*` (RFC 2326 §C.1.1): the presentation's own URL,
+/// which names no one media.
+const AGGREGATE_CONTROL: &str = "*";
+
+/// Whether `url`, a stream's control URL as retina resolved it, is the
+/// media's `control` value resolved: the absolute URL itself, or the base
+/// URL, `/`, then the relative one, as retina joins them (its
+/// `join_control`, the live555 and ffmpeg way rather than RFC 3986 §5,
+/// observed in retina's source at e38c156, 2026-11-04).
+fn resolves_to(url: &str, control: &str) -> bool {
+    url == control
+        || url
+            .strip_suffix(control)
+            .is_some_and(|base| base.ends_with('/'))
+}
+
 impl Offer {
     /// The index of the retina stream that carries this backchannel among
-    /// `streams`, one entry per retina stream in its order: whether its
-    /// direction is `Sending`, and its `rtp_payload_type`. When retina
-    /// parsed every media description, its indices are the SDP's, and the
-    /// stream is the one at [`Offer::media`] if it sends with the first
-    /// payload type; when it skipped some, the one stream that sends with
-    /// that payload type, since of several, another media's could come
-    /// first. `None` when there is none, or several.
-    pub fn stream(&self, streams: &[(bool, u8)]) -> Option<usize> {
-        let carries = |&(sending, payload_type): &(bool, u8)| {
-            sending && payload_type == self.first_payload_type
+    /// `streams`, one [`Candidate`] per retina stream in its order.
+    ///
+    /// When retina parsed every media description, its indices are the
+    /// SDP's, and the stream is the one at [`Offer::media`] if it sends with
+    /// the first payload type. When it skipped some (a media it cannot
+    /// parse), the indices shift, and neither a position nor a payload type
+    /// proves which media survived: the stream is the one that sends with
+    /// the first payload type on the media's control URL (RFC 2326 §C.3:
+    /// each media of an aggregate presentation has its own), so that the
+    /// chain's bytes never go out on another media's stream. `None` when
+    /// the media has no control of its own (none, an empty one, or `*`),
+    /// when no stream or several match it, or when retina's URL parser
+    /// rewrote the control so that it no longer reads as the camera wrote
+    /// it: an uncertain mapping is no backchannel, logged at info.
+    pub fn stream(&self, streams: &[Candidate<'_>]) -> Option<usize> {
+        let carries = |stream: &Candidate<'_>| {
+            stream.sending && stream.payload_type == self.first_payload_type
         };
         if streams.len() == self.medias {
             return streams
@@ -142,17 +188,37 @@ impl Offer {
                 .filter(|stream| carries(stream))
                 .map(|_| self.media);
         }
+        let Some(control) = self
+            .control
+            .as_deref()
+            .filter(|control| !control.is_empty() && *control != AGGREGATE_CONTROL)
+        else {
+            tracing::info!(
+                media = self.media,
+                "rtsp: retina skipped a media description, and the backchannel's media has no control URL of its own to find its stream by; no backchannel"
+            );
+            return None;
+        };
         let mut carrying = streams
             .iter()
             .enumerate()
-            .filter(|(_, stream)| carries(stream))
+            .filter(|(_, stream)| {
+                carries(stream) && stream.control.is_some_and(|url| resolves_to(url, control))
+            })
             .map(|(index, _)| index);
-        let first = carrying.next()?;
+        let Some(first) = carrying.next() else {
+            tracing::info!(
+                media = self.media,
+                payload_type = self.first_payload_type,
+                "rtsp: retina skipped a media description, and no stream it sends on with the backchannel's payload type has its media's control URL; no backchannel"
+            );
+            return None;
+        };
         if carrying.next().is_some() {
             tracing::info!(
                 media = self.media,
                 payload_type = self.first_payload_type,
-                "rtsp: retina skipped a media description and sends on several streams with the backchannel's payload type; no backchannel"
+                "rtsp: retina skipped a media description, and several streams it sends on with the backchannel's payload type have its media's control URL; no backchannel"
             );
             return None;
         }
@@ -169,6 +235,19 @@ fn direction(attributes: &[sdp_types::Attribute]) -> Option<&str> {
         .iter()
         .map(|attribute| attribute.attribute.as_str())
         .find(|name| DIRECTIONS.contains(name))
+}
+
+/// The value of `media`'s `a=control` attribute (RFC 2326 §C.1.1), owned:
+/// the last one, which retina keeps of several (observed in retina's
+/// `parse_media` at e38c156, 2026-11-04); `None` when it has none, or the
+/// last has no value.
+fn control(media: &sdp_types::Media) -> Option<String> {
+    media
+        .attributes
+        .iter()
+        .rev()
+        .find(|attribute| attribute.attribute == "control")
+        .and_then(|attribute| attribute.value.clone())
 }
 
 /// The backchannel of a `DESCRIBE` answer's SDP `sdp`, sent with the
@@ -203,6 +282,7 @@ pub fn offer(sdp: &[u8]) -> Option<Offer> {
                 media: index,
                 medias,
                 first_payload_type,
+                control: control(media),
                 format: backchannel_format(media)?,
             })
         });
@@ -233,7 +313,9 @@ mod tests {
 
     use lotse_core::codec::Codec;
     use lotse_testing::CameraConfig;
-    use lotse_testing::fake_camera::{BackchannelCodec, CameraAudio, CameraBackchannel};
+    use lotse_testing::fake_camera::{
+        BACKCHANNEL_CONTROL, BackchannelCodec, CameraAudio, CameraBackchannel,
+    };
 
     use super::*;
 
@@ -393,6 +475,7 @@ mod tests {
                 media: 2,
                 medias: 4,
                 first_payload_type: 97,
+                control: None,
                 format: BackchannelFormat {
                     codec: Codec::Pcma,
                     ptime: Some(Duration::from_millis(40)),
@@ -401,6 +484,18 @@ mod tests {
             })
         );
     }
+
+    /// One retina stream that sends with `payload_type` on `control`.
+    fn sends(payload_type: u8, control: Option<&str>) -> Candidate<'_> {
+        Candidate {
+            sending: true,
+            payload_type,
+            control,
+        }
+    }
+
+    const TRACK1: &str = "rtsp://127.0.0.1:1/stream/track1";
+    const TRACK2: &str = "rtsp://127.0.0.1:1/stream/track2";
 
     /// The backchannel's retina stream is its media's, not the first that
     /// sends with its payload type: two `sendonly` media may share one.
@@ -417,19 +512,142 @@ mod tests {
         ]);
         let offer = offer(&answer).unwrap();
         assert_eq!((offer.media, offer.medias), (1, 2));
+        let not_sending = Candidate {
+            sending: false,
+            ..sends(96, None)
+        };
         // retina parsed both: the stream at the media's index.
-        assert_eq!(offer.stream(&[(true, 96), (true, 96)]), Some(1));
-        assert_eq!(offer.stream(&[(true, 96), (false, 96)]), None);
-        assert_eq!(offer.stream(&[(true, 96), (true, 97)]), None);
-        // retina skipped one: the one stream that sends with 96, else none.
-        assert_eq!(offer.stream(&[(true, 96)]), Some(0));
-        assert_eq!(offer.stream(&[(false, 96)]), None);
+        assert_eq!(offer.stream(&[sends(96, None), sends(96, None)]), Some(1));
+        assert_eq!(offer.stream(&[sends(96, None), not_sending]), None);
+        assert_eq!(offer.stream(&[sends(96, None), sends(97, None)]), None);
+    }
+
+    /// RFC 2326 §C.3: when retina skipped a media, the backchannel's stream
+    /// is the one on its media's control URL; a payload type alone could be
+    /// another media's, whose stream would carry the chain's bytes.
+    #[test]
+    fn rfc2326_c_3_when_retina_skipped_media_the_backchannels_stream_is_the_one_on_its_control() {
+        // A valueless `a=fmtp` on the PCMU media makes retina drop it; the
+        // G.722 media at 96 survives.
+        let answer = sdp(&[
+            "m=audio 0 RTP/AVP 96",
+            "a=rtpmap:96 G722/8000",
+            "a=sendonly",
+            "a=control:track1",
+            "m=audio 0 RTP/AVP 96",
+            "a=rtpmap:96 PCMU/8000",
+            "a=fmtp",
+            "a=sendonly",
+            "a=control:track2",
+        ]);
+        let offer = offer(&answer).unwrap();
+        assert_eq!((offer.media, offer.medias), (1, 2));
+        assert_eq!(offer.control.as_deref(), Some("track2"));
         let three = Offer { medias: 3, ..offer };
-        let log = logged(|| assert_eq!(three.stream(&[(true, 96), (true, 96)]), None));
+        // The backchannel's media is the one skipped: no stream.
+        let log = logged(|| assert_eq!(three.stream(&[sends(96, Some(TRACK1))]), None));
         assert!(
-            log.contains("sends on several streams with the backchannel's payload type"),
+            log.contains("rtsp: retina skipped a media description, and no stream it sends on with the backchannel's payload type has its media's control URL; no backchannel media=1 payload_type=96"),
             "{log}"
         );
+        // Another media was skipped: the stream on the relative control,
+        // the base URL, `/`, then it.
+        let skipped_other = [sends(96, Some(TRACK1)), sends(96, Some(TRACK2))];
+        assert_eq!(three.stream(&skipped_other), Some(1));
+        let not_sending = Candidate {
+            sending: false,
+            ..sends(96, Some(TRACK2))
+        };
+        assert_eq!(three.stream(&[sends(96, Some(TRACK1)), not_sending]), None);
+        assert_eq!(
+            three.stream(&[sends(96, Some(TRACK1)), sends(97, Some(TRACK2))]),
+            None
+        );
+        assert_eq!(
+            three.stream(&[sends(96, None)]),
+            None,
+            "a stream without a control"
+        );
+        // A suffix not after a `/` is another control.
+        let longer = "rtsp://127.0.0.1:1/stream/xtrack2";
+        assert_eq!(three.stream(&[sends(96, Some(longer))]), None);
+        // An absolute control is the stream's URL itself.
+        let absolute = Offer {
+            control: Some(TRACK2.to_owned()),
+            ..three.clone()
+        };
+        assert_eq!(
+            absolute.stream(&[sends(96, Some(TRACK1)), sends(96, Some(TRACK2))]),
+            Some(1)
+        );
+        assert_eq!(
+            absolute.stream(&[sends(96, Some("rtsp://127.0.0.1:2/stream/track2"))]),
+            None
+        );
+        // Of several streams on it, none is the backchannel's.
+        let log = logged(|| {
+            let twice = [
+                sends(96, Some("rtsp://127.0.0.1:1/a/track2")),
+                sends(96, Some("rtsp://127.0.0.1:1/b/track2")),
+            ];
+            assert_eq!(three.stream(&twice), None);
+        });
+        assert!(
+            log.contains("several streams it sends on with the backchannel's payload type have its media's control URL; no backchannel media=1 payload_type=96"),
+            "{log}"
+        );
+    }
+
+    /// RFC 2326 §C.1.1: `*` is the presentation's own URL and names no one
+    /// media; without a control of its own, a media cannot be found once
+    /// retina's indices shifted.
+    #[test]
+    fn rfc2326_c_1_1_a_media_without_a_control_of_its_own_has_no_stream_once_retina_skipped_media()
+    {
+        for control in [None, Some(""), Some("*")] {
+            let offer = Offer {
+                media: 1,
+                medias: 3,
+                first_payload_type: 0,
+                control: control.map(str::to_owned),
+                format: pcmu(0),
+            };
+            let streams = [
+                sends(0, Some("rtsp://127.0.0.1:1/stream/")),
+                sends(0, Some("rtsp://127.0.0.1:1/stream/*")),
+            ];
+            let log = logged(|| assert_eq!(offer.stream(&streams), None, "{control:?}"));
+            assert!(
+                log.contains("the backchannel's media has no control URL of its own to find its stream by; no backchannel media=1"),
+                "{control:?}: {log}"
+            );
+            // retina parsed every media: the index decides, control or not.
+            let all = Offer { medias: 2, ..offer };
+            assert_eq!(all.stream(&streams), Some(1), "{control:?}");
+        }
+    }
+
+    #[test]
+    fn rfc2326_c_1_1_the_offer_carries_its_medias_last_control_value() {
+        let control = |lines: &[&str]| {
+            let mut answer = vec!["m=audio 0 RTP/AVP 0", "a=sendonly"];
+            answer.extend_from_slice(lines);
+            offer(&sdp(&answer)).unwrap().control
+        };
+        assert_eq!(
+            control(&["a=control:trackID=3"]).as_deref(),
+            Some("trackID=3")
+        );
+        assert_eq!(
+            control(&["a=control:rtsp://cam/a", "a=control:rtsp://cam/b"]).as_deref(),
+            Some("rtsp://cam/b"),
+            "the last, as retina"
+        );
+        assert_eq!(control(&["a=control:trackID=3", "a=control"]), None);
+        assert_eq!(control(&[]), None);
+        // The session's control is not the media's.
+        let session_level = sdp(&["a=control:*", "m=audio 0 RTP/AVP 0", "a=sendonly"]);
+        assert_eq!(offer(&session_level).unwrap().control, None);
     }
 
     #[test]
@@ -540,6 +758,11 @@ mod tests {
         assert_eq!(offered.first_payload_type, 8);
         assert_eq!(offered.format.codec, Codec::Pcma);
         assert_eq!(offered.format.ptime, Some(Duration::from_millis(30)));
+        assert_eq!(
+            offered.control,
+            Some(format!("{base}{BACKCHANNEL_CONTROL}")),
+            "its absolute control"
+        );
         assert_eq!(offer(config.sdp(base, false).as_bytes()), None);
     }
 }

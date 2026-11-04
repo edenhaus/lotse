@@ -27,7 +27,7 @@ use lotse_tls::TlsTarget;
 use retina::client::{SessionOptions, StreamDirection, TeardownPolicy};
 use tokio_util::sync::CancellationToken;
 
-use super::session::{Offer, offer};
+use super::session::{Candidate, Offer, offer};
 use crate::driver::Driver;
 use crate::framer::MAX_MESSAGE;
 use crate::options::RtspOptions;
@@ -118,31 +118,41 @@ impl Camera {
     /// on fresh connections dialed as the first was, when retina's policy
     /// makes them. The connection closes when it returns, as a camera may
     /// stay in two-way mode until it does. `why` is the session's end, for
-    /// the log.
+    /// the log. Nothing cuts the budget short: the claim's close that
+    /// usually precedes it is the session's normal end, not a deadline,
+    /// and the next claim's session waits for this one to close on the
+    /// camera (`BackchannelTasks`); the worker's shutdown bounds its own
+    /// wait for the task.
     pub(crate) async fn tear_down(&self, driver: Driver, why: &(dyn std::fmt::Display + Sync)) {
         let dialer = self.dialer();
         let dial = || dialer.boxed();
         tracing::debug!(%why, "rtsp: tearing the backchannel session down");
-        driver.teardown(&dial, TEARDOWN).await;
+        // No cancellation applies to the backchannel's teardown: a token
+        // nobody holds never fires.
+        driver
+            .teardown(&dial, TEARDOWN, &CancellationToken::new())
+            .await;
     }
 }
 
 /// The camera's backchannel in the `DESCRIBE` answer `driver` holds (ONVIF
 /// Streaming Specification §5.3.2): the media [`offer`] finds in the raw
-/// SDP, and the retina stream that sends on it ([`Offer::stream`]: the one
-/// at that media's index, whose direction is `Sending` with that media's
-/// first payload type, RFC 8866 §5.14), not merely the first such stream,
-/// which another media could carry. `None` when there is none.
+/// SDP, and the retina stream that sends on it ([`Offer::stream`], from
+/// each stream's direction, payload type and control URL: the one at that
+/// media's index, whose direction is `Sending` with that media's first
+/// payload type, RFC 8866 §5.14; when retina skipped media, the one on
+/// that media's control URL, RFC 2326 §C.3), not merely the first such
+/// stream, which another media could carry. `None` when there is none, or
+/// the mapping is uncertain.
 pub(crate) fn backchannel_stream(driver: &Driver) -> Option<(usize, Offer)> {
     let offer = offer(driver.sdp())?;
-    let streams: Vec<(bool, u8)> = driver
+    let streams: Vec<Candidate<'_>> = driver
         .streams()
         .iter()
-        .map(|stream| {
-            (
-                stream.direction() == StreamDirection::Sending,
-                stream.rtp_payload_type(),
-            )
+        .map(|stream| Candidate {
+            sending: stream.direction() == StreamDirection::Sending,
+            payload_type: stream.rtp_payload_type(),
+            control: stream.control().map(url::Url::as_str),
         })
         .collect();
     let index = offer.stream(&streams);

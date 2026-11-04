@@ -82,7 +82,9 @@ use crate::udp::UdpRelay;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
-/// How long the teardown may take once the connection is cancelled.
+/// How long the teardown may take once the connection is cancelled, and
+/// on the session's own connection: `Source::run`'s 100 ms to honor its
+/// cancel.
 pub(crate) const TEARDOWN_BUDGET: Duration = Duration::from_millis(100);
 
 /// How long the TCP interleaved session's teardown may take, from its
@@ -90,7 +92,10 @@ pub(crate) const TEARDOWN_BUDGET: Duration = Duration::from_millis(100);
 /// policy does for a live555 camera with the stale TCP session bug: a
 /// dial and, for `rtsps`, a TLS handshake do not fit in
 /// [`TEARDOWN_BUDGET`] beyond loopback. It delays the attempt's end, and
-/// so the next connection, only in that case.
+/// so the next connection, only in that case, and never a cancelled one:
+/// a cancellation, before the teardown or during its retries, leaves it
+/// [`TEARDOWN_BUDGET`] from then on, and a session still set up then
+/// expires on the camera by its timeout (RFC 2326 §12.37).
 const FRESH_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
 /// The teardown budget of every session the source drives on retina's
@@ -859,7 +864,9 @@ impl Dialer {
 /// `TEARDOWN` (RFC 2326 §10.7, RFC 7826 §13.7) after a failed or
 /// cancelled `SETUP` or `PLAY` too, within [`TEARDOWN_BUDGET`] on its own
 /// connection and, when retina's policy retries on fresh connections,
-/// within [`FRESH_TEARDOWN_BUDGET`].
+/// within [`FRESH_TEARDOWN_BUDGET`], unless cancelled: then within
+/// [`TEARDOWN_BUDGET`] of the cancellation, which bounds a retry already
+/// in progress too.
 async fn run_core(dialer: &Dialer, ask: &Ask, ctx: &mut SourceCtx) -> SourceError {
     let url = &ask.camera.url;
     let deadline = Duration::from_millis(ask.camera.options.timeout_ms);
@@ -879,7 +886,7 @@ async fn run_core(dialer: &Dialer, ask: &Ask, ctx: &mut SourceCtx) -> SourceErro
     let exit = exit.scrubbed(url);
     let dial = || dialer.boxed();
     tracing::debug!(why = %exit, "rtsp: tearing down");
-    driver.teardown(&dial, TEARDOWN).await;
+    driver.teardown(&dial, TEARDOWN, &ctx.cancel).await;
     exit
 }
 
