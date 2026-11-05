@@ -4201,7 +4201,9 @@ mod tests {
 
         let dir = private_dir("driver-stale-recording");
         let (script, out) = recording_script(&dir);
-        let shared = shared(&script);
+        // A fake clock that stands still: on a real one, a slow run's wait
+        // for the worker takes a millisecond off k1's `duration_ms`.
+        let shared = shared_with(&script, Arc::new(FakeClock::from_system()));
         // k1 runs as serial 3: serial 1's start is an earlier recording's. k2
         // ended (serial 2) while its start waited, its id held.
         let _events = hold_recording(&shared, "k1", 3);
@@ -4274,7 +4276,9 @@ mod tests {
         assert!(shared.lock().recording_id_in_use("k3"));
         let worker = driver.worker.take().unwrap();
         drop(driver);
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        // The shared clock is fake: the stop's budget needs a real one.
+        let real: Arc<dyn Clock> = Arc::new(SystemClock);
+        let _status = worker.stop(Duration::from_millis(200), &real).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
