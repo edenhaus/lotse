@@ -1095,6 +1095,17 @@ mod tests {
     }
 
     #[test]
+    fn the_pre_roll_bound_is_half_the_worker_s_address_space() {
+        assert_eq!(
+            ClipLimits::preroll_bytes_for(1 << 30),
+            ClipLimits::DEFAULT.preroll_bytes,
+            "the default address space gives the default bound"
+        );
+        assert_eq!(ClipLimits::preroll_bytes_for(6), 3);
+        assert_eq!(ClipLimits::preroll_bytes_for(7), 3, "rounded down");
+    }
+
+    #[test]
     fn started_passes_once_with_the_known_codecs_the_supervisor_stamps() {
         let captured = Captured::default();
         let _logs = captured.install();
