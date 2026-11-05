@@ -11,7 +11,8 @@
 //! client: before that no client exists to be incompatible with, so an
 //! API change does not bump it.
 
-/// Defines [`API_VERSION`], [`CURRENT`], [`WS_PATH`] and [`RECORDING_PATH`]
+/// Defines [`API_VERSION`], [`CURRENT`], [`WS_PATH`], [`RECORDING_PATH`] and
+/// [`PAIR_PATH`]
 /// from one `major, minor, patch`, so they cannot disagree.
 macro_rules! api_version {
     ($major:literal, $minor:literal, $patch:literal) => {
@@ -31,6 +32,12 @@ macro_rules! api_version {
         /// Where event recordings' bytes are served: `/v<major>/recording`, each
         /// recording at `/v<major>/recording/{recording_id}` ([`crate::recording::recording_path`]).
         pub const RECORDING_PATH: &str = concat!("/v", $major, "/recording");
+
+        /// Where a pairing connection sends its secret: `POST
+        /// /v<major>/pair`. Versioned with the API like every other path;
+        /// the pairing code's `LOTSE1` prefix versions the code's format,
+        /// not the route.
+        pub const PAIR_PATH: &str = concat!("/v", $major, "/pair");
     };
 }
 
@@ -106,6 +113,7 @@ mod tests {
         assert_eq!(API_VERSION, "0.1.0");
         assert_eq!(CURRENT, v(0, 1, 0));
         assert_eq!(WS_PATH, "/v0/ws");
+        assert_eq!(PAIR_PATH, "/v0/pair");
         assert_eq!(RECORDING_PATH, "/v0/recording");
         assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
     }
