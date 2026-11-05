@@ -144,8 +144,7 @@ impl Handler for FakeHandler {
             | Command::SessionList(_)
             | Command::SessionClose(_)
             | Command::SessionAdopt(_)
-            | Command::BackchannelRelease(_)
-            | Command::ClipStop(_) => Outcome::Result(json!({})),
+            | Command::BackchannelRelease(_) => Outcome::Result(json!({})),
             Command::Ping(_)
             | Command::Schema(_)
             | Command::Unsubscribe(_)
@@ -528,7 +527,8 @@ async fn a_subscription_may_start_with_a_result_of_its_own() {
     recv(&mut ws).await;
     send(
         &mut ws,
-        json!({ "id": 1, "type": "clip/start", "stream_id": "a", "clip_id": "k1" }),
+        json!({ "id": 1, "type": "clip/start", "stream_id": "a", "clip_id": "k1",
+                "after_ms": 1_000 }),
     )
     .await;
     assert_eq!(
@@ -566,7 +566,10 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
             json!({ "type": "webrtc/offer", "stream_id": "a", "sdp": "v=0" }),
         ),
         (5, json!({ "type": "session/adopt", "session_id": "s1" })),
-        (6, json!({ "type": "clip/start", "stream_id": "a" })),
+        (
+            6,
+            json!({ "type": "clip/start", "stream_id": "a", "after_ms": 1_000 }),
+        ),
     ] {
         let mut frame = frame;
         frame["id"] = json!(id);
@@ -589,15 +592,9 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
         "{refusals:?}"
     );
     assert!(refusals[3].contains("clip/start"), "{refusals:?}");
-    // Other commands are not affected, stopping a clip included.
+    // Other commands are not affected.
     send(&mut ws, json!({ "id": 7, "type": "info" })).await;
     assert_eq!(recv(&mut ws).await["result"]["version"], "0.0.0-test");
-    send(
-        &mut ws,
-        json!({ "id": 8, "type": "clip/stop", "clip_id": "c" }),
-    )
-    .await;
-    assert_eq!(recv(&mut ws).await["success"], true);
 
     // The session's channel closes: its subscription ended and frees a slot.
     running.handler.sessions.lock().unwrap().clear();

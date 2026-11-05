@@ -6,7 +6,7 @@
 //! as old as `started.before_ms` says, the audio starts with the video
 //! (EBU R37, on the container's timestamps) and runs to its end, a camera
 //! reconnect inside a clip is one `gap` event where the file's timeline
-//! has it, `clip/stop` ends the body with its last chunk, a worker crash
+//! has it, a clip's end ends the body with its last chunk, a worker crash
 //! cuts it, a clip nobody fetches ends `not_fetched`, two clips run on one
 //! stream, and the mTLS listener serves the route as the socket does.
 //! Needs the `source-rtsp` and `output-clip` features (the defaults).
@@ -644,7 +644,7 @@ async fn rfc9112_7_1_two_clips_of_one_stream_come_whole_over_the_socket_and_the_
         fetch(tls, second["url"].as_str().unwrap().to_owned()),
     );
     let third = control
-        .send(json!({ "type": "clip/start", "stream_id": "front" }))
+        .send(json!({ "type": "clip/start", "stream_id": "front", "after_ms": 1_000 }))
         .await;
     let refused = control.result_of(third).await;
     assert_eq!(
@@ -699,11 +699,10 @@ async fn rfc9112_7_1_two_clips_of_one_stream_come_whole_over_the_socket_and_the_
 /// last frame before the drop to the new connection's first, a keyframe,
 /// where the file has them; the hole between them is what the reconnect
 /// took beyond the last frame's length (the fake camera's, on the same
-/// host, takes a few milliseconds, so the file has none). `clip/stop`
-/// then ends the clip `stopped` with the frames up to the stop and the
-/// body's last chunk (RFC 9112 §7.1).
+/// host, takes a few milliseconds, so the file has none). The clip then
+/// ends `completed` at its end with the body's last chunk (RFC 9112 §7.1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc9112_7_1_a_reconnect_inside_a_clip_is_one_gap_where_the_file_has_it_and_a_stop_ends_it_whole()
+async fn rfc9112_7_1_a_reconnect_inside_a_clip_is_one_gap_where_the_file_has_it_and_its_end_ends_it_whole()
  {
     let cam = camera(Some(CameraAudio::Aac)).await;
     let (mut daemon, dir) = daemon("clip-gap", &[], &[]);
@@ -713,7 +712,7 @@ async fn rfc9112_7_1_a_reconnect_inside_a_clip_is_one_gap_where_the_file_has_it_
     control.put("front", &cam.url(), true, 10_000).await;
     control.wait_window("front", 1_000).await;
     let (id, result) = control
-        .start_clip(json!({ "stream_id": "front", "before_ms": 500 }))
+        .start_clip(json!({ "stream_id": "front", "before_ms": 500, "after_ms": 5_000 }))
         .await;
     let clip_id = result["clip_id"].as_str().unwrap().to_owned();
     let fetch = fetch_on_socket(&socket, result["url"].as_str().unwrap()).await;
@@ -724,13 +723,10 @@ async fn rfc9112_7_1_a_reconnect_inside_a_clip_is_one_gap_where_the_file_has_it_
     let gap = control.event(id).await;
     assert_eq!(gap["type"], "gap", "{gap}");
     assert_eq!(gap["reason"], "reconnect", "{gap}");
-    control
-        .call(json!({ "type": "clip/stop", "clip_id": clip_id }))
-        .await;
     let mut events = vec![started, gap.clone()];
     events.extend(control.until_stopped(id).await);
     let fetched = within("the body", fetch).await.unwrap();
-    assert_ended_whole(&fetched, &clip_id, &events, "stopped");
+    assert_ended_whole(&fetched, &clip_id, &events, "completed");
     assert_eq!(events.len(), 3, "one gap: {events:?}");
     assert_eq!(events[2]["gaps"], 1);
 
@@ -799,7 +795,7 @@ async fn rfc9112_8_a_worker_crash_ends_the_clip_worker_crashed_and_cuts_its_body
         .as_i64()
         .unwrap();
     let (id, result) = control
-        .start_clip(json!({ "stream_id": "front", "before_ms": 500 }))
+        .start_clip(json!({ "stream_id": "front", "before_ms": 500, "after_ms": 60_000 }))
         .await;
     let fetch = fetch_on_socket(&socket, result["url"].as_str().unwrap()).await;
     let started = control.event(id).await;
@@ -850,7 +846,7 @@ async fn rfc9110_15_5_5_a_clip_nobody_fetches_ends_not_fetched_and_its_body_is_g
     let mut control = Control::connect(&socket).await;
     control.put("front", &cam.url(), false, 0).await;
     let (id, result) = control
-        .start_clip(json!({ "stream_id": "front", "before_ms": 2_000 }))
+        .start_clip(json!({ "stream_id": "front", "before_ms": 2_000, "after_ms": 60_000 }))
         .await;
     let events = control.until_stopped(id).await;
     assert_eq!(events[0]["type"], "started", "{events:?}");

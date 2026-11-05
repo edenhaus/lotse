@@ -344,11 +344,9 @@ pub struct ClipStart {
     #[serde(default)]
     pub before_ms: u32,
     /// How long the clip runs after now, in milliseconds, 1 to
-    /// `limits.clip_max_ms`; absent, it runs until `clip/stop`, at most
     /// `limits.clip_max_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
-    pub after_ms: Option<u32>,
+    pub after_ms: u32,
     /// Take the stream's audio into the clip: AAC-LC and Opus as they are,
     /// G.711 (PCMU, PCMA) and G.722 transcoded to Opus; any other codec is
     /// left out with an `audio_omitted` warning. `false` makes a
@@ -360,20 +358,6 @@ pub struct ClipStart {
 /// `clip/start`'s default `audio`: with it.
 const fn with_audio() -> bool {
     true
-}
-
-/// `clip/stop`: ends a clip cleanly, its last fragment written and its
-/// body ended with its last chunk; idempotent, so an id that is no open
-/// clip succeeds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct ClipStop {
-    /// The command id.
-    pub id: u64,
-    /// The clip.
-    #[cfg_attr(feature = "schema", schemars(regex(pattern = CLIP_ID_PATTERN)))]
-    pub clip_id: String,
 }
 
 /// Every command, tagged by `type`. Each variant's schema title names the
@@ -483,10 +467,6 @@ pub enum Command {
     #[serde(rename = "clip/start")]
     #[cfg_attr(feature = "schema", schemars(title = "ClipStartCommand"))]
     ClipStart(ClipStart),
-    /// `clip/stop`: ends a clip cleanly; idempotent.
-    #[serde(rename = "clip/stop")]
-    #[cfg_attr(feature = "schema", schemars(title = "ClipStopCommand"))]
-    ClipStop(ClipStop),
 }
 
 impl Command {
@@ -514,7 +494,6 @@ impl Command {
         "session/adopt",
         "backchannel/release",
         "clip/start",
-        "clip/stop",
     ];
 
     /// The command's id.
@@ -540,7 +519,6 @@ impl Command {
             Self::SessionList(c) => c.id,
             Self::BackchannelRelease(c) => c.id,
             Self::ClipStart(c) => c.id,
-            Self::ClipStop(c) => c.id,
         }
     }
 
@@ -569,7 +547,6 @@ impl Command {
             Self::SessionAdopt(_) => "session/adopt",
             Self::BackchannelRelease(_) => "backchannel/release",
             Self::ClipStart(_) => "clip/start",
-            Self::ClipStop(_) => "clip/stop",
         }
     }
 }
@@ -773,15 +750,14 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             cap_stream_id(&start.stream_id)?;
             let clip_id = start.clip_id.as_deref().unwrap_or_default();
             cap_chars("clip_id", clip_id, MAX_ID_CHARS)?;
-            if start.after_ms == Some(0) {
+            if start.after_ms == 0 {
                 return Err(ApiError::new(
                     ErrorCode::InvalidRequest,
-                    "`after_ms` must be at least 1; leave it out for a clip that runs until `clip/stop`",
+                    "`after_ms` must be at least 1",
                 )
                 .with_detail("field", "after_ms"));
             }
         }
-        Command::ClipStop(stop) => cap_chars("clip_id", &stop.clip_id, MAX_ID_CHARS)?,
         Command::Ping(_)
         | Command::Info(_)
         | Command::MetricsGet(_)
@@ -946,10 +922,6 @@ mod tests {
                 r#"{"id":22,"type":"clip/start","stream_id":"front","clip_id":"01JB","before_ms":10000,"after_ms":20000,"audio":true}"#,
                 "clip/start",
             ),
-            (
-                r#"{"id":23,"type":"clip/stop","clip_id":"01JB"}"#,
-                "clip/stop",
-            ),
         ];
         for (index, (text, name)) in cases.iter().enumerate() {
             let_assert!(Ok(command) = parse_command(text), "{text}");
@@ -1057,10 +1029,12 @@ mod tests {
     }
 
     #[test]
-    fn a_clip_starts_with_audio_from_now_until_stopped_unless_asked_otherwise() {
+    fn a_clip_starts_with_audio_from_now_unless_asked_otherwise_and_always_has_its_length() {
         let_assert!(
-            Command::ClipStart(start) =
-                parse_command(r#"{"id":1,"type":"clip/start","stream_id":"front"}"#).unwrap()
+            Command::ClipStart(start) = parse_command(
+                r#"{"id":1,"type":"clip/start","stream_id":"front","after_ms":30000}"#
+            )
+            .unwrap()
         );
         assert_eq!(
             (
@@ -1069,12 +1043,13 @@ mod tests {
                 start.after_ms,
                 start.audio
             ),
-            (None, 0, None, true)
+            (None, 0, 30_000, true)
         );
         // It serializes back with the defaults it took, the absent ones left out.
         assert_eq!(
             serde_json::to_value(Command::ClipStart(start)).unwrap(),
-            json!({ "id": 1, "type": "clip/start", "stream_id": "front", "before_ms": 0, "audio": true })
+            json!({ "id": 1, "type": "clip/start", "stream_id": "front", "before_ms": 0,
+                    "after_ms": 30_000, "audio": true })
         );
         let_assert!(
             Command::ClipStart(start) = parse_command(
@@ -1082,8 +1057,8 @@ mod tests {
             )
             .unwrap()
         );
-        assert_eq!((start.after_ms, start.audio), (Some(1), false));
-        // A clip of no time is a mistake, not an open-ended one.
+        assert_eq!((start.after_ms, start.audio), (1, false));
+        // A clip of no time is a mistake.
         let err = parse_command(r#"{"id":3,"type":"clip/start","stream_id":"front","after_ms":0}"#)
             .unwrap_err();
         assert_eq!(
@@ -1094,13 +1069,17 @@ mod tests {
         assert_eq!(err.error.details["type"], "clip/start");
         for frame in [
             r#"{"id":4,"type":"clip/start","stream_id":"front","after_ms":-1}"#,
-            r#"{"id":5,"type":"clip/start","stream_id":"front","before_ms":4294967296}"#,
-            r#"{"id":6,"type":"clip/start","stream_id":"front","preroll_ms":1}"#,
-            r#"{"id":7,"type":"clip/stop"}"#,
+            r#"{"id":5,"type":"clip/start","stream_id":"front","after_ms":1,"before_ms":4294967296}"#,
+            r#"{"id":6,"type":"clip/start","stream_id":"front","after_ms":1,"preroll_ms":1}"#,
+            // A clip always has its length.
+            r#"{"id":7,"type":"clip/start","stream_id":"front"}"#,
         ] {
             let err = parse_command(frame).unwrap_err();
             assert_eq!(err.error.code, ErrorCode::InvalidRequest, "{frame}");
         }
+        // Nor is there a stop.
+        let err = parse_command(r#"{"id":8,"type":"clip/stop","clip_id":"c"}"#).unwrap_err();
+        assert_eq!(err.error.code, ErrorCode::UnknownCommand);
     }
 
     #[test]
@@ -1232,16 +1211,15 @@ mod tests {
     #[test]
     fn a_clips_ids_are_capped_like_a_sessions() {
         let text = |n: usize| "x".repeat(n);
-        let clip_as =
-            |n| json!({ "id": 1, "type": "clip/start", "stream_id": "a", "clip_id": text(n) });
-        let stop_as = |n| json!({ "id": 1, "type": "clip/stop", "clip_id": text(n) });
-        for frame in [clip_as(MAX_ID_CHARS), stop_as(MAX_ID_CHARS)] {
-            assert!(limited(&frame).is_ok(), "{}", frame["type"]);
-        }
-        for frame in [clip_as(MAX_ID_CHARS + 1), stop_as(MAX_ID_CHARS + 1)] {
-            let kind = &frame["type"];
-            assert_eq!(limited(&frame).unwrap_err().0, "clip_id", "{kind}");
-        }
+        let clip_as = |n| {
+            json!({ "id": 1, "type": "clip/start", "stream_id": "a", "clip_id": text(n),
+                    "after_ms": 1 })
+        };
+        assert!(limited(&clip_as(MAX_ID_CHARS)).is_ok());
+        assert_eq!(
+            limited(&clip_as(MAX_ID_CHARS + 1)).unwrap_err().0,
+            "clip_id"
+        );
     }
 
     #[test]
@@ -1255,7 +1233,7 @@ mod tests {
                 json!({ "id": 1, "type": "stream/subscribe", "stream_id": id(n) }),
                 json!({ "id": 1, "type": "webrtc/offer", "stream_id": id(n), "sdp": "v=0" }),
                 json!({ "id": 1, "type": "backchannel/release", "stream_id": id(n), "session_id": "s" }),
-                json!({ "id": 1, "type": "clip/start", "stream_id": id(n) }),
+                json!({ "id": 1, "type": "clip/start", "stream_id": id(n), "after_ms": 1 }),
             ]
         };
         for frame in frames(MAX_ID_CHARS) {

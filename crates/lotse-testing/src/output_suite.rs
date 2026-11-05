@@ -810,7 +810,8 @@ pub mod clip {
 
     use super::{Check, ready_now};
 
-    /// What the suite asks of a clip: open-ended, video only.
+    /// What the suite asks of a clip: long enough that only its stop ends
+    /// it, video only.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ClipAsk {
         /// How far before now it starts (`before_ms`).
@@ -862,7 +863,8 @@ pub mod clip {
             pipe: OwnedFd,
         );
 
-        /// Asks the running clip to stop, as `clip/stop` does.
+        /// Asks the running clip to stop, as the supervisor's `StopClip`
+        /// does.
         fn stop(&mut self);
 
         /// The clip's next report; `None` once none can come.

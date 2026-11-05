@@ -5093,7 +5093,7 @@ mod tests {
         ToWorker::StartClip(ClipSpec {
             clip_id: clip_id.into(),
             before_ms: 10_000,
-            after_ms: None,
+            after_ms: 600_000,
             audio: true,
         })
     }
@@ -5639,7 +5639,7 @@ mod tests {
                 ClipSpec {
                     clip_id: "k1".into(),
                     before_ms: 0,
-                    after_ms: None,
+                    after_ms: 600_000,
                     audio: false,
                 },
                 vec![writer],
@@ -5713,7 +5713,7 @@ mod tests {
             spec: ClipSpec {
                 clip_id: "k1".into(),
                 before_ms: 0,
-                after_ms: None,
+                after_ms: 600_000,
                 audio: false,
             },
             pipe: tokio::net::unix::pipe::Sender::from_owned_fd(writer).unwrap(),
@@ -5800,7 +5800,7 @@ mod tests {
             spec: ClipSpec {
                 clip_id: "k1".into(),
                 before_ms: 0,
-                after_ms: None,
+                after_ms: 600_000,
                 audio: false,
             },
             pipe: tokio::net::unix::pipe::Sender::from_owned_fd(writer).unwrap(),

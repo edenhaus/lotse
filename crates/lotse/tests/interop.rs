@@ -1297,7 +1297,8 @@ mod clip {
         // ffmpeg restarts while the clip runs, a camera that reboots:
         // MediaMTX drops the path, the daemon reconnects once ffmpeg
         // publishes again, and the clip goes on with a hole of the real time
-        // the restart took.
+        // the restart took, up to its end: long enough for the restart, the
+        // reconnect and seconds of the new connection's media.
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let mut camera = Camera::start_video(Video::H264, Audio::Aac, Arc::clone(&clock))
             .await
@@ -1305,10 +1306,12 @@ mod clip {
         let (daemon, control, dir) = daemon("reconnect").await;
         put_and_fill(&control, &camera, 1_000, &*clock).await;
         let (_id, result, mut events) = control
-            .subscribe(json!({ "type": "clip/start", "stream_id": STREAM, "before_ms": 1_000 }))
+            .subscribe(
+                json!({ "type": "clip/start", "stream_id": STREAM, "before_ms": 1_000,
+                               "after_ms": 15_000 }),
+            )
             .await
             .expect("clip/start");
-        let clip_id = result["clip_id"].as_str().unwrap().to_owned();
         let fetch = fetch_on_socket(&dir.join("lotse.sock"), result["url"].as_str().unwrap()).await;
         let started = next_event(&mut events, &*clock).await;
         assert_eq!(started["type"], "started", "{started}");
@@ -1323,16 +1326,10 @@ mod clip {
             (&json!("gap"), &json!("reconnect")),
             "{gap}"
         );
-        // Two seconds of the new connection's media in the clip.
-        clock.sleep(Duration::from_secs(2)).await;
-        control
-            .command(json!({ "type": "clip/stop", "clip_id": clip_id }))
-            .await
-            .expect("clip/stop");
         let mut all = vec![started, gap.clone()];
         all.extend(until_stopped(&mut events, &*clock).await);
         let fetched = fetch.await.expect("the fetch");
-        check_whole(&fetched, &all, "stopped");
+        check_whole(&fetched, &all, "completed");
         assert_eq!(all.len(), 3, "one gap: {all:?}");
         assert_eq!(all[2]["gaps"], 1, "{all:?}");
 

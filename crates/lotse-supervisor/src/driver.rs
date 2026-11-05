@@ -74,7 +74,7 @@ use lotse_core::connection::{
 use lotse_core::source::SourceError;
 use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::throttle::Throttle;
-use lotse_ipc::{ClipReport, ClipSpec, SessionSpec, SourceSpec};
+use lotse_ipc::{ClipReport, ClipSpec, STOPPED_AS_ASKED, SessionSpec, SourceSpec};
 use tokio::sync::{mpsc, watch};
 
 use crate::connect::{CONNECT_LEASE, ConnectSlot, SlotWake};
@@ -1244,7 +1244,7 @@ impl Driver {
 
     /// A clip stopped while it waits for a worker: its start leaves the
     /// queue with its pipe, and it ends here as its worker would have
-    /// ended it, `stopped` with nothing written. One not queued went with
+    /// ended it, [`STOPPED_AS_ASKED`] with nothing written. One not queued went with
     /// the worker that had it, which ended it, or was dropped as stale
     /// ([`Self::queue`]). A start the queue holds is that of the clip that
     /// holds the id, running or ending, and a later clip's start comes
@@ -1261,7 +1261,7 @@ impl Driver {
             clip.id = clip_id,
             "clip stopped before a worker got it; ended here"
         );
-        self.end_unqueued(clip_id, ClipStopReason::Stopped);
+        self.end_unqueued(clip_id, STOPPED_AS_ASKED);
     }
 
     /// How long a clip's start waits in the queue for a worker: the
@@ -1298,7 +1298,7 @@ impl Driver {
                     waited_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
                     "no worker took the clip's start in time; ended here source_not_live"
                 );
-                self.end_unqueued(&clip_id, ClipStopReason::SourceNotLive);
+                self.end_unqueued(&clip_id, ClipStopReason::SourceNotLive.as_str());
             }
         }
         self.clip_wait = self.clip_waits.front().map(|(queued, ..)| {
@@ -1309,8 +1309,8 @@ impl Driver {
 
     /// Prepares a queued `command` for the worker that now comes, `now`
     /// being when it does and `waits` the queue's record of when each clip
-    /// start was queued. Any command but a clip's start with an `after_ms`
-    /// comes back unchanged. That start comes back with `after_ms` set to
+    /// start was queued. Any command but a clip's start comes back
+    /// unchanged. That start comes back with `after_ms` set to
     /// what is left of it ([`after_left`]), the wait being the one `waits`
     /// holds for its clip id and serial (none: no wait). With nothing left
     /// its end passed while it waited: it is dropped with its pipe, and if
@@ -1337,9 +1337,7 @@ impl Driver {
         else {
             return Some(command);
         };
-        let Some(after_ms) = spec.after_ms else {
-            return Some(DriverCommand::StartClip { spec, serial, pipe });
-        };
+        let after_ms = spec.after_ms;
         let waited = waits
             .iter()
             .find(|(_, clip_id, queued)| *clip_id == spec.clip_id && *queued == serial)
@@ -1348,7 +1346,7 @@ impl Driver {
             });
         let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
         if let Some(left) = after_left(after_ms, waited) {
-            spec.after_ms = Some(left);
+            spec.after_ms = left;
             tracing::debug!(
                 clip.id = %spec.clip_id,
                 serial,
@@ -1367,7 +1365,7 @@ impl Driver {
                 after_ms,
                 "the clip's end passed while its start waited for a worker; ended here source_not_live"
             );
-            self.end_unqueued(&spec.clip_id, ClipStopReason::SourceNotLive);
+            self.end_unqueued(&spec.clip_id, ClipStopReason::SourceNotLive.as_str());
         }
         None
     }
@@ -1386,11 +1384,12 @@ impl Driver {
         self.queued.len() < before
     }
 
-    /// Ends clip `clip_id`, whose start no worker got, for `reason` as its
-    /// worker would have ended it: nothing written, so its body ends empty.
-    fn end_unqueued(&self, clip_id: &str, reason: ClipStopReason) {
+    /// Ends clip `clip_id`, whose start no worker got, for `reason`, by
+    /// the name its worker would have ended it with: nothing written, so
+    /// its body ends empty.
+    fn end_unqueued(&self, clip_id: &str, reason: &str) {
         let stopped = ClipReport::Stopped {
-            reason: reason.as_str().to_owned(),
+            reason: reason.to_owned(),
             bytes: 0,
             duration_ms: 0,
             gaps: 0,
@@ -3979,7 +3978,7 @@ mod tests {
         ClipSpec {
             clip_id: clip_id.into(),
             before_ms: 10_000,
-            after_ms: None,
+            after_ms: 20_000,
             audio: true,
         }
     }
@@ -4244,7 +4243,8 @@ mod tests {
     }
 
     /// A clip stopped while its start waits for a worker leaves the queue
-    /// with its pipe and ends as its worker would have ended it.
+    /// with its pipe and ends as its worker would have ended it, for the
+    /// supervisor's reason.
     #[tokio::test]
     async fn a_clip_stopped_before_a_worker_got_it_ends_here_with_nothing_written() {
         use std::io::Read as _;
@@ -4267,6 +4267,8 @@ mod tests {
         });
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
+        // The registry's stop, whose slot the test leaves out, says why.
+        shared.lock().stop_clip("k1", ClipStopReason::NotFetched);
         driver.queue(DriverCommand::StopClip {
             clip_id: "k1".into(),
         });
@@ -4282,7 +4284,7 @@ mod tests {
         let stopped = rx.try_recv().unwrap().payload;
         assert_eq!(
             (&stopped["reason"], &stopped["bytes"]),
-            (&serde_json::json!("stopped"), &serde_json::json!(0))
+            (&serde_json::json!("not_fetched"), &serde_json::json!(0))
         );
         assert!(!shared.lock().clips.contains_key("k1"));
         // One not queued went with the worker that had it.
@@ -4531,8 +4533,7 @@ mod tests {
     }
 
     /// The starts a new worker gets from the queue run what is left of
-    /// their `after_ms`, which counts from `clip/start`; an open-ended one
-    /// is unchanged; one whose end passed while it waited never reaches the
+    /// their `after_ms`, which counts from `clip/start`; one whose end passed while it waited never reaches the
     /// worker and ends `source_not_live` with its pipe and an empty body;
     /// a stale one (its clip ended, a later one holds the id) ends nothing;
     /// a later start that took a stale one's id counts its own wait from
@@ -4550,7 +4551,6 @@ mod tests {
         let shared = shared_with(&script, clock.clone());
         let _k1 = hold_clip(&shared, "k1", 1);
         let mut k2 = hold_clip(&shared, "k2", 2);
-        let _k3 = hold_clip(&shared, "k3", 3);
         let k4 = hold_clip(&shared, "k4", 4);
         let mut body = shared.lock().take_clip_body("k2").unwrap();
         let (_demand_tx, demand) = watch::channel(Demand::default());
@@ -4559,10 +4559,9 @@ mod tests {
         let _logs = captured.install();
         let (mut reader, writer) = std::io::pipe().unwrap();
         for (clip_id, serial, after_ms, pipe) in [
-            ("k1", 1, Some(6_000), fd()),
-            ("k2", 2, Some(1_000), writer.into()),
-            ("k3", 3, None, fd()),
-            ("k4", 4, Some(1_000), fd()),
+            ("k1", 1, 6_000, fd()),
+            ("k2", 2, 1_000, writer.into()),
+            ("k4", 4, 1_000, fd()),
         ] {
             driver.queue(DriverCommand::StartClip {
                 spec: ClipSpec {
@@ -4581,7 +4580,7 @@ mod tests {
         clock.advance(Duration::from_secs(4));
         driver.queue(DriverCommand::StartClip {
             spec: ClipSpec {
-                after_ms: Some(2_000),
+                after_ms: 2_000,
                 ..clip_spec("k4")
             },
             serial: 5,
@@ -4603,17 +4602,16 @@ mod tests {
             messages[1..],
             [
                 lotse_ipc::ToWorker::StartClip(ClipSpec {
-                    after_ms: Some(1_000),
+                    after_ms: 1_000,
                     ..clip_spec("k1")
                 }),
-                lotse_ipc::ToWorker::StartClip(clip_spec("k3")),
                 lotse_ipc::ToWorker::StartClip(ClipSpec {
-                    after_ms: Some(1_000),
+                    after_ms: 1_000,
                     ..clip_spec("k4")
                 }),
                 end,
             ],
-            "k1 and the later k4 run the rest, k3 is unchanged, k2 and the stale k4 never reach the worker"
+            "k1 and the later k4 run the rest, k2 and the stale k4 never reach the worker"
         );
         let stopped = k2.try_recv().unwrap().payload;
         assert_eq!(

@@ -1260,7 +1260,7 @@ mod tests {
         let clip = ClipSpec {
             clip_id: "k1".into(),
             before_ms: 10_000,
-            after_ms: Some(20_000),
+            after_ms: 20_000,
             audio: true,
         };
         let (mut clip_bytes, pipe) = io::pipe().unwrap();

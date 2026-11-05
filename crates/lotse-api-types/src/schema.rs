@@ -93,7 +93,6 @@ mod generator {
             "webrtc/candidate",
             "session/close",
             "session/adopt",
-            "clip/stop",
         ] {
             results.insert(name.into(), reference::<Success<Empty>>(&mut generator));
         }

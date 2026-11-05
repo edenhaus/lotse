@@ -151,8 +151,12 @@ pub enum ToWorker {
     /// [`ToSupervisor::Clip`], the last a [`ClipReport::Stopped`], after
     /// which the worker holds the write end no more.
     StartClip(ClipSpec),
-    /// End the clip `clip_id` cleanly: its last fragment is written and
-    /// it reports `Stopped`. One the worker does not run is ignored.
+    /// End the clip `clip_id` cleanly for a reason of the supervisor's
+    /// own (its body not fetched in time, its subscription gone): its last
+    /// fragment is written and it reports `Stopped` with
+    /// [`STOPPED_AS_ASKED`], in whose place the supervisor puts its reason.
+    /// One the worker does not run is ignored. A client never stops a clip:
+    /// it runs the length it asked for.
     StopClip {
         /// The clip.
         clip_id: String,
@@ -170,9 +174,9 @@ pub struct ClipSpec {
     pub before_ms: u32,
     /// How long it runs after the worker gets it, in milliseconds: what
     /// is left of the client's `after_ms`, the supervisor taking off what
-    /// the start waited for a worker; `None` until it is stopped, bounded
-    /// by the worker's longest clip.
-    pub after_ms: Option<u32>,
+    /// the start waited for a worker; bounded by the worker's longest
+    /// clip.
+    pub after_ms: u32,
     /// Take the stream's audio into the clip when it has one that fits.
     pub audio: bool,
 }
@@ -416,6 +420,11 @@ pub enum ToSupervisor {
     },
 }
 
+/// The reason of a [`ClipReport::Stopped`] that ends a clip as the
+/// supervisor asked ([`ToWorker::StopClip`]): no reason of the API, since
+/// the supervisor puts its own in its place.
+pub const STOPPED_AS_ASKED: &str = "stopped";
+
 /// What an event clip reports, in the order the API's events come: one
 /// `Started` unless it ends first, warnings and gaps, and `Stopped` last.
 /// Names and numbers only; the supervisor checks each against what it
@@ -457,7 +466,8 @@ pub enum ClipReport {
     },
     /// The last report: the clip ended and the worker closed its pipe.
     Stopped {
-        /// Why (`completed`, `stopped`, `client_gone`, ...).
+        /// Why (`completed`, `client_gone`, ...), or [`STOPPED_AS_ASKED`]
+        /// for the end of a [`ToWorker::StopClip`].
         reason: String,
         /// The file's length: the bytes written to the pipe, and the last
         /// ones its reader did not take in time, which the pipe never got;
@@ -942,13 +952,13 @@ mod tests {
             ToWorker::StartClip(ClipSpec {
                 clip_id: "01JB".into(),
                 before_ms: 10_000,
-                after_ms: Some(20_000),
+                after_ms: 20_000,
                 audio: true,
             }),
             ToWorker::StartClip(ClipSpec {
-                clip_id: "open".into(),
+                clip_id: "short".into(),
                 before_ms: 0,
-                after_ms: None,
+                after_ms: 1,
                 audio: false,
             }),
             ToWorker::StopClip {

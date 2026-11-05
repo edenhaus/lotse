@@ -358,8 +358,7 @@ pub struct StreamStats {
     /// Clips started on the stream.
     #[serde(default)]
     pub clips_started: u64,
-    /// Clips that ended with their whole file written: `completed`,
-    /// `stopped` or `max_duration`.
+    /// Clips that ended with their whole file written: `completed`.
     #[serde(default)]
     pub clips_completed: u64,
     /// Gaps in the stream's clips.

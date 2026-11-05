@@ -82,7 +82,8 @@
 //! for no video frame after it; nor does a video track event queued behind
 //! it (a codec change, a source switch, lost control events) end the clip:
 //! the file's video is complete, and the audio runs on to its end.
-//! A graceful end (`completed`, `stopped`, `max_duration`) first writes
+//! A graceful end (`completed`, or `stopped` as the supervisor asked)
+//! first writes
 //! what the queue still holds, frames held for the other track included,
 //! up to the clip's end, for at most [`FINISH_GRACE`] of a reader taking
 //! it; any other end drops the queue. Every end but a gone reader then
@@ -138,8 +139,8 @@ use tokio::task::JoinHandle;
 use crate::params;
 
 /// Default of `limits.clip_max_ms`: the longest a clip runs after its
-/// start, open-ended or not: an hour, the longest a client's record call
-/// asks for after an event.
+/// start: an hour, the longest a client's record call asks for after an
+/// event.
 pub const DEFAULT_CLIP_MAX: Duration = Duration::from_secs(3600);
 
 /// Default of `limits.clip_start_timeout_ms`: how long a clip with nothing
@@ -218,12 +219,12 @@ impl Default for ClipSettings {
 /// Why a clip ended, by the name its `Stopped` carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EndReason {
-    /// `after_ms` reached.
+    /// `after_ms` reached, or `clip_max_ms` for a clip that asked for
+    /// more.
     Completed,
-    /// `clip/stop`.
+    /// The supervisor's `StopClip`, for a reason of its own that it puts
+    /// in place of this one ([`lotse_ipc::STOPPED_AS_ASKED`]).
     Stopped,
-    /// An open-ended clip reached `clip_max_ms`.
-    MaxDuration,
     /// The video track closed: the stream is gone.
     StreamDeleted,
     /// A track's codec moved off the container's sample entry, or the
@@ -245,17 +246,16 @@ pub(crate) enum EndReason {
 
 impl EndReason {
     /// Whether the clip ends as asked, its queue written first:
-    /// `completed`, `stopped`, `max_duration`.
+    /// `completed`, `stopped`.
     const fn is_graceful(self) -> bool {
-        matches!(self, Self::Completed | Self::Stopped | Self::MaxDuration)
+        matches!(self, Self::Completed | Self::Stopped)
     }
 
     /// The API's name.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Completed => "completed",
-            Self::Stopped => "stopped",
-            Self::MaxDuration => "max_duration",
+            Self::Stopped => lotse_ipc::STOPPED_AS_ASKED,
             Self::StreamDeleted => "stream_deleted",
             Self::StreamChanged => "stream_changed",
             Self::NoVideoTrack => "no_video_track",
@@ -768,9 +768,6 @@ struct Clip {
     /// The capture time at which it ends, by the ring's measure
     /// ([`captured`]).
     end_at: Instant,
-    /// Why it ends then: `completed`, or `max_duration` when it asked for
-    /// no end or for one past `clip_max_ms`.
-    end_reason: EndReason,
     /// Where its reports go.
     reports: mpsc::Sender<(String, ClipReport)>,
     /// Reports not yet sent.
@@ -870,18 +867,10 @@ impl Clip {
         started: Instant,
         reports: mpsc::Sender<(String, ClipReport)>,
     ) -> Self {
-        let after = spec
-            .after_ms
-            .map(|ms| Duration::from_millis(u64::from(ms)))
-            .filter(|after| *after <= settings.max_duration);
-        let end_reason = if after.is_some() {
-            EndReason::Completed
-        } else {
-            EndReason::MaxDuration
-        };
-        let end_at = started
-            .checked_add(after.unwrap_or(settings.max_duration))
-            .unwrap_or(started);
+        // The supervisor holds `after_ms` to the same bound; this one keeps
+        // a clip that asks for more to the longest a clip runs.
+        let after = Duration::from_millis(u64::from(spec.after_ms)).min(settings.max_duration);
+        let end_at = started.checked_add(after).unwrap_or(started);
         Self {
             id: spec.clip_id.clone(),
             before: Duration::from_millis(u64::from(spec.before_ms)),
@@ -894,7 +883,6 @@ impl Clip {
             transcode,
             started,
             end_at,
-            end_reason,
             reports,
             outbox: Vec::new(),
             pending: VecDeque::new(),
@@ -1133,8 +1121,8 @@ impl Clip {
             return Err(EndReason::SourceNotLive);
         }
         if now >= self.end_deadline() {
-            tracing::info!(clip.id = %self.id, reason = self.end_reason.name(), "clip: no frame after its end came; ending");
-            return Err(self.end_reason);
+            tracing::info!(clip.id = %self.id, "clip: no frame after its end came; ending");
+            return Err(EndReason::Completed);
         }
         self.step_packets = 0;
         loop {
@@ -1263,8 +1251,8 @@ impl Clip {
                 // stays out, and so does the video behind it.
                 self.video_ended = true;
             }
-            tracing::debug!(clip.id = %self.id, %track, reason = self.end_reason.name(), "clip: its end is reached");
-            return Err(self.end_reason);
+            tracing::debug!(clip.id = %self.id, %track, "clip: its end is reached");
+            return Err(EndReason::Completed);
         }
         if !self.begun {
             self.begin(track, &frame, media)?;
@@ -1704,7 +1692,7 @@ impl Clip {
                     .unwrap_or(now);
                 let out = media.interleaver.next(release)?;
                 if let Err(end) = self.take(out, media) {
-                    return (end != self.end_reason).then_some(end);
+                    return (end != EndReason::Completed).then_some(end);
                 }
                 continue;
             }
@@ -1868,7 +1856,11 @@ mod tests {
         }
     }
 
-    fn spec(before_ms: u32, after_ms: Option<u32>, audio: bool) -> ClipSpec {
+    /// A clip's `after_ms` that outlasts every test: only a stop, or
+    /// another end, ends it first.
+    const LONG: u32 = 3_600_000;
+
+    fn spec(before_ms: u32, after_ms: u32, audio: bool) -> ClipSpec {
         ClipSpec {
             clip_id: "k1".into(),
             before_ms,
@@ -2162,7 +2154,7 @@ mod tests {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::new(Some(fake_aac()));
         ten_seconds(&rig);
-        let reader = rig.start(spec(3_500, Some(1_000), true));
+        let reader = rig.start(spec(3_500, 1_000, true));
         settle().await;
         assert_eq!(rig.report().await, started(4_000, Some("aac_lc")));
         let mut audio = 155;
@@ -2212,15 +2204,15 @@ mod tests {
     /// An audio codec the container cannot carry and the clip cannot
     /// transcode leaves the clip video-only with an `audio_omitted`
     /// warning after `started`; a clip that asks for no audio, or a
-    /// stream without any, gets none and no warning. `clip/stop` ends a
-    /// clip `stopped`, its last fragment written.
+    /// stream without any, gets none and no warning. The supervisor's stop
+    /// ends a clip `stopped`, its last fragment written.
     #[tokio::test]
     async fn audio_the_container_cannot_carry_is_omitted_with_a_warning() {
         let mut rig = Rig::new(Some(Codec::Unsupported {
             kind: Kind::Audio,
             name: "l16".into(),
         }));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         rig.video_frame(0, 0, true, 32);
         assert_eq!(rig.report().await, started(0, None));
         assert_eq!(
@@ -2241,7 +2233,7 @@ mod tests {
 
         for (audio, asked) in [(Some(fake_aac()), false), (None, true)] {
             let mut rig = Rig::new(audio);
-            let reader = rig.start(spec(0, None, asked));
+            let reader = rig.start(spec(0, LONG, asked));
             rig.video_frame(0, 0, true, 32);
             assert_eq!(rig.report().await, started(0, None));
             rig.clips.stop("k1", EndReason::Stopped);
@@ -2382,7 +2374,7 @@ mod tests {
         // A G.711 clip into the container without Opus: video only, and
         // the audio omitted with a warning.
         let mut rig = Rig::new(Some(Codec::Pcmu));
-        let reader = rig.start_with(spec(0, None, true), NoOpus, ClipSettings::default());
+        let reader = rig.start_with(spec(0, LONG, true), NoOpus, ClipSettings::default());
         rig.video_frame(0, 0, true, 32);
         assert_eq!(rig.report().await, started(0, None));
         assert_eq!(
@@ -2466,7 +2458,7 @@ mod tests {
         for codec in [Codec::Pcmu, Codec::Pcma, Codec::G722] {
             let mut rig = Rig::new(Some(codec.clone()));
             ten_narrowband_seconds(&rig, &codec);
-            let reader = rig.start(spec(3_500, Some(1_000), true));
+            let reader = rig.start(spec(3_500, 1_000, true));
             settle().await;
             assert_eq!(rig.report().await, started(4_000, Some("opus")));
             let payload = narrowband_payload(&codec);
@@ -2527,7 +2519,7 @@ mod tests {
     async fn a_transcoded_audio_codec_that_changes_after_the_start_ends_the_clip_stream_changed() {
         let payload = narrowband_payload(&Codec::Pcmu);
         let mut rig = Rig::new(Some(Codec::Pcmu));
-        let _reader = rig.start(spec(0, None, true));
+        let _reader = rig.start(spec(0, LONG, true));
         rig.video_frame(0, 0, true, 32);
         rig.narrowband_frame(1, &payload);
         rig.narrowband_frame(2, &payload);
@@ -2550,7 +2542,7 @@ mod tests {
         let (logs, _guard) = Logs::capture();
         let payload = narrowband_payload(&Codec::Pcmu);
         let mut rig = Rig::new(Some(Codec::G722));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         settle().await;
         rig.audio.as_ref().unwrap().set_codec(Codec::Pcmu);
         settle().await;
@@ -2582,7 +2574,7 @@ mod tests {
         );
 
         let mut rig = Rig::new(Some(Codec::Pcmu));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         settle().await;
         rig.audio
             .as_ref()
@@ -2638,7 +2630,7 @@ mod tests {
             if !waiting {
                 reconnect(&rig);
             }
-            let reader = rig.start(spec(0, None, true));
+            let reader = rig.start(spec(0, LONG, true));
             settle().await;
             if waiting {
                 reconnect(&rig);
@@ -2748,7 +2740,7 @@ mod tests {
     async fn a_reconnect_s_gap_is_where_the_container_put_its_frames() {
         assert!(Moving.accepts(&h264()), "what the fake container takes");
         let mut rig = Rig::new(None);
-        let reader = rig.start_with(spec(0, None, false), Moving, ClipSettings::default());
+        let reader = rig.start_with(spec(0, LONG, false), Moving, ClipSettings::default());
         rig.video_frame(0, 0, true, 32);
         rig.video_frame(100, 1, false, 16);
         settle().await;
@@ -2784,7 +2776,7 @@ mod tests {
     async fn a_reconnect_and_dropped_frames_are_gaps_in_clip_media_time() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         // Timestamps in steps of 3000 ticks: 100 ms apart, 6000.
         for (ms, step, keyframe) in [
             (0, 0, true),
@@ -2829,7 +2821,7 @@ mod tests {
     async fn a_new_epoch_s_video_starts_at_its_first_keyframe() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         rig.video_frame(0, 0, true, 32);
         rig.video_frame(100, 1, false, 16);
         settle().await;
@@ -2887,7 +2879,7 @@ mod tests {
     #[tokio::test]
     async fn frames_arriving_together_with_even_timestamps_are_no_gap() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         for (ms, index) in [
             (0, 0),
             (40, 1),
@@ -2932,7 +2924,7 @@ mod tests {
             let (reports_tx, reports) = mpsc::channel(1024);
             let mut clips = Clips::new(reports_tx);
             clips.start(ClipStart {
-                spec: spec(millis(ask.before), None, false),
+                spec: spec(millis(ask.before), LONG, false),
                 pipe: pipe::Sender::from_owned_fd(pipe).unwrap(),
                 tracks: Arc::clone(tracks),
                 factory,
@@ -3021,7 +3013,7 @@ mod tests {
             ..ClipSettings::default()
         };
         let mut reader = rig.start_with(
-            spec(0, None, false),
+            spec(0, LONG, false),
             FakeClipMuxerFactory::default(),
             settings,
         );
@@ -3068,12 +3060,12 @@ mod tests {
     }
 
     /// A clip whose end no frame shows (the source went quiet) ends
-    /// anyway, `END_GRACE` after its end; an open-ended one, or one asking
-    /// past `clip_max_ms`, ends `max_duration` at the longest a clip runs.
+    /// anyway, `END_GRACE` after its end; one asking past `clip_max_ms`
+    /// ends `completed` at the longest a clip runs.
     #[tokio::test]
     async fn a_clip_ends_after_its_end_without_frames_and_at_the_longest_without_one() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, Some(1_000), false));
+        let reader = rig.start(spec(0, 1_000, false));
         rig.video_frame(0, 0, true, 32);
         assert_eq!(rig.report().await, started(0, None));
         rig.advance_to(2_999);
@@ -3088,27 +3080,22 @@ mod tests {
             max_duration: Duration::from_secs(2),
             ..ClipSettings::default()
         };
-        for after in [None, Some(5_000)] {
-            let mut rig = Rig::new(None);
-            let reader = rig.start_with(
-                spec(0, after, false),
-                FakeClipMuxerFactory::default(),
-                settings,
-            );
-            rig.video_frame(0, 0, true, 32);
-            rig.video_frame(1_000, 1, false, 16);
-            rig.video_frame(2_000, 2, false, 16);
-            settle().await;
-            // The clip task first runs at 2 s, the keyframe captured at 0: 2 s.
-            assert_eq!(rig.report().await, started(2_000, None));
-            let reports = rig.until_stopped().await;
-            let bytes = reader.rest().await;
-            assert_eq!(lines(&bytes).len(), 4, "the frame at 2 s is past the end");
-            assert_eq!(
-                reports,
-                vec![stopped("max_duration", bytes.len(), 1_000, 0)]
-            );
-        }
+        let mut rig = Rig::new(None);
+        let reader = rig.start_with(
+            spec(0, 5_000, false),
+            FakeClipMuxerFactory::default(),
+            settings,
+        );
+        rig.video_frame(0, 0, true, 32);
+        rig.video_frame(1_000, 1, false, 16);
+        rig.video_frame(2_000, 2, false, 16);
+        settle().await;
+        // The clip task first runs at 2 s, the keyframe captured at 0: 2 s.
+        assert_eq!(rig.report().await, started(2_000, None));
+        let reports = rig.until_stopped().await;
+        let bytes = reader.rest().await;
+        assert_eq!(lines(&bytes).len(), 4, "the frame at 2 s is past the end");
+        assert_eq!(reports, vec![stopped("completed", bytes.len(), 1_000, 0)]);
     }
 
     /// A clip whose source declares no tracks, or sends no keyframe, within the
@@ -3119,7 +3106,7 @@ mod tests {
         let (logs, _guard) = Logs::capture();
         for ready in [false, true] {
             let mut rig = Rig::with(Some(h264()), None, ready, 16);
-            let reader = rig.start(spec(0, None, false));
+            let reader = rig.start(spec(0, LONG, false));
             settle().await;
             rig.advance_to(9_999);
             settle().await;
@@ -3141,7 +3128,7 @@ mod tests {
         );
 
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, Some(500), false));
+        let reader = rig.start(spec(0, 500, false));
         rig.advance_to(2_500);
         assert_eq!(
             rig.until_stopped().await,
@@ -3158,7 +3145,7 @@ mod tests {
     async fn a_codec_change_ends_the_clip_stream_changed_and_a_closed_track_stream_deleted() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         settle().await;
         let with_sets = Codec::H264 {
             profile_level_id: None,
@@ -3207,7 +3194,7 @@ mod tests {
         );
 
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         rig.video_frame(0, 0, true, 32);
         assert_eq!(rig.report().await, started(0, None));
         rig.video().close();
@@ -3222,7 +3209,7 @@ mod tests {
     #[tokio::test]
     async fn the_audio_track_closing_ends_the_audio_and_its_codec_change_the_clip() {
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         rig.audio_frame(0);
         rig.video_frame(10, 0, true, 32);
         rig.audio_frame(1);
@@ -3253,7 +3240,7 @@ mod tests {
         assert_eq!(reports, vec![stopped("stopped", bytes.len(), 200, 0)]);
 
         let mut rig = Rig::new(Some(fake_aac()));
-        let _reader = rig.start(spec(0, None, true));
+        let _reader = rig.start(spec(0, LONG, true));
         rig.audio_frame(0);
         rig.video_frame(10, 0, true, 32);
         rig.audio_frame(1);
@@ -3280,7 +3267,7 @@ mod tests {
     async fn a_reader_that_closed_its_end_ends_the_clip_client_gone() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         rig.video_frame(0, 0, true, 32);
         assert_eq!(rig.report().await, started(0, None));
         drop(reader);
@@ -3324,7 +3311,7 @@ mod tests {
     #[tokio::test]
     async fn a_frame_held_while_the_pipe_is_full_waits_without_spinning() {
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         let big = 24 * 1024;
         for (index, ms) in [10, 138, 266].into_iter().enumerate() {
             let index = u32::try_from(index).unwrap();
@@ -3355,7 +3342,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_slice_from_the_container_is_no_full_pipe() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         rig.video_frame(0, 0, true, 32);
         rig.video_frame(100, 1, false, 0);
         settle().await;
@@ -3379,7 +3366,7 @@ mod tests {
     #[tokio::test]
     async fn a_reader_gone_while_the_pipe_is_full_ends_the_clip_client_gone() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         stall(&rig).await;
         assert_eq!(rig.report().await, started(0, None));
         drop(reader);
@@ -3397,7 +3384,7 @@ mod tests {
     async fn a_stalled_reader_bounds_the_drain_and_the_last_fragment_of_a_graceful_end() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         stall(&rig).await;
         assert_eq!(rig.report().await, started(0, None));
         rig.clips.stop("k1", EndReason::Stopped);
@@ -3433,7 +3420,7 @@ mod tests {
     #[tokio::test]
     async fn a_reader_gone_during_the_drain_ends_the_clip_client_gone() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         stall(&rig).await;
         assert_eq!(rig.report().await, started(0, None));
         rig.clips.stop("k1", EndReason::Stopped);
@@ -3442,12 +3429,12 @@ mod tests {
         let_assert_reason(&rig.until_stopped().await, "client_gone");
     }
 
-    /// A graceful end writes what the queue holds: `clip/stop` keeps the
+    /// A graceful end writes what the queue holds: a stop keeps the
     /// audio frame the interleaver held for the video (`max_skew`), and the
     /// drain stops at a held frame captured at or after the clip's end.
     #[tokio::test]
     async fn a_stop_writes_the_frames_held_for_the_other_track_up_to_the_end() {
-        for after in [None, Some(100)] {
+        for after in [LONG, 100] {
             let mut rig = Rig::new(Some(fake_aac()));
             let reader = rig.start(spec(0, after, true));
             rig.audio_frame(0);
@@ -3456,7 +3443,7 @@ mod tests {
             settle().await;
             // Audio frame 1 at 64 ms releases the keyframe captured at 10 ms: 54 ms.
             assert_eq!(rig.report().await, started(54, Some("aac_lc")));
-            if after.is_some() {
+            if after == 100 {
                 // Releases the audio frame; the video frame, past the end,
                 // is held in its place.
                 rig.video_frame(150, 1, false, 16);
@@ -3489,7 +3476,7 @@ mod tests {
         for (fail, reports) in [(FakeClipFailure::Start, 1), (FakeClipFailure::Push, 2)] {
             let mut rig = Rig::new(None);
             let reader = rig.start_with(
-                spec(0, None, false),
+                spec(0, LONG, false),
                 FakeClipMuxerFactory { fail: Some(fail) },
                 ClipSettings::default(),
             );
@@ -3508,7 +3495,7 @@ mod tests {
         ] {
             let mut rig = Rig::new(None);
             let reader = rig.start_with(
-                spec(0, None, false),
+                spec(0, LONG, false),
                 FakeClipMuxerFactory {
                     fail: Some(FakeClipFailure::Finish),
                 },
@@ -3536,7 +3523,7 @@ mod tests {
     async fn a_shutdown_ends_the_clips_with_their_last_fragment_or_aborts_them() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         rig.video_frame(0, 0, true, 32);
         assert_eq!(rig.report().await, started(0, None));
         let clock: Arc<dyn Clock> = rig.clock.clone();
@@ -3548,7 +3535,7 @@ mod tests {
         assert_eq!(reports, vec![stopped("shutting_down", bytes.len(), 0, 0)]);
 
         let mut rig = Rig::with(Some(h264()), None, true, 1);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         rig.video_frame(0, 0, true, 32);
         settle().await;
         let fake = Arc::clone(&rig.clock);
@@ -3576,7 +3563,7 @@ mod tests {
     async fn a_shutdown_deadline_before_the_grace_aborts_the_clips_by_it() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::with(Some(h264()), None, true, 1);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         rig.video_frame(0, 0, true, 32);
         settle().await;
         let fake = Arc::clone(&rig.clock);
@@ -3602,14 +3589,14 @@ mod tests {
     #[tokio::test]
     async fn a_clip_without_video_or_stopped_or_dropped_while_waiting_ends_at_once() {
         let mut rig = Rig::with(None, Some(fake_aac()), true, 16);
-        let _reader = rig.start(spec(0, None, true));
+        let _reader = rig.start(spec(0, LONG, true));
         assert_eq!(
             rig.until_stopped().await,
             vec![stopped("no_video_track", 0, 0, 0)]
         );
 
         let mut rig = Rig::with(Some(h264()), None, false, 16);
-        let _reader = rig.start(spec(0, None, true));
+        let _reader = rig.start(spec(0, LONG, true));
         assert!(rig.clips.stop("k1", EndReason::Stopped));
         rig.clips.stop_all(EndReason::ShuttingDown);
         assert!(!rig.clips.stop("k2", EndReason::Stopped), "no such clip");
@@ -3619,7 +3606,7 @@ mod tests {
         assert!(!rig.clips.runs("k1"));
 
         let mut rig = Rig::with(Some(h264()), None, false, 16);
-        let _reader = rig.start(spec(0, None, true));
+        let _reader = rig.start(spec(0, LONG, true));
         settle().await;
         rig.clips.running.clear();
         assert_eq!(
@@ -3634,7 +3621,7 @@ mod tests {
     async fn gap_reports_are_capped_and_every_gap_counted() {
         let (logs, _guard) = Logs::capture();
         let mut rig = Rig::new(None);
-        let _reader = rig.start(spec(0, None, false));
+        let _reader = rig.start(spec(0, LONG, false));
         rig.video_frame(0, 0, true, 32);
         rig.video_frame(100, 1, false, 1);
         let mut ms = 100;
@@ -3690,7 +3677,7 @@ mod tests {
                 }));
             }
             rig.advance_to(2_000);
-            let _reader = rig.start(spec(5_000, None, false));
+            let _reader = rig.start(spec(5_000, LONG, false));
             settle().await;
             let_assert_started(&rig.report().await, before_ms);
             rig.clips.stop("k1", EndReason::Stopped);
@@ -3739,7 +3726,7 @@ mod tests {
             }));
         }
         rig.advance_to(3_000);
-        let _reader = rig.start(spec(5_000, None, false));
+        let _reader = rig.start(spec(5_000, LONG, false));
         settle().await;
         // From the keyframe that arrived at 1 s, by its arrival: the
         // capture time ahead of it does not count (`captured`).
@@ -3831,7 +3818,6 @@ mod tests {
             [
                 EndReason::Completed,
                 EndReason::Stopped,
-                EndReason::MaxDuration,
                 EndReason::StreamDeleted,
                 EndReason::StreamChanged,
                 EndReason::NoVideoTrack,
@@ -3844,7 +3830,6 @@ mod tests {
             [
                 "completed",
                 "stopped",
-                "max_duration",
                 "stream_deleted",
                 "stream_changed",
                 "no_video_track",
@@ -3980,7 +3965,7 @@ mod tests {
         });
         assert_eq!(clock.wall_now(), rig.clock.wall_now());
         let reader = rig.start_on(
-            spec(0, None, true),
+            spec(0, LONG, true),
             FakeClipMuxerFactory::default(),
             ClipSettings::default(),
             clock,
@@ -4028,7 +4013,7 @@ mod tests {
         rig.advance_to(11_000);
         let count = Counting::default();
         let audio = Arc::clone(&count.0);
-        let reader = rig.start_with(spec(4_500, None, true), count, ClipSettings::default());
+        let reader = rig.start_with(spec(4_500, LONG, true), count, ClipSettings::default());
         // The burst starts once the pipe is known to take the container's
         // header: until then every step ends at it, with nothing transcoded.
         let mut bytes = Vec::new();
@@ -4071,7 +4056,7 @@ mod tests {
         ten_narrowband_seconds(&rig, &Codec::Pcmu);
         let count = Counting::default();
         let audio = Arc::clone(&count.0);
-        let reader = rig.start_with(spec(3_500, None, true), count, ClipSettings::default());
+        let reader = rig.start_with(spec(3_500, LONG, true), count, ClipSettings::default());
         // Before the clip's first poll: it opens, takes its first step and
         // yields, then ends at the stop and drains what is left.
         assert!(rig.clips.stop("k1", EndReason::Stopped));
@@ -4112,7 +4097,7 @@ mod tests {
             ten_narrowband_seconds_stamped(&rig, &Codec::Pcmu, |_| 0);
             let count = Counting::default();
             let (audio, video) = (Arc::clone(&count.0), Arc::clone(&count.1));
-            let reader = rig.start_with(spec(3_500, None, true), count, ClipSettings::default());
+            let reader = rig.start_with(spec(3_500, LONG, true), count, ClipSettings::default());
             if stop {
                 // Before the clip's first poll: the pre-roll goes out in the drain.
                 assert!(rig.clips.stop("k1", EndReason::Stopped));
@@ -4161,7 +4146,7 @@ mod tests {
             rig.audio_frame(index);
         }
         rig.advance_to(1_000);
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         settle().await;
         assert_eq!(rig.report().await, started(500, Some("aac_lc")));
         rig.clips.stop("k1", EndReason::Stopped);
@@ -4327,7 +4312,7 @@ mod tests {
             let before_ms = u32::try_from(1_100 - keyframe.1).unwrap();
             let placing = Placing::default();
             let reader = rig.start_with(
-                spec(before_ms, None, true),
+                spec(before_ms, LONG, true),
                 placing.clone(),
                 ClipSettings::default(),
             );
@@ -4369,7 +4354,7 @@ mod tests {
             }
             let placing = Placing::default();
             let reader = rig.start_with(
-                spec(99, None, true),
+                spec(99, LONG, true),
                 placing.clone(),
                 ClipSettings::default(),
             );
@@ -4403,7 +4388,7 @@ mod tests {
             )));
         }
         rig.advance_to(3_000);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         settle().await;
         assert_eq!(rig.report().await, started(1_000, None));
         rig.clips.stop("k1", EndReason::Stopped);
@@ -4531,7 +4516,7 @@ mod tests {
             let (before, after): (Vec<_>, Vec<_>) =
                 sent.into_iter().partition(|(at, _)| *at <= 4_000);
             send(&rig, &mapper, &before);
-            let reader = rig.start(spec(1_500, Some(1_000), true));
+            let reader = rig.start(spec(1_500, 1_000, true));
             settle().await;
             assert_eq!(
                 rig.report().await,
@@ -4579,7 +4564,7 @@ mod tests {
     #[tokio::test]
     async fn a_lag_s_gap_is_where_the_container_put_its_frames() {
         let mut rig = Rig::new(None);
-        let reader = rig.start_with(spec(0, None, false), Moving, ClipSettings::default());
+        let reader = rig.start_with(spec(0, LONG, false), Moving, ClipSettings::default());
         rig.video_frame(0, 0, true, 32);
         rig.video_frame(100, 1, false, 16);
         settle().await;
@@ -4607,7 +4592,7 @@ mod tests {
     async fn a_lag_resumes_at_the_frame_interval_after_it_across_a_reconnect_or_not() {
         for reconnect in [true, false] {
             let mut rig = Rig::new(None);
-            let reader = rig.start(spec(0, None, false));
+            let reader = rig.start(spec(0, LONG, false));
             rig.video_frame(0, 0, true, 32);
             rig.video_frame(100, 1, false, 16);
             settle().await;
@@ -4697,7 +4682,7 @@ mod tests {
     #[tokio::test]
     async fn a_codec_change_or_a_container_failure_the_drain_meets_ends_the_clip_for_it() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         stall(&rig).await;
         assert_eq!(rig.report().await, started(0, None));
         rig.video().set_codec(Codec::H264 {
@@ -4717,7 +4702,7 @@ mod tests {
         assert!(FailingAt(15_000).accepts(&h264()), "what the fake takes");
         let mut rig = Rig::new(None);
         let reader = rig.start_with(
-            spec(0, None, false),
+            spec(0, LONG, false),
             FailingAt(15_000),
             ClipSettings::default(),
         );
@@ -4746,7 +4731,7 @@ mod tests {
             let mut rig = Rig::new(Some(Codec::Pcmu));
             rig.transcode = ToOpus::failing;
             ten_narrowband_seconds(&rig, &Codec::Pcmu);
-            let reader = rig.start(spec(3_500, None, true));
+            let reader = rig.start(spec(3_500, LONG, true));
             if drain {
                 // Before the clip's first poll: the pre-roll goes out in the drain.
                 assert!(rig.clips.stop("k1", EndReason::Stopped));
@@ -4782,7 +4767,7 @@ mod tests {
             (EndReason::ShuttingDown, "shutting_down"),
         ] {
             let mut rig = Rig::new(None);
-            let reader = rig.start(spec(0, None, false));
+            let reader = rig.start(spec(0, LONG, false));
             stall(&rig).await;
             assert_eq!(rig.report().await, started(0, None));
             rig.clips.stop("k1", asked);
@@ -4814,7 +4799,7 @@ mod tests {
         ] {
             let (logs, _guard) = Logs::capture();
             let mut rig = Rig::new(None);
-            let reader = rig.start(spec(0, None, false));
+            let reader = rig.start(spec(0, LONG, false));
             stall(&rig).await;
             assert_eq!(rig.report().await, started(0, None));
             rig.clips.stop("k1", asked);
@@ -4852,7 +4837,7 @@ mod tests {
     #[tokio::test]
     async fn an_audio_lag_is_the_audio_s_gap_and_leaves_the_video_s_continuity() {
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         for index in 0..3_u32 {
             rig.audio_frame(index);
             rig.video_frame(u64::from(index) * 100, index, index == 0, 16);
@@ -4913,7 +4898,7 @@ mod tests {
         // (frames lost in a row from frame 10, a second single loss)
         for (lost, again) in [(1_u32, Some(20_u32)), (51, None), (51, Some(62))] {
             let mut rig = Rig::new(Some(Codec::Pcmu));
-            let reader = rig.start(spec(0, None, true));
+            let reader = rig.start(spec(0, LONG, true));
             settle().await; // the clip subscribes before any frame
             let audio = Arc::clone(rig.audio.as_ref().unwrap());
             for index in 0..10 + lost + 20 {
@@ -4998,7 +4983,7 @@ mod tests {
         // (frames lost in a row from frame 10, the empty frame's stamp)
         for (lost, empty) in [(1_u32, 1_600 + 7_840), (51, 11 * 160)] {
             let mut rig = Rig::new(Some(Codec::Pcmu));
-            let reader = rig.start(spec(0, None, true));
+            let reader = rig.start(spec(0, LONG, true));
             settle().await; // the clip subscribes before any frame
             let audio = Arc::clone(rig.audio.as_ref().unwrap());
             for index in 0..10 + lost + 20 {
@@ -5084,7 +5069,7 @@ mod tests {
             i64::try_from(delay.as_nanos() * 48 / 1_000_000).unwrap()
         };
         let mut rig = Rig::new(Some(Codec::Pcmu));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         settle().await; // the clip subscribes before any frame
         let audio = Arc::clone(rig.audio.as_ref().unwrap());
         for index in 0..40_u32 {
@@ -5138,12 +5123,11 @@ mod tests {
     /// waiting for a keyframe, and waiting for the tracks. The pipe's write
     /// end polls an error then, whatever room it has (`poll(2)`: `POLLERR`).
     /// Regression: nothing noticed until the next write or the clip's end,
-    /// up to `clip_max_ms` for an open-ended clip, which kept its slot that
-    /// long.
+    /// up to `clip_max_ms` for a long clip, which kept its slot that long.
     #[tokio::test]
     async fn a_reader_gone_while_the_clip_has_nothing_to_write_ends_it_client_gone() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         rig.video_frame(0, 0, true, 32);
         assert_eq!(rig.report().await, started(0, None));
         settle().await;
@@ -5154,7 +5138,7 @@ mod tests {
 
         for ready in [true, false] {
             let mut rig = Rig::with(Some(h264()), None, ready, 16);
-            let reader = rig.start(spec(0, None, false));
+            let reader = rig.start(spec(0, LONG, false));
             settle().await;
             drop(reader);
             assert_eq!(
@@ -5179,7 +5163,7 @@ mod tests {
         for audio in [false, true] {
             let mut rig = Rig::new(audio.then(fake_aac));
             rig.advance_to(1_000);
-            let reader = rig.start(spec(0, None, audio));
+            let reader = rig.start(spec(0, LONG, audio));
             settle().await;
             rig.advance_to(1_100);
             assert!(
@@ -5233,7 +5217,7 @@ mod tests {
         let mut rig = Rig::new(Some(fake_aac()));
         rig.video_frame(0, 0, true, 32);
         rig.advance_to(100);
-        let reader = rig.start(spec(100, None, true));
+        let reader = rig.start(spec(100, LONG, true));
         settle().await;
         rig.video().set_codec(Codec::H265 {
             vps: None,
@@ -5264,7 +5248,7 @@ mod tests {
     #[tokio::test]
     async fn an_audio_change_before_the_start_omits_the_audio_or_is_its_entry() {
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         settle().await;
         rig.audio.as_ref().unwrap().set_codec(Codec::Unsupported {
             kind: Kind::Audio,
@@ -5292,7 +5276,7 @@ mod tests {
         assert_eq!(reports, vec![stopped("stopped", bytes.len(), 0, 0)]);
 
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         settle().await;
         rig.audio
             .as_ref()
@@ -5316,7 +5300,7 @@ mod tests {
     #[tokio::test]
     async fn a_codec_change_undone_before_a_frame_came_under_it_is_none() {
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         rig.audio_frame(0);
         rig.video_frame(10, 0, true, 32);
         rig.audio_frame(1);
@@ -5354,7 +5338,7 @@ mod tests {
     #[tokio::test]
     async fn a_keyframe_and_a_codec_change_published_together_keep_their_order() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         settle().await;
         rig.video_frame(0, 0, true, 32);
         rig.video().set_codec(Codec::H265 {
@@ -5384,7 +5368,7 @@ mod tests {
     #[tokio::test]
     async fn control_events_lost_to_a_lag_end_the_clip_stream_changed() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         settle().await;
         rig.video_frame(0, 0, true, 32);
         settle().await;
@@ -5418,7 +5402,7 @@ mod tests {
     #[tokio::test]
     async fn b_frames_behind_the_video_s_end_in_decode_order_are_left_out() {
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, Some(290), true));
+        let reader = rig.start(spec(0, 290, true));
         rig.audio_frame(0);
         rig.video_frame(10, 0, true, 32);
         for index in 1..=4 {
@@ -5525,7 +5509,7 @@ mod tests {
     #[tokio::test]
     async fn rfc3550_6_4_1_a_clip_ends_its_audio_with_the_video_s_end_as_dated() {
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, Some(1_000), true));
+        let reader = rig.start(spec(0, 1_000, true));
         send_video_dated_ahead_and_aac(&rig, 400, 16, &every_100_ms_from_50(16), &every_64_ms(25))
             .await;
         let reports = rig.until_stopped().await;
@@ -5568,7 +5552,7 @@ mod tests {
         ] {
             let case = format!("{changed} after {after}");
             let mut rig = Rig::new(Some(fake_aac()));
-            let reader = rig.start(spec(0, Some(1_000), true));
+            let reader = rig.start(spec(0, 1_000, true));
             let mut sent: Vec<(u64, Kind, u32)> = (0..)
                 .zip(every_100_ms_from_50(16))
                 .map(|(index, at)| (at, Kind::Video, index))
@@ -5657,7 +5641,7 @@ mod tests {
     async fn rfc3550_6_4_1_the_audio_waits_at_most_max_skew_for_its_end_after_the_video_s() {
         let mut rig = Rig::new(Some(fake_aac()));
         let reader = rig.start_with(
-            spec(0, Some(1_000), true),
+            spec(0, 1_000, true),
             FakeClipMuxerFactory::default(),
             skew_400(),
         );
@@ -5702,7 +5686,7 @@ mod tests {
     async fn rfc3550_6_4_1_the_audio_end_frame_within_max_skew_ends_the_clip_then() {
         let mut rig = Rig::new(Some(fake_aac()));
         let reader = rig.start_with(
-            spec(0, Some(1_000), true),
+            spec(0, 1_000, true),
             FakeClipMuxerFactory::default(),
             skew_400(),
         );
@@ -5736,7 +5720,7 @@ mod tests {
     async fn rfc3550_6_4_1_the_wait_for_the_audio_end_stays_within_the_late_end() {
         let mut rig = Rig::new(Some(fake_aac()));
         let reader = rig.start_with(
-            spec(0, Some(1_000), true),
+            spec(0, 1_000, true),
             FakeClipMuxerFactory::default(),
             skew_400(),
         );
@@ -5780,7 +5764,7 @@ mod tests {
     async fn rfc3550_6_4_1_queued_audio_ends_with_the_video_s_end_as_dated_after_its_track_closed()
     {
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, Some(1_000), true));
+        let reader = rig.start(spec(0, 1_000, true));
         send_video_dated_ahead_and_aac(
             &rig,
             400,
@@ -5838,7 +5822,7 @@ mod tests {
             let mut rig = Rig::new(Some(fake_aac()));
             let placing = Placing::default();
             let reader = rig.start_with(
-                spec(0, Some(1_000), true),
+                spec(0, 1_000, true),
                 placing.clone(),
                 ClipSettings::default(),
             );
@@ -5914,7 +5898,7 @@ mod tests {
             let mut rig = Rig::new(Some(fake_aac()));
             let placing = Placing(Arc::default(), after_ms, Duration::ZERO);
             let reader = rig.start_with(
-                spec(0, Some(1_000), true),
+                spec(0, 1_000, true),
                 placing.clone(),
                 ClipSettings::default(),
             );
@@ -5978,7 +5962,7 @@ mod tests {
         let mut rig = Rig::new(None);
         let placing = Placing(Arc::default(), 0, Duration::from_millis(1_400));
         let reader = rig.start_with(
-            spec(0, Some(1_000), true),
+            spec(0, 1_000, true),
             placing.clone(),
             ClipSettings::default(),
         );
@@ -6024,7 +6008,7 @@ mod tests {
         late.extend(after.clone());
         for audio in [after, late] {
             let mut rig = Rig::new(Some(fake_aac()));
-            let reader = rig.start(spec(0, Some(1_000), true));
+            let reader = rig.start(spec(0, 1_000, true));
             rig.advance_to(1_050);
             let keyframe = frame_at(&rig, (1_450, 1_050), 0, true, 16);
             assert!(rig.video().publish_frame(keyframe));
@@ -6073,7 +6057,7 @@ mod tests {
             );
         }
         rig.advance_to(3_000);
-        let reader = rig.start(spec(5_000, Some(1_000), false));
+        let reader = rig.start(spec(5_000, 1_000, false));
         settle().await;
         assert_eq!(rig.report().await, started(2_000, None));
         rig.video_frame(3_500, 105, false, 16);
@@ -6117,7 +6101,7 @@ mod tests {
                 .publish_frame(frame_at(&rig, (61_000, 1_000), 90_000, true, 32))
         );
         rig.advance_to(2_000);
-        let reader = rig.start(spec(5_000, Some(2_000), true));
+        let reader = rig.start(spec(5_000, 2_000, true));
         settle().await;
         assert_eq!(rig.report().await, started(1_000, Some("aac_lc")));
         // The keyframe goes out when its hold for the audio ends.
@@ -6176,7 +6160,7 @@ mod tests {
     #[tokio::test]
     async fn a_switch_to_another_source_ends_the_clip_at_the_switch() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         settle().await;
         rig.video_frame(0, 0, true, 32);
         rig.video_frame(100, 1, false, 16);
@@ -6217,7 +6201,7 @@ mod tests {
         rig.video_frame_on(&standby, 1_000, 0, true, 32);
         rig.video_frame_on(&standby, 1_100, 1, false, 16);
         rig.advance_to(1_200);
-        let reader = rig.start(spec(5_000, None, false));
+        let reader = rig.start(spec(5_000, LONG, false));
         settle().await;
         assert_eq!(rig.report().await, started(200, None));
         rig.clips.stop("k1", EndReason::Stopped);
@@ -6259,7 +6243,7 @@ mod tests {
         let (_reader, writer) = io::pipe().unwrap();
         let (reports, _) = mpsc::channel(1);
         let mut clip = Clip::new(
-            &spec(5_000, None, true),
+            &spec(5_000, LONG, true),
             pipe::Sender::from_owned_fd(OwnedFd::from(writer)).unwrap(),
             Arc::new(FakeClipMuxerFactory::default()),
             ClipSettings::default(),
@@ -6304,7 +6288,7 @@ mod tests {
     async fn b_frame_runs_of_varying_length_are_no_gap() {
         for order in [&[0, 3, 1, 2, 4, 7, 5, 6, 8][..], &[0, 1, 2, 5, 3, 4, 6][..]] {
             let mut rig = Rig::new(None);
-            let reader = rig.start(spec(0, None, false));
+            let reader = rig.start(spec(0, LONG, false));
             for (at, index) in order.iter().enumerate() {
                 let ms = u64::try_from(at).unwrap() * 100;
                 rig.video_frame(ms, *index, *index == 0, 16);
@@ -6326,7 +6310,7 @@ mod tests {
     #[tokio::test]
     async fn a_keyframe_held_for_the_audio_at_the_start_timeout_starts_the_clip() {
         let mut rig = Rig::new(Some(fake_aac()));
-        let reader = rig.start(spec(0, None, true));
+        let reader = rig.start(spec(0, LONG, true));
         settle().await;
         rig.video_frame(9_500, 95, true, 32);
         settle().await;
@@ -6360,7 +6344,7 @@ mod tests {
     #[tokio::test]
     async fn a_jump_followed_by_its_own_timestamp_is_a_gap() {
         let mut rig = Rig::new(None);
-        let reader = rig.start(spec(0, None, false));
+        let reader = rig.start(spec(0, LONG, false));
         for (ms, index) in [(0, 0), (100, 1), (200, 2), (600, 6), (700, 6)] {
             rig.video_frame(ms, index, index == 0, 16);
             settle().await;

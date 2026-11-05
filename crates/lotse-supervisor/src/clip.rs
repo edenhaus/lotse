@@ -29,12 +29,13 @@
 //!
 //! A clip ends with the worker's `Stopped` report, whose `bytes` go to the
 //! body, which ends whole only when they match what it read. When the
-//! supervisor ends a clip itself (`clip/stop`, `unsubscribe`, `not_fetched`,
-//! its control connection closing) it asks the worker through a slot
-//! reserved in the driver's queue at `clip/start` and waits for that
-//! report, putting its own reason in place of the worker's `stopped`, and in
-//! place of its `client_gone` when that reason already says the file is not
-//! whole (`not_fetched`, `session_closed`): the worker ends a stop
+//! supervisor ends a clip itself (`not_fetched`, `unsubscribe` or its
+//! control connection closing, both `session_closed`; a client never
+//! stops a clip, which runs the length it asked for) it asks the worker
+//! through a slot reserved in the driver's queue at `clip/start` and waits
+//! for that report, putting its own reason in place of the worker's
+//! [`STOPPED_AS_ASKED`], and in place of its `client_gone`, since its
+//! reason already says the file is not whole: the worker ends a stop
 //! `client_gone` when the reader does not take the last bytes in time, as a
 //! body nobody fetched never does once the pipe is full, its tail counted in
 //! the bytes. A
@@ -78,7 +79,7 @@ use lotse_api_types::clip::{
 use lotse_api_types::time::rfc3339;
 use lotse_core::codec::CodecFamily;
 use lotse_core::text::plain;
-use lotse_ipc::{ClipReport, ClipSpec};
+use lotse_ipc::{ClipReport, ClipSpec, STOPPED_AS_ASKED};
 use tokio::sync::mpsc::{self, OwnedPermit};
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
@@ -137,7 +138,7 @@ pub struct ClipLimits {
     /// `info` reports as `limits.preroll_bytes`.
     pub preroll_bytes: u64,
     /// `limits.clip_max_ms`: the most `after_ms` may ask, and the worker's
-    /// end of an open-ended clip.
+    /// bound on it.
     pub clip_max_ms: u32,
     /// `limits.clip_queue_bytes`: what one clip's queue in the worker holds
     /// before it drops to the next keyframe and reports the gap.
@@ -215,8 +216,7 @@ impl Default for ClipLimits {
 pub(crate) struct ClipCounters {
     /// Clips `clip/start` handed to the stream's connection.
     pub(crate) started: u64,
-    /// Clips that ended with their whole file written: `completed`,
-    /// `stopped` or `max_duration`.
+    /// Clips that ended with their whole file written: `completed`.
     pub(crate) completed: u64,
     /// Gaps in the stream's clips, every one the workers counted, added
     /// as each clip ends.
@@ -545,13 +545,14 @@ impl ClipEntry {
     }
 
     /// The end a worker's `Stopped` report makes: its reason as the API's,
-    /// the supervisor's own when it asked: for `stopped`, and for
-    /// `client_gone` when its own reason (`not_fetched`, `session_closed`)
-    /// already says the file is not whole; or the reason the
-    /// report breaks the contract: a reason the API does not know or only
-    /// the supervisor gives (a malformed report, whose figures are not
+    /// the supervisor's own when it asked: for [`STOPPED_AS_ASKED`], and
+    /// for `client_gone`, since its own reason (`not_fetched`,
+    /// `session_closed`) already says the file is not whole; or the reason
+    /// the report breaks the contract: a reason the API does not know or
+    /// only the supervisor gives (a malformed report, whose figures are not
     /// believed: `lotse_api_types::clip::ClipEvent::Stopped` says 0 bytes
-    /// and a cut body for one), or fewer gaps than it reported.
+    /// and a cut body for one), [`STOPPED_AS_ASKED`] for a stop not asked
+    /// for, or fewer gaps than it reported.
     fn stopped(
         &self,
         (reason, bytes, duration_ms, gaps): (&str, u64, u32, u32),
@@ -559,20 +560,24 @@ impl ClipEntry {
         if gaps < self.gaps {
             return Err("stopped counts fewer gaps than were reported");
         }
-        let reason = ClipStopReason::parse(reason)
-            .filter(|r| !SUPERVISOR_REASONS.contains(r))
-            .ok_or("stopped names a reason the worker may not give")?;
-        let reason = match (reason, self.ending) {
-            (ClipStopReason::Stopped, Some(ending)) => ending,
-            // A stop is a graceful end at the worker, which ends it
-            // `client_gone` when the reader does not take the last bytes
-            // within its grace: always so for a body nobody fetched once
-            // the pipe is full. A reason of the supervisor's that already
-            // says the file is not whole (`not_fetched`, `session_closed`)
-            // is why the clip ended and stays, as the worker keeps such a
-            // reason of its own; `stopped`, a whole file, yields.
-            (ClipStopReason::ClientGone, Some(ending)) if !completed(ending) => ending,
-            (reason, _) => reason,
+        let reason = if reason == STOPPED_AS_ASKED {
+            self.ending
+                .ok_or("stopped ends a stop the supervisor did not ask for")?
+        } else {
+            let reason = ClipStopReason::parse(reason)
+                .filter(|r| !SUPERVISOR_REASONS.contains(r))
+                .ok_or("stopped names a reason the worker may not give")?;
+            match (reason, self.ending) {
+                // A stop is a graceful end at the worker, which ends it
+                // `client_gone` when the reader does not take the last
+                // bytes within its grace: always so for a body nobody
+                // fetched once the pipe is full. The supervisor's reason
+                // (`not_fetched`, `session_closed`) already says the file
+                // is not whole, and is why the clip ended, so it stays, as
+                // the worker keeps such a reason of its own.
+                (ClipStopReason::ClientGone, Some(ending)) => ending,
+                (reason, _) => reason,
+            }
         };
         Ok(ClipEnd::Reported {
             reason,
@@ -613,10 +618,7 @@ pub(crate) fn clip_event(event: &ClipEvent) -> Event {
 
 /// Whether a clip that ended for `reason` wrote its whole file.
 const fn completed(reason: ClipStopReason) -> bool {
-    matches!(
-        reason,
-        ClipStopReason::Completed | ClipStopReason::Stopped | ClipStopReason::MaxDuration
-    )
+    matches!(reason, ClipStopReason::Completed)
 }
 
 impl State {
@@ -848,8 +850,9 @@ impl State {
     }
 
     /// `unsubscribe` ended `connection`'s subscription `subscription`: the
-    /// clip it was, if any, loses its owner and is stopped (`stopped`), its
-    /// end going nowhere; `false` when no clip had it.
+    /// clip it was, if any, loses its owner and is stopped
+    /// (`session_closed`, as a session's `unsubscribe` closes it), its end
+    /// going nowhere; `false` when no clip had it.
     pub(crate) fn unsubscribe_clip(&mut self, connection: ConnectionId, subscription: u64) -> bool {
         let Some((id, entry)) = self
             .clips
@@ -860,7 +863,7 @@ impl State {
         };
         entry.owner = None;
         let id = id.clone();
-        self.stop_clip(&id, ClipStopReason::Stopped);
+        self.stop_clip(&id, ClipStopReason::SessionClosed);
         true
     }
 
@@ -1034,7 +1037,7 @@ mod tests {
         let spec = ClipSpec {
             clip_id: "k1".into(),
             before_ms: 10_000,
-            after_ms: Some(20_000),
+            after_ms: 20_000,
             audio,
         };
         let owner = ClipOwner {
@@ -1090,7 +1093,7 @@ mod tests {
             (ClipLimits::NONE.max_clips, ClipLimits::NONE.preroll_max_ms),
             (0, 0)
         );
-        assert!(completed(ClipStopReason::MaxDuration));
+        assert!(completed(ClipStopReason::Completed));
         assert!(!completed(ClipStopReason::ClientGone));
     }
 
@@ -1293,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_maps_the_worker_s_reason_and_puts_the_supervisor_s_own_in_for_stopped() {
+    fn stopped_maps_the_worker_s_reason_and_puts_the_supervisor_s_own_in_for_its_stop() {
         let stopped = |reason: &str, duration_ms: u32, gaps: u32| ClipReport::Stopped {
             reason: reason.into(),
             bytes: 7,
@@ -1309,9 +1312,15 @@ mod tests {
             end(&mut clip, stopped("completed", 1, 0)),
             ClipStopReason::Completed
         );
+        // A reader gone that no stop of the supervisor's ended stays.
         assert_eq!(
-            end(&mut clip, stopped("stopped", 1, 0)),
-            ClipStopReason::Stopped
+            end(&mut clip, stopped("client_gone", 1, 0)),
+            ClipStopReason::ClientGone
+        );
+        // A stop the supervisor did not ask for breaks the contract.
+        assert_eq!(
+            applied(&mut clip, stopped("stopped", 1, 0)).unwrap_err(),
+            "stopped ends a stop the supervisor did not ask for"
         );
         clip.ending = Some(ClipStopReason::NotFetched);
         assert_eq!(
@@ -1331,13 +1340,6 @@ mod tests {
         assert_eq!(
             end(&mut clip, stopped("client_gone", 1, 0)),
             ClipStopReason::SessionClosed
-        );
-        // `stopped` says the file is whole: the worker's `client_gone`, a
-        // cut file, stays.
-        clip.ending = Some(ClipStopReason::Stopped);
-        assert_eq!(
-            end(&mut clip, stopped("client_gone", 1, 0)),
-            ClipStopReason::ClientGone
         );
         // A worker that ended it otherwise first keeps its reason.
         clip.ending = Some(ClipStopReason::NotFetched);

@@ -356,7 +356,7 @@ mod tests {
             Duration::from_millis(bare.clip_max_ms),
             lotse_worker::DEFAULT_CLIP_MAX
         );
-        // ... which are the supervisor's: the daemon refuses no `after_ms`
+        // ... which are the supervisor's: the daemon takes no `after_ms`
         // its worker would cut short.
         assert_eq!(
             Duration::from_millis(u64::from(lotse_supervisor::ClipLimits::DEFAULT.clip_max_ms)),
@@ -544,7 +544,7 @@ mod tests {
                     command: StreamCommand::Clip {
                         stream_id,
                         before: 10_000,
-                        after: Some(500),
+                        after: 500,
                         no_audio: true,
                         output,
                     },
@@ -555,14 +555,15 @@ mod tests {
         );
         let args: CtlArgs = args_of(
             &[
-                "lotse", "ctl", "--socket", "/s", "stream", "clip", "front", "--output", "c.mp4",
+                "lotse", "ctl", "--socket", "/s", "stream", "clip", "front", "--after", "1s",
+                "--output", "c.mp4",
             ],
             "ctl",
         );
         let shown = format!("{:?}", args.command);
         assert!(
-            shown.contains("before: 0, after: None, no_audio: false"),
-            "open-ended with audio by default: {shown}"
+            shown.contains("before: 0, after: 1000, no_audio: false"),
+            "from now with audio by default: {shown}"
         );
         let args: CtlArgs = args_of(
             &[
@@ -588,7 +589,10 @@ mod tests {
         };
         let err = clip(&[]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-        let err = clip(&["-o", "c.mp4", "--before", "10"]).unwrap_err();
+        // A clip always has its length.
+        let err = clip(&["-o", "c.mp4"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let err = clip(&["-o", "c.mp4", "--after", "1s", "--before", "10"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 

@@ -4,7 +4,8 @@
 //! A clip is one fragmented MP4 file (ISO/IEC 14496-12 §8.8) of a stream's
 //! video and, when it fits the container, its audio. It starts up to
 //! `before_ms` before the command, from the stream's pre-roll window, at a
-//! keyframe, and runs `after_ms` after it or until `clip/stop`. Its bytes
+//! keyframe, and runs `after_ms` after it: a fixed length, never stopped
+//! early by the client. Its bytes
 //! are one HTTP response body, `GET /v0/clips/{clip_id}` ([`clip_path`]) on
 //! the same socket, in the chunked transfer coding (RFC 9112 §7.1): the body
 //! ends with its last chunk when the file is whole, and without it when the
@@ -216,10 +217,6 @@ impl fmt::Display for ClipGapReason {
 pub enum ClipStopReason {
     /// `after_ms` reached.
     Completed,
-    /// `clip/stop` or `unsubscribe`.
-    Stopped,
-    /// `limits.clip_max_ms` reached: an open-ended clip's end.
-    MaxDuration,
     /// The stream was deleted.
     StreamDeleted,
     /// The stream's codec, its parameter sets or picture size changed, or
@@ -237,7 +234,8 @@ pub enum ClipStopReason {
     ClientGone,
     /// Nobody fetched the clip's bytes in time.
     NotFetched,
-    /// The control connection that started the clip closed.
+    /// `unsubscribe`, or the control connection that started the clip
+    /// closed.
     SessionClosed,
     /// The daemon is shutting down; the last fragment is written if the
     /// body takes it in time.
@@ -252,8 +250,6 @@ impl ClipStopReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Completed => "completed",
-            Self::Stopped => "stopped",
-            Self::MaxDuration => "max_duration",
             Self::StreamDeleted => "stream_deleted",
             Self::StreamChanged => "stream_changed",
             Self::NoVideoTrack => "no_video_track",
@@ -405,8 +401,6 @@ mod tests {
         // The worker's reasons and the supervisor's own.
         let names = [
             "completed",
-            "stopped",
-            "max_duration",
             "stream_deleted",
             "stream_changed",
             "no_video_track",
@@ -429,5 +423,8 @@ mod tests {
         assert_eq!(ClipGapReason::parse("completed"), None);
         assert_eq!(ClipStopReason::parse("peer_closed"), None);
         assert_eq!(ClipStopReason::parse("overflow"), None);
+        // A clip is never stopped early by its client, nor open-ended.
+        assert_eq!(ClipStopReason::parse("stopped"), None);
+        assert_eq!(ClipStopReason::parse("max_duration"), None);
     }
 }

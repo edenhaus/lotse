@@ -315,16 +315,6 @@
           "type": "string"
         },
         {
-          "const": "stopped",
-          "description": "`clip/stop` or `unsubscribe`.",
-          "type": "string"
-        },
-        {
-          "const": "max_duration",
-          "description": "`limits.clip_max_ms` reached: an open-ended clip's end.",
-          "type": "string"
-        },
-        {
           "const": "stream_deleted",
           "description": "The stream was deleted.",
           "type": "string"
@@ -361,7 +351,7 @@
         },
         {
           "const": "session_closed",
-          "description": "The control connection that started the clip closed.",
+          "description": "`unsubscribe`, or the control connection that started the clip\nclosed.",
           "type": "string"
         },
         {
@@ -1175,13 +1165,10 @@
           "description": "`clip/start`: records an event clip of a stream; its bytes are\nfetched with `GET /v0/clips/{clip_id}`.",
           "properties": {
             "after_ms": {
-              "description": "How long the clip runs after now, in milliseconds, 1 to\n`limits.clip_max_ms`; absent, it runs until `clip/stop`, at most\n`limits.clip_max_ms`.",
+              "description": "How long the clip runs after now, in milliseconds, 1 to\n`limits.clip_max_ms`.",
               "format": "uint32",
               "minimum": 1,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "audio": {
               "default": true,
@@ -1222,37 +1209,10 @@
           "required": [
             "type",
             "id",
-            "stream_id"
+            "stream_id",
+            "after_ms"
           ],
           "title": "ClipStartCommand",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "`clip/stop`: ends a clip cleanly; idempotent.",
-          "properties": {
-            "clip_id": {
-              "description": "The clip.",
-              "pattern": "^(?:[A-Za-z0-9._-]{3,128}|[A-Za-z0-9_-][A-Za-z0-9._-]?|\\.[A-Za-z0-9_-])$",
-              "type": "string"
-            },
-            "id": {
-              "description": "The command id.",
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "type": {
-              "const": "clip/stop",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "id",
-            "clip_id"
-          ],
-          "title": "ClipStopCommand",
           "type": "object"
         }
       ]
@@ -1866,7 +1826,7 @@
       "properties": {
         "clip_max_ms": {
           "default": 0,
-          "description": "The longest clip, in milliseconds: the most `after_ms` may ask, and\nwhere an open-ended clip ends (`max_duration`).",
+          "description": "The longest clip, in milliseconds: the most `after_ms` may ask.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -2840,7 +2800,7 @@
         },
         "clips_completed": {
           "default": 0,
-          "description": "Clips that ended with their whole file written: `completed`,\n`stopped` or `max_duration`.",
+          "description": "Clips that ended with their whole file written: `completed`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -3762,9 +3722,6 @@
     },
     "clip/start": {
       "$ref": "#/$defs/Success_for_ClipStartResult"
-    },
-    "clip/stop": {
-      "$ref": "#/$defs/Success_for_Empty"
     },
     "info": {
       "$ref": "#/$defs/Success_for_InfoResult"

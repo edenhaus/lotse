@@ -54,8 +54,7 @@ pub struct Limits {
     /// then holds a shorter window than `preroll_ms`.
     #[serde(default)]
     pub preroll_bytes: u64,
-    /// The longest clip, in milliseconds: the most `after_ms` may ask, and
-    /// where an open-ended clip ends (`max_duration`).
+    /// The longest clip, in milliseconds: the most `after_ms` may ask.
     #[serde(default)]
     pub clip_max_ms: u32,
     /// Clips open at once on all streams; 0 when the daemon records none.

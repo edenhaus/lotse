@@ -1373,13 +1373,6 @@ impl Supervisor {
                     Outcome::Error(error)
                 }
             },
-            // Idempotent: an id that is no open clip succeeds.
-            Command::ClipStop(stop) => {
-                self.shared
-                    .lock()
-                    .stop_clip(&stop.clip_id, ClipStopReason::Stopped);
-                Outcome::Result(serde_json::Value::Object(serde_json::Map::new()))
-            }
             Command::Ping(_)
             | Command::Schema(_)
             | Command::Unsubscribe(_)
@@ -1626,12 +1619,12 @@ fn check_clip_request(
         )
         .with_detail("field", "before_ms"));
     }
-    if let Some(after_ms) = start.after_ms.filter(|ms| *ms > limits.clip_max_ms) {
+    if start.after_ms > limits.clip_max_ms {
         return Err(ApiError::new(
             ErrorCode::InvalidRequest,
             format!(
-                "`after_ms` is {after_ms}, the maximum is {} (`limits.clip_max_ms`)",
-                limits.clip_max_ms
+                "`after_ms` is {}, the maximum is {} (`limits.clip_max_ms`)",
+                start.after_ms, limits.clip_max_ms
             ),
         )
         .with_detail("field", "after_ms"));
@@ -2015,16 +2008,26 @@ mod tests {
         );
         assert_eq!(err.details["field"], "preroll_ms");
         assert!(s.shared.lock().streams.is_empty());
-        let err = error(call(&s, r#"{"id":3,"type":"clip/start","stream_id":"front"}"#).await);
-        assert_eq!(err.code, ErrorCode::LimitReached);
-        assert_eq!(err.details["limit"], "max_clips");
+        let err = error(
+            call(
+                &s,
+                r#"{"id":3,"type":"clip/start","stream_id":"front","after_ms":1}"#,
+            )
+            .await,
+        );
+        // No clip is long enough: the longest is 0.
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert_eq!(
+            err.message,
+            "`after_ms` is 1, the maximum is 0 (`limits.clip_max_ms`)"
+        );
         let refused = captured.lines("clip/start refused");
         assert_eq!(refused.len(), 1, "{refused:?}");
-        assert!(refused[0].contains("code=\"limit_reached\""), "{refused:?}");
-        // Stopping is idempotent: there is no clip to stop.
-        let stopped = result(call(&s, r#"{"id":4,"type":"clip/stop","clip_id":"c1"}"#).await);
-        assert_eq!(stopped, json!({}));
-        // Nor has any id a body.
+        assert!(
+            refused[0].contains("code=\"invalid_request\""),
+            "{refused:?}"
+        );
+        // No id has a body.
         let clip_id = ClipId::new("c1").unwrap();
         assert_eq!(s.clip_body(&clip_id).unwrap_err(), ClipBodyError::NotFound);
     }
@@ -5130,7 +5133,7 @@ mod tests {
                 let spec = ClipSpec {
                     clip_id: "k1".into(),
                     before_ms: 5_000,
-                    after_ms: Some(after_ms),
+                    after_ms,
                     audio: true,
                 };
                 lotse_ipc::encode(&lotse_ipc::ToWorker::StartClip(spec)).unwrap()
@@ -5248,10 +5251,8 @@ mod tests {
         assert_eq!(err.code, ErrorCode::StreamNotFound);
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
-        // An open-ended clip, its id generated.
-        let mut open = clip(2, "front", None);
-        open.as_object_mut().unwrap().remove("after_ms");
-        let (generated, _g) = started(call(&s, &open.to_string()).await);
+        // A clip whose id is generated.
+        let (generated, _g) = started(call(&s, &clip(2, "front", None).to_string()).await);
         let id = generated["clip_id"].as_str().unwrap();
         assert_eq!(id.len(), 26, "a ULID");
         assert_eq!(generated["url"], format!("/v0/clips/{id}"));
@@ -5436,7 +5437,7 @@ mod tests {
         // A late fetch still gets the body of a clip being stopped.
         let k1_id = ClipId::new("k1").unwrap();
         drop(s.clip_body(&k1_id).unwrap());
-        clip_report(&s, "k1", stopped_report("stopped", 10));
+        clip_report(&s, "k1", stopped_report(lotse_ipc::STOPPED_AS_ASKED, 10));
         assert_eq!(next(&mut k1).await["reason"], "not_fetched");
         assert_eq!(front_stats(&s).1, 0, "not a whole file");
         clip_report(&s, "k2", stopped_report("completed", 10));
@@ -5484,17 +5485,21 @@ mod tests {
         // A clip whose deadline passed while it was being stopped keeps
         // no body.
         let (_r6, _k6) = started(call(&s, &clip(6, "front", Some("k6")).to_string()).await);
-        result(call(&s, r#"{"id":7,"type":"clip/stop","clip_id":"k6"}"#).await);
+        assert!(s.unsubscribed(ConnectionId(1), 6).is_none());
         clock.advance(Duration::from_secs(10));
         settle().await;
-        clip_report(&s, "k6", stopped_report("stopped", 0));
+        clip_report(&s, "k6", stopped_report(lotse_ipc::STOPPED_AS_ASKED, 0));
         assert!(!s.shared.lock().clip_id_in_use("k6"));
         shutdown_on(&s, &clock).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// `unsubscribe` stops a clip once (`session_closed`, as it closes a
+    /// session), its end going nowhere, and a closed control connection
+    /// ends its own clips alike; a clip that ran its length is a whole
+    /// file.
     #[tokio::test]
-    async fn clip_stop_and_unsubscribe_stop_a_clip_once_and_a_closed_connection_ends_its_own() {
+    async fn unsubscribe_stops_a_clip_once_and_a_closed_connection_ends_its_own_session_closed() {
         let dir = private_dir("clip-stop");
         let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
         let captured = Captured::default();
@@ -5508,30 +5513,35 @@ mod tests {
             drained.push(command);
         }
         assert_eq!(drained.len(), 2);
-        // clip/stop is idempotent, and any id succeeds.
-        for id in ["k1", "k1", "nope"] {
-            let stop = json!({ "id": 3, "type": "clip/stop", "clip_id": id });
-            assert_eq!(result(call_on(&s, 2, &stop).await), json!({}));
-        }
+        // Another connection's subscription 1 is not k1's.
+        assert!(s.unsubscribed(ConnectionId(2), 1).is_none());
+        assert!(commands.try_recv().is_err(), "another connection's id 1");
+        assert!(s.unsubscribed(ConnectionId(1), 1).is_none());
         let_assert!(Some(DriverCommand::StopClip { clip_id }) = commands.recv().await);
         assert_eq!(clip_id, "k1");
+        // A second stop of a clip being stopped, or of one not open, asks
+        // nothing more.
+        s.shared.lock().stop_clip("k1", ClipStopReason::NotFetched);
+        s.shared
+            .lock()
+            .stop_clip("nope", ClipStopReason::NotFetched);
         assert!(commands.try_recv().is_err(), "one stop");
         let asked = captured.lines("clip stop asked of its worker");
-        assert!(asked[0].contains("reason=\"stopped\""), "{asked:?}");
+        assert!(asked[0].contains("reason=\"session_closed\""), "{asked:?}");
         let again = captured.lines("clip already being stopped");
-        assert!(again[0].contains("ending=\"stopped\""), "{again:?}");
+        assert!(again[0].contains("ending=\"session_closed\""), "{again:?}");
         assert_eq!(captured.lines("stop of a clip that is not open").len(), 1);
-        clip_report(&s, "k1", stopped_report("stopped", 5));
-        assert_eq!(next(&mut k1).await["reason"], "stopped");
-        assert_eq!(front_stats(&s).1, 1, "a clean stop is a whole file");
-        // Unsubscribing stops it too; its end goes nowhere.
-        assert!(s.unsubscribed(ConnectionId(2), 2).is_none());
-        assert!(commands.try_recv().is_err(), "another connection's id 2");
-        assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
-        let_assert!(Some(DriverCommand::StopClip { clip_id }) = commands.recv().await);
-        assert_eq!(clip_id, "k2");
-        clip_report(&s, "k2", stopped_report("stopped", 5));
-        assert!(k2.recv().await.is_none());
+        clip_report(&s, "k1", stopped_report(lotse_ipc::STOPPED_AS_ASKED, 5));
+        assert!(k1.recv().await.is_none(), "its end goes nowhere");
+        assert_eq!(
+            front_stats(&s).1,
+            0,
+            "a clip stopped early is no whole file"
+        );
+        // A clip that ran its length is.
+        clip_report(&s, "k2", stopped_report("completed", 5));
+        assert_eq!(next(&mut k2).await["reason"], "completed");
+        assert_eq!(front_stats(&s).1, 1);
         // A closed control connection ends its clips at once, and only its.
         let (_r3, mut k3) = started(call_on(&s, 1, &clip(4, "front", Some("k3"))).await);
         let (_r4, mut k4) = started(call_on(&s, 2, &clip(5, "front", Some("k4"))).await);
@@ -5540,13 +5550,14 @@ mod tests {
         let_assert!(Some(DriverCommand::StopClip { clip_id }) = commands.recv().await);
         assert_eq!(clip_id, "k3");
         assert!(commands.try_recv().is_err());
-        clip_report(&s, "k3", stopped_report("stopped", 5));
+        clip_report(&s, "k3", stopped_report(lotse_ipc::STOPPED_AS_ASKED, 5));
         assert!(k3.recv().await.is_none());
         let lines = captured.lines("clip: stopped");
+        assert!(lines[0].contains("reason=\"session_closed\""), "{lines:?}");
         assert!(lines[2].contains("reason=\"session_closed\""), "{lines:?}");
         assert!(s.shared.lock().clips.contains_key("k4"));
         assert!(k4.try_recv().is_err());
-        assert_eq!(front_stats(&s), (4, 2, 3, 15));
+        assert_eq!(front_stats(&s), (4, 1, 3, 15));
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -5652,9 +5663,10 @@ mod tests {
         assert_eq!(clip_id, "k1");
         assert!(s.shared.lock().clips.is_empty());
         // Ending a clip that is gone changes nothing.
-        s.shared
-            .lock()
-            .end_clip("k1", crate::clip::ClipEnd::Now(ClipStopReason::Stopped));
+        s.shared.lock().end_clip(
+            "k1",
+            crate::clip::ClipEnd::Now(ClipStopReason::SessionClosed),
+        );
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -5768,14 +5780,17 @@ mod tests {
         // Another worker's `Stopped`, or a report that is not one, frees
         // nothing.
         let at = s.shared.clock.wall_now();
-        s.shared
-            .lock()
-            .clip_report("c9", "k1", stopped_report("stopped", 7), at);
+        s.shared.lock().clip_report(
+            "c9",
+            "k1",
+            stopped_report(lotse_ipc::STOPPED_AS_ASKED, 7),
+            at,
+        );
         clip_report(&s, "k1", gap_report("lagged"));
         assert!(s.shared.lock().clip_id_in_use("k1"));
         // Its worker's `Stopped` frees it, and goes to no one.
         let stats = front_stats(&s);
-        clip_report(&s, "k1", stopped_report("stopped", 7));
+        clip_report(&s, "k1", stopped_report(lotse_ipc::STOPPED_AS_ASKED, 7));
         assert!(!s.shared.lock().clip_id_in_use("k1"));
         assert_eq!(front_stats(&s), stats, "the clip was counted as it ended");
         assert_eq!(

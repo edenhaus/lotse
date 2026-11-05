@@ -164,7 +164,7 @@ async fn a_sandboxed_worker_takes_a_clip_s_pipe_and_closes_it() {
     let clip = ClipSpec {
         clip_id: "k1".into(),
         before_ms: 10_000,
-        after_ms: Some(20_000),
+        after_ms: 20_000,
         audio: true,
     };
     worker
@@ -495,7 +495,7 @@ async fn a_sandboxed_worker_records_a_clip_into_its_pipe() {
     let clip = ClipSpec {
         clip_id: "k1".into(),
         before_ms: 10_000,
-        after_ms: Some(1_000),
+        after_ms: 1_000,
         audio: true,
     };
     worker
