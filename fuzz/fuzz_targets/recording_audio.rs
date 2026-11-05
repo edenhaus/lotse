@@ -1,12 +1,12 @@
-//! `clip_audio`: the event clips' G.711 and G.722 → Opus transcode, as a
-//! clip's task runs it on a camera's audio, never panics on arbitrary
+//! `recording_audio`: the event recordings' G.711 and G.722 → Opus transcode, as a
+//! recording's task runs it on a camera's audio, never panics on arbitrary
 //! payloads (every octet goes through the G.711 tables or the G.722
 //! decoder), timestamps, epochs and discontinuities, and keeps its output
 //! timeline: every packet is one 20 ms Opus packet (RFC 6716 §3.1, 960
 //! samples at 48 kHz), and within one output epoch each is exactly one
 //! packet (960 ticks, RFC 7587 §4.1) after the one before, so nothing
 //! overlaps or leaves a hole inside an epoch.
-//! Run with `cargo +nightly fuzz run clip_audio` from the repository root.
+//! Run with `cargo +nightly fuzz run recording_audio` from the repository root.
 //!
 //! The input is `[codec]` then frames `[flags][ts delta:i16 le][len][payload]`:
 //! the codec byte picks PCMU, PCMA or G.722; a frame's timestamp moves by
@@ -20,7 +20,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use lotse_codec::opus::packet_samples;
-use lotse_codec::transcode::clip::ToOpus;
+use lotse_codec::transcode::recording::ToOpus;
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::codec::Codec;
 use lotse_core::media::{MediaFrame, MediaTime};

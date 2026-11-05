@@ -95,7 +95,7 @@ fn front_door_with(sandbox: &str, ports: &[u16]) -> FrontDoor {
             worker_threads: 2,
             worker_address_space: 1 << 30,
             max_sessions: 256,
-            clips: lotse_supervisor::ClipLimits::DEFAULT,
+            recordings: lotse_supervisor::RecordingLimits::DEFAULT,
         },
         Some(bound.socket),
     );
@@ -192,7 +192,7 @@ async fn run_camera_with(door: &mut FrontDoor, cam: &FakeCamera, options: &str) 
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec![cam.addr()],
             backoff: lotse_ipc::BackoffPosition::default(),
-            preroll_ms: 0,
+            prerecord_ms: 0,
         })
         .await
         .expect("run source");
@@ -920,7 +920,7 @@ async fn two_sessions_on_one_stream_send_every_datagram() {
             worker_threads: 2,
             worker_address_space: 1 << 30,
             max_sessions: 256,
-            clips: lotse_supervisor::ClipLimits::DEFAULT,
+            recordings: lotse_supervisor::RecordingLimits::DEFAULT,
         },
         Some(bound.socket),
     );

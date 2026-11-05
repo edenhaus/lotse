@@ -7,11 +7,11 @@
 //! connection goes, the session is orphaned for `limits.session_grace` and
 //! a `session/adopt` may take it back.
 //!
-//! An event clip is recorded by the stream's connection's worker into a
+//! An event recording is recorded by the stream's connection's worker into a
 //! pipe the supervisor creates: the worker gets the write end with
-//! `clip/start`, the read end waits here for `GET /v0/clips/{clip_id}`
-//! ([`Handler::clip_body`]). A clip ends with its control connection, as
-//! its events have nowhere else to go ([`crate::clip`]).
+//! `recording/create`, the read end waits here for `GET /v0/recording/{recording_id}`
+//! ([`Handler::recording_body`]). A recording ends with its control connection, as
+//! its events have nowhere else to go ([`crate::recording`]).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -19,11 +19,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lotse_api::{ClipBody, ClipBodyError, ConnectionId, Event, Handler, Outcome};
+use lotse_api::{ConnectionId, Event, Handler, Outcome, RecordingBody, RecordingBodyError};
 use lotse_api_types::API_VERSION;
-use lotse_api_types::clip::{ClipStartResult, ClipStopReason, clip_path};
 use lotse_api_types::command::{
-    ClipStart, Command, StreamPut, WebrtcCandidate, WebrtcOffer, WebrtcRenegotiate,
+    Command, RecordingCreate, StreamPut, WebrtcCandidate, WebrtcOffer, WebrtcRenegotiate,
 };
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Hello, HelloTag};
@@ -31,21 +30,21 @@ use lotse_api_types::info::{
     BuildInfo, Codecs, DemuxMetrics, InfoResult, Limits, Metrics, ProcessMetrics, SandboxInfo,
     SupervisorMetrics,
 };
+use lotse_api_types::recording::{RecordingCloseReason, RecordingCreateResult, recording_path};
 use lotse_api_types::session::{CloseCode, SessionEvent, SessionList, WebrtcRenegotiateResult};
 use lotse_api_types::stream::{AudioMode, BackchannelReleaseResult, StreamList, StreamPutResult};
 use lotse_core::clock::Clock;
 use lotse_core::codec::{CodecFamily, Kind};
 use lotse_core::connection::{ConnectionConfig, ConnectionError, ConnectionState};
-use lotse_core::id::{ClipId, StreamId};
+use lotse_core::id::{RecordingId, StreamId};
 use lotse_core::registry::Registries;
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
-use lotse_ipc::{ClipSpec, SessionSpec};
+use lotse_ipc::{RecordingSpec, SessionSpec};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 
-use crate::clip::{CLIP_QUEUE, ClipEntry, ClipLimits, ClipOwner, ClipTimer};
 use crate::connect::ConnectPermits;
 use crate::driver::{COMMAND_QUEUE, Demand, Driver, DriverCommand, DriverSpec};
 use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnServer};
@@ -53,6 +52,9 @@ use crate::memory::{Memory, MemoryProbe};
 use crate::net::demux::{DemuxStats, Registrations};
 use crate::net::stun_client::StunClient;
 use crate::net::turn_client::TurnClient;
+use crate::recording::{
+    RECORDING_QUEUE, RecordingEntry, RecordingLimits, RecordingOwner, RecordingTimer,
+};
 use crate::registry::{
     CloseBy, ConnectionEntry, ConnectionKey, ConnectionSnapshot, Shared, State, StreamEntry,
     StreamSource, Talker,
@@ -67,9 +69,9 @@ use crate::{Settings, millis};
 /// The output kind that opens WebRTC sessions.
 const WEBRTC: &str = "webrtc";
 
-/// The output kind of event clips, announced when the build has a clip
-/// container (`Registries::clip`).
-const CLIP: &str = "clip";
+/// The output kind of event recordings, announced when the build has a recording
+/// container (`Registries::recording`).
+const RECORDING: &str = "recording";
 
 /// What `hello` and `info` always announce beyond the outputs.
 const FEATURES: [&str; 1] = ["session_adopt"];
@@ -204,12 +206,12 @@ impl Supervisor {
         );
         let mut state = State::default();
         state.registrations = registrations;
-        // Without a clip output the workers refuse every clip: no window
-        // and no clip is accepted, which `info` reports.
-        state.clip_limits = if environment.registries.clip.is_some() {
-            settings.limits.clips
+        // Without a recording output the workers refuse every recording: no window
+        // and no recording is accepted, which `info` reports.
+        state.recording_limits = if environment.registries.recording.is_some() {
+            settings.limits.recordings
         } else {
-            ClipLimits::NONE
+            RecordingLimits::NONE
         };
         let shared = Arc::new(Shared {
             clock,
@@ -235,9 +237,9 @@ impl Supervisor {
         }
     }
 
-    /// Closes every session and ends every clip with `shutting_down`; the
+    /// Closes every session and ends every recording with `shutting_down`; the
     /// first step of the shutdown, before the control connections say
-    /// goodbye. A clip's worker writes its last fragment while it stops,
+    /// goodbye. A recording's worker writes its last fragment while it stops,
     /// but its report is not waited for, so the body is cut.
     pub fn close_sessions(&self) {
         let mut state = self.shared.lock();
@@ -247,7 +249,7 @@ impl Supervisor {
             "the daemon is shutting down",
             CloseBy::Supervisor,
         );
-        state.end_clips_where(|_| true, ClipStopReason::ShuttingDown);
+        state.end_recordings_where(|_| true, RecordingCloseReason::ShuttingDown);
     }
 
     /// Closes the sessions, stops every connection's worker within the
@@ -272,7 +274,7 @@ impl Supervisor {
     /// `info`.
     fn info(&self) -> InfoResult {
         let limits = &self.settings.limits;
-        let clips = self.shared.lock().clip_limits;
+        let recordings = self.shared.lock().recording_limits;
         InfoResult {
             version: self.identity.version.clone(),
             build: self.identity.build.clone(),
@@ -295,11 +297,11 @@ impl Supervisor {
                 max_sessions_per_stream: limits.max_sessions_per_stream,
                 max_connections: limits.max_connections,
                 session_grace_ms: millis(limits.session_grace),
-                preroll_max_ms: clips.preroll_max_ms,
-                preroll_bytes: clips.preroll_bytes,
-                clip_max_ms: clips.clip_max_ms,
-                max_clips: clips.max_clips,
-                clips_per_stream: clips.clips_per_stream,
+                max_prerecord_ms: recordings.max_prerecord_ms,
+                max_prerecord_bytes: recordings.max_prerecord_bytes,
+                max_recording_ms: recordings.max_recording_ms,
+                max_recordings: recordings.max_recordings,
+                max_recordings_per_stream: recordings.max_recordings_per_stream,
             },
             sandbox: self.identity.sandbox.clone(),
         }
@@ -330,14 +332,14 @@ impl Supervisor {
             .collect()
     }
 
-    /// The output kinds compiled in: the session outputs, then `clip` with
-    /// a clip container.
+    /// The output kinds compiled in: the session outputs, then `recording` with
+    /// a recording container.
     fn outputs(&self) -> Vec<String> {
         self.registries
             .outputs
             .kinds()
             .into_iter()
-            .chain(self.registries.clip.is_some().then_some(CLIP))
+            .chain(self.registries.recording.is_some().then_some(RECORDING))
             .map(str::to_owned)
             .collect()
     }
@@ -471,7 +473,7 @@ impl Supervisor {
                 .map(|source| source.connection.clone())
                 .collect();
             for connection in &connections {
-                state.follow_preroll(connection, stream_id.as_str());
+                state.follow_prerecord(connection, stream_id.as_str());
             }
             tracing::debug!(stream.id = %stream_id, "stream/put: unchanged");
             return Outcome::Result(
@@ -483,14 +485,14 @@ impl Supervisor {
         }
         let reoriented = existing.is_some_and(|entry| entry.orientation != put.orientation);
         // The counters outlive a change of the stream.
-        let clips = existing.map(|entry| entry.clips).unwrap_or_default();
+        let recordings = existing.map(|entry| entry.recordings).unwrap_or_default();
         let previous: Vec<String> = existing.map_or_else(Vec::new, |entry| {
             entry.sources.iter().map(|s| s.connection.clone()).collect()
         });
 
         let sources = self.bind_sources(
             &mut state,
-            (&stream_id, put.preroll_ms),
+            (&stream_id, put.prerecord_ms),
             &previous,
             validated,
         );
@@ -508,14 +510,14 @@ impl Supervisor {
                 audio: put.audio,
                 orientation: put.orientation,
                 created: self.shared.clock.wall_now(),
-                preroll_ms: put.preroll_ms,
-                clips,
+                prerecord_ms: put.prerecord_ms,
+                recordings,
             },
         );
         for connection in connections {
             state.refresh_connection(&connection);
             state.follow_backchannel(&connection, stream_id.as_str());
-            state.follow_preroll(&connection, stream_id.as_str());
+            state.follow_prerecord(&connection, stream_id.as_str());
         }
         close_moved_sessions(&mut state, stream_id.as_str());
         if reoriented {
@@ -531,14 +533,14 @@ impl Supervisor {
             created,
             preload = put.preload,
             orientation = ?put.orientation,
-            preroll_ms = put.preroll_ms,
+            prerecord_ms = put.prerecord_ms,
             "stream desired state set"
         );
         Outcome::Result(serde_json::to_value(StreamPutResult { created }).unwrap_or_default())
     }
 
-    /// Checks a `stream/put`'s stream id, its pre-roll window against
-    /// `limits.preroll_max_ms`, and each source.
+    /// Checks a `stream/put`'s stream id, its pre-record window against
+    /// `limits.max_prerecord_ms`, and each source.
     fn validate_put(&self, put: &StreamPut) -> Result<(StreamId, Vec<ValidatedSource>), ApiError> {
         let stream_id = StreamId::new(&put.stream_id).map_err(|err| {
             ApiError::new(ErrorCode::InvalidStreamId, err.to_string())
@@ -550,16 +552,16 @@ impl Supervisor {
                 "sources must name at least one source",
             ));
         }
-        let preroll_max_ms = self.shared.lock().clip_limits.preroll_max_ms;
-        if put.preroll_ms > preroll_max_ms {
+        let max_prerecord_ms = self.shared.lock().recording_limits.max_prerecord_ms;
+        if put.prerecord_ms > max_prerecord_ms {
             return Err(ApiError::new(
                 ErrorCode::InvalidRequest,
                 format!(
-                    "`preroll_ms` is {}, the maximum is {preroll_max_ms} (`limits.preroll_max_ms`)",
-                    put.preroll_ms
+                    "`prerecord_ms` is {}, the maximum is {max_prerecord_ms} (`limits.max_prerecord_ms`)",
+                    put.prerecord_ms
                 ),
             )
-            .with_detail("field", "preroll_ms"));
+            .with_detail("field", "prerecord_ms"));
         }
         let validated = put
             .sources
@@ -572,12 +574,12 @@ impl Supervisor {
     /// Binds each validated source of `stream_id` to a connection: the
     /// one keyed by it, else the stream's previous connection at that
     /// index switched to it in place where the worker can follow
-    /// ([`switchable`]), else a new one with the stream's pre-roll window
-    /// `preroll_ms`.
+    /// ([`switchable`]), else a new one with the stream's pre-record window
+    /// `prerecord_ms`.
     fn bind_sources(
         &self,
         state: &mut State,
-        (stream_id, preroll_ms): (&StreamId, u32),
+        (stream_id, prerecord_ms): (&StreamId, u32),
         previous: &[String],
         validated: Vec<ValidatedSource>,
     ) -> Vec<StreamSource> {
@@ -599,7 +601,7 @@ impl Supervisor {
                         state.switch_connection(id, source.key.clone(), driver_spec(id, &source));
                         id.clone()
                     }
-                    None => self.create_connection(state, &source, preroll_ms),
+                    None => self.create_connection(state, &source, prerecord_ms),
                 },
             };
             if let Some(entry) = state.connections.get_mut(&connection) {
@@ -617,29 +619,33 @@ impl Supervisor {
     }
 
     /// Creates a connection for `source` and starts its driver, with a
-    /// pre-roll window of `preroll_ms`.
+    /// pre-record window of `prerecord_ms`.
     fn create_connection(
         &self,
         state: &mut State,
         source: &ValidatedSource,
-        preroll_ms: u32,
+        prerecord_ms: u32,
     ) -> String {
         state.next_connection = state.next_connection.saturating_add(1);
         let id = format!("c{}", state.next_connection);
         let (demand, demand_rx) = watch::channel(Demand::default());
         // Room besides the rest for the close each session reserves and
-        // the stop each clip does.
+        // the stop each recording does.
         let sessions = usize::try_from(self.settings.limits.max_sessions).unwrap_or(usize::MAX);
-        let clips = usize::try_from(state.clip_limits.max_clips).unwrap_or(usize::MAX);
-        let (commands, commands_rx) =
-            mpsc::channel(COMMAND_QUEUE.saturating_add(sessions).saturating_add(clips));
+        let recordings =
+            usize::try_from(state.recording_limits.max_recordings).unwrap_or(usize::MAX);
+        let (commands, commands_rx) = mpsc::channel(
+            COMMAND_QUEUE
+                .saturating_add(sessions)
+                .saturating_add(recordings),
+        );
         state.connections.insert(
             id.clone(),
             ConnectionEntry {
                 key: source.key.clone(),
                 port: source.url.port().or(source.default_port),
                 backchannel: source.backchannel,
-                preroll_ms,
+                prerecord_ms,
                 demand,
                 snapshot: ConnectionSnapshot::idle(self.shared.clock.wall_now()),
                 switches: 0,
@@ -655,7 +661,7 @@ impl Supervisor {
         };
         let span = tracing::info_span!("connection", connection.id = %id, url = %source.url);
         let run = Driver::new(
-            (spec, preroll_ms),
+            (spec, prerecord_ms),
             Arc::clone(&self.shared),
             demand_rx,
             (commands, commands_rx),
@@ -695,7 +701,7 @@ impl Supervisor {
     }
 
     /// `stream/delete`: idempotent; the stream's sessions close and its
-    /// clips end first.
+    /// recordings end first.
     fn stream_delete(&self, stream_id: &str) -> Outcome {
         let removed = {
             let mut state = self.shared.lock();
@@ -705,15 +711,15 @@ impl Supervisor {
                 "the stream was deleted",
                 CloseBy::Supervisor,
             );
-            state.end_clips_where(
-                |clip| clip.stream_id == stream_id,
-                ClipStopReason::StreamDeleted,
+            state.end_recordings_where(
+                |recording| recording.stream_id == stream_id,
+                RecordingCloseReason::StreamDeleted,
             );
             state.streams.remove(stream_id).map(|entry| {
                 for source in entry.sources {
                     state.refresh_connection(&source.connection);
                     state.follow_backchannel(&source.connection, stream_id);
-                    state.follow_preroll(&source.connection, stream_id);
+                    state.follow_prerecord(&source.connection, stream_id);
                 }
                 state.notify_removed(stream_id);
             })
@@ -1215,38 +1221,38 @@ impl Supervisor {
         )
     }
 
-    /// `clip/start`: validates against the limits, creates the clip's
+    /// `recording/create`: validates against the limits, creates the recording's
     /// pipe, hands its start with the write end to the stream's
-    /// connection's driver (which raises its demand: a clip is a viewer),
-    /// keeps the read end for `GET /v0/clips/{clip_id}`, and answers with
-    /// the clip's id and path, then its events. The fetch deadline runs
+    /// connection's driver (which raises its demand: a recording is a viewer),
+    /// keeps the read end for `GET /v0/recording/{recording_id}`, and answers with
+    /// the recording's id and path, then its events. The fetch deadline runs
     /// from here until the body is taken.
-    fn clip_start(
+    fn recording_create(
         &self,
         connection: ConnectionId,
-        start: &ClipStart,
-    ) -> Result<(ClipStartResult, mpsc::Receiver<Event>), ApiError> {
+        start: &RecordingCreate,
+    ) -> Result<(RecordingCreateResult, mpsc::Receiver<Event>), ApiError> {
         let stream_id = StreamId::new(&start.stream_id).map_err(|err| {
             ApiError::new(ErrorCode::InvalidStreamId, err.to_string())
                 .with_detail("stream_id", start.stream_id.as_str())
         })?;
-        let clip_id = match &start.clip_id {
-            Some(id) => ClipId::new(id).map_err(|_| {
+        let recording_id = match &start.recording_id {
+            Some(id) => RecordingId::new(id).map_err(|_| {
                 ApiError::new(
                     ErrorCode::InvalidRequest,
-                    "clip_id must match ^[A-Za-z0-9._-]{1,128}$ and not be `.` or `..`",
+                    "recording_id must match ^[A-Za-z0-9._-]{1,128}$ and not be `.` or `..`",
                 )
-                .with_detail("clip_id", id.as_str())
+                .with_detail("recording_id", id.as_str())
             })?,
-            None => ClipId::new(&ulid(self.shared.clock.wall_now()).map_err(internal)?)
+            None => RecordingId::new(&ulid(self.shared.clock.wall_now()).map_err(internal)?)
                 .map_err(internal)?,
         };
         let (reader, writer) = std::io::pipe().map_err(internal)?;
         let reader =
             tokio::net::unix::pipe::Receiver::from_owned_fd(reader.into()).map_err(internal)?;
         let mut state = self.shared.lock();
-        let limits = state.clip_limits;
-        check_clip_request(&state, start, limits)?;
+        let limits = state.recording_limits;
+        check_recording_request(&state, start, limits)?;
         let stream = state.streams.get(stream_id.as_str()).ok_or_else(|| {
             ApiError::new(ErrorCode::StreamNotFound, "no such stream")
                 .with_detail("stream_id", stream_id.as_str())
@@ -1256,34 +1262,35 @@ impl Supervisor {
             commands,
             ..
         } = session_connection(&state, stream)?;
-        check_clip_stream(&state, stream_id.as_str(), &connection_id, limits)?;
-        if state.clip_id_in_use(clip_id.as_str()) {
-            return Err(
-                ApiError::new(ErrorCode::ClipIdInUse, "the clip id is already open")
-                    .with_detail("clip_id", clip_id.as_str()),
-            );
+        check_recording_stream(&state, stream_id.as_str(), &connection_id, limits)?;
+        if state.recording_id_in_use(recording_id.as_str()) {
+            return Err(ApiError::new(
+                ErrorCode::RecordingIdInUse,
+                "the recording id is already open",
+            )
+            .with_detail("recording_id", recording_id.as_str()));
         }
-        let spec = ClipSpec {
-            clip_id: clip_id.as_str().to_owned(),
-            before_ms: start.before_ms,
-            after_ms: start.after_ms,
+        let spec = RecordingSpec {
+            recording_id: recording_id.as_str().to_owned(),
+            prerecord_ms: start.prerecord_ms,
+            duration_ms: start.duration_ms,
             audio: start.audio,
         };
-        let serial = state.last_clip.saturating_add(1);
-        let stop_slot = hand_over_clip(&commands, (spec.clone(), serial), writer.into())?;
-        state.last_clip = serial;
-        let (events, rx) = mpsc::channel(CLIP_QUEUE);
+        let serial = state.last_recording.saturating_add(1);
+        let stop_slot = hand_over_recording(&commands, (spec.clone(), serial), writer.into())?;
+        state.last_recording = serial;
+        let (events, rx) = mpsc::channel(RECORDING_QUEUE);
         let (written, report) = oneshot::channel();
-        let body = ClipBody {
+        let body = RecordingBody {
             reader: Box::new(reader),
             written: report,
         };
-        let owner = ClipOwner {
+        let owner = RecordingOwner {
             connection,
             subscription: start.id,
             events,
         };
-        let mut entry = ClipEntry::new(
+        let mut entry = RecordingEntry::new(
             serial,
             (stream_id.as_str().to_owned(), connection_id.clone()),
             spec,
@@ -1291,43 +1298,46 @@ impl Supervisor {
             (body, written),
         );
         entry.stop_slot = Some(stop_slot);
-        entry.timer = Some(self.fetch_deadline(clip_id.as_str(), serial, limits.fetch_timeout));
-        state.clips.insert(clip_id.as_str().to_owned(), entry);
+        entry.timer =
+            Some(self.fetch_deadline(recording_id.as_str(), serial, limits.fetch_timeout));
+        state
+            .recordings
+            .insert(recording_id.as_str().to_owned(), entry);
         if let Some(stream) = state.streams.get_mut(stream_id.as_str()) {
-            stream.clips.started = stream.clips.started.saturating_add(1);
+            stream.recordings.started = stream.recordings.started.saturating_add(1);
         }
         state.refresh_connection(&connection_id);
         drop(state);
         tracing::info!(
-            event = "clip_opened",
-            clip.id = %clip_id,
+            event = "recording_opened",
+            recording.id = %recording_id,
             stream.id = %stream_id,
             connection.id = %connection_id,
             control.connection = connection.0,
-            before_ms = start.before_ms,
-            after_ms = start.after_ms,
+            prerecord_ms = start.prerecord_ms,
+            duration_ms = start.duration_ms,
             audio = start.audio,
-            "clip opened; handed to the connection"
+            "recording opened; handed to the connection"
         );
-        let result = ClipStartResult {
-            url: clip_path(clip_id.as_str()),
-            clip_id: clip_id.as_str().to_owned(),
+        let result = RecordingCreateResult {
+            url: recording_path(recording_id.as_str()),
+            recording_id: recording_id.as_str().to_owned(),
         };
         Ok((result, rx))
     }
 
-    /// The fetch deadline of clip `serial`, `clip_id`, `timeout` from now on
-    /// the injected clock ([`State::clip_fetch_deadline`]).
-    fn fetch_deadline(&self, clip_id: &str, serial: u64, timeout: Duration) -> ClipTimer {
+    /// The fetch deadline of recording `serial`, `recording_id`, `timeout` from now on
+    /// the injected clock ([`State::recording_fetch_deadline`]).
+    fn fetch_deadline(&self, recording_id: &str, serial: u64, timeout: Duration) -> RecordingTimer {
         // The deadline counts from now, not from the task's first poll.
         let sleep = self.shared.clock.sleep(timeout);
         let shared = Arc::clone(&self.shared);
-        let id = clip_id.to_owned();
-        let timer = spawn_named("clip.fetch", async move {
+        let id = recording_id.to_owned();
+        let timer = spawn_named("recording.fetch", async move {
             sleep.await;
-            shared.lock().clip_fetch_deadline(&id, serial);
+            shared.lock().recording_fetch_deadline(&id, serial);
         });
-        ClipTimer(timer.abort_handle())
+        RecordingTimer(timer.abort_handle())
     }
 
     /// Answers one command.
@@ -1363,13 +1373,13 @@ impl Supervisor {
             Command::BackchannelRelease(release) => {
                 self.backchannel_release(&release.stream_id, release.session_id.as_deref())
             }
-            Command::ClipStart(start) => match self.clip_start(connection, &start) {
+            Command::RecordingCreate(start) => match self.recording_create(connection, &start) {
                 Ok((result, events)) => Outcome::SubscribedWith {
                     result: serde_json::to_value(result).unwrap_or_default(),
                     events,
                 },
                 Err(error) => {
-                    tracing::debug!(code = error.code.as_str(), detail = %error.message, "clip/start refused");
+                    tracing::debug!(code = error.code.as_str(), detail = %error.message, "recording/create refused");
                     Outcome::Error(error)
                 }
             },
@@ -1411,11 +1421,11 @@ impl Handler for Supervisor {
         self.dispatch(connection, command)
     }
 
-    /// A session's ends with its `closed`; a clip's is stopped, and its
-    /// `stopped` goes nowhere, the client having asked for no more events.
+    /// A session's ends with its `closed`; a recording's is stopped, and its
+    /// `closed` goes nowhere, the client having asked for no more events.
     fn unsubscribed(&self, connection: ConnectionId, subscription: u64) -> Option<Event> {
         let mut state = self.shared.lock();
-        if state.unsubscribe_clip(connection, subscription) {
+        if state.unsubscribe_recording(connection, subscription) {
             return None;
         }
         let session_id = state
@@ -1431,11 +1441,11 @@ impl Handler for Supervisor {
         )
     }
 
-    /// Its sessions are orphaned for the grace, its clips end at once.
+    /// Its sessions are orphaned for the grace, its recordings end at once.
     fn connection_closed(&self, connection: ConnectionId) {
         let orphans = {
             let mut state = self.shared.lock();
-            state.clips_connection_closed(connection);
+            state.recordings_connection_closed(connection);
             state.connection_closed(connection)
         };
         for (id, serial, epoch) in orphans {
@@ -1462,15 +1472,23 @@ impl Handler for Supervisor {
         }
     }
 
-    /// Hands out the read end of the clip's pipe once, with the way its
+    /// Hands out the read end of the recording's pipe once, with the way its
     /// worker's `bytes` reach the body.
-    fn clip_body(&self, clip_id: &ClipId) -> Result<ClipBody, ClipBodyError> {
-        let body = self.shared.lock().take_clip_body(clip_id.as_str());
+    fn recording_body(
+        &self,
+        recording_id: &RecordingId,
+    ) -> Result<RecordingBody, RecordingBodyError> {
+        let body = self
+            .shared
+            .lock()
+            .take_recording_body(recording_id.as_str());
         match &body {
             Ok(_) => {
-                tracing::info!(event = "clip_fetched", clip.id = %clip_id, "clip body handed out");
+                tracing::info!(event = "recording_fetched", recording.id = %recording_id, "recording body handed out");
             }
-            Err(error) => tracing::debug!(clip.id = %clip_id, %error, "clip body refused"),
+            Err(error) => {
+                tracing::debug!(recording.id = %recording_id, %error, "recording body refused");
+            }
         }
         body
     }
@@ -1488,7 +1506,7 @@ async fn sample(probe: Option<&MemoryProbe>, now: Instant) -> Memory {
 /// sources, URL and options alike, in order.
 fn unchanged(entry: &StreamEntry, put: &StreamPut, validated: &[ValidatedSource]) -> bool {
     entry.preload == put.preload
-        && entry.preroll_ms == put.preroll_ms
+        && entry.prerecord_ms == put.prerecord_ms
         && entry.audio == put.audio
         && entry.orientation == put.orientation
         && entry.sources.len() == validated.len()
@@ -1550,7 +1568,7 @@ fn switchable(state: &State, id: &str, source: &ValidatedSource) -> bool {
         .is_some_and(|entry| entry.port == source.url.port().or(source.default_port))
 }
 
-/// Closes the sessions and ends the clips of `stream_id` that are not on
+/// Closes the sessions and ends the recordings of `stream_id` that are not on
 /// its first source's connection any more: a `stream/put` changed the
 /// source's port, so it moved to a new worker.
 fn close_moved_sessions(state: &mut State, stream_id: &str) {
@@ -1565,9 +1583,11 @@ fn close_moved_sessions(state: &mut State, stream_id: &str) {
         "the stream's source changed",
         CloseBy::Supervisor,
     );
-    state.end_clips_where(
-        |clip| clip.stream_id == stream_id && current.as_ref() != Some(&clip.connection),
-        ClipStopReason::StreamChanged,
+    state.end_recordings_where(
+        |recording| {
+            recording.stream_id == stream_id && current.as_ref() != Some(&recording.connection)
+        },
+        RecordingCloseReason::StreamChanged,
     );
 }
 
@@ -1600,60 +1620,62 @@ fn check_session_limits(
 }
 
 /// `invalid_request` when `start` asks further back than the longest
-/// window or longer than the longest clip, `limit_reached` when another
-/// clip would exceed `max_clips`, which counts the clips their workers are
+/// window or longer than the longest recording, `limit_reached` when another
+/// recording would exceed `max_recordings`, which counts the recordings their workers are
 /// still finishing and the bodies that wait for their `GET` besides those
-/// that run ([`State::clips_held`]): each holds a pipe's end.
-fn check_clip_request(
+/// that run ([`State::recordings_held`]): each holds a pipe's end.
+fn check_recording_request(
     state: &State,
-    start: &ClipStart,
-    limits: ClipLimits,
+    start: &RecordingCreate,
+    limits: RecordingLimits,
 ) -> Result<(), ApiError> {
-    if start.before_ms > limits.preroll_max_ms {
+    if start.prerecord_ms > limits.max_prerecord_ms {
         return Err(ApiError::new(
             ErrorCode::InvalidRequest,
             format!(
-                "`before_ms` is {}, the maximum is {} (`limits.preroll_max_ms`)",
-                start.before_ms, limits.preroll_max_ms
+                "`prerecord_ms` is {}, the maximum is {} (`limits.max_prerecord_ms`)",
+                start.prerecord_ms, limits.max_prerecord_ms
             ),
         )
-        .with_detail("field", "before_ms"));
+        .with_detail("field", "prerecord_ms"));
     }
-    if start.after_ms > limits.clip_max_ms {
+    if start.duration_ms > limits.max_recording_ms {
         return Err(ApiError::new(
             ErrorCode::InvalidRequest,
             format!(
-                "`after_ms` is {}, the maximum is {} (`limits.clip_max_ms`)",
-                start.after_ms, limits.clip_max_ms
+                "`duration_ms` is {}, the maximum is {} (`limits.max_recording_ms`)",
+                start.duration_ms, limits.max_recording_ms
             ),
         )
-        .with_detail("field", "after_ms"));
+        .with_detail("field", "duration_ms"));
     }
-    if state.clips_held() >= usize::try_from(limits.max_clips).unwrap_or(usize::MAX) {
-        return Err(ApiError::new(ErrorCode::LimitReached, "too many clips")
-            .with_detail("limit", "max_clips"));
+    if state.recordings_held() >= usize::try_from(limits.max_recordings).unwrap_or(usize::MAX) {
+        return Err(
+            ApiError::new(ErrorCode::LimitReached, "too many recordings")
+                .with_detail("limit", "max_recordings"),
+        );
     }
     Ok(())
 }
 
-/// `limit_reached` when another clip of `stream_id` would exceed
-/// `clips_per_stream`; `no_video_track` when the tracks its connection
+/// `limit_reached` when another recording of `stream_id` would exceed
+/// `max_recordings_per_stream`; `no_video_track` when the tracks its connection
 /// `connection` declared, while its source is live, have no video.
-fn check_clip_stream(
+fn check_recording_stream(
     state: &State,
     stream_id: &str,
     connection: &str,
-    limits: ClipLimits,
+    limits: RecordingLimits,
 ) -> Result<(), ApiError> {
     let on_stream = state
-        .clips
+        .recordings
         .values()
-        .filter(|clip| clip.stream_id == stream_id)
+        .filter(|recording| recording.stream_id == stream_id)
         .count();
-    if on_stream >= usize::try_from(limits.clips_per_stream).unwrap_or(usize::MAX) {
+    if on_stream >= usize::try_from(limits.max_recordings_per_stream).unwrap_or(usize::MAX) {
         return Err(
-            ApiError::new(ErrorCode::LimitReached, "too many clips of the stream")
-                .with_detail("limit", "clips_per_stream"),
+            ApiError::new(ErrorCode::LimitReached, "too many recordings of the stream")
+                .with_detail("limit", "max_recordings_per_stream"),
         );
     }
     // Only a live source's tracks are its own: those the connection keeps
@@ -1661,7 +1683,7 @@ fn check_clip_stream(
     // `stream/put` switched it in place since) or the camera's before it
     // changed, and with nothing running a refusal here would hold back
     // the very demand that finds out. A source that is not live takes the
-    // start; its worker ends a clip without video itself
+    // start; its worker ends a recording without video itself
     // (`no_video_track`), on the tracks it declares when it comes up.
     let tracks = state
         .connections
@@ -1679,13 +1701,13 @@ fn check_clip_stream(
     Ok(())
 }
 
-/// Hands the start of clip `spec`, `serial`, with `pipe`, the write end of
+/// Hands the start of recording `spec`, `serial`, with `pipe`, the write end of
 /// its pipe, to its connection's driver, and returns the slot reserved
-/// behind it for the clip's stop; a queue without room for both is
+/// behind it for the recording's stop; a queue without room for both is
 /// `limit_reached`.
-fn hand_over_clip(
+fn hand_over_recording(
     commands: &mpsc::Sender<DriverCommand>,
-    (spec, serial): (ClipSpec, u64),
+    (spec, serial): (RecordingSpec, u64),
     pipe: std::os::fd::OwnedFd,
 ) -> Result<mpsc::OwnedPermit<DriverCommand>, ApiError> {
     let busy = |_| {
@@ -1694,7 +1716,7 @@ fn hand_over_clip(
     };
     let start = commands.clone().try_reserve_owned().map_err(busy)?;
     let stop = commands.clone().try_reserve_owned().map_err(busy)?;
-    drop(start.send(DriverCommand::StartClip { spec, serial, pipe }));
+    drop(start.send(DriverCommand::StartRecording { spec, serial, pipe }));
     Ok(stop)
 }
 
@@ -1983,15 +2005,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn without_clips_no_window_or_clip_is_taken_and_info_says_so() {
+    async fn without_recordings_no_window_or_recording_is_taken_and_info_says_so() {
         let s = supervisor("/bin/sh", Arc::new(SystemClock));
         let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
         for limit in [
-            "preroll_max_ms",
-            "preroll_bytes",
-            "clip_max_ms",
-            "max_clips",
-            "clips_per_stream",
+            "max_prerecord_ms",
+            "max_prerecord_bytes",
+            "max_recording_ms",
+            "max_recordings",
+            "max_recordings_per_stream",
         ] {
             assert_eq!(info["limits"][limit], 0, "{limit}");
         }
@@ -1999,37 +2021,40 @@ mod tests {
         let _logs = captured.install();
         // A window asked for is refused, not ignored.
         let windowed = json!({ "id": 2, "type": "stream/put", "stream_id": "front",
-                               "sources": [{ "url": "fake://127.0.0.1/" }], "preroll_ms": 1 });
+                               "sources": [{ "url": "fake://127.0.0.1/" }], "prerecord_ms": 1 });
         let err = error(call(&s, &windowed.to_string()).await);
         assert_eq!(err.code, ErrorCode::InvalidRequest);
         assert_eq!(
             err.message,
-            "`preroll_ms` is 1, the maximum is 0 (`limits.preroll_max_ms`)"
+            "`prerecord_ms` is 1, the maximum is 0 (`limits.max_prerecord_ms`)"
         );
-        assert_eq!(err.details["field"], "preroll_ms");
+        assert_eq!(err.details["field"], "prerecord_ms");
         assert!(s.shared.lock().streams.is_empty());
         let err = error(
             call(
                 &s,
-                r#"{"id":3,"type":"clip/start","stream_id":"front","after_ms":1}"#,
+                r#"{"id":3,"type":"recording/create","stream_id":"front","duration_ms":1}"#,
             )
             .await,
         );
-        // No clip is long enough: the longest is 0.
+        // No recording is long enough: the longest is 0.
         assert_eq!(err.code, ErrorCode::InvalidRequest);
         assert_eq!(
             err.message,
-            "`after_ms` is 1, the maximum is 0 (`limits.clip_max_ms`)"
+            "`duration_ms` is 1, the maximum is 0 (`limits.max_recording_ms`)"
         );
-        let refused = captured.lines("clip/start refused");
+        let refused = captured.lines("recording/create refused");
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(
             refused[0].contains("code=\"invalid_request\""),
             "{refused:?}"
         );
         // No id has a body.
-        let clip_id = ClipId::new("c1").unwrap();
-        assert_eq!(s.clip_body(&clip_id).unwrap_err(), ClipBodyError::NotFound);
+        let recording_id = RecordingId::new("c1").unwrap();
+        assert_eq!(
+            s.recording_body(&recording_id).unwrap_err(),
+            RecordingBodyError::NotFound
+        );
     }
 
     #[tokio::test]
@@ -4994,21 +5019,21 @@ mod tests {
         demux.stop();
     }
 
-    /// A supervisor with a clip output, whose workers are `binary`.
-    fn with_clips(binary: &str, clock: Arc<dyn Clock>) -> Supervisor {
+    /// A supervisor with a recording output, whose workers are `binary`.
+    fn with_recordings(binary: &str, clock: Arc<dyn Clock>) -> Supervisor {
         let mut environment = environment(binary);
-        environment.registries.clip = Some(Arc::new(
-            lotse_core::test_util::FakeClipMuxerFactory::default(),
+        environment.registries.recording = Some(Arc::new(
+            lotse_core::test_util::FakeRecordingMuxerFactory::default(),
         ));
         Supervisor::new(session_settings(), environment, clock)
     }
 
-    /// `clip/start` of `stream_id` as `clip_id` (generated when `None`).
-    fn clip(id: u64, stream_id: &str, clip_id: Option<&str>) -> Value {
-        let mut start = json!({ "id": id, "type": "clip/start", "stream_id": stream_id,
-                                "before_ms": 5_000, "after_ms": 20_000 });
-        if let Some(clip_id) = clip_id {
-            start["clip_id"] = json!(clip_id);
+    /// `recording/create` of `stream_id` as `recording_id` (generated when `None`).
+    fn recording(id: u64, stream_id: &str, recording_id: Option<&str>) -> Value {
+        let mut start = json!({ "id": id, "type": "recording/create", "stream_id": stream_id,
+                                "prerecord_ms": 5_000, "duration_ms": 20_000 });
+        if let Some(recording_id) = recording_id {
+            start["recording_id"] = json!(recording_id);
         }
         start
     }
@@ -5019,14 +5044,16 @@ mod tests {
         (result, events)
     }
 
-    /// A clip's report, as the driver hands it on from the worker of `c1`.
-    fn clip_report(s: &Supervisor, clip_id: &str, report: lotse_ipc::ClipReport) {
+    /// A recording's report, as the driver hands it on from the worker of `c1`.
+    fn recording_report(s: &Supervisor, recording_id: &str, report: lotse_ipc::RecordingReport) {
         let at = s.shared.clock.wall_now();
-        s.shared.lock().clip_report("c1", clip_id, report, at);
+        s.shared
+            .lock()
+            .recording_report("c1", recording_id, report, at);
     }
 
-    fn stopped_report(reason: &str, bytes: u64) -> lotse_ipc::ClipReport {
-        lotse_ipc::ClipReport::Stopped {
+    fn closed_report(reason: &str, bytes: u64) -> lotse_ipc::RecordingReport {
+        lotse_ipc::RecordingReport::Closed {
             reason: reason.into(),
             bytes,
             duration_ms: 20_000,
@@ -5048,10 +5075,10 @@ mod tests {
             state.stream_stats(&state.streams["front"])
         };
         (
-            counters.clips_started,
-            counters.clips_completed,
-            counters.clip_gaps,
-            counters.clip_bytes,
+            counters.recordings_started,
+            counters.recordings_completed,
+            counters.recording_gaps,
+            counters.recording_bytes,
         )
     }
 
@@ -5060,31 +5087,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn the_configured_clip_limits_are_reported_and_enforced() {
+    async fn the_configured_recording_limits_are_reported_and_enforced() {
         let mut settings = session_settings();
-        settings.limits.clips = ClipLimits {
-            preroll_max_ms: 30_000,
-            preroll_bytes: 1 << 20,
-            clip_max_ms: 45_000,
-            max_clips: 5,
-            clips_per_stream: 1,
-            ..ClipLimits::DEFAULT
+        settings.limits.recordings = RecordingLimits {
+            max_prerecord_ms: 30_000,
+            max_prerecord_bytes: 1 << 20,
+            max_recording_ms: 45_000,
+            max_recordings: 5,
+            max_recordings_per_stream: 1,
+            ..RecordingLimits::DEFAULT
         };
         let mut environment = environment("/bin/sh");
-        environment.registries.clip = Some(Arc::new(
-            lotse_core::test_util::FakeClipMuxerFactory::default(),
+        environment.registries.recording = Some(Arc::new(
+            lotse_core::test_util::FakeRecordingMuxerFactory::default(),
         ));
         let s = Supervisor::new(settings, environment, Arc::new(SystemClock));
         let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
-        assert_eq!(info["outputs"], json!(["clip"]));
-        assert_eq!(s.hello().outputs, ["clip"]);
+        assert_eq!(info["outputs"], json!(["recording"]));
+        assert_eq!(s.hello().outputs, ["recording"]);
         assert_eq!(
             (
-                &info["limits"]["preroll_max_ms"],
-                &info["limits"]["preroll_bytes"],
-                &info["limits"]["clip_max_ms"],
-                &info["limits"]["max_clips"],
-                &info["limits"]["clips_per_stream"],
+                &info["limits"]["max_prerecord_ms"],
+                &info["limits"]["max_prerecord_bytes"],
+                &info["limits"]["max_recording_ms"],
+                &info["limits"]["max_recordings"],
+                &info["limits"]["max_recordings_per_stream"],
             ),
             (
                 &json!(30_000),
@@ -5095,64 +5122,67 @@ mod tests {
             )
         );
         let windowed = json!({ "id": 2, "type": "stream/put", "stream_id": "front",
-                               "sources": [{ "url": "fake://127.0.0.1/" }], "preroll_ms": 30_001 });
+                               "sources": [{ "url": "fake://127.0.0.1/" }], "prerecord_ms": 30_001 });
         let err = error(call(&s, &windowed.to_string()).await);
         assert_eq!(
             err.message,
-            "`preroll_ms` is 30001, the maximum is 30000 (`limits.preroll_max_ms`)"
+            "`prerecord_ms` is 30001, the maximum is 30000 (`limits.max_prerecord_ms`)"
         );
     }
 
     #[tokio::test]
-    async fn a_clip_reaches_the_worker_with_its_pipe_and_its_reports_reach_the_owner() {
+    async fn a_recording_reaches_the_worker_with_its_pipe_and_its_reports_reach_the_owner() {
         use tokio::io::AsyncReadExt as _;
 
-        let dir = private_dir("clip-start");
-        let s = with_clips(&recording_worker(&dir), Arc::new(SystemClock));
+        let dir = private_dir("recording-start");
+        let s = with_recordings(&recording_worker(&dir), Arc::new(SystemClock));
         let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
         assert_eq!(
             info["limits"],
             json!({ "max_streams": 2, "max_sessions": 3, "max_sessions_per_stream": 2,
                     "max_connections": 8, "session_grace_ms": 10_000,
-                    "preroll_max_ms": 300_000, "preroll_bytes": 512 << 20, "clip_max_ms": 3_600_000,
-                    "max_clips": 8, "clips_per_stream": 2 })
+                    "max_prerecord_ms": 300_000, "max_prerecord_bytes": 512 << 20, "max_recording_ms": 3_600_000,
+                    "max_recordings": 8, "max_recordings_per_stream": 2 })
         );
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         assert_eq!(demand(&s).total(), 0);
         let (result, mut events) =
-            started(call(&s, &clip(2, "front", Some("k1")).to_string()).await);
-        assert_eq!(result, json!({ "clip_id": "k1", "url": "/v0/clips/k1" }));
-        // A clip is a viewer: the idle stream connects for it.
+            started(call(&s, &recording(2, "front", Some("k1")).to_string()).await);
+        assert_eq!(
+            result,
+            json!({ "recording_id": "k1", "url": "/v0/recording/k1" })
+        );
+        // A recording is a viewer: the idle stream connects for it.
         assert_eq!(demand(&s).viewers, 1);
         let pid = worker_pid(&s).await;
         // The start waits in the driver's queue while the worker spawns,
-        // and that wait comes off its `after_ms` (`driver::after_left`):
+        // and that wait comes off its `duration_ms` (`driver::duration_left`):
         // on the real clock, a millisecond or more of the 20 s.
         let starts: Vec<Vec<u8>> = (19_000..=20_000)
-            .map(|after_ms| {
-                let spec = ClipSpec {
-                    clip_id: "k1".into(),
-                    before_ms: 5_000,
-                    after_ms,
+            .map(|duration_ms| {
+                let spec = RecordingSpec {
+                    recording_id: "k1".into(),
+                    prerecord_ms: 5_000,
+                    duration_ms,
                     audio: true,
                 };
-                lotse_ipc::encode(&lotse_ipc::ToWorker::StartClip(spec)).unwrap()
+                lotse_ipc::encode(&lotse_ipc::ToWorker::StartRecording(spec)).unwrap()
             })
             .collect();
         wait_received_any(&dir, pid, &starts).await;
         let front = result_of(&s, "front").await;
-        assert_eq!(front["clips"], json!(["k1"]));
+        assert_eq!(front["recordings"], json!(["k1"]));
         // The write end went to the worker, which discarded it with the
         // message: the read end the body gets is at its end.
-        let mut body = s.clip_body(&ClipId::new("k1").unwrap()).unwrap();
+        let mut body = s.recording_body(&RecordingId::new("k1").unwrap()).unwrap();
         let mut bytes = Vec::new();
         within(body.reader.read_to_end(&mut bytes)).await.unwrap();
         assert!(bytes.is_empty());
-        clip_report(
+        recording_report(
             &s,
             "k1",
-            lotse_ipc::ClipReport::Started {
-                before_ms: 4_960,
+            lotse_ipc::RecordingReport::Started {
+                prerecord_ms: 4_960,
                 video: "h264".into(),
                 picture: Some((640, 480)),
                 audio: None,
@@ -5162,37 +5192,37 @@ mod tests {
         assert_eq!(
             (
                 &event["type"],
-                &event["before_ms"],
+                &event["prerecord_ms"],
                 &event["video"]["width"]
             ),
             (&json!("started"), &json!(4_960), &json!(640))
         );
-        clip_report(
+        recording_report(
             &s,
             "k1",
-            lotse_ipc::ClipReport::Gap {
+            lotse_ipc::RecordingReport::Gap {
                 reason: "reconnect".into(),
                 from_ms: 1_000,
                 to_ms: 2_000,
             },
         );
         assert_eq!(next(&mut events).await["reason"], "reconnect");
-        clip_report(&s, "k1", stopped_report("completed", 4_096));
+        recording_report(&s, "k1", closed_report("completed", 4_096));
         assert_eq!(
             next(&mut events).await,
-            json!({ "type": "stopped", "reason": "completed", "bytes": 4_096,
+            json!({ "type": "closed", "reason": "completed", "bytes": 4_096,
                     "duration_ms": 20_000, "gaps": 1 })
         );
-        assert!(events.recv().await.is_none(), "stopped is the last event");
-        // The body learns what the worker wrote; the stream counts the clip.
+        assert!(events.recv().await.is_none(), "closed is the last event");
+        // The body learns what the worker wrote; the stream counts the recording.
         assert_eq!(within(&mut body.written).await, Ok(4_096));
         assert_eq!(front_stats(&s), (1, 1, 1, 4_096));
         assert_eq!(demand(&s).viewers, 0);
         let front = result_of(&s, "front").await;
-        assert_eq!(front["clips"], json!([]));
-        assert_eq!(front["stats"]["clip_bytes"], 4_096);
-        // A report for a clip that is gone is dropped.
-        clip_report(&s, "k1", stopped_report("completed", 1));
+        assert_eq!(front["recordings"], json!([]));
+        assert_eq!(front["stats"]["recording_bytes"], 4_096);
+        // A report for a recording that is gone is dropped.
+        recording_report(&s, "k1", closed_report("completed", 1));
         assert_eq!(front_stats(&s), (1, 1, 1, 4_096));
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
@@ -5205,75 +5235,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clip_start_holds_the_request_to_the_limits_and_the_stream_to_its_tracks() {
-        let dir = private_dir("clip-limits");
-        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+    async fn recording_start_holds_the_request_to_the_limits_and_the_stream_to_its_tracks() {
+        let dir = private_dir("recording-limits");
+        let s = with_recordings(&blocking_worker(&dir), Arc::new(SystemClock));
         let captured = Captured::default();
         let _logs = captured.install();
         let refused = |outcome: Outcome| error(outcome);
-        let err = refused(call(&s, &clip(1, "a/b", None).to_string()).await);
+        let err = refused(call(&s, &recording(1, "a/b", None).to_string()).await);
         assert_eq!(err.code, ErrorCode::InvalidStreamId);
-        let err = refused(call(&s, &clip(1, "front", Some("a/b")).to_string()).await);
+        let err = refused(call(&s, &recording(1, "front", Some("a/b")).to_string()).await);
         assert_eq!(
-            (err.code, &err.details["clip_id"]),
+            (err.code, &err.details["recording_id"]),
             (ErrorCode::InvalidRequest, &json!("a/b"))
         );
         // A dot segment matches the characters but is refused (RFC 3986
         // section 3.3), and the message says so.
-        let err = refused(call(&s, &clip(1, "front", Some("..")).to_string()).await);
+        let err = refused(call(&s, &recording(1, "front", Some("..")).to_string()).await);
         assert_eq!(
-            (err.code, err.message.as_str(), &err.details["clip_id"]),
+            (err.code, err.message.as_str(), &err.details["recording_id"]),
             (
                 ErrorCode::InvalidRequest,
-                "clip_id must match ^[A-Za-z0-9._-]{1,128}$ and not be `.` or `..`",
+                "recording_id must match ^[A-Za-z0-9._-]{1,128}$ and not be `.` or `..`",
                 &json!("..")
             )
         );
-        let mut far = clip(1, "front", None);
-        far["before_ms"] = json!(300_001);
+        let mut far = recording(1, "front", None);
+        far["prerecord_ms"] = json!(300_001);
         let err = refused(call(&s, &far.to_string()).await);
-        assert_eq!(err.details["field"], "before_ms");
+        assert_eq!(err.details["field"], "prerecord_ms");
         assert_eq!(
             err.message,
-            "`before_ms` is 300001, the maximum is 300000 (`limits.preroll_max_ms`)"
+            "`prerecord_ms` is 300001, the maximum is 300000 (`limits.max_prerecord_ms`)"
         );
-        let mut long = clip(1, "front", None);
-        long["after_ms"] = json!(3_600_001);
+        let mut long = recording(1, "front", None);
+        long["duration_ms"] = json!(3_600_001);
         let err = refused(call(&s, &long.to_string()).await);
-        assert_eq!(err.details["field"], "after_ms");
-        // The longest window and the longest clip are allowed, 5 minutes
+        assert_eq!(err.details["field"], "duration_ms");
+        // The longest window and the longest recording are allowed, 5 minutes
         // before and an hour after, the most a client's record call asks:
         // what refuses this one is the stream.
-        let mut longest = clip(1, "front", None);
-        longest["before_ms"] = json!(300_000);
-        longest["after_ms"] = json!(3_600_000);
+        let mut longest = recording(1, "front", None);
+        longest["prerecord_ms"] = json!(300_000);
+        longest["duration_ms"] = json!(3_600_000);
         let err = refused(call(&s, &longest.to_string()).await);
         assert_eq!(err.code, ErrorCode::StreamNotFound);
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
-        // A clip whose id is generated.
-        let (generated, _g) = started(call(&s, &clip(2, "front", None).to_string()).await);
-        let id = generated["clip_id"].as_str().unwrap();
+        // A recording whose id is generated.
+        let (generated, _g) = started(call(&s, &recording(2, "front", None).to_string()).await);
+        let id = generated["recording_id"].as_str().unwrap();
         assert_eq!(id.len(), 26, "a ULID");
-        assert_eq!(generated["url"], format!("/v0/clips/{id}"));
-        assert_eq!(s.shared.lock().clips[id].stream_id, "front");
-        let (_k1, _e1) = started(call(&s, &clip(3, "front", Some("k1")).to_string()).await);
-        let err = refused(call(&s, &clip(4, "back", Some("k1")).to_string()).await);
-        assert_eq!(err.code, ErrorCode::ClipIdInUse);
-        let err = refused(call(&s, &clip(4, "front", Some("k2")).to_string()).await);
+        assert_eq!(generated["url"], format!("/v0/recording/{id}"));
+        assert_eq!(s.shared.lock().recordings[id].stream_id, "front");
+        let (_k1, _e1) = started(call(&s, &recording(3, "front", Some("k1")).to_string()).await);
+        let err = refused(call(&s, &recording(4, "back", Some("k1")).to_string()).await);
+        assert_eq!(err.code, ErrorCode::RecordingIdInUse);
+        let err = refused(call(&s, &recording(4, "front", Some("k2")).to_string()).await);
         assert_eq!(
             (err.code, &err.details["limit"]),
-            (ErrorCode::LimitReached, &json!("clips_per_stream"))
+            (ErrorCode::LimitReached, &json!("max_recordings_per_stream"))
         );
-        s.shared.lock().clip_limits.max_clips = 3;
-        let (_k3, _e3) = started(call(&s, &clip(5, "back", Some("k3")).to_string()).await);
-        let err = refused(call(&s, &clip(6, "back", Some("k4")).to_string()).await);
-        assert_eq!(err.details["limit"], "max_clips");
-        assert_eq!(captured.lines("clip/start refused").len(), 9);
-        assert_eq!(s.shared.lock().clips_held(), 3);
+        s.shared.lock().recording_limits.max_recordings = 3;
+        let (_k3, _e3) = started(call(&s, &recording(5, "back", Some("k3")).to_string()).await);
+        let err = refused(call(&s, &recording(6, "back", Some("k4")).to_string()).await);
+        assert_eq!(err.details["limit"], "max_recordings");
+        assert_eq!(captured.lines("recording/create refused").len(), 9);
+        assert_eq!(s.shared.lock().recordings_held(), 3);
         assert_eq!(
             captured
-                .lines("clip opened; handed to the connection")
+                .lines("recording opened; handed to the connection")
                 .len(),
             3
         );
@@ -5282,9 +5312,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stream_without_video_or_a_busy_connection_takes_no_clip() {
-        let dir = private_dir("clip-refused");
-        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+    async fn a_stream_without_video_or_a_busy_connection_takes_no_recording() {
+        let dir = private_dir("recording-refused");
+        let s = with_recordings(&blocking_worker(&dir), Arc::new(SystemClock));
         let refused = |outcome: Outcome| error(outcome);
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         // A stream whose source declared no video records none.
@@ -5297,7 +5327,7 @@ mod tests {
             audio_delay_ms: None,
             params: lotse_ipc::TrackParams::default(),
         };
-        // A live source's tracks without video refuse the clip.
+        // A live source's tracks without video refuse the recording.
         {
             let mut state = s.shared.lock();
             let snapshot = &mut state.connections.get_mut("c1").unwrap().snapshot;
@@ -5305,7 +5335,7 @@ mod tests {
             snapshot.state = ConnectionState::Live;
             drop(state);
         }
-        let err = refused(call(&s, &clip(7, "front", Some("k4")).to_string()).await);
+        let err = refused(call(&s, &recording(7, "front", Some("k4")).to_string()).await);
         assert_eq!(err.code, ErrorCode::NoVideoTrack);
         audio.kind = "video".into();
         s.shared
@@ -5318,45 +5348,45 @@ mod tests {
         // A busy connection takes neither the start nor its stop.
         let full = {
             let (tx, rx) = mpsc::channel(1);
-            tx.try_send(DriverCommand::StopClip {
-                clip_id: "x".into(),
+            tx.try_send(DriverCommand::StopRecording {
+                recording_id: "x".into(),
             })
             .unwrap();
             s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
             rx
         };
-        let err = refused(call(&s, &clip(8, "front", Some("k4")).to_string()).await);
+        let err = refused(call(&s, &recording(8, "front", Some("k4")).to_string()).await);
         assert_eq!(err.details["limit"], "connection_queue");
         let (tx, mut one_free) = mpsc::channel(2);
-        tx.try_send(DriverCommand::StopClip {
-            clip_id: "x".into(),
+        tx.try_send(DriverCommand::StopRecording {
+            recording_id: "x".into(),
         })
         .unwrap();
         s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
-        let err = refused(call(&s, &clip(9, "front", Some("k4")).to_string()).await);
+        let err = refused(call(&s, &recording(9, "front", Some("k4")).to_string()).await);
         assert_eq!(err.details["limit"], "connection_queue");
         assert!(matches!(
             one_free.try_recv(),
-            Ok(DriverCommand::StopClip { .. })
+            Ok(DriverCommand::StopRecording { .. })
         ));
         assert!(one_free.try_recv().is_err(), "the start is not handed on");
-        assert!(!s.shared.lock().clips.contains_key("k4"));
+        assert!(!s.shared.lock().recordings.contains_key("k4"));
         drop(full);
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A source's tracks refuse a clip `no_video_track` only while it is
+    /// A source's tracks refuse a recording `no_video_track` only while it is
     /// live: the tracks a connection keeps from the last time it went live
     /// may be another source's after a `stream/put` switched it in place
-    /// while idle, and the worker ends a clip without video itself.
+    /// while idle, and the worker ends a recording without video itself.
     /// Regression: an audio-only source switched while idle to a video one
-    /// refused every `clip/start`, and with `preload: false` none raised
+    /// refused every `recording/create`, and with `preload: false` none raised
     /// the demand that would declare the video.
     #[tokio::test]
-    async fn only_the_tracks_of_a_live_source_refuse_a_clip_no_video_track() {
-        let dir = private_dir("clip-stale-tracks");
-        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+    async fn only_the_tracks_of_a_live_source_refuse_a_recording_no_video_track() {
+        let dir = private_dir("recording-stale-tracks");
+        let s = with_recordings(&blocking_worker(&dir), Arc::new(SystemClock));
         let captured = Captured::default();
         let _logs = captured.install();
         result(call(&s, &put("front", "fake://127.0.0.1:1/a", false)).await);
@@ -5379,7 +5409,7 @@ mod tests {
         // Held throughout, so the driver publishes nothing in between.
         {
             let mut state = s.shared.lock();
-            let limits = state.clip_limits;
+            let limits = state.recording_limits;
             // The first source's, from when it was live.
             state.connections.get_mut("c1").unwrap().snapshot.tracks = vec![audio];
             for idle in [
@@ -5389,12 +5419,12 @@ mod tests {
             ] {
                 state.connections.get_mut("c1").unwrap().snapshot.state = idle;
                 assert!(
-                    check_clip_stream(&state, "front", "c1", limits).is_ok(),
+                    check_recording_stream(&state, "front", "c1", limits).is_ok(),
                     "{idle:?}"
                 );
             }
             state.connections.get_mut("c1").unwrap().snapshot.state = ConnectionState::Live;
-            let err = check_clip_stream(&state, "front", "c1", limits).unwrap_err();
+            let err = check_recording_stream(&state, "front", "c1", limits).unwrap_err();
             drop(state);
             assert_eq!(err.code, ErrorCode::NoVideoTrack);
         }
@@ -5403,76 +5433,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_clip_not_fetched_in_time_is_stopped_not_fetched_and_a_fetched_one_runs_on() {
-        let dir = private_dir("clip-fetch");
+    async fn a_recording_not_fetched_in_time_is_stopped_not_fetched_and_a_fetched_one_runs_on() {
+        let dir = private_dir("recording-fetch");
         let clock = Arc::new(FakeClock::from_system());
-        let s = with_clips(&blocking_worker(&dir), clock.clone());
+        let s = with_recordings(&blocking_worker(&dir), clock.clone());
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut commands = intercept(&s, 16);
-        let (_r1, mut k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
-        let (_r2, mut k2) = started(call(&s, &clip(2, "front", Some("k2")).to_string()).await);
+        let (_r1, mut k1) = started(call(&s, &recording(1, "front", Some("k1")).to_string()).await);
+        let (_r2, mut k2) = started(call(&s, &recording(2, "front", Some("k2")).to_string()).await);
         for id in ["k1", "k2"] {
-            let_assert!(Some(DriverCommand::StartClip { spec, .. }) = commands.recv().await);
-            assert_eq!(spec.clip_id, id);
+            let_assert!(Some(DriverCommand::StartRecording { spec, .. }) = commands.recv().await);
+            assert_eq!(spec.recording_id, id);
         }
-        let k2_id = ClipId::new("k2").unwrap();
-        let _body = s.clip_body(&k2_id).unwrap();
-        // A deadline that fired as the body was taken, or for a clip that
+        let k2_id = RecordingId::new("k2").unwrap();
+        let _body = s.recording_body(&k2_id).unwrap();
+        // A deadline that fired as the body was taken, or for a recording that
         // is gone, does nothing.
-        let serial = s.shared.lock().clips["k2"].serial;
-        s.shared.lock().clip_fetch_deadline("k2", serial);
-        s.shared.lock().clip_fetch_deadline("gone", serial);
+        let serial = s.shared.lock().recordings["k2"].serial;
+        s.shared.lock().recording_fetch_deadline("k2", serial);
+        s.shared.lock().recording_fetch_deadline("gone", serial);
         assert_eq!(
-            s.clip_body(&k2_id).unwrap_err(),
-            ClipBodyError::AlreadyFetched
+            s.recording_body(&k2_id).unwrap_err(),
+            RecordingBodyError::AlreadyFetched
         );
         clock.advance(Duration::from_millis(9_999));
         settle().await;
         assert!(commands.try_recv().is_err());
         clock.advance(Duration::from_millis(1));
         settle().await;
-        let_assert!(Some(DriverCommand::StopClip { clip_id }) = commands.recv().await);
-        assert_eq!(clip_id, "k1");
+        let_assert!(Some(DriverCommand::StopRecording { recording_id }) = commands.recv().await);
+        assert_eq!(recording_id, "k1");
         assert!(commands.try_recv().is_err(), "k2 was fetched");
-        // A late fetch still gets the body of a clip being stopped.
-        let k1_id = ClipId::new("k1").unwrap();
-        drop(s.clip_body(&k1_id).unwrap());
-        clip_report(&s, "k1", stopped_report(lotse_ipc::STOPPED_AS_ASKED, 10));
+        // A late fetch still gets the body of a recording being stopped.
+        let k1_id = RecordingId::new("k1").unwrap();
+        drop(s.recording_body(&k1_id).unwrap());
+        recording_report(&s, "k1", closed_report(lotse_ipc::STOPPED_AS_ASKED, 10));
         assert_eq!(next(&mut k1).await["reason"], "not_fetched");
         assert_eq!(front_stats(&s).1, 0, "not a whole file");
-        clip_report(&s, "k2", stopped_report("completed", 10));
+        recording_report(&s, "k2", closed_report("completed", 10));
         assert_eq!(next(&mut k2).await["reason"], "completed");
-        // A clip that ends before anyone fetched it keeps its body until
+        // A recording that ends before anyone fetched it keeps its body until
         // the deadline; one not taken by then goes.
-        let (_r3, _k3) = started(call(&s, &clip(3, "front", Some("k3")).to_string()).await);
-        let (_r4, _k4) = started(call(&s, &clip(4, "front", Some("k4")).to_string()).await);
+        let (_r3, _k3) = started(call(&s, &recording(3, "front", Some("k3")).to_string()).await);
+        let (_r4, _k4) = started(call(&s, &recording(4, "front", Some("k4")).to_string()).await);
         for id in ["k3", "k4"] {
-            clip_report(&s, id, stopped_report("completed", 0));
+            recording_report(&s, id, closed_report("completed", 0));
         }
-        assert!(s.shared.lock().clip_id_in_use("k3"));
-        let err = error(call(&s, &clip(5, "front", Some("k3")).to_string()).await);
-        assert_eq!(err.code, ErrorCode::ClipIdInUse);
-        assert!(s.clip_body(&ClipId::new("k3").unwrap()).is_ok());
+        assert!(s.shared.lock().recording_id_in_use("k3"));
+        let err = error(call(&s, &recording(5, "front", Some("k3")).to_string()).await);
+        assert_eq!(err.code, ErrorCode::RecordingIdInUse);
+        assert!(s.recording_body(&RecordingId::new("k3").unwrap()).is_ok());
         assert_eq!(
-            s.clip_body(&ClipId::new("k3").unwrap()).unwrap_err(),
-            ClipBodyError::NotFound
+            s.recording_body(&RecordingId::new("k3").unwrap())
+                .unwrap_err(),
+            RecordingBodyError::NotFound
         );
         clock.advance(Duration::from_secs(10));
         settle().await;
-        assert!(!s.shared.lock().clip_id_in_use("k4"));
+        assert!(!s.shared.lock().recording_id_in_use("k4"));
         assert_eq!(
-            s.clip_body(&ClipId::new("k4").unwrap()).unwrap_err(),
-            ClipBodyError::NotFound
+            s.recording_body(&RecordingId::new("k4").unwrap())
+                .unwrap_err(),
+            RecordingBodyError::NotFound
         );
         // A full pipe: nobody read the body, so the stop could not write
         // the file's last bytes in time and the worker ends it
-        // `client_gone`, the tail counted in its bytes; the clip still
+        // `client_gone`, the tail counted in its bytes; the recording still
         // ends `not_fetched`, a file not whole.
-        let (_r8, mut k8) = started(call(&s, &clip(8, "front", Some("k8")).to_string()).await);
+        let (_r8, mut k8) = started(call(&s, &recording(8, "front", Some("k8")).to_string()).await);
         let before = front_stats(&s);
         clock.advance(Duration::from_secs(10));
         settle().await;
-        clip_report(&s, "k8", stopped_report("client_gone", 70_000));
+        recording_report(&s, "k8", closed_report("client_gone", 70_000));
         let end = next(&mut k8).await;
         assert_eq!(
             (&end["reason"], &end["bytes"]),
@@ -5481,33 +5513,34 @@ mod tests {
         let after = front_stats(&s);
         assert_eq!(after.1, before.1, "not a whole file");
         assert_eq!(after.3, before.3 + 70_000, "the tail counted");
-        assert!(!s.shared.lock().clip_id_in_use("k8"), "no body kept");
-        // A clip whose deadline passed while it was being stopped keeps
+        assert!(!s.shared.lock().recording_id_in_use("k8"), "no body kept");
+        // A recording whose deadline passed while it was being stopped keeps
         // no body.
-        let (_r6, _k6) = started(call(&s, &clip(6, "front", Some("k6")).to_string()).await);
+        let (_r6, _k6) = started(call(&s, &recording(6, "front", Some("k6")).to_string()).await);
         assert!(s.unsubscribed(ConnectionId(1), 6).is_none());
         clock.advance(Duration::from_secs(10));
         settle().await;
-        clip_report(&s, "k6", stopped_report(lotse_ipc::STOPPED_AS_ASKED, 0));
-        assert!(!s.shared.lock().clip_id_in_use("k6"));
+        recording_report(&s, "k6", closed_report(lotse_ipc::STOPPED_AS_ASKED, 0));
+        assert!(!s.shared.lock().recording_id_in_use("k6"));
         shutdown_on(&s, &clock).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// `unsubscribe` stops a clip once (`session_closed`, as it closes a
+    /// `unsubscribe` stops a recording once (`session_closed`, as it closes a
     /// session), its end going nowhere, and a closed control connection
-    /// ends its own clips alike; a clip that ran its length is a whole
+    /// ends its own recordings alike; a recording that ran its length is a whole
     /// file.
     #[tokio::test]
-    async fn unsubscribe_stops_a_clip_once_and_a_closed_connection_ends_its_own_session_closed() {
-        let dir = private_dir("clip-stop");
-        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+    async fn unsubscribe_stops_a_recording_once_and_a_closed_connection_ends_its_own_session_closed()
+     {
+        let dir = private_dir("recording-stop");
+        let s = with_recordings(&blocking_worker(&dir), Arc::new(SystemClock));
         let captured = Captured::default();
         let _logs = captured.install();
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut commands = intercept(&s, 16);
-        let (_r1, mut k1) = started(call_on(&s, 1, &clip(1, "front", Some("k1"))).await);
-        let (_r2, mut k2) = started(call_on(&s, 1, &clip(2, "front", Some("k2"))).await);
+        let (_r1, mut k1) = started(call_on(&s, 1, &recording(1, "front", Some("k1"))).await);
+        let (_r2, mut k2) = started(call_on(&s, 1, &recording(2, "front", Some("k2"))).await);
         let mut drained = Vec::new();
         while let Ok(command) = commands.try_recv() {
             drained.push(command);
@@ -5517,45 +5550,50 @@ mod tests {
         assert!(s.unsubscribed(ConnectionId(2), 1).is_none());
         assert!(commands.try_recv().is_err(), "another connection's id 1");
         assert!(s.unsubscribed(ConnectionId(1), 1).is_none());
-        let_assert!(Some(DriverCommand::StopClip { clip_id }) = commands.recv().await);
-        assert_eq!(clip_id, "k1");
-        // A second stop of a clip being stopped, or of one not open, asks
+        let_assert!(Some(DriverCommand::StopRecording { recording_id }) = commands.recv().await);
+        assert_eq!(recording_id, "k1");
+        // A second stop of a recording being stopped, or of one not open, asks
         // nothing more.
-        s.shared.lock().stop_clip("k1", ClipStopReason::NotFetched);
         s.shared
             .lock()
-            .stop_clip("nope", ClipStopReason::NotFetched);
+            .stop_recording("k1", RecordingCloseReason::NotFetched);
+        s.shared
+            .lock()
+            .stop_recording("nope", RecordingCloseReason::NotFetched);
         assert!(commands.try_recv().is_err(), "one stop");
-        let asked = captured.lines("clip stop asked of its worker");
+        let asked = captured.lines("recording stop asked of its worker");
         assert!(asked[0].contains("reason=\"session_closed\""), "{asked:?}");
-        let again = captured.lines("clip already being stopped");
+        let again = captured.lines("recording already being stopped");
         assert!(again[0].contains("ending=\"session_closed\""), "{again:?}");
-        assert_eq!(captured.lines("stop of a clip that is not open").len(), 1);
-        clip_report(&s, "k1", stopped_report(lotse_ipc::STOPPED_AS_ASKED, 5));
+        assert_eq!(
+            captured.lines("stop of a recording that is not open").len(),
+            1
+        );
+        recording_report(&s, "k1", closed_report(lotse_ipc::STOPPED_AS_ASKED, 5));
         assert!(k1.recv().await.is_none(), "its end goes nowhere");
         assert_eq!(
             front_stats(&s).1,
             0,
-            "a clip stopped early is no whole file"
+            "a recording stopped early is no whole file"
         );
-        // A clip that ran its length is.
-        clip_report(&s, "k2", stopped_report("completed", 5));
+        // A recording that ran its length is.
+        recording_report(&s, "k2", closed_report("completed", 5));
         assert_eq!(next(&mut k2).await["reason"], "completed");
         assert_eq!(front_stats(&s).1, 1);
-        // A closed control connection ends its clips at once, and only its.
-        let (_r3, mut k3) = started(call_on(&s, 1, &clip(4, "front", Some("k3"))).await);
-        let (_r4, mut k4) = started(call_on(&s, 2, &clip(5, "front", Some("k4"))).await);
+        // A closed control connection ends its recordings at once, and only its.
+        let (_r3, mut k3) = started(call_on(&s, 1, &recording(4, "front", Some("k3"))).await);
+        let (_r4, mut k4) = started(call_on(&s, 2, &recording(5, "front", Some("k4"))).await);
         let _starts = (commands.recv().await, commands.recv().await);
         s.connection_closed(ConnectionId(1));
-        let_assert!(Some(DriverCommand::StopClip { clip_id }) = commands.recv().await);
-        assert_eq!(clip_id, "k3");
+        let_assert!(Some(DriverCommand::StopRecording { recording_id }) = commands.recv().await);
+        assert_eq!(recording_id, "k3");
         assert!(commands.try_recv().is_err());
-        clip_report(&s, "k3", stopped_report(lotse_ipc::STOPPED_AS_ASKED, 5));
+        recording_report(&s, "k3", closed_report(lotse_ipc::STOPPED_AS_ASKED, 5));
         assert!(k3.recv().await.is_none());
-        let lines = captured.lines("clip: stopped");
+        let lines = captured.lines("recording: closed");
         assert!(lines[0].contains("reason=\"session_closed\""), "{lines:?}");
         assert!(lines[2].contains("reason=\"session_closed\""), "{lines:?}");
-        assert!(s.shared.lock().clips.contains_key("k4"));
+        assert!(s.shared.lock().recordings.contains_key("k4"));
         assert!(k4.try_recv().is_err());
         assert_eq!(front_stats(&s), (4, 1, 3, 15));
         s.shutdown().await;
@@ -5563,42 +5601,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_moved_or_deleted_stream_and_shutdown_end_its_clips_and_cut_their_bodies() {
-        let dir = private_dir("clip-end");
-        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+    async fn a_moved_or_deleted_stream_and_shutdown_end_its_recordings_and_cut_their_bodies() {
+        let dir = private_dir("recording-end");
+        let s = with_recordings(&blocking_worker(&dir), Arc::new(SystemClock));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
-        let (_r1, mut k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
-        let (_r9, _k9) = started(call(&s, &clip(9, "back", Some("k9")).to_string()).await);
-        let mut body = s.clip_body(&ClipId::new("k1").unwrap()).unwrap();
-        clip_report(
+        let (_r1, mut k1) = started(call(&s, &recording(1, "front", Some("k1")).to_string()).await);
+        let (_r9, _k9) = started(call(&s, &recording(9, "back", Some("k9")).to_string()).await);
+        let mut body = s.recording_body(&RecordingId::new("k1").unwrap()).unwrap();
+        recording_report(
             &s,
             "k1",
-            lotse_ipc::ClipReport::Gap {
+            lotse_ipc::RecordingReport::Gap {
                 reason: "lagged".into(),
                 from_ms: 0,
                 to_ms: 1,
             },
         );
         next(&mut k1).await;
-        // Another port is another worker: the clip ends with the old one.
+        // Another port is another worker: the recording ends with the old one.
         result(call(&s, &put("front", "fake://127.0.0.1:3/", false)).await);
         assert_eq!(
             next(&mut k1).await,
-            json!({ "type": "stopped", "reason": "stream_changed", "bytes": 0,
+            json!({ "type": "closed", "reason": "stream_changed", "bytes": 0,
                     "duration_ms": 0, "gaps": 1 })
         );
         assert!(within(&mut body.written).await.is_err(), "the body is cut");
         assert_eq!(front_stats(&s), (1, 0, 1, 0), "kept over the put");
         // Its old worker stops with its connection: the id is free at once.
-        assert!(!s.shared.lock().clip_id_in_use("k1"));
-        // Another stream's clip, on another connection, runs on.
-        assert!(s.shared.lock().clips.contains_key("k9"));
-        let (_r2, mut k2) = started(call(&s, &clip(2, "front", Some("k2")).to_string()).await);
+        assert!(!s.shared.lock().recording_id_in_use("k1"));
+        // Another stream's recording, on another connection, runs on.
+        assert!(s.shared.lock().recordings.contains_key("k9"));
+        let (_r2, mut k2) = started(call(&s, &recording(2, "front", Some("k2")).to_string()).await);
         result(call(&s, r#"{"id":3,"type":"stream/delete","stream_id":"front"}"#).await);
         assert_eq!(next(&mut k2).await["reason"], "stream_deleted");
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
-        let (_r4, mut k4) = started(call(&s, &clip(4, "front", Some("k4")).to_string()).await);
+        let (_r4, mut k4) = started(call(&s, &recording(4, "front", Some("k4")).to_string()).await);
         s.shutdown().await;
         assert_eq!(next(&mut k4).await["reason"], "shutting_down");
         assert!(k4.recv().await.is_none());
@@ -5606,66 +5644,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_worker_exit_ends_its_clips_worker_crashed() {
+    async fn a_worker_exit_ends_its_recordings_worker_crashed() {
         // `/bin/sh worker ...` exits at once.
-        let s = with_clips("/bin/sh", Arc::new(SystemClock));
+        let s = with_recordings("/bin/sh", Arc::new(SystemClock));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
-        let (_r, mut events) = started(call(&s, &clip(2, "front", Some("k1")).to_string()).await);
-        let stopped = next(&mut events).await;
+        let (_r, mut events) =
+            started(call(&s, &recording(2, "front", Some("k1")).to_string()).await);
+        let closed = next(&mut events).await;
         assert_eq!(
-            (&stopped["type"], &stopped["reason"]),
-            (&json!("stopped"), &json!("worker_crashed"))
+            (&closed["type"], &closed["reason"]),
+            (&json!("closed"), &json!("worker_crashed"))
         );
-        assert!(s.shared.lock().clips.is_empty());
+        assert!(s.shared.lock().recordings.is_empty());
         s.shutdown().await;
     }
 
     #[tokio::test]
-    async fn a_worker_s_report_on_another_connection_s_clip_is_ignored_and_a_malformed_one_ends_it()
-    {
-        let dir = private_dir("clip-report");
-        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+    async fn a_worker_s_report_on_another_connection_s_recording_is_ignored_and_a_malformed_one_ends_it()
+     {
+        let dir = private_dir("recording-report");
+        let s = with_recordings(&blocking_worker(&dir), Arc::new(SystemClock));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut commands = intercept(&s, 4);
-        let (_r, mut events) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
+        let (_r, mut events) =
+            started(call(&s, &recording(1, "front", Some("k1")).to_string()).await);
         let _start = commands.recv().await;
         let captured = Captured::default();
         let _logs = captured.install();
-        let gap = |reason: &str| lotse_ipc::ClipReport::Gap {
+        let gap = |reason: &str| lotse_ipc::RecordingReport::Gap {
             reason: reason.into(),
             from_ms: 0,
             to_ms: 1,
         };
         let at = s.shared.clock.wall_now();
-        s.shared.lock().clip_report("c9", "k1", gap("lagged"), at);
-        // An unknown warning is dropped, the clip goes on.
-        let warning = lotse_ipc::ClipReport::Warning {
+        s.shared
+            .lock()
+            .recording_report("c9", "k1", gap("lagged"), at);
+        // An unknown warning is dropped, the recording goes on.
+        let warning = lotse_ipc::RecordingReport::Warning {
             code: "bogus".into(),
             message: String::new(),
         };
-        clip_report(&s, "k1", warning);
-        assert!(s.shared.lock().clips.contains_key("k1"));
+        recording_report(&s, "k1", warning);
+        assert!(s.shared.lock().recordings.contains_key("k1"));
         assert_eq!(
             captured
-                .lines("a worker reported a clip it does not run; ignored")
+                .lines("a worker reported a recording it does not run; ignored")
                 .len(),
             1
         );
         assert!(events.try_recv().is_err());
-        clip_report(&s, "k1", gap("solar\nflare"));
-        let lines = captured.lines("a worker reported a malformed clip report; clip ended");
+        recording_report(&s, "k1", gap("solar\nflare"));
+        let lines =
+            captured.lines("a worker reported a malformed recording report; recording ended");
         assert!(
             lines[0].contains("gap names an unknown reason"),
             "{lines:?}"
         );
         assert_eq!(next(&mut events).await["reason"], "internal_error");
-        let_assert!(Ok(DriverCommand::StopClip { clip_id }) = commands.try_recv());
-        assert_eq!(clip_id, "k1");
-        assert!(s.shared.lock().clips.is_empty());
-        // Ending a clip that is gone changes nothing.
-        s.shared.lock().end_clip(
+        let_assert!(Ok(DriverCommand::StopRecording { recording_id }) = commands.try_recv());
+        assert_eq!(recording_id, "k1");
+        assert!(s.shared.lock().recordings.is_empty());
+        // Ending a recording that is gone changes nothing.
+        s.shared.lock().end_recording(
             "k1",
-            crate::clip::ClipEnd::Now(ClipStopReason::SessionClosed),
+            crate::recording::RecordingEnd::Now(RecordingCloseReason::SessionClosed),
         );
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
@@ -5673,20 +5716,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_window_is_no_demand_and_a_put_that_changes_only_it_tells_the_running_worker() {
-        let dir = private_dir("clip-window");
-        let s = with_clips(&recording_worker(&dir), Arc::new(SystemClock));
-        let windowed = |preroll_ms: u32, preload: bool| {
+        let dir = private_dir("recording-window");
+        let s = with_recordings(&recording_worker(&dir), Arc::new(SystemClock));
+        let windowed = |prerecord_ms: u32, preload: bool| {
             json!({ "id": 1, "type": "stream/put", "stream_id": "front",
                     "sources": [{ "url": "fake://127.0.0.1:1/" }],
-                    "preload": preload, "preroll_ms": preroll_ms })
+                    "preload": preload, "prerecord_ms": prerecord_ms })
             .to_string()
         };
         result(call(&s, &windowed(30_000, false)).await);
         assert_eq!(demand(&s).total(), 0, "a window is not demand");
-        assert_eq!(s.shared.lock().connections["c1"].preroll_ms, 30_000);
-        assert_eq!(result_of(&s, "front").await["preroll_ms"], 30_000);
+        assert_eq!(s.shared.lock().connections["c1"].prerecord_ms, 30_000);
+        assert_eq!(result_of(&s, "front").await["prerecord_ms"], 30_000);
         let err = error(call(&s, &windowed(300_001, false)).await);
-        assert_eq!(err.details["field"], "preroll_ms");
+        assert_eq!(err.details["field"], "prerecord_ms");
         let unchanged = result(call(&s, &windowed(30_000, false)).await);
         assert_eq!(unchanged["created"], false);
         result(call(&s, &windowed(30_000, true)).await);
@@ -5699,29 +5742,29 @@ mod tests {
         wait_received(
             &dir,
             pid,
-            &lotse_ipc::encode(&lotse_ipc::ToWorker::Preroll { ms: 10_000 }).unwrap(),
+            &lotse_ipc::encode(&lotse_ipc::ToWorker::Prerecord { ms: 10_000 }).unwrap(),
         )
         .await;
         assert_eq!(worker_pid(&s).await, pid);
         assert_eq!(front_connection(&s).await, "c1");
-        let lines = captured.lines("connection pre-roll window changed");
+        let lines = captured.lines("connection pre-record window changed");
         assert!(
-            lines[0].contains("preroll.before_ms=30000")
-                && lines[0].contains("preroll.after_ms=10000"),
+            lines[0].contains("prerecord.before_ms=30000")
+                && lines[0].contains("prerecord.after_ms=10000"),
             "{lines:?}"
         );
         // A full driver queue keeps the window until the next put.
         let (full, _rx) = mpsc::channel(1);
-        full.try_send(DriverCommand::StopClip {
-            clip_id: "x".into(),
+        full.try_send(DriverCommand::StopRecording {
+            recording_id: "x".into(),
         })
         .unwrap();
         s.shared.lock().connections.get_mut("c1").unwrap().commands = full;
         result(call(&s, &windowed(0, true)).await);
-        assert_eq!(s.shared.lock().connections["c1"].preroll_ms, 10_000);
+        assert_eq!(s.shared.lock().connections["c1"].prerecord_ms, 10_000);
         assert_eq!(
             captured
-                .lines("driver queue full; the connection keeps its pre-roll window")
+                .lines("driver queue full; the connection keeps its pre-record window")
                 .len(),
             1
         );
@@ -5731,118 +5774,127 @@ mod tests {
         let mut commands = intercept(&s, 4);
         let unchanged = result(call(&s, &windowed(0, true)).await);
         assert_eq!(unchanged["created"], false);
-        let_assert!(Ok(DriverCommand::Preroll { ms: 0 }) = commands.try_recv());
-        assert_eq!(s.shared.lock().connections["c1"].preroll_ms, 0);
+        let_assert!(Ok(DriverCommand::Prerecord { ms: 0 }) = commands.try_recv());
+        assert_eq!(s.shared.lock().connections["c1"].prerecord_ms, 0);
         result(call(&s, &windowed(0, true)).await);
         assert!(commands.try_recv().is_err());
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    fn gap_report(reason: &str) -> lotse_ipc::ClipReport {
-        lotse_ipc::ClipReport::Gap {
+    fn gap_report(reason: &str) -> lotse_ipc::RecordingReport {
+        lotse_ipc::RecordingReport::Gap {
             reason: reason.into(),
             from_ms: 0,
             to_ms: 1,
         }
     }
 
-    /// A worker runs one clip per id and drops a second start under an id
-    /// it runs, and its reports name the clip by id alone: a clip the
+    /// A worker runs one recording per id and drops a second start under an id
+    /// it runs, and its reports name the recording by id alone: a recording the
     /// supervisor ended while its worker still runs it keeps its id until
-    /// that worker's `Stopped`, or a new clip under it would be dropped by
+    /// that worker's `Closed`, or a new recording under it would be dropped by
     /// the worker and end with the old one's figures.
     #[tokio::test]
-    async fn a_clip_ended_while_its_worker_runs_it_holds_its_id_until_the_worker_stopped_it() {
-        let dir = private_dir("clip-reuse");
-        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+    async fn a_recording_ended_while_its_worker_runs_it_holds_its_id_until_the_worker_stopped_it() {
+        let dir = private_dir("recording-reuse");
+        let s = with_recordings(&blocking_worker(&dir), Arc::new(SystemClock));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut commands = intercept(&s, 8);
-        let (_r1, mut k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
-        let_assert!(Some(DriverCommand::StartClip { serial, .. }) = commands.recv().await);
+        let (_r1, mut k1) = started(call(&s, &recording(1, "front", Some("k1")).to_string()).await);
+        let_assert!(Some(DriverCommand::StartRecording { serial, .. }) = commands.recv().await);
         let captured = Captured::default();
         let _logs = captured.install();
         // A malformed report ends it here; its worker is told to stop it.
-        clip_report(&s, "k1", gap_report("solar\nflare"));
+        recording_report(&s, "k1", gap_report("solar\nflare"));
         assert_eq!(next(&mut k1).await["reason"], "internal_error");
-        let_assert!(Ok(DriverCommand::StopClip { clip_id }) = commands.try_recv());
-        assert_eq!(clip_id, "k1");
-        assert!(s.shared.lock().clips.is_empty());
-        let held = captured.lines("clip ended while its worker may still run it");
+        let_assert!(Ok(DriverCommand::StopRecording { recording_id }) = commands.try_recv());
+        assert_eq!(recording_id, "k1");
+        assert!(s.shared.lock().recordings.is_empty());
+        let held = captured.lines("recording ended while its worker may still run it");
         assert_eq!(held.len(), 1, "{held:?}");
-        // Until the worker stopped it, the id is taken and the clip counts.
-        let err = error(call(&s, &clip(2, "front", Some("k1")).to_string()).await);
-        assert_eq!(err.code, ErrorCode::ClipIdInUse);
-        s.shared.lock().clip_limits.max_clips = 1;
-        let err = error(call(&s, &clip(3, "front", Some("k2")).to_string()).await);
-        assert_eq!(err.details["limit"], "max_clips");
-        s.shared.lock().clip_limits.max_clips = 8;
-        // Another worker's `Stopped`, or a report that is not one, frees
+        // Until the worker stopped it, the id is taken and the recording counts.
+        let err = error(call(&s, &recording(2, "front", Some("k1")).to_string()).await);
+        assert_eq!(err.code, ErrorCode::RecordingIdInUse);
+        s.shared.lock().recording_limits.max_recordings = 1;
+        let err = error(call(&s, &recording(3, "front", Some("k2")).to_string()).await);
+        assert_eq!(err.details["limit"], "max_recordings");
+        s.shared.lock().recording_limits.max_recordings = 8;
+        // Another worker's `Closed`, or a report that is not one, frees
         // nothing.
         let at = s.shared.clock.wall_now();
-        s.shared.lock().clip_report(
+        s.shared.lock().recording_report(
             "c9",
             "k1",
-            stopped_report(lotse_ipc::STOPPED_AS_ASKED, 7),
+            closed_report(lotse_ipc::STOPPED_AS_ASKED, 7),
             at,
         );
-        clip_report(&s, "k1", gap_report("lagged"));
-        assert!(s.shared.lock().clip_id_in_use("k1"));
-        // Its worker's `Stopped` frees it, and goes to no one.
+        recording_report(&s, "k1", gap_report("lagged"));
+        assert!(s.shared.lock().recording_id_in_use("k1"));
+        // Its worker's `Closed` frees it, and goes to no one.
         let stats = front_stats(&s);
-        clip_report(&s, "k1", stopped_report(lotse_ipc::STOPPED_AS_ASKED, 7));
-        assert!(!s.shared.lock().clip_id_in_use("k1"));
-        assert_eq!(front_stats(&s), stats, "the clip was counted as it ended");
+        recording_report(&s, "k1", closed_report(lotse_ipc::STOPPED_AS_ASKED, 7));
+        assert!(!s.shared.lock().recording_id_in_use("k1"));
+        assert_eq!(
+            front_stats(&s),
+            stats,
+            "the recording was counted as it ended"
+        );
         assert_eq!(
             captured
-                .lines("the worker finished a clip that had ended; its id is free")
+                .lines("the worker finished a recording that had ended; its id is free")
                 .len(),
             1
         );
-        let (_r4, _k1) = started(call(&s, &clip(4, "front", Some("k1")).to_string()).await);
-        let_assert!(Some(DriverCommand::StartClip { serial: again, .. }) = commands.recv().await);
+        let (_r4, _k1) = started(call(&s, &recording(4, "front", Some("k1")).to_string()).await);
+        let_assert!(
+            Some(DriverCommand::StartRecording { serial: again, .. }) = commands.recv().await
+        );
         assert!(again > serial);
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A held id is free once nothing can report on it: its worker exited,
-    /// or its connection was released, which stops the worker. A clip whose
+    /// or its connection was released, which stops the worker. A recording whose
     /// worker is gone holds none.
     #[tokio::test]
-    async fn a_held_clip_id_is_free_once_its_worker_or_its_connection_is_gone() {
-        let dir = private_dir("clip-held");
-        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+    async fn a_held_recording_id_is_free_once_its_worker_or_its_connection_is_gone() {
+        let dir = private_dir("recording-held");
+        let s = with_recordings(&blocking_worker(&dir), Arc::new(SystemClock));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
         let mut commands = intercept(&s, 8);
-        let (_r1, _k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
-        let (_r2, _k2) = started(call(&s, &clip(2, "back", Some("k2")).to_string()).await);
+        let (_r1, _k1) = started(call(&s, &recording(1, "front", Some("k1")).to_string()).await);
+        let (_r2, _k2) = started(call(&s, &recording(2, "back", Some("k2")).to_string()).await);
         let at = s.shared.clock.wall_now();
-        clip_report(&s, "k1", gap_report("bogus"));
+        recording_report(&s, "k1", gap_report("bogus"));
         s.shared
             .lock()
-            .clip_report("c2", "k2", gap_report("bogus"), at);
-        assert!(s.shared.lock().clip_id_in_use("k1") && s.shared.lock().clip_id_in_use("k2"));
+            .recording_report("c2", "k2", gap_report("bogus"), at);
+        assert!(
+            s.shared.lock().recording_id_in_use("k1") && s.shared.lock().recording_id_in_use("k2")
+        );
         let captured = Captured::default();
         let _logs = captured.install();
         // `c1`'s worker exited: k1 is free, `c2`'s k2 is not.
-        s.shared.lock().clips_worker_gone("c1");
-        assert!(!s.shared.lock().clip_id_in_use("k1"));
-        assert!(s.shared.lock().clip_id_in_use("k2"));
+        s.shared.lock().recordings_worker_gone("c1");
+        assert!(!s.shared.lock().recording_id_in_use("k1"));
+        assert!(s.shared.lock().recording_id_in_use("k2"));
         // Deleting `back` releases `c2`, whose worker stops with it.
         result(call(&s, r#"{"id":3,"type":"stream/delete","stream_id":"back"}"#).await);
-        assert!(!s.shared.lock().clip_id_in_use("k2"));
-        let freed = captured.lines("the worker of a clip that had ended is gone; its id is free");
+        assert!(!s.shared.lock().recording_id_in_use("k2"));
+        let freed =
+            captured.lines("the worker of a recording that had ended is gone; its id is free");
         assert_eq!(freed.len(), 2, "{freed:?}");
-        // A clip whose worker exited holds no id and asks it nothing.
-        let (_r4, _k4) = started(call(&s, &clip(4, "front", Some("k4")).to_string()).await);
+        // A recording whose worker exited holds no id and asks it nothing.
+        let (_r4, _k4) = started(call(&s, &recording(4, "front", Some("k4")).to_string()).await);
         while commands.try_recv().is_ok() {}
-        s.shared.lock().end_clip(
+        s.shared.lock().end_recording(
             "k4",
-            crate::clip::ClipEnd::Now(ClipStopReason::WorkerCrashed),
+            crate::recording::RecordingEnd::Now(RecordingCloseReason::WorkerCrashed),
         );
-        assert!(!s.shared.lock().clip_id_in_use("k4"));
+        assert!(!s.shared.lock().recording_id_in_use("k4"));
         assert!(
             commands.try_recv().is_err(),
             "no stop for a worker that is gone"
@@ -5852,65 +5904,66 @@ mod tests {
     }
 
     /// Each body that waits for its `GET` holds the read end of its pipe
-    /// until the fetch deadline: `max_clips` counts it, or short clips that
+    /// until the fetch deadline: `max_recordings` counts it, or short recordings that
     /// nobody fetches would pile up descriptors without bound.
     #[tokio::test]
-    async fn a_body_that_waits_for_its_get_counts_toward_max_clips() {
-        let dir = private_dir("clip-held-bodies");
-        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+    async fn a_body_that_waits_for_its_get_counts_toward_max_recordings() {
+        let dir = private_dir("recording-held-bodies");
+        let s = with_recordings(&blocking_worker(&dir), Arc::new(SystemClock));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let _commands = intercept(&s, 8);
-        s.shared.lock().clip_limits.max_clips = 1;
-        let (_r1, mut k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
-        clip_report(&s, "k1", stopped_report("completed", 0));
+        s.shared.lock().recording_limits.max_recordings = 1;
+        let (_r1, mut k1) = started(call(&s, &recording(1, "front", Some("k1")).to_string()).await);
+        recording_report(&s, "k1", closed_report("completed", 0));
         assert_eq!(next(&mut k1).await["reason"], "completed");
-        assert!(s.shared.lock().clips.is_empty());
-        let err = error(call(&s, &clip(2, "front", Some("k2")).to_string()).await);
+        assert!(s.shared.lock().recordings.is_empty());
+        let err = error(call(&s, &recording(2, "front", Some("k2")).to_string()).await);
         assert_eq!(
             (err.code, &err.details["limit"]),
-            (ErrorCode::LimitReached, &json!("max_clips"))
+            (ErrorCode::LimitReached, &json!("max_recordings"))
         );
         // Fetched, it holds nothing here any more.
-        drop(s.clip_body(&ClipId::new("k1").unwrap()).unwrap());
-        let (_r3, _k2) = started(call(&s, &clip(3, "front", Some("k2")).to_string()).await);
+        drop(s.recording_body(&RecordingId::new("k1").unwrap()).unwrap());
+        let (_r3, _k2) = started(call(&s, &recording(3, "front", Some("k2")).to_string()).await);
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A `Stopped` naming a reason the worker may not give is a malformed
-    /// report: its figures are not believed, so `stopped` says 0 bytes and
-    /// the body is cut (`ClipEvent::Stopped`); the worker, which ended the
-    /// clip with it, is asked nothing and holds no id.
+    /// A `Closed` naming a reason the worker may not give is a malformed
+    /// report: its figures are not believed, so `closed` says 0 bytes and
+    /// the body is cut (`RecordingEvent::Closed`); the worker, which ended the
+    /// recording with it, is asked nothing and holds no id.
     #[tokio::test]
-    async fn a_stopped_with_a_reason_the_worker_may_not_give_cuts_the_body_and_says_nothing_written()
-     {
-        let dir = private_dir("clip-bad-stop");
-        let s = with_clips(&blocking_worker(&dir), Arc::new(SystemClock));
+    async fn a_closed_with_a_reason_the_worker_may_not_give_cuts_the_body_and_says_nothing_written()
+    {
+        let dir = private_dir("recording-bad-stop");
+        let s = with_recordings(&blocking_worker(&dir), Arc::new(SystemClock));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut commands = intercept(&s, 8);
-        let (_r1, mut k1) = started(call(&s, &clip(1, "front", Some("k1")).to_string()).await);
+        let (_r1, mut k1) = started(call(&s, &recording(1, "front", Some("k1")).to_string()).await);
         let _start = commands.recv().await;
-        let mut body = s.clip_body(&ClipId::new("k1").unwrap()).unwrap();
+        let mut body = s.recording_body(&RecordingId::new("k1").unwrap()).unwrap();
         let captured = Captured::default();
         let _logs = captured.install();
-        clip_report(&s, "k1", stopped_report("worker_crashed", 4_096));
+        recording_report(&s, "k1", closed_report("worker_crashed", 4_096));
         assert_eq!(
             next(&mut k1).await,
-            json!({ "type": "stopped", "reason": "internal_error", "bytes": 0,
+            json!({ "type": "closed", "reason": "internal_error", "bytes": 0,
                     "duration_ms": 0, "gaps": 0 })
         );
         assert!(within(&mut body.written).await.is_err(), "the body is cut");
         assert_eq!(front_stats(&s), (1, 0, 0, 0));
-        let lines = captured.lines("a worker reported a malformed clip report; clip ended");
+        let lines =
+            captured.lines("a worker reported a malformed recording report; recording ended");
         assert!(
-            lines[0].contains("stopped names a reason the worker may not give"),
+            lines[0].contains("closed names a reason the worker may not give"),
             "{lines:?}"
         );
         assert!(
             commands.try_recv().is_err(),
-            "no stop for a clip that ended"
+            "no stop for a recording that ended"
         );
-        assert!(!s.shared.lock().clip_id_in_use("k1"));
+        assert!(!s.shared.lock().recording_id_in_use("k1"));
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }

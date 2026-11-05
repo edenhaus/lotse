@@ -70,7 +70,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::clients::ClientStore;
-use crate::clip::Watched;
+use crate::recording::Watched;
 use crate::{MAX_UPGRADE_HEADER_BYTES, MAX_UPGRADE_HEADERS};
 
 /// How long a code stays valid: 10 minutes.

@@ -1,15 +1,15 @@
-//! Event clips as the API sees them: `clip/start`'s result, the events of
-//! its subscription, and where a clip's bytes are fetched.
+//! Event recordings as the API sees them: `recording/create`'s result, the events of
+//! its subscription, and where a recording's bytes are fetched.
 //!
-//! A clip is one fragmented MP4 file (ISO/IEC 14496-12 §8.8) of a stream's
+//! A recording is one fragmented MP4 file (ISO/IEC 14496-12 §8.8) of a stream's
 //! video and, when it fits the container, its audio. It starts up to
-//! `before_ms` before the command, from the stream's pre-roll window, at a
-//! keyframe, and runs `after_ms` after it: a fixed length, never stopped
+//! `prerecord_ms` before the command, from the stream's pre-record window, at a
+//! keyframe, and runs `duration_ms` after it: a fixed length, never stopped
 //! early by the client. Its bytes
-//! are one HTTP response body, `GET /v0/clips/{clip_id}` ([`clip_path`]) on
+//! are one HTTP response body, `GET /v0/recording/{recording_id}` ([`recording_path`]) on
 //! the same socket, in the chunked transfer coding (RFC 9112 §7.1): the body
 //! ends with its last chunk when the file is whole, and without it when the
-//! clip was cut (RFC 9112 §8). The events say how the clip went; its gaps
+//! recording was cut (RFC 9112 §8). The events say how the recording went; its gaps
 //! are holes on the file's timeline, not marked inside the file.
 
 use std::fmt;
@@ -18,32 +18,32 @@ use std::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::version::CLIPS_PATH;
+use crate::version::RECORDING_PATH;
 
-/// The path of clip `clip_id`'s bytes, `/v0/clips/{clip_id}`: the `url` of
-/// `clip/start`'s result. The id matches `^[A-Za-z0-9._-]{1,128}$`, so it
+/// The path of recording `recording_id`'s bytes, `/v0/recording/{recording_id}`: the `url` of
+/// `recording/create`'s result. The id matches `^[A-Za-z0-9._-]{1,128}$`, so it
 /// needs no percent-encoding (RFC 3986 §2.3), and is never `.` or `..`, so
 /// resolving the path keeps it whole (RFC 3986 §5.2.4).
-pub fn clip_path(clip_id: &str) -> String {
-    format!("{CLIPS_PATH}/{clip_id}")
+pub fn recording_path(recording_id: &str) -> String {
+    format!("{RECORDING_PATH}/{recording_id}")
 }
 
-/// `clip/start`'s result: the clip, and where its bytes are fetched.
+/// `recording/create`'s result: the recording, and where its bytes are fetched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
-pub struct ClipStartResult {
-    /// The clip: the client's id, or a generated ULID.
-    pub clip_id: String,
+pub struct RecordingCreateResult {
+    /// The recording: the client's id, or a generated ULID.
+    pub recording_id: String,
     /// The path to `GET` its bytes from on the socket this command came
-    /// over: `/v0/clips/{clip_id}`. One request takes them; a clip not
+    /// over: `/v0/recording/{recording_id}`. One request takes them; a recording not
     /// fetched in time stops with `not_fetched`.
     pub url: String,
 }
 
-/// A clip's video, as `started` reports it.
+/// A recording's video, as `started` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
-pub struct ClipVideo {
+pub struct RecordingVideo {
     /// The codec name (`h264`, `h265`).
     pub codec: String,
     /// The picture's width in pixels, cropping applied (ISO/IEC 14496-10
@@ -56,57 +56,57 @@ pub struct ClipVideo {
     pub height: Option<u32>,
 }
 
-/// A clip's audio, as `started` reports it.
+/// A recording's audio, as `started` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
-pub struct ClipAudio {
-    /// The codec name in the clip (`aac_lc`, `opus`): G.711 and G.722
+pub struct RecordingAudio {
+    /// The codec name in the recording (`aac_lc`, `opus`): G.711 and G.722
     /// audio is transcoded to `opus`.
     pub codec: String,
 }
 
-/// An event of `clip/start`, in the order they come: `started` unless
-/// the clip ends first, then warnings and gaps, and `stopped` always last.
+/// An event of `recording/create`, in the order they come: `started` unless
+/// the recording ends first, then warnings and gaps, and `closed` always last.
 /// Each variant's schema title names the Python client's class for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClipEvent {
-    /// The clip's file is under way: its first bytes are on their way to
+pub enum RecordingEvent {
+    /// The recording's file is under way: its first bytes are on their way to
     /// the body.
-    #[cfg_attr(feature = "schema", schemars(title = "ClipEventStarted"))]
+    #[cfg_attr(feature = "schema", schemars(title = "RecordingEventStarted"))]
     Started {
-        /// The clip.
-        clip_id: String,
+        /// The recording.
+        recording_id: String,
         /// When it started, RFC 3339 UTC: the daemon's time of the start,
-        /// which `before_ms` counts back from.
+        /// which `prerecord_ms` counts back from.
         at: String,
-        /// How far before `at` the clip begins, in milliseconds: the age
-        /// of the keyframe it starts at, which is what the pre-roll window
+        /// How far before `at` the recording begins, in milliseconds: the age
+        /// of the keyframe it starts at, which is what the pre-record window
         /// held, not what was asked; 0 without a window.
-        before_ms: u32,
+        prerecord_ms: u32,
         /// Its video.
-        video: ClipVideo,
-        /// Its audio; null for a clip without audio (`audio: false`, a
+        video: RecordingVideo,
+        /// Its audio; null for a recording without audio (`audio: false`, a
         /// stream without audio, or `audio_omitted`).
         #[serde(default)]
-        audio: Option<ClipAudio>,
+        audio: Option<RecordingAudio>,
     },
-    /// Non-fatal: the clip goes on.
-    #[cfg_attr(feature = "schema", schemars(title = "ClipEventWarning"))]
+    /// Non-fatal: the recording goes on.
+    #[cfg_attr(feature = "schema", schemars(title = "RecordingEventWarning"))]
     Warning {
         /// The stable code.
-        code: ClipWarningCode,
+        code: RecordingWarningCode,
         /// For humans.
         message: String,
     },
-    /// The clip has a hole: no media between `from_ms` and `to_ms`, so
+    /// The recording has a hole: no media between `from_ms` and `to_ms`, so
     /// the file's timeline has a hole of that length.
-    #[cfg_attr(feature = "schema", schemars(title = "ClipEventGap"))]
+    #[cfg_attr(feature = "schema", schemars(title = "RecordingEventGap"))]
     Gap {
         /// Why.
-        reason: ClipGapReason,
-        /// Where the hole begins, in milliseconds of the clip's media time
+        reason: RecordingGapReason,
+        /// Where the hole begins, in milliseconds of the recording's media time
         /// (from its first frame), as the file counts it.
         from_ms: u32,
         /// Where it ends, likewise.
@@ -114,13 +114,13 @@ pub enum ClipEvent {
     },
     /// The last event; the subscription ends with it, and the body ends
     /// once the bytes before it are read.
-    #[cfg_attr(feature = "schema", schemars(title = "ClipEventStopped"))]
-    Stopped {
+    #[cfg_attr(feature = "schema", schemars(title = "RecordingEventClosed"))]
+    Closed {
         /// Why.
-        reason: ClipStopReason,
+        reason: RecordingCloseReason,
         /// The file's length, as its worker made it: the bytes written for
         /// the body, and a last tail the body did not take in time, which it
-        /// then ends without, cut; 0 when the clip ended without its worker's
+        /// then ends without, cut; 0 when the recording ended without its worker's
         /// last word (`worker_crashed`, `stream_deleted`, `stream_changed` by
         /// a move to another connection, `shutting_down`, `internal_error`
         /// for a malformed report), whose body is then cut.
@@ -128,25 +128,25 @@ pub enum ClipEvent {
         /// The media time the file covers, in milliseconds; 0 for the
         /// same ends.
         duration_ms: u32,
-        /// The gaps the clip had, every one counted even where not each
+        /// The gaps the recording had, every one counted even where not each
         /// was reported as an event.
         gaps: u32,
     },
 }
 
-/// The code of a clip's `warning`: every code a clip may warn with, and
+/// The code of a recording's `warning`: every code a recording may warn with, and
 /// nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum ClipWarningCode {
-    /// The stream's audio neither fits the clip's container nor can be
-    /// transcoded into it; the clip has no audio, and the message names
+pub enum RecordingWarningCode {
+    /// The stream's audio neither fits the recording's container nor can be
+    /// transcoded into it; the recording has no audio, and the message names
     /// the codec.
     AudioOmitted,
 }
 
-impl ClipWarningCode {
+impl RecordingWarningCode {
     /// The code as the API spells it.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -160,34 +160,34 @@ impl ClipWarningCode {
     }
 }
 
-impl fmt::Display for ClipWarningCode {
+impl fmt::Display for RecordingWarningCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-/// Why a clip has a hole: the `reason` of `gap`.
+/// Why a recording has a hole: the `reason` of `gap`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum ClipGapReason {
-    /// The camera's connection dropped and came back, during the clip or
-    /// inside its pre-roll: the hole is the real time between.
+pub enum RecordingGapReason {
+    /// The camera's connection dropped and came back, during the recording or
+    /// inside its pre-record: the hole is the real time between.
     Reconnect,
     /// Video frames are missing inside one connection: two consecutive
     /// ones arrived more than twice the frame interval apart (the camera
     /// or the network dropped them).
     FramesDropped,
-    /// The clip's queue ran full, since its body is read slower than the
+    /// The recording's queue ran full, since its body is read slower than the
     /// camera sends, and frames were dropped up to the next keyframe; or a
-    /// pre-roll GOP larger than the window's byte cap was cut short.
+    /// pre-record GOP larger than the window's byte cap was cut short.
     Overflow,
-    /// The clip fell behind the stream's frames and missed some; it goes
+    /// The recording fell behind the stream's frames and missed some; it goes
     /// on from the next keyframe.
     Lagged,
 }
 
-impl ClipGapReason {
+impl RecordingGapReason {
     /// The reason as the API spells it.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -204,24 +204,24 @@ impl ClipGapReason {
     }
 }
 
-impl fmt::Display for ClipGapReason {
+impl fmt::Display for RecordingGapReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-/// Why a clip ended: the `reason` of `stopped`.
+/// Why a recording ended: the `reason` of `closed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum ClipStopReason {
-    /// `after_ms` reached.
+pub enum RecordingCloseReason {
+    /// `duration_ms` reached.
     Completed,
     /// The stream was deleted.
     StreamDeleted,
     /// The stream's codec, its parameter sets or picture size changed, or
     /// its source was switched: a file has one sample entry per track, so
-    /// the client starts another clip.
+    /// the client starts another recording.
     StreamChanged,
     /// The stream had no video track when its source came up.
     NoVideoTrack,
@@ -230,11 +230,11 @@ pub enum ClipStopReason {
     WorkerCrashed,
     /// The source sent no keyframe to start at in time.
     SourceNotLive,
-    /// The body's reader went away before the clip ended.
+    /// The body's reader went away before the recording ended.
     ClientGone,
-    /// Nobody fetched the clip's bytes in time.
+    /// Nobody fetched the recording's bytes in time.
     NotFetched,
-    /// `unsubscribe`, or the control connection that started the clip
+    /// `unsubscribe`, or the control connection that started the recording
     /// closed.
     SessionClosed,
     /// The daemon is shutting down; the last fragment is written if the
@@ -245,7 +245,7 @@ pub enum ClipStopReason {
     InternalError,
 }
 
-impl ClipStopReason {
+impl RecordingCloseReason {
     /// The reason as the API spells it.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -269,7 +269,7 @@ impl ClipStopReason {
     }
 }
 
-impl fmt::Display for ClipStopReason {
+impl fmt::Display for RecordingCloseReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -288,16 +288,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rfc3986_2_3_a_clips_path_carries_its_id_unencoded() {
-        assert_eq!(clip_path("01JB.x_y-z"), "/v0/clips/01JB.x_y-z");
-        let result = ClipStartResult {
-            clip_id: "c1".into(),
-            url: clip_path("c1"),
+    fn rfc3986_2_3_a_recordings_path_carries_its_id_unencoded() {
+        assert_eq!(recording_path("01JB.x_y-z"), "/v0/recording/01JB.x_y-z");
+        let result = RecordingCreateResult {
+            recording_id: "c1".into(),
+            url: recording_path("c1"),
         };
         let json = serde_json::to_value(&result).unwrap();
-        assert_eq!(json, json!({ "clip_id": "c1", "url": "/v0/clips/c1" }));
         assert_eq!(
-            serde_json::from_value::<ClipStartResult>(json).unwrap(),
+            json,
+            json!({ "recording_id": "c1", "url": "/v0/recording/c1" })
+        );
+        assert_eq!(
+            serde_json::from_value::<RecordingCreateResult>(json).unwrap(),
             result
         );
     }
@@ -306,96 +309,101 @@ mod tests {
     fn events_serialize_like_the_contract_examples() {
         for (event, expected) in [
             (
-                ClipEvent::Started {
-                    clip_id: "01JB".into(),
+                RecordingEvent::Started {
+                    recording_id: "01JB".into(),
                     at: "2026-10-22T10:00:00.000Z".into(),
-                    before_ms: 9800,
-                    video: ClipVideo {
+                    prerecord_ms: 9800,
+                    video: RecordingVideo {
                         codec: "h264".into(),
                         width: Some(1920),
                         height: Some(1080),
                     },
-                    audio: Some(ClipAudio {
+                    audio: Some(RecordingAudio {
                         codec: "aac_lc".into(),
                     }),
                 },
-                json!({ "type": "started", "clip_id": "01JB", "at": "2026-10-22T10:00:00.000Z",
-                        "before_ms": 9800,
+                json!({ "type": "started", "recording_id": "01JB", "at": "2026-10-22T10:00:00.000Z",
+                        "prerecord_ms": 9800,
                         "video": { "codec": "h264", "width": 1920, "height": 1080 },
                         "audio": { "codec": "aac_lc" } }),
             ),
             // Without audio it says so, and an unknown picture is left out.
             (
-                ClipEvent::Started {
-                    clip_id: "c".into(),
+                RecordingEvent::Started {
+                    recording_id: "c".into(),
                     at: "2026-10-22T10:00:00.000Z".into(),
-                    before_ms: 0,
-                    video: ClipVideo {
+                    prerecord_ms: 0,
+                    video: RecordingVideo {
                         codec: "h265".into(),
                         width: None,
                         height: None,
                     },
                     audio: None,
                 },
-                json!({ "type": "started", "clip_id": "c", "at": "2026-10-22T10:00:00.000Z",
-                        "before_ms": 0, "video": { "codec": "h265" }, "audio": null }),
+                json!({ "type": "started", "recording_id": "c", "at": "2026-10-22T10:00:00.000Z",
+                        "prerecord_ms": 0, "video": { "codec": "h265" }, "audio": null }),
             ),
             (
-                ClipEvent::Warning {
-                    code: ClipWarningCode::AudioOmitted,
-                    message: "pcmu does not fit the clip's container; the clip has no audio".into(),
+                RecordingEvent::Warning {
+                    code: RecordingWarningCode::AudioOmitted,
+                    message:
+                        "pcmu does not fit the recording's container; the recording has no audio"
+                            .into(),
                 },
                 json!({ "type": "warning", "code": "audio_omitted",
-                        "message": "pcmu does not fit the clip's container; the clip has no audio" }),
+                        "message": "pcmu does not fit the recording's container; the recording has no audio" }),
             ),
             (
-                ClipEvent::Gap {
-                    reason: ClipGapReason::Reconnect,
+                RecordingEvent::Gap {
+                    reason: RecordingGapReason::Reconnect,
                     from_ms: 12_040,
                     to_ms: 15_310,
                 },
                 json!({ "type": "gap", "reason": "reconnect", "from_ms": 12_040, "to_ms": 15_310 }),
             ),
             (
-                ClipEvent::Stopped {
-                    reason: ClipStopReason::Completed,
+                RecordingEvent::Closed {
+                    reason: RecordingCloseReason::Completed,
                     bytes: 24_117_248,
                     duration_ms: 29_800,
                     gaps: 1,
                 },
-                json!({ "type": "stopped", "reason": "completed", "bytes": 24_117_248,
+                json!({ "type": "closed", "reason": "completed", "bytes": 24_117_248,
                         "duration_ms": 29_800, "gaps": 1 }),
             ),
         ] {
             assert_eq!(serde_json::to_value(&event).unwrap(), expected);
             assert_eq!(
-                serde_json::from_value::<ClipEvent>(expected).unwrap(),
+                serde_json::from_value::<RecordingEvent>(expected).unwrap(),
                 event
             );
         }
         // A daemon that leaves `audio` out means none.
-        let started: ClipEvent = serde_json::from_value(json!({
-            "type": "started", "clip_id": "c", "at": "t", "before_ms": 0,
+        let started: RecordingEvent = serde_json::from_value(json!({
+            "type": "started", "recording_id": "c", "at": "t", "prerecord_ms": 0,
             "video": { "codec": "h264" }
         }))
         .unwrap();
-        assert!(matches!(started, ClipEvent::Started { audio: None, .. }));
+        assert!(matches!(
+            started,
+            RecordingEvent::Started { audio: None, .. }
+        ));
     }
 
     #[test]
-    fn every_clip_name_serializes_as_itself_and_parses_back() {
-        let code = ClipWarningCode::AudioOmitted;
+    fn every_recording_name_serializes_as_itself_and_parses_back() {
+        let code = RecordingWarningCode::AudioOmitted;
         assert_eq!(serde_json::to_value(code).unwrap(), "audio_omitted");
-        assert_eq!(ClipWarningCode::parse("audio_omitted"), Some(code));
+        assert_eq!(RecordingWarningCode::parse("audio_omitted"), Some(code));
         assert_eq!(code.to_string(), "audio_omitted");
         for reason in [
-            ClipGapReason::Reconnect,
-            ClipGapReason::FramesDropped,
-            ClipGapReason::Overflow,
-            ClipGapReason::Lagged,
+            RecordingGapReason::Reconnect,
+            RecordingGapReason::FramesDropped,
+            RecordingGapReason::Overflow,
+            RecordingGapReason::Lagged,
         ] {
             assert_eq!(serde_json::to_value(reason).unwrap(), reason.as_str());
-            assert_eq!(ClipGapReason::parse(reason.as_str()), Some(reason));
+            assert_eq!(RecordingGapReason::parse(reason.as_str()), Some(reason));
             assert_eq!(reason.to_string(), reason.as_str());
         }
         // The worker's reasons and the supervisor's own.
@@ -413,18 +421,18 @@ mod tests {
             "internal_error",
         ];
         for name in names {
-            let reason = ClipStopReason::parse(name).unwrap();
+            let reason = RecordingCloseReason::parse(name).unwrap();
             assert_eq!(reason.as_str(), name);
             assert_eq!(serde_json::to_value(reason).unwrap(), name);
             assert_eq!(reason.to_string(), name);
         }
         // A name of another kind, or none at all, is not one.
-        assert_eq!(ClipWarningCode::parse("turn_unsupported"), None);
-        assert_eq!(ClipGapReason::parse("completed"), None);
-        assert_eq!(ClipStopReason::parse("peer_closed"), None);
-        assert_eq!(ClipStopReason::parse("overflow"), None);
-        // A clip is never stopped early by its client, nor open-ended.
-        assert_eq!(ClipStopReason::parse("stopped"), None);
-        assert_eq!(ClipStopReason::parse("max_duration"), None);
+        assert_eq!(RecordingWarningCode::parse("turn_unsupported"), None);
+        assert_eq!(RecordingGapReason::parse("completed"), None);
+        assert_eq!(RecordingCloseReason::parse("peer_closed"), None);
+        assert_eq!(RecordingCloseReason::parse("overflow"), None);
+        // A recording is never stopped early by its client, nor open-ended.
+        assert_eq!(RecordingCloseReason::parse("stopped"), None);
+        assert_eq!(RecordingCloseReason::parse("max_duration"), None);
     }
 }

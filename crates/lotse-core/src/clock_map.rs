@@ -750,7 +750,7 @@ mod tests {
     /// The first report, the audio's, took 60 ms longer to arrive after its
     /// NTP time than the video's (a camera whose audio comes 60 ms after
     /// its video; MediaMTX 1.21.1's reports differed so by 16 to 22 ms on
-    /// `x86_64` and, by the clips they made, by 60 and about 575 ms on a
+    /// `x86_64` and, by the recordings they made, by 60 and about 575 ms on a
     /// loaded aarch64 runner, 2026-10-26): the offset drops to the video's
     /// transit at once, so no video frame is dated after it arrived and the
     /// audio is dated 60 ms before it arrived, both at their capture times

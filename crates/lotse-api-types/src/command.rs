@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorCode};
 #[cfg(feature = "schema")]
-use crate::limits::{CLIP_ID_PATTERN, ID_PATTERN};
+use crate::limits::{ID_PATTERN, RECORDING_ID_PATTERN};
 use crate::limits::{
     MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_SDP_CHARS, MAX_SOURCES,
     MAX_TEXT_CHARS, MAX_URL_CHARS,
@@ -112,16 +112,16 @@ pub struct StreamPut {
     /// Changing only this never reconnects.
     #[serde(default)]
     pub orientation: Orientation,
-    /// Keep the last `preroll_ms` milliseconds of the stream's media in
-    /// memory, so a `clip/start` can begin before it was asked for; 0, the
-    /// default, keeps none. At most `limits.preroll_max_ms`. What it holds
+    /// Keep the last `prerecord_ms` milliseconds of the stream's media in
+    /// memory, so a `recording/create` can begin before it was asked for; 0, the
+    /// default, keeps none. At most `limits.max_prerecord_ms`. What it holds
     /// follows the stream's bitrate; only a stream far above any real
-    /// camera's reaches `limits.preroll_bytes`, its tracks together, and
+    /// camera's reaches `limits.max_prerecord_bytes`, its tracks together, and
     /// holds a shorter window (`stream/get` reports it). Not a reason to
     /// connect: the window fills only while `preload` or a viewer keeps
     /// the source connected. Changing only this never reconnects.
     #[serde(default)]
-    pub preroll_ms: u32,
+    pub prerecord_ms: u32,
 }
 
 /// `stream/get`.
@@ -314,48 +314,49 @@ pub struct BackchannelRelease {
     pub session_id: Option<String>,
 }
 
-/// `clip/start`: records an event clip of a stream into one fragmented MP4
-/// file, whose bytes `GET /v0/clips/{clip_id}` serves once (the result's
-/// `url`); the subscription's events say how it goes, `stopped` last.
+/// `recording/create`: records a stream for a fixed duration into one
+/// fragmented MP4 file, whose bytes `GET /v0/recording/{recording_id}`
+/// serves once (the result's `url`); the subscription's events say how it
+/// goes, `closed` last.
 ///
-/// The clip starts at the newest keyframe captured at least `before_ms`
-/// ago that the stream's pre-roll window holds, else at the oldest one it
+/// The recording starts at the newest keyframe captured at least `prerecord_ms`
+/// ago that the stream's pre-record window holds, else at the oldest one it
 /// holds, and with none held (no window, or the source not live yet) at
-/// the next one. A running clip keeps the source connected, as a viewer
+/// the next one. A running recording keeps the source connected, as a viewer
 /// does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
-pub struct ClipStart {
+pub struct RecordingCreate {
     /// The command id, which becomes the subscription id.
     pub id: u64,
     /// The stream to record.
     #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub stream_id: String,
-    /// The client's clip id, `^[A-Za-z0-9._-]{1,128}$` but `.` and `..`,
+    /// The client's recording id, `^[A-Za-z0-9._-]{1,128}$` but `.` and `..`,
     /// which would be dot segments of the result's `url` (RFC 3986 §3.3),
-    /// unique among the open clips; a ULID when absent.
+    /// unique among the open recordings; a ULID when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "schema", schemars(regex(pattern = CLIP_ID_PATTERN)))]
-    pub clip_id: Option<String>,
-    /// How far before now the clip should start, in milliseconds, up to
-    /// `limits.preroll_max_ms`; what the window holds bounds what it gets
-    /// (`started.before_ms`).
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = RECORDING_ID_PATTERN)))]
+    pub recording_id: Option<String>,
+    /// How far before now the recording should start, in milliseconds, up to
+    /// `limits.max_prerecord_ms`; what the window holds bounds what it gets
+    /// (`started.prerecord_ms`).
     #[serde(default)]
-    pub before_ms: u32,
-    /// How long the clip runs after now, in milliseconds, 1 to
-    /// `limits.clip_max_ms`.
+    pub prerecord_ms: u32,
+    /// How long the recording runs after now, in milliseconds, 1 to
+    /// `limits.max_recording_ms`.
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
-    pub after_ms: u32,
-    /// Take the stream's audio into the clip: AAC-LC and Opus as they are,
+    pub duration_ms: u32,
+    /// Take the stream's audio into the recording: AAC-LC and Opus as they are,
     /// G.711 (PCMU, PCMA) and G.722 transcoded to Opus; any other codec is
     /// left out with an `audio_omitted` warning. `false` makes a
-    /// video-only clip.
+    /// video-only recording.
     #[serde(default = "with_audio")]
     pub audio: bool,
 }
 
-/// `clip/start`'s default `audio`: with it.
+/// `recording/create`'s default `audio`: with it.
 const fn with_audio() -> bool {
     true
 }
@@ -462,11 +463,11 @@ pub enum Command {
     #[serde(rename = "backchannel/release")]
     #[cfg_attr(feature = "schema", schemars(title = "BackchannelReleaseCommand"))]
     BackchannelRelease(BackchannelRelease),
-    /// `clip/start`: records an event clip of a stream; its bytes are
-    /// fetched with `GET /v0/clips/{clip_id}`.
-    #[serde(rename = "clip/start")]
-    #[cfg_attr(feature = "schema", schemars(title = "ClipStartCommand"))]
-    ClipStart(ClipStart),
+    /// `recording/create`: records a stream for a fixed duration; its bytes
+    /// are fetched with `GET /v0/recording/{recording_id}`.
+    #[serde(rename = "recording/create")]
+    #[cfg_attr(feature = "schema", schemars(title = "RecordingCreateCommand"))]
+    RecordingCreate(RecordingCreate),
 }
 
 impl Command {
@@ -493,7 +494,7 @@ impl Command {
         "session/close",
         "session/adopt",
         "backchannel/release",
-        "clip/start",
+        "recording/create",
     ];
 
     /// The command's id.
@@ -518,7 +519,7 @@ impl Command {
             Self::SessionGet(c) | Self::SessionClose(c) | Self::SessionAdopt(c) => c.id,
             Self::SessionList(c) => c.id,
             Self::BackchannelRelease(c) => c.id,
-            Self::ClipStart(c) => c.id,
+            Self::RecordingCreate(c) => c.id,
         }
     }
 
@@ -546,7 +547,7 @@ impl Command {
             Self::SessionClose(_) => "session/close",
             Self::SessionAdopt(_) => "session/adopt",
             Self::BackchannelRelease(_) => "backchannel/release",
-            Self::ClipStart(_) => "clip/start",
+            Self::RecordingCreate(_) => "recording/create",
         }
     }
 }
@@ -746,16 +747,16 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             cap_stream_id(subscribe.stream_id.as_deref().unwrap_or_default())?;
         }
         Command::ClientsRemove(remove) => cap_chars("pin", &remove.pin, MAX_PIN_CHARS)?,
-        Command::ClipStart(start) => {
+        Command::RecordingCreate(start) => {
             cap_stream_id(&start.stream_id)?;
-            let clip_id = start.clip_id.as_deref().unwrap_or_default();
-            cap_chars("clip_id", clip_id, MAX_ID_CHARS)?;
-            if start.after_ms == 0 {
+            let recording_id = start.recording_id.as_deref().unwrap_or_default();
+            cap_chars("recording_id", recording_id, MAX_ID_CHARS)?;
+            if start.duration_ms == 0 {
                 return Err(ApiError::new(
                     ErrorCode::InvalidRequest,
-                    "`after_ms` must be at least 1",
+                    "`duration_ms` must be at least 1",
                 )
-                .with_detail("field", "after_ms"));
+                .with_detail("field", "duration_ms"));
             }
         }
         Command::Ping(_)
@@ -919,8 +920,8 @@ mod tests {
                 "clients/remove",
             ),
             (
-                r#"{"id":22,"type":"clip/start","stream_id":"front","clip_id":"01JB","before_ms":10000,"after_ms":20000,"audio":true}"#,
-                "clip/start",
+                r#"{"id":22,"type":"recording/create","stream_id":"front","recording_id":"01JB","prerecord_ms":10000,"duration_ms":20000,"audio":true}"#,
+                "recording/create",
             ),
         ];
         for (index, (text, name)) in cases.iter().enumerate() {
@@ -947,7 +948,7 @@ mod tests {
                 && minimal.audio == AudioMode::Auto
                 && minimal.orientation == Orientation::NoTransform
                 && minimal.sources[0].options.is_empty()
-                && minimal.preroll_ms == 0
+                && minimal.prerecord_ms == 0
         );
         // A client may send only the offer and the stream; the rest defaults.
         let_assert!(
@@ -1029,70 +1030,76 @@ mod tests {
     }
 
     #[test]
-    fn a_clip_starts_with_audio_from_now_unless_asked_otherwise_and_always_has_its_length() {
+    fn a_recording_starts_with_audio_from_now_unless_asked_otherwise_and_always_has_its_length() {
         let_assert!(
-            Command::ClipStart(start) = parse_command(
-                r#"{"id":1,"type":"clip/start","stream_id":"front","after_ms":30000}"#
+            Command::RecordingCreate(start) = parse_command(
+                r#"{"id":1,"type":"recording/create","stream_id":"front","duration_ms":30000}"#
             )
             .unwrap()
         );
         assert_eq!(
             (
-                start.clip_id.as_deref(),
-                start.before_ms,
-                start.after_ms,
+                start.recording_id.as_deref(),
+                start.prerecord_ms,
+                start.duration_ms,
                 start.audio
             ),
             (None, 0, 30_000, true)
         );
         // It serializes back with the defaults it took, the absent ones left out.
         assert_eq!(
-            serde_json::to_value(Command::ClipStart(start)).unwrap(),
-            json!({ "id": 1, "type": "clip/start", "stream_id": "front", "before_ms": 0,
-                    "after_ms": 30_000, "audio": true })
+            serde_json::to_value(Command::RecordingCreate(start)).unwrap(),
+            json!({ "id": 1, "type": "recording/create", "stream_id": "front", "prerecord_ms": 0,
+                    "duration_ms": 30_000, "audio": true })
         );
         let_assert!(
-            Command::ClipStart(start) = parse_command(
-                r#"{"id":2,"type":"clip/start","stream_id":"front","after_ms":1,"audio":false}"#
+            Command::RecordingCreate(start) = parse_command(
+                r#"{"id":2,"type":"recording/create","stream_id":"front","duration_ms":1,"audio":false}"#
             )
             .unwrap()
         );
-        assert_eq!((start.after_ms, start.audio), (1, false));
-        // A clip of no time is a mistake.
-        let err = parse_command(r#"{"id":3,"type":"clip/start","stream_id":"front","after_ms":0}"#)
-            .unwrap_err();
+        assert_eq!((start.duration_ms, start.audio), (1, false));
+        // A recording of no time is a mistake.
+        let err = parse_command(
+            r#"{"id":3,"type":"recording/create","stream_id":"front","duration_ms":0}"#,
+        )
+        .unwrap_err();
         assert_eq!(
             (err.id, err.error.code),
             (Some(3), ErrorCode::InvalidRequest)
         );
-        assert_eq!(err.error.details["field"], "after_ms");
-        assert_eq!(err.error.details["type"], "clip/start");
+        assert_eq!(err.error.details["field"], "duration_ms");
+        assert_eq!(err.error.details["type"], "recording/create");
         for frame in [
-            r#"{"id":4,"type":"clip/start","stream_id":"front","after_ms":-1}"#,
-            r#"{"id":5,"type":"clip/start","stream_id":"front","after_ms":1,"before_ms":4294967296}"#,
-            r#"{"id":6,"type":"clip/start","stream_id":"front","after_ms":1,"preroll_ms":1}"#,
-            // A clip always has its length.
-            r#"{"id":7,"type":"clip/start","stream_id":"front"}"#,
+            r#"{"id":4,"type":"recording/create","stream_id":"front","duration_ms":-1}"#,
+            r#"{"id":5,"type":"recording/create","stream_id":"front","duration_ms":1,"prerecord_ms":4294967296}"#,
+            // Names its fields had before are unknown fields.
+            r#"{"id":6,"type":"recording/create","stream_id":"front","duration_ms":1,"preroll_ms":1}"#,
+            r#"{"id":6,"type":"recording/create","stream_id":"front","duration_ms":1,"before_ms":1}"#,
+            r#"{"id":6,"type":"recording/create","stream_id":"front","after_ms":1}"#,
+            // A recording always has its length.
+            r#"{"id":7,"type":"recording/create","stream_id":"front"}"#,
         ] {
             let err = parse_command(frame).unwrap_err();
             assert_eq!(err.error.code, ErrorCode::InvalidRequest, "{frame}");
         }
         // Nor is there a stop.
-        let err = parse_command(r#"{"id":8,"type":"clip/stop","clip_id":"c"}"#).unwrap_err();
+        let err =
+            parse_command(r#"{"id":8,"type":"recording/stop","recording_id":"c"}"#).unwrap_err();
         assert_eq!(err.error.code, ErrorCode::UnknownCommand);
     }
 
     #[test]
-    fn a_put_keeps_a_pre_roll_window_only_when_it_asks_for_one() {
+    fn a_put_keeps_a_pre_record_window_only_when_it_asks_for_one() {
         let_assert!(
             Command::StreamPut(put) = parse_command(
-                r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"url":"rtsp://c/"}],"preroll_ms":30000}"#
+                r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"url":"rtsp://c/"}],"prerecord_ms":30000}"#
             )
             .unwrap()
         );
-        assert_eq!(put.preroll_ms, 30_000);
+        assert_eq!(put.prerecord_ms, 30_000);
         let json = serde_json::to_value(Command::StreamPut(put)).unwrap();
-        assert_eq!(json["preroll_ms"], 30_000);
+        assert_eq!(json["prerecord_ms"], 30_000);
     }
 
     /// `frame` parsed, or the field and message of its refusal; the
@@ -1209,16 +1216,16 @@ mod tests {
     }
 
     #[test]
-    fn a_clips_ids_are_capped_like_a_sessions() {
+    fn a_recordings_ids_are_capped_like_a_sessions() {
         let text = |n: usize| "x".repeat(n);
-        let clip_as = |n| {
-            json!({ "id": 1, "type": "clip/start", "stream_id": "a", "clip_id": text(n),
-                    "after_ms": 1 })
+        let recording_as = |n| {
+            json!({ "id": 1, "type": "recording/create", "stream_id": "a", "recording_id": text(n),
+                    "duration_ms": 1 })
         };
-        assert!(limited(&clip_as(MAX_ID_CHARS)).is_ok());
+        assert!(limited(&recording_as(MAX_ID_CHARS)).is_ok());
         assert_eq!(
-            limited(&clip_as(MAX_ID_CHARS + 1)).unwrap_err().0,
-            "clip_id"
+            limited(&recording_as(MAX_ID_CHARS + 1)).unwrap_err().0,
+            "recording_id"
         );
     }
 
@@ -1233,7 +1240,7 @@ mod tests {
                 json!({ "id": 1, "type": "stream/subscribe", "stream_id": id(n) }),
                 json!({ "id": 1, "type": "webrtc/offer", "stream_id": id(n), "sdp": "v=0" }),
                 json!({ "id": 1, "type": "backchannel/release", "stream_id": id(n), "session_id": "s" }),
-                json!({ "id": 1, "type": "clip/start", "stream_id": id(n), "after_ms": 1 }),
+                json!({ "id": 1, "type": "recording/create", "stream_id": id(n), "duration_ms": 1 }),
             ]
         };
         for frame in frames(MAX_ID_CHARS) {

@@ -11,7 +11,7 @@
 //! client: before that no client exists to be incompatible with, so an
 //! API change does not bump it.
 
-/// Defines [`API_VERSION`], [`CURRENT`], [`WS_PATH`] and [`CLIPS_PATH`]
+/// Defines [`API_VERSION`], [`CURRENT`], [`WS_PATH`] and [`RECORDING_PATH`]
 /// from one `major, minor, patch`, so they cannot disagree.
 macro_rules! api_version {
     ($major:literal, $minor:literal, $patch:literal) => {
@@ -28,9 +28,9 @@ macro_rules! api_version {
         /// The WebSocket path: `/v<major>/ws`.
         pub const WS_PATH: &str = concat!("/v", $major, "/ws");
 
-        /// Where event clips' bytes are served: `/v<major>/clips`, each
-        /// clip at `/v<major>/clips/{clip_id}` ([`crate::clip::clip_path`]).
-        pub const CLIPS_PATH: &str = concat!("/v", $major, "/clips");
+        /// Where event recordings' bytes are served: `/v<major>/recording`, each
+        /// recording at `/v<major>/recording/{recording_id}` ([`crate::recording::recording_path`]).
+        pub const RECORDING_PATH: &str = concat!("/v", $major, "/recording");
     };
 }
 
@@ -106,7 +106,7 @@ mod tests {
         assert_eq!(API_VERSION, "0.1.0");
         assert_eq!(CURRENT, v(0, 1, 0));
         assert_eq!(WS_PATH, "/v0/ws");
-        assert_eq!(CLIPS_PATH, "/v0/clips");
+        assert_eq!(RECORDING_PATH, "/v0/recording");
         assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
     }
 

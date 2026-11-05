@@ -33,11 +33,11 @@ mod generator {
 
     use crate::API_VERSION;
     use crate::clients::ClientList;
-    use crate::clip::{ClipEvent, ClipStartResult};
     use crate::command::Command;
     use crate::frame::{Empty, EventFrame, Failure, Hello, Pong, Shutdown, Success};
     use crate::info::{InfoResult, Metrics};
     use crate::pairing::PairingCreateResult;
+    use crate::recording::{RecordingCreateResult, RecordingEvent};
     use crate::session::{Session, SessionEvent, SessionList, WebrtcRenegotiateResult};
     use crate::stream::{
         BackchannelReleaseResult, Stream, StreamEvent, StreamList, StreamPutResult,
@@ -113,8 +113,8 @@ mod generator {
             reference::<Success<BackchannelReleaseResult>>(&mut generator),
         );
         results.insert(
-            "clip/start".into(),
-            reference::<Success<ClipStartResult>>(&mut generator),
+            "recording/create".into(),
+            reference::<Success<RecordingCreateResult>>(&mut generator),
         );
         let hello = reference::<Hello>(&mut generator);
         let shutdown = reference::<Shutdown>(&mut generator);
@@ -122,7 +122,7 @@ mod generator {
         let failure = reference::<Failure>(&mut generator);
         let stream_events = reference::<EventFrame<StreamEvent>>(&mut generator);
         let session_events = reference::<EventFrame<SessionEvent>>(&mut generator);
-        let clip_events = reference::<EventFrame<ClipEvent>>(&mut generator);
+        let recording_events = reference::<EventFrame<RecordingEvent>>(&mut generator);
         json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "lotse control API",
@@ -136,7 +136,7 @@ mod generator {
                 "stream/subscribe": stream_events,
                 "webrtc/offer": session_events,
                 "session/adopt": session_events,
-                "clip/start": clip_events,
+                "recording/create": recording_events,
             },
             "$defs": generator.take_definitions(true),
         })
@@ -262,7 +262,7 @@ mod tests {
             "stream/subscribe",
             "webrtc/offer",
             "session/adopt",
-            "clip/start",
+            "recording/create",
         ] {
             assert_eq!(tag_of(&bundle, &bundle["events"][name]), "event", "{name}");
         }

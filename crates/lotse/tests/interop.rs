@@ -19,15 +19,15 @@
 //! and ffmpeg's own raw MPEG-TS (ISO/IEC 13818-1) over HTTP; a publisher
 //! that restarts is seen as a reconnect.
 //!
-//! The [`clip`] tests record event clips of the stream (H.264 or libx265's
-//! H.265; AAC, Opus, PCMU or G.722) from the daemon's pre-roll window and
+//! The [`recording`] tests record event recordings of the stream (H.264 or libx265's
+//! H.265; AAC, Opus, PCMU or G.722) from the daemon's pre-record window and
 //! have ffprobe decode them (ISO/IEC 14496-12).
 //!
 //! Ignored by default: they need `mediamtx`, `ffmpeg` and `ffprobe` on
 //! `PATH`, which `mise run interop` provides (pinned in `mise.toml`) before
 //! it runs them. Needs the `source-rtsp` and `output-webrtc` features (the
-//! defaults), `source-http` for the HTTP tests and `output-clip` for the
-//! clip tests.
+//! defaults), `source-http` for the HTTP tests and `output-recording` for the
+//! recording tests.
 
 #![cfg(all(feature = "source-rtsp", feature = "output-webrtc"))]
 #![allow(
@@ -93,7 +93,7 @@ fn negotiated(audio: Audio) -> Option<&'static str> {
         Audio::None => None,
         Audio::Aac | Audio::Opus => Some("opus"),
         Audio::Pcmu => Some("pcmu"),
-        // Not played by these tests: the clips transcode it.
+        // Not played by these tests: the recordings transcode it.
         Audio::G722 => Some("g722"),
     }
 }
@@ -782,20 +782,20 @@ mod http {
     }
 }
 
-/// Event clips of MediaMTX's stream, checked by ffprobe, an independent
+/// Event recordings of MediaMTX's stream, checked by ffprobe, an independent
 /// reader of ISO/IEC 14496-12 that decodes every frame: a preloaded
-/// stream with a pre-roll window records a clip from `before_ms` ago to
-/// `after_ms` from now (`clip/start`), fetched as it runs (`GET
-/// /v0/clips/{clip_id}`), written to a file and read with `ffprobe
+/// stream with a pre-record window makes a recording from `prerecord_ms` ago to
+/// `duration_ms` from now (`recording/create`), fetched as it runs (`GET
+/// /v0/recording/{recording_id}`), written to a file and read with `ffprobe
 /// -show_streams -show_frames`. Each test checks the streams and their
 /// codecs (H.264 as `avc1`, H.265 as `hvc1`, AAC-LC as the camera sent it,
 /// Opus as sent or transcoded from G.711 and G.722, never `audio_omitted`),
 /// that every frame decodes (ffprobe reports no error), the frames against
-/// the clip's duration, the first video frame a keyframe, and the audio
-/// starting with the video; a publisher restart inside a clip is one `gap`
+/// the recording's duration, the first video frame a keyframe, and the audio
+/// starting with the video; a publisher restart inside a recording is one `gap`
 /// event where the file has a real hole.
-#[cfg(feature = "output-clip")]
-mod clip {
+#[cfg(feature = "output-recording")]
+mod recording {
     use std::path::Path;
 
     use lotse_testing::mediamtx::{FPS, HEIGHT, Video, WIDTH};
@@ -803,19 +803,19 @@ mod clip {
 
     use super::*;
     use crate::common::SocketDir;
-    use crate::common::clip_body::{Fetched, fetch_on_socket};
+    use crate::common::recording_body::{Fetched, fetch_on_socket};
 
-    /// The pre-roll window the stream keeps.
-    const PREROLL_MS: u64 = 10_000;
+    /// The pre-record window the stream keeps.
+    const WINDOW_MS: u64 = 10_000;
 
-    /// How much of the window the clip asks for.
-    const BEFORE_MS: u64 = 2_000;
+    /// How much of the window the recording asks for.
+    const PRERECORD_MS: u64 = 2_000;
 
-    /// How long the clip runs after it starts.
-    const AFTER_MS: u64 = 3_000;
+    /// How long the recording runs after it starts.
+    const DURATION_MS: u64 = 3_000;
 
     /// One video frame at the camera's rate, in the 90 kHz RTP clock of
-    /// H.264 and H.265 (RFC 6184 §8.2.1, RFC 7798 §7.1), which the clip's
+    /// H.264 and H.265 (RFC 6184 §8.2.1, RFC 7798 §7.1), which the recording's
     /// video track keeps as its timescale.
     const FRAME_TICKS: i64 = 90_000 / FPS as i64;
 
@@ -826,7 +826,7 @@ mod clip {
     const AV_SYNC_MS: u64 = 40;
 
     /// The G.711 to Opus transcode's delay, 312 ticks at 48 kHz: what the
-    /// clip's origin lies before its first frame's capture time, so its
+    /// recording's origin lies before its first frame's capture time, so its
     /// first video sample starts there.
     const G711_DELAY_US: u64 = 6_500;
 
@@ -835,7 +835,7 @@ mod clip {
 
     /// A daemon on a socket of its own with its control connection.
     async fn daemon(test: &str) -> (Daemon, Arc<Control>, SocketDir) {
-        let dir = socket_dir(&format!("interop-clip-{test}"));
+        let dir = socket_dir(&format!("interop-recording-{test}"));
         let socket = dir.join("lotse.sock");
         let mut daemon = Daemon::start(
             &[
@@ -846,7 +846,7 @@ mod clip {
                 "--socket",
                 socket.to_str().unwrap(),
                 // The test binary is dynamic, and Landlock checks `execute`
-                // on its loader too; the sandbox records a clip in
+                // on its loader too; the sandbox makes a recording in
                 // `worker.rs`.
                 "--sandbox",
                 "off",
@@ -860,7 +860,7 @@ mod clip {
         (daemon, Arc::new(control), dir)
     }
 
-    /// `stream/put` of the camera, preloaded with a [`PREROLL_MS`] window,
+    /// `stream/put` of the camera, preloaded with a [`WINDOW_MS`] window,
     /// then `stream/get` until it is live with every track and the video's
     /// window holds `held_ms`.
     async fn put_and_fill(
@@ -875,7 +875,7 @@ mod clip {
                 "stream_id": STREAM,
                 "sources": [{ "url": camera.url() }],
                 "preload": true,
-                "preroll_ms": PREROLL_MS,
+                "prerecord_ms": WINDOW_MS,
             }))
             .await
             .expect("stream/put");
@@ -886,48 +886,48 @@ mod clip {
             "{live}"
         );
         wait_stream(control, clock, |stream| {
-            native(stream, "video")["preroll"]["held_ms"]
+            native(stream, "video")["prerecord"]["held_ms"]
                 .as_u64()
                 .is_some_and(|held| held >= held_ms)
         })
         .await
     }
 
-    /// The next event of a clip's subscription, or a failure after
+    /// The next event of a recording's subscription, or a failure after
     /// [`LIVE_WITHIN`].
     async fn next_event(events: &mut mpsc::UnboundedReceiver<Value>, clock: &dyn Clock) -> Value {
         tokio::select! {
-            event = events.recv() => event.expect("the subscription ends with stopped"),
-            () = clock.sleep(LIVE_WITHIN) => panic!("no clip event in {LIVE_WITHIN:?}"),
+            event = events.recv() => event.expect("the subscription ends with closed"),
+            () = clock.sleep(LIVE_WITHIN) => panic!("no recording event in {LIVE_WITHIN:?}"),
         }
     }
 
-    /// The events up to and including `stopped`.
-    async fn until_stopped(
+    /// The events up to and including `closed`.
+    async fn until_closed(
         events: &mut mpsc::UnboundedReceiver<Value>,
         clock: &dyn Clock,
     ) -> Vec<Value> {
         let mut seen = Vec::new();
         loop {
             let event = next_event(events, clock).await;
-            let stopped = event["type"] == "stopped";
+            let closed = event["type"] == "closed";
             seen.push(event);
-            if stopped {
+            if closed {
                 return seen;
             }
         }
     }
 
-    /// The body as the clip ended `reason`: 200 `video/mp4`, ended with its
-    /// last chunk (RFC 9112 §7.1), as many bytes as `stopped` counts.
+    /// The body as the recording ended `reason`: 200 `video/mp4`, ended with its
+    /// last chunk (RFC 9112 §7.1), as many bytes as `closed` counts.
     fn check_whole(fetched: &Fetched, events: &[Value], reason: &str) {
         assert_eq!(fetched.status, 200, "{fetched:?}");
         assert_eq!(fetched.content_type.as_deref(), Some("video/mp4"));
         assert!(fetched.whole, "the body ends with its last chunk");
         assert_eq!(events[0]["type"], "started", "{events:?}");
-        let stopped = events.last().unwrap();
+        let closed = events.last().unwrap();
         assert_eq!(
-            (&stopped["reason"], stopped["bytes"].as_u64()),
+            (&closed["reason"], closed["bytes"].as_u64()),
             (&json!(reason), u64::try_from(fetched.bytes.len()).ok()),
             "{events:?}"
         );
@@ -954,7 +954,7 @@ mod clip {
 
     impl Probed {
         /// Milliseconds from the file's zero to `ticks`, rounded down as the
-        /// daemon's clip times are.
+        /// daemon's recording times are.
         fn ms(&self, ticks: i64) -> u64 {
             u64::try_from(ticks * 1_000 / self.rate).unwrap()
         }
@@ -990,7 +990,7 @@ mod clip {
     /// every frame did.
     #[expect(
         clippy::disallowed_methods,
-        reason = "a third-party reader of the daemon's clip, never the daemon's code"
+        reason = "a third-party reader of the daemon's recording, never the daemon's code"
     )]
     fn ffprobe(file: &Path) -> (Probed, Option<Probed>) {
         let output = std::process::Command::new("ffprobe")
@@ -1086,42 +1086,42 @@ mod clip {
         );
     }
 
-    /// A clip of a preloaded camera sending `video` and `audio`: from the
-    /// newest keyframe at least [`BEFORE_MS`] old to [`AFTER_MS`] from the
+    /// A recording of a preloaded camera sending `video` and `audio`: from the
+    /// newest keyframe at least [`PRERECORD_MS`] old to [`DURATION_MS`] from the
     /// start, whole, its streams checked by ffprobe.
-    async fn clip(video: Video, audio: Audio) {
+    async fn recording(video: Video, audio: Audio) {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let camera = Camera::start_video(video, audio, Arc::clone(&clock))
             .await
             .expect("MediaMTX and ffmpeg (run through `mise run interop`)");
         let (daemon, control, dir) = daemon(&format!("{}-{}", video.name(), audio.name())).await;
-        put_and_fill(&control, &camera, BEFORE_MS + 1_000, &*clock).await;
+        put_and_fill(&control, &camera, PRERECORD_MS + 1_000, &*clock).await;
 
         let asked = clock.now();
         let (_id, result, mut events) = control
             .subscribe(json!({
-                "type": "clip/start",
+                "type": "recording/create",
                 "stream_id": STREAM,
-                "before_ms": BEFORE_MS,
-                "after_ms": AFTER_MS,
+                "prerecord_ms": PRERECORD_MS,
+                "duration_ms": DURATION_MS,
             }))
             .await
-            .expect("clip/start");
+            .expect("recording/create");
         let fetch = fetch_on_socket(&dir.join("lotse.sock"), result["url"].as_str().unwrap()).await;
         let first = next_event(&mut events, &*clock).await;
-        // At least how long after the command the clip started (`at`,
-        // which `before_ms` counts back from), while `after_ms` counts from
+        // At least how long after the command the recording started (`at`,
+        // which `prerecord_ms` counts back from), while `duration_ms` counts from
         // the command.
         let start_delay =
             u64::try_from(clock.now().saturating_duration_since(asked).as_millis()).unwrap();
-        let events = [vec![first], until_stopped(&mut events, &*clock).await].concat();
+        let events = [vec![first], until_closed(&mut events, &*clock).await].concat();
         let fetched = fetch.await.expect("the fetch");
         check_whole(&fetched, &events, "completed");
         assert_eq!(
-            fetched.clip_id.as_ref(),
-            result["clip_id"].as_str().map(str::to_owned).as_ref()
+            fetched.recording_id.as_ref(),
+            result["recording_id"].as_str().map(str::to_owned).as_ref()
         );
-        // `started` and `stopped`: no gap, and no `audio_omitted` warning.
+        // `started` and `closed`: no gap, and no `audio_omitted` warning.
         assert_eq!(events.len(), 2, "{events:?}");
         let started = &events[0];
         let audio_codec = match audio {
@@ -1137,29 +1137,29 @@ mod clip {
             ),
             "{started}"
         );
-        // The keyframe's age when the container starts (`Clip::begin`),
+        // The keyframe's age when the container starts (`Recording::begin`),
         // which can be up to `start_delay` after the command chose it.
-        let before_ms = started["before_ms"].as_u64().unwrap();
+        let prerecord_ms = started["prerecord_ms"].as_u64().unwrap();
         assert!(
-            (BEFORE_MS..BEFORE_MS + 1_000 + FRAME_MS + start_delay).contains(&before_ms),
-            "the newest keyframe {BEFORE_MS} ms ago or more, a second apart, \
-             started at most {start_delay} ms after it was asked: {before_ms}"
+            (PRERECORD_MS..PRERECORD_MS + 1_000 + FRAME_MS + start_delay).contains(&prerecord_ms),
+            "the newest keyframe {PRERECORD_MS} ms ago or more, a second apart, \
+             started at most {start_delay} ms after it was asked: {prerecord_ms}"
         );
 
-        let file = dir.join("clip.mp4");
+        let file = dir.join("recording.mp4");
         std::fs::write(&file, &fetched.bytes).unwrap();
         let (video_frames, audio_frames) = ffprobe(&file);
         check_video(&video_frames, video);
-        // From the keyframe `before_ms` before the clip started to the
-        // first frame at or after `after_ms` from the command, which the
-        // clip leaves out: `before_ms + AFTER_MS` less however long after
-        // the command the clip started, which the round trip bounds.
+        // From the keyframe `prerecord_ms` before the recording started to the
+        // first frame at or after `duration_ms` from the command, which the
+        // recording leaves out: `prerecord_ms + DURATION_MS` less however long after
+        // the command the recording started, which the round trip bounds.
         let span = video_frames.span_ms();
-        let asked_span = before_ms + AFTER_MS;
+        let asked_span = prerecord_ms + DURATION_MS;
         assert!(
             (asked_span.saturating_sub(start_delay + 2 * FRAME_MS)..=asked_span + 2 * FRAME_MS)
                 .contains(&span),
-            "the video covers {span} ms, the clip {before_ms} + {AFTER_MS} ms, \
+            "the video covers {span} ms, the recording {prerecord_ms} + {DURATION_MS} ms, \
              started at most {start_delay} ms after it was asked"
         );
         // The duration counts from the file's media time 0 to where its
@@ -1169,10 +1169,10 @@ mod clip {
             .as_ref()
             .map_or(0, end_ms)
             .max(end_ms(&video_frames));
-        let stopped = events.last().unwrap();
+        let closed = events.last().unwrap();
         assert!(
-            stopped["duration_ms"].as_u64().unwrap().abs_diff(media_end) <= 2 * FRAME_MS,
-            "{stopped} for media to {media_end} ms"
+            closed["duration_ms"].as_u64().unwrap().abs_diff(media_end) <= 2 * FRAME_MS,
+            "{closed} for media to {media_end} ms"
         );
 
         check_audio(audio, &video_frames, audio_frames.as_ref());
@@ -1189,9 +1189,9 @@ mod clip {
     /// channels, the count RFC 7587 §7 has every Opus `rtpmap` declare,
     /// whatever the encoder sends; mono packets decode to both) or
     /// transcoded (mono), without a hole, over the video's span. The audio starts with the
-    /// video (EBU R37, within 40 ms), except AAC-LC: the clip starts with
+    /// video (EBU R37, within 40 ms), except AAC-LC: the recording starts with
     /// the audio frame playing at the keyframe, 64 ms long, so the keyframe
-    /// falls inside the first audio frame. A transcoded clip's origin lies
+    /// falls inside the first audio frame. A transcoded recording's origin lies
     /// the transcode's delay before its first frame, so its video starts at
     /// that delay, plus the lead of the audio frame playing at the keyframe
     /// when that one was captured before it and so came first.
@@ -1201,7 +1201,10 @@ mod clip {
             return;
         };
         let (codec, rate, frame_ticks, channels) = match audio {
-            Audio::None => panic!("no audio stream in a video-only clip: {}", sound.stream),
+            Audio::None => panic!(
+                "no audio stream in a video-only recording: {}",
+                sound.stream
+            ),
             Audio::Aac => ("aac", 16_000, 1_024, 1),
             Audio::Opus => ("opus", 48_000, 960, 2),
             Audio::Pcmu | Audio::G722 => ("opus", 48_000, 960, 1),
@@ -1263,40 +1266,40 @@ mod clip {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
-    async fn mediamtx_iso14496_12_clip_h264_aac() {
-        clip(Video::H264, Audio::Aac).await;
+    async fn mediamtx_iso14496_12_recording_h264_aac() {
+        recording(Video::H264, Audio::Aac).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
-    async fn mediamtx_iso14496_12_clip_h265() {
-        clip(Video::H265, Audio::None).await;
+    async fn mediamtx_iso14496_12_recording_h265() {
+        recording(Video::H265, Audio::None).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
-    async fn mediamtx_iso14496_12_clip_opus() {
-        clip(Video::H264, Audio::Opus).await;
+    async fn mediamtx_iso14496_12_recording_opus() {
+        recording(Video::H264, Audio::Opus).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
-    async fn mediamtx_iso14496_12_clip_pcmu_to_opus() {
-        clip(Video::H264, Audio::Pcmu).await;
+    async fn mediamtx_iso14496_12_recording_pcmu_to_opus() {
+        recording(Video::H264, Audio::Pcmu).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
-    async fn mediamtx_iso14496_12_clip_g722_to_opus() {
-        clip(Video::H264, Audio::G722).await;
+    async fn mediamtx_iso14496_12_recording_g722_to_opus() {
+        recording(Video::H264, Audio::G722).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
-    async fn mediamtx_iso14496_12_clip_reconnect() {
-        // ffmpeg restarts while the clip runs, a camera that reboots:
+    async fn mediamtx_iso14496_12_recording_reconnect() {
+        // ffmpeg restarts while the recording runs, a camera that reboots:
         // MediaMTX drops the path, the daemon reconnects once ffmpeg
-        // publishes again, and the clip goes on with a hole of the real time
+        // publishes again, and the recording goes on with a hole of the real time
         // the restart took, up to its end: long enough for the restart, the
         // reconnect and seconds of the new connection's media.
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -1307,11 +1310,11 @@ mod clip {
         put_and_fill(&control, &camera, 1_000, &*clock).await;
         let (_id, result, mut events) = control
             .subscribe(
-                json!({ "type": "clip/start", "stream_id": STREAM, "before_ms": 1_000,
-                               "after_ms": 15_000 }),
+                json!({ "type": "recording/create", "stream_id": STREAM, "prerecord_ms": 1_000,
+                               "duration_ms": 15_000 }),
             )
             .await
-            .expect("clip/start");
+            .expect("recording/create");
         let fetch = fetch_on_socket(&dir.join("lotse.sock"), result["url"].as_str().unwrap()).await;
         let started = next_event(&mut events, &*clock).await;
         assert_eq!(started["type"], "started", "{started}");
@@ -1327,16 +1330,16 @@ mod clip {
             "{gap}"
         );
         let mut all = vec![started, gap.clone()];
-        all.extend(until_stopped(&mut events, &*clock).await);
+        all.extend(until_closed(&mut events, &*clock).await);
         let fetched = fetch.await.expect("the fetch");
         check_whole(&fetched, &all, "completed");
         assert_eq!(all.len(), 3, "one gap: {all:?}");
         assert_eq!(all[2]["gaps"], 1, "{all:?}");
 
-        let file = dir.join("clip.mp4");
+        let file = dir.join("recording.mp4");
         std::fs::write(&file, &fetched.bytes).unwrap();
         let (video, sound) = ffprobe(&file);
-        assert!(video.frames[0].key, "the clip starts at a keyframe");
+        assert!(video.frames[0].key, "the recording starts at a keyframe");
         assert!(sound.is_some(), "with its audio");
         // One hole: from the last frame before the restart to the new
         // connection's first, a keyframe, at the times the gap names (whole

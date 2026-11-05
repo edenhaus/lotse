@@ -12,8 +12,8 @@
 //! A/V offset at the output (40 ms, EBU R37) joins the suite with audio
 //! sessions in M2.
 //!
-//! The clip output's checks, the `Reliable` delivery and the `Preroll`
-//! join, are in [`clip`]: they run a clip task through its own seam, on a
+//! The recording output's checks, the `Reliable` delivery and the `Prerecord`
+//! join, are in [`recording`]: they run a recording task through its own seam, on a
 //! fake clock, against a recording container.
 
 use std::net::SocketAddr;
@@ -780,15 +780,15 @@ pub fn check_all(factory: &dyn OutputFactory, now: Instant) -> Vec<(&'static str
         .collect()
 }
 
-/// The clip output's checks: the `Reliable` delivery and the `Preroll`
-/// join of the egress contract, run against a clip task through
-/// [`ClipUnderTest`](clip::ClipUnderTest), the seam the worker's clip
+/// The recording output's checks: the `Reliable` delivery and the `Prerecord`
+/// join of the egress contract, run against a recording task through
+/// [`RecordingUnderTest`](recording::RecordingUnderTest), the seam the worker's recording
 /// task implements in its tests. A scripted H.264 track on a fake clock
-/// keeps a pre-roll window; the clip writes into a pipe through a
+/// keeps a pre-record window; the recording writes into a pipe through a
 /// recording container, which hands on each frame's payload as is, so the
-/// checks see what the clip gave the container, in order, and what reached
+/// checks see what the recording gave the container, in order, and what reached
 /// the pipe.
-pub mod clip {
+pub mod recording {
     use std::future::Future;
     use std::os::fd::OwnedFd;
     use std::pin::Pin;
@@ -796,12 +796,13 @@ pub mod clip {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use lotse_core::clip::{
-        ClipError, ClipMuxer, ClipMuxerFactory, ClipPolicy, ClipTrack, DEFAULT_CLIP_QUEUE_BYTES,
-    };
     use lotse_core::clock::{Clock, FakeClock, SystemClock};
     use lotse_core::codec::{Codec, Kind};
     use lotse_core::media::{MediaFrame, MediaTime};
+    use lotse_core::recording::{
+        DEFAULT_RECORDING_QUEUE_BYTES, RecordingError, RecordingMuxer, RecordingMuxerFactory,
+        RecordingPolicy, RecordingTrack,
+    };
     use lotse_core::source::{TrackPublisher, TrackSet};
     use lotse_core::task::spawn_named;
     use lotse_core::track::{Track, TrackEvent, TrackLimits, Unit};
@@ -810,22 +811,22 @@ pub mod clip {
 
     use super::{Check, ready_now};
 
-    /// What the suite asks of a clip: long enough that only its stop ends
+    /// What the suite asks of a recording: long enough that only its stop ends
     /// it, video only.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ClipAsk {
-        /// How far before now it starts (`before_ms`).
+    pub struct RecordingAsk {
+        /// How far before now it starts (`prerecord_ms`).
         pub before: Duration,
-        /// The bound of its reliable queue (`limits.clip_queue_bytes`).
+        /// The bound of its reliable queue (`limits.recording_queue_bytes`).
         pub queue_bytes: usize,
     }
 
-    /// What a clip reported, as the suite reads it.
+    /// What a recording reported, as the suite reads it.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum ClipNote {
-        /// The clip began: its first keyframe's age when it was asked.
+    pub enum RecordingNote {
+        /// The recording began: its first keyframe's age when it was asked.
         Started {
-            /// The age (`started.before_ms`).
+            /// The age (`started.prerecord_ms`).
             before: Duration,
         },
         /// A hole, for `reason` (`gap.reason`).
@@ -834,8 +835,8 @@ pub mod clip {
             reason: String,
         },
         /// The last report.
-        Stopped {
-            /// Why (`stopped.reason`).
+        Closed {
+            /// Why (`closed.reason`).
             reason: String,
             /// The bytes written into the pipe.
             bytes: u64,
@@ -846,28 +847,28 @@ pub mod clip {
         Other,
     }
 
-    /// The future of a clip's next report.
-    pub type NextNote<'a> = Pin<Box<dyn Future<Output = Option<ClipNote>> + Send + 'a>>;
+    /// The future of a recording's next report.
+    pub type NextNote<'a> = Pin<Box<dyn Future<Output = Option<RecordingNote>> + Send + 'a>>;
 
-    /// A clip task under test: one clip at a time, the way its process
+    /// A recording task under test: one recording at a time, the way its process
     /// runs it.
-    pub trait ClipUnderTest: Send {
-        /// Starts a clip of `tracks` that asks `ask`, through `factory`'s
+    pub trait RecordingUnderTest: Send {
+        /// Starts a recording of `tracks` that asks `ask`, through `factory`'s
         /// container, on `clock`, writing into the pipe's write end `pipe`.
         fn start(
             &mut self,
             tracks: &Arc<TrackSet>,
-            factory: Arc<dyn ClipMuxerFactory>,
+            factory: Arc<dyn RecordingMuxerFactory>,
             clock: Arc<dyn Clock>,
-            ask: ClipAsk,
+            ask: RecordingAsk,
             pipe: OwnedFd,
         );
 
-        /// Asks the running clip to stop, as the supervisor's `StopClip`
+        /// Asks the running recording to stop, as the supervisor's `StopRecording`
         /// does.
         fn stop(&mut self);
 
-        /// The clip's next report; `None` once none can come.
+        /// The recording's next report; `None` once none can come.
         fn report(&mut self) -> NextNote<'_>;
     }
 
@@ -886,28 +887,28 @@ pub mod clip {
     /// What the recording container writes before the frames.
     const HEAD: &[u8] = b"head\n";
 
-    /// What it writes when the clip finishes: the container is complete.
+    /// What it writes when the recording finishes: the container is complete.
     const TAIL: &[u8] = b"tail\n";
 
     /// How long the suite waits for a report or the pipe's end, in real
-    /// time, before it calls the clip stuck.
+    /// time, before it calls the recording stuck.
     const STUCK: Duration = Duration::from_secs(5);
 
-    /// What the clip gave the container, and what the container made of
+    /// What the recording gave the container, and what the container made of
     /// it.
     #[derive(Debug, Default)]
     struct Record {
         /// The frames, in order: capture time and timestamp.
         frames: Vec<(Instant, i64, bool)>,
-        /// Every byte the container handed the clip, in order: [`HEAD`],
+        /// Every byte the container handed the recording, in order: [`HEAD`],
         /// each frame's payload, [`TAIL`] once finished. The pipe must
         /// carry exactly these.
         made: Vec<u8>,
-        /// Whether the clip finished the container.
+        /// Whether the recording finished the container.
         finished: bool,
     }
 
-    /// A container that records what the clip hands it and writes each
+    /// A container that records what the recording hands it and writes each
     /// frame's payload as is, [`HEAD`] before them and [`TAIL`] when it
     /// finishes.
     #[derive(Debug, Default, Clone)]
@@ -920,29 +921,33 @@ pub mod clip {
         }
     }
 
-    impl ClipMuxerFactory for Recorder {
+    impl RecordingMuxerFactory for Recorder {
         fn accepts(&self, _codec: &Codec) -> bool {
             true
         }
 
-        fn muxer(&self, _policy: &ClipPolicy) -> Box<dyn ClipMuxer> {
+        fn muxer(&self, _policy: &RecordingPolicy) -> Box<dyn RecordingMuxer> {
             Box::new(self.clone())
         }
     }
 
-    impl ClipMuxer for Recorder {
+    impl RecordingMuxer for Recorder {
         fn start(
             &mut self,
-            _video: &ClipTrack,
-            _audio: Option<&ClipTrack>,
-        ) -> Result<Vec<Bytes>, ClipError> {
+            _video: &RecordingTrack,
+            _audio: Option<&RecordingTrack>,
+        ) -> Result<Vec<Bytes>, RecordingError> {
             self.with(|record| record.made.extend_from_slice(HEAD));
             Ok(vec![Bytes::from_static(HEAD)])
         }
 
         fn set_origin(&mut self, _origin: Instant) {}
 
-        fn push(&mut self, _track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, ClipError> {
+        fn push(
+            &mut self,
+            _track: Kind,
+            frame: Arc<MediaFrame>,
+        ) -> Result<Vec<Bytes>, RecordingError> {
             self.with(|record| {
                 record
                     .frames
@@ -952,7 +957,7 @@ pub mod clip {
             Ok(vec![frame.payload.clone()])
         }
 
-        /// The capture time from the first frame's: the suite's clips are
+        /// The capture time from the first frame's: the suite's recordings are
         /// video only, and the recorder moves no frame.
         fn media_time(&self, _track: Kind) -> Duration {
             self.with(
@@ -963,7 +968,7 @@ pub mod clip {
             )
         }
 
-        fn finish(&mut self) -> Result<Vec<Bytes>, ClipError> {
+        fn finish(&mut self) -> Result<Vec<Bytes>, RecordingError> {
             self.with(|record| {
                 record.finished = true;
                 record.made.extend_from_slice(TAIL);
@@ -981,7 +986,7 @@ pub mod clip {
         }
     }
 
-    /// Lets the clip's task run until it waits.
+    /// Lets the recording's task run until it waits.
     async fn settle() {
         for _ in 0..64 {
             tokio::task::yield_now().await;
@@ -1018,7 +1023,7 @@ pub mod clip {
                 pps: None,
             };
             let video = publisher.declare(Kind::Video, codec, 90_000);
-            video.set_preroll(Some(WINDOW));
+            video.set_prerecord(Some(WINDOW));
             publisher.ready();
             Self {
                 clock,
@@ -1055,21 +1060,21 @@ pub mod clip {
             })
         }
 
-        /// Starts `ask`'s clip of the track through a fresh [`Recorder`];
+        /// Starts `ask`'s recording of the track through a fresh [`Recorder`];
         /// the recorder and the pipe's read end.
         fn start(
             &self,
-            clip: &mut dyn ClipUnderTest,
-            ask: ClipAsk,
+            recording: &mut dyn RecordingUnderTest,
+            ask: RecordingAsk,
         ) -> Result<(Recorder, pipe::Receiver), String> {
             let (reader, writer) = std::io::pipe().map_err(|err| format!("a pipe: {err}"))?;
             let reader = pipe::Receiver::from_owned_fd(OwnedFd::from(reader))
                 .map_err(|err| format!("the pipe's read end: {err}"))?;
             let recorder = Recorder::default();
-            // A clip asks only whether its audio fits; the recorder takes any.
+            // A recording asks only whether its audio fits; the recorder takes any.
             debug_assert!(recorder.accepts(&self.video.codec()));
             let clock: Arc<dyn Clock> = self.clock.clone();
-            clip.start(
+            recording.start(
                 &self.set,
                 Arc::new(recorder.clone()),
                 clock,
@@ -1081,26 +1086,26 @@ pub mod clip {
     }
 
     /// The next report, which must come.
-    async fn next(clip: &mut dyn ClipUnderTest) -> Result<ClipNote, String> {
-        within("a report", clip.report())
+    async fn next(recording: &mut dyn RecordingUnderTest) -> Result<RecordingNote, String> {
+        within("a report", recording.report())
             .await?
-            .ok_or_else(|| "the clip ended without its stopped report".to_owned())
+            .ok_or_else(|| "the recording ended without its closed report".to_owned())
     }
 
-    /// Every report up to `Stopped`: the gaps' reasons and the stop.
-    async fn until_stopped(
-        clip: &mut dyn ClipUnderTest,
+    /// Every report up to `Closed`: the gaps' reasons and the stop.
+    async fn until_closed(
+        recording: &mut dyn RecordingUnderTest,
     ) -> Result<(Vec<String>, String, u64, u32), String> {
         let mut gaps = Vec::new();
         loop {
-            match next(clip).await? {
-                ClipNote::Gap { reason } => gaps.push(reason),
-                ClipNote::Stopped {
+            match next(recording).await? {
+                RecordingNote::Gap { reason } => gaps.push(reason),
+                RecordingNote::Closed {
                     reason,
                     bytes,
                     gaps: counted,
                 } => return Ok((gaps, reason, bytes, counted)),
-                ClipNote::Started { .. } | ClipNote::Other => {}
+                RecordingNote::Started { .. } | RecordingNote::Other => {}
             }
         }
     }
@@ -1134,7 +1139,7 @@ pub mod clip {
         }
     }
 
-    /// A `Stopped` with `reason` whose bytes are what the pipe carried,
+    /// A `Closed` with `reason` whose bytes are what the pipe carried,
     /// and the pipe carried what the container made, in order, none lost,
     /// none twice, [`TAIL`] last: the container finished.
     fn finished(
@@ -1145,12 +1150,12 @@ pub mod clip {
     ) {
         found.ensure(
             reason == "stopped",
-            format!("the clip stopped {reason}, not stopped"),
+            format!("the recording closed {reason}, not stopped"),
         );
         let carried = bytes.len();
         found.ensure(
             u64::try_from(carried).ok() == Some(written),
-            format!("the clip reported {written} bytes, the pipe carried {carried}"),
+            format!("the recording reported {written} bytes, the pipe carried {carried}"),
         );
         let made = recorder.with(|record| record.made.clone());
         found.ensure(
@@ -1183,16 +1188,16 @@ pub mod clip {
         );
     }
 
-    /// `Preroll`: a clip asking 3.5 s before now, 10 s into a stream with a
+    /// `Prerecord`: a recording asking 3.5 s before now, 10 s into a stream with a
     /// keyframe each second, starts at the keyframe captured at 6 s, the
     /// newest at or before 6.5 s, and says it is 4 s old; it gives the
     /// container every frame from it on with the camera's own timestamps,
     /// the window's and then the live ones, none lost or twice at the seam,
     /// and the pipe carries exactly the bytes the container made of them:
-    /// a clip that dropped or repeated a frame's bytes on the way out would
+    /// a recording that dropped or repeated a frame's bytes on the way out would
     /// still report the bytes it wrote.
-    pub async fn a_preroll_clip_starts_where_it_says_with_the_original_timestamps(
-        clip: &mut dyn ClipUnderTest,
+    pub async fn a_prerecord_recording_starts_where_it_says_with_the_original_timestamps(
+        recording: &mut dyn RecordingUnderTest,
     ) -> Check {
         let mut found = Found::default();
         let mut feed = Feed::new();
@@ -1200,14 +1205,14 @@ pub mod clip {
             feed.frame(16);
         }
         feed.clock.advance(FRAME_STEP);
-        let ask = ClipAsk {
+        let ask = RecordingAsk {
             before: Duration::from_millis(3_500),
-            queue_bytes: DEFAULT_CLIP_QUEUE_BYTES,
+            queue_bytes: DEFAULT_RECORDING_QUEUE_BYTES,
         };
-        let (recorder, reader) = feed.start(clip, ask)?;
+        let (recorder, reader) = feed.start(recording, ask)?;
         settle().await;
-        let started = next(clip).await?;
-        let four_seconds = ClipNote::Started {
+        let started = next(recording).await?;
+        let four_seconds = RecordingNote::Started {
             before: Duration::from_secs(4),
         };
         found.ensure(
@@ -1218,13 +1223,13 @@ pub mod clip {
             feed.frame(16);
             settle().await;
         }
-        clip.stop();
-        let (gaps, reason, written, _) = until_stopped(clip).await?;
+        recording.stop();
+        let (gaps, reason, written, _) = until_closed(recording).await?;
         let bytes = read_to_end(reader).await?;
         finished(&mut found, &recorder, &bytes, (&reason, written));
         found.ensure(
             gaps.is_empty(),
-            format!("gaps {gaps:?} in a clip without a hole"),
+            format!("gaps {gaps:?} in a recording without a hole"),
         );
         let expected = feed.published.get(60..).unwrap_or_default();
         let frames = recorder.with(|record| record.frames.clone());
@@ -1235,21 +1240,23 @@ pub mod clip {
         found.done()
     }
 
-    /// The reliable queue of a clip whose reader stalls: its 4 KiB bound
+    /// The reliable queue of a recording whose reader stalls: its 4 KiB bound
     /// overflows once the pipe is full; frames 16 KiB each.
-    const SMALL_QUEUE: ClipAsk = ClipAsk {
+    const SMALL_QUEUE: RecordingAsk = RecordingAsk {
         before: Duration::ZERO,
         queue_bytes: 4_096,
     };
 
     /// `Reliable` overflow: a reader that stalls fills the pipe and then the
-    /// clip's queue, and the frames that no longer fit cost the clip an
-    /// `overflow` gap, reported and counted in its stop; the clip resumes
+    /// recording's queue, and the frames that no longer fit cost the recording an
+    /// `overflow` gap, reported and counted in its stop; the recording resumes
     /// at a keyframe once the reader reads again.
-    pub async fn reliable_overflow_is_a_counted_gap(clip: &mut dyn ClipUnderTest) -> Check {
+    pub async fn reliable_overflow_is_a_counted_gap(
+        recording: &mut dyn RecordingUnderTest,
+    ) -> Check {
         let mut found = Found::default();
         let mut feed = Feed::new();
-        let (recorder, reader) = feed.start(clip, SMALL_QUEUE)?;
+        let (recorder, reader) = feed.start(recording, SMALL_QUEUE)?;
         settle().await;
         for _ in 0..8 {
             feed.frame(16_384);
@@ -1261,8 +1268,8 @@ pub mod clip {
             feed.frame(16);
             settle().await;
         }
-        clip.stop();
-        let (gaps, reason, written, counted) = until_stopped(clip).await?;
+        recording.stop();
+        let (gaps, reason, written, counted) = until_closed(recording).await?;
         let bytes = read(reading).await?;
         finished(&mut found, &recorder, &bytes, (&reason, written));
         only_overflow(&mut found, &gaps);
@@ -1285,22 +1292,22 @@ pub mod clip {
             .and_then(|pair| pair.get(1));
         found.ensure(
             matches!(resumed, Some((_, _, true))),
-            format!("after the overflow the clip resumed at {resumed:?}"),
+            format!("after the overflow the recording resumed at {resumed:?}"),
         );
         found.done()
     }
 
-    /// A stalled consumer never slows the producer: while a clip's reader
+    /// A stalled consumer never slows the producer: while a recording's reader
     /// reads nothing, 200 frames go into the track, each taken at once and
-    /// seen by another consumer, and the clip keeps draining the track
+    /// seen by another consumer, and the recording keeps draining the track
     /// into its own queue, so once its reader reads again its only gaps are
     /// its queue's `overflow`, never a `lagged` subscription.
     pub async fn a_stalled_consumer_never_slows_the_producer(
-        clip: &mut dyn ClipUnderTest,
+        recording: &mut dyn RecordingUnderTest,
     ) -> Check {
         let mut found = Found::default();
         let mut feed = Feed::new();
-        let (recorder, reader) = feed.start(clip, SMALL_QUEUE)?;
+        let (recorder, reader) = feed.start(recording, SMALL_QUEUE)?;
         settle().await;
         let mut other = feed.video.subscribe(Unit::Frames);
         let (mut taken, mut seen, mut lagged) = (0_u32, 0_u32, false);
@@ -1323,35 +1330,36 @@ pub mod clip {
             feed.frame(16);
             settle().await;
         }
-        clip.stop();
-        let (gaps, reason, written, _) = until_stopped(clip).await?;
+        recording.stop();
+        let (gaps, reason, written, _) = until_closed(recording).await?;
         let bytes = read(reading).await?;
         finished(&mut found, &recorder, &bytes, (&reason, written));
         only_overflow(&mut found, &gaps);
         found.done()
     }
 
-    /// Cancellation within 100 ms: a running clip asked to stop finishes
-    /// its container, closes the pipe and reports `stopped` while the clock
+    /// Cancellation within 100 ms: a running recording asked to stop finishes
+    /// its container, closes the pipe and reports `closed` (`stopped`) while
+    /// the clock
     /// moves 100 ms at most.
     pub async fn a_stop_finishes_the_container_within_100_ms(
-        clip: &mut dyn ClipUnderTest,
+        recording: &mut dyn RecordingUnderTest,
     ) -> Check {
         let mut found = Found::default();
         let mut feed = Feed::new();
-        let ask = ClipAsk {
+        let ask = RecordingAsk {
             before: Duration::ZERO,
-            queue_bytes: DEFAULT_CLIP_QUEUE_BYTES,
+            queue_bytes: DEFAULT_RECORDING_QUEUE_BYTES,
         };
-        let (recorder, reader) = feed.start(clip, ask)?;
+        let (recorder, reader) = feed.start(recording, ask)?;
         let reading = spawn_named("suite-reader", read_to_end(reader));
         for _ in 0..15 {
             feed.frame(16);
             settle().await;
         }
-        clip.stop();
+        recording.stop();
         feed.clock.advance(Duration::from_millis(100));
-        let (_, reason, written, _) = until_stopped(clip).await?;
+        let (_, reason, written, _) = until_closed(recording).await?;
         let bytes = read(reading).await?;
         finished(&mut found, &recorder, &bytes, (&reason, written));
         let frames = recorder.with(|record| record.frames.len());
@@ -1362,24 +1370,25 @@ pub mod clip {
         found.done()
     }
 
-    /// Runs every check against `clip`; the violations, by check name.
-    pub async fn check_all(clip: &mut dyn ClipUnderTest) -> Vec<(&'static str, String)> {
+    /// Runs every check against `recording`; the violations, by check name.
+    pub async fn check_all(recording: &mut dyn RecordingUnderTest) -> Vec<(&'static str, String)> {
         let checks = [
             (
-                "a_preroll_clip_starts_where_it_says_with_the_original_timestamps",
-                a_preroll_clip_starts_where_it_says_with_the_original_timestamps(clip).await,
+                "a_prerecord_recording_starts_where_it_says_with_the_original_timestamps",
+                a_prerecord_recording_starts_where_it_says_with_the_original_timestamps(recording)
+                    .await,
             ),
             (
                 "reliable_overflow_is_a_counted_gap",
-                reliable_overflow_is_a_counted_gap(clip).await,
+                reliable_overflow_is_a_counted_gap(recording).await,
             ),
             (
                 "a_stalled_consumer_never_slows_the_producer",
-                a_stalled_consumer_never_slows_the_producer(clip).await,
+                a_stalled_consumer_never_slows_the_producer(recording).await,
             ),
             (
                 "a_stop_finishes_the_container_within_100_ms",
-                a_stop_finishes_the_container_within_100_ms(clip).await,
+                a_stop_finishes_the_container_within_100_ms(recording).await,
             ),
         ];
         checks

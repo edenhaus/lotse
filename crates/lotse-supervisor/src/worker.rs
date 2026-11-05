@@ -30,16 +30,16 @@ use lotse_core::task::spawn_named;
 use lotse_core::text::plain;
 use lotse_ipc::{Channel, IpcError, Receiver, Sender, SourceState, ToSupervisor, ToWorker};
 pub use lotse_ipc::{
-    ClipReport, ClipSpec, SessionEvent, SessionSpec, SourceSpec, TrackInfo, WorkerStats,
+    RecordingReport, RecordingSpec, SessionEvent, SessionSpec, SourceSpec, TrackInfo, WorkerStats,
 };
 use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::clip::ClipLimits;
 use crate::memory::MemoryProbe;
 use crate::net::turn_client::{RelayOwner, TurnClient, uplink};
+use crate::recording::RecordingLimits;
 use crate::worker_text::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES};
 
 /// The most tracks a worker may declare, and track counters it may report:
@@ -65,10 +65,10 @@ pub struct WorkerConfig {
     /// `--max-sessions`: the daemon's `limits.max_sessions`, the most
     /// sessions one worker can be asked to hold.
     pub max_sessions: u32,
-    /// The worker's share of the clip limits, the same values the
-    /// supervisor checks against: `--preroll-bytes`, `--clip-max-ms`,
-    /// `--clip-queue-bytes`, `--clip-start-timeout-ms` and `--max-clips`.
-    pub clips: ClipLimits,
+    /// The worker's share of the recording limits, the same values the
+    /// supervisor checks against: `--max-prerecord-bytes`, `--max-recording-ms`,
+    /// `--recording-queue-bytes`, `--recording-start-timeout-ms` and `--max-recordings`.
+    pub recordings: RecordingLimits,
 }
 
 /// What a worker tells the supervisor, mapped onto trusted types.
@@ -118,14 +118,14 @@ pub enum WorkerEvent {
         /// When, on the worker's wall clock.
         at: SystemTime,
     },
-    /// An event clip reported something, as the worker wrote it: checked
-    /// against the clip the supervisor holds under `clip_id`, as a
+    /// An event recording reported something, as the worker wrote it: checked
+    /// against the recording the supervisor holds under `recording_id`, as a
     /// session's report is against its session.
-    Clip {
-        /// The clip.
-        clip_id: String,
+    Recording {
+        /// The recording.
+        recording_id: String,
         /// What happened.
-        event: ClipReport,
+        event: RecordingReport,
     },
     /// The worker closed its channel cleanly.
     ChannelClosed,
@@ -228,18 +228,18 @@ impl WorkerManager {
             .arg(self.config.worker_address_space.to_string())
             .arg("--max-sessions")
             .arg(self.config.max_sessions.to_string());
-        let clips = &self.config.clips;
+        let recordings = &self.config.recordings;
         command
-            .arg("--preroll-bytes")
-            .arg(clips.preroll_bytes.to_string())
-            .arg("--clip-max-ms")
-            .arg(clips.clip_max_ms.to_string())
-            .arg("--clip-queue-bytes")
-            .arg(clips.clip_queue_bytes.to_string())
-            .arg("--clip-start-timeout-ms")
-            .arg(clips.start_timeout.as_millis().to_string())
-            .arg("--max-clips")
-            .arg(clips.max_clips.to_string());
+            .arg("--max-prerecord-bytes")
+            .arg(recordings.max_prerecord_bytes.to_string())
+            .arg("--max-recording-ms")
+            .arg(recordings.max_recording_ms.to_string())
+            .arg("--recording-queue-bytes")
+            .arg(recordings.recording_queue_bytes.to_string())
+            .arg("--recording-start-timeout-ms")
+            .arg(recordings.start_timeout.as_millis().to_string())
+            .arg("--max-recordings")
+            .arg(recordings.max_recordings.to_string());
         if !connect_ports.is_empty() {
             let ports: Vec<String> = connect_ports.iter().map(u16::to_string).collect();
             command.arg("--connect-ports").arg(ports.join(","));
@@ -368,7 +368,13 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
         ToSupervisor::Tracks(tracks) => WorkerEvent::Tracks(declared(tracks, &mut trims.tracks)),
         ToSupervisor::Stats(stats) => WorkerEvent::Stats(counted(stats, &mut trims.stats)),
         ToSupervisor::Session { session_id, event } => WorkerEvent::Session { session_id, event },
-        ToSupervisor::Clip { clip_id, event } => WorkerEvent::Clip { clip_id, event },
+        ToSupervisor::Recording {
+            recording_id,
+            event,
+        } => WorkerEvent::Recording {
+            recording_id,
+            event,
+        },
         ToSupervisor::ProbeConnecting { probe } => WorkerEvent::ProbeConnecting(probe),
         ToSupervisor::ProbeEnded { probe } => WorkerEvent::ProbeEnded(probe),
         ToSupervisor::Talker(change) => match TalkerReason::parse(&change.reason) {
@@ -532,30 +538,36 @@ impl Worker {
             .await
     }
 
-    /// Tells the worker its connection's pre-roll window is `ms` from now
+    /// Tells the worker its connection's pre-record window is `ms` from now
     /// on, 0 for none: its tracks keep or free their rings, and nothing
     /// reconnects.
-    pub async fn preroll(&mut self, ms: u32) -> Result<(), IpcError> {
-        self.control.send_msg(&ToWorker::Preroll { ms }, &[]).await
-    }
-
-    /// Starts the event clip `spec` on the worker's tracks, its bytes going
-    /// to `pipe`, the write end of the pipe whose read end the supervisor
-    /// keeps. The descriptor is closed here once sent, so the worker's is
-    /// the only write end and the reader sees the end of the clip when the
-    /// worker closes it, or dies. The reports arrive as
-    /// [`WorkerEvent::Clip`] events.
-    pub async fn start_clip(&mut self, spec: &ClipSpec, pipe: OwnedFd) -> Result<(), IpcError> {
+    pub async fn prerecord(&mut self, ms: u32) -> Result<(), IpcError> {
         self.control
-            .send_msg(&ToWorker::StartClip(spec.clone()), &[pipe.as_fd()])
+            .send_msg(&ToWorker::Prerecord { ms }, &[])
             .await
     }
 
-    /// Ends the clip `clip_id` cleanly; the worker ignores one it does not
+    /// Starts the event recording `spec` on the worker's tracks, its bytes going
+    /// to `pipe`, the write end of the pipe whose read end the supervisor
+    /// keeps. The descriptor is closed here once sent, so the worker's is
+    /// the only write end and the reader sees the end of the recording when the
+    /// worker closes it, or dies. The reports arrive as
+    /// [`WorkerEvent::Recording`] events.
+    pub async fn start_recording(
+        &mut self,
+        spec: &RecordingSpec,
+        pipe: OwnedFd,
+    ) -> Result<(), IpcError> {
+        self.control
+            .send_msg(&ToWorker::StartRecording(spec.clone()), &[pipe.as_fd()])
+            .await
+    }
+
+    /// Ends the recording `recording_id` cleanly; the worker ignores one it does not
     /// run.
-    pub async fn stop_clip(&mut self, clip_id: &str) -> Result<(), IpcError> {
-        let message = ToWorker::StopClip {
-            clip_id: clip_id.to_owned(),
+    pub async fn stop_recording(&mut self, recording_id: &str) -> Result<(), IpcError> {
+        let message = ToWorker::StopRecording {
+            recording_id: recording_id.to_owned(),
         };
         self.control.send_msg(&message, &[]).await
     }
@@ -1014,7 +1026,7 @@ mod tests {
                         frame_bytes: 4,
                         frames_dropped_oversize: 6,
                         frames_over_browser_limit: 7,
-                        preroll: None,
+                        prerecord: None,
                     };
                     ((*id).to_owned(), counters)
                 })
@@ -1050,7 +1062,7 @@ mod tests {
             frame_bytes: 4,
             frames_dropped_oversize: 6,
             frames_over_browser_limit: 7,
-            preroll: None,
+            prerecord: None,
         };
         let stats = WorkerStats {
             tracks: (0..=MAX_TRACKS)
@@ -1144,22 +1156,22 @@ mod tests {
     }
 
     #[test]
-    fn a_clip_message_maps_onto_its_clip_s_event() {
-        let event = ClipReport::Gap {
+    fn a_recording_message_maps_onto_its_recording_s_event() {
+        let event = RecordingReport::Gap {
             reason: "overflow".into(),
             from_ms: 1_000,
             to_ms: 2_500,
         };
         assert_eq!(
             mapped(
-                ToSupervisor::Clip {
-                    clip_id: "k1".into(),
+                ToSupervisor::Recording {
+                    recording_id: "k1".into(),
                     event: event.clone(),
                 },
                 None
             ),
-            WorkerEvent::Clip {
-                clip_id: "k1".into(),
+            WorkerEvent::Recording {
+                recording_id: "k1".into(),
                 event
             }
         );
@@ -1232,13 +1244,13 @@ mod tests {
         let dir = crate::test_support::private_dir("worker-recording");
         let mut config = crate::test_support::environment("/bin/sh").worker;
         config.binary = recording_worker(&dir);
-        config.clips = ClipLimits {
-            preroll_bytes: 1 << 20,
-            clip_max_ms: 45_000,
-            clip_queue_bytes: 1 << 16,
+        config.recordings = RecordingLimits {
+            max_prerecord_bytes: 1 << 20,
+            max_recording_ms: 45_000,
+            recording_queue_bytes: 1 << 16,
             start_timeout: Duration::from_millis(2_500),
-            max_clips: 3,
-            ..ClipLimits::DEFAULT
+            max_recordings: 3,
+            ..RecordingLimits::DEFAULT
         };
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
         let manager = WorkerManager::new(config, Some(udp));
@@ -1250,22 +1262,25 @@ mod tests {
             peer_host: "cam".into(),
             peer_addrs: vec![],
             backoff: lotse_ipc::BackoffPosition::default(),
-            preroll_ms: 0,
+            prerecord_ms: 0,
         };
         worker.run_source(&spec).await.unwrap();
         worker.backchannel(true).await.unwrap();
         worker.grant_switch_connect().await.unwrap();
         worker.grant_probe_connect(4).await.unwrap();
-        worker.preroll(30_000).await.unwrap();
-        let clip = ClipSpec {
-            clip_id: "k1".into(),
-            before_ms: 10_000,
-            after_ms: 20_000,
+        worker.prerecord(30_000).await.unwrap();
+        let recording = RecordingSpec {
+            recording_id: "k1".into(),
+            prerecord_ms: 10_000,
+            duration_ms: 20_000,
             audio: true,
         };
-        let (mut clip_bytes, pipe) = io::pipe().unwrap();
-        worker.start_clip(&clip, pipe.into()).await.unwrap();
-        worker.stop_clip("k1").await.unwrap();
+        let (mut recording_bytes, pipe) = io::pipe().unwrap();
+        worker
+            .start_recording(&recording, pipe.into())
+            .await
+            .unwrap();
+        worker.stop_recording("k1").await.unwrap();
         assert_eq!(
             received(&dir, 8).await,
             [
@@ -1274,10 +1289,10 @@ mod tests {
                 ToWorker::Backchannel { asks: true },
                 ToWorker::SwitchConnectGranted,
                 ToWorker::ProbeConnectGranted { probe: 4 },
-                ToWorker::Preroll { ms: 30_000 },
-                ToWorker::StartClip(clip),
-                ToWorker::StopClip {
-                    clip_id: "k1".into()
+                ToWorker::Prerecord { ms: 30_000 },
+                ToWorker::StartRecording(recording),
+                ToWorker::StopRecording {
+                    recording_id: "k1".into()
                 },
             ],
             "the sockets ride on the first message, once"
@@ -1286,16 +1301,16 @@ mod tests {
         // kept none: once `cat` read the message and so discarded it, the
         // read end ends.
         let mut rest = Vec::new();
-        io::Read::read_to_end(&mut clip_bytes, &mut rest).unwrap();
+        io::Read::read_to_end(&mut recording_bytes, &mut rest).unwrap();
         assert!(rest.is_empty());
         let args = std::fs::read_to_string(dir.join("args")).unwrap();
         assert!(args.contains("--connect-ports\n554,8554\n"), "{args}");
         assert!(
             args.contains(
-                "--preroll-bytes\n1048576\n--clip-max-ms\n45000\n--clip-queue-bytes\n65536\n\
-                 --clip-start-timeout-ms\n2500\n--max-clips\n3\n"
+                "--max-prerecord-bytes\n1048576\n--max-recording-ms\n45000\n--recording-queue-bytes\n65536\n\
+                 --recording-start-timeout-ms\n2500\n--max-recordings\n3\n"
             ),
-            "the clip limits as the supervisor holds them: {args}"
+            "the recording limits as the supervisor holds them: {args}"
         );
         // A kill is sent once, however often it is asked for.
         let captured = Captured::default();
@@ -1466,7 +1481,7 @@ mod tests {
                 worker_threads: 1,
                 worker_address_space: 1 << 30,
                 max_sessions: 256,
-                clips: ClipLimits::DEFAULT,
+                recordings: RecordingLimits::DEFAULT,
             },
             None,
         );

@@ -1,5 +1,5 @@
-//! The pre-roll ring of a [`Track`](crate::track::Track): the last stretch
-//! of its frames, held in memory while a window is set, so a clip can start
+//! The pre-record ring of a [`Track`](crate::track::Track): the last stretch
+//! of its frames, held in memory while a window is set, so a recording can start
 //! before the moment it was asked for.
 //!
 //! Invariants: the ring holds the `Arc`s the track publishes and copies no
@@ -8,14 +8,14 @@
 //! keyframe), so whatever it hands out starts decodable. At each keyframe
 //! it starts again at the newest keyframe that arrived at least the window
 //! before it, so it keeps the window plus the open GOP; at any frame it drops its
-//! oldest GOPs while it would hold more than `preroll_bytes`. A GOP that
-//! alone outgrows `preroll_bytes` keeps its keyframe and the frames that
+//! oldest GOPs while it would hold more than `prerecord_bytes`. A GOP that
+//! alone outgrows `prerecord_bytes` keeps its keyframe and the frames that
 //! fit, drops the rest and is counted; a GOP that loses a frame the track
 //! dropped over `max_frame_bytes` (a keyframe too, whose frames would
 //! otherwise follow the GOP before) is cut there the same way, counted by
 //! the track. A cut GOP holds nothing after the cut, and the next keyframe
 //! drops it with everything before it, so the ring starts again there, no
-//! clip spans a gap the track saw unreported, and every GOP held but the
+//! recording spans a gap the track saw unreported, and every GOP held but the
 //! newest is whole as the track received it. A unit a source's
 //! depacketizer dropped (a packet lost inside it, RFC 6184 §5.8) never
 //! reaches the track, so the ring holds what the GOP cache and the live
@@ -27,7 +27,7 @@
 //! keyframe's, unless a Sender Report correcting the mapping back dated a
 //! later one before it), and everything after it (by its own window, by
 //! arrival, while the video ring holds nothing), and drops its oldest
-//! frames while it holds more than `preroll_bytes`, down to the newest one.
+//! frames while it holds more than `prerecord_bytes`, down to the newest one.
 //! Of the frames captured at or before the floor by the ring's measure,
 //! the one it keeps is the newest dated at or before the floor, where a
 //! snapshot from any held keyframe can start its audio, else the newest.
@@ -37,11 +37,11 @@
 //! snapshot's start, which line audio up with video, use capture time, and
 //! neither the floor nor the end of the audio frames it trims counts from
 //! after it arrived; of those, the one kept counts by its date. An audio
-//! snapshot starts by the frames' capture times as they are, as a clip's
+//! snapshot starts by the frames' capture times as they are, as a recording's
 //! container places them: its target is the video start's capture time,
 //! and the frame playing then is the one the file plays with that
 //! keyframe.
-//! Every frame is charged its payload plus [`PREROLL_FRAME_OVERHEAD`], so a
+//! Every frame is charged its payload plus [`PRERECORD_FRAME_OVERHEAD`], so a
 //! camera sending tiny frames cannot hold more memory than the bound says.
 //! Every trim drops a prefix in one pass that stops where the kept frames
 //! begin, so it costs what it drops; an audio ring's trim by the floor
@@ -62,13 +62,13 @@ use crate::throttle::Throttle;
 /// What a held frame costs beyond its payload: the `MediaFrame` and its
 /// `Arc` counts, which the ring keeps alive after every other holder has
 /// let go, and the ring's slot.
-pub const PREROLL_FRAME_OVERHEAD: usize = size_of::<MediaFrame>()
+pub const PRERECORD_FRAME_OVERHEAD: usize = size_of::<MediaFrame>()
     .saturating_add(2_usize.saturating_mul(size_of::<usize>()))
     .saturating_add(size_of::<Arc<MediaFrame>>());
 
-/// What `frame` counts against `preroll_bytes`.
+/// What `frame` counts against `prerecord_bytes`.
 fn cost(frame: &MediaFrame) -> usize {
-    frame.payload.len().saturating_add(PREROLL_FRAME_OVERHEAD)
+    frame.payload.len().saturating_add(PRERECORD_FRAME_OVERHEAD)
 }
 
 /// When `frame` was captured, but never later than it arrived: a capture
@@ -79,17 +79,17 @@ pub fn captured(frame: &MediaFrame) -> Instant {
     frame.wallclock.min(frame.arrival)
 }
 
-/// A pre-roll ring's state, as a track reports it while a window is set.
+/// A pre-record ring's state, as a track reports it while a window is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct PrerollStats {
-    /// What the held frames count against `preroll_bytes`: their payload
-    /// plus [`PREROLL_FRAME_OVERHEAD`] each. A video ring shares its open
+pub struct PrerecordStats {
+    /// What the held frames count against `prerecord_bytes`: their payload
+    /// plus [`PRERECORD_FRAME_OVERHEAD`] each. A video ring shares its open
     /// GOP with the GOP cache, so the two overlap.
     pub bytes: u64,
     /// The capture time from the oldest held frame (a keyframe, on video)
-    /// to the newest: how far back a clip can start now.
+    /// to the newest: how far back a recording can start now.
     pub held: Duration,
-    /// GOPs that alone outgrew `preroll_bytes`, so only their start was
+    /// GOPs that alone outgrew `prerecord_bytes`, so only their start was
     /// held, over the track's life. A frame the track dropped over
     /// `max_frame_bytes` cuts a GOP short too, but is counted in
     /// [`TrackStats::frames_dropped_oversize`](crate::track::TrackStats::frames_dropped_oversize).
@@ -97,21 +97,21 @@ pub struct PrerollStats {
 }
 
 /// A copy of a ring's frames from a chosen start to the newest: the
-/// pre-roll a clip begins with. Holds the frames, not the ring, so the
-/// track keeps publishing while the clip reads it.
-pub struct PrerollSnapshot {
+/// pre-record a recording begins with. Holds the frames, not the ring, so the
+/// track keeps publishing while the recording reads it.
+pub struct PrerecordSnapshot {
     /// The first frame: a keyframe on video.
     start: Arc<MediaFrame>,
     /// The frames after `start`, in the order the track published them.
     following: Vec<Arc<MediaFrame>>,
     /// The ring stopped holding the newest GOP because it outgrew
-    /// `preroll_bytes` or lost a frame the track dropped: the live frames
+    /// `prerecord_bytes` or lost a frame the track dropped: the live frames
     /// after the snapshot's last one are not the next of its GOP, so a
     /// reader resumes at the next keyframe.
     truncated: bool,
 }
 
-impl PrerollSnapshot {
+impl PrerecordSnapshot {
     /// The first frame: on video the chosen keyframe.
     pub const fn start(&self) -> &Arc<MediaFrame> {
         &self.start
@@ -127,7 +127,7 @@ impl PrerollSnapshot {
     /// moved, and leaves it as it is when none qualifies. The frames it
     /// drops all come before the ones it keeps, so the snapshot still pairs
     /// with the subscription it was taken with
-    /// ([`Track::subscribe_from_preroll`](crate::track::Track::subscribe_from_preroll)).
+    /// ([`Track::subscribe_from_prerecord`](crate::track::Track::subscribe_from_prerecord)).
     /// By position, never by capture time: a camera's Sender Reports can
     /// date a frame ahead of a later one.
     pub fn advance_to_keyframe(&mut self, mut accept: impl FnMut(&MediaFrame) -> bool) -> bool {
@@ -152,7 +152,7 @@ impl PrerollSnapshot {
         self.following.len().saturating_add(1)
     }
 
-    /// Whether the newest GOP was cut short, by `preroll_bytes` or by a
+    /// Whether the newest GOP was cut short, by `prerecord_bytes` or by a
     /// frame the track dropped over `max_frame_bytes`, so the frames after
     /// the last one held are missing; every GOP before it is whole.
     pub const fn truncated(&self) -> bool {
@@ -161,16 +161,16 @@ impl PrerollSnapshot {
 
     /// How old `start` is at `now`, by its capture time, but at least as
     /// old as its arrival makes it, as [`GopSnapshot::age`](crate::track::GopSnapshot::age)
-    /// counts: how far before `now` a clip from it starts.
+    /// counts: how far before `now` a recording from it starts.
     pub fn age(&self, now: Instant) -> Duration {
         now.saturating_duration_since(captured(&self.start))
     }
 }
 
-impl fmt::Debug for PrerollSnapshot {
-    /// A summary: the frames themselves would be the whole pre-roll.
+impl fmt::Debug for PrerecordSnapshot {
+    /// A summary: the frames themselves would be the whole pre-record.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PrerollSnapshot")
+        f.debug_struct("PrerecordSnapshot")
             .field("start_ts", &self.start.ts)
             .field("frames", &self.frame_count())
             .field("truncated", &self.truncated)
@@ -180,27 +180,27 @@ impl fmt::Debug for PrerollSnapshot {
 
 /// What every ring of one connection shares: the floor its audio rings
 /// trim by, and what its rings hold together, which the one bound of
-/// `preroll_bytes` applies to. Written by the tracks' source tasks: the
+/// `prerecord_bytes` applies to. Written by the tracks' source tasks: the
 /// floor's lock is never held for more than a copy, and the count is
 /// atomic.
 #[derive(Debug, Default)]
-pub(crate) struct PrerollShared {
+pub(crate) struct PrerecordShared {
     /// The oldest capture time of any keyframe the connection's leading
     /// video ring holds, but never later than its arrival
-    /// ([`Preroll::oldest`]); `None` while it holds nothing.
+    /// ([`Prerecord::oldest`]); `None` while it holds nothing.
     floor: Mutex<Option<Instant>>,
     /// What the connection's rings hold together, as each counts its
     /// frames ([`cost`]).
     held: AtomicUsize,
 }
 
-impl PrerollShared {
+impl PrerecordShared {
     /// The video ring's floor, `None` while it holds nothing.
     pub(crate) fn floor(&self) -> Option<Instant> {
         *self.floor.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records the video ring's floor ([`Preroll::oldest`]).
+    /// Records the video ring's floor ([`Prerecord::oldest`]).
     pub(crate) fn set_floor(&self, oldest: Option<Instant>) {
         *self.floor.lock().unwrap_or_else(PoisonError::into_inner) = oldest;
     }
@@ -231,7 +231,7 @@ impl PrerollShared {
 
 /// A ring that goes (its track closed or replaced) leaves the
 /// connection's `held` without its frames.
-impl Drop for Preroll {
+impl Drop for Prerecord {
     fn drop(&mut self) {
         self.shared.sub(self.bytes);
     }
@@ -246,7 +246,7 @@ pub(crate) struct Truncation {
     pub(crate) count: u64,
 }
 
-/// What an audio ring's trim by the floor ([`Preroll::floor_start`])
+/// What an audio ring's trim by the floor ([`Prerecord::floor_start`])
 /// knows of the frames it kept, so a push walks only the frames it adds
 /// to the stale run or drops, never again the ones it keeps: without it,
 /// a frame dated at the floor followed by frames that arrived before the
@@ -300,7 +300,7 @@ impl FloorRun {
 /// One track's ring. Written only by the track's source task, under the
 /// track's lock.
 #[derive(Debug)]
-pub(crate) struct Preroll {
+pub(crate) struct Prerecord {
     /// A video ring, trimmed by whole GOPs; else an audio ring.
     video: bool,
     /// How far back, by arrival, to hold; `None` holds nothing and frees
@@ -319,18 +319,18 @@ pub(crate) struct Preroll {
     /// What the audio ring's trim by the floor knows of the frames it
     /// kept. Empty on a video ring.
     run: FloorRun,
-    /// What `frames` counts against `preroll_bytes`.
+    /// What `frames` counts against `prerecord_bytes`.
     bytes: usize,
     /// What this connection's rings share; `bytes` is this ring's part of
     /// its `held`.
-    shared: Arc<PrerollShared>,
-    /// The newest GOP outgrew `preroll_bytes` or lost a frame the track
+    shared: Arc<PrerecordShared>,
+    /// The newest GOP outgrew `prerecord_bytes` or lost a frame the track
     /// dropped ([`Self::frame_dropped`]); its frames are dropped until
     /// the next keyframe, which drops the GOP too, so no older GOP held
     /// is ever truncated. Meaningless while nothing is held: only a
     /// keyframe starts an empty ring, and it resets this.
     truncated: bool,
-    /// See [`PrerollStats::truncations`].
+    /// See [`PrerecordStats::truncations`].
     truncations: u64,
     /// Rate-limits the line of a truncation, which a camera with GOPs
     /// larger than the bound hits on every GOP. Timed by the frames'
@@ -339,10 +339,10 @@ pub(crate) struct Preroll {
     truncation_log: Throttle,
 }
 
-impl Preroll {
+impl Prerecord {
     /// An empty ring without a window, one of the connection's that share
     /// `shared`.
-    pub(crate) fn new(video: bool, shared: Arc<PrerollShared>) -> Self {
+    pub(crate) fn new(video: bool, shared: Arc<PrerecordShared>) -> Self {
         Self {
             video,
             window: None,
@@ -395,12 +395,12 @@ impl Preroll {
     }
 
     /// The oldest capture time of any keyframe held, which the audio rings
-    /// trim by ([`PrerollShared::floor`]): the oldest keyframe's, unless a Sender
+    /// trim by ([`PrerecordShared::floor`]): the oldest keyframe's, unless a Sender
     /// Report correcting the mapping back (RFC 3550 §6.4.1) dated a later
-    /// one before it, whose audio a clip from it plays as well. Never later
-    /// than the keyframe arrived, as [`PrerollSnapshot::age`] counts: a
+    /// one before it, whose audio a recording from it plays as well. Never later
+    /// than the keyframe arrived, as [`PrerecordSnapshot::age`] counts: a
     /// capture time ahead of the arrival is a mapping off, and as the floor
-    /// it would drop the audio a clip from that keyframe plays
+    /// it would drop the audio a recording from that keyframe plays
     /// ([`captured`]). `None` while nothing is held, and on an audio ring.
     pub(crate) fn oldest(&self) -> Option<Instant> {
         self.floor_keys.front().map(|keyframe| captured(keyframe))
@@ -433,8 +433,8 @@ impl Preroll {
     /// would have started, for a keyframe) lacks a frame the ones after
     /// it may reference: the ring holds nothing more of it and starts
     /// again at the next keyframe, as for a GOP outgrowing
-    /// `preroll_bytes`, and a snapshot until then reports the cut. Not
-    /// counted in [`PrerollStats::truncations`]: the track counts the
+    /// `prerecord_bytes`, and a snapshot until then reports the cut. Not
+    /// counted in [`PrerecordStats::truncations`]: the track counts the
     /// frame. An audio ring keeps going, as every audio frame is a start.
     pub(crate) fn frame_dropped(&mut self) {
         if self.video {
@@ -453,7 +453,7 @@ impl Preroll {
         if frame.keyframe {
             if self.truncated {
                 // The truncated GOP lost frames before this keyframe: a
-                // clip from its keyframe would skip them, and one from an
+                // recording from its keyframe would skip them, and one from an
                 // older keyframe would jump over the gap unreported, so
                 // the ring starts again here. (After a cap truncation the
                 // cap had already dropped every GOP before it.)
@@ -468,7 +468,7 @@ impl Preroll {
             self.drop_front(start);
             return None;
         }
-        // Before the first keyframe there is nothing a clip could start
+        // Before the first keyframe there is nothing a recording could start
         // from; after a truncation, nothing until the next.
         if self.frames.is_empty() || self.truncated {
             return None;
@@ -493,7 +493,7 @@ impl Preroll {
     /// least the window before this one, and what follows. A capture time
     /// that moves back while behind its arrival still ends the stale run at
     /// the frame before it: the ring holds what follows until the floor
-    /// passes that frame or `preroll_bytes` drops it, and a snapshot still
+    /// passes that frame or `prerecord_bytes` drops it, and a snapshot still
     /// starts at the newest frame dated at or before its target.
     fn push_audio(
         &mut self,
@@ -532,7 +532,7 @@ impl Preroll {
     /// otherwise be gone, and the audio start after the keyframe. The run
     /// kept beyond the ring's measure is the frames that arrived before the
     /// floor dated after it: the audio's own dating ahead of its arrival,
-    /// at most `preroll_bytes` as all a ring holds.
+    /// at most `prerecord_bytes` as all a ring holds.
     ///
     /// The run is the same as one pass from the front would find, for any
     /// floor, forward or back, and any dates, but the frames it kept are
@@ -608,7 +608,7 @@ impl Preroll {
         }
     }
 
-    /// Whether a clip can start at `frame`: a keyframe, or any audio
+    /// Whether a recording can start at `frame`: a keyframe, or any audio
     /// frame, whatever its source marked it.
     fn starts_at(&self, frame: &MediaFrame) -> bool {
         frame.keyframe || !self.video
@@ -616,10 +616,10 @@ impl Preroll {
 
     /// When `frame` was captured, as a snapshot's start counts it: by the
     /// ring's measure ([`captured`]) on video, whose target is a moment on
-    /// the worker's clock (`now − before_ms`); as dated on audio, whose
-    /// target is the video start's capture time and whose frames a clip's
+    /// the worker's clock (`now − prerecord_ms`); as dated on audio, whose
+    /// target is the video start's capture time and whose frames a recording's
     /// container places by their capture times as well. Counted from its
-    /// arrival, an audio frame dated after the keyframe would start a clip
+    /// arrival, an audio frame dated after the keyframe would start a recording
     /// whose container then puts it after the keyframe, and an audio frame
     /// that arrived before a keyframe dated ahead of its own arrival would
     /// start the audio that much before the video.
@@ -713,14 +713,14 @@ impl Preroll {
     /// The held frames from the newest keyframe captured at or before
     /// `target` to the newest frame, or from the oldest when every
     /// keyframe is later; `None` when nothing is held. Captured by the
-    /// ring's measure ([`captured`]), as a clip measures its start and
-    /// `before_ms`: a keyframe dated ahead of its arrival counts from its
+    /// ring's measure ([`captured`]), as a recording measures its start and
+    /// `prerecord_ms`: a keyframe dated ahead of its arrival counts from its
     /// arrival, so a Sender Report mapping off (RFC 3550 §6.4.1) cannot
     /// push the start back to an older one. Every audio frame is a start,
     /// so an audio ring starts at the frame playing at `target`, the video
     /// start's capture time, by the frames' capture times as they are
     /// ([`Self::start_time`]).
-    pub(crate) fn snapshot(&self, target: Instant) -> Option<PrerollSnapshot> {
+    pub(crate) fn snapshot(&self, target: Instant) -> Option<PrerecordSnapshot> {
         let from = self
             .frames
             .iter()
@@ -728,7 +728,7 @@ impl Preroll {
             .unwrap_or(0);
         let mut frames = self.frames.range(from..).cloned();
         let start = frames.next()?;
-        Some(PrerollSnapshot {
+        Some(PrerecordSnapshot {
             start,
             following: frames.collect(),
             truncated: self.truncated,
@@ -736,7 +736,7 @@ impl Preroll {
     }
 
     /// The ring's state; `None` without a window.
-    pub(crate) fn stats(&self) -> Option<PrerollStats> {
+    pub(crate) fn stats(&self) -> Option<PrerecordStats> {
         self.window?;
         let held = match (self.frames.front(), self.frames.back()) {
             (Some(oldest), Some(newest)) => {
@@ -744,7 +744,7 @@ impl Preroll {
             }
             _ => Duration::ZERO,
         };
-        Some(PrerollStats {
+        Some(PrerecordStats {
             bytes: u64::try_from(self.bytes).unwrap_or(u64::MAX),
             held,
             truncations: self.truncations,
@@ -768,17 +768,17 @@ mod tests {
 
     /// What a frame of `bytes` payload counts.
     const fn c(bytes: usize) -> usize {
-        bytes + PREROLL_FRAME_OVERHEAD
+        bytes + PRERECORD_FRAME_OVERHEAD
     }
 
     /// Frames are labelled by their capture time: `ts` is the
     /// milliseconds after the test's start, which is also how far after it
     /// they were captured.
-    struct Clip {
+    struct Recording {
         t0: Instant,
     }
 
-    impl Clip {
+    impl Recording {
         fn new() -> Self {
             Self {
                 t0: SystemClock.now(),
@@ -811,8 +811,8 @@ mod tests {
         }
     }
 
-    fn ring(video: bool, window_ms: u64) -> Preroll {
-        let mut ring = Preroll::new(video, Arc::default());
+    fn ring(video: bool, window_ms: u64) -> Prerecord {
+        let mut ring = Prerecord::new(video, Arc::default());
         assert_eq!(
             ring.set_window(Some(Duration::from_millis(window_ms))),
             None
@@ -821,16 +821,16 @@ mod tests {
     }
 
     /// The held frames' labels, oldest first.
-    fn held(ring: &Preroll) -> Vec<i64> {
+    fn held(ring: &Prerecord) -> Vec<i64> {
         ring.frames.iter().map(|frame| frame.ts.ticks()).collect()
     }
 
     /// Pushes a video GOP: a keyframe at `from` and frames every 250 ms
     /// up to, not including, `to`.
-    fn gop(ring: &mut Preroll, clip: &Clip, from: u64, to: u64, cap: usize) {
+    fn gop(ring: &mut Prerecord, recording: &Recording, from: u64, to: u64, cap: usize) {
         for ms in (from..to).step_by(250) {
             assert_eq!(
-                ring.push(&clip.frame(ms, ms == from, 10), cap, || None),
+                ring.push(&recording.frame(ms, ms == from, 10), cap, || None),
                 None
             );
         }
@@ -838,23 +838,23 @@ mod tests {
 
     #[test]
     fn a_video_ring_drops_whole_gops_once_the_second_keyframe_is_a_window_old() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 2000);
-        gop(&mut ring, &clip, 0, 1000, usize::MAX);
-        gop(&mut ring, &clip, 1000, 2000, usize::MAX);
-        gop(&mut ring, &clip, 2000, 3000, usize::MAX);
+        gop(&mut ring, &recording, 0, 1000, usize::MAX);
+        gop(&mut ring, &recording, 1000, 2000, usize::MAX);
+        gop(&mut ring, &recording, 2000, 3000, usize::MAX);
         assert_eq!(
             held(&ring).first(),
             Some(&0),
             "the second keyframe is a GOP short of the window"
         );
-        gop(&mut ring, &clip, 3000, 4000, usize::MAX);
+        gop(&mut ring, &recording, 3000, 4000, usize::MAX);
         assert_eq!(
             held(&ring),
             (1000..4000).step_by(250).collect::<Vec<_>>(),
             "the first GOP went whole; the window plus the open GOP is held"
         );
-        assert_eq!(ring.oldest(), Some(clip.at(1000)));
+        assert_eq!(ring.oldest(), Some(recording.at(1000)));
         let stats = ring.stats().unwrap();
         assert_eq!(stats.held, Duration::from_millis(2750));
         assert_eq!(stats.bytes, u64::try_from(12 * c(10)).unwrap());
@@ -863,7 +863,7 @@ mod tests {
         // Two GOPs at once: a keyframe captured far later. The newest
         // keyframe at least a window before it stays, with its GOP.
         assert_eq!(
-            ring.push(&clip.frame(9000, true, 10), usize::MAX, || None),
+            ring.push(&recording.frame(9000, true, 10), usize::MAX, || None),
             None
         );
         assert_eq!(held(&ring), [3000, 3250, 3500, 3750, 9000]);
@@ -871,10 +871,10 @@ mod tests {
 
     #[test]
     fn a_video_ring_holds_nothing_before_its_first_keyframe_or_without_a_window() {
-        let clip = Clip::new();
-        let mut ring = Preroll::new(true, Arc::default());
+        let recording = Recording::new();
+        let mut ring = Prerecord::new(true, Arc::default());
         assert_eq!(
-            ring.push(&clip.frame(0, true, 10), usize::MAX, || None),
+            ring.push(&recording.frame(0, true, 10), usize::MAX, || None),
             None
         );
         assert!(held(&ring).is_empty(), "no window");
@@ -883,44 +883,47 @@ mod tests {
 
         let mut ring = self::ring(true, 1000);
         assert_eq!(
-            ring.push(&clip.frame(0, false, 10), usize::MAX, || None),
+            ring.push(&recording.frame(0, false, 10), usize::MAX, || None),
             None
         );
-        assert!(held(&ring).is_empty(), "nothing to start a clip from");
+        assert!(held(&ring).is_empty(), "nothing to start a recording from");
         assert_eq!(ring.oldest(), None);
         assert_eq!(
             ring.stats(),
-            Some(PrerollStats::default()),
+            Some(PrerecordStats::default()),
             "a window with nothing held yet"
         );
-        assert!(ring.snapshot(clip.at(0)).is_none());
-        gop(&mut ring, &clip, 40, 600, usize::MAX);
+        assert!(ring.snapshot(recording.at(0)).is_none());
+        gop(&mut ring, &recording, 40, 600, usize::MAX);
         assert_eq!(held(&ring).first(), Some(&40));
     }
 
     #[test]
     fn the_byte_cap_drops_the_oldest_gops_and_keeps_the_newest() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 60_000);
         let cap = 5 * c(10);
-        gop(&mut ring, &clip, 0, 750, cap);
-        gop(&mut ring, &clip, 750, 1250, cap);
+        gop(&mut ring, &recording, 0, 750, cap);
+        gop(&mut ring, &recording, 750, 1250, cap);
         assert_eq!(
             held(&ring),
             [0, 250, 500, 750, 1000],
             "exactly the cap fits"
         );
-        assert_eq!(ring.push(&clip.frame(1250, false, 10), cap, || None), None);
+        assert_eq!(
+            ring.push(&recording.frame(1250, false, 10), cap, || None),
+            None
+        );
         assert_eq!(held(&ring), [750, 1000, 1250], "a GOP went, not a frame");
         // A keyframe over the cap drops the GOPs before it.
         assert_eq!(
-            ring.push(&clip.frame(1500, true, 3 * c(10)), cap, || None),
+            ring.push(&recording.frame(1500, true, 3 * c(10)), cap, || None),
             None
         );
         assert_eq!(held(&ring), [1500]);
         assert_eq!(
             ring.stats().unwrap().bytes,
-            u64::try_from(3 * c(10) + PREROLL_FRAME_OVERHEAD).unwrap()
+            u64::try_from(3 * c(10) + PRERECORD_FRAME_OVERHEAD).unwrap()
         );
         assert_eq!(
             ring.stats().unwrap().truncations,
@@ -929,7 +932,7 @@ mod tests {
         );
         // A keyframe alone larger than the cap is still held.
         assert_eq!(
-            ring.push(&clip.frame(1750, true, 2 * cap), cap, || None),
+            ring.push(&recording.frame(1750, true, 2 * cap), cap, || None),
             None
         );
         assert_eq!(held(&ring), [1750]);
@@ -938,7 +941,7 @@ mod tests {
         let mut ring = self::ring(true, 60_000);
         for ms in [0, 250] {
             assert_eq!(
-                ring.push(&clip.frame(ms, true, 10), 2 * c(10), || None),
+                ring.push(&recording.frame(ms, true, 10), 2 * c(10), || None),
                 None
             );
         }
@@ -947,12 +950,12 @@ mod tests {
 
     #[test]
     fn a_truncated_gop_goes_whole_at_the_next_keyframe_even_when_that_fits() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 60_000);
         let cap = 4 * c(10);
-        gop(&mut ring, &clip, 0, 500, cap);
+        gop(&mut ring, &recording, 0, 500, cap);
         assert_eq!(
-            ring.push(&clip.frame(500, false, 3 * c(10)), cap, || None),
+            ring.push(&recording.frame(500, false, 3 * c(10)), cap, || None),
             Some(Truncation {
                 gop_bytes: 2 * c(10) + c(3 * c(10)),
                 count: 1
@@ -960,48 +963,54 @@ mod tests {
         );
         assert_eq!(held(&ring), [0, 250]);
         // The next keyframe fits beside the truncated GOP, which still goes.
-        assert_eq!(ring.push(&clip.frame(750, true, 10), cap, || None), None);
-        assert_eq!(held(&ring), [750], "no clip may span the lost frame");
+        assert_eq!(
+            ring.push(&recording.frame(750, true, 10), cap, || None),
+            None
+        );
+        assert_eq!(held(&ring), [750], "no recording may span the lost frame");
         assert_eq!(ring.stats().unwrap().bytes, u64::try_from(c(10)).unwrap());
-        let snapshot = ring.snapshot(clip.at(0)).unwrap();
+        let snapshot = ring.snapshot(recording.at(0)).unwrap();
         assert_eq!(snapshot.start().ts.ticks(), 750);
         assert!(!snapshot.truncated());
         assert_eq!(ring.stats().unwrap().truncations, 1);
-        assert_eq!(ring.push(&clip.frame(1000, false, 10), cap, || None), None);
+        assert_eq!(
+            ring.push(&recording.frame(1000, false, 10), cap, || None),
+            None
+        );
         assert_eq!(held(&ring), [750, 1000]);
     }
 
     #[test]
     fn a_gop_larger_than_the_cap_keeps_its_start_and_is_counted_once() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 60_000);
         let cap = 3 * c(10);
-        gop(&mut ring, &clip, 0, 750, cap);
+        gop(&mut ring, &recording, 0, 750, cap);
         assert_eq!(
-            ring.push(&clip.frame(750, false, 10), cap, || None),
+            ring.push(&recording.frame(750, false, 10), cap, || None),
             Some(Truncation {
                 gop_bytes: 4 * c(10),
                 count: 1
             })
         );
         assert_eq!(
-            ring.push(&clip.frame(1000, false, 10), cap, || None),
+            ring.push(&recording.frame(1000, false, 10), cap, || None),
             None,
             "the rest of the GOP is dropped, not counted again"
         );
         assert_eq!(held(&ring), [0, 250, 500]);
-        let snapshot = ring.snapshot(clip.at(0)).unwrap();
+        let snapshot = ring.snapshot(recording.at(0)).unwrap();
         assert!(
             snapshot.truncated(),
             "the live frames are not the next ones"
         );
         assert_eq!(snapshot.frame_count(), 3);
 
-        gop(&mut ring, &clip, 1250, 1750, cap);
+        gop(&mut ring, &recording, 1250, 1750, cap);
         assert_eq!(held(&ring), [1250, 1500], "the next keyframe resumes");
-        assert!(!ring.snapshot(clip.at(0)).unwrap().truncated());
+        assert!(!ring.snapshot(recording.at(0)).unwrap().truncated());
         assert_eq!(
-            ring.push(&clip.frame(1750, false, 2 * c(10)), cap, || None),
+            ring.push(&recording.frame(1750, false, 2 * c(10)), cap, || None),
             None,
             "a second truncation inside the summary interval is not logged"
         );
@@ -1011,14 +1020,14 @@ mod tests {
 
     #[test]
     fn a_dropped_frame_cuts_its_gop_and_the_next_keyframe_starts_the_ring_again() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 60_000);
-        gop(&mut ring, &clip, 0, 1000, usize::MAX);
-        gop(&mut ring, &clip, 1000, 1500, usize::MAX);
+        gop(&mut ring, &recording, 0, 1000, usize::MAX);
+        gop(&mut ring, &recording, 1000, 1500, usize::MAX);
         // The frame at 1500 never reaches the ring.
         ring.frame_dropped();
         assert_eq!(
-            ring.push(&clip.frame(1750, false, 10), usize::MAX, || None),
+            ring.push(&recording.frame(1750, false, 10), usize::MAX, || None),
             None
         );
         assert_eq!(
@@ -1026,62 +1035,67 @@ mod tests {
             [0, 250, 500, 750, 1000, 1250],
             "the whole GOPs before the gap stay"
         );
-        let snapshot = ring.snapshot(clip.at(0)).unwrap();
+        let snapshot = ring.snapshot(recording.at(0)).unwrap();
         assert!(snapshot.truncated());
         assert_eq!(snapshot.frames().last().unwrap().ts.ticks(), 1250);
         assert_eq!(ring.stats().unwrap().truncations, 0, "counted by the track");
-        assert_eq!(ring.oldest(), Some(clip.at(0)), "the floor does not move");
+        assert_eq!(
+            ring.oldest(),
+            Some(recording.at(0)),
+            "the floor does not move"
+        );
 
-        gop(&mut ring, &clip, 2000, 2500, usize::MAX);
+        gop(&mut ring, &recording, 2000, 2500, usize::MAX);
         assert_eq!(held(&ring), [2000, 2250], "the next keyframe restarts");
-        assert!(!ring.snapshot(clip.at(0)).unwrap().truncated());
+        assert!(!ring.snapshot(recording.at(0)).unwrap().truncated());
 
         // A lost keyframe: the frames of its GOP stay out as well.
         ring.frame_dropped();
         assert_eq!(
-            ring.push(&clip.frame(3250, false, 10), usize::MAX, || None),
+            ring.push(&recording.frame(3250, false, 10), usize::MAX, || None),
             None
         );
         assert_eq!(held(&ring), [2000, 2250]);
-        assert!(ring.snapshot(clip.at(0)).unwrap().truncated());
+        assert!(ring.snapshot(recording.at(0)).unwrap().truncated());
         assert_eq!(
-            ring.push(&clip.frame(4000, true, 10), usize::MAX, || None),
+            ring.push(&recording.frame(4000, true, 10), usize::MAX, || None),
             None
         );
         assert_eq!(held(&ring), [4000]);
-        assert!(!ring.snapshot(clip.at(0)).unwrap().truncated());
+        assert!(!ring.snapshot(recording.at(0)).unwrap().truncated());
     }
 
     #[test]
     fn a_dropped_audio_frame_leaves_the_audio_ring_whole() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(false, 60_000);
         for ms in [0, 400] {
             assert_eq!(
-                ring.push(&clip.frame(ms, false, 10), usize::MAX, || None),
+                ring.push(&recording.frame(ms, false, 10), usize::MAX, || None),
                 None
             );
         }
         ring.frame_dropped();
         assert_eq!(
-            ring.push(&clip.frame(1200, false, 10), usize::MAX, || None),
+            ring.push(&recording.frame(1200, false, 10), usize::MAX, || None),
             None
         );
         assert_eq!(held(&ring), [0, 400, 1200]);
         assert!(
-            !ring.snapshot(clip.at(0)).unwrap().truncated(),
+            !ring.snapshot(recording.at(0)).unwrap().truncated(),
             "every audio frame is a start"
         );
     }
 
     #[test]
     fn a_truncation_line_is_timed_by_arrival_not_by_the_capture_time() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         // Ten hours: no keyframe here is ever a window old.
         let mut ring = ring(true, 36_000_000);
         let cap = 2 * c(10);
-        let frame =
-            |capture: u64, arrival: u64, keyframe: bool| clip.shifted(capture, arrival, keyframe);
+        let frame = |capture: u64, arrival: u64, keyframe: bool| {
+            recording.shifted(capture, arrival, keyframe)
+        };
         let truncation = Some(Truncation {
             gop_bytes: 3 * c(10),
             count: 1,
@@ -1114,11 +1128,15 @@ mod tests {
 
     #[test]
     fn a_video_ring_s_window_is_measured_by_arrival_when_a_capture_time_jumps_ahead_and_back() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 2000);
-        let push = |ring: &mut Preroll, capture: u64, arrival: u64| {
+        let push = |ring: &mut Prerecord, capture: u64, arrival: u64| {
             assert_eq!(
-                ring.push(&clip.shifted(capture, arrival, true), usize::MAX, || None),
+                ring.push(
+                    &recording.shifted(capture, arrival, true),
+                    usize::MAX,
+                    || None
+                ),
                 None
             );
         };
@@ -1141,36 +1159,40 @@ mod tests {
 
     #[test]
     fn the_oldest_held_frame_never_counts_from_after_its_arrival() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 60_000);
         assert_eq!(
-            ring.push(&clip.shifted(3_600_000, 1000, true), usize::MAX, || None),
+            ring.push(
+                &recording.shifted(3_600_000, 1000, true),
+                usize::MAX,
+                || None
+            ),
             None
         );
-        assert_eq!(ring.oldest(), Some(clip.at(1000)));
+        assert_eq!(ring.oldest(), Some(recording.at(1000)));
         let mut early = self::ring(true, 60_000);
         assert_eq!(
-            early.push(&clip.shifted(200, 1000, true), usize::MAX, || None),
+            early.push(&recording.shifted(200, 1000, true), usize::MAX, || None),
             None
         );
         assert_eq!(
             early.oldest(),
-            Some(clip.at(200)),
+            Some(recording.at(200)),
             "a capture time before the arrival stands"
         );
     }
 
     /// RFC 3550 §6.4.1: a Sender Report correcting a camera's mapping
     /// back can date a later keyframe before the oldest held, and the
-    /// audio a clip from it plays must stay too.
+    /// audio a recording from it plays must stay too.
     #[test]
     fn rfc3550_6_4_1_the_floor_is_the_oldest_capture_time_of_any_keyframe_held() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 2000);
-        let push = |ring: &mut Preroll, capture: u64, arrival: u64, keyframe: bool| {
+        let push = |ring: &mut Prerecord, capture: u64, arrival: u64, keyframe: bool| {
             assert_eq!(
                 ring.push(
-                    &clip.shifted(capture, arrival, keyframe),
+                    &recording.shifted(capture, arrival, keyframe),
                     usize::MAX,
                     || None
                 ),
@@ -1180,17 +1202,17 @@ mod tests {
         // Labelled by arrival.
         push(&mut ring, 10_000, 10_000, true);
         push(&mut ring, 10_250, 10_250, false);
-        assert_eq!(ring.oldest(), Some(clip.at(10_000)));
+        assert_eq!(ring.oldest(), Some(recording.at(10_000)));
         push(&mut ring, 1000, 11_000, true);
         push(&mut ring, 1250, 11_250, false);
         assert_eq!(
             ring.oldest(),
-            Some(clip.at(1000)),
+            Some(recording.at(1000)),
             "the later keyframe, dated before the oldest"
         );
         push(&mut ring, 5000, 12_000, true);
         push(&mut ring, 5000, 13_000, true);
-        assert_eq!(ring.oldest(), Some(clip.at(1000)));
+        assert_eq!(ring.oldest(), Some(recording.at(1000)));
         assert_eq!(
             ring.floor_keys.len(),
             2,
@@ -1201,15 +1223,15 @@ mod tests {
         // oldest capture time of the keyframes still held.
         push(&mut ring, 6000, 14_000, true);
         assert_eq!(held(&ring), [12_000, 13_000, 14_000]);
-        assert_eq!(ring.oldest(), Some(clip.at(5000)));
+        assert_eq!(ring.oldest(), Some(recording.at(5000)));
         push(&mut ring, 7000, 16_000, true);
         assert_eq!(held(&ring), [14_000, 16_000]);
-        assert_eq!(ring.oldest(), Some(clip.at(6000)));
+        assert_eq!(ring.oldest(), Some(recording.at(6000)));
 
         assert!(ring.clear());
         assert_eq!(ring.oldest(), None);
         push(&mut ring, 8000, 17_000, true);
-        assert_eq!(ring.oldest(), Some(clip.at(8000)));
+        assert_eq!(ring.oldest(), Some(recording.at(8000)));
         assert_eq!(ring.set_window(None), Some(Duration::from_millis(2000)));
         assert_eq!(ring.oldest(), None);
         assert!(ring.floor_keys.is_empty());
@@ -1217,7 +1239,7 @@ mod tests {
 
     #[test]
     fn an_audio_ring_s_own_window_is_measured_by_arrival() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(false, 1000);
         for (capture, arrival) in [
             (0, 0),
@@ -1227,14 +1249,18 @@ mod tests {
             (1600, 1600),
         ] {
             assert_eq!(
-                ring.push(&clip.shifted(capture, arrival, false), usize::MAX, || None),
+                ring.push(
+                    &recording.shifted(capture, arrival, false),
+                    usize::MAX,
+                    || None
+                ),
                 None
             );
         }
         assert_eq!(held(&ring), [400, 800, 1200, 1600]);
         // The window counts from this frame's arrival, not its capture time.
         assert_eq!(
-            ring.push(&clip.shifted(0, 2000, false), usize::MAX, || None),
+            ring.push(&recording.shifted(0, 2000, false), usize::MAX, || None),
             None
         );
         assert_eq!(held(&ring), [800, 1200, 1600, 2000]);
@@ -1242,19 +1268,19 @@ mod tests {
 
     #[test]
     fn an_audio_ring_keeps_the_frame_playing_at_the_video_s_oldest_keyframe() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(false, 60_000);
-        let floor = || Some(clip.at(1000));
+        let floor = || Some(recording.at(1000));
         for ms in (0..=1600).step_by(400) {
             assert_eq!(
-                ring.push(&clip.frame(ms, false, 10), usize::MAX, floor),
+                ring.push(&recording.frame(ms, false, 10), usize::MAX, floor),
                 None
             );
         }
         assert_eq!(held(&ring), [800, 1200, 1600]);
         assert_eq!(
-            ring.push(&clip.frame(2000, false, 10), usize::MAX, || Some(
-                clip.at(1200)
+            ring.push(&recording.frame(2000, false, 10), usize::MAX, || Some(
+                recording.at(1200)
             )),
             None
         );
@@ -1267,9 +1293,9 @@ mod tests {
 
     #[test]
     fn an_audio_ring_s_floor_counts_a_frame_dated_ahead_of_its_arrival_by_its_arrival() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(false, 60_000);
-        let floor = || Some(clip.at(1000));
+        let floor = || Some(recording.at(1000));
         // A Sender Report maps the second frame an hour ahead; the next
         // one corrects it.
         for (capture, arrival) in [
@@ -1280,7 +1306,11 @@ mod tests {
             (1600, 1600),
         ] {
             assert_eq!(
-                ring.push(&clip.shifted(capture, arrival, false), usize::MAX, floor),
+                ring.push(
+                    &recording.shifted(capture, arrival, false),
+                    usize::MAX,
+                    floor
+                ),
                 None
             );
         }
@@ -1293,7 +1323,7 @@ mod tests {
             ring.stats().unwrap().bytes,
             u64::try_from(3 * c(10)).unwrap()
         );
-        let snapshot = ring.snapshot(clip.at(1000)).unwrap();
+        let snapshot = ring.snapshot(recording.at(1000)).unwrap();
         assert_eq!(
             snapshot
                 .frames()
@@ -1308,7 +1338,11 @@ mod tests {
         let mut late = self::ring(false, 60_000);
         for (capture, arrival) in [(600, 1000), (900, 1300), (1200, 1600)] {
             assert_eq!(
-                late.push(&clip.shifted(capture, arrival, false), usize::MAX, floor),
+                late.push(
+                    &recording.shifted(capture, arrival, false),
+                    usize::MAX,
+                    floor
+                ),
                 None
             );
         }
@@ -1329,16 +1363,16 @@ mod tests {
     /// started the audio with the one dated 1.032 s, after the keyframe.
     #[test]
     fn rfc3550_6_4_1_an_audio_ring_keeps_the_frame_dated_at_the_floor() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         for (every, ahead, keyframe, last, kept) in
             [(64, 8, 1_027, 1_088, 960), (20, 43, 983, 1_060, 940)]
         {
             let mut ring = ring(false, 60_000);
             for arrival in (0..=last).step_by(every) {
-                let floor = (arrival >= keyframe).then(|| clip.at(keyframe));
+                let floor = (arrival >= keyframe).then(|| recording.at(keyframe));
                 assert_eq!(
                     ring.push(
-                        &clip.shifted(arrival + ahead, arrival, false),
+                        &recording.shifted(arrival + ahead, arrival, false),
                         usize::MAX,
                         || floor
                     ),
@@ -1346,9 +1380,9 @@ mod tests {
                 );
             }
             assert_eq!(held(&ring)[0], kept, "{every} ms");
-            let start = ring.snapshot(clip.at(keyframe)).unwrap();
+            let start = ring.snapshot(recording.at(keyframe)).unwrap();
             assert_eq!(start.start().ts.ticks(), kept);
-            assert!(start.start().wallclock <= clip.at(keyframe));
+            assert!(start.start().wallclock <= recording.at(keyframe));
         }
     }
 
@@ -1381,7 +1415,7 @@ mod tests {
     /// it drops.
     #[test]
     fn rfc3550_6_4_1_an_audio_ring_trims_by_the_floor_as_a_full_scan_would() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         for seed in 1..=64_u64 {
             let mut xorshift = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let mut random = |bound: u64| {
@@ -1395,8 +1429,8 @@ mod tests {
             let mut arrival = 1000;
             for _ in 0..500 {
                 arrival += random(4);
-                let frame = clip.shifted(arrival + random(121) - 30, arrival, false);
-                let floor = (random(10) > 0).then(|| clip.at(arrival - random(80)));
+                let frame = recording.shifted(arrival + random(121) - 30, arrival, false);
+                let floor = (random(10) > 0).then(|| recording.at(arrival - random(80)));
                 let cap = match random(10) {
                     0 => usize::try_from(1 + random(8)).unwrap() * c(10),
                     _ => usize::MAX,
@@ -1449,17 +1483,17 @@ mod tests {
     /// visited in all.
     #[test]
     fn rfc3550_6_4_1_an_audio_ring_s_trim_by_the_floor_walks_each_frame_once() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(false, 3_600_000);
         assert_eq!(
-            ring.push(&clip.shifted(0, 1000, false), usize::MAX, || None),
+            ring.push(&recording.shifted(0, 1000, false), usize::MAX, || None),
             None
         );
         for arrival in (1020..41_000).step_by(20) {
-            let floor = clip.at(arrival - 1000);
+            let floor = recording.at(arrival - 1000);
             assert_eq!(
                 ring.push(
-                    &clip.shifted(arrival + 60_000, arrival, false),
+                    &recording.shifted(arrival + 60_000, arrival, false),
                     usize::MAX,
                     || Some(floor)
                 ),
@@ -1479,30 +1513,32 @@ mod tests {
     /// the floor at 250 ms and the one at 150 ms after it.
     #[test]
     fn rfc3550_6_4_1_an_audio_ring_s_trim_by_an_earlier_floor_walks_what_it_drops() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         for (front_date, kept, walked) in [
             (0, vec![0, 100, 200, 300], 2),
             (200, vec![100, 200, 300], 3),
         ] {
             let mut ring = ring(false, 60_000);
             assert_eq!(
-                ring.push(&clip.shifted(front_date, 0, false), usize::MAX, || None),
+                ring.push(&recording.shifted(front_date, 0, false), usize::MAX, || {
+                    None
+                }),
                 None
             );
             for arrival in [100, 200] {
                 assert_eq!(
                     ring.push(
-                        &clip.shifted(arrival + 10_000, arrival, false),
+                        &recording.shifted(arrival + 10_000, arrival, false),
                         usize::MAX,
-                        || Some(clip.at(250))
+                        || Some(recording.at(250))
                     ),
                     None
                 );
             }
             assert_eq!(ring.run.len, 2);
             assert_eq!(
-                ring.push(&clip.shifted(10_300, 300, false), usize::MAX, || Some(
-                    clip.at(150)
+                ring.push(&recording.shifted(10_300, 300, false), usize::MAX, || Some(
+                    recording.at(150)
                 )),
                 None
             );
@@ -1513,17 +1549,17 @@ mod tests {
 
     #[test]
     fn an_audio_ring_without_a_video_keyframe_keeps_its_own_window() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(false, 1000);
         for ms in (0..=1200).step_by(400) {
             assert_eq!(
-                ring.push(&clip.frame(ms, false, 10), usize::MAX, || None),
+                ring.push(&recording.frame(ms, false, 10), usize::MAX, || None),
                 None
             );
         }
         assert_eq!(held(&ring), [0, 400, 800, 1200]);
         assert_eq!(
-            ring.push(&clip.frame(1600, false, 10), usize::MAX, || None),
+            ring.push(&recording.frame(1600, false, 10), usize::MAX, || None),
             None
         );
         assert_eq!(held(&ring), [400, 800, 1200, 1600]);
@@ -1532,15 +1568,18 @@ mod tests {
 
     #[test]
     fn an_audio_ring_keeps_its_newest_frames_within_the_cap() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(false, 60_000);
         let cap = 2 * c(10);
         for ms in (0..=800).step_by(400) {
-            assert_eq!(ring.push(&clip.frame(ms, false, 10), cap, || None), None);
+            assert_eq!(
+                ring.push(&recording.frame(ms, false, 10), cap, || None),
+                None
+            );
         }
         assert_eq!(held(&ring), [400, 800]);
         assert_eq!(
-            ring.push(&clip.frame(1200, false, 3 * cap), cap, || None),
+            ring.push(&recording.frame(1200, false, 3 * cap), cap, || None),
             None
         );
         assert_eq!(held(&ring), [1200], "one frame over the cap is still held");
@@ -1549,10 +1588,10 @@ mod tests {
 
     #[test]
     fn a_snapshot_starts_at_the_newest_keyframe_at_or_before_the_target_else_the_oldest() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 60_000);
         for from in [1000, 2000, 3000] {
-            gop(&mut ring, &clip, from, from + 1000, usize::MAX);
+            gop(&mut ring, &recording, from, from + 1000, usize::MAX);
         }
         let starts = |target: Instant| {
             let snapshot = ring.snapshot(target).unwrap();
@@ -1569,12 +1608,16 @@ mod tests {
             );
             snapshot.start().ts.ticks()
         };
-        assert_eq!(starts(clip.at(2500)), 2000);
-        assert_eq!(starts(clip.at(2000)), 2000, "at the target counts");
-        assert_eq!(starts(clip.at(1999)), 1000);
-        assert_eq!(starts(clip.at(500)), 1000, "earlier than held: the oldest");
-        assert_eq!(starts(clip.at(60_000)), 3000);
-        let snapshot = ring.snapshot(clip.at(2000)).unwrap();
+        assert_eq!(starts(recording.at(2500)), 2000);
+        assert_eq!(starts(recording.at(2000)), 2000, "at the target counts");
+        assert_eq!(starts(recording.at(1999)), 1000);
+        assert_eq!(
+            starts(recording.at(500)),
+            1000,
+            "earlier than held: the oldest"
+        );
+        assert_eq!(starts(recording.at(60_000)), 3000);
+        let snapshot = ring.snapshot(recording.at(2000)).unwrap();
         assert_eq!(snapshot.frame_count(), 8);
         assert_eq!(
             snapshot
@@ -1588,9 +1631,9 @@ mod tests {
             "the ring's frames, not copies"
         );
         assert!(!snapshot.truncated());
-        assert_eq!(snapshot.age(clip.at(12_000)), Duration::from_secs(10));
+        assert_eq!(snapshot.age(recording.at(12_000)), Duration::from_secs(10));
         let text = format!("{snapshot:?}");
-        assert!(text.starts_with("PrerollSnapshot {"), "{text}");
+        assert!(text.starts_with("PrerecordSnapshot {"), "{text}");
         assert!(text.contains("start_ts: MediaTime(2000)"), "{text}");
         assert!(text.contains("frames: 8"), "{text}");
         assert!(text.contains("truncated: false"), "{text}");
@@ -1601,26 +1644,26 @@ mod tests {
     /// one (RFC 3550 §6.4.1).
     #[test]
     fn rfc3550_6_4_1_a_snapshot_advances_to_a_later_keyframe_by_position_not_capture_time() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 60_000);
-        gop(&mut ring, &clip, 1000, 2000, usize::MAX);
+        gop(&mut ring, &recording, 1000, 2000, usize::MAX);
         // Labelled by arrival: the keyframe at 2 s is dated 61 s, the one
         // at 3 s back to 9 s.
         for frame in [
-            clip.shifted(61_000, 2000, true),
-            clip.shifted(61_250, 2250, false),
-            clip.shifted(9000, 3000, true),
-            clip.shifted(9250, 3250, false),
+            recording.shifted(61_000, 2000, true),
+            recording.shifted(61_250, 2250, false),
+            recording.shifted(9000, 3000, true),
+            recording.shifted(9250, 3250, false),
         ] {
             assert_eq!(ring.push(&frame, usize::MAX, || None), None);
         }
-        let labels = |snapshot: &PrerollSnapshot| {
+        let labels = |snapshot: &PrerecordSnapshot| {
             snapshot
                 .frames()
                 .map(|frame| frame.ts.ticks())
                 .collect::<Vec<_>>()
         };
-        let mut snapshot = ring.snapshot(clip.at(1000)).unwrap();
+        let mut snapshot = ring.snapshot(recording.at(1000)).unwrap();
         let all = labels(&snapshot);
         assert!(!snapshot.advance_to_keyframe(|_| false));
         assert_eq!(labels(&snapshot), all, "none qualifies: unchanged");
@@ -1638,12 +1681,12 @@ mod tests {
             "the ring's frames, not copies"
         );
 
-        let mut snapshot = ring.snapshot(clip.at(1000)).unwrap();
+        let mut snapshot = ring.snapshot(recording.at(1000)).unwrap();
         assert!(snapshot.advance_to_keyframe(|frame| frame.ts.ticks() == 3000));
         assert_eq!(labels(&snapshot), [3000, 3250]);
     }
 
-    /// A video snapshot measures its keyframes' capture times as a clip
+    /// A video snapshot measures its keyframes' capture times as a recording
     /// measures its start ([`captured`]): a keyframe dated ahead of its
     /// arrival (a Sender Report mapping off, RFC 3550 §6.4.1) counts from
     /// its arrival. Video keyframes arriving at 1 s and 2 s dated 61 s and
@@ -1655,7 +1698,7 @@ mod tests {
     #[test]
     fn rfc3550_6_4_1_a_snapshot_starts_by_when_its_frames_were_captured_never_after_their_arrival()
     {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut video = ring(true, 60_000);
         // Labelled by arrival.
         for (capture, arrival, keyframe) in [
@@ -1666,15 +1709,15 @@ mod tests {
         ] {
             assert_eq!(
                 video.push(
-                    &clip.shifted(capture, arrival, keyframe),
+                    &recording.shifted(capture, arrival, keyframe),
                     usize::MAX,
                     || None
                 ),
                 None
             );
         }
-        let starts = |ring: &Preroll, target: u64| {
-            ring.snapshot(clip.at(target))
+        let starts = |ring: &Prerecord, target: u64| {
+            ring.snapshot(recording.at(target))
                 .unwrap()
                 .frames()
                 .map(|frame| frame.ts.ticks())
@@ -1687,7 +1730,11 @@ mod tests {
         let mut audio = ring(false, 60_000);
         for ms in (0..=1600).step_by(400) {
             assert_eq!(
-                audio.push(&clip.shifted(60_000 + ms, ms, false), usize::MAX, || None),
+                audio.push(
+                    &recording.shifted(60_000 + ms, ms, false),
+                    usize::MAX,
+                    || None
+                ),
                 None
             );
         }
@@ -1696,7 +1743,7 @@ mod tests {
 
     /// An audio snapshot starts with the frame playing at its target, the
     /// video start's capture time, by the frames' capture times as dated,
-    /// where a clip's container places them: of audio frames dated 3 ms
+    /// where a recording's container places them: of audio frames dated 3 ms
     /// after their arrival every 20 ms, the one for a keyframe captured at
     /// 1.001 s is the one dated 0.983 s, which arrived at 0.98 s. Regression
     /// (interop with MediaMTX 1.21.1, 2026-10-26: G.722 transcoded with its
@@ -1705,15 +1752,22 @@ mod tests {
     /// at 1 s, dated 1.003 s, after the keyframe.
     #[test]
     fn rfc3550_6_4_1_an_audio_snapshot_starts_with_the_frame_dated_at_its_target() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut audio = ring(false, 60_000);
         for ms in (900..=1100).step_by(20) {
             assert_eq!(
-                audio.push(&clip.shifted(ms + 3, ms, false), usize::MAX, || None),
+                audio.push(&recording.shifted(ms + 3, ms, false), usize::MAX, || None),
                 None
             );
         }
-        let start = |target: u64| audio.snapshot(clip.at(target)).unwrap().start().ts.ticks();
+        let start = |target: u64| {
+            audio
+                .snapshot(recording.at(target))
+                .unwrap()
+                .start()
+                .ts
+                .ticks()
+        };
         assert_eq!(start(1001), 980);
         assert_eq!(start(1003), 1000, "at the date counts");
         assert_eq!(start(902), 900, "before every date, the oldest held");
@@ -1721,29 +1775,29 @@ mod tests {
 
     #[test]
     fn a_snapshot_s_age_never_counts_from_after_the_arrival() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 60_000);
         // A Sender Report maps the capture an hour ahead of the arrival.
         let frame = Arc::new(MediaFrame {
-            wallclock: clip.at(3_600_000),
-            ..(*clip.frame(1000, true, 10)).clone()
+            wallclock: recording.at(3_600_000),
+            ..(*recording.frame(1000, true, 10)).clone()
         });
         assert_eq!(ring.push(&frame, usize::MAX, || None), None);
-        let snapshot = ring.snapshot(clip.at(0)).unwrap();
-        assert_eq!(snapshot.age(clip.at(3000)), Duration::from_secs(2));
+        let snapshot = ring.snapshot(recording.at(0)).unwrap();
+        assert_eq!(snapshot.age(recording.at(3000)), Duration::from_secs(2));
     }
 
     #[test]
     fn an_audio_snapshot_starts_with_the_frame_playing_at_the_target() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(false, 60_000);
         for ms in (0..=1600).step_by(400) {
             assert_eq!(
-                ring.push(&clip.frame(ms, false, 10), usize::MAX, || None),
+                ring.push(&recording.frame(ms, false, 10), usize::MAX, || None),
                 None
             );
         }
-        let snapshot = ring.snapshot(clip.at(1000)).unwrap();
+        let snapshot = ring.snapshot(recording.at(1000)).unwrap();
         assert_eq!(
             snapshot
                 .frames()
@@ -1755,28 +1809,28 @@ mod tests {
 
     #[test]
     fn removing_the_window_frees_the_ring_and_clearing_keeps_the_window() {
-        let clip = Clip::new();
+        let recording = Recording::new();
         let mut ring = ring(true, 1000);
-        gop(&mut ring, &clip, 0, 1000, usize::MAX);
+        gop(&mut ring, &recording, 0, 1000, usize::MAX);
         assert!(ring.clear(), "frames were held");
         assert!(held(&ring).is_empty());
-        assert_eq!(ring.stats(), Some(PrerollStats::default()));
+        assert_eq!(ring.stats(), Some(PrerecordStats::default()));
         assert!(!ring.clear(), "nothing held");
         assert_eq!(ring.window(), Some(Duration::from_secs(1)));
 
         // A truncated GOP: the keyframe after clearing starts afresh.
-        gop(&mut ring, &clip, 1000, 1500, usize::MAX);
+        gop(&mut ring, &recording, 1000, 1500, usize::MAX);
         assert!(
-            ring.push(&clip.frame(1500, false, 10), c(10), || None)
+            ring.push(&recording.frame(1500, false, 10), c(10), || None)
                 .is_some()
         );
         assert!(ring.clear());
         assert_eq!(
-            ring.push(&clip.frame(1750, false, 10), usize::MAX, || None),
+            ring.push(&recording.frame(1750, false, 10), usize::MAX, || None),
             None
         );
         assert!(held(&ring).is_empty(), "no keyframe since the clear");
-        gop(&mut ring, &clip, 2000, 2500, usize::MAX);
+        gop(&mut ring, &recording, 2000, 2500, usize::MAX);
         assert_eq!(held(&ring), [2000, 2250]);
 
         assert_eq!(
@@ -1788,19 +1842,22 @@ mod tests {
         assert!(held(&ring).is_empty());
         assert_eq!(ring.frames.capacity(), 0, "the allocation is freed");
         assert_eq!(ring.stats(), None);
-        assert!(ring.snapshot(clip.at(0)).is_none());
+        assert!(ring.snapshot(recording.at(0)).is_none());
     }
 
     #[test]
     fn a_frame_costs_its_payload_and_a_fixed_overhead() {
-        assert!(PREROLL_FRAME_OVERHEAD > size_of::<MediaFrame>());
-        let clip = Clip::new();
-        assert_eq!(cost(&clip.frame(0, true, 7)), 7 + PREROLL_FRAME_OVERHEAD);
+        assert!(PRERECORD_FRAME_OVERHEAD > size_of::<MediaFrame>());
+        let recording = Recording::new();
+        assert_eq!(
+            cost(&recording.frame(0, true, 7)),
+            7 + PRERECORD_FRAME_OVERHEAD
+        );
     }
 
     #[test]
     fn the_floor_holds_what_was_set_last() {
-        let shared = PrerollShared::default();
+        let shared = PrerecordShared::default();
         assert_eq!(shared.floor(), None);
         let at = SystemClock.now();
         shared.set_floor(Some(at));

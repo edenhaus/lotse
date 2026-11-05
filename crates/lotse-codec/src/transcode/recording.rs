@@ -1,13 +1,13 @@
-//! The event clips' audio transcoder: a G.711 (PCMU, PCMA) or G.722
-//! track's frames in, Opus packets at 48 kHz out, for a clip container
+//! The event recordings' audio transcoder: a G.711 (PCMU, PCMA) or G.722
+//! track's frames in, Opus packets at 48 kHz out, for a recording container
 //! that has no form for those codecs (ISO/IEC 14496-14 registers none) and
 //! carries Opus ("Encapsulation of Opus in ISO Base Media File Format").
 //!
-//! One [`ToOpus`] per clip, which the clip's task calls on each audio
+//! One [`ToOpus`] per recording, which the recording's task calls on each audio
 //! frame as its queue releases them, in capture order: the camera's frames
-//! stay as they arrived in the pre-roll ring, and only a clip transcodes
-//! them, the pre-roll's in a burst at its start. Synchronous and unpaced:
-//! a clip writes as fast as its reader takes the bytes.
+//! stay as they arrived in the pre-record ring, and only a recording transcodes
+//! them, the pre-record's in a burst at its start. Synchronous and unpaced:
+//! a recording writes as fast as its reader takes the bytes.
 //!
 //! The chain is the decoder ([`Law::decode`], G.711 §2 and §3;
 //! [`g722::Decoder`], G.722 §4) → PCM at the codec's sampling rate, cut
@@ -54,7 +54,7 @@
 //! anywhere else re-anchors and also resets the G.722 decoder (the
 //! camera's encoder may have started over). The Opus encoder is never
 //! reset: its look-ahead splices the old timeline's last 2.5 ms in before
-//! the new anchor, where they belong. A clip's end leaves the PCM not yet
+//! the new anchor, where they belong. A recording's end leaves the PCM not yet
 //! encoded out, less than 20 ms plus the chain's delay. A frame without
 //! samples (an RTP packet of padding only) is left out: it moves nothing.
 //!
@@ -65,9 +65,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lotse_core::clip::{ClipError, ClipTrack};
 use lotse_core::codec::{Codec, CodecFamily};
 use lotse_core::media::{MediaFrame, MediaTime};
+use lotse_core::recording::{RecordingError, RecordingTrack};
 use lotse_core::throttle::Throttle;
 
 use super::{shift, to_48k};
@@ -122,7 +122,7 @@ fn wrapped(ticks: i64) -> i64 {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ToOpusError {
     /// A codec other than G.711 and G.722.
-    #[error("no clip transcode from {0}")]
+    #[error("no recording transcode from {0}")]
     Unsupported(CodecFamily),
     /// The resampler refused its parameters or a chunk.
     #[error(transparent)]
@@ -132,8 +132,8 @@ pub enum ToOpusError {
     Encode(OpusError),
 }
 
-impl From<ToOpusError> for ClipError {
-    /// A transcode that failed fails the clip as its container would.
+impl From<ToOpusError> for RecordingError {
+    /// A transcode that failed fails the recording as its container would.
     fn from(err: ToOpusError) -> Self {
         Self::Failed(format!("audio transcode: {err}"))
     }
@@ -172,7 +172,7 @@ struct Timeline {
     placed: Option<(i64, Instant)>,
 }
 
-/// One clip's G.711 or G.722 → Opus chain.
+/// One recording's G.711 or G.722 → Opus chain.
 #[derive(Debug)]
 pub struct ToOpus {
     /// The input's decoder.
@@ -281,8 +281,8 @@ impl ToOpus {
     }
 
     /// The track the packets make: mono Opus at 48 kHz.
-    pub const fn output() -> ClipTrack {
-        ClipTrack {
+    pub const fn output() -> RecordingTrack {
+        RecordingTrack {
             codec: Codec::Opus { channels: 1 },
             clock_rate: OUTPUT_RATE,
         }
@@ -453,7 +453,7 @@ impl ToOpus {
                 hole_ticks = ticks,
                 samples,
                 count,
-                "clip audio: frames lost; the hole is filled with silence"
+                "recording audio: frames lost; the hole is filled with silence"
             );
         }
         self.pcm.resize(self.pcm.len().saturating_add(samples), 0.0);
@@ -487,7 +487,7 @@ impl ToOpus {
                 input_epoch = frame.epoch,
                 offset_ticks = near,
                 count,
-                "clip audio: a new input epoch continues the sample count; the decoder goes on in a new output epoch"
+                "recording audio: a new input epoch continues the sample count; the decoder goes on in a new output epoch"
             );
         }
         self.timeline.input_epoch = frame.epoch;
@@ -525,7 +525,7 @@ impl ToOpus {
                     reason,
                     offset_ticks = offset,
                     count,
-                    "clip audio: timeline re-anchored; a new output epoch"
+                    "recording audio: timeline re-anchored; a new output epoch"
                 );
             }
             self.new_epoch();
@@ -558,7 +558,7 @@ impl ToOpus {
     /// ([`ResampleError::ChunkLength`]). The path of a transcode that
     /// fails, which real input never takes (the chain cuts its PCM in the
     /// resampler's own chunks, and libopus takes every 20 ms of finite
-    /// PCM), for the tests of what a clip does then.
+    /// PCM), for the tests of what a recording does then.
     pub fn failing(codec: &Codec) -> Result<Self, ToOpusError> {
         let mut chain = Self::new(codec)?;
         chain.chunk = 0;
@@ -696,15 +696,15 @@ mod tests {
         );
         assert_eq!(
             ToOpusError::Unsupported(CodecFamily::AacLc).to_string(),
-            "no clip transcode from aac_lc"
+            "no recording transcode from aac_lc"
         );
         assert_eq!(
-            ClipError::from(ToOpusError::Unsupported(CodecFamily::AacLc)),
-            ClipError::Failed("audio transcode: no clip transcode from aac_lc".into())
+            RecordingError::from(ToOpusError::Unsupported(CodecFamily::AacLc)),
+            RecordingError::Failed("audio transcode: no recording transcode from aac_lc".into())
         );
         assert_eq!(
             ToOpus::output(),
-            ClipTrack {
+            RecordingTrack {
                 codec: Codec::Opus { channels: 1 },
                 clock_rate: 48_000,
             }
@@ -714,7 +714,7 @@ mod tests {
     /// The test-util chain that fails refuses every frame with samples,
     /// its resampler taking no chunk of none, and leaves one without out
     /// as any chain does; it is built for what `new` builds, and its error
-    /// fails a clip as a container's would.
+    /// fails a recording as a container's would.
     #[test]
     fn a_failing_chain_refuses_every_frame_with_samples() {
         for codec in CODECS {
@@ -744,11 +744,11 @@ mod tests {
             ToOpusError::Unsupported(CodecFamily::Opus)
         );
         assert_eq!(
-            ClipError::from(ToOpusError::Resample(ResampleError::ChunkLength {
+            RecordingError::from(ToOpusError::Resample(ResampleError::ChunkLength {
                 got: 0,
                 expected: 160
             })),
-            ClipError::Failed("audio transcode: 0 samples, a chunk is 160".into())
+            RecordingError::Failed("audio transcode: 0 samples, a chunk is 160".into())
         );
     }
 
@@ -878,7 +878,7 @@ mod tests {
         assert_eq!(
             logs.count(
                 Level::DEBUG,
-                "clip audio: frames lost; the hole is filled with silence"
+                "recording audio: frames lost; the hole is filled with silence"
             ),
             0
         );
@@ -906,7 +906,7 @@ mod tests {
         }
         let lines = logs.fields(
             Level::DEBUG,
-            "clip audio: frames lost; the hole is filled with silence",
+            "recording audio: frames lost; the hole is filled with silence",
         );
         assert!(
             lines
@@ -973,7 +973,7 @@ mod tests {
         let reasons: Vec<String> = logs
             .fields(
                 Level::DEBUG,
-                "clip audio: timeline re-anchored; a new output epoch",
+                "recording audio: timeline re-anchored; a new output epoch",
             )
             .into_iter()
             .take(3)
@@ -1039,7 +1039,7 @@ mod tests {
         assert_eq!(
             logs.count(
                 Level::DEBUG,
-                "clip audio: a new input epoch continues the sample count; the decoder goes on in a new output epoch"
+                "recording audio: a new input epoch continues the sample count; the decoder goes on in a new output epoch"
             ),
             2
         );
@@ -1172,7 +1172,7 @@ mod tests {
     /// on, but the epoch is placed at the frame's capture time, which can
     /// step), and one that re-anchors (an epoch off the count, a step back,
     /// a hole over a second). Regression: a frame across an epoch it
-    /// continues was `continued`, and the clip took a hole before it, which
+    /// continues was `continued`, and the recording took a hole before it, which
     /// a capture-time step leaves in the file, for one silence filled.
     #[test]
     fn continued_is_a_frame_in_the_output_epoch_before_it_not_one_that_starts_one() {

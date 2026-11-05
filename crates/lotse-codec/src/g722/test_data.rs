@@ -1,5 +1,5 @@
 //! G.722 for tests: this crate's decoder and transcoder tests and, behind
-//! the `test-util` feature, other crates' clip tests, the benchmarks and
+//! the `test-util` feature, other crates' recording tests, the benchmarks and
 //! the fuzz target.
 //!
 //! [`SWEEP_NOISE`] is half a second at 16 kHz, mono: a sine sweeping from

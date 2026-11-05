@@ -120,16 +120,16 @@ impl Handler for FakeHandler {
                 self.sessions.lock().unwrap().push((offer.id, tx));
                 Outcome::Subscribed(rx)
             }
-            Command::ClipStart(start) => {
-                // A result with content, then the clip's events.
+            Command::RecordingCreate(start) => {
+                // A result with content, then the recording's events.
                 let (tx, rx) = mpsc::channel(8);
-                let clip_id = start.clip_id.unwrap_or_default();
+                let recording_id = start.recording_id.unwrap_or_default();
                 let _queued = tx.try_send(Event {
                     class: EventClass::Signaling,
-                    payload: json!({ "type": "stopped", "reason": "completed", "bytes": 0, "duration_ms": 0, "gaps": 0 }),
+                    payload: json!({ "type": "closed", "reason": "completed", "bytes": 0, "duration_ms": 0, "gaps": 0 }),
                 });
                 Outcome::SubscribedWith {
-                    result: json!({ "clip_id": clip_id, "url": format!("/v0/clips/{clip_id}") }),
+                    result: json!({ "recording_id": recording_id, "url": format!("/v0/recording/{recording_id}") }),
                     events: rx,
                 }
             }
@@ -518,7 +518,7 @@ async fn unsubscribing_a_session_sends_its_closed_event_before_the_result() {
     running.finish().await;
 }
 
-/// `clip/start`'s result names the clip, and its events follow it on the
+/// `recording/create`'s result names the recording, and its events follow it on the
 /// subscription the command opened.
 #[tokio::test]
 async fn a_subscription_may_start_with_a_result_of_its_own() {
@@ -527,16 +527,16 @@ async fn a_subscription_may_start_with_a_result_of_its_own() {
     recv(&mut ws).await;
     send(
         &mut ws,
-        json!({ "id": 1, "type": "clip/start", "stream_id": "a", "clip_id": "k1",
-                "after_ms": 1_000 }),
+        json!({ "id": 1, "type": "recording/create", "stream_id": "a", "recording_id": "k1",
+                "duration_ms": 1_000 }),
     )
     .await;
     assert_eq!(
         recv(&mut ws).await,
         json!({ "id": 1, "type": "result", "success": true,
-                "result": { "clip_id": "k1", "url": "/v0/clips/k1" } })
+                "result": { "recording_id": "k1", "url": "/v0/recording/k1" } })
     );
-    assert_eq!(recv(&mut ws).await["event"]["type"], "stopped");
+    assert_eq!(recv(&mut ws).await["event"]["type"], "closed");
     ws.close(None).await.unwrap();
     running.finish().await;
 }
@@ -568,7 +568,7 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
         (5, json!({ "type": "session/adopt", "session_id": "s1" })),
         (
             6,
-            json!({ "type": "clip/start", "stream_id": "a", "after_ms": 1_000 }),
+            json!({ "type": "recording/create", "stream_id": "a", "duration_ms": 1_000 }),
         ),
     ] {
         let mut frame = frame;
@@ -591,7 +591,7 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
         refusals[2].contains("id=5") && refusals[2].contains("session/adopt"),
         "{refusals:?}"
     );
-    assert!(refusals[3].contains("clip/start"), "{refusals:?}");
+    assert!(refusals[3].contains("recording/create"), "{refusals:?}");
     // Other commands are not affected.
     send(&mut ws, json!({ "id": 7, "type": "info" })).await;
     assert_eq!(recv(&mut ws).await["result"]["version"], "0.0.0-test");

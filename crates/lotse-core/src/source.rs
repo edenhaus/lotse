@@ -23,7 +23,7 @@ use crate::codec::{Codec, Kind};
 use crate::ingest::{IngestCounters, IngestStats};
 use crate::media::MediaPacket;
 use crate::negotiate::TrackInfo;
-use crate::preroll::PrerollShared;
+use crate::prerecord::PrerecordShared;
 use crate::runner::ProbeGate;
 use crate::source_url::SourceUrl;
 use crate::task::{BoxFuture, spawn_named};
@@ -878,12 +878,12 @@ pub struct TrackSet {
     tag: u8,
     /// The live set a staging set forwards into.
     live: Option<Arc<Self>>,
-    /// What the connection's pre-roll rings hold together, which one
-    /// `preroll_bytes` bounds, and the oldest capture time of a keyframe
-    /// its video pre-roll holds, which its audio pre-roll trims by; a
+    /// What the connection's pre-record rings hold together, which one
+    /// `prerecord_bytes` bounds, and the oldest capture time of a keyframe
+    /// its video pre-record holds, which its audio pre-record trims by; a
     /// staging set shares the live set's, and only the live set's `v0`
     /// writes the floor.
-    preroll_shared: Arc<PrerollShared>,
+    prerecord_shared: Arc<PrerecordShared>,
 }
 
 impl TrackSet {
@@ -900,7 +900,7 @@ impl TrackSet {
             feeds: Arc::new(Feeds::new(weak.clone())),
             tag: 0,
             live: None,
-            preroll_shared: Arc::default(),
+            prerecord_shared: Arc::default(),
         })
     }
 
@@ -920,7 +920,7 @@ impl TrackSet {
             feeds: Arc::clone(&live.feeds),
             tag: live.feeds.next_tag(),
             live: Some(Arc::clone(live)),
-            preroll_shared: Arc::clone(&live.preroll_shared),
+            prerecord_shared: Arc::clone(&live.prerecord_shared),
         })
     }
 
@@ -1075,7 +1075,7 @@ impl TrackSet {
             Arc::clone(&self.feeds),
             self.tag,
             forward_to,
-            Arc::clone(&self.preroll_shared),
+            Arc::clone(&self.prerecord_shared),
         ));
         self.tracks
             .write()
@@ -1356,20 +1356,20 @@ mod tests {
         assert_eq!(live.ingest().packets_lost, 1);
     }
 
-    /// A switch is a stream boundary for the pre-roll and for frame
+    /// A switch is a stream boundary for the pre-record and for frame
     /// subscribers, with the same codec too: the live ring drops the old
     /// source's frames and holds the standby's first keyframe on, and a
     /// frame subscription yields the old source's frames queued before the
     /// switch, then `SourceSwitched` and the new epoch, then the standby's.
-    /// Regression: the ring kept the old source's GOPs, so a clip started
+    /// Regression: the ring kept the old source's GOPs, so a recording started
     /// after the switch began in the old source, and its subscription had
     /// nothing in band to tell a switch from a reconnect.
     #[tokio::test]
-    async fn a_switch_drops_the_old_source_s_pre_roll_and_comes_in_its_place_among_the_frames() {
+    async fn a_switch_drops_the_old_source_s_pre_record_and_comes_in_its_place_among_the_frames() {
         let t0 = SystemClock.now();
         let live = TrackSet::new(TrackLimits::default(), t0);
         let v0 = live.publisher().declare(Kind::Video, h264(), 90_000);
-        v0.set_preroll(Some(Duration::from_secs(30)));
+        v0.set_prerecord(Some(Duration::from_secs(30)));
         let mut frames = v0.subscribe(Unit::Frames);
         assert!(v0.publish_frame(frame(true)));
         let staging = TrackSet::staging(&live);
@@ -1380,7 +1380,7 @@ mod tests {
         assert!(sv0.publish_frame(frame(true)));
         assert_eq!(v0.codec().family(), CodecFamily::H264, "the same codec");
         let held: Vec<u32> = v0
-            .preroll_snapshot(t0)
+            .prerecord_snapshot(t0)
             .unwrap()
             .frames()
             .map(|frame| frame.epoch)
@@ -1550,12 +1550,18 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_s_tracks_share_one_pre_roll_floor_across_its_sources() {
+    fn a_connection_s_tracks_share_one_pre_record_floor_across_its_sources() {
         let live = TrackSet::new(TrackLimits::default(), SystemClock.now());
         let staging = TrackSet::staging(&live);
-        assert!(Arc::ptr_eq(&live.preroll_shared, &staging.preroll_shared));
+        assert!(Arc::ptr_eq(
+            &live.prerecord_shared,
+            &staging.prerecord_shared
+        ));
         let other = TrackSet::new(TrackLimits::default(), SystemClock.now());
-        assert!(!Arc::ptr_eq(&live.preroll_shared, &other.preroll_shared));
+        assert!(!Arc::ptr_eq(
+            &live.prerecord_shared,
+            &other.prerecord_shared
+        ));
     }
 
     #[test]

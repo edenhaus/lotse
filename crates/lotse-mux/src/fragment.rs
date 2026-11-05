@@ -1,4 +1,4 @@
-//! The movie fragments of a clip and the decode timeline of each track.
+//! The movie fragments of a recording and the decode timeline of each track.
 //!
 //! Implements ISO/IEC 14496-12: a fragment is one `moof` (§8.8.4) with its
 //! `mfhd` (§8.8.5, the sequence number from 1) and one `traf` (§8.8.6)
@@ -23,9 +23,9 @@
 //!
 //! SPEC-DEVIATION: from the first H.265 sample with a parameter set the
 //! sample entry lacks on, every sample keeps all its parameter sets, the
-//! entry's included. Only a pre-roll GOP from before a change of the sets
+//! entry's included. Only a pre-record GOP from before a change of the sets
 //! within the codec family has such a set (the ring keeps those GOPs, the
-//! clip's sample entry has the newest sets), and without it that GOP
+//! recording's sample entry has the newest sets), and without it that GOP
 //! would not decode. Its set takes the place of the entry's with the same
 //! ID in the decoder (ITU-T H.265 §7.4.2.4.2), and a new fragment does not
 //! bring the entry's back, so the GOPs after it need their own in-band
@@ -34,9 +34,9 @@
 //!
 //! The timeline: a track's timescale is its clock rate, so the camera's
 //! timestamps are the file's. Each epoch of a track is presented from its
-//! first frame's capture time after the clip's origin (the capture time
-//! of the clip's first frame, or the earlier one the clip task set with
-//! [`ClipMuxer::set_origin`](lotse_core::clip::ClipMuxer::set_origin)),
+//! first frame's capture time after the recording's origin (the capture time
+//! of the recording's first frame, or the earlier one the recording task set with
+//! [`RecordingMuxer::set_origin`](lotse_core::recording::RecordingMuxer::set_origin)),
 //! in ticks, and no earlier than where the
 //! track's presentation so far ends; inside the epoch a sample's
 //! presentation time is that anchor plus its timestamp's distance from
@@ -64,8 +64,8 @@
 //! no next, takes its frame's own length where the codec states one (an
 //! AAC-LC frame's 1024 samples, ISO/IEC 14496-3 §4.4.1; an Opus packet's
 //! frames, RFC 6716 §3.1), else, for the video's last, until the frame the
-//! clip ended the video at would be decoded when that is of its epoch
-//! ([`ClipMuxer::end_video`](lotse_core::clip::ClipMuxer::end_video)), else
+//! recording ended the video at would be decoded when that is of its epoch
+//! ([`RecordingMuxer::end_video`](lotse_core::recording::RecordingMuxer::end_video)), else
 //! the one before it (video), cut short so
 //! its presentation ends where the next epoch begins when that is sooner
 //! and no sooner than the track's presentation so far ends, and an epoch
@@ -78,7 +78,7 @@
 //! them, which are decoded after that frame and so left out, or past it
 //! when that frame is presented before pictures that went in; the muxer
 //! says where, on that frame's date ([`TrackWriter::close_at`]), and the
-//! clip ends its audio there.
+//! recording ends its audio there.
 //!
 //! Video whose timestamps go back in decode order is reordered
 //! (B-frames): from the first such frame on, the epoch's decode times
@@ -97,7 +97,7 @@ use lotse_codec::aac::FRAME_SAMPLES as AAC_FRAME_SAMPLES;
 use lotse_codec::h264::annex_b_units;
 use lotse_codec::h265::nal;
 use lotse_codec::opus::packet_samples;
-use lotse_core::clip::{ClipError, ClipTrack};
+use lotse_core::recording::{RecordingError, RecordingTrack};
 use lotse_core::{Codec, Kind, MediaFrame};
 use mp4_atom::{
     Atom as _, Encode as _, Header, Mdat, Mfhd, Moof, Tfdt, Tfhd, Traf, Trun, TrunEntry,
@@ -145,9 +145,9 @@ pub(crate) fn duration_of(ticks: i128, rate: u32) -> Duration {
     u64::try_from(nanos).map_or(Duration::MAX, Duration::from_nanos)
 }
 
-/// A conversion that does not fit its field: the clip cannot go on.
-fn out_of_range(what: &str, value: i128) -> ClipError {
-    ClipError::Failed(format!("{what} of {value} ticks out of range"))
+/// A conversion that does not fit its field: the recording cannot go on.
+fn out_of_range(what: &str, value: i128) -> RecordingError {
+    RecordingError::Failed(format!("{what} of {value} ticks out of range"))
 }
 
 /// How a track's last sample learns its length when no sample follows.
@@ -348,7 +348,7 @@ pub(crate) struct Run {
     samples: Vec<Sample>,
 }
 
-/// One track of a clip: its timeline, the sample whose duration waits
+/// One track of a recording: its timeline, the sample whose duration waits
 /// for the next frame, and the samples ready for the next fragment.
 #[derive(Debug)]
 pub(crate) struct TrackWriter {
@@ -395,8 +395,8 @@ pub(crate) struct TrackWriter {
 }
 
 impl TrackWriter {
-    /// The writer of track `track_id`, the clip's `track`.
-    pub(crate) fn new(track_id: u32, kind: Kind, track: &ClipTrack) -> Self {
+    /// The writer of track `track_id`, the recording's `track`.
+    pub(crate) fn new(track_id: u32, kind: Kind, track: &RecordingTrack) -> Self {
         let length = match track.codec {
             Codec::AacLc { sample_rate, .. } => FrameLength::Aac { sample_rate },
             Codec::Opus { .. } => FrameLength::Opus,
@@ -426,7 +426,7 @@ impl TrackWriter {
         }
     }
 
-    /// Times `frame` on a clip whose origin is `origin`, and finishes the
+    /// Times `frame` on a recording whose origin is `origin`, and finishes the
     /// sample before it. Returns whether `frame` re-anchored the track's
     /// timeline (a new epoch after another), which the fragment must
     /// begin with.
@@ -434,7 +434,7 @@ impl TrackWriter {
         &mut self,
         frame: Arc<MediaFrame>,
         origin: Instant,
-    ) -> Result<bool, ClipError> {
+    ) -> Result<bool, RecordingError> {
         let ts = i128::from(frame.ts.ticks());
         let video = self.video;
         let (dts, cts, anchored) = match self.epoch.as_mut() {
@@ -482,13 +482,13 @@ impl TrackWriter {
             .map_or(self.shown, |shown| self.shown.max(shown))
     }
 
-    /// The presentation time of the latest frame taken, from the clip's
+    /// The presentation time of the latest frame taken, from the recording's
     /// media time 0; zero before the first.
     pub(crate) fn media_time(&self) -> Duration {
         duration_of(self.latest, self.clock_rate)
     }
 
-    /// Where the track's presentation reaches, from the clip's media time
+    /// Where the track's presentation reaches, from the recording's media time
     /// 0: where its finished samples' presentation ends as written
     /// ([`Self::written`]: the video's last too once
     /// [`close_at`](Self::close_at) ended it), or where the latest frame
@@ -507,7 +507,7 @@ impl TrackWriter {
         duration_of(self.written.1.max(latest), self.clock_rate)
     }
 
-    /// The decode time of the latest frame taken, from the clip's media
+    /// The decode time of the latest frame taken, from the recording's media
     /// time 0; zero before the first. It never goes back (see the
     /// module), and inside an epoch it follows the frames' timestamps,
     /// not their capture times.
@@ -527,10 +527,10 @@ impl TrackWriter {
     }
 
     /// [`close`](Self::close), with the held video sample lasting until
-    /// `next`, the frame after it that the clip leaves out, would be
+    /// `next`, the frame after it that the recording leaves out, would be
     /// decoded, as [`push`](Self::push) would time it, when `next` is of its
     /// epoch: a sample before a hole in the frames (the camera skipped some,
-    /// or slowed down) lasts until the next picture, where the clip ends its
+    /// or slowed down) lasts until the next picture, where the recording ends its
     /// audio, not as long as the one before it. A `next` of another epoch
     /// leaves the hole between them, as a reconnect does: the sample ends
     /// as [`close`](Self::close) ends it, and so does one whose duration
@@ -548,7 +548,7 @@ impl TrackWriter {
     /// `I0 P3 B1 B2 P6 B4 B5` at 25 fps ended at `P9` (360 ms) is presented
     /// until 280 ms, where `P6`, a frame long, ends ([`Epoch::shown`]),
     /// 80 ms before `P9`. After, when `next` is presented before pictures
-    /// that went in, as a clip that ends by the frames' arrival leaves out
+    /// that went in, as a recording that ends by the frames' arrival leaves out
     /// the first to arrive after its end: `I0 P3 B1 B2 P6 B4` ended at `B5`
     /// (200 ms) is presented until 280 ms too, 80 ms after `B5`. `B5` in
     /// the first, `B4` in the second, lasts its step of the decode times,
@@ -771,7 +771,7 @@ fn traf(run: &Run, offset: i32) -> Traf {
 /// The movie fragment `sequence` of `runs` (those without samples left
 /// out), and its media data: the `moof` and the `mdat` header in the
 /// first piece, then the samples' bytes. Empty when no run has samples.
-pub(crate) fn fragment(sequence: u32, runs: &[Run]) -> Result<Vec<Bytes>, ClipError> {
+pub(crate) fn fragment(sequence: u32, runs: &[Run]) -> Result<Vec<Bytes>, RecordingError> {
     let runs: Vec<&Run> = runs.iter().filter(|run| !run.samples.is_empty()).collect();
     if runs.is_empty() {
         return Ok(Vec::new());

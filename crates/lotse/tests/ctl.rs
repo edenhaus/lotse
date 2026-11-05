@@ -1,7 +1,7 @@
 //! The M0 exit criterion: a `lotse ctl` round trip over the socket of a
 //! real daemon. `info`, `stream put` with `preload` (a worker runs the fake
 //! source), `stream get` until it is live, `stream subscribe`, an error
-//! result, `raw`, `stream clip` (and Ctrl-C leaving it), `stream delete`,
+//! result, `raw`, `recording create` (and Ctrl-C leaving it), `stream delete`,
 //! and a clean stop. Needs the
 //! `source-fake` feature (on with `--all-features`).
 
@@ -91,18 +91,22 @@ fn check_info(socket: &Path) {
             "{scheme} in {schemes:?}"
         );
     }
-    // The clip container follows its feature, with the limits of clips.
+    // The recording container follows its feature, with the limits of recordings.
     assert_eq!(
         info["outputs"]
             .as_array()
             .unwrap()
-            .contains(&Value::from("clip")),
-        cfg!(feature = "output-clip")
+            .contains(&Value::from("recording")),
+        cfg!(feature = "output-recording")
     );
-    // Without a clip output the daemon takes no clip, whatever is
+    // Without a recording output the daemon takes no recording, whatever is
     // configured, and says so with a zero.
-    let max_clips = if cfg!(feature = "output-clip") { 3 } else { 0 };
-    assert_eq!(info["limits"]["max_clips"], max_clips);
+    let max_recordings = if cfg!(feature = "output-recording") {
+        3
+    } else {
+        0
+    };
+    assert_eq!(info["limits"]["max_recordings"], max_recordings);
     assert_eq!(info["sandbox"]["mode"], "off");
     assert!(!info["build"]["target"].as_str().unwrap().is_empty());
     // The fake and the RTSP source declare a backchannel (the ONVIF one,
@@ -203,42 +207,42 @@ fn check_errors(socket: &Path) {
     assert!(String::from_utf8_lossy(&raw.stderr).contains("not JSON"));
 }
 
-/// `stream clip` of the fake source: the daemon takes the clip and hands
-/// its file over, but the fake source sends no frame, so the clip never
+/// `recording create` of the fake source: the daemon takes the recording and hands
+/// its file over, but the fake source sends no frame, so the recording never
 /// starts and ends `source_not_live` without a byte once its end has
 /// passed; `lotse ctl` prints its events and exits 1.
-#[cfg(feature = "output-clip")]
-fn check_clip(socket: &Path, dir: &Path) {
-    let file = dir.join("clip.mp4");
+#[cfg(feature = "output-recording")]
+fn check_recording(socket: &Path, dir: &Path) {
+    let file = dir.join("recording.mp4");
     let path = file.to_str().unwrap();
-    let clip = ctl(
+    let recording = ctl(
         socket,
         &[
             "--compact",
-            "stream",
-            "clip",
+            "recording",
+            "create",
             "front",
-            "--after",
+            "--duration",
             "1s",
             "-o",
             path,
         ],
     );
-    let stdout = String::from_utf8_lossy(&clip.stdout);
+    let stdout = String::from_utf8_lossy(&recording.stdout);
     assert_eq!(
-        clip.status.code(),
+        recording.status.code(),
         Some(1),
         "{stdout}\n{}",
-        String::from_utf8_lossy(&clip.stderr)
+        String::from_utf8_lossy(&recording.stderr)
     );
     let lines: Vec<Value> = stdout.lines().map(json).collect();
-    let clip_id = lines[0]["clip_id"].as_str().unwrap();
-    assert_eq!(lines[0]["url"], format!("/v0/clips/{clip_id}"));
-    let stopped = lines.last().unwrap();
+    let recording_id = lines[0]["recording_id"].as_str().unwrap();
+    assert_eq!(lines[0]["url"], format!("/v0/recording/{recording_id}"));
+    let closed = lines.last().unwrap();
     assert_eq!(
-        (&stopped["type"], &stopped["reason"], &stopped["bytes"]),
+        (&closed["type"], &closed["reason"], &closed["bytes"]),
         (
-            &Value::from("stopped"),
+            &Value::from("closed"),
             &Value::from("source_not_live"),
             &Value::from(0)
         ),
@@ -247,12 +251,12 @@ fn check_clip(socket: &Path, dir: &Path) {
     assert_eq!(std::fs::metadata(&file).unwrap().len(), 0);
 }
 
-/// A long `stream clip` left by Ctrl-C: `lotse ctl` ends at once, as
+/// A long `recording create` left by Ctrl-C: `lotse ctl` ends at once, as
 /// SIGINT's default does, its connection closes, and the daemon ends the
-/// clip `session_closed`. First of the clip checks: the daemon's first
-/// `clip_opened` and `clip_stopped` are this clip's.
-#[cfg(feature = "output-clip")]
-fn check_clip_interrupted(socket: &Path, dir: &Path, daemon: &mut Daemon) {
+/// recording `session_closed`. First of the recording checks: the daemon's first
+/// `recording_opened` and `recording_closed` are this recording's.
+#[cfg(feature = "output-recording")]
+fn check_recording_interrupted(socket: &Path, dir: &Path, daemon: &mut Daemon) {
     use std::io::{BufRead as _, BufReader};
     use std::process::Stdio;
 
@@ -263,10 +267,10 @@ fn check_clip_interrupted(socket: &Path, dir: &Path, daemon: &mut Daemon) {
         .arg(socket)
         .args([
             "--compact",
-            "stream",
-            "clip",
+            "recording",
+            "create",
             "front",
-            "--after",
+            "--duration",
             "60m",
             "-o",
         ])
@@ -279,7 +283,7 @@ fn check_clip_interrupted(socket: &Path, dir: &Path, daemon: &mut Daemon) {
     let mut result = String::new();
     stdout.read_line(&mut result).expect("the result line");
     assert!(json(result.trim())["url"].is_string(), "{result}");
-    daemon.wait_for("\"event\":\"clip_opened\"");
+    daemon.wait_for("\"event\":\"recording_opened\"");
     rustix::process::kill_process(
         rustix::process::Pid::from_child(&child),
         rustix::process::Signal::INT,
@@ -287,7 +291,7 @@ fn check_clip_interrupted(socket: &Path, dir: &Path, daemon: &mut Daemon) {
     .expect("SIGINT sent");
     let output = child.wait_with_output().expect("ctl exits");
     assert!(!output.status.success(), "{output:?}");
-    let stopped = json(&daemon.wait_for("\"event\":\"clip_stopped\""));
+    let stopped = json(&daemon.wait_for("\"event\":\"recording_closed\""));
     assert_eq!(stopped["reason"], "session_closed", "{stopped}");
 }
 
@@ -336,11 +340,11 @@ fn ctl_round_trips_over_the_socket_of_a_running_daemon() {
             "--log-format",
             "json",
         ],
-        &[("LOTSE_MAX_CLIPS", "3")],
+        &[("LOTSE_MAX_RECORDINGS", "3")],
     );
-    let max_clips = json(&daemon.wait_for("\"setting\":\"limits.max_clips\""));
+    let max_recordings = json(&daemon.wait_for("\"setting\":\"limits.max_recordings\""));
     assert_eq!(
-        (&max_clips["value"], &max_clips["source"]),
+        (&max_recordings["value"], &max_recordings["source"]),
         (&Value::from("3"), &Value::from("env"))
     );
     daemon.wait_for("\"event\":\"ready\"");
@@ -361,10 +365,10 @@ fn ctl_round_trips_over_the_socket_of_a_running_daemon() {
     assert!(metrics["streams"].get("front").is_some(), "{metrics}");
     check_errors(&socket);
     check_raw(&socket);
-    #[cfg(feature = "output-clip")]
+    #[cfg(feature = "output-recording")]
     {
-        check_clip_interrupted(&socket, &dir, &mut daemon);
-        check_clip(&socket, &dir);
+        check_recording_interrupted(&socket, &dir, &mut daemon);
+        check_recording(&socket, &dir);
     }
     let schema = ok(&socket, &["schema"]);
     assert_eq!(schema["api"], lotse_api_types::API_VERSION);

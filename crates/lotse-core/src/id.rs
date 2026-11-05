@@ -1,7 +1,7 @@
 //! The identifiers a client and the daemon exchange: [`StreamId`],
-//! [`SessionId`] and [`ClipId`]. All match `^[A-Za-z0-9._-]{1,128}$`,
+//! [`SessionId`] and [`RecordingId`]. All match `^[A-Za-z0-9._-]{1,128}$`,
 //! checked on construction so an invalid id never exists inside the daemon;
-//! a [`ClipId`] is a path segment of its bytes' route besides, so it is
+//! a [`RecordingId`] is a path segment of its bytes' route besides, so it is
 //! never `.` or `..`, which URL resolution would remove (RFC 3986 §3.3,
 //! §5.2.4). The API maps [`IdError`] to `invalid_stream_id` or
 //! `invalid_request`.
@@ -36,7 +36,7 @@ pub enum IdError {
         index: usize,
     },
     /// The string is `.` or `..`, a dot segment (RFC 3986 §3.3) that URL
-    /// resolution removes from a path (§5.2.4), where a [`ClipId`] names
+    /// resolution removes from a path (§5.2.4), where a [`RecordingId`] names
     /// its bytes' route.
     #[error("identifier is {0:?}, a dot segment of a path (RFC 3986 §3.3)")]
     DotSegment(&'static str),
@@ -61,8 +61,8 @@ fn validate(s: &str) -> Result<(), IdError> {
 }
 
 /// Checks `s` against the identifier pattern and refuses the dot segments
-/// `.` and `..` (RFC 3986 §3.3): `/v0/clips/..` resolves to `/v0/`
-/// (§5.2.4), so a clip of that id could not be fetched by its URL.
+/// `.` and `..` (RFC 3986 §3.3): `/v0/recording/..` resolves to `/v0/`
+/// (§5.2.4), so a recording of that id could not be fetched by its URL.
 fn validate_segment(s: &str) -> Result<(), IdError> {
     validate(s)?;
     match s {
@@ -131,11 +131,11 @@ identifier! {
 }
 
 identifier! {
-    /// The id of an event clip (`clip_id` in the API), which names its
-    /// bytes' route, `/v0/clips/{clip_id}`, and so is never a dot segment.
+    /// The id of an event recording (`recording_id` in the API), which names its
+    /// bytes' route, `/v0/recording/{recording_id}`, and so is never a dot segment.
     /// The client passes its own; the daemon generates a ULID when it does
     /// not.
-    ClipId,
+    RecordingId,
     validate_segment,
     "`^[A-Za-z0-9._-]{1,128}$`, `.` and `..` excepted"
 }
@@ -167,37 +167,40 @@ mod tests {
             "...",
             "a..",
         ] {
-            assert_eq!(ClipId::new(id).unwrap().as_str(), id);
+            assert_eq!(RecordingId::new(id).unwrap().as_str(), id);
         }
     }
 
     #[test]
-    fn rfc3986_3_3_a_clip_id_is_never_a_dot_segment() {
-        // RFC 3986 §5.2.4: `/v0/clips/.` and `/v0/clips/..` resolve to
-        // `/v0/clips/` and `/v0/`, so their clips' URLs would name none.
-        assert_eq!(ClipId::new(".").unwrap_err(), IdError::DotSegment("."));
-        assert_eq!(ClipId::new("..").unwrap_err(), IdError::DotSegment(".."));
+    fn rfc3986_3_3_a_recording_id_is_never_a_dot_segment() {
+        // RFC 3986 §5.2.4: `/v0/recording/.` and `/v0/recording/..` resolve to
+        // `/v0/recording/` and `/v0/`, so their recordings' URLs would name none.
+        assert_eq!(RecordingId::new(".").unwrap_err(), IdError::DotSegment("."));
+        assert_eq!(
+            RecordingId::new("..").unwrap_err(),
+            IdError::DotSegment("..")
+        );
         assert_eq!(
             IdError::DotSegment("..").to_string(),
             "identifier is \"..\", a dot segment of a path (RFC 3986 §3.3)"
         );
         // The character rules come first.
-        assert_eq!(ClipId::new("").unwrap_err(), IdError::Empty);
+        assert_eq!(RecordingId::new("").unwrap_err(), IdError::Empty);
     }
 
     #[test]
-    fn a_clip_id_keeps_the_same_rules_and_round_trips() {
-        assert_eq!(ClipId::new("").unwrap_err(), IdError::Empty);
+    fn a_recording_id_keeps_the_same_rules_and_round_trips() {
+        assert_eq!(RecordingId::new("").unwrap_err(), IdError::Empty);
         assert_eq!(
-            ClipId::new("a/b").unwrap_err(),
+            RecordingId::new("a/b").unwrap_err(),
             IdError::InvalidChar { ch: '/', index: 1 }
         );
-        let id: ClipId = "01JB.clip".parse().unwrap();
+        let id: RecordingId = "01JB.recording".parse().unwrap();
         assert_eq!(
             (id.to_string().as_str(), id.as_ref()),
-            ("01JB.clip", "01JB.clip")
+            ("01JB.recording", "01JB.recording")
         );
-        assert_eq!(format!("{id:?}"), "ClipId(\"01JB.clip\")");
+        assert_eq!(format!("{id:?}"), "RecordingId(\"01JB.recording\")");
     }
 
     #[test]

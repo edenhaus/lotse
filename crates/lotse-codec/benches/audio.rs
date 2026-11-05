@@ -2,9 +2,9 @@
 //! depacketizer every AAC packet of a camera passes, and the AAC-LC to
 //! Opus chain of the transcoder (ISO/IEC 14496-3 decode, resampling to
 //! 48 kHz, RFC 6716 encode), the most expensive work per frame a worker
-//! does; and the event clips' G.711 and G.722 to Opus transcode (ITU-T
+//! does; and the event recordings' G.711 and G.722 to Opus transcode (ITU-T
 //! G.711 or G.722 decode, resampling to 48 kHz, RFC 6716 encode), which
-//! each clip of such a camera runs on its audio.
+//! each recording of such a camera runs on its audio.
 //!
 //! The input is one second of a recorded 1 kHz sine from this crate's
 //! `test-util` fixtures (`aac::test_data`), and one second of a 1 kHz tone
@@ -29,7 +29,7 @@ use lotse_codec::g711::Law;
 use lotse_codec::g722::test_data::{encode, tone};
 use lotse_codec::opus::{self, Encoder};
 use lotse_codec::resample::Resampler;
-use lotse_codec::transcode::clip::ToOpus;
+use lotse_codec::transcode::recording::ToOpus;
 use lotse_core::clock::{Clock as _, FakeClock};
 use lotse_core::codec::Codec;
 use lotse_core::media::{MediaFrame, MediaTime};
@@ -108,8 +108,8 @@ fn aac_to_opus(bencher: Bencher<'_, '_>, rate: u32) {
     );
 }
 
-/// The codecs a clip transcodes, by their API names.
-const CLIP_CODECS: [&str; 3] = ["pcmu", "pcma", "g722"];
+/// The codecs a recording transcodes, by their API names.
+const RECORDING_CODECS: [&str; 3] = ["pcmu", "pcma", "g722"];
 
 /// One second of a 1 kHz tone in `codec`, as fifty 20 ms payloads.
 fn narrowband_second(codec: &Codec) -> Vec<Bytes> {
@@ -131,13 +131,13 @@ fn narrowband_second(codec: &Codec) -> Vec<Bytes> {
     }
 }
 
-/// A clip's G.711 or G.722 to Opus transcode on one second of 20 ms
+/// A recording's G.711 or G.722 to Opus transcode on one second of 20 ms
 /// frames, the timeline going on from one iteration to the next as a
-/// clip's does: decode, resampling to 48 kHz and one Opus packet per
-/// 20 ms. The time for one second is the share of one core a clip of such
+/// recording's does: decode, resampling to 48 kHz and one Opus packet per
+/// 20 ms. The time for one second is the share of one core a recording of such
 /// a camera spends on its audio.
-#[divan::bench(args = CLIP_CODECS)]
-fn clip_to_opus(bencher: Bencher<'_, '_>, name: &str) {
+#[divan::bench(args = RECORDING_CODECS)]
+fn recording_to_opus(bencher: Bencher<'_, '_>, name: &str) {
     let codec = match name {
         "pcmu" => Codec::Pcmu,
         "pcma" => Codec::Pcma,

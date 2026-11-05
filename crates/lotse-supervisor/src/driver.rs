@@ -28,26 +28,26 @@
 //! it, and an offer that requests talk-back meanwhile goes to the worker
 //! as any other, where it waits for the probe.
 //!
-//! A stream's pre-roll window reaches the running worker the same way
-//! ([`DriverCommand::Preroll`]): its tracks keep or free their rings, and
+//! A stream's pre-record window reaches the running worker the same way
+//! ([`DriverCommand::Prerecord`]): its tracks keep or free their rings, and
 //! nothing reconnects; the next worker starts with the window. An event
-//! clip's start carries the write end of its pipe to the worker as the
+//! recording's start carries the write end of its pipe to the worker as the
 //! message's descriptor; one that never reached a worker before it was
 //! stopped ends here, as the worker would have ended it, and so does one
-//! that waited `limits.clip_start_timeout_ms` for a worker
-//! ([`Driver::clip_start_wait`]; `source_not_live`: the
+//! that waited `limits.recording_start_timeout_ms` for a worker
+//! ([`Driver::recording_start_wait`]; `source_not_live`: the
 //! host lookup keeps failing, or a backoff holds the next worker back),
-//! one whose clip
+//! one whose recording
 //! ended meanwhile is dropped with its pipe (a start still queued when its
-//! worker exited never reaches the next one, and one whose clip ended
-//! after it was sent is not held for the next), and the clips of a worker
+//! worker exited never reaches the next one, and one whose recording ended
+//! after it was sent is not held for the next), and the recordings of a worker
 //! that exits end `worker_crashed`. A start a worker gets after waiting
-//! runs only what is left of its `after_ms`, which counts from
-//! `clip/start` ([`after_left`]), and one whose end passed meanwhile ends
+//! runs only what is left of its `duration_ms`, which counts from
+//! `recording/create` ([`duration_left`]), and one whose end passed meanwhile ends
 //! here `source_not_live`, as a worker ends one whose source showed
-//! nothing before its end; its `before_ms` stays, since the new worker's
+//! nothing before its end; its `prerecord_ms` stays, since the new worker's
 //! ring holds nothing from before it. A worker stopped for want of demand
-//! runs no clip, and the ids of the clips it was finishing are free once
+//! runs no recording, and the ids of the recordings it was finishing are free once
 //! the driver lets go of it, since their reports reach no one.
 //!
 //! A worker that can no longer be told what to do is killed, so its exit
@@ -64,7 +64,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lotse_api_types::clip::ClipStopReason;
+use lotse_api_types::recording::RecordingCloseReason;
 use lotse_api_types::session::CloseCode;
 use lotse_core::backoff::{BackoffPosition, ReconnectBackoff};
 use lotse_core::connection::{
@@ -74,7 +74,7 @@ use lotse_core::connection::{
 use lotse_core::source::SourceError;
 use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::throttle::Throttle;
-use lotse_ipc::{ClipReport, ClipSpec, STOPPED_AS_ASKED, SessionSpec, SourceSpec};
+use lotse_ipc::{RecordingReport, RecordingSpec, STOPPED_AS_ASKED, SessionSpec, SourceSpec};
 use tokio::sync::{mpsc, watch};
 
 use crate::connect::{CONNECT_LEASE, ConnectSlot, SlotWake};
@@ -94,16 +94,16 @@ pub(crate) const COMMAND_QUEUE: usize = 256;
 /// missed in a row is a worker that hangs, not one that is busy.
 pub(crate) const WORKER_SILENCE_LIMIT: Duration = Duration::from_secs(10);
 
-/// What is left of a clip's `after_ms` once its start waited `waited`
-/// for a worker: the API counts it from `clip/start` ("how long the
-/// clip runs after now", `lotse_api_types::command::ClipStart`), a
+/// What is left of a recording's `duration_ms` once its start waited `waited`
+/// for a worker: the API counts it from `recording/create` ("how long the
+/// recording runs after now", `lotse_api_types::command::RecordingCreate`), a
 /// worker from when it gets the start, so the worker gets the rest;
-/// `None` when none is, the clip's end passed before a worker could
+/// `None` when none is, the recording's end passed before a worker could
 /// record it. Whole milliseconds are taken off, so the end comes at
 /// most a millisecond late, never early.
-fn after_left(after_ms: u32, waited: Duration) -> Option<u32> {
+fn duration_left(duration_ms: u32, waited: Duration) -> Option<u32> {
     let waited_ms = u32::try_from(waited.as_millis()).unwrap_or(u32::MAX);
-    after_ms.checked_sub(waited_ms).filter(|left| *left > 0)
+    duration_ms.checked_sub(waited_ms).filter(|left| *left > 0)
 }
 
 /// Who wants a connection, as its registry counts them; the driver follows
@@ -137,30 +137,30 @@ pub(crate) enum DriverCommand {
     /// running worker, whose sources turn their probe on or off without
     /// restarting.
     Backchannel(DriverSpec),
-    /// The connection's pre-roll window is `ms` from now on, 0 for none:
+    /// The connection's pre-record window is `ms` from now on, 0 for none:
     /// tell a running worker, and start the next one with it.
-    Preroll {
+    Prerecord {
         /// The window, in milliseconds.
         ms: u32,
     },
-    /// Start this event clip, writing into `pipe`; handed to a worker
-    /// only while the clip still runs ([`State::clip_start_wanted`]). Its
-    /// `after_ms` counts from `clip/start` ([`after_left`]).
+    /// Start this event recording, writing into `pipe`; handed to a worker
+    /// only while the recording still runs ([`State::recording_start_wanted`]). Its
+    /// `duration_ms` counts from `recording/create` ([`duration_left`]).
     ///
-    /// [`State::clip_start_wanted`]: crate::registry::State::clip_start_wanted
-    StartClip {
-        /// The clip.
-        spec: ClipSpec,
-        /// Its serial in the registry: a start of an earlier clip under the
+    /// [`State::recording_start_wanted`]: crate::registry::State::recording_start_wanted
+    StartRecording {
+        /// The recording.
+        spec: RecordingSpec,
+        /// Its serial in the registry: a start of an earlier recording under the
         /// same id is not this one.
         serial: u64,
-        /// The write end of the clip's pipe, which goes to the worker.
+        /// The write end of the recording's pipe, which goes to the worker.
         pipe: OwnedFd,
     },
-    /// Stop this event clip cleanly.
-    StopClip {
-        /// The clip.
-        clip_id: String,
+    /// Stop this event recording cleanly.
+    StopRecording {
+        /// The recording.
+        recording_id: String,
     },
     /// Open this session.
     OpenSession(SessionSpec),
@@ -254,9 +254,9 @@ impl DriverCommand {
             Self::IceTcp { .. }
             | Self::SwitchSource(_)
             | Self::Backchannel(_)
-            | Self::Preroll { .. }
-            | Self::StartClip { .. }
-            | Self::StopClip { .. }
+            | Self::Prerecord { .. }
+            | Self::StartRecording { .. }
+            | Self::StopRecording { .. }
             | Self::ReleaseBackchannel { .. } => None,
         }
     }
@@ -312,12 +312,12 @@ pub(crate) struct DriverSpec {
 
 impl DriverSpec {
     /// The spec as the worker takes it, with the resolved addresses, where
-    /// its reconnect schedule starts, and the connection's pre-roll window.
+    /// its reconnect schedule starts, and the connection's pre-record window.
     fn source_spec(
         &self,
         peer_addrs: Vec<SocketAddr>,
         backoff: BackoffPosition,
-        preroll_ms: u32,
+        prerecord_ms: u32,
     ) -> SourceSpec {
         SourceSpec {
             connection_id: self.connection_id.clone(),
@@ -329,7 +329,7 @@ impl DriverSpec {
                 attempts: backoff.attempts,
                 immediate_used: backoff.immediate_used,
             },
-            preroll_ms,
+            prerecord_ms,
         }
     }
 }
@@ -420,9 +420,9 @@ enum Wake {
     SwitchConnect(SlotWake),
     /// The probe's connect slot has something for the worker.
     ProbeConnect(SlotWake),
-    /// The oldest clip start in the queue may have waited
-    /// [`Driver::clip_start_wait`].
-    ClipStartWaited,
+    /// The oldest recording start in the queue may have waited
+    /// [`Driver::recording_start_wait`].
+    RecordingStartWaited,
 }
 
 /// The worker's next event, or never while there is no worker.
@@ -455,14 +455,14 @@ pub(crate) struct Driver {
     commands_tx: mpsc::Sender<DriverCommand>,
     /// Messages waiting for a worker, in order.
     queued: Vec<DriverCommand>,
-    /// When each clip start was queued, oldest first, with its clip's id
+    /// When each recording start was queued, oldest first, with its recording's id
     /// and serial; one that left the queue meanwhile is skipped. Taken
     /// with the queue when a worker comes, each start running what is left
-    /// of its `after_ms`.
-    clip_waits: VecDeque<(Instant, String, u64)>,
-    /// Fires when the oldest of `clip_waits` has waited
-    /// [`Self::clip_start_wait`]; `None` while none waits.
-    clip_wait: Option<BoxFuture<'static, ()>>,
+    /// of its `duration_ms`.
+    recording_waits: VecDeque<(Instant, String, u64)>,
+    /// Fires when the oldest of `recording_waits` has waited
+    /// [`Self::recording_start_wait`]; `None` while none waits.
+    recording_wait: Option<BoxFuture<'static, ()>>,
     /// The state machine.
     machine: ConnectionMachine,
     /// The running worker.
@@ -505,17 +505,17 @@ pub(crate) struct Driver {
     switching: bool,
     /// The failed attempt of the source to switch to, until its next one.
     switch_failure: Option<ConnectionError>,
-    /// The connection's pre-roll window, in milliseconds, which every
+    /// The connection's pre-record window, in milliseconds, which every
     /// worker it starts and every source it switches to gets.
-    preroll_ms: u32,
+    prerecord_ms: u32,
 }
 
 impl Driver {
     /// A driver for `spec` following `demand` and taking `commands`, whose
-    /// sending side is `commands_tx`, keeping a pre-roll window of
-    /// `preroll_ms` until told another.
+    /// sending side is `commands_tx`, keeping a pre-record window of
+    /// `prerecord_ms` until told another.
     pub(crate) fn new(
-        (spec, preroll_ms): (DriverSpec, u32),
+        (spec, prerecord_ms): (DriverSpec, u32),
         shared: Arc<Shared>,
         demand: watch::Receiver<Demand>,
         commands: (mpsc::Sender<DriverCommand>, mpsc::Receiver<DriverCommand>),
@@ -533,8 +533,8 @@ impl Driver {
             commands,
             commands_tx,
             queued: Vec::new(),
-            clip_waits: VecDeque::new(),
-            clip_wait: None,
+            recording_waits: VecDeque::new(),
+            recording_wait: None,
             machine: ConnectionMachine::new(config),
             worker: None,
             linger: None,
@@ -552,7 +552,7 @@ impl Driver {
             published: (ConnectionState::Idle, None),
             switching: false,
             switch_failure: None,
-            preroll_ms,
+            prerecord_ms,
         }
     }
 
@@ -586,7 +586,7 @@ impl Driver {
             window,
             silence,
             pending,
-            clip_wait,
+            recording_wait,
             connect,
             switch_connect,
             probe_connect,
@@ -602,7 +602,7 @@ impl Driver {
             wake = switch_connect.wait() => Wake::SwitchConnect(wake),
             wake = probe_connect.wait() => Wake::ProbeConnect(wake),
             Some(command) = commands.recv() => Wake::Command(command),
-            () = timer(clip_wait) => Wake::ClipStartWaited,
+            () = timer(recording_wait) => Wake::RecordingStartWaited,
             () = timer(linger) => Wake::LingerExpired,
             () = timer(crash) => Wake::CrashBackoffExpired,
             () = timer(window) => Wake::BackoffWindowExpired,
@@ -633,14 +633,14 @@ impl Driver {
             Wake::Worker(event) => self.on_worker_event(event),
             Wake::Command(DriverCommand::SwitchSource(spec)) => self.on_switch_source(spec),
             Wake::Command(DriverCommand::Backchannel(spec)) => self.on_backchannel(spec).await,
-            Wake::Command(DriverCommand::Preroll { ms }) => self.on_preroll(ms).await,
+            Wake::Command(DriverCommand::Prerecord { ms }) => self.on_prerecord(ms).await,
             Wake::Command(command) => match self.worker.as_mut() {
                 Some(worker) => {
                     Self::send(worker, &self.shared, &self.commands_tx, command).await;
                 }
                 None => self.queue(command),
             },
-            Wake::ClipStartWaited => self.end_waited_clips(),
+            Wake::RecordingStartWaited => self.end_waited_recordings(),
             Wake::LingerExpired => {
                 self.linger = None;
                 self.feed(Input::LingerExpired);
@@ -727,7 +727,7 @@ impl Driver {
                     // schedule starts at the first step.
                     let spec =
                         self.spec
-                            .source_spec(addrs, BackoffPosition::default(), self.preroll_ms);
+                            .source_spec(addrs, BackoffPosition::default(), self.prerecord_ms);
                     if let Err(err) = worker.switch_source(&spec).await {
                         tracing::warn!(pid = worker.pid(), error = %err, "source switch could not be sent to the worker");
                     }
@@ -845,26 +845,26 @@ impl Driver {
         }
     }
 
-    /// `Preroll`: the connection keeps a window of `ms` from now on. A
+    /// `Prerecord`: the connection keeps a window of `ms` from now on. A
     /// running worker is told, and its tracks keep or free their rings
     /// without reconnecting; without one, the next starts with it.
-    async fn on_preroll(&mut self, ms: u32) {
-        self.preroll_ms = ms;
+    async fn on_prerecord(&mut self, ms: u32) {
+        self.prerecord_ms = ms;
         let Some(worker) = self.worker.as_mut() else {
             tracing::info!(
-                preroll_ms = ms,
-                "no worker runs; the next one starts with the pre-roll window"
+                prerecord_ms = ms,
+                "no worker runs; the next one starts with the pre-record window"
             );
             return;
         };
         tracing::info!(
             pid = worker.pid(),
-            preroll_ms = ms,
-            "pre-roll window passed to the running worker; nothing reconnects"
+            prerecord_ms = ms,
+            "pre-record window passed to the running worker; nothing reconnects"
         );
-        if let Err(err) = worker.preroll(ms).await {
+        if let Err(err) = worker.prerecord(ms).await {
             // The exit follows, and the next worker starts with the window.
-            tracing::warn!(pid = worker.pid(), error = %err, "pre-roll window could not be sent to the worker");
+            tracing::warn!(pid = worker.pid(), error = %err, "pre-record window could not be sent to the worker");
         }
     }
 
@@ -876,6 +876,15 @@ impl Driver {
         self.pending = Pending::ResolvingSwitch(Box::pin(async move {
             crate::resolve::resolve(&host, port).await
         }));
+    }
+
+    /// A worker's report on one of its recordings, stamped with its arrival
+    /// on the wall clock.
+    fn on_recording_report(&self, recording_id: &str, event: RecordingReport) {
+        let at = self.shared.clock.wall_now();
+        self.shared
+            .lock()
+            .recording_report(&self.spec.connection_id, recording_id, event, at);
     }
 
     /// The worker said something or exited.
@@ -949,12 +958,10 @@ impl Driver {
                     now,
                 );
             }
-            WorkerEvent::Clip { clip_id, event } => {
-                let at = self.shared.clock.wall_now();
-                self.shared
-                    .lock()
-                    .clip_report(&self.spec.connection_id, &clip_id, event, at);
-            }
+            WorkerEvent::Recording {
+                recording_id,
+                event,
+            } => self.on_recording_report(&recording_id, event),
             WorkerEvent::Talker {
                 session_id,
                 reason,
@@ -1057,7 +1064,7 @@ impl Driver {
             CloseBy::WorkerGone,
         );
         // The pipes' write ends died with it: the bodies are cut.
-        state.clips_worker_gone(&connection);
+        state.recordings_worker_gone(&connection);
         drop(state);
         let crashes = self.machine.crashes();
         self.feed(Input::WorkerExited);
@@ -1114,13 +1121,13 @@ impl Driver {
                 if let Some(worker) = self.worker.take() {
                     self.snapshot.worker = None;
                     self.talker_gone();
-                    // Its reports reach no one from here on: the clips it
-                    // was finishing hold their ids no longer. No clip it
-                    // got runs: a clip is demand, and it is stopped for
+                    // Its reports reach no one from here on: the recordings it
+                    // was finishing hold their ids no longer. No recording it
+                    // got runs: a recording is demand, and it is stopped for
                     // want of any.
                     self.shared
                         .lock()
-                        .forget_stopping_clips(&self.spec.connection_id);
+                        .forget_stopping_recordings(&self.spec.connection_id);
                     let shared = Arc::clone(&self.shared);
                     let stop = async move {
                         let _status = worker.stop(shared.shutdown_budget, &shared.clock).await;
@@ -1169,9 +1176,11 @@ impl Driver {
         match self.shared.manager.spawn(&ports) {
             Ok(mut worker) => {
                 // The schedule continues where the last worker's left off.
-                let spec =
-                    self.spec
-                        .source_spec(addrs, self.machine.backoff_position(), self.preroll_ms);
+                let spec = self.spec.source_spec(
+                    addrs,
+                    self.machine.backoff_position(),
+                    self.prerecord_ms,
+                );
                 if let Err(err) = worker.run_source(&spec).await {
                     tracing::warn!(pid = worker.pid(), error = %err, "source could not be sent to the worker");
                 }
@@ -1181,8 +1190,8 @@ impl Driver {
                     memory: None,
                 });
                 // The queued starts leave with their waits: each runs what is left.
-                let waits = std::mem::take(&mut self.clip_waits);
-                self.clip_wait = None;
+                let waits = std::mem::take(&mut self.recording_waits);
+                self.recording_wait = None;
                 let now = self.shared.clock.now();
                 for command in std::mem::take(&mut self.queued) {
                     let Some(command) = self.after_the_wait(command, &waits, now) else {
@@ -1201,24 +1210,29 @@ impl Driver {
     }
 
     /// Holds a message until there is a worker. A close takes its session's
-    /// messages out of the queue instead: the worker never saw it. A clip's
-    /// start is held only while its clip runs ([`State::clip_start_wanted`]):
-    /// a stale one (its clip ended after it was sent, and the id may name a
-    /// later clip by now) is dropped with its pipe, so a stop behind it
-    /// finds nothing to end here and never ends the later clip.
+    /// messages out of the queue instead: the worker never saw it. A recording's
+    /// start is held only while its recording runs ([`State::recording_start_wanted`]):
+    /// a stale one (its recording ended after it was sent, and the id may name a
+    /// later recording by now) is dropped with its pipe, so a stop behind it
+    /// finds nothing to end here and never ends the later recording.
     ///
-    /// [`State::clip_start_wanted`]: crate::registry::State::clip_start_wanted
+    /// [`State::recording_start_wanted`]: crate::registry::State::recording_start_wanted
     fn queue(&mut self, command: DriverCommand) {
         match command {
-            DriverCommand::StartClip {
+            DriverCommand::StartRecording {
                 ref spec, serial, ..
             } => {
-                let clip_id = spec.clip_id.clone();
-                if self.shared.lock().clip_start_wanted(&clip_id, serial) {
-                    self.clip_waits
-                        .push_back((self.shared.clock.now(), clip_id, serial));
-                    if self.clip_wait.is_none() {
-                        self.clip_wait = Some(self.shared.clock.sleep(self.clip_start_wait()));
+                let recording_id = spec.recording_id.clone();
+                if self
+                    .shared
+                    .lock()
+                    .recording_start_wanted(&recording_id, serial)
+                {
+                    self.recording_waits
+                        .push_back((self.shared.clock.now(), recording_id, serial));
+                    if self.recording_wait.is_none() {
+                        self.recording_wait =
+                            Some(self.shared.clock.sleep(self.recording_start_wait()));
                     }
                     self.queued.push(command);
                 }
@@ -1230,7 +1244,7 @@ impl Driver {
             DriverCommand::IceTcp { peer, .. } => {
                 tracing::debug!(%peer, "ice-tcp connection without a worker; closed");
             }
-            DriverCommand::StopClip { clip_id } => self.unqueue_clip(&clip_id),
+            DriverCommand::StopRecording { recording_id } => self.unqueue_recording(&recording_id),
             // Without a worker no session talks.
             DriverCommand::ReleaseBackchannel { session_id } => {
                 tracing::debug!(
@@ -1242,94 +1256,94 @@ impl Driver {
         }
     }
 
-    /// A clip stopped while it waits for a worker: its start leaves the
+    /// A recording stopped while it waits for a worker: its start leaves the
     /// queue with its pipe, and it ends here as its worker would have
     /// ended it, [`STOPPED_AS_ASKED`] with nothing written. One not queued went with
     /// the worker that had it, which ended it, or was dropped as stale
-    /// ([`Self::queue`]). A start the queue holds is that of the clip that
-    /// holds the id, running or ending, and a later clip's start comes
-    /// after this stop, so the end is that clip's.
-    fn unqueue_clip(&mut self, clip_id: &str) {
-        if !self.unqueue_start(clip_id, None) {
+    /// ([`Self::queue`]). A start the queue holds is that of the recording that
+    /// holds the id, running or ending, and a later recording's start comes
+    /// after this stop, so the end is that recording's.
+    fn unqueue_recording(&mut self, recording_id: &str) {
+        if !self.unqueue_start(recording_id, None) {
             tracing::debug!(
-                clip.id = clip_id,
-                "clip stop without a worker for a clip none holds; dropped"
+                recording.id = recording_id,
+                "recording stop without a worker for a recording none holds; dropped"
             );
             return;
         }
         tracing::debug!(
-            clip.id = clip_id,
-            "clip stopped before a worker got it; ended here"
+            recording.id = recording_id,
+            "recording stopped before a worker got it; ended here"
         );
-        self.end_unqueued(clip_id, STOPPED_AS_ASKED);
+        self.end_unqueued(recording_id, STOPPED_AS_ASKED);
     }
 
-    /// How long a clip's start waits in the queue for a worker: the
-    /// configured `limits.clip_start_timeout_ms` ([`ClipLimits::start_timeout`]),
-    /// as long as a worker gives a clip to find a keyframe to start at. No
-    /// worker runs the clip meanwhile, so none of its timeouts does, and the
+    /// How long a recording's start waits in the queue for a worker: the
+    /// configured `limits.recording_start_timeout_ms` ([`RecordingLimits::start_timeout`]),
+    /// as long as a worker gives a recording to find a keyframe to start at. No
+    /// worker runs the recording meanwhile, so none of its timeouts does, and the
     /// body's `GET` ends the only deadline the registry keeps: without this
-    /// bound, a host lookup that keeps failing would hold the clip, its
+    /// bound, a host lookup that keeps failing would hold the recording, its
     /// subscription and its pipe for good.
     ///
-    /// [`ClipLimits::start_timeout`]: crate::ClipLimits::start_timeout
-    fn clip_start_wait(&self) -> Duration {
-        self.shared.lock().clip_limits.start_timeout
+    /// [`RecordingLimits::start_timeout`]: crate::RecordingLimits::start_timeout
+    fn recording_start_wait(&self) -> Duration {
+        self.shared.lock().recording_limits.start_timeout
     }
 
-    /// The clips whose start waited [`Self::clip_start_wait`] for a worker
+    /// The recordings whose start waited [`Self::recording_start_wait`] for a worker
     /// and still waits end here as a worker ends one that finds no keyframe
     /// in time, `source_not_live` with nothing written; the timer then
     /// waits for the next oldest.
-    fn end_waited_clips(&mut self) {
+    fn end_waited_recordings(&mut self) {
         let now = self.shared.clock.now();
-        let wait = self.clip_start_wait();
+        let wait = self.recording_start_wait();
         let waited = self
-            .clip_waits
+            .recording_waits
             .iter()
             .take_while(|(queued, ..)| now.saturating_duration_since(*queued) >= wait)
             .count();
-        let ended: Vec<(Instant, String, u64)> = self.clip_waits.drain(..waited).collect();
-        for (_, clip_id, serial) in ended {
-            if self.unqueue_start(&clip_id, Some(serial)) {
+        let ended: Vec<(Instant, String, u64)> = self.recording_waits.drain(..waited).collect();
+        for (_, recording_id, serial) in ended {
+            if self.unqueue_start(&recording_id, Some(serial)) {
                 tracing::info!(
-                    clip.id = %clip_id,
+                    recording.id = %recording_id,
                     serial,
                     waited_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
-                    "no worker took the clip's start in time; ended here source_not_live"
+                    "no worker took the recording's start in time; ended here source_not_live"
                 );
-                self.end_unqueued(&clip_id, ClipStopReason::SourceNotLive.as_str());
+                self.end_unqueued(&recording_id, RecordingCloseReason::SourceNotLive.as_str());
             }
         }
-        self.clip_wait = self.clip_waits.front().map(|(queued, ..)| {
+        self.recording_wait = self.recording_waits.front().map(|(queued, ..)| {
             let left = wait.saturating_sub(now.saturating_duration_since(*queued));
             self.shared.clock.sleep(left)
         });
     }
 
     /// Prepares a queued `command` for the worker that now comes, `now`
-    /// being when it does and `waits` the queue's record of when each clip
-    /// start was queued. Any command but a clip's start comes back
-    /// unchanged. That start comes back with `after_ms` set to
-    /// what is left of it ([`after_left`]), the wait being the one `waits`
-    /// holds for its clip id and serial (none: no wait). With nothing left
+    /// being when it does and `waits` the queue's record of when each recording
+    /// start was queued. Any command but a recording's start comes back
+    /// unchanged. That start comes back with `duration_ms` set to
+    /// what is left of it ([`duration_left`]), the wait being the one `waits`
+    /// holds for its recording id and serial (none: no wait). With nothing left
     /// its end passed while it waited: it is dropped with its pipe, and if
-    /// its clip still runs (`clip_start_wanted`, asked here only, since
-    /// its false branch logs and frees the id) the clip ends here
+    /// its recording still runs (`recording_start_wanted`, asked here only, since
+    /// its false branch logs and frees the id) the recording ends here
     /// `source_not_live`, as a worker ends one whose source showed nothing
-    /// before its end. A stale start (its clip ended while queued, the id
-    /// possibly taken by a later serial) must not end that later clip,
-    /// which a report matches by id alone: hence the guard. `before_ms` is
+    /// before its end. A stale start (its recording ended while queued, the id
+    /// possibly taken by a later serial) must not end that later recording,
+    /// which a report matches by id alone: hence the guard. `prerecord_ms` is
     /// left alone: the new worker's ring holds nothing captured before it
-    /// gets the start, so the clip begins at the first keyframe either
-    /// way (`ClipStart`'s "the source not live yet").
+    /// gets the start, so the recording begins at the first keyframe either
+    /// way (`RecordingCreate`'s "the source not live yet").
     fn after_the_wait(
         &self,
         command: DriverCommand,
         waits: &VecDeque<(Instant, String, u64)>,
         now: Instant,
     ) -> Option<DriverCommand> {
-        let DriverCommand::StartClip {
+        let DriverCommand::StartRecording {
             mut spec,
             serial,
             pipe,
@@ -1337,58 +1351,67 @@ impl Driver {
         else {
             return Some(command);
         };
-        let after_ms = spec.after_ms;
+        let duration_ms = spec.duration_ms;
         let waited = waits
             .iter()
-            .find(|(_, clip_id, queued)| *clip_id == spec.clip_id && *queued == serial)
+            .find(|(_, recording_id, queued)| {
+                *recording_id == spec.recording_id && *queued == serial
+            })
             .map_or(Duration::ZERO, |(queued, ..)| {
                 now.saturating_duration_since(*queued)
             });
         let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
-        if let Some(left) = after_left(after_ms, waited) {
-            spec.after_ms = left;
+        if let Some(left) = duration_left(duration_ms, waited) {
+            spec.duration_ms = left;
             tracing::debug!(
-                clip.id = %spec.clip_id,
+                recording.id = %spec.recording_id,
                 serial,
                 waited_ms,
-                after_ms = left,
-                "clip start handed to the new worker; it runs what is left of after_ms"
+                duration_ms = left,
+                "recording start handed to the new worker; it runs what is left of duration_ms"
             );
-            return Some(DriverCommand::StartClip { spec, serial, pipe });
+            return Some(DriverCommand::StartRecording { spec, serial, pipe });
         }
         drop(pipe);
-        if self.shared.lock().clip_start_wanted(&spec.clip_id, serial) {
+        if self
+            .shared
+            .lock()
+            .recording_start_wanted(&spec.recording_id, serial)
+        {
             tracing::info!(
-                clip.id = %spec.clip_id,
+                recording.id = %spec.recording_id,
                 serial,
                 waited_ms,
-                after_ms,
-                "the clip's end passed while its start waited for a worker; ended here source_not_live"
+                duration_ms,
+                "the recording's end passed while its start waited for a worker; ended here source_not_live"
             );
-            self.end_unqueued(&spec.clip_id, ClipStopReason::SourceNotLive.as_str());
+            self.end_unqueued(
+                &spec.recording_id,
+                RecordingCloseReason::SourceNotLive.as_str(),
+            );
         }
         None
     }
 
-    /// Takes the start of clip `clip_id` out of the queue with its pipe,
+    /// Takes the start of recording `recording_id` out of the queue with its pipe,
     /// only `serial`'s when given; whether there was one.
-    fn unqueue_start(&mut self, clip_id: &str, serial: Option<u64>) -> bool {
+    fn unqueue_start(&mut self, recording_id: &str, serial: Option<u64>) -> bool {
         let before = self.queued.len();
         self.queued.retain(|queued| {
             !matches!(
                 queued,
-                DriverCommand::StartClip { spec, serial: queued, .. }
-                    if spec.clip_id == clip_id && serial.is_none_or(|serial| serial == *queued)
+                DriverCommand::StartRecording { spec, serial: queued, .. }
+                    if spec.recording_id == recording_id && serial.is_none_or(|serial| serial == *queued)
             )
         });
         self.queued.len() < before
     }
 
-    /// Ends clip `clip_id`, whose start no worker got, for `reason`, by
+    /// Ends recording `recording_id`, whose start no worker got, for `reason`, by
     /// the name its worker would have ended it with: nothing written, so
     /// its body ends empty.
-    fn end_unqueued(&self, clip_id: &str, reason: &str) {
-        let stopped = ClipReport::Stopped {
+    fn end_unqueued(&self, recording_id: &str, reason: &str) {
+        let closed = RecordingReport::Closed {
             reason: reason.to_owned(),
             bytes: 0,
             duration_ms: 0,
@@ -1397,13 +1420,13 @@ impl Driver {
         let at = self.shared.clock.wall_now();
         self.shared
             .lock()
-            .clip_report(&self.spec.connection_id, clip_id, stopped, at);
+            .recording_report(&self.spec.connection_id, recording_id, closed, at);
     }
 
     /// Passes a message to `worker`. An offer is registered with the demux
     /// first, with a sink whose ICE-TCP hand-offs come back on `commands`,
-    /// unless its session closed in the meantime; a clip's start goes only
-    /// while its clip runs, else its pipe is dropped.
+    /// unless its session closed in the meantime; a recording's start goes only
+    /// while its recording runs, else its pipe is dropped.
     async fn send(
         worker: &mut Worker,
         shared: &Shared,
@@ -1415,14 +1438,19 @@ impl Driver {
             // Handled by the driver itself, never queued for a worker.
             DriverCommand::SwitchSource(_)
             | DriverCommand::Backchannel(_)
-            | DriverCommand::Preroll { .. } => return,
-            DriverCommand::StartClip { spec, serial, pipe } => {
-                if !shared.lock().clip_start_wanted(&spec.clip_id, serial) {
+            | DriverCommand::Prerecord { .. } => return,
+            DriverCommand::StartRecording { spec, serial, pipe } => {
+                if !shared
+                    .lock()
+                    .recording_start_wanted(&spec.recording_id, serial)
+                {
                     return;
                 }
-                worker.start_clip(&spec, pipe).await
+                worker.start_recording(&spec, pipe).await
             }
-            DriverCommand::StopClip { clip_id } => worker.stop_clip(&clip_id).await,
+            DriverCommand::StopRecording { recording_id } => {
+                worker.stop_recording(&recording_id).await
+            }
             DriverCommand::OpenSession(spec) => {
                 let sink = Arc::new(SessionSink {
                     local_ufrag: spec.ice_ufrag.clone(),
@@ -2009,7 +2037,7 @@ mod tests {
                 crate::registry::ConnectionEntry {
                     port: None,
                     backchannel: false,
-                    preroll_ms: 0,
+                    prerecord_ms: 0,
                     key: crate::registry::ConnectionKey {
                         url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                         options: serde_json::Value::Null,
@@ -2036,8 +2064,8 @@ mod tests {
                     audio: lotse_api_types::stream::AudioMode::Auto,
                     orientation: lotse_api_types::stream::Orientation::NoTransform,
                     created: UNIX_EPOCH,
-                    preroll_ms: 0,
-                    clips: crate::clip::ClipCounters::default(),
+                    prerecord_ms: 0,
+                    recordings: crate::recording::RecordingCounters::default(),
                 },
             );
             state.sessions.insert(
@@ -2177,7 +2205,7 @@ mod tests {
                     attempts,
                     immediate_used,
                 },
-                preroll_ms: 0,
+                prerecord_ms: 0,
             })
         };
         demand_tx.send_replace(PRELOAD);
@@ -2267,7 +2295,7 @@ mod tests {
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:0".parse().unwrap()],
             backoff: lotse_ipc::BackoffPosition::default(),
-            preroll_ms: 0,
+            prerecord_ms: 0,
         });
         recorded(&dir.join("received-0"), &first).await;
         driver.on_worker_event(WorkerEvent::Report(WorkerReport::Backoff {
@@ -2307,7 +2335,7 @@ mod tests {
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:2".parse().unwrap()],
             backoff: lotse_ipc::BackoffPosition::default(),
-            preroll_ms: 0,
+            prerecord_ms: 0,
         });
         recorded(&dir.join("received-1"), &run).await;
         assert!(driver.worker.is_some());
@@ -2771,7 +2799,7 @@ mod tests {
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
             backoff: lotse_ipc::BackoffPosition::default(),
-            preroll_ms: 0,
+            prerecord_ms: 0,
         });
         let messages = recorded(&out, &want).await;
         assert_eq!(messages, [want]);
@@ -2855,7 +2883,7 @@ mod tests {
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
             backoff: lotse_ipc::BackoffPosition::default(),
-            preroll_ms: 0,
+            prerecord_ms: 0,
         };
         let backchannel = |options: &str, asks: bool| {
             Wake::Command(DriverCommand::Backchannel(spec(options, asks)))
@@ -2925,19 +2953,19 @@ mod tests {
         assert_eq!(captured.lines("connection driver stopped").len(), 1);
     }
 
-    /// A worker's clip report names no clip the supervisor holds: it is
+    /// A worker's recording report names no recording the supervisor holds: it is
     /// dropped with a debug line whose id is plain and capped, and the
     /// driver goes on.
     #[tokio::test]
-    async fn a_report_for_a_clip_the_supervisor_does_not_hold_is_dropped() {
+    async fn a_report_for_a_recording_the_supervisor_does_not_hold_is_dropped() {
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
         let shared = shared("/usr/bin/true");
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        driver.on_worker_event(WorkerEvent::Clip {
-            clip_id: format!("k\n{}", "x".repeat(100)),
-            event: ClipReport::Stopped {
+        driver.on_worker_event(WorkerEvent::Recording {
+            recording_id: format!("k\n{}", "x".repeat(100)),
+            event: RecordingReport::Closed {
                 reason: "internal_error".into(),
                 bytes: 0,
                 duration_ms: 0,
@@ -2946,9 +2974,9 @@ mod tests {
         });
         assert!(driver.silence.is_some(), "a report is a sign of life");
         drop(driver);
-        let lines = captured.lines("report for a clip the supervisor does not hold");
+        let lines = captured.lines("report for a recording the supervisor does not hold");
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("clip.id=k x"), "{lines:?}");
+        assert!(lines[0].contains("recording.id=k x"), "{lines:?}");
         let cap = crate::worker_text::MAX_NAME_BYTES;
         assert!(!lines[0].contains(&"x".repeat(cap)), "{lines:?}");
     }
@@ -3479,8 +3507,8 @@ mod tests {
                 audio: AudioMode::Auto,
                 orientation: Orientation::NoTransform,
                 created: UNIX_EPOCH,
-                preroll_ms: 0,
-                clips: crate::clip::ClipCounters::default(),
+                prerecord_ms: 0,
+                recordings: crate::recording::RecordingCounters::default(),
             },
         );
         state.connections.insert(
@@ -3492,7 +3520,7 @@ mod tests {
                 },
                 port: None,
                 backchannel: false,
-                preroll_ms: 0,
+                prerecord_ms: 0,
                 demand: watch::channel(Demand {
                     preloads: 0,
                     viewers: 1,
@@ -3974,35 +4002,39 @@ mod tests {
         (script.to_string_lossy().into_owned(), out)
     }
 
-    fn clip_spec(clip_id: &str) -> ClipSpec {
-        ClipSpec {
-            clip_id: clip_id.into(),
-            before_ms: 10_000,
-            after_ms: 20_000,
+    fn recording_spec(recording_id: &str) -> RecordingSpec {
+        RecordingSpec {
+            recording_id: recording_id.into(),
+            prerecord_ms: 10_000,
+            duration_ms: 20_000,
             audio: true,
         }
     }
 
-    /// Clip `clip_id`, `serial`, of `front` on `c1` in `shared`'s registry,
+    /// Recording `recording_id`, `serial`, of `front` on `c1` in `shared`'s registry,
     /// and its events.
-    fn hold_clip(shared: &Shared, clip_id: &str, serial: u64) -> mpsc::Receiver<lotse_api::Event> {
+    fn hold_recording(
+        shared: &Shared,
+        recording_id: &str,
+        serial: u64,
+    ) -> mpsc::Receiver<lotse_api::Event> {
         let (events, rx) = mpsc::channel(4);
         let (written, report) = tokio::sync::oneshot::channel();
-        let body = lotse_api::ClipBody {
+        let body = lotse_api::RecordingBody {
             reader: Box::new(tokio::io::empty()),
             written: report,
         };
-        let owner = crate::clip::ClipOwner {
+        let owner = crate::recording::RecordingOwner {
             connection: ConnectionId(1),
             subscription: 1,
             events,
         };
-        shared.lock().clips.insert(
-            clip_id.into(),
-            crate::clip::ClipEntry::new(
+        shared.lock().recordings.insert(
+            recording_id.into(),
+            crate::recording::RecordingEntry::new(
                 serial,
                 ("front".into(), "c1".into()),
-                clip_spec(clip_id),
+                recording_spec(recording_id),
                 owner,
                 (body, written),
             ),
@@ -4011,22 +4043,22 @@ mod tests {
     }
 
     /// A worker's `Started` is stamped on the wall clock when it reaches the
-    /// driver, not when the clip was asked for: the worker counts
-    /// `before_ms` back from the moment it sends it, so `at − before_ms` is
+    /// driver, not when the recording was asked for: the worker counts
+    /// `prerecord_ms` back from the moment it sends it, so `at − prerecord_ms` is
     /// the first keyframe's capture time.
     #[tokio::test]
-    async fn a_started_report_is_stamped_on_its_arrival_which_before_ms_counts_back_from() {
+    async fn a_started_report_is_stamped_on_its_arrival_which_prerecord_ms_counts_back_from() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/usr/bin/true", clock.clone());
-        let mut rx = hold_clip(&shared, "k1", 1);
+        let mut rx = hold_recording(&shared, "k1", 1);
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         clock.advance(Duration::from_millis(1_100));
         let arrival = clock.wall_now();
-        driver.on_worker_event(WorkerEvent::Clip {
-            clip_id: "k1".into(),
-            event: ClipReport::Started {
-                before_ms: 400,
+        driver.on_worker_event(WorkerEvent::Recording {
+            recording_id: "k1".into(),
+            event: RecordingReport::Started {
+                prerecord_ms: 400,
                 video: "h264".into(),
                 picture: None,
                 audio: None,
@@ -4035,7 +4067,7 @@ mod tests {
         drop(driver);
         let started = rx.try_recv().unwrap().payload;
         assert_eq!(
-            (&started["at"], &started["before_ms"]),
+            (&started["at"], &started["prerecord_ms"]),
             (
                 &serde_json::json!(lotse_api_types::time::rfc3339(arrival)),
                 &serde_json::json!(400)
@@ -4044,11 +4076,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_pre_roll_window_and_the_clip_messages_reach_the_worker_and_the_next_starts_with_it()
+    async fn the_pre_record_window_and_the_recording_messages_reach_the_worker_and_the_next_starts_with_it()
      {
         use std::io::Read as _;
 
-        let dir = private_dir("driver-preroll");
+        let dir = private_dir("driver-prerecord");
         let (script, out) = recording_script(&dir);
         let shared = shared(&script);
         let captured = crate::test_support::Captured::default();
@@ -4057,11 +4089,11 @@ mod tests {
         let mut driver = driver_on(&shared, demand);
         // Without a worker the window waits for the next one.
         driver
-            .handle(Wake::Command(DriverCommand::Preroll { ms: 30_000 }))
+            .handle(Wake::Command(DriverCommand::Prerecord { ms: 30_000 }))
             .await;
         assert_eq!(
             captured
-                .lines("no worker runs; the next one starts with the pre-roll window")
+                .lines("no worker runs; the next one starts with the pre-record window")
                 .len(),
             1
         );
@@ -4072,37 +4104,37 @@ mod tests {
             .source_spec(addrs, driver.machine.backoff_position(), 30_000);
         recorded(&out, &lotse_ipc::ToWorker::RunSource(run)).await;
         driver
-            .handle(Wake::Command(DriverCommand::Preroll { ms: 0 }))
+            .handle(Wake::Command(DriverCommand::Prerecord { ms: 0 }))
             .await;
         assert_eq!(
             captured
-                .lines("pre-roll window passed to the running worker; nothing reconnects")
+                .lines("pre-record window passed to the running worker; nothing reconnects")
                 .len(),
             1
         );
         let (mut reader, writer) = std::io::pipe().unwrap();
-        let _events = hold_clip(&shared, "k1", 1);
+        let _events = hold_recording(&shared, "k1", 1);
         driver
-            .handle(Wake::Command(DriverCommand::StartClip {
-                spec: clip_spec("k1"),
+            .handle(Wake::Command(DriverCommand::StartRecording {
+                spec: recording_spec("k1"),
                 serial: 1,
                 pipe: writer.into(),
             }))
             .await;
         driver
-            .handle(Wake::Command(DriverCommand::StopClip {
-                clip_id: "k1".into(),
+            .handle(Wake::Command(DriverCommand::StopRecording {
+                recording_id: "k1".into(),
             }))
             .await;
-        let stop = lotse_ipc::ToWorker::StopClip {
-            clip_id: "k1".into(),
+        let stop = lotse_ipc::ToWorker::StopRecording {
+            recording_id: "k1".into(),
         };
         let messages = recorded(&out, &stop).await;
         assert_eq!(
             messages[1..],
             [
-                lotse_ipc::ToWorker::Preroll { ms: 0 },
-                lotse_ipc::ToWorker::StartClip(clip_spec("k1")),
+                lotse_ipc::ToWorker::Prerecord { ms: 0 },
+                lotse_ipc::ToWorker::StartRecording(recording_spec("k1")),
                 stop
             ]
         );
@@ -4118,7 +4150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clip_messages_to_a_dead_worker_are_logged_and_the_window_waits_for_the_next() {
+    async fn recording_messages_to_a_dead_worker_are_logged_and_the_window_waits_for_the_next() {
         let shared = shared("/usr/bin/true");
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
@@ -4126,30 +4158,30 @@ mod tests {
         let _logs = captured.install();
         driver.worker = Some(dead_worker(&shared).await);
         driver
-            .handle(Wake::Command(DriverCommand::Preroll { ms: 1_000 }))
+            .handle(Wake::Command(DriverCommand::Prerecord { ms: 1_000 }))
             .await;
-        assert_eq!(driver.preroll_ms, 1_000);
+        assert_eq!(driver.prerecord_ms, 1_000);
         assert_eq!(
             captured
-                .lines("pre-roll window could not be sent to the worker")
+                .lines("pre-record window could not be sent to the worker")
                 .len(),
             1
         );
         let (commands, _rx) = mpsc::channel(1);
         let worker = driver.worker.as_mut().unwrap();
         let (_reader, writer) = std::io::pipe().unwrap();
-        let _events = hold_clip(&shared, "k1", 1);
+        let _events = hold_recording(&shared, "k1", 1);
         for command in [
-            DriverCommand::StartClip {
-                spec: clip_spec("k1"),
+            DriverCommand::StartRecording {
+                spec: recording_spec("k1"),
                 serial: 1,
                 pipe: writer.into(),
             },
-            DriverCommand::StopClip {
-                clip_id: "k1".into(),
+            DriverCommand::StopRecording {
+                recording_id: "k1".into(),
             },
             // Never the worker's.
-            DriverCommand::Preroll { ms: 0 },
+            DriverCommand::Prerecord { ms: 0 },
         ] {
             assert!(command.session_id().is_none());
             Driver::send(worker, &shared, &commands, command).await;
@@ -4158,24 +4190,24 @@ mod tests {
         assert_eq!(captured.lines("session message could not be sent").len(), 2);
     }
 
-    /// A start whose clip is gone when the driver hands it to a worker is
-    /// dropped with its pipe: queued while its clip ran, the clip then
-    /// ended before the worker came (and a new clip may have taken the id
+    /// A start whose recording is gone when the driver hands it to a worker is
+    /// dropped with its pipe: queued while its recording ran, the recording then
+    /// ended before the worker came (and a new recording may have taken the id
     /// since), or ended holding its id, which is then free. Only the start
-    /// of the clip that runs reaches the worker.
+    /// of the recording that runs reaches the worker.
     #[tokio::test]
-    async fn a_start_whose_clip_is_gone_never_reaches_a_worker_and_frees_the_id_it_held() {
+    async fn a_start_whose_recording_is_gone_never_reaches_a_worker_and_frees_the_id_it_held() {
         use std::io::Read as _;
 
-        let dir = private_dir("driver-stale-clip");
+        let dir = private_dir("driver-stale-recording");
         let (script, out) = recording_script(&dir);
         let shared = shared(&script);
-        // k1 runs as serial 3: serial 1's start is an earlier clip's. k2
+        // k1 runs as serial 3: serial 1's start is an earlier recording's. k2
         // ended (serial 2) while its start waited, its id held.
-        let _events = hold_clip(&shared, "k1", 3);
-        shared.lock().stopping_clips.insert(
+        let _events = hold_recording(&shared, "k1", 3);
+        shared.lock().stopping_recordings.insert(
             "k2".into(),
-            crate::clip::StoppingClip {
+            crate::recording::StoppingRecording {
                 connection: "c1".into(),
                 serial: 2,
             },
@@ -4183,19 +4215,19 @@ mod tests {
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let (mut stale, writer) = std::io::pipe().unwrap();
-        // Queued while their clips ran: `queue` holds no other.
-        driver.queued.push(DriverCommand::StartClip {
-            spec: clip_spec("k1"),
+        // Queued while their recordings ran: `queue` holds no other.
+        driver.queued.push(DriverCommand::StartRecording {
+            spec: recording_spec("k1"),
             serial: 1,
             pipe: writer.into(),
         });
-        driver.queued.push(DriverCommand::StartClip {
-            spec: clip_spec("k2"),
+        driver.queued.push(DriverCommand::StartRecording {
+            spec: recording_spec("k2"),
             serial: 2,
             pipe: fd(),
         });
-        driver.queue(DriverCommand::StartClip {
-            spec: clip_spec("k1"),
+        driver.queue(DriverCommand::StartRecording {
+            spec: recording_spec("k1"),
             serial: 3,
             pipe: fd(),
         });
@@ -4204,131 +4236,138 @@ mod tests {
         let addrs = vec!["127.0.0.1:1".parse().unwrap()];
         driver.spawn_worker(addrs.clone()).await;
         // A stop behind the starts: once it is in, every start before it is.
-        let end = lotse_ipc::ToWorker::StopClip {
-            clip_id: "end".into(),
+        let end = lotse_ipc::ToWorker::StopRecording {
+            recording_id: "end".into(),
         };
         driver
-            .handle(Wake::Command(DriverCommand::StopClip {
-                clip_id: "end".into(),
+            .handle(Wake::Command(DriverCommand::StopRecording {
+                recording_id: "end".into(),
             }))
             .await;
         let messages = recorded(&out, &end).await;
         assert_eq!(
             messages[1..],
-            [lotse_ipc::ToWorker::StartClip(clip_spec("k1")), end],
+            [
+                lotse_ipc::ToWorker::StartRecording(recording_spec("k1")),
+                end
+            ],
             "k1's one start"
         );
         let mut rest = Vec::new();
         stale.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty(), "the stale start's pipe went with it");
-        assert!(!shared.lock().clip_id_in_use("k2"), "no worker got k2");
-        assert!(shared.lock().clips.contains_key("k1"));
-        let dropped = captured.lines("clip ended before its worker got it; its start is dropped");
+        assert!(!shared.lock().recording_id_in_use("k2"), "no worker got k2");
+        assert!(shared.lock().recordings.contains_key("k1"));
+        let dropped =
+            captured.lines("recording ended before its worker got it; its start is dropped");
         assert_eq!(dropped.len(), 2, "{dropped:?}");
         assert!(dropped[0].contains("serial=1"), "{dropped:?}");
-        // The id of a later clip is not freed by an earlier one's start.
-        shared.lock().stopping_clips.insert(
+        // The id of a later recording is not freed by an earlier one's start.
+        shared.lock().stopping_recordings.insert(
             "k3".into(),
-            crate::clip::StoppingClip {
+            crate::recording::StoppingRecording {
                 connection: "c1".into(),
                 serial: 5,
             },
         );
-        assert!(!shared.lock().clip_start_wanted("k3", 4));
-        assert!(shared.lock().clip_id_in_use("k3"));
+        assert!(!shared.lock().recording_start_wanted("k3", 4));
+        assert!(shared.lock().recording_id_in_use("k3"));
         let worker = driver.worker.take().unwrap();
         drop(driver);
         let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A clip stopped while its start waits for a worker leaves the queue
+    /// A recording stopped while its start waits for a worker leaves the queue
     /// with its pipe and ends as its worker would have ended it, for the
     /// supervisor's reason.
     #[tokio::test]
-    async fn a_clip_stopped_before_a_worker_got_it_ends_here_with_nothing_written() {
+    async fn a_recording_closed_before_a_worker_got_it_ends_here_with_nothing_written() {
         use std::io::Read as _;
 
         let shared = shared("/bin/sh");
-        let mut rx = hold_clip(&shared, "k1", 1);
-        let _k2 = hold_clip(&shared, "k2", 2);
+        let mut rx = hold_recording(&shared, "k1", 1);
+        let _k2 = hold_recording(&shared, "k2", 2);
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let (mut reader, writer) = std::io::pipe().unwrap();
-        driver.queue(DriverCommand::StartClip {
-            spec: clip_spec("k1"),
+        driver.queue(DriverCommand::StartRecording {
+            spec: recording_spec("k1"),
             serial: 1,
             pipe: writer.into(),
         });
-        driver.queue(DriverCommand::StartClip {
-            spec: clip_spec("k2"),
+        driver.queue(DriverCommand::StartRecording {
+            spec: recording_spec("k2"),
             serial: 2,
             pipe: fd(),
         });
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
         // The registry's stop, whose slot the test leaves out, says why.
-        shared.lock().stop_clip("k1", ClipStopReason::NotFetched);
-        driver.queue(DriverCommand::StopClip {
-            clip_id: "k1".into(),
+        shared
+            .lock()
+            .stop_recording("k1", RecordingCloseReason::NotFetched);
+        driver.queue(DriverCommand::StopRecording {
+            recording_id: "k1".into(),
         });
         assert_eq!(driver.queued.len(), 1, "k2 waits on");
         // Before the read: a start still queued would keep the write end.
         assert!(matches!(
             driver.queued[0],
-            DriverCommand::StartClip { serial: 2, .. }
+            DriverCommand::StartRecording { serial: 2, .. }
         ));
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty(), "its pipe went with it");
-        let stopped = rx.try_recv().unwrap().payload;
+        let closed = rx.try_recv().unwrap().payload;
         assert_eq!(
-            (&stopped["reason"], &stopped["bytes"]),
+            (&closed["reason"], &closed["bytes"]),
             (&serde_json::json!("not_fetched"), &serde_json::json!(0))
         );
-        assert!(!shared.lock().clips.contains_key("k1"));
+        assert!(!shared.lock().recordings.contains_key("k1"));
         // One not queued went with the worker that had it.
-        driver.queue(DriverCommand::StopClip {
-            clip_id: "k3".into(),
+        driver.queue(DriverCommand::StopRecording {
+            recording_id: "k3".into(),
         });
         assert_eq!(driver.queued.len(), 1);
         assert_eq!(
             captured
-                .lines("clip stop without a worker for a clip none holds")
+                .lines("recording stop without a worker for a recording none holds")
                 .len(),
             1
         );
     }
 
-    /// A start and a stop of a clip that ended `worker_crashed` (its worker
+    /// A start and a stop of a recording that ended `worker_crashed` (its worker
     /// exited with both still on their way) reach the driver after a new
-    /// clip took the id, with no worker yet: the stale start is not held,
-    /// so the stop finds nothing to end, and the new clip runs on and is
+    /// recording took the id, with no worker yet: the stale start is not held,
+    /// so the stop finds nothing to end, and the new recording runs on and is
     /// the one start the next worker gets. Regression: the stale start was
-    /// queued, and the stop took it out and ended the new clip `stopped`
+    /// queued, and the stop took it out and ended the new recording `stopped`
     /// with nothing written.
     #[tokio::test]
-    async fn a_stale_start_and_stop_after_a_worker_exit_never_end_the_clip_that_reuses_the_id() {
+    async fn a_stale_start_and_stop_after_a_worker_exit_never_end_the_recording_that_reuses_the_id()
+    {
         use std::io::Read as _;
 
         let shared = shared("/bin/sh");
-        let mut rx = hold_clip(&shared, "k1", 2);
+        let mut rx = hold_recording(&shared, "k1", 2);
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
         let (mut stale, writer) = std::io::pipe().unwrap();
         for command in [
-            DriverCommand::StartClip {
-                spec: clip_spec("k1"),
+            DriverCommand::StartRecording {
+                spec: recording_spec("k1"),
                 serial: 1,
                 pipe: writer.into(),
             },
-            DriverCommand::StopClip {
-                clip_id: "k1".into(),
+            DriverCommand::StopRecording {
+                recording_id: "k1".into(),
             },
-            DriverCommand::StartClip {
-                spec: clip_spec("k1"),
+            DriverCommand::StartRecording {
+                spec: recording_spec("k1"),
                 serial: 2,
                 pipe: fd(),
             },
@@ -4339,39 +4378,41 @@ mod tests {
         assert!(
             shared
                 .lock()
-                .clips
+                .recordings
                 .get("k1")
-                .is_some_and(|clip| clip.serial == 2)
+                .is_some_and(|recording| recording.serial == 2)
         );
         assert_eq!(driver.queued.len(), 1, "k1's own start waits");
         assert!(matches!(
             driver.queued[0],
-            DriverCommand::StartClip { serial: 2, .. }
+            DriverCommand::StartRecording { serial: 2, .. }
         ));
         drop(driver);
         let mut rest = Vec::new();
         stale.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty(), "the stale start's pipe went with it");
-        let dropped = captured.lines("clip ended before its worker got it; its start is dropped");
+        let dropped =
+            captured.lines("recording ended before its worker got it; its start is dropped");
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert!(dropped[0].contains("serial=1"), "{dropped:?}");
         assert_eq!(
             captured
-                .lines("clip stop without a worker for a clip none holds")
+                .lines("recording stop without a worker for a recording none holds")
                 .len(),
             1
         );
     }
 
-    /// A clip that ended while its worker ran it holds its id until that
+    /// A recording that ended while its worker ran it holds its id until that
     /// worker's `Stopped`. When the connection loses its demand while
     /// connecting (a `stream/put` moved the stream's source to a fallback
-    /// position, ending the clip `stream_changed`), the driver stops the
+    /// position, ending the recording `stream_changed`), the driver stops the
     /// worker at once, whose reports then reach no one: the id is free,
     /// and only this connection's. Regression: it stayed taken, and
-    /// counted toward `max_clips`, until the connection was released.
+    /// counted toward `max_recordings`, until the connection was released.
     #[tokio::test]
-    async fn a_worker_stopped_for_want_of_demand_frees_the_ids_of_the_clips_it_was_finishing() {
+    async fn a_worker_stopped_for_want_of_demand_frees_the_ids_of_the_recordings_it_was_finishing()
+    {
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
         let shared = shared("/usr/bin/true");
@@ -4383,10 +4424,10 @@ mod tests {
         });
         driver.worker = Some(dead_worker(&shared).await);
         assert_eq!(driver.machine.state(), ConnectionState::Connecting);
-        for (clip_id, connection) in [("k1", "c1"), ("k9", "c2")] {
-            shared.lock().stopping_clips.insert(
-                clip_id.into(),
-                crate::clip::StoppingClip {
+        for (recording_id, connection) in [("k1", "c1"), ("k9", "c2")] {
+            shared.lock().stopping_recordings.insert(
+                recording_id.into(),
+                crate::recording::StoppingRecording {
                     connection: connection.into(),
                     serial: 1,
                 },
@@ -4394,11 +4435,14 @@ mod tests {
         }
         driver.follow(Demand::default());
         assert!(driver.worker.is_none(), "stopped");
-        assert!(!shared.lock().clip_id_in_use("k1"));
-        assert!(shared.lock().clip_id_in_use("k9"), "another connection's");
+        assert!(!shared.lock().recording_id_in_use("k1"));
+        assert!(
+            shared.lock().recording_id_in_use("k9"),
+            "another connection's"
+        );
         assert_eq!(
             captured
-                .lines("the worker of a clip that had ended is gone; its id is free")
+                .lines("the worker of a recording that had ended is gone; its id is free")
                 .len(),
             1
         );
@@ -4407,48 +4451,48 @@ mod tests {
         shared.tracker.wait().await;
     }
 
-    /// A clip whose start waits for a worker that does not come (its host
+    /// A recording whose start waits for a worker that does not come (its host
     /// lookup keeps failing, or a backoff holds the worker back) ends
-    /// `source_not_live` once it waited [`Driver::clip_start_wait`], as a worker
+    /// `source_not_live` once it waited [`Driver::recording_start_wait`], as a worker
     /// ends one that finds no keyframe in time: its body, fetched already,
     /// ends empty and whole, and its pipe goes with its start. A start
     /// queued later waits its own time, and one that left the queue meanwhile
     /// ends nothing. Regression: with its body fetched, nothing ended such
-    /// a clip, which held its slot, subscription and pipe for good.
+    /// a recording, which held its slot, subscription and pipe for good.
     #[tokio::test]
-    async fn a_clip_start_no_worker_takes_in_time_ends_source_not_live_and_the_next_waits_its_own()
-    {
+    async fn a_recording_start_no_worker_takes_in_time_ends_source_not_live_and_the_next_waits_its_own()
+     {
         use std::io::Read as _;
 
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/bin/sh", clock.clone());
-        let mut k1 = hold_clip(&shared, "k1", 1);
-        let mut k2 = hold_clip(&shared, "k2", 2);
-        let _k3 = hold_clip(&shared, "k3", 3);
-        let mut body = shared.lock().take_clip_body("k1").unwrap();
+        let mut k1 = hold_recording(&shared, "k1", 1);
+        let mut k2 = hold_recording(&shared, "k2", 2);
+        let _k3 = hold_recording(&shared, "k3", 3);
+        let mut body = shared.lock().take_recording_body("k1").unwrap();
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
-        let wait = shared.lock().clip_limits.start_timeout;
+        let wait = shared.lock().recording_limits.start_timeout;
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
         let (mut reader, writer) = std::io::pipe().unwrap();
-        driver.queue(DriverCommand::StartClip {
-            spec: clip_spec("k1"),
+        driver.queue(DriverCommand::StartRecording {
+            spec: recording_spec("k1"),
             serial: 1,
             pipe: writer.into(),
         });
         // k3's start leaves the queue with its stop.
-        driver.queue(DriverCommand::StartClip {
-            spec: clip_spec("k3"),
+        driver.queue(DriverCommand::StartRecording {
+            spec: recording_spec("k3"),
             serial: 3,
             pipe: fd(),
         });
-        driver.queue(DriverCommand::StopClip {
-            clip_id: "k3".into(),
+        driver.queue(DriverCommand::StopRecording {
+            recording_id: "k3".into(),
         });
         clock.advance(wait / 2);
-        driver.queue(DriverCommand::StartClip {
-            spec: clip_spec("k2"),
+        driver.queue(DriverCommand::StartRecording {
+            spec: recording_spec("k2"),
             serial: 2,
             pipe: fd(),
         });
@@ -4458,9 +4502,9 @@ mod tests {
         );
         clock.advance(wait / 2);
         step(&mut driver).await;
-        let stopped = k1.try_recv().unwrap().payload;
+        let closed = k1.try_recv().unwrap().payload;
         assert_eq!(
-            (&stopped["reason"], &stopped["bytes"]),
+            (&closed["reason"], &closed["bytes"]),
             (&serde_json::json!("source_not_live"), &serde_json::json!(0))
         );
         assert_eq!(body.written.try_recv(), Ok(0), "the body ends whole");
@@ -4473,34 +4517,34 @@ mod tests {
         assert!(ready_wake(&mut driver).await.is_none());
         clock.advance(wait / 2);
         step(&mut driver).await;
-        let stopped = k2.try_recv().unwrap().payload;
-        assert_eq!(stopped["reason"], "source_not_live");
+        let closed = k2.try_recv().unwrap().payload;
+        assert_eq!(closed["reason"], "source_not_live");
         assert!(driver.queued.is_empty());
-        assert!(driver.clip_wait.is_none(), "nothing left to wait for");
-        assert!(shared.lock().clips.is_empty());
+        assert!(driver.recording_wait.is_none(), "nothing left to wait for");
+        assert!(shared.lock().recordings.is_empty());
         drop(driver);
-        let ended = captured.lines("no worker took the clip's start in time");
+        let ended = captured.lines("no worker took the recording's start in time");
         assert_eq!(ended.len(), 2, "{ended:?}");
-        assert!(ended[0].contains("clip.id=k1"), "{ended:?}");
+        assert!(ended[0].contains("recording.id=k1"), "{ended:?}");
     }
 
-    /// A queued clip start waits as long as the configured
-    /// `limits.clip_start_timeout_ms`, not the default: one longer than
-    /// 10 s holds the clip past 10 s and ends it at its own end.
-    /// Regression: the driver waited a fixed 10 s, cutting such a clip
+    /// A queued recording start waits as long as the configured
+    /// `limits.recording_start_timeout_ms`, not the default: one longer than
+    /// 10 s holds the recording past 10 s and ends it at its own end.
+    /// Regression: the driver waited a fixed 10 s, cutting such a recording
     /// short of what its worker would have given it.
     #[tokio::test]
-    async fn a_clip_start_waits_the_configured_start_timeout() {
+    async fn a_recording_start_waits_the_configured_start_timeout() {
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with("/bin/sh", clock.clone());
-        shared.lock().clip_limits.start_timeout = Duration::from_secs(25);
-        let mut k1 = hold_clip(&shared, "k1", 1);
+        shared.lock().recording_limits.start_timeout = Duration::from_secs(25);
+        let mut k1 = hold_recording(&shared, "k1", 1);
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
-        driver.queue(DriverCommand::StartClip {
-            spec: clip_spec("k1"),
+        driver.queue(DriverCommand::StartRecording {
+            spec: recording_spec("k1"),
             serial: 1,
             pipe: fd(),
         });
@@ -4510,78 +4554,86 @@ mod tests {
         assert!(ready_wake(&mut driver).await.is_none(), "nor is a ms short");
         clock.advance(Duration::from_millis(1));
         step(&mut driver).await;
-        let stopped = k1.try_recv().unwrap().payload;
-        assert_eq!(stopped["reason"], "source_not_live");
+        let closed = k1.try_recv().unwrap().payload;
+        assert_eq!(closed["reason"], "source_not_live");
         assert!(driver.queued.is_empty());
         drop(driver);
-        let ended = captured.lines("no worker took the clip's start in time");
+        let ended = captured.lines("no worker took the recording's start in time");
         assert_eq!(ended.len(), 1, "{ended:?}");
         assert!(ended[0].contains("waited_ms=25000"), "{ended:?}");
     }
 
-    /// What a worker gets of a clip's `after_ms` is what the wait for it
-    /// left (`ClipStart`: "how long the clip runs after now"): the wait
+    /// What a worker gets of a recording's `duration_ms` is what the wait for it
+    /// left (`RecordingCreate`: "how long the recording runs after now"): the wait
     /// taken off in whole milliseconds, and nothing once none is left.
     #[test]
-    fn after_left_takes_off_the_wait_and_none_once_the_clip_s_end_passed() {
-        assert_eq!(after_left(1_000, Duration::ZERO), Some(1_000));
-        assert_eq!(after_left(6_000, Duration::from_secs(5)), Some(1_000));
-        assert_eq!(after_left(1_000, Duration::from_micros(999_900)), Some(1));
-        assert_eq!(after_left(1_000, Duration::from_secs(1)), None, "the end");
-        assert_eq!(after_left(1_000, Duration::from_secs(5)), None);
-        assert_eq!(after_left(u32::MAX, Duration::MAX), None, "saturated");
+    fn after_left_takes_off_the_wait_and_none_once_the_recording_s_end_passed() {
+        assert_eq!(duration_left(1_000, Duration::ZERO), Some(1_000));
+        assert_eq!(duration_left(6_000, Duration::from_secs(5)), Some(1_000));
+        assert_eq!(
+            duration_left(1_000, Duration::from_micros(999_900)),
+            Some(1)
+        );
+        assert_eq!(
+            duration_left(1_000, Duration::from_secs(1)),
+            None,
+            "the end"
+        );
+        assert_eq!(duration_left(1_000, Duration::from_secs(5)), None);
+        assert_eq!(duration_left(u32::MAX, Duration::MAX), None, "saturated");
     }
 
     /// The starts a new worker gets from the queue run what is left of
-    /// their `after_ms`, which counts from `clip/start`; one whose end passed while it waited never reaches the
-    /// worker and ends `source_not_live` with its pipe and an empty body;
-    /// a stale one (its clip ended, a later one holds the id) ends nothing;
-    /// a later start that took a stale one's id counts its own wait from
-    /// when it was queued.
-    /// Regression: the worker counted `after_ms` from the handoff, so a
-    /// clip queued behind a backoff ran its whole `after_ms` after it.
+    /// their `duration_ms`, which counts from `recording/create`; one whose
+    /// end passed while it waited never reaches the worker and ends
+    /// `source_not_live` with its pipe and an empty body; a stale one (its
+    /// recording ended, a later one holds the id) ends nothing; a later
+    /// start that took a stale one's id counts its own wait from when it
+    /// was queued.
+    /// Regression: the worker counted `duration_ms` from the handoff, so a
+    /// recording queued behind a backoff ran its whole `duration_ms` after it.
     #[tokio::test]
-    async fn a_queued_clip_start_runs_what_is_left_of_after_ms_and_one_whose_end_passed_ends_source_not_live()
+    async fn a_queued_recording_start_runs_what_is_left_of_duration_ms_and_one_whose_end_passed_ends_source_not_live()
      {
         use std::io::Read as _;
 
-        let dir = private_dir("driver-clip-wait");
+        let dir = private_dir("driver-recording-wait");
         let (script, out) = recording_script(&dir);
         let clock = Arc::new(FakeClock::from_system());
         let shared = shared_with(&script, clock.clone());
-        let _k1 = hold_clip(&shared, "k1", 1);
-        let mut k2 = hold_clip(&shared, "k2", 2);
-        let k4 = hold_clip(&shared, "k4", 4);
-        let mut body = shared.lock().take_clip_body("k2").unwrap();
+        let _k1 = hold_recording(&shared, "k1", 1);
+        let mut k2 = hold_recording(&shared, "k2", 2);
+        let k4 = hold_recording(&shared, "k4", 4);
+        let mut body = shared.lock().take_recording_body("k2").unwrap();
         let (_demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
         let (mut reader, writer) = std::io::pipe().unwrap();
-        for (clip_id, serial, after_ms, pipe) in [
+        for (recording_id, serial, duration_ms, pipe) in [
             ("k1", 1, 6_000, fd()),
             ("k2", 2, 1_000, writer.into()),
             ("k4", 4, 1_000, fd()),
         ] {
-            driver.queue(DriverCommand::StartClip {
-                spec: ClipSpec {
-                    after_ms,
-                    ..clip_spec(clip_id)
+            driver.queue(DriverCommand::StartRecording {
+                spec: RecordingSpec {
+                    duration_ms,
+                    ..recording_spec(recording_id)
                 },
                 serial,
                 pipe,
             });
         }
-        // k4's clip ended while its start waited, and a later one took the id
+        // k4's recording ended while its start waited, and a later one took the id
         // and queued its own start 4 s on: it counts its own wait, not the
         // stale start's.
         drop(k4);
-        let mut k4_later = hold_clip(&shared, "k4", 5);
+        let mut k4_later = hold_recording(&shared, "k4", 5);
         clock.advance(Duration::from_secs(4));
-        driver.queue(DriverCommand::StartClip {
-            spec: ClipSpec {
-                after_ms: 2_000,
-                ..clip_spec("k4")
+        driver.queue(DriverCommand::StartRecording {
+            spec: RecordingSpec {
+                duration_ms: 2_000,
+                ..recording_spec("k4")
             },
             serial: 5,
             pipe: fd(),
@@ -4589,33 +4641,33 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         let addrs = vec!["127.0.0.1:1".parse().unwrap()];
         driver.spawn_worker(addrs).await;
-        let end = lotse_ipc::ToWorker::StopClip {
-            clip_id: "end".into(),
+        let end = lotse_ipc::ToWorker::StopRecording {
+            recording_id: "end".into(),
         };
         driver
-            .handle(Wake::Command(DriverCommand::StopClip {
-                clip_id: "end".into(),
+            .handle(Wake::Command(DriverCommand::StopRecording {
+                recording_id: "end".into(),
             }))
             .await;
         let messages = recorded(&out, &end).await;
         assert_eq!(
             messages[1..],
             [
-                lotse_ipc::ToWorker::StartClip(ClipSpec {
-                    after_ms: 1_000,
-                    ..clip_spec("k1")
+                lotse_ipc::ToWorker::StartRecording(RecordingSpec {
+                    duration_ms: 1_000,
+                    ..recording_spec("k1")
                 }),
-                lotse_ipc::ToWorker::StartClip(ClipSpec {
-                    after_ms: 1_000,
-                    ..clip_spec("k4")
+                lotse_ipc::ToWorker::StartRecording(RecordingSpec {
+                    duration_ms: 1_000,
+                    ..recording_spec("k4")
                 }),
                 end,
             ],
             "k1 and the later k4 run the rest, k2 and the stale k4 never reach the worker"
         );
-        let stopped = k2.try_recv().unwrap().payload;
+        let closed = k2.try_recv().unwrap().payload;
         assert_eq!(
-            (&stopped["reason"], &stopped["bytes"]),
+            (&closed["reason"], &closed["bytes"]),
             (&serde_json::json!("source_not_live"), &serde_json::json!(0))
         );
         assert_eq!(body.written.try_recv(), Ok(0), "the body ends whole");
@@ -4623,22 +4675,24 @@ mod tests {
         reader.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty(), "k2's pipe went with its start");
         assert!(k4_later.try_recv().is_err(), "the later k4 is not ended");
-        assert_eq!(shared.lock().clips.get("k4").unwrap().serial, 5);
-        let dropped = captured.lines("clip ended before its worker got it; its start is dropped");
+        assert_eq!(shared.lock().recordings.get("k4").unwrap().serial, 5);
+        let dropped =
+            captured.lines("recording ended before its worker got it; its start is dropped");
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert!(dropped[0].contains("serial=4"), "{dropped:?}");
-        let passed = captured.lines("the clip's end passed while its start waited for a worker");
+        let passed =
+            captured.lines("the recording's end passed while its start waited for a worker");
         assert_eq!(passed.len(), 1, "{passed:?}");
-        assert!(passed[0].contains("clip.id=k2"), "{passed:?}");
-        let left = captured.lines("it runs what is left of after_ms");
+        assert!(passed[0].contains("recording.id=k2"), "{passed:?}");
+        let left = captured.lines("it runs what is left of duration_ms");
         assert_eq!(left.len(), 2, "{left:?}");
-        assert!(left[0].contains("clip.id=k1"), "{left:?}");
-        assert!(left[0].contains("after_ms=1000"), "{left:?}");
-        assert!(left[1].contains("clip.id=k4"), "{left:?}");
+        assert!(left[0].contains("recording.id=k1"), "{left:?}");
+        assert!(left[0].contains("duration_ms=1000"), "{left:?}");
+        assert!(left[1].contains("recording.id=k4"), "{left:?}");
         assert!(left[1].contains("serial=5"), "{left:?}");
-        assert!(left[1].contains("after_ms=1000"), "{left:?}");
-        assert!(driver.clip_waits.is_empty());
-        assert!(driver.clip_wait.is_none());
+        assert!(left[1].contains("duration_ms=1000"), "{left:?}");
+        assert!(driver.recording_waits.is_empty());
+        assert!(driver.recording_wait.is_none());
         let worker = driver.worker.take().unwrap();
         drop(driver);
         // The shared clock is fake: the stop's budget needs a real one.
