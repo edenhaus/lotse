@@ -1078,8 +1078,8 @@ mod tests {
     /// A daemon that accepts one connection on `listener` and upgrades it,
     /// sends `hello` when `greet` and plays `script`; unless that ends in
     /// [`Step::Drop`], it then reads on until the client is gone, so the
-    /// client answers a ping or reads to the end without a broken pipe, and
-    /// keeps the commands among what it reads. Returns the commands it read.
+    /// client answers a ping or reads to the end without a broken pipe.
+    /// Returns the commands the script read.
     async fn daemon(
         listener: tokio::net::UnixListener,
         greet: bool,
@@ -1112,11 +1112,7 @@ mod tests {
                 }
             }
         }
-        while let Some(Ok(frame)) = ws.next().await {
-            if let Ok(command) = serde_json::from_str(frame.to_text().unwrap_or_default()) {
-                read.push(command);
-            }
-        }
+        while let Some(Ok(_frame)) = ws.next().await {}
         read
     }
 
@@ -1699,12 +1695,9 @@ mod tests {
     }
 
     /// A writer (the recording's file, or stdout) as the test scripts it: each
-    /// write either takes its bytes into `taken` or, when `stall`, never
-    /// completes, as a full FIFO. Its flush and shutdown fail, as on a full
-    /// disk.
+    /// write takes its bytes into `taken`; its flush and shutdown fail, as on
+    /// a full disk.
     struct Scripted {
-        /// No write completes.
-        stall: bool,
         /// What the writer took.
         taken: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     }
@@ -1715,11 +1708,7 @@ mod tests {
             _cx: &mut std::task::Context<'_>,
             buf: &[u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
-            let this = self.get_mut();
-            if this.stall {
-                return std::task::Poll::Pending;
-            }
-            this.taken.lock().unwrap().extend_from_slice(buf);
+            self.get_mut().taken.lock().unwrap().extend_from_slice(buf);
             std::task::Poll::Ready(Ok(buf.len()))
         }
 
@@ -1747,7 +1736,6 @@ mod tests {
     ) -> (anyhow::Result<ExitCode>, Vec<u8>, Vec<Value>) {
         let taken = std::sync::Arc::default();
         let writer = Scripted {
-            stall: false,
             taken: std::sync::Arc::clone(&taken),
         };
         let command = recording_command("front", 0, 1_000, false);
@@ -1781,7 +1769,6 @@ mod tests {
         assert_eq!(err.root_cause().to_string(), "no space left");
         assert_eq!(taken, b"ftyp");
         let mut writer = Scripted {
-            stall: false,
             taken: std::sync::Arc::default(),
         };
         assert!(writer.shutdown().await.is_err(), "as its flush");
@@ -1860,11 +1847,10 @@ mod tests {
         assert_eq!(*writer.landed.lock().unwrap(), b"moov", "as its flush");
     }
 
-    /// A [`Scripted`] stdout, stalled or not, and what it takes.
-    fn quiet_stdout(stall: bool) -> (Scripted, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+    /// A [`Scripted`] stdout, and what it takes.
+    fn quiet_stdout() -> (Scripted, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
         let taken = std::sync::Arc::<std::sync::Mutex<Vec<u8>>>::default();
         let writer = Scripted {
-            stall,
             taken: std::sync::Arc::clone(&taken),
         };
         (writer, taken)
@@ -1980,7 +1966,7 @@ mod tests {
     /// `finish` has nothing to wait for without a queued line.
     #[tokio::test]
     async fn printer_finish_waits_for_nothing_unqueued() {
-        let (stdout, _taken) = quiet_stdout(true);
+        let (stdout, _taken) = quiet_stdout();
         let mut printer = Printer::new(Box::pin(stdout));
         bounded(printer.finish()).await.unwrap();
     }
@@ -1990,7 +1976,7 @@ mod tests {
     /// killed `lotse ctl` mid-recording.
     #[tokio::test]
     async fn recording_create_fails_when_stdout_fails() {
-        let (stdout, taken) = quiet_stdout(false);
+        let (stdout, taken) = quiet_stdout();
         let script = vec![Step::Read, recording_started()];
         let command = recording_command("front", 0, 1_000, false);
         let (code, _file, _read) =
