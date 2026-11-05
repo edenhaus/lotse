@@ -25,7 +25,9 @@
 //! within the source's teardown budget ([`Camera::tear_down`]), and the
 //! connection closes, as a camera may stay in two-way mode until it does.
 //! Should the camera end the session first (its connection lost, a
-//! request refused), the loss is reported with why; nothing is opened again until the next claim. A session
+//! request refused), the loss is reported with why, before its
+//! `TEARDOWN`, which may take the teardown budget's retries on fresh
+//! connections; nothing is opened again until the next claim. A session
 //! opens only once the one before it closed on the camera, its bounded
 //! `TEARDOWN` included ([`BackchannelTasks::spawn`]): a camera with one
 //! backchannel refuses a `SETUP` of it while another session holds it
@@ -149,12 +151,21 @@ pub(crate) async fn run(
         addr = %camera.addr,
         "rtsp: opening the camera's backchannel in a session of its own; its connection bypasses sources.connect_concurrency, as a talker waits for it"
     );
-    let mut opened = Some(opened);
-    let Some(why) = Box::pin(session(&camera, &codec, &close, &mut opened)).await else {
-        tracing::info!("rtsp: backchannel session closed: TEARDOWN sent and its connection closed");
+    Box::pin(session(&camera, &codec, &close, opened, on_loss)).await;
+}
+
+/// Tells why the session ended, if it did not close: to `opened` while it
+/// is still there (the session did not open), else to `on_loss` (it was
+/// lost). `None` for a session that closed.
+fn tell(
+    ended: Option<BackchannelRefused>,
+    opened: Option<oneshot::Sender<Result<Opened, BackchannelRefused>>>,
+    on_loss: oneshot::Sender<BackchannelRefused>,
+) {
+    let Some(why) = ended else {
         return;
     };
-    if let Some(opened) = opened.take() {
+    if let Some(opened) = opened {
         tracing::warn!(
             status = why.status,
             error = %why,
@@ -178,30 +189,37 @@ fn hold(camera: &Camera) -> Duration {
 }
 
 /// Connects, opens the session in `codec` and forwards until it is closed
-/// (`None`) or fails: why, sent by [`run`] to `opened` while it is still
-/// there, else reported as the session's loss. However it ended, a
+/// or fails, then tells why it failed ([`tell`]): before its `TEARDOWN`,
+/// so the talker hears of a loss at once rather than once the teardown's
+/// retries on fresh connections ran their budget. However it ended, a
 /// session the camera set up gets its `TEARDOWN` within the budget, and
 /// the connection closes ([`Camera::tear_down`]).
 async fn session(
     camera: &Camera,
     codec: &Codec,
     close: &CancellationToken,
-    opened: &mut Option<oneshot::Sender<Result<Opened, BackchannelRefused>>>,
-) -> Option<BackchannelRefused> {
+    opened: oneshot::Sender<Result<Opened, BackchannelRefused>>,
+    on_loss: oneshot::Sender<BackchannelRefused>,
+) {
+    let mut opened = Some(opened);
     let hold = hold(camera);
     let start = camera.time.now();
     let mut driver = match camera.connect("backchannel session", hold, close).await {
         Ok(driver) => driver,
-        Err(err) => return Some(unanswered(err)),
+        Err(err) => return tell(Some(unanswered(err)), opened, on_loss),
     };
     let left = hold.saturating_sub(camera.time.now().saturating_duration_since(start));
-    let ended = talk(camera, codec, &mut driver, left, close, opened).await;
-    let why: &(dyn std::fmt::Display + Sync) = match &ended {
-        Some(why) => why,
-        None => &"the backchannel session closed",
-    };
-    camera.tear_down(driver, why).await;
-    ended
+    let ended = talk(camera, codec, &mut driver, left, close, &mut opened).await;
+    let why = ended.as_ref().map_or_else(
+        || "the backchannel session closed".to_owned(),
+        ToString::to_string,
+    );
+    let closed = ended.is_none();
+    tell(ended, opened, on_loss);
+    camera.tear_down(driver, &why).await;
+    if closed {
+        tracing::info!("rtsp: backchannel session closed: TEARDOWN sent and its connection closed");
+    }
 }
 
 /// The session on `driver`: the handshake in `codec` within `left`, the

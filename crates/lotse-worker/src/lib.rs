@@ -1327,8 +1327,13 @@ async fn stop_source(
 /// How long the shutdown waits, once the sessions closed and the sources
 /// stopped, for the backchannel sessions they opened to close on the
 /// device. A session's task ends within its source's teardown budget once
-/// its talker let go (RTSP: 100 ms for the answer to its `TEARDOWN`, RFC
-/// 2326 §10.7, RFC 7826 §13.4); this bounds one that does not.
+/// its talker let go. For RTSP that is 100 ms for the answer to its
+/// `TEARDOWN` on the session's own connection (RFC 2326 §10.7, RFC 7826
+/// §13.4), but up to 2 s when retina retries it on fresh connections, as
+/// it does for a live555 camera. The grace cuts such retries short, as a
+/// cancelled source cuts its own session's: the camera's session then
+/// expires on its own (RFC 2326 §12.37). It bounds any task that does not
+/// end in time, too.
 const BACKCHANNEL_CLOSE_GRACE: Duration = Duration::from_millis(500);
 
 /// Waits, at most [`BACKCHANNEL_CLOSE_GRACE`] on `clock`, for the tasks of
