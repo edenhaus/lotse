@@ -141,7 +141,10 @@ pub struct ClipLimits {
     /// end of an open-ended clip.
     pub clip_max_ms: u32,
     /// `limits.clip_queue_bytes`: what one clip's queue in the worker holds
-    /// before it drops to the next keyframe and reports the gap.
+    /// before it drops to the next keyframe and reports the gap; and the
+    /// clip's memory budget beside the pre-roll: its container ends a
+    /// fragment once it holds this much, and at most one finished fragment
+    /// waits for the reader, so a clip holds about three times this.
     pub clip_queue_bytes: u64,
     /// `limits.clip_fetch_timeout_ms`: how long a clip's body waits for
     /// its `GET` from the `clip/start` result on.
@@ -183,7 +186,10 @@ impl ClipLimits {
     /// a time, is what decides what they hold, and a camera sending far
     /// more than any real one, or clips writing slower than it sends, get
     /// a shorter pre-roll instead of taking the worker's memory; the rest
-    /// of the worker fits in the other half.
+    /// of the worker fits in the other half, its clips among it at about
+    /// three times `clip_queue_bytes` each (their queue, their open
+    /// fragment and one fragment waiting for the reader: 192 MiB for the
+    /// default 8 clips of 8 MiB).
     #[must_use]
     pub const fn preroll_bytes_for(worker_address_space: u64) -> u64 {
         worker_address_space / 2
@@ -1105,6 +1111,13 @@ mod tests {
         );
         assert_eq!(ClipLimits::preroll_bytes_for(6), 3);
         assert_eq!(ClipLimits::preroll_bytes_for(7), 3, "rounded down");
+        let clips =
+            u64::from(ClipLimits::DEFAULT.max_clips) * 3 * ClipLimits::DEFAULT.clip_queue_bytes;
+        assert_eq!(clips, 192 << 20, "the clips' budget beside the pre-roll");
+        assert!(
+            ClipLimits::DEFAULT.preroll_bytes + clips <= (1 << 30) * 3 / 4,
+            "a quarter of the worker's address space is left for the rest"
+        );
     }
 
     #[test]

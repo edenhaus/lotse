@@ -16,8 +16,17 @@
 //! time. A fragment ends before every video keyframe, before a frame that
 //! begins a new epoch of its track, once a track's decode time has
 //! advanced by the clip policy's fragment span in it, and once what its
-//! samples hold, their frames' bytes and what describes them, reaches
-//! [`MAX_FRAGMENT_BYTES`]; [`ClipMuxer::finish`] writes the last.
+//! samples hold, their frames' bytes and what describes them, reaches the
+//! clip's memory budget, its queue's bound (`ClipPolicy::queue_bytes`, at
+//! most [`MAX_FRAGMENT_BYTES`]); [`ClipMuxer::finish`] writes the last.
+//! So a camera whose timestamps barely advance, or that sends no
+//! keyframe, cannot make one fragment hold more than the clip's queue
+//! would: the frames a fragment holds have left the queue's bound, and a
+//! pre-roll's the stream's. A fragment may begin at any sample, since each
+//! sample carries its own sync flag (ISO/IEC 14496-12 §8.8.3.1,
+//! `sample_is_non_sync_sample`, in the `trun`'s `sample_flags`, §8.8.8),
+//! as a fragment the span ends does too; a frame that alone reaches the
+//! bound ends the fragment it is in at once.
 //! The file is playable up to its last complete fragment whenever it
 //! ends. Sample payloads go out as slices of the frames' own bytes, never
 //! copied.
@@ -50,10 +59,11 @@ use crate::init::{AUDIO_TRACK_ID, VIDEO_TRACK_ID};
 /// (ISO/IEC 14496-12 §8.8.8, `sample_size`).
 pub const MAX_SAMPLE_BYTES: usize = 256 * 1024 * 1024;
 
-/// What a fragment's samples hold after which it ends early: their
-/// frames' bytes, their NAL units' lengths and the descriptors of their
-/// pieces, so a frame of many tiny NAL units counts the memory it takes,
-/// not only its media data. The media data are less, and one more sample
+/// The most a fragment's samples hold before it ends early, however large
+/// the clip's queue bound ([`Muxer::new`]): their frames' bytes, their
+/// NAL units' lengths and the descriptors of their pieces, so a frame of
+/// many tiny NAL units counts the memory it takes, not only its media
+/// data. The media data are less, and one more sample
 /// of each track may follow, so the run's data offset, a signed 32-bit
 /// count from the `moof` (ISO/IEC 14496-12 §8.8.8, `data_offset`), always
 /// fits.
@@ -85,8 +95,9 @@ impl ClipMuxerFactory for Factory {
     }
 }
 
-/// The bounds a muxer keeps; [`MAX_SAMPLE_BYTES`] and
-/// [`MAX_FRAGMENT_BYTES`] outside the tests.
+/// The bounds a muxer keeps; outside the tests [`MAX_SAMPLE_BYTES`] and
+/// the clip's queue bound, at most [`MAX_FRAGMENT_BYTES`]
+/// ([`Muxer::new`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Limits {
     /// The largest frame a sample takes.
@@ -237,13 +248,19 @@ pub struct Muxer {
 }
 
 impl Muxer {
-    /// A muxer whose fragments span at most `policy.fragment`.
+    /// A muxer whose fragments span at most `policy.fragment` and end
+    /// once their samples hold `policy.queue_bytes`, the clip's queue's
+    /// bound, or [`MAX_FRAGMENT_BYTES`] if that is less: the clip's
+    /// memory budget, so the fragment it writes holds no more than its
+    /// queue does.
     pub fn new(policy: &ClipPolicy) -> Self {
         Self {
             span: policy.fragment,
             limits: Limits {
                 sample_bytes: MAX_SAMPLE_BYTES,
-                fragment_bytes: MAX_FRAGMENT_BYTES,
+                fragment_bytes: u64::try_from(policy.queue_bytes)
+                    .unwrap_or(MAX_FRAGMENT_BYTES)
+                    .min(MAX_FRAGMENT_BYTES),
             },
             state: State::Idle,
         }

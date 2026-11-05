@@ -56,7 +56,12 @@
 //! full the task takes nothing out of its queue but keeps draining the
 //! subscriptions into it, so a stalled reader fills the kernel's pipe,
 //! then the queue up to `clip_queue_bytes`, and then costs the clip a gap,
-//! never the camera's other consumers. The video ends at its first frame
+//! never the camera's other consumers. Beside its queue a clip holds the
+//! container's open fragment, which ends once it holds `clip_queue_bytes`
+//! too, and the bytes of at most one finished fragment the pipe has not
+//! taken, since it takes nothing out of its queue while any are pending:
+//! about three times `clip_queue_bytes` a clip, whatever the camera's
+//! timestamps and keyframes. The video ends at its first frame
 //! captured at or after the clip's end, by the ring's measure as its
 //! start ([`captured`]), and the audio at its first frame dated at or
 //! after that frame's capture time, where the container puts the video's
