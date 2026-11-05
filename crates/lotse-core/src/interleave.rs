@@ -38,7 +38,7 @@
 //! interleaver chooses between the tracks, never within one.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::codec::Kind;
@@ -200,9 +200,13 @@ struct Lane {
     reached: Option<Instant>,
     /// The pre-record's frames, oldest first, while the live frames that
     /// repeat them may still come: those the track published after the
-    /// recording subscribed, which the snapshot starting before the subscription
-    /// makes its newest; empty once a live frame was none of them.
-    duplicates: Vec<Arc<MediaFrame>>,
+    /// recording subscribed, which the snapshot starting before the
+    /// subscription makes its newest; empty once a live frame was none of
+    /// them. Weak, so a frame handed out before any live frame came frees
+    /// its payload with its charge; the allocation a weak reference keeps
+    /// cannot be reused by a later frame, so a pointer match is still that
+    /// frame.
+    duplicates: Vec<Weak<MediaFrame>>,
     /// The subscription lagged while `duplicates` may still come: a hole
     /// only once the next frame is none of them, since the frames lost
     /// before one of them are the pre-record's.
@@ -259,7 +263,7 @@ impl Lane {
         if let Some(at) = self
             .duplicates
             .iter()
-            .rposition(|held| Arc::ptr_eq(held, frame))
+            .rposition(|held| std::ptr::eq(held.as_ptr(), Arc::as_ptr(frame)))
         {
             self.duplicates.drain(..=at);
             true
@@ -427,7 +431,7 @@ impl ReliableQueue {
                 Some(Arc::clone(&held.charge)),
             );
         }
-        lane.duplicates = snapshot.frames().cloned().collect();
+        lane.duplicates = snapshot.frames().map(Arc::downgrade).collect();
         if snapshot.truncated() {
             self.hole(track, GapReason::PrerecordTruncated, now);
         }
@@ -1124,6 +1128,36 @@ mod tests {
         assert_eq!(shared.held(), one, "the queue holds the keyframe");
         drop(queue);
         assert_eq!(shared.held(), 0, "a queue that goes gives its charges back");
+    }
+
+    /// Regression: the duplicate check kept the snapshot's frames alive, so
+    /// a queue that handed them out before any live frame came left their
+    /// payloads allocated with their charges given back.
+    #[test]
+    fn a_pre_record_handed_out_before_a_live_frame_frees_its_payloads() {
+        let recording = Recording::new();
+        let shared = Arc::default();
+        let mut ring = Prerecord::new(true, Arc::clone(&shared));
+        ring.set_window(Some(Duration::from_secs(60)));
+        let frames = [recording.frame(0, true, 10), recording.frame(40, false, 10)];
+        for frame in &frames {
+            assert_eq!(ring.push(frame, usize::MAX, || None), None);
+        }
+        let held: Vec<_> = frames.iter().map(Arc::downgrade).collect();
+        drop(frames);
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        queue.prerecord(
+            Kind::Video,
+            &ring.snapshot(recording.at(0)).unwrap(),
+            recording.now(),
+        );
+        assert!(ring.clear());
+        assert_eq!(drain(&mut queue, Kind::Video, &recording), ["v0", "v40"]);
+        assert_eq!(shared.held(), 0);
+        assert!(
+            held.iter().all(|frame| frame.upgrade().is_none()),
+            "no frame outlives its charge"
+        );
     }
 
     #[test]
