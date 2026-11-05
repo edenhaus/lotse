@@ -16,9 +16,10 @@
 //! [`QUEUED_FRAME_OVERHEAD`] against the bound; a pre-record frame counts
 //! nothing against it, since it stays counted against the stream's
 //! `prerecord_bytes` until it is handed out (the queue keeps its charge, see
-//! [`crate::prerecord`]), and the live frames the pre-record holds too are
-//! dropped, so none is written twice. The snapshot must start at a frame
-//! the track published before the recording subscribed, which
+//! [`crate::prerecord`]), and so does what the queue keeps beside each
+//! ([`QUEUED_PRERECORD_OVERHEAD`]) until the last is out; the live frames
+//! the pre-record holds too are dropped, so none is written twice. The snapshot must start at a frame the track published before the
+//! recording subscribed, which
 //! [`Track::subscribe_from_prerecord`](crate::track::Track::subscribe_from_prerecord)
 //! guarantees: a live frame published before the snapshot's start could not
 //! be told from one after its newest. A lag while those frames may still
@@ -53,6 +54,21 @@ use crate::track::TrackEvent;
 pub const QUEUED_FRAME_OVERHEAD: usize = size_of::<MediaFrame>()
     .saturating_add(2_usize.saturating_mul(size_of::<usize>()))
     .saturating_add(size_of::<Item>());
+
+/// What a recording's queue keeps for each pre-record frame beside the frame and
+/// its charge ([`PRERECORD_FRAME_OVERHEAD`](crate::prerecord::PRERECORD_FRAME_OVERHEAD)),
+/// counted against the stream's `prerecord_bytes` while it keeps it: two of
+/// its items' slots, as the queue's capacity doubles while the pre-record
+/// fills it; the duplicate check's weak reference; and the frame's
+/// allocation that reference keeps after the frame's last holder let it
+/// go, the `MediaFrame` and its `Arc` counts. The ring holds the frames
+/// in far less than this per frame, so a camera of tiny frames cannot
+/// make each recording that starts from them take more than the bound says.
+pub const QUEUED_PRERECORD_OVERHEAD: usize = 2_usize
+    .saturating_mul(size_of::<Item>())
+    .saturating_add(size_of::<Weak<MediaFrame>>())
+    .saturating_add(size_of::<MediaFrame>())
+    .saturating_add(2_usize.saturating_mul(size_of::<usize>()));
 
 /// Why a track has a hole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +227,14 @@ struct Lane {
     /// only once the next frame is none of them, since the frames lost
     /// before one of them are the pre-record's.
     lagged: bool,
+    /// The pre-record's frames still queued: those whose item has a charge.
+    prerecord_left: usize,
+    /// What the lane keeps for its pre-record's frames beside them, counted
+    /// against the stream's `prerecord_bytes`: [`QUEUED_PRERECORD_OVERHEAD`]
+    /// for each frame of its pre-record, until the last is handed out and
+    /// the duplicate check is over ([`Self::settle_prerecord`]), so it
+    /// counts what it keeps while it drains, a little more than it holds.
+    bookkeeping: Option<PrerecordCharge>,
 }
 
 impl Lane {
@@ -226,6 +250,8 @@ impl Lane {
             reached: None,
             duplicates: Vec::new(),
             lagged: false,
+            prerecord_left: 0,
+            bookkeeping: None,
         }
     }
 
@@ -266,10 +292,27 @@ impl Lane {
             .rposition(|held| std::ptr::eq(held.as_ptr(), Arc::as_ptr(frame)))
         {
             self.duplicates.drain(..=at);
+            self.settle_prerecord();
             true
         } else {
             self.duplicates = Vec::new();
+            self.settle_prerecord();
             false
+        }
+    }
+
+    /// Gives the pre-record's bookkeeping back once nothing of it is kept:
+    /// its last frame handed out and its duplicate check over. The slots
+    /// it grew the queue by and the check's list go with it.
+    fn settle_prerecord(&mut self) {
+        if self.prerecord_left == 0
+            && self.duplicates.is_empty()
+            && let Some(bookkeeping) = self.bookkeeping.take()
+        {
+            self.items.shrink_to_fit();
+            self.duplicates = Vec::new();
+            drop(bookkeeping);
+            tracing::trace!(track = %self.kind, "recording queue: the pre-record is out");
         }
     }
 
@@ -414,7 +457,10 @@ impl ReliableQueue {
     /// A video snapshot starts at a keyframe; an audio one is taken only
     /// after the video's (it is ignored before), from the video snapshot's
     /// start. A truncated snapshot puts the track in a hole until its next
-    /// keyframe.
+    /// keyframe. What the lane keeps beside the frames counts against
+    /// `prerecord_bytes` too ([`QUEUED_PRERECORD_OVERHEAD`] a frame) until the
+    /// last of them is handed out and no live frame can repeat one; the
+    /// snapshot's own list, which the caller drops at once, does not.
     pub fn prerecord(&mut self, track: Kind, snapshot: &PrerecordSnapshot, now: Instant) {
         let blocked = track == Kind::Audio && self.video.blocks_audio();
         let lane = self.lane_mut(track);
@@ -432,6 +478,13 @@ impl ReliableQueue {
             );
         }
         lane.duplicates = snapshot.frames().map(Arc::downgrade).collect();
+        lane.prerecord_left = lane.prerecord_left.saturating_add(snapshot.frame_count());
+        lane.bookkeeping = Some(
+            snapshot.charge(
+                lane.prerecord_left
+                    .saturating_mul(QUEUED_PRERECORD_OVERHEAD),
+            ),
+        );
         if snapshot.truncated() {
             self.hole(track, GapReason::PrerecordTruncated, now);
         }
@@ -589,16 +642,22 @@ impl ReliableQueue {
 
     /// The oldest item `track` queued, taken out. A pre-record frame's charge
     /// goes with it: the stream's bound no longer counts what the recording
-    /// writes now.
+    /// writes now; with the pre-record's last frame, so does what the lane
+    /// kept beside them, once the duplicate check is over too.
     pub fn pop(&mut self, track: Kind) -> Option<Out> {
+        let lane = self.lane_mut(track);
         let Item {
             entry,
             cost,
             charge,
             ..
-        } = self.lane_mut(track).items.pop_front()?;
+        } = lane.items.pop_front()?;
+        if let Some(charge) = charge {
+            drop(charge);
+            lane.prerecord_left = lane.prerecord_left.saturating_sub(1);
+            lane.settle_prerecord();
+        }
         self.bytes = self.bytes.saturating_sub(cost);
-        drop(charge);
         Some(match entry {
             Entry::Frame(frame) => Out::Frame { track, frame },
             Entry::Gap { reason, from, to } => Out::Gap {
@@ -1078,7 +1137,8 @@ mod tests {
         let mut ring = Prerecord::new(true, Arc::clone(&shared));
         ring.set_window(Some(Duration::from_secs(60)));
         let one = 10 + PRERECORD_FRAME_OVERHEAD;
-        let cap = 4 * one;
+        let kept = 3 * QUEUED_PRERECORD_OVERHEAD;
+        let cap = 4 * one + kept;
         for frame in [
             recording.frame(0, true, 10),
             recording.frame(40, false, 10),
@@ -1095,7 +1155,7 @@ mod tests {
         assert_eq!(queue.bytes(), 0, "nothing against the queue's bound");
         assert_eq!(
             shared.held(),
-            3 * one,
+            3 * one + kept,
             "the snapshot is gone, the queue holds them"
         );
         // The ring moves on: dropping the GOP the queue holds frees nothing,
@@ -1113,11 +1173,15 @@ mod tests {
         assert!(queue.pop(Kind::Video).is_some());
         assert_eq!(
             shared.held(),
-            3 * one,
+            3 * one + kept,
             "the frame handed out gave its charge back"
         );
         assert_eq!(drain(&mut queue, Kind::Video, &recording), ["v40", "v80"]);
-        assert_eq!(shared.held(), one, "the ring's keyframe");
+        assert_eq!(
+            shared.held(),
+            one + kept,
+            "the ring's keyframe, and the duplicate check's references"
+        );
 
         queue.prerecord(
             Kind::Video,
@@ -1125,7 +1189,11 @@ mod tests {
             recording.now(),
         );
         assert!(ring.clear());
-        assert_eq!(shared.held(), one, "the queue holds the keyframe");
+        assert_eq!(
+            shared.held(),
+            one + QUEUED_PRERECORD_OVERHEAD,
+            "the queue holds the keyframe, and keeps one frame's references"
+        );
         drop(queue);
         assert_eq!(shared.held(), 0, "a queue that goes gives its charges back");
     }
@@ -1153,11 +1221,117 @@ mod tests {
         );
         assert!(ring.clear());
         assert_eq!(drain(&mut queue, Kind::Video, &recording), ["v0", "v40"]);
-        assert_eq!(shared.held(), 0);
+        assert_eq!(
+            shared.held(),
+            2 * QUEUED_PRERECORD_OVERHEAD,
+            "the duplicate check's references stay counted"
+        );
         assert!(
             held.iter().all(|frame| frame.upgrade().is_none()),
             "no frame outlives its charge"
         );
+    }
+
+    /// Regression: a recording's queue kept an item and a weak reference for
+    /// each pre-record frame uncounted, so a camera of tiny frames, whose
+    /// ring held millions of them within the bound, had each recording from it
+    /// take hundreds of megabytes beside the bound.
+    #[test]
+    fn what_the_queue_keeps_beside_the_pre_roll_counts_against_the_stream_until_it_is_out() {
+        let recording = Recording::new();
+        let shared = Arc::default();
+        let mut ring = Prerecord::new(true, Arc::clone(&shared));
+        ring.set_window(Some(Duration::from_secs(60)));
+        let one = 10 + PRERECORD_FRAME_OVERHEAD;
+        let gop = [
+            recording.frame(0, true, 10),
+            recording.frame(40, false, 10),
+            recording.frame(80, false, 10),
+        ];
+        for frame in &gop {
+            assert_eq!(ring.push(frame, usize::MAX, || None), None);
+        }
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        queue.prerecord(
+            Kind::Video,
+            &ring.snapshot(recording.at(0)).unwrap(),
+            recording.now(),
+        );
+        let kept = 3 * QUEUED_PRERECORD_OVERHEAD;
+        assert!(kept >= one, "more than a frame the ring holds");
+        assert_eq!(shared.held(), 3 * one + kept);
+
+        // The ring holds that much less: with room for one more frame
+        // beside the queue's, the next GOP keeps only its keyframe.
+        assert!(ring.clear());
+        let cap = 3 * one + kept + one;
+        assert_eq!(
+            ring.push(&recording.frame(120, true, 10), cap, || None),
+            None
+        );
+        assert!(
+            ring.push(&recording.frame(160, false, 10), cap, || None)
+                .is_some()
+        );
+        assert_eq!(shared.held(), cap);
+
+        // The frames handed out give their charges back; what the queue
+        // keeps stays while a live frame may still repeat one of them.
+        assert_eq!(
+            drain(&mut queue, Kind::Video, &recording),
+            ["v0", "v40", "v80"]
+        );
+        assert_eq!(shared.held(), one + kept);
+        recording.push(&mut queue, Kind::Video, 200, false);
+        assert_eq!(shared.held(), one, "the ring's keyframe alone");
+        assert_eq!(queue.video.duplicates.capacity(), 0);
+    }
+
+    /// A live frame that ends the duplicate check before the pre-record is
+    /// out leaves what the queue keeps beside the pre-record counted until
+    /// its last frame is out, and frees the slots the pre-record grew the
+    /// queue by with it.
+    #[test]
+    fn what_the_queue_keeps_beside_the_pre_roll_goes_with_its_last_frame() {
+        let recording = Recording::new();
+        let shared = Arc::default();
+        let gop: Vec<_> = (0..8)
+            .map(|i| recording.frame(1000 + 40 * i, i == 0, 10))
+            .collect();
+        let mut ring = Prerecord::new(true, Arc::clone(&shared));
+        ring.set_window(Some(Duration::from_secs(60)));
+        for frame in &gop {
+            assert_eq!(ring.push(frame, usize::MAX, || None), None);
+        }
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        queue.prerecord(
+            Kind::Video,
+            &ring.snapshot(recording.at(1000)).unwrap(),
+            recording.now(),
+        );
+        let held = shared.held();
+        recording.push(&mut queue, Kind::Video, 2000, false);
+        assert_eq!(shared.held(), held, "the pre-record is still queued");
+        for _ in 0..7 {
+            assert!(queue.pop(Kind::Video).is_some());
+        }
+        assert_eq!(shared.held(), held, "one pre-record frame is left");
+        assert!(queue.video.items.capacity() >= 8);
+        assert!(queue.pop(Kind::Video).is_some());
+        assert_eq!(shared.held(), held - 8 * QUEUED_PRERECORD_OVERHEAD);
+        assert!(queue.video.items.capacity() < 8, "its slots are freed");
+        assert_eq!(drain(&mut queue, Kind::Video, &recording), ["v2000"]);
+
+        // A queue that goes gives it back too.
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        queue.prerecord(
+            Kind::Video,
+            &ring.snapshot(recording.at(1000)).unwrap(),
+            recording.now(),
+        );
+        assert_eq!(shared.held(), held);
+        drop(queue);
+        assert_eq!(shared.held(), held - 8 * QUEUED_PRERECORD_OVERHEAD);
     }
 
     #[test]

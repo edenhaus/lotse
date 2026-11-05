@@ -47,7 +47,13 @@
 //! as the ring holds it, in the ring's slot, so a full ring allocates
 //! nothing per frame; shared, the first time a snapshot takes the frame,
 //! with the snapshots and the recording queues that hold it after; and given
-//! back when the last of them lets it go. So the
+//! back when the last of them lets it go. A recording's queue counts there as
+//! well what it keeps for each frame it took beside the frame, its item
+//! and its duplicate check
+//! ([`QUEUED_PRERECORD_OVERHEAD`](crate::interleave::QUEUED_PRERECORD_OVERHEAD)),
+//! until it has handed out the last of them; only a snapshot's own list
+//! of its frames, which the recording's queue takes as it is taken, counts
+//! nothing. So the
 //! connection's count is what its pre-record frames take in memory, whoever
 //! holds them, and a ring that pushes trims until the count fits
 //! `prerecord_bytes`: dropping a frame a recording still holds frees nothing, so
@@ -177,6 +183,14 @@ impl PrerecordSnapshot {
         self.following.len().saturating_add(1)
     }
 
+    /// A charge of `bytes` against the bound this snapshot's frames count
+    /// against, until it is dropped: what a recording's queue keeps beside the
+    /// frames it took from the snapshot
+    /// ([`QUEUED_PRERECORD_OVERHEAD`](crate::interleave::QUEUED_PRERECORD_OVERHEAD)).
+    pub(crate) fn charge(&self, bytes: usize) -> PrerecordCharge {
+        PrerecordCharge::new(bytes, &self.start.charge.shared)
+    }
+
     /// Whether the newest GOP was cut short, by `prerecord_bytes` or by a
     /// frame the track dropped over `max_frame_bytes`, so the frames after
     /// the last one held are missing; every GOP before it is whole.
@@ -216,7 +230,9 @@ pub(crate) struct PrerecordShared {
     floor: Mutex<Option<Instant>>,
     /// What the connection's pre-record frames take together, as each
     /// counts ([`cost`]), while a ring, a snapshot or a recording's queue holds
-    /// it: the sum of the live [`PrerecordCharge`]s.
+    /// it, and what the recordings' queues keep for them beside
+    /// ([`PrerecordSnapshot::charge`]): the sum of the live
+    /// [`PrerecordCharge`]s.
     held: AtomicUsize,
 }
 
@@ -262,7 +278,8 @@ impl PrerecordShared {
 /// counted when the ring takes the frame, given back when it is dropped,
 /// by the ring or, once shared, by the last of the ring, the snapshots and
 /// the recording queues that hold it. So a frame counts once however many hold
-/// it, and as long as one does.
+/// it, and as long as one does. A recording's queue holds one more for what it
+/// keeps beside a snapshot's frames ([`PrerecordSnapshot::charge`]).
 ///
 /// Invariant: `held` is the sum of the `bytes` of the charges alive. The
 /// drop only updates the atomic count and takes no lock, since a ring drops

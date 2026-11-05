@@ -24,7 +24,8 @@ use crate::codec::{Codec, CodecFamily, Kind};
 use crate::media::MediaFrame;
 
 /// Default of `limits.recording_queue_bytes`: 8 MiB of frames a recording holds
-/// while its reader is slower than the camera.
+/// while its reader is slower than the camera, and what its container's
+/// open fragment holds at most.
 pub const DEFAULT_RECORDING_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Default of the interleaver's hold: how long a frame waits for the other
@@ -42,7 +43,8 @@ pub const DEFAULT_RECORDING_FRAGMENT: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordingPolicy {
     /// The most the recording's queue holds before it drops to the next video
-    /// keyframe and reports the gap (`limits.recording_queue_bytes`).
+    /// keyframe and reports the gap (`limits.recording_queue_bytes`), and what
+    /// the container's open fragment may hold: the recording's memory budget.
     pub queue_bytes: usize,
     /// How long a frame waits for the other track to pass its capture
     /// time before it goes out regardless.
