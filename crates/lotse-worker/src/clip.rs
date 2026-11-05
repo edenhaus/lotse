@@ -138,8 +138,9 @@ use tokio::task::JoinHandle;
 use crate::params;
 
 /// Default of `limits.clip_max_ms`: the longest a clip runs after its
-/// start, open-ended or not.
-pub const DEFAULT_CLIP_MAX: Duration = Duration::from_secs(600);
+/// start, open-ended or not: an hour, the longest a client's record call
+/// asks for after an event.
+pub const DEFAULT_CLIP_MAX: Duration = Duration::from_secs(3600);
 
 /// Default of `limits.clip_start_timeout_ms`: how long a clip with nothing
 /// held waits for the source's tracks and their next keyframe, the
@@ -3866,7 +3867,7 @@ mod tests {
             ClipSettings::default(),
             ClipSettings {
                 policy: ClipPolicy::default(),
-                max_duration: Duration::from_secs(600),
+                max_duration: Duration::from_secs(3600),
                 start_timeout: Duration::from_secs(10),
                 max_clips: 8,
             }
@@ -5137,7 +5138,8 @@ mod tests {
     /// waiting for a keyframe, and waiting for the tracks. The pipe's write
     /// end polls an error then, whatever room it has (`poll(2)`: `POLLERR`).
     /// Regression: nothing noticed until the next write or the clip's end,
-    /// ten minutes for an open-ended clip, which kept its slot that long.
+    /// up to `clip_max_ms` for an open-ended clip, which kept its slot that
+    /// long.
     #[tokio::test]
     async fn a_reader_gone_while_the_clip_has_nothing_to_write_ends_it_client_gone() {
         let mut rig = Rig::new(None);

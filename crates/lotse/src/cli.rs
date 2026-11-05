@@ -93,7 +93,7 @@ pub(crate) struct WorkerArgs {
     pub(crate) preroll_bytes: usize,
 
     /// The longest a clip runs: the daemon's `limits.clip_max_ms`.
-    #[arg(long, value_name = "MS", default_value_t = 600_000)]
+    #[arg(long, value_name = "MS", default_value_t = 3_600_000)]
     pub(crate) clip_max_ms: u64,
 
     /// What one clip's queue holds before it drops to the next keyframe:
@@ -359,6 +359,12 @@ mod tests {
         );
         assert_eq!(
             Duration::from_millis(bare.clip_max_ms),
+            lotse_worker::DEFAULT_CLIP_MAX
+        );
+        // ... which are the supervisor's: the daemon refuses no `after_ms`
+        // its worker would cut short.
+        assert_eq!(
+            Duration::from_millis(u64::from(lotse_supervisor::ClipLimits::DEFAULT.clip_max_ms)),
             lotse_worker::DEFAULT_CLIP_MAX
         );
         assert_eq!(

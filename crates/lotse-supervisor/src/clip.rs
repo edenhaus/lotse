@@ -155,15 +155,17 @@ pub struct ClipLimits {
 }
 
 impl ClipLimits {
-    /// The defaults: a 2-minute window at most, 32 MiB per track (core's
-    /// `DEFAULT_PREROLL_BYTES`), 10-minute clips (the worker's
-    /// `DEFAULT_CLIP_MAX`), an 8 MiB queue (core's
+    /// The defaults: a 5-minute window at most and 1-hour clips (the
+    /// worker's `DEFAULT_CLIP_MAX`), so a client's record call that asks
+    /// up to 5 minutes before an event and up to an hour after it is never
+    /// refused; 32 MiB per track (core's `DEFAULT_PREROLL_BYTES`), which
+    /// bounds what a window actually holds; an 8 MiB queue (core's
     /// `DEFAULT_CLIP_QUEUE_BYTES`), 10 s to fetch, 10 s to start (the
     /// worker's `DEFAULT_CLIP_START_TIMEOUT`), 8 clips, 2 per stream.
     pub const DEFAULT: Self = Self {
-        preroll_max_ms: 120_000,
+        preroll_max_ms: 300_000,
         preroll_bytes: 32 * 1024 * 1024,
-        clip_max_ms: 600_000,
+        clip_max_ms: 3_600_000,
         clip_queue_bytes: 8 * 1024 * 1024,
         fetch_timeout: Duration::from_secs(10),
         start_timeout: Duration::from_secs(10),
