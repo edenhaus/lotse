@@ -143,7 +143,10 @@ pub struct RecordingLimits {
     /// bound on it.
     pub max_recording_ms: u32,
     /// `limits.recording_queue_bytes`: what one recording's queue in the worker holds
-    /// before it drops to the next keyframe and reports the gap.
+    /// before it drops to the next keyframe and reports the gap; and the
+    /// recording's memory budget beside the pre-record: its container ends a
+    /// fragment once it holds this much, and at most one finished fragment
+    /// waits for the reader, so a recording holds about three times this.
     pub recording_queue_bytes: u64,
     /// `limits.recording_fetch_timeout_ms`: how long a recording's body waits for
     /// its `GET` from the `recording/create` result on.
@@ -185,7 +188,10 @@ impl RecordingLimits {
     /// a time, is what decides what they hold, and a camera sending far
     /// more than any real one, or recordings writing slower than it sends, get
     /// a shorter pre-record instead of taking the worker's memory; the rest
-    /// of the worker fits in the other half.
+    /// of the worker fits in the other half, its recordings among it at about
+    /// three times `recording_queue_bytes` each (their queue, their open
+    /// fragment and one fragment waiting for the reader: 192 MiB for the
+    /// default 8 recordings of 8 MiB).
     #[must_use]
     pub const fn max_prerecord_bytes_for(worker_address_space: u64) -> u64 {
         worker_address_space / 2
@@ -1139,6 +1145,18 @@ mod tests {
             RecordingLimits::max_prerecord_bytes_for(7),
             3,
             "rounded down"
+        );
+        let recordings = u64::from(RecordingLimits::DEFAULT.max_recordings)
+            * 3
+            * RecordingLimits::DEFAULT.recording_queue_bytes;
+        assert_eq!(
+            recordings,
+            192 << 20,
+            "the recordings' budget beside the pre-record"
+        );
+        assert!(
+            RecordingLimits::DEFAULT.max_prerecord_bytes + recordings <= (1 << 30) * 3 / 4,
+            "a quarter of the worker's address space is left for the rest"
         );
     }
 
