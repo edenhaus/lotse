@@ -14,10 +14,11 @@
 //! Invariants: the producer never waits, so a frame that does not fit is
 //! dropped, never held back. A live frame counts its payload plus
 //! [`QUEUED_FRAME_OVERHEAD`] against the bound; a pre-record frame counts
-//! nothing, since its ring bounded it by `prerecord_bytes` already, and the
-//! live frames the pre-record holds too are dropped, so none is written
-//! twice. The snapshot must start at a frame the track published before the
-//! recording subscribed, which
+//! nothing against it, since it stays counted against the stream's
+//! `prerecord_bytes` until it is handed out (the queue keeps its charge, see
+//! [`crate::prerecord`]), and the live frames the pre-record holds too are
+//! dropped, so none is written twice. The snapshot must start at a frame
+//! the track published before the recording subscribed, which
 //! [`Track::subscribe_from_prerecord`](crate::track::Track::subscribe_from_prerecord)
 //! guarantees: a live frame published before the snapshot's start could not
 //! be told from one after its newest. A lag while those frames may still
@@ -42,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use crate::codec::Kind;
 use crate::media::MediaFrame;
-use crate::prerecord::{PrerecordSnapshot, captured};
+use crate::prerecord::{PrerecordCharge, PrerecordSnapshot, captured};
 use crate::throttle::Throttle;
 use crate::track::TrackEvent;
 
@@ -143,6 +144,10 @@ struct Item {
     /// What it counts against the bound: nothing for a pre-record frame, a
     /// gap or a control event.
     cost: usize,
+    /// A pre-record frame's charge against the stream's `prerecord_bytes`,
+    /// kept until the frame is handed out, so the frames a slow recording has
+    /// not written yet count there; `None` for anything else.
+    charge: Option<Arc<PrerecordCharge>>,
 }
 
 impl Item {
@@ -319,17 +324,25 @@ impl Lane {
             entry: Entry::Control(event),
             queued,
             cost: 0,
+            charge: None,
         });
     }
 
-    /// Queues `frame`, which counts `cost`.
-    fn queue_frame(&mut self, frame: Arc<MediaFrame>, queued: Instant, cost: usize) {
+    /// Queues `frame`, which counts `cost`, with its pre-record `charge`.
+    fn queue_frame(
+        &mut self,
+        frame: Arc<MediaFrame>,
+        queued: Instant,
+        cost: usize,
+        charge: Option<Arc<PrerecordCharge>>,
+    ) {
         self.started = true;
         self.last = Some(frame.wallclock);
         self.items.push_back(Item {
             entry: Entry::Frame(frame),
             queued,
             cost,
+            charge,
         });
     }
 }
@@ -385,8 +398,10 @@ impl ReliableQueue {
         }
     }
 
-    /// Queues the pre-record `track` starts from, counting nothing, before
-    /// any live item of the track: the snapshot starts at a frame published
+    /// Queues the pre-record `track` starts from, counting nothing against
+    /// the queue's bound, before any live item of the track; each frame
+    /// keeps its charge against the stream's `prerecord_bytes` until it is
+    /// handed out: the snapshot starts at a frame published
     /// before the recording subscribed
     /// ([`Track::subscribe_from_prerecord`](crate::track::Track::subscribe_from_prerecord)),
     /// so the live frames it holds too come first and are dropped as they
@@ -403,9 +418,14 @@ impl ReliableQueue {
             tracing::debug!(%track, "recording queue: pre-record ignored, the track takes nothing now");
             return;
         }
-        for frame in snapshot.frames() {
-            lane.reached = Some(captured(frame));
-            lane.queue_frame(Arc::clone(frame), now, 0);
+        for held in snapshot.charged() {
+            lane.reached = Some(captured(&held.frame));
+            lane.queue_frame(
+                Arc::clone(&held.frame),
+                now,
+                0,
+                Some(Arc::clone(&held.charge)),
+            );
         }
         lane.duplicates = snapshot.frames().cloned().collect();
         if snapshot.truncated() {
@@ -483,9 +503,10 @@ impl ReliableQueue {
                 },
                 queued: now,
                 cost: 0,
+                charge: None,
             });
         }
-        lane.queue_frame(frame, now, cost);
+        lane.queue_frame(frame, now, cost, None);
         self.bytes = self.bytes.saturating_add(cost);
     }
 
@@ -562,11 +583,19 @@ impl ReliableQueue {
             })
     }
 
-    /// The oldest item `track` queued, taken out.
+    /// The oldest item `track` queued, taken out. A pre-record frame's charge
+    /// goes with it: the stream's bound no longer counts what the recording
+    /// writes now.
     pub fn pop(&mut self, track: Kind) -> Option<Out> {
-        let item = self.lane_mut(track).items.pop_front()?;
-        self.bytes = self.bytes.saturating_sub(item.cost);
-        Some(match item.entry {
+        let Item {
+            entry,
+            cost,
+            charge,
+            ..
+        } = self.lane_mut(track).items.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(cost);
+        drop(charge);
+        Some(match entry {
             Entry::Frame(frame) => Out::Frame { track, frame },
             Entry::Gap { reason, from, to } => Out::Gap {
                 track,
@@ -681,7 +710,7 @@ mod tests {
     use crate::clock::{Clock as _, FakeClock};
     use crate::codec::Codec;
     use crate::media::MediaTime;
-    use crate::prerecord::Prerecord;
+    use crate::prerecord::{PRERECORD_FRAME_OVERHEAD, Prerecord};
     use crate::track::{Track, TrackId, TrackLimits, TrackSubscription, Unit};
 
     const SKEW: Duration = Duration::from_secs(1);
@@ -1039,6 +1068,65 @@ mod tests {
     }
 
     #[test]
+    fn the_pre_record_stays_counted_against_the_stream_until_it_is_handed_out() {
+        let recording = Recording::new();
+        let shared = Arc::default();
+        let mut ring = Prerecord::new(true, Arc::clone(&shared));
+        ring.set_window(Some(Duration::from_secs(60)));
+        let one = 10 + PRERECORD_FRAME_OVERHEAD;
+        let cap = 4 * one;
+        for frame in [
+            recording.frame(0, true, 10),
+            recording.frame(40, false, 10),
+            recording.frame(80, false, 10),
+        ] {
+            assert_eq!(ring.push(&frame, cap, || None), None);
+        }
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        queue.prerecord(
+            Kind::Video,
+            &ring.snapshot(recording.at(0)).unwrap(),
+            recording.now(),
+        );
+        assert_eq!(queue.bytes(), 0, "nothing against the queue's bound");
+        assert_eq!(
+            shared.held(),
+            3 * one,
+            "the snapshot is gone, the queue holds them"
+        );
+        // The ring moves on: dropping the GOP the queue holds frees nothing,
+        // so the next GOP is cut short instead.
+        assert_eq!(
+            ring.push(&recording.frame(120, true, 10), cap, || None),
+            None
+        );
+        assert!(
+            ring.push(&recording.frame(160, false, 10), cap, || None)
+                .is_some()
+        );
+        assert_eq!(ring.stats().unwrap().truncations, 1);
+        assert_eq!(shared.held(), cap);
+        assert!(queue.pop(Kind::Video).is_some());
+        assert_eq!(
+            shared.held(),
+            3 * one,
+            "the frame handed out gave its charge back"
+        );
+        assert_eq!(drain(&mut queue, Kind::Video, &recording), ["v40", "v80"]);
+        assert_eq!(shared.held(), one, "the ring's keyframe");
+
+        queue.prerecord(
+            Kind::Video,
+            &ring.snapshot(recording.at(0)).unwrap(),
+            recording.now(),
+        );
+        assert!(ring.clear());
+        assert_eq!(shared.held(), one, "the queue holds the keyframe");
+        drop(queue);
+        assert_eq!(shared.held(), 0, "a queue that goes gives its charges back");
+    }
+
+    #[test]
     fn the_pre_record_counts_nothing_and_the_live_frames_it_holds_are_dropped() {
         let recording = Recording::new();
         let gop = [
@@ -1100,7 +1188,7 @@ mod tests {
             recording.frame(40, false, 10),
             recording.frame(80, false, 10),
         ];
-        let cap = 2 * crate::prerecord::PRERECORD_FRAME_OVERHEAD + 20;
+        let cap = 2 * PRERECORD_FRAME_OVERHEAD + 20;
         let snapshot = snapshot(&recording, &gop, cap);
         assert!(snapshot.truncated());
         let mut queue = ReliableQueue::new(usize::MAX, true);

@@ -84,7 +84,8 @@ pub const DEFAULT_GOP_CACHE_FRAMES: usize = 1024;
 /// default address space (`limits.worker_address_space`, 1 GiB), from
 /// which the supervisor derives it. The window is a time
 /// (`prerecord_ms`), and what it holds follows the stream's bitrate; this
-/// bound on a connection's rings together only keeps a camera sending far
+/// bound on a connection's pre-record frames together, its rings' and those
+/// its recordings have not written yet, only keeps a camera sending far
 /// more than any real one (30 s above about 140 Mbit/s) from taking its
 /// worker's memory, so that camera gets a shorter pre-record instead.
 /// Nothing is held while no window is set.
@@ -117,12 +118,14 @@ pub struct TrackLimits {
     /// The GOP cache keeps only the keyframe once a GOP has more frames
     /// than this, keyframe included; a keyframe alone is always kept.
     pub gop_cache_frames: usize,
-    /// The pre-record rings of a connection's tracks (video, audio, derived
-    /// ones too) hold no more than this together, counted as
+    /// The pre-record frames of a connection's tracks (video, audio, derived
+    /// ones too) take no more than this together, counted as
     /// [`PRERECORD_FRAME_OVERHEAD`](crate::prerecord::PRERECORD_FRAME_OVERHEAD)
-    /// plus the payload per frame: a ring that pushes trims its own oldest
-    /// frames while they would hold more; a GOP larger than what is left
-    /// keeps only its start, until the next keyframe drops it.
+    /// plus the payload per frame, whoever holds them: the rings, and the
+    /// recordings that took them in a snapshot and have not written them yet. A
+    /// ring that pushes trims its own oldest frames while they would take
+    /// more; a GOP larger than what is left keeps only its start, until the
+    /// next keyframe drops it.
     pub prerecord_bytes: usize,
     /// Capacity of the packet broadcast, in packets. Zero is treated as one.
     pub packet_capacity: usize,
@@ -913,7 +916,8 @@ pub struct Track {
     /// only while a switch runs.
     prerecord: Mutex<Fed>,
     /// Shared by the connection's tracks, staging ones included: what
-    /// their rings hold together, which `prerecord_bytes` bounds, and the
+    /// their pre-record frames take together, which `prerecord_bytes` bounds,
+    /// and the
     /// oldest keyframe of the live set's `v0` ring, which the audio rings
     /// trim by, written only by that live `v0` ([`Self::leads_prerecord`]).
     /// Oldest by capture time ([`Prerecord::oldest`]), which a Sender Report
@@ -1332,7 +1336,7 @@ impl Track {
         self: &Arc<Self>,
         target: Instant,
     ) -> (TrackSubscription, Option<PrerecordSnapshot>, Arc<Codec>, u8) {
-        let fed = self.lock_prerecord();
+        let mut fed = self.lock_prerecord();
         let subscription = self.subscribe(Unit::Frames);
         let snapshot = fed.ring.snapshot(target);
         let codec = self.codec();
@@ -1556,6 +1560,7 @@ impl Track {
             tracing::debug!(
                 track = %self.id,
                 gop_bytes = truncation.gop_bytes,
+                held = truncation.held,
                 limit = self.limits.prerecord_bytes,
                 truncations = truncation.count,
                 "prerecord: GOP exceeds prerecord_bytes, keeping only its start"
@@ -3096,7 +3101,7 @@ mod tests {
         assert_eq!(
             lines[0].fields,
             format!(
-                " track=v0 gop_bytes={} limit={limit} truncations=1",
+                " track=v0 gop_bytes={0} held={0} limit={limit} truncations=1",
                 3 * cost(10)
             )
         );
