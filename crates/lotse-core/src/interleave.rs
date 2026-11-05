@@ -799,7 +799,7 @@ mod tests {
     /// A video ring holding `frames` (ms, keyframe), and its snapshot from
     /// the first; `cap` bounds it.
     fn snapshot(clip: &Clip, frames: &[Arc<MediaFrame>], cap: usize) -> PrerollSnapshot {
-        let mut ring = Preroll::new(frames.first().unwrap().keyframe);
+        let mut ring = Preroll::new(frames.first().unwrap().keyframe, Arc::default());
         ring.set_window(Some(Duration::from_secs(60)));
         for frame in frames {
             let _ = ring.push(frame, cap, || None);

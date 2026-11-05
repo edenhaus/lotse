@@ -31,7 +31,7 @@ use crate::clock_map::ticks_between;
 use crate::codec::{Codec, Kind};
 use crate::lateness::LatenessMeter;
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
-use crate::preroll::{Preroll, PrerollFloor, PrerollSnapshot, PrerollStats, Truncation};
+use crate::preroll::{Preroll, PrerollShared, PrerollSnapshot, PrerollStats, Truncation};
 use crate::throttle::Throttle;
 
 /// The id of a track within its stream: a kind letter and an index (`v0`,
@@ -84,17 +84,11 @@ pub const DEFAULT_GOP_CACHE_FRAMES: usize = 1024;
 /// default address space (`limits.worker_address_space`, 1 GiB), from
 /// which the supervisor derives it. The window is a time
 /// (`preroll_ms`), and what it holds follows the stream's bitrate; this
-/// bound only keeps a camera sending far more than any real one (30 s
-/// above about 140 Mbit/s) from taking its worker's memory, so that
-/// camera gets a shorter pre-roll instead. Nothing is held while no
-/// window is set.
+/// bound on a connection's rings together only keeps a camera sending far
+/// more than any real one (30 s above about 140 Mbit/s) from taking its
+/// worker's memory, so that camera gets a shorter pre-roll instead.
+/// Nothing is held while no window is set.
 pub const DEFAULT_PREROLL_BYTES: usize = 512 * 1024 * 1024;
-
-/// An audio track's pre-roll ring holds at most this share of
-/// [`TrackLimits::preroll_bytes`] (32 MiB of the default, 300 s of
-/// 850 kbit/s), so a worker's rings together, its video's and every audio
-/// track's (a derived one too), stay within its address space.
-pub const AUDIO_PREROLL_SHARE: usize = 16;
 
 /// Default packet broadcast capacity: ~500 ms at 4000 packets/s, which is
 /// a 40 Mbit/s stream in 1200-byte packets. The capacity is only the safety
@@ -123,11 +117,12 @@ pub struct TrackLimits {
     /// The GOP cache keeps only the keyframe once a GOP has more frames
     /// than this, keyframe included; a keyframe alone is always kept.
     pub gop_cache_frames: usize,
-    /// A video track's pre-roll ring holds no more than this, an audio
-    /// track's an [`AUDIO_PREROLL_SHARE`]th of it, counted as
+    /// The pre-roll rings of a connection's tracks (video, audio, derived
+    /// ones too) hold no more than this together, counted as
     /// [`PREROLL_FRAME_OVERHEAD`](crate::preroll::PREROLL_FRAME_OVERHEAD)
-    /// plus the payload per frame; a GOP larger than this keeps only its
-    /// start, until the next keyframe drops it.
+    /// plus the payload per frame: a ring that pushes trims its own oldest
+    /// frames while they would hold more; a GOP larger than what is left
+    /// keeps only its start, until the next keyframe drops it.
     pub preroll_bytes: usize,
     /// Capacity of the packet broadcast, in packets. Zero is treated as one.
     pub packet_capacity: usize,
@@ -917,12 +912,13 @@ pub struct Track {
     /// lock, a clip's start and a switch take it; the old source's task
     /// only while a switch runs.
     preroll: Mutex<Fed>,
-    /// The oldest keyframe of the live set's `v0` ring, which the audio
-    /// rings trim by; shared by the connection's tracks, staging ones
-    /// included, and written only by that live `v0`
-    /// ([`Self::leads_preroll`]). Oldest by capture time
-    /// ([`Preroll::oldest`]), which a Sender Report can move back.
-    preroll_floor: Arc<PrerollFloor>,
+    /// Shared by the connection's tracks, staging ones included: what
+    /// their rings hold together, which `preroll_bytes` bounds, and the
+    /// oldest keyframe of the live set's `v0` ring, which the audio rings
+    /// trim by, written only by that live `v0` ([`Self::leads_preroll`]).
+    /// Oldest by capture time ([`Preroll::oldest`]), which a Sender Report
+    /// can move back.
+    preroll_shared: Arc<PrerollShared>,
     /// Set by [`Track::close`]; subscriptions end and nothing is published.
     closed: AtomicBool,
     /// The instant `last_activity` counts from.
@@ -969,7 +965,7 @@ impl Track {
 
     /// [`Self::new`] as the source tagged `tag` of `feeds` writes it,
     /// forwarding into `forward_to` while that source is active; its
-    /// audio pre-roll trims by `preroll_floor`, which only a live set's `v0` writes.
+    /// audio pre-roll trims by `preroll_shared`, which only a live set's `v0` writes.
     #[expect(
         clippy::too_many_arguments,
         reason = "a constructor wiring the track into its set's feeds; called from the set alone"
@@ -983,7 +979,7 @@ impl Track {
         feeds: Arc<Feeds>,
         tag: u8,
         forward_to: Option<Arc<Self>>,
-        preroll_floor: Arc<PrerollFloor>,
+        preroll_shared: Arc<PrerollShared>,
     ) -> Self {
         let (packets, _no_receivers_yet) = broadcast::channel(limits.packet_capacity.max(1));
         let (frames, _no_receivers_yet) = broadcast::channel(limits.frame_capacity.max(1));
@@ -1005,10 +1001,10 @@ impl Track {
             oversize_drops: Mutex::new(Throttle::default()),
             codec_changes: Mutex::new(Throttle::default()),
             preroll: Mutex::new(Fed {
-                ring: Preroll::new(id.kind() == Kind::Video),
+                ring: Preroll::new(id.kind() == Kind::Video, Arc::clone(&preroll_shared)),
                 source: tag,
             }),
-            preroll_floor,
+            preroll_shared,
             closed: AtomicBool::new(false),
             origin,
             last_activity: AtomicU64::new(0),
@@ -1130,7 +1126,7 @@ impl Track {
         self.publish_control(TrackControlEvent::TrackChanged(Arc::clone(&codec)));
         drop(fed);
         if clears && self.leads_preroll() {
-            self.preroll_floor.set(None);
+            self.preroll_shared.set_floor(None);
         }
         let due = self
             .codec_changes
@@ -1248,7 +1244,7 @@ impl Track {
         self.publish_control(TrackControlEvent::SourceSwitched);
         drop(fed);
         if self.leads_preroll() {
-            self.preroll_floor.set(None);
+            self.preroll_shared.set_floor(None);
         }
         tracing::debug!(track = %self.id, "source switched: pre-roll dropped");
     }
@@ -1299,7 +1295,7 @@ impl Track {
             return;
         }
         if self.leads_preroll() {
-            self.preroll_floor.set(None);
+            self.preroll_shared.set_floor(None);
         }
         tracing::info!(track = %self.id, freed_bytes = freed, "preroll: window removed, ring freed");
     }
@@ -1347,7 +1343,7 @@ impl Track {
     fn free_preroll(&self) {
         let _previous = self.lock_preroll().ring.set_window(None);
         if self.leads_preroll() {
-            self.preroll_floor.set(None);
+            self.preroll_shared.set_floor(None);
         }
     }
 
@@ -1558,7 +1554,7 @@ impl Track {
             tracing::debug!(
                 track = %self.id,
                 gop_bytes = truncation.gop_bytes,
-                limit = self.preroll_limit(),
+                limit = self.limits.preroll_bytes,
                 truncations = truncation.count,
                 "preroll: GOP exceeds preroll_bytes, keeping only its start"
             );
@@ -1643,22 +1639,13 @@ impl Track {
     /// this is the leading ring; the GOP the ring cut short, if any, for
     /// the caller to log once the lock is released.
     fn update_preroll(&self, fed: &mut Fed, frame: &Arc<MediaFrame>) -> Option<Truncation> {
-        let truncation = fed
-            .ring
-            .push(frame, self.preroll_limit(), || self.preroll_floor.get());
+        let truncation = fed.ring.push(frame, self.limits.preroll_bytes, || {
+            self.preroll_shared.floor()
+        });
         if self.leads_preroll() && fed.ring.window().is_some() {
-            self.preroll_floor.set(fed.ring.oldest());
+            self.preroll_shared.set_floor(fed.ring.oldest());
         }
         truncation
-    }
-
-    /// What this track's pre-roll ring may hold: `preroll_bytes` for video,
-    /// an [`AUDIO_PREROLL_SHARE`]th of it for audio.
-    fn preroll_limit(&self) -> usize {
-        match self.kind() {
-            Kind::Video => self.limits.preroll_bytes,
-            Kind::Audio => self.limits.preroll_bytes / AUDIO_PREROLL_SHARE,
-        }
     }
 }
 
@@ -2699,42 +2686,63 @@ mod tests {
     }
 
     #[test]
-    fn the_pre_roll_is_bounded_to_512_mib_for_video_and_32_mib_for_audio_by_default() {
+    fn the_pre_roll_is_bounded_to_512_mib_per_connection_by_default() {
         assert_eq!(TrackLimits::default().preroll_bytes, 536_870_912);
-        assert_eq!(
-            TrackLimits::default().preroll_bytes / AUDIO_PREROLL_SHARE,
-            33_554_432
-        );
     }
 
     #[test]
-    fn an_audio_track_s_pre_roll_holds_a_sixteenth_of_the_bound() {
+    fn a_connection_s_rings_share_one_bound_and_a_closed_track_frees_its_share() {
         let t0 = SystemClock.now();
-        let limits = TrackLimits {
-            preroll_bytes: AUDIO_PREROLL_SHARE * 2 * cost_usize(10),
-            ..TrackLimits::default()
-        };
-        let audio = Track::new(
-            TrackId::new(Kind::Audio, 0),
-            Codec::Opus { channels: 2 },
-            48_000,
-            limits,
+        let one = 10 + PREROLL_FRAME_OVERHEAD;
+        let set = crate::source::TrackSet::new(
+            TrackLimits {
+                preroll_bytes: 6 * one,
+                ..TrackLimits::default()
+            },
             t0,
         );
-        let video = video_track(limits);
-        for track in [&audio, &video] {
+        let mut publisher = set.publisher();
+        let video = publisher.declare(
+            Kind::Video,
+            Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            90_000,
+        );
+        let audio = publisher.declare(Kind::Audio, Codec::Opus { channels: 2 }, 48_000);
+        for track in [&video, &audio] {
             track.set_preroll(Some(Duration::from_secs(10)));
-            for ms in [0, 20, 40, 60] {
-                assert!(track.publish_frame(timed(t0, ms, true, 10)));
-            }
         }
-        assert_eq!(preroll(&audio, t0), [40, 60], "two frames' worth");
-        assert_eq!(preroll(&video, t0), [0, 20, 40, 60], "the whole bound");
-    }
-
-    /// [`cost`] as the ring counts it, in `usize`.
-    fn cost_usize(bytes: usize) -> usize {
-        bytes + PREROLL_FRAME_OVERHEAD
+        for ms in [0, 20, 40, 60] {
+            assert!(video.publish_frame(timed(t0, ms, true, 10)));
+        }
+        for ms in [0, 20, 40, 60] {
+            assert!(audio.publish_frame(timed(t0, ms, true, 10)));
+        }
+        assert_eq!(preroll(&video, t0), [0, 20, 40, 60], "under the bound");
+        assert_eq!(
+            preroll(&audio, t0),
+            [40, 60],
+            "the audio holds what the video leaves of the bound"
+        );
+        assert!(video.publish_frame(timed(t0, 80, true, 10)));
+        assert_eq!(
+            preroll(&video, t0),
+            [20, 40, 60, 80],
+            "the video trims its own oldest to make room"
+        );
+        assert_eq!(video.preroll_shared.held(), 6 * one);
+        video.set_preroll(None);
+        assert_eq!(video.preroll_shared.held(), 2 * one, "the audio's share");
+        assert!(audio.publish_frame(timed(t0, 80, true, 10)));
+        assert_eq!(preroll(&audio, t0), [40, 60, 80], "room again");
+        drop(publisher);
+        drop(set);
+        let shared = Arc::clone(&audio.preroll_shared);
+        drop(audio);
+        assert_eq!(shared.held(), 0, "a ring that goes takes its share along");
     }
 
     #[test]
@@ -2820,7 +2828,7 @@ mod tests {
         let track = video_track(TrackLimits::default());
         track.set_preroll(Some(Duration::from_secs(10)));
         assert!(track.publish_frame(timed(t0, 0, true, 10)));
-        assert_eq!(track.preroll_floor.get(), Some(t0));
+        assert_eq!(track.preroll_shared.floor(), Some(t0));
         track.set_codec(Codec::H265 {
             vps: None,
             sps: None,
@@ -2830,7 +2838,7 @@ mod tests {
             preroll(&track, t0).is_empty(),
             "nothing before shares a clip"
         );
-        assert_eq!(track.preroll_floor.get(), None);
+        assert_eq!(track.preroll_shared.floor(), None);
         assert_eq!(
             track.stats().preroll,
             Some(PrerollStats::default()),
@@ -2853,7 +2861,10 @@ mod tests {
             [1000],
             "the same family keeps a video ring: its keyframes carry their parameter sets"
         );
-        assert_eq!(track.preroll_floor.get(), Some(t0 + Duration::from_secs(1)));
+        assert_eq!(
+            track.preroll_shared.floor(),
+            Some(t0 + Duration::from_secs(1))
+        );
     }
 
     #[test]
@@ -2887,6 +2898,7 @@ mod tests {
             preroll(&track, t0).is_empty(),
             "the old frames need the old AudioSpecificConfig"
         );
+        assert_eq!(track.preroll_shared.held(), 0, "and leave the shared count");
         assert_eq!(
             track.stats().preroll,
             Some(PrerollStats::default()),
@@ -2923,11 +2935,11 @@ mod tests {
         let track = video_track(TrackLimits::default());
         track.set_preroll(Some(Duration::from_secs(10)));
         assert!(track.publish_frame(timed(t0, 0, true, 10)));
-        assert_eq!(track.preroll_floor.get(), Some(t0));
+        assert_eq!(track.preroll_shared.floor(), Some(t0));
         track.close();
         assert_eq!(track.stats().preroll, None);
         assert!(track.preroll_snapshot(t0).is_none());
-        assert_eq!(track.preroll_floor.get(), None);
+        assert_eq!(track.preroll_shared.floor(), None);
     }
 
     #[test]
@@ -3107,7 +3119,10 @@ mod tests {
         }
         let video_from = |target: u64| preroll(&video, t0 + Duration::from_millis(target));
         assert_eq!(video_from(0).first(), Some(&2000));
-        assert_eq!(audio.preroll_floor.get(), Some(t0 + Duration::from_secs(2)));
+        assert_eq!(
+            audio.preroll_shared.floor(),
+            Some(t0 + Duration::from_secs(2))
+        );
         assert_eq!(
             preroll(&audio, t0 + Duration::from_millis(2000)),
             (2000..=3000).step_by(200).collect::<Vec<_>>(),
@@ -3118,17 +3133,20 @@ mod tests {
         // Another video track and the audio track never move the floor.
         assert!(second.publish_frame(timed(t0, 3100, true, 10)));
         assert!(audio.publish_frame(timed(t0, 3200, true, 10)));
-        assert_eq!(video.preroll_floor.get(), Some(t0 + Duration::from_secs(2)));
+        assert_eq!(
+            video.preroll_shared.floor(),
+            Some(t0 + Duration::from_secs(2))
+        );
 
         // Without the video's window, the audio keeps its own.
         video.set_preroll(None);
-        assert_eq!(audio.preroll_floor.get(), None);
+        assert_eq!(audio.preroll_shared.floor(), None);
         assert!(audio.publish_frame(timed(t0, 3400, true, 10)));
         assert_eq!(preroll(&audio, t0).first(), Some(&2400));
         // An audio track without a window never moves it either.
         audio.set_preroll(None);
         assert!(audio.publish_frame(timed(t0, 3600, true, 10)));
-        assert_eq!(audio.preroll_floor.get(), None);
+        assert_eq!(audio.preroll_shared.floor(), None);
     }
 
     #[test]
@@ -3157,7 +3175,7 @@ mod tests {
         for ms in (0..=1000).step_by(200) {
             assert!(audio.publish_frame(timed(t0, ms, true, 10)));
         }
-        assert_eq!(video.preroll_floor.get(), Some(t0));
+        assert_eq!(video.preroll_shared.floor(), Some(t0));
         assert_eq!(preroll(&audio, t0), [0, 200, 400, 600, 800, 1000]);
     }
 
@@ -3201,7 +3219,7 @@ mod tests {
             [11_000, 11_100, 11_200],
             "the audio playing at the second keyframe stays"
         );
-        assert_eq!(video.preroll_floor.get(), Some(at(1000)));
+        assert_eq!(video.preroll_shared.floor(), Some(at(1000)));
     }
 
     #[test]
@@ -3231,7 +3249,7 @@ mod tests {
             }
         }
         let floor = Some(t0 + Duration::from_secs(2));
-        assert_eq!(video.preroll_floor.get(), floor);
+        assert_eq!(video.preroll_shared.floor(), floor);
 
         // The standby changes family between live video and audio frames.
         standby.set_codec(Codec::H265 {
@@ -3246,7 +3264,7 @@ mod tests {
         );
         assert_eq!(video.codec().family(), CodecFamily::H264);
         assert_eq!(
-            video.preroll_floor.get(),
+            video.preroll_shared.floor(),
             floor,
             "the live ring is unchanged"
         );
@@ -3261,7 +3279,7 @@ mod tests {
         standby.set_preroll(Some(Duration::from_secs(1)));
         standby.set_preroll(None);
         standby.close();
-        assert_eq!(video.preroll_floor.get(), floor);
+        assert_eq!(video.preroll_shared.floor(), floor);
         assert_eq!(preroll(&video, t0).first(), Some(&2000));
     }
 
@@ -3294,12 +3312,15 @@ mod tests {
         let stats = track.stats();
         assert_eq!(stats.frames_dropped_oversize, 1);
         assert_eq!(stats.preroll.unwrap().truncations, 0, "the track counts it");
-        assert_eq!(track.preroll_floor.get(), Some(t0), "the floor stays");
+        assert_eq!(track.preroll_shared.floor(), Some(t0), "the floor stays");
 
         assert!(track.publish_frame(timed(t0, 2000, true, 10)));
         assert_eq!(preroll(&track, t0), [2000], "the ring starts again");
         assert!(!track.preroll_snapshot(t0).unwrap().truncated());
-        assert_eq!(track.preroll_floor.get(), Some(t0 + Duration::from_secs(2)));
+        assert_eq!(
+            track.preroll_shared.floor(),
+            Some(t0 + Duration::from_secs(2))
+        );
     }
 
     #[test]
@@ -3344,7 +3365,7 @@ mod tests {
             "the lost keyframe's GOP stays out"
         );
         assert!(video.preroll_snapshot(t0).unwrap().truncated());
-        assert_eq!(video.preroll_floor.get(), Some(t0));
+        assert_eq!(video.preroll_shared.floor(), Some(t0));
         assert_eq!(
             preroll(&audio, t0),
             [0, 500, 1000, 1500],
@@ -3354,7 +3375,10 @@ mod tests {
 
         assert!(video.publish_frame(timed(t0, 2000, true, 10)));
         assert_eq!(preroll(&video, t0), [2000]);
-        assert_eq!(video.preroll_floor.get(), Some(t0 + Duration::from_secs(2)));
+        assert_eq!(
+            video.preroll_shared.floor(),
+            Some(t0 + Duration::from_secs(2))
+        );
         for ms in [2000, 2500] {
             assert!(audio.publish_frame(timed(t0, ms, true, 10)));
         }

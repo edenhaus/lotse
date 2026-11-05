@@ -721,7 +721,7 @@
             },
             "preroll_ms": {
               "default": 0,
-              "description": "Keep the last `preroll_ms` milliseconds of the stream's media in\nmemory, so a `clip/start` can begin before it was asked for; 0, the\ndefault, keeps none. At most `limits.preroll_max_ms`. What it holds\nfollows the stream's bitrate; only a stream far above any real\ncamera's reaches `limits.preroll_bytes` (an audio track a 16th of\nit) and holds a shorter window (`stream/get` reports it). Not a reason to\nconnect: the window fills only while `preload` or a viewer keeps\nthe source connected. Changing only this never reconnects.",
+              "description": "Keep the last `preroll_ms` milliseconds of the stream's media in\nmemory, so a `clip/start` can begin before it was asked for; 0, the\ndefault, keeps none. At most `limits.preroll_max_ms`. What it holds\nfollows the stream's bitrate; only a stream far above any real\ncamera's reaches `limits.preroll_bytes`, its tracks together, and\nholds a shorter window (`stream/get` reports it). Not a reason to\nconnect: the window fills only while `preload` or a viewer keeps\nthe source connected. Changing only this never reconnects.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -1911,7 +1911,7 @@
         },
         "preroll_bytes": {
           "default": 0,
-          "description": "The memory one video track's pre-roll ring may hold, in bytes (an\naudio track's: a 16th): no setting but half the worker's address\nspace, a bound only a stream far above any real camera's bitrate\nreaches, which then holds a shorter window than `preroll_ms`.",
+          "description": "The memory a stream's pre-roll may hold, all its tracks together,\nin bytes: no setting but half the worker's address space, a bound\nonly a stream far above any real camera's bitrate reaches, which\nthen holds a shorter window than `preroll_ms`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -3523,7 +3523,7 @@
       "description": "A track's pre-roll ring, as `stream/get` reports it: whole GOPs of the\nnewest media, kept for clips while the stream has a window.",
       "properties": {
         "bytes": {
-          "description": "The memory the ring holds: its frames' payloads plus a fixed cost\nper frame, at most `limits.preroll_bytes` (an audio track a 16th of\nit). The open GOP is also in\nthe track's GOP cache, so the two overlap; the frames are shared,\nnot copied.",
+          "description": "The memory the ring holds: its frames' payloads plus a fixed cost\nper frame; the stream's tracks hold at most `limits.preroll_bytes`\ntogether. The open GOP is also in\nthe track's GOP cache, so the two overlap; the frames are shared,\nnot copied.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

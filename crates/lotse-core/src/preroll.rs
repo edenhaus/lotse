@@ -52,6 +52,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -177,23 +178,62 @@ impl fmt::Debug for PrerollSnapshot {
     }
 }
 
-/// The oldest capture time of any keyframe a connection's leading video
-/// ring holds, but never later than its arrival ([`Preroll::oldest`]),
-/// which its audio rings trim by. Shared by every track of the connection;
-/// written by the video track's source task, read by the audio tracks', so
-/// the lock is never held for more than a copy.
+/// What every ring of one connection shares: the floor its audio rings
+/// trim by, and what its rings hold together, which the one bound of
+/// `preroll_bytes` applies to. Written by the tracks' source tasks: the
+/// floor's lock is never held for more than a copy, and the count is
+/// atomic.
 #[derive(Debug, Default)]
-pub(crate) struct PrerollFloor(Mutex<Option<Instant>>);
+pub(crate) struct PrerollShared {
+    /// The oldest capture time of any keyframe the connection's leading
+    /// video ring holds, but never later than its arrival
+    /// ([`Preroll::oldest`]); `None` while it holds nothing.
+    floor: Mutex<Option<Instant>>,
+    /// What the connection's rings hold together, as each counts its
+    /// frames ([`cost`]).
+    held: AtomicUsize,
+}
 
-impl PrerollFloor {
+impl PrerollShared {
     /// The video ring's floor, `None` while it holds nothing.
-    pub(crate) fn get(&self) -> Option<Instant> {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    pub(crate) fn floor(&self) -> Option<Instant> {
+        *self.floor.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Records the video ring's floor ([`Preroll::oldest`]).
-    pub(crate) fn set(&self, oldest: Option<Instant>) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = oldest;
+    pub(crate) fn set_floor(&self, oldest: Option<Instant>) {
+        *self.floor.lock().unwrap_or_else(PoisonError::into_inner) = oldest;
+    }
+
+    /// What the connection's rings hold together.
+    pub(crate) fn held(&self) -> usize {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    /// A ring took `bytes` more.
+    fn add(&self, bytes: usize) {
+        let _previous = self
+            .held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_add(bytes))
+            });
+    }
+
+    /// A ring let `bytes` go.
+    fn sub(&self, bytes: usize) {
+        let _previous = self
+            .held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_sub(bytes))
+            });
+    }
+}
+
+/// A ring that goes (its track closed or replaced) leaves the
+/// connection's `held` without its frames.
+impl Drop for Preroll {
+    fn drop(&mut self) {
+        self.shared.sub(self.bytes);
     }
 }
 
@@ -281,6 +321,9 @@ pub(crate) struct Preroll {
     run: FloorRun,
     /// What `frames` counts against `preroll_bytes`.
     bytes: usize,
+    /// What this connection's rings share; `bytes` is this ring's part of
+    /// its `held`.
+    shared: Arc<PrerollShared>,
     /// The newest GOP outgrew `preroll_bytes` or lost a frame the track
     /// dropped ([`Self::frame_dropped`]); its frames are dropped until
     /// the next keyframe, which drops the GOP too, so no older GOP held
@@ -297,8 +340,9 @@ pub(crate) struct Preroll {
 }
 
 impl Preroll {
-    /// An empty ring without a window.
-    pub(crate) fn new(video: bool) -> Self {
+    /// An empty ring without a window, one of the connection's that share
+    /// `shared`.
+    pub(crate) fn new(video: bool, shared: Arc<PrerollShared>) -> Self {
         Self {
             video,
             window: None,
@@ -306,6 +350,7 @@ impl Preroll {
             floor_keys: VecDeque::new(),
             run: FloorRun::default(),
             bytes: 0,
+            shared,
             truncated: false,
             truncations: 0,
             truncation_log: Throttle::default(),
@@ -326,7 +371,7 @@ impl Preroll {
             self.frames = VecDeque::new();
             self.floor_keys = VecDeque::new();
             self.run = FloorRun::default();
-            self.bytes = 0;
+            self.release_all();
         }
         std::mem::replace(&mut self.window, window)
     }
@@ -339,12 +384,18 @@ impl Preroll {
         self.frames.clear();
         self.floor_keys.clear();
         self.run = FloorRun::default();
-        self.bytes = 0;
+        self.release_all();
         held
     }
 
+    /// Counts nothing held any more, here and in the connection's `held`.
+    fn release_all(&mut self) {
+        self.shared.sub(self.bytes);
+        self.bytes = 0;
+    }
+
     /// The oldest capture time of any keyframe held, which the audio rings
-    /// trim by ([`PrerollFloor`]): the oldest keyframe's, unless a Sender
+    /// trim by ([`PrerollShared::floor`]): the oldest keyframe's, unless a Sender
     /// Report correcting the mapping back (RFC 3550 §6.4.1) dated a later
     /// one before it, whose audio a clip from it plays as well. Never later
     /// than the keyframe arrived, as [`PrerollSnapshot::age`] counts: a
@@ -357,8 +408,9 @@ impl Preroll {
 
     /// Takes `frame`, just published, and trims; `floor` is asked, on an
     /// audio ring only, for the video ring's floor ([`Self::oldest`]). Nothing
-    /// without a window. `Some` when a GOP outgrew `cap` and its line is
-    /// due.
+    /// without a window. `cap` bounds what the connection's rings hold
+    /// together: this ring holds at most what the others leave of it.
+    /// `Some` when a GOP outgrew that and its line is due.
     pub(crate) fn push(
         &mut self,
         frame: &Arc<MediaFrame>,
@@ -366,6 +418,8 @@ impl Preroll {
         floor: impl FnOnce() -> Option<Instant>,
     ) -> Option<Truncation> {
         let window = self.window?;
+        let others = self.shared.held().saturating_sub(self.bytes);
+        let cap = cap.saturating_sub(others);
         if self.video {
             self.push_video(frame, window, cap)
         } else {
@@ -581,6 +635,7 @@ impl Preroll {
     fn append(&mut self, frame: &Arc<MediaFrame>, cost: usize) {
         self.frames.push_back(Arc::clone(frame));
         self.bytes = self.bytes.saturating_add(cost);
+        self.shared.add(cost);
     }
 
     /// Takes `keyframe`, just held, into `floor_keys`: the keyframes held
@@ -605,7 +660,9 @@ impl Preroll {
         let count = count.min(self.frames.len());
         self.run.dropped(count);
         for frame in self.frames.drain(..count) {
-            self.bytes = self.bytes.saturating_sub(cost(&frame));
+            let cost = cost(&frame);
+            self.bytes = self.bytes.saturating_sub(cost);
+            self.shared.sub(cost);
             if self
                 .floor_keys
                 .front()
@@ -755,7 +812,7 @@ mod tests {
     }
 
     fn ring(video: bool, window_ms: u64) -> Preroll {
-        let mut ring = Preroll::new(video);
+        let mut ring = Preroll::new(video, Arc::default());
         assert_eq!(
             ring.set_window(Some(Duration::from_millis(window_ms))),
             None
@@ -815,7 +872,7 @@ mod tests {
     #[test]
     fn a_video_ring_holds_nothing_before_its_first_keyframe_or_without_a_window() {
         let clip = Clip::new();
-        let mut ring = Preroll::new(true);
+        let mut ring = Preroll::new(true, Arc::default());
         assert_eq!(
             ring.push(&clip.frame(0, true, 10), usize::MAX, || None),
             None
@@ -1743,12 +1800,12 @@ mod tests {
 
     #[test]
     fn the_floor_holds_what_was_set_last() {
-        let floor = PrerollFloor::default();
-        assert_eq!(floor.get(), None);
+        let shared = PrerollShared::default();
+        assert_eq!(shared.floor(), None);
         let at = SystemClock.now();
-        floor.set(Some(at));
-        assert_eq!(floor.get(), Some(at));
-        floor.set(None);
-        assert_eq!(floor.get(), None);
+        shared.set_floor(Some(at));
+        assert_eq!(shared.floor(), Some(at));
+        shared.set_floor(None);
+        assert_eq!(shared.floor(), None);
     }
 }

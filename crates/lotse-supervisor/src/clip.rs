@@ -131,8 +131,8 @@ pub struct ClipLimits {
     /// `limits.preroll_max_ms`: the longest window `stream/put` may ask
     /// for, and the furthest back a clip's `before_ms` may ask.
     pub preroll_max_ms: u32,
-    /// What one video track's ring may hold (an audio track's a 16th):
-    /// no setting, half of `limits.worker_address_space`
+    /// What a stream's rings, all its tracks', may hold together: no
+    /// setting, half of `limits.worker_address_space`
     /// ([`ClipLimits::preroll_bytes_for`]); the worker's bound, which
     /// `info` reports as `limits.preroll_bytes`.
     pub preroll_bytes: u64,
@@ -160,7 +160,7 @@ impl ClipLimits {
     /// The defaults: a 5-minute window at most and 1-hour clips (the
     /// worker's `DEFAULT_CLIP_MAX`), so a client's record call that asks
     /// up to 5 minutes before an event and up to an hour after it is never
-    /// refused; 512 MiB per video track (core's `DEFAULT_PREROLL_BYTES`,
+    /// refused; 512 MiB per stream (core's `DEFAULT_PREROLL_BYTES`,
     /// [`ClipLimits::preroll_bytes_for`] the default worker address
     /// space), a bound no real camera's window reaches; an 8 MiB queue (core's
     /// `DEFAULT_CLIP_QUEUE_BYTES`), 10 s to fetch, 10 s to start (the
@@ -177,11 +177,10 @@ impl ClipLimits {
     };
 
     /// The pre-roll's byte bound for workers limited to
-    /// `worker_address_space`: half of it for a video track's ring, so the
-    /// window, a time, is what decides what a ring holds, and a camera
+    /// `worker_address_space`: half of it for a stream's rings together,
+    /// so the window, a time, is what decides what they hold, and a camera
     /// sending far more than any real one gets a shorter pre-roll instead
-    /// of taking its worker's memory; the audio tracks' rings (a 16th each,
-    /// core's `AUDIO_PREROLL_SHARE`) and the rest of the worker fit in the
+    /// of taking its worker's memory; the rest of the worker fits in the
     /// other half.
     #[must_use]
     pub const fn preroll_bytes_for(worker_address_space: u64) -> u64 {

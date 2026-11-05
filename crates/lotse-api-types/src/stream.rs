@@ -310,8 +310,8 @@ pub struct TrackInfo {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct TrackPreroll {
     /// The memory the ring holds: its frames' payloads plus a fixed cost
-    /// per frame, at most `limits.preroll_bytes` (an audio track a 16th of
-    /// it). The open GOP is also in
+    /// per frame; the stream's tracks hold at most `limits.preroll_bytes`
+    /// together. The open GOP is also in
     /// the track's GOP cache, so the two overlap; the frames are shared,
     /// not copied.
     pub bytes: u64,
