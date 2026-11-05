@@ -131,8 +131,9 @@ pub struct ClipLimits {
     /// `limits.preroll_max_ms`: the longest window `stream/put` may ask
     /// for, and the furthest back a clip's `before_ms` may ask.
     pub preroll_max_ms: u32,
-    /// What a stream's rings, all its tracks', may hold together: no
-    /// setting, half of `limits.worker_address_space`
+    /// What a stream's pre-roll frames may take together, all its tracks'
+    /// rings and the frames its clips took from them and have not written
+    /// yet: no setting, half of `limits.worker_address_space`
     /// ([`ClipLimits::preroll_bytes_for`]); the worker's bound, which
     /// `info` reports as `limits.preroll_bytes`.
     pub preroll_bytes: u64,
@@ -177,11 +178,12 @@ impl ClipLimits {
     };
 
     /// The pre-roll's byte bound for workers limited to
-    /// `worker_address_space`: half of it for a stream's rings together,
-    /// so the window, a time, is what decides what they hold, and a camera
-    /// sending far more than any real one gets a shorter pre-roll instead
-    /// of taking its worker's memory; the rest of the worker fits in the
-    /// other half.
+    /// `worker_address_space`: half of it for a stream's pre-roll frames
+    /// together, its rings' and its clips' not yet written, so the window,
+    /// a time, is what decides what they hold, and a camera sending far
+    /// more than any real one, or clips writing slower than it sends, get
+    /// a shorter pre-roll instead of taking the worker's memory; the rest
+    /// of the worker fits in the other half.
     #[must_use]
     pub const fn preroll_bytes_for(worker_address_space: u64) -> u64 {
         worker_address_space / 2

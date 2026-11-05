@@ -14,9 +14,10 @@
 //! Invariants: the producer never waits, so a frame that does not fit is
 //! dropped, never held back. A live frame counts its payload plus
 //! [`QUEUED_FRAME_OVERHEAD`] against the bound; a pre-roll frame counts
-//! nothing, since its ring bounded it by `preroll_bytes` already, and the
-//! live frames the pre-roll holds too are dropped, so none is written
-//! twice. The snapshot must start at a frame the track published before the
+//! nothing against it, since it stays counted against the stream's
+//! `preroll_bytes` until it is handed out (the queue keeps its charge, see
+//! [`crate::preroll`]), and the live frames the pre-roll holds too are
+//! dropped, so none is written twice. The snapshot must start at a frame the track published before the
 //! clip subscribed, which
 //! [`Track::subscribe_from_preroll`](crate::track::Track::subscribe_from_preroll)
 //! guarantees: a live frame published before the snapshot's start could not
@@ -42,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use crate::codec::Kind;
 use crate::media::MediaFrame;
-use crate::preroll::{PrerollSnapshot, captured};
+use crate::preroll::{PrerollCharge, PrerollSnapshot, captured};
 use crate::throttle::Throttle;
 use crate::track::TrackEvent;
 
@@ -143,6 +144,10 @@ struct Item {
     /// What it counts against the bound: nothing for a pre-roll frame, a
     /// gap or a control event.
     cost: usize,
+    /// A pre-roll frame's charge against the stream's `preroll_bytes`,
+    /// kept until the frame is handed out, so the frames a slow clip has
+    /// not written yet count there; `None` for anything else.
+    charge: Option<Arc<PrerollCharge>>,
 }
 
 impl Item {
@@ -319,17 +324,25 @@ impl Lane {
             entry: Entry::Control(event),
             queued,
             cost: 0,
+            charge: None,
         });
     }
 
-    /// Queues `frame`, which counts `cost`.
-    fn queue_frame(&mut self, frame: Arc<MediaFrame>, queued: Instant, cost: usize) {
+    /// Queues `frame`, which counts `cost`, with its pre-roll `charge`.
+    fn queue_frame(
+        &mut self,
+        frame: Arc<MediaFrame>,
+        queued: Instant,
+        cost: usize,
+        charge: Option<Arc<PrerollCharge>>,
+    ) {
         self.started = true;
         self.last = Some(frame.wallclock);
         self.items.push_back(Item {
             entry: Entry::Frame(frame),
             queued,
             cost,
+            charge,
         });
     }
 }
@@ -385,8 +398,10 @@ impl ReliableQueue {
         }
     }
 
-    /// Queues the pre-roll `track` starts from, counting nothing, before
-    /// any live item of the track: the snapshot starts at a frame published
+    /// Queues the pre-roll `track` starts from, counting nothing against
+    /// the queue's bound, before any live item of the track; each frame
+    /// keeps its charge against the stream's `preroll_bytes` until it is
+    /// handed out: the snapshot starts at a frame published
     /// before the clip subscribed
     /// ([`Track::subscribe_from_preroll`](crate::track::Track::subscribe_from_preroll)),
     /// so the live frames it holds too come first and are dropped as they
@@ -403,9 +418,14 @@ impl ReliableQueue {
             tracing::debug!(%track, "clip queue: pre-roll ignored, the track takes nothing now");
             return;
         }
-        for frame in snapshot.frames() {
-            lane.reached = Some(captured(frame));
-            lane.queue_frame(Arc::clone(frame), now, 0);
+        for held in snapshot.charged() {
+            lane.reached = Some(captured(&held.frame));
+            lane.queue_frame(
+                Arc::clone(&held.frame),
+                now,
+                0,
+                Some(Arc::clone(&held.charge)),
+            );
         }
         lane.duplicates = snapshot.frames().cloned().collect();
         if snapshot.truncated() {
@@ -483,9 +503,10 @@ impl ReliableQueue {
                 },
                 queued: now,
                 cost: 0,
+                charge: None,
             });
         }
-        lane.queue_frame(frame, now, cost);
+        lane.queue_frame(frame, now, cost, None);
         self.bytes = self.bytes.saturating_add(cost);
     }
 
@@ -560,11 +581,19 @@ impl ReliableQueue {
             })
     }
 
-    /// The oldest item `track` queued, taken out.
+    /// The oldest item `track` queued, taken out. A pre-roll frame's charge
+    /// goes with it: the stream's bound no longer counts what the clip
+    /// writes now.
     pub fn pop(&mut self, track: Kind) -> Option<Out> {
-        let item = self.lane_mut(track).items.pop_front()?;
-        self.bytes = self.bytes.saturating_sub(item.cost);
-        Some(match item.entry {
+        let Item {
+            entry,
+            cost,
+            charge,
+            ..
+        } = self.lane_mut(track).items.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(cost);
+        drop(charge);
+        Some(match entry {
             Entry::Frame(frame) => Out::Frame { track, frame },
             Entry::Gap { reason, from, to } => Out::Gap {
                 track,
@@ -679,7 +708,7 @@ mod tests {
     use crate::clock::{Clock as _, FakeClock};
     use crate::codec::Codec;
     use crate::media::MediaTime;
-    use crate::preroll::Preroll;
+    use crate::preroll::{PREROLL_FRAME_OVERHEAD, Preroll};
     use crate::track::{Track, TrackId, TrackLimits, TrackSubscription, Unit};
 
     const SKEW: Duration = Duration::from_secs(1);
@@ -1029,6 +1058,54 @@ mod tests {
     }
 
     #[test]
+    fn the_pre_roll_stays_counted_against_the_stream_until_it_is_handed_out() {
+        let clip = Clip::new();
+        let shared = Arc::default();
+        let mut ring = Preroll::new(true, Arc::clone(&shared));
+        ring.set_window(Some(Duration::from_secs(60)));
+        let one = 10 + PREROLL_FRAME_OVERHEAD;
+        let cap = 4 * one;
+        for frame in [
+            clip.frame(0, true, 10),
+            clip.frame(40, false, 10),
+            clip.frame(80, false, 10),
+        ] {
+            assert_eq!(ring.push(&frame, cap, || None), None);
+        }
+        let mut queue = ReliableQueue::new(usize::MAX, false);
+        queue.preroll(Kind::Video, &ring.snapshot(clip.at(0)).unwrap(), clip.now());
+        assert_eq!(queue.bytes(), 0, "nothing against the queue's bound");
+        assert_eq!(
+            shared.held(),
+            3 * one,
+            "the snapshot is gone, the queue holds them"
+        );
+        // The ring moves on: dropping the GOP the queue holds frees nothing,
+        // so the next GOP is cut short instead.
+        assert_eq!(ring.push(&clip.frame(120, true, 10), cap, || None), None);
+        assert!(
+            ring.push(&clip.frame(160, false, 10), cap, || None)
+                .is_some()
+        );
+        assert_eq!(ring.stats().unwrap().truncations, 1);
+        assert_eq!(shared.held(), cap);
+        assert!(queue.pop(Kind::Video).is_some());
+        assert_eq!(
+            shared.held(),
+            3 * one,
+            "the frame handed out gave its charge back"
+        );
+        assert_eq!(drain(&mut queue, Kind::Video, &clip), ["v40", "v80"]);
+        assert_eq!(shared.held(), one, "the ring's keyframe");
+
+        queue.preroll(Kind::Video, &ring.snapshot(clip.at(0)).unwrap(), clip.now());
+        assert!(ring.clear());
+        assert_eq!(shared.held(), one, "the queue holds the keyframe");
+        drop(queue);
+        assert_eq!(shared.held(), 0, "a queue that goes gives its charges back");
+    }
+
+    #[test]
     fn the_pre_roll_counts_nothing_and_the_live_frames_it_holds_are_dropped() {
         let clip = Clip::new();
         let gop = [
@@ -1082,7 +1159,7 @@ mod tests {
             clip.frame(40, false, 10),
             clip.frame(80, false, 10),
         ];
-        let cap = 2 * crate::preroll::PREROLL_FRAME_OVERHEAD + 20;
+        let cap = 2 * PREROLL_FRAME_OVERHEAD + 20;
         let snapshot = snapshot(&clip, &gop, cap);
         assert!(snapshot.truncated());
         let mut queue = ReliableQueue::new(usize::MAX, true);

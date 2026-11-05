@@ -49,9 +49,11 @@ pub struct Limits {
     #[serde(default)]
     pub preroll_max_ms: u32,
     /// The memory a stream's pre-roll may hold, all its tracks together,
-    /// in bytes: no setting but half the worker's address space, a bound
-    /// only a stream far above any real camera's bitrate reaches, which
-    /// then holds a shorter window than `preroll_ms`.
+    /// in bytes, the frames its clips took and have not written yet
+    /// included: no setting but half the worker's address space, a bound
+    /// only a stream far above any real camera's bitrate reaches, or one
+    /// whose clips write slower than it sends, which then holds a shorter
+    /// window than `preroll_ms`.
     #[serde(default)]
     pub preroll_bytes: u64,
     /// The longest clip, in milliseconds: the most `after_ms` may ask, and

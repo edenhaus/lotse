@@ -87,8 +87,9 @@ pub(crate) struct WorkerArgs {
     #[arg(long, value_name = "PORT,...", value_delimiter = ',')]
     pub(crate) connect_ports: Vec<u16>,
 
-    /// What a stream's pre-roll rings may hold together: half the
-    /// daemon's `limits.worker_address_space`.
+    /// What a stream's pre-roll frames may take together, its rings' and
+    /// those its clips have not written yet: half the daemon's
+    /// `limits.worker_address_space`.
     #[arg(long, value_name = "BYTES", default_value_t = lotse_core::track::DEFAULT_PREROLL_BYTES)]
     pub(crate) preroll_bytes: usize,
 

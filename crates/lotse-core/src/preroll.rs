@@ -43,6 +43,20 @@
 //! keyframe.
 //! Every frame is charged its payload plus [`PREROLL_FRAME_OVERHEAD`], so a
 //! camera sending tiny frames cannot hold more memory than the bound says.
+//! The charge goes with the frame, not the ring (`PrerollCharge`): taken
+//! as the ring holds it, in the ring's slot, so a full ring allocates
+//! nothing per frame; shared, the first time a snapshot takes the frame,
+//! with the snapshots and the clip queues that hold it after; and given
+//! back when the last of them lets it go. So the
+//! connection's count is what its pre-roll frames take in memory, whoever
+//! holds them, and a ring that pushes trims until the count fits
+//! `preroll_bytes`: dropping a frame a clip still holds frees nothing, so
+//! while a slow clip holds an old snapshot the live ring holds that much
+//! less, and its GOPs are truncated rather than the worker running out of
+//! memory. A ring counts the frame it pushes before it reads the count, so
+//! of rings pushing at once the one that reads last sees every frame the
+//! others pushed and trims to fit, and the bound holds once they are done,
+//! past the newest start each ring always keeps.
 //! Every trim drops a prefix in one pass that stops where the kept frames
 //! begin, so it costs what it drops; an audio ring's trim by the floor
 //! remembers the frames it keeps that arrived before the floor, dated
@@ -61,10 +75,12 @@ use crate::throttle::Throttle;
 
 /// What a held frame costs beyond its payload: the `MediaFrame` and its
 /// `Arc` counts, which the ring keeps alive after every other holder has
-/// let go, and the ring's slot.
+/// let go, the ring's slot, and the charge a snapshot shares, with its
+/// `Arc` counts.
 pub const PREROLL_FRAME_OVERHEAD: usize = size_of::<MediaFrame>()
-    .saturating_add(2_usize.saturating_mul(size_of::<usize>()))
-    .saturating_add(size_of::<Arc<MediaFrame>>());
+    .saturating_add(size_of::<PrerollCharge>())
+    .saturating_add(4_usize.saturating_mul(size_of::<usize>()))
+    .saturating_add(size_of::<RingFrame>());
 
 /// What `frame` counts against `preroll_bytes`.
 fn cost(frame: &MediaFrame) -> usize {
@@ -84,7 +100,9 @@ pub fn captured(frame: &MediaFrame) -> Instant {
 pub struct PrerollStats {
     /// What the held frames count against `preroll_bytes`: their payload
     /// plus [`PREROLL_FRAME_OVERHEAD`] each. A video ring shares its open
-    /// GOP with the GOP cache, so the two overlap.
+    /// GOP with the GOP cache, so the two overlap. The ring's own: frames
+    /// it dropped that a clip has not written yet still count against the
+    /// bound, but not here.
     pub bytes: u64,
     /// The capture time from the oldest held frame (a keyframe, on video)
     /// to the newest: how far back a clip can start now.
@@ -98,12 +116,13 @@ pub struct PrerollStats {
 
 /// A copy of a ring's frames from a chosen start to the newest: the
 /// pre-roll a clip begins with. Holds the frames, not the ring, so the
-/// track keeps publishing while the clip reads it.
+/// track keeps publishing while the clip reads it, and their charges, so
+/// they count against the connection's bound while it holds them.
 pub struct PrerollSnapshot {
     /// The first frame: a keyframe on video.
-    start: Arc<MediaFrame>,
+    start: ChargedFrame,
     /// The frames after `start`, in the order the track published them.
-    following: Vec<Arc<MediaFrame>>,
+    following: Vec<ChargedFrame>,
     /// The ring stopped holding the newest GOP because it outgrew
     /// `preroll_bytes` or lost a frame the track dropped: the live frames
     /// after the snapshot's last one are not the next of its GOP, so a
@@ -114,11 +133,17 @@ pub struct PrerollSnapshot {
 impl PrerollSnapshot {
     /// The first frame: on video the chosen keyframe.
     pub const fn start(&self) -> &Arc<MediaFrame> {
-        &self.start
+        &self.start.frame
     }
 
     /// Every frame, `start` first, in the order the track published them.
     pub fn frames(&self) -> impl Iterator<Item = &Arc<MediaFrame>> {
+        self.charged().map(|held| &held.frame)
+    }
+
+    /// Every frame with its charge, `start` first: what a clip's queue
+    /// keeps until it hands the frame out.
+    pub(crate) fn charged(&self) -> impl Iterator<Item = &ChargedFrame> {
         std::iter::once(&self.start).chain(&self.following)
     }
 
@@ -134,7 +159,7 @@ impl PrerollSnapshot {
         let Some(at) = self
             .following
             .iter()
-            .position(|frame| frame.keyframe && accept(frame))
+            .position(|held| held.frame.keyframe && accept(&held.frame))
         else {
             return false;
         };
@@ -163,7 +188,7 @@ impl PrerollSnapshot {
     /// old as its arrival makes it, as [`GopSnapshot::age`](crate::track::GopSnapshot::age)
     /// counts: how far before `now` a clip from it starts.
     pub fn age(&self, now: Instant) -> Duration {
-        now.saturating_duration_since(captured(&self.start))
+        now.saturating_duration_since(captured(&self.start.frame))
     }
 }
 
@@ -171,7 +196,7 @@ impl fmt::Debug for PrerollSnapshot {
     /// A summary: the frames themselves would be the whole pre-roll.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrerollSnapshot")
-            .field("start_ts", &self.start.ts)
+            .field("start_ts", &self.start.frame.ts)
             .field("frames", &self.frame_count())
             .field("truncated", &self.truncated)
             .finish_non_exhaustive()
@@ -179,18 +204,19 @@ impl fmt::Debug for PrerollSnapshot {
 }
 
 /// What every ring of one connection shares: the floor its audio rings
-/// trim by, and what its rings hold together, which the one bound of
-/// `preroll_bytes` applies to. Written by the tracks' source tasks: the
-/// floor's lock is never held for more than a copy, and the count is
-/// atomic.
+/// trim by, and what its pre-roll frames take together, which the one bound
+/// of `preroll_bytes` applies to. Written by the tracks' source tasks and,
+/// for the count, by whoever lets the last hold of a frame go: the floor's
+/// lock is never held for more than a copy, and the count is atomic.
 #[derive(Debug, Default)]
 pub(crate) struct PrerollShared {
     /// The oldest capture time of any keyframe the connection's leading
     /// video ring holds, but never later than its arrival
     /// ([`Preroll::oldest`]); `None` while it holds nothing.
     floor: Mutex<Option<Instant>>,
-    /// What the connection's rings hold together, as each counts its
-    /// frames ([`cost`]).
+    /// What the connection's pre-roll frames take together, as each
+    /// counts ([`cost`]), while a ring, a snapshot or a clip's queue holds
+    /// it: the sum of the live [`PrerollCharge`]s.
     held: AtomicUsize,
 }
 
@@ -205,43 +231,156 @@ impl PrerollShared {
         *self.floor.lock().unwrap_or_else(PoisonError::into_inner) = oldest;
     }
 
-    /// What the connection's rings hold together.
+    /// What the connection's pre-roll frames take together. Sequentially
+    /// consistent, as every change of it: of the rings that count a frame
+    /// and then read this, the one that reads last sees every frame the
+    /// others counted ([`Preroll::push`]).
     pub(crate) fn held(&self) -> usize {
-        self.held.load(Ordering::Relaxed)
+        self.held.load(Ordering::SeqCst)
     }
 
-    /// A ring took `bytes` more.
+    /// A frame came to count `bytes`.
     fn add(&self, bytes: usize) {
         let _previous = self
             .held
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 Some(held.saturating_add(bytes))
             });
     }
 
-    /// A ring let `bytes` go.
+    /// A frame that counted `bytes` is gone.
     fn sub(&self, bytes: usize) {
         let _previous = self
             .held
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 Some(held.saturating_sub(bytes))
             });
     }
 }
 
-/// A ring that goes (its track closed or replaced) leaves the
-/// connection's `held` without its frames.
-impl Drop for Preroll {
+/// One frame's charge against its connection's [`PrerollShared::held`]:
+/// counted when the ring takes the frame, given back when it is dropped,
+/// by the ring or, once shared, by the last of the ring, the snapshots and
+/// the clip queues that hold it. So a frame counts once however many hold
+/// it, and as long as one does.
+///
+/// Invariant: `held` is the sum of the `bytes` of the charges alive. The
+/// drop only updates the atomic count and takes no lock, since a ring drops
+/// frames under its track's lock and may hold the last charge.
+#[derive(Debug)]
+pub(crate) struct PrerollCharge {
+    /// What the frame counts ([`cost`]).
+    bytes: usize,
+    /// The count it is part of.
+    shared: Arc<PrerollShared>,
+}
+
+impl PrerollCharge {
+    /// Counts `bytes` in `shared`, until the charge is dropped.
+    fn new(bytes: usize, shared: &Arc<PrerollShared>) -> Self {
+        shared.add(bytes);
+        Self {
+            bytes,
+            shared: Arc::clone(shared),
+        }
+    }
+
+    /// The charge moved into one a snapshot can share, counted once still:
+    /// this one counts nothing after.
+    fn share(&mut self) -> Arc<Self> {
+        Arc::new(Self {
+            bytes: std::mem::take(&mut self.bytes),
+            shared: Arc::clone(&self.shared),
+        })
+    }
+}
+
+/// The frame's last holder let it go: it counts no more.
+impl Drop for PrerollCharge {
     fn drop(&mut self) {
         self.shared.sub(self.bytes);
     }
 }
 
-/// A GOP outgrew the ring and a log line is due.
+/// How a ring holds a frame's charge.
+#[derive(Debug)]
+enum Charge {
+    /// The ring's alone, in its slot: no allocation for a frame no
+    /// snapshot took.
+    Ring(PrerollCharge),
+    /// Shared with the snapshots that took the frame and the clip queues
+    /// they handed it to.
+    Shared(Arc<PrerollCharge>),
+}
+
+/// A frame as a ring holds it: with its charge, so it counts against the
+/// connection's bound while anyone holds it.
+#[derive(Debug)]
+struct RingFrame {
+    /// The frame, as the track published it.
+    frame: Arc<MediaFrame>,
+    /// Its charge.
+    charge: Charge,
+}
+
+impl RingFrame {
+    /// What the frame counts ([`cost`]).
+    fn bytes(&self) -> usize {
+        match &self.charge {
+            Charge::Ring(charge) => charge.bytes,
+            Charge::Shared(charge) => charge.bytes,
+        }
+    }
+
+    /// What dropping this frame from the ring frees now: what it counts
+    /// when the ring is the charge's last holder, else nothing, as a
+    /// snapshot or a clip's queue holding it keeps it counted. Only the
+    /// ring shares a charge, under its track's lock, so the other holders
+    /// seen here only ever get fewer.
+    fn frees(&self) -> usize {
+        match &self.charge {
+            Charge::Ring(charge) => charge.bytes,
+            Charge::Shared(charge) if Arc::strong_count(charge) == 1 => charge.bytes,
+            Charge::Shared(_) => 0,
+        }
+    }
+
+    /// The frame with its charge, shared, for a snapshot.
+    fn share(&mut self) -> ChargedFrame {
+        let charge = match &mut self.charge {
+            Charge::Shared(charge) => Arc::clone(charge),
+            Charge::Ring(charge) => {
+                let charge = charge.share();
+                self.charge = Charge::Shared(Arc::clone(&charge));
+                charge
+            }
+        };
+        ChargedFrame {
+            frame: Arc::clone(&self.frame),
+            charge,
+        }
+    }
+}
+
+/// A frame as a snapshot holds it, and a clip's queue after: with its
+/// charge, shared with the ring, so it counts against the connection's
+/// bound until the last holder lets it go.
+#[derive(Debug)]
+pub(crate) struct ChargedFrame {
+    /// The frame, as the track published it.
+    pub(crate) frame: Arc<MediaFrame>,
+    /// Its charge.
+    pub(crate) charge: Arc<PrerollCharge>,
+}
+
+/// A GOP outgrew what the ring may hold and a log line is due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Truncation {
     /// What the GOP would have counted with the frame that did not fit.
     pub(crate) gop_bytes: usize,
+    /// What the connection's pre-roll frames would have counted with it,
+    /// the frames clips still hold included.
+    pub(crate) held: usize,
     /// GOPs truncated since the last line.
     pub(crate) count: u64,
 }
@@ -306,8 +445,9 @@ pub(crate) struct Preroll {
     /// How far back, by arrival, to hold; `None` holds nothing and frees
     /// the ring.
     window: Option<Duration>,
-    /// The held frames, oldest first; a keyframe first on video.
-    frames: VecDeque<Arc<MediaFrame>>,
+    /// The held frames with their charges, oldest first; a keyframe first
+    /// on video.
+    frames: VecDeque<RingFrame>,
     /// The held keyframes the floor can come from ([`Self::oldest`]),
     /// oldest first, each captured ([`captured`]) before every later one
     /// here: a keyframe enters at the back and evicts those captured at or
@@ -319,10 +459,10 @@ pub(crate) struct Preroll {
     /// What the audio ring's trim by the floor knows of the frames it
     /// kept. Empty on a video ring.
     run: FloorRun,
-    /// What `frames` counts against `preroll_bytes`.
+    /// What `frames` counts against `preroll_bytes`, their charges' sum.
     bytes: usize,
-    /// What this connection's rings share; `bytes` is this ring's part of
-    /// its `held`.
+    /// What this connection's rings share; `bytes` is part of its `held`,
+    /// as long as the ring holds the frames.
     shared: Arc<PrerollShared>,
     /// The newest GOP outgrew `preroll_bytes` or lost a frame the track
     /// dropped ([`Self::frame_dropped`]); its frames are dropped until
@@ -371,7 +511,7 @@ impl Preroll {
             self.frames = VecDeque::new();
             self.floor_keys = VecDeque::new();
             self.run = FloorRun::default();
-            self.release_all();
+            self.bytes = 0;
         }
         std::mem::replace(&mut self.window, window)
     }
@@ -384,14 +524,8 @@ impl Preroll {
         self.frames.clear();
         self.floor_keys.clear();
         self.run = FloorRun::default();
-        self.release_all();
-        held
-    }
-
-    /// Counts nothing held any more, here and in the connection's `held`.
-    fn release_all(&mut self) {
-        self.shared.sub(self.bytes);
         self.bytes = 0;
+        held
     }
 
     /// The oldest capture time of any keyframe held, which the audio rings
@@ -408,9 +542,13 @@ impl Preroll {
 
     /// Takes `frame`, just published, and trims; `floor` is asked, on an
     /// audio ring only, for the video ring's floor ([`Self::oldest`]). Nothing
-    /// without a window. `cap` bounds what the connection's rings hold
-    /// together: this ring holds at most what the others leave of it.
-    /// `Some` when a GOP outgrew that and its line is due.
+    /// without a window. `cap` bounds what the connection's pre-roll frames
+    /// take together, those clips still hold included: this ring holds at
+    /// most what the rest leaves of it. The frame is counted before the
+    /// count is read ([`PrerollShared::held`]), so whichever of the
+    /// connection's rings reads last sees what the others pushed and trims
+    /// to fit, and none can both judge the room left before the other
+    /// took it. `Some` when a GOP outgrew that and its line is due.
     pub(crate) fn push(
         &mut self,
         frame: &Arc<MediaFrame>,
@@ -418,8 +556,6 @@ impl Preroll {
         floor: impl FnOnce() -> Option<Instant>,
     ) -> Option<Truncation> {
         let window = self.window?;
-        let others = self.shared.held().saturating_sub(self.bytes);
-        let cap = cap.saturating_sub(others);
         if self.video {
             self.push_video(frame, window, cap)
         } else {
@@ -464,7 +600,7 @@ impl Preroll {
             self.push_floor_key(frame);
             let start = self.window_start(frame.arrival, window);
             self.drop_front(start);
-            let start = self.fitting_start(cap, 0);
+            let (start, _) = self.fitting_start(self.shared.held(), cap);
             self.drop_front(start);
             return None;
         }
@@ -473,18 +609,25 @@ impl Preroll {
         if self.frames.is_empty() || self.truncated {
             return None;
         }
-        let start = self.fitting_start(cap, cost);
+        self.append(frame, cost);
+        let (start, held) = self.fitting_start(self.shared.held(), cap);
         self.drop_front(start);
-        let gop_bytes = self.bytes.saturating_add(cost);
-        if gop_bytes > cap {
+        if held > cap {
+            // Even from its keyframe the GOP does not fit what the rest
+            // leaves: the frame goes again, and the GOP stops here.
+            let gop_bytes = self.bytes;
+            self.drop_back();
             self.truncated = true;
             self.truncations = self.truncations.saturating_add(1);
             return self
                 .truncation_log
                 .hit(frame.arrival)
-                .map(|count| Truncation { gop_bytes, count });
+                .map(|count| Truncation {
+                    gop_bytes,
+                    held,
+                    count,
+                });
         }
-        self.append(frame, cost);
         None
     }
 
@@ -509,12 +652,12 @@ impl Preroll {
                 self.frames
                     .iter()
                     .skip(1)
-                    .take_while(|next| next.arrival <= cutoff)
+                    .take_while(|next| next.frame.arrival <= cutoff)
                     .count()
             }),
         };
         self.drop_front(stale);
-        let start = self.fitting_start(cap, 0);
+        let (start, _) = self.fitting_start(self.shared.held(), cap);
         self.drop_front(start);
     }
 
@@ -547,13 +690,13 @@ impl Preroll {
         let front_dated = self
             .frames
             .front()
-            .is_some_and(|front| front.wallclock <= floor);
+            .is_some_and(|front| front.frame.wallclock <= floor);
         let known = self.run.len;
         if known > 0
             && self
                 .frames
                 .get(known)
-                .is_some_and(|newest| newest.arrival > floor)
+                .is_some_and(|newest| newest.frame.arrival > floor)
         {
             // The floor moved back before the newest known frame arrived:
             // the run ends among the known frames, none of them dated at
@@ -565,7 +708,7 @@ impl Preroll {
                 .frames
                 .iter()
                 .skip(1)
-                .take_while(|next| captured(next) <= floor)
+                .take_while(|next| captured(&next.frame) <= floor)
                 .count();
             #[cfg(test)]
             {
@@ -577,7 +720,7 @@ impl Preroll {
         while let Some(next) = self
             .frames
             .get(self.run.len.saturating_add(1))
-            .filter(|next| captured(next) <= floor)
+            .filter(|next| captured(&next.frame) <= floor)
         {
             self.run.len = self.run.len.saturating_add(1);
             #[cfg(test)]
@@ -588,12 +731,12 @@ impl Preroll {
                 .run
                 .minima
                 .back()
-                .is_some_and(|&(_, date)| date >= next.wallclock)
+                .is_some_and(|&(_, date)| date >= next.frame.wallclock)
             {
                 self.run.minima.pop_back();
             }
             let position = self.run.front.wrapping_add(self.run.len);
-            self.run.minima.push_back((position, next.wallclock));
+            self.run.minima.push_back((position, next.frame.wallclock));
         }
         let mut dated = None;
         while let Some(&(position, _)) = self.run.minima.front().filter(|&&(_, date)| date <= floor)
@@ -631,11 +774,22 @@ impl Preroll {
         }
     }
 
-    /// Holds `frame`, which counts `cost`.
+    /// Holds `frame`, which counts `cost`, here and, by its charge, in the
+    /// connection's count.
     fn append(&mut self, frame: &Arc<MediaFrame>, cost: usize) {
-        self.frames.push_back(Arc::clone(frame));
+        self.frames.push_back(RingFrame {
+            frame: Arc::clone(frame),
+            charge: Charge::Ring(PrerollCharge::new(cost, &self.shared)),
+        });
         self.bytes = self.bytes.saturating_add(cost);
-        self.shared.add(cost);
+    }
+
+    /// Lets the newest frame go again: a non-keyframe just appended that
+    /// did not fit.
+    fn drop_back(&mut self) {
+        if let Some(newest) = self.frames.pop_back() {
+            self.bytes = self.bytes.saturating_sub(newest.bytes());
+        }
     }
 
     /// Takes `keyframe`, just held, into `floor_keys`: the keyframes held
@@ -656,17 +810,17 @@ impl Preroll {
     /// Drops the `count` oldest frames, and a keyframe among them from
     /// `floor_keys`: both are in the ring's order, so it is at the front.
     /// The known frames of the stale run ([`FloorRun`]) among them leave it.
+    /// A frame's charge is given back with it unless a snapshot or a
+    /// clip's queue still holds it.
     fn drop_front(&mut self, count: usize) {
         let count = count.min(self.frames.len());
         self.run.dropped(count);
-        for frame in self.frames.drain(..count) {
-            let cost = cost(&frame);
-            self.bytes = self.bytes.saturating_sub(cost);
-            self.shared.sub(cost);
+        for held in self.frames.drain(..count) {
+            self.bytes = self.bytes.saturating_sub(held.bytes());
             if self
                 .floor_keys
                 .front()
-                .is_some_and(|keyframe| Arc::ptr_eq(keyframe, &frame))
+                .is_some_and(|keyframe| Arc::ptr_eq(keyframe, &held.frame))
             {
                 self.floor_keys.pop_front();
             }
@@ -685,27 +839,31 @@ impl Preroll {
             .iter()
             .enumerate()
             .skip(1)
-            .filter(|(_, frame)| frame.keyframe)
-            .take_while(|(_, frame)| newest.saturating_duration_since(frame.arrival) >= window)
+            .filter(|(_, held)| held.frame.keyframe)
+            .take_while(|(_, held)| newest.saturating_duration_since(held.frame.arrival) >= window)
             .last()
             .map_or(0, |(index, _)| index)
     }
 
-    /// Where the ring starts so that what it holds, plus `extra`, fits in
-    /// `cap`: the oldest start that fits, else the newest start, which is
-    /// always kept. Stops at the first start that fits, so it costs what
-    /// it drops.
-    fn fitting_start(&self, cap: usize, extra: usize) -> usize {
-        let mut dropped = 0_usize;
-        let mut start = 0;
-        for (index, frame) in self.frames.iter().enumerate() {
-            if self.starts_at(frame) {
-                start = index;
-                if self.bytes.saturating_sub(dropped).saturating_add(extra) <= cap {
+    /// Where the ring starts so that the connection's pre-roll frames,
+    /// counting `held` with this ring's newest, fit in `cap`: the oldest
+    /// start that fits, else the newest start, which is always kept; and
+    /// what they count from there. Dropping a frame frees what it counts
+    /// only when the ring is its last holder ([`RingFrame::frees`]): one
+    /// a clip has not written yet stays counted, so the ring holds that
+    /// much less. Stops at the first start that fits, so it costs what it
+    /// drops.
+    fn fitting_start(&self, held: usize, cap: usize) -> (usize, usize) {
+        let mut left = held;
+        let mut start = (0, held);
+        for (index, entry) in self.frames.iter().enumerate() {
+            if self.starts_at(&entry.frame) {
+                start = (index, left);
+                if left <= cap {
                     break;
                 }
             }
-            dropped = dropped.saturating_add(cost(frame));
+            left = left.saturating_sub(entry.frees());
         }
         start
     }
@@ -720,13 +878,17 @@ impl Preroll {
     /// so an audio ring starts at the frame playing at `target`, the video
     /// start's capture time, by the frames' capture times as they are
     /// ([`Self::start_time`]).
-    pub(crate) fn snapshot(&self, target: Instant) -> Option<PrerollSnapshot> {
+    ///
+    /// The frames' charges become shared with the snapshot, so they count
+    /// against the bound while the snapshot or a clip's queue holds them,
+    /// whatever the ring drops.
+    pub(crate) fn snapshot(&mut self, target: Instant) -> Option<PrerollSnapshot> {
         let from = self
             .frames
             .iter()
-            .rposition(|frame| self.starts_at(frame) && self.start_time(frame) <= target)
+            .rposition(|held| self.starts_at(&held.frame) && self.start_time(&held.frame) <= target)
             .unwrap_or(0);
-        let mut frames = self.frames.range(from..).cloned();
+        let mut frames = self.frames.range_mut(from..).map(RingFrame::share);
         let start = frames.next()?;
         Some(PrerollSnapshot {
             start,
@@ -739,9 +901,10 @@ impl Preroll {
     pub(crate) fn stats(&self) -> Option<PrerollStats> {
         self.window?;
         let held = match (self.frames.front(), self.frames.back()) {
-            (Some(oldest), Some(newest)) => {
-                newest.wallclock.saturating_duration_since(oldest.wallclock)
-            }
+            (Some(oldest), Some(newest)) => newest
+                .frame
+                .wallclock
+                .saturating_duration_since(oldest.frame.wallclock),
             _ => Duration::ZERO,
         };
         Some(PrerollStats {
@@ -822,7 +985,10 @@ mod tests {
 
     /// The held frames' labels, oldest first.
     fn held(ring: &Preroll) -> Vec<i64> {
-        ring.frames.iter().map(|frame| frame.ts.ticks()).collect()
+        ring.frames
+            .iter()
+            .map(|held| held.frame.ts.ticks())
+            .collect()
     }
 
     /// Pushes a video GOP: a keyframe at `from` and frames every 250 ms
@@ -955,6 +1121,7 @@ mod tests {
             ring.push(&clip.frame(500, false, 3 * c(10)), cap, || None),
             Some(Truncation {
                 gop_bytes: 2 * c(10) + c(3 * c(10)),
+                held: 2 * c(10) + c(3 * c(10)),
                 count: 1
             })
         );
@@ -981,6 +1148,7 @@ mod tests {
             ring.push(&clip.frame(750, false, 10), cap, || None),
             Some(Truncation {
                 gop_bytes: 4 * c(10),
+                held: 4 * c(10),
                 count: 1
             })
         );
@@ -996,6 +1164,8 @@ mod tests {
             "the live frames are not the next ones"
         );
         assert_eq!(snapshot.frame_count(), 3);
+        // A snapshot kept would keep its frames counted against the cap.
+        drop(snapshot);
 
         gop(&mut ring, &clip, 1250, 1750, cap);
         assert_eq!(held(&ring), [1250, 1500], "the next keyframe resumes");
@@ -1084,6 +1254,7 @@ mod tests {
             |capture: u64, arrival: u64, keyframe: bool| clip.shifted(capture, arrival, keyframe);
         let truncation = Some(Truncation {
             gop_bytes: 3 * c(10),
+            held: 3 * c(10),
             count: 1,
         });
         // A Sender Report maps the third frame an hour ahead.
@@ -1413,7 +1584,7 @@ mod tests {
                 let mut expected: Vec<_> = ring
                     .frames
                     .iter()
-                    .cloned()
+                    .map(|held| Arc::clone(&held.frame))
                     .chain([Arc::clone(&frame)])
                     .collect();
                 let stale = match floor {
@@ -1433,7 +1604,10 @@ mod tests {
                 }
                 assert_eq!(ring.push(&frame, cap, || floor), None);
                 assert_eq!(
-                    ring.frames.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+                    ring.frames
+                        .iter()
+                        .map(|held| Arc::as_ptr(&held.frame))
+                        .collect::<Vec<_>>(),
                     expected.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
                     "seed {seed}"
                 );
@@ -1554,7 +1728,7 @@ mod tests {
         for from in [1000, 2000, 3000] {
             gop(&mut ring, &clip, from, from + 1000, usize::MAX);
         }
-        let starts = |target: Instant| {
+        let mut starts = |target: Instant| {
             let snapshot = ring.snapshot(target).unwrap();
             assert!(snapshot.start().keyframe);
             assert_eq!(
@@ -1584,7 +1758,7 @@ mod tests {
             (2000..4000).step_by(250).collect::<Vec<_>>()
         );
         assert!(
-            Arc::ptr_eq(snapshot.start(), ring.frames.get(4).unwrap()),
+            Arc::ptr_eq(snapshot.start(), &ring.frames.get(4).unwrap().frame),
             "the ring's frames, not copies"
         );
         assert!(!snapshot.truncated());
@@ -1634,7 +1808,7 @@ mod tests {
         assert_eq!(labels(&snapshot), [2000, 2250, 3000, 3250]);
         assert_eq!(snapshot.frame_count(), 4);
         assert!(
-            Arc::ptr_eq(snapshot.start(), ring.frames.get(4).unwrap()),
+            Arc::ptr_eq(snapshot.start(), &ring.frames.get(4).unwrap().frame),
             "the ring's frames, not copies"
         );
 
@@ -1673,16 +1847,20 @@ mod tests {
                 None
             );
         }
-        let starts = |ring: &Preroll, target: u64| {
+        let starts = |ring: &mut Preroll, target: u64| {
             ring.snapshot(clip.at(target))
                 .unwrap()
                 .frames()
                 .map(|frame| frame.ts.ticks())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(starts(&video, 3000), [2000, 2250]);
-        assert_eq!(starts(&video, 2000), [2000, 2250], "at the arrival counts");
-        assert_eq!(starts(&video, 1999), [1000, 1250, 2000, 2250]);
+        assert_eq!(starts(&mut video, 3000), [2000, 2250]);
+        assert_eq!(
+            starts(&mut video, 2000),
+            [2000, 2250],
+            "at the arrival counts"
+        );
+        assert_eq!(starts(&mut video, 1999), [1000, 1250, 2000, 2250]);
 
         let mut audio = ring(false, 60_000);
         for ms in (0..=1600).step_by(400) {
@@ -1691,7 +1869,7 @@ mod tests {
                 None
             );
         }
-        assert_eq!(starts(&audio, 61_000), [800, 1200, 1600]);
+        assert_eq!(starts(&mut audio, 61_000), [800, 1200, 1600]);
     }
 
     /// An audio snapshot starts with the frame playing at its target, the
@@ -1713,7 +1891,7 @@ mod tests {
                 None
             );
         }
-        let start = |target: u64| audio.snapshot(clip.at(target)).unwrap().start().ts.ticks();
+        let mut start = |target: u64| audio.snapshot(clip.at(target)).unwrap().start().ts.ticks();
         assert_eq!(start(1001), 980);
         assert_eq!(start(1003), 1000, "at the date counts");
         assert_eq!(start(902), 900, "before every date, the oldest held");
@@ -1796,6 +1974,114 @@ mod tests {
         assert!(PREROLL_FRAME_OVERHEAD > size_of::<MediaFrame>());
         let clip = Clip::new();
         assert_eq!(cost(&clip.frame(0, true, 7)), 7 + PREROLL_FRAME_OVERHEAD);
+    }
+
+    /// A ring of `video` frames with a minute's window, one of those
+    /// sharing `shared`.
+    fn shared_ring(video: bool, shared: &Arc<PrerollShared>) -> Preroll {
+        let mut ring = Preroll::new(video, Arc::clone(shared));
+        assert_eq!(ring.set_window(Some(Duration::from_secs(60))), None);
+        ring
+    }
+
+    #[test]
+    fn a_frame_a_snapshot_holds_stays_counted_and_the_ring_holds_that_much_less() {
+        let clip = Clip::new();
+        let shared = Arc::default();
+        let mut ring = shared_ring(true, &shared);
+        let cap = 6 * c(10);
+        gop(&mut ring, &clip, 0, 1000, cap);
+        let snapshot = ring.snapshot(clip.at(0)).unwrap();
+        assert_eq!(snapshot.frame_count(), 4);
+        gop(&mut ring, &clip, 1000, 1500, cap);
+        assert_eq!(held(&ring), [0, 250, 500, 750, 1000, 1250]);
+        // Dropping the first GOP frees nothing while the snapshot holds it,
+        // so the second GOP does not fit what is left.
+        assert_eq!(
+            ring.push(&clip.frame(1500, false, 10), cap, || None),
+            Some(Truncation {
+                gop_bytes: 3 * c(10),
+                held: 7 * c(10),
+                count: 1
+            })
+        );
+        assert_eq!(held(&ring), [1000, 1250]);
+        assert_eq!(
+            ring.stats().unwrap().bytes,
+            u64::try_from(2 * c(10)).unwrap(),
+            "the ring's own"
+        );
+        assert_eq!(shared.held(), 6 * c(10), "the snapshot's frames count");
+        drop(snapshot);
+        assert_eq!(shared.held(), 2 * c(10), "the last holder gave them back");
+        gop(&mut ring, &clip, 2000, 2500, cap);
+        assert_eq!(
+            held(&ring),
+            [2000, 2250],
+            "room again from the next keyframe"
+        );
+        assert_eq!(ring.stats().unwrap().truncations, 1);
+    }
+
+    #[test]
+    fn a_ring_that_lets_its_frames_go_frees_only_what_nobody_else_holds() {
+        let clip = Clip::new();
+        let shared = Arc::default();
+        let mut ring = shared_ring(true, &shared);
+        gop(&mut ring, &clip, 0, 1000, usize::MAX);
+        gop(&mut ring, &clip, 1000, 1500, usize::MAX);
+        let snapshot = ring.snapshot(clip.at(1000)).unwrap();
+        assert_eq!(snapshot.frame_count(), 2);
+        assert!(ring.clear());
+        assert_eq!(shared.held(), 2 * c(10), "cleared: the snapshot's");
+        drop(snapshot);
+        assert_eq!(shared.held(), 0);
+
+        gop(&mut ring, &clip, 2000, 3000, usize::MAX);
+        let snapshot = ring.snapshot(clip.at(2500)).unwrap();
+        assert_eq!(ring.set_window(None), Some(Duration::from_secs(60)));
+        assert_eq!(shared.held(), 4 * c(10), "freed: the snapshot's");
+        drop(snapshot);
+        assert_eq!(shared.held(), 0);
+
+        let mut ring = shared_ring(false, &shared);
+        for ms in [0, 20, 40] {
+            assert_eq!(
+                ring.push(&clip.frame(ms, false, 10), usize::MAX, || None),
+                None
+            );
+        }
+        let snapshot = ring.snapshot(clip.at(20)).unwrap();
+        drop(ring);
+        assert_eq!(shared.held(), 2 * c(10), "dropped: the snapshot's");
+        drop(snapshot);
+        assert_eq!(shared.held(), 0);
+    }
+
+    #[test]
+    fn a_ring_counts_its_frame_before_it_reads_what_the_others_hold() {
+        let clip = Clip::new();
+        let shared = Arc::default();
+        let cap = 4 * c(10);
+        let mut audio = shared_ring(false, &shared);
+        let mut video = shared_ring(true, &shared);
+        for ms in [0, 20] {
+            assert_eq!(audio.push(&clip.frame(ms, false, 10), cap, || None), None);
+        }
+        // The video ring pushes while the audio ring is inside its push,
+        // before it holds its frame: the audio ring then counts what the
+        // video ring took and makes room, where judging the room before
+        // holding the frame would have kept all three.
+        let pushed = audio.push(&clip.frame(40, false, 10), cap, || {
+            for ms in [0, 250] {
+                assert_eq!(video.push(&clip.frame(ms, true, 10), cap, || None), None);
+            }
+            None
+        });
+        assert_eq!(pushed, None);
+        assert_eq!(held(&video), [0, 250]);
+        assert_eq!(held(&audio), [20, 40]);
+        assert_eq!(shared.held(), cap);
     }
 
     #[test]
