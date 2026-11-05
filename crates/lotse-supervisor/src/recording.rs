@@ -133,8 +133,9 @@ pub struct RecordingLimits {
     /// `limits.max_prerecord_ms`: the longest window `stream/put` may ask
     /// for, and the furthest back a recording's `prerecord_ms` may ask.
     pub max_prerecord_ms: u32,
-    /// What a stream's rings, all its tracks', may hold together: no
-    /// setting, half of `limits.worker_address_space`
+    /// What a stream's pre-record frames may take together, all its tracks'
+    /// rings and the frames its recordings took from them and have not written
+    /// yet: no setting, half of `limits.worker_address_space`
     /// ([`RecordingLimits::max_prerecord_bytes_for`]); the worker's bound, which
     /// `info` reports as `limits.max_prerecord_bytes`.
     pub max_prerecord_bytes: u64,
@@ -179,11 +180,12 @@ impl RecordingLimits {
     };
 
     /// The pre-record's byte bound for workers limited to
-    /// `worker_address_space`: half of it for a stream's rings together,
-    /// so the window, a time, is what decides what they hold, and a camera
-    /// sending far more than any real one gets a shorter pre-record instead
-    /// of taking its worker's memory; the rest of the worker fits in the
-    /// other half.
+    /// `worker_address_space`: half of it for a stream's pre-record frames
+    /// together, its rings' and its recordings' not yet written, so the window,
+    /// a time, is what decides what they hold, and a camera sending far
+    /// more than any real one, or recordings writing slower than it sends, get
+    /// a shorter pre-record instead of taking the worker's memory; the rest
+    /// of the worker fits in the other half.
     #[must_use]
     pub const fn max_prerecord_bytes_for(worker_address_space: u64) -> u64 {
         worker_address_space / 2
@@ -1123,6 +1125,21 @@ mod tests {
         );
         assert!(completed(RecordingCloseReason::Completed));
         assert!(!completed(RecordingCloseReason::ClientGone));
+    }
+
+    #[test]
+    fn the_pre_record_bound_is_half_the_worker_s_address_space() {
+        assert_eq!(
+            RecordingLimits::max_prerecord_bytes_for(1 << 30),
+            RecordingLimits::DEFAULT.max_prerecord_bytes,
+            "the default address space gives the default bound"
+        );
+        assert_eq!(RecordingLimits::max_prerecord_bytes_for(6), 3);
+        assert_eq!(
+            RecordingLimits::max_prerecord_bytes_for(7),
+            3,
+            "rounded down"
+        );
     }
 
     #[test]

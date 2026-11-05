@@ -49,9 +49,11 @@ pub struct Limits {
     #[serde(default)]
     pub max_prerecord_ms: u32,
     /// The memory a stream's pre-record may hold, all its tracks together,
-    /// in bytes: no setting but half the worker's address space, a bound
-    /// only a stream far above any real camera's bitrate reaches, which
-    /// then holds a shorter window than `prerecord_ms`.
+    /// in bytes, the frames its recordings took and have not written yet
+    /// included: no setting but half the worker's address space, a bound
+    /// only a stream far above any real camera's bitrate reaches, or one
+    /// whose recordings write slower than it sends, which then holds a shorter
+    /// window than `prerecord_ms`.
     #[serde(default)]
     pub max_prerecord_bytes: u64,
     /// The longest recording, in milliseconds: the most `duration_ms` may ask.
