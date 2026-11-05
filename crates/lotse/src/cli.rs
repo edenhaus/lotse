@@ -87,8 +87,8 @@ pub(crate) struct WorkerArgs {
     #[arg(long, value_name = "PORT,...", value_delimiter = ',')]
     pub(crate) connect_ports: Vec<u16>,
 
-    /// What one track's pre-roll ring may hold: the daemon's
-    /// `limits.preroll_bytes`.
+    /// What one video track's pre-roll ring may hold (an audio track's a
+    /// 16th): half the daemon's `limits.worker_address_space`.
     #[arg(long, value_name = "BYTES", default_value_t = lotse_core::track::DEFAULT_PREROLL_BYTES)]
     pub(crate) preroll_bytes: usize,
 
@@ -206,11 +206,6 @@ pub(crate) struct ServeArgs {
     /// Grace after the last viewer leaves before a camera connection closes.
     #[arg(long, env = "LOTSE_LINGER_MS", value_name = "MS")]
     pub(crate) linger_ms: Option<u64>,
-
-    /// What one track's pre-roll ring may hold, in bytes; allocated only
-    /// while a stream asks for a window.
-    #[arg(long, env = "LOTSE_PREROLL_BYTES", value_name = "BYTES")]
-    pub(crate) preroll_bytes: Option<u64>,
 
     /// The longest pre-roll window a stream may ask for, and the furthest
     /// back a clip may start.
@@ -366,6 +361,17 @@ mod tests {
         assert_eq!(
             Duration::from_millis(u64::from(lotse_supervisor::ClipLimits::DEFAULT.clip_max_ms)),
             lotse_worker::DEFAULT_CLIP_MAX
+        );
+        // The pre-roll bound is half the default worker address space.
+        let derived = lotse_supervisor::ClipLimits::preroll_bytes_for(
+            lotse_sandbox::DEFAULT_WORKER_ADDRESS_SPACE,
+        );
+        assert_eq!(
+            (derived, lotse_supervisor::ClipLimits::DEFAULT.preroll_bytes),
+            (
+                u64::try_from(lotse_core::track::DEFAULT_PREROLL_BYTES).unwrap(),
+                derived
+            )
         );
         assert_eq!(
             Duration::from_millis(bare.clip_start_timeout_ms),

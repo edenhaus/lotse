@@ -5111,7 +5111,7 @@ mod tests {
             info["limits"],
             json!({ "max_streams": 2, "max_sessions": 3, "max_sessions_per_stream": 2,
                     "max_connections": 8, "session_grace_ms": 10_000,
-                    "preroll_max_ms": 300_000, "preroll_bytes": 32 << 20, "clip_max_ms": 3_600_000,
+                    "preroll_max_ms": 300_000, "preroll_bytes": 512 << 20, "clip_max_ms": 3_600_000,
                     "max_clips": 8, "clips_per_stream": 2 })
         );
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);

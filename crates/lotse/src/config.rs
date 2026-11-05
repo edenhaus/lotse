@@ -319,8 +319,6 @@ struct LimitsFile {
     worker_threads: Option<usize>,
     /// `limits.worker_address_space`.
     worker_address_space: Option<u64>,
-    /// `limits.preroll_bytes`.
-    preroll_bytes: Option<u64>,
     /// `limits.preroll_max_ms`.
     preroll_max_ms: Option<u32>,
     /// `limits.clip_max_ms`.
@@ -449,7 +447,7 @@ impl Resolver<'_> {
 
     /// The `[limits]` group.
     fn limits(&mut self, args: &ServeArgs, file: &LimitsFile) -> Limits {
-        Limits {
+        let limits = Limits {
             max_connections: self.pick(
                 "limits.max_connections",
                 "max_connections",
@@ -499,23 +497,28 @@ impl Resolver<'_> {
                 file.worker_address_space,
                 lotse_sandbox::DEFAULT_WORKER_ADDRESS_SPACE,
             ),
-            clips: self.clip_limits(args, file),
+            clips: ClipLimits::NONE,
+        };
+        Limits {
+            clips: self.clip_limits(args, file, limits.worker_address_space),
+            ..limits
         }
     }
 
     /// The pre-roll and clip limits of the `[limits]` group, defaults
     /// [`ClipLimits::DEFAULT`]; the supervisor holds them when the build has
-    /// a clip output, and passes the worker's share to every worker.
-    fn clip_limits(&mut self, args: &ServeArgs, file: &LimitsFile) -> ClipLimits {
+    /// a clip output, and passes the worker's share to every worker. The
+    /// pre-roll's byte bound is no setting: half of `worker_address_space`
+    /// ([`ClipLimits::preroll_bytes_for`]).
+    fn clip_limits(
+        &mut self,
+        args: &ServeArgs,
+        file: &LimitsFile,
+        worker_address_space: u64,
+    ) -> ClipLimits {
         let default = ClipLimits::DEFAULT;
         ClipLimits {
-            preroll_bytes: self.pick(
-                "limits.preroll_bytes",
-                "preroll_bytes",
-                args.preroll_bytes,
-                file.preroll_bytes,
-                default.preroll_bytes,
-            ),
+            preroll_bytes: ClipLimits::preroll_bytes_for(worker_address_space),
             preroll_max_ms: self.pick(
                 "limits.preroll_max_ms",
                 "preroll_max_ms",
@@ -904,9 +907,9 @@ mod tests {
     fn the_clip_limits_come_from_flags_over_the_file_over_the_defaults() {
         let (settings, provenance) = resolve(&["lotse", "serve", "--socket", "/s"]).unwrap();
         assert_eq!(settings.supervisor.limits.clips, ClipLimits::DEFAULT);
-        assert_eq!(
-            source_of(&provenance, "limits.preroll_bytes"),
-            ("33554432".into(), Source::Default)
+        assert!(
+            provenance.iter().all(|p| p.name != "limits.preroll_bytes"),
+            "no setting"
         );
         assert_eq!(
             source_of(&provenance, "limits.clip_fetch_timeout_ms"),
@@ -917,7 +920,7 @@ mod tests {
         let path = dir.join("lotse.toml");
         std::fs::write(
             &path,
-            "socket = \"/s\"\n[limits]\npreroll_bytes = 1048576\npreroll_max_ms = 30000\n\
+            "socket = \"/s\"\n[limits]\nworker_address_space = 2097152\npreroll_max_ms = 30000\n\
              clip_max_ms = 45000\nclip_queue_bytes = 65536\nclip_fetch_timeout_ms = 3000\n\
              clip_start_timeout_ms = 4000\nmax_clips = 5\nclips_per_stream = 1\n",
         )
@@ -936,7 +939,7 @@ mod tests {
         };
         assert_eq!(settings.supervisor.limits.clips, from_file);
         for (name, value) in [
-            ("limits.preroll_bytes", "1048576"),
+            ("limits.worker_address_space", "2097152"),
             ("limits.preroll_max_ms", "30000"),
             ("limits.clip_max_ms", "45000"),
             ("limits.clip_queue_bytes", "65536"),
@@ -956,8 +959,8 @@ mod tests {
             "serve",
             "--config",
             config,
-            "--preroll-bytes",
-            "2097152",
+            "--worker-address-space",
+            "4194304",
             "--preroll-max-ms",
             "60000",
             "--clip-max-ms",

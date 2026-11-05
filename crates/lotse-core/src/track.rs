@@ -80,9 +80,21 @@ pub const DEFAULT_GOP_CACHE_BYTES: usize = 4 * 1024 * 1024;
 /// overhead it does not count.
 pub const DEFAULT_GOP_CACHE_FRAMES: usize = 1024;
 
-/// Default of `limits.preroll_bytes`: 32 MiB per track, about 60 s of a
-/// 4 Mbit/s stream; held only while a pre-roll window is set.
-pub const DEFAULT_PREROLL_BYTES: usize = 32 * 1024 * 1024;
+/// Default of [`TrackLimits::preroll_bytes`]: 512 MiB, half the worker's
+/// default address space (`limits.worker_address_space`, 1 GiB), from
+/// which the supervisor derives it. The window is a time
+/// (`preroll_ms`), and what it holds follows the stream's bitrate; this
+/// bound only keeps a camera sending far more than any real one (30 s
+/// above about 140 Mbit/s) from taking its worker's memory, so that
+/// camera gets a shorter pre-roll instead. Nothing is held while no
+/// window is set.
+pub const DEFAULT_PREROLL_BYTES: usize = 512 * 1024 * 1024;
+
+/// An audio track's pre-roll ring holds at most this share of
+/// [`TrackLimits::preroll_bytes`] (32 MiB of the default, 300 s of
+/// 850 kbit/s), so a worker's rings together, its video's and every audio
+/// track's (a derived one too), stay within its address space.
+pub const AUDIO_PREROLL_SHARE: usize = 16;
 
 /// Default packet broadcast capacity: ~500 ms at 4000 packets/s, which is
 /// a 40 Mbit/s stream in 1200-byte packets. The capacity is only the safety
@@ -111,7 +123,8 @@ pub struct TrackLimits {
     /// The GOP cache keeps only the keyframe once a GOP has more frames
     /// than this, keyframe included; a keyframe alone is always kept.
     pub gop_cache_frames: usize,
-    /// The pre-roll ring holds no more than this, counted as
+    /// A video track's pre-roll ring holds no more than this, an audio
+    /// track's an [`AUDIO_PREROLL_SHARE`]th of it, counted as
     /// [`PREROLL_FRAME_OVERHEAD`](crate::preroll::PREROLL_FRAME_OVERHEAD)
     /// plus the payload per frame; a GOP larger than this keeps only its
     /// start, until the next keyframe drops it.
@@ -1545,7 +1558,7 @@ impl Track {
             tracing::debug!(
                 track = %self.id,
                 gop_bytes = truncation.gop_bytes,
-                limit = self.limits.preroll_bytes,
+                limit = self.preroll_limit(),
                 truncations = truncation.count,
                 "preroll: GOP exceeds preroll_bytes, keeping only its start"
             );
@@ -1630,13 +1643,22 @@ impl Track {
     /// this is the leading ring; the GOP the ring cut short, if any, for
     /// the caller to log once the lock is released.
     fn update_preroll(&self, fed: &mut Fed, frame: &Arc<MediaFrame>) -> Option<Truncation> {
-        let truncation = fed.ring.push(frame, self.limits.preroll_bytes, || {
-            self.preroll_floor.get()
-        });
+        let truncation = fed
+            .ring
+            .push(frame, self.preroll_limit(), || self.preroll_floor.get());
         if self.leads_preroll() && fed.ring.window().is_some() {
             self.preroll_floor.set(fed.ring.oldest());
         }
         truncation
+    }
+
+    /// What this track's pre-roll ring may hold: `preroll_bytes` for video,
+    /// an [`AUDIO_PREROLL_SHARE`]th of it for audio.
+    fn preroll_limit(&self) -> usize {
+        match self.kind() {
+            Kind::Video => self.limits.preroll_bytes,
+            Kind::Audio => self.limits.preroll_bytes / AUDIO_PREROLL_SHARE,
+        }
     }
 }
 
@@ -2677,8 +2699,42 @@ mod tests {
     }
 
     #[test]
-    fn the_pre_roll_is_bounded_to_32_mib_per_track_by_default() {
-        assert_eq!(TrackLimits::default().preroll_bytes, 33_554_432);
+    fn the_pre_roll_is_bounded_to_512_mib_for_video_and_32_mib_for_audio_by_default() {
+        assert_eq!(TrackLimits::default().preroll_bytes, 536_870_912);
+        assert_eq!(
+            TrackLimits::default().preroll_bytes / AUDIO_PREROLL_SHARE,
+            33_554_432
+        );
+    }
+
+    #[test]
+    fn an_audio_track_s_pre_roll_holds_a_sixteenth_of_the_bound() {
+        let t0 = SystemClock.now();
+        let limits = TrackLimits {
+            preroll_bytes: AUDIO_PREROLL_SHARE * 2 * cost_usize(10),
+            ..TrackLimits::default()
+        };
+        let audio = Track::new(
+            TrackId::new(Kind::Audio, 0),
+            Codec::Opus { channels: 2 },
+            48_000,
+            limits,
+            t0,
+        );
+        let video = video_track(limits);
+        for track in [&audio, &video] {
+            track.set_preroll(Some(Duration::from_secs(10)));
+            for ms in [0, 20, 40, 60] {
+                assert!(track.publish_frame(timed(t0, ms, true, 10)));
+            }
+        }
+        assert_eq!(preroll(&audio, t0), [40, 60], "two frames' worth");
+        assert_eq!(preroll(&video, t0), [0, 20, 40, 60], "the whole bound");
+    }
+
+    /// [`cost`] as the ring counts it, in `usize`.
+    fn cost_usize(bytes: usize) -> usize {
+        bytes + PREROLL_FRAME_OVERHEAD
     }
 
     #[test]

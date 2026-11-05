@@ -48,7 +48,10 @@ pub struct Limits {
     /// the daemon keeps none.
     #[serde(default)]
     pub preroll_max_ms: u32,
-    /// The memory one track's pre-roll ring may hold, in bytes.
+    /// The memory one video track's pre-roll ring may hold, in bytes (an
+    /// audio track's: a 16th): no setting but half the worker's address
+    /// space, a bound only a stream far above any real camera's bitrate
+    /// reaches, which then holds a shorter window than `preroll_ms`.
     #[serde(default)]
     pub preroll_bytes: u64,
     /// The longest clip, in milliseconds: the most `after_ms` may ask, and

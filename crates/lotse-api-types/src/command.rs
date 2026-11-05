@@ -114,9 +114,10 @@ pub struct StreamPut {
     pub orientation: Orientation,
     /// Keep the last `preroll_ms` milliseconds of the stream's media in
     /// memory, so a `clip/start` can begin before it was asked for; 0, the
-    /// default, keeps none. At most `limits.preroll_max_ms`, and each track
-    /// holds at most `limits.preroll_bytes` of whole GOPs, so the window
-    /// held may be shorter (`stream/get` reports it). Not a reason to
+    /// default, keeps none. At most `limits.preroll_max_ms`. What it holds
+    /// follows the stream's bitrate; only a stream far above any real
+    /// camera's reaches `limits.preroll_bytes` (an audio track a 16th of
+    /// it) and holds a shorter window (`stream/get` reports it). Not a reason to
     /// connect: the window fills only while `preload` or a viewer keeps
     /// the source connected. Changing only this never reconnects.
     #[serde(default)]

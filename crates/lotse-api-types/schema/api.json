@@ -721,7 +721,7 @@
             },
             "preroll_ms": {
               "default": 0,
-              "description": "Keep the last `preroll_ms` milliseconds of the stream's media in\nmemory, so a `clip/start` can begin before it was asked for; 0, the\ndefault, keeps none. At most `limits.preroll_max_ms`, and each track\nholds at most `limits.preroll_bytes` of whole GOPs, so the window\nheld may be shorter (`stream/get` reports it). Not a reason to\nconnect: the window fills only while `preload` or a viewer keeps\nthe source connected. Changing only this never reconnects.",
+              "description": "Keep the last `preroll_ms` milliseconds of the stream's media in\nmemory, so a `clip/start` can begin before it was asked for; 0, the\ndefault, keeps none. At most `limits.preroll_max_ms`. What it holds\nfollows the stream's bitrate; only a stream far above any real\ncamera's reaches `limits.preroll_bytes` (an audio track a 16th of\nit) and holds a shorter window (`stream/get` reports it). Not a reason to\nconnect: the window fills only while `preload` or a viewer keeps\nthe source connected. Changing only this never reconnects.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -1911,7 +1911,7 @@
         },
         "preroll_bytes": {
           "default": 0,
-          "description": "The memory one track's pre-roll ring may hold, in bytes.",
+          "description": "The memory one video track's pre-roll ring may hold, in bytes (an\naudio track's: a 16th): no setting but half the worker's address\nspace, a bound only a stream far above any real camera's bitrate\nreaches, which then holds a shorter window than `preroll_ms`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -3523,19 +3523,19 @@
       "description": "A track's pre-roll ring, as `stream/get` reports it: whole GOPs of the\nnewest media, kept for clips while the stream has a window.",
       "properties": {
         "bytes": {
-          "description": "The memory the ring holds: its frames' payloads plus a fixed cost\nper frame, at most `limits.preroll_bytes`. The open GOP is also in\nthe track's GOP cache, so the two overlap; the frames are shared,\nnot copied.",
+          "description": "The memory the ring holds: its frames' payloads plus a fixed cost\nper frame, at most `limits.preroll_bytes` (an audio track a 16th of\nit). The open GOP is also in\nthe track's GOP cache, so the two overlap; the frames are shared,\nnot copied.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "held_ms": {
-          "description": "The window it holds, in milliseconds: from its oldest keyframe to\nits newest frame; shorter than `preroll_ms` while it fills, after\na reconnect, or when `limits.preroll_bytes` caps it.",
+          "description": "The window it holds, in milliseconds: from its oldest keyframe to\nits newest frame; shorter than `preroll_ms` while it fills, after\na reconnect, or when its bound (`bytes`) caps it.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "truncations": {
-          "description": "GOPs larger than `limits.preroll_bytes` the ring could keep only\nthe start of.",
+          "description": "GOPs larger than its bound (`bytes`) the ring could keep only the\nstart of.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
