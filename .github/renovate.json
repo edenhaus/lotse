@@ -6,6 +6,7 @@
     "group:allNonMajor",
     "schedule:weekly"
   ],
+  "ignorePresets": [":pinDevDependencies"],
   "labels": ["dependencies"],
   "lockFileMaintenance": { "enabled": true },
   "pre-commit": { "enabled": true },
