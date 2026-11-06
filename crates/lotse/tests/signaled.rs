@@ -8,7 +8,7 @@
 //! connection may answer. A later subscription supersedes the earlier,
 //! whose signal ends, and an `unsubscribe` ends the new one's: each time
 //! the source connects again and offers to whichever subscription takes
-//! its stream then, one that comes while its open waits included.
+//! its stream then.
 //! Needs the `source-fake` feature (on with `--all-features`).
 
 #![cfg(feature = "source-fake")]
@@ -307,15 +307,16 @@ async fn a_later_subscription_supersedes_the_earlier_and_an_unsubscribe_ends_its
         error_code(call(&s, 1, &answer(3, &second)).await),
         "signal_not_found"
     );
-    // Its unsubscribe ends that signal too; the next open, after the
-    // source's backoff of a second or so, waits for a subscription, and
-    // one that comes in time gets it.
+    // Its unsubscribe ends that signal too; the source's next attempt,
+    // after its backoff, offers to the subscription that takes its stream
+    // then. (An open that comes before any subscription waits for one:
+    // the registry's and the driver's tests pin that wait on a fake
+    // clock.)
     assert!(s.unsubscribed(ConnectionId(2), 1).is_none());
     assert_eq!(
         error_code(call(&s, 2, &answer(2, &second)).await),
         "signal_not_found"
     );
-    SystemClock.sleep(Duration::from_millis(2500)).await;
     let mut door = subscribe(&s, 3, 1, Some("door")).await;
     let third = offer(&mut door).await;
     assert_ne!(third, second);
