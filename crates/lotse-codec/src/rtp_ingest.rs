@@ -113,28 +113,53 @@ enum Video {
 
 impl Video {
     /// The layers for a declared stream, seeded with the session
-    /// description's sets; `None` for codecs without them.
+    /// description's sets, or with none when it announced none (or sets
+    /// of another codec): the parameter sets then come in band (RFC 6184
+    /// §8.4), which the layers follow either way. `None` for codecs
+    /// without them.
     fn new(declared: &Declared, max_frame_bytes: usize) -> Option<Self> {
-        match (&declared.codec, &declared.sets) {
-            (Codec::H264 { .. }, Sprop::H264(sets)) => Some(Self::H264 {
-                normalizer: PacketNormalizer::new(DEFAULT_MAX_PAYLOAD, sets.clone()),
-                depacketizer: Depacketizer::new(max_frame_bytes, sets.clone()),
-                units: Vec::new(),
-                sps: sets
-                    .sps
-                    .as_deref()
-                    .and_then(|sps| crate::h264::parse_sps(sps).ok()),
-            }),
-            (Codec::H265 { .. }, Sprop::H265(sets)) => Some(Self::H265 {
-                normalizer: h265::PacketNormalizer::new(DEFAULT_MAX_PAYLOAD, sets.clone()),
-                depacketizer: h265::Depacketizer::new(max_frame_bytes, sets.clone()),
-                units: Vec::new(),
-                sps: sets
-                    .sps
-                    .as_deref()
-                    .and_then(|sps| h265::parse_sps(sps).ok()),
-            }),
+        match &declared.codec {
+            Codec::H264 { .. } => {
+                let sets = match &declared.sets {
+                    Sprop::H264(sets) => sets.clone(),
+                    Sprop::None | Sprop::H265(_) => ParameterSets::default(),
+                };
+                Some(Self::h264(&sets, max_frame_bytes))
+            }
+            Codec::H265 { .. } => {
+                let sets = match &declared.sets {
+                    Sprop::H265(sets) => sets.clone(),
+                    Sprop::None | Sprop::H264(_) => h265::ParameterSets::default(),
+                };
+                Some(Self::h265(&sets, max_frame_bytes))
+            }
             _ => None,
+        }
+    }
+
+    /// H.264's layers, seeded with `sets`.
+    fn h264(sets: &ParameterSets, max_frame_bytes: usize) -> Self {
+        Self::H264 {
+            normalizer: PacketNormalizer::new(DEFAULT_MAX_PAYLOAD, sets.clone()),
+            depacketizer: Depacketizer::new(max_frame_bytes, sets.clone()),
+            units: Vec::new(),
+            sps: sets
+                .sps
+                .as_deref()
+                .and_then(|sps| crate::h264::parse_sps(sps).ok()),
+        }
+    }
+
+    /// H.265's layers, seeded with `sets`.
+    fn h265(sets: &h265::ParameterSets, max_frame_bytes: usize) -> Self {
+        Self::H265 {
+            normalizer: h265::PacketNormalizer::new(DEFAULT_MAX_PAYLOAD, sets.clone()),
+            depacketizer: h265::Depacketizer::new(max_frame_bytes, sets.clone()),
+            units: Vec::new(),
+            sps: sets
+                .sps
+                .as_deref()
+                .and_then(|sps| h265::parse_sps(sps).ok()),
         }
     }
 }
@@ -189,6 +214,11 @@ impl RtpTrack {
     }
 }
 
+/// The most streams one attempt carries, its indices `0..MAX_STREAMS`:
+/// far above any camera's media sections, low enough that an index a
+/// device chose cannot make the streams' vector large.
+pub const MAX_STREAMS: usize = 64;
+
 /// The streams one connection attempt carries, by the source's index of
 /// each, with the state their packets go through: what one attempt of an
 /// RTP source publishes, from its first packet to its last. The indices
@@ -220,8 +250,21 @@ impl RtpTracks {
 
     /// Carries stream `index` on `track`, declared as `declared` with
     /// payload type `pt`, from the next packet on; the stream that index
-    /// carried before is forgotten.
+    /// carried before is forgotten. An index of [`MAX_STREAMS`] or more is
+    /// not carried, so an index taken from what a device sent never sizes
+    /// the streams' vector: its packets are dropped as any stream's not
+    /// carried.
     pub fn carry(&mut self, index: usize, track: Arc<Track>, pt: u8, declared: &Declared) {
+        if index >= MAX_STREAMS {
+            tracing::warn!(
+                protocol = self.protocol,
+                index,
+                max = MAX_STREAMS,
+                "{}: stream index over the limit; not carried",
+                self.protocol
+            );
+            return;
+        }
         if self.tracks.len() <= index {
             self.tracks.resize_with(index.saturating_add(1), || None);
         }
@@ -1105,6 +1148,39 @@ mod tests {
     }
 
     #[test]
+    fn an_index_over_the_limit_is_not_carried_and_its_packets_drop() {
+        let (logs, _guard) = Logs::capture();
+        let (t0, _set, mut ctx) = video_ctx();
+        let audio = pcmu();
+        let a0 = declare(&mut ctx, &audio);
+        let mut tracks = RtpTracks::new(RTSP);
+        tracks.carry(MAX_STREAMS, Arc::clone(&a0), 0, &audio);
+        assert!(tracks.tracks.is_empty(), "the vector never grew");
+        tracks
+            .receive(MAX_STREAMS, packet(1, 0, true, &[0xff; 160]), t0, &ctx)
+            .unwrap();
+        assert_eq!(a0.stats().packets, 0);
+        assert_eq!(
+            logs.count(
+                Level::WARN,
+                "rtsp: stream index over the limit; not carried"
+            ),
+            1
+        );
+        // The last index below the limit is carried.
+        tracks.carry(MAX_STREAMS - 1, Arc::clone(&a0), 0, &audio);
+        tracks
+            .receive(
+                MAX_STREAMS - 1,
+                packet(2, 160, true, &[0xff; 160]),
+                t0,
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(a0.stats().packets, 1);
+    }
+
+    #[test]
     fn carrying_an_index_again_replaces_its_stream() {
         let (t0, _set, mut ctx) = video_ctx();
         let audio = pcmu();
@@ -1160,6 +1236,47 @@ mod tests {
             "count=1",
         ] {
             assert!(lines[0].contains(&field.to_owned()), "{field}: {lines:?}");
+        }
+    }
+
+    #[test]
+    fn rfc6184_8_4_video_declared_without_its_codecs_sets_is_normalized_from_in_band_sets() {
+        // A source whose session description carries no sprop parameter
+        // sets (WebRTC answers have none) declares `Sprop::None`, or sets of
+        // another codec by mistake: the layers start from empty sets.
+        for (codec, sets, idr) in [
+            (h264().codec, Sprop::None, vec![0x65, 0xaa, 0xbb]),
+            (
+                h264().codec,
+                Sprop::H265(h265::ParameterSets::default()),
+                vec![0x65, 0xaa, 0xbb],
+            ),
+            (
+                h265().codec,
+                Sprop::None,
+                vec![h265::nal::IDR_W_RADL << 1, 0x01, 0xaa],
+            ),
+            (
+                h265().codec,
+                Sprop::H264(ParameterSets::default()),
+                vec![h265::nal::IDR_W_RADL << 1, 0x01, 0xaa],
+            ),
+        ] {
+            let (t0, _set, mut ctx) = video_ctx();
+            let video = declared(Kind::Video, codec, 90_000, sets);
+            let v0 = declare(&mut ctx, &video);
+            let mut packets = v0.subscribe_packets();
+            let mut frames = v0.subscribe_frames();
+            let mut tracks = RtpTracks::new(RTSP);
+            tracks.carry(0, Arc::clone(&v0), 96, &video);
+            tracks
+                .receive(0, packet(1, 3_000, true, &idr), t0, &ctx)
+                .unwrap();
+            let packet = packets.try_recv().unwrap().unwrap();
+            assert!(packet.keyframe_start && packet.rtp.marker, "{video:?}");
+            let frame = frames.try_recv().unwrap().unwrap();
+            assert!(frame.keyframe, "{video:?}");
+            assert_eq!(frame.ts.ticks(), 3_000);
         }
     }
 
