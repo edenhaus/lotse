@@ -444,7 +444,7 @@ pub(crate) fn build_config(
 /// without their `a=`, in order. str0m hands every candidate of an offer
 /// it parses to the agent; taken out, they reach it through
 /// [`Session::add_remote`], under the same policy as trickled ones.
-fn split_candidates(offer: &str) -> (String, Vec<&str>) {
+pub(crate) fn split_candidates(offer: &str) -> (String, Vec<&str>) {
     let mut rest = String::with_capacity(offer.len());
     let mut candidates = Vec::new();
     for line in offer.lines() {
@@ -463,7 +463,7 @@ fn split_candidates(offer: &str) -> (String, Vec<&str>) {
 /// ([`refused_address`]); any other, private, shared, public or unique
 /// local, is paired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddressClass {
+pub(crate) enum AddressClass {
     /// `0.0.0.0`, `::`: no one's address.
     Unspecified,
     /// `127.0.0.0/8`, `::1`: the host's own services.
@@ -531,10 +531,10 @@ impl AddressClass {
 
 /// A scope an address reaches no further than, with its family (`true`
 /// for IPv4): the host (loopback) or the link (link-local).
-type Scope = (AddressClass, bool);
+pub(crate) type Scope = (AddressClass, bool);
 
 /// The scope of `ip`, `None` when it is not loopback or link-local.
-fn scope(ip: IpAddr) -> Option<Scope> {
+pub(crate) fn scope(ip: IpAddr) -> Option<Scope> {
     AddressClass::of(ip)
         .filter(|class| matches!(class, AddressClass::Loopback | AddressClass::LinkLocal))
         .map(|class| (class, ip.is_ipv4()))
@@ -559,7 +559,7 @@ fn scope(ip: IpAddr) -> Option<Scope> {
 // browser's own checks still yield a peer-reflexive candidate for its real
 // address (§7.3.1.3);
 // gate: rfc8445_6_1_2_2_remote_candidates_of_refused_address_classes_get_no_checks
-fn refused_address(ip: IpAddr, scopes: &[Scope]) -> Option<&'static str> {
+pub(crate) fn refused_address(ip: IpAddr, scopes: &[Scope]) -> Option<&'static str> {
     let class = AddressClass::of(ip)?;
     if scope(ip).is_some_and(|scope| scopes.contains(&scope)) {
         return None;
@@ -570,7 +570,7 @@ fn refused_address(ip: IpAddr, scopes: &[Scope]) -> Option<&'static str> {
 /// Whether a candidate's connection-address (the fifth field, RFC 8839
 /// §5.1) is an mDNS name: one label and `.local`
 /// (draft-ietf-mmusic-mdns-ice-candidates §3.2.1, step 1).
-fn is_mdns(candidate: &str) -> bool {
+pub(crate) fn is_mdns(candidate: &str) -> bool {
     candidate
         .split_ascii_whitespace()
         .nth(4)

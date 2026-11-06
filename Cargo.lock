@@ -1744,9 +1744,13 @@ dependencies = [
  "lotse-core",
  "lotse-testing",
  "rcgen",
+ "serde",
+ "serde_json",
  "sha1",
  "sha2",
  "str0m",
+ "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

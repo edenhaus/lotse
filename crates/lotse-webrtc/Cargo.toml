@@ -20,8 +20,11 @@ dimpl = { workspace = true } # DTLS on its RustCrypto backend
 hmac = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5)
 rcgen = { workspace = true } # the self-signed DTLS certificate
 sha1 = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5)
+serde = { workspace = true } # the `webrtc://` source's typed options
+serde_json = { workspace = true } # the options as `stream/put` carries them
 sha2 = { workspace = true } # the DTLS certificate fingerprint (RFC 8122 §5)
 str0m = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net"] } # the ingest source: `select!` over signals, datagrams, its timer and the cancel; its UDP sockets
 tracing = { workspace = true }
 lotse-codec = { workspace = true } # RFC 6184 and RFC 7798 packetization of the join frames; the H.265 SPS's profile for negotiation
 lotse-core = { workspace = true }
@@ -31,7 +34,9 @@ allocation-counter = { workspace = true } # the write path's allocation count
 lotse-codec = { workspace = true, features = ["test-util"] } # hand-built parameter sets
 lotse-core = { workspace = true, features = ["test-util"] } # the fake clock and hand-built packets
 lotse-testing = { workspace = true } # the browser stand-in
-tracing-subscriber = { workspace = true } # captures the H.265 level deviation's log line
+tokio = { workspace = true, features = ["macros", "sync"] } # the ingest source's tests: the runtime, its clock reports' queue
+tokio-util = { workspace = true } # the ingest source's cancel in its tests
+tracing-subscriber = { workspace = true } # captures the H.265 level deviation's log line; the ingest tests evaluate every log line's fields
 
 [lints]
 workspace = true
