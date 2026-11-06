@@ -252,9 +252,14 @@ fn check_recording(socket: &Path, dir: &Path) {
 }
 
 /// A long `recording create` left by Ctrl-C: `lotse ctl` ends at once, as
-/// SIGINT's default does, its connection closes, and the daemon ends the
-/// recording `session_closed`. First of the recording checks: the daemon's first
-/// `recording_opened` and `recording_closed` are this recording's.
+/// SIGINT's default does, and the daemon ends the recording without waiting
+/// out its 60 minutes. Both of `ctl`'s connections close together, the
+/// control connection and the body's, so the reason is whichever the daemon
+/// sees first: `session_closed` when the supervisor handles the closed
+/// control connection first, `client_gone` when the worker sees the body's
+/// reader go before the supervisor asks it to stop (seen in CI, 2026-11-06).
+/// First of the recording checks: the daemon's first `recording_opened` and
+/// `recording_closed` are this recording's.
 #[cfg(feature = "output-recording")]
 fn check_recording_interrupted(socket: &Path, dir: &Path, daemon: &mut Daemon) {
     use std::io::{BufRead as _, BufReader};
@@ -292,7 +297,10 @@ fn check_recording_interrupted(socket: &Path, dir: &Path, daemon: &mut Daemon) {
     let output = child.wait_with_output().expect("ctl exits");
     assert!(!output.status.success(), "{output:?}");
     let stopped = json(&daemon.wait_for("\"event\":\"recording_closed\""));
-    assert_eq!(stopped["reason"], "session_closed", "{stopped}");
+    assert!(
+        ["session_closed", "client_gone"].contains(&stopped["reason"].as_str().unwrap()),
+        "{stopped}"
+    );
 }
 
 /// `raw` prints every frame up to the result, as sent.
