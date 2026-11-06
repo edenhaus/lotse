@@ -65,7 +65,7 @@ libc = { version = "0.2", default-features = false }
 # The command line of the one binary: subcommands, flags and `LOTSE_*` environment variables.
 clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 # The standalone TOML configuration file, below flags and environment in precedence.
-toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 # JSON (or text) log lines on stderr with `RUST_LOG` filtering.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
 # The `log` facade that crates below lotse still log through (dimpl, sctp-proto, mpeg2ts-reader,
