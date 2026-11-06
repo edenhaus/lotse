@@ -701,7 +701,7 @@ async fn run(mut chain: Chain, mut input: FrameSubscription, stop: CancellationT
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::arithmetic_side_effects,
         clippy::missing_docs_in_private_items,
@@ -730,22 +730,22 @@ mod tests {
     /// The events logged on this thread while captured: level and message.
     /// Also makes every field expression of the module's log lines run.
     #[derive(Debug, Clone, Default)]
-    pub(super) struct Logs(Arc<Mutex<Vec<(Level, Message)>>>);
+    pub(crate) struct Logs(Arc<Mutex<Vec<(Level, Message)>>>);
 
     impl Logs {
-        pub(super) fn capture() -> (Self, DefaultGuard) {
+        pub(crate) fn capture() -> (Self, DefaultGuard) {
             let logs = Self::default();
             let guard = tracing::subscriber::set_default(logs.clone());
             (logs, guard)
         }
 
         /// How many events at `level` carried `message`.
-        pub(super) fn count(&self, level: Level, message: &str) -> usize {
+        pub(crate) fn count(&self, level: Level, message: &str) -> usize {
             self.fields(level, message).len()
         }
 
         /// The other fields of each event at `level` with `message`.
-        pub(super) fn fields(&self, level: Level, message: &str) -> Vec<Vec<String>> {
+        pub(crate) fn fields(&self, level: Level, message: &str) -> Vec<Vec<String>> {
             let events = self.0.lock().unwrap();
             events
                 .iter()
