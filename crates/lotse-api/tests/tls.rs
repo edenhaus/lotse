@@ -758,7 +758,7 @@ async fn request<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
     Ok((status, body))
 }
 
-/// `client` connects and sends `secret` to `POST /v1/pair`.
+/// `client` connects and sends `secret` to `POST /v0/pair`.
 async fn pair(
     running: &Running,
     client: &ClientIdentity,
@@ -766,7 +766,7 @@ async fn pair(
 ) -> io::Result<(u16, String)> {
     let connected = connect(running.addr, running.config(ClientCert::Own(client))).await;
     let body = format!(r#"{{"secret":"{secret}"}}"#);
-    request(connected, "POST", "/v1/pair", &body).await
+    request(connected, "POST", "/v0/pair", &body).await
 }
 
 /// Whether a pairing attempt was refused in the handshake or closed
@@ -822,7 +822,7 @@ async fn a_code_used_after_the_handshake_is_410_rfc9110_15_5_11() {
     let (status, _) = pair(&running, &first, secret_of(&code)).await.unwrap();
     assert_eq!(status, 204);
     let body = format!(r#"{{"secret":"{}"}}"#, secret_of(&code));
-    let (status, body) = request(late, "POST", "/v1/pair", &body).await.unwrap();
+    let (status, body) = request(late, "POST", "/v0/pair", &body).await.unwrap();
     assert_eq!(status, 410, "{body}");
     assert!(body.contains("not_permitted"), "{body}");
     running.finish().await;
@@ -900,12 +900,12 @@ async fn a_pairing_connection_reaches_nothing_but_the_pair_request() {
     let mut answers = Vec::new();
     for (method, path, body) in [
         ("GET", lotse_api_types::WS_PATH, String::new()),
-        ("GET", "/v1/pair", String::new()),
-        ("POST", "/v1/other", String::new()),
-        ("POST", "/v1/pair", "{}".to_owned()),
+        ("GET", "/v0/pair", String::new()),
+        ("POST", "/v0/other", String::new()),
+        ("POST", "/v0/pair", "{}".to_owned()),
         (
             "POST",
-            "/v1/pair",
+            "/v0/pair",
             format!(r#"{{"secret":"{}"}}"#, "a".repeat(300)),
         ),
     ] {

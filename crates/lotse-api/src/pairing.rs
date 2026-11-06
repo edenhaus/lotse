@@ -9,7 +9,7 @@
 //! inside an authenticated, encrypted connection. While a code is open the
 //! listener lets an unknown client certificate through its handshake (the
 //! handshake signature is still verified), and such a connection can make
-//! exactly one request, `POST /v1/pair` with the secret. A match enrolls the
+//! exactly one request, `POST /v0/pair` with the secret. A match enrolls the
 //! pin of the certificate the handshake proved, never one the request
 //! names, closes the code and the connection; the client reconnects as an
 //! enrolled one.
@@ -54,6 +54,7 @@ use axum::routing::post;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
+use lotse_api_types::PAIR_PATH;
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::pairing::PairingCreateResult;
 use lotse_core::clock::Clock;
@@ -78,9 +79,6 @@ pub const CODE_LIFETIME: Duration = Duration::from_secs(600);
 
 /// The code's first part, which names its format.
 pub const CODE_PREFIX: &str = "LOTSE1";
-
-/// Where a pairing connection sends the secret.
-pub const PAIR_PATH: &str = "/v1/pair";
 
 /// The largest pairing request body: 256 bytes, several times
 /// `{"secret":"<32 hex digits>"}`. A longer one is answered 413.
@@ -402,7 +400,7 @@ impl PairContext {
 
 /// Serves the one request a pairing connection may make, within
 /// [`PAIR_TIMEOUT`], then closes it and waits for a redemption it began.
-/// Anything but `POST /v1/pair` is 404 (405 for another method on it).
+/// Anything but `POST /v0/pair` is 404 (405 for another method on it).
 pub(crate) async fn serve(
     stream: TlsStream<Watched>,
     context: PairContext,
@@ -440,7 +438,7 @@ fn idle(pairing: &Pairing, addr: SocketAddr, pin: Fingerprint) {
     }
 }
 
-/// `POST /v1/pair`: 204 once enrolled, 400 for a body that is not a
+/// `POST /v0/pair`: 204 once enrolled, 400 for a body that is not a
 /// secret, 403 for a wrong secret (the code stays open), 410 when no code
 /// is open any more, 500 when the pin could not be stored. The redemption
 /// is a task of its own, tracked by the connection, so it ends and is
