@@ -22,6 +22,7 @@ use crate::clock::Clock;
 use crate::clock_map::ClockMapper;
 use crate::codec::Kind;
 use crate::connection::DEFAULT_STABLE_AFTER;
+use crate::signaling::SignalingOpener;
 use crate::source::{
     BackchannelSlot, ClockInput, ResolvedPeer, Source, SourceCtx, SourceError, TrackSet,
 };
@@ -366,6 +367,10 @@ pub struct SourceRunner {
     mapper: Arc<ClockMapper>,
     /// The backchannel slot shared with the connection.
     backchannel: BackchannelSlot,
+    /// Opens each attempt's signaling channel, for a signaled source
+    /// ([`crate::source::SourceCapabilities::signaled`]); every attempt
+    /// gets it.
+    signaling: Option<Arc<dyn SignalingOpener>>,
     /// The clock.
     clock: Arc<dyn Clock>,
     /// The tunables.
@@ -381,7 +386,8 @@ pub struct SourceRunner {
 }
 
 impl SourceRunner {
-    /// A runner for `source` toward `peer`.
+    /// A runner for `source` toward `peer`, handing each attempt
+    /// `signaling`, the opener of its signaling channel, if any.
     #[expect(
         clippy::too_many_arguments,
         reason = "a constructor wiring the connection's shared parts; the runner is built once per connection"
@@ -392,6 +398,7 @@ impl SourceRunner {
         tracks: Arc<TrackSet>,
         mapper: Arc<ClockMapper>,
         backchannel: BackchannelSlot,
+        signaling: Option<Arc<dyn SignalingOpener>>,
         clock: Arc<dyn Clock>,
         config: RunnerConfig,
         backoff: ReconnectBackoff,
@@ -405,6 +412,7 @@ impl SourceRunner {
             tracks,
             mapper,
             backchannel,
+            signaling,
             clock,
             config,
             backoff,
@@ -500,6 +508,7 @@ impl SourceRunner {
             clock: clock_input,
             time: Arc::clone(&self.clock),
             backchannel: self.backchannel.clone(),
+            signaling: self.signaling.clone(),
             cancel: cancel.clone(),
         };
         let mut run = self.source.run(ctx);
@@ -681,14 +690,24 @@ mod tests {
         options: &serde_json::Value,
         gate: ConnectGate,
     ) -> Harness {
+        let source = FakeSourceFactory::new(&["fake"])
+            .validate(&SourceUrl::parse("fake://cam/").unwrap(), options)
+            .unwrap();
+        start_source(config, source, gate, None)
+    }
+
+    /// A runner of `source` behind `gate`, handing its attempts `signaling`.
+    fn start_source(
+        config: RunnerConfig,
+        source: Box<dyn Source>,
+        gate: ConnectGate,
+        signaling: Option<Arc<dyn SignalingOpener>>,
+    ) -> Harness {
         let clock = Arc::new(FakeClock::default());
         let tracks = TrackSet::new(TrackLimits::default(), clock.now());
         let (tx, events) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let mapper = Arc::new(ClockMapper::new());
-        let source = FakeSourceFactory::new(&["fake"])
-            .validate(&SourceUrl::parse("fake://cam/").unwrap(), options)
-            .unwrap();
         let runner = SourceRunner::new(
             source,
             ResolvedPeer {
@@ -698,6 +717,7 @@ mod tests {
             Arc::clone(&tracks),
             Arc::clone(&mapper),
             BackchannelSlot::default(),
+            signaling,
             clock.clone(),
             config,
             ReconnectBackoff::new(1),
@@ -723,6 +743,16 @@ mod tests {
         tokio::select! {
             event = events.recv() => event,
             () = SystemClock.sleep(Duration::from_secs(5)) => panic!("no runner event within 5 s"),
+        }
+    }
+
+    /// `future`'s output; one that does not resolve within 5 s fails the
+    /// test instead of hanging it.
+    async fn within<T>(future: impl Future<Output = T>) -> T {
+        use crate::clock::{Clock as _, SystemClock};
+        tokio::select! {
+            output = future => output,
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("nothing within 5 s"),
         }
     }
 
@@ -823,6 +853,65 @@ mod tests {
         assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Stopped));
         h.runner.await.unwrap();
         ConnectGate::open().grant();
+    }
+
+    #[tokio::test]
+    async fn every_attempt_of_a_signaled_source_opens_its_own_channel_and_a_refusal_backs_off() {
+        use crate::signaling::{LocalSignal, RemoteSignal, close};
+        use crate::test_util::{FAKE_SIGNALED_OFFER, FakeSignaling};
+
+        let signaling = FakeSignaling::new(vec![std::net::IpAddr::from([127, 0, 0, 1])]);
+        signaling.refuse_next("no_signaling_client", "nobody relays it");
+        let source = FakeSourceFactory::signaled(&["fake-signaled"])
+            .validate(
+                &SourceUrl::parse("fake-signaled://cam").unwrap(),
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        let mut h = start_source(
+            RunnerConfig::default(),
+            source,
+            ConnectGate::open(),
+            Some(signaling.clone()),
+        );
+        assert_eq!(
+            next(&mut h.events).await,
+            Some(RunnerEvent::Connecting { attempt: 1 })
+        );
+        // Refused: the attempt is unreachable, and the runner backs off.
+        crate::let_assert!(Some(RunnerEvent::Backoff { error, .. }) = next(&mut h.events).await);
+        assert_eq!(
+            error,
+            SourceError::Unreachable(
+                "signaling refused: no_signaling_client: nobody relays it".into()
+            )
+        );
+        h.clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            next(&mut h.events).await,
+            Some(RunnerEvent::Connecting { attempt: 2 })
+        );
+        // The second attempt opens through the same opener.
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        assert_eq!(signaling.opens(), 2);
+        assert_eq!(relay.id, "fake-signal-2");
+        assert_eq!(
+            within(relay.outgoing.recv()).await,
+            Some(LocalSignal::Offer(FAKE_SIGNALED_OFFER.into()))
+        );
+        relay
+            .incoming
+            .send(RemoteSignal::Answer("v=0 answer".into()))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Live));
+        h.cancel.cancel();
+        assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Stopped));
+        h.runner.await.unwrap();
+        assert_eq!(
+            within(relay.closed.wait()).await.code,
+            close::SOURCE_STOPPED
+        );
     }
 
     #[tokio::test]
@@ -1164,6 +1253,7 @@ mod tests {
             Arc::clone(&tracks),
             Arc::new(ClockMapper::new()),
             BackchannelSlot::default(),
+            None,
             clock.clone(),
             RunnerConfig::default(),
             ReconnectBackoff::new(1),
@@ -1247,6 +1337,7 @@ mod tests {
             Arc::clone(&tracks),
             Arc::new(ClockMapper::new()),
             BackchannelSlot::default(),
+            None,
             clock.clone(),
             config,
             ReconnectBackoff::new(1),
@@ -1380,6 +1471,7 @@ mod tests {
             Arc::clone(&tracks),
             Arc::clone(&mapper),
             BackchannelSlot::default(),
+            None,
             clock.clone(),
             config,
             ReconnectBackoff::new(1),
@@ -1508,6 +1600,7 @@ mod tests {
                 Arc::clone(&tracks),
                 Arc::new(ClockMapper::new()),
                 BackchannelSlot::default(),
+                None,
                 clock.clone(),
                 RunnerConfig::default(),
                 ReconnectBackoff::new(1),

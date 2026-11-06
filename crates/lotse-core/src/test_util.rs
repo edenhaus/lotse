@@ -1,12 +1,14 @@
 //! Fakes for core's own contracts, behind the `test-util` feature: a source
-//! factory and source, an output factory, a session output whose engine
+//! factory and source, a signaled source and its signaling opener, an
+//! output factory, a session output whose engine
 //! echoes, a transcoder and a recording container that do nothing but honor the
 //! contracts, and the tests' `let_assert!`. `lotse-testing` cannot hold them because it
 //! depends on this crate.
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::clock::Clock;
@@ -21,10 +23,14 @@ use crate::session::{
     RenegotiateError, SessionEngine, SessionEvent, SessionOpenError, SessionOutput, SessionRequest,
     SessionStats, TalkbackClaim, TalkbackTarget, Transport,
 };
+use crate::signaling::{
+    LocalSignal, RemoteSignal, SignalCandidate, SignalingChannel, SignalingOpener,
+    SignalingRefused, SignalingRelay, close,
+};
 use crate::source::{
     BackchannelOffer, BackchannelOpener, BackchannelRefused, BackchannelSession, BackchannelSlot,
     ProbeMark, Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor,
-    SourceError, SourceFactory,
+    SourceError, SourceFactory, TrackPublisher,
 };
 use crate::source_url::SourceUrl;
 use crate::task::BoxFuture;
@@ -78,7 +84,9 @@ macro_rules! let_assert {
 /// tests can see the validation error path. Beside any of these,
 /// `{"talk": true}` has the source ask for the device's backchannel
 /// ([`Source::wants_backchannel`]), left out of its connection options as
-/// RTSP's `backchannel` is.
+/// RTSP's `backchannel` is. A signaled factory
+/// ([`FakeSourceFactory::signaled`]) takes no options and makes
+/// [`FakeSignaledSource`]s instead.
 #[derive(Debug)]
 pub struct FakeSourceFactory {
     /// The schemes it claims.
@@ -89,6 +97,9 @@ pub struct FakeSourceFactory {
     backchannel: bool,
     /// Where its sources' backchannels put what they receive.
     capture: Option<BackchannelCapture>,
+    /// Its signaling is relayed by the client
+    /// (`SourceCapabilities::signaled`): it makes [`FakeSignaledSource`]s.
+    signaled: bool,
 }
 
 impl FakeSourceFactory {
@@ -102,6 +113,20 @@ impl FakeSourceFactory {
             abort: std::process::abort,
             backchannel: false,
             capture: None,
+            signaled: false,
+        }
+    }
+
+    /// A factory claiming `schemes` whose protocol's signaling the client
+    /// relays (`SourceCapabilities::signaled`), as the WebRTC camera
+    /// source's is: its sources are [`FakeSignaledSource`]s.
+    pub const fn signaled(schemes: &'static [&'static str]) -> Self {
+        Self {
+            schemes,
+            abort: std::process::abort,
+            backchannel: false,
+            capture: None,
+            signaled: true,
         }
     }
 
@@ -113,6 +138,7 @@ impl FakeSourceFactory {
             abort: std::process::abort,
             backchannel: true,
             capture: None,
+            signaled: false,
         }
     }
 
@@ -133,6 +159,7 @@ impl FakeSourceFactory {
             abort: std::process::abort,
             backchannel: true,
             capture: Some(capture),
+            signaled: false,
         }
     }
 }
@@ -333,6 +360,7 @@ impl SourceFactory for FakeSourceFactory {
     fn capabilities(&self) -> SourceCapabilities {
         SourceCapabilities {
             backchannel: self.backchannel,
+            signaled: self.signaled,
         }
     }
 
@@ -342,6 +370,9 @@ impl SourceFactory for FakeSourceFactory {
         options: &serde_json::Value,
     ) -> Result<Box<dyn Source>, SourceConfigError> {
         let scheme = self.schemes.first().copied().unwrap_or("fake");
+        if self.signaled {
+            return FakeSignaledSource::validate(scheme, url, options);
+        }
         let Some((talk, options)) = take_talk(options) else {
             return Err(SourceConfigError::InvalidOptions {
                 scheme,
@@ -868,6 +899,288 @@ fn pcmu_packet(arrival: Instant, seq: u16) -> MediaPacket {
         epoch: 0,
         lateness: Duration::ZERO,
         payload: Arc::from(&[0xff_u8; 160][..]),
+    }
+}
+
+/// The offer a [`FakeSignaledSource`] sends: no SDP a peer could answer,
+/// but it starts as SDP does (`v=0`, RFC 8866 §5.1).
+pub const FAKE_SIGNALED_OFFER: &str = "v=0 fake signaled offer";
+
+/// The priority of a fake host candidate on component 1: RFC 8445
+/// §5.1.2.1's formula with the host type preference 126 and the highest
+/// local preference, 65535 (§5.1.2.2).
+const FAKE_HOST_PRIORITY: u32 = 2_130_706_431;
+
+/// A source whose signaling the client relays, as the WebRTC camera
+/// source's is, made by a signaled [`FakeSourceFactory`]. Each attempt
+/// opens a channel through its context's opener (none: unreachable;
+/// refused: unreachable with the refusal), sends [`FAKE_SIGNALED_OFFER`],
+/// a host candidate per local address of the channel and the
+/// end-of-candidates indication, and waits for the answer, ignoring the
+/// camera's candidates. An answer that does not start with `v=0` ends it
+/// as a protocol error, closing `invalid_answer`; any other declares one
+/// H.264 track, goes live and publishes a `video_packet` every
+/// [`VIDEO_FRAME`] on the injected clock. A relayed failure ends it,
+/// closing `camera_error`: unreachable before the answer, ended after;
+/// the client going away (`incoming` yields `None`) ends it, closing
+/// `signaling_lost`; a cancel ends it, its channel dropped, which closes
+/// `source_stopped`.
+#[derive(Debug)]
+pub struct FakeSignaledSource {
+    /// The protocol name it reports.
+    protocol: &'static str,
+    /// Its URL.
+    url: SourceUrl,
+}
+
+impl FakeSignaledSource {
+    /// A signaled source of `scheme` for `url`, whose `options` must be
+    /// `null` or an empty object.
+    fn validate(
+        scheme: &'static str,
+        url: &SourceUrl,
+        options: &serde_json::Value,
+    ) -> Result<Box<dyn Source>, SourceConfigError> {
+        let empty = options.is_null() || options.as_object().is_some_and(serde_json::Map::is_empty);
+        if !empty {
+            return Err(SourceConfigError::InvalidOptions {
+                scheme,
+                message: format!("fake signaled source takes no options, got {options}"),
+            });
+        }
+        Ok(Box::new(Self {
+            protocol: scheme,
+            url: url.clone(),
+        }))
+    }
+}
+
+impl Source for FakeSignaledSource {
+    fn describe(&self) -> SourceDescriptor {
+        SourceDescriptor {
+            protocol: self.protocol,
+            url: self.url.clone(),
+            options: serde_json::Value::Null,
+        }
+    }
+
+    fn connection_options(&self) -> serde_json::Value {
+        serde_json::json!({ "signaled": true })
+    }
+
+    fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
+        let SourceCtx {
+            tracks,
+            time,
+            signaling,
+            cancel,
+            ..
+        } = ctx;
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                // First: once live, the cancel ends the video feed, and
+                // with it the run.
+                error = signaled_run(signaling, tracks, time, cancel.clone()) => error,
+                () = cancel.cancelled() => SourceError::Ended("cancelled before live".into()),
+            }
+        })
+    }
+}
+
+/// One attempt of a [`FakeSignaledSource`] through `opener`, declaring on
+/// `tracks` and publishing on `time` until `cancel` once live.
+async fn signaled_run(
+    opener: Option<Arc<dyn SignalingOpener>>,
+    mut tracks: TrackPublisher,
+    time: Arc<dyn Clock>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> SourceError {
+    let Some(opener) = opener else {
+        return SourceError::Unreachable("no signaling relay to the client".into());
+    };
+    let mut channel = match opener.open().await {
+        Ok(channel) => channel,
+        Err(refused) => return SourceError::Unreachable(format!("signaling refused: {refused}")),
+    };
+    tracing::debug!(signal = %channel.id, "fake signaled source: channel open; offering");
+    for signal in fake_offer(&channel.local_addrs) {
+        // A relay that stopped reading shows as the client gone on
+        // `incoming`.
+        let _sent = channel.outgoing.send(signal).await;
+    }
+    let answer = loop {
+        match channel.incoming.recv().await {
+            Some(RemoteSignal::Answer(sdp)) => break sdp,
+            // A fake has no ICE agent to feed.
+            Some(RemoteSignal::Candidate(_)) => {}
+            Some(RemoteSignal::Failed { code, message }) => {
+                return camera_failed(channel, &code, &message, SourceError::Unreachable);
+            }
+            None => return client_gone(channel),
+        }
+    };
+    if !answer.starts_with("v=0") {
+        channel.close(close::INVALID_ANSWER, "the answer is no SDP".to_owned());
+        return SourceError::Protocol("the answer is no SDP".into());
+    }
+    let video = tracks.declare(
+        Kind::Video,
+        Codec::H264 {
+            profile_level_id: None,
+            sps: None,
+            pps: None,
+        },
+        90_000,
+    );
+    tracks.ready();
+    tracing::debug!(signal = %channel.id, "fake signaled source: answered; live");
+    let mut feed = std::pin::pin!(fake_video(&video, &*time, &cancel));
+    loop {
+        tokio::select! {
+            error = &mut feed => return error,
+            signal = channel.incoming.recv() => match signal {
+                Some(RemoteSignal::Failed { code, message }) => {
+                    return camera_failed(channel, &code, &message, SourceError::Ended);
+                }
+                None => return client_gone(channel),
+                // A trickled candidate or a repeated answer: nothing to
+                // apply.
+                Some(RemoteSignal::Answer(_) | RemoteSignal::Candidate(_)) => {}
+            },
+        }
+    }
+}
+
+/// What a [`FakeSignaledSource`] sends once its channel is open: its
+/// offer, a host candidate (RFC 8839 §5.1) per address of `local_addrs`
+/// on port 9, as a fake has no socket, and the end-of-candidates
+/// indication (RFC 8838 §13), all of the first media section.
+fn fake_offer(local_addrs: &[IpAddr]) -> Vec<LocalSignal> {
+    let first = |candidate: String| {
+        LocalSignal::Candidate(SignalCandidate {
+            candidate,
+            sdp_mid: Some("0".to_owned()),
+            sdp_mline_index: Some(0),
+        })
+    };
+    let mut signals = vec![LocalSignal::Offer(FAKE_SIGNALED_OFFER.to_owned())];
+    signals.extend(local_addrs.iter().zip(1_u32..).map(|(addr, foundation)| {
+        first(format!(
+            "candidate:{foundation} 1 udp {FAKE_HOST_PRIORITY} {addr} 9 typ host"
+        ))
+    }));
+    signals.push(first(String::new()));
+    signals
+}
+
+/// Ends a [`FakeSignaledSource`]'s attempt on the failure `code` and
+/// `message` the client relayed: closes `channel` as `camera_error` and
+/// returns the error `as_error` makes of what happened.
+fn camera_failed(
+    channel: SignalingChannel,
+    code: &str,
+    message: &str,
+    as_error: fn(String) -> SourceError,
+) -> SourceError {
+    let what = format!("camera: {code}: {message}");
+    channel.close(close::CAMERA_ERROR, what.clone());
+    as_error(what)
+}
+
+/// Ends a [`FakeSignaledSource`]'s attempt once the client is gone:
+/// closes `channel` as `signaling_lost`.
+fn client_gone(channel: SignalingChannel) -> SourceError {
+    channel.close(
+        close::SIGNALING_LOST,
+        "the signaling client is gone".to_owned(),
+    );
+    SourceError::Ended("signaling client gone".into())
+}
+
+/// How many opened channels a [`FakeSignaling`] holds for the test before
+/// an open waits for it to take one.
+const FAKE_RELAYS: usize = 8;
+
+/// A scripted [`SignalingOpener`], the control-API client's relay as a
+/// test plays it. An open takes the next refusal queued
+/// ([`FakeSignaling::refuse_next`]), or else opens a channel
+/// `fake-signal-<n>` (`n` counting every open, from 1) whose source may
+/// gather on the fake's local addresses, and hands its relay end to the
+/// test ([`FakeSignaling::next_signal`]): there the test reads the offer,
+/// the candidates and the close, and sends answers, candidates and
+/// failures; dropping the relay's `incoming` is the client going away.
+#[derive(Debug)]
+pub struct FakeSignaling {
+    /// The local addresses of every channel it opens.
+    local_addrs: Vec<IpAddr>,
+    /// The refusals the next opens take, in order.
+    refusals: std::sync::Mutex<VecDeque<SignalingRefused>>,
+    /// The opens asked for, refused ones included.
+    opens: AtomicU64,
+    /// Where an open puts its relay end for the test.
+    relays: tokio::sync::mpsc::Sender<SignalingRelay>,
+    /// Where the test takes them.
+    opened: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SignalingRelay>>,
+}
+
+impl FakeSignaling {
+    /// An opener whose channels' sources may gather on `local_addrs`,
+    /// refusing nothing until told to.
+    pub fn new(local_addrs: Vec<IpAddr>) -> Arc<Self> {
+        let (relays, opened) = tokio::sync::mpsc::channel(FAKE_RELAYS);
+        Arc::new(Self {
+            local_addrs,
+            refusals: std::sync::Mutex::default(),
+            opens: AtomicU64::new(0),
+            relays,
+            opened: tokio::sync::Mutex::new(opened),
+        })
+    }
+
+    /// Refuses the next open not refused yet with `code` and `message`.
+    pub fn refuse_next(&self, code: &str, message: &str) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(SignalingRefused {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            });
+    }
+
+    /// How many opens were asked for, refused ones included.
+    pub fn opens(&self) -> u64 {
+        self.opens.load(Ordering::Relaxed)
+    }
+
+    /// The relay end of the next channel opened, once one is; `None`
+    /// never while the fake lives.
+    pub async fn next_signal(&self) -> Option<SignalingRelay> {
+        self.opened.lock().await.recv().await
+    }
+}
+
+impl SignalingOpener for FakeSignaling {
+    fn open(&self) -> BoxFuture<'static, Result<SignalingChannel, SignalingRefused>> {
+        let n = self.opens.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let refusal = self
+            .refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+        if let Some(refusal) = refusal {
+            tracing::debug!(%refusal, "fake signaling: open refused as scripted");
+            return Box::pin(std::future::ready(Err(refusal)));
+        }
+        let (channel, relay) =
+            crate::signaling::channel(format!("fake-signal-{n}"), self.local_addrs.clone());
+        let relays = self.relays.clone();
+        Box::pin(async move {
+            // The fake holds the receiving end as long as it lives.
+            let _held = relays.send(relay).await;
+            Ok(channel)
+        })
     }
 }
 
@@ -1491,6 +1804,7 @@ mod tests {
             clock,
             time: Arc::new(SystemClock),
             backchannel: BackchannelSlot::default(),
+            signaling: None,
             cancel: cancel.clone(),
         });
         let mut ready = set.ready();
@@ -1532,6 +1846,7 @@ mod tests {
             clock: input,
             time: clock,
             backchannel: BackchannelSlot::default(),
+            signaling: None,
             cancel: cancel.clone(),
         });
         let run = crate::task::spawn_named("test.fake_source", run);
@@ -1630,6 +1945,7 @@ mod tests {
                 clock,
                 time: Arc::new(SystemClock),
                 backchannel: slot.clone(),
+                signaling: None,
                 cancel: cancel.clone(),
             });
             let mut ready = set.ready();
@@ -1733,6 +2049,7 @@ mod tests {
             clock: input,
             time: clock.clone(),
             backchannel: slot.clone(),
+            signaling: None,
             cancel: cancel.clone(),
         });
         let mut ready = set.ready();
@@ -1809,6 +2126,7 @@ mod tests {
             clock: input,
             time: clock.clone(),
             backchannel: BackchannelSlot::default(),
+            signaling: None,
             cancel: cancel.clone(),
         });
         let run = crate::task::spawn_named("test.fake_source", run);
@@ -1848,6 +2166,7 @@ mod tests {
                 clock: input,
                 time: Arc::new(SystemClock),
                 backchannel: slot.clone(),
+                signaling: None,
                 cancel: cancel.clone(),
             });
             let mut ready = set.ready();
@@ -1881,6 +2200,309 @@ mod tests {
         }
     }
 
+    /// A signaled fake source running through `signaling` on a fake clock:
+    /// its run, its track set and its cancel.
+    fn run_signaled(
+        signaling: Option<Arc<dyn SignalingOpener>>,
+    ) -> (
+        tokio::task::JoinHandle<SourceError>,
+        Arc<TrackSet>,
+        CancellationToken,
+    ) {
+        let clock = Arc::new(crate::clock::FakeClock::default());
+        let source = FakeSourceFactory::signaled(&["fake-signaled"])
+            .validate(
+                &SourceUrl::parse("fake-signaled://cam").unwrap(),
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        let set = TrackSet::new(TrackLimits::default(), clock.now());
+        let (input, _reports) = ClockInput::channel(Arc::new(crate::clock_map::ClockMapper::new()));
+        let cancel = CancellationToken::new();
+        let run = source.run(SourceCtx {
+            peer: ResolvedPeer {
+                host: "cam".into(),
+                addrs: vec![],
+            },
+            tracks: set.publisher(),
+            clock: input,
+            time: clock,
+            backchannel: BackchannelSlot::default(),
+            signaling,
+            cancel: cancel.clone(),
+        });
+        let run = crate::task::spawn_named("test.fake_signaled_source", run);
+        (run, set, cancel)
+    }
+
+    fn loopback() -> Vec<IpAddr> {
+        vec![
+            IpAddr::from([127, 0, 0, 1]),
+            IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+        ]
+    }
+
+    /// A fake signaled source on a fresh [`FakeSignaling`] over
+    /// [`loopback`], with the relay end of its first channel, its offer
+    /// and candidates read.
+    async fn offered() -> (
+        tokio::task::JoinHandle<SourceError>,
+        Arc<TrackSet>,
+        CancellationToken,
+        SignalingRelay,
+    ) {
+        let signaling = FakeSignaling::new(loopback());
+        let (run, set, cancel) = run_signaled(Some(signaling.clone()));
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        for _ in 0..4 {
+            assert!(within(relay.outgoing.recv()).await.is_some());
+        }
+        (run, set, cancel, relay)
+    }
+
+    /// Waits until the source took everything sent to it on `relay`.
+    async fn drained(relay: &SignalingRelay) {
+        within(async {
+            while relay.incoming.capacity() < crate::signaling::INCOMING_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
+    fn remote_candidate() -> RemoteSignal {
+        RemoteSignal::Candidate(SignalCandidate {
+            candidate: "candidate:9 1 udp 2130706431 192.0.2.9 50000 typ host".into(),
+            sdp_mid: Some("0".into()),
+            sdp_mline_index: None,
+        })
+    }
+
+    fn failed() -> RemoteSignal {
+        RemoteSignal::Failed {
+            code: "camera_offline".into(),
+            message: "the camera is offline".into(),
+        }
+    }
+
+    #[test]
+    fn a_signaled_fake_factory_declares_signaling_and_takes_no_options() {
+        assert!(!FakeSourceFactory::new(&["fake"]).capabilities().signaled);
+        assert!(
+            !FakeSourceFactory::with_backchannel(&["fake"])
+                .capabilities()
+                .signaled
+        );
+        let capture = BackchannelCapture::default();
+        assert!(
+            !FakeSourceFactory::capturing(&["fake"], capture)
+                .capabilities()
+                .signaled
+        );
+        let factory = FakeSourceFactory::signaled(&["fake-signaled"]);
+        assert_eq!(
+            factory.capabilities(),
+            SourceCapabilities {
+                backchannel: false,
+                signaled: true,
+            }
+        );
+        let url = SourceUrl::parse("fake-signaled://cam").unwrap();
+        for options in [serde_json::Value::Null, serde_json::json!({})] {
+            let source = factory.validate(&url, &options).unwrap();
+            assert_eq!(source.describe().protocol, "fake-signaled");
+            assert_eq!(source.describe().url, url);
+            assert_eq!(source.describe().options, serde_json::Value::Null);
+            assert_eq!(
+                source.connection_options(),
+                serde_json::json!({"signaled": true})
+            );
+            assert!(!source.wants_backchannel());
+        }
+        let err = factory
+            .validate(&url, &serde_json::json!({"audio": true}))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SourceConfigError::InvalidOptions {
+                scheme: "fake-signaled",
+                message: "fake signaled source takes no options, got {\"audio\":true}".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signaled_fake_offers_with_trickled_host_candidates_rfc8838_section_13_and_goes_live_on_the_answer()
+     {
+        let signaling = FakeSignaling::new(loopback());
+        let (run, set, cancel) = run_signaled(Some(signaling.clone()));
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        assert_eq!(relay.id, "fake-signal-1");
+        assert_eq!(signaling.opens(), 1);
+        let mut signals = Vec::new();
+        for _ in 0..4 {
+            signals.push(within(relay.outgoing.recv()).await.unwrap());
+        }
+        let host = |candidate: &str| {
+            LocalSignal::Candidate(SignalCandidate {
+                candidate: candidate.into(),
+                sdp_mid: Some("0".into()),
+                sdp_mline_index: Some(0),
+            })
+        };
+        assert_eq!(
+            signals,
+            vec![
+                LocalSignal::Offer(FAKE_SIGNALED_OFFER.into()),
+                host("candidate:1 1 udp 2130706431 127.0.0.1 9 typ host"),
+                host("candidate:2 1 udp 2130706431 ::1 9 typ host"),
+                LocalSignal::Candidate(SignalCandidate::end_of_candidates(
+                    Some("0".into()),
+                    Some(0)
+                )),
+            ]
+        );
+
+        // The camera's candidates change nothing, before the answer or after.
+        relay.incoming.send(remote_candidate()).await.unwrap();
+        drained(&relay).await;
+        assert!(set.tracks().is_empty(), "not live before the answer");
+        let mut ready = set.ready();
+        relay
+            .incoming
+            .send(RemoteSignal::Answer("v=0 answer".into()))
+            .await
+            .unwrap();
+        within(ready.wait_for(|ready| *ready)).await.unwrap();
+        let tracks = set.tracks();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].kind(), Kind::Video);
+        assert_eq!(tracks[0].codec().family(), CodecFamily::H264);
+        relay.incoming.send(remote_candidate()).await.unwrap();
+        relay
+            .incoming
+            .send(RemoteSignal::Answer("v=0 again".into()))
+            .await
+            .unwrap();
+        drained(&relay).await;
+        assert!(!run.is_finished());
+
+        cancel.cancel();
+        assert_eq!(
+            within(run).await.unwrap(),
+            SourceError::Ended("cancelled".into())
+        );
+        let close = within(relay.closed.wait()).await;
+        assert_eq!(close.code, close::SOURCE_STOPPED);
+    }
+
+    #[tokio::test]
+    async fn a_signaled_fake_without_an_opener_or_refused_is_unreachable() {
+        let (run, _set, _cancel) = run_signaled(None);
+        assert_eq!(
+            within(run).await.unwrap(),
+            SourceError::Unreachable("no signaling relay to the client".into())
+        );
+
+        let signaling = FakeSignaling::new(loopback());
+        signaling.refuse_next("no_signaling_client", "nobody relays it");
+        let (run, _set, _cancel) = run_signaled(Some(signaling.clone()));
+        assert_eq!(
+            within(run).await.unwrap(),
+            SourceError::Unreachable(
+                "signaling refused: no_signaling_client: nobody relays it".into()
+            )
+        );
+        assert_eq!(signaling.opens(), 1);
+        // The refusal was used up: the next open opens, counted on.
+        let (run, _set, cancel) = run_signaled(Some(signaling.clone()));
+        let relay = within(signaling.next_signal()).await.unwrap();
+        assert_eq!(relay.id, "fake-signal-2");
+        cancel.cancel();
+        assert_eq!(
+            within(run).await.unwrap(),
+            SourceError::Ended("cancelled before live".into())
+        );
+        assert_eq!(
+            within(relay.closed.wait()).await.code,
+            close::SOURCE_STOPPED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signaled_fake_fails_unreachable_before_the_answer_and_ended_after() {
+        let (run, set, _cancel, relay) = offered().await;
+        relay.incoming.send(failed()).await.unwrap();
+        assert_eq!(
+            within(run).await.unwrap(),
+            SourceError::Unreachable("camera: camera_offline: the camera is offline".into())
+        );
+        assert!(set.tracks().is_empty());
+        let close = within(relay.closed.wait()).await;
+        assert_eq!(close.code, close::CAMERA_ERROR);
+        assert_eq!(
+            close.message,
+            "camera: camera_offline: the camera is offline"
+        );
+
+        let (run, set, _cancel, relay) = offered().await;
+        relay
+            .incoming
+            .send(RemoteSignal::Answer("v=0 answer".into()))
+            .await
+            .unwrap();
+        relay.incoming.send(failed()).await.unwrap();
+        assert_eq!(
+            within(run).await.unwrap(),
+            SourceError::Ended("camera: camera_offline: the camera is offline".into())
+        );
+        assert_eq!(set.tracks().len(), 1, "live before it failed");
+        assert_eq!(within(relay.closed.wait()).await.code, close::CAMERA_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_signaled_fake_ends_once_the_client_is_gone_before_the_answer_or_after() {
+        for answered in [false, true] {
+            let (run, set, _cancel, relay) = offered().await;
+            if answered {
+                relay
+                    .incoming
+                    .send(RemoteSignal::Answer("v=0 answer".into()))
+                    .await
+                    .unwrap();
+            }
+            let SignalingRelay {
+                incoming, closed, ..
+            } = relay;
+            drop(incoming);
+            assert_eq!(
+                within(run).await.unwrap(),
+                SourceError::Ended("signaling client gone".into()),
+                "answered: {answered}"
+            );
+            assert_eq!(set.tracks().len(), usize::from(answered));
+            assert_eq!(within(closed.wait()).await.code, close::SIGNALING_LOST);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signaled_fake_refuses_an_answer_that_is_no_sdp_rfc8866_section_5_1() {
+        let (run, set, _cancel, relay) = offered().await;
+        relay
+            .incoming
+            .send(RemoteSignal::Answer("not sdp".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            within(run).await.unwrap(),
+            SourceError::Protocol("the answer is no SDP".into())
+        );
+        assert!(set.tracks().is_empty());
+        let close = within(relay.closed.wait()).await;
+        assert_eq!(close.code, close::INVALID_ANSWER);
+        assert_eq!(close.message, "the answer is no SDP");
+    }
+
     #[tokio::test]
     async fn fake_source_with_audio_declares_pcmu_and_publishes_every_20_ms() {
         use crate::clock::FakeClock;
@@ -1903,6 +2525,7 @@ mod tests {
             clock: input,
             time: clock.clone(),
             backchannel: BackchannelSlot::default(),
+            signaling: None,
             cancel: cancel.clone(),
         });
         let mut ready = set.ready();
@@ -1950,6 +2573,7 @@ mod tests {
             clock: input,
             time: clock.clone(),
             backchannel: BackchannelSlot::default(),
+            signaling: None,
             cancel: cancel.clone(),
         });
         let mut ready = set.ready();
@@ -2010,6 +2634,7 @@ mod tests {
             clock: input,
             time: clock.clone(),
             backchannel: BackchannelSlot::default(),
+            signaling: None,
             cancel: cancel.clone(),
         });
         let mut ready = set.ready();

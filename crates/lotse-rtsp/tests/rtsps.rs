@@ -387,6 +387,7 @@ async fn a_pin_mismatch_waits_for_the_reconnect_backoff() {
         Arc::clone(&tracks),
         Arc::new(ClockMapper::new()),
         BackchannelSlot::default(),
+        None,
         clock(),
         RunnerConfig::default(),
         ReconnectBackoff::new(1),

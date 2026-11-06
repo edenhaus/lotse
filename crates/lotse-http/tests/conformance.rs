@@ -502,6 +502,7 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
         Arc::clone(&tracks),
         Arc::new(ClockMapper::new()),
         BackchannelSlot::default(),
+        None,
         clock,
         RunnerConfig::default(),
         ReconnectBackoff::new(1),

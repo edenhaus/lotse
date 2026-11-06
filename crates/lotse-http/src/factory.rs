@@ -59,7 +59,10 @@ impl SourceFactory for HttpFactory {
 
     /// Nothing goes back to the server: no backchannel.
     fn capabilities(&self) -> SourceCapabilities {
-        SourceCapabilities { backchannel: false }
+        SourceCapabilities {
+            backchannel: false,
+            signaled: false,
+        }
     }
 
     fn default_port(&self, scheme: &str) -> Option<u16> {

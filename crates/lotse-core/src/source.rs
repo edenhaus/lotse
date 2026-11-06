@@ -25,6 +25,7 @@ use crate::media::MediaPacket;
 use crate::negotiate::TrackInfo;
 use crate::prerecord::PrerecordShared;
 use crate::runner::ProbeGate;
+use crate::signaling::SignalingOpener;
 use crate::source_url::SourceUrl;
 use crate::task::{BoxFuture, spawn_named};
 use crate::track::{Feeds, Track, TrackId, TrackLimits};
@@ -34,6 +35,12 @@ use crate::track::{Feeds, Track, TrackId, TrackLimits};
 pub struct SourceCapabilities {
     /// The protocol can carry audio back to the device.
     pub backchannel: bool,
+    /// The protocol's signaling is relayed by the control-API client
+    /// (a WebRTC camera whose offer and answer travel through Home
+    /// Assistant): each connection attempt opens a channel to it through
+    /// [`SourceCtx::signaling`], which the worker hands only to such a
+    /// source. Such a source has no address to resolve.
+    pub signaled: bool,
 }
 
 /// Why a factory refused a URL and its options. The API reports it as
@@ -1146,6 +1153,11 @@ pub struct SourceCtx {
     /// if the protocol has one, and where the probe waits for its connect
     /// permit.
     pub backchannel: BackchannelSlot,
+    /// Opens this attempt's signaling channel to the control-API client,
+    /// for a signaled source ([`SourceCapabilities::signaled`]); `None`
+    /// for every other source, and for a signaled one that has no relay to
+    /// the client, which then cannot connect.
+    pub signaling: Option<Arc<dyn SignalingOpener>>,
     /// Cancelled when core wants the connection to end; honor within 100 ms.
     pub cancel: CancellationToken,
 }

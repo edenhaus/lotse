@@ -1,8 +1,10 @@
 //! Protocol-blind media core: tracks, packets, frames, the source and output
-//! contracts, factory registries, source supervision (backoff, stall watchdog,
-//! hot swap), clock mapping and its skew watchdog, fan-out, the pre-record
-//! ring, a recording's reliable queue and interleaver and its container
-//! contract, track negotiation and a session's uplink track for talk-back.
+//! contracts, the signaling channel a source whose signaling the control-API
+//! client relays opens at each attempt, factory registries, source
+//! supervision (backoff, stall watchdog, hot swap), clock mapping and its
+//! skew watchdog, fan-out, the pre-record ring, a recording's reliable queue
+//! and interleaver and its container contract, track negotiation and a
+//! session's uplink track for talk-back.
 //!
 //! Runs inside a worker process. Knows nothing about RTSP, WebRTC, HTTP or
 //! processes: it defines the traits the protocol crates implement and never
@@ -10,7 +12,9 @@
 //! wrappers in `.cargo/deny.toml`. Test fakes for core's own types live behind
 //! its `test-util` feature, never in `lotse-testing`.
 //!
-//! Standards: RFC 3550 (RTP timestamps, sequence numbers, Sender Reports).
+//! Standards: RFC 3550 (RTP timestamps, sequence numbers, Sender Reports);
+//! the signaling channel carries RFC 8829 (JSEP) offers and answers and
+//! RFC 8838 (Trickle ICE) candidates as opaque text.
 
 pub mod backoff;
 pub mod clock;
@@ -33,6 +37,7 @@ pub mod registry;
 pub mod runner;
 pub mod secret;
 pub mod session;
+pub mod signaling;
 pub mod skew;
 pub mod source;
 pub mod source_url;

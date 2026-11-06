@@ -73,6 +73,7 @@ impl SourceFactory for RtspFactory {
     fn capabilities(&self) -> SourceCapabilities {
         SourceCapabilities {
             backchannel: BACKCHANNEL,
+            signaled: false,
         }
     }
 

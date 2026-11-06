@@ -702,6 +702,7 @@ mod tests {
             clock,
             time: Arc::new(SystemClock),
             backchannel: BackchannelSlot::default(),
+            signaling: None,
             cancel: CancellationToken::new(),
         };
         (t0, set, ctx)

@@ -1261,6 +1261,10 @@ fn start_runner(
         native,
         Arc::clone(&mapper),
         backchannel.clone().unwrap_or_default(),
+        // No relay of signaling to the control-API client yet: a signaled
+        // source (`SourceCapabilities::signaled`) gets no opener, and each
+        // of its attempts ends unreachable.
+        None,
         Arc::clone(clock),
         settings.runner,
         ReconnectBackoff::resumed(
