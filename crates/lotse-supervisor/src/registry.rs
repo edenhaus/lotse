@@ -1645,6 +1645,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: None,
             backchannel,
+            signaled: false,
         }
     }
 
@@ -2377,6 +2378,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: None,
             backchannel: false,
+            signaled: false,
         };
         state.switch_connection(
             "gone",

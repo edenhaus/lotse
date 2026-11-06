@@ -37,7 +37,7 @@ use lotse_core::clock::Clock;
 use lotse_core::codec::{CodecFamily, Kind};
 use lotse_core::connection::{ConnectionConfig, ConnectionError, ConnectionState};
 use lotse_core::id::{RecordingId, StreamId};
-use lotse_core::registry::Registries;
+use lotse_core::registry::{Registries, SourceRegistry};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_ipc::{RecordingSpec, SessionSpec};
@@ -166,6 +166,21 @@ struct ValidatedSource {
     /// The source asks for the camera's backchannel
     /// ([`Source::wants_backchannel`](lotse_core::source::Source::wants_backchannel)).
     backchannel: bool,
+    /// The source's signaling is the control-API client's to relay
+    /// (`SourceCapabilities::signaled`): no host to look up, no port.
+    signaled: bool,
+}
+
+impl ValidatedSource {
+    /// The port the source's worker may connect to, from the URL or the
+    /// scheme's default; none for a signaled source, which connects to
+    /// what the client's signaling names, never to its URL.
+    fn port(&self) -> Option<u16> {
+        if self.signaled {
+            return None;
+        }
+        self.url.port().or(self.default_port)
+    }
 }
 
 /// The supervisor: the registry and the API handler over it.
@@ -413,6 +428,7 @@ impl Supervisor {
             .map_err(|err| ApiError::new(ErrorCode::InvalidRequest, err.to_string()))?;
         let described = built.describe();
         let backchannel = built.wants_backchannel();
+        let signaled = factory.capabilities().signaled;
         let default_port = factory.default_port(url.scheme());
         Ok(ValidatedSource {
             key: ConnectionKey {
@@ -426,6 +442,7 @@ impl Supervisor {
             protocol: described.protocol,
             default_port,
             backchannel,
+            signaled,
         })
     }
 
@@ -589,7 +606,7 @@ impl Supervisor {
                 Some(id) => id,
                 None => match previous
                     .get(index)
-                    .filter(|id| switchable(state, id, &source))
+                    .filter(|id| switchable(state, &self.registries.sources, id, &source))
                 {
                     Some(id) => {
                         tracing::info!(
@@ -643,7 +660,7 @@ impl Supervisor {
             id.clone(),
             ConnectionEntry {
                 key: source.key.clone(),
-                port: source.url.port().or(source.default_port),
+                port: source.port(),
                 backchannel: source.backchannel,
                 prerecord_ms,
                 demand,
@@ -1553,19 +1570,25 @@ fn driver_spec(id: &str, source: &ValidatedSource) -> DriverSpec {
         url: source.raw.clone(),
         options: serde_json::Value::Object(source.options.clone()).to_string(),
         host: source.url.host().to_owned(),
-        port: source.url.port().or(source.default_port),
+        port: source.port(),
         backchannel: source.backchannel,
+        signaled: source.signaled,
     }
 }
 
 /// Whether connection `id` can switch to `source` in place, keeping its
 /// worker and so its sessions: the worker's sandbox is pinned to the port
-/// it may connect to, so a source on another port needs a new worker.
-fn switchable(state: &State, id: &str, source: &ValidatedSource) -> bool {
-    state
-        .connections
-        .get(id)
-        .is_some_and(|entry| entry.port == source.url.port().or(source.default_port))
+/// it may connect to, so a source on another port needs a new worker. A
+/// signaled source, which `sources` says the connection's or `source`'s
+/// scheme is, never switches in place: its standby would be a second
+/// signal of one camera, offered while the first still streams.
+fn switchable(state: &State, sources: &SourceRegistry, id: &str, source: &ValidatedSource) -> bool {
+    state.connections.get(id).is_some_and(|entry| {
+        let signaled = sources
+            .get(entry.key.url.scheme())
+            .is_some_and(|factory| factory.capabilities().signaled);
+        !signaled && !source.signaled && entry.port == source.port()
+    })
 }
 
 /// Closes the sessions and ends the recordings of `stream_id` that are not on
@@ -3486,6 +3509,59 @@ mod tests {
             .await,
         );
         s.shutdown().await;
+    }
+
+    /// A signaled source has no port to pin its worker to, and a
+    /// connection never switches to or from one in place: each is a new
+    /// connection.
+    #[tokio::test]
+    async fn a_signaled_source_has_no_port_and_never_switches_in_place() {
+        let dir = private_dir("signaled-switch");
+        let mut environment = environment(&blocking_worker(&dir));
+        environment
+            .registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::signaled(&["webrtc"])))
+            .unwrap();
+        let s = Supervisor::new(
+            settings(PathBuf::from("/nonexistent/lotse.sock")),
+            environment,
+            Arc::new(SystemClock),
+        );
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let source = |s: &Supervisor| {
+            let state = s.shared.lock();
+            let source = state.streams["front"].sources[0].clone();
+            let port = state.connections[&source.connection].port;
+            drop(state);
+            (source.connection, source.spec, port)
+        };
+        let mut connections = Vec::new();
+        for url in [
+            "fake://127.0.0.1/",
+            "webrtc://camera.front_door:9",
+            "fake://127.0.0.1/other",
+            "fake://127.0.0.1/again",
+        ] {
+            result(call(&s, &put("front", url, false)).await);
+            let (connection, spec, port) = source(&s);
+            let signaled = url.starts_with("webrtc:");
+            assert_eq!(spec.signaled, signaled, "{url}");
+            assert_eq!((spec.port, port), (None, None), "{url}");
+            connections.push(connection);
+        }
+        // To the signaled source, away from it: new connections each; then
+        // between two portless fakes, in place.
+        assert_eq!(connections[1..], ["c2", "c3", "c3"], "{connections:?}");
+        assert_eq!(
+            captured
+                .lines("the connection switches to the new source in place")
+                .len(),
+            1
+        );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Shuts down while moving a fake clock, so the worker stop budget

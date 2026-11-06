@@ -24,7 +24,8 @@ mod pair;
 pub use channel::{Channel, Decoded, Message, Receiver, Sender};
 pub use codec::{IpcError, MAX_MESSAGE_BYTES, decode, encode};
 pub use message::{
-    BackoffPosition, PrerecordStats, RecordingReport, RecordingSpec, STOPPED_AS_ASKED,
-    SessionEvent, SessionSpec, SourceSpec, SourceState, TalkbackStats, TalkerChange, ToSupervisor,
-    ToWorker, TrackInfo, TrackParams, TrackStats, WorkerStats,
+    BackoffPosition, MAX_SIGNAL_SDP_BYTES, MAX_SIGNAL_TEXT_BYTES, PrerecordStats, RecordingReport,
+    RecordingSpec, STOPPED_AS_ASKED, SessionEvent, SessionSpec, SignalCommand, SignalReport,
+    SourceSpec, SourceState, TalkbackStats, TalkerChange, ToSupervisor, ToWorker, TrackInfo,
+    TrackParams, TrackStats, WorkerStats,
 };

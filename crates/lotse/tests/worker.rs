@@ -133,7 +133,8 @@ async fn a_worker_crash_is_observed_and_contained() {
             | WorkerEvent::ProbeConnecting(_)
             | WorkerEvent::ProbeEnded(_)
             | WorkerEvent::Talker { .. }
-            | WorkerEvent::Recording { .. }) => {
+            | WorkerEvent::Recording { .. }
+            | WorkerEvent::Signal(_)) => {
                 panic!("unexpected {other:?}")
             }
         }

@@ -30,6 +30,7 @@ mod recording;
 pub mod relay;
 mod sendmsg;
 mod sessions;
+mod signaling;
 mod talkback;
 #[cfg(test)]
 mod test_logs;
@@ -49,6 +50,7 @@ use lotse_core::runner::{
     ConnectGate, ProbeAsk, ProbeGate, RunnerConfig, RunnerEvent, SourceRunner,
 };
 use lotse_core::session::SessionLimits;
+use lotse_core::signaling::SignalingOpener;
 use lotse_core::source::{BackchannelSlot, BackchannelTasks, ResolvedPeer, TrackSet};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
@@ -56,8 +58,8 @@ use lotse_core::throttle::Throttle;
 use lotse_core::track::{Track, TrackId, TrackLimits};
 use lotse_ipc::{
     Channel, Decoded, IpcError, PrerecordStats, RecordingReport, RecordingSpec, Sender,
-    SessionEvent, SessionSpec, SourceSpec, SourceState, ToSupervisor, ToWorker, TrackInfo,
-    TrackStats, WorkerStats,
+    SessionEvent, SessionSpec, SignalCommand, SignalReport, SourceSpec, SourceState, ToSupervisor,
+    ToWorker, TrackInfo, TrackStats, WorkerStats,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -71,6 +73,7 @@ pub use crate::recording::{
 };
 use crate::recording::{EndReason, RecordingStart, Recordings};
 use crate::sessions::{ConnectionMedia, SessionManager};
+use crate::signaling::WorkerSignaling;
 use crate::talkback::{Arbiter, TalkerChanged, TalkerFeed};
 
 /// How often the worker pushes its counters.
@@ -258,6 +261,7 @@ pub async fn serve(
     let (session_tx, mut session_rx) = mpsc::channel::<(String, SessionEvent)>(256);
     let (recording_tx, recording_rx) = mpsc::channel::<(String, RecordingReport)>(64);
     let (probes, mut probe_asks) = ProbeGate::closed();
+    let (signaling, signal_rx) = WorkerSignaling::new();
     let mut serving = Serving {
         tx,
         registries,
@@ -277,6 +281,8 @@ pub async fn serve(
         recordings: Recordings::new(recording_tx),
         recording_rx,
         prerecord: None,
+        signaling,
+        signal_rx,
     };
     let fds: Vec<BorrowedFd<'_>> = memory.iter().map(AsFd::as_fd).collect();
     serving
@@ -313,6 +319,10 @@ pub async fn serve(
             // `serving` holds the recordings' sender, so the reports never end.
             Some((recording_id, event)) = serving.recording_rx.recv() => {
                 serving.on_recording_report(recording_id, event).await?;
+            }
+            // `serving` holds the signaling's sender, so the reports never end.
+            Some(report) = serving.signal_rx.recv() => {
+                serving.tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
             }
             // `serving` holds the gate's sender, so the asks never end.
             Some(ask) = probe_asks.recv() => {
@@ -372,6 +382,12 @@ struct Serving<'a> {
     /// The connection's pre-record window, set on its native tracks; `None`
     /// keeps no ring.
     prerecord: Option<Duration>,
+    /// The signaling of the worker's signaled sources: one opener for the
+    /// running source and the standby, and the dispatcher of the
+    /// supervisor's answers.
+    signaling: Arc<WorkerSignaling>,
+    /// What the signaled sources send the supervisor.
+    signal_rx: mpsc::Receiver<SignalReport>,
 }
 
 /// The message that passes a probe's `ask` on to the supervisor.
@@ -405,6 +421,9 @@ impl Serving<'_> {
                     &[],
                 )
                 .await?;
+        }
+        while let Ok(report) = self.signal_rx.try_recv() {
+            self.tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
         }
         while let Ok(event) = self.runner_rx.try_recv() {
             report(&mut self.tx, event, None).await?;
@@ -535,6 +554,7 @@ impl Serving<'_> {
             ToWorker::Prerecord { ms } => self.on_prerecord(ms),
             ToWorker::StartRecording(spec) => self.on_start_recording(spec, fds).await?,
             ToWorker::StopRecording { recording_id } => self.on_stop_recording(&recording_id),
+            ToWorker::Signal(command) => self.on_signal(command).await?,
             ToWorker::Shutdown { deadline_ms } => {
                 return self.on_shutdown(deadline_ms).await.map(Some);
             }
@@ -581,6 +601,7 @@ impl Serving<'_> {
             self.settings,
             &self.probes,
             &self.backchannels,
+            &self.signaling,
             self.runner_tx.clone(),
         )?);
         self.prerecord = prerecord_window(spec.prerecord_ms);
@@ -682,6 +703,16 @@ impl Serving<'_> {
                 &[],
             )
             .await?;
+        Ok(())
+    }
+
+    /// `Signal`: the supervisor's answer to a signaled source's open, or
+    /// what the client relays on its channel; a channel the worker cannot
+    /// take is closed at once.
+    async fn on_signal(&mut self, command: SignalCommand) -> Result<(), Error> {
+        if let Some(report) = self.signaling.command(command) {
+            self.tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
+        }
         Ok(())
     }
 
@@ -812,6 +843,7 @@ impl Serving<'_> {
             self.settings,
             &self.probes,
             &self.backchannels,
+            &self.signaling,
             self.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -1135,7 +1167,8 @@ async fn refuse_renegotiation(
 
 /// Validates `spec` against the registry and starts its runner on a new
 /// track set, its probes waiting at `probes`, its backchannel sessions'
-/// tasks tracked in `backchannels`.
+/// tasks tracked in `backchannels`, a signaled source's channels opened
+/// through `signaling`.
 #[expect(
     clippy::too_many_arguments,
     reason = "wires the source into the worker's shared parts, as start_runner does"
@@ -1147,6 +1180,7 @@ fn start_source(
     settings: &Settings,
     probes: &ProbeGate,
     backchannels: &BackchannelTasks,
+    signaling: &Arc<WorkerSignaling>,
     events: mpsc::Sender<RunnerEvent>,
 ) -> Result<Running, Error> {
     let native = TrackSet::new(settings.limits, clock.now());
@@ -1157,6 +1191,7 @@ fn start_source(
         settings,
         probes,
         backchannels,
+        signaling,
         events,
         Arc::clone(&native),
         "source",
@@ -1191,8 +1226,9 @@ fn start_source(
 
 /// Validates `spec` against the registry and starts its runner on
 /// `native`, reporting to `events`, its probes waiting at `probes`, its
-/// backchannel sessions' tasks tracked in `backchannels`; `role` names it
-/// in the log.
+/// backchannel sessions' tasks tracked in `backchannels`, its signaling
+/// channels opened through `signaling` when its protocol's signaling is
+/// the client's to relay; `role` names it in the log.
 #[expect(
     clippy::too_many_arguments,
     reason = "wires one runner into the worker's shared parts; called from two places"
@@ -1204,6 +1240,7 @@ fn start_runner(
     settings: &Settings,
     probes: &ProbeGate,
     backchannels: &BackchannelTasks,
+    signaling: &Arc<WorkerSignaling>,
     events: mpsc::Sender<RunnerEvent>,
     native: Arc<TrackSet>,
     role: &'static str,
@@ -1237,6 +1274,12 @@ fn start_runner(
         .backchannel
         .then(|| BackchannelSlot::gated(probes.clone()).tracked(backchannels.clone()));
     let capable = backchannel.is_some();
+    // Only a signaled source gets the opener: no other opens a channel to
+    // the control-API client.
+    let signaled = factory.capabilities().signaled.then(|| {
+        let opener: Arc<dyn SignalingOpener> = Arc::<WorkerSignaling>::clone(signaling);
+        opener
+    });
     tracing::info!(
         connection = %spec.connection_id,
         url = %url,
@@ -1244,6 +1287,7 @@ fn start_runner(
         addrs = ?spec.peer_addrs,
         role,
         backchannel = capable,
+        signaled = signaled.is_some(),
         backoff_attempts = spec.backoff.attempts,
         immediate_used = spec.backoff.immediate_used,
         "running source"
@@ -1261,10 +1305,7 @@ fn start_runner(
         native,
         Arc::clone(&mapper),
         backchannel.clone().unwrap_or_default(),
-        // No relay of signaling to the control-API client yet: a signaled
-        // source (`SourceCapabilities::signaled`) gets no opener, and each
-        // of its attempts ends unreachable.
-        None,
+        signaled,
         Arc::clone(clock),
         settings.runner,
         ReconnectBackoff::resumed(
@@ -2711,6 +2752,201 @@ mod tests {
                 },
             }
         );
+    }
+
+    /// The signaled fake source, as the WebRTC camera source's scheme.
+    fn signaled_registries() -> Arc<Registries> {
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::signaled(&["webrtc"])))
+            .unwrap();
+        Arc::new(registries)
+    }
+
+    /// The worker's next signal report, the other messages skipped.
+    async fn next_signal(h: &mut Harness) -> SignalReport {
+        let_assert!(
+            ToSupervisor::Signal(report) =
+                next_where(h, &|message| matches!(message, ToSupervisor::Signal(_))).await
+        );
+        report
+    }
+
+    fn is_backoff(message: &ToSupervisor) -> bool {
+        matches!(
+            message,
+            ToSupervisor::SourceState(SourceState::Backoff { .. })
+        )
+    }
+
+    async fn signal_command(h: &mut Harness, command: SignalCommand) {
+        h.tx.send_msg(&ToWorker::Signal(command), &[])
+            .await
+            .unwrap();
+    }
+
+    /// A signaled source opens a channel per attempt through the
+    /// supervisor: its offer and candidates go out as reports, the
+    /// client's answer comes in and it goes live; the client gone ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc8829_5_a_signaled_source_s_offer_and_answer_go_through_the_supervisor() {
+        let mut h = start_with_settings(signaled_registries(), quiet_settings());
+        h.next().await;
+        h.tx.send_msg(
+            &ToWorker::RunSource(spec("webrtc://camera.front_door", "{}")),
+            &[],
+        )
+        .await
+        .unwrap();
+        let_assert!(SignalReport::Open { request } = next_signal(&mut h).await);
+        signal_command(
+            &mut h,
+            SignalCommand::Opened {
+                request,
+                signal_id: "sig-1".into(),
+                local_addrs: vec!["192.0.2.7".parse().unwrap()],
+            },
+        )
+        .await;
+        let candidate = |candidate: &str| SignalReport::Candidate {
+            signal_id: "sig-1".into(),
+            candidate: candidate.into(),
+            mid: Some("0".into()),
+            mline_index: Some(0),
+        };
+        assert_eq!(
+            [
+                next_signal(&mut h).await,
+                next_signal(&mut h).await,
+                next_signal(&mut h).await,
+            ],
+            [
+                SignalReport::Offer {
+                    signal_id: "sig-1".into(),
+                    sdp: lotse_core::test_util::FAKE_SIGNALED_OFFER.into(),
+                },
+                candidate("candidate:1 1 udp 2130706431 192.0.2.7 9 typ host"),
+                candidate(""),
+            ]
+        );
+        signal_command(
+            &mut h,
+            SignalCommand::Answer {
+                signal_id: "sig-1".into(),
+                sdp: "v=0 answer".into(),
+            },
+        )
+        .await;
+        next_where(&mut h, &|message| {
+            *message == ToSupervisor::SourceState(SourceState::Live)
+        })
+        .await;
+
+        signal_command(
+            &mut h,
+            SignalCommand::Gone {
+                signal_id: "sig-1".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_signal(&mut h).await,
+            SignalReport::Closed {
+                signal_id: "sig-1".into(),
+                code: "signaling_lost".into(),
+                message: "the signaling client is gone".into(),
+            }
+        );
+        // The reconnect's attempt opens again.
+        let_assert!(SignalReport::Open { request: again } = next_signal(&mut h).await);
+        assert_eq!(again, request + 1);
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
+    /// A signaled source whose open the supervisor refuses backs off
+    /// unreachable; a channel no attempt asked for is closed at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_signaled_source_whose_open_is_refused_backs_off_unreachable() {
+        let mut h = start_with_settings(signaled_registries(), quiet_settings());
+        h.next().await;
+        signal_command(
+            &mut h,
+            SignalCommand::Opened {
+                request: 99,
+                signal_id: "stale".into(),
+                local_addrs: vec![],
+            },
+        )
+        .await;
+        assert_eq!(
+            next_signal(&mut h).await,
+            SignalReport::Closed {
+                signal_id: "stale".into(),
+                code: "source_stopped".into(),
+                message: "the attempt that asked for the channel is over".into(),
+            }
+        );
+        h.tx.send_msg(
+            &ToWorker::RunSource(spec("webrtc://camera.front_door", "{}")),
+            &[],
+        )
+        .await
+        .unwrap();
+        let_assert!(SignalReport::Open { request: again } = next_signal(&mut h).await);
+        signal_command(
+            &mut h,
+            SignalCommand::Refused {
+                request: again,
+                code: "no_signaling_client".into(),
+                message: "no client relays this stream's signaling".into(),
+            },
+        )
+        .await;
+        let backoff = next_where(&mut h, &is_backoff).await;
+        let_assert!(
+            ToSupervisor::SourceState(SourceState::Backoff { code, message, .. }) = backoff
+        );
+        assert_eq!(code, "source_unreachable");
+        assert!(message.contains("no_signaling_client"), "{message}");
+
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
+    /// The signal reports still queued when the worker is done go out
+    /// with its last messages.
+    #[tokio::test]
+    async fn the_last_signal_reports_go_out_before_the_worker_exits() {
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let (signaling, signal_rx) = WorkerSignaling::new();
+        serving.signaling = signaling;
+        serving.signal_rx = signal_rx;
+        let opening = spawn_named("test.open", serving.signaling.open());
+        while serving.signal_rx.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let mut session_rx = mpsc::channel(1).1;
+        serving
+            .flush(ExitReason::Shutdown, &mut session_rx)
+            .await
+            .unwrap();
+        drop(serving);
+        assert_eq!(
+            within(rx.recv_msg::<ToSupervisor>())
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            ToSupervisor::Signal(SignalReport::Open { request: 1 })
+        );
+        opening.abort();
     }
 
     /// A release on a connection whose protocol has no backchannel does
@@ -4671,6 +4907,8 @@ mod tests {
             recordings: Recordings::new(mpsc::channel(1).0),
             recording_rx: mpsc::channel(1).1,
             prerecord: None,
+            signaling: WorkerSignaling::new().0,
+            signal_rx: mpsc::channel(1).1,
         };
         (serving, ours.split().1)
     }
@@ -4755,6 +4993,7 @@ mod tests {
             &settings,
             &serving.probes,
             &serving.backchannels,
+            &serving.signaling,
             serving.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -5083,6 +5322,7 @@ mod tests {
             &settings,
             &ProbeGate::default(),
             &tasks,
+            &WorkerSignaling::new().0,
             mpsc::channel(1).0,
             TrackSet::new(TrackLimits::default(), clock.now()),
             "source",
@@ -5664,6 +5904,7 @@ mod tests {
             &settings,
             &serving.probes,
             &serving.backchannels,
+            &serving.signaling,
             serving.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",

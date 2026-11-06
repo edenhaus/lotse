@@ -3,7 +3,10 @@
 //! the supervisor, which treats a worker as possibly compromised,
 //! forwards only a bounded answer made of well-formed SDP lines and
 //! candidate lines of RFC 8839's grammar. A report that fails the check
-//! closes its session; the reason is logged, never the text.
+//! closes its session; the reason is logged, never the text. A signaled
+//! source's offer and candidates, which go to the client relaying its
+//! signaling, are checked the same way, the offer bounded tighter
+//! ([`check_signal`]); one that fails ends its signal.
 //!
 //! The check is syntactic: it bounds what a worker can make the client and
 //! the browser parse, not which addresses its candidates name, which a web
@@ -29,12 +32,17 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use lotse_api_types::limits::{MAX_SDP_CHARS, MAX_TEXT_CHARS};
-use lotse_ipc::SessionEvent as WorkerSessionEvent;
+use lotse_ipc::{SessionEvent as WorkerSessionEvent, SignalReport};
 
 /// The longest answer, in bytes: the offer's cap, which is the control
 /// API's frame;
 /// str0m's answers are a few KiB.
 pub(crate) const MAX_ANSWER_BYTES: usize = MAX_SDP_CHARS;
+
+/// The longest offer a signaled source sends the client, in bytes: a
+/// WebRTC offer of audio, video and a data channel, its host candidates
+/// included, is two or three KiB.
+pub(crate) const MAX_OFFER_BYTES: usize = 16 * 1024;
 
 /// The longest candidate line or `mid`, in bytes: the cap on the
 /// browser's (`MAX_TEXT_CHARS`).
@@ -97,25 +105,49 @@ pub(crate) fn check(report: &WorkerSessionEvent) -> Result<(), &'static str> {
 /// but NUL, CR and LF), and its `a=candidate` and `a=mid` lines as
 /// [`check_candidate`] and [`check_mid`] take them.
 fn check_answer(sdp: &str) -> Result<(), &'static str> {
-    if sdp.len() > MAX_ANSWER_BYTES {
-        return Err("answer too long");
+    check_sdp(sdp, MAX_ANSWER_BYTES)
+}
+
+/// Checks what of a signaled source's signal report goes to the client
+/// as text: an offer as [`check_sdp`] takes one of at most
+/// [`MAX_OFFER_BYTES`], a candidate line and its `mid` as for a session.
+/// The error is the reason, for the log.
+pub(crate) fn check_signal(report: &SignalReport) -> Result<(), &'static str> {
+    match report {
+        SignalReport::Offer { sdp, .. } => check_sdp(sdp, MAX_OFFER_BYTES),
+        SignalReport::Candidate { candidate, mid, .. } => {
+            if !candidate.is_empty() {
+                check_candidate(candidate)?;
+            }
+            mid.as_deref().map_or(Ok(()), check_mid)
+        }
+        SignalReport::Open { .. } | SignalReport::Cancel { .. } | SignalReport::Closed { .. } => {
+            Ok(())
+        }
+    }
+}
+
+/// An SDP of at most `max` bytes, as [`check_answer`] describes.
+fn check_sdp(sdp: &str, max: usize) -> Result<(), &'static str> {
+    if sdp.len() > max {
+        return Err("SDP too long");
     }
     let body = sdp.strip_suffix("\r\n").unwrap_or(sdp);
     let mut lines = body.split("\r\n");
     if lines.next() != Some("v=0") {
-        return Err("answer does not start with v=0");
+        return Err("SDP does not start with v=0");
     }
     for line in lines {
         let Some((head, value)) = line.split_at_checked(2) else {
-            return Err("answer line too short");
+            return Err("SDP line too short");
         };
         let attribute = match head.as_bytes() {
             [b'a', b'='] => true,
             [letter, b'='] if letter.is_ascii_lowercase() => false,
-            _ => return Err("answer line not <type>=<value>"),
+            _ => return Err("SDP line not <type>=<value>"),
         };
         if value.chars().any(|c| c.is_control() && c != '\t') {
-            return Err("control character in an answer line");
+            return Err("control character in an SDP line");
         }
         if !attribute {
             continue;
@@ -287,47 +319,35 @@ a=end-of-candidates\r\n";
         let at_cap = format!("v=0\r\na={}\r\n", "x".repeat(MAX_ANSWER_BYTES - 9));
         assert_eq!(at_cap.len(), MAX_ANSWER_BYTES);
         assert_eq!(answer(&at_cap), Ok(()));
-        assert_eq!(answer(&format!("{at_cap}a")), Err("answer too long"));
-        assert_eq!(answer(""), Err("answer does not start with v=0"));
-        assert_eq!(answer("v=1\r\n"), Err("answer does not start with v=0"));
-        assert_eq!(answer("v=0 answer"), Err("answer does not start with v=0"));
-        assert_eq!(
-            answer("o=x\r\nv=0\r\n"),
-            Err("answer does not start with v=0")
-        );
+        assert_eq!(answer(&format!("{at_cap}a")), Err("SDP too long"));
+        assert_eq!(answer(""), Err("SDP does not start with v=0"));
+        assert_eq!(answer("v=1\r\n"), Err("SDP does not start with v=0"));
+        assert_eq!(answer("v=0 answer"), Err("SDP does not start with v=0"));
+        assert_eq!(answer("o=x\r\nv=0\r\n"), Err("SDP does not start with v=0"));
     }
 
     #[test]
     fn rfc8866_5_every_line_is_a_type_letter_and_a_value_without_controls() {
-        assert_eq!(answer("v=0\r\n\r\n"), Err("answer line too short"));
-        assert_eq!(answer("v=0\r\na\r\n"), Err("answer line too short"));
+        assert_eq!(answer("v=0\r\n\r\n"), Err("SDP line too short"));
+        assert_eq!(answer("v=0\r\na\r\n"), Err("SDP line too short"));
         assert_eq!(answer("v=0\r\na=\r\n"), Ok(()), "an empty value");
-        assert_eq!(
-            answer("v=0\r\nA=x\r\n"),
-            Err("answer line not <type>=<value>")
-        );
-        assert_eq!(
-            answer("v=0\r\n1=x\r\n"),
-            Err("answer line not <type>=<value>")
-        );
+        assert_eq!(answer("v=0\r\nA=x\r\n"), Err("SDP line not <type>=<value>"));
+        assert_eq!(answer("v=0\r\n1=x\r\n"), Err("SDP line not <type>=<value>"));
         assert_eq!(
             answer("v=0\r\naa=x\r\n"),
-            Err("answer line not <type>=<value>")
+            Err("SDP line not <type>=<value>")
         );
-        assert_eq!(
-            answer("v=0\r\né=x\r\n"),
-            Err("answer line not <type>=<value>")
-        );
+        assert_eq!(answer("v=0\r\né=x\r\n"), Err("SDP line not <type>=<value>"));
         for control in ["\n", "\r", "\0", "\u{1b}", "\u{7f}", "\u{85}"] {
             assert_eq!(
                 answer(&format!("v=0\r\ns=a{control}b\r\n")),
-                Err("control character in an answer line"),
+                Err("control character in an SDP line"),
                 "{control:?}"
             );
         }
         assert_eq!(
             answer("v=0\ns=-\n"),
-            Err("answer does not start with v=0"),
+            Err("SDP does not start with v=0"),
             "LF only"
         );
         assert_eq!(answer("v=0\r\ns=é\r\n"), Ok(()), "UTF-8 text");
@@ -516,6 +536,61 @@ a=end-of-candidates\r\n";
             }),
             Ok(())
         );
+    }
+
+    fn offer(sdp: &str) -> Result<(), &'static str> {
+        check_signal(&SignalReport::Offer {
+            signal_id: "sig".into(),
+            sdp: sdp.into(),
+        })
+    }
+
+    fn signal_candidate(candidate: &str, mid: Option<&str>) -> Result<(), &'static str> {
+        check_signal(&SignalReport::Candidate {
+            signal_id: "sig".into(),
+            candidate: candidate.into(),
+            mid: mid.map(str::to_owned),
+            mline_index: Some(0),
+        })
+    }
+
+    #[test]
+    fn rfc8866_5_a_signaled_source_s_offer_is_checked_as_an_answer_and_bounded_tighter() {
+        assert_eq!(offer(ANSWER), Ok(()));
+        let at_cap = format!("v=0\r\ns={}", "x".repeat(MAX_OFFER_BYTES - 7));
+        assert_eq!(at_cap.len(), MAX_OFFER_BYTES);
+        assert_eq!(offer(&at_cap), Ok(()));
+        assert_eq!(offer(&format!("{at_cap}x")), Err("SDP too long"));
+        assert_eq!(offer("v=0 offer"), Err("SDP does not start with v=0"));
+        assert_eq!(
+            offer("v=0\r\na=candidate:x\r\n"),
+            Err("candidate component malformed")
+        );
+    }
+
+    #[test]
+    fn rfc8839_5_1_a_signaled_source_s_candidates_are_checked_as_a_session_s() {
+        let host = "candidate:1 1 udp 2130706431 192.0.2.7 50000 typ host";
+        assert_eq!(signal_candidate(host, Some("0")), Ok(()));
+        assert_eq!(signal_candidate(host, None), Ok(()));
+        // End-of-candidates.
+        assert_eq!(signal_candidate("", Some("0")), Ok(()));
+        assert_eq!(
+            signal_candidate("candidate:1 1 udp 1 cam.local 9 typ host", None),
+            Err("candidate address not an IP address")
+        );
+        assert_eq!(signal_candidate(host, Some("0 1")), Err("mid malformed"));
+        for report in [
+            SignalReport::Open { request: 1 },
+            SignalReport::Cancel { request: 1 },
+            SignalReport::Closed {
+                signal_id: "sig".into(),
+                code: "\0".into(),
+                message: "\0".into(),
+            },
+        ] {
+            assert_eq!(check_signal(&report), Ok(()));
+        }
     }
 
     #[test]

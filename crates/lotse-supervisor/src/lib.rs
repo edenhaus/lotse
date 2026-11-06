@@ -48,6 +48,7 @@ mod recording;
 mod registry;
 mod resolve;
 mod session;
+mod signaling;
 pub mod worker;
 mod worker_text;
 
