@@ -379,19 +379,16 @@ async fn run(
     if !offer(&attempt.engine, &channel, ctx).await {
         return attempt.finish(channel, cancelled());
     }
-    let mut timer: Option<(Instant, BoxFuture<'static, ()>)> = None;
     loop {
         let wake = match attempt.drain(ctx) {
             Ok(wake) => wake,
             Err(end) => return attempt.finish(channel, end),
         };
-        let (at, mut sleeping) = match timer.take() {
-            Some((at, sleeping)) if at <= wake => (at, sleeping),
-            _ => {
-                let wait = wake.saturating_duration_since(ctx.time.now());
-                (wake, ctx.time.sleep(wait))
-            }
-        };
+        // A new timer each time: str0m's next timeout moves with nearly
+        // every datagram, so one kept would rarely be the one due.
+        let mut sleeping = ctx
+            .time
+            .sleep(wake.saturating_duration_since(ctx.time.now()));
         let event = tokio::select! {
             biased;
             () = ctx.cancel.cancelled() => Woke::Cancelled,
@@ -399,12 +396,8 @@ async fn run(
             (index, received) = recv_any(&attempt.hosts, &mut attempt.buf) => Woke::Datagram(index, received),
             () = &mut sleeping => Woke::Timer,
         };
-        let fired = matches!(event, Woke::Timer);
         if let Some(end) = attempt.woke(event, ctx.time.now()) {
             return attempt.finish(channel, end);
-        }
-        if !fired {
-            timer = Some((at, sleeping));
         }
     }
 }

@@ -276,6 +276,9 @@ struct Pair {
     outputs: Vec<IngestOutput>,
     /// Datagrams go through; `false` cuts the link both ways.
     link: bool,
+    /// DTLS records go through (RFC 7983 §7: first byte 20 to 63); `false`
+    /// lets only the rest pass.
+    dtls: bool,
 }
 
 impl Pair {
@@ -287,6 +290,7 @@ impl Pair {
             now,
             outputs: Vec::new(),
             link: true,
+            dtls: true,
         };
         pair.drain();
         pair
@@ -317,6 +321,7 @@ impl Pair {
                     payload,
                 } => {
                     if self.link
+                        && (self.dtls || !(20..64).contains(&payload[0]))
                         && destination == CAMERA
                         && let Some(camera) = self.camera.as_mut()
                     {
@@ -350,6 +355,9 @@ impl Pair {
             return;
         }
         for (source, destination, payload) in out {
+            if !self.dtls && (20..64).contains(&payload[0]) {
+                continue;
+            }
             self.engine.receive(self.now, source, destination, &payload);
             self.drain();
         }
@@ -613,6 +621,7 @@ fn rfc8445_6_1_1_the_offerer_controls_connects_and_carries_the_negotiated_tracks
     // asked for; what it sends is counted and dropped.
     assert_eq!(pair.camera().channels.len(), 1);
     assert_eq!(pair.camera().channels[0].1, "dataSendChannel");
+    assert!(pair.engine.stats().data_channel_open);
     pair.camera().send_data(b"hello");
     pair.deliver();
     pair.step(Duration::from_millis(10));
@@ -622,6 +631,7 @@ fn rfc8445_6_1_1_the_offerer_controls_connects_and_carries_the_negotiated_tracks
     pair.camera().rtc.direct_api().close_data_channel(id);
     pair.camera().drain();
     pair.run(Duration::from_millis(100));
+    assert!(!pair.engine.stats().data_channel_open);
     assert!(pair.ended().is_none(), "a closed data channel ends nothing");
     // A repeated answer changes nothing.
     pair.engine.accept_answer(pair.now, &answer);
@@ -638,13 +648,13 @@ fn rfc4585_6_3_1_startup_plis_every_second_until_a_keyframe_at_most_five() {
     let tracks = pair.tracks();
     assert_eq!(tracks.len(), 1);
     assert_eq!(tracks[0].index, 0, "the video is the first m-line");
+    // The first as the connection is up.
     pair.connect();
-    pair.step(Duration::from_millis(1));
     assert_eq!(pair.engine.stats().plis, 1);
-    pair.step(PLI_INTERVAL - Duration::from_millis(10));
+    pair.step(PLI_INTERVAL - Duration::from_millis(1));
     assert_eq!(pair.engine.stats().plis, 1, "not before the interval");
-    pair.step(Duration::from_millis(20));
-    assert_eq!(pair.engine.stats().plis, 2);
+    pair.step(Duration::from_millis(1));
+    assert_eq!(pair.engine.stats().plis, 2, "on the interval");
     pair.run(Duration::from_secs(10));
     assert_eq!(pair.engine.stats().plis, u64::from(STARTUP_PLIS));
     assert_eq!(pair.camera().keyframe_requests, STARTUP_PLIS as usize);
@@ -678,6 +688,8 @@ fn rfc4585_6_3_1_a_keyframe_stops_the_startup_plis_and_a_loss_asks_again_rate_li
     assert_eq!(pair.rtp().len(), before + 1, "it arrives");
     pair.camera().seq += 3;
     pair.step(PLI_INTERVAL);
+    // The next in order after the highest: no loss either.
+    pair.frame(false);
     assert_eq!(pair.engine.stats().plis, 2);
     pair.camera().seq += 5;
     pair.frame(false);
@@ -864,6 +876,27 @@ fn rfc8445_8_not_connected_within_10_s_of_the_answer_ends_as_ice_failed() {
         error,
         SourceError::Timeout("webrtc: not connected within 10 s of the answer".into())
     );
+    assert_eq!(code, close::ICE_FAILED);
+}
+
+#[test]
+fn rfc8445_8_ice_up_without_dtls_and_then_lost_is_ice_failed_at_10_s() {
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    pair.dtls = false;
+    pair.answer(camera_config(false), |answer| answer);
+    // STUN only (RFC 7983 §7: first byte 0 to 3): ICE pairs, DTLS never
+    // gets through; then the link goes altogether. Not connected, the
+    // attempt ends at the connection deadline (str0m 0.24's agent takes
+    // longer to give the pair up).
+    pair.run(Duration::from_secs(1));
+    assert!(!pair.engine.is_connected());
+    pair.link = false;
+    pair.run(CONNECT_TIMEOUT - Duration::from_millis(1_100));
+    assert!(pair.ended().is_none(), "{:?}", pair.ended());
+    pair.run(Duration::from_millis(200));
+    let (error, code, _) = pair.ended().unwrap();
+    assert!(matches!(error, SourceError::Timeout(_)), "{error}");
     assert_eq!(code, close::ICE_FAILED);
 }
 
@@ -1371,6 +1404,49 @@ mod source {
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn rfc4585_6_3_1_the_source_stops_asking_for_a_keyframe_once_one_arrived() {
+        let _logs = logs();
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
+        let running = start(
+            serde_json::json!({ "audio": false }),
+            Some(signaling.clone()),
+            Arc::new(SystemClock),
+        );
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        let (offer, _) = read_offer(&mut relay).await;
+        let (mut camera, answer) = Live::answer(&offer, false).await;
+        relay
+            .incoming
+            .send(RemoteSignal::Answer(answer))
+            .await
+            .unwrap();
+        camera.connect().await;
+        let video = Arc::clone(&running.set.tracks()[0]);
+        // Delta frames alone for 2.5 s: a request a second meanwhile.
+        for _ in 0..25 {
+            camera.camera.frame(SystemClock.now(), false);
+            camera.pump(Duration::from_millis(100)).await;
+        }
+        assert!(video.stats().packets > 0);
+        assert_eq!(video.stats().keyframes, 0);
+        let asked = camera.camera.keyframe_requests;
+        assert!(asked >= 2, "{asked}");
+        // The keyframe: the requests stop.
+        while video.stats().keyframes == 0 {
+            camera.camera.frame(SystemClock.now(), true);
+            camera.pump(Duration::from_millis(100)).await;
+        }
+        let asked = camera.camera.keyframe_requests;
+        for _ in 0..25 {
+            camera.camera.frame(SystemClock.now(), false);
+            camera.pump(Duration::from_millis(100)).await;
+        }
+        assert_eq!(camera.camera.keyframe_requests, asked);
+        running.cancel.cancel();
+        within(running.run).await.unwrap();
     }
 
     #[tokio::test]

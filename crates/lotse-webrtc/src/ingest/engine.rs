@@ -171,6 +171,9 @@ pub struct IngestStats {
     pub data_messages: u64,
     /// Their bytes.
     pub data_bytes: u64,
+    /// The offer's data channel is open (RFC 8832 §6: its
+    /// `DATA_CHANNEL_OPEN` acknowledged) and not closed since.
+    pub data_channel_open: bool,
     /// Remote candidates handed to the agent.
     pub remote_candidates: u64,
     /// Remote candidates refused or unreadable.
@@ -732,18 +735,17 @@ impl IngestEngine {
                 );
                 return;
             }
-            Phase::Ended => return,
+            // Once ended, str0m is inert and nothing is due.
             _ => {}
         }
         self.startup_pli(false);
         self.input(Input::Timeout(now));
     }
 
-    /// The first keyframe arrived: no more startup keyframe requests.
+    /// The first keyframe arrived: no more startup keyframe requests, and
+    /// a loss asks for one from now on. Called once per attempt.
     pub fn keyframe_seen(&mut self) {
-        if !self.keyframe {
-            tracing::info!(plis = self.startup_plis, "webrtc: first keyframe");
-        }
+        tracing::info!(plis = self.startup_plis, "webrtc: first keyframe");
         self.keyframe = true;
         self.pli_due = None;
     }
@@ -842,7 +844,8 @@ impl IngestEngine {
                 }
             }
             Event::ChannelOpen(id, label) => {
-                let ours = self.channel.as_ref().is_some_and(|(ours, _)| *ours == id);
+                let ours = self.is_ours(id);
+                self.stats.data_channel_open |= ours;
                 tracing::info!(label, ours, "webrtc: data channel open");
             }
             Event::ChannelData(data) => {
@@ -850,7 +853,11 @@ impl IngestEngine {
                 self.stats.data_messages = self.stats.data_messages.saturating_add(1);
                 self.stats.data_bytes = self.stats.data_bytes.saturating_add(bytes);
             }
-            Event::ChannelClose(_) => tracing::info!("webrtc: data channel closed by the camera"),
+            Event::ChannelClose(id) => {
+                let ours = self.is_ours(id);
+                self.stats.data_channel_open &= !ours;
+                tracing::info!(ours, "webrtc: data channel closed");
+            }
             Event::Closed => self.end(
                 SourceError::Ended,
                 close::PEER_CLOSED,
@@ -858,6 +865,11 @@ impl IngestEngine {
             ),
             _ => {}
         }
+    }
+
+    /// Whether `id` is the data channel the offer opened.
+    fn is_ours(&self, id: ChannelId) -> bool {
+        self.channel.as_ref().is_some_and(|(ours, _)| *ours == id)
     }
 
     /// One RTP packet: handed on under its stream's index when it is of a
@@ -894,7 +906,7 @@ impl IngestEngine {
         let ahead = stream
             .highest
             .map_or(1, |highest| seq.wrapping_sub(highest));
-        let forward = ahead > 0 && ahead < 0x8000;
+        let forward = (1..0x8000).contains(&ahead);
         let lost = stream.video && forward && ahead > 1 && stream.highest.is_some();
         stream.highest = if forward { Some(seq) } else { stream.highest };
         self.stats.rtp_packets = self.stats.rtp_packets.saturating_add(1);
