@@ -15,7 +15,8 @@
 //! without waiting. A queue the source does not drain in time ends the
 //! signal: its incoming end is dropped, which the source reads as the
 //! client gone, as it does a [`SignalCommand::Gone`]. A worker holds at
-//! most [`MAX_SIGNALS`] channels; an `Opened` past them is refused.
+//! most [`MAX_SIGNALS`] channels, each until its relay queued its close
+//! (one it let go of early included); an `Opened` past them is refused.
 //!
 //! Every report is bounded as the supervisor takes it
 //! ([`MAX_SIGNAL_OFFER_BYTES`], [`MAX_SIGNAL_CANDIDATE_BYTES`]), so the
@@ -32,7 +33,7 @@
 //! carries; RFC 8838 (Trickle ICE) for the candidates and the
 //! end-of-candidates indication, as `lotse_core::signaling` cites them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lotse_core::signaling::{
@@ -85,6 +86,26 @@ struct Signals {
     opening: HashMap<u64, oneshot::Sender<OpenAnswer>>,
     /// The open channels' incoming ends, by signal id.
     open: HashMap<String, mpsc::Sender<RemoteSignal>>,
+    /// The channels whose relay still runs, by signal id: a channel the
+    /// worker let go of early (failed, its client gone) counts against
+    /// [`MAX_SIGNALS`] until its source closed it and its relay queued
+    /// the close.
+    relaying: HashSet<String>,
+}
+
+/// A channel's place among [`Signals::relaying`], which its relay holds
+/// and gives up when it ends, however it ends.
+struct Relaying {
+    /// The signals.
+    state: Arc<Mutex<Signals>>,
+    /// The channel.
+    signal_id: String,
+}
+
+impl Drop for Relaying {
+    fn drop(&mut self) {
+        lock(&self.state).relaying.remove(&self.signal_id);
+    }
 }
 
 /// Locks the signals; a poisoned lock is taken as it is, since every
@@ -198,8 +219,8 @@ impl WorkerSignaling {
                 message: "the attempt that asked for the channel is over".to_owned(),
             });
         };
-        let duplicate = state.open.contains_key(&signal_id);
-        if duplicate || state.open.len() >= MAX_SIGNALS {
+        let duplicate = state.relaying.contains(&signal_id);
+        if duplicate || state.relaying.len() >= MAX_SIGNALS {
             drop(state);
             let message = if duplicate {
                 "the signal id names an open channel"
@@ -221,7 +242,12 @@ impl WorkerSignaling {
         }
         let (channel, relay) = lotse_core::signaling::channel(signal_id.clone(), local_addrs);
         state.open.insert(signal_id.clone(), relay.incoming);
+        state.relaying.insert(signal_id.clone());
         drop(state);
+        let relaying = Relaying {
+            state: Arc::clone(&self.state),
+            signal_id: signal_id.clone(),
+        };
         tracing::info!(request, signal = %signal_id, local_addrs = ?channel.local_addrs, "signaling channel opened");
         let _relay = spawn_named(
             "signal.relay",
@@ -231,6 +257,7 @@ impl WorkerSignaling {
                 signal_id,
                 relay.outgoing,
                 relay.closed,
+                relaying,
             )),
         );
         // An open abandoned meanwhile drops the channel, which closes it
@@ -335,7 +362,8 @@ impl Drop for PendingOpen {
 
 /// Relays the channel `signal_id`'s `outgoing` signals to `reports` as
 /// the supervisor's reports, ahead of its close from `closed`, which goes
-/// last; then the channel leaves `state`. A signal longer than the
+/// last; then the channel leaves `state`, and with `relaying` its place
+/// among the channels the worker holds. A signal longer than the
 /// supervisor takes ends the signal there: the source is told the relay
 /// rejected it ([`REJECTED`]), its own fault and not the camera's.
 async fn relay_signal(
@@ -344,6 +372,7 @@ async fn relay_signal(
     signal_id: String,
     mut outgoing: mpsc::Receiver<LocalSignal>,
     closed: SignalClosed,
+    relaying: Relaying,
 ) {
     let mut closed = std::pin::pin!(closed.wait());
     let (code, message) = loop {
@@ -384,6 +413,7 @@ async fn relay_signal(
             message: plain(&message, MAX_SIGNAL_TEXT_BYTES),
         })
         .await;
+    drop(relaying);
 }
 
 /// `signal` of `signal_id` as the supervisor's report, or why the
@@ -819,6 +849,57 @@ mod tests {
             refused("the signal id names an open channel")
         );
         assert_eq!(held(&signaling), MAX_SIGNALS);
+        drop(channels);
+    }
+
+    /// A channel the worker let go of early (here the relay rejected it)
+    /// still counts until its source closed it and its relay queued the
+    /// close, so a source cannot hold more channels than the supervisor's
+    /// driver remembers ending.
+    #[tokio::test]
+    async fn a_channel_counts_against_max_signals_until_its_relay_ends() {
+        let (signaling, mut reports) = WorkerSignaling::new();
+        let mut channels = Vec::new();
+        for n in 0..MAX_SIGNALS {
+            channels.push(open(&signaling, &mut reports, &format!("sig-{n}")).await);
+        }
+        assert_eq!(
+            signaling.command(SignalCommand::Failed {
+                signal_id: "sig-0".into(),
+                code: REJECTED.into(),
+                message: "rejected".into(),
+            }),
+            None
+        );
+        assert_eq!(held(&signaling), MAX_SIGNALS - 1, "let go of");
+        let opening = spawn_named("test.open", signaling.open());
+        let_assert!(SignalReport::Open { request } = next(&mut reports).await);
+        let_assert!(
+            Some(SignalReport::Closed { message, .. }) =
+                signaling.command(opened(request, "sig-x"))
+        );
+        assert_eq!(
+            message,
+            "the worker holds as many signaling channels as it may"
+        );
+        assert!(opening.await.unwrap().is_err());
+        // Its id is still taken, too.
+        let opening = spawn_named("test.open", signaling.open());
+        let_assert!(SignalReport::Open { request } = next(&mut reports).await);
+        assert_eq!(signaling.command(opened(request, "sig-0")), None);
+        assert!(opening.await.unwrap().is_err());
+        // Its source closes it; once the close is queued, a place is free.
+        drop(channels.remove(0));
+        let_assert!(SignalReport::Closed { signal_id, .. } = next(&mut reports).await);
+        assert_eq!(signal_id, "sig-0");
+        for _ in 0..100 {
+            if lock(&signaling.state).relaying.len() < MAX_SIGNALS {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        channels.push(open(&signaling, &mut reports, "sig-y").await);
+        assert_eq!(lock(&signaling.state).relaying.len(), MAX_SIGNALS);
         drop(channels);
     }
 

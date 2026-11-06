@@ -243,9 +243,11 @@ pub(crate) struct Signaling {
     /// The signals opened so far, for an id when the ULID's randomness is
     /// unavailable.
     opened: u64,
-    /// Rate-limits the line of an open refused past [`MAX_OPEN_SIGNALS`],
-    /// which a worker can repeat as fast as its driver answers it.
-    limit_lines: Throttle,
+    /// Rate-limits, per source connection, the line of an open refused
+    /// past [`MAX_OPEN_SIGNALS`], which a worker can repeat as fast as its
+    /// driver answers it: one worker's flood hides no other's. A
+    /// connection's goes with it.
+    limit_lines: BTreeMap<String, Throttle>,
 }
 
 impl Signaling {
@@ -561,7 +563,12 @@ impl State {
             return;
         }
         if self.signaling.open_count(connection) >= MAX_OPEN_SIGNALS {
-            if let Some(count) = self.signaling.limit_lines.hit(now) {
+            let lines = self
+                .signaling
+                .limit_lines
+                .entry(connection.to_owned())
+                .or_default();
+            if let Some(count) = lines.hit(now) {
                 tracing::warn!(
                     connection.id = connection,
                     request,
@@ -695,6 +702,9 @@ impl State {
             .waiting
             .retain(|waiting| waiting.connection != connection);
         let _forgotten = self.signaling.held.remove(connection);
+        if !self.connections.contains_key(connection) {
+            let _gone = self.signaling.limit_lines.remove(connection);
+        }
         let (ended, open) = std::mem::take(&mut self.signaling.signals)
             .into_iter()
             .partition(|(_, signal)| signal.connection == connection);
@@ -2052,13 +2062,28 @@ mod tests {
             .lines("signaling open refused: the connection holds as many signals as it may");
         assert_eq!(lines.len(), 1, "rate-limited: {lines:?}");
         assert!(lines[0].contains("limit=4"), "{lines:?}");
-        // Another connection's are its own; one that ends frees a place.
-        open(&mut state, "c2", 1);
-        let _yard = opened(&mut queues, "c2", 1);
+        // Another connection's are its own, and so is its line's rate
+        // limit; one that ends frees a place.
+        for request in 1..=4 {
+            open(&mut state, "c2", request);
+        }
+        let _yard = queues.take("c2");
+        open(&mut state, "c2", 5);
+        let lines = captured
+            .lines("signaling open refused: the connection holds as many signals as it may");
+        assert_eq!(lines.len(), 2, "one per connection: {lines:?}");
+        assert!(lines[1].contains("connection.id=\"c2\""), "{lines:?}");
         report(&mut state, "c1", closed(&signals[0], "peer_closed"));
         open(&mut state, "c1", 26);
         let _fifth = opened(&mut queues, "c1", 26);
         assert_eq!(MAX_OPEN_SIGNALS, 4);
+        // A worker's end keeps its connection's rate limit; the
+        // connection's release forgets it.
+        state.signals_ended("c1", SignalCloseCode::WorkerGone, "exited");
+        assert!(state.signaling.limit_lines.contains_key("c1"));
+        let _gone = state.connections.remove("c1");
+        state.signals_ended("c1", SignalCloseCode::SourceStopped, "released");
+        assert!(!state.signaling.limit_lines.contains_key("c1"));
     }
 
     /// A connection several streams share offers to the subscription of

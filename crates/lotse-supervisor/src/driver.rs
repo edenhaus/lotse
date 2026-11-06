@@ -1168,12 +1168,14 @@ impl Driver {
                 SignalReport::Open { request }
             }
             SignalReport::Cancel { request } => {
+                // One the driver no longer waits on (answered, or
+                // forgotten after OPEN_EXPIRY) still goes to the registry,
+                // which drops it unless it holds the open.
                 if self.signal_opens.remove(&request).is_none() {
                     tracing::debug!(
                         request,
-                        "cancel of a signaling open already answered; ignored"
+                        "cancel of a signaling open the driver does not wait on; passed on"
                     );
-                    return;
                 }
                 SignalReport::Cancel { request }
             }
@@ -1189,6 +1191,11 @@ impl Driver {
                 }
             }
         };
+        self.to_registry(report);
+    }
+
+    /// Hands the checked `report` to the registry.
+    fn to_registry(&self, report: SignalReport) {
         let (now, wall) = (self.shared.clock.now(), self.shared.clock.wall_now());
         let from = self.signal_from();
         self.shared.lock().signal_report(&from, report, now, wall);
@@ -1204,10 +1211,12 @@ impl Driver {
     }
 
     /// Forgets the opens waiting longer than [`OPEN_EXPIRY`]: their answer
-    /// or cancel was lost on a full queue, as the attempt that asked is
-    /// over by then.
+    /// or cancel was lost, as the attempt that asked is over by then. The
+    /// registry forgets them too, as it does a cancel, so it holds no open
+    /// the driver does not count.
     fn expire_opens(&mut self) {
         let now = self.shared.clock.now();
+        let mut expired = Vec::new();
         self.signal_opens.retain(|request, open| {
             let waiting = now.saturating_duration_since(open.asked) < OPEN_EXPIRY;
             if !waiting {
@@ -1216,9 +1225,13 @@ impl Driver {
                     expiry_ms = OPEN_EXPIRY.as_millis(),
                     "a signaling open got no answer in time; forgotten"
                 );
+                expired.push(*request);
             }
             waiting
         });
+        for request in expired {
+            self.to_registry(SignalReport::Cancel { request });
+        }
     }
 
     /// Times the earliest wait of `signal_opens` still to end; none when
@@ -4707,6 +4720,83 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The supervisor reads nothing a stopping worker still reports, so a
+    /// worker's stop closes its signals in the registry itself, as its
+    /// exit does.
+    #[tokio::test]
+    async fn a_worker_s_stop_closes_its_signals_source_stopped() {
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        let mut events = subscribe_all(&shared);
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 1 }));
+        let queued = queued_signals(&mut driver);
+        let_assert!([SignalCommand::Opened { signal_id, .. }] = queued.as_slice());
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Offer {
+            signal_id: signal_id.clone(),
+            sdp: lotse_core::test_util::FAKE_SIGNALED_OFFER.into(),
+        }));
+        assert_eq!(signaling_event(&mut events)["type"], "offer");
+        driver.feed(Input::Demand(1));
+        driver.feed(Input::Demand(0));
+        driver.feed(Input::LingerExpired);
+        assert_eq!(
+            signaling_event(&mut events),
+            serde_json::json!({ "type": "closed", "signal_id": signal_id, "code": "source_stopped",
+                                "message": "the source stopped" })
+        );
+        assert!(shared.lock().signal_ids_for_tests().is_empty());
+        drop(driver);
+    }
+
+    /// What the registry held while the queue was full reaches the worker
+    /// once the driver has handled what the queue held before it.
+    #[tokio::test]
+    async fn an_answer_a_full_queue_could_not_take_reaches_the_worker_after_the_queue() {
+        let dir = private_dir("driver-signal-held");
+        let (script, out) = recording_script(&dir);
+        let shared = shared(&script);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        let _events = subscribe_all(&shared);
+        driver.spawn_worker(vec![]).await;
+        for ms in 1..=4 {
+            driver
+                .commands_tx
+                .try_send(DriverCommand::Prerecord { ms })
+                .unwrap();
+        }
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 1 }));
+        // The queue's own come first; the held answer waits for the last.
+        for ms in 1..=4 {
+            let wake = next_wake(&mut driver).await;
+            assert!(
+                matches!(wake, Wake::Command(DriverCommand::Prerecord { ms: got }) if got == ms)
+            );
+            driver.handle(wake).await;
+            assert_eq!(waiting(&driver).is_empty(), ms == 4, "after {ms}");
+        }
+        let messages = recorded(&out, &lotse_ipc::ToWorker::Prerecord { ms: 4 }).await;
+        let opened = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    lotse_ipc::ToWorker::Signal(SignalCommand::Opened { request: 1, .. })
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            messages.get(opened.checked_sub(1).unwrap()),
+            Some(&lotse_ipc::ToWorker::Prerecord { ms: 4 })
+        );
+        assert!(shared.lock().take_held_signals("c1").is_empty());
+        let worker = driver.worker.take().unwrap();
+        drop(driver);
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A worker's open ids restart at 1, so an answer queued for the
     /// worker before it never reaches the running one, even under an id
     /// the running one waits on.
@@ -4806,9 +4896,12 @@ mod tests {
         let at_registry = captured.lines("signaling open cancelled while it waited for a client");
         assert_eq!(at_registry.len(), 1, "{at_registry:?}");
         assert!(at_registry[0].contains("request=1"), "{at_registry:?}");
-        let ignored = captured.lines("cancel of a signaling open already answered; ignored");
-        assert_eq!(ignored.len(), 1, "{ignored:?}");
-        assert!(ignored[0].contains("request=9"), "{ignored:?}");
+        let passed = captured.lines("cancel of a signaling open the driver does not wait on");
+        assert_eq!(passed.len(), 1, "{passed:?}");
+        assert!(passed[0].contains("request=9"), "{passed:?}");
+        let dropped = captured.lines("signaling open cancelled; nothing holds it");
+        assert_eq!(dropped.len(), 1, "the registry drops it: {dropped:?}");
+        assert!(dropped[0].contains("request=9"), "{dropped:?}");
         // The worker's exit takes its waiting opens and the signals it
         // ended with it, here and in the registry, and so does its stop: a
         // subscription finds none.
@@ -4841,12 +4934,11 @@ mod tests {
         let mut driver = signaled_driver(&shared, demand);
         let captured = crate::test_support::Captured::default();
         let _logs = captured.install();
-        let _events = subscribe_all(&shared);
+        // Their waits' ends are lost.
         for request in [1, 2] {
             driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request }));
         }
-        // The registry's answers are lost.
-        assert_eq!(queued_signals(&mut driver).len(), 2);
+        assert!(queued_signals(&mut driver).is_empty());
         clock.advance(OPEN_EXPIRY.checked_sub(Duration::from_millis(1)).unwrap());
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 3 }));
         assert_eq!(waiting(&driver), [1, 2]);
@@ -4862,6 +4954,13 @@ mod tests {
             forgotten[0].contains("request=1 expiry_ms=35000"),
             "{forgotten:?}"
         );
+        // The registry forgets them as well: a subscription serves only
+        // the open the driver still counts.
+        let cancelled = captured.lines("signaling open cancelled while it waited for a client");
+        assert_eq!(cancelled.len(), 2, "{cancelled:?}");
+        let _events = subscribe_all(&shared);
+        let queued = queued_signals(&mut driver);
+        let_assert!([SignalCommand::Opened { request: 4, .. }] = queued.as_slice());
         drop(driver);
     }
 
