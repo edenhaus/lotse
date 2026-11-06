@@ -427,7 +427,7 @@ mod tests {
         }
         let mut out = Vec::new();
         length_prefixed_to_annex_b(&[], 4, &mut out).unwrap();
-        assert!(out.is_empty());
+        assert_eq!(out, b"");
         // A unit longer than one length byte counts: 0x012c = 300 bytes.
         let long = [0x65; 300];
         for field in [&[0x01, 0x2c][..], &[0, 0, 0x01, 0x2c]] {
@@ -470,7 +470,7 @@ mod tests {
                 Err(LengthPrefixError::LengthSize(size))
             );
         }
-        assert!(out.is_empty());
+        assert_eq!(out, b"");
         assert_eq!(
             LengthPrefixError::LengthSize(5).to_string(),
             "a NAL unit length of 5 bytes"
@@ -591,8 +591,8 @@ mod tests {
         stream.extend_from_slice(&idr);
         let units = annex_b_units(&stream);
         assert_eq!(units, [SPS, PPS, idr.as_slice()]);
-        assert!(annex_b_units(&[]).is_empty());
-        assert!(annex_b_units(&[0, 0, 0, 1]).is_empty());
+        assert_eq!(annex_b_units(&[]), Vec::<&[u8]>::new());
+        assert_eq!(annex_b_units(&[0, 0, 0, 1]), Vec::<&[u8]>::new());
         assert_eq!(
             annex_b_units(&[0x65, 1]),
             Vec::<&[u8]>::new(),
@@ -603,7 +603,7 @@ mod tests {
         assert!(packets.iter().all(|p| p.len() <= 100));
         assert_eq!(packets[0].as_ref(), SPS);
         assert_eq!(nal_type(packets[2][0]), FU_A);
-        assert!(packetize(&[], 100).is_empty());
+        assert_eq!(packetize(&[], 100), Vec::<Bytes>::new());
     }
 
     #[test]

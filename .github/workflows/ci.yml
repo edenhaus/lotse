@@ -506,7 +506,7 @@ jobs:
       groups: ${{ steps.select.outputs.groups }}
       corpus: ${{ steps.corpus.outputs.sha }}
     env:
-      NIGHTLY: nightly-2026-10-01 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
+      NIGHTLY: nightly-2026-11-05 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
       BIN_DIR: fuzz/target/x86_64-unknown-linux-gnu/release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

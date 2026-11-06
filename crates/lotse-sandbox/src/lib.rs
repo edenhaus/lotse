@@ -493,7 +493,7 @@ mod tests {
             report.missing_layers(),
             ["seccomp", "landlock.fs", "landlock.net"]
         );
-        assert!(!report.notes.is_empty());
+        assert_ne!(report.notes, Vec::<String>::new());
 
         let config = SandboxConfig {
             mode: Mode::Require,

@@ -1118,7 +1118,7 @@ mod tests {
             "/data",
         ])
         .unwrap();
-        assert!(settings.supervisor.control_tls.unwrap().clients.is_empty());
+        assert_eq!(settings.supervisor.control_tls.unwrap().clients, []);
 
         let err = resolve(&[
             "lotse",
