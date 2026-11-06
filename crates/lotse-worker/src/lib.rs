@@ -2773,13 +2773,6 @@ mod tests {
         report
     }
 
-    fn is_backoff(message: &ToSupervisor) -> bool {
-        matches!(
-            message,
-            ToSupervisor::SourceState(SourceState::Backoff { .. })
-        )
-    }
-
     async fn signal_command(h: &mut Harness, command: SignalCommand) {
         h.tx.send_msg(&ToWorker::Signal(command), &[])
             .await
@@ -2906,7 +2899,11 @@ mod tests {
             },
         )
         .await;
-        let backoff = next_where(&mut h, &is_backoff).await;
+        // One line, so the line is covered whichever message comes first.
+        let backoff = next_where(&mut h, &|m| {
+            matches!(m, ToSupervisor::SourceState(SourceState::Backoff { .. }))
+        })
+        .await;
         let_assert!(
             ToSupervisor::SourceState(SourceState::Backoff { code, message, .. }) = backoff
         );
