@@ -23,6 +23,7 @@ pub mod pairing;
 pub mod recording;
 pub mod schema;
 pub mod session;
+pub mod signaling;
 pub mod stream;
 pub mod time;
 pub mod version;

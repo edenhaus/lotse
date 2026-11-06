@@ -39,6 +39,7 @@ mod generator {
     use crate::pairing::PairingCreateResult;
     use crate::recording::{RecordingCreateResult, RecordingEvent};
     use crate::session::{Session, SessionEvent, SessionList, WebrtcRenegotiateResult};
+    use crate::signaling::SignalingEvent;
     use crate::stream::{
         BackchannelReleaseResult, Stream, StreamEvent, StreamList, StreamPutResult,
     };
@@ -93,6 +94,10 @@ mod generator {
             "webrtc/candidate",
             "session/close",
             "session/adopt",
+            "signaling/subscribe",
+            "signaling/answer",
+            "signaling/candidate",
+            "signaling/error",
         ] {
             results.insert(name.into(), reference::<Success<Empty>>(&mut generator));
         }
@@ -123,6 +128,7 @@ mod generator {
         let stream_events = reference::<EventFrame<StreamEvent>>(&mut generator);
         let session_events = reference::<EventFrame<SessionEvent>>(&mut generator);
         let recording_events = reference::<EventFrame<RecordingEvent>>(&mut generator);
+        let signaling_events = reference::<EventFrame<SignalingEvent>>(&mut generator);
         json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "lotse control API",
@@ -137,6 +143,7 @@ mod generator {
                 "webrtc/offer": session_events,
                 "session/adopt": session_events,
                 "recording/create": recording_events,
+                "signaling/subscribe": signaling_events,
             },
             "$defs": generator.take_definitions(true),
         })
@@ -263,6 +270,7 @@ mod tests {
             "webrtc/offer",
             "session/adopt",
             "recording/create",
+            "signaling/subscribe",
         ] {
             assert_eq!(tag_of(&bundle, &bundle["events"][name]), "event", "{name}");
         }

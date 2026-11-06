@@ -76,6 +76,9 @@ pub enum ErrorCode {
     /// `GET /v0/recording/{recording_id}` (HTTP 409) of a recording whose bytes another
     /// request already took: a recording has one body.
     RecordingAlreadyFetched,
+    /// `signaling/answer`, `signaling/candidate` or `signaling/error` of a
+    /// signal that is not open, or that another control connection owns.
+    SignalNotFound,
 }
 
 impl ErrorCode {
@@ -109,6 +112,7 @@ impl ErrorCode {
             Self::RecordingNotFound => "recording_not_found",
             Self::RecordingIdInUse => "recording_id_in_use",
             Self::RecordingAlreadyFetched => "recording_already_fetched",
+            Self::SignalNotFound => "signal_not_found",
         }
     }
 
@@ -202,6 +206,7 @@ mod tests {
             ErrorCode::RecordingNotFound,
             ErrorCode::RecordingIdInUse,
             ErrorCode::RecordingAlreadyFetched,
+            ErrorCode::SignalNotFound,
         ];
         for code in all {
             let json = serde_json::to_value(code).unwrap();
@@ -216,6 +221,8 @@ mod tests {
         // Nor is a recording event's.
         assert_eq!(ErrorCode::parse("audio_omitted"), None);
         assert_eq!(ErrorCode::parse("not_fetched"), None);
+        // Nor is a signal's.
+        assert_eq!(ErrorCode::parse("camera_error"), None);
     }
 
     #[test]
