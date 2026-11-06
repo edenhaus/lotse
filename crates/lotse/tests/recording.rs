@@ -1,17 +1,17 @@
-//! Event clips end to end: a real daemon (supervisor and workers) plays
-//! the fake RTSP camera, keeps a pre-roll window while the stream is
-//! preloaded, and records clips through `clip/start` and `GET
-//! /v0/clips/{clip_id}`. Every file is read back with mp4-atom, an
+//! Event recordings end to end: a real daemon (supervisor and workers) plays
+//! the fake RTSP camera, keeps a pre-record window while the stream is
+//! preloaded, and records recordings through `recording/create` and `GET
+//! /v0/recording/{recording_id}`. Every file is read back with mp4-atom, an
 //! independent reader of ISO/IEC 14496-12: the first sample is a keyframe
-//! as old as `started.before_ms` says, the audio starts with the video
+//! as old as `started.prerecord_ms` says, the audio starts with the video
 //! (EBU R37, on the container's timestamps) and runs to its end, a camera
-//! reconnect inside a clip is one `gap` event where the file's timeline
-//! has it, `clip/stop` ends the body with its last chunk, a worker crash
-//! cuts it, a clip nobody fetches ends `not_fetched`, two clips run on one
+//! reconnect inside a recording is one `gap` event where the file's timeline
+//! has it, a recording's end ends the body with its last chunk, a worker crash
+//! cuts it, a recording nobody fetches ends `not_fetched`, two recordings run on one
 //! stream, and the mTLS listener serves the route as the socket does.
-//! Needs the `source-rtsp` and `output-clip` features (the defaults).
+//! Needs the `source-rtsp` and `output-recording` features (the defaults).
 
-#![cfg(all(feature = "source-rtsp", feature = "output-clip"))]
+#![cfg(all(feature = "source-rtsp", feature = "output-recording"))]
 #![allow(
     clippy::missing_docs_in_private_items,
     clippy::arithmetic_side_effects,
@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::clip_body::{Fetched, fetch, fetch_on_socket};
+use common::recording_body::{Fetched, fetch, fetch_on_socket};
 use common::{Daemon, SocketDir, json, socket_dir};
 use futures_util::{SinkExt as _, StreamExt as _};
 use lotse_core::clock::{Clock, SystemClock};
@@ -44,7 +44,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
 /// How long one step of a test may take before it fails: a frame, a
-/// result, a clip's end.
+/// result, a recording's end.
 const STEP: Duration = Duration::from_secs(20);
 
 /// The camera's frame rate: 40 ms frames.
@@ -198,32 +198,32 @@ impl Control {
         frame["event"].clone()
     }
 
-    /// The events of the clip subscribed as `id` up to and including its
-    /// `stopped`.
-    async fn until_stopped(&mut self, id: u64) -> Vec<Value> {
+    /// The events of the recording subscribed as `id` up to and including its
+    /// `closed`.
+    async fn until_closed(&mut self, id: u64) -> Vec<Value> {
         let mut events = Vec::new();
         loop {
             let event = self.event(id).await;
-            let stopped = event["type"] == "stopped";
+            let closed = event["type"] == "closed";
             events.push(event);
-            if stopped {
+            if closed {
                 return events;
             }
         }
     }
 
     /// `stream/put` of `stream_id` playing `url`, preloaded with a window
-    /// of `preroll_ms` when `preload`.
-    async fn put(&mut self, stream_id: &str, url: &str, preload: bool, preroll_ms: u32) {
+    /// of `prerecord_ms` when `preload`.
+    async fn put(&mut self, stream_id: &str, url: &str, preload: bool, prerecord_ms: u32) {
         let put = self
             .call(json!({ "type": "stream/put", "stream_id": stream_id,
                           "sources": [{ "url": url }], "preload": preload,
-                          "preroll_ms": preroll_ms }))
+                          "prerecord_ms": prerecord_ms }))
             .await;
         assert_eq!(put, json!({ "created": true }));
     }
 
-    /// `stream/get` until the video track's pre-roll holds `held_ms`.
+    /// `stream/get` until the video track's pre-record holds `held_ms`.
     async fn wait_window(&mut self, stream_id: &str, held_ms: u64) -> Value {
         let deadline = SystemClock.now() + STEP;
         loop {
@@ -233,7 +233,7 @@ impl Control {
             let held = stream["tracks"]
                 .as_array()
                 .and_then(|tracks| tracks.iter().find(|track| track["kind"] == "video"))
-                .and_then(|video| video["preroll"]["held_ms"].as_u64());
+                .and_then(|video| video["prerecord"]["held_ms"].as_u64());
             if held.is_some_and(|held| held >= held_ms) {
                 return stream;
             }
@@ -246,20 +246,20 @@ impl Control {
         }
     }
 
-    /// `clip/start` with `fields`; the subscription's id and the result.
-    async fn start_clip(&mut self, fields: Value) -> (u64, Value) {
-        let mut command = json!({ "type": "clip/start" });
+    /// `recording/create` with `fields`; the subscription's id and the result.
+    async fn start_recording(&mut self, fields: Value) -> (u64, Value) {
+        let mut command = json!({ "type": "recording/create" });
         for (key, value) in fields.as_object().expect("an object") {
             command[key] = value.clone();
         }
         let id = self.send(command).await;
         let frame = self.result_of(id).await;
-        assert_eq!(frame["success"], true, "clip/start: {frame}");
+        assert_eq!(frame["success"], true, "recording/create: {frame}");
         (id, frame["result"].clone())
     }
 }
 
-/// A clip's file as mp4-atom reads it: every top-level box, in order.
+/// A recording's file as mp4-atom reads it: every top-level box, in order.
 struct Mp4 {
     moov: Moov,
     /// Each fragment and where its `moof` starts in the file.
@@ -401,7 +401,7 @@ fn nal_types(sample: &[u8]) -> Vec<u8> {
 }
 
 /// Milliseconds of `ticks` at `rate`, rounded down as the daemon's
-/// clip times are.
+/// recording times are.
 fn ms(ticks: u64, rate: u64) -> u64 {
     ticks * 1_000 / rate
 }
@@ -430,37 +430,37 @@ fn assert_starts_at_a_keyframe_without_holes(samples: &[Sample]) {
     assert_eq!(holes(samples), [], "the video runs without a hole");
 }
 
-/// The common checks of a clip that ended `reason` with its body whole:
-/// the events' order, `stopped`'s bytes against the body, the headers.
-fn assert_ended_whole(fetched: &Fetched, clip_id: &str, events: &[Value], reason: &str) {
+/// The common checks of a recording that ended `reason` with its body whole:
+/// the events' order, `closed`'s bytes against the body, the headers.
+fn assert_ended_whole(fetched: &Fetched, recording_id: &str, events: &[Value], reason: &str) {
     assert_eq!(fetched.status, 200, "{fetched:?}");
     assert_eq!(fetched.content_type.as_deref(), Some("video/mp4"));
-    assert_eq!(fetched.clip_id.as_deref(), Some(clip_id));
+    assert_eq!(fetched.recording_id.as_deref(), Some(recording_id));
     assert!(fetched.whole, "the body ends with its last chunk");
     assert_eq!(events[0]["type"], "started", "{events:?}");
-    let stopped = events.last().unwrap();
+    let closed = events.last().unwrap();
     assert_eq!(
-        (&stopped["reason"], stopped["bytes"].as_u64()),
+        (&closed["reason"], closed["bytes"].as_u64()),
         (&json!(reason), u64::try_from(fetched.bytes.len()).ok()),
         "{events:?}"
     );
 }
 
-/// A clip of a preloaded stream with a window starts at the newest
-/// keyframe captured at or before `before_ms` ago: `started.before_ms` is
+/// A recording of a preloaded stream with a window starts at the newest
+/// keyframe captured at or before `prerecord_ms` ago: `started.prerecord_ms` is
 /// that keyframe's age, so at least what was asked and less than a GOP
 /// more, and the file's video starts at it with its IDR and covers its age
-/// and `after_ms`. The audio starts with the video on the file's timeline
+/// and `duration_ms`. The audio starts with the video on the file's timeline
 /// (EBU R37: within 40 ms) and runs to the video's end, each track's last
-/// sample the last captured before the clip's end: AAC-LC as the camera
+/// sample the last captured before the recording's end: AAC-LC as the camera
 /// sends it, starting with the frame playing at the keyframe, and PCMU
 /// transcoded to Opus, whose last PCM short of a packet the end leaves
 /// out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ebu_r37_a_preloaded_clip_starts_at_a_keyframe_before_ms_old_with_its_audio() {
+async fn ebu_r37_a_preloaded_recording_starts_at_a_keyframe_prerecord_ms_old_with_its_audio() {
     let aac = camera(Some(CameraAudio::Aac)).await;
     let pcmu = camera(Some(CameraAudio::Pcmu)).await;
-    let (mut daemon, dir) = daemon("clip-av", &[], &[]);
+    let (mut daemon, dir) = daemon("recording-av", &[], &[]);
     daemon.wait_for("\"event\":\"ready\"");
     let socket = dir.join("lotse.sock");
     let mut control = Control::connect(&socket).await;
@@ -469,20 +469,22 @@ async fn ebu_r37_a_preloaded_clip_starts_at_a_keyframe_before_ms_old_with_its_au
     control.wait_window("front", 3_000).await;
     control.wait_window("door", 3_000).await;
 
-    let mut clips = Vec::new();
+    let mut recordings = Vec::new();
     for stream_id in ["front", "door"] {
         let (id, result) = control
-            .start_clip(json!({ "stream_id": stream_id, "before_ms": 2_000, "after_ms": 2_000 }))
+            .start_recording(
+                json!({ "stream_id": stream_id, "prerecord_ms": 2_000, "duration_ms": 2_000 }),
+            )
             .await;
         let fetch = fetch_on_socket(&socket, result["url"].as_str().unwrap()).await;
-        clips.push((id, result, fetch));
+        recordings.push((id, result, fetch));
     }
-    for ((id, result, fetch), audio) in clips.into_iter().zip(["aac_lc", "opus"]) {
-        let events = control.until_stopped(id).await;
+    for ((id, result, fetch), audio) in recordings.into_iter().zip(["aac_lc", "opus"]) {
+        let events = control.until_closed(id).await;
         let fetched = within("the body", fetch).await.expect("the fetch");
-        let clip_id = result["clip_id"].as_str().unwrap();
-        assert_ended_whole(&fetched, clip_id, &events, "completed");
-        assert_eq!(events.len(), 2, "started and stopped: {events:?}");
+        let recording_id = result["recording_id"].as_str().unwrap();
+        assert_ended_whole(&fetched, recording_id, &events, "completed");
+        assert_eq!(events.len(), 2, "started and closed: {events:?}");
         let started = &events[0];
         assert_eq!(
             (&started["video"], &started["audio"]),
@@ -491,10 +493,10 @@ async fn ebu_r37_a_preloaded_clip_starts_at_a_keyframe_before_ms_old_with_its_au
                 &json!({ "codec": audio })
             )
         );
-        let before_ms = started["before_ms"].as_u64().unwrap();
+        let prerecord_ms = started["prerecord_ms"].as_u64().unwrap();
         assert!(
-            (2_000..2_000 + GOP_MS + FRAME_MS).contains(&before_ms),
-            "the newest keyframe 2 s ago or more: {before_ms}"
+            (2_000..2_000 + GOP_MS + FRAME_MS).contains(&prerecord_ms),
+            "the newest keyframe 2 s ago or more: {prerecord_ms}"
         );
 
         let file = &fetched.bytes;
@@ -503,19 +505,19 @@ async fn ebu_r37_a_preloaded_clip_starts_at_a_keyframe_before_ms_old_with_its_au
         assert_eq!(video_rate, VIDEO_RATE);
         let video = mp4.samples(file, video_id);
         assert_starts_at_a_keyframe_without_holes(&video);
-        // From the keyframe `before_ms` ago to the first frame at or after
-        // `after_ms` from now, which the clip leaves out.
+        // From the keyframe `prerecord_ms` ago to the first frame at or after
+        // `duration_ms` from now, which the recording leaves out.
         let last = video.last().unwrap();
         let span = ms(last.dts + last.duration - video[0].dts, video_rate);
-        let expected = before_ms + 2_000;
+        let expected = prerecord_ms + 2_000;
         assert!(
             span.abs_diff(expected) <= 2 * FRAME_MS,
-            "the video covers {span} ms, the clip asked {expected} ms"
+            "the video covers {span} ms, the recording asked {expected} ms"
         );
-        let stopped = events.last().unwrap();
+        let closed = events.last().unwrap();
         assert!(
-            stopped["duration_ms"].as_u64().unwrap().abs_diff(span) <= 2 * FRAME_MS,
-            "{stopped} for {span} ms of video"
+            closed["duration_ms"].as_u64().unwrap().abs_diff(span) <= 2 * FRAME_MS,
+            "{closed} for {span} ms of video"
         );
 
         let (entry, audio_rate, audio) = mp4.audio(file).expect("an audio track");
@@ -553,7 +555,7 @@ async fn ebu_r37_a_preloaded_clip_starts_at_a_keyframe_before_ms_old_with_its_au
             other => panic!("audio {other:?}"),
         };
         // The audio runs to the video's end: each track's last sample is
-        // the last captured before the clip's end, so the audio ends at
+        // the last captured before the recording's end, so the audio ends at
         // most a packet after the video and at most a video frame, and what
         // the end leaves out, before it. 5 ms of slack: each track's ticks
         // rounded down, and the capture times the end goes by against the
@@ -573,13 +575,14 @@ async fn ebu_r37_a_preloaded_clip_starts_at_a_keyframe_before_ms_old_with_its_au
     pcmu.stop().await;
 }
 
-/// Two clips run on one stream at once, one fetched over the socket and
+/// Two recordings run on one stream at once, one fetched over the socket and
 /// one over the mutual-TLS listener, which serves the same route; a third
-/// is refused `limit_reached` (`clips_per_stream`). A clip without audio
+/// is refused `limit_reached` (`max_recordings_per_stream`). A recording without audio
 /// has one track, and one asking nothing before now starts at the newest
 /// keyframe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc9112_7_1_two_clips_of_one_stream_come_whole_over_the_socket_and_the_mtls_listener() {
+async fn rfc9112_7_1_two_recordings_of_one_stream_come_whole_over_the_socket_and_the_mtls_listener()
+{
     use std::os::unix::fs::DirBuilderExt as _;
 
     use lotse_core::fingerprint::Fingerprint;
@@ -587,7 +590,7 @@ async fn rfc9112_7_1_two_clips_of_one_stream_come_whole_over_the_socket_and_the_
 
     let cam = camera(Some(CameraAudio::Aac)).await;
     let client = ClientIdentity::generate().unwrap();
-    let dir = socket_dir("clip-two");
+    let dir = socket_dir("recording-two");
     let data = dir.join("data");
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -624,27 +627,27 @@ async fn rfc9112_7_1_two_clips_of_one_stream_come_whole_over_the_socket_and_the_
     control.wait_window("front", 2_000).await;
 
     let (with_audio, first) = control
-        .start_clip(json!({ "stream_id": "front", "clip_id": "with-audio",
-                            "before_ms": 1_000, "after_ms": 1_500 }))
+        .start_recording(json!({ "stream_id": "front", "recording_id": "with-audio",
+                            "prerecord_ms": 1_000, "duration_ms": 1_500 }))
         .await;
     assert_eq!(
         first,
-        json!({ "clip_id": "with-audio", "url": "/v0/clips/with-audio" })
+        json!({ "recording_id": "with-audio", "url": "/v0/recording/with-audio" })
     );
-    let over_socket = fetch_on_socket(&socket, "/v0/clips/with-audio").await;
+    let over_socket = fetch_on_socket(&socket, "/v0/recording/with-audio").await;
     let (video_only, second) = control
-        .start_clip(json!({ "stream_id": "front", "after_ms": 1_000, "audio": false }))
+        .start_recording(json!({ "stream_id": "front", "duration_ms": 1_000, "audio": false }))
         .await;
     let config =
         control_tls::client_config(server_pin, ClientCert::Own(&client), control_tls::TLS13)
             .unwrap();
     let tls = control_tls::connect(listener, config).await.expect("mTLS");
     let over_tls = spawn_named(
-        "clip-fetch",
+        "recording-fetch",
         fetch(tls, second["url"].as_str().unwrap().to_owned()),
     );
     let third = control
-        .send(json!({ "type": "clip/start", "stream_id": "front" }))
+        .send(json!({ "type": "recording/create", "stream_id": "front", "duration_ms": 1_000 }))
         .await;
     let refused = control.result_of(third).await;
     assert_eq!(
@@ -652,9 +655,12 @@ async fn rfc9112_7_1_two_clips_of_one_stream_come_whole_over_the_socket_and_the_
         (&json!(false), &json!("limit_reached")),
         "{refused}"
     );
-    assert_eq!(refused["error"]["details"]["limit"], "clips_per_stream");
+    assert_eq!(
+        refused["error"]["details"]["limit"],
+        "max_recordings_per_stream"
+    );
 
-    let events = control.until_stopped(with_audio).await;
+    let events = control.until_closed(with_audio).await;
     let fetched = within("the socket's body", over_socket).await.unwrap();
     assert_ended_whole(&fetched, "with-audio", &events, "completed");
     let mp4 = parse(&fetched.bytes);
@@ -662,15 +668,15 @@ async fn rfc9112_7_1_two_clips_of_one_stream_come_whole_over_the_socket_and_the_
     assert_starts_at_a_keyframe_without_holes(&mp4.samples(&fetched.bytes, video_id));
     assert!(mp4.audio(&fetched.bytes).is_some(), "with its audio");
 
-    let events = control.until_stopped(video_only).await;
+    let events = control.until_closed(video_only).await;
     let fetched = within("the listener's body", over_tls).await.unwrap();
-    let clip_id = second["clip_id"].as_str().unwrap();
-    assert_ended_whole(&fetched, clip_id, &events, "completed");
+    let recording_id = second["recording_id"].as_str().unwrap();
+    assert_ended_whole(&fetched, recording_id, &events, "completed");
     assert_eq!(events[0]["audio"], Value::Null, "{events:?}");
-    let before_ms = events[0]["before_ms"].as_u64().unwrap();
+    let prerecord_ms = events[0]["prerecord_ms"].as_u64().unwrap();
     assert!(
-        before_ms < GOP_MS + FRAME_MS,
-        "the newest keyframe: {before_ms}"
+        prerecord_ms < GOP_MS + FRAME_MS,
+        "the newest keyframe: {prerecord_ms}"
     );
     let mp4 = parse(&fetched.bytes);
     assert_eq!(mp4.moov.trak.len(), 1, "video only");
@@ -682,8 +688,8 @@ async fn rfc9112_7_1_two_clips_of_one_stream_come_whole_over_the_socket_and_the_
         .await;
     assert_eq!(
         (
-            &stream["stats"]["clips_started"],
-            &stream["stats"]["clips_completed"]
+            &stream["stats"]["recordings_started"],
+            &stream["stats"]["recordings_completed"]
         ),
         (&json!(2), &json!(2)),
         "{stream}"
@@ -694,28 +700,27 @@ async fn rfc9112_7_1_two_clips_of_one_stream_come_whole_over_the_socket_and_the_
     cam.stop().await;
 }
 
-/// The camera drops its connection while a clip runs: the stream
-/// reconnects, the clip goes on and reports one `reconnect` gap, from the
+/// The camera drops its connection while a recording runs: the stream
+/// reconnects, the recording goes on and reports one `reconnect` gap, from the
 /// last frame before the drop to the new connection's first, a keyframe,
 /// where the file has them; the hole between them is what the reconnect
 /// took beyond the last frame's length (the fake camera's, on the same
-/// host, takes a few milliseconds, so the file has none). `clip/stop`
-/// then ends the clip `stopped` with the frames up to the stop and the
-/// body's last chunk (RFC 9112 §7.1).
+/// host, takes a few milliseconds, so the file has none). The recording then
+/// ends `completed` at its end with the body's last chunk (RFC 9112 §7.1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc9112_7_1_a_reconnect_inside_a_clip_is_one_gap_where_the_file_has_it_and_a_stop_ends_it_whole()
+async fn rfc9112_7_1_a_reconnect_inside_a_recording_is_one_gap_where_the_file_has_it_and_its_end_ends_it_whole()
  {
     let cam = camera(Some(CameraAudio::Aac)).await;
-    let (mut daemon, dir) = daemon("clip-gap", &[], &[]);
+    let (mut daemon, dir) = daemon("recording-gap", &[], &[]);
     daemon.wait_for("\"event\":\"ready\"");
     let socket = dir.join("lotse.sock");
     let mut control = Control::connect(&socket).await;
     control.put("front", &cam.url(), true, 10_000).await;
     control.wait_window("front", 1_000).await;
     let (id, result) = control
-        .start_clip(json!({ "stream_id": "front", "before_ms": 500 }))
+        .start_recording(json!({ "stream_id": "front", "prerecord_ms": 500, "duration_ms": 5_000 }))
         .await;
-    let clip_id = result["clip_id"].as_str().unwrap().to_owned();
+    let recording_id = result["recording_id"].as_str().unwrap().to_owned();
     let fetch = fetch_on_socket(&socket, result["url"].as_str().unwrap()).await;
     let started = control.event(id).await;
     assert_eq!(started["type"], "started", "{started}");
@@ -724,13 +729,10 @@ async fn rfc9112_7_1_a_reconnect_inside_a_clip_is_one_gap_where_the_file_has_it_
     let gap = control.event(id).await;
     assert_eq!(gap["type"], "gap", "{gap}");
     assert_eq!(gap["reason"], "reconnect", "{gap}");
-    control
-        .call(json!({ "type": "clip/stop", "clip_id": clip_id }))
-        .await;
     let mut events = vec![started, gap.clone()];
-    events.extend(control.until_stopped(id).await);
+    events.extend(control.until_closed(id).await);
     let fetched = within("the body", fetch).await.unwrap();
-    assert_ended_whole(&fetched, &clip_id, &events, "stopped");
+    assert_ended_whole(&fetched, &recording_id, &events, "completed");
     assert_eq!(events.len(), 3, "one gap: {events:?}");
     assert_eq!(events[2]["gaps"], 1);
 
@@ -738,8 +740,8 @@ async fn rfc9112_7_1_a_reconnect_inside_a_clip_is_one_gap_where_the_file_has_it_
     let mp4 = parse(file);
     let (video_id, rate) = mp4.video();
     let video = mp4.samples(file, video_id);
-    assert!(video[0].sync, "the clip starts at a keyframe");
-    // The gap's times are clip media times, as the file's (whole
+    assert!(video[0].sync, "the recording starts at a keyframe");
+    // The gap's times are recording media times, as the file's (whole
     // milliseconds, rounded down by both): the frame before the hole and
     // the new connection's first, a keyframe that begins a fragment of
     // its own. The hole between them is what the camera's reconnect took
@@ -782,14 +784,14 @@ async fn rfc9112_7_1_a_reconnect_inside_a_clip_is_one_gap_where_the_file_has_it_
     cam.stop().await;
 }
 
-/// The worker dies while its clip runs, its body fetched: the clip ends
+/// The worker dies while its recording runs, its body fetched: the recording ends
 /// `worker_crashed` with no bytes counted, and its body ends without its
 /// last chunk, a cut transfer (RFC 9112 §8), after the bytes the worker
 /// wrote: the file's beginning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc9112_8_a_worker_crash_ends_the_clip_worker_crashed_and_cuts_its_body() {
+async fn rfc9112_8_a_worker_crash_ends_the_recording_worker_crashed_and_cuts_its_body() {
     let cam = camera(None).await;
-    let (mut daemon, dir) = daemon("clip-crash", &[], &[]);
+    let (mut daemon, dir) = daemon("recording-crash", &[], &[]);
     daemon.wait_for("\"event\":\"ready\"");
     let socket = dir.join("lotse.sock");
     let mut control = Control::connect(&socket).await;
@@ -799,27 +801,32 @@ async fn rfc9112_8_a_worker_crash_ends_the_clip_worker_crashed_and_cuts_its_body
         .as_i64()
         .unwrap();
     let (id, result) = control
-        .start_clip(json!({ "stream_id": "front", "before_ms": 500 }))
+        .start_recording(
+            json!({ "stream_id": "front", "prerecord_ms": 500, "duration_ms": 60_000 }),
+        )
         .await;
     let fetch = fetch_on_socket(&socket, result["url"].as_str().unwrap()).await;
     let started = control.event(id).await;
     assert_eq!(started["type"], "started", "{started}");
     // The supervisor handed the body to the `GET` before the worker dies:
-    // a clip that ends `worker_crashed` keeps no body nobody took, so a
-    // `GET` it beat would find no clip (404). Neither `started` nor the
+    // a recording that ends `worker_crashed` keeps no body nobody took, so a
+    // `GET` it beat would find no recording (404). Neither `started` nor the
     // request leaving the test says the body was taken.
-    let handed_out = json(&daemon.wait_for("\"event\":\"clip_fetched\""));
-    assert_eq!(handed_out["clip.id"], result["clip_id"], "{handed_out}");
+    let handed_out = json(&daemon.wait_for("\"event\":\"recording_fetched\""));
+    assert_eq!(
+        handed_out["recording.id"], result["recording_id"],
+        "{handed_out}"
+    );
 
     rustix::process::kill_process(
         rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
         rustix::process::Signal::KILL,
     )
     .expect("SIGKILL sent");
-    let events = control.until_stopped(id).await;
+    let events = control.until_closed(id).await;
     assert_eq!(
         events.last().unwrap(),
-        &json!({ "type": "stopped", "reason": "worker_crashed", "bytes": 0,
+        &json!({ "type": "closed", "reason": "worker_crashed", "bytes": 0,
                  "duration_ms": 0, "gaps": 0 }),
         "{events:?}"
     );
@@ -832,32 +839,34 @@ async fn rfc9112_8_a_worker_crash_ends_the_clip_worker_crashed_and_cuts_its_body
     cam.stop().await;
 }
 
-/// A clip of an idle stream is demand: the stream connects for it, and it
-/// starts at the first keyframe as it arrives (`before_ms` under a frame:
+/// A recording of an idle stream is demand: the stream connects for it, and it
+/// starts at the first keyframe as it arrives (`prerecord_ms` under a frame:
 /// the time it took to reach the container). Nobody fetches its body
-/// within `limits.clip_fetch_timeout_ms`, so it ends `not_fetched`, and a
-/// `GET` afterwards finds no clip (404 `clip_not_found`).
+/// within `limits.recording_fetch_timeout_ms`, so it ends `not_fetched`, and a
+/// `GET` afterwards finds no recording (404 `recording_not_found`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc9110_15_5_5_a_clip_nobody_fetches_ends_not_fetched_and_its_body_is_gone() {
+async fn rfc9110_15_5_5_a_recording_nobody_fetches_ends_not_fetched_and_its_body_is_gone() {
     let cam = camera(None).await;
     let (mut daemon, dir) = daemon(
-        "clip-unfetched",
+        "recording-unfetched",
         &[],
-        &[("LOTSE_CLIP_FETCH_TIMEOUT_MS", "4000")],
+        &[("LOTSE_RECORDING_FETCH_TIMEOUT_MS", "4000")],
     );
     daemon.wait_for("\"event\":\"ready\"");
     let socket = dir.join("lotse.sock");
     let mut control = Control::connect(&socket).await;
     control.put("front", &cam.url(), false, 0).await;
     let (id, result) = control
-        .start_clip(json!({ "stream_id": "front", "before_ms": 2_000 }))
+        .start_recording(
+            json!({ "stream_id": "front", "prerecord_ms": 2_000, "duration_ms": 60_000 }),
+        )
         .await;
-    let events = control.until_stopped(id).await;
+    let events = control.until_closed(id).await;
     assert_eq!(events[0]["type"], "started", "{events:?}");
-    let before_ms = events[0]["before_ms"].as_u64().unwrap();
+    let prerecord_ms = events[0]["prerecord_ms"].as_u64().unwrap();
     assert!(
-        before_ms < FRAME_MS,
-        "nothing held: the first keyframe as it arrived, {before_ms} ms old: {events:?}"
+        prerecord_ms < FRAME_MS,
+        "nothing held: the first keyframe as it arrived, {prerecord_ms} ms old: {events:?}"
     );
     assert_eq!(
         events.last().unwrap()["reason"],
@@ -871,7 +880,7 @@ async fn rfc9110_15_5_5_a_clip_nobody_fetches_ends_not_fetched_and_its_body_is_g
     .await;
     assert_eq!(fetched.status, 404, "{fetched:?}");
     let error: Value = serde_json::from_slice(&fetched.bytes).unwrap();
-    assert_eq!(error["code"], "clip_not_found", "{error}");
+    assert_eq!(error["code"], "recording_not_found", "{error}");
     let (code, rest) = daemon.terminate();
     assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
     cam.stop().await;

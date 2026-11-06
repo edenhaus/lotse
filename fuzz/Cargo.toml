@@ -241,8 +241,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "clip_audio"
-path = "fuzz_targets/clip_audio.rs"
+name = "recording_audio"
+path = "fuzz_targets/recording_audio.rs"
 test = false
 doc = false
 bench = false

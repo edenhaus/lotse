@@ -1,7 +1,7 @@
 //! The registry: every stream's desired state, the source connections
 //! streams share, each connection's demand and its latest snapshot as the
-//! driver reports it, the viewer sessions, the event clips
-//! ([`crate::clip`]), and the subscribers of `stream/subscribe`.
+//! driver reports it, the viewer sessions, the event recordings
+//! ([`crate::recording`]), and the subscribers of `stream/subscribe`.
 //!
 //! One mutex over the maps, taken only on control-plane operations and
 //! never held across an await. Drivers publish snapshots into it, the
@@ -20,7 +20,7 @@ use lotse_api_types::session::{CloseCode, Session, SessionEvent};
 use lotse_api_types::stream::{
     AudioMode, BackchannelState, ConnectionInfo, LastError, Orientation, SourceBackchannel,
     SourceInfo, Stream, StreamBackchannel, StreamEvent, StreamState, StreamStats, TalkerReason,
-    TrackInfo, TrackPreroll, WorkerInfo,
+    TrackInfo, TrackPrerecord, WorkerInfo,
 };
 use lotse_api_types::time::rfc3339;
 use lotse_core::clock::Clock;
@@ -28,13 +28,12 @@ use lotse_core::connection::{ConnectionError, ConnectionState};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_ipc::{
-    PrerollStats, SessionEvent as WorkerSessionEvent, SessionSpec, TalkbackStats,
+    PrerecordStats, SessionEvent as WorkerSessionEvent, SessionSpec, TalkbackStats,
     TrackInfo as IpcTrackInfo, WorkerStats,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::task::TaskTracker;
 
-use crate::clip::{ClipCounters, ClipEntry, ClipLimits, FinishedClip, StoppingClip};
 use crate::connect::ConnectPermits;
 use crate::driver::{Demand, DriverCommand, DriverSpec};
 use crate::gather::Relayed;
@@ -44,6 +43,9 @@ use crate::net::allocation::Transport;
 use crate::net::demux::{DatagramSink, Registrations};
 use crate::net::stun_client::StunClient;
 use crate::net::turn_client::TurnClient;
+use crate::recording::{
+    FinishedRecording, RecordingCounters, RecordingEntry, RecordingLimits, StoppingRecording,
+};
 use crate::session::{ChannelRequest, SessionEntry, api_event, close_code};
 use crate::worker::WorkerManager;
 
@@ -232,12 +234,12 @@ pub(crate) struct StreamEntry {
     /// When the stream was created, the `since` of a stream without a
     /// connection.
     pub(crate) created: SystemTime,
-    /// The pre-roll window its connection keeps for clips, in
+    /// The pre-record window its connection keeps for recordings, in
     /// milliseconds; 0 for none. Not demand: the window fills only while
     /// the connection is up for a preload or a viewer.
-    pub(crate) preroll_ms: u32,
-    /// Its clips' counters.
-    pub(crate) clips: ClipCounters,
+    pub(crate) prerecord_ms: u32,
+    /// Its recordings' counters.
+    pub(crate) recordings: RecordingCounters,
 }
 
 /// A source connection and the streams that reference it.
@@ -252,9 +254,9 @@ pub(crate) struct ConnectionEntry {
     /// Whether the spec its driver last got asks for the camera's
     /// backchannel ([`State::follow_backchannel`]).
     pub(crate) backchannel: bool,
-    /// The pre-roll window its driver last got, in milliseconds
-    /// ([`State::follow_preroll`]).
-    pub(crate) preroll_ms: u32,
+    /// The pre-record window its driver last got, in milliseconds
+    /// ([`State::follow_prerecord`]).
+    pub(crate) prerecord_ms: u32,
     /// The demand the driver follows; dropping it stops the driver.
     pub(crate) demand: watch::Sender<Demand>,
     /// What the driver last reported.
@@ -319,18 +321,18 @@ pub(crate) struct State {
     pub(crate) sessions: BTreeMap<String, SessionEntry>,
     /// The serial of the last session opened.
     pub(crate) last_session: u64,
-    /// Event clips that run, by id.
-    pub(crate) clips: BTreeMap<String, ClipEntry>,
-    /// Clips that ended while their worker may still run them, by id,
+    /// Event recordings that run, by id.
+    pub(crate) recordings: BTreeMap<String, RecordingEntry>,
+    /// Recordings that ended while their worker may still run them, by id,
     /// until it says it stopped them: their ids stay taken.
-    pub(crate) stopping_clips: BTreeMap<String, StoppingClip>,
-    /// The bodies of clips that ended before they were fetched, by id,
+    pub(crate) stopping_recordings: BTreeMap<String, StoppingRecording>,
+    /// The bodies of recordings that ended before they were fetched, by id,
     /// until their fetch deadline.
-    pub(crate) finished_clips: BTreeMap<String, FinishedClip>,
-    /// The serial of the last clip started.
-    pub(crate) last_clip: u64,
-    /// The limits on clips and the pre-roll window.
-    pub(crate) clip_limits: ClipLimits,
+    pub(crate) finished_recordings: BTreeMap<String, FinishedRecording>,
+    /// The serial of the last recording started.
+    pub(crate) last_recording: u64,
+    /// The limits on recordings and the pre-record window.
+    pub(crate) recording_limits: RecordingLimits,
     /// The demux's sessions; `None` without a front door (tests).
     pub(crate) registrations: Option<Arc<Registrations>>,
 }
@@ -445,43 +447,43 @@ impl State {
         }
     }
 
-    /// Gives connection `id` the largest pre-roll window of the streams on
+    /// Gives connection `id` the largest pre-record window of the streams on
     /// it, after `stream_id`'s put or delete. When that changes, its driver
-    /// is told ([`DriverCommand::Preroll`]): a running worker keeps or frees
+    /// is told ([`DriverCommand::Prerecord`]): a running worker keeps or frees
     /// its tracks' rings without reconnecting, the next one starts with
     /// it. A connection gone (its last stream left) has nothing to follow.
-    pub(crate) fn follow_preroll(&mut self, id: &str, stream_id: &str) {
+    pub(crate) fn follow_prerecord(&mut self, id: &str, stream_id: &str) {
         let window = self
             .streams
             .values()
             .filter(|stream| stream.sources.iter().any(|source| source.connection == id))
-            .map(|stream| stream.preroll_ms)
+            .map(|stream| stream.prerecord_ms)
             .max();
         let (Some(window), Some(entry)) = (window, self.connections.get_mut(id)) else {
             return;
         };
-        let before = entry.preroll_ms;
+        let before = entry.prerecord_ms;
         if before == window {
             return;
         }
         if entry
             .commands
-            .try_send(DriverCommand::Preroll { ms: window })
+            .try_send(DriverCommand::Prerecord { ms: window })
             .is_err()
         {
             tracing::warn!(
                 connection.id = id,
-                "driver queue full; the connection keeps its pre-roll window until the next put"
+                "driver queue full; the connection keeps its pre-record window until the next put"
             );
             return;
         }
-        entry.preroll_ms = window;
+        entry.prerecord_ms = window;
         tracing::info!(
             connection.id = id,
             stream.id = stream_id,
-            preroll.before_ms = before,
-            preroll.after_ms = window,
-            "connection pre-roll window changed; nothing reconnects"
+            prerecord.before_ms = before,
+            prerecord.after_ms = window,
+            "connection pre-record window changed; nothing reconnects"
         );
     }
 
@@ -501,7 +503,7 @@ impl State {
         if entry.streams.is_empty() {
             tracing::info!(connection.id = id, "connection released");
             self.connections.remove(id);
-            self.forget_stopping_clips(id);
+            self.forget_stopping_recordings(id);
             return;
         }
         let preloads = entry
@@ -509,16 +511,16 @@ impl State {
             .iter()
             .filter(|stream| streams.get(*stream).is_some_and(|s| s.preload))
             .count();
-        // A clip is a viewer: it keeps the connection up while it runs.
+        // A recording is a viewer: it keeps the connection up while it runs.
         let viewers = self
             .sessions
             .values()
             .filter(|session| session.connection == id)
             .count()
             .saturating_add(
-                self.clips
+                self.recordings
                     .values()
-                    .filter(|clip| clip.connection == id)
+                    .filter(|recording| recording.connection == id)
                     .count(),
             );
         let demand = Demand {
@@ -1244,13 +1246,13 @@ impl State {
     }
 
     /// A stream's counters, for `metrics/get`: its worker's, and its
-    /// clips'.
+    /// recordings'.
     pub(crate) fn stream_stats(&self, entry: &StreamEntry) -> StreamStats {
         StreamStats {
-            clips_started: entry.clips.started,
-            clips_completed: entry.clips.completed,
-            clip_gaps: entry.clips.gaps,
-            clip_bytes: entry.clips.bytes,
+            recordings_started: entry.recordings.started,
+            recordings_completed: entry.recordings.completed,
+            recording_gaps: entry.recordings.gaps,
+            recording_bytes: entry.recordings.bytes,
             ..stream_stats_of(
                 self.first_connection(entry)
                     .and_then(|c| c.snapshot.stats.as_ref()),
@@ -1350,11 +1352,11 @@ impl State {
                     since: connection.talker.since.map(rfc3339),
                 },
             ),
-            preroll_ms: entry.preroll_ms,
-            clips: self
-                .clips
+            prerecord_ms: entry.prerecord_ms,
+            recordings: self
+                .recordings
                 .iter()
-                .filter(|(_, clip)| clip.stream_id == stream_id)
+                .filter(|(_, recording)| recording.stream_id == stream_id)
                 .map(|(id, _)| id.clone())
                 .collect(),
         };
@@ -1453,10 +1455,10 @@ fn stream_stats_of(stats: Option<&WorkerStats>) -> StreamStats {
         packets_out_of_order: stats.map_or(0, |s| s.packets_out_of_order),
         datagrams_rejected: stats.map_or(0, |s| s.datagrams_rejected),
         // The stream's own ([`State::stream_stats`]).
-        clips_started: 0,
-        clips_completed: 0,
-        clip_gaps: 0,
-        clip_bytes: 0,
+        recordings_started: 0,
+        recordings_completed: 0,
+        recording_gaps: 0,
+        recording_bytes: 0,
     }
 }
 
@@ -1487,13 +1489,13 @@ fn track_dto(track: &IpcTrackInfo, stats: Option<&WorkerStats>) -> TrackInfo {
         channels: track.params.channels,
         frames: counters.map_or(0, |t| t.frames),
         bytes: counters.map_or(0, |t| t.packet_bytes.max(t.frame_bytes)),
-        preroll: counters.and_then(|t| t.preroll).map(preroll_dto),
+        prerecord: counters.and_then(|t| t.prerecord).map(prerecord_dto),
     }
 }
 
-/// A track's pre-roll ring as the API reports it.
-const fn preroll_dto(ring: PrerollStats) -> TrackPreroll {
-    TrackPreroll {
+/// A track's pre-record ring as the API reports it.
+const fn prerecord_dto(ring: PrerecordStats) -> TrackPrerecord {
+    TrackPrerecord {
         bytes: ring.bytes,
         held_ms: ring.held_ms,
         truncations: ring.truncations,
@@ -1660,8 +1662,8 @@ mod tests {
             audio: AudioMode::Auto,
             orientation: Orientation::NoTransform,
             created: SystemTime::UNIX_EPOCH,
-            preroll_ms: 0,
-            clips: ClipCounters::default(),
+            prerecord_ms: 0,
+            recordings: RecordingCounters::default(),
         }
     }
 
@@ -1732,7 +1734,7 @@ mod tests {
             ConnectionEntry {
                 port: None,
                 backchannel: false,
-                preroll_ms: 0,
+                prerecord_ms: 0,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -1817,7 +1819,7 @@ mod tests {
             ConnectionEntry {
                 port: None,
                 backchannel: false,
-                preroll_ms: 0,
+                prerecord_ms: 0,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -2068,7 +2070,7 @@ mod tests {
             ConnectionEntry {
                 port: None,
                 backchannel: false,
-                preroll_ms: 0,
+                prerecord_ms: 0,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -2130,7 +2132,7 @@ mod tests {
             ConnectionEntry {
                 port: None,
                 backchannel: false,
-                preroll_ms: 0,
+                prerecord_ms: 0,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -2276,7 +2278,7 @@ mod tests {
             ConnectionEntry {
                 port: None,
                 backchannel: false,
-                preroll_ms: 0,
+                prerecord_ms: 0,
                 key: key.clone(),
                 demand,
                 snapshot: ConnectionSnapshot::idle(SystemTime::UNIX_EPOCH),
@@ -2455,7 +2457,7 @@ mod tests {
             ConnectionEntry {
                 port: None,
                 backchannel: false,
-                preroll_ms: 0,
+                prerecord_ms: 0,
                 key: ConnectionKey {
                     url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                     options: serde_json::Value::Null,
@@ -2670,7 +2672,7 @@ mod tests {
                     frame_bytes: 200,
                     frames_dropped_oversize: 2,
                     frames_over_browser_limit: 3,
-                    preroll: None,
+                    prerecord: None,
                 },
             )],
             sessions: 1,
@@ -2760,13 +2762,13 @@ mod tests {
         let dto = registry.stream_dto("front", &entry).stream;
         assert_eq!(dto.tracks.len(), 1);
         assert_eq!((dto.tracks[0].id.as_str(), dto.tracks[0].frames), ("a1", 5));
-        assert_eq!((dto.preroll_ms, dto.clips.len()), (0, 0));
-        assert_eq!(dto.tracks[0].preroll, None, "no window");
+        assert_eq!((dto.prerecord_ms, dto.recordings.len()), (0, 0));
+        assert_eq!(dto.tracks[0].prerecord, None, "no window");
     }
 
     #[test]
-    fn a_tracks_pre_roll_ring_is_reported_as_its_worker_counts_it() {
-        let ring = PrerollStats {
+    fn a_tracks_pre_record_ring_is_reported_as_its_worker_counts_it() {
+        let ring = PrerecordStats {
             bytes: 14_201_337,
             held_ms: 29_800,
             truncations: 1,
@@ -2780,7 +2782,7 @@ mod tests {
                     frame_bytes: 0,
                     frames_dropped_oversize: 0,
                     frames_over_browser_limit: 0,
-                    preroll: Some(ring),
+                    prerecord: Some(ring),
                 },
             )],
             sessions: 0,
@@ -2796,20 +2798,20 @@ mod tests {
         };
         let video = track_dto(&ipc_track("v0", None, None), Some(&stats));
         assert_eq!(
-            video.preroll,
-            Some(TrackPreroll {
+            video.prerecord,
+            Some(TrackPrerecord {
                 bytes: 14_201_337,
                 held_ms: 29_800,
                 truncations: 1
             })
         );
-        let clips = stream_stats_of(Some(&stats));
+        let recordings = stream_stats_of(Some(&stats));
         assert_eq!(
             (
-                clips.clips_started,
-                clips.clips_completed,
-                clips.clip_gaps,
-                clips.clip_bytes
+                recordings.recordings_started,
+                recordings.recordings_completed,
+                recordings.recording_gaps,
+                recordings.recording_bytes
             ),
             (0, 0, 0, 0)
         );

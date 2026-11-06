@@ -63,10 +63,10 @@ use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::clients::ClientStore;
-use crate::clip::{BodyWatch, Watched};
 use crate::identity::ServerIdentity;
 use crate::listener::{BindError, PeerInfo, accept_retrying};
 use crate::pairing::{self, CODE_LIFETIME, PairContext, Pairing, Unpaired};
+use crate::recording::{BodyWatch, Watched};
 use crate::{UPGRADE_TIMEOUT, upgrade_slot};
 
 /// From accept to the end of the TLS handshake: 3 s. A TLS 1.3 handshake
@@ -553,7 +553,7 @@ async fn handshake(tcp: TcpStream, addr: SocketAddr, ticket: Ticket, h: Handshak
     let _nodelay = tcp.set_nodelay(true);
     // The session goes over the watched socket: it takes what it is given
     // into its own buffer, so only the socket says whether the client
-    // takes a clip's body.
+    // takes a recording's body.
     let body = BodyWatch::new();
     let socket = Watched::new(Box::new(tcp), body.clone(), Arc::clone(&h.clock));
     let accepted = tokio::select! {

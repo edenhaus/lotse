@@ -1,23 +1,23 @@
-//! `GET /v0/clips/{clip_id}`: an event clip's bytes as one HTTP response
+//! `GET /v0/recording/{recording_id}`: an event recording's bytes as one HTTP response
 //! body, on either listener, through the same `Extension(peer)` path as
 //! the upgrade.
 //!
-//! The handler hands each clip over once ([`Handler::clip_body`]): a
+//! The handler hands each recording over once ([`Handler::recording_body`]): a
 //! reader of the file's bytes and the producer's report of how many it
 //! wrote. The body is sent in the chunked transfer coding (RFC 9112 §7.1),
-//! since its length is not known before the clip ends, and ends with the
+//! since its length is not known before the recording ends, and ends with the
 //! last chunk only when the reader ended and the report says every byte
-//! arrived. A clip cut short (its worker died, its reader failed, the
-//! report disagrees or never comes within [`CLIP_REPORT_TIMEOUT`]) ends
+//! arrived. A recording cut short (its worker died, its reader failed, the
+//! report disagrees or never comes within [`RECORDING_REPORT_TIMEOUT`]) ends
 //! without it, which a client reads as an incomplete message (RFC 9112
 //! §8). The response carries `Connection: close` (RFC 9112 §9.6), so the
 //! connection ends with the body and serves nothing else.
 //!
 //! Once its response begins, the connection leaves the pending upgrades
-//! and their deadline (a clip runs for minutes) and is bounded instead by
+//! and their deadline (a recording runs for minutes) and is bounded instead by
 //! the client taking the body: a socket that refuses the response, taking
 //! none of it for [`BODY_STALL_TIMEOUT`], drops the connection, whether
-//! the body waits for more of the clip meanwhile or not (each write the
+//! the body waits for more of the recording meanwhile or not (each write the
 //! socket takes ends the wait, so a client reading slowly keeps it), and
 //! so does still sending
 //! [`CLOSE_TIMEOUT`] after shutdown began, or the removal of the TLS
@@ -27,20 +27,20 @@
 //! stops.
 //!
 //! Refusals carry the error body of the WebSocket's results, and none
-//! takes the clip: 403 for a request carrying `Origin` (RFC 6455 §10.2, as
+//! takes the recording: 403 for a request carrying `Origin` (RFC 6455 §10.2, as
 //! the upgrade refuses it), 503 `shutting_down` (RFC 9110 §15.6.4), 403
 //! `not_permitted` (RFC 9110 §15.5.4) for a TLS client removed since its
 //! handshake, on a connection that then closes, 505 `invalid_request` (RFC
 //! 9110 §15.6.6) for a request not in HTTP/1.1, whose response could not
 //! be chunked (RFC 9112 §6.1) and so could not end cut (§6.3: it would be
-//! close-delimited), 404 `clip_not_found` (RFC 9110 §15.5.5) for an id
-//! that is no open clip's (`.` and `..` included, which no clip has), 409
-//! `clip_already_fetched` (RFC 9110 §15.5.10) for a body another request
+//! close-delimited), 404 `recording_not_found` (RFC 9110 §15.5.5) for an id
+//! that is no open recording's (`.` and `..` included, which no recording has), 409
+//! `recording_already_fetched` (RFC 9110 §15.5.10) for a body another request
 //! took, and 405 with `Allow: GET` (RFC 9110 §15.5.6) for any other
 //! method, HEAD included, which would otherwise take the body.
 //!
-//! [`Handler::clip_body`]: crate::Handler::clip_body
-//! [`CLIP_REPORT_TIMEOUT`]: crate::CLIP_REPORT_TIMEOUT
+//! [`Handler::recording_body`]: crate::Handler::recording_body
+//! [`RECORDING_REPORT_TIMEOUT`]: crate::RECORDING_REPORT_TIMEOUT
 //! [`BODY_STALL_TIMEOUT`]: crate::BODY_STALL_TIMEOUT
 
 use std::fmt;
@@ -56,10 +56,10 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, StatusCode, Uri, Version, header};
 use axum::response::{IntoResponse as _, Response};
 use futures_util::StreamExt as _;
-use lotse_api_types::CLIPS_PATH;
+use lotse_api_types::RECORDING_PATH;
 use lotse_api_types::error::ErrorCode;
 use lotse_core::clock::Clock;
-use lotse_core::id::ClipId;
+use lotse_core::id::RecordingId;
 use lotse_core::task::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{oneshot, watch};
@@ -68,66 +68,66 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::refuse;
 use crate::listener::PeerInfo;
-use crate::{AppState, BODY_STALL_TIMEOUT, CLIP_REPORT_TIMEOUT, CLOSE_TIMEOUT, Handler};
+use crate::{AppState, BODY_STALL_TIMEOUT, CLOSE_TIMEOUT, Handler, RECORDING_REPORT_TIMEOUT};
 
-/// The most bytes read from a clip at once: a Linux pipe's default
+/// The most bytes read from a recording at once: a Linux pipe's default
 /// capacity (pipe(7)), so one read can take all a full pipe holds.
 const CHUNK_BYTES: usize = 64 * 1024;
 
-/// The response header naming the clip a body belongs to.
-const X_CLIP_ID: HeaderName = HeaderName::from_static("x-clip-id");
+/// The response header naming the recording a body belongs to.
+const X_RECORDING_ID: HeaderName = HeaderName::from_static("x-recording-id");
 
-/// One clip's bytes, as the handler hands them to the one request that
+/// One recording's bytes, as the handler hands them to the one request that
 /// takes them.
-pub struct ClipBody {
+pub struct RecordingBody {
     /// The file's bytes, read to their end: the read end of the pipe the
-    /// clip's worker writes.
+    /// recording's worker writes.
     pub reader: Box<dyn AsyncRead + Send + Unpin>,
     /// The length of the file the producer reports, sent once it closed
     /// its end: the body ends whole only when it read that many, so a tail
     /// the producer left out (a reader that did not take it in time) cuts
-    /// it. A sender dropped without it means the clip did not finish (its
+    /// it. A sender dropped without it means the recording did not finish (its
     /// worker died): the body is then cut.
     pub written: oneshot::Receiver<u64>,
 }
 
 /// Names the type only: the reader is any byte source.
-impl fmt::Debug for ClipBody {
+impl fmt::Debug for RecordingBody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClipBody").finish_non_exhaustive()
+        f.debug_struct("RecordingBody").finish_non_exhaustive()
     }
 }
 
-/// Why the handler has no body for a clip.
+/// Why the handler has no body for a recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ClipBodyError {
-    /// No open clip has the id: answered 404 `clip_not_found`.
-    #[error("no open clip has this id")]
+pub enum RecordingBodyError {
+    /// No open recording has the id: answered 404 `recording_not_found`.
+    #[error("no open recording has this id")]
     NotFound,
-    /// Another request took the clip's body: answered 409
-    /// `clip_already_fetched`.
-    #[error("the clip's body was already fetched")]
+    /// Another request took the recording's body: answered 409
+    /// `recording_already_fetched`.
+    #[error("the recording's body was already fetched")]
     AlreadyFetched,
 }
 
-/// What a connection's clip body is doing, as its connection task
+/// What a connection's recording body is doing, as its connection task
 /// watches it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyState {
-    /// No clip body: the connection is before its upgrade.
+    /// No recording body: the connection is before its upgrade.
     Idle,
-    /// A clip body is being sent, and the socket took what it was last
+    /// A recording body is being sent, and the socket took what it was last
     /// offered, or was offered nothing yet.
     Taken,
-    /// A clip body is being sent, and the socket refused a write of the
+    /// A recording body is being sent, and the socket refused a write of the
     /// response at this instant and took none of it since: what the
     /// response holds waits for the client, whether the body waits for
-    /// more of the clip or not.
+    /// more of the recording or not.
     Waiting(Instant),
 }
 
 impl BodyState {
-    /// Whether a clip body is being sent.
+    /// Whether a recording body is being sent.
     pub(crate) const fn is_sending(&self) -> bool {
         !matches!(self, Self::Idle)
     }
@@ -140,7 +140,7 @@ impl BodyState {
 pub(crate) struct BodyWatch(Arc<watch::Sender<BodyState>>);
 
 impl BodyWatch {
-    /// A connection without a clip body.
+    /// A connection without a recording body.
     pub(crate) fn new() -> Self {
         Self(Arc::new(watch::Sender::new(BodyState::Idle)))
     }
@@ -188,7 +188,7 @@ pub(crate) trait Transport: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Transport for T {}
 
 /// A connection's socket, as hyper reads and writes it: a write it refuses
-/// starts a clip body's wait for the client ([`BodyWatch::refused`]) and
+/// starts a recording body's wait for the client ([`BodyWatch::refused`]) and
 /// one that takes bytes ends it ([`BodyWatch::progressed`]), so
 /// [`BODY_STALL_TIMEOUT`] bounds a client that takes none of the response,
 /// whatever the body does meanwhile, not one that takes it slowly. A
@@ -272,7 +272,7 @@ impl AsyncWrite for Watched {
     }
 }
 
-/// `GET /v0/clips/{clip_id}`: the checks, then the clip's body from the
+/// `GET /v0/recording/{recording_id}`: the checks, then the recording's body from the
 /// handler. The peer was authenticated by its listener; a TLS client
 /// removed since then is refused here, and one removed later is dropped
 /// by its connection's task.
@@ -299,16 +299,18 @@ pub(crate) async fn fetch<H: Handler>(
         clock: &state.clock,
     };
     let handler = Arc::clone(&state.handler);
-    answer(&request, &|clip_id| handler.clip_body(clip_id))
+    answer(&request, &|recording_id| {
+        handler.recording_body(recording_id)
+    })
 }
 
-/// Any other method on a clip's path, HEAD included: 405 with `Allow: GET`
-/// (RFC 9110 §15.5.6), the clip untouched.
+/// Any other method on a recording's path, HEAD included: 405 with `Allow: GET`
+/// (RFC 9110 §15.5.6), the recording untouched.
 pub(crate) async fn not_allowed() -> Response {
     let mut response = refuse(
         StatusCode::METHOD_NOT_ALLOWED,
         ErrorCode::InvalidRequest,
-        "a clip's bytes are fetched with GET",
+        "a recording's bytes are fetched with GET",
     );
     response
         .headers_mut()
@@ -316,7 +318,7 @@ pub(crate) async fn not_allowed() -> Response {
     response
 }
 
-/// A clip request as the route sees it, before the handler is asked.
+/// A recording request as the route sees it, before the handler is asked.
 struct Request<'a> {
     /// Who asks.
     peer: &'a PeerInfo,
@@ -327,7 +329,7 @@ struct Request<'a> {
     version: Version,
     /// The request's header fields.
     headers: &'a HeaderMap,
-    /// The request's path, `/v0/clips/{clip_id}`.
+    /// The request's path, `/v0/recording/{recording_id}`.
     path: &'a str,
     /// Whether the daemon is shutting down.
     shutting_down: bool,
@@ -337,15 +339,15 @@ struct Request<'a> {
     clock: &'a Arc<dyn Clock>,
 }
 
-/// The answer to `request`, the clip taken from `lookup`: not generic
+/// The answer to `request`, the recording taken from `lookup`: not generic
 /// over the handler, so every handler's route shares it.
 fn answer(
     request: &Request<'_>,
-    lookup: &dyn Fn(&ClipId) -> Result<ClipBody, ClipBodyError>,
+    lookup: &dyn Fn(&RecordingId) -> Result<RecordingBody, RecordingBodyError>,
 ) -> Response {
     let peer = request.peer;
     if request.headers.contains_key(header::ORIGIN) {
-        tracing::warn!(%peer, "clip body refused: the request carries Origin, as only a browser sends");
+        tracing::warn!(%peer, "recording body refused: the request carries Origin, as only a browser sends");
         return refuse(
             StatusCode::FORBIDDEN,
             ErrorCode::InvalidRequest,
@@ -360,7 +362,7 @@ fn answer(
         );
     }
     if request.removed {
-        tracing::warn!(%peer, "clip body refused: its client was removed");
+        tracing::warn!(%peer, "recording body refused: its client was removed");
         let mut response = refuse(
             StatusCode::FORBIDDEN,
             ErrorCode::NotPermitted,
@@ -377,46 +379,46 @@ fn answer(
     // RFC 9112 §6.1: no chunked response to a request before HTTP/1.1, and
     // a close-delimited one (§6.3) would end alike whole or cut.
     if request.version != Version::HTTP_11 {
-        tracing::warn!(%peer, version = ?request.version, "clip body refused: the request is not HTTP/1.1, so the body could not be chunked");
+        tracing::warn!(%peer, version = ?request.version, "recording body refused: the request is not HTTP/1.1, so the body could not be chunked");
         return refuse(
             StatusCode::HTTP_VERSION_NOT_SUPPORTED,
             ErrorCode::InvalidRequest,
-            "a clip's bytes are sent in the chunked transfer coding, which needs HTTP/1.1",
+            "a recording's bytes are sent in the chunked transfer coding, which needs HTTP/1.1",
         );
     }
-    // A clip id never needs percent-encoding (RFC 3986 §2.3), so the raw
-    // segment is the id or names no clip; it is never repeated.
-    let clip_id = request
+    // A recording id never needs percent-encoding (RFC 3986 §2.3), so the raw
+    // segment is the id or names no recording; it is never repeated.
+    let recording_id = request
         .path
-        .strip_prefix(CLIPS_PATH)
+        .strip_prefix(RECORDING_PATH)
         .and_then(|rest| rest.strip_prefix('/'))
-        .and_then(|raw| ClipId::new(raw).ok());
-    let Some(clip_id) = clip_id else {
-        tracing::debug!(%peer, "clip body refused: the path names no clip id");
-        return clip_not_found();
+        .and_then(|raw| RecordingId::new(raw).ok());
+    let Some(recording_id) = recording_id else {
+        tracing::debug!(%peer, "recording body refused: the path names no recording id");
+        return recording_not_found();
     };
-    match lookup(&clip_id) {
-        Err(ClipBodyError::NotFound) => {
-            tracing::debug!(%peer, clip.id = %clip_id, "clip body refused: no open clip has this id");
-            clip_not_found()
+    match lookup(&recording_id) {
+        Err(RecordingBodyError::NotFound) => {
+            tracing::debug!(%peer, recording.id = %recording_id, "recording body refused: no open recording has this id");
+            recording_not_found()
         }
-        Err(ClipBodyError::AlreadyFetched) => {
-            tracing::warn!(%peer, clip.id = %clip_id, "clip body refused: another request took it");
+        Err(RecordingBodyError::AlreadyFetched) => {
+            tracing::warn!(%peer, recording.id = %recording_id, "recording body refused: another request took it");
             refuse(
                 StatusCode::CONFLICT,
-                ErrorCode::ClipAlreadyFetched,
-                "the clip's bytes were already fetched; a clip has one body",
+                ErrorCode::RecordingAlreadyFetched,
+                "the recording's bytes were already fetched; a recording has one body",
             )
         }
-        Ok(clip) => {
-            tracing::info!(%peer, clip.id = %clip_id, "clip body: sending");
+        Ok(recording) => {
+            tracing::info!(%peer, recording.id = %recording_id, "recording body: sending");
             request.body.set(BodyState::Taken);
-            let header = clip_id.to_string();
+            let header = recording_id.to_string();
             let body = body_stream(Sending {
-                chunks: ReaderStream::with_capacity(clip.reader, CHUNK_BYTES),
-                written: clip.written,
+                chunks: ReaderStream::with_capacity(recording.reader, CHUNK_BYTES),
+                written: recording.written,
                 sent: 0,
-                clip_id,
+                recording_id,
                 peer: peer.clone(),
                 clock: Arc::clone(request.clock),
             });
@@ -425,7 +427,7 @@ fn answer(
                     (header::CONTENT_TYPE, "video/mp4"),
                     (header::CACHE_CONTROL, "no-store"),
                     (header::CONNECTION, "close"),
-                    (X_CLIP_ID, header.as_str()),
+                    (X_RECORDING_ID, header.as_str()),
                 ],
                 Body::from_stream(body),
             )
@@ -434,16 +436,16 @@ fn answer(
     }
 }
 
-/// 404 `clip_not_found`.
-fn clip_not_found() -> Response {
+/// 404 `recording_not_found`.
+fn recording_not_found() -> Response {
     refuse(
         StatusCode::NOT_FOUND,
-        ErrorCode::ClipNotFound,
-        "no open clip has this id",
+        ErrorCode::RecordingNotFound,
+        "no open recording has this id",
     )
 }
 
-/// One clip's body while it is sent.
+/// One recording's body while it is sent.
 struct Sending {
     /// The file's bytes in chunks of up to [`CHUNK_BYTES`].
     chunks: ReaderStream<Box<dyn AsyncRead + Send + Unpin>>,
@@ -451,8 +453,8 @@ struct Sending {
     written: oneshot::Receiver<u64>,
     /// The bytes handed to the response so far.
     sent: u64,
-    /// The clip, for the logs.
-    clip_id: ClipId,
+    /// The recording, for the logs.
+    recording_id: RecordingId,
     /// Who takes it, for the logs.
     peer: PeerInfo,
     /// Times the report.
@@ -483,10 +485,10 @@ async fn next_chunk(sending: Option<Sending>) -> Option<Step> {
 }
 
 impl Sending {
-    /// The end of the clip's bytes: whole when the producer reports
-    /// exactly the bytes sent within [`CLIP_REPORT_TIMEOUT`], else cut.
+    /// The end of the recording's bytes: whole when the producer reports
+    /// exactly the bytes sent within [`RECORDING_REPORT_TIMEOUT`], else cut.
     async fn finish(mut self) -> Option<Step> {
-        let report = self.clock.sleep(CLIP_REPORT_TIMEOUT);
+        let report = self.clock.sleep(RECORDING_REPORT_TIMEOUT);
         let written = tokio::select! {
             written = &mut self.written => written.ok(),
             () = report => None,
@@ -495,22 +497,22 @@ impl Sending {
             Some(written) if written == self.sent => {
                 tracing::info!(
                     peer = %self.peer,
-                    clip.id = %self.clip_id,
+                    recording.id = %self.recording_id,
                     bytes = self.sent,
-                    "clip body: sent whole"
+                    "recording body: sent whole"
                 );
                 None
             }
             Some(written) => {
                 let message = format!(
-                    "the clip reports {written} bytes written, {} arrived",
+                    "the recording reports {written} bytes written, {} arrived",
                     self.sent
                 );
                 Some(self.cut(io::Error::other(message)).await)
             }
             None => Some(
                 self.cut(io::Error::other(
-                    "the clip ended without a report of its bytes",
+                    "the recording ended without a report of its bytes",
                 ))
                 .await,
             ),
@@ -525,16 +527,16 @@ impl Sending {
         tokio::task::yield_now().await;
         tracing::warn!(
             peer = %self.peer,
-            clip.id = %self.clip_id,
+            recording.id = %self.recording_id,
             bytes = self.sent,
             error = %err,
-            "clip body cut: it ends without its last chunk"
+            "recording body cut: it ends without its last chunk"
         );
         (Err(err), None)
     }
 }
 
-/// Drives a connection whose clip body is being sent until it ends, its
+/// Drives a connection whose recording body is being sent until it ends, its
 /// client makes no room for the body within [`BODY_STALL_TIMEOUT`], its
 /// client is `removed`, or [`CLOSE_TIMEOUT`] after shutdown began;
 /// dropping it closes the socket.
@@ -548,18 +550,18 @@ pub(crate) async fn send_body(
 ) {
     tokio::select! {
         sent = connection => {
-            tracing::debug!(%peer, error = ?sent.err(), "clip body: connection closed");
+            tracing::debug!(%peer, error = ?sent.err(), "recording body: connection closed");
         }
         () = removed.cancelled() => {
-            tracing::info!(%peer, "clip body dropped: its client was removed");
+            tracing::info!(%peer, "recording body dropped: its client was removed");
         }
         () = stalled(&mut body, clock) => {
             let timeout_ms = BODY_STALL_TIMEOUT.as_millis();
-            tracing::warn!(%peer, timeout_ms, "clip body dropped: the client made no room for it in time");
+            tracing::warn!(%peer, timeout_ms, "recording body dropped: the client made no room for it in time");
         }
         () = closing(shutdown, clock) => {
             let timeout_ms = CLOSE_TIMEOUT.as_millis();
-            tracing::warn!(%peer, timeout_ms, "clip body dropped: still being sent when shutdown's close timeout ran out");
+            tracing::warn!(%peer, timeout_ms, "recording body dropped: still being sent when shutdown's close timeout ran out");
         }
     }
 }
@@ -659,36 +661,36 @@ mod tests {
         PeerInfo::Unix { uid: 0, pid: None }
     }
 
-    /// A clip whose bytes the test writes and whose report it sends.
-    fn new_clip() -> (ClipBody, tokio::io::DuplexStream, oneshot::Sender<u64>) {
+    /// A recording whose bytes the test writes and whose report it sends.
+    fn new_recording() -> (RecordingBody, tokio::io::DuplexStream, oneshot::Sender<u64>) {
         let (reader, writer) = tokio::io::duplex(1024);
         let (report, written) = oneshot::channel();
-        let body = ClipBody {
+        let body = RecordingBody {
             reader: Box::new(reader),
             written,
         };
         (body, writer, report)
     }
 
-    fn sending(clip: ClipBody, clock: &Arc<FakeClock>) -> Sending {
+    fn sending(recording: RecordingBody, clock: &Arc<FakeClock>) -> Sending {
         Sending {
-            chunks: ReaderStream::with_capacity(clip.reader, CHUNK_BYTES),
-            written: clip.written,
+            chunks: ReaderStream::with_capacity(recording.reader, CHUNK_BYTES),
+            written: recording.written,
             sent: 0,
-            clip_id: ClipId::new("c1").unwrap(),
+            recording_id: RecordingId::new("c1").unwrap(),
             peer: peer(),
             clock: Arc::<FakeClock>::clone(clock),
         }
     }
 
     /// `answer` for an HTTP/1.1 request to `path` with `headers` from a
-    /// client not removed, the clip from `lookup`.
+    /// client not removed, the recording from `lookup`.
     fn answer_to(
         path: &str,
         headers: &HeaderMap,
         shutting_down: bool,
         body: &BodyWatch,
-        lookup: &dyn Fn(&ClipId) -> Result<ClipBody, ClipBodyError>,
+        lookup: &dyn Fn(&RecordingId) -> Result<RecordingBody, RecordingBodyError>,
     ) -> Response {
         answer_as(
             (false, Version::HTTP_11),
@@ -707,7 +709,7 @@ mod tests {
         path: &str,
         shutting_down: bool,
         body: &BodyWatch,
-        lookup: &dyn Fn(&ClipId) -> Result<ClipBody, ClipBodyError>,
+        lookup: &dyn Fn(&RecordingId) -> Result<RecordingBody, RecordingBodyError>,
         headers: &HeaderMap,
     ) -> Response {
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::default());
@@ -736,15 +738,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rfc9110_15_5_a_request_that_names_no_clip_it_may_take_is_refused_with_the_error_body()
-    {
+    async fn rfc9110_15_5_a_request_that_names_no_recording_it_may_take_is_refused_with_the_error_body()
+     {
         let (logs, _guard) = capture(tracing::Level::DEBUG);
         let body = BodyWatch::new();
         let none = HeaderMap::new();
         let asked = std::cell::Cell::new(0);
-        let gone = |_: &ClipId| {
+        let gone = |_: &RecordingId| {
             asked.set(asked.get() + 1);
-            Err(ClipBodyError::NotFound)
+            Err(RecordingBodyError::NotFound)
         };
         let mut browser = HeaderMap::new();
         browser.insert(
@@ -752,79 +754,80 @@ mod tests {
             HeaderValue::from_static("https://example.com"),
         );
         // RFC 6455 §10.2, as the upgrade: a browser's request is refused.
-        let refused = answer_to("/v0/clips/c1", &browser, false, &body, &gone);
+        let refused = answer_to("/v0/recording/c1", &browser, false, &body, &gone);
         assert_eq!(
             status_and_code(refused).await,
             (403, "invalid_request".into())
         );
-        let refused = answer_to("/v0/clips/c1", &none, true, &body, &gone);
+        let refused = answer_to("/v0/recording/c1", &none, true, &body, &gone);
         assert_eq!(
             status_and_code(refused).await,
             (503, "shutting_down".into())
         );
-        // An id no clip can have is not looked up, and never repeated: a
+        // An id no recording can have is not looked up, and never repeated: a
         // dot segment neither (RFC 3986 §3.3), which a URL cannot keep.
         for path in [
-            "/v0/clips/a%2Fb",
-            "/v0/clips/secret secret",
-            "/v0/clips",
-            "/v0/clips/.",
-            "/v0/clips/..",
+            "/v0/recording/a%2Fb",
+            "/v0/recording/secret secret",
+            "/v0/recording",
+            "/v0/recording/.",
+            "/v0/recording/..",
         ] {
             let refused = answer_to(path, &none, false, &body, &gone);
             assert_eq!(
                 status_and_code(refused).await,
-                (404, "clip_not_found".into()),
+                (404, "recording_not_found".into()),
                 "{path}"
             );
         }
         assert_eq!(asked.get(), 0, "none of them was looked up");
-        let refused = answer_to("/v0/clips/c1", &none, false, &body, &gone);
+        let refused = answer_to("/v0/recording/c1", &none, false, &body, &gone);
         assert_eq!(
             status_and_code(refused).await,
-            (404, "clip_not_found".into())
+            (404, "recording_not_found".into())
         );
         assert_eq!(asked.get(), 1);
-        let taken = |_: &ClipId| Err(ClipBodyError::AlreadyFetched);
-        let refused = answer_to("/v0/clips/c1", &none, false, &body, &taken);
+        let taken = |_: &RecordingId| Err(RecordingBodyError::AlreadyFetched);
+        let refused = answer_to("/v0/recording/c1", &none, false, &body, &taken);
         assert_eq!(
             status_and_code(refused).await,
-            (409, "clip_already_fetched".into())
+            (409, "recording_already_fetched".into())
         );
         assert_eq!(*body.subscribe().borrow(), BodyState::Idle, "nothing sent");
         let text = logs.text();
         assert!(
-            text.contains("clip body refused: the request carries Origin"),
+            text.contains("recording body refused: the request carries Origin"),
             "{text}"
         );
         assert!(
-            text.contains("clip body refused: the path names no clip id"),
+            text.contains("recording body refused: the path names no recording id"),
             "{text}"
         );
         assert!(
-            text.contains("clip body refused: no open clip has this id"),
+            text.contains("recording body refused: no open recording has this id"),
             "{text}"
         );
         assert!(
-            text.contains("clip body refused: another request took it"),
+            text.contains("recording body refused: another request took it"),
             "{text}"
         );
         assert!(!text.contains("secret"), "{text}");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rfc9110_15_3_1_a_clip_is_answered_200_as_an_uncached_mp4_on_a_closing_connection() {
+    async fn rfc9110_15_3_1_a_recording_is_answered_200_as_an_uncached_mp4_on_a_closing_connection()
+    {
         let (logs, _guard) = capture(tracing::Level::INFO);
         let body = BodyWatch::new();
         let asked = std::sync::Mutex::new(None);
-        let (clip, mut writer, report) = new_clip();
-        let clip = std::sync::Mutex::new(Some(clip));
-        let lookup = |id: &ClipId| {
+        let (recording, mut writer, report) = new_recording();
+        let recording = std::sync::Mutex::new(Some(recording));
+        let lookup = |id: &RecordingId| {
             *asked.lock().unwrap() = Some(id.clone());
-            Ok(clip.lock().unwrap().take().unwrap())
+            Ok(recording.lock().unwrap().take().unwrap())
         };
         let response = answer_to(
-            "/v0/clips/01JB.c-1_x",
+            "/v0/recording/01JB.c-1_x",
             &HeaderMap::new(),
             false,
             &body,
@@ -841,7 +844,7 @@ mod tests {
         // ends with the body.
         assert_eq!(headers[header::CACHE_CONTROL], "no-store");
         assert_eq!(headers[header::CONNECTION], "close");
-        assert_eq!(headers["x-clip-id"], "01JB.c-1_x");
+        assert_eq!(headers["x-recording-id"], "01JB.c-1_x");
         assert!(
             headers.get(header::CONTENT_LENGTH).is_none(),
             "its length is not known"
@@ -855,25 +858,26 @@ mod tests {
             .unwrap();
         assert_eq!(&bytes[..], b"ftyp");
         let text = logs.text();
-        assert!(text.contains("clip body: sending"), "{text}");
-        assert!(text.contains("clip body: sent whole"), "{text}");
+        assert!(text.contains("recording body: sending"), "{text}");
+        assert!(text.contains("recording body: sent whole"), "{text}");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_removed_client_or_a_request_before_http_1_1_is_refused_before_the_clip_is_taken() {
+    async fn a_removed_client_or_a_request_before_http_1_1_is_refused_before_the_recording_is_taken()
+     {
         let (logs, _guard) = capture(tracing::Level::WARN);
         let body = BodyWatch::new();
         let none = HeaderMap::new();
         let asked = std::cell::Cell::new(0);
-        let lookup = |_: &ClipId| {
+        let lookup = |_: &RecordingId| {
             asked.set(asked.get() + 1);
-            Err(ClipBodyError::NotFound)
+            Err(RecordingBodyError::NotFound)
         };
         // RFC 9110 §15.5.4: its client was removed since its handshake; the
         // connection closes with the answer (RFC 9112 §9.6).
         let refused = answer_as(
             (true, Version::HTTP_11),
-            "/v0/clips/c1",
+            "/v0/recording/c1",
             false,
             &body,
             &lookup,
@@ -888,7 +892,7 @@ mod tests {
         for version in [Version::HTTP_10, Version::HTTP_09] {
             let refused = answer_as(
                 (false, version),
-                "/v0/clips/c1",
+                "/v0/recording/c1",
                 false,
                 &body,
                 &lookup,
@@ -905,7 +909,7 @@ mod tests {
         // The same request in HTTP/1.1 from a client still allowed is.
         let looked_up = answer_as(
             (false, Version::HTTP_11),
-            "/v0/clips/c1",
+            "/v0/recording/c1",
             false,
             &body,
             &lookup,
@@ -913,16 +917,16 @@ mod tests {
         );
         assert_eq!(
             status_and_code(looked_up).await,
-            (404, "clip_not_found".into())
+            (404, "recording_not_found".into())
         );
         assert_eq!(asked.get(), 1);
         let text = logs.text();
         assert!(
-            text.contains("clip body refused: its client was removed"),
+            text.contains("recording body refused: its client was removed"),
             "{text}"
         );
         assert!(
-            text.contains("clip body refused: the request is not HTTP/1.1"),
+            text.contains("recording body refused: the request is not HTTP/1.1"),
             "{text}"
         );
     }
@@ -932,11 +936,11 @@ mod tests {
         let clock = Arc::new(FakeClock::default());
         let (reader, mut writer) = tokio::io::duplex(256 * 1024);
         let (_report, written) = oneshot::channel();
-        let clip = ClipBody {
+        let recording = RecordingBody {
             reader: Box::new(reader),
             written,
         };
-        let mut body = Box::pin(body_stream(sending(clip, &clock)));
+        let mut body = Box::pin(body_stream(sending(recording, &clock)));
         writer.write_all(&vec![1_u8; 3 * 64 * 1024]).await.unwrap();
         assert_eq!(body.next().await.unwrap().unwrap().len(), 64 * 1024);
     }
@@ -952,7 +956,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn the_route_takes_the_clip_from_the_handler_by_the_paths_id() {
+    async fn the_route_takes_the_recording_from_the_handler_by_the_paths_id() {
         let state = state(1, false);
         let response = fetch(
             State(state),
@@ -960,21 +964,21 @@ mod tests {
             Extension(BodyWatch::new()),
             Version::HTTP_11,
             HeaderMap::new(),
-            Uri::from_static("/v0/clips/c1"),
+            Uri::from_static("/v0/recording/c1"),
         )
         .await;
-        // The default handler has no clips.
+        // The default handler has no recordings.
         assert_eq!(
             status_and_code(response).await,
-            (404, "clip_not_found".into())
+            (404, "recording_not_found".into())
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn rfc9112_7_1_a_body_reported_whole_ends_after_its_chunks() {
         let clock = Arc::new(FakeClock::default());
-        let (clip, mut writer, report) = new_clip();
-        let mut body = Box::pin(body_stream(sending(clip, &clock)));
+        let (recording, mut writer, report) = new_recording();
+        let mut body = Box::pin(body_stream(sending(recording, &clock)));
         writer.write_all(b"moov").await.unwrap();
         assert_eq!(&body.next().await.unwrap().unwrap()[..], b"moov");
         writer.write_all(b"moof").await.unwrap();
@@ -990,8 +994,8 @@ mod tests {
         let (logs, _guard) = capture(tracing::Level::WARN);
         let clock = Arc::new(FakeClock::default());
         // Fewer bytes arrived than the producer wrote.
-        let (clip, mut writer, report) = new_clip();
-        let mut body = Box::pin(body_stream(sending(clip, &clock)));
+        let (recording, mut writer, report) = new_recording();
+        let mut body = Box::pin(body_stream(sending(recording, &clock)));
         writer.write_all(b"ab").await.unwrap();
         drop(writer);
         report.send(3).unwrap();
@@ -999,36 +1003,36 @@ mod tests {
         let err = body.next().await.unwrap().unwrap_err();
         assert_eq!(
             err.to_string(),
-            "the clip reports 3 bytes written, 2 arrived"
+            "the recording reports 3 bytes written, 2 arrived"
         );
         assert!(body.next().await.is_none());
         // The producer died: its report never comes.
-        let (clip, writer, report) = new_clip();
-        let mut body = Box::pin(body_stream(sending(clip, &clock)));
+        let (recording, writer, report) = new_recording();
+        let mut body = Box::pin(body_stream(sending(recording, &clock)));
         drop((writer, report));
         let err = body.next().await.unwrap().unwrap_err();
         assert_eq!(
             err.to_string(),
-            "the clip ended without a report of its bytes"
+            "the recording ended without a report of its bytes"
         );
         // The producer is alive and silent: the report's deadline.
-        let (clip, writer, report) = new_clip();
-        let mut body = Box::pin(body_stream(sending(clip, &clock)));
+        let (recording, writer, report) = new_recording();
+        let mut body = Box::pin(body_stream(sending(recording, &clock)));
         drop(writer);
         let end = lotse_core::task::spawn_named("test.end", async move { body.next().await });
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        clock.advance(CLIP_REPORT_TIMEOUT);
+        clock.advance(RECORDING_REPORT_TIMEOUT);
         let err = end.await.unwrap().unwrap().unwrap_err();
         assert_eq!(
             err.to_string(),
-            "the clip ended without a report of its bytes"
+            "the recording ended without a report of its bytes"
         );
         drop(report);
         let text = logs.text();
         assert_eq!(
-            text.matches("clip body cut: it ends without its last chunk")
+            text.matches("recording body cut: it ends without its last chunk")
                 .count(),
             3,
             "{text}"
@@ -1052,12 +1056,12 @@ mod tests {
     async fn rfc9112_8_a_body_whose_reader_fails_is_cut() {
         let clock = Arc::new(FakeClock::default());
         let (_report, written) = oneshot::channel();
-        let clip = ClipBody {
+        let recording = RecordingBody {
             reader: Box::new(Failing),
             written,
         };
-        assert_eq!(format!("{clip:?}"), "ClipBody { .. }");
-        let mut body = Box::pin(body_stream(sending(clip, &clock)));
+        assert_eq!(format!("{recording:?}"), "RecordingBody { .. }");
+        let mut body = Box::pin(body_stream(sending(recording, &clock)));
         assert_eq!(
             body.next().await.unwrap().unwrap_err().to_string(),
             "pipe broke"
@@ -1117,7 +1121,7 @@ mod tests {
         let (watch, end, task) = sent_body(&clock, &CancellationToken::new());
         watch.set(BodyState::Taken);
         settle().await;
-        // Waiting on the clip is no stall, however long.
+        // Waiting on the recording is no stall, however long.
         clock.advance(BODY_STALL_TIMEOUT * 3);
         settle().await;
         // A chunk taken just before its deadline restarts nothing.
@@ -1133,8 +1137,8 @@ mod tests {
         end.send(()).unwrap();
         task.await.unwrap();
         let text = logs.text();
-        assert!(text.contains("clip body: connection closed"), "{text}");
-        assert!(!text.contains("clip body dropped"), "{text}");
+        assert!(text.contains("recording body: connection closed"), "{text}");
+        assert!(!text.contains("recording body dropped"), "{text}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1151,7 +1155,7 @@ mod tests {
         task.await.unwrap();
         let text = logs.text();
         assert!(
-            text.contains("clip body dropped: the client made no room for it in time"),
+            text.contains("recording body dropped: the client made no room for it in time"),
             "{text}"
         );
     }
@@ -1167,13 +1171,13 @@ mod tests {
         settle().await;
         clock.advance(CLOSE_TIMEOUT.saturating_sub(Duration::from_millis(1)));
         settle().await;
-        assert!(!task.is_finished(), "the clip may still end whole");
+        assert!(!task.is_finished(), "the recording may still end whole");
         clock.advance(Duration::from_millis(1));
         task.await.unwrap();
         let text = logs.text();
         assert!(
             text.contains(
-                "clip body dropped: still being sent when shutdown's close timeout ran out"
+                "recording body dropped: still being sent when shutdown's close timeout ran out"
             ),
             "{text}"
         );
@@ -1193,7 +1197,7 @@ mod tests {
         task.await.unwrap();
         let text = logs.text();
         assert!(
-            text.contains("clip body dropped: its client was removed"),
+            text.contains("recording body dropped: its client was removed"),
             "{text}"
         );
     }
@@ -1228,15 +1232,15 @@ mod tests {
         task.await.unwrap();
         let text = logs.text();
         assert!(
-            text.contains("clip body dropped: the client made no room for it in time"),
+            text.contains("recording body dropped: the client made no room for it in time"),
             "{text}"
         );
     }
 
-    /// The body waits for more of the clip when the socket starts
+    /// The body waits for more of the recording when the socket starts
     /// refusing the response, and nothing tells the stall timer.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_wait_that_begins_while_the_body_waits_for_the_clip_is_dropped_a_stall_deadline_after_it()
+    async fn a_wait_that_begins_while_the_body_waits_for_the_recording_is_dropped_a_stall_deadline_after_it()
      {
         let (logs, _guard) = capture(tracing::Level::WARN);
         let clock = Arc::new(FakeClock::default());
@@ -1260,7 +1264,7 @@ mod tests {
         task.await.unwrap();
         let text = logs.text();
         assert!(
-            text.contains("clip body dropped: the client made no room for it in time"),
+            text.contains("recording body dropped: the client made no room for it in time"),
             "{text}"
         );
     }
@@ -1270,7 +1274,7 @@ mod tests {
         let clock = FakeClock::default();
         let watch = BodyWatch::new();
         let mut states = watch.subscribe();
-        // A connection without a clip body has nothing to wait for.
+        // A connection without a recording body has nothing to wait for.
         watch.refused(&clock);
         assert_eq!(*states.borrow(), BodyState::Idle);
         watch.progressed();
@@ -1383,17 +1387,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_connection_without_a_clip_body_is_idle() {
+    fn only_a_connection_without_a_recording_body_is_idle() {
         assert!(!BodyState::Idle.is_sending());
         assert!(BodyState::Taken.is_sending());
         assert!(BodyState::Waiting(FakeClock::default().now()).is_sending());
         assert_eq!(
-            ClipBodyError::AlreadyFetched.to_string(),
-            "the clip's body was already fetched"
+            RecordingBodyError::AlreadyFetched.to_string(),
+            "the recording's body was already fetched"
         );
         assert_eq!(
-            ClipBodyError::NotFound.to_string(),
-            "no open clip has this id"
+            RecordingBodyError::NotFound.to_string(),
+            "no open recording has this id"
         );
     }
 }

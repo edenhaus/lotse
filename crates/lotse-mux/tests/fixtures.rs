@@ -1,4 +1,4 @@
-//! The muxer's fixtures, in `crates/lotse-mux/testdata/`: whole clips
+//! The muxer's fixtures, in `crates/lotse-mux/testdata/`: whole recordings
 //! (init segment and fragments) made here through the public API from the
 //! codec crate's test data (its hand-built parameter sets and recorded
 //! AAC) and from synthetic frames (slices of a few bytes, B-frame order,
@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use lotse_codec::aac::test_data::{CONFIG_16K_MONO, SINE_16K_MONO, frames};
 use lotse_codec::{h264, h265};
-use lotse_core::clip::{ClipMuxer as _, ClipPolicy, ClipTrack};
 use lotse_core::clock::{Clock as _, FakeClock};
+use lotse_core::recording::{RecordingMuxer as _, RecordingPolicy, RecordingTrack};
 use lotse_core::{Codec, Kind, MediaFrame, MediaTime};
 use lotse_mux::Muxer;
 use mp4_atom::{Any, Decode as _};
@@ -57,7 +57,7 @@ fn path(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// A frame captured `after` the clip's base instant.
+/// A frame captured `after` the recording's base instant.
 struct At {
     kind: Kind,
     after: Duration,
@@ -88,12 +88,12 @@ fn merged(frames: Vec<At>) -> Vec<At> {
     }
 }
 
-/// The clip of `video`, `audio` and `frames` ([`merged`]) with the
+/// The recording of `video`, `audio` and `frames` ([`merged`]) with the
 /// default policy, as one file.
-fn clip(video: &ClipTrack, audio: Option<&ClipTrack>, frames: Vec<At>) -> Vec<u8> {
+fn recording(video: &RecordingTrack, audio: Option<&RecordingTrack>, frames: Vec<At>) -> Vec<u8> {
     let base: Instant = FakeClock::from_system().now();
     let frames = merged(frames);
-    let mut muxer = Muxer::new(&ClipPolicy::default());
+    let mut muxer = Muxer::new(&RecordingPolicy::default());
     let mut file = Vec::new();
     let mut write = |pieces: Vec<Bytes>| {
         for piece in pieces {
@@ -126,8 +126,8 @@ fn annex_b(units: &[&[u8]]) -> Bytes {
     Bytes::from(out)
 }
 
-fn h264_track() -> ClipTrack {
-    ClipTrack {
+fn h264_track() -> RecordingTrack {
+    RecordingTrack {
         codec: Codec::H264 {
             profile_level_id: None,
             sps: Some(Bytes::from(h264::test_data::sps(320, 240))),
@@ -183,7 +183,7 @@ fn h264_aac() -> Vec<u8> {
             payload: Bytes::copy_from_slice(aac[usize::try_from(j).unwrap() % aac.len()]),
         });
     }
-    let audio = ClipTrack {
+    let audio = RecordingTrack {
         codec: Codec::AacLc {
             sample_rate: 16_000,
             channels: 1,
@@ -191,7 +191,7 @@ fn h264_aac() -> Vec<u8> {
         },
         clock_rate: 16_000,
     };
-    clip(&h264_track(), Some(&audio), all)
+    recording(&h264_track(), Some(&audio), all)
 }
 
 /// H.265 for 2 s at 25 fps with a keyframe every second.
@@ -220,7 +220,7 @@ fn h265() -> Vec<u8> {
             }
         })
         .collect();
-    let video = ClipTrack {
+    let video = RecordingTrack {
         codec: Codec::H265 {
             vps: Some(Bytes::from(h265::test_data::vps())),
             sps: Some(Bytes::from(h265::test_data::sps(640, 480))),
@@ -228,7 +228,7 @@ fn h265() -> Vec<u8> {
         },
         clock_rate: 90_000,
     };
-    clip(&video, None, frames)
+    recording(&video, None, frames)
 }
 
 /// H.264 for 1 s and mono Opus in 20 ms packets.
@@ -245,11 +245,11 @@ fn h264_opus() -> Vec<u8> {
             payload: Bytes::from(vec![0xf8, u8::try_from(j).unwrap(), 0xfe]),
         });
     }
-    let audio = ClipTrack {
+    let audio = RecordingTrack {
         codec: Codec::Opus { channels: 1 },
         clock_rate: 48_000,
     };
-    clip(&h264_track(), Some(&audio), frames)
+    recording(&h264_track(), Some(&audio), frames)
 }
 
 /// The frame numbers of [`h264_bframes`] in decode order: two closed
@@ -264,7 +264,7 @@ fn bframes_order() -> Vec<u32> {
 
 /// H.264 with B-frames, pushed in decode order ([`bframes_order`]).
 fn h264_bframes() -> Vec<u8> {
-    clip(&h264_track(), None, h264_frames(&bframes_order(), 0, 12))
+    recording(&h264_track(), None, h264_frames(&bframes_order(), 0, 12))
 }
 
 #[test]
@@ -379,7 +379,7 @@ fn ffprobe_iso14496_15_reads_h264_with_aac_lc() {
     assert_eq!(audio["channels"], 1);
     let video = packets(&probe, 0);
     assert_eq!(video.len(), 75);
-    // 16 ms after the first audio frame, the clip's origin, at 90 kHz.
+    // 16 ms after the first audio frame, the recording's origin, at 90 kHz.
     assert_eq!(video[0], (1440, 1440, true));
     let keyframes: Vec<usize> = (0..video.len()).filter(|&i| video[i].2).collect();
     assert_eq!(keyframes, [0, 50]);

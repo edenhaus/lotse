@@ -3,7 +3,7 @@
 A small, fast, memory-safe media daemon built for Home Assistant. It takes
 camera streams (RTSP, and HLS or MPEG-TS over HTTP) and serves them to
 browsers over WebRTC, with two-way audio designed in from the start, and
-as event clips: fragmented MP4 that starts before the event, from the
+as event recordings: fragmented MP4 that starts before the event, from the
 seconds it keeps in memory, for its client to store. It does nothing
 else.
 
@@ -18,7 +18,7 @@ else.
 
 Live camera view in Home Assistant needs little from a media daemon: one
 signaling path (offer/answer/candidate), a stream registry, a JPEG
-snapshot, a way to keep a stream connected without viewers, and a clip of
+snapshot, a way to keep a stream connected without viewers, and a recording of
 an event with the seconds before it.
 
 lotse is scoped to exactly that, written in Rust with a sans-IO WebRTC
@@ -49,7 +49,7 @@ is designed with.
 - **Fast.** One UDP socket for all viewers, zero-copy fan-out with `Bytes`,
   no per-packet allocation on the hot path, static musl binaries tuned per
   target.
-- **Small surface.** Only the features live viewing and event clips need. New features start
+- **Small surface.** Only the features live viewing and event recordings need. New features start
   as a design, reviewed before any code.
 
 ## Platforms

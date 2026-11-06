@@ -1,7 +1,7 @@
-//! `GET /v0/clips/{clip_id}` end to end over a real Unix socket: a clip's
+//! `GET /v0/recording/{recording_id}` end to end over a real Unix socket: a recording's
 //! bytes as one chunked body, whole or cut, the refusals, and what bounds
 //! a body's connection (the client taking it, shutdown), against
-//! `test_util`'s clips standing in for the supervisor's.
+//! `test_util`'s recordings standing in for the supervisor's.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -18,28 +18,28 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt as _;
-use lotse_api::test_util::{FakeClipWriter, FakeClips};
+use lotse_api::test_util::{FakeRecordingWriter, FakeRecordings};
 use lotse_api::{
-    BODY_STALL_TIMEOUT, CLOSE_TIMEOUT, ClipBody, ClipBodyError, Config, ConnectionId, Handler,
-    MAX_PENDING_UPGRADES, Outcome, ServeError, Server, UPGRADE_TIMEOUT,
+    BODY_STALL_TIMEOUT, CLOSE_TIMEOUT, Config, ConnectionId, Handler, MAX_PENDING_UPGRADES,
+    Outcome, RecordingBody, RecordingBodyError, ServeError, Server, UPGRADE_TIMEOUT,
 };
 use lotse_api_types::command::Command;
 use lotse_api_types::frame::{Hello, HelloTag};
 use lotse_core::clock::FakeClock;
-use lotse_core::id::ClipId;
+use lotse_core::id::RecordingId;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-/// The supervisor's stand-in: its clips, nothing else.
+/// The supervisor's stand-in: its recordings, nothing else.
 #[derive(Default)]
-struct ClipHandler {
-    clips: FakeClips,
+struct RecordingHandler {
+    recordings: FakeRecordings,
 }
 
-impl Handler for ClipHandler {
+impl Handler for RecordingHandler {
     fn hello(&self) -> Hello {
         Hello {
             kind: HelloTag::default(),
@@ -58,8 +58,11 @@ impl Handler for ClipHandler {
         std::future::ready(Outcome::Result(serde_json::Value::Null))
     }
 
-    fn clip_body(&self, clip_id: &ClipId) -> Result<ClipBody, ClipBodyError> {
-        self.clips.take(clip_id)
+    fn recording_body(
+        &self,
+        recording_id: &RecordingId,
+    ) -> Result<RecordingBody, RecordingBodyError> {
+        self.recordings.take(recording_id)
     }
 }
 
@@ -68,7 +71,7 @@ struct Running {
     socket: PathBuf,
     shutdown: CancellationToken,
     server: JoinHandle<Result<(), ServeError>>,
-    handler: Arc<ClipHandler>,
+    handler: Arc<RecordingHandler>,
     clock: Arc<FakeClock>,
 }
 
@@ -79,14 +82,14 @@ impl Running {
         std::fs::remove_dir_all(&self.dir).unwrap();
     }
 
-    /// Opens clip `clip_id` on the handler.
-    fn open(&self, clip_id: &str) -> FakeClipWriter {
-        self.handler.clips.open(clip_id)
+    /// Opens recording `recording_id` on the handler.
+    fn open(&self, recording_id: &str) -> FakeRecordingWriter {
+        self.handler.recordings.open(recording_id)
     }
 }
 
 fn start(name: &str) -> Running {
-    let dir = std::env::temp_dir().join(format!("lotse-clip-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("lotse-recording-{name}-{}", std::process::id()));
     let _gone = std::fs::remove_dir_all(&dir);
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let socket = dir.join("lotse.sock");
@@ -103,7 +106,7 @@ fn start(name: &str) -> Running {
         tls: None,
     })
     .unwrap();
-    let handler = Arc::new(ClipHandler::default());
+    let handler = Arc::new(RecordingHandler::default());
     let shutdown = CancellationToken::new();
     let clock = Arc::new(FakeClock::default());
     let task = lotse_core::task::spawn_named(
@@ -280,7 +283,7 @@ async fn rfc9112_7_1_chunked_body_ends_with_the_last_chunk() {
     let (logs, _guard) = capture(tracing::Level::INFO);
     let running = start("whole");
     let mut writer = running.open("c1");
-    let mut client = request(&running.socket, "GET", "/v0/clips/c1").await;
+    let mut client = request(&running.socket, "GET", "/v0/recording/c1").await;
     writer.write(b"ftyp-moov-").await.unwrap();
     settle().await;
     let middle = vec![7_u8; 100_000];
@@ -294,7 +297,7 @@ async fn rfc9112_7_1_chunked_body_ends_with_the_last_chunk() {
         "content-type: video/mp4",
         "cache-control: no-store",
         "connection: close",
-        "x-clip-id: c1",
+        "x-recording-id: c1",
         "transfer-encoding: chunked",
     ] {
         assert!(response.head.contains(field), "{field}: {}", response.head);
@@ -305,17 +308,17 @@ async fn rfc9112_7_1_chunked_body_ends_with_the_last_chunk() {
     expected.extend_from_slice(b"-moof-mdat");
     assert_eq!(response.body, expected);
     let text = logs.text();
-    assert!(text.contains("clip body: sending"), "{text}");
-    assert!(text.contains("clip body: sent whole"), "{text}");
+    assert!(text.contains("recording body: sending"), "{text}");
+    assert!(text.contains("recording body: sent whole"), "{text}");
     running.finish().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rfc9112_8_a_clip_cut_short_ends_without_the_last_chunk() {
+async fn rfc9112_8_a_recording_cut_short_ends_without_the_last_chunk() {
     let running = start("cut");
     // Its worker died: the bytes end and no report comes.
     let mut crashed = running.open("crashed");
-    let mut client = request(&running.socket, "GET", "/v0/clips/crashed").await;
+    let mut client = request(&running.socket, "GET", "/v0/recording/crashed").await;
     crashed.write(b"ftyp").await.unwrap();
     drop(crashed);
     let response = Response::parse(&read_all(&mut client).await);
@@ -324,7 +327,7 @@ async fn rfc9112_8_a_clip_cut_short_ends_without_the_last_chunk() {
     assert!(!response.last_chunk, "a truncated transfer");
     // The report says more was written than arrived.
     let mut short = running.open("short");
-    let mut client = request(&running.socket, "GET", "/v0/clips/short").await;
+    let mut client = request(&running.socket, "GET", "/v0/recording/short").await;
     short.write(b"ftyp").await.unwrap();
     short.finish_reporting(5);
     let response = Response::parse(&read_all(&mut client).await);
@@ -333,31 +336,35 @@ async fn rfc9112_8_a_clip_cut_short_ends_without_the_last_chunk() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rfc9110_15_5_a_clip_is_fetched_once_and_an_unknown_one_not_at_all() {
+async fn rfc9110_15_5_a_recording_is_fetched_once_and_an_unknown_one_not_at_all() {
     let running = start("once");
     let writer = running.open("c1");
-    let mut first = request(&running.socket, "GET", "/v0/clips/c1").await;
+    let mut first = request(&running.socket, "GET", "/v0/recording/c1").await;
     let head = read_head(&mut first).await;
     assert!(head.starts_with(b"HTTP/1.1 200"), "{head:?}");
-    // RFC 9110 §15.5.10: a clip has one body.
-    let mut second = request(&running.socket, "GET", "/v0/clips/c1").await;
+    // RFC 9110 §15.5.10: a recording has one body.
+    let mut second = request(&running.socket, "GET", "/v0/recording/c1").await;
     let response = Response::parse(&read_all(&mut second).await);
     assert_eq!(
         (response.status(), response.error_code().as_str()),
-        ("409", "clip_already_fetched")
+        ("409", "recording_already_fetched")
     );
     assert!(response.head.contains("content-type: application/json"));
-    // RFC 9110 §15.5.5: no open clip has the id, or no clip can.
-    for path in ["/v0/clips/never", "/v0/clips/%FF", "/v0/clips/a%20b"] {
+    // RFC 9110 §15.5.5: no open recording has the id, or no recording can.
+    for path in [
+        "/v0/recording/never",
+        "/v0/recording/%FF",
+        "/v0/recording/a%20b",
+    ] {
         let mut other = request(&running.socket, "GET", path).await;
         let response = Response::parse(&read_all(&mut other).await);
         assert_eq!(
             (response.status(), response.error_code().as_str()),
-            ("404", "clip_not_found"),
+            ("404", "recording_not_found"),
             "{path}"
         );
     }
-    // The first request still gets the clip.
+    // The first request still gets the recording.
     writer.finish();
     let mut rest = head;
     rest.extend(read_all(&mut first).await);
@@ -367,17 +374,17 @@ async fn rfc9110_15_5_a_clip_is_fetched_once_and_an_unknown_one_not_at_all() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rfc9110_15_5_6_head_and_other_methods_are_405_and_leave_the_clip() {
+async fn rfc9110_15_5_6_head_and_other_methods_are_405_and_leave_the_recording() {
     let running = start("methods");
     let writer = running.open("c1");
     for method in ["HEAD", "POST", "DELETE"] {
-        let mut client = request(&running.socket, method, "/v0/clips/c1").await;
+        let mut client = request(&running.socket, method, "/v0/recording/c1").await;
         let raw = read_all(&mut client).await;
         let head = String::from_utf8_lossy(&raw).to_lowercase();
         assert!(head.starts_with("http/1.1 405"), "{method}: {head}");
         assert!(head.contains("allow: get\r\n"), "{method}: {head}");
     }
-    let mut client = request(&running.socket, "GET", "/v0/clips/c1").await;
+    let mut client = request(&running.socket, "GET", "/v0/recording/c1").await;
     writer.finish();
     let response = Response::parse(&read_all(&mut client).await);
     assert_eq!(response.status(), "200");
@@ -386,10 +393,10 @@ async fn rfc9110_15_5_6_head_and_other_methods_are_405_and_leave_the_clip() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_clip_body_leaves_the_upgrade_deadline_and_the_pending_slots() {
+async fn a_recording_body_leaves_the_upgrade_deadline_and_the_pending_slots() {
     let running = start("slots");
     let mut writer = running.open("c1");
-    let mut client = request(&running.socket, "GET", "/v0/clips/c1").await;
+    let mut client = request(&running.socket, "GET", "/v0/recording/c1").await;
     writer.write(b"ftyp").await.unwrap();
     let mut seen = read_head(&mut client).await;
     // Past the upgrade's deadline the body still flows.
@@ -433,7 +440,7 @@ async fn a_client_that_takes_none_of_a_body_is_dropped_at_the_stall_deadline() {
     let (logs, _guard) = capture(tracing::Level::WARN);
     let running = start("stall");
     let mut writer = running.open("c1");
-    let client = request(&running.socket, "GET", "/v0/clips/c1").await;
+    let client = request(&running.socket, "GET", "/v0/recording/c1").await;
     // The client reads nothing: the socket, the server's buffer and the
     // pipe fill, and the producer waits.
     let mut written = 0_usize;
@@ -460,7 +467,7 @@ async fn a_client_that_takes_none_of_a_body_is_dropped_at_the_stall_deadline() {
     assert_eq!(failed.kind(), std::io::ErrorKind::BrokenPipe);
     let text = logs.text();
     assert!(
-        text.contains("clip body dropped: the client made no room for it in time"),
+        text.contains("recording body dropped: the client made no room for it in time"),
         "{text}"
     );
     drop(client);
@@ -468,14 +475,14 @@ async fn a_client_that_takes_none_of_a_body_is_dropped_at_the_stall_deadline() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rfc9112_6_1_an_http_1_0_request_is_refused_505_and_leaves_the_clip() {
+async fn rfc9112_6_1_an_http_1_0_request_is_refused_505_and_leaves_the_recording() {
     let (logs, _guard) = capture(tracing::Level::WARN);
     let running = start("http10");
     let writer = running.open("c1");
     // RFC 9112 §6.3: a body to HTTP/1.0 could only be close-delimited, and
     // a cut one would read as whole.
     let mut old = UnixStream::connect(&running.socket).await.unwrap();
-    old.write_all(b"GET /v0/clips/c1 HTTP/1.0\r\nHost: lotse\r\n\r\n")
+    old.write_all(b"GET /v0/recording/c1 HTTP/1.0\r\nHost: lotse\r\n\r\n")
         .await
         .unwrap();
     let mut raw = read_head(&mut old).await;
@@ -484,15 +491,15 @@ async fn rfc9112_6_1_an_http_1_0_request_is_refused_505_and_leaves_the_clip() {
     raw.extend(read_all(&mut old).await);
     let response = Response::parse(&raw);
     assert_eq!(response.error_code(), "invalid_request");
-    // The clip was not taken: a request in HTTP/1.1 gets it whole.
-    let mut client = request(&running.socket, "GET", "/v0/clips/c1").await;
+    // The recording was not taken: a request in HTTP/1.1 gets it whole.
+    let mut client = request(&running.socket, "GET", "/v0/recording/c1").await;
     writer.finish();
     let response = Response::parse(&read_all(&mut client).await);
     assert_eq!(response.status(), "200");
     assert!(response.last_chunk);
     let text = logs.text();
     assert!(
-        text.contains("clip body refused: the request is not HTTP/1.1"),
+        text.contains("recording body refused: the request is not HTTP/1.1"),
         "{text}"
     );
     running.finish().await;
@@ -502,7 +509,7 @@ async fn rfc9112_6_1_an_http_1_0_request_is_refused_505_and_leaves_the_clip() {
 async fn a_client_gone_early_fails_the_producers_writes() {
     let running = start("gone");
     let mut writer = running.open("c1");
-    let mut client = request(&running.socket, "GET", "/v0/clips/c1").await;
+    let mut client = request(&running.socket, "GET", "/v0/recording/c1").await;
     writer.write(b"ftyp").await.unwrap();
     read_head(&mut client).await;
     drop(client);
@@ -522,10 +529,10 @@ async fn a_client_gone_early_fails_the_producers_writes() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_waits_for_a_body_that_ends_in_time_and_drops_one_that_does_not() {
-    // The clip ends whole after shutdown began: the server waits for it.
+    // The recording ends whole after shutdown began: the server waits for it.
     let running = start("shutdown-whole");
     let mut writer = running.open("c1");
-    let mut client = request(&running.socket, "GET", "/v0/clips/c1").await;
+    let mut client = request(&running.socket, "GET", "/v0/recording/c1").await;
     let mut seen = read_head(&mut client).await;
     running.shutdown.cancel();
     settle().await;
@@ -542,11 +549,11 @@ async fn shutdown_waits_for_a_body_that_ends_in_time_and_drops_one_that_does_not
     within_5_s(running.server).await.unwrap().unwrap();
     std::fs::remove_dir_all(&running.dir).unwrap();
 
-    // The clip outlives the close timeout: it is dropped, cut.
+    // The recording outlives the close timeout: it is dropped, cut.
     let (logs, _guard) = capture(tracing::Level::WARN);
     let running = start("shutdown-cut");
     let _writer = running.open("c1");
-    let mut client = request(&running.socket, "GET", "/v0/clips/c1").await;
+    let mut client = request(&running.socket, "GET", "/v0/recording/c1").await;
     let mut seen = read_head(&mut client).await;
     running.shutdown.cancel();
     settle().await;
@@ -556,18 +563,20 @@ async fn shutdown_waits_for_a_body_that_ends_in_time_and_drops_one_that_does_not
     assert!(!Response::parse(&seen).last_chunk);
     let text = logs.text();
     assert!(
-        text.contains("clip body dropped: still being sent when shutdown's close timeout ran out"),
+        text.contains(
+            "recording body dropped: still being sent when shutdown's close timeout ran out"
+        ),
         "{text}"
     );
     std::fs::remove_dir_all(&running.dir).unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_connection_that_never_asks_for_a_clip_keeps_the_upgrade_deadline() {
+async fn a_connection_that_never_asks_for_a_recording_keeps_the_upgrade_deadline() {
     let (logs, _guard) = capture(tracing::Level::WARN);
     let running = start("deadline");
     let mut slow = UnixStream::connect(&running.socket).await.unwrap();
-    slow.write_all(b"GET /v0/clips/c1 HTTP/1.1\r\nHost: lo")
+    slow.write_all(b"GET /v0/recording/c1 HTTP/1.1\r\nHost: lo")
         .await
         .unwrap();
     settle().await;
@@ -585,11 +594,17 @@ async fn a_connection_that_never_asks_for_a_clip_keeps_the_upgrade_deadline() {
 }
 
 #[test]
-fn a_fake_clip_is_handed_out_once() {
-    let clips = FakeClips::default();
-    let id = ClipId::new("c1").unwrap();
-    assert_eq!(clips.take(&id).unwrap_err(), ClipBodyError::NotFound);
-    let _writer = clips.open("c1");
-    assert!(clips.take(&id).is_ok());
-    assert_eq!(clips.take(&id).unwrap_err(), ClipBodyError::AlreadyFetched);
+fn a_fake_recording_is_handed_out_once() {
+    let recordings = FakeRecordings::default();
+    let id = RecordingId::new("c1").unwrap();
+    assert_eq!(
+        recordings.take(&id).unwrap_err(),
+        RecordingBodyError::NotFound
+    );
+    let _writer = recordings.open("c1");
+    assert!(recordings.take(&id).is_ok());
+    assert_eq!(
+        recordings.take(&id).unwrap_err(),
+        RecordingBodyError::AlreadyFetched
+    );
 }

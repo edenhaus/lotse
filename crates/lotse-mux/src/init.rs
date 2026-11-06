@@ -1,5 +1,5 @@
-//! The init segment of a clip: the file type box and the movie box with
-//! one track per clip track, and the movie extends box that announces the
+//! The init segment of a recording: the file type box and the movie box with
+//! one track per recording track, and the movie extends box that announces the
 //! fragments.
 //!
 //! Implements ISO/IEC 14496-12: `ftyp` (§4.3), `moov` with `mvhd`
@@ -23,7 +23,7 @@ use bytes::Bytes;
 use lotse_codec::h265::nal::{PPS_NUT, SPS_NUT, VPS_NUT};
 use lotse_codec::{h264, h265};
 use lotse_core::Codec;
-use lotse_core::clip::{ClipError, ClipTrack};
+use lotse_core::recording::{RecordingError, RecordingTrack};
 use mp4_atom::esds::{DecoderConfig, DecoderSpecific, EsDescriptor, SLConfig};
 use mp4_atom::{
     Audio, Avc1, Avcc, AvccExt, Codec as SampleEntry, Dinf, Dops, Dref, Encode as _, Esds,
@@ -73,7 +73,7 @@ pub(crate) const OPUS_RATE: u32 = 48_000;
 /// §4.3.2, RFC 7845 §5.1.1.1).
 const OPUS_MAX_CHANNELS: u8 = 2;
 
-/// Whether a clip track of `codec` gets a sample entry: the four codecs,
+/// Whether a recording track of `codec` gets a sample entry: the four codecs,
 /// with the parameter sets or the configuration their entry carries.
 pub(crate) fn carries(codec: &Codec) -> bool {
     match codec {
@@ -85,12 +85,12 @@ pub(crate) fn carries(codec: &Codec) -> bool {
     }
 }
 
-/// The init segment of a clip of `video` and, when it has one, `audio`:
+/// The init segment of a recording of `video` and, when it has one, `audio`:
 /// `ftyp` and `moov`.
 pub(crate) fn init_segment(
-    video: &ClipTrack,
-    audio: Option<&ClipTrack>,
-) -> Result<Bytes, ClipError> {
+    video: &RecordingTrack,
+    audio: Option<&RecordingTrack>,
+) -> Result<Bytes, RecordingError> {
     let (entry, (width, height)) = video_entry(&video.codec)?;
     let mut trak = vec![track(
         VIDEO_TRACK_ID,
@@ -160,10 +160,10 @@ fn track(
     width: u16,
     height: u16,
     entry: SampleEntry,
-) -> Result<Trak, ClipError> {
+) -> Result<Trak, RecordingError> {
     if clock_rate == 0 {
         // §8.4.2: `timescale` counts units per second; 0 is none.
-        return Err(ClipError::Failed(format!(
+        return Err(RecordingError::Failed(format!(
             "track {track_id} has a clock rate of 0"
         )));
     }
@@ -217,9 +217,9 @@ fn track(
 
 /// The visual sample entry fields of a `width` × `height` picture
 /// (ISO/IEC 14496-12 §12.1.3), which are 16 bits.
-fn visual(width: u32, height: u32) -> Result<(Visual, (u16, u16)), ClipError> {
+fn visual(width: u32, height: u32) -> Result<(Visual, (u16, u16)), RecordingError> {
     let (Ok(w), Ok(h)) = (u16::try_from(width), u16::try_from(height)) else {
-        return Err(ClipError::Failed(format!(
+        return Err(RecordingError::Failed(format!(
             "a picture of {width}x{height} does not fit a sample entry"
         )));
     };
@@ -233,7 +233,7 @@ fn visual(width: u32, height: u32) -> Result<(Visual, (u16, u16)), ClipError> {
 }
 
 /// The sample entry of the video track and its picture size.
-fn video_entry(codec: &Codec) -> Result<(SampleEntry, (u16, u16)), ClipError> {
+fn video_entry(codec: &Codec) -> Result<(SampleEntry, (u16, u16)), RecordingError> {
     match codec {
         Codec::H264 {
             sps: Some(sps),
@@ -245,7 +245,7 @@ fn video_entry(codec: &Codec) -> Result<(SampleEntry, (u16, u16)), ClipError> {
             sps: Some(sps),
             pps: Some(pps),
         } => hvc1(vps, sps, pps),
-        other => Err(ClipError::Unsupported(other.family())),
+        other => Err(RecordingError::Unsupported(other.family())),
     }
 }
 
@@ -253,8 +253,9 @@ fn video_entry(codec: &Codec) -> Result<(SampleEntry, (u16, u16)), ClipError> {
 /// §5.3.3.1, §5.4.2.1): profile, compatibility and level are the SPS's
 /// three bytes after its header, the chroma format and bit depths follow
 /// for the High profiles.
-fn avc1(sps: &[u8], pps: &[u8]) -> Result<(SampleEntry, (u16, u16)), ClipError> {
-    let info = h264::parse_sps(sps).map_err(|err| ClipError::Failed(format!("h264 sps: {err}")))?;
+fn avc1(sps: &[u8], pps: &[u8]) -> Result<(SampleEntry, (u16, u16)), RecordingError> {
+    let info =
+        h264::parse_sps(sps).map_err(|err| RecordingError::Failed(format!("h264 sps: {err}")))?;
     let [profile, compatibility, level] = info.profile_level_id;
     let ext = AVCC_EXT_PROFILES.contains(&profile).then(|| AvccExt {
         chroma_format: info.chroma_format_idc,
@@ -289,8 +290,9 @@ fn avc1(sps: &[u8], pps: &[u8]) -> Result<(SampleEntry, (u16, u16)), ClipError> 
 /// requires of `hvc1`: the samples leave those sets out. `hvc1` rather
 /// than `hev1` (whose sets may stay in-band) because Apple's HLS
 /// authoring specification requires `hvc1` for HEVC.
-fn hvc1(vps: &[u8], sps: &[u8], pps: &[u8]) -> Result<(SampleEntry, (u16, u16)), ClipError> {
-    let info = h265::parse_sps(sps).map_err(|err| ClipError::Failed(format!("h265 sps: {err}")))?;
+fn hvc1(vps: &[u8], sps: &[u8], pps: &[u8]) -> Result<(SampleEntry, (u16, u16)), RecordingError> {
+    let info =
+        h265::parse_sps(sps).map_err(|err| RecordingError::Failed(format!("h265 sps: {err}")))?;
     let array = |nal_unit_type: u8, unit: &[u8]| HvcCArray {
         completeness: true,
         nal_unit_type,
@@ -338,7 +340,7 @@ fn audio(channels: u8, sample_rate: u32) -> Audio {
 }
 
 /// The sample entry of the audio track.
-fn audio_entry(codec: &Codec) -> Result<SampleEntry, ClipError> {
+fn audio_entry(codec: &Codec) -> Result<SampleEntry, RecordingError> {
     match codec {
         Codec::AacLc {
             sample_rate,
@@ -381,6 +383,6 @@ fn audio_entry(codec: &Codec) -> Result<SampleEntry, ClipError> {
             btrt: None,
         }
         .into()),
-        other => Err(ClipError::Unsupported(other.family())),
+        other => Err(RecordingError::Unsupported(other.family())),
     }
 }

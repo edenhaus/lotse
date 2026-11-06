@@ -297,27 +297,27 @@ pub struct TrackInfo {
     pub frames: u64,
     /// Bytes seen.
     pub bytes: u64,
-    /// What the track's pre-roll ring holds for clips; null without a
-    /// window (`stream/put`'s `preroll_ms` 0). The worker's figures,
+    /// What the track's pre-record ring holds for recordings; null without a
+    /// window (`stream/put`'s `prerecord_ms` 0). The worker's figures,
     /// pushed once per second.
     #[serde(default)]
-    pub preroll: Option<TrackPreroll>,
+    pub prerecord: Option<TrackPrerecord>,
 }
 
-/// A track's pre-roll ring, as `stream/get` reports it: whole GOPs of the
-/// newest media, kept for clips while the stream has a window.
+/// A track's pre-record ring, as `stream/get` reports it: whole GOPs of the
+/// newest media, kept for recordings while the stream has a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
-pub struct TrackPreroll {
+pub struct TrackPrerecord {
     /// The memory the ring holds: its frames' payloads plus a fixed cost
-    /// per frame; the stream's tracks hold at most `limits.preroll_bytes`
-    /// together, less what its clips took from the rings and have not
+    /// per frame; the stream's tracks hold at most `limits.max_prerecord_bytes`
+    /// together, less what its recordings took from the rings and have not
     /// written yet. The open GOP is also in
     /// the track's GOP cache, so the two overlap; the frames are shared,
     /// not copied.
     pub bytes: u64,
     /// The window it holds, in milliseconds: from its oldest keyframe to
-    /// its newest frame; shorter than `preroll_ms` while it fills, after
+    /// its newest frame; shorter than `prerecord_ms` while it fills, after
     /// a reconnect, or when its bound (`bytes`) caps it.
     pub held_ms: u32,
     /// GOPs larger than its bound (`bytes`) the ring could keep only the
@@ -356,21 +356,20 @@ pub struct StreamStats {
     /// another synchronization source.
     #[serde(default)]
     pub datagrams_rejected: u64,
-    /// Clips started on the stream.
+    /// Recordings started on the stream.
     #[serde(default)]
-    pub clips_started: u64,
-    /// Clips that ended with their whole file written: `completed`,
-    /// `stopped` or `max_duration`.
+    pub recordings_started: u64,
+    /// Recordings that ended with their whole file written: `completed`.
     #[serde(default)]
-    pub clips_completed: u64,
-    /// Gaps in the stream's clips.
+    pub recordings_completed: u64,
+    /// Gaps in the stream's recordings.
     #[serde(default)]
-    pub clip_gaps: u64,
-    /// The length of the stream's clip files, as their workers report
-    /// them (`stopped`'s `bytes`): a last tail a body did not take in time
+    pub recording_gaps: u64,
+    /// The length of the stream's recording files, as their workers report
+    /// them (`closed`'s `bytes`): a last tail a body did not take in time
     /// is counted, though it never reached the body.
     #[serde(default)]
-    pub clip_bytes: u64,
+    pub recording_bytes: u64,
 }
 
 /// A stream, as `stream/get` returns it and `stream/list` lists it.
@@ -398,13 +397,13 @@ pub struct Stream {
     /// Who talks to the camera through its backchannel.
     #[serde(default)]
     pub backchannel: StreamBackchannel,
-    /// The pre-roll window `stream/put` asked for, in milliseconds; 0
-    /// without one. What each track holds is its `preroll`.
+    /// The pre-record window `stream/put` asked for, in milliseconds; 0
+    /// without one. What each track holds is its `prerecord`.
     #[serde(default)]
-    pub preroll_ms: u32,
-    /// Open clip ids.
+    pub prerecord_ms: u32,
+    /// Open recording ids.
     #[serde(default)]
-    pub clips: Vec<String>,
+    pub recordings: Vec<String>,
 }
 
 /// The talker of a stream's backchannel, as `stream/get` reports it.
@@ -654,7 +653,7 @@ mod tests {
                 channels: None,
                 frames: 1,
                 bytes: 2,
-                preroll: Some(TrackPreroll {
+                prerecord: Some(TrackPrerecord {
                     bytes: 14_201_337,
                     held_ms: 29_800,
                     truncations: 0,
@@ -674,7 +673,7 @@ mod tests {
                 channels: Some(2),
                 frames: 3,
                 bytes: 4,
-                preroll: None,
+                prerecord: None,
             },
         ]
     }
@@ -741,20 +740,20 @@ mod tests {
                 talker: Some("s1".into()),
                 since: Some("2026-09-28T11:02:04.000Z".into()),
             },
-            preroll_ms: 30_000,
-            clips: vec!["01JB".into()],
+            prerecord_ms: 30_000,
+            recordings: vec!["01JB".into()],
         };
         let json = serde_json::to_value(&stream).unwrap();
         assert_eq!(
-            (&json["preroll_ms"], &json["clips"]),
+            (&json["prerecord_ms"], &json["recordings"]),
             (&json!(30_000), &json!(["01JB"]))
         );
         assert_eq!(
-            json["tracks"][0]["preroll"],
+            json["tracks"][0]["prerecord"],
             json!({ "bytes": 14_201_337, "held_ms": 29_800, "truncations": 0 })
         );
-        assert!(json["tracks"][1]["preroll"].is_null(), "no window, null");
-        assert_eq!(json["stats"]["clip_bytes"], 0);
+        assert!(json["tracks"][1]["prerecord"].is_null(), "no window, null");
+        assert_eq!(json["stats"]["recording_bytes"], 0);
         assert_eq!(json["state"], "live");
         assert_eq!(json["sources"][0]["connection"]["worker"]["pid"], 4711);
         assert_eq!(json["stats"]["frames_dropped"], 0);
@@ -841,7 +840,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(stream.backchannel, StreamBackchannel::default());
-        assert_eq!((stream.preroll_ms, stream.clips.len()), (0, 0));
+        assert_eq!((stream.prerecord_ms, stream.recordings.len()), (0, 0));
         let source: SourceInfo = serde_json::from_value(json!({
             "url": "rtsp://cam/", "protocol": "rtsp", "state": "live", "reconnects": 0,
             "connection": { "id": "c1", "worker": null }
@@ -889,7 +888,7 @@ mod tests {
             ),
             (None, None, None, None, None)
         );
-        assert_eq!(track.preroll, None, "an older daemon keeps no window");
+        assert_eq!(track.prerecord, None, "an older daemon keeps no window");
     }
 
     #[test]
@@ -905,10 +904,10 @@ mod tests {
         );
         assert_eq!(
             (
-                partial.clips_started,
-                partial.clips_completed,
-                partial.clip_gaps,
-                partial.clip_bytes
+                partial.recordings_started,
+                partial.recordings_completed,
+                partial.recording_gaps,
+                partial.recording_bytes
             ),
             (0, 0, 0, 0)
         );

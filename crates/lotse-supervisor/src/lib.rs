@@ -1,8 +1,8 @@
 //! Supervisor process: stream registry and desired state, worker manager
 //! (spawn, crash backoff), host resolution, the control API handler with
 //! the viewer sessions' signaling (offer, trickle, orphaning and adoption),
-//! the event clips (their pipes' read ends until fetched, the workers'
-//! reports checked and passed on, the counters, the pre-roll window each
+//! the event recordings (their pipes' read ends until fetched, the workers'
+//! reports checked and passed on, the counters, the pre-record window each
 //! connection keeps), the UDP receive and demux, ICE-TCP accept and srflx
 //! gathering with the STUN client, the TURN client (the codec, the
 //! long-term credential and
@@ -38,24 +38,24 @@ use lotse_core::task::spawn_named;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-mod clip;
 mod connect;
 mod driver;
 mod gather;
 mod handler;
 pub mod memory;
 pub mod net;
+mod recording;
 mod registry;
 mod resolve;
 mod session;
 pub mod worker;
 mod worker_text;
 
-pub use clip::ClipLimits;
 pub use handler::{Environment, FrontDoor, Identity, Supervisor};
 pub use lotse_api::Server as ApiServer;
 pub use lotse_api::TlsConfig as ControlTls;
 pub use lotse_api::identity::{IdentityError, ServerIdentity};
+pub use recording::RecordingLimits;
 
 use crate::net::demux::Demux;
 use crate::net::tcp::{IceTcpConfig, IceTcpStats};
@@ -95,10 +95,10 @@ pub struct Limits {
     pub worker_threads: usize,
     /// `RLIMIT_AS` per worker.
     pub worker_address_space: u64,
-    /// `limits.preroll_*` and `limits.clip_*`: the pre-roll window and the
-    /// event clips. Without a clip output the supervisor holds
-    /// [`ClipLimits::NONE`] instead.
-    pub clips: ClipLimits,
+    /// `limits.prerecord_*` and `limits.recording_*`: the pre-record window and the
+    /// event recordings. Without a recording output the supervisor holds
+    /// [`RecordingLimits::NONE`] instead.
+    pub recordings: RecordingLimits,
 }
 
 /// The supervisor's effective settings, resolved by the binary.
@@ -494,7 +494,7 @@ pub(crate) mod test_support {
                 session_grace: Duration::from_secs(10),
                 worker_threads: 1,
                 worker_address_space: 1 << 30,
-                clips: ClipLimits::DEFAULT,
+                recordings: RecordingLimits::DEFAULT,
             },
             linger: Duration::from_secs(5),
             connect_concurrency: DEFAULT_CONNECT_CONCURRENCY,
@@ -558,7 +558,7 @@ pub(crate) mod test_support {
                 worker_threads: 1,
                 worker_address_space: 1 << 30,
                 max_sessions: 256,
-                clips: ClipLimits::DEFAULT,
+                recordings: RecordingLimits::DEFAULT,
             },
             udp: None,
             front_door: None,

@@ -1,18 +1,18 @@
-//! The clip contract: what a container output implements to turn one
-//! event clip's frames into the bytes of one file, and the policy a clip
+//! The recording contract: what a container output implements to turn one
+//! event recording's frames into the bytes of one file, and the policy a recording
 //! runs under.
 //!
-//! A clip joins with the track's pre-roll ring, taking its subscription and
+//! A recording joins with the track's pre-record ring, taking its subscription and
 //! the snapshot together
-//! ([`Track::subscribe_from_preroll`](crate::track::Track::subscribe_from_preroll)),
-//! and takes its frames with reliable delivery: the worker's clip task drains the subscriptions into
+//! ([`Track::subscribe_from_prerecord`](crate::track::Track::subscribe_from_prerecord)),
+//! and takes its frames with reliable delivery: the worker's recording task drains the subscriptions into
 //! a [`ReliableQueue`](crate::interleave::ReliableQueue), merges them in
 //! capture order through an [`Interleaver`](crate::interleave::Interleaver)
-//! and hands each frame to the [`ClipMuxer`] the registered
-//! [`ClipMuxerFactory`] made for it. Core knows no container: the factory
+//! and hands each frame to the [`RecordingMuxer`] the registered
+//! [`RecordingMuxerFactory`] made for it. Core knows no container: the factory
 //! is registered by the binary
-//! ([`Registries::clip`](crate::registry::Registries::clip)), and a worker
-//! without one runs no clip.
+//! ([`Registries::recording`](crate::registry::Registries::recording)), and a worker
+//! without one runs no recording.
 
 use std::fmt;
 use std::sync::Arc;
@@ -23,10 +23,10 @@ use bytes::Bytes;
 use crate::codec::{Codec, CodecFamily, Kind};
 use crate::media::MediaFrame;
 
-/// Default of `limits.clip_queue_bytes`: 8 MiB of frames a clip holds
+/// Default of `limits.recording_queue_bytes`: 8 MiB of frames a recording holds
 /// while its reader is slower than the camera, and what its container's
 /// open fragment holds at most.
-pub const DEFAULT_CLIP_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_RECORDING_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Default of the interleaver's hold: how long a frame waits for the other
 /// track to pass its capture time. An AAC path that delivers a PES late
@@ -36,15 +36,15 @@ pub const DEFAULT_MAX_SKEW: Duration = Duration::from_secs(1);
 /// Default of a fragment's longest span: a fragment ends at every video
 /// keyframe and at the latest this long after it began, so the reader
 /// gets bytes continuously.
-pub const DEFAULT_CLIP_FRAGMENT: Duration = Duration::from_secs(1);
+pub const DEFAULT_RECORDING_FRAGMENT: Duration = Duration::from_secs(1);
 
-/// The policy a clip runs under: its reliable delivery's bound, the
+/// The policy a recording runs under: its reliable delivery's bound, the
 /// interleaver's hold and the container's fragment span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClipPolicy {
-    /// The most the clip's queue holds before it drops to the next video
-    /// keyframe and reports the gap (`limits.clip_queue_bytes`), and what
-    /// the container's open fragment may hold: the clip's memory budget.
+pub struct RecordingPolicy {
+    /// The most the recording's queue holds before it drops to the next video
+    /// keyframe and reports the gap (`limits.recording_queue_bytes`), and what
+    /// the container's open fragment may hold: the recording's memory budget.
     pub queue_bytes: usize,
     /// How long a frame waits for the other track to pass its capture
     /// time before it goes out regardless.
@@ -53,19 +53,19 @@ pub struct ClipPolicy {
     pub fragment: Duration,
 }
 
-impl Default for ClipPolicy {
+impl Default for RecordingPolicy {
     fn default() -> Self {
         Self {
-            queue_bytes: DEFAULT_CLIP_QUEUE_BYTES,
+            queue_bytes: DEFAULT_RECORDING_QUEUE_BYTES,
             max_skew: DEFAULT_MAX_SKEW,
-            fragment: DEFAULT_CLIP_FRAGMENT,
+            fragment: DEFAULT_RECORDING_FRAGMENT,
         }
     }
 }
 
-/// One track of a clip as its container declares it.
+/// One track of a recording as its container declares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClipTrack {
+pub struct RecordingTrack {
     /// The codec, with the parameter sets or configuration the container's
     /// sample entry carries.
     pub codec: Codec,
@@ -74,43 +74,43 @@ pub struct ClipTrack {
     pub clock_rate: u32,
 }
 
-/// Why a muxer could not write a clip.
+/// Why a muxer could not write a recording.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ClipError {
+pub enum RecordingError {
     /// The container cannot carry this codec, or the codec lacks what its
     /// sample entry needs (a parameter set not yet known).
-    #[error("the clip container cannot carry {0}")]
+    #[error("the recording container cannot carry {0}")]
     Unsupported(CodecFamily),
     /// A frame or a timestamp the container cannot represent.
-    #[error("clip muxing failed: {0}")]
+    #[error("recording muxing failed: {0}")]
     Failed(String),
 }
 
 /// One container output, registered at startup behind its Cargo feature.
-pub trait ClipMuxerFactory: fmt::Debug + Send + Sync {
+pub trait RecordingMuxerFactory: fmt::Debug + Send + Sync {
     /// Whether the container can carry `codec` as the track has it; the
-    /// clip task decides what becomes of an audio track it cannot.
+    /// recording task decides what becomes of an audio track it cannot.
     fn accepts(&self, codec: &Codec) -> bool;
 
-    /// A muxer for one clip under `policy`.
-    fn muxer(&self, policy: &ClipPolicy) -> Box<dyn ClipMuxer>;
+    /// A muxer for one recording under `policy`.
+    fn muxer(&self, policy: &RecordingPolicy) -> Box<dyn RecordingMuxer>;
 }
 
-/// One clip's container writer. Sans-IO: every call returns the bytes it
+/// One recording's container writer. Sans-IO: every call returns the bytes it
 /// completed, in order, as slices the caller writes as they are (a
 /// sample's payload is the frame's own, never copied); an empty list when
 /// nothing is complete yet.
-pub trait ClipMuxer: Send {
-    /// The container's header for the clip's tracks: the video, and the
-    /// audio when the clip has one.
+pub trait RecordingMuxer: Send {
+    /// The container's header for the recording's tracks: the video, and the
+    /// audio when the recording has one.
     fn start(
         &mut self,
-        video: &ClipTrack,
-        audio: Option<&ClipTrack>,
-    ) -> Result<Vec<Bytes>, ClipError>;
+        video: &RecordingTrack,
+        audio: Option<&RecordingTrack>,
+    ) -> Result<Vec<Bytes>, RecordingError>;
 
-    /// Puts the clip's media time 0 at capture time `origin` instead of
-    /// at its first frame's: a clip whose audio is transcoded moves the
+    /// Puts the recording's media time 0 at capture time `origin` instead of
+    /// at its first frame's: a recording whose audio is transcoded moves the
     /// packets back by the transcode's delay and so starts that much
     /// before its first frame, where the first packets belong. Called
     /// after `start`, before the first `push`; ignored otherwise.
@@ -119,24 +119,24 @@ pub trait ClipMuxer: Send {
     /// Takes the next frame of the `track` kind, in the order the
     /// interleaver hands them out; returns the fragment it completed, if
     /// any. The first video frame is a keyframe.
-    fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, ClipError>;
+    fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, RecordingError>;
 
     /// Where the container put the latest frame of the `track` kind it
-    /// took: its presentation time from the clip's media time 0; zero
+    /// took: its presentation time from the recording's media time 0; zero
     /// before the first. A container may place a frame later than its
     /// capture time (an epoch that would begin before the one ahead of it
-    /// did), so the clip reports its gaps where the file has them by this.
+    /// did), so the recording reports its gaps where the file has them by this.
     fn media_time(&self, track: Kind) -> Duration;
 
-    /// Ends the video before `end`, the frame the clip ends it at, which
+    /// Ends the video before `end`, the frame the recording ends it at, which
     /// stays out of the file: the video's last frame lasts until `end`
-    /// would have been put, where the clip ends its audio too, not as long
+    /// would have been put, where the recording ends its audio too, not as long
     /// as a frame before it, which after a hole in the frames ends the
     /// video short of the audio. Called once the video's last frame went
     /// in, at most once, and before `finish`.
     ///
     /// Returns the date the video's presentation then ends, on `end`'s
-    /// date, where the clip ends its audio: `end`'s own when the video
+    /// date, where the recording ends its audio: `end`'s own when the video
     /// lasts until `end`. Reordered video's last frame in decode order is
     /// not its last presented, so its presentation can end before `end`'s
     /// presentation time or after it. Before, when the pictures presented
@@ -154,12 +154,12 @@ pub trait ClipMuxer: Send {
         end.wallclock
     }
 
-    /// Where the file's media ends so far, from the clip's media time 0:
+    /// Where the file's media ends so far, from the recording's media time 0:
     /// the furthest a track's presentation reaches, counting each
     /// sample's length where the container knows it (an audio frame's,
     /// which its codec states, the latest's too before the finish writes
     /// it; the video's last once [`end_video`](Self::end_video) ended it
-    /// there), else its frame's start; zero before the first. The clip reports it as the
+    /// there), else its frame's start; zero before the first. The recording reports it as the
     /// file's duration. The default is the later of the tracks'
     /// [`media_time`](Self::media_time), for a container that knows no
     /// more.
@@ -168,8 +168,8 @@ pub trait ClipMuxer: Send {
             .max(self.media_time(Kind::Audio))
     }
 
-    /// Ends the clip: the last fragment, after which the file is complete.
-    fn finish(&mut self) -> Result<Vec<Bytes>, ClipError>;
+    /// Ends the recording: the last fragment, after which the file is complete.
+    fn finish(&mut self) -> Result<Vec<Bytes>, RecordingError>;
 }
 
 #[cfg(test)]
@@ -185,8 +185,8 @@ mod tests {
     #[test]
     fn the_default_policy_is_the_documented_limits() {
         assert_eq!(
-            ClipPolicy::default(),
-            ClipPolicy {
+            RecordingPolicy::default(),
+            RecordingPolicy {
                 queue_bytes: 8 * 1024 * 1024,
                 max_skew: Duration::from_secs(1),
                 fragment: Duration::from_secs(1),
@@ -197,12 +197,12 @@ mod tests {
     #[test]
     fn errors_name_the_codec_or_the_failure() {
         assert_eq!(
-            ClipError::Unsupported(CodecFamily::Pcmu).to_string(),
-            "the clip container cannot carry pcmu"
+            RecordingError::Unsupported(CodecFamily::Pcmu).to_string(),
+            "the recording container cannot carry pcmu"
         );
         assert_eq!(
-            ClipError::Failed("timestamp".into()).to_string(),
-            "clip muxing failed: timestamp"
+            RecordingError::Failed("timestamp".into()).to_string(),
+            "recording muxing failed: timestamp"
         );
     }
 }

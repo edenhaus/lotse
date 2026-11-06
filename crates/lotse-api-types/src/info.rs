@@ -43,29 +43,28 @@ pub struct Limits {
     pub max_connections: u32,
     /// How long an orphaned session outlives its connection.
     pub session_grace_ms: u64,
-    /// The longest pre-roll window `stream/put` may ask for
-    /// (`preroll_ms`), and so the furthest back a clip can start; 0 when
+    /// The longest pre-record window `stream/put` may ask for
+    /// (`prerecord_ms`), and so the furthest back a recording can start; 0 when
     /// the daemon keeps none.
     #[serde(default)]
-    pub preroll_max_ms: u32,
-    /// The memory a stream's pre-roll may hold, all its tracks together,
-    /// in bytes, the frames its clips took and have not written yet
+    pub max_prerecord_ms: u32,
+    /// The memory a stream's pre-record may hold, all its tracks together,
+    /// in bytes, the frames its recordings took and have not written yet
     /// included: no setting but half the worker's address space, a bound
     /// only a stream far above any real camera's bitrate reaches, or one
-    /// whose clips write slower than it sends, which then holds a shorter
-    /// window than `preroll_ms`.
+    /// whose recordings write slower than it sends, which then holds a shorter
+    /// window than `prerecord_ms`.
     #[serde(default)]
-    pub preroll_bytes: u64,
-    /// The longest clip, in milliseconds: the most `after_ms` may ask, and
-    /// where an open-ended clip ends (`max_duration`).
+    pub max_prerecord_bytes: u64,
+    /// The longest recording, in milliseconds: the most `duration_ms` may ask.
     #[serde(default)]
-    pub clip_max_ms: u32,
-    /// Clips open at once on all streams; 0 when the daemon records none.
+    pub max_recording_ms: u32,
+    /// Recordings open at once on all streams; 0 when the daemon records none.
     #[serde(default)]
-    pub max_clips: u32,
-    /// Clips open at once on one stream.
+    pub max_recordings: u32,
+    /// Recordings open at once on one stream.
     #[serde(default)]
-    pub clips_per_stream: u32,
+    pub max_recordings_per_stream: u32,
 }
 
 /// The Landlock layers.
@@ -239,20 +238,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn limits_from_a_daemon_without_clips_say_none() {
+    fn limits_from_a_daemon_without_recordings_say_none() {
         let limits: Limits = serde_json::from_value(json!({
             "max_streams": 1, "max_sessions": 1, "max_sessions_per_stream": 1,
             "max_connections": 1, "session_grace_ms": 1
         }))
         .unwrap();
-        assert_eq!(serde_json::to_value(limits).unwrap()["clips_per_stream"], 0);
+        assert_eq!(
+            serde_json::to_value(limits).unwrap()["max_recordings_per_stream"],
+            0
+        );
         assert_eq!(
             (
-                limits.preroll_max_ms,
-                limits.preroll_bytes,
-                limits.clip_max_ms,
-                limits.max_clips,
-                limits.clips_per_stream
+                limits.max_prerecord_ms,
+                limits.max_prerecord_bytes,
+                limits.max_recording_ms,
+                limits.max_recordings,
+                limits.max_recordings_per_stream
             ),
             (0, 0, 0, 0, 0)
         );
@@ -279,11 +281,11 @@ mod tests {
                 max_sessions_per_stream: 16,
                 max_connections: 8,
                 session_grace_ms: 10_000,
-                preroll_max_ms: 120_000,
-                preroll_bytes: 32 << 20,
-                clip_max_ms: 600_000,
-                max_clips: 8,
-                clips_per_stream: 2,
+                max_prerecord_ms: 120_000,
+                max_prerecord_bytes: 32 << 20,
+                max_recording_ms: 600_000,
+                max_recordings: 8,
+                max_recordings_per_stream: 2,
             },
             sandbox: SandboxInfo {
                 mode: "on".into(),

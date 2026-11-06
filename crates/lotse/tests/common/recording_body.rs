@@ -1,7 +1,7 @@
-//! A clip's body as a client fetches it: `GET /v0/clips/{clip_id}` over
-//! HTTP/1.1 with hyper's client, read as the clip runs, telling a body that
+//! A recording's body as a client fetches it: `GET /v0/recording/{recording_id}` over
+//! HTTP/1.1 with hyper's client, read as the recording runs, telling a body that
 //! ended with its last chunk (RFC 9112 §7.1) from a cut one. Shared by the
-//! clip tests and the interop tests' clips.
+//! recording tests and the interop tests' recordings.
 
 use std::path::Path;
 
@@ -11,12 +11,12 @@ use hyper_util::rt::TokioIo;
 use lotse_core::task::spawn_named;
 use tokio::net::UnixStream;
 
-/// What a `GET` of a clip's body got.
+/// What a `GET` of a recording's body got.
 #[derive(Debug)]
 pub(crate) struct Fetched {
     pub(crate) status: u16,
     pub(crate) content_type: Option<String>,
-    pub(crate) clip_id: Option<String>,
+    pub(crate) recording_id: Option<String>,
     pub(crate) bytes: Vec<u8>,
     /// The body ended with its last chunk (RFC 9112 §7.1), not cut.
     pub(crate) whole: bool,
@@ -43,7 +43,7 @@ where
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned)
         };
-        let (content_type, clip_id) = (header("content-type"), header("x-clip-id"));
+        let (content_type, recording_id) = (header("content-type"), header("x-recording-id"));
         let status = response.status().as_u16();
         let mut body = response.into_body();
         let mut bytes = Vec::new();
@@ -61,7 +61,7 @@ where
         Fetched {
             status,
             content_type,
-            clip_id,
+            recording_id,
             bytes,
             whole,
         }
@@ -72,8 +72,8 @@ where
 }
 
 /// `GET url` over a new connection to the daemon's socket, on a task of
-/// its own so the body is read as the clip runs.
+/// its own so the body is read as the recording runs.
 pub(crate) async fn fetch_on_socket(socket: &Path, url: &str) -> tokio::task::JoinHandle<Fetched> {
     let stream = UnixStream::connect(socket).await.expect("socket connects");
-    spawn_named("clip-fetch", fetch(stream, url.to_owned()))
+    spawn_named("recording-fetch", fetch(stream, url.to_owned()))
 }

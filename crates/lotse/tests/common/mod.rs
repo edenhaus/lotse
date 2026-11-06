@@ -14,7 +14,7 @@
     reason = "test code shared by several test binaries; each uses a subset"
 )]
 
-pub(crate) mod clip_body;
+pub(crate) mod recording_body;
 
 use std::io::{BufRead as _, BufReader};
 use std::ops::Deref;

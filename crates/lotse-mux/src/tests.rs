@@ -11,10 +11,13 @@ use bytes::Bytes;
 use lotse_codec::aac::test_data::{CONFIG_16K_MONO, SINE_16K_MONO, frames};
 use lotse_codec::h264::annex_b_units;
 use lotse_codec::opus::Decoder;
-use lotse_codec::transcode::clip::ToOpus;
+use lotse_codec::transcode::recording::ToOpus;
 use lotse_codec::{g711, g722, h264, h265};
-use lotse_core::clip::{ClipError, ClipMuxer as _, ClipMuxerFactory as _, ClipPolicy, ClipTrack};
 use lotse_core::clock::{Clock as _, FakeClock};
+use lotse_core::recording::{
+    RecordingError, RecordingMuxer as _, RecordingMuxerFactory as _, RecordingPolicy,
+    RecordingTrack,
+};
 use lotse_core::{Codec, CodecFamily, Kind, MediaFrame, MediaTime};
 use mp4_atom::{Any, Codec as SampleEntry, Decode as _, Ftyp, Moof, Moov};
 
@@ -109,8 +112,8 @@ fn h264_codec(sps: Vec<u8>) -> Codec {
     }
 }
 
-fn h264_track() -> ClipTrack {
-    ClipTrack {
+fn h264_track() -> RecordingTrack {
+    RecordingTrack {
         codec: h264_codec(h264::test_data::sps(320, 240)),
         clock_rate: 90_000,
     }
@@ -124,8 +127,8 @@ fn h265_codec(sps: Vec<u8>) -> Codec {
     }
 }
 
-fn h265_track() -> ClipTrack {
-    ClipTrack {
+fn h265_track() -> RecordingTrack {
+    RecordingTrack {
         codec: h265_codec(h265::test_data::sps(640, 480)),
         clock_rate: 90_000,
     }
@@ -139,15 +142,15 @@ fn aac_codec(sample_rate: u32) -> Codec {
     }
 }
 
-fn aac_track() -> ClipTrack {
-    ClipTrack {
+fn aac_track() -> RecordingTrack {
+    RecordingTrack {
         codec: aac_codec(16_000),
         clock_rate: 16_000,
     }
 }
 
-fn opus_track(channels: u8) -> ClipTrack {
-    ClipTrack {
+fn opus_track(channels: u8) -> RecordingTrack {
+    RecordingTrack {
         codec: Codec::Opus { channels },
         clock_rate: 48_000,
     }
@@ -159,14 +162,14 @@ fn opus_packet(n: u8) -> Bytes {
     Bytes::from(vec![0xf8, n, 0xfe])
 }
 
-fn policy(fragment_ms: u64) -> ClipPolicy {
-    ClipPolicy {
+fn policy(fragment_ms: u64) -> RecordingPolicy {
+    RecordingPolicy {
         fragment: Duration::from_millis(fragment_ms),
-        ..ClipPolicy::default()
+        ..RecordingPolicy::default()
     }
 }
 
-/// What a clip wrote: the whole file, and which pushes completed a
+/// What a recording wrote: the whole file, and which pushes completed a
 /// fragment.
 struct Written {
     file: Vec<u8>,
@@ -175,8 +178,8 @@ struct Written {
 
 fn run(
     muxer: &mut Muxer,
-    video: &ClipTrack,
-    audio: Option<&ClipTrack>,
+    video: &RecordingTrack,
+    audio: Option<&RecordingTrack>,
     frames: &[(Kind, Arc<MediaFrame>)],
 ) -> Written {
     let mut file = Vec::new();
@@ -665,7 +668,7 @@ fn iso14496_15_5_3_3_1_avcc_carries_the_sets_profile_level_and_the_high_profiles
     assert_eq!(record.picture_parameter_sets, [h264::test_data::pps()]);
     assert_eq!(record.ext, None, "Baseline has no chroma fields");
 
-    let high = ClipTrack {
+    let high = RecordingTrack {
         codec: h264_codec(h264::test_data::high_sps(122, 2, 2, 2)),
         clock_rate: 90_000,
     };
@@ -760,7 +763,7 @@ fn iso14496_15_8_3_3_1_hvcc_carries_profile_tier_level_and_complete_parameter_se
 #[test]
 fn h265_parameter_sets_other_than_the_entry_s_stay_in_band_with_every_later_sample_s() {
     let base = base();
-    // A pre-roll GOP from before the sets changed: another picture size
+    // A pre-record GOP from before the sets changed: another picture size
     // under the same SPS ID, which replaces the entry's in the decoder.
     // The GOPs after it bring the current sets back in band: a new
     // fragment does not reload `hvcC`, so without them they would decode
@@ -820,7 +823,7 @@ fn h265_sps(profile_space: u32, high_tier: bool, luma_minus8: u32, chroma_minus8
 
 #[test]
 fn iso14496_15_8_3_3_1_hvcc_carries_the_profile_space_tier_and_bit_depths() {
-    let track = ClipTrack {
+    let track = RecordingTrack {
         codec: h265_codec(h265_sps(1, true, 2, 1)),
         clock_rate: 90_000,
     };
@@ -863,7 +866,7 @@ fn iso14496_14_5_6_esds_carries_the_audio_specific_config_as_mpeg4_audio() {
     assert_eq!(mp4a.esds.es_desc.es_id, 0);
 
     // A rate past the 16.16 field is written as 0.
-    let fast = ClipTrack {
+    let fast = RecordingTrack {
         codec: aac_codec(96_000),
         clock_rate: 96_000,
     };
@@ -1163,7 +1166,7 @@ fn a_frame_of_many_tiny_nal_units_counts_what_it_holds_against_the_bound() {
 }
 
 /// Video frames of `aus` at 25 fps, the first a keyframe, under a span
-/// far above them and a clip queue bound of `queue_bytes`: which pushes
+/// far above them and a recording queue bound of `queue_bytes`: which pushes
 /// completed a fragment.
 fn cuts_at_the_queue_bound(aus: &[Bytes], queue_bytes: u64) -> Written {
     let base = base();
@@ -1183,7 +1186,7 @@ fn cuts_at_the_queue_bound(aus: &[Bytes], queue_bytes: u64) -> Written {
             )
         })
         .collect();
-    let policy = ClipPolicy {
+    let policy = RecordingPolicy {
         queue_bytes: usize::try_from(queue_bytes).unwrap(),
         ..policy(10_000)
     };
@@ -1192,12 +1195,12 @@ fn cuts_at_the_queue_bound(aus: &[Bytes], queue_bytes: u64) -> Written {
 
 /// Regression: a fragment ended only at a keyframe, after its span or at
 /// [`MAX_FRAGMENT_BYTES`], so a camera whose timestamps barely advance
-/// had one fragment of a clip hold up to 1 GiB of frames that neither the
-/// clip's queue nor the stream's pre-roll counted any more. It ends at the
-/// clip's queue bound, at a sample that is not a sync sample, which the
+/// had one fragment of a recording hold up to 1 GiB of frames that neither the
+/// recording's queue nor the stream's pre-record counted any more. It ends at the
+/// recording's queue bound, at a sample that is not a sync sample, which the
 /// sample's own flags say.
 #[test]
-fn iso14496_12_8_8_3_1_a_fragment_ends_at_the_clip_s_queue_bound_at_any_sample() {
+fn iso14496_12_8_8_3_1_a_fragment_ends_at_the_recording_s_queue_bound_at_any_sample() {
     let au = annex_b(&[&[0x41; 21]]);
     let written = cuts_at_the_queue_bound(&vec![au.clone(); 10], 4 * holds(au.len(), 1));
     assert_eq!(written.cuts, [4, 8]);
@@ -1214,10 +1217,10 @@ fn iso14496_12_8_8_3_1_a_fragment_ends_at_the_clip_s_queue_bound_at_any_sample()
     assert_eq!(firsts, [Some(NON_SYNC_SAMPLE), Some(NON_SYNC_SAMPLE)]);
 }
 
-/// A frame that alone holds more than the clip's queue bound still goes
+/// A frame that alone holds more than the recording's queue bound still goes
 /// into a fragment, alone, and the fragments after it end at the bound.
 #[test]
-fn a_frame_larger_than_the_clip_s_queue_bound_forms_a_fragment_alone() {
+fn a_frame_larger_than_the_recording_s_queue_bound_forms_a_fragment_alone() {
     let small = annex_b(&[&[0x41; 21]]);
     let large = annex_b(&[&[0x65; 1000]]);
     let mut aus = vec![large.clone()];
@@ -1316,9 +1319,9 @@ fn a_new_epoch_starts_a_fragment_at_its_capture_time_leaving_the_hole() {
 /// ended, a reconnect quicker than a frame, starts at its capture time:
 /// that sample is cut short to meet it (ISO/IEC 14496-12 §8.8.12: the
 /// fragment's `tfdt` is the capture time), so the track keeps its capture
-/// times, in sync with the other track, and a gap the clip reports from
+/// times, in sync with the other track, and a gap the recording reports from
 /// capture times is where the file has it. The next epoch's last sample
-/// takes the uncut duration. Regression: the end-to-end clip test's
+/// takes the uncut duration. Regression: the end-to-end recording test's
 /// camera reconnected within 4 ms of its last frame, and the file resumed
 /// 36 ms after the gap's end, the rest of the video that much late.
 #[test]
@@ -1797,14 +1800,18 @@ fn iso14496_12_8_8_8_1_a_new_epoch_is_presented_no_earlier_than_the_last_frame_e
 }
 
 /// The media time the muxer gives the latest frame of a track is its
-/// presentation time from the clip's origin, where the file has it (ISO/IEC
+/// presentation time from the recording's origin, where the file has it (ISO/IEC
 /// 14496-12 §8.8.12), an epoch moved off its capture time included; zero
-/// before the first frame, for a track the clip lacks, and outside a clip.
+/// before the first frame, for a track the recording lacks, and outside a recording.
 #[test]
 fn iso14496_12_8_8_12_the_media_time_is_where_the_latest_frame_of_a_track_is() {
     let base = base();
     let mut muxer = Muxer::new(&policy(10_000));
-    assert_eq!(muxer.media_time(Kind::Video), Duration::ZERO, "no clip yet");
+    assert_eq!(
+        muxer.media_time(Kind::Video),
+        Duration::ZERO,
+        "no recording yet"
+    );
     muxer.start(&h264_track(), None).unwrap();
     assert_eq!(
         muxer.media_time(Kind::Video),
@@ -1914,31 +1921,32 @@ fn the_origin_is_the_first_frame_so_audio_captured_before_the_first_keyframe_sta
 #[test]
 fn rfc6716_3_1_a_last_sample_takes_its_frame_length_else_the_duration_before_it() {
     let base = base();
-    let last = |video: ClipTrack, audio: Option<(ClipTrack, Vec<Bytes>)>, video_frames: u8| {
-        let mut frames: Vec<_> = (0..video_frames)
-            .map(|i| {
-                let key = i == 0;
-                let at = ms(base, 40 * u64::from(i));
-                (
-                    Kind::Video,
-                    frame(at, FRAME * i64::from(i), key, 0, h264_au(key, i)),
-                )
-            })
-            .collect();
-        let track = audio.as_ref().map(|(track, _)| track.clone());
-        for (i, payload) in (0_u8..).zip(audio.into_iter().flat_map(|(_, payloads)| payloads)) {
-            let at = ms(base, 20 * u64::from(i));
-            frames.push((Kind::Audio, frame(at, 960 * i64::from(i), true, 0, payload)));
-        }
-        let written = run(
-            &mut Muxer::new(&policy(1000)),
-            &video,
-            track.as_ref(),
-            &frames,
-        );
-        let id = if track.is_some() { 2 } else { 1 };
-        samples(&written.file, id).last().unwrap().duration
-    };
+    let last =
+        |video: RecordingTrack, audio: Option<(RecordingTrack, Vec<Bytes>)>, video_frames: u8| {
+            let mut frames: Vec<_> = (0..video_frames)
+                .map(|i| {
+                    let key = i == 0;
+                    let at = ms(base, 40 * u64::from(i));
+                    (
+                        Kind::Video,
+                        frame(at, FRAME * i64::from(i), key, 0, h264_au(key, i)),
+                    )
+                })
+                .collect();
+            let track = audio.as_ref().map(|(track, _)| track.clone());
+            for (i, payload) in (0_u8..).zip(audio.into_iter().flat_map(|(_, payloads)| payloads)) {
+                let at = ms(base, 20 * u64::from(i));
+                frames.push((Kind::Audio, frame(at, 960 * i64::from(i), true, 0, payload)));
+            }
+            let written = run(
+                &mut Muxer::new(&policy(1000)),
+                &video,
+                track.as_ref(),
+                &frames,
+            );
+            let id = if track.is_some() { 2 } else { 1 };
+            samples(&written.file, id).last().unwrap().duration
+        };
     // Video alone in its track: one frame at 30 fps.
     assert_eq!(last(h264_track(), None, 1), 3000);
     assert_eq!(last(h264_track(), None, 2), 3600);
@@ -1948,7 +1956,7 @@ fn rfc6716_3_1_a_last_sample_takes_its_frame_length_else_the_duration_before_it(
         last(h264_track(), Some((aac_track(), one_aac.clone())), 1),
         1024
     );
-    let doubled = ClipTrack {
+    let doubled = RecordingTrack {
         codec: aac_codec(16_000),
         clock_rate: 32_000,
     };
@@ -1977,16 +1985,16 @@ fn rfc6716_3_1_a_last_sample_takes_its_frame_length_else_the_duration_before_it(
     assert_eq!(last(h264_track(), Some((opus_track(1), unknown)), 1), 960);
 }
 
-/// The video's last sample lasts until the frame the clip ends the video
-/// at, which stays out of the file, would be decoded, where the clip ends
+/// The video's last sample lasts until the frame the recording ends the video
+/// at, which stays out of the file, would be decoded, where the recording ends
 /// its audio: after a hole in the frames (every 100 ms through 0.9 s, the
 /// next at 1.4 s) the video ends at 1.4 s, not a frame after 0.9 s
 /// (ISO/IEC 14496-12 §8.8.8: a sample lasts until the next one's decode
 /// time). A frame of another epoch, a reconnect, leaves the hole as the
 /// finish does, and so does one whose duration would not fit its field;
-/// outside a running clip nothing happens. Regression: the video ended at
+/// outside a running recording nothing happens. Regression: the video ended at
 /// 1 s, the last frame's length the one before it, and the audio the
-/// clip ran on to 1.4 s played 0.4 s past the video's end.
+/// recording ran on to 1.4 s played 0.4 s past the video's end.
 #[test]
 fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() {
     let base = base();
@@ -2040,7 +2048,7 @@ fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() 
 }
 
 /// Where the file's media ends counts the video's last sample until the
-/// frame the clip ended the video at (ISO/IEC 14496-12 §8.8.8: a sample
+/// frame the recording ended the video at (ISO/IEC 14496-12 §8.8.8: a sample
 /// lasts until the next one's decode time): video-only, every 100 ms from
 /// 0 to 0.9 s and the end frame at 1.4 s (a camera that stalled), 1.4 s.
 /// Before the end, the latest frame's start; reordered video, where its
@@ -2052,7 +2060,7 @@ fn iso14496_12_8_8_8_the_video_s_last_sample_lasts_until_the_frame_it_ends_at() 
 /// audio ends; AAC from 960 ms with the video ending at 1 s, 1.024 s; a
 /// GOP cut short, where its last presented sample's written duration ends
 /// (`P3` of `I0 P3 B1 B2` ended at `P6`, 200 ms, not 160 ms); outside a
-/// running clip, zero. Regressions: the clip reported 900 ms, the
+/// running recording, zero. Regressions: the recording reported 900 ms, the
 /// last frame's start, for the file of 1.4 s; and 300 ms and 1 s, the
 /// audio's last frame left out before the finish.
 #[test]
@@ -2150,7 +2158,7 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
 
 /// Reordered video ended at a frame is presented until its last presented
 /// picture ends, which is not where that frame is presented, and the muxer
-/// says where on that frame's date, so the clip ends its audio there too
+/// says where on that frame's date, so the recording ends its audio there too
 /// (ISO/IEC 14496-12 §8.8.8.1: a sample is presented at its decode time
 /// plus its composition offset; its duration is a step of the decode
 /// times). Short of it by the pictures presented between them, decoded
@@ -2158,7 +2166,7 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
 /// ended at `P9`, captured at 360 ms, is presented until 280 ms, where
 /// `P6`, the last presented, ends. Past it when that frame is presented
 /// before pictures that went in, as an end by arrival leaves out the first
-/// to arrive after the clip's end: `I0 P3 B1 B2 P6 B4` ended at `B5`,
+/// to arrive after the recording's end: `I0 P3 B1 B2 P6 B4` ended at `B5`,
 /// captured at 200 ms, is presented until 280 ms too. Either way the Opus
 /// captured before 280 ms ends there with it. In order, `I0 P1 .. P6` ended
 /// at `P9` after a hole, the video lasts until it, 360 ms. Past it too when
@@ -2167,7 +2175,7 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
 /// times) ends, not 160 ms, a frame after it, and the audio ends there
 /// (ISO/IEC 14496-12 §8.6.1.4: the track's composition end is its last
 /// presented sample's composition time plus duration). Regressions: the
-/// clip ended the audio at 360 ms, 80 ms past the video, told nothing; and
+/// recording ended the audio at 360 ms, 80 ms past the video, told nothing; and
 /// at 200 ms for the excluded `B5`, 80 ms before the video, told only how
 /// far before its end frame the video ends; and at 160 ms for the GOP cut
 /// short at `P6`, 40 ms before the video.
@@ -2189,7 +2197,7 @@ fn iso14496_12_8_8_8_1_reordered_video_ends_the_audio_where_its_presentation_end
         let (_, end) = starts.iter().max().unwrap();
         (first * 1000 / rate, end * 1000 / rate)
     };
-    let clip = |order: &[u8], end: u8| {
+    let recording = |order: &[u8], end: u8| {
         let video = gop(order, base, 0, 0, 0);
         let end_ms = u64::from(end) * 40;
         let end = frame(
@@ -2210,7 +2218,7 @@ fn iso14496_12_8_8_8_1_reordered_video_ends_the_audio_where_its_presentation_end
         for (kind, frame) in video {
             put(muxer.push(kind, frame).unwrap());
         }
-        // The audio the clip lets in: captured before where the video ends.
+        // The audio the recording lets in: captured before where the video ends.
         let end = muxer.end_video(&end).duration_since(base).as_millis();
         let end = u64::try_from(end).unwrap();
         for i in (0..).take_while(|i| i * 20 < end) {
@@ -2229,27 +2237,27 @@ fn iso14496_12_8_8_8_1_reordered_video_ends_the_audio_where_its_presentation_end
         )
     };
     assert_eq!(
-        clip(&[0, 3, 1, 2, 6, 4, 5], 9),
+        recording(&[0, 3, 1, 2, 6, 4, 5], 9),
         (280, (0, 280), (0, 280)),
         "reordered"
     );
     assert_eq!(
-        clip(&[0, 1, 2, 3, 4, 5, 6], 9),
+        recording(&[0, 1, 2, 3, 4, 5, 6], 9),
         (360, (0, 360), (0, 360)),
         "in order"
     );
     assert_eq!(
-        clip(&[0, 3, 1, 2, 6, 4], 5),
+        recording(&[0, 3, 1, 2, 6, 4], 5),
         (280, (0, 280), (0, 280)),
         "B5 excluded"
     );
     assert_eq!(
-        clip(&[0, 3, 1, 2], 6),
+        recording(&[0, 3, 1, 2], 6),
         (200, (0, 200), (0, 200)),
         "a GOP cut short at P6"
     );
     assert_eq!(
-        clip(&[0, 4, 2, 1, 3], 8),
+        recording(&[0, 4, 2, 1, 3], 8),
         (240, (0, 240), (0, 240)),
         "a pyramid cut short at P8"
     );
@@ -2260,10 +2268,10 @@ fn calls_out_of_order_fail() {
     let base = base();
     let video = || frame(base, 0, true, 0, h264_au(true, 0));
     let mut muxer = Muxer::new(&policy(1000));
-    let failed = |result: Result<Vec<Bytes>, ClipError>, call: &str| {
+    let failed = |result: Result<Vec<Bytes>, RecordingError>, call: &str| {
         assert_eq!(
             result,
-            Err(ClipError::Failed(format!("{call} out of order")))
+            Err(RecordingError::Failed(format!("{call} out of order")))
         );
     };
     failed(muxer.push(Kind::Video, video()), "push");
@@ -2289,8 +2297,8 @@ fn an_audio_frame_without_an_audio_track_and_an_oversized_frame_fail() {
     muxer.start(&h264_track(), None).unwrap();
     assert_eq!(
         muxer.push(Kind::Audio, frame(base, 0, true, 0, opus_packet(0))),
-        Err(ClipError::Failed(
-            "an audio frame for a clip without audio".into()
+        Err(RecordingError::Failed(
+            "an audio frame for a recording without audio".into()
         ))
     );
     let mut muxer = Muxer {
@@ -2309,7 +2317,7 @@ fn an_audio_frame_without_an_audio_track_and_an_oversized_frame_fail() {
     );
     assert_eq!(
         muxer.push(Kind::Video, frame(base, FRAME, false, 0, au(31))),
-        Err(ClipError::Failed(
+        Err(RecordingError::Failed(
             "a frame of 31 bytes is larger than a sample may be (30)".into()
         ))
     );
@@ -2319,18 +2327,18 @@ fn an_audio_frame_without_an_audio_track_and_an_oversized_frame_fail() {
 #[test]
 fn tracks_without_a_sample_entry_are_unsupported() {
     let unsupported = |video: Codec, audio: Option<Codec>, family: CodecFamily| {
-        let video = ClipTrack {
+        let video = RecordingTrack {
             codec: video,
             clock_rate: 90_000,
         };
-        let audio = audio.map(|codec| ClipTrack {
+        let audio = audio.map(|codec| RecordingTrack {
             codec,
             clock_rate: 48_000,
         });
         let mut muxer = Muxer::new(&policy(1000));
         assert_eq!(
             muxer.start(&video, audio.as_ref()),
-            Err(ClipError::Unsupported(family))
+            Err(RecordingError::Unsupported(family))
         );
         // A refused start leaves the muxer to start again.
         assert!(muxer.start(&h264_track(), None).is_ok());
@@ -2378,12 +2386,12 @@ fn tracks_without_a_sample_entry_are_unsupported() {
 #[test]
 fn sample_entries_the_sets_cannot_describe_fail_the_start() {
     let failed = |video: Codec, clock_rate: u32| {
-        let track = ClipTrack {
+        let track = RecordingTrack {
             codec: video,
             clock_rate,
         };
         match Muxer::new(&policy(1000)).start(&track, None) {
-            Err(ClipError::Failed(message)) => message,
+            Err(RecordingError::Failed(message)) => message,
             other => panic!("{other:?}"),
         }
     };
@@ -2400,20 +2408,22 @@ fn sample_entries_the_sets_cannot_describe_fail_the_start() {
         failed(h264_track().codec, 0),
         "track 1 has a clock rate of 0"
     );
-    let audio = ClipTrack {
+    let audio = RecordingTrack {
         codec: aac_codec(16_000),
         clock_rate: 0,
     };
     assert_eq!(
         Muxer::new(&policy(1000)).start(&h264_track(), Some(&audio)),
-        Err(ClipError::Failed("track 2 has a clock rate of 0".into()))
+        Err(RecordingError::Failed(
+            "track 2 has a clock rate of 0".into()
+        ))
     );
     // chroma_format_idc 4, which the record's two bits cannot hold.
     assert_eq!(
         failed(h264_codec(h264::test_data::high_sps(100, 4, 0, 0)), 90_000),
         encode_failed(mp4_atom::Error::InvalidSize)
             .to_string()
-            .replace("clip muxing failed: ", "")
+            .replace("recording muxing failed: ", "")
     );
 }
 
@@ -2427,7 +2437,7 @@ fn timestamps_a_field_cannot_hold_fail_the_push() {
         muxer.push(Kind::Video, second)
     };
     let out_of_range = |what: &str, value: i128| {
-        Err(ClipError::Failed(format!(
+        Err(RecordingError::Failed(format!(
             "{what} of {value} ticks out of range"
         )))
     };
@@ -2550,7 +2560,7 @@ fn capture_times_become_ticks_rounded_down() {
     assert_eq!(ticks(Duration::MAX, u32::MAX), u64::MAX);
     assert_eq!(
         encode_failed(mp4_atom::Error::InvalidSize),
-        ClipError::Failed(format!("mp4 encoding: {}", mp4_atom::Error::InvalidSize))
+        RecordingError::Failed(format!("mp4 encoding: {}", mp4_atom::Error::InvalidSize))
     );
 }
 
@@ -2629,8 +2639,8 @@ fn tone_onset(audio: &[Read]) -> f64 {
 /// sound at most 40 ms before the picture, at most 60 ms after): a tone
 /// that starts at a capture time decodes from the file at the media time
 /// the video gives that capture time, within half a millisecond. The audio
-/// starts 10 ms before the first keyframe, as a pre-roll's does, and the
-/// clip's origin is the transcode's delay before it, so its first packet
+/// starts 10 ms before the first keyframe, as a pre-record's does, and the
+/// recording's origin is the transcode's delay before it, so its first packet
 /// is not clamped; the packets are one run of 20 ms.
 #[test]
 fn ebu_r37_transcoded_g711_and_g722_audio_keeps_sync_with_its_video() {

@@ -1,4 +1,4 @@
-//! Allocation counts of the live fan-out and the pre-roll ring.
+//! Allocation counts of the live fan-out and the pre-record ring.
 //!
 //! Linking `allocation-counter` makes its counting allocator this test
 //! binary's global allocator; it counts the calling thread's allocations,
@@ -105,7 +105,7 @@ fn a_published_packet_costs_one_allocation_whatever_the_viewers_and_reading_cost
     }
 }
 
-/// Frames per pre-roll measurement: 80 s of 25 fps.
+/// Frames per pre-record measurement: 80 s of 25 fps.
 const FRAMES: u64 = 2_000;
 
 /// The `n`th frame of a 25 fps stream from `t0`, a keyframe every second
@@ -136,10 +136,10 @@ fn publish_frames(track: &Track, t0: Instant, from: u64, to: u64, payload: &Byte
 }
 
 /// Once the ring has grown to its window, a frame costs the same
-/// allocations with a pre-roll as without: the ring holds the frame's
+/// allocations with a pre-record as without: the ring holds the frame's
 /// `Arc`, which the track allocates anyway, in a slot it already has.
 #[test]
-fn a_pre_roll_allocates_nothing_per_frame_once_its_window_is_full() {
+fn a_pre_record_allocates_nothing_per_frame_once_its_window_is_full() {
     let payload = Bytes::from(vec![7_u8; 1_200]);
     for (kind, codec, rate) in [
         (
@@ -160,7 +160,7 @@ fn a_pre_roll_allocates_nothing_per_frame_once_its_window_is_full() {
         let with = TrackSet::new(TrackLimits::default(), t0)
             .publisher()
             .declare(kind, codec, rate);
-        with.set_preroll(Some(Duration::from_secs(5)));
+        with.set_prerecord(Some(Duration::from_secs(5)));
         // Warm-up: the window and an open GOP, twice over.
         let warm_up = 500;
         let _ = publish_frames(&without, t0, 0, warm_up, &payload);
@@ -169,7 +169,7 @@ fn a_pre_roll_allocates_nothing_per_frame_once_its_window_is_full() {
         let measured = publish_frames(&with, t0, warm_up, warm_up + FRAMES, &payload);
         assert!(baseline >= FRAMES, "{kind}: {baseline}");
         assert_eq!(measured, baseline, "{kind}");
-        let held = with.stats().preroll.unwrap().held;
+        let held = with.stats().prerecord.unwrap().held;
         assert!(held >= Duration::from_secs(5), "{kind}: {held:?}");
     }
 }

@@ -87,29 +87,29 @@ pub(crate) struct WorkerArgs {
     #[arg(long, value_name = "PORT,...", value_delimiter = ',')]
     pub(crate) connect_ports: Vec<u16>,
 
-    /// What a stream's pre-roll frames may take together, its rings' and
-    /// those its clips have not written yet: half the daemon's
+    /// What a stream's pre-record frames may take together, its rings' and
+    /// those its recordings have not written yet: half the daemon's
     /// `limits.worker_address_space`.
-    #[arg(long, value_name = "BYTES", default_value_t = lotse_core::track::DEFAULT_PREROLL_BYTES)]
-    pub(crate) preroll_bytes: usize,
+    #[arg(long, value_name = "BYTES", default_value_t = lotse_core::track::DEFAULT_PRERECORD_BYTES)]
+    pub(crate) max_prerecord_bytes: usize,
 
-    /// The longest a clip runs: the daemon's `limits.clip_max_ms`.
+    /// The longest a recording runs: the daemon's `limits.max_recording_ms`.
     #[arg(long, value_name = "MS", default_value_t = 3_600_000)]
-    pub(crate) clip_max_ms: u64,
+    pub(crate) max_recording_ms: u64,
 
-    /// What one clip's queue holds before it drops to the next keyframe:
-    /// the daemon's `limits.clip_queue_bytes`.
-    #[arg(long, value_name = "BYTES", default_value_t = lotse_core::clip::DEFAULT_CLIP_QUEUE_BYTES)]
-    pub(crate) clip_queue_bytes: usize,
+    /// What one recording's queue holds before it drops to the next keyframe:
+    /// the daemon's `limits.recording_queue_bytes`.
+    #[arg(long, value_name = "BYTES", default_value_t = lotse_core::recording::DEFAULT_RECORDING_QUEUE_BYTES)]
+    pub(crate) recording_queue_bytes: usize,
 
-    /// How long a clip waits for its first keyframe: the daemon's
-    /// `limits.clip_start_timeout_ms`.
+    /// How long a recording waits for its first keyframe: the daemon's
+    /// `limits.recording_start_timeout_ms`.
     #[arg(long, value_name = "MS", default_value_t = 10_000)]
-    pub(crate) clip_start_timeout_ms: u64,
+    pub(crate) recording_start_timeout_ms: u64,
 
-    /// The most clips at once: the daemon's `limits.max_clips`.
-    #[arg(long, value_name = "N", default_value_t = lotse_worker::DEFAULT_MAX_CLIPS)]
-    pub(crate) max_clips: usize,
+    /// The most recordings at once: the daemon's `limits.max_recordings`.
+    #[arg(long, value_name = "N", default_value_t = lotse_worker::DEFAULT_MAX_RECORDINGS)]
+    pub(crate) max_recordings: usize,
 }
 
 /// `lotse serve`. Every flag has a `LOTSE_*` variable; both override the
@@ -208,35 +208,35 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "LOTSE_LINGER_MS", value_name = "MS")]
     pub(crate) linger_ms: Option<u64>,
 
-    /// The longest pre-roll window a stream may ask for, and the furthest
-    /// back a clip may start.
-    #[arg(long, env = "LOTSE_PREROLL_MAX_MS", value_name = "MS")]
-    pub(crate) preroll_max_ms: Option<u32>,
+    /// The longest pre-record window a stream may ask for, and the furthest
+    /// back a recording may start.
+    #[arg(long, env = "LOTSE_MAX_PRERECORD_MS", value_name = "MS")]
+    pub(crate) max_prerecord_ms: Option<u32>,
 
-    /// The longest a clip runs after its start.
-    #[arg(long, env = "LOTSE_CLIP_MAX_MS", value_name = "MS")]
-    pub(crate) clip_max_ms: Option<u32>,
+    /// The longest a recording runs after its start.
+    #[arg(long, env = "LOTSE_MAX_RECORDING_MS", value_name = "MS")]
+    pub(crate) max_recording_ms: Option<u32>,
 
-    /// What one clip's queue holds, in bytes, while its reader is slower
-    /// than the camera; beyond it the clip skips to the next keyframe.
-    #[arg(long, env = "LOTSE_CLIP_QUEUE_BYTES", value_name = "BYTES")]
-    pub(crate) clip_queue_bytes: Option<u64>,
+    /// What one recording's queue holds, in bytes, while its reader is slower
+    /// than the camera; beyond it the recording skips to the next keyframe.
+    #[arg(long, env = "LOTSE_RECORDING_QUEUE_BYTES", value_name = "BYTES")]
+    pub(crate) recording_queue_bytes: Option<u64>,
 
-    /// How long a clip's file waits for its `GET`; then the clip stops.
-    #[arg(long, env = "LOTSE_CLIP_FETCH_TIMEOUT_MS", value_name = "MS")]
-    pub(crate) clip_fetch_timeout_ms: Option<u64>,
+    /// How long a recording's file waits for its `GET`; then the recording stops.
+    #[arg(long, env = "LOTSE_RECORDING_FETCH_TIMEOUT_MS", value_name = "MS")]
+    pub(crate) recording_fetch_timeout_ms: Option<u64>,
 
-    /// How long a clip waits for the stream and a keyframe to start at.
-    #[arg(long, env = "LOTSE_CLIP_START_TIMEOUT_MS", value_name = "MS")]
-    pub(crate) clip_start_timeout_ms: Option<u64>,
+    /// How long a recording waits for the stream and a keyframe to start at.
+    #[arg(long, env = "LOTSE_RECORDING_START_TIMEOUT_MS", value_name = "MS")]
+    pub(crate) recording_start_timeout_ms: Option<u64>,
 
-    /// Clips at once, over every stream.
-    #[arg(long, env = "LOTSE_MAX_CLIPS", value_name = "N")]
-    pub(crate) max_clips: Option<u32>,
+    /// Recordings at once, over every stream.
+    #[arg(long, env = "LOTSE_MAX_RECORDINGS", value_name = "N")]
+    pub(crate) max_recordings: Option<u32>,
 
-    /// Clips at once on one stream.
-    #[arg(long, env = "LOTSE_CLIPS_PER_STREAM", value_name = "N")]
-    pub(crate) clips_per_stream: Option<u32>,
+    /// Recordings at once on one stream.
+    #[arg(long, env = "LOTSE_MAX_RECORDINGS_PER_STREAM", value_name = "N")]
+    pub(crate) max_recordings_per_stream: Option<u32>,
 
     /// Source connection attempts at once, across every camera; at least 1.
     #[arg(long, env = "LOTSE_CONNECT_CONCURRENCY", value_name = "N")]
@@ -344,64 +344,73 @@ mod tests {
         assert!(bare.connect_ports.is_empty());
         assert_eq!(bare.sandbox, Mode::On);
         assert_eq!(bare.max_sessions, 256);
-        // A worker started by hand holds the daemon's default clip limits.
+        // A worker started by hand holds the daemon's default recording limits.
         assert_eq!(
-            (bare.preroll_bytes, bare.clip_queue_bytes, bare.max_clips),
             (
-                lotse_core::track::DEFAULT_PREROLL_BYTES,
-                lotse_core::clip::DEFAULT_CLIP_QUEUE_BYTES,
-                lotse_worker::DEFAULT_MAX_CLIPS
+                bare.max_prerecord_bytes,
+                bare.recording_queue_bytes,
+                bare.max_recordings
+            ),
+            (
+                lotse_core::track::DEFAULT_PRERECORD_BYTES,
+                lotse_core::recording::DEFAULT_RECORDING_QUEUE_BYTES,
+                lotse_worker::DEFAULT_MAX_RECORDINGS
             )
         );
         assert_eq!(
-            Duration::from_millis(bare.clip_max_ms),
-            lotse_worker::DEFAULT_CLIP_MAX
+            Duration::from_millis(bare.max_recording_ms),
+            lotse_worker::DEFAULT_MAX_RECORDING
         );
-        // ... which are the supervisor's: the daemon refuses no `after_ms`
+        // ... which are the supervisor's: the daemon takes no `duration_ms`
         // its worker would cut short.
         assert_eq!(
-            Duration::from_millis(u64::from(lotse_supervisor::ClipLimits::DEFAULT.clip_max_ms)),
-            lotse_worker::DEFAULT_CLIP_MAX
+            Duration::from_millis(u64::from(
+                lotse_supervisor::RecordingLimits::DEFAULT.max_recording_ms
+            )),
+            lotse_worker::DEFAULT_MAX_RECORDING
         );
-        // The pre-roll bound is half the default worker address space.
-        let derived = lotse_supervisor::ClipLimits::preroll_bytes_for(
+        // The pre-record bound is half the default worker address space.
+        let derived = lotse_supervisor::RecordingLimits::max_prerecord_bytes_for(
             lotse_sandbox::DEFAULT_WORKER_ADDRESS_SPACE,
         );
         assert_eq!(
-            (derived, lotse_supervisor::ClipLimits::DEFAULT.preroll_bytes),
             (
-                u64::try_from(lotse_core::track::DEFAULT_PREROLL_BYTES).unwrap(),
+                derived,
+                lotse_supervisor::RecordingLimits::DEFAULT.max_prerecord_bytes
+            ),
+            (
+                u64::try_from(lotse_core::track::DEFAULT_PRERECORD_BYTES).unwrap(),
                 derived
             )
         );
         assert_eq!(
-            Duration::from_millis(bare.clip_start_timeout_ms),
-            lotse_worker::DEFAULT_CLIP_START_TIMEOUT
+            Duration::from_millis(bare.recording_start_timeout_ms),
+            lotse_worker::DEFAULT_RECORDING_START_TIMEOUT
         );
-        let clips: WorkerArgs = args_of(
+        let recordings: WorkerArgs = args_of(
             &[
                 "lotse",
                 "worker",
-                "--preroll-bytes",
+                "--max-prerecord-bytes",
                 "1048576",
-                "--clip-max-ms",
+                "--max-recording-ms",
                 "45000",
-                "--clip-queue-bytes",
+                "--recording-queue-bytes",
                 "65536",
-                "--clip-start-timeout-ms",
+                "--recording-start-timeout-ms",
                 "2500",
-                "--max-clips",
+                "--max-recordings",
                 "3",
             ],
             "worker",
         );
         assert_eq!(
             (
-                clips.preroll_bytes,
-                clips.clip_max_ms,
-                clips.clip_queue_bytes,
-                clips.clip_start_timeout_ms,
-                clips.max_clips
+                recordings.max_prerecord_bytes,
+                recordings.max_recording_ms,
+                recordings.recording_queue_bytes,
+                recordings.recording_start_timeout_ms,
+                recordings.max_recordings
             ),
             (1 << 20, 45_000, 1 << 16, 2_500, 3)
         );
@@ -443,7 +452,7 @@ mod tests {
                         options,
                         preload: true,
                         audio,
-                        preroll: None,
+                        prerecord: None,
                     },
                 } if stream_id == "front"
                     && urls == &["fake://cam/"]
@@ -517,53 +526,63 @@ mod tests {
     }
 
     #[test]
-    fn ctl_stream_clip_and_put_take_durations_with_their_unit() {
-        use crate::ctl::{CtlCommand, StreamCommand};
+    fn ctl_recording_create_and_put_take_durations_with_their_unit() {
+        use crate::ctl::{CtlCommand, RecordingCommand};
         let args: CtlArgs = args_of(
             &[
                 "lotse",
                 "ctl",
                 "--socket",
                 "/s",
-                "stream",
-                "clip",
+                "recording",
+                "create",
                 "front",
-                "--before",
+                "--prerecord",
                 "10s",
-                "--after",
+                "--duration",
                 "500ms",
                 "--no-audio",
                 "-o",
-                "clip.mp4",
+                "recording.mp4",
             ],
             "ctl",
         );
         assert!(
             matches!(
                 &args.command,
-                CtlCommand::Stream {
-                    command: StreamCommand::Clip {
+                CtlCommand::Recording {
+                    command: RecordingCommand::Create {
                         stream_id,
-                        before: 10_000,
-                        after: Some(500),
+                        prerecord: 10_000,
+                        duration: 500,
                         no_audio: true,
                         output,
                     },
-                } if stream_id == "front" && output == std::path::Path::new("clip.mp4")
+                } if stream_id == "front" && output == std::path::Path::new("recording.mp4")
             ),
             "{:?}",
             args.command
         );
         let args: CtlArgs = args_of(
             &[
-                "lotse", "ctl", "--socket", "/s", "stream", "clip", "front", "--output", "c.mp4",
+                "lotse",
+                "ctl",
+                "--socket",
+                "/s",
+                "recording",
+                "create",
+                "front",
+                "--duration",
+                "1s",
+                "--output",
+                "c.mp4",
             ],
             "ctl",
         );
         let shown = format!("{:?}", args.command);
         assert!(
-            shown.contains("before: 0, after: None, no_audio: false"),
-            "open-ended with audio by default: {shown}"
+            shown.contains("prerecord: 0, duration: 1000, no_audio: false"),
+            "from now with audio by default: {shown}"
         );
         let args: CtlArgs = args_of(
             &[
@@ -576,20 +595,31 @@ mod tests {
                 "front",
                 "--url",
                 "fake://cam/",
-                "--preroll",
+                "--prerecord",
                 "2m",
             ],
             "ctl",
         );
         let shown = format!("{:?}", args.command);
-        assert!(shown.contains("preroll: Some(120000)"), "{shown}");
-        let clip = |extra: &[&str]| {
-            let base = ["lotse", "ctl", "--socket", "/s", "stream", "clip", "front"];
+        assert!(shown.contains("prerecord: Some(120000)"), "{shown}");
+        let recording = |extra: &[&str]| {
+            let base = [
+                "lotse",
+                "ctl",
+                "--socket",
+                "/s",
+                "recording",
+                "create",
+                "front",
+            ];
             Cli::try_parse_from(base.iter().chain(extra))
         };
-        let err = clip(&[]).unwrap_err();
+        let err = recording(&[]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-        let err = clip(&["-o", "c.mp4", "--before", "10"]).unwrap_err();
+        // A recording always has its duration.
+        let err = recording(&["-o", "c.mp4"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let err = recording(&["-o", "c.mp4", "--duration", "1s", "--prerecord", "10"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 

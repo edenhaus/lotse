@@ -1,7 +1,7 @@
 //! Worker process: the IPC client, the source connection runner, the
 //! derived tracks, the session manager with each session's talk-back
 //! uplink track, the arbiter that picks the backchannel's one talker, the
-//! event clips written from the tracks' pre-roll rings into the pipes the
+//! event recordings written from the tracks' pre-record rings into the pipes the
 //! supervisor passes, and the once-per-second stats push, for one camera
 //! connection.
 //!
@@ -19,14 +19,14 @@
 //! RFC 8656 §12.4 (the `ChannelData` it frames, [`relay`]), RFC 6184 §8.1
 //! (the `profile-level-id` it reports) and the picture size of ISO/IEC
 //! 14496-10 §7.4.2.1.1 and ITU-T H.265 §7.4.3.2.1, which `lotse-codec`
-//! reads from a track's SPS; for the clips, the parameter-set types of
+//! reads from a track's SPS; for the recordings, the parameter-set types of
 //! ISO/IEC 14496-10 and ITU-T H.265 Table 7-1 and Linux `pipe(7)`, as the
-//! `clip` module cites them (the container is the registered muxer's).
+//! `recording` module cites them (the container is the registered muxer's).
 
-mod clip;
 mod derived;
 mod ice_tcp;
 mod params;
+mod recording;
 pub mod relay;
 mod sendmsg;
 mod sessions;
@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
-use lotse_codec::transcode::clip::ToOpus;
+use lotse_codec::transcode::recording::ToOpus;
 use lotse_core::backoff::{BackoffPosition, ReconnectBackoff};
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
@@ -55,20 +55,21 @@ use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
 use lotse_core::track::{Track, TrackId, TrackLimits};
 use lotse_ipc::{
-    Channel, ClipReport, ClipSpec, Decoded, IpcError, PrerollStats, Sender, SessionEvent,
-    SessionSpec, SourceSpec, SourceState, ToSupervisor, ToWorker, TrackInfo, TrackStats,
-    WorkerStats,
+    Channel, Decoded, IpcError, PrerecordStats, RecordingReport, RecordingSpec, Sender,
+    SessionEvent, SessionSpec, SourceSpec, SourceState, ToSupervisor, ToWorker, TrackInfo,
+    TrackStats, WorkerStats,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-pub use crate::clip::{
-    ClipSettings, DEFAULT_CLIP_MAX, DEFAULT_CLIP_START_TIMEOUT, DEFAULT_MAX_CLIPS,
-};
-use crate::clip::{ClipStart, Clips, EndReason};
 use crate::derived::DerivedTracks;
+pub use crate::recording::{
+    DEFAULT_MAX_RECORDING, DEFAULT_MAX_RECORDINGS, DEFAULT_RECORDING_START_TIMEOUT,
+    RecordingSettings,
+};
+use crate::recording::{EndReason, RecordingStart, Recordings};
 use crate::sessions::{ConnectionMedia, SessionManager};
 use crate::talkback::{Arbiter, TalkerChanged, TalkerFeed};
 
@@ -94,8 +95,8 @@ pub struct Settings {
     /// arrives, the one the worker's seccomp filter keeps it to sending
     /// on; `None` leaves it where it lands.
     pub shared_udp_fd: Option<RawFd>,
-    /// The event clips' limits (`limits.clip_*`, `limits.max_clips`).
-    pub clip: ClipSettings,
+    /// The event recordings' limits (`limits.recording_*`, `limits.max_recordings`).
+    pub recording: RecordingSettings,
 }
 
 /// Why the worker stopped serving.
@@ -255,7 +256,7 @@ pub async fn serve(
     let (runner_tx, runner_rx) = mpsc::channel::<RunnerEvent>(64);
     let (standby_tx, standby_rx) = mpsc::channel::<RunnerEvent>(64);
     let (session_tx, mut session_rx) = mpsc::channel::<(String, SessionEvent)>(256);
-    let (clip_tx, clip_rx) = mpsc::channel::<(String, ClipReport)>(64);
+    let (recording_tx, recording_rx) = mpsc::channel::<(String, RecordingReport)>(64);
     let (probes, mut probe_asks) = ProbeGate::closed();
     let mut serving = Serving {
         tx,
@@ -273,9 +274,9 @@ pub async fn serve(
         lost_hand_offs: Throttle::default(),
         probes,
         backchannels: BackchannelTasks::default(),
-        clips: Clips::new(clip_tx),
-        clip_rx,
-        preroll: None,
+        recordings: Recordings::new(recording_tx),
+        recording_rx,
+        prerecord: None,
     };
     let fds: Vec<BorrowedFd<'_>> = memory.iter().map(AsFd::as_fd).collect();
     serving
@@ -309,9 +310,9 @@ pub async fn serve(
             Some((session_id, event)) = session_rx.recv() => {
                 serving.tx.send_msg(&ToSupervisor::Session { session_id, event }, &[]).await?;
             }
-            // `serving` holds the clips' sender, so the reports never end.
-            Some((clip_id, event)) = serving.clip_rx.recv() => {
-                serving.on_clip_report(clip_id, event).await?;
+            // `serving` holds the recordings' sender, so the reports never end.
+            Some((recording_id, event)) = serving.recording_rx.recv() => {
+                serving.on_recording_report(recording_id, event).await?;
             }
             // `serving` holds the gate's sender, so the asks never end.
             Some(ask) = probe_asks.recv() => {
@@ -364,13 +365,13 @@ struct Serving<'a> {
     /// the shutdown waits for ([`close_backchannels`]): one tracker for
     /// the worker, shared by every source's slot.
     backchannels: BackchannelTasks,
-    /// The running event clips.
-    clips: Clips,
+    /// The running event recordings.
+    recordings: Recordings,
     /// Their reports.
-    clip_rx: mpsc::Receiver<(String, ClipReport)>,
-    /// The connection's pre-roll window, set on its native tracks; `None`
+    recording_rx: mpsc::Receiver<(String, RecordingReport)>,
+    /// The connection's pre-record window, set on its native tracks; `None`
     /// keeps no ring.
-    preroll: Option<Duration>,
+    prerecord: Option<Duration>,
 }
 
 /// The message that passes a probe's `ask` on to the supervisor.
@@ -394,9 +395,15 @@ impl Serving<'_> {
                 .send_msg(&ToSupervisor::Session { session_id, event }, &[])
                 .await?;
         }
-        while let Ok((clip_id, event)) = self.clip_rx.try_recv() {
+        while let Ok((recording_id, event)) = self.recording_rx.try_recv() {
             self.tx
-                .send_msg(&ToSupervisor::Clip { clip_id, event }, &[])
+                .send_msg(
+                    &ToSupervisor::Recording {
+                        recording_id,
+                        event,
+                    },
+                    &[],
+                )
                 .await?;
         }
         while let Ok(event) = self.runner_rx.try_recv() {
@@ -408,8 +415,8 @@ impl Serving<'_> {
     /// One received message. A hand-off whose connection the kernel
     /// discarded, because this process had no free descriptor for it,
     /// costs that connection alone: the browser sees it close and tries
-    /// another pair, and the camera's other viewers keep playing. A clip
-    /// whose pipe was discarded likewise costs that clip alone, refused as
+    /// another pair, and the camera's other viewers keep playing. A recording
+    /// whose pipe was discarded likewise costs that recording alone, refused as
     /// one without a pipe. Any other message that lost its descriptors
     /// ends the worker, as it cannot do its work without them.
     async fn on_decoded(
@@ -424,8 +431,8 @@ impl Serving<'_> {
                     }
                     return Ok(None);
                 }
-                ToWorker::StartClip(spec) => {
-                    tracing::warn!(clip.id = %spec.clip_id, "clip arrived without its pipe: no free descriptor");
+                ToWorker::StartRecording(spec) => {
+                    tracing::warn!(recording.id = %spec.recording_id, "recording arrived without its pipe: no free descriptor");
                 }
                 _ => return Err(IpcError::FdsTruncated.into()),
             }
@@ -525,9 +532,9 @@ impl Serving<'_> {
             ToWorker::ReleaseBackchannel { session_id } => {
                 self.release_backchannel(session_id.as_deref());
             }
-            ToWorker::Preroll { ms } => self.on_preroll(ms),
-            ToWorker::StartClip(spec) => self.on_start_clip(spec, fds).await?,
-            ToWorker::StopClip { clip_id } => self.on_stop_clip(&clip_id),
+            ToWorker::Prerecord { ms } => self.on_prerecord(ms),
+            ToWorker::StartRecording(spec) => self.on_start_recording(spec, fds).await?,
+            ToWorker::StopRecording { recording_id } => self.on_stop_recording(&recording_id),
             ToWorker::Shutdown { deadline_ms } => {
                 return self.on_shutdown(deadline_ms).await.map(Some);
             }
@@ -556,7 +563,7 @@ impl Serving<'_> {
         let live = event == RunnerEvent::Live;
         report(&mut self.tx, event, self.running.as_mut()).await?;
         if live {
-            self.apply_preroll();
+            self.apply_prerecord();
         }
         Ok(())
     }
@@ -576,85 +583,104 @@ impl Serving<'_> {
             &self.backchannels,
             self.runner_tx.clone(),
         )?);
-        self.preroll = preroll_window(spec.preroll_ms);
+        self.prerecord = prerecord_window(spec.prerecord_ms);
         Ok(())
     }
 
-    /// `Preroll`: the connection's window is `ms` now, on its tracks at
+    /// `Prerecord`: the connection's window is `ms` now, on its tracks at
     /// once; nothing reconnects.
-    fn on_preroll(&mut self, ms: u32) {
-        self.preroll = preroll_window(ms);
-        tracing::debug!(window_ms = ms, "pre-roll window received");
-        self.apply_preroll();
+    fn on_prerecord(&mut self, ms: u32) {
+        self.prerecord = prerecord_window(ms);
+        tracing::debug!(window_ms = ms, "pre-record window received");
+        self.apply_prerecord();
     }
 
     /// Sets the connection's window on every native track declared so
     /// far: at a window's change, once the source is live (a track a
     /// reconnect added included) and after a switch. A staging set's
     /// tracks forward into these, rings included, so they need none.
-    fn apply_preroll(&self) {
+    fn apply_prerecord(&self) {
         if let Some(running) = &self.running {
-            set_preroll(&running.tracks, self.preroll);
+            set_prerecord(&running.tracks, self.prerecord);
         }
     }
 
-    /// `StartClip`: runs `spec`'s clip into the pipe that came with it, or
-    /// refuses it, closing that pipe, which ends the clip's body for its
+    /// `StartRecording`: runs `spec`'s recording into the pipe that came with it, or
+    /// refuses it, closing that pipe, which ends the recording's body for its
     /// reader: without a container, a pipe, a source, or room. A second
-    /// clip under a running one's id is the supervisor's bug: its pipe is
+    /// recording under a running one's id is the supervisor's bug: its pipe is
     /// closed and nothing reported, since the report would be the running
-    /// clip's.
-    async fn on_start_clip(&mut self, spec: ClipSpec, fds: Vec<OwnedFd>) -> Result<(), Error> {
-        if self.clips.runs(&spec.clip_id) {
-            tracing::warn!(clip.id = %spec.clip_id, "clip id already runs; the second start is dropped");
+    /// recording's.
+    async fn on_start_recording(
+        &mut self,
+        spec: RecordingSpec,
+        fds: Vec<OwnedFd>,
+    ) -> Result<(), Error> {
+        if self.recordings.runs(&spec.recording_id) {
+            tracing::warn!(recording.id = %spec.recording_id, "recording id already runs; the second start is dropped");
             return Ok(());
         }
-        let refusal = match (&self.registries.clip, fds.into_iter().next(), &self.running) {
-            (None, _, _) => ("internal_error", "this worker runs no clips"),
-            (_, None, _) => ("internal_error", "the clip came without its pipe"),
+        let refusal = match (
+            &self.registries.recording,
+            fds.into_iter().next(),
+            &self.running,
+        ) {
+            (None, _, _) => ("internal_error", "this worker runs no recordings"),
+            (_, None, _) => ("internal_error", "the recording came without its pipe"),
             (_, _, None) => ("source_not_live", "the worker runs no source"),
-            _ if self.clips.len() >= self.settings.clip.max_clips => {
-                ("internal_error", "the worker runs as many clips as it may")
-            }
+            _ if self.recordings.len() >= self.settings.recording.max_recordings => (
+                "internal_error",
+                "the worker runs as many recordings as it may",
+            ),
             (Some(factory), Some(fd), Some(running)) => {
                 match tokio::net::unix::pipe::Sender::from_owned_fd(fd) {
                     Ok(pipe) => {
-                        self.clips.start(ClipStart {
+                        self.recordings.start(RecordingStart {
                             spec,
                             pipe,
                             tracks: Arc::clone(running.tracks.tracks()),
                             factory: Arc::clone(factory),
-                            settings: self.settings.clip,
+                            settings: self.settings.recording,
                             clock: Arc::clone(&self.clock),
                             transcode: ToOpus::new,
                         });
                         return Ok(());
                     }
                     Err(err) => {
-                        tracing::debug!(error = %err, "clip descriptor is no pipe");
-                        ("internal_error", "the clip's descriptor is no pipe")
+                        tracing::debug!(error = %err, "recording descriptor is no pipe");
+                        ("internal_error", "the recording's descriptor is no pipe")
                     }
                 }
             }
         };
-        refuse_clip(&mut self.tx, spec.clip_id, refusal).await
+        refuse_recording(&mut self.tx, spec.recording_id, refusal).await
     }
 
-    /// `StopClip`: ends `clip_id` cleanly; one this worker does not run is
+    /// `StopRecording`: ends `recording_id` cleanly; one this worker does not run is
     /// ignored.
-    fn on_stop_clip(&self, clip_id: &str) {
-        if !self.clips.stop(clip_id, EndReason::Stopped) {
-            tracing::debug!(clip.id = %clip_id, "stop for a clip this worker does not run; ignored");
+    fn on_stop_recording(&self, recording_id: &str) {
+        if !self.recordings.stop(recording_id, EndReason::Stopped) {
+            tracing::debug!(recording.id = %recording_id, "stop for a recording this worker does not run; ignored");
         }
     }
 
-    /// A clip's report, passed on; after its `Stopped` the clip is over.
-    async fn on_clip_report(&mut self, clip_id: String, event: ClipReport) -> Result<(), Error> {
-        if matches!(event, ClipReport::Stopped { .. }) {
-            self.clips.ended(&clip_id);
+    /// A recording's report, passed on; after its `Closed` the recording is over.
+    async fn on_recording_report(
+        &mut self,
+        recording_id: String,
+        event: RecordingReport,
+    ) -> Result<(), Error> {
+        if matches!(event, RecordingReport::Closed { .. }) {
+            self.recordings.ended(&recording_id);
         }
         self.tx
-            .send_msg(&ToSupervisor::Clip { clip_id, event }, &[])
+            .send_msg(
+                &ToSupervisor::Recording {
+                    recording_id,
+                    event,
+                },
+                &[],
+            )
             .await?;
         Ok(())
     }
@@ -694,43 +720,43 @@ impl Serving<'_> {
         refuse_renegotiation(&mut self.tx, session_id, message).await
     }
 
-    /// `Shutdown`: ends the clips, closes every session, stops the standby
+    /// `Shutdown`: ends the recordings, closes every session, stops the standby
     /// and the source within `deadline_ms`, past which the supervisor
-    /// kills the worker. The clips end beside the rest, never ahead of it,
-    /// and by that deadline at the latest, so a clip whose reader stalls
+    /// kills the worker. The recordings end beside the rest, never ahead of it,
+    /// and by that deadline at the latest, so a recording whose reader stalls
     /// costs the source's teardown nothing.
     async fn on_shutdown(&mut self, deadline_ms: u32) -> Result<ExitReason, Error> {
         let sessions = self.sessions.as_mut().map_or(0, SessionManager::len);
-        let clips = self.clips.len();
-        tracing::info!(deadline_ms, sessions, clips, "shutdown requested");
+        let recordings = self.recordings.len();
+        tracing::info!(deadline_ms, sessions, recordings, "shutdown requested");
         let budget = Duration::from_millis(u64::from(deadline_ms));
         let now = self.clock.now();
         let deadline = now.checked_add(budget).unwrap_or(now);
         let Self {
             tx,
             clock,
-            clips,
-            clip_rx,
+            recordings,
+            recording_rx,
             sessions,
             standby,
             running,
             backchannels,
             ..
         } = self;
-        // Each clip writes its last fragment, and its report waits for the
-        // flush. Their reports go on meanwhile: a clip waiting for room in
-        // their channel would be aborted at the deadline, its `Stopped`
+        // Each recording writes its last fragment, and its report waits for the
+        // flush. Their reports go on meanwhile: a recording waiting for room in
+        // their channel would be aborted at the deadline, its `Closed`
         // lost.
         let ending = async {
-            let ending = clips.shutdown(clock, deadline);
+            let ending = recordings.shutdown(clock, deadline);
             tokio::pin!(ending);
             loop {
                 tokio::select! {
                     biased;
                     () = &mut ending => return Ok::<(), Error>(()),
-                    // `self` holds the clips' sender, so the reports never end.
-                    Some((clip_id, event)) = clip_rx.recv() => {
-                        tx.send_msg(&ToSupervisor::Clip { clip_id, event }, &[]).await?;
+                    // `self` holds the recordings' sender, so the reports never end.
+                    Some((recording_id, event)) = recording_rx.recv() => {
+                        tx.send_msg(&ToSupervisor::Recording { recording_id, event }, &[]).await?;
                     }
                 }
             }
@@ -756,7 +782,7 @@ impl Serving<'_> {
     /// second for the source.
     async fn on_supervisor_gone(&mut self) -> Result<ExitReason, Error> {
         tracing::warn!("supervisor closed the control channel; stopping");
-        self.clips.abort_all();
+        self.recordings.abort_all();
         self.sessions.take();
         stop_standby(self.standby.take(), &self.clock).await;
         stop_source(self.running.take(), &self.clock, Duration::from_secs(1)).await?;
@@ -772,8 +798,8 @@ impl Serving<'_> {
             return Err(Error::SwitchWithoutSource);
         };
         let staging = TrackSet::staging(running.tracks.tracks());
-        self.preroll = preroll_window(spec.preroll_ms);
-        self.apply_preroll();
+        self.prerecord = prerecord_window(spec.prerecord_ms);
+        self.apply_prerecord();
         if let Some(replaced) = self.standby.take() {
             tracing::info!("standby source replaced before it took over");
             replaced.staging.disarm();
@@ -810,7 +836,7 @@ impl Serving<'_> {
 
     /// The tracks switched to the standby `tag`: the old source is
     /// stopped, the standby becomes the source, and the supervisor hears
-    /// of the switch and the tracks as they are now. The clips are left
+    /// of the switch and the tracks as they are now. The recordings are left
     /// alone: each ended at the switch itself, in its place among its
     /// frames (`SourceSwitched`, or `ControlLost` when its subscription
     /// lost that to a lag), and one started since runs on the new source
@@ -825,7 +851,7 @@ impl Serving<'_> {
         };
         tracing::info!(
             tag,
-            clips = self.clips.len(),
+            recordings = self.recordings.len(),
             "tracks switched to the standby; stopping the old source"
         );
         running.cancel.cancel();
@@ -860,7 +886,7 @@ impl Serving<'_> {
         std::mem::swap(&mut self.runner_tx, &mut self.standby_tx);
         running.tracks.refresh();
         running.reported = track_infos(&running.tracks, &running.mapper);
-        set_preroll(&running.tracks, self.preroll);
+        set_prerecord(&running.tracks, self.prerecord);
         self.tx.send_msg(&ToSupervisor::Switched, &[]).await?;
         self.tx
             .send_msg(&ToSupervisor::Tracks(running.reported.clone()), &[])
@@ -1049,8 +1075,8 @@ async fn refuse_session(
     Ok(())
 }
 
-/// The pre-roll window of `ms` milliseconds; none for 0.
-fn preroll_window(ms: u32) -> Option<Duration> {
+/// The pre-record window of `ms` milliseconds; none for 0.
+fn prerecord_window(ms: u32) -> Option<Duration> {
     match ms {
         0 => None,
         ms => Some(Duration::from_millis(u64::from(ms))),
@@ -1058,30 +1084,30 @@ fn preroll_window(ms: u32) -> Option<Duration> {
 }
 
 /// Sets `window` on every native track of `tracks` declared so far.
-fn set_preroll(tracks: &DerivedTracks, window: Option<Duration>) {
+fn set_prerecord(tracks: &DerivedTracks, window: Option<Duration>) {
     for track in tracks.tracks().tracks() {
-        track.set_preroll(window);
+        track.set_prerecord(window);
     }
 }
 
-/// Refuses the clip `clip_id` with `(reason, why)`: its `Stopped` at once,
+/// Refuses the recording `recording_id` with `(reason, why)`: its `Closed` at once,
 /// nothing written; its pipe, if one came, is closed already.
-async fn refuse_clip(
+async fn refuse_recording(
     tx: &mut Sender,
-    clip_id: String,
+    recording_id: String,
     (reason, why): (&str, &str),
 ) -> Result<(), Error> {
-    tracing::warn!(clip.id = %clip_id, reason, why, "clip refused");
-    let stopped = ToSupervisor::Clip {
-        clip_id,
-        event: ClipReport::Stopped {
+    tracing::warn!(recording.id = %recording_id, reason, why, "recording refused");
+    let closed = ToSupervisor::Recording {
+        recording_id,
+        event: RecordingReport::Closed {
             reason: reason.to_owned(),
             bytes: 0,
             duration_ms: 0,
             gaps: 0,
         },
     };
-    tx.send_msg(&stopped, &[]).await?;
+    tx.send_msg(&closed, &[]).await?;
     Ok(())
 }
 
@@ -1504,7 +1530,7 @@ fn track_stats(track: &Track) -> TrackStats {
         frame_bytes: stats.frame_bytes,
         frames_dropped_oversize: stats.frames_dropped_oversize,
         frames_over_browser_limit: stats.frames_over_browser_limit,
-        preroll: stats.preroll.map(|ring| PrerollStats {
+        prerecord: stats.prerecord.map(|ring| PrerecordStats {
             bytes: ring.bytes,
             held_ms: u32::try_from(ring.held.as_millis()).unwrap_or(u32::MAX),
             truncations: ring.truncations,
@@ -1531,8 +1557,8 @@ mod tests {
     };
     use lotse_core::task::BoxFuture;
     use lotse_core::test_util::{
-        BackchannelCapture, ECHO_ANSWER, EchoSessionFactory, FakeClipMuxerFactory,
-        FakeOutputFactory, FakeSourceFactory,
+        BackchannelCapture, ECHO_ANSWER, EchoSessionFactory, FakeOutputFactory,
+        FakeRecordingMuxerFactory, FakeSourceFactory,
     };
     use lotse_ipc::Receiver;
     use tokio::sync::Notify;
@@ -1549,7 +1575,7 @@ mod tests {
             session: SessionLimits::default(),
             max_sessions: 256,
             shared_udp_fd: None,
-            clip: ClipSettings::default(),
+            recording: RecordingSettings::default(),
         }
     }
 
@@ -1599,7 +1625,7 @@ mod tests {
             peer_host: "cam".into(),
             peer_addrs: vec![],
             backoff: lotse_ipc::BackoffPosition::default(),
-            preroll_ms: 0,
+            prerecord_ms: 0,
         }
     }
 
@@ -4638,9 +4664,9 @@ mod tests {
             lost_hand_offs: Throttle::default(),
             probes: ProbeGate::default(),
             backchannels: BackchannelTasks::default(),
-            clips: Clips::new(mpsc::channel(1).0),
-            clip_rx: mpsc::channel(1).1,
-            preroll: None,
+            recordings: Recordings::new(mpsc::channel(1).0),
+            recording_rx: mpsc::channel(1).1,
+            prerecord: None,
         };
         (serving, ours.split().1)
     }
@@ -5089,19 +5115,19 @@ mod tests {
         assert_eq!(STATS_INTERVAL, Duration::from_secs(1));
     }
 
-    fn start_clip(clip_id: &str) -> ToWorker {
-        ToWorker::StartClip(ClipSpec {
-            clip_id: clip_id.into(),
-            before_ms: 10_000,
-            after_ms: None,
+    fn start_recording(recording_id: &str) -> ToWorker {
+        ToWorker::StartRecording(RecordingSpec {
+            recording_id: recording_id.into(),
+            prerecord_ms: 10_000,
+            duration_ms: 600_000,
             audio: true,
         })
     }
 
-    fn refused(clip_id: &str) -> ToSupervisor {
-        ToSupervisor::Clip {
-            clip_id: clip_id.into(),
-            event: ClipReport::Stopped {
+    fn refused(recording_id: &str) -> ToSupervisor {
+        ToSupervisor::Recording {
+            recording_id: recording_id.into(),
+            event: RecordingReport::Closed {
                 reason: "internal_error".into(),
                 bytes: 0,
                 duration_ms: 0,
@@ -5118,21 +5144,21 @@ mod tests {
         rest
     }
 
-    /// A worker that runs no clips refuses every `StartClip` at once with
+    /// A worker that runs no recordings refuses every `StartRecording` at once with
     /// `internal_error` and closes the pipe that came with it, and one
-    /// without a pipe too; a pre-roll window without a source and a stop
-    /// for a clip it does not run send nothing back, and it keeps serving.
+    /// without a pipe too; a pre-record window without a source and a stop
+    /// for a recording it does not run send nothing back, and it keeps serving.
     #[tokio::test]
-    async fn a_clip_is_refused_with_its_pipe_closed_and_a_window_or_a_stop_is_ignored() {
+    async fn a_recording_is_refused_with_its_pipe_closed_and_a_window_or_a_stop_is_ignored() {
         let (logs, _guard) = Logs::capture();
         let mut h = start();
         h.next().await;
-        h.tx.send_msg(&ToWorker::Preroll { ms: 30_000 }, &[])
+        h.tx.send_msg(&ToWorker::Prerecord { ms: 30_000 }, &[])
             .await
             .unwrap();
         h.tx.send_msg(
-            &ToWorker::StopClip {
-                clip_id: "k0".into(),
+            &ToWorker::StopRecording {
+                recording_id: "k0".into(),
             },
             &[],
         )
@@ -5140,11 +5166,11 @@ mod tests {
         .unwrap();
         let (reader, writer) = io::pipe().unwrap();
         let writer = OwnedFd::from(writer);
-        h.tx.send_msg(&start_clip("k1"), &[writer.as_fd()])
+        h.tx.send_msg(&start_recording("k1"), &[writer.as_fd()])
             .await
             .unwrap();
         drop(writer);
-        h.tx.send_msg(&start_clip("k2"), &[]).await.unwrap();
+        h.tx.send_msg(&start_recording("k2"), &[]).await.unwrap();
         assert_eq!(
             h.next().await,
             refused("k1"),
@@ -5152,21 +5178,21 @@ mod tests {
         );
         assert_eq!(h.next().await, refused("k2"));
         assert!(drained(reader).is_empty());
-        let windows = logs.lines(Level::DEBUG, "pre-roll window received");
+        let windows = logs.lines(Level::DEBUG, "pre-record window received");
         assert!(windows[0].fields.contains("window_ms=30000"), "{windows:?}");
         assert_eq!(
             logs.count(
                 Level::DEBUG,
-                "stop for a clip this worker does not run; ignored"
+                "stop for a recording this worker does not run; ignored"
             ),
             1
         );
-        let refusals = logs.lines(Level::WARN, "clip refused");
+        let refusals = logs.lines(Level::WARN, "recording refused");
         assert_eq!(refusals.len(), 2, "{refusals:?}");
         assert!(
-            refusals
-                .iter()
-                .all(|line| line.fields.contains("why=\"this worker runs no clips\"")),
+            refusals.iter().all(|line| line
+                .fields
+                .contains("why=\"this worker runs no recordings\"")),
             "{refusals:?}"
         );
         h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
@@ -5178,18 +5204,18 @@ mod tests {
         );
     }
 
-    /// WRK-20 for a clip: its pipe arrives while the worker's descriptor
-    /// table is full, so the kernel discards it. That costs the one clip,
+    /// WRK-20 for a recording: its pipe arrives while the worker's descriptor
+    /// table is full, so the kernel discards it. That costs the one recording,
     /// refused as one without a pipe, never the worker.
     #[tokio::test]
-    async fn a_clip_whose_pipe_found_no_free_descriptor_is_refused_and_the_worker_lives() {
+    async fn a_recording_whose_pipe_found_no_free_descriptor_is_refused_and_the_worker_lives() {
         let (logs, _guard) = Logs::capture();
         let mut h = start();
         h.next().await;
         let (reader, writer) = io::pipe().unwrap();
         let writer = OwnedFd::from(writer);
         let limit = starve_descriptors();
-        h.tx.send_msg(&start_clip("k1"), &[writer.as_fd()])
+        h.tx.send_msg(&start_recording("k1"), &[writer.as_fd()])
             .await
             .unwrap();
         // Closed only once the worker received: closed before, its number
@@ -5202,7 +5228,7 @@ mod tests {
         assert_eq!(
             logs.count(
                 Level::WARN,
-                "clip arrived without its pipe: no free descriptor"
+                "recording arrived without its pipe: no free descriptor"
             ),
             1
         );
@@ -5215,10 +5241,10 @@ mod tests {
         );
     }
 
-    /// A track's pre-roll ring reaches its wire counters, the held window
+    /// A track's pre-record ring reaches its wire counters, the held window
     /// in milliseconds; a track without a window reports none.
     #[test]
-    fn a_track_s_pre_roll_ring_reaches_its_counters() {
+    fn a_track_s_pre_record_ring_reaches_its_counters() {
         let clock = FakeClock::default();
         let t0 = clock.now();
         let track = Track::new(
@@ -5232,8 +5258,8 @@ mod tests {
             TrackLimits::default(),
             t0,
         );
-        assert_eq!(track_stats(&track).preroll, None);
-        track.set_preroll(Some(Duration::from_secs(30)));
+        assert_eq!(track_stats(&track).prerecord, None);
+        track.set_prerecord(Some(Duration::from_secs(30)));
         for n in 0..3_u32 {
             let at = t0 + Duration::from_millis(u64::from(n) * 1_500);
             assert!(track.publish_frame(lotse_core::media::MediaFrame {
@@ -5246,8 +5272,8 @@ mod tests {
                 payload: vec![0, 0, 0, 1, 0x65, 0x88].into(),
             }));
         }
-        let ring = track_stats(&track).preroll.unwrap();
-        let core = track.stats().preroll.unwrap();
+        let ring = track_stats(&track).prerecord.unwrap();
+        let core = track.stats().prerecord.unwrap();
         assert_eq!(
             (ring.bytes, ring.held_ms, ring.truncations),
             (core.bytes, 3_000, 0)
@@ -5255,8 +5281,8 @@ mod tests {
         assert!(ring.bytes > 0);
     }
 
-    /// The fake source, the fake output and the fake clip container.
-    fn clip_registries() -> Arc<Registries> {
+    /// The fake source, the fake output and the fake recording container.
+    fn recording_registries() -> Arc<Registries> {
         let mut registries = Registries::default();
         registries
             .sources
@@ -5266,94 +5292,95 @@ mod tests {
             .outputs
             .register(Arc::new(FakeOutputFactory("webrtc")))
             .unwrap();
-        registries.clip = Some(Arc::new(FakeClipMuxerFactory::default()));
+        registries.recording = Some(Arc::new(FakeRecordingMuxerFactory::default()));
         Arc::new(registries)
     }
 
-    /// A clip's pipe: the reader's end, and the write end to pass.
-    fn clip_pipe() -> (tokio::net::unix::pipe::Receiver, OwnedFd) {
+    /// A recording's pipe: the reader's end, and the write end to pass.
+    fn recording_pipe() -> (tokio::net::unix::pipe::Receiver, OwnedFd) {
         let (reader, writer) = io::pipe().unwrap();
         let reader =
             tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(reader)).unwrap();
         (reader, OwnedFd::from(writer))
     }
 
-    /// Everything the clip wrote, once its pipe closed.
-    async fn clip_bytes(mut reader: tokio::net::unix::pipe::Receiver) -> Vec<u8> {
+    /// Everything the recording wrote, once its pipe closed.
+    async fn recording_bytes(mut reader: tokio::net::unix::pipe::Receiver) -> Vec<u8> {
         use tokio::io::AsyncReadExt as _;
         let mut bytes = Vec::new();
         within(reader.read_to_end(&mut bytes)).await.unwrap();
         bytes
     }
 
-    /// `clip_id`'s report among `seen` that `want` picks.
-    fn clip_report<'a>(
+    /// `recording_id`'s report among `seen` that `want` picks.
+    fn recording_report<'a>(
         seen: &'a [ToSupervisor],
-        clip_id: &str,
-        want: fn(&ClipReport) -> bool,
-    ) -> Option<&'a ClipReport> {
+        recording_id: &str,
+        want: fn(&RecordingReport) -> bool,
+    ) -> Option<&'a RecordingReport> {
         seen.iter().find_map(|message| match message {
-            ToSupervisor::Clip { clip_id: id, event } if id == clip_id && want(event) => {
-                Some(event)
-            }
+            ToSupervisor::Recording {
+                recording_id: id,
+                event,
+            } if id == recording_id && want(event) => Some(event),
             _ => None,
         })
     }
 
-    fn is_started(report: &ClipReport) -> bool {
-        matches!(report, ClipReport::Started { .. })
+    fn is_started(report: &RecordingReport) -> bool {
+        matches!(report, RecordingReport::Started { .. })
     }
 
-    fn is_stopped(report: &ClipReport) -> bool {
-        matches!(report, ClipReport::Stopped { .. })
+    fn is_closed(report: &RecordingReport) -> bool {
+        matches!(report, RecordingReport::Closed { .. })
     }
 
-    /// The reason of `clip_id`'s `Stopped` among `seen`.
-    fn stop_reason(seen: &[ToSupervisor], clip_id: &str) -> Option<String> {
+    /// The reason of `recording_id`'s `Closed` among `seen`.
+    fn stop_reason(seen: &[ToSupervisor], recording_id: &str) -> Option<String> {
         seen.iter().find_map(|message| match message {
-            ToSupervisor::Clip {
-                clip_id: id,
-                event: ClipReport::Stopped { reason, .. },
-            } if id == clip_id => Some(reason.clone()),
+            ToSupervisor::Recording {
+                recording_id: id,
+                event: RecordingReport::Closed { reason, .. },
+            } if id == recording_id => Some(reason.clone()),
             _ => None,
         })
     }
 
-    /// The pre-roll ring of `v0` in a stats push.
-    fn video_preroll(stats: &WorkerStats) -> Option<PrerollStats> {
+    /// The pre-record ring of `v0` in a stats push.
+    fn video_prerecord(stats: &WorkerStats) -> Option<PrerecordStats> {
         stats
             .tracks
             .iter()
             .find(|(id, _)| id == "v0")
-            .and_then(|(_, track)| track.preroll)
+            .and_then(|(_, track)| track.prerecord)
     }
 
-    /// A worker with a clip container refuses a clip before any source
+    /// A worker with a recording container refuses a recording before any source
     /// (`source_not_live`), one without a pipe, one whose descriptor is no
-    /// pipe and one past `max_clips`, each with its pipe closed; a second
-    /// start under a running clip's id is dropped with its pipe and no
-    /// report, which would be the running clip's. The running clip
-    /// reports through the worker and ends `stopped` on `StopClip`.
+    /// pipe and one past `max_recordings`, each with its pipe closed; a second
+    /// start under a running recording's id is dropped with its pipe and no
+    /// report, which would be the running recording's. The running recording
+    /// reports through the worker and ends `stopped` on `StopRecording`.
     #[tokio::test]
-    async fn clips_are_refused_without_a_source_a_pipe_or_room_and_a_running_one_reports() {
+    async fn recordings_are_refused_without_a_source_a_pipe_or_room_and_a_running_one_reports() {
         let (logs, _guard) = Logs::capture();
         let mut settings = quiet_settings();
-        settings.clip.max_clips = 1;
-        let mut h = start_with_settings(clip_registries(), settings);
+        settings.recording.max_recordings = 1;
+        let mut h = start_with_settings(recording_registries(), settings);
         h.next().await;
-        let (reader, writer) = clip_pipe();
-        h.tx.send_msg(&start_clip("k1"), &[writer.as_fd()])
+        let (reader, writer) = recording_pipe();
+        h.tx.send_msg(&start_recording("k1"), &[writer.as_fd()])
             .await
             .unwrap();
         drop(writer);
         let_assert!(
-            ToSupervisor::Clip {
-                event: ClipReport::Stopped { reason, .. },
+            ToSupervisor::Recording {
+                event: RecordingReport::Closed { reason, .. },
                 ..
             } = h.next().await
         );
         assert_eq!(reason, "source_not_live");
-        assert!(clip_bytes(reader).await.is_empty());
+        assert!(recording_bytes(reader).await.is_empty());
         h.tx.send_msg(
             &ToWorker::RunSource(spec("fake://cam/", r#"{"keyframes_every_ms": 100}"#)),
             &[],
@@ -5361,26 +5388,26 @@ mod tests {
         .await
         .unwrap();
         until_live(&mut h).await;
-        h.tx.send_msg(&start_clip("k2"), &[]).await.unwrap();
+        h.tx.send_msg(&start_recording("k2"), &[]).await.unwrap();
         assert_eq!(h.next().await, refused("k2"));
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        h.tx.send_msg(&start_clip("k3"), &[socket.as_fd()])
+        h.tx.send_msg(&start_recording("k3"), &[socket.as_fd()])
             .await
             .unwrap();
         assert_eq!(h.next().await, refused("k3"));
         let (reader, seen) = run_k4_beside_k5(&mut h).await;
         assert_eq!(
-            clip_report(&seen, "k4", is_started),
-            Some(&ClipReport::Started {
-                before_ms: 0,
+            recording_report(&seen, "k4", is_started),
+            Some(&RecordingReport::Started {
+                prerecord_ms: 0,
                 video: "h264".into(),
                 picture: None,
                 audio: None,
             })
         );
         h.tx.send_msg(
-            &ToWorker::StopClip {
-                clip_id: "k4".into(),
+            &ToWorker::StopRecording {
+                recording_id: "k4".into(),
             },
             &[],
         )
@@ -5388,19 +5415,19 @@ mod tests {
         .unwrap();
         let seen = messages_until(&mut h, |seen| stop_reason(seen, "k4").is_some()).await;
         assert_eq!(stop_reason(&seen, "k4").unwrap(), "stopped");
-        let bytes = clip_bytes(reader).await;
+        let bytes = recording_bytes(reader).await;
         assert!(bytes.starts_with(b"init video=h264\n"), "{bytes:?}");
         assert!(bytes.ends_with(b"end\n"), "{bytes:?}");
         let whys: Vec<String> = logs
-            .lines(Level::WARN, "clip refused")
+            .lines(Level::WARN, "recording refused")
             .into_iter()
             .map(|line| line.fields)
             .collect();
         for why in [
             "the worker runs no source",
-            "the clip came without its pipe",
-            "the clip's descriptor is no pipe",
-            "the worker runs as many clips as it may",
+            "the recording came without its pipe",
+            "the recording's descriptor is no pipe",
+            "the worker runs as many recordings as it may",
         ] {
             assert!(
                 whys.iter().any(|fields| fields.contains(why)),
@@ -5410,58 +5437,58 @@ mod tests {
         assert_eq!(
             logs.count(
                 Level::WARN,
-                "clip id already runs; the second start is dropped"
+                "recording id already runs; the second start is dropped"
             ),
             1
         );
-        // Over, the clip is gone from the worker: a stop for it is ignored.
+        // Over, the recording is gone from the worker: a stop for it is ignored.
         stop_and_shut_down(h, "k4").await;
         assert_eq!(
             logs.count(
                 Level::DEBUG,
-                "stop for a clip this worker does not run; ignored"
+                "stop for a recording this worker does not run; ignored"
             ),
             1
         );
     }
 
-    /// Starts clip `k4`, a second `k4` that is dropped and `k5`, which
-    /// `max_clips` 1 refuses, both with their pipes closed; `k4`'s
+    /// Starts recording `k4`, a second `k4` that is dropped and `k5`, which
+    /// `max_recordings` 1 refuses, both with their pipes closed; `k4`'s
     /// reader's end and what the worker sent until it started.
     async fn run_k4_beside_k5(
         h: &mut Harness,
     ) -> (tokio::net::unix::pipe::Receiver, Vec<ToSupervisor>) {
-        let (reader, writer) = clip_pipe();
-        h.tx.send_msg(&start_clip("k4"), &[writer.as_fd()])
+        let (reader, writer) = recording_pipe();
+        h.tx.send_msg(&start_recording("k4"), &[writer.as_fd()])
             .await
             .unwrap();
         drop(writer);
-        let (second, writer) = clip_pipe();
-        h.tx.send_msg(&start_clip("k4"), &[writer.as_fd()])
+        let (second, writer) = recording_pipe();
+        h.tx.send_msg(&start_recording("k4"), &[writer.as_fd()])
             .await
             .unwrap();
         drop(writer);
-        let (fifth, writer) = clip_pipe();
-        h.tx.send_msg(&start_clip("k5"), &[writer.as_fd()])
+        let (fifth, writer) = recording_pipe();
+        h.tx.send_msg(&start_recording("k5"), &[writer.as_fd()])
             .await
             .unwrap();
         drop(writer);
         let seen = messages_until(h, |seen| {
-            clip_report(seen, "k4", is_started).is_some()
-                && clip_report(seen, "k5", is_stopped).is_some()
+            recording_report(seen, "k4", is_started).is_some()
+                && recording_report(seen, "k5", is_closed).is_some()
         })
         .await;
         assert!(seen.contains(&refused("k5")), "{seen:?}");
-        assert!(clip_bytes(second).await.is_empty());
-        assert!(clip_bytes(fifth).await.is_empty());
+        assert!(recording_bytes(second).await.is_empty());
+        assert!(recording_bytes(fifth).await.is_empty());
         (reader, seen)
     }
 
-    /// Stops `clip_id`, then the worker, which ends `Shutdown`.
-    async fn stop_and_shut_down(mut h: Harness, clip_id: &str) {
+    /// Stops `recording_id`, then the worker, which ends `Shutdown`.
+    async fn stop_and_shut_down(mut h: Harness, recording_id: &str) {
         h.tx.send_msg(
-            &ToWorker::StopClip {
-                clip_id: clip_id.into(),
+            &ToWorker::StopRecording {
+                recording_id: recording_id.into(),
             },
             &[],
         )
@@ -5478,46 +5505,49 @@ mod tests {
         );
     }
 
-    /// The source's `preroll_ms` gives its tracks the window once they are
-    /// live (`Live`: no `Stable` comes within the test), so a clip starts in
-    /// the ring, `before_ms` back as far as it holds; `Preroll { ms: 0 }`
+    /// The source's `prerecord_ms` gives its tracks the window once they are
+    /// live (`Live`: no `Stable` comes within the test), so a recording starts in
+    /// the ring, `prerecord_ms` back as far as it holds; `Prerecord { ms: 0 }`
     /// frees the ring at once, without a reconnect; the daemon's shutdown
-    /// ends the clip `shutting_down`, its report before the source's last.
+    /// ends the recording `shutting_down`, its report before the source's last.
     #[tokio::test]
-    async fn the_window_fills_the_ring_a_clip_starts_in_and_a_shutdown_ends_it() {
+    async fn the_window_fills_the_ring_a_recording_starts_in_and_a_shutdown_ends_it() {
         let mut settings = quiet_settings();
         settings.runner.stable_after = Duration::from_hours(24 * 365);
-        let mut h = start_with_settings(clip_registries(), settings);
+        let mut h = start_with_settings(recording_registries(), settings);
         h.next().await;
         let mut source = spec("fake://cam/", r#"{"keyframes_every_ms": 100}"#);
-        source.preroll_ms = 30_000;
+        source.prerecord_ms = 30_000;
         h.tx.send_msg(&ToWorker::RunSource(source), &[])
             .await
             .unwrap();
         until_live(&mut h).await;
         messages_until(&mut h, |seen| {
             seen.iter().any(|message| {
-                matches!(message, ToSupervisor::Stats(stats) if video_preroll(stats).is_some_and(|ring| ring.held_ms >= 1_000))
+                matches!(message, ToSupervisor::Stats(stats) if video_prerecord(stats).is_some_and(|ring| ring.held_ms >= 1_000))
             })
         })
         .await;
-        let (reader, writer) = clip_pipe();
-        h.tx.send_msg(&start_clip("k1"), &[writer.as_fd()])
+        let (reader, writer) = recording_pipe();
+        h.tx.send_msg(&start_recording("k1"), &[writer.as_fd()])
             .await
             .unwrap();
         drop(writer);
-        let seen =
-            messages_until(&mut h, |seen| clip_report(seen, "k1", is_started).is_some()).await;
+        let seen = messages_until(&mut h, |seen| {
+            recording_report(seen, "k1", is_started).is_some()
+        })
+        .await;
         let_assert!(
-            Some(ClipReport::Started { before_ms, .. }) = clip_report(&seen, "k1", is_started)
+            Some(RecordingReport::Started { prerecord_ms, .. }) =
+                recording_report(&seen, "k1", is_started)
         );
-        assert!(*before_ms >= 1_000, "{seen:?}");
-        h.tx.send_msg(&ToWorker::Preroll { ms: 0 }, &[])
+        assert!(*prerecord_ms >= 1_000, "{seen:?}");
+        h.tx.send_msg(&ToWorker::Prerecord { ms: 0 }, &[])
             .await
             .unwrap();
         let seen = messages_until(&mut h, |seen| {
             seen.iter().any(|message| {
-                matches!(message, ToSupervisor::Stats(stats) if video_preroll(stats).is_none())
+                matches!(message, ToSupervisor::Stats(stats) if video_prerecord(stats).is_none())
             })
         })
         .await;
@@ -5532,30 +5562,30 @@ mod tests {
         let stopped = ToSupervisor::SourceState(SourceState::Stopped);
         let seen = messages_until(&mut h, |seen| seen.contains(&stopped)).await;
         assert_eq!(stop_reason(&seen, "k1").unwrap(), "shutting_down");
-        let clip = seen.iter().position(|message| {
-            clip_report(std::slice::from_ref(message), "k1", is_stopped).is_some()
+        let recording = seen.iter().position(|message| {
+            recording_report(std::slice::from_ref(message), "k1", is_closed).is_some()
         });
-        assert!(clip < seen.iter().position(|message| *message == stopped));
+        assert!(recording < seen.iter().position(|message| *message == stopped));
         assert_eq!(
             ended(h.worker).await.unwrap().unwrap(),
             ExitReason::Shutdown
         );
-        let bytes = clip_bytes(reader).await;
+        let bytes = recording_bytes(reader).await;
         let frames = bytes
             .windows(b"frame v".len())
             .filter(|window| *window == b"frame v")
             .count();
-        assert!(frames > 10, "the pre-roll's keyframes: {frames}");
+        assert!(frames > 10, "the pre-record's keyframes: {frames}");
         assert!(bytes.ends_with(b"end\n"), "{bytes:?}");
     }
 
-    /// A switch to another source ends a running clip `stream_changed` (another
-    /// source is another stream), and the standby's `preroll_ms` is the
+    /// A switch to another source ends a running recording `stream_changed` (another
+    /// source is another stream), and the standby's `prerecord_ms` is the
     /// connection's window from then on.
     #[tokio::test]
-    async fn a_switch_to_another_source_ends_the_clips_stream_changed() {
+    async fn a_switch_to_another_source_ends_the_recordings_stream_changed() {
         let (logs, _guard) = Logs::capture();
-        let mut h = start_with_settings(clip_registries(), quiet_settings());
+        let mut h = start_with_settings(recording_registries(), quiet_settings());
         h.next().await;
         h.tx.send_msg(
             &ToWorker::RunSource(spec("fake://cam/", r#"{"keyframes_every_ms": 10}"#)),
@@ -5564,18 +5594,21 @@ mod tests {
         .await
         .unwrap();
         until_live(&mut h).await;
-        let (reader, writer) = clip_pipe();
-        h.tx.send_msg(&start_clip("k1"), &[writer.as_fd()])
+        let (reader, writer) = recording_pipe();
+        h.tx.send_msg(&start_recording("k1"), &[writer.as_fd()])
             .await
             .unwrap();
         drop(writer);
-        messages_until(&mut h, |seen| clip_report(seen, "k1", is_started).is_some()).await;
+        messages_until(&mut h, |seen| {
+            recording_report(seen, "k1", is_started).is_some()
+        })
+        .await;
         let mut standby = spec("fake://cam2/", r#"{"keyframes_every_ms": 10}"#);
-        standby.preroll_ms = 5_000;
+        standby.prerecord_ms = 5_000;
         h.tx.send_msg(&ToWorker::SwitchSource(standby), &[])
             .await
             .unwrap();
-        // The clip ends at the switch itself, before or after the worker
+        // The recording ends at the switch itself, before or after the worker
         // hears of it.
         let seen = messages_until(&mut h, |seen| {
             stop_reason(seen, "k1").is_some() && seen.contains(&ToSupervisor::Switched)
@@ -5589,10 +5622,10 @@ mod tests {
             ),
             1
         );
-        assert!(clip_bytes(reader).await.ends_with(b"end\n"));
+        assert!(recording_bytes(reader).await.ends_with(b"end\n"));
         messages_until(&mut h, |seen| {
             seen.iter().any(|message| {
-                matches!(message, ToSupervisor::Stats(stats) if video_preroll(stats).is_some())
+                matches!(message, ToSupervisor::Stats(stats) if video_prerecord(stats).is_some())
             })
         })
         .await;
@@ -5605,19 +5638,19 @@ mod tests {
         );
     }
 
-    /// A clip the worker starts after the tracks switched but before it
+    /// A recording the worker starts after the tracks switched but before it
     /// hears of the switch runs on: it subscribes to the new source alone,
-    /// the ring cleared at the switch, and the switch leaves the clips
+    /// the ring cleared at the switch, and the switch leaves the recordings
     /// alone, each running one having ended at the switch in its own
-    /// stream. Regression: the worker ended every clip `stream_changed`
+    /// stream. Regression: the worker ended every recording `stream_changed`
     /// when it heard of the switch, this one included.
     #[tokio::test]
-    async fn a_clip_started_between_a_switch_and_the_worker_hearing_of_it_runs_on() {
+    async fn a_recording_started_between_a_switch_and_the_worker_hearing_of_it_runs_on() {
         let settings = settings();
         let (mut serving, _rx) = serving(&settings);
-        serving.registries = clip_registries();
-        let (clip_tx, mut clip_rx) = mpsc::channel(16);
-        serving.clips = Clips::new(clip_tx);
+        serving.registries = recording_registries();
+        let (recording_tx, mut recording_rx) = mpsc::channel(16);
+        serving.recordings = Recordings::new(recording_tx);
         serving.on_run_source(&spec("fake://cam/", "null")).unwrap();
         let staging = TrackSet::staging(serving.running.as_ref().unwrap().tracks.tracks());
         let runner = start_runner(
@@ -5633,13 +5666,13 @@ mod tests {
         )
         .unwrap();
         serving.standby = Some(Standby { runner, staging });
-        let (_reader, writer) = clip_pipe();
+        let (_reader, writer) = recording_pipe();
         serving
-            .on_start_clip(
-                ClipSpec {
-                    clip_id: "k1".into(),
-                    before_ms: 0,
-                    after_ms: None,
+            .on_start_recording(
+                RecordingSpec {
+                    recording_id: "k1".into(),
+                    prerecord_ms: 0,
+                    duration_ms: 600_000,
                     audio: false,
                 },
                 vec![writer],
@@ -5651,17 +5684,17 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(serving.standby.is_none(), "the switch went through");
-        assert!(serving.clips.runs("k1"));
-        let report = clip_rx.try_recv();
-        assert!(report.is_err(), "the clip runs on: {report:?}");
-        serving.clips.abort_all();
+        assert!(serving.recordings.runs("k1"));
+        let report = recording_rx.try_recv();
+        assert!(report.is_err(), "the recording runs on: {report:?}");
+        serving.recordings.abort_all();
     }
 
-    /// A supervisor that goes away takes the clips with it: each is
+    /// A supervisor that goes away takes the recordings with it: each is
     /// aborted, its pipe closed without the last fragment.
     #[tokio::test]
-    async fn the_supervisor_gone_aborts_the_clips() {
-        let mut h = start_with_settings(clip_registries(), quiet_settings());
+    async fn the_supervisor_gone_aborts_the_recordings() {
+        let mut h = start_with_settings(recording_registries(), quiet_settings());
         h.next().await;
         h.tx.send_msg(
             &ToWorker::RunSource(spec("fake://cam/", r#"{"keyframes_every_ms": 100}"#)),
@@ -5670,57 +5703,62 @@ mod tests {
         .await
         .unwrap();
         until_live(&mut h).await;
-        let (reader, writer) = clip_pipe();
-        h.tx.send_msg(&start_clip("k1"), &[writer.as_fd()])
+        let (reader, writer) = recording_pipe();
+        h.tx.send_msg(&start_recording("k1"), &[writer.as_fd()])
             .await
             .unwrap();
         drop(writer);
-        messages_until(&mut h, |seen| clip_report(seen, "k1", is_started).is_some()).await;
+        messages_until(&mut h, |seen| {
+            recording_report(seen, "k1", is_started).is_some()
+        })
+        .await;
         drop(h.tx);
         drop(h.rx);
         assert_eq!(
             ended(h.worker).await.unwrap().unwrap(),
             ExitReason::SupervisorGone
         );
-        let bytes = clip_bytes(reader).await;
+        let bytes = recording_bytes(reader).await;
         assert!(bytes.starts_with(b"init video=h264\n"), "{bytes:?}");
         assert!(!bytes.ends_with(b"end\n"), "{bytes:?}");
     }
 
-    /// The shutdown passes the clips' reports on while it waits for them:
+    /// The shutdown passes the recordings' reports on while it waits for them:
     /// a full report channel (here one slot, filled by a report the loop
-    /// had not passed on yet) never blocks a clip's `Stopped` until its
+    /// had not passed on yet) never blocks a recording's `Closed` until its
     /// grace runs out. Regression: the shutdown took no report while it
-    /// waited, so the clip waited for room until it was aborted, its
-    /// `Stopped` lost.
+    /// waited, so the recording waited for room until it was aborted, its
+    /// `Closed` lost.
     #[tokio::test]
-    async fn a_shutdown_passes_the_clips_reports_on_while_it_waits_for_them() {
+    async fn a_shutdown_passes_the_recordings_reports_on_while_it_waits_for_them() {
         let (logs, _guard) = Logs::capture();
         let settings = settings();
         let (mut serving, mut rx) = serving(&settings);
         let clock = Arc::new(FakeClock::default());
         serving.clock = clock.clone();
-        let (clip_tx, clip_rx) = mpsc::channel(1);
-        let queued = ClipReport::Warning {
+        let (recording_tx, recording_rx) = mpsc::channel(1);
+        let queued = RecordingReport::Warning {
             code: "audio_omitted".into(),
             message: "queued before the shutdown".into(),
         };
-        clip_tx.try_send(("k0".into(), queued.clone())).unwrap();
-        serving.clips = Clips::new(clip_tx);
-        serving.clip_rx = clip_rx;
-        let (reader, writer) = clip_pipe();
-        serving.clips.start(ClipStart {
-            spec: ClipSpec {
-                clip_id: "k1".into(),
-                before_ms: 0,
-                after_ms: None,
+        recording_tx
+            .try_send(("k0".into(), queued.clone()))
+            .unwrap();
+        serving.recordings = Recordings::new(recording_tx);
+        serving.recording_rx = recording_rx;
+        let (reader, writer) = recording_pipe();
+        serving.recordings.start(RecordingStart {
+            spec: RecordingSpec {
+                recording_id: "k1".into(),
+                prerecord_ms: 0,
+                duration_ms: 600_000,
                 audio: false,
             },
             pipe: tokio::net::unix::pipe::Sender::from_owned_fd(writer).unwrap(),
-            // Never ready: the clip waits for its tracks.
+            // Never ready: the recording waits for its tracks.
             tracks: TrackSet::new(TrackLimits::default(), clock.now()),
-            factory: Arc::new(FakeClipMuxerFactory::default()),
-            settings: ClipSettings::default(),
+            factory: Arc::new(FakeRecordingMuxerFactory::default()),
+            settings: RecordingSettings::default(),
             clock: clock.clone(),
             transcode: ToOpus::new,
         });
@@ -5728,7 +5766,7 @@ mod tests {
             for _ in 0..64 {
                 tokio::task::yield_now().await;
             }
-            // Past the shutdown's grace: a clip still waiting is aborted.
+            // Past the shutdown's grace: a recording still waiting is aborted.
             clock.advance(Duration::from_secs(2));
         });
         assert_eq!(exit.unwrap(), ExitReason::Shutdown);
@@ -5745,13 +5783,13 @@ mod tests {
         assert_eq!(
             seen,
             [
-                ToSupervisor::Clip {
-                    clip_id: "k0".into(),
+                ToSupervisor::Recording {
+                    recording_id: "k0".into(),
                     event: queued,
                 },
-                ToSupervisor::Clip {
-                    clip_id: "k1".into(),
-                    event: ClipReport::Stopped {
+                ToSupervisor::Recording {
+                    recording_id: "k1".into(),
+                    event: RecordingReport::Closed {
                         reason: "shutting_down".into(),
                         bytes: 0,
                         duration_ms: 0,
@@ -5761,28 +5799,31 @@ mod tests {
             ]
         );
         assert_eq!(
-            logs.count(Level::WARN, "clip still finishing at shutdown; aborted"),
+            logs.count(
+                Level::WARN,
+                "recording still finishing at shutdown; aborted"
+            ),
             0
         );
-        assert!(clip_bytes(reader).await.is_empty());
+        assert!(recording_bytes(reader).await.is_empty());
     }
 
-    /// A clip whose reader stalls ends by the shutdown's deadline, aborted
+    /// A recording whose reader stalls ends by the shutdown's deadline, aborted
     /// then, and its wait runs beside the sources' teardown rather than
     /// ahead of it, so the worker is done within the deadline the
-    /// supervisor kills it at. Regression: the clips had their whole grace
+    /// supervisor kills it at. Regression: the recordings had their whole grace
     /// (1.5 s) first, whatever the deadline, and the source its whole
     /// deadline after it.
     #[tokio::test]
-    async fn a_shutdown_ends_a_stalled_clip_by_its_deadline() {
+    async fn a_shutdown_ends_a_stalled_recording_by_its_deadline() {
         let (logs, _guard) = Logs::capture();
         let settings = settings();
         let (mut serving, _rx) = serving(&settings);
         let clock = Arc::new(FakeClock::default());
         serving.clock = clock.clone();
-        let (clip_tx, clip_rx) = mpsc::channel(16);
-        serving.clips = Clips::new(clip_tx);
-        serving.clip_rx = clip_rx;
+        let (recording_tx, recording_rx) = mpsc::channel(16);
+        serving.recordings = Recordings::new(recording_tx);
+        serving.recording_rx = recording_rx;
         let tracks = TrackSet::new(TrackLimits::default(), clock.now());
         let mut publisher = tracks.publisher();
         let video = publisher.declare(
@@ -5795,18 +5836,18 @@ mod tests {
             90_000,
         );
         publisher.ready();
-        let (_reader, writer) = clip_pipe();
-        serving.clips.start(ClipStart {
-            spec: ClipSpec {
-                clip_id: "k1".into(),
-                before_ms: 0,
-                after_ms: None,
+        let (_reader, writer) = recording_pipe();
+        serving.recordings.start(RecordingStart {
+            spec: RecordingSpec {
+                recording_id: "k1".into(),
+                prerecord_ms: 0,
+                duration_ms: 600_000,
                 audio: false,
             },
             pipe: tokio::net::unix::pipe::Sender::from_owned_fd(writer).unwrap(),
             tracks,
-            factory: Arc::new(FakeClipMuxerFactory::default()),
-            settings: ClipSettings::default(),
+            factory: Arc::new(FakeRecordingMuxerFactory::default()),
+            settings: RecordingSettings::default(),
             clock: clock.clone(),
             transcode: ToOpus::new,
         });
@@ -5837,7 +5878,10 @@ mod tests {
         })
         .await;
         assert_eq!(exit.unwrap(), ExitReason::Shutdown);
-        let aborted = logs.lines(Level::WARN, "clip still finishing at shutdown; aborted");
+        let aborted = logs.lines(
+            Level::WARN,
+            "recording still finishing at shutdown; aborted",
+        );
         assert_eq!(aborted.len(), 1);
         assert!(aborted[0].fields.contains("grace_ms=500"), "{aborted:?}");
     }

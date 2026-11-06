@@ -15,8 +15,8 @@ exclude_re = [
     "replace Handler::unsubscribed -> Option<Event> with None",
     # The default body already returns an empty list.
     "replace OutputFactory::session_tracks -> Vec<TrackRequest> with vec!\\[\\]",
-    # The clip takes the later of it and the media times it saw, the default's value.
-    "replace ClipMuxer::media_end -> Duration with Default::default\\(\\)",
+    # The recording takes the later of it and the media times it saw, the default's value.
+    "replace RecordingMuxer::media_end -> Duration with Default::default\\(\\)",
     # The arms only pick the log level; the fallback arm logs the same event at debug.
     "delete match arm SessionEvent::(Answer|State|Warning)\\{.*\\} in State::deliver_session",
     # The shifted-in low byte is zero, so `|` and `^` produce the same value.
@@ -77,11 +77,11 @@ exclude_re = [
     "g711.rs:.*replace \\| with \\^ in (mu|a)_encode$",
     # A re-anchor that is no restart comes from a frame more than `JITTER_TOLERANCE` (>= 0) off
     # the sample count, so its offset is never 0: `>` and `>=` pick the same log reason.
-    "transcode/clip.rs:\\d+:30: replace > with >= in ToOpus::anchor$",
+    "transcode/recording.rs:\\d+:30: replace > with >= in ToOpus::anchor$",
     # Inside the branch the offset is more than `JITTER_TOLERANCE` (>= 0) either way, so never 0:
     # `offset > 0` and `offset >= 0` pick the same, a hole to fill.
     # (Column 27 is `offset > 0`; the rest of the condition stays mutated.)
-    "transcode/clip.rs:\\d+:27: replace > with >= in ToOpus::push$",
+    "transcode/recording.rs:\\d+:27: replace > with >= in ToOpus::push$",
     # The seconds shifted up 32 bits and the fraction below 2^32 occupy disjoint bits.
     "replace \\| with \\^ in ntp_timestamp",
     # The CVO flip bit and the rotation bits are disjoint, so `|` and `^` produce the same byte.
@@ -115,11 +115,11 @@ exclude_re = [
     "clients.rs:.*replace match guard err == Errno::WOULDBLOCK with true in ClientStore::open$",
     # A directory sync shows only after a crash: skipping it changes nothing a test can see.
     "clients.rs:.*replace fsync_dir -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
-    # `Clip::queue` leaves no empty slice pending, and a write of at least one byte to a pipe
+    # `Recording::queue` leaves no empty slice pending, and a write of at least one byte to a pipe
     # writes at least one or fails (POSIX `write`, Linux `pipe(7)`): `Ok(0)` never comes, so
     # the guard, there so it could not loop forever, picks what `true` and `>=` pick.
-    "clip.rs:.*replace match guard written > 0 with true in Clip::write$",
-    "clip.rs:.*replace > with >= in Clip::write$",
+    "recording.rs:.*replace match guard written > 0 with true in Recording::write$",
+    "recording.rs:.*replace > with >= in Recording::write$",
     # Built only without the RTSP source, and the mutants are tested with every feature on:
     # no test of the run reaches it. (With the source, `retina` returns a `RetinaLog`.)
     "logging.rs:.*replace retina -> L with Default::default\\(\\)$",

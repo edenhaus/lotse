@@ -15,14 +15,14 @@
 //! queue that sheds low-value traffic and disconnects a client that still
 //! overflows it, and a deadline on the closing handshake, so a peer that
 //! stops reading cannot hold a connection or its slot. Beside the upgrade
-//! it serves event clips' bytes, `GET /v0/clips/{clip_id}`, as chunked
-//! response bodies the handler hands over ([`Handler::clip_body`]),
+//! it serves event recordings' bytes, `GET /v0/recording/{recording_id}`, as chunked
+//! response bodies the handler hands over ([`Handler::recording_body`]),
 //! bounded by the client taking them and, over TLS, by its client staying
 //! enrolled.
 //!
 //! Standards: RFC 6455 (WebSocket, close codes §7.4.1, `Origin` §10.2),
 //! RFC 9110 (HTTP), RFC 9112 (HTTP/1.1, the chunked transfer coding §7.1
-//! of a clip's body), RFC 6585 §5 (431 for an oversized request head),
+//! of a recording's body), RFC 6585 §5 (431 for an oversized request head),
 //! unix(7) `SO_PEERCRED`, RFC 8446 (TLS 1.3, in [`tls`]).
 
 use std::future::Future;
@@ -42,7 +42,7 @@ use lotse_api_types::command::Command;
 use lotse_api_types::error::ApiError;
 use lotse_api_types::frame::Hello;
 use lotse_core::clock::Clock;
-use lotse_core::id::ClipId;
+use lotse_core::id::RecordingId;
 use lotse_core::task::{BoxFuture, spawn_named};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -51,19 +51,19 @@ use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 
 mod clients;
-mod clip;
 mod connection;
 pub mod identity;
 mod listener;
 mod outbox;
 pub mod pairing;
+mod recording;
 #[cfg(feature = "test-util")]
 pub mod test_util;
 pub mod tls;
 
 pub use clients::ClientsError;
-pub use clip::{ClipBody, ClipBodyError};
 pub use listener::{BindError, PeerInfo};
+pub use recording::{RecordingBody, RecordingBodyError};
 pub use tls::TlsConfig;
 
 /// The largest inbound WebSocket message, and so frame: 64 KiB, enough for
@@ -98,10 +98,10 @@ pub const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 /// the Close anyway).
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a clip's response may wait for the client while the socket
+/// How long a recording's response may wait for the client while the socket
 /// refuses it, taking none of it: 10 s, after which the connection is
 /// dropped and the body ends without its last chunk, whether the body
-/// waits for more of the clip meanwhile or not. Every write the socket
+/// waits for more of the recording meanwhile or not. Every write the socket
 /// takes ends the wait, so a client reading at any pace the kernel passes
 /// on keeps the body going (Linux wakes a socket's writer once part of
 /// its send buffer drained, about a quarter for a Unix socket and a third
@@ -115,10 +115,10 @@ pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// client that reads.
 pub const BODY_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// From the end of a clip's bytes to the producer's report of how many it
+/// From the end of a recording's bytes to the producer's report of how many it
 /// wrote: 5 s, after which the body ends without its last chunk. A worker
 /// reports as it closes its pipe.
-pub const CLIP_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const RECORDING_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connections accepted and not yet upgraded, at once: 8. One more is
 /// closed at accept, without a response. A TLS connection takes its place
@@ -171,8 +171,8 @@ pub enum Outcome {
     /// or the client unsubscribes.
     Subscribed(mpsc::Receiver<Event>),
     /// A successful `result` with content, then the events on this
-    /// channel as for [`Outcome::Subscribed`]: `clip/start`'s, whose
-    /// result names the clip and where its bytes are fetched.
+    /// channel as for [`Outcome::Subscribed`]: `recording/create`'s, whose
+    /// result names the recording and where its bytes are fetched.
     SubscribedWith {
         /// The `result`.
         result: serde_json::Value,
@@ -184,7 +184,7 @@ pub enum Outcome {
 /// What the supervisor implements. `ping`, `schema`, `unsubscribe`,
 /// `pairing/create`, `clients/list` and `clients/remove` are answered by
 /// the server itself; everything else goes here, and so do the requests
-/// for clips' bytes.
+/// for recordings' bytes.
 pub trait Handler: Send + Sync + 'static {
     /// The `hello` frame's content.
     fn hello(&self) -> Hello;
@@ -213,16 +213,19 @@ pub trait Handler: Send + Sync + 'static {
         let _ = connection;
     }
 
-    /// `GET /v0/clips/{clip_id}` in HTTP/1.1, from any peer either listener
+    /// `GET /v0/recording/{recording_id}` in HTTP/1.1, from any peer either listener
     /// admits (over TLS, one whose client is still allowed): the bytes of
-    /// clip `clip_id`, handed over once, so a second request
-    /// is [`ClipBodyError::AlreadyFetched`]. The server sends them as the
+    /// recording `recording_id`, handed over once, so a second request
+    /// is [`RecordingBodyError::AlreadyFetched`]. The server sends them as the
     /// response body and ends it whole only when the reader ended and the
-    /// report agrees with what arrived. Never waits. Without clips, every
-    /// id is [`ClipBodyError::NotFound`].
-    fn clip_body(&self, clip_id: &ClipId) -> Result<ClipBody, ClipBodyError> {
-        let _ = clip_id;
-        Err(ClipBodyError::NotFound)
+    /// report agrees with what arrived. Never waits. Without recordings, every
+    /// id is [`RecordingBodyError::NotFound`].
+    fn recording_body(
+        &self,
+        recording_id: &RecordingId,
+    ) -> Result<RecordingBody, RecordingBodyError> {
+        let _ = recording_id;
+        Err(RecordingBodyError::NotFound)
     }
 }
 
@@ -239,7 +242,7 @@ pub struct Config {
     /// Control connections at once.
     pub max_connections: u32,
     /// Open subscriptions per connection (`stream/subscribe`,
-    /// `webrtc/offer`, `session/adopt`, `clip/start`); one more is answered
+    /// `webrtc/offer`, `session/adopt`, `recording/create`); one more is answered
     /// `limit_reached` before the handler sees it. Ended ones do not count.
     pub max_subscriptions: u32,
     /// The mutual-TLS listener, if one is configured.
@@ -344,7 +347,7 @@ impl Server {
 
     /// Serves until `shutdown` is cancelled: then no new connections, the
     /// ones not yet upgraded (or still in their TLS handshake) are closed,
-    /// every upgraded one gets `shutdown` and a `1001` close, a clip body
+    /// every upgraded one gets `shutdown` and a `1001` close, a recording body
     /// still being sent may end, and the call returns once each has
     /// closed, within [`CLOSE_TIMEOUT`], and no
     /// command about the TLS listener's clients is still at the disk: the
@@ -432,7 +435,7 @@ impl Server {
         tracing::info!("control API stopped accepting");
         // The router holds the state, and with it a token, as does every
         // upgraded connection until it has closed and every connection
-        // still sending a clip's body.
+        // still sending a recording's body.
         drop(admission);
         serving.close();
         serving.wait().await;
@@ -455,9 +458,9 @@ struct Admission {
     /// Cancelled on graceful shutdown.
     shutdown: CancellationToken,
     /// Held by every connection's task until it ends, so the server's
-    /// stop waits for a clip body still being sent.
+    /// stop waits for a recording body still being sent.
     serving: TaskTrackerToken,
-    /// The TLS listener's clients, which a connection sending a clip's
+    /// The TLS listener's clients, which a connection sending a recording's
     /// body is registered with; `None` without a listener.
     clients: Option<Arc<clients::ClientStore>>,
     /// The next connection id, shared with the upgraded connections.
@@ -477,10 +480,10 @@ impl Admission {
         let app = Router::new()
             .route(lotse_api_types::WS_PATH, get(connection::upgrade::<H>))
             .route(
-                &format!("{}/{{clip_id}}", lotse_api_types::CLIPS_PATH),
-                get(clip::fetch::<H>)
-                    .head(clip::not_allowed)
-                    .fallback(clip::not_allowed),
+                &format!("{}/{{recording_id}}", lotse_api_types::RECORDING_PATH),
+                get(recording::fetch::<H>)
+                    .head(recording::not_allowed)
+                    .fallback(recording::not_allowed),
             )
             .with_state(state);
         let mut http = http1::Builder::new();
@@ -511,20 +514,21 @@ impl Admission {
         let Some(slot) = upgrade_slot(&self.pending, &peer) else {
             return;
         };
-        let body = clip::BodyWatch::new();
-        let socket = clip::Watched::new(Box::new(stream), body.clone(), Arc::clone(&self.clock));
+        let body = recording::BodyWatch::new();
+        let socket =
+            recording::Watched::new(Box::new(stream), body.clone(), Arc::clone(&self.clock));
         self.serve(socket, body, peer, slot, self.clock.sleep(UPGRADE_TIMEOUT));
     }
 
     /// Serves `stream`, whose peer is `peer`, up to its upgrade, in the
     /// pending `slot` it was given, and closes it at `deadline` if it has
     /// not upgraded by then. Its socket's writes report to `body`: the
-    /// stream is the socket in a [`clip::Watched`], or a TLS session over
+    /// stream is the socket in a [`recording::Watched`], or a TLS session over
     /// one.
     fn serve<S>(
         &self,
         stream: S,
-        body: clip::BodyWatch,
+        body: recording::BodyWatch,
         peer: PeerInfo,
         slot: OwnedSemaphorePermit,
         deadline: BoxFuture<'static, ()>,
@@ -587,26 +591,26 @@ struct Accepted {
     peer: PeerInfo,
     /// Its place among the connections awaiting their upgrade.
     slot: OwnedSemaphorePermit,
-    /// Whether the connection sends a clip's body.
-    body: clip::BodyWatch,
-    /// Times a clip body's waits.
+    /// Whether the connection sends a recording's body.
+    body: recording::BodyWatch,
+    /// Times a recording body's waits.
     clock: Arc<dyn Clock>,
     /// Held until the connection ends.
     serving: TaskTrackerToken,
-    /// The TLS listener's clients, to close a clip body's connection once
+    /// The TLS listener's clients, to close a recording body's connection once
     /// its client is removed.
     clients: Option<Arc<clients::ClientStore>>,
-    /// Numbers the connection once it sends a clip's body.
+    /// Numbers the connection once it sends a recording's body.
     next_id: Arc<AtomicU64>,
 }
 
 /// Drives one connection from accept to the upgrade, after which the
 /// connection task in [`connection`] owns it. Closes it at `deadline` or
 /// on shutdown if it has not upgraded by then, and returns the pending
-/// slot either way. A connection whose response is a clip's body leaves
+/// slot either way. A connection whose response is a recording's body leaves
 /// the slot and the deadline when the body begins, is registered with the
 /// TLS listener's clients as an upgraded connection is, and is driven
-/// until the body ends or its client is removed ([`clip::send_body`]).
+/// until the body ends or its client is removed ([`recording::send_body`]).
 async fn handshake(
     mut connection: BoxFuture<'static, hyper::Result<()>>,
     deadline: BoxFuture<'static, ()>,
@@ -623,7 +627,7 @@ async fn handshake(
         next_id,
     } = accepted;
     let mut sending = body.subscribe();
-    let sends_a_clip = tokio::select! {
+    let sends_a_recording = tokio::select! {
         served = &mut connection => {
             if let Err(err) = served {
                 tracing::debug!(%peer, error = %err, "control connection ended before the upgrade");
@@ -646,14 +650,14 @@ async fn handshake(
             );
             false
         }
-        _ = sending.wait_for(clip::BodyState::is_sending) => true,
+        _ = sending.wait_for(recording::BodyState::is_sending) => true,
     };
-    if sends_a_clip {
+    if sends_a_recording {
         drop(slot);
         // A removal since the route's check cancels the token at once.
         let id = ConnectionId(next_id.fetch_add(1, Ordering::AcqRel));
         let removed = connection::attach(clients.as_deref(), &peer, id);
-        clip::send_body(
+        recording::send_body(
             connection,
             sending,
             clock.as_ref(),
@@ -715,11 +719,11 @@ mod tests {
         assert!(handler.unsubscribed(ConnectionId(1), 2).is_none());
         handler.connection_closed(ConnectionId(1));
         assert_eq!(handler.hello().api, lotse_api_types::API_VERSION);
-        // Without clips, no id has a body.
-        let clip_id = ClipId::new("c1").unwrap();
+        // Without recordings, no id has a body.
+        let recording_id = RecordingId::new("c1").unwrap();
         assert_eq!(
-            handler.clip_body(&clip_id).unwrap_err(),
-            ClipBodyError::NotFound
+            handler.recording_body(&recording_id).unwrap_err(),
+            RecordingBodyError::NotFound
         );
     }
 
@@ -835,11 +839,11 @@ mod tests {
         );
     }
 
-    /// A handler with one clip, whatever its id, whose body it hands out
+    /// A handler with one recording, whatever its id, whose body it hands out
     /// once; it answers commands as [`Minimal`] does.
-    struct OneClip(std::sync::Mutex<Option<ClipBody>>);
+    struct OneRecording(std::sync::Mutex<Option<RecordingBody>>);
 
-    impl Handler for OneClip {
+    impl Handler for OneRecording {
         fn hello(&self) -> Hello {
             Minimal.hello()
         }
@@ -852,10 +856,13 @@ mod tests {
             Minimal.handle(connection, command)
         }
 
-        fn clip_body(&self, clip_id: &ClipId) -> Result<ClipBody, ClipBodyError> {
-            let _ = clip_id;
+        fn recording_body(
+            &self,
+            recording_id: &RecordingId,
+        ) -> Result<RecordingBody, RecordingBodyError> {
+            let _ = recording_id;
             let body = self.0.lock().unwrap().take();
-            body.ok_or(ClipBodyError::AlreadyFetched)
+            body.ok_or(RecordingBodyError::AlreadyFetched)
         }
     }
 
@@ -903,15 +910,15 @@ mod tests {
     /// buffer and a body's 64 KiB chunks.
     const SOCKET_BYTES: usize = 4 * 1024;
 
-    /// The admission both listeners use, for a handler whose one clip is
-    /// `clip`, on `clock`, and its pending upgrades; the admission must
+    /// The admission both listeners use, for a handler whose one recording is
+    /// `recording`, on `clock`, and its pending upgrades; the admission must
     /// outlive the connections it serves.
     async fn admission(
         clock: &Arc<lotse_core::clock::FakeClock>,
-        clip: ClipBody,
+        recording: RecordingBody,
     ) -> (Admission, Arc<Semaphore>) {
         let state = state(1, false);
-        let handler = OneClip(std::sync::Mutex::new(Some(clip)));
+        let handler = OneRecording(std::sync::Mutex::new(Some(recording)));
         assert_eq!(handler.hello(), Minimal.hello());
         let info = lotse_api_types::parse_command(r#"{"id":1,"type":"info"}"#).unwrap();
         assert!(matches!(
@@ -934,14 +941,14 @@ mod tests {
     }
 
     /// One connection over a [`SOCKET_BYTES`] pipe, served through the
-    /// admission both listeners use by a handler whose one clip is
-    /// `clip`, on `clock`; the client's end, and the admission, which
+    /// admission both listeners use by a handler whose one recording is
+    /// `recording`, on `clock`; the client's end, and the admission, which
     /// must outlive the connection.
     async fn served(
         clock: &Arc<lotse_core::clock::FakeClock>,
-        clip: ClipBody,
+        recording: RecordingBody,
     ) -> (tokio::io::DuplexStream, Admission) {
-        let (admission, _pending) = admission(clock, clip).await;
+        let (admission, _pending) = admission(clock, recording).await;
         let (client, server) = tokio::io::duplex(SOCKET_BYTES);
         admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
         (client, admission)
@@ -951,21 +958,21 @@ mod tests {
     /// body is asked for its next chunk only every 12 s or so, while the
     /// socket takes bytes every second.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_clip_body_a_client_drains_slowly_outlives_the_stall_deadline() {
+    async fn a_recording_body_a_client_drains_slowly_outlives_the_stall_deadline() {
         use tokio::io::AsyncWriteExt as _;
 
         let clock = Arc::new(lotse_core::clock::FakeClock::default());
         let (reader, mut producer) = tokio::io::duplex(256 * 1024);
         let (report, written) = tokio::sync::oneshot::channel();
-        let clip = ClipBody {
+        let recording = RecordingBody {
             reader: Box::new(reader),
             written,
         };
-        let (mut client, admission) = served(&clock, clip).await;
-        let clip = vec![7_u8; 128 * 1024];
-        producer.write_all(&clip).await.unwrap();
+        let (mut client, admission) = served(&clock, recording).await;
+        let recording = vec![7_u8; 128 * 1024];
+        producer.write_all(&recording).await.unwrap();
         client
-            .write_all(b"GET /v0/clips/c1 HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .write_all(b"GET /v0/recording/c1 HTTP/1.1\r\nHost: lotse\r\n\r\n")
             .await
             .unwrap();
         settle().await;
@@ -978,9 +985,9 @@ mod tests {
             clock.advance(Duration::from_secs(1));
             settle().await;
         }
-        // Then the clip ends and the client takes the rest at once.
+        // Then the recording ends and the client takes the rest at once.
         drop(producer);
-        report.send(clip.len() as u64).unwrap();
+        report.send(recording.len() as u64).unwrap();
         seen.extend(finish(&mut client).await);
         let head = String::from_utf8_lossy(seen.get(..200).unwrap_or(&seen));
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
@@ -988,32 +995,36 @@ mod tests {
             seen.ends_with(b"\r\n0\r\n\r\n"),
             "ended whole with its last chunk"
         );
-        // The chunks' framing is hex digits and CRLF, never the clip's byte.
+        // The chunks' framing is hex digits and CRLF, never the recording's byte.
         let framing = seen.iter().filter(|byte| **byte != 7).count();
-        assert_eq!(seen.len() - framing, clip.len(), "every byte of the clip");
+        assert_eq!(
+            seen.len() - framing,
+            recording.len(),
+            "every byte of the recording"
+        );
         drop(admission);
     }
 
     /// The client reads nothing, the socket is full and hyper holds the
-    /// rest of the clip's first chunk, which is under its buffer, so the
-    /// body is asked for more while the clip pauses: its producer neither
+    /// rest of the recording's first chunk, which is under its buffer, so the
+    /// body is asked for more while the recording pauses: its producer neither
     /// writes nor ends. The response waits for the client all the same.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_clip_body_a_client_stops_taking_is_dropped_at_the_stall_deadline_while_the_clip_pauses()
+    async fn a_recording_body_a_client_stops_taking_is_dropped_at_the_stall_deadline_while_the_recording_pauses()
      {
         use tokio::io::AsyncWriteExt as _;
 
         let clock = Arc::new(lotse_core::clock::FakeClock::default());
         let (reader, mut producer) = tokio::io::duplex(256 * 1024);
         let (report, written) = tokio::sync::oneshot::channel::<u64>();
-        let clip = ClipBody {
+        let recording = RecordingBody {
             reader: Box::new(reader),
             written,
         };
-        let (mut client, admission) = served(&clock, clip).await;
+        let (mut client, admission) = served(&clock, recording).await;
         producer.write_all(&[7_u8; 2 * SOCKET_BYTES]).await.unwrap();
         client
-            .write_all(b"GET /v0/clips/c1 HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .write_all(b"GET /v0/recording/c1 HTTP/1.1\r\nHost: lotse\r\n\r\n")
             .await
             .unwrap();
         settle().await;
@@ -1065,22 +1076,22 @@ mod tests {
 
     /// One connection over a [`SOCKET_BYTES`] pipe as the TLS listener
     /// serves it, with a session over the socket, by a handler whose one
-    /// clip is `clip`, on `clock`; the client sends `request` and leaves
+    /// recording is `recording`, on `clock`; the client sends `request` and leaves
     /// its session, so the test takes the socket's bytes as they come:
     /// the client's end of the socket, its session, and the admission.
     async fn served_tls(
         clock: &Arc<lotse_core::clock::FakeClock>,
-        clip: ClipBody,
+        recording: RecordingBody,
         request: &[u8],
     ) -> (tokio::io::DuplexStream, rustls::ClientConnection, Admission) {
         use tokio::io::AsyncWriteExt as _;
 
-        let (admission, pending) = admission(clock, clip).await;
+        let (admission, pending) = admission(clock, recording).await;
         let (acceptor, config) = tls_pair();
         let (client, server) = tokio::io::duplex(SOCKET_BYTES);
         // As the TLS listener does: the session over the watched socket.
-        let body = clip::BodyWatch::new();
-        let server = clip::Watched::new(
+        let body = recording::BodyWatch::new();
+        let server = recording::Watched::new(
             Box::new(server),
             body.clone(),
             Arc::<lotse_core::clock::FakeClock>::clone(clock),
@@ -1121,16 +1132,16 @@ mod tests {
         }
     }
 
-    /// The clip request every TLS test sends.
-    const GET_C1: &[u8] = b"GET /v0/clips/c1 HTTP/1.1\r\nHost: lotse\r\n\r\n";
+    /// The recording request every TLS test sends.
+    const GET_C1: &[u8] = b"GET /v0/recording/c1 HTTP/1.1\r\nHost: lotse\r\n\r\n";
 
-    /// The client reads nothing. The clip is whole and small: hyper hands
+    /// The client reads nothing. The recording is whole and small: hyper hands
     /// the whole response, its last chunk included, to the session, which
     /// takes it into its own buffer; the socket takes 4 KiB of the records
     /// and refuses the rest. Nothing is written after that, the session
     /// only flushes, and the response waits for the client all the same.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_tls_clip_body_a_client_stops_taking_is_dropped_at_the_stall_deadline_once_the_session_holds_its_end()
+    async fn a_tls_recording_body_a_client_stops_taking_is_dropped_at_the_stall_deadline_once_the_session_holds_its_end()
      {
         use tokio::io::AsyncWriteExt as _;
 
@@ -1138,17 +1149,20 @@ mod tests {
         let clock = Arc::new(lotse_core::clock::FakeClock::default());
         let (reader, mut producer) = tokio::io::duplex(256 * 1024);
         let (report, written) = tokio::sync::oneshot::channel();
-        let clip = ClipBody {
+        let recording = RecordingBody {
             reader: Box::new(reader),
             written,
         };
-        let clip_len = 2 * SOCKET_BYTES;
-        producer.write_all(&vec![7_u8; clip_len]).await.unwrap();
+        let recording_len = 2 * SOCKET_BYTES;
+        producer
+            .write_all(&vec![7_u8; recording_len])
+            .await
+            .unwrap();
         drop(producer);
-        report.send(clip_len as u64).unwrap();
-        let (mut socket, mut session, admission) = served_tls(&clock, clip, GET_C1).await;
+        report.send(recording_len as u64).unwrap();
+        let (mut socket, mut session, admission) = served_tls(&clock, recording, GET_C1).await;
         settle().await;
-        let dropped = "clip body dropped: the client made no room for it in time";
+        let dropped = "recording body dropped: the client made no room for it in time";
         clock.advance(BODY_STALL_TIMEOUT.saturating_sub(Duration::from_millis(1)));
         settle().await;
         assert!(
@@ -1170,20 +1184,20 @@ mod tests {
         drop(admission);
     }
 
-    /// The whole clip is there at once and the client's socket takes
+    /// The whole recording is there at once and the client's socket takes
     /// 4 KiB of records a second: hyper hands the last of the response to
     /// the session some 16 s before the socket has taken it all, and the
     /// session holds it, flushing, for that long. The socket takes bytes
     /// every second all the while.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_tls_clip_body_a_client_drains_slowly_outlives_the_stall_deadline_while_the_session_flushes()
+    async fn a_tls_recording_body_a_client_drains_slowly_outlives_the_stall_deadline_while_the_session_flushes()
      {
         use tokio::io::AsyncWriteExt as _;
 
         let clock = Arc::new(lotse_core::clock::FakeClock::default());
         let (reader, mut producer) = tokio::io::duplex(256 * 1024);
         let (report, written) = tokio::sync::oneshot::channel();
-        let clip = ClipBody {
+        let recording = RecordingBody {
             reader: Box::new(reader),
             written,
         };
@@ -1191,7 +1205,7 @@ mod tests {
         producer.write_all(&bytes).await.unwrap();
         drop(producer);
         report.send(bytes.len() as u64).unwrap();
-        let (mut socket, mut session, admission) = served_tls(&clock, clip, GET_C1).await;
+        let (mut socket, mut session, admission) = served_tls(&clock, recording, GET_C1).await;
         settle().await;
         let mut cipher = Vec::new();
         for _ in 0..30 {
@@ -1210,7 +1224,11 @@ mod tests {
             "ended whole with its last chunk"
         );
         let framing = plain.iter().filter(|byte| **byte != 7).count();
-        assert_eq!(plain.len() - framing, bytes.len(), "every byte of the clip");
+        assert_eq!(
+            plain.len() - framing,
+            bytes.len(),
+            "every byte of the recording"
+        );
         drop(admission);
     }
 }

@@ -64,7 +64,7 @@ const CLOSE_UNSUPPORTED_DATA: u16 = 1003;
 /// the client was removed).
 const CLOSE_POLICY_VIOLATION: u16 = 1008;
 
-/// A JSON error body for a refused upgrade or clip request.
+/// A JSON error body for a refused upgrade or recording request.
 pub(crate) fn refuse(status: StatusCode, code: ErrorCode, message: &str) -> Response {
     let body = serde_json::to_string(&ApiError::new(code, message)).unwrap_or_default();
     (status, [("content-type", "application/json")], body).into_response()
@@ -231,7 +231,7 @@ async fn clients_remove(
 }
 
 /// The token that closes connection `id`, an upgraded one or one sending
-/// a clip's body, once its client is removed: registered with the TLS
+/// a recording's body, once its client is removed: registered with the TLS
 /// listener's clients for a peer that came through it, never cancelled for
 /// a peer on the socket.
 pub(crate) fn attach(
@@ -676,7 +676,7 @@ const fn opens_subscription(command: &Command) -> bool {
         Command::StreamSubscribe(_)
             | Command::WebrtcOffer(_)
             | Command::SessionAdopt(_)
-            | Command::ClipStart(_)
+            | Command::RecordingCreate(_)
     )
 }
 

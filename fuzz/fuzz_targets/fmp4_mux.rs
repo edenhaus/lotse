@@ -1,5 +1,5 @@
-//! `fmp4_mux`: the clip muxer never panics on an arbitrary sequence of
-//! frames, and every clip it completes is a fragmented MP4 that two
+//! `fmp4_mux`: the recording muxer never panics on an arbitrary sequence of
+//! frames, and every recording it completes is a fragmented MP4 that two
 //! independent readers take: mp4-atom reads every box (ISO/IEC 14496-12
 //! §8.8.4 `moof`, §8.1.1 `mdat`), each run's data lies inside its
 //! fragment's `mdat`, the `mdat`s hold exactly the samples, each track's
@@ -12,7 +12,7 @@
 //! fragments and hands on every non-empty H.264, H.265 and AAC sample as
 //! the frame it was, in decode-time order per track.
 //!
-//! The first input byte picks the clip: bit 0 H.265 instead of H.264,
+//! The first input byte picks the recording: bit 0 H.265 instead of H.264,
 //! bits 1 and 2 the audio (none, AAC-LC, mono or stereo Opus), bits 3 to 5
 //! the fragment span (100 ms to 800 ms). The rest is frames, each a
 //! control byte (bit 0 audio, bit 1 keyframe, bit 2 a new epoch, bit 3 a
@@ -31,8 +31,8 @@ use libfuzzer_sys::fuzz_target;
 use lotse_codec::aac::test_data::CONFIG_16K_MONO;
 use lotse_codec::h264::annex_b_units;
 use lotse_codec::{h264, h265};
-use lotse_core::clip::{ClipMuxer as _, ClipPolicy, ClipTrack};
 use lotse_core::clock::{Clock as _, FakeClock};
+use lotse_core::recording::{RecordingMuxer as _, RecordingPolicy, RecordingTrack};
 use lotse_core::{Codec, Kind, MediaFrame, MediaTime};
 use lotse_http::fmp4::Reader;
 use lotse_mux::Muxer;
@@ -62,7 +62,7 @@ impl Input<'_> {
 }
 
 /// The video track and its codec's tracks.
-fn video_track(h265: bool) -> ClipTrack {
+fn video_track(h265: bool) -> RecordingTrack {
     let codec = if h265 {
         Codec::H265 {
             vps: Some(Bytes::from(h265::test_data::vps())),
@@ -76,15 +76,15 @@ fn video_track(h265: bool) -> ClipTrack {
             pps: Some(Bytes::from(h264::test_data::pps())),
         }
     };
-    ClipTrack {
+    RecordingTrack {
         codec,
         clock_rate: 90_000,
     }
 }
 
-fn audio_track(selector: u8) -> Option<ClipTrack> {
+fn audio_track(selector: u8) -> Option<RecordingTrack> {
     match selector {
-        1 => Some(ClipTrack {
+        1 => Some(RecordingTrack {
             codec: Codec::AacLc {
                 sample_rate: 16_000,
                 channels: 1,
@@ -92,7 +92,7 @@ fn audio_track(selector: u8) -> Option<ClipTrack> {
             },
             clock_rate: 16_000,
         }),
-        2 | 3 => Some(ClipTrack {
+        2 | 3 => Some(RecordingTrack {
             codec: Codec::Opus {
                 channels: selector - 1,
             },
@@ -176,9 +176,9 @@ fuzz_target!(|data: &[u8]| {
     };
     let audio = audio_track((config >> 1) & 0x03);
     let span = Duration::from_millis(100 * (u64::from((config >> 3) & 0x07) + 1));
-    let mut muxer = Muxer::new(&ClipPolicy {
+    let mut muxer = Muxer::new(&RecordingPolicy {
         fragment: span,
-        ..ClipPolicy::default()
+        ..RecordingPolicy::default()
     });
 
     let mut file = Vec::new();
@@ -234,7 +234,7 @@ fuzz_target!(|data: &[u8]| {
             payload: Bytes::from(payload.clone()),
         };
         let Ok(out) = muxer.push(kind, Arc::new(frame)) else {
-            // A timestamp a field cannot hold ends the clip.
+            // A timestamp a field cannot hold ends the recording.
             return;
         };
         for piece in out {
@@ -297,7 +297,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(read[track], expected, "the {kind} samples are the frames");
     }
 
-    // The HTTP source's reader takes the clip.
+    // The HTTP source's reader takes the recording.
     let mut reader = Reader::new(&file[..init_len], MAX_FRAME).unwrap();
     let layout = reader.layout().clone();
     let mut units = Vec::new();
