@@ -3016,37 +3016,44 @@ mod tests {
         let settings = settings();
         let (mut serving, mut rx) = serving(&settings);
         let (signaling, mut signal_rx) = WorkerSignaling::new();
-        let channel = opened_channel(&signaling, &mut signal_rx, "sig-1").await;
+        let mut channels = Vec::new();
+        for signal_id in ["sig-1", "sig-2"] {
+            channels.push(opened_channel(&signaling, &mut signal_rx, signal_id).await);
+        }
         serving.signaling = signaling;
         serving.signal_rx = signal_rx;
-        // The source lets go of its channel a while later, as a stopping
-        // one does.
-        let _source = spawn_named("test.source", async move {
-            for _ in 0..10 {
-                tokio::task::yield_now().await;
+        // The sources let go of their channels a while later, as stopping
+        // ones do.
+        let _sources = spawn_named("test.sources", async move {
+            for channel in channels {
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                drop(channel);
             }
-            drop(channel);
         });
         assert_eq!(
             serving.on_shutdown(1_000).await.unwrap(),
             ExitReason::Shutdown
         );
         drop(serving);
-        assert_eq!(
-            within(rx.recv_msg::<ToSupervisor>())
-                .await
-                .unwrap()
-                .unwrap()
-                .0,
-            ToSupervisor::Signal(SignalReport::Closed {
-                signal_id: "sig-1".into(),
-                code: "source_stopped".into(),
-                message: "the source stopped".into(),
-            })
-        );
+        for signal_id in ["sig-1", "sig-2"] {
+            assert_eq!(
+                within(rx.recv_msg::<ToSupervisor>())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                ToSupervisor::Signal(SignalReport::Closed {
+                    signal_id: signal_id.into(),
+                    code: "source_stopped".into(),
+                    message: "the source stopped".into(),
+                })
+            );
+        }
         assert_eq!(
             logs.lines(Level::DEBUG, "signaling relays ended")[0].fields,
-            " open=1"
+            " open=2"
         );
     }
 
