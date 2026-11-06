@@ -214,22 +214,18 @@ impl RtpTrack {
     }
 }
 
-/// The most streams one attempt carries, its indices `0..MAX_STREAMS`:
-/// far above any camera's media sections, low enough that an index a
-/// device chose cannot make the streams' vector large.
-pub const MAX_STREAMS: usize = 64;
-
 /// The streams one connection attempt carries, by the source's index of
 /// each, with the state their packets go through: what one attempt of an
 /// RTP source publishes, from its first packet to its last. The indices
-/// are the source's own, small and dense from zero (an SDP's media order):
-/// the streams are held in a vector as long as the highest one carried.
+/// are the source's own (an SDP's media order) and may be sparse or
+/// large: the streams are held as a short list of the ones carried, a
+/// handful at most, so no index sizes anything.
 #[derive(Debug)]
 pub struct RtpTracks {
     /// The source's protocol, the prefix of the lines logged.
     protocol: &'static str,
-    /// What each stream index maps to, if carried.
-    tracks: Vec<Option<RtpTrack>>,
+    /// Each stream carried, by its index; one entry per index.
+    tracks: Vec<(usize, RtpTrack)>,
     /// The new timelines of the attempt.
     timelines: Timelines,
     /// The live path's packets of one source packet, a reused buffer.
@@ -250,27 +246,27 @@ impl RtpTracks {
 
     /// Carries stream `index` on `track`, declared as `declared` with
     /// payload type `pt`, from the next packet on; the stream that index
-    /// carried before is forgotten. An index of [`MAX_STREAMS`] or more is
-    /// not carried, so an index taken from what a device sent never sizes
-    /// the streams' vector: its packets are dropped as any stream's not
-    /// carried.
+    /// carried before is forgotten.
     pub fn carry(&mut self, index: usize, track: Arc<Track>, pt: u8, declared: &Declared) {
-        if index >= MAX_STREAMS {
-            tracing::warn!(
-                protocol = self.protocol,
-                index,
-                max = MAX_STREAMS,
-                "{}: stream index over the limit; not carried",
-                self.protocol
-            );
-            return;
+        let entry = RtpTrack::new(track, pt, declared, self.protocol);
+        match self.entry_mut(index) {
+            Some(slot) => *slot = entry,
+            None => self.tracks.push((index, entry)),
         }
-        if self.tracks.len() <= index {
-            self.tracks.resize_with(index.saturating_add(1), || None);
-        }
-        if let Some(slot) = self.tracks.get_mut(index) {
-            *slot = Some(RtpTrack::new(track, pt, declared, self.protocol));
-        }
+    }
+
+    /// The stream `index`, if carried.
+    fn entry(&self, index: usize) -> Option<&RtpTrack> {
+        self.tracks
+            .iter()
+            .find_map(|(i, entry)| (*i == index).then_some(entry))
+    }
+
+    /// The stream `index`, if carried, to update.
+    fn entry_mut(&mut self, index: usize) -> Option<&mut RtpTrack> {
+        self.tracks
+            .iter_mut()
+            .find_map(|(i, entry)| (*i == index).then_some(entry))
     }
 
     /// One RTP packet of stream `index`, arrived at `arrival`: published
@@ -287,15 +283,14 @@ impl RtpTracks {
         ctx: &SourceCtx,
     ) -> Result<(), SourceError> {
         let jumped = self
-            .tracks
-            .get_mut(index)
-            .and_then(Option::as_mut)
+            .entry_mut(index)
             .and_then(|entry| entry.guard.observe(packet.ts, arrival));
         if let Some(moved_ms) = jumped {
             self.new_timeline(index, ctx, moved_ms, arrival)?;
         }
-        if let Some(Some(entry)) = self.tracks.get_mut(index) {
-            on_rtp(entry, ctx, arrival, packet, &mut self.normalized);
+        let normalized = &mut self.normalized;
+        if let Some((_, entry)) = self.tracks.iter_mut().find(|(i, _)| *i == index) {
+            on_rtp(entry, ctx, arrival, packet, normalized);
         }
         Ok(())
     }
@@ -312,7 +307,7 @@ impl RtpTracks {
         arrival: Instant,
         ctx: &SourceCtx,
     ) {
-        if let Some(Some(entry)) = self.tracks.get(index) {
+        if let Some(entry) = self.entry(index) {
             ctx.clock.report(ClockReport {
                 track: entry.track.id(),
                 clock_rate: entry.track.clock_rate(),
@@ -338,11 +333,8 @@ impl RtpTracks {
         let protocol = self.protocol;
         self.timelines.admit(arrival, protocol)?;
         let logged = self.timelines.log.hit(arrival);
-        for (i, entry) in self.tracks.iter_mut().enumerate() {
-            let Some(entry) = entry.as_mut() else {
-                continue;
-            };
-            if i == index {
+        for (i, entry) in &mut self.tracks {
+            if *i == index {
                 if let Some(count) = logged {
                     tracing::info!(track = %entry.track.id(), moved_ms, count, "{protocol}: timestamps jumped; new epoch");
                 }
@@ -839,7 +831,7 @@ mod tests {
         let mut tracks = RtpTracks::new(RTSP);
         tracks.carry(0, Arc::clone(&v0), 96, &video);
         tracks.carry(2, Arc::clone(&a0), 0, &audio);
-        for entry in tracks.tracks.iter_mut().flatten() {
+        for (_, entry) in &mut tracks.tracks {
             assert_eq!(entry.guard.observe(1_000, t0), None);
             entry.unwrapper.unwrap(1_000);
             entry.last_ts = Some(1_000);
@@ -857,8 +849,8 @@ mod tests {
 
         // Video jumped: its guard already holds the new timestamp.
         assert!(
-            tracks.tracks[0]
-                .as_mut()
+            tracks
+                .entry_mut(0)
                 .unwrap()
                 .guard
                 .observe(5_000_000, t0)
@@ -867,10 +859,9 @@ mod tests {
         tracks.new_timeline(0, &ctx, 55, t0).unwrap();
         assert_eq!((v0.epoch(), a0.epoch()), (1, 1), "one epoch for all tracks");
         assert_eq!(mapper.mode(v0.id()), SyncMode::Arrival);
-        let [v, none, a] =
-            <&mut [Option<RtpTrack>; 3]>::try_from(tracks.tracks.as_mut_slice()).unwrap();
-        assert!(none.is_none(), "the streams stay");
-        let (v, a) = (v.as_mut().unwrap(), a.as_mut().unwrap());
+        let [(vi, v), (ai, a)] =
+            <&mut [(usize, RtpTrack); 2]>::try_from(tracks.tracks.as_mut_slice()).unwrap();
+        assert_eq!((*vi, *ai), (0, 2), "the streams stay");
         assert_eq!(
             v.guard.observe(5_003_000, t0),
             None,
@@ -939,10 +930,10 @@ mod tests {
         for _ in 0..MAX_TIMELINES {
             tracks.new_timeline(0, &ctx, 55, t0).unwrap();
         }
-        tracks.tracks[0].as_mut().unwrap().last_ts = Some(1_000);
+        tracks.entry_mut(0).unwrap().last_ts = Some(1_000);
         assert!(tracks.new_timeline(0, &ctx, 55, t0).is_err());
         assert_eq!(v0.epoch(), 10, "no epoch for the refused one");
-        assert_eq!(tracks.tracks[0].as_ref().unwrap().last_ts, Some(1_000));
+        assert_eq!(tracks.entry(0).unwrap().last_ts, Some(1_000));
         let jumped = logs.fields(Level::INFO, "rtsp: timestamps jumped; new epoch");
         assert_eq!(jumped.len(), 1, "{jumped:?}");
         assert!(
@@ -1149,36 +1140,27 @@ mod tests {
     }
 
     #[test]
-    fn an_index_over_the_limit_is_not_carried_and_its_packets_drop() {
-        let (logs, _guard) = Logs::capture();
+    fn a_sparse_or_large_index_is_carried_without_sizing_anything() {
+        // RTSP carries the SDP's media index, which nothing bounds: a
+        // camera may list many media sections before the one chosen.
         let (t0, _set, mut ctx) = video_ctx();
         let audio = pcmu();
         let a0 = declare(&mut ctx, &audio);
+        let a1 = declare(&mut ctx, &audio);
         let mut tracks = RtpTracks::new(RTSP);
-        tracks.carry(MAX_STREAMS, Arc::clone(&a0), 0, &audio);
-        assert!(tracks.tracks.is_empty(), "the vector never grew");
+        tracks.carry(usize::MAX, Arc::clone(&a0), 0, &audio);
+        tracks.carry(70, Arc::clone(&a1), 8, &audio);
+        assert_eq!(tracks.tracks.len(), 2, "one entry per stream carried");
         tracks
-            .receive(MAX_STREAMS, packet(1, 0, true, &[0xff; 160]), t0, &ctx)
+            .receive(usize::MAX, packet(1, 0, true, &[0xff; 160]), t0, &ctx)
             .unwrap();
-        assert_eq!(a0.stats().packets, 0);
-        assert_eq!(
-            logs.count(
-                Level::WARN,
-                "rtsp: stream index over the limit; not carried"
-            ),
-            1
-        );
-        // The last index below the limit is carried.
-        tracks.carry(MAX_STREAMS - 1, Arc::clone(&a0), 0, &audio);
         tracks
-            .receive(
-                MAX_STREAMS - 1,
-                packet(2, 160, true, &[0xff; 160]),
-                t0,
-                &ctx,
-            )
+            .receive(70, packet(1, 0, true, &[0xd5; 160]), t0, &ctx)
             .unwrap();
-        assert_eq!(a0.stats().packets, 1);
+        tracks
+            .receive(69, packet(2, 160, true, &[0xd5; 160]), t0, &ctx)
+            .unwrap();
+        assert_eq!((a0.stats().packets, a1.stats().packets), (1, 1));
     }
 
     #[test]
