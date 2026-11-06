@@ -194,7 +194,7 @@ async fn a_sandboxed_worker_takes_a_recording_s_pipe_and_closes_it() {
     );
     let mut rest = Vec::new();
     std::io::Read::read_to_end(&mut reader, &mut rest).expect("reads to the end");
-    assert!(rest.is_empty());
+    assert_eq!(rest, b"");
     let exit = worker.stop(Duration::from_secs(5), &clock).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
 }
@@ -406,7 +406,7 @@ async fn a_sandboxed_worker_plays_hls_over_http() {
         "null".into(),
     )
     .await;
-    assert!(!server.requests().is_empty());
+    assert_ne!(server.requests(), []);
     server.stop().await;
 }
 

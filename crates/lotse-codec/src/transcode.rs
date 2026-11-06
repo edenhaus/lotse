@@ -1379,7 +1379,7 @@ mod tests {
             i * 1024 + by
         });
         publish_silent(&rig, stamps).await;
-        assert!(jumps(&rig.finish().await).is_empty());
+        assert_eq!(jumps(&rig.finish().await), Vec::<usize>::new());
         assert_eq!(logs.count(Level::DEBUG, MOVED), 0);
         drop(guard);
 
@@ -1411,7 +1411,7 @@ mod tests {
         .await;
         let packets = rig.finish().await;
         assert!(packets.iter().all(|p| p.epoch == 0));
-        assert!(jumps(&packets).is_empty());
+        assert_eq!(jumps(&packets), Vec::<usize>::new());
         assert_eq!(logs.count(Level::DEBUG, started), 0);
         drop(guard);
 
@@ -1466,7 +1466,7 @@ mod tests {
             (0..40).map(|i| i * 1024 + if i > 0 { 1024 } else { 0 }),
         )
         .await;
-        assert!(jumps(&rig.finish().await).is_empty());
+        assert_eq!(jumps(&rig.finish().await), Vec::<usize>::new());
         assert_eq!(logs.count(Level::DEBUG, MOVED), 0);
     }
 
@@ -1485,7 +1485,7 @@ mod tests {
         assert_eq!(before.len(), 8 * 1024 * 3 / 960);
         rig.publish(8 * 1024, &BROKEN_FRAME);
         let later = rig.clock.now() + Duration::from_millis(100);
-        assert!(rig.run_until(later).await.is_empty());
+        assert_eq!(rig.run_until(later).await, []);
         rig.publish(9 * 1024, input[9]);
         // A second failure inside the summary interval is counted quietly.
         rig.publish(10 * 1024, &BROKEN_FRAME);
@@ -1588,7 +1588,7 @@ mod tests {
         rig.publish(2048, frames(SINE_16K_MONO)[2]);
         rig.clock.advance(Duration::from_secs(1));
         settle().await;
-        assert!(rig.drain().is_empty());
+        assert_eq!(rig.drain(), []);
     }
 
     #[tokio::test]

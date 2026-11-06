@@ -108,7 +108,7 @@ fn check_info(socket: &Path) {
     };
     assert_eq!(info["limits"]["max_recordings"], max_recordings);
     assert_eq!(info["sandbox"]["mode"], "off");
-    assert!(!info["build"]["target"].as_str().unwrap().is_empty());
+    assert_ne!(info["build"]["target"].as_str().unwrap(), "");
     // The fake and the RTSP source declare a backchannel (the ONVIF one,
     // ONVIF Streaming Specification §5.3) and the build carries the
     // talk-back transcoder and WebRTC, so two-way audio is on, as in a
@@ -481,7 +481,7 @@ fn ctl_without_a_daemon_fails_with_a_message() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("connecting to"), "{stderr}");
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
 }
 
 /// A daemon started with `--log-level <level>` and `env` on top.

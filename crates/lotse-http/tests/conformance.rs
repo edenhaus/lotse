@@ -750,7 +750,7 @@ async fn rfc7616_credentials_are_checked_and_never_described_debugged_or_logged(
     // Neither the password, nor its Basic encoding, nor the path or query
     // of the URL reached a log line.
     let text = logs.text();
-    assert!(!text.is_empty());
+    assert_ne!(text, "");
     for needle in ["secret", "YWRtaW46c2VjcmV0", "hidden", "index.m3u8"] {
         assert!(!text.contains(needle), "{needle} logged: {text}");
     }

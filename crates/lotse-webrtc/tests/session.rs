@@ -594,7 +594,7 @@ fn rfc6184_8_1_safari_gets_a_high_camera_under_its_constrained_high_payload_type
         .open_session(request(&safari, h264(Some([0x42, 0xe0, 0x1f]))), now)
         .expect("answered");
     assert!(answer.contains("profile-level-id=42e01f"), "{answer}");
-    assert!(warnings(engine.as_mut()).is_empty());
+    assert_eq!(warnings(engine.as_mut()), Vec::<&str>::new());
 }
 
 #[test]
@@ -2072,7 +2072,7 @@ fn rfc3264_6_an_audio_m_line_without_a_known_codec_is_still_rejected() {
         section(&answer, "audio")[0].starts_with("m=audio 0 "),
         "{answer}"
     );
-    assert!(warnings(&mut session).is_empty());
+    assert_eq!(warnings(&mut session), Vec::<&str>::new());
     // An offer that names the stream's codec in a form the engine does not
     // match (two-channel PCMU): rejected too, and the stream audio warns.
     let offer = with_audio_codecs(viewer.offer(), "a=rtpmap:0 PCMU/8000/2\n");
@@ -2196,7 +2196,7 @@ fn rfc8829_5_3_1_the_viewer_plays_video_beside_an_inactive_audio_m_line() {
     for _ in 0..50 {
         pair.step();
     }
-    assert!(pair.viewer.audio_packets().is_empty());
+    assert_eq!(pair.viewer.audio_packets(), []);
     assert_eq!(pair.session.stats().audio_dropped, 1);
 }
 
@@ -4268,7 +4268,7 @@ fn rfc8829_5_3_2_playout_delay_0_0_follows_a_re_offer_that_adds_or_drops_the_aud
         str0m::media::Frequency::HUNDREDTHS,
     ));
     let delays = |packets: &[str0m::rtp::RtpPacket]| {
-        assert!(!packets.is_empty());
+        assert_ne!(packets, []);
         packets
             .iter()
             .map(|packet| {
@@ -5509,8 +5509,8 @@ fn rfc8285_6_abs_capture_time_is_answered_under_chromes_id_and_not_unless_offere
     assert!(!answer.contains(ABS_CAPTURE_TIME_URI), "{answer}");
     play_timed(&mut pair, &answer, 40);
     assert!(!pair.viewer.packets().is_empty() && !pair.viewer.audio_packets().is_empty());
-    assert!(carriers(pair.viewer.packets()).is_empty());
-    assert!(carriers(pair.viewer.audio_packets()).is_empty());
+    assert_eq!(carriers(pair.viewer.packets()), []);
+    assert_eq!(carriers(pair.viewer.audio_packets()), []);
 }
 
 /// The viewer's offer with every line `edit` maps, lines it drops left out.
@@ -5753,8 +5753,8 @@ fn rfc8829_5_3_1_a_talk_only_offer_is_answered_without_video_and_its_talk_back_h
             "no video, so no codec it cannot carry"
         );
         pair.settle_talkback();
-        assert!(pair.viewer.packets().is_empty());
-        assert!(pair.viewer.audio_packets().is_empty());
+        assert_eq!(pair.viewer.packets(), []);
+        assert_eq!(pair.viewer.audio_packets(), []);
         let stats = pair.session.stats();
         assert_eq!(
             stats,
@@ -5858,5 +5858,5 @@ fn rfc8829_5_3_1_a_listen_only_offer_gets_the_stream_audio_and_no_video() {
     pair.run_until(|p| p.viewer.audio_packets().len() >= 5, 500, "audio");
     let stats = pair.session.stats();
     assert_eq!((stats.audio_packets, stats.packets), (5, 0));
-    assert!(pair.viewer.packets().is_empty());
+    assert_eq!(pair.viewer.packets(), []);
 }

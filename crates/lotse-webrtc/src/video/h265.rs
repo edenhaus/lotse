@@ -332,7 +332,7 @@ mod tests {
                 },
             ]
         );
-        assert!(offered("v=0\r\n").is_empty());
+        assert_eq!(offered("v=0\r\n"), []);
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
         // A profile str0m does not know is left out.
         assert_eq!(profiles(Some(&h265_info(11, 0x0010_0000))), [11]);
         assert_eq!(profiles(Some(&h265_info(12, 0x4008_0000))), [1]);
-        assert!(profiles(Some(&h265_info(0, 0))).is_empty());
+        assert_eq!(profiles(Some(&h265_info(0, 0))), b"");
     }
 
     #[test]

@@ -967,7 +967,7 @@ async fn a_pairing_connection_that_sends_nothing_is_closed_at_its_deadline() {
     let (status, _) = pair(&running, &client, secret_of(&code)).await.unwrap();
     assert_eq!(status, 204);
     running.clock.advance(PAIR_TIMEOUT);
-    assert!(closed(&mut idle).await.is_empty());
+    assert_eq!(closed(&mut idle).await, b"");
     assert!(
         logs.text()
             .contains("pairing connection closed: no request before the deadline"),

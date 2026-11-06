@@ -459,7 +459,7 @@ mod tests {
         );
         assert_eq!(audio.attribute("rtp").count(), 0);
         assert_eq!(video.mid(), None);
-        assert!(video.lines().is_empty());
+        assert_eq!(video.lines(), Vec::<&str>::new());
         assert!(video.is("video") && !video.is("vide") && !video.is("audio"));
         assert_eq!(
             sdp.first("video").map(Section::m_line),

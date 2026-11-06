@@ -3137,7 +3137,7 @@ mod tests {
                 rig.until_closed().await,
                 vec![closed("source_not_live", 0, 0, 0)]
             );
-            assert!(reader.rest().await.is_empty());
+            assert_eq!(reader.rest().await, b"");
         }
         assert_eq!(
             logs.count(Level::INFO, "recording: the source did not go live in time"),
@@ -3155,7 +3155,7 @@ mod tests {
             rig.until_closed().await,
             vec![closed("source_not_live", 0, 0, 0)]
         );
-        assert!(reader.rest().await.is_empty());
+        assert_eq!(reader.rest().await, b"");
     }
 
     /// A codec change after the container started (other parameter sets, the
@@ -6068,7 +6068,7 @@ mod tests {
             }
             let reports = rig.until_closed().await;
             assert_eq!(reports, vec![closed("completed", 0, 0, 0)]);
-            assert!(reader.rest().await.is_empty());
+            assert_eq!(reader.rest().await, b"");
         }
         assert_eq!(
             logs.count(
