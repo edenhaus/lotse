@@ -131,14 +131,20 @@ pub struct ClipLimits {
     /// `limits.preroll_max_ms`: the longest window `stream/put` may ask
     /// for, and the furthest back a clip's `before_ms` may ask.
     pub preroll_max_ms: u32,
-    /// `limits.preroll_bytes`: what one track's ring may hold; the
-    /// worker's bound, which `info` reports.
+    /// What a stream's pre-roll frames may take together, all its tracks'
+    /// rings and the frames its clips took from them and have not written
+    /// yet: no setting, half of `limits.worker_address_space`
+    /// ([`ClipLimits::preroll_bytes_for`]); the worker's bound, which
+    /// `info` reports as `limits.preroll_bytes`.
     pub preroll_bytes: u64,
     /// `limits.clip_max_ms`: the most `after_ms` may ask, and the worker's
     /// end of an open-ended clip.
     pub clip_max_ms: u32,
     /// `limits.clip_queue_bytes`: what one clip's queue in the worker holds
-    /// before it drops to the next keyframe and reports the gap.
+    /// before it drops to the next keyframe and reports the gap; and the
+    /// clip's memory budget beside the pre-roll: its container ends a
+    /// fragment once it holds this much, and at most one finished fragment
+    /// waits for the reader, so a clip holds about three times this.
     pub clip_queue_bytes: u64,
     /// `limits.clip_fetch_timeout_ms`: how long a clip's body waits for
     /// its `GET` from the `clip/start` result on.
@@ -155,21 +161,39 @@ pub struct ClipLimits {
 }
 
 impl ClipLimits {
-    /// The defaults: a 2-minute window at most, 32 MiB per track (core's
-    /// `DEFAULT_PREROLL_BYTES`), 10-minute clips (the worker's
-    /// `DEFAULT_CLIP_MAX`), an 8 MiB queue (core's
+    /// The defaults: a 5-minute window at most and 1-hour clips (the
+    /// worker's `DEFAULT_CLIP_MAX`), so a client's record call that asks
+    /// up to 5 minutes before an event and up to an hour after it is never
+    /// refused; 512 MiB per stream (core's `DEFAULT_PREROLL_BYTES`,
+    /// [`ClipLimits::preroll_bytes_for`] the default worker address
+    /// space), a bound no real camera's window reaches; an 8 MiB queue (core's
     /// `DEFAULT_CLIP_QUEUE_BYTES`), 10 s to fetch, 10 s to start (the
     /// worker's `DEFAULT_CLIP_START_TIMEOUT`), 8 clips, 2 per stream.
     pub const DEFAULT: Self = Self {
-        preroll_max_ms: 120_000,
-        preroll_bytes: 32 * 1024 * 1024,
-        clip_max_ms: 600_000,
+        preroll_max_ms: 300_000,
+        preroll_bytes: 512 * 1024 * 1024,
+        clip_max_ms: 3_600_000,
         clip_queue_bytes: 8 * 1024 * 1024,
         fetch_timeout: Duration::from_secs(10),
         start_timeout: Duration::from_secs(10),
         max_clips: 8,
         clips_per_stream: 2,
     };
+
+    /// The pre-roll's byte bound for workers limited to
+    /// `worker_address_space`: half of it for a stream's pre-roll frames
+    /// together, its rings' and its clips' not yet written, so the window,
+    /// a time, is what decides what they hold, and a camera sending far
+    /// more than any real one, or clips writing slower than it sends, get
+    /// a shorter pre-roll instead of taking the worker's memory; the rest
+    /// of the worker fits in the other half, its clips among it at about
+    /// three times `clip_queue_bytes` each (their queue, their open
+    /// fragment and one fragment waiting for the reader: 192 MiB for the
+    /// default 8 clips of 8 MiB).
+    #[must_use]
+    pub const fn preroll_bytes_for(worker_address_space: u64) -> u64 {
+        worker_address_space / 2
+    }
 
     /// No window and no clip: a supervisor without a clip output, whose
     /// workers refuse every clip, says so with these zeros.
@@ -1076,6 +1100,24 @@ mod tests {
         );
         assert!(completed(ClipStopReason::MaxDuration));
         assert!(!completed(ClipStopReason::ClientGone));
+    }
+
+    #[test]
+    fn the_pre_roll_bound_is_half_the_worker_s_address_space() {
+        assert_eq!(
+            ClipLimits::preroll_bytes_for(1 << 30),
+            ClipLimits::DEFAULT.preroll_bytes,
+            "the default address space gives the default bound"
+        );
+        assert_eq!(ClipLimits::preroll_bytes_for(6), 3);
+        assert_eq!(ClipLimits::preroll_bytes_for(7), 3, "rounded down");
+        let clips =
+            u64::from(ClipLimits::DEFAULT.max_clips) * 3 * ClipLimits::DEFAULT.clip_queue_bytes;
+        assert_eq!(clips, 192 << 20, "the clips' budget beside the pre-roll");
+        assert!(
+            ClipLimits::DEFAULT.preroll_bytes + clips <= (1 << 30) * 3 / 4,
+            "a quarter of the worker's address space is left for the rest"
+        );
     }
 
     #[test]

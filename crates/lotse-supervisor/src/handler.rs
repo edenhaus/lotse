@@ -5111,7 +5111,7 @@ mod tests {
             info["limits"],
             json!({ "max_streams": 2, "max_sessions": 3, "max_sessions_per_stream": 2,
                     "max_connections": 8, "session_grace_ms": 10_000,
-                    "preroll_max_ms": 120_000, "preroll_bytes": 32 << 20, "clip_max_ms": 600_000,
+                    "preroll_max_ms": 300_000, "preroll_bytes": 512 << 20, "clip_max_ms": 3_600_000,
                     "max_clips": 8, "clips_per_stream": 2 })
         );
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
@@ -5227,22 +5227,23 @@ mod tests {
             )
         );
         let mut far = clip(1, "front", None);
-        far["before_ms"] = json!(120_001);
+        far["before_ms"] = json!(300_001);
         let err = refused(call(&s, &far.to_string()).await);
         assert_eq!(err.details["field"], "before_ms");
         assert_eq!(
             err.message,
-            "`before_ms` is 120001, the maximum is 120000 (`limits.preroll_max_ms`)"
+            "`before_ms` is 300001, the maximum is 300000 (`limits.preroll_max_ms`)"
         );
         let mut long = clip(1, "front", None);
-        long["after_ms"] = json!(600_001);
+        long["after_ms"] = json!(3_600_001);
         let err = refused(call(&s, &long.to_string()).await);
         assert_eq!(err.details["field"], "after_ms");
-        // The longest window and the longest clip are allowed: what refuses
-        // this one is the stream.
+        // The longest window and the longest clip are allowed, 5 minutes
+        // before and an hour after, the most a client's record call asks:
+        // what refuses this one is the stream.
         let mut longest = clip(1, "front", None);
-        longest["before_ms"] = json!(120_000);
-        longest["after_ms"] = json!(600_000);
+        longest["before_ms"] = json!(300_000);
+        longest["after_ms"] = json!(3_600_000);
         let err = refused(call(&s, &longest.to_string()).await);
         assert_eq!(err.code, ErrorCode::StreamNotFound);
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
@@ -5672,7 +5673,7 @@ mod tests {
         assert_eq!(demand(&s).total(), 0, "a window is not demand");
         assert_eq!(s.shared.lock().connections["c1"].preroll_ms, 30_000);
         assert_eq!(result_of(&s, "front").await["preroll_ms"], 30_000);
-        let err = error(call(&s, &windowed(120_001, false)).await);
+        let err = error(call(&s, &windowed(300_001, false)).await);
         assert_eq!(err.details["field"], "preroll_ms");
         let unchanged = result(call(&s, &windowed(30_000, false)).await);
         assert_eq!(unchanged["created"], false);

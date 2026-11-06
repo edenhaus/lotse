@@ -310,16 +310,18 @@ pub struct TrackInfo {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct TrackPreroll {
     /// The memory the ring holds: its frames' payloads plus a fixed cost
-    /// per frame, at most `limits.preroll_bytes`. The open GOP is also in
+    /// per frame; the stream's tracks hold at most `limits.preroll_bytes`
+    /// together, less what its clips took from the rings and have not
+    /// written yet. The open GOP is also in
     /// the track's GOP cache, so the two overlap; the frames are shared,
     /// not copied.
     pub bytes: u64,
     /// The window it holds, in milliseconds: from its oldest keyframe to
     /// its newest frame; shorter than `preroll_ms` while it fills, after
-    /// a reconnect, or when `limits.preroll_bytes` caps it.
+    /// a reconnect, or when its bound (`bytes`) caps it.
     pub held_ms: u32,
-    /// GOPs larger than `limits.preroll_bytes` the ring could keep only
-    /// the start of.
+    /// GOPs larger than its bound (`bytes`) the ring could keep only the
+    /// start of.
     pub truncations: u64,
 }
 

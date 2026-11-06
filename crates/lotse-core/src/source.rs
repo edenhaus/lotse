@@ -23,7 +23,7 @@ use crate::codec::{Codec, Kind};
 use crate::ingest::{IngestCounters, IngestStats};
 use crate::media::MediaPacket;
 use crate::negotiate::TrackInfo;
-use crate::preroll::PrerollFloor;
+use crate::preroll::PrerollShared;
 use crate::runner::ProbeGate;
 use crate::source_url::SourceUrl;
 use crate::task::{BoxFuture, spawn_named};
@@ -878,10 +878,12 @@ pub struct TrackSet {
     tag: u8,
     /// The live set a staging set forwards into.
     live: Option<Arc<Self>>,
-    /// The oldest capture time of a keyframe the connection's video
-    /// pre-roll holds, which its audio pre-roll trims by; a staging set
-    /// shares the live set's, and only the live set's `v0` writes it.
-    preroll_floor: Arc<PrerollFloor>,
+    /// What the connection's pre-roll rings hold together, which one
+    /// `preroll_bytes` bounds, and the oldest capture time of a keyframe
+    /// its video pre-roll holds, which its audio pre-roll trims by; a
+    /// staging set shares the live set's, and only the live set's `v0`
+    /// writes the floor.
+    preroll_shared: Arc<PrerollShared>,
 }
 
 impl TrackSet {
@@ -898,7 +900,7 @@ impl TrackSet {
             feeds: Arc::new(Feeds::new(weak.clone())),
             tag: 0,
             live: None,
-            preroll_floor: Arc::default(),
+            preroll_shared: Arc::default(),
         })
     }
 
@@ -918,7 +920,7 @@ impl TrackSet {
             feeds: Arc::clone(&live.feeds),
             tag: live.feeds.next_tag(),
             live: Some(Arc::clone(live)),
-            preroll_floor: Arc::clone(&live.preroll_floor),
+            preroll_shared: Arc::clone(&live.preroll_shared),
         })
     }
 
@@ -1073,7 +1075,7 @@ impl TrackSet {
             Arc::clone(&self.feeds),
             self.tag,
             forward_to,
-            Arc::clone(&self.preroll_floor),
+            Arc::clone(&self.preroll_shared),
         ));
         self.tracks
             .write()
@@ -1551,9 +1553,9 @@ mod tests {
     fn a_connection_s_tracks_share_one_pre_roll_floor_across_its_sources() {
         let live = TrackSet::new(TrackLimits::default(), SystemClock.now());
         let staging = TrackSet::staging(&live);
-        assert!(Arc::ptr_eq(&live.preroll_floor, &staging.preroll_floor));
+        assert!(Arc::ptr_eq(&live.preroll_shared, &staging.preroll_shared));
         let other = TrackSet::new(TrackLimits::default(), SystemClock.now());
-        assert!(!Arc::ptr_eq(&live.preroll_floor, &other.preroll_floor));
+        assert!(!Arc::ptr_eq(&live.preroll_shared, &other.preroll_shared));
     }
 
     #[test]

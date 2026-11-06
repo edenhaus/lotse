@@ -1162,6 +1162,88 @@ fn a_frame_of_many_tiny_nal_units_counts_what_it_holds_against_the_bound() {
     assert!(samples.iter().all(|s| s.bytes.len() == 5000));
 }
 
+/// Video frames of `aus` at 25 fps, the first a keyframe, under a span
+/// far above them and a clip queue bound of `queue_bytes`: which pushes
+/// completed a fragment.
+fn cuts_at_the_queue_bound(aus: &[Bytes], queue_bytes: u64) -> Written {
+    let base = base();
+    let frames: Vec<_> = aus
+        .iter()
+        .zip(0_u8..)
+        .map(|(au, i)| {
+            (
+                Kind::Video,
+                frame(
+                    ms(base, u64::from(i) * 40),
+                    i64::from(i) * FRAME,
+                    i == 0,
+                    0,
+                    au.clone(),
+                ),
+            )
+        })
+        .collect();
+    let policy = ClipPolicy {
+        queue_bytes: usize::try_from(queue_bytes).unwrap(),
+        ..policy(10_000)
+    };
+    run(&mut Muxer::new(&policy), &h264_track(), None, &frames)
+}
+
+/// Regression: a fragment ended only at a keyframe, after its span or at
+/// [`MAX_FRAGMENT_BYTES`], so a camera whose timestamps barely advance
+/// had one fragment of a clip hold up to 1 GiB of frames that neither the
+/// clip's queue nor the stream's pre-roll counted any more. It ends at the
+/// clip's queue bound, at a sample that is not a sync sample, which the
+/// sample's own flags say.
+#[test]
+fn iso14496_12_8_8_3_1_a_fragment_ends_at_the_clip_s_queue_bound_at_any_sample() {
+    let au = annex_b(&[&[0x41; 21]]);
+    let written = cuts_at_the_queue_bound(&vec![au.clone(); 10], 4 * holds(au.len(), 1));
+    assert_eq!(written.cuts, [4, 8]);
+    let samples = samples(&written.file, 1);
+    let firsts: Vec<_> = (1..=2)
+        .map(|fragment| {
+            samples
+                .iter()
+                .find(|s| s.fragment == fragment)
+                .unwrap()
+                .flags
+        })
+        .collect();
+    assert_eq!(firsts, [Some(NON_SYNC_SAMPLE), Some(NON_SYNC_SAMPLE)]);
+}
+
+/// A frame that alone holds more than the clip's queue bound still goes
+/// into a fragment, alone, and the fragments after it end at the bound.
+#[test]
+fn a_frame_larger_than_the_clip_s_queue_bound_forms_a_fragment_alone() {
+    let small = annex_b(&[&[0x41; 21]]);
+    let large = annex_b(&[&[0x65; 1000]]);
+    let mut aus = vec![large.clone()];
+    aus.extend(std::iter::repeat_n(small.clone(), 6));
+    let bound = 3 * holds(small.len(), 1);
+    assert!(holds(large.len(), 1) > bound);
+    let written = cuts_at_the_queue_bound(&aus, bound);
+    assert_eq!(written.cuts, [1, 4]);
+    let sizes: Vec<_> = samples(&written.file, 1)
+        .iter()
+        .map(|s| (s.fragment, s.bytes.len()))
+        .collect();
+    assert_eq!(
+        sizes,
+        [
+            (0, 1004),
+            (1, 25),
+            (1, 25),
+            (1, 25),
+            (2, 25),
+            (2, 25),
+            (2, 25)
+        ]
+    );
+}
+
 #[test]
 fn a_new_epoch_starts_a_fragment_at_its_capture_time_leaving_the_hole() {
     let base = base();
