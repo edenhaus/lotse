@@ -440,7 +440,7 @@ fn the_answer_carries_credentials_h264_candidates_and_playout_delay_rfc8829() {
 #[test]
 fn rfc9143_9_1_1_a_payload_type_with_two_codecs_is_invalid_sdp_not_a_crash() {
     // Opus on 109, which the video m-line of the same BUNDLE group uses for
-    // H.264's retransmissions: str0m 0.24 locked 109 twice and panicked,
+    // H.264's retransmissions: str0m 0.25 locks 109 twice and panics,
     // which aborts the worker. Refused before it sees the offer, whether
     // the session sends audio or not.
     let now = SystemClock.now();
@@ -5153,7 +5153,7 @@ fn ts_26_114_6_2_3_3_no_cvo_unless_offered_and_none_sent_without_an_orientation(
 
 #[test]
 fn ts_26_114_7_4_5_a_mirrored_orientation_sends_its_rotation_without_the_flip_bit() {
-    // SPEC-DEVIATION: str0m 0.24 carries R1 R0 only.
+    // SPEC-DEVIATION: str0m 0.25 carries R1 R0 only.
     let (mut pair, answer, logs) = oriented(Orientation::RotateRightAndFlip, str::to_owned);
     assert!(logs.contains("cvo=7 sent=Deg90"), "{logs}");
     let received = join_and_play(&mut pair, &answer);
@@ -5263,11 +5263,20 @@ fn captured_at(start: Instant, n: u32, per_second: u32) -> Instant {
     start + Duration::from_nanos(u64::from(n) * 1_000_000_000 / u64::from(per_second))
 }
 
+/// When [`play_timed`] wrote each video frame and each audio packet, by
+/// their number into the play.
+#[derive(Default)]
+struct Written {
+    video: Vec<Instant>,
+    audio: Vec<Instant>,
+}
+
 /// Connects `pair` and plays it for `frames` video frames at 30 fps and
 /// the audio beside them, 20 ms PCMU packets, each written 20 ms after its
-/// capture. The keyframe comes first; every P frame is a full FU-A packet
-/// and a short one. Returns the capture times' origin.
-fn play_timed(pair: &mut Pair, answer: &str, frames: u32) -> Instant {
+/// capture or as the engine's timeouts step the clock past that. The
+/// keyframe comes first; every P frame is a full FU-A packet and a short
+/// one. Returns the capture times' origin and when each was written.
+fn play_timed(pair: &mut Pair, answer: &str, frames: u32) -> (Instant, Written) {
     pair.viewer
         .accept_answer(answer, &mut pair.to_daemon)
         .expect("the answer applies");
@@ -5277,6 +5286,7 @@ fn play_timed(pair: &mut Pair, answer: &str, frames: u32) -> Instant {
         "connected",
     );
     let start = pair.now;
+    let mut written = Written::default();
     let mut normalizer = normalizer();
     let (mut seq, mut audio_seq, mut audio) = (0, 0, 0);
     for n in 0..frames {
@@ -5288,8 +5298,10 @@ fn play_timed(pair: &mut Pair, answer: &str, frames: u32) -> Instant {
             let at = captured_at(start, audio, 50);
             let packet = audio_packet(audio_seq, audio * 160, 0, at);
             pair.session.write_audio(pair.now, &packet, at);
+            written.audio.push(pair.now);
             (audio, audio_seq) = (audio + 1, audio_seq + 1);
         }
+        written.video.push(pair.now);
         let bytes = if n == 0 {
             300
         } else {
@@ -5312,7 +5324,7 @@ fn play_timed(pair: &mut Pair, answer: &str, frames: u32) -> Instant {
         500,
         "the play",
     );
-    start
+    (start, written)
 }
 
 /// The packets that carry `abs-capture-time`, with their value.
@@ -5356,12 +5368,23 @@ fn abs_capture_time_carries_the_written_capture_time_on_the_session_wall_clock_o
         );
     }
     // 2.3 s of play.
-    let start = play_timed(&mut pair, &answer, 70);
+    let (start, written) = play_timed(&mut pair, &answer, 70);
     let on_wall = |capture: Instant| wall + capture.duration_since(opened);
-    for (kind, packets, per_tick) in [
-        ("video", pair.viewer.packets(), 90_000_u64),
-        ("audio", pair.viewer.audio_packets(), 8_000),
+    for (kind, packets, per_tick, times) in [
+        ("video", pair.viewer.packets(), 90_000_u64, &written.video),
+        ("audio", pair.viewer.audio_packets(), 8_000, &written.audio),
     ] {
+        // A packet's number into the play: its frame's, or its own.
+        let per_second = if kind == "video" { 30 } else { 50 };
+        let number = |packet: &str0m::rtp::RtpPacket| {
+            let ticks = u64::from(
+                packet
+                    .header
+                    .timestamp
+                    .wrapping_sub(packets[0].header.timestamp),
+            );
+            usize::try_from(ticks * per_second / per_tick).unwrap()
+        };
         let sent = carriers(packets);
         // libwebrtc's sender: the first packet, then once more than a
         // second has passed; 2.3 s hold three.
@@ -5376,17 +5399,14 @@ fn abs_capture_time_carries_the_written_capture_time_on_the_session_wall_clock_o
             "{kind}: the first packet"
         );
         for pair in sent.windows(2) {
-            let ticks = u64::from(
-                pair[1]
-                    .0
-                    .header
-                    .timestamp
-                    .wrapping_sub(pair[0].0.header.timestamp),
-            );
-            let gap = Duration::from_nanos(ticks * 1_000_000_000 / per_tick);
+            // Written more than a second after the last carrier, and the
+            // frame or packet before, which had room too, not.
+            let (last, next) = (number(pair[0].0), number(pair[1].0));
+            let after = times[next] - times[last];
+            let before = times[next - 1] - times[last];
             assert!(
-                gap > Duration::from_secs(1) && gap < Duration::from_millis(1_100),
-                "{kind}: {gap:?} apart"
+                after > Duration::from_secs(1) && before <= Duration::from_secs(1),
+                "{kind}: written {after:?} after the last carrier, {before:?} before"
             );
         }
         for (packet, value) in &sent {
@@ -5859,4 +5879,41 @@ fn rfc8829_5_3_1_a_listen_only_offer_gets_the_stream_audio_and_no_video() {
     let stats = pair.session.stats();
     assert_eq!((stats.audio_packets, stats.packets), (5, 0));
     assert_eq!(pair.viewer.packets(), []);
+}
+
+/// A session checks the browser's candidates on its own, paced by its
+/// timeouts (RFC 8445 §6.1.4.2), before anything arrives from the
+/// browser: a relay candidate's checks are what open the TURN
+/// permission the browser's own checks need (RFC 8656 §9).
+#[test]
+fn rfc8445_6_1_4_2_a_session_checks_the_browser_before_hearing_from_it() {
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let (mut session, _answer) =
+        Session::answer(&request(viewer.offer(), h264(None)), now).unwrap();
+    let browser: SocketAddr = BROWSER.parse().unwrap();
+    let mut at = now;
+    let mut checked = None;
+    while checked.is_none() && at < now + Duration::from_secs(1) {
+        match session.poll() {
+            SessionOutput::Timeout(next) => {
+                at = next;
+                session.handle_timeout(at);
+            }
+            // A STUN Binding request (RFC 8489 §5: class and method 0x0001).
+            SessionOutput::Transmit {
+                destination,
+                payload,
+                ..
+            } if destination == browser && payload.starts_with(&[0x00, 0x01]) => {
+                checked = Some(at);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        checked.is_some(),
+        "a connectivity check to the browser within 1 s"
+    );
 }
