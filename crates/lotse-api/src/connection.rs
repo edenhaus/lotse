@@ -677,6 +677,7 @@ const fn opens_subscription(command: &Command) -> bool {
             | Command::WebrtcOffer(_)
             | Command::SessionAdopt(_)
             | Command::RecordingCreate(_)
+            | Command::SignalingSubscribe(_)
     )
 }
 

@@ -174,7 +174,8 @@ pub struct Shutdown {
 }
 
 /// An empty result (`stream/delete`, `unsubscribe`, the subscriptions,
-/// `webrtc/candidate`, `session/close`).
+/// `webrtc/candidate`, `session/close`, `signaling/answer`,
+/// `signaling/candidate`, `signaling/error`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Empty {}

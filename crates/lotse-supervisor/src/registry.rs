@@ -1,7 +1,8 @@
 //! The registry: every stream's desired state, the source connections
 //! streams share, each connection's demand and its latest snapshot as the
 //! driver reports it, the viewer sessions, the event recordings
-//! ([`crate::recording`]), and the subscribers of `stream/subscribe`.
+//! ([`crate::recording`]), the subscribers of `stream/subscribe`, and the
+//! signaled sources' signaling ([`crate::signaling`]).
 //!
 //! One mutex over the maps, taken only on control-plane operations and
 //! never held across an await. Drivers publish snapshots into it, the
@@ -17,6 +18,7 @@ use lotse_api::{ConnectionId, Event, EventClass};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::info::{ProcessMetrics, WorkerMetrics};
 use lotse_api_types::session::{CloseCode, Session, SessionEvent};
+use lotse_api_types::signaling::SignalCloseCode;
 use lotse_api_types::stream::{
     AudioMode, BackchannelState, ConnectionInfo, LastError, Orientation, SourceBackchannel,
     SourceInfo, Stream, StreamBackchannel, StreamEvent, StreamState, StreamStats, TalkerReason,
@@ -47,6 +49,7 @@ use crate::recording::{
     FinishedRecording, RecordingCounters, RecordingEntry, RecordingLimits, StoppingRecording,
 };
 use crate::session::{ChannelRequest, SessionEntry, api_event, close_code};
+use crate::signaling::Signaling;
 use crate::worker::WorkerManager;
 
 /// Events a subscription may hold before the server's forwarder drains
@@ -335,6 +338,8 @@ pub(crate) struct State {
     pub(crate) recording_limits: RecordingLimits,
     /// The demux's sessions; `None` without a front door (tests).
     pub(crate) registrations: Option<Arc<Registrations>>,
+    /// The signaled sources' signaling: subscriptions, opens and signals.
+    pub(crate) signaling: Signaling,
 }
 
 impl State {
@@ -504,6 +509,11 @@ impl State {
             tracing::info!(connection.id = id, "connection released");
             self.connections.remove(id);
             self.forget_stopping_recordings(id);
+            self.signals_ended(
+                id,
+                SignalCloseCode::SourceStopped,
+                "the stream's source was removed",
+            );
             return;
         }
         let preloads = entry
@@ -579,8 +589,8 @@ impl State {
         rx
     }
 
-    /// Drops the subscriptions of a control connection that closed and
-    /// orphans its sessions; returns each orphan's id, serial and epoch
+    /// Drops the subscriptions of a control connection that closed (its
+    /// signaling ones end their signals) and orphans its sessions; returns each orphan's id, serial and epoch
     /// for its grace timer.
     pub(crate) fn connection_closed(
         &mut self,
@@ -588,6 +598,7 @@ impl State {
     ) -> Vec<(String, u64, u64)> {
         self.subscribers
             .retain(|subscriber| subscriber.connection != connection);
+        self.signaling_connection_closed(connection);
         let mut orphans = Vec::new();
         for (id, session) in &mut self.sessions {
             if session.owned_by_connection(connection) {

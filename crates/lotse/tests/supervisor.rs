@@ -5,7 +5,8 @@
 //! attempts take turns under `sources.connect_concurrency`, a backchannel
 //! probe among them, and shutdown stops everything within the budget; a
 //! signaled source starts its worker without a host lookup and, with no
-//! client relaying its signaling, backs off unreachable.
+//! client subscribing to its signaling within the wait, backs off
+//! unreachable.
 //! Needs the `source-fake` feature (on with `--all-features`).
 
 #![cfg(feature = "source-fake")]
@@ -219,9 +220,10 @@ async fn preload_starts_a_worker_that_goes_live_and_linger_stops_it() {
 }
 
 /// A signaled source's worker starts without a host lookup (its label
-/// resolves nowhere), and with no control-API client relaying its
-/// signaling the supervisor refuses its open: the source's attempt ends
-/// unreachable, and the stream backs off with that as its last error.
+/// resolves nowhere), and with no control-API client subscribing to its
+/// signaling the supervisor refuses its open once it waited 10 s for one:
+/// the source's attempt ends unreachable, and the stream backs off with
+/// that as its last error.
 #[tokio::test]
 async fn a_signaled_source_without_a_signaling_client_backs_off_unreachable() {
     let s = supervisor();
