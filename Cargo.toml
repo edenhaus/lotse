@@ -108,7 +108,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # its UDP pairs; `unstable-send`: the backchannel's `rtp::Sender` and `SessionCore::queue_rtp`; `h264`, `h265`: `Stream::parameters`, the parameter sets
 # of an H.264 (RFC 6184 §8.1 `sprop-parameter-sets`) or H.265 (RFC 7798 §7.1 `sprop-vps`,
 # `sprop-sps`, `sprop-pps`) camera's SDP, which retina reads only with the codec's feature.
-retina = { git = "https://github.com/edenhaus/retina", rev = "13a0114e9b16271b5796dac5343076d5bf0bfb37", default-features = false, features = ["unstable-sans-io", "unstable-send", "h264", "h265"] }
+retina = { git = "https://github.com/edenhaus/retina", rev = "836bfaf260183a4f4728bd6589c6bf5d6f0d143f", default-features = false, features = ["unstable-sans-io", "unstable-send", "h264", "h265"] }
 # The HLS playlist parser of the HTTP source (RFC 8216 §4); only the parser feature, whose nom 7
 # is already in the tree via rtsp-types; chrono comes with it, for `EXT-X-PROGRAM-DATE-TIME`.
 m3u8-rs = { version = "6", default-features = false, features = ["parser"] }
