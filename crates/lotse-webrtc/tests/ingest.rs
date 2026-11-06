@@ -949,10 +949,12 @@ fn rfc8838_10_trickled_candidates_connect_and_bad_ones_are_refused() {
         sdp_mline_index: Some(0),
     };
     let camera_line = "candidate:1 1 udp 2130706431 192.0.2.20 6000 typ host";
-    // Before the answer the camera's credentials are unknown.
+    // Before the answer: held until it comes, `a=` as some integrations
+    // keep it.
     pair.engine
-        .add_remote_candidate(pair.now, &candidate(camera_line));
-    assert_eq!(pair.engine.stats().refused_candidates, 1);
+        .add_remote_candidate(pair.now, &candidate(&format!("a={camera_line}")));
+    assert_eq!(pair.engine.stats().refused_candidates, 0);
+    assert_eq!(pair.engine.stats().remote_candidates, 0);
     // The answer without its candidates: they come trickled.
     pair.answer(camera_config(false), |answer| {
         answer
@@ -961,7 +963,7 @@ fn rfc8838_10_trickled_candidates_connect_and_bad_ones_are_refused() {
             .map(|line| format!("{line}\r\n"))
             .collect()
     });
-    assert_eq!(pair.engine.stats().remote_candidates, 0);
+    assert_eq!(pair.engine.stats().remote_candidates, 1, "the held one");
     for refused in [
         // RFC 8445 §6.1.2.2 as the viewer sessions apply it: loopback
         // without a loopback host candidate of ours.
@@ -973,14 +975,45 @@ fn rfc8838_10_trickled_candidates_connect_and_bad_ones_are_refused() {
         pair.engine
             .add_remote_candidate(pair.now, &candidate(refused));
     }
-    assert_eq!(pair.engine.stats().refused_candidates, 4);
+    assert_eq!(pair.engine.stats().refused_candidates, 3);
     pair.engine
         .add_remote_candidate(pair.now, &SignalCandidate::end_of_candidates(None, Some(0)));
-    assert_eq!(pair.engine.stats().refused_candidates, 4);
-    // `a=` as some integrations keep it.
+    assert_eq!(pair.engine.stats().refused_candidates, 3);
+    // One trickled after the answer goes to the agent.
+    pair.engine.add_remote_candidate(
+        pair.now,
+        &candidate("candidate:4 1 udp 2130706431 192.0.2.20 6001 typ host"),
+    );
+    assert_eq!(pair.engine.stats().remote_candidates, 2);
+    pair.connect();
+    pair.engine.close();
     pair.engine
-        .add_remote_candidate(pair.now, &candidate(&format!("a={camera_line}")));
-    assert_eq!(pair.engine.stats().remote_candidates, 1);
+        .add_remote_candidate(pair.now, &candidate(camera_line));
+    assert_eq!(pair.engine.stats().refused_candidates, 4, "after the end");
+}
+
+#[test]
+fn rfc8838_10_at_most_64_candidates_are_held_until_the_answer() {
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    for port in 0..=64 {
+        let line = format!(
+            "candidate:{port} 1 udp 2130706431 192.0.2.30 {} typ host",
+            7_000 + port
+        );
+        pair.engine.add_remote_candidate(
+            pair.now,
+            &SignalCandidate {
+                candidate: line,
+                sdp_mid: None,
+                sdp_mline_index: Some(0),
+            },
+        );
+    }
+    assert_eq!(pair.engine.stats().refused_candidates, 1);
+    pair.answer(camera_config(false), |answer| answer);
+    // The answer's own and the 64 held.
+    assert_eq!(pair.engine.stats().remote_candidates, 65);
     pair.connect();
 }
 

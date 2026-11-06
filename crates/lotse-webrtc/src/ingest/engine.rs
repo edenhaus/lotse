@@ -75,6 +75,10 @@ pub const STARTUP_PLIS: u32 = 5;
 /// source's own.
 pub const INTERNAL_ERROR: &str = "internal_error";
 
+/// How many of the camera's candidates are held until its answer: the
+/// control API's bound on a client's candidates per signal.
+pub const MAX_EARLY_CANDIDATES: usize = 64;
+
 /// How many outputs a close may queue (its DTLS `close_notify`, the RTCP
 /// BYE); the rest is not waited for.
 const CLOSE_OUTPUTS: usize = 64;
@@ -224,6 +228,8 @@ pub struct IngestEngine {
     /// The scopes of the host candidates, for the remote candidates'
     /// address check.
     scopes: Vec<Scope>,
+    /// The camera's candidates that came before its answer.
+    early: Vec<String>,
     /// Where the attempt is.
     phase: Phase,
     /// The last time handed in.
@@ -444,6 +450,7 @@ impl IngestEngine {
             channel,
             local,
             scopes,
+            early: Vec::new(),
             phase: Phase::Offered,
             now,
             deadline: now.checked_add(ANSWER_TIMEOUT),
@@ -574,6 +581,9 @@ impl IngestEngine {
         for line in candidates {
             self.add_remote(line);
         }
+        for line in std::mem::take(&mut self.early) {
+            self.add_remote(&line);
+        }
         self.phase = Phase::Answered;
         self.deadline = self.now.checked_add(CONNECT_TIMEOUT);
         self.queued.push_back(IngestOutput::Tracks(tracks));
@@ -609,22 +619,30 @@ impl IngestEngine {
     }
 
     /// A candidate the camera trickled (RFC 8838 §10), at `now`. Its
-    /// end-of-candidates indication is noted only; a candidate before the
-    /// answer is refused, as the camera's ICE credentials are not known
-    /// yet.
+    /// end-of-candidates indication is noted only. One that arrives
+    /// before the answer is held (at most [`MAX_EARLY_CANDIDATES`]) and
+    /// handed to the agent with the answer, as the camera's ICE
+    /// credentials come with it: a relay may pass on the camera's
+    /// candidates ahead of its answer (RFC 8838 §10 lets them arrive in
+    /// any order). After the end, one is ignored.
     pub fn add_remote_candidate(&mut self, now: Instant, candidate: &SignalCandidate) {
         self.now = now;
         if candidate.is_end_of_candidates() {
             tracing::debug!("webrtc: the camera's end of candidates");
             return;
         }
-        if self.phase != Phase::Answered && self.phase != Phase::Connected {
-            self.stats.refused_candidates = self.stats.refused_candidates.saturating_add(1);
-            tracing::debug!(phase = ?self.phase, "webrtc: remote candidate outside the connection's setup ignored");
-            return;
-        }
         let line = candidate.candidate.as_str();
-        self.add_remote(line.strip_prefix("a=").unwrap_or(line));
+        let line = line.strip_prefix("a=").unwrap_or(line);
+        match self.phase {
+            Phase::Offered if self.early.len() < MAX_EARLY_CANDIDATES => {
+                self.early.push(line.to_owned());
+            }
+            Phase::Answered | Phase::Connected => self.add_remote(line),
+            Phase::Offered | Phase::Ended => {
+                self.stats.refused_candidates = self.stats.refused_candidates.saturating_add(1);
+                tracing::debug!(phase = ?self.phase, "webrtc: remote candidate ignored: too many before the answer, or after the end");
+            }
+        }
     }
 
     /// Hands one remote candidate line to the agent unless the viewer
