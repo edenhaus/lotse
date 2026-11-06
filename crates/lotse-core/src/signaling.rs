@@ -58,7 +58,18 @@ pub mod close {
     pub const CAMERA_ERROR: &str = "camera_error";
     /// The client relaying the signal went away.
     pub const SIGNALING_LOST: &str = "signaling_lost";
+    /// lotse itself broke the signal: what the source sent was refused on
+    /// its way to the client ([`super::REJECTED`]), or did not fit.
+    pub const INTERNAL_ERROR: &str = "internal_error";
 }
+
+/// The code of a [`RemoteSignal::Failed`] that the relay, not the camera,
+/// sends: it refused an offer or candidate of the source's (too long, or
+/// malformed) and ended the signal. The fault is the source's, never the
+/// camera's, so a source ends its attempt as a protocol error and closes
+/// its channel [`close::INTERNAL_ERROR`], not [`close::CAMERA_ERROR`]. The
+/// supervisor never relays a client's own code as this one.
+pub const REJECTED: &str = "signal_rejected";
 
 /// One ICE candidate as the client relays it, the fields of W3C WebRTC
 /// 1.0's `RTCIceCandidateInit`. An empty `candidate` is the
