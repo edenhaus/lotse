@@ -235,7 +235,9 @@ fuzz_target!(|data: &[u8]| {
                 run.drain();
             }
             4 => {
-                let Some(ms) = take::<2>(&mut rest) else { break };
+                let Some(ms) = take::<2>(&mut rest) else {
+                    break;
+                };
                 run.step(Duration::from_millis(u64::from(u16::from_le_bytes(ms))));
             }
             5 => {
