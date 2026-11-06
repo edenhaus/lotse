@@ -258,7 +258,7 @@ fn samples(file: &[u8], track_id: u32) -> Vec<Read> {
             assert_eq!(traf.trun.len(), 1);
             let trun = &traf.trun[0];
             let mut at = start + usize::try_from(trun.data_offset.unwrap()).unwrap();
-            for entry in &trun.entries {
+            for entry in &trun.samples {
                 let size = usize::try_from(entry.size.unwrap()).unwrap();
                 let duration = entry.duration.unwrap();
                 out.push(Read {
@@ -266,7 +266,7 @@ fn samples(file: &[u8], track_id: u32) -> Vec<Read> {
                     dts,
                     duration,
                     flags: entry.flags,
-                    cts: entry.cts.unwrap_or(0),
+                    cts: i32::try_from(entry.cts.unwrap_or(0)).unwrap(),
                     bytes: file[at..at + size].to_vec(),
                 });
                 at += size;
@@ -600,8 +600,12 @@ fn iso14496_12_8_4_each_track_has_its_media_header_handler_and_empty_sample_tabl
         assert_eq!(stbl.stsd.codecs.len(), 1);
         assert!(stbl.stts.entries.is_empty() && stbl.stsc.entries.is_empty());
         assert_eq!(stbl.stco.as_ref().unwrap().entries, Vec::<u32>::new());
-        assert_eq!(trak.mdia.minf.dinf.dref.urls.len(), 1);
-        assert_eq!(trak.mdia.minf.dinf.dref.urls[0].location, "");
+        let entries = &trak.mdia.minf.dinf.dref.entries;
+        assert_eq!(entries.len(), 1);
+        let mp4_atom::DrefEntry::Url(url) = &entries[0] else {
+            panic!("a url entry: {entries:?}");
+        };
+        assert_eq!(url.location, "");
     }
 }
 

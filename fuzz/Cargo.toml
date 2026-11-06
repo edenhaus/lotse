@@ -29,7 +29,7 @@ lotse-supervisor = { path = "../crates/lotse-supervisor" }
 lotse-testing = { path = "../crates/lotse-testing" }
 lotse-webrtc = { path = "../crates/lotse-webrtc" }
 lotse-worker = { path = "../crates/lotse-worker" }
-mp4-atom = { version = "0.16", default-features = false }
+mp4-atom = { version = "0.17", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # Without its default features, as in the root: they link aws-lc-rs, which .cargo/deny.toml bans.
 str0m = { version = "0.25", default-features = false }
