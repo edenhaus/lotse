@@ -37,7 +37,7 @@ lotse-core = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "time"] } # `time`: a real-time bound where a regression would hang a test
 lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock` drives the upgrade deadline
-tokio-tungstenite = { version = "0.29", default-features = false } # the client side of the tests; axum's own WebSocket engine
+tokio-tungstenite = { version = "=0.29.0", default-features = false } # the client side of the tests; axum's own WebSocket engine
 lotse-testing = { workspace = true } # the TLS listener's clients, well-behaved and not
 tracing-subscriber = { workspace = true } # captures log lines with their spans
 
