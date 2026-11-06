@@ -32,17 +32,17 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use lotse_api_types::limits::{MAX_SDP_CHARS, MAX_TEXT_CHARS};
-use lotse_ipc::{SessionEvent as WorkerSessionEvent, SignalReport};
+use lotse_ipc::{MAX_SIGNAL_OFFER_BYTES, SessionEvent as WorkerSessionEvent, SignalReport};
 
 /// The longest answer, in bytes: the offer's cap, which is the control
 /// API's frame;
 /// str0m's answers are a few KiB.
 pub(crate) const MAX_ANSWER_BYTES: usize = MAX_SDP_CHARS;
 
-/// The longest offer a signaled source sends the client, in bytes: a
-/// WebRTC offer of audio, video and a data channel, its host candidates
-/// included, is two or three KiB.
-pub(crate) const MAX_OFFER_BYTES: usize = 16 * 1024;
+/// The longest offer a signaled source sends the client, in bytes: the
+/// worker's own cap ([`MAX_SIGNAL_OFFER_BYTES`]), so a worker that keeps
+/// to it never sends one this rejects.
+pub(crate) const MAX_OFFER_BYTES: usize = MAX_SIGNAL_OFFER_BYTES;
 
 /// The longest candidate line or `mid`, in bytes: the cap on the
 /// browser's (`MAX_TEXT_CHARS`).
@@ -566,6 +566,15 @@ a=end-of-candidates\r\n";
             offer("v=0\r\na=candidate:x\r\n"),
             Err("candidate component malformed")
         );
+    }
+
+    /// The worker keeps to the caps this checks a signal against, so a
+    /// signal of a worker that is not compromised is never rejected for
+    /// its length.
+    #[test]
+    fn the_worker_s_caps_on_a_signal_are_the_supervisor_s() {
+        assert_eq!(MAX_OFFER_BYTES, MAX_SIGNAL_OFFER_BYTES);
+        assert_eq!(MAX_LINE_BYTES, lotse_ipc::MAX_SIGNAL_CANDIDATE_BYTES);
     }
 
     #[test]

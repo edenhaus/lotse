@@ -39,7 +39,7 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use lotse_codec::transcode::recording::ToOpus;
 use lotse_core::backoff::{BackoffPosition, ReconnectBackoff};
@@ -772,6 +772,8 @@ impl Serving<'_> {
             standby,
             running,
             backchannels,
+            signaling,
+            signal_rx,
             ..
         } = self;
         // Each recording writes its last fragment, and its report waits for the
@@ -806,6 +808,9 @@ impl Serving<'_> {
         let (ended, torn_down) = tokio::join!(ending, teardown);
         ended?;
         torn_down?;
+        // The sources stopped, so their signaling channels are closed: each
+        // relay queues its close, which goes out ahead of the exit.
+        close_signaling(signaling, signal_rx, tx, clock, deadline).await?;
         Ok(ExitReason::Shutdown)
     }
 
@@ -1420,6 +1425,44 @@ async fn close_backchannels(tasks: &BackchannelTasks, clock: &Arc<dyn Clock>) {
             grace_ms = BACKCHANNEL_CLOSE_GRACE.as_millis(),
             "backchannel sessions still closing after the grace; the worker exits without them"
         ),
+    }
+}
+
+/// Waits, until `deadline` on `clock`, for the relays of the signaling
+/// channels to end, each having queued its channel's close, and sends the
+/// reports of `signal_rx` to the supervisor on `tx` meanwhile, so no relay
+/// waits for room; the last ones go out with the worker's final flush.
+async fn close_signaling(
+    signaling: &WorkerSignaling,
+    signal_rx: &mut mpsc::Receiver<SignalReport>,
+    tx: &mut Sender,
+    clock: &Arc<dyn Clock>,
+    deadline: Instant,
+) -> Result<(), Error> {
+    let open = signaling.relays();
+    let ended = signaling.relays_ended();
+    tokio::pin!(ended);
+    let grace = clock.sleep(deadline.saturating_duration_since(clock.now()));
+    tokio::pin!(grace);
+    loop {
+        tokio::select! {
+            biased;
+            // The signaling holds the reports' sender, so they never end.
+            Some(report) = signal_rx.recv() => {
+                tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
+            }
+            () = &mut ended => {
+                tracing::debug!(open, "signaling relays ended");
+                return Ok(());
+            }
+            () = &mut grace => {
+                tracing::warn!(
+                    left = signaling.relays(),
+                    "signaling relays still closing at the deadline; the worker exits without their closes"
+                );
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -2946,6 +2989,103 @@ mod tests {
         opening.abort();
     }
 
+    /// Opens the channel `signal_id` through `signaling`, reading the open
+    /// from `signal_rx`.
+    async fn opened_channel(
+        signaling: &WorkerSignaling,
+        signal_rx: &mut mpsc::Receiver<SignalReport>,
+        signal_id: &str,
+    ) -> lotse_core::signaling::SignalingChannel {
+        let opening = spawn_named("test.open", signaling.open());
+        let_assert!(Some(SignalReport::Open { request }) = within(signal_rx.recv()).await);
+        let opened = SignalCommand::Opened {
+            request,
+            signal_id: signal_id.into(),
+            local_addrs: vec![],
+        };
+        assert_eq!(signaling.command(opened), None);
+        opening.await.unwrap().unwrap()
+    }
+
+    /// The shutdown waits for the signaling relays, so the close each
+    /// queues once its source let go of the channel goes out before the
+    /// worker exits.
+    #[tokio::test]
+    async fn the_shutdown_waits_for_the_signaling_relays_to_queue_their_closes() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let (signaling, mut signal_rx) = WorkerSignaling::new();
+        let channel = opened_channel(&signaling, &mut signal_rx, "sig-1").await;
+        serving.signaling = signaling;
+        serving.signal_rx = signal_rx;
+        // The source lets go of its channel a while later, as a stopping
+        // one does.
+        let _source = spawn_named("test.source", async move {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            drop(channel);
+        });
+        assert_eq!(
+            serving.on_shutdown(1_000).await.unwrap(),
+            ExitReason::Shutdown
+        );
+        drop(serving);
+        assert_eq!(
+            within(rx.recv_msg::<ToSupervisor>())
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            ToSupervisor::Signal(SignalReport::Closed {
+                signal_id: "sig-1".into(),
+                code: "source_stopped".into(),
+                message: "the source stopped".into(),
+            })
+        );
+        assert_eq!(
+            logs.lines(Level::DEBUG, "signaling relays ended")[0].fields,
+            " open=1"
+        );
+    }
+
+    /// A relay whose channel is still open at the shutdown's deadline is
+    /// left with a warning: the shutdown goes on.
+    #[tokio::test]
+    async fn a_signaling_relay_still_open_at_the_deadline_is_left_with_a_warning() {
+        let (logs, _guard) = Logs::capture();
+        let fake = Arc::new(FakeClock::default());
+        let clock: Arc<dyn Clock> = fake.clone();
+        let (signaling, mut signal_rx) = WorkerSignaling::new();
+        let channel = opened_channel(&signaling, &mut signal_rx, "sig-1").await;
+        let (ours, theirs) = Channel::pair().unwrap();
+        let (mut tx, _) = Channel::from_fd(theirs).unwrap().split();
+        let deadline = fake.now() + Duration::from_secs(1);
+        let closing = spawn_named("test.close", async move {
+            close_signaling(&signaling, &mut signal_rx, &mut tx, &clock, deadline)
+                .await
+                .unwrap();
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        fake.advance(Duration::from_millis(999));
+        tokio::task::yield_now().await;
+        assert!(!closing.is_finished(), "waits until the deadline");
+        fake.advance(Duration::from_millis(1));
+        within(closing).await.unwrap();
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "signaling relays still closing at the deadline; the worker exits without their closes"
+            )[0]
+            .fields,
+            " left=1"
+        );
+        drop((channel, ours));
+    }
+
     /// A release on a connection whose protocol has no backchannel does
     /// nothing, and nothing is reported.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3678,7 +3818,7 @@ mod tests {
         fn open_session(
             &self,
             request: lotse_core::session::SessionRequest,
-            now: std::time::Instant,
+            now: Instant,
         ) -> Result<
             (Box<dyn lotse_core::session::SessionEngine>, String),
             lotse_core::session::SessionOpenError,

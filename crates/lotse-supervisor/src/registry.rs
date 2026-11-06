@@ -27,6 +27,7 @@ use lotse_core::clock::Clock;
 use lotse_core::connection::{ConnectionError, ConnectionState};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
+use lotse_core::throttle::Throttle;
 use lotse_ipc::{
     PrerecordStats, SessionEvent as WorkerSessionEvent, SessionSpec, TalkbackStats,
     TrackInfo as IpcTrackInfo, WorkerStats,
@@ -335,6 +336,9 @@ pub(crate) struct State {
     pub(crate) recording_limits: RecordingLimits,
     /// The demux's sessions; `None` without a front door (tests).
     pub(crate) registrations: Option<Arc<Registrations>>,
+    /// Rate-limits the line of a signal command a driver's full queue
+    /// dropped, which a worker's reports can cause as fast as it sends.
+    pub(crate) signal_queue_lines: Throttle,
 }
 
 impl State {
