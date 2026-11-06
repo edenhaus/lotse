@@ -8,7 +8,7 @@
 //! by echoing the offered `a=extmap` under its id, RFC 8285 §6), in the
 //! one-byte header form (RFC 8285 §4.2).
 //!
-//! `SPEC-DEVIATION`: str0m 0.24 carries only the two rotation bits
+//! `SPEC-DEVIATION`: str0m 0.25 carries only the two rotation bits
 //! (`str0m::rtp::VideoOrientation`), so the flip
 //! bit of the four mirrored orientations is not sent and those play
 //! turned but not mirrored. The browsers that offer CVO read only the
@@ -56,7 +56,7 @@ pub(crate) const fn byte(orientation: Orientation) -> u8 {
 /// they are (`Deg270` is R = 1, `Deg90` R = 3: the turn on the link,
 /// counterclockwise by R × 90°). The flip bit is lost (module docs).
 fn engine_value(byte: u8) -> VideoOrientation {
-    // SPEC-DEVIATION(3GPP TS 26.114 §7.4.5): F is not sent, as str0m 0.24
+    // SPEC-DEVIATION(3GPP TS 26.114 §7.4.5): F is not sent, as str0m 0.25
     // has no field for it and libwebrtc ignores it; gate:
     // ts_26_114_7_4_5_a_mirrored_orientation_sends_its_rotation_without_the_flip_bit
     VideoOrientation::from(byte & ROTATION)

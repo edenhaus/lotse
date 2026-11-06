@@ -124,18 +124,6 @@ impl Pair {
     }
 }
 
-/// Whether two media sections of `offer` carry one `a=mid`.
-fn duplicate_mids(offer: &str) -> bool {
-    let mut mids: Vec<&str> = offer
-        .lines()
-        .filter_map(|l| l.strip_prefix("a=mid:"))
-        .collect();
-    let all = mids.len();
-    mids.sort_unstable();
-    mids.dedup();
-    mids.len() != all
-}
-
 /// Takes `N` bytes off the front of `rest`.
 fn take<const N: usize>(rest: &mut &[u8]) -> Option<[u8; N]> {
     let (head, tail) = rest.split_first_chunk::<N>()?;
@@ -224,10 +212,6 @@ fuzz_target!(|data: &[u8]| {
     };
     let (session, answer) = match Session::answer(&request, t0) {
         Ok(answered) => answered,
-        // str0m 0.24's offerer can draw one random mid for two media added
-        // in one change (observed 2026-10-01); the session refuses that
-        // offer, rightly. The viewer is test code: start over.
-        Err(_) if duplicate_mids(&request.offer) => return,
         Err(err) => panic!("the viewer's offer is answered: {err:?}\n{}", request.offer),
     };
     let mut pair = Pair {
