@@ -50,12 +50,28 @@
 //! runs no recording, and the ids of the recordings it was finishing are free once
 //! the driver lets go of it, since their reports reach no one.
 //!
+//! A signaled source's signaling (`lotse_core::signaling`) passes through
+//! the driver both ways: its worker's reports are checked here, untrusted
+//! (at most [`MAX_PENDING_OPENS`] opens waiting, each for at most
+//! [`OPEN_EXPIRY`]; offers and candidates as [`worker_text::check_signal`]
+//! takes them, a malformed one ending its signal with a
+//! [`REJECTED`] failure to the worker and the signal's one close to the
+//! registry), and handed to the registry ([`State::signal_report`]), whose
+//! answers come back on the command queue ([`DriverCommand::Signal`]) and
+//! go to the worker they are for if it still runs; one for a worker that
+//! is gone is dropped, as its signal went with that worker. A signaled
+//! source has no host to look up: its worker starts without a lookup and
+//! connects nowhere by itself.
+//!
+//! [`State::signal_report`]: crate::registry::State::signal_report
+//! [`worker_text::check_signal`]: crate::worker_text::check_signal
+//!
 //! A worker that can no longer be told what to do is killed, so its exit
 //! runs the crash path and the machine restarts it with backoff: one whose
 //! channel ended while it runs, and one that sent nothing for
 //! [`WORKER_SILENCE_LIMIT`] (a worker sends its counters every second).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
@@ -71,16 +87,21 @@ use lotse_core::connection::{
     Action, ConnectionConfig, ConnectionError, ConnectionMachine, ConnectionState, Input,
     WorkerReport,
 };
+use lotse_core::signaling::{REJECTED, close};
 use lotse_core::source::SourceError;
 use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::throttle::Throttle;
-use lotse_ipc::{RecordingReport, RecordingSpec, STOPPED_AS_ASKED, SessionSpec, SourceSpec};
+use lotse_ipc::{
+    RecordingReport, RecordingSpec, STOPPED_AS_ASKED, SessionSpec, SignalCommand, SignalReport,
+    SourceSpec, SourceTarget,
+};
 use tokio::sync::{mpsc, watch};
 
 use crate::connect::{CONNECT_LEASE, ConnectSlot, SlotWake};
 use crate::net::demux::{DatagramSink, WorkerSink};
 use crate::net::turn_client::LeaseGrant;
 use crate::registry::{CloseBy, ConnectionSnapshot, Shared, WorkerProcess};
+use crate::signaling::{MAX_ENDED_SIGNALS, MAX_PENDING_OPENS, OPEN_EXPIRY, SignalFrom};
 use crate::worker::{Worker, WorkerEvent};
 
 /// Session messages a driver holds, queued or in flight, besides the
@@ -226,6 +247,18 @@ pub(crate) enum DriverCommand {
         /// Only if this session holds it, which the worker decides.
         session_id: Option<String>,
     },
+    /// Tell the worker this about its signaled source's signaling: the
+    /// answer to an open, or what the client relays on a signal. Only the
+    /// worker `worker` (the driver's serial of it,
+    /// [`SignalFrom::worker`](crate::signaling::SignalFrom::worker)) is
+    /// told: a worker's open ids restart at 1, so an answer queued for a
+    /// worker that exited never reaches the next one.
+    Signal {
+        /// The serial of the worker it is for.
+        worker: u64,
+        /// What to tell it.
+        command: SignalCommand,
+    },
     /// An ICE-TCP connection the acceptor verified for one of the
     /// worker's sessions.
     IceTcp {
@@ -257,7 +290,8 @@ impl DriverCommand {
             | Self::Prerecord { .. }
             | Self::StartRecording { .. }
             | Self::StopRecording { .. }
-            | Self::ReleaseBackchannel { .. } => None,
+            | Self::ReleaseBackchannel { .. }
+            | Self::Signal { .. } => None,
         }
     }
 }
@@ -296,11 +330,13 @@ impl DatagramSink for SessionSink {
 pub(crate) struct DriverSpec {
     /// The connection's id.
     pub(crate) connection_id: String,
-    /// The full source URL, credentials included.
-    pub(crate) url: String,
-    /// The per-scheme options as JSON text.
+    /// The full source URL, credentials included, or a signaled source's
+    /// protocol.
+    pub(crate) target: SourceTarget,
+    /// The per-scheme or per-protocol options as JSON text.
     pub(crate) options: String,
-    /// The host to resolve, as the URL spells it.
+    /// The host to resolve, as the URL spells it; empty for a signaled
+    /// source.
     pub(crate) host: String,
     /// The port, from the URL or the scheme's default.
     pub(crate) port: Option<u16>,
@@ -311,6 +347,12 @@ pub(crate) struct DriverSpec {
 }
 
 impl DriverSpec {
+    /// Whether the source's signaling is the control-API client's to
+    /// relay: it has no host to look up and no port to connect to.
+    pub(crate) const fn signaled(&self) -> bool {
+        matches!(self.target, SourceTarget::Signaled(_))
+    }
+
     /// The spec as the worker takes it, with the resolved addresses, where
     /// its reconnect schedule starts, and the connection's pre-record window.
     fn source_spec(
@@ -321,7 +363,7 @@ impl DriverSpec {
     ) -> SourceSpec {
         SourceSpec {
             connection_id: self.connection_id.clone(),
-            url: self.url.clone(),
+            target: self.target.clone(),
             options: self.options.clone(),
             peer_host: self.host.clone(),
             peer_addrs,
@@ -344,7 +386,7 @@ impl fmt::Debug for DriverSpec {
                 .map(|options| options.keys().cloned().collect::<Vec<_>>());
         let mut out = f.debug_struct("DriverSpec");
         out.field("connection_id", &self.connection_id)
-            .field("url", &"****");
+            .field("target", &self.target);
         match &options {
             Ok(names) => out.field("options", names),
             Err(_) => out.field("options", &"****"),
@@ -508,6 +550,27 @@ pub(crate) struct Driver {
     /// The connection's pre-record window, in milliseconds, which every
     /// worker it starts and every source it switches to gets.
     prerecord_ms: u32,
+    /// The serial of the running worker, or of the last one: counts up at
+    /// each start, so a signal command names the worker it is for.
+    worker_serial: u64,
+    /// The running worker's signaling opens the registry has not answered
+    /// yet, by the worker's id, with when each was asked: at most
+    /// [`MAX_PENDING_OPENS`], each forgotten after [`OPEN_EXPIRY`], so an
+    /// answer or a cancel lost on a full queue cannot hold its place.
+    signal_opens: BTreeMap<u64, Instant>,
+    /// The signals the driver ended itself, over a malformed offer or
+    /// candidate, the latest last and at most [`MAX_ENDED_SIGNALS`]: the
+    /// rest of their reports, the worker's close included, are dropped, as
+    /// the registry already had their close.
+    ended_signals: VecDeque<String>,
+    /// Rate-limits the line of a worker's signaling open that breaks the
+    /// contract, which a worker can repeat as fast as it likes.
+    signal_open_lines: Throttle,
+    /// Rate-limits the line of a worker's malformed offer or candidate.
+    signal_text_lines: Throttle,
+    /// Rate-limits the line of a signal command the full queue dropped,
+    /// which a worker's reports can cause as fast as it sends them.
+    signal_queue_lines: Throttle,
 }
 
 impl Driver {
@@ -553,6 +616,12 @@ impl Driver {
             switching: false,
             switch_failure: None,
             prerecord_ms,
+            worker_serial: 0,
+            signal_opens: BTreeMap::new(),
+            ended_signals: VecDeque::new(),
+            signal_open_lines: Throttle::default(),
+            signal_text_lines: Throttle::default(),
+            signal_queue_lines: Throttle::default(),
         }
     }
 
@@ -634,6 +703,9 @@ impl Driver {
             Wake::Command(DriverCommand::SwitchSource(spec)) => self.on_switch_source(spec),
             Wake::Command(DriverCommand::Backchannel(spec)) => self.on_backchannel(spec).await,
             Wake::Command(DriverCommand::Prerecord { ms }) => self.on_prerecord(ms).await,
+            Wake::Command(DriverCommand::Signal { worker, command }) => {
+                self.signal_worker(worker, command).await;
+            }
             Wake::Command(command) => match self.worker.as_mut() {
                 Some(worker) => {
                     Self::send(worker, &self.shared, &self.commands_tx, command).await;
@@ -871,11 +943,20 @@ impl Driver {
     /// Starts the host lookup of the source to switch to; the worker is
     /// told once it is done.
     fn start_resolving_switch(&mut self) {
+        self.pending = Pending::ResolvingSwitch(self.lookup());
+    }
+
+    /// The lookup of the source's host, or, for a signaled source, which
+    /// reaches its camera through the client's signaling and has no host
+    /// to look up, no addresses at once.
+    fn lookup(&self) -> BoxFuture<'static, Result<Vec<SocketAddr>, String>> {
+        if self.spec.signaled() {
+            tracing::debug!("signaled source: no host to look up");
+            return Box::pin(std::future::ready(Ok(Vec::new())));
+        }
         let host = self.spec.host.clone();
         let port = self.spec.port.unwrap_or(0);
-        self.pending = Pending::ResolvingSwitch(Box::pin(async move {
-            crate::resolve::resolve(&host, port).await
-        }));
+        Box::pin(async move { crate::resolve::resolve(&host, port).await })
     }
 
     /// A worker's report on one of its recordings, stamped with its arrival
@@ -962,6 +1043,7 @@ impl Driver {
                 recording_id,
                 event,
             } => self.on_recording_report(&recording_id, event),
+            WorkerEvent::Signal(report) => self.on_signal_report(report),
             WorkerEvent::Talker {
                 session_id,
                 reason,
@@ -987,6 +1069,188 @@ impl Driver {
                 }
             }
             WorkerEvent::Exited(status) => self.on_worker_exited(status),
+        }
+    }
+
+    /// A signal report of the worker's, untrusted: checked, then handed to
+    /// the registry. An open past [`MAX_PENDING_OPENS`] is refused at once,
+    /// one the worker already waits for and a cancel of one answered are
+    /// ignored, an offer or candidate that fails
+    /// [`check_signal`](crate::worker_text::check_signal) ends its signal
+    /// (the worker is told it was rejected, the registry that it closed),
+    /// and what the worker reports on a signal ended so is dropped.
+    fn on_signal_report(&mut self, report: SignalReport) {
+        if let SignalReport::Offer { signal_id, .. }
+        | SignalReport::Candidate { signal_id, .. }
+        | SignalReport::Closed { signal_id, .. } = &report
+            && self.ended_signals.contains(signal_id)
+        {
+            if matches!(report, SignalReport::Closed { .. }) {
+                // The worker's last report of it.
+                self.ended_signals.retain(|ended| ended != signal_id);
+            }
+            tracing::debug!(signal = %signal_id, "report on a signal the driver ended; dropped");
+            return;
+        }
+        let report = match report {
+            SignalReport::Open { request } => {
+                self.expire_opens();
+                if self.signal_opens.contains_key(&request) {
+                    self.signal_misuse(request, "a second open under one id; ignored");
+                    return;
+                }
+                if self.signal_opens.len() >= MAX_PENDING_OPENS {
+                    self.signal_misuse(
+                        request,
+                        "more opens waiting than a worker may have; refused",
+                    );
+                    self.queue_signal(SignalCommand::Refused {
+                        request,
+                        code: "limit_reached".to_owned(),
+                        message: format!(
+                            "a worker may have {MAX_PENDING_OPENS} signaling opens waiting"
+                        ),
+                    });
+                    return;
+                }
+                self.signal_opens.insert(request, self.shared.clock.now());
+                SignalReport::Open { request }
+            }
+            SignalReport::Cancel { request } => {
+                if self.signal_opens.remove(&request).is_none() {
+                    tracing::debug!(
+                        request,
+                        "cancel of a signaling open already answered; ignored"
+                    );
+                    return;
+                }
+                SignalReport::Cancel { request }
+            }
+            report => {
+                if let SignalReport::Offer { signal_id, .. }
+                | SignalReport::Candidate { signal_id, .. } = &report
+                    && let Err(reason) = crate::worker_text::check_signal(&report)
+                {
+                    let signal_id = signal_id.clone();
+                    self.malformed_signal(signal_id, reason)
+                } else {
+                    report
+                }
+            }
+        };
+        let now = self.shared.clock.now();
+        let from = SignalFrom {
+            connection: &self.spec.connection_id,
+            worker: self.worker_serial,
+        };
+        self.shared.lock().signal_report(&from, report, now);
+    }
+
+    /// Forgets the opens waiting longer than [`OPEN_EXPIRY`]: their answer
+    /// or cancel was lost on a full queue, as the attempt that asked is
+    /// over by then.
+    fn expire_opens(&mut self) {
+        let now = self.shared.clock.now();
+        self.signal_opens.retain(|request, asked| {
+            let waiting = now.saturating_duration_since(*asked) < OPEN_EXPIRY;
+            if !waiting {
+                tracing::info!(
+                    request,
+                    expiry_ms = OPEN_EXPIRY.as_millis(),
+                    "a signaling open got no answer in time; forgotten"
+                );
+            }
+            waiting
+        });
+    }
+
+    /// Ends the signal `signal_id`, whose offer or candidate failed the
+    /// check for `reason`: the worker is told the relay rejected it
+    /// ([`REJECTED`]: its source's fault, not the camera's), and its close
+    /// goes to the registry in the report's place, the only one it gets.
+    fn malformed_signal(&mut self, signal_id: String, reason: &'static str) -> SignalReport {
+        if let Some(count) = self.signal_text_lines.hit(self.shared.clock.now()) {
+            tracing::warn!(signal = %signal_id, reason, count, "a worker's signaling offer or candidate is malformed; signal ended");
+        }
+        let message = "the worker's offer or candidate was malformed";
+        self.queue_signal(SignalCommand::Failed {
+            signal_id: signal_id.clone(),
+            code: REJECTED.to_owned(),
+            message: message.to_owned(),
+        });
+        if self.ended_signals.len() >= MAX_ENDED_SIGNALS {
+            self.ended_signals.pop_front();
+        }
+        self.ended_signals.push_back(signal_id.clone());
+        SignalReport::Closed {
+            signal_id,
+            code: close::INTERNAL_ERROR.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+
+    /// Logs a worker's signaling open `request` that breaks the contract
+    /// for `reason`, rate-limited.
+    fn signal_misuse(&mut self, request: u64, reason: &'static str) {
+        if let Some(count) = self.signal_open_lines.hit(self.shared.clock.now()) {
+            tracing::warn!(
+                request,
+                reason,
+                count,
+                "a worker's signaling open breaks the contract"
+            );
+        }
+    }
+
+    /// Queues `command` for the running worker behind the registry's
+    /// commands, in order with them. A full queue drops it, as the
+    /// registry's own are, with a rate-limited line.
+    fn queue_signal(&mut self, command: SignalCommand) {
+        let queued = DriverCommand::Signal {
+            worker: self.worker_serial,
+            command,
+        };
+        if let Err(err) = self.commands_tx.try_send(queued)
+            && let Some(count) = self.signal_queue_lines.hit(self.shared.clock.now())
+        {
+            tracing::warn!(command = ?err.into_inner(), count, "the driver's queue is full; signal command dropped");
+        }
+    }
+
+    /// The running worker and what it waits for forget its signaling: it
+    /// exited or stops.
+    fn forget_signals(&mut self) {
+        self.signal_opens.clear();
+        self.ended_signals.clear();
+    }
+
+    /// `Signal`: passes `command` to the running worker if it is the
+    /// worker `worker` the command is for, an open's answer taking it off
+    /// the opens waiting. Otherwise it is dropped: the signal it concerns
+    /// went with the worker, and an open id of that worker's may name
+    /// another open of the running one.
+    async fn signal_worker(&mut self, worker: u64, command: SignalCommand) {
+        let running = self
+            .worker
+            .as_mut()
+            .filter(|_| worker == self.worker_serial);
+        let Some(running) = running else {
+            tracing::debug!(
+                worker,
+                running = self.worker_serial,
+                ?command,
+                "signal command for a worker that is gone; dropped with its signal"
+            );
+            return;
+        };
+        if let SignalCommand::Opened { request, .. } | SignalCommand::Refused { request, .. } =
+            &command
+        {
+            self.signal_opens.remove(request);
+        }
+        if let Err(err) = running.signal(&command).await {
+            // The exit follows, and the signals go with the worker.
+            tracing::warn!(pid = running.pid(), error = %err, "signal command could not be sent to the worker");
         }
     }
 
@@ -1045,6 +1309,7 @@ impl Driver {
     /// back, and the machine restarts it with backoff if it crashed.
     fn on_worker_exited(&mut self, status: ExitStatus) {
         self.worker = None;
+        self.forget_signals();
         self.connect.release("worker exited");
         self.switch_connect.release("worker exited");
         self.probe_connect.release("worker exited");
@@ -1118,6 +1383,7 @@ impl Driver {
                 self.silence = None;
                 self.connect.release("worker stopped");
                 self.probe_connect.release("worker stopped");
+                self.forget_signals();
                 if let Some(worker) = self.worker.take() {
                     self.snapshot.worker = None;
                     self.talker_gone();
@@ -1162,11 +1428,7 @@ impl Driver {
 
     /// Starts the host lookup; the worker follows once it is done.
     fn start_resolving(&mut self) {
-        let host = self.spec.host.clone();
-        let port = self.spec.port.unwrap_or(0);
-        self.pending = Pending::Resolving(Box::pin(async move {
-            crate::resolve::resolve(&host, port).await
-        }));
+        self.pending = Pending::Resolving(self.lookup());
     }
 
     /// Starts the worker and hands it the source; a failed start counts as
@@ -1175,6 +1437,7 @@ impl Driver {
         let ports: Vec<u16> = self.spec.port.into_iter().collect();
         match self.shared.manager.spawn(&ports) {
             Ok(mut worker) => {
+                self.worker_serial = self.worker_serial.wrapping_add(1);
                 // The schedule continues where the last worker's left off.
                 let spec = self.spec.source_spec(
                     addrs,
@@ -1438,7 +1701,8 @@ impl Driver {
             // Handled by the driver itself, never queued for a worker.
             DriverCommand::SwitchSource(_)
             | DriverCommand::Backchannel(_)
-            | DriverCommand::Prerecord { .. } => return,
+            | DriverCommand::Prerecord { .. }
+            | DriverCommand::Signal { .. } => return,
             DriverCommand::StartRecording { spec, serial, pipe } => {
                 if !shared
                     .lock()
@@ -1699,7 +1963,7 @@ mod tests {
     fn the_spec_logs_without_its_credentials() {
         let spec = DriverSpec {
             connection_id: "c1".into(),
-            url: "rtsps://admin:secret@cam/key?token=tok".into(),
+            target: SourceTarget::Url("rtsps://admin:secret@cam/key?token=tok".into()),
             options: r#"{"user_agent":"secret/1"}"#.into(),
             host: "cam".into(),
             port: Some(322),
@@ -1717,7 +1981,7 @@ mod tests {
     fn the_spec_logs_its_option_names_without_their_values() {
         let spec = |options: &str| DriverSpec {
             connection_id: "c1".into(),
-            url: "rtsp://cam/".into(),
+            target: SourceTarget::Url("rtsp://cam/".into()),
             options: options.into(),
             host: "cam".into(),
             port: None,
@@ -1745,7 +2009,7 @@ mod tests {
             (
                 DriverSpec {
                     connection_id: "c1".into(),
-                    url: "fake://h/".into(),
+                    target: SourceTarget::Url("fake://h/".into()),
                     options: "{}".into(),
                     host: "h".into(),
                     port: None,
@@ -2039,7 +2303,9 @@ mod tests {
                     backchannel: false,
                     prerecord_ms: 0,
                     key: crate::registry::ConnectionKey {
-                        url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        target: crate::registry::SourceTarget::Url(
+                            lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        ),
                         options: serde_json::Value::Null,
                     },
                     demand: demand_tx,
@@ -2055,7 +2321,9 @@ mod tests {
                 crate::registry::StreamEntry {
                     sources: vec![crate::registry::StreamSource {
                         spec: spec_of("fake://127.0.0.1/"),
-                        url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        target: crate::registry::SourceTarget::Url(
+                            lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        ),
                         options: serde_json::Map::new(),
                         protocol: "fake",
                         connection: "c1".into(),
@@ -2153,7 +2421,7 @@ mod tests {
             (
                 DriverSpec {
                     connection_id: "c1".into(),
-                    url: "fake://127.0.0.1/".into(),
+                    target: SourceTarget::Url("fake://127.0.0.1/".into()),
                     options: "{}".into(),
                     host: "127.0.0.1".into(),
                     port: None,
@@ -2197,7 +2465,7 @@ mod tests {
         let run = |attempts, immediate_used| {
             lotse_ipc::ToWorker::RunSource(SourceSpec {
                 connection_id: "c1".into(),
-                url: "fake://127.0.0.1/".into(),
+                target: SourceTarget::Url("fake://127.0.0.1/".into()),
                 options: "{}".into(),
                 peer_host: "127.0.0.1".into(),
                 peer_addrs: vec!["127.0.0.1:0".parse().unwrap()],
@@ -2290,7 +2558,7 @@ mod tests {
         step(&mut driver).await;
         let first = lotse_ipc::ToWorker::RunSource(SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://127.0.0.1/".into(),
+            target: SourceTarget::Url("fake://127.0.0.1/".into()),
             options: "{}".into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:0".parse().unwrap()],
@@ -2312,7 +2580,7 @@ mod tests {
         driver
             .handle(Wake::Command(DriverCommand::SwitchSource(DriverSpec {
                 connection_id: "c1".into(),
-                url: "fake://127.0.0.1:2/".into(),
+                target: SourceTarget::Url("fake://127.0.0.1:2/".into()),
                 options: "{}".into(),
                 host: "127.0.0.1".into(),
                 port: Some(2),
@@ -2330,7 +2598,7 @@ mod tests {
         step(&mut driver).await;
         let run = lotse_ipc::ToWorker::RunSource(SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://127.0.0.1:2/".into(),
+            target: SourceTarget::Url("fake://127.0.0.1:2/".into()),
             options: "{}".into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:2".parse().unwrap()],
@@ -2422,7 +2690,10 @@ mod tests {
             BackoffPosition::default(),
             0,
         );
-        assert_eq!(switched.url, "fake://127.0.0.1:2/");
+        assert_eq!(
+            switched.target,
+            SourceTarget::Url("fake://127.0.0.1:2/".into())
+        );
         recorded(
             &dir.join("received-1"),
             &lotse_ipc::ToWorker::RunSource(switched),
@@ -2752,20 +3023,18 @@ mod tests {
         let mut driver = driver_on(&shared, demand);
         let switch = |url: &str, host: &str| DriverSpec {
             connection_id: "c1".into(),
-            url: url.into(),
+            target: SourceTarget::Url(url.into()),
             options: "{}".into(),
             host: host.into(),
             port: Some(1),
             backchannel: false,
         };
         // Without a worker the spec is taken for the next one, nothing more.
+        let a = switch("fake://127.0.0.1:1/a", "127.0.0.1");
         driver
-            .handle(Wake::Command(DriverCommand::SwitchSource(switch(
-                "fake://127.0.0.1:1/a",
-                "127.0.0.1",
-            ))))
+            .handle(Wake::Command(DriverCommand::SwitchSource(a.clone())))
             .await;
-        assert_eq!(driver.spec.url, "fake://127.0.0.1:1/a");
+        assert_eq!(driver.spec.target, a.target);
         assert!(ready_wake(&mut driver).await.is_none(), "nothing pending");
         // While the old host resolves, the lookup starts over for the new.
         driver.start_resolving();
@@ -2794,7 +3063,7 @@ mod tests {
         driver.handle(wake).await;
         let want = lotse_ipc::ToWorker::SwitchSource(SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://127.0.0.1:1/c".into(),
+            target: SourceTarget::Url("fake://127.0.0.1:1/c".into()),
             options: "{}".into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
@@ -2870,7 +3139,7 @@ mod tests {
         let mut driver = driver_on(&shared, demand);
         let spec = |options: &str, backchannel: bool| DriverSpec {
             connection_id: "c1".into(),
-            url: "fake://127.0.0.1:1/".into(),
+            target: SourceTarget::Url("fake://127.0.0.1:1/".into()),
             options: options.into(),
             host: "127.0.0.1".into(),
             port: Some(1),
@@ -2878,7 +3147,7 @@ mod tests {
         };
         let source = |options: &str| SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://127.0.0.1:1/".into(),
+            target: SourceTarget::Url("fake://127.0.0.1:1/".into()),
             options: options.into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
@@ -3184,7 +3453,7 @@ mod tests {
     fn spec_of(url: &str) -> DriverSpec {
         DriverSpec {
             connection_id: "c1".into(),
-            url: url.into(),
+            target: SourceTarget::Url(url.into()),
             options: "{}".into(),
             host: "127.0.0.1".into(),
             port: Some(1),
@@ -3498,7 +3767,7 @@ mod tests {
             StreamEntry {
                 sources: vec![StreamSource {
                     spec,
-                    url: url.clone(),
+                    target: crate::registry::SourceTarget::Url(url.clone()),
                     options: serde_json::Map::new(),
                     protocol: "fake",
                     connection: "c1".into(),
@@ -3515,7 +3784,7 @@ mod tests {
             "c1".into(),
             ConnectionEntry {
                 key: ConnectionKey {
-                    url,
+                    target: crate::registry::SourceTarget::Url(url),
                     options: serde_json::json!({}),
                 },
                 port: None,
@@ -3566,7 +3835,7 @@ mod tests {
             (
                 DriverSpec {
                     connection_id: "c1".into(),
-                    url: "fake://admin:hunter2@cam.example/".into(),
+                    target: SourceTarget::Url("fake://admin:hunter2@cam.example/".into()),
                     options: "{}".into(),
                     host: "cam.example".into(),
                     port: None,
@@ -3848,7 +4117,8 @@ mod tests {
         let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         // Over the channel's message limit: the send fails before a write.
-        driver.spec.url = format!("fake://127.0.0.1/{}", "x".repeat(300 * 1024));
+        driver.spec.target =
+            SourceTarget::Url(format!("fake://127.0.0.1/{}", "x".repeat(300 * 1024)));
         demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         let captured = crate::test_support::Captured::default();
@@ -3893,7 +4163,7 @@ mod tests {
             (
                 DriverSpec {
                     connection_id: "c1".into(),
-                    url: "fake://127.0.0.1/".into(),
+                    target: SourceTarget::Url("fake://127.0.0.1/".into()),
                     options: "{}".into(),
                     host: "127.0.0.1".into(),
                     port: None,
@@ -4072,6 +4342,464 @@ mod tests {
                 &serde_json::json!(lotse_api_types::time::rfc3339(arrival)),
                 &serde_json::json!(400)
             )
+        );
+    }
+
+    /// The spec of a signaled source: no host to look up.
+    fn signaled_spec() -> DriverSpec {
+        DriverSpec {
+            connection_id: "c1".into(),
+            target: SourceTarget::Signaled("webrtc".into()),
+            options: "{}".into(),
+            host: String::new(),
+            port: None,
+            backchannel: false,
+        }
+    }
+
+    /// A driver of [`signaled_spec`] on `shared`, registered as connection
+    /// `c1` with its own command queue, as the handler creates one.
+    fn signaled_driver(shared: &Arc<Shared>, demand: watch::Receiver<Demand>) -> Driver {
+        let (commands_tx, commands) = mpsc::channel(4);
+        shared.lock().connections.insert(
+            "c1".into(),
+            crate::registry::ConnectionEntry {
+                port: None,
+                backchannel: false,
+                prerecord_ms: 0,
+                key: crate::registry::ConnectionKey {
+                    target: crate::registry::SourceTarget::Signaled {
+                        protocol: "webrtc",
+                        stream: "front".into(),
+                    },
+                    options: serde_json::Value::Null,
+                },
+                demand: watch::channel(Demand::default()).0,
+                snapshot: ConnectionSnapshot::idle(UNIX_EPOCH),
+                switches: 0,
+                streams: std::collections::BTreeSet::new(),
+                commands: commands_tx.clone(),
+                talker: crate::registry::Talker::default(),
+            },
+        );
+        Driver::new(
+            (signaled_spec(), 0),
+            Arc::clone(shared),
+            demand,
+            (commands_tx, commands),
+            ConnectionConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_signaled_source_s_worker_starts_without_a_lookup_and_its_switch_resolves_at_once() {
+        let dir = private_dir("driver-signaled-lookup");
+        let (script, out) = recording_script(&dir);
+        let shared = shared(&script);
+        let (demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        demand_tx.send_replace(PRELOAD);
+        step(&mut driver).await;
+        assert!(matches!(driver.pending, Pending::Resolving(_)));
+        // No DNS: no host, no addresses, at once.
+        let wake = next_wake(&mut driver).await;
+        assert!(matches!(&wake, Wake::Resolved(Ok(addrs)) if addrs.is_empty()));
+        driver.handle(wake).await;
+        let run = driver
+            .spec
+            .source_spec(vec![], driver.machine.backoff_position(), 0);
+        assert_eq!(run.peer_host, "", "no host");
+        recorded(&out, &lotse_ipc::ToWorker::RunSource(run)).await;
+        driver.start_resolving_switch();
+        let wake = next_wake(&mut driver).await;
+        assert!(matches!(&wake, Wake::SwitchResolved(Ok(addrs)) if addrs.is_empty()));
+        let worker = driver.worker.take().unwrap();
+        drop(driver);
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Handles what the driver's queue holds now.
+    async fn drain_commands(driver: &mut Driver) {
+        while let Some(wake) = ready_wake(driver).await {
+            assert!(matches!(wake, Wake::Command(DriverCommand::Signal { .. })));
+            driver.handle(wake).await;
+        }
+    }
+
+    /// The ids of the opens the driver holds as waiting.
+    fn waiting(driver: &Driver) -> Vec<u64> {
+        driver.signal_opens.keys().copied().collect()
+    }
+
+    #[tokio::test]
+    async fn a_worker_s_signaling_open_is_refused_no_signaling_client_through_the_queue() {
+        let dir = private_dir("driver-signal-refused");
+        let (script, out) = recording_script(&dir);
+        let shared = shared(&script);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        // Without a worker the registry's answer is dropped with the signal.
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 1 }));
+        assert_eq!(waiting(&driver), [1]);
+        drain_commands(&mut driver).await;
+        assert_eq!(
+            waiting(&driver),
+            [1],
+            "an answer for no worker frees nothing"
+        );
+        assert_eq!(
+            captured
+                .lines("signal command for a worker that is gone; dropped with its signal")
+                .len(),
+            1
+        );
+        driver.signal_opens.clear();
+
+        driver.spawn_worker(vec![]).await;
+        assert_eq!(driver.worker_serial, 1);
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 2 }));
+        drain_commands(&mut driver).await;
+        let refused = |request| {
+            lotse_ipc::ToWorker::Signal(SignalCommand::Refused {
+                request,
+                code: "no_signaling_client".into(),
+                message: "no control-API client relays this source's signaling".into(),
+            })
+        };
+        recorded(&out, &refused(2)).await;
+        assert!(waiting(&driver).is_empty());
+        let worker = driver.worker.take().unwrap();
+        drop(driver);
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A worker's open ids restart at 1, so an answer queued for the
+    /// worker before it never reaches the running one, even under an id
+    /// the running one waits on.
+    #[tokio::test]
+    async fn an_answer_for_an_earlier_worker_never_reaches_the_running_one() {
+        let dir = private_dir("driver-signal-stale");
+        let (script, out) = recording_script(&dir);
+        let shared = shared(&script);
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver.spawn_worker(vec![]).await;
+        // As if it were the connection's second worker.
+        driver.worker_serial = 2;
+        driver.signal_opens.insert(1, shared.clock.now());
+        let refused = |request, code: &str| SignalCommand::Refused {
+            request,
+            code: code.into(),
+            message: "m".into(),
+        };
+        // The first worker's answer to its open 1 is dropped, and the
+        // second worker's open 1 still waits.
+        for (worker, command) in [(1, refused(1, "stale")), (2, refused(1, "current"))] {
+            driver
+                .handle(Wake::Command(DriverCommand::Signal { worker, command }))
+                .await;
+            if worker == 1 {
+                assert_eq!(waiting(&driver), [1]);
+            }
+        }
+        assert!(waiting(&driver).is_empty());
+        let seen = recorded(&out, &lotse_ipc::ToWorker::Signal(refused(1, "current"))).await;
+        assert!(
+            !seen.contains(&lotse_ipc::ToWorker::Signal(refused(1, "stale"))),
+            "{seen:?}"
+        );
+        let stale =
+            captured.lines("signal command for a worker that is gone; dropped with its signal");
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert!(stale[0].contains("worker=1 running=2"), "{stale:?}");
+        let worker = driver.worker.take().unwrap();
+        drop(driver);
+        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The signal commands the driver's queue holds now, each for the
+    /// driver's worker.
+    fn queued_signals(driver: &mut Driver) -> Vec<SignalCommand> {
+        let mut queued = Vec::new();
+        while let Ok(DriverCommand::Signal { worker, command }) = driver.commands.try_recv() {
+            assert_eq!(worker, driver.worker_serial);
+            queued.push(command);
+        }
+        queued
+    }
+
+    #[tokio::test]
+    async fn a_worker_may_have_two_signaling_opens_waiting_and_cancel_only_those() {
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        driver.worker_serial = 5;
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        // Two opens wait; a third is refused at once, a repeated one ignored.
+        for request in [1, 2, 3, 1] {
+            driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request }));
+        }
+        assert_eq!(waiting(&driver), [1, 2]);
+        let refusal = |request| SignalCommand::Refused {
+            request,
+            code: "no_signaling_client".into(),
+            message: "no control-API client relays this source's signaling".into(),
+        };
+        assert_eq!(
+            queued_signals(&mut driver),
+            [
+                refusal(1),
+                refusal(2),
+                SignalCommand::Refused {
+                    request: 3,
+                    code: "limit_reached".into(),
+                    message: "a worker may have 2 signaling opens waiting".into(),
+                },
+            ]
+        );
+        let misuse = captured.lines("a worker's signaling open breaks the contract");
+        assert_eq!(misuse.len(), 1, "rate-limited: {misuse:?}");
+        assert!(
+            misuse[0].contains("more opens waiting than a worker may have"),
+            "{misuse:?}"
+        );
+        // A cancel of a waiting open reaches the registry; of another, not.
+        for request in [1, 9] {
+            driver.on_worker_event(WorkerEvent::Signal(SignalReport::Cancel { request }));
+        }
+        assert_eq!(waiting(&driver), [2]);
+        let at_registry = captured.lines("signaling open cancelled; nothing holds it");
+        assert_eq!(at_registry.len(), 1, "{at_registry:?}");
+        assert!(at_registry[0].contains("request=1"), "{at_registry:?}");
+        let ignored = captured.lines("cancel of a signaling open already answered; ignored");
+        assert_eq!(ignored.len(), 1, "{ignored:?}");
+        assert!(ignored[0].contains("request=9"), "{ignored:?}");
+        // The worker's exit takes its waiting opens and the signals it
+        // ended with it, and so does its stop.
+        driver.ended_signals.push_back("ended".into());
+        driver.worker = Some(dead_worker(&shared).await);
+        driver.on_worker_exited(ExitStatus::default());
+        assert!(waiting(&driver).is_empty());
+        assert!(driver.ended_signals.is_empty());
+        driver.signal_opens.insert(7, shared.clock.now());
+        driver.ended_signals.push_back("ended".into());
+        driver.feed(Input::Demand(1));
+        driver.feed(Input::Demand(0));
+        driver.feed(Input::LingerExpired);
+        assert!(waiting(&driver).is_empty(), "a stop clears them too");
+        assert!(driver.ended_signals.is_empty(), "a stop clears them too");
+        drop(driver);
+    }
+
+    /// An open whose answer or cancel a full queue lost holds its place
+    /// only as long as the attempt that asked can last.
+    #[tokio::test]
+    async fn an_open_left_without_an_answer_is_forgotten_after_its_attempt() {
+        let clock = Arc::new(FakeClock::default());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        for request in [1, 2] {
+            driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request }));
+        }
+        // The registry's answers are lost.
+        assert_eq!(queued_signals(&mut driver).len(), 2);
+        clock.advance(OPEN_EXPIRY.checked_sub(Duration::from_millis(1)).unwrap());
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 3 }));
+        assert_eq!(waiting(&driver), [1, 2]);
+        let queued = queued_signals(&mut driver);
+        let_assert!([SignalCommand::Refused { code, .. }] = queued.as_slice());
+        assert_eq!(code, "limit_reached");
+        clock.advance(Duration::from_millis(1));
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 4 }));
+        assert_eq!(waiting(&driver), [4]);
+        let forgotten = captured.lines("a signaling open got no answer in time; forgotten");
+        assert_eq!(forgotten.len(), 2, "{forgotten:?}");
+        assert!(
+            forgotten[0].contains("request=1 expiry_ms=35000"),
+            "{forgotten:?}"
+        );
+        drop(driver);
+    }
+
+    #[tokio::test]
+    async fn rfc8839_5_1_a_worker_s_malformed_offer_or_candidate_ends_its_signal() {
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        // A well-formed offer and candidate and a close reach the registry
+        // as they are; a malformed offer or candidate ends its signal.
+        for report in [
+            SignalReport::Offer {
+                signal_id: "sig".into(),
+                sdp: "v=0\r\n".into(),
+            },
+            SignalReport::Candidate {
+                signal_id: "sig".into(),
+                candidate: String::new(),
+                mid: Some("0".into()),
+                mline_index: Some(0),
+            },
+            SignalReport::Closed {
+                signal_id: "sig".into(),
+                code: "source_stopped".into(),
+                message: "stopped".into(),
+            },
+            SignalReport::Offer {
+                signal_id: "bad-offer".into(),
+                sdp: "v=0 offer".into(),
+            },
+            SignalReport::Candidate {
+                signal_id: "bad-candidate".into(),
+                candidate: "candidate:1 1 udp 1 cam.local 9 typ host".into(),
+                mid: None,
+                mline_index: Some(0),
+            },
+        ] {
+            driver.on_worker_event(WorkerEvent::Signal(report));
+        }
+        let at_registry = || {
+            captured.lines("a worker reported on a signal the supervisor does not hold; dropped")
+        };
+        assert_eq!(at_registry().len(), 5);
+        let rejected = at_registry();
+        assert!(
+            rejected[3].contains("bad-offer") && rejected[4].contains("bad-candidate"),
+            "{rejected:?}"
+        );
+        // The worker is told the relay rejected it, not the camera.
+        let failed = |signal_id: &str| SignalCommand::Failed {
+            signal_id: signal_id.into(),
+            code: "signal_rejected".into(),
+            message: "the worker's offer or candidate was malformed".into(),
+        };
+        assert_eq!(
+            queued_signals(&mut driver),
+            [failed("bad-offer"), failed("bad-candidate")]
+        );
+        let malformed = captured.lines("signaling offer or candidate is malformed; signal ended");
+        assert_eq!(malformed.len(), 1, "rate-limited: {malformed:?}");
+        assert!(
+            malformed[0].contains("SDP does not start with v=0"),
+            "{malformed:?}"
+        );
+
+        // What the worker still reports on them, its own close included,
+        // reaches the registry no more: it had the signal's one close.
+        let closed = |signal_id: &str| SignalReport::Closed {
+            signal_id: signal_id.into(),
+            code: "internal_error".into(),
+            message: "the relay rejected the source's signal".into(),
+        };
+        for report in [
+            SignalReport::Candidate {
+                signal_id: "bad-offer".into(),
+                candidate: String::new(),
+                mid: None,
+                mline_index: Some(0),
+            },
+            closed("bad-offer"),
+            closed("bad-candidate"),
+        ] {
+            driver.on_worker_event(WorkerEvent::Signal(report));
+        }
+        assert_eq!(at_registry().len(), 5);
+        assert_eq!(
+            captured
+                .lines("report on a signal the driver ended; dropped")
+                .len(),
+            3
+        );
+        // Their close was the last of them the driver waited for.
+        assert!(driver.ended_signals.is_empty());
+        driver.on_worker_event(WorkerEvent::Signal(closed("bad-offer")));
+        assert_eq!(at_registry().len(), 6);
+        drop(driver);
+    }
+
+    /// The driver remembers the signals it ended up to
+    /// [`MAX_ENDED_SIGNALS`], the oldest forgotten first.
+    #[tokio::test]
+    async fn the_driver_remembers_the_latest_signals_it_ended() {
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        for n in 0..=MAX_ENDED_SIGNALS {
+            driver.on_worker_event(WorkerEvent::Signal(SignalReport::Offer {
+                signal_id: format!("bad-{n}"),
+                sdp: String::new(),
+            }));
+            // The queue holds 4.
+            let _commands = queued_signals(&mut driver);
+        }
+        let ended: Vec<String> = (1..=MAX_ENDED_SIGNALS)
+            .map(|n| format!("bad-{n}"))
+            .collect();
+        assert_eq!(driver.ended_signals, ended);
+        drop(driver);
+    }
+
+    #[tokio::test]
+    async fn a_signal_command_the_queue_or_the_worker_cannot_take_is_dropped() {
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        // A queue that is full drops the worker's refusals, with one line
+        // within the summary interval.
+        for _ in 0..4 {
+            driver
+                .commands_tx
+                .try_send(DriverCommand::Prerecord { ms: 0 })
+                .unwrap();
+        }
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 1 }));
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 2 }));
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 3 }));
+        for request in 4..6 {
+            driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request }));
+        }
+        // The registry's two refusals and the driver's three limit
+        // refusals: one line each.
+        let dropped = captured.lines("the driver's queue is full; signal command dropped");
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        assert_eq!(
+            dropped
+                .iter()
+                .filter(|line| line.contains("connection.id"))
+                .count(),
+            1,
+            "{dropped:?}"
+        );
+        // A worker that is gone cannot be told.
+        driver.worker = Some(dead_worker(&shared).await);
+        driver
+            .handle(Wake::Command(DriverCommand::Signal {
+                worker: 0,
+                command: SignalCommand::Gone {
+                    signal_id: "sig".into(),
+                },
+            }))
+            .await;
+        drop(driver);
+        assert_eq!(
+            captured
+                .lines("signal command could not be sent to the worker")
+                .len(),
+            1
         );
     }
 

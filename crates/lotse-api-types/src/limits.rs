@@ -32,6 +32,9 @@ pub const MAX_SOURCES: usize = 8;
 /// The longest source URL, credentials and query included.
 pub const MAX_URL_CHARS: usize = 4096;
 
+/// The longest name of a signaled source's protocol (`webrtc`).
+pub const MAX_PROTOCOL_CHARS: usize = 64;
+
 /// The longest SDP offer: the whole 64 KiB frame.
 pub const MAX_SDP_CHARS: usize = 64 * 1024;
 

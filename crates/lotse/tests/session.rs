@@ -187,7 +187,7 @@ async fn run_camera_with(door: &mut FrontDoor, cam: &FakeCamera, options: &str) 
     door.worker
         .run_source(&SourceSpec {
             connection_id: "c1".into(),
-            url: cam.url(),
+            target: lotse_ipc::SourceTarget::Url(cam.url()),
             options: options.into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec![cam.addr()],

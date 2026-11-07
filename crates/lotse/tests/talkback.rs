@@ -604,7 +604,7 @@ impl InProcess {
         tx.send_msg(
             &ToWorker::RunSource(SourceSpec {
                 connection_id: "c1".into(),
-                url: url.into(),
+                target: lotse_ipc::SourceTarget::Url(url.into()),
                 options: options.into(),
                 peer_host: "cam".into(),
                 peer_addrs,

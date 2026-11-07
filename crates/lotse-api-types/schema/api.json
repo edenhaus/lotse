@@ -1120,6 +1120,11 @@
           "type": "string"
         },
         {
+          "const": "protocol_unsupported",
+          "description": "The signaled source's protocol is not in\n`info.signaled_protocols`.",
+          "type": "string"
+        },
+        {
           "const": "source_in_use",
           "description": "The source URL, credentials aside, is already another stream's;\n`details.stream_id` names it.",
           "type": "string"
@@ -1444,6 +1449,13 @@
           },
           "type": "array"
         },
+        "signaled_protocols": {
+          "description": "The protocols of the sources whose signaling the client relays\n(`webrtc`), which `stream/put` names by `protocol` instead of a\nURL.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "version": {
           "description": "The daemon version.",
           "type": "string"
@@ -1453,6 +1465,7 @@
         "version",
         "build",
         "schemes",
+        "signaled_protocols",
         "outputs",
         "features",
         "codecs",
@@ -2407,6 +2420,26 @@
         }
       ]
     },
+    "SignaledSource": {
+      "additionalProperties": false,
+      "description": "A source whose signaling the client relays, named by its protocol: a\n`stream/put` source of a protocol in `info.signaled_protocols`.",
+      "properties": {
+        "options": {
+          "additionalProperties": true,
+          "description": "Per-protocol options, typed by the protocol's factory; unknown\nfields there are rejected too.",
+          "type": "object"
+        },
+        "protocol": {
+          "description": "The protocol (`webrtc`).",
+          "maxLength": 64,
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol"
+      ],
+      "type": "object"
+    },
     "SourceBackchannel": {
       "description": "A source's backchannel as `stream/get` reports it: the camera's reverse\naudio path (an RTSP camera's ONVIF backchannel, ONVIF Streaming\nSpecification §5.3), one per connection.",
       "properties": {
@@ -2445,7 +2478,7 @@
           "description": "The shared connection."
         },
         "protocol": {
-          "description": "The protocol (`rtsp`).",
+          "description": "The protocol (`rtsp`; `webrtc` for a signaled source).",
           "type": "string"
         },
         "reconnects": {
@@ -2459,12 +2492,14 @@
           "description": "The connection's state."
         },
         "url": {
-          "description": "The URL redacted to its origin, `scheme://[****@]host[:port]`, then\n`/****` when the path is anything but empty or `/` and `?****` when\na query is present: the path and query can carry secrets (a camera\nkey, a session token) as the userinfo can.",
-          "type": "string"
+          "description": "The URL redacted to its origin, `scheme://[****@]host[:port]`, then\n`/****` when the path is anything but empty or `/` and `?****` when\na query is present: the path and query can carry secrets (a camera\nkey, a session token) as the userinfo can. Absent for a signaled\nsource, which has no address.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "url",
         "protocol",
         "state",
         "reconnects",
@@ -2473,24 +2508,15 @@
       "type": "object"
     },
     "SourceSpec": {
-      "additionalProperties": false,
-      "description": "One entry of `stream/put`'s `sources`.",
-      "properties": {
-        "options": {
-          "additionalProperties": true,
-          "description": "Per-scheme options, typed by the scheme's factory; unknown fields\nthere are rejected too.",
-          "type": "object"
+      "description": "One entry of `stream/put`'s `sources`: a source lotse connects to, named by its `url`, or a source whose signaling the client relays (a WebRTC camera), named by its `protocol`. Exactly one of the two.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/UrlSource"
         },
-        "url": {
-          "description": "The source URL, credentials included; redacted everywhere it is\nreported.",
-          "maxLength": 4096,
-          "type": "string"
+        {
+          "$ref": "#/$defs/SignaledSource"
         }
-      },
-      "required": [
-        "url"
-      ],
-      "type": "object"
+      ]
     },
     "Stream": {
       "description": "A stream, as `stream/get` returns it and `stream/list` lists it.",
@@ -3505,6 +3531,26 @@
         "bytes",
         "held_ms",
         "truncations"
+      ],
+      "type": "object"
+    },
+    "UrlSource": {
+      "additionalProperties": false,
+      "description": "A source lotse connects to, named by its URL: a `stream/put` source of\na scheme in `info.schemes`.",
+      "properties": {
+        "options": {
+          "additionalProperties": true,
+          "description": "Per-scheme options, typed by the scheme's factory; unknown fields\nthere are rejected too.",
+          "type": "object"
+        },
+        "url": {
+          "description": "The source URL, credentials included; redacted everywhere it is\nreported.",
+          "maxLength": 4096,
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
       ],
       "type": "object"
     },
