@@ -535,7 +535,14 @@ async fn the_source_describes_itself_without_secrets() {
     );
     let described = source.describe();
     assert_eq!(described.protocol, "http");
-    assert!(!described.url.to_string().contains("secret"));
+    assert!(
+        !described
+            .url
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("secret")
+    );
     assert_eq!(described.options["max_bandwidth"], 1);
     assert_eq!(source.connection_options()["max_bandwidth"], 1);
 }
@@ -596,7 +603,7 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
     let source = HttpSource::new(SourceUrl::parse(&url).unwrap(), options(), None);
     let described = source.describe();
     assert_eq!(
-        described.url.to_string(),
+        described.url.as_ref().unwrap().to_string(),
         format!("http://****@{}/****?****", rig.server.addr())
     );
     let mut harness = rig.run(&source);
@@ -1575,7 +1582,14 @@ async fn rfc9110_4_2_2_https_plays_with_a_pinned_certificate_and_refuses_another
     )
     .unwrap();
     let source = rig.source("/s/index.m3u8", options(), Some(pinned));
-    assert!(source.describe().url.to_string().starts_with("https://"));
+    assert!(
+        source
+            .describe()
+            .url
+            .unwrap()
+            .to_string()
+            .starts_with("https://")
+    );
     let harness = rig.run(&source);
     let set = Arc::clone(&harness.tracks);
     let err = rig.exit(harness).await;

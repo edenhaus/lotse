@@ -1419,7 +1419,7 @@ mod tests {
         let mut worker = manager.spawn(&[554, 8554]).unwrap();
         let spec = SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://cam/".into(),
+            target: lotse_ipc::SourceTarget::Url("fake://cam/".into()),
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],

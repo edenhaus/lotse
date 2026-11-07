@@ -36,6 +36,9 @@ pub enum ErrorCode {
     LimitReached,
     /// The source URL scheme is not in `info.schemes`.
     SchemeUnsupported,
+    /// The signaled source's protocol is not in
+    /// `info.signaled_protocols`.
+    ProtocolUnsupported,
     /// The source URL, credentials aside, is already another stream's;
     /// `details.stream_id` names it.
     SourceInUse,
@@ -95,6 +98,7 @@ impl ErrorCode {
             Self::SubscriptionNotFound => "subscription_not_found",
             Self::LimitReached => "limit_reached",
             Self::SchemeUnsupported => "scheme_unsupported",
+            Self::ProtocolUnsupported => "protocol_unsupported",
             Self::SourceInUse => "source_in_use",
             Self::ShuttingDown => "shutting_down",
             Self::NotPermitted => "not_permitted",
@@ -190,6 +194,7 @@ mod tests {
             ErrorCode::SubscriptionNotFound,
             ErrorCode::LimitReached,
             ErrorCode::SchemeUnsupported,
+            ErrorCode::ProtocolUnsupported,
             ErrorCode::SourceInUse,
             ErrorCode::ShuttingDown,
             ErrorCode::InternalError,
