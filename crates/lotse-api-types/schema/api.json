@@ -2865,6 +2865,9 @@
             "user_agent": {
               "default": null,
               "description": "The `User-Agent` to send instead of the daemon's: 1 to 256\nprintable ASCII characters, spaces or tabs only between them\n(RFC 7230 §3.2, RFC 2326 §12.41); `null`, the default, sends\nthe daemon's.",
+              "maxLength": 256,
+              "minLength": 1,
+              "pattern": "^[!-~]([\\t -~]*[!-~])?$",
               "type": [
                 "string",
                 "null"
@@ -2911,6 +2914,9 @@
             "user_agent": {
               "default": null,
               "description": "The `User-Agent` to send instead of the daemon's: 1 to 256\nprintable ASCII characters, spaces or tabs only between them\n(RFC 7230 §3.2, RFC 2326 §12.41); `null`, the default, sends\nthe daemon's.",
+              "maxLength": 256,
+              "minLength": 1,
+              "pattern": "^[!-~]([\\t -~]*[!-~])?$",
               "type": [
                 "string",
                 "null"
@@ -3017,6 +3023,8 @@
             "data_channel": {
               "default": null,
               "description": "The label of a data channel to offer beside the media (RFC 8831,\nRFC 8832), as the camera's integration asks for one: Nest refuses\nan offer without an `application` m-line and wants\n`dataSendChannel`. 1 to 64 characters, none a control character;\n`null`, the default, offers none.",
+              "maxLength": 64,
+              "minLength": 1,
               "type": [
                 "string",
                 "null"

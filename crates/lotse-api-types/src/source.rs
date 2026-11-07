@@ -33,6 +33,12 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 /// implementation.
 pub const MAX_USER_AGENT_LEN: usize = 256;
 
+/// The schema's shape of a `user_agent`, as the daemon checks it: a
+/// `VCHAR` at both ends and `VCHAR`, `SP` or `HTAB` between
+/// (RFC 7230 §3.2), so clients generated from the bundle refuse what the
+/// daemon refuses.
+pub const USER_AGENT_PATTERN: &str = "^[!-~]([\\t -~]*[!-~])?$";
+
 /// The longest `data_channel` label accepted, in characters. Not from a
 /// spec (RFC 8832 §5.1 allows up to 65535 bytes); the label the cameras'
 /// integrations ask for is a short name (Nest's `dataSendChannel`).
@@ -223,6 +229,9 @@ macro_rules! url_sources {
             "them: declared with [`", stringify!($source), "`]'s."
         )]
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        // Only so the fields' `schemars` attributes, which the two structs
+        // share, are known here too; the bundle names the source, not this.
+        #[cfg_attr(feature = "schema", derive(JsonSchema))]
         #[serde(deny_unknown_fields)]
         pub struct $options {
             $( $(#[$field_meta])* pub $field: $type, )*
@@ -271,6 +280,7 @@ url_sources! {
         /// (RFC 7230 §3.2, RFC 2326 §12.41); `null`, the default, sends
         /// the daemon's.
         #[serde(default, deserialize_with = "deserialize_user_agent")]
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = MAX_USER_AGENT_LEN), regex(pattern = USER_AGENT_PATTERN)))]
         pub user_agent: Option<String>,
     }
     /// An `rtsp` source: an RTSP camera (RFC 2326), `rtsp://` URL.
@@ -329,6 +339,7 @@ pub struct WebRtcOptions {
     /// `dataSendChannel`. 1 to 64 characters, none a control character;
     /// `null`, the default, offers none.
     #[serde(default, deserialize_with = "deserialize_label")]
+    #[cfg_attr(feature = "schema", schemars(length(min = 1, max = MAX_LABEL_CHARS)))]
     pub data_channel: Option<String>,
     /// Offer to receive the camera's audio (default `true`); `false`
     /// offers video only.
@@ -363,11 +374,22 @@ impl fmt::Debug for FakeSource {
 /// The signaled fake source of `lotse_core::test_util`, in builds with the
 /// `test-util` feature only.
 #[cfg(feature = "test-util")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FakeSignaledSource {
     /// The fake factory's options.
     #[serde(flatten)]
     pub options: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Prints the options' names only: a misplaced `url` lands among them, and
+/// its credentials must not reach a log.
+#[cfg(feature = "test-util")]
+impl fmt::Debug for FakeSignaledSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FakeSignaledSource")
+            .field("options", &self.options.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// One entry of `stream/put`'s `sources`, named by its `protocol`, with
@@ -876,5 +898,13 @@ mod tests {
         );
         assert!(signaled.options().is_empty());
         assert_eq!(signaled.clone().with_url("x://".into()), signaled);
+        // A misplaced URL lands among the options: its credentials stay
+        // out of the debug output.
+        let misplaced =
+            spec(json!({ "protocol": "fake-signaled", "url": "rtsp://u:hunter2@cam/" }));
+        assert_eq!(
+            format!("{misplaced:?}"),
+            r#"FakeSignaled(FakeSignaledSource { options: ["url"] })"#
+        );
     }
 }
