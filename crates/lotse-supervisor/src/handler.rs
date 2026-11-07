@@ -12,6 +12,10 @@
 //! `recording/create`, the read end waits here for `GET /v0/recording/{recording_id}`
 //! ([`Handler::recording_body`]). A recording ends with its control connection, as
 //! its events have nowhere else to go ([`crate::recording`]).
+//!
+//! A signaled source's signaling goes to the `signaling/subscribe`
+//! subscription for its stream, and the client's answer, candidates and
+//! errors back to its worker ([`crate::signaling`]).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -66,6 +70,7 @@ use crate::session::{
     MAX_EARLY_CANDIDATES, MAX_REMOTE_CANDIDATES, SESSION_QUEUE, SessionEntry, api_event,
     ice_credentials, ulid,
 };
+use crate::signaling::Owner;
 use crate::worker::{WorkerConfig, WorkerManager};
 use crate::{Settings, millis};
 
@@ -221,6 +226,13 @@ impl Supervisor {
         );
         let mut state = State::default();
         state.registrations = registrations;
+        state.signaling.clock = Arc::clone(&clock);
+        // A signaled source gathers on the hosts sessions answer with.
+        for ip in hosts.iter().map(SocketAddr::ip) {
+            if !state.signaling.local_addrs.contains(&ip) {
+                state.signaling.local_addrs.push(ip);
+            }
+        }
         // Without a recording output the workers refuse every recording: no window
         // and no recording is accepted, which `info` reports.
         state.recording_limits = if environment.registries.recording.is_some() {
@@ -252,10 +264,12 @@ impl Supervisor {
         }
     }
 
-    /// Closes every session and ends every recording with `shutting_down`; the
-    /// first step of the shutdown, before the control connections say
-    /// goodbye. A recording's worker writes its last fragment while it stops,
-    /// but its report is not waited for, so the body is cut.
+    /// Closes every session and ends every recording with `shutting_down`,
+    /// and ends the signaling (each offered signal closes `source_stopped`,
+    /// each signaling subscription ends); the first step of the shutdown,
+    /// before the control connections say goodbye. A recording's worker
+    /// writes its last fragment while it stops, but its report is not
+    /// waited for, so the body is cut.
     pub fn close_sessions(&self) {
         let mut state = self.shared.lock();
         state.close_sessions_where(
@@ -265,6 +279,7 @@ impl Supervisor {
             CloseBy::Supervisor,
         );
         state.end_recordings_where(|_| true, RecordingCloseReason::ShuttingDown);
+        state.signaling_shutdown();
     }
 
     /// Closes the sessions, stops every connection's worker within the
@@ -609,10 +624,12 @@ impl Supervisor {
                 recordings,
             },
         );
+        let now = (self.shared.clock.now(), self.shared.clock.wall_now());
         for connection in connections {
             state.refresh_connection(&connection);
             state.follow_backchannel(&connection, stream_id.as_str());
             state.follow_prerecord(&connection, stream_id.as_str());
+            state.route_waiting_opens(&connection, now);
         }
         close_moved_sessions(&mut state, stream_id.as_str());
         if reoriented {
@@ -840,6 +857,34 @@ impl Supervisor {
             );
         }
         Outcome::Subscribed(self.shared.lock().subscribe(connection, stream_id))
+    }
+
+    /// `signaling/subscribe`: takes the signals of one stream's signaled
+    /// sources, or of every stream's ([`crate::signaling`]).
+    fn signaling_subscribe(
+        &self,
+        connection: ConnectionId,
+        id: u64,
+        stream_id: Option<String>,
+    ) -> Outcome {
+        if let Some(id) = &stream_id
+            && let Err(err) = StreamId::new(id)
+        {
+            return Outcome::Error(
+                ApiError::new(ErrorCode::InvalidStreamId, err.to_string())
+                    .with_detail("stream_id", id.as_str()),
+            );
+        }
+        let owner = Owner {
+            connection,
+            subscription: id,
+        };
+        let now = (self.shared.clock.now(), self.shared.clock.wall_now());
+        Outcome::Subscribed(
+            self.shared
+                .lock()
+                .signaling_subscribe(owner, stream_id, now),
+        )
     }
 
     /// `webrtc/offer`: validates, registers the session on the stream's
@@ -1479,6 +1524,18 @@ impl Supervisor {
                     Outcome::Error(error)
                 }
             },
+            Command::SignalingSubscribe(subscribe) => {
+                self.signaling_subscribe(connection, subscribe.id, subscribe.stream_id)
+            }
+            Command::SignalingAnswer(answer) => {
+                empty(self.shared.lock().signal_answer(connection, &answer))
+            }
+            Command::SignalingCandidate(candidate) => {
+                empty(self.shared.lock().signal_candidate(connection, &candidate))
+            }
+            Command::SignalingError(error) => {
+                empty(self.shared.lock().signal_error(connection, &error))
+            }
             Command::Ping(_)
             | Command::Schema(_)
             | Command::Unsubscribe(_)
@@ -1518,10 +1575,13 @@ impl Handler for Supervisor {
     }
 
     /// A session's ends with its `closed`; a recording's is stopped, and its
-    /// `closed` goes nowhere, the client having asked for no more events.
+    /// `closed` goes nowhere, the client having asked for no more events;
+    /// a signaling one ends its signals, whose sources connect again.
     fn unsubscribed(&self, connection: ConnectionId, subscription: u64) -> Option<Event> {
         let mut state = self.shared.lock();
-        if state.unsubscribe_recording(connection, subscription) {
+        if state.unsubscribe_recording(connection, subscription)
+            || state.signaling_unsubscribed(connection, subscription)
+        {
             return None;
         }
         let session_id = state
@@ -1537,7 +1597,8 @@ impl Handler for Supervisor {
         )
     }
 
-    /// Its sessions are orphaned for the grace, its recordings end at once.
+    /// Its sessions are orphaned for the grace, its recordings and its
+    /// signaling subscriptions end at once.
     fn connection_closed(&self, connection: ConnectionId) {
         let orphans = {
             let mut state = self.shared.lock();
@@ -1587,6 +1648,15 @@ impl Handler for Supervisor {
             }
         }
         body
+    }
+}
+
+/// The empty result of a command that changed what `result` says, or its
+/// refusal.
+fn empty(result: Result<(), ApiError>) -> Outcome {
+    match result {
+        Ok(()) => Outcome::Result(serde_json::Value::Object(serde_json::Map::new())),
+        Err(error) => Outcome::Error(error),
     }
 }
 
@@ -3604,7 +3674,11 @@ mod tests {
     #[tokio::test]
     async fn a_signaled_source_is_named_by_protocol_and_a_url_source_by_url() {
         let s = supervisor("/bin/sh", Arc::new(SystemClock));
-        let err = error(call(&s, &put("a", "fake-signaled://camera.front_door", false)).await);
+        // A URL whose scheme is a signaled protocol, as a client might
+        // write one.
+        let protocol = "fake-signaled";
+        let url = format!("{protocol}://camera.front_door");
+        let err = error(call(&s, &put("a", &url, false)).await);
         assert_eq!(err.code, ErrorCode::InvalidRequest);
         assert_eq!(err.details["protocol"], "fake-signaled");
         assert_eq!(
@@ -3712,6 +3786,131 @@ mod tests {
                 .len(),
             1
         );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A signal of the signaled source of `door`, its worker's offer
+    /// handed to the registry.
+    fn offered_signal(s: &Supervisor, request: u64) -> String {
+        let mut state = s.shared.lock();
+        let connection = state.streams["door"].sources[0].connection.clone();
+        let from = crate::signaling::SignalFrom {
+            connection: &connection,
+            worker: 1,
+        };
+        let now = SystemClock.now();
+        state.signal_report(
+            &from,
+            lotse_ipc::SignalReport::Open { request },
+            now,
+            std::time::UNIX_EPOCH,
+        );
+        let signal_id = state
+            .signal_ids_for_tests()
+            .into_iter()
+            .last()
+            .expect("a signal");
+        state.signal_report(
+            &from,
+            lotse_ipc::SignalReport::Offer {
+                signal_id: signal_id.clone(),
+                sdp: lotse_core::test_util::FAKE_SIGNALED_OFFER.into(),
+            },
+            now,
+            std::time::UNIX_EPOCH,
+        );
+        signal_id
+    }
+
+    #[tokio::test]
+    async fn signaling_commands_reach_the_owner_s_signals_and_end_with_its_subscription() {
+        let dir = private_dir("signaling-commands");
+        let mut environment = environment(&blocking_worker(&dir));
+        environment.front_door = Some(FrontDoor {
+            registrations: Arc::new(Registrations::default()),
+            // Two ports of one address: a source gathers on each address
+            // once.
+            hosts: vec![
+                "192.0.2.1:18556".parse().unwrap(),
+                "192.0.2.1:18557".parse().unwrap(),
+                "[2001:db8::1]:18556".parse().unwrap(),
+            ],
+            tcp_hosts: vec![],
+            stun: None,
+            turn: None,
+            demux: None,
+        });
+        let s = Supervisor::new(
+            settings(PathBuf::from("/nonexistent/lotse.sock")),
+            environment,
+            Arc::new(SystemClock),
+        );
+        assert_eq!(
+            s.shared.lock().signaling.local_addrs,
+            [
+                "192.0.2.1".parse::<std::net::IpAddr>().unwrap(),
+                "2001:db8::1".parse().unwrap()
+            ]
+        );
+        result(call(&s, &put_signaled("door", "fake-signaled", &json!({}))).await);
+        let refused = error(
+            call_on(
+                &s,
+                1,
+                &json!({ "id": 1, "type": "signaling/subscribe", "stream_id": "a b" }),
+            )
+            .await,
+        );
+        assert_eq!(refused.code, ErrorCode::InvalidStreamId);
+        assert_eq!(refused.details["stream_id"], "a b");
+        let mut door = subscription(
+            call_on(
+                &s,
+                1,
+                &json!({ "id": 2, "type": "signaling/subscribe", "stream_id": "door" }),
+            )
+            .await,
+        );
+        let signal_id = offered_signal(&s, 1);
+        let offer = next(&mut door).await;
+        assert_eq!(offer["type"], "offer");
+        assert_eq!(offer["signal_id"], signal_id.as_str());
+        assert_eq!(offer["protocol"], "fake-signaled");
+        assert_eq!(offer["sdp"], lotse_core::test_util::FAKE_SIGNALED_OFFER);
+        let commands = |id: u64, signal_id: &str| {
+            [
+                json!({ "id": id, "type": "signaling/answer", "signal_id": signal_id, "sdp": "v=0\r\n" }),
+                json!({ "id": id + 1, "type": "signaling/candidate", "signal_id": signal_id, "candidate": "" }),
+                json!({ "id": id + 2, "type": "signaling/error", "signal_id": signal_id, "code": "offline", "message": "m" }),
+            ]
+        };
+        // Another control connection's are refused; the owner's taken.
+        for command in commands(3, &signal_id) {
+            let refused = error(call_on(&s, 2, &command).await);
+            assert_eq!(refused.code, ErrorCode::SignalNotFound, "{command}");
+        }
+        for command in commands(6, &signal_id) {
+            assert_eq!(
+                result(call_on(&s, 1, &command).await),
+                json!({}),
+                "{command}"
+            );
+        }
+        // Its unsubscribe ends its signals; another subscription's is no
+        // signaling one.
+        assert!(s.unsubscribed(ConnectionId(1), 99).is_none());
+        assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
+        let refused = error(call_on(&s, 1, &commands(9, &signal_id)[0]).await);
+        assert_eq!(refused.code, ErrorCode::SignalNotFound);
+        assert!(door.recv().await.is_none(), "the subscription ended");
+        // So does its control connection's close.
+        let _all =
+            subscription(call_on(&s, 3, &json!({ "id": 1, "type": "signaling/subscribe" })).await);
+        let signal_id = offered_signal(&s, 2);
+        s.connection_closed(ConnectionId(3));
+        let refused = error(call_on(&s, 3, &commands(2, &signal_id)[1]).await);
+        assert_eq!(refused.code, ErrorCode::SignalNotFound);
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }

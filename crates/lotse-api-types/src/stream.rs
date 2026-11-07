@@ -84,7 +84,8 @@ impl fmt::Debug for UrlSource {
 }
 
 /// A source whose signaling the client relays, named by its protocol: a
-/// `stream/put` source of a protocol in `info.signaled_protocols`.
+/// `stream/put` source of a protocol in `info.signaled_protocols`. Its
+/// connection attempts offer through `signaling/subscribe`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]

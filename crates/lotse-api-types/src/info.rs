@@ -113,7 +113,7 @@ pub struct InfoResult {
     pub schemes: Vec<String>,
     /// The protocols of the sources whose signaling the client relays
     /// (`webrtc`), which `stream/put` names by `protocol` instead of a
-    /// URL.
+    /// URL; their offers come through `signaling/subscribe`.
     pub signaled_protocols: Vec<String>,
     /// The output kinds compiled in.
     pub outputs: Vec<String>,
