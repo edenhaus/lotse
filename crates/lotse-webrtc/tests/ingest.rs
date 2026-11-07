@@ -37,10 +37,14 @@ use lotse_core::source::{
     SourceFactory as _, SyncHint, TrackSet,
 };
 use lotse_core::source_url::SourceUrl;
-use lotse_core::task::{BoxFuture, spawn_named};
+use lotse_core::task::spawn_named;
 use lotse_core::test_util::FakeSignaling;
 use lotse_core::track::TrackLimits;
-use lotse_webrtc::ingest::engine::{ANSWER_TIMEOUT, CONNECT_TIMEOUT, PLI_INTERVAL, STARTUP_PLIS};
+use lotse_webrtc::ingest::engine::{
+    ANSWER_TIMEOUT, ATTEMPT_BUDGET, CONNECT_BY, CONNECT_TIMEOUT, MAX_OFFER_BYTES, PLI_INTERVAL,
+    STARTUP_PLIS,
+};
+use lotse_webrtc::ingest::source::MAX_HOSTS;
 use lotse_webrtc::ingest::{
     IngestEngine, IngestOutput, IngestTrack, WebRtcOptions, WebRtcSourceFactory,
 };
@@ -49,7 +53,7 @@ use str0m::channel::ChannelId;
 use str0m::format::Codec as EngineCodec;
 use str0m::media::{Mid, Pt};
 use str0m::net::{DatagramRecv, Protocol, Receive};
-use str0m::rtp::{ExtensionValues, RtpWrite, SeqNo};
+use str0m::rtp::{ExtensionValues, RtpWrite, SeqNo, Ssrc};
 use str0m::{Candidate, Event, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -251,6 +255,16 @@ impl Camera {
         self.drain();
     }
 
+    /// The video's stream sends from `ssrc` (and its repairs from the
+    /// next) from now on, as after an encoder restart.
+    fn new_ssrc(&mut self, ssrc: u32) {
+        let mid = self.video.unwrap();
+        self.rtc
+            .direct_api()
+            .reset_stream_tx(mid, None, Ssrc::from(ssrc), Some(Ssrc::from(ssrc + 1)))
+            .unwrap();
+    }
+
     /// One access unit: the parameter sets and an IDR, or a P slice.
     fn frame(&mut self, now: Instant, keyframe: bool) {
         let pt = self.h264_pts()[0];
@@ -294,7 +308,7 @@ impl Pair {
     fn offer_on(options: &WebRtcOptions, hosts: &[SocketAddr]) -> Self {
         let now = SystemClock.now();
         let mut pair = Self {
-            engine: IngestEngine::offer(options, hosts, now).unwrap(),
+            engine: IngestEngine::offer(options, hosts, now, now).unwrap(),
             camera: None,
             now,
             outputs: Vec::new(),
@@ -438,7 +452,7 @@ fn rfc8829_5_2_1_the_offer_has_audio_video_and_the_data_channel_in_that_order() 
     let _logs = logs();
     lotse_webrtc::install_crypto_provider();
     let now = SystemClock.now();
-    let engine = IngestEngine::offer(&nest(), &[ENGINE], now).unwrap();
+    let engine = IngestEngine::offer(&nest(), &[ENGINE], now, now).unwrap();
     let offer = engine.offer_sdp();
     assert!(offer.starts_with("v=0\r\n"), "{offer}");
     let lines = media_lines(offer);
@@ -505,7 +519,13 @@ fn rfc8829_5_2_1_the_offer_has_audio_video_and_the_data_channel_in_that_order() 
 fn rfc8829_5_2_1_without_audio_or_data_channel_the_offer_is_video_alone() {
     let _logs = logs();
     lotse_webrtc::install_crypto_provider();
-    let engine = IngestEngine::offer(&video_only(), &[ENGINE], SystemClock.now()).unwrap();
+    let engine = IngestEngine::offer(
+        &video_only(),
+        &[ENGINE],
+        SystemClock.now(),
+        SystemClock.now(),
+    )
+    .unwrap();
     let lines = media_lines(engine.offer_sdp());
     assert_eq!(lines.len(), 1);
     assert!(lines[0].starts_with("m=video "));
@@ -525,11 +545,11 @@ fn rfc8445_5_1_1_without_a_usable_host_address_no_offer_is_made() {
     let _logs = logs();
     lotse_webrtc::install_crypto_provider();
     let now = SystemClock.now();
-    let err = IngestEngine::offer(&nest(), &[], now).unwrap_err();
+    let err = IngestEngine::offer(&nest(), &[], now, now).unwrap_err();
     assert_eq!(err, "no usable host candidate among []");
     // IPv4 link-local, which the agent does not gather on.
     let link_local: SocketAddr = "169.254.1.1:5000".parse().unwrap();
-    let err = IngestEngine::offer(&nest(), &[link_local], now).unwrap_err();
+    let err = IngestEngine::offer(&nest(), &[link_local], now, now).unwrap_err();
     assert!(err.starts_with("no usable host candidate"), "{err}");
 }
 
@@ -874,6 +894,149 @@ fn rfc3264_7_a_camera_that_sends_another_accepted_codec_switches_the_track() {
     );
 }
 
+/// The video's RTP and switches, in order: `rtp <seq>` and `switch
+/// <codec>`.
+fn video_order(pair: &Pair) -> Vec<String> {
+    pair.outputs
+        .iter()
+        .filter_map(|output| match output {
+            IngestOutput::Switched(track) => {
+                Some(format!("switch {}", track.declared.codec.name()))
+            }
+            IngestOutput::Rtp { packet, .. } => Some(format!("rtp {}", packet.seq)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn rfc3550_a_late_packet_of_the_codec_before_a_switch_does_not_switch_back() {
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    pair.answer(camera_config(false).enable_h265(true), |answer| answer);
+    pair.connect();
+    let video = pair.camera().video.unwrap();
+    let h264 = pair.camera().pts(video, EngineCodec::H264)[0];
+    let h265 = pair.camera().pts(video, EngineCodec::H265)[0];
+    let now = pair.now;
+    // H.264 96, 97 and 99, H.265 100, then H.264 98 late (reordered on
+    // the way), and H.265 101; each through the camera's pacer in turn.
+    let send = |pair: &mut Pair, seq: u16, pt: Pt, payload: &[u8]| {
+        pair.camera().seq = seq;
+        pair.camera().write(now, pt, true, payload);
+        pair.run(Duration::from_millis(20));
+    };
+    for seq in [96, 97, 99] {
+        send(&mut pair, seq, h264, &[0x41, 0x00]);
+    }
+    send(&mut pair, 100, h265, &[0x02, 0x01, 0x00]);
+    send(&mut pair, 98, h264, &[0x41, 0x01]);
+    send(&mut pair, 101, h265, &[0x02, 0x01, 0x01]);
+    assert_eq!(
+        video_order(&pair),
+        [
+            "rtp 96",
+            "rtp 97",
+            "rtp 99",
+            "switch h265",
+            "rtp 100",
+            "rtp 101"
+        ]
+    );
+    assert_eq!(pair.engine.stats().late_packets, 1);
+    assert_eq!(pair.engine.stats().switches, 1);
+}
+
+#[test]
+fn rfc3550_8_2_a_new_synchronization_source_numbers_anew_and_may_switch() {
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    pair.answer(camera_config(false).enable_h265(true), |answer| answer);
+    pair.connect();
+    let video = pair.camera().video.unwrap();
+    let h264 = pair.camera().pts(video, EngineCodec::H264)[0];
+    let h265 = pair.camera().pts(video, EngineCodec::H265)[0];
+    let now = pair.now;
+    pair.camera().seq = 1_000;
+    pair.camera().write(now, h264, true, &[0x41, 0x00]);
+    // Through the camera's pacer before the next source's.
+    pair.run(Duration::from_millis(50));
+    // The camera's encoder restarted in H.265 under a new SSRC, its
+    // numbers from 5: no packet of it is late.
+    pair.camera().seq = 5;
+    pair.camera().new_ssrc(0x5eed);
+    pair.camera().write(now, h265, true, &[0x02, 0x01, 0x00]);
+    pair.camera().write(now, h265, true, &[0x02, 0x01, 0x01]);
+    pair.run(Duration::from_millis(50));
+    assert_eq!(
+        video_order(&pair),
+        ["rtp 1000", "switch h265", "rtp 5", "rtp 6"]
+    );
+    assert_eq!(pair.engine.stats().late_packets, 0);
+}
+
+#[test]
+fn rfc3264_7_a_camera_alternating_codecs_logs_the_switches_rate_limited() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish(),
+    );
+    let mut pair = Pair::offer(&video_only());
+    pair.answer(camera_config(false).enable_h265(true), |answer| answer);
+    pair.connect();
+    let video = pair.camera().video.unwrap();
+    let h264 = pair.camera().pts(video, EngineCodec::H264)[0];
+    let h265 = pair.camera().pts(video, EngineCodec::H265)[0];
+    let now = pair.now;
+    for _ in 0..10 {
+        pair.camera().write(now, h265, true, &[0x02, 0x01, 0x00]);
+        pair.camera().write(now, h264, true, &[0x41, 0x00]);
+    }
+    pair.step(Duration::ZERO);
+    assert_eq!(pair.engine.stats().switches, 20);
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("the camera switched the track's codec")
+            .count(),
+        1,
+        "{logs}"
+    );
+}
+
+#[test]
+fn an_offer_over_what_the_relay_takes_is_not_made() {
+    let _logs = logs();
+    lotse_webrtc::install_crypto_provider();
+    let now = SystemClock.now();
+    let hosts = |count: u16| -> Vec<SocketAddr> {
+        (1..=count)
+            .map(|n| {
+                format!("[2001:db8:ffff:ffff:ffff:ffff:ffff:{n:x}]:65535")
+                    .parse()
+                    .unwrap()
+            })
+            .collect()
+    };
+    // The most hosts a source gathers on, of the longest lines: well
+    // within.
+    let engine = IngestEngine::offer(&nest(), &hosts(16), now, now).unwrap();
+    assert!(
+        engine.offer_sdp().len() < MAX_OFFER_BYTES / 2,
+        "{}",
+        engine.offer_sdp().len()
+    );
+    let err = IngestEngine::offer(&nest(), &hosts(400), now, now).unwrap_err();
+    assert!(
+        err.ends_with(" bytes, over the 16384 the relay takes"),
+        "{err}"
+    );
+}
+
 #[test]
 fn rfc3264_7_an_accepted_audio_format_of_another_clock_rate_is_not_the_track_s() {
     let _logs = logs();
@@ -923,7 +1086,12 @@ fn rfc8829_5_3_a_camera_without_a_carried_audio_codec_still_sends_video() {
 #[test]
 fn rfc8829_5_3_answers_the_engine_cannot_take_end_the_attempt_as_invalid() {
     let _logs = logs();
-    let cases: [(&str, fn(String) -> String, &str); 4] = [
+    let cases: [(&str, fn(String) -> String, &str); 5] = [
+        (
+            "an m-line short",
+            |answer| answer[..answer.find("m=application").unwrap()].to_owned(),
+            "Differing m-line count in offer vs answer",
+        ),
         (
             "garbage",
             |_| "v=0\r\nnonsense\r\n".to_owned(),
@@ -1016,37 +1184,75 @@ fn rfc8829_5_2_no_answer_within_20_s_ends_the_attempt_as_answer_timeout() {
 }
 
 #[test]
-fn rfc8445_8_not_connected_within_10_s_of_the_answer_ends_as_ice_failed() {
+fn rfc8445_8_not_connected_in_the_attempt_s_budget_ends_as_ice_failed_before_the_runner_s_timeout()
+{
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
-    pair.link = false;
-    pair.answer(camera_config(false), |answer| answer);
-    assert_eq!(pair.tracks().len(), 1);
-    pair.run(CONNECT_TIMEOUT - Duration::from_millis(20));
-    assert!(pair.ended().is_none());
-    pair.run(Duration::from_millis(40));
-    let (error, code, _) = pair.ended().unwrap();
-    assert_eq!(
-        error,
-        SourceError::Timeout("webrtc: not connected within 10 s of the answer".into())
+    // Both of the attempt's deadlines end it before the runner's ready
+    // timeout would cancel it as not ready.
+    assert!(
+        ANSWER_TIMEOUT + CONNECT_TIMEOUT > ATTEMPT_BUDGET,
+        "the cap is reached"
     );
-    assert_eq!(code, close::ICE_FAILED);
+    assert!(CONNECT_BY < ATTEMPT_BUDGET);
+    assert!(ATTEMPT_BUDGET < lotse_core::runner::DEFAULT_READY_TIMEOUT);
+    // (when the answer came, when the attempt ends): by 27 s into it,
+    // 10 s after a later answer, at 28 s at the latest.
+    for (answer_ms, end_ms) in [(0, 27_000), (17_500, 27_500), (19_000, 28_000)] {
+        let mut pair = Pair::offer(&video_only());
+        pair.link = false;
+        pair.run(Duration::from_millis(answer_ms));
+        pair.answer(camera_config(false), |answer| answer);
+        assert_eq!(pair.tracks().len(), 1, "{answer_ms}");
+        pair.run(Duration::from_millis(end_ms - answer_ms - 10));
+        assert!(pair.ended().is_none(), "{answer_ms}: {:?}", pair.ended());
+        pair.run(Duration::from_millis(10));
+        let (error, code, _) = pair.ended().unwrap();
+        assert_eq!(
+            error,
+            SourceError::Timeout(format!(
+                "webrtc: not connected {end_ms} ms into the attempt"
+            )),
+            "{answer_ms}"
+        );
+        assert_eq!(code, close::ICE_FAILED);
+    }
 }
 
 #[test]
-fn rfc8445_8_ice_up_without_dtls_and_then_lost_is_ice_failed_at_10_s() {
+fn rfc8829_5_2_the_answer_deadline_counts_from_the_attempt_s_start() {
+    let _logs = logs();
+    lotse_webrtc::install_crypto_provider();
+    let started = SystemClock.now();
+    // The offer made 9 s into the attempt (a client came late): the
+    // answer is due 11 s later.
+    let now = started + Duration::from_secs(9);
+    let mut engine = IngestEngine::offer(&video_only(), &[ENGINE], started, now).unwrap();
+    engine.handle_timeout(started + ANSWER_TIMEOUT - Duration::from_millis(1));
+    loop {
+        match engine.poll() {
+            IngestOutput::Timeout(_) => break,
+            IngestOutput::Ended(end) => panic!("ended early: {end:?}"),
+            _ => {}
+        }
+    }
+    engine.handle_timeout(started + ANSWER_TIMEOUT);
+    assert!(engine.is_ended());
+}
+
+#[test]
+fn rfc8445_8_ice_up_without_dtls_and_then_lost_is_ice_failed_at_the_deadline() {
     let _logs = logs();
     let mut pair = Pair::offer(&video_only());
     pair.dtls = false;
     pair.answer(camera_config(false), |answer| answer);
     // STUN only (RFC 7983 §7: first byte 0 to 3): ICE pairs, DTLS never
     // gets through; then the link goes altogether. Not connected, the
-    // attempt ends at the connection deadline (str0m 0.24's agent takes
-    // longer to give the pair up).
+    // attempt ends at the connection deadline; str0m 0.24's agent going
+    // Disconnected meanwhile ends nothing.
     pair.run(Duration::from_secs(1));
     assert!(!pair.engine.is_connected());
     pair.link = false;
-    pair.run(CONNECT_TIMEOUT - Duration::from_millis(1_100));
+    pair.run(CONNECT_BY - Duration::from_millis(1_100));
     assert!(pair.ended().is_none(), "{:?}", pair.ended());
     pair.run(Duration::from_millis(200));
     let (error, code, _) = pair.ended().unwrap();
@@ -1225,7 +1431,13 @@ fn rfc7983_datagrams_that_are_not_the_engine_s_are_counted_and_dropped() {
 #[test]
 fn rfc8445_5_1_3_a_host_address_given_twice_is_one_candidate() {
     let _logs = logs();
-    let engine = IngestEngine::offer(&video_only(), &[ENGINE, ENGINE], SystemClock.now()).unwrap();
+    let engine = IngestEngine::offer(
+        &video_only(),
+        &[ENGINE, ENGINE],
+        SystemClock.now(),
+        SystemClock.now(),
+    )
+    .unwrap();
     assert_eq!(engine.local_candidates().len(), 2, "one host and the end");
     assert_eq!(engine.offer_sdp().matches("a=candidate:").count(), 1);
 }
@@ -1407,17 +1619,6 @@ mod source {
         signaling: Option<Arc<dyn SignalingOpener>>,
         clock: Arc<dyn Clock>,
     ) -> Running {
-        start_with(options, signaling, clock, |run| run)
-    }
-
-    /// [`start`], the attempt's future through `wrap` before it is
-    /// spawned.
-    fn start_with(
-        options: serde_json::Value,
-        signaling: Option<Arc<dyn SignalingOpener>>,
-        clock: Arc<dyn Clock>,
-        wrap: impl FnOnce(BoxFuture<'static, SourceError>) -> BoxFuture<'static, SourceError>,
-    ) -> Running {
         lotse_webrtc::install_crypto_provider();
         let source = WebRtcSourceFactory
             .validate(
@@ -1441,7 +1642,7 @@ mod source {
             cancel: cancel.clone(),
         });
         Running {
-            run: spawn_named("test.webrtc_source", wrap(run)),
+            run: spawn_named("test.webrtc_source", run),
             set,
             reports,
             cancel,
@@ -1976,11 +2177,12 @@ mod source {
     }
 
     #[tokio::test]
-    async fn a_cancel_while_the_relay_takes_no_signal_ends_the_offer() {
+    async fn rfc8445_5_1_1_an_attempt_gathers_on_at_most_16_host_addresses_handed_over_at_once() {
         let _logs = logs();
-        // More host addresses than the channel holds signals: the offer
-        // waits for the relay, which never reads.
-        let hosts: Vec<IpAddr> = (1..=40)
+        // More host addresses than an offer carries: the first 16 (all of
+        // one class), and all the signals queued at once, the relay
+        // reading none.
+        let hosts: Vec<IpAddr> = (1..=20)
             .map(|n| IpAddr::V4(Ipv4Addr::new(127, 0, 0, n)))
             .collect();
         let signaling = FakeSignaling::new(hosts);
@@ -1989,13 +2191,22 @@ mod source {
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
-        let relay = within(signaling.next_signal()).await.unwrap();
+        let mut relay = within(signaling.next_signal()).await.unwrap();
         within(async {
-            while relay.outgoing.len() < lotse_core::signaling::OUTGOING_CAPACITY {
+            while relay.outgoing.len() < MAX_HOSTS + 2 {
                 tokio::task::yield_now().await;
             }
         })
         .await;
+        const { assert!(MAX_HOSTS + 2 <= lotse_core::signaling::OUTGOING_CAPACITY) };
+        let (offer, candidates) = read_offer(&mut relay).await;
+        assert_eq!(candidates.len(), MAX_HOSTS + 1, "the hosts and the end");
+        assert_eq!(offer.matches("a=candidate:").count(), MAX_HOSTS);
+        for n in 1..=16 {
+            assert!(offer.contains(&format!(" 127.0.0.{n} ")), "{n}: {offer}");
+        }
+        assert!(!offer.contains(" 127.0.0.17 "), "{offer}");
+        assert!(offer.len() <= MAX_OFFER_BYTES);
         running.cancel.cancel();
         assert_eq!(
             within(running.run).await.unwrap(),
@@ -2049,12 +2260,6 @@ mod source {
         }
     }
 
-    /// The host address of the trickled candidate `candidate`.
-    fn host_of(candidate: &SignalCandidate) -> SocketAddr {
-        let fields: Vec<&str> = candidate.candidate.split_whitespace().collect();
-        SocketAddr::new(fields[4].parse().unwrap(), fields[5].parse().unwrap())
-    }
-
     #[tokio::test]
     async fn without_a_host_address_no_offer_is_made_and_the_reason_says_why() {
         let _logs = logs();
@@ -2076,15 +2281,49 @@ mod source {
         assert_eq!(close.message, reason);
     }
 
-    #[tokio::test]
-    async fn rfc8445_a_camera_slower_to_connect_than_the_stall_timeout_goes_live_under_the_runner()
-    {
-        use lotse_core::backoff::ReconnectBackoff;
-        use lotse_core::runner::{ConnectGate, RunnerConfig, RunnerEvent, SourceRunner};
+    /// An opener that opens `inner`'s channel `delay` late on `clock`, as
+    /// the supervisor does while no client subscribed.
+    #[derive(Debug)]
+    struct LateOpener {
+        inner: Arc<FakeSignaling>,
+        clock: Arc<FakeClock>,
+        delay: Duration,
+    }
 
-        let _logs = logs();
-        let clock = Arc::new(FakeClock::from_system());
-        let signaling = FakeSignaling::new(vec![LOOPBACK]);
+    impl SignalingOpener for LateOpener {
+        fn open(
+            &self,
+        ) -> lotse_core::task::BoxFuture<
+            'static,
+            Result<
+                lotse_core::signaling::SignalingChannel,
+                lotse_core::signaling::SignalingRefused,
+            >,
+        > {
+            let wait = self.clock.sleep(self.delay);
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                wait.await;
+                inner.open().await
+            })
+        }
+    }
+
+    /// A source runner with the default configuration on `clock`, its
+    /// channels opened by `opener`: its task, its tracks, its events and
+    /// its cancel.
+    fn runner(
+        clock: &Arc<FakeClock>,
+        opener: Arc<dyn SignalingOpener>,
+    ) -> (
+        JoinHandle<()>,
+        Arc<TrackSet>,
+        mpsc::Receiver<lotse_core::runner::RunnerEvent>,
+        CancellationToken,
+    ) {
+        use lotse_core::backoff::ReconnectBackoff;
+        use lotse_core::runner::{ConnectGate, RunnerConfig, SourceRunner};
+
         let source = WebRtcSourceFactory
             .validate(
                 &SourceUrl::parse("webrtc://camera.front_door").unwrap(),
@@ -2092,9 +2331,8 @@ mod source {
             )
             .unwrap();
         let set = TrackSet::new(TrackLimits::default(), clock.now());
-        let (events, mut reports) = mpsc::channel(64);
+        let (events, reports) = mpsc::channel(64);
         let cancel = CancellationToken::new();
-        let config = RunnerConfig::default();
         let runner = SourceRunner::new(
             source,
             ResolvedPeer {
@@ -2104,15 +2342,55 @@ mod source {
             Arc::clone(&set),
             Arc::new(ClockMapper::new()),
             BackchannelSlot::default(),
-            Some(signaling.clone()),
+            Some(opener),
             clock.clone(),
-            config,
+            RunnerConfig::default(),
             ReconnectBackoff::new(7),
             events,
             ConnectGate::open(),
             cancel.clone(),
         );
-        let runner = spawn_named("test.webrtc_runner", runner.run());
+        (
+            spawn_named("test.webrtc_runner", runner.run()),
+            set,
+            reports,
+            cancel,
+        )
+    }
+
+    /// Lets `span` pass on `clock` in steps, the tasks running between.
+    async fn pass(clock: &FakeClock, span: Duration) {
+        let step = Duration::from_millis(100);
+        let mut passed = Duration::ZERO;
+        while passed < span {
+            settle().await;
+            clock.advance(step);
+            passed += step;
+        }
+        settle().await;
+    }
+
+    /// Advances `clock` with the wall's until dropped.
+    fn ticking(clock: &Arc<FakeClock>) -> JoinHandle<()> {
+        let clock = clock.clone();
+        spawn_named("test.ticker", async move {
+            loop {
+                SystemClock.sleep(Duration::from_millis(5)).await;
+                clock.advance(Duration::from_millis(5));
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn rfc8445_a_camera_slower_to_connect_than_the_stall_timeout_goes_live_under_the_runner()
+    {
+        use lotse_core::runner::{RunnerConfig, RunnerEvent};
+
+        let _logs = logs();
+        let clock = Arc::new(FakeClock::from_system());
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
+        let config = RunnerConfig::default();
+        let (runner, set, mut reports, cancel) = runner(&clock, signaling.clone());
         let mut relay = within(signaling.next_signal()).await.unwrap();
         let (offer, _) = read_offer(&mut relay).await;
         let (mut camera, answer) = Live::answer(&offer, false).await;
@@ -2124,15 +2402,7 @@ mod source {
         // The camera takes longer than the video stall timeout to answer
         // a check: the tracks are declared, the source is not live, the
         // runner waits under its ready timeout.
-        let withheld = config.stall_video + Duration::from_secs(2);
-        let step = Duration::from_millis(100);
-        let mut passed = Duration::ZERO;
-        while passed < withheld {
-            settle().await;
-            clock.advance(step);
-            passed += step;
-        }
-        settle().await;
+        pass(&clock, config.stall_video + Duration::from_secs(2)).await;
         assert_eq!(set.tracks().len(), 1, "declared at the answer");
         assert!(!*set.ready().borrow(), "not ready before the connection");
         let mut seen = Vec::new();
@@ -2144,15 +2414,7 @@ mod source {
             "{seen:?}"
         );
         // Now the camera connects, the clock running as the wall's.
-        let ticking = {
-            let clock = clock.clone();
-            spawn_named("test.ticker", async move {
-                loop {
-                    SystemClock.sleep(Duration::from_millis(5)).await;
-                    clock.advance(Duration::from_millis(5));
-                }
-            })
-        };
+        let ticking = ticking(&clock);
         camera.connect().await;
         let video = Arc::clone(&set.tracks()[0]);
         within(camera.stream_until(|| video.stats().keyframes >= 1)).await;
@@ -2179,29 +2441,131 @@ mod source {
         ticking.abort();
     }
 
+    /// The runner's events up to its first `Backoff` or `Live`, that one
+    /// included.
+    async fn first_outcome(
+        reports: &mut mpsc::Receiver<lotse_core::runner::RunnerEvent>,
+    ) -> lotse_core::runner::RunnerEvent {
+        use lotse_core::runner::RunnerEvent;
+
+        within(async {
+            loop {
+                match reports.recv().await.unwrap() {
+                    RunnerEvent::Connecting { .. } => {}
+                    other => return other,
+                }
+            }
+        })
+        .await
+    }
+
     #[tokio::test]
-    async fn rfc8829_5_2_a_relay_that_takes_no_signal_holds_neither_the_answer_deadline_nor_a_failure()
+    async fn rfc8829_a_late_client_and_a_late_answer_still_connect_within_the_runner_s_timeout() {
+        use lotse_core::runner::RunnerEvent;
+
+        let _logs = logs();
+        let clock = Arc::new(FakeClock::from_system());
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
+        let opener = Arc::new(LateOpener {
+            inner: signaling.clone(),
+            clock: clock.clone(),
+            delay: Duration::from_secs(9),
+        });
+        let (runner, set, mut reports, cancel) = runner(&clock, opener);
+        // A client 9 s late, the answer 10 s after the offer, the camera
+        // connecting 7 s after that: 26 s into the attempt.
+        pass(&clock, Duration::from_secs(9)).await;
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        let (offer, _) = read_offer(&mut relay).await;
+        pass(&clock, Duration::from_secs(10)).await;
+        let (mut camera, answer) = Live::answer(&offer, false).await;
+        relay
+            .incoming
+            .send(RemoteSignal::Answer(answer))
+            .await
+            .unwrap();
+        pass(&clock, Duration::from_secs(7)).await;
+        let ticking = ticking(&clock);
+        camera.connect().await;
+        let video = Arc::clone(&set.tracks()[0]);
+        within(camera.stream_until(|| video.stats().packets > 0)).await;
+        assert!(matches!(
+            first_outcome(&mut reports).await,
+            RunnerEvent::Live
+        ));
+        cancel.cancel();
+        within(runner).await.unwrap();
+        ticking.abort();
+    }
+
+    #[tokio::test]
+    async fn rfc8829_5_2_a_late_client_s_attempt_ends_with_its_own_reason_before_the_runner_s_timeout()
+     {
+        use lotse_core::runner::RunnerEvent;
+
+        let _logs = logs();
+        // (when the answer comes, if at all; the attempt's error)
+        let cases = [
+            (
+                None,
+                SourceError::Timeout("webrtc: no answer within 20 s".into()),
+                close::ANSWER_TIMEOUT,
+            ),
+            (
+                Some(Duration::from_secs(10)),
+                SourceError::Timeout("webrtc: not connected 28000 ms into the attempt".into()),
+                close::ICE_FAILED,
+            ),
+        ];
+        for (answer_after, expected, code) in cases {
+            let clock = Arc::new(FakeClock::from_system());
+            let signaling = FakeSignaling::new(vec![LOOPBACK]);
+            let opener = Arc::new(LateOpener {
+                inner: signaling.clone(),
+                clock: clock.clone(),
+                delay: Duration::from_secs(9),
+            });
+            let (runner, _set, mut reports, cancel) = runner(&clock, opener);
+            pass(&clock, Duration::from_secs(9)).await;
+            let mut relay = within(signaling.next_signal()).await.unwrap();
+            let (offer, _) = read_offer(&mut relay).await;
+            // A camera that never answers a check.
+            let _camera = if let Some(after) = answer_after {
+                pass(&clock, after).await;
+                let (camera, answer) = Live::answer(&offer, false).await;
+                relay
+                    .incoming
+                    .send(RemoteSignal::Answer(answer))
+                    .await
+                    .unwrap();
+                Some(camera)
+            } else {
+                None
+            };
+            pass(&clock, Duration::from_secs(21)).await;
+            let outcome = first_outcome(&mut reports).await;
+            let RunnerEvent::Backoff { error, .. } = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(error, expected);
+            assert_eq!(within(relay.closed.wait()).await.code, code);
+            cancel.cancel();
+            within(runner).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rfc8829_5_2_a_relay_that_reads_no_signal_holds_neither_the_answer_deadline_nor_a_failure()
      {
         let _logs = logs();
-        // More host addresses than the channel holds signals: the relay
-        // never reads them all.
-        let hosts: Vec<IpAddr> = (1..=40)
-            .map(|n| IpAddr::V4(Ipv4Addr::new(127, 0, 0, n)))
-            .collect();
-        // A failure while signals wait.
-        let signaling = FakeSignaling::new(hosts.clone());
+        // A failure while the signals wait unread.
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
             serde_json::Value::Null,
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
         let relay = within(signaling.next_signal()).await.unwrap();
-        within(async {
-            while relay.outgoing.len() < lotse_core::signaling::OUTGOING_CAPACITY {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
         relay
             .incoming
             .send(RemoteSignal::Failed {
@@ -2214,17 +2578,14 @@ mod source {
             within(running.run).await.unwrap(),
             SourceError::Unreachable("camera: offline: gone".into())
         );
-        assert_eq!(
-            relay.outgoing.len(),
-            lotse_core::signaling::OUTGOING_CAPACITY
-        );
+        assert_eq!(relay.outgoing.len(), 3, "the offer, a candidate, the end");
         assert_eq!(closed(relay).await.code, close::CAMERA_ERROR);
 
-        // The answer deadline while signals wait, and after the relay
-        // stopped taking them altogether.
+        // The answer deadline while they wait, and once the relay stopped
+        // reading altogether.
         for stop_reading in [false, true] {
             let clock = Arc::new(FakeClock::from_system());
-            let signaling = FakeSignaling::new(hosts.clone());
+            let signaling = FakeSignaling::new(vec![LOOPBACK]);
             let running = start(
                 serde_json::Value::Null,
                 Some(signaling.clone()),
@@ -2236,12 +2597,6 @@ mod source {
                 closed: on_close,
                 ..
             } = within(signaling.next_signal()).await.unwrap();
-            within(async {
-                while outgoing.len() < lotse_core::signaling::OUTGOING_CAPACITY {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await;
             let outgoing = (!stop_reading).then_some(outgoing);
             let mut run = running.run;
             for _ in 0..21 {
@@ -2259,86 +2614,41 @@ mod source {
             assert_eq!(within(on_close.wait()).await.code, close::ANSWER_TIMEOUT);
             drop((outgoing, incoming));
         }
+    }
 
-        // A deadline that is due goes before the signals still to send.
+    #[tokio::test]
+    async fn rfc8829_5_2_a_deadline_that_is_due_goes_before_the_signals_waiting() {
+        let _logs = logs();
         let clock = Arc::new(FakeClock::from_system());
-        let signaling = FakeSignaling::new(hosts);
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
             serde_json::Value::Null,
             Some(signaling.clone()),
             clock.clone(),
         );
-        let SignalingRelay {
-            mut outgoing,
-            incoming,
-            closed: on_close,
-            ..
-        } = within(signaling.next_signal()).await.unwrap();
-        within(async {
-            while outgoing.len() < lotse_core::signaling::OUTGOING_CAPACITY {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        read_offer(&mut relay).await;
         settle().await;
+        // In one step: the answer deadline passes, then two signals
+        // arrive. The source takes the first in the wait under way, then
+        // the deadline, before the camera's failure.
         clock.advance(ANSWER_TIMEOUT);
-        // Room for all the rest (an offer, 40 candidates and the end), in
-        // the same step.
-        let mut taken = 0;
-        while outgoing.try_recv().is_ok() {
-            taken += 1;
-        }
-        assert_eq!(taken, lotse_core::signaling::OUTGOING_CAPACITY);
+        relay
+            .incoming
+            .try_send(RemoteSignal::Candidate(SignalCandidate::end_of_candidates(
+                None,
+                Some(0),
+            )))
+            .unwrap();
+        relay
+            .incoming
+            .try_send(RemoteSignal::Failed {
+                code: "offline".into(),
+                message: "gone".into(),
+            })
+            .unwrap();
         assert_eq!(
             within(running.run).await.unwrap(),
-            SourceError::Timeout("webrtc: no answer within 20 s".into())
-        );
-        // Only the one the wait under way took.
-        assert_eq!(outgoing.len(), 1);
-        assert_eq!(within(on_close.wait()).await.code, close::ANSWER_TIMEOUT);
-        drop(incoming);
-    }
-
-    #[tokio::test]
-    async fn rfc8829_5_2_a_flood_of_datagrams_postpones_no_deadline() {
-        let _logs = logs();
-        let clock = Arc::new(FakeClock::from_system());
-        let signaling = FakeSignaling::new(vec![LOOPBACK]);
-        // Without the runtime's budget: nothing but the source's own
-        // order makes it look at its timer while a socket is readable.
-        let running = start_with(
-            serde_json::Value::Null,
-            Some(signaling.clone()),
-            clock.clone(),
-            |run| Box::pin(tokio::task::unconstrained(run)),
-        );
-        let run = running.run;
-        let mut relay = within(signaling.next_signal()).await.unwrap();
-        let (_, candidates) = read_offer(&mut relay).await;
-        let host = host_of(&candidates[0]);
-        // Threads of their own: the source, never yielding while a
-        // datagram waits, does not hold them up.
-        let flooding = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let flooders: Vec<std::thread::JoinHandle<()>> = (0..2)
-            .map(|_| {
-                let flooding = Arc::clone(&flooding);
-                std::thread::spawn(move || {
-                    let socket = std::net::UdpSocket::bind((LOOPBACK, 0)).unwrap();
-                    while flooding.load(std::sync::atomic::Ordering::Relaxed) {
-                        let _sent = socket.send_to(&[0xff; 8], host);
-                    }
-                })
-            })
-            .collect();
-        SystemClock.sleep(Duration::from_millis(50)).await;
-        clock.advance(ANSWER_TIMEOUT);
-        let ended = within(run).await.unwrap();
-        flooding.store(false, std::sync::atomic::Ordering::Relaxed);
-        for flooder in flooders {
-            flooder.join().unwrap();
-        }
-        assert_eq!(
-            ended,
             SourceError::Timeout("webrtc: no answer within 20 s".into())
         );
         assert_eq!(closed(relay).await.code, close::ANSWER_TIMEOUT);

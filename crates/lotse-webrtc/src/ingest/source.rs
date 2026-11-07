@@ -11,12 +11,12 @@
 //! | no relay, or the open refused | `Unreachable` | (none opened) |
 //! | no host address enumerated (the UDP front door off) | `Unreachable` | `internal_error` |
 //! | no host address could be bound | `Unreachable` | `ice_failed` |
-//! | no answer within 20 s | `Timeout` | `answer_timeout` |
+//! | no answer within 20 s of the attempt's start | `Timeout` | `answer_timeout` |
 //! | an answer the engine cannot apply | `Protocol` | `invalid_answer` |
 //! | the relay refused a signal of the source's (`signal_rejected`) | `Protocol` | `internal_error` |
 //! | the camera failed before its answer | `Unreachable("camera: code: message")` | `camera_error` |
 //! | the camera failed after it | `Ended("camera: code: message")` | `camera_error` |
-//! | not connected within 10 s of the answer | `Timeout` | `ice_failed` |
+//! | not connected 27 s into the attempt (10 s after a later answer, 28 s at most) | `Timeout` | `ice_failed` |
 //! | consent lost (RFC 7675) | `Ended` | `consent_lost` |
 //! | the camera's DTLS `close_notify` | `Ended` | `peer_closed` |
 //! | the relaying client went away | `Ended("signaling client gone")` | `signaling_lost` |
@@ -28,14 +28,16 @@
 //! The tracks are declared at the answer and the source is ready once ICE
 //! and DTLS are up: until then the runner's ready timeout bounds the
 //! attempt, not its stall watchdog, so a camera that takes seconds to
-//! connect is not cut off as stalled, and one that never connects ends as
-//! `ice_failed`. The loop waits on the cancel, the signals, the host
-//! sockets (in turn, so a busy one starves none), the engine's timeout and
-//! the relay taking the next outgoing signal; an engine timeout already
-//! due is handled before any more I/O, so a socket that is always readable
-//! postpones no deadline.
+//! connect is not cut off as stalled. The attempt's own deadlines count
+//! from its start, the wait for a relaying client included, and end
+//! before that ready timeout ([`super::engine::ATTEMPT_BUDGET`]), so one
+//! that never connects ends as `ice_failed`. The offer and its candidates
+//! go to the relay at once, at most [`MAX_HOSTS`] of them, which its queue
+//! holds, so nothing waits on the relay. The loop waits on the cancel,
+//! the signals, the host sockets (in turn, so a busy one starves none) and
+//! the engine's timeout; an engine timeout already due is handled before
+//! any more I/O, so I/O that is always ready postpones no deadline.
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -176,8 +178,6 @@ enum Woke {
     Datagram(usize, io::Result<(SocketAddr, usize)>),
     /// The engine's timeout.
     Timer,
-    /// The relay took the next outgoing signal, or is gone (`false`).
-    Sent(bool),
 }
 
 /// The end of an attempt by cancel.
@@ -208,9 +208,6 @@ struct Attempt {
     rtp: RtpTracks,
     /// The tracks declared, by stream index, for a switch of codec.
     tracks: Vec<(usize, Arc<Track>)>,
-    /// The signals the relay has yet to take, in order: the offer, the
-    /// host candidates and the end-of-candidates indication.
-    outbox: VecDeque<LocalSignal>,
     /// The video's index, its track and its keyframes before this
     /// attempt, while the attempt waits for its first.
     waiting: Option<(usize, Arc<Track>, u64)>,
@@ -356,16 +353,6 @@ impl Attempt {
                 }
             }
             Woke::Timer => self.engine.handle_timeout(now),
-            Woke::Sent(true) => {}
-            Woke::Sent(false) => {
-                // A relay that stopped reading shows as the client gone on
-                // `incoming`.
-                tracing::debug!(
-                    unsent = self.outbox.len(),
-                    "webrtc: the relay takes no more signals"
-                );
-                self.outbox.clear();
-            }
         }
         None
     }
@@ -393,8 +380,76 @@ impl Attempt {
     }
 }
 
+/// The most host addresses an attempt gathers on. Its offer carries one
+/// candidate line per address and trickles each again, then the
+/// end-of-candidates indication: 16 keeps that within what the relay
+/// queues at once ([`lotse_core::signaling::OUTGOING_CAPACITY`], so handing them over never
+/// waits), within the supervisor's budget of a signal's candidates (its
+/// `MAX_WORKER_CANDIDATES`, 64) and the offer far under
+/// [`super::engine::MAX_OFFER_BYTES`] (an IPv6 candidate line is about 100 bytes, the rest
+/// of the offer three KiB). A host with more addresses than this has no
+/// camera to reach on most of them.
+pub const MAX_HOSTS: usize = 16;
+
+/// How well an address of the supervisor's list reaches a camera, lower
+/// first: the first one, the address of the default route (the
+/// supervisor lists it first), then private IPv4 (RFC 1918, the home LAN a
+/// camera is on), other IPv4, unique-local IPv6 (RFC 4193), other IPv6.
+fn rank(at: usize, ip: IpAddr) -> u8 {
+    match ip {
+        _ if at == 0 => 0,
+        IpAddr::V4(v4) if v4.is_private() => 1,
+        IpAddr::V4(_) => 2,
+        IpAddr::V6(v6) if v6.is_unique_local() => 3,
+        IpAddr::V6(_) => 4,
+    }
+}
+
+/// The host addresses of `addrs` an attempt gathers on: the [`MAX_HOSTS`]
+/// that [`rank`] puts first, in the supervisor's order, which str0m keeps
+/// as the candidates' preference.
+fn preferred(addrs: &[IpAddr]) -> Vec<IpAddr> {
+    let mut ranked: Vec<(u8, usize, IpAddr)> = addrs
+        .iter()
+        .enumerate()
+        .map(|(at, ip)| (rank(at, *ip), at, *ip))
+        .collect();
+    ranked.sort_unstable();
+    let listed = ranked.len();
+    ranked.truncate(MAX_HOSTS);
+    tracing::debug!(
+        listed,
+        kept = ranked.len(),
+        "webrtc: host addresses to gather on, the preferred of those listed"
+    );
+    ranked.sort_unstable_by_key(|(_, at, _)| *at);
+    ranked.into_iter().map(|(_, _, ip)| ip).collect()
+}
+
+/// Hands the offer, the host candidates and the end-of-candidates
+/// indication to the relay at once, without waiting: there are at most
+/// [`MAX_HOSTS`] + 2 of them, which
+/// [`lotse_core::signaling::OUTGOING_CAPACITY`] holds. One the
+/// relay does not take (it is gone, which shows on `incoming`) is counted
+/// in the line logged.
+fn hand_over(engine: &IngestEngine, channel: &SignalingChannel) {
+    let candidates = engine.local_candidates();
+    let signals = candidates.len().saturating_add(1);
+    let unsent = std::iter::once(LocalSignal::Offer(engine.offer_sdp().to_owned()))
+        .chain(candidates.into_iter().map(LocalSignal::Candidate))
+        .map(|signal| channel.outgoing.try_send(signal).is_err())
+        .filter(|unsent| *unsent)
+        .count();
+    tracing::debug!(
+        signals,
+        unsent,
+        "webrtc: offer and candidates handed to the relay"
+    );
+}
+
 /// One connection attempt of a source with `options`.
 async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
+    let started = ctx.time.now();
     let Some(relay) = ctx.signaling.clone() else {
         return SourceError::Unreachable("webrtc: no signaling relay to the client".into());
     };
@@ -419,9 +474,9 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
         channel.close(close::INTERNAL_ERROR, reason.to_owned());
         return SourceError::Unreachable(format!("webrtc: {reason}"));
     }
-    let hosts = bind(&channel.local_addrs).await;
+    let hosts = bind(&preferred(&channel.local_addrs)).await;
     let addrs: Vec<SocketAddr> = hosts.iter().map(|(addr, _)| *addr).collect();
-    let engine = match IngestEngine::offer(&options, &addrs, ctx.time.now()) {
+    let engine = match IngestEngine::offer(&options, &addrs, started, ctx.time.now()) {
         Ok(engine) => engine,
         Err(reason) => {
             let error = SourceError::Unreachable(format!("webrtc: {reason}"));
@@ -429,13 +484,7 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
             return error;
         }
     };
-    let mut outbox = VecDeque::from([LocalSignal::Offer(engine.offer_sdp().to_owned())]);
-    outbox.extend(
-        engine
-            .local_candidates()
-            .into_iter()
-            .map(LocalSignal::Candidate),
-    );
+    hand_over(&engine, &channel);
     let attempt = Attempt {
         engine,
         hosts: Hosts {
@@ -444,7 +493,6 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
         },
         rtp: RtpTracks::new(SCHEME),
         tracks: Vec::new(),
-        outbox,
         waiting: None,
         buf: vec![0_u8; RECEIVE_BUFFER],
         dropped: 0,
@@ -475,15 +523,10 @@ async fn run(
             // nearly every datagram, so one kept would rarely be the one
             // due.
             let mut sleeping = ctx.time.sleep(wake.saturating_duration_since(now));
-            let sending = !attempt.outbox.is_empty();
             tokio::select! {
                 biased;
                 () = ctx.cancel.cancelled() => Err(cancelled()),
                 signal = channel.incoming.recv() => signal.map(Woke::Signal).ok_or_else(client_gone),
-                permit = channel.outgoing.reserve(), if sending => {
-                    let sent = permit.ok().zip(attempt.outbox.pop_front());
-                    Ok(Woke::Sent(sent.map(|(permit, signal)| permit.send(signal)).is_some()))
-                }
                 (index, received) = attempt.hosts.recv(&mut attempt.buf) => Ok(Woke::Datagram(index, received)),
                 () = &mut sleeping => Ok(Woke::Timer),
             }
@@ -517,6 +560,75 @@ mod tests {
         assert!(due(now, now));
         assert!(due(now + Duration::from_nanos(1), now));
         assert!(!due(now, now + Duration::from_nanos(1)));
+    }
+
+    #[test]
+    fn rfc8445_5_1_1_the_preferred_host_addresses_are_kept_in_their_order() {
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        // The default route's first, whatever it is; then 5 of each class
+        // in a mixed order, the global IPv6 ones last and cut.
+        let mut listed = vec![ip("2001:db8::1")];
+        for n in 1..=5 {
+            listed.push(ip(&format!("2001:db8::1:{n}")));
+            listed.push(ip(&format!("fd00::{n}")));
+            listed.push(ip(&format!("198.51.100.{n}")));
+            listed.push(ip(&format!("192.168.1.{n}")));
+        }
+        let kept = preferred(&listed);
+        assert_eq!(kept.len(), MAX_HOSTS);
+        let expected: Vec<IpAddr> = listed
+            .iter()
+            .copied()
+            .filter(|ip| *ip == listed[0] || !ip.to_string().starts_with("2001:db8::1:"))
+            .collect();
+        assert_eq!(kept, expected);
+        // Under the bound, all of them, as listed.
+        assert_eq!(preferred(&listed[..4]), listed[..4]);
+        assert_eq!(rank(0, ip("2001:db8::1")), 0);
+        assert_eq!(rank(1, ip("192.168.1.1")), 1);
+        assert_eq!(rank(1, ip("198.51.100.1")), 2);
+        assert_eq!(rank(1, ip("fd00::1")), 3);
+        assert_eq!(rank(1, ip("2001:db8::1")), 4);
+    }
+
+    #[tokio::test]
+    async fn a_receive_that_failed_or_on_no_socket_reaches_nothing() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let local = socket.local_addr().unwrap();
+        let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
+        let options = WebRtcOptions {
+            data_channel: None,
+            audio: false,
+        };
+        let mut attempt = Attempt {
+            engine: IngestEngine::offer(&options, &[local], now, now).unwrap(),
+            hosts: Hosts {
+                sockets: vec![(local, socket)],
+                next: 0,
+            },
+            rtp: RtpTracks::new(SCHEME),
+            tracks: Vec::new(),
+            waiting: None,
+            buf: vec![0_u8; RECEIVE_BUFFER],
+            dropped: 0,
+        };
+        let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let failed = Woke::Datagram(0, Err(io::Error::other("refused")));
+        assert!(attempt.woke(failed, now).is_none());
+        // A datagram on a socket the attempt does not have.
+        assert!(
+            attempt
+                .woke(Woke::Datagram(1, Ok((from, 4))), now)
+                .is_none()
+        );
+        assert_eq!(attempt.engine.stats().bad_datagrams, 0);
+        // The same on the one it has is the engine's (and not one it reads).
+        assert!(
+            attempt
+                .woke(Woke::Datagram(0, Ok((from, 4))), now)
+                .is_none()
+        );
+        assert_eq!(attempt.engine.stats().bad_datagrams, 1);
     }
 
     #[tokio::test]
