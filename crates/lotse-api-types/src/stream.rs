@@ -115,15 +115,30 @@ impl fmt::Debug for SignaledSource {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceFields {
-    /// [`UrlSource::url`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// [`UrlSource::url`]: absent, or a string, never `null`.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     url: Option<String>,
-    /// [`SignaledSource::protocol`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// [`SignaledSource::protocol`]: absent, or a string, never `null`.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     protocol: Option<String>,
     /// The options of either form.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     options: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A field of [`SourceFields`] that is present: a string. An explicit
+/// `null` is refused as the schema's closed forms refuse it (an absent
+/// field never gets here: `default`).
+fn present<'de, D: serde::Deserializer<'de>>(fields: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(fields).map(Some)
 }
 
 impl TryFrom<SourceFields> for SourceSpec {
@@ -778,6 +793,15 @@ mod tests {
             (
                 json!({ "protocol": "webrtc", "label": "camera.front_door" }),
                 "unknown field `label`",
+            ),
+            // A discriminator given as `null` is no absent one.
+            (
+                json!({ "url": "rtsp://cam/", "protocol": null }),
+                "invalid type: null, expected a string",
+            ),
+            (
+                json!({ "protocol": "webrtc", "url": null }),
+                "invalid type: null, expected a string",
             ),
         ] {
             let err = serde_json::from_value::<SourceSpec>(value).unwrap_err();
