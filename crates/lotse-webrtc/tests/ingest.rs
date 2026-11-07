@@ -823,12 +823,6 @@ fn rfc3264_7_every_accepted_h264_format_goes_to_the_video_track_and_others_are_d
             .collect::<Vec<_>>(),
         [0, 0, 0]
     );
-    assert!(
-        !pair
-            .outputs
-            .iter()
-            .any(|output| matches!(output, IngestOutput::Switched(_)))
-    );
     // A payload type the answer did not accept: not handed on.
     pair.camera().write(now, Pt::from(50), true, &[0x41, 0x03]);
     pair.step(Duration::ZERO);
@@ -836,175 +830,91 @@ fn rfc3264_7_every_accepted_h264_format_goes_to_the_video_track_and_others_are_d
 }
 
 #[test]
-fn rfc3264_7_a_camera_that_sends_another_accepted_codec_switches_the_track() {
-    let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
-    let config = camera_config(false).enable_h265(true);
-    pair.answer(config, |answer| answer);
-    pair.connect();
-    let video = pair.camera().video.unwrap();
-    let h264 = pair.camera().pts(video, EngineCodec::H264);
-    let h265 = pair.camera().pts(video, EngineCodec::H265);
-    assert!(!h265.is_empty(), "the answer takes H.265 too");
-    let tracks = pair.tracks();
-    assert!(
-        matches!(tracks[0].declared.codec, Codec::H264 { .. }),
-        "{tracks:?}"
-    );
-    let now = pair.now;
-    pair.camera().write(now, h265[0], true, &[0x02, 0x01, 0x00]);
-    pair.camera().write(now, h265[0], true, &[0x02, 0x01, 0x01]);
-    pair.camera().write(now, h264[1], true, &[0x41, 0x02]);
-    pair.step(Duration::ZERO);
-    let order: Vec<String> = pair
-        .outputs
-        .iter()
-        .filter_map(|output| match output {
-            IngestOutput::Switched(track) => Some(format!(
-                "switch {} {} {}",
-                track.index,
-                track.pt,
-                track.declared.codec.name()
-            )),
-            IngestOutput::Rtp { index, packet, .. } => Some(format!("rtp {index} {}", packet.seq)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        order,
-        [
-            format!("switch 0 {} h265", *h265[0]),
-            "rtp 0 0".to_owned(),
-            "rtp 0 1".to_owned(),
-            format!("switch 0 {} h264", *h264[1]),
-            "rtp 0 2".to_owned(),
-        ]
-    );
-    let Some(IngestOutput::Switched(track)) = pair
-        .outputs
-        .iter()
-        .find(|output| matches!(output, IngestOutput::Switched(_)))
-    else {
-        panic!("no switch");
-    };
-    assert_eq!(track.declared.clock_rate, 90_000);
-    assert_eq!(
-        track.declared.sets,
-        lotse_codec::rtp_ingest::Sprop::H265(lotse_codec::h265::ParameterSets::default())
-    );
-}
-
-/// The video's RTP and switches, in order: `rtp <seq>` and `switch
-/// <codec>`.
-fn video_order(pair: &Pair) -> Vec<String> {
-    pair.outputs
-        .iter()
-        .filter_map(|output| match output {
-            IngestOutput::Switched(track) => {
-                Some(format!("switch {}", track.declared.codec.name()))
-            }
-            IngestOutput::Rtp { packet, .. } => Some(format!("rtp {}", packet.seq)),
-            _ => None,
-        })
-        .collect()
-}
-
-#[test]
-fn rfc3550_a_late_packet_of_the_codec_before_a_switch_does_not_switch_back() {
-    let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
-    pair.answer(camera_config(false).enable_h265(true), |answer| answer);
-    pair.connect();
-    let video = pair.camera().video.unwrap();
-    let h264 = pair.camera().pts(video, EngineCodec::H264)[0];
-    let h265 = pair.camera().pts(video, EngineCodec::H265)[0];
-    let now = pair.now;
-    // H.264 96, 97 and 99, H.265 100, then H.264 98 late (reordered on
-    // the way), and H.265 101; each through the camera's pacer in turn.
-    let send = |pair: &mut Pair, seq: u16, pt: Pt, payload: &[u8]| {
-        pair.camera().seq = seq;
-        pair.camera().write(now, pt, true, payload);
-        pair.run(Duration::from_millis(20));
-    };
-    for seq in [96, 97, 99] {
-        send(&mut pair, seq, h264, &[0x41, 0x00]);
-    }
-    send(&mut pair, 100, h265, &[0x02, 0x01, 0x00]);
-    send(&mut pair, 98, h264, &[0x41, 0x01]);
-    send(&mut pair, 101, h265, &[0x02, 0x01, 0x01]);
-    assert_eq!(
-        video_order(&pair),
-        [
-            "rtp 96",
-            "rtp 97",
-            "rtp 99",
-            "switch h265",
-            "rtp 100",
-            "rtp 101"
-        ]
-    );
-    assert_eq!(pair.engine.stats().late_packets, 1);
-    assert_eq!(pair.engine.stats().switches, 1);
-}
-
-#[test]
-fn rfc3550_8_2_a_new_synchronization_source_numbers_anew_and_may_switch() {
-    let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
-    pair.answer(camera_config(false).enable_h265(true), |answer| answer);
-    pair.connect();
-    let video = pair.camera().video.unwrap();
-    let h264 = pair.camera().pts(video, EngineCodec::H264)[0];
-    let h265 = pair.camera().pts(video, EngineCodec::H265)[0];
-    let now = pair.now;
-    pair.camera().seq = 1_000;
-    pair.camera().write(now, h264, true, &[0x41, 0x00]);
-    // Through the camera's pacer before the next source's.
-    pair.run(Duration::from_millis(50));
-    // The camera's encoder restarted in H.265 under a new SSRC, its
-    // numbers from 5: no packet of it is late.
-    pair.camera().seq = 5;
-    pair.camera().new_ssrc(0x5eed);
-    pair.camera().write(now, h265, true, &[0x02, 0x01, 0x00]);
-    pair.camera().write(now, h265, true, &[0x02, 0x01, 0x01]);
-    pair.run(Duration::from_millis(50));
-    assert_eq!(
-        video_order(&pair),
-        ["rtp 1000", "switch h265", "rtp 5", "rtp 6"]
-    );
-    assert_eq!(pair.engine.stats().late_packets, 0);
-}
-
-#[test]
-fn rfc3264_7_a_camera_alternating_codecs_logs_the_switches_rate_limited() {
+fn rfc3264_7_a_packet_of_another_accepted_codec_is_dropped_not_switched() {
     let captured = Captured::default();
     let writer = captured.clone();
     let _logs = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
             .with_writer(move || writer.clone())
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(tracing::Level::TRACE)
             .with_ansi(false)
             .finish(),
     );
-    let mut pair = Pair::offer(&video_only());
-    pair.answer(camera_config(false).enable_h265(true), |answer| answer);
+    let mut pair = Pair::offer(&WebRtcOptions {
+        data_channel: None,
+        audio: true,
+    });
+    pair.answer(camera_config(true).enable_h265(true), |answer| answer);
     pair.connect();
     let video = pair.camera().video.unwrap();
+    let audio = pair.camera().audio.unwrap();
     let h264 = pair.camera().pts(video, EngineCodec::H264)[0];
-    let h265 = pair.camera().pts(video, EngineCodec::H265)[0];
+    let h265 = pair.camera().pts(video, EngineCodec::H265);
+    let opus = pair.camera().pts(audio, EngineCodec::Opus)[0];
+    assert!(!h265.is_empty(), "the answer takes H.265 too");
+    assert!(matches!(
+        pair.tracks()[1].declared.codec,
+        Codec::H264 { .. }
+    ));
     let now = pair.now;
+    // H.265 on the H.264 track, again and again: dropped, one warning.
     for _ in 0..10 {
-        pair.camera().write(now, h265, true, &[0x02, 0x01, 0x00]);
-        pair.camera().write(now, h264, true, &[0x41, 0x00]);
+        pair.camera().write(now, h265[0], true, &[0x02, 0x01, 0x00]);
+    }
+    pair.camera().write(now, h264, true, &[0x41, 0x00]);
+    pair.step(Duration::ZERO);
+    assert_eq!(pair.engine.stats().other_codec_packets, 10);
+    assert_eq!(pair.engine.stats().rtp_packets, 1);
+    assert_eq!(pair.rtp().len(), 1);
+    // Opus on the video's m-line is no format of it: foreign.
+    for _ in 0..2 {
+        pair.camera()
+            .write_on(video, now, opus, true, &[0xfc, 0xff, 0xfe]);
     }
     pair.step(Duration::ZERO);
-    assert_eq!(pair.engine.stats().switches, 20);
+    assert_eq!(pair.engine.stats().foreign_packets, 2);
+    assert_eq!(pair.engine.stats().other_codec_packets, 10);
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert_eq!(
-        logs.matches("the camera switched the track's codec")
+        logs.matches("RTP in another codec than its track's dropped")
             .count(),
         1,
         "{logs}"
+    );
+}
+
+#[test]
+fn rfc3550_8_2_a_new_synchronization_source_s_losses_count_from_its_own_numbers() {
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    pair.answer(camera_config(false), |answer| answer);
+    pair.connect();
+    pair.step(Duration::from_millis(1));
+    pair.frame(true);
+    pair.engine.keyframe_seen();
+    pair.camera().seq = 1_000;
+    pair.frame(false);
+    pair.run(Duration::from_millis(50));
+    // Past the spacing of keyframe requests.
+    pair.step(PLI_INTERVAL);
+    let plis = pair.engine.stats().plis;
+    // The camera's encoder restarted under a new SSRC, its numbers from
+    // 5: no loss at 5, one at the gap after it.
+    pair.camera().new_ssrc(0x5eed);
+    pair.camera().seq = 5;
+    pair.frame(false);
+    pair.run(Duration::from_millis(50));
+    assert_eq!(pair.engine.stats().plis, plis, "a new source is no loss");
+    pair.camera().seq = 9;
+    pair.frame(false);
+    pair.run(Duration::from_millis(50));
+    assert_eq!(pair.engine.stats().plis, plis + 1, "its own gap is");
+    assert_eq!(
+        pair.rtp()
+            .iter()
+            .map(|(_, seq, _)| *seq)
+            .collect::<Vec<_>>()[3..],
+        [1_000, 5, 9]
     );
 }
 
@@ -1038,7 +948,7 @@ fn an_offer_over_what_the_relay_takes_is_not_made() {
 }
 
 #[test]
-fn rfc3264_7_an_accepted_audio_format_of_another_clock_rate_is_not_the_track_s() {
+fn rfc3264_7_an_accepted_audio_codec_other_than_the_track_s_is_dropped() {
     let _logs = logs();
     let mut pair = Pair::offer(&WebRtcOptions {
         data_channel: None,
@@ -1053,8 +963,7 @@ fn rfc3264_7_an_accepted_audio_format_of_another_clock_rate_is_not_the_track_s()
     assert!(!pcmu.is_empty(), "the answer takes PCMU too");
     assert_eq!(Pt::from(pair.tracks()[0].pt), opus[0]);
     let now = pair.now;
-    // PCMU's 8 kHz is not the Opus track's 48 kHz: dropped (the line
-    // logged once).
+    // PCMU is another codec than the Opus track's: dropped.
     for _ in 0..2 {
         pair.camera()
             .write_on(audio, now, pcmu[0], true, &[0xff; 160]);
@@ -1062,14 +971,9 @@ fn rfc3264_7_an_accepted_audio_format_of_another_clock_rate_is_not_the_track_s()
     pair.camera()
         .write_on(audio, now, opus[0], true, &[0xfc, 0xff, 0xfe]);
     pair.step(Duration::ZERO);
-    assert_eq!(pair.engine.stats().foreign_packets, 2);
+    assert_eq!(pair.engine.stats().other_codec_packets, 2);
+    assert_eq!(pair.engine.stats().foreign_packets, 0);
     assert_eq!(pair.engine.stats().rtp_packets, 1);
-    assert!(
-        !pair
-            .outputs
-            .iter()
-            .any(|output| matches!(output, IngestOutput::Switched(_)))
-    );
 }
 
 #[test]
@@ -1237,6 +1141,53 @@ fn rfc8829_5_2_the_answer_deadline_counts_from_the_attempt_s_start() {
     }
     engine.handle_timeout(started + ANSWER_TIMEOUT);
     assert!(engine.is_ended());
+}
+
+#[test]
+fn rfc8445_8_an_answer_or_a_handshake_completing_at_its_deadline_is_not_taken() {
+    let _logs = logs();
+    // The answer at its deadline, the timeout not handled yet.
+    let mut pair = Pair::offer(&video_only());
+    pair.now += ANSWER_TIMEOUT;
+    pair.answer(camera_config(false), |answer| answer);
+    assert!(pair.tracks().is_empty());
+    let (error, code, _) = pair.ended().unwrap();
+    assert_eq!(
+        error,
+        SourceError::Timeout("webrtc: no answer within 20 s".into())
+    );
+    assert_eq!(code, close::ANSWER_TIMEOUT);
+
+    // The camera's last handshake flight at the connect deadline. The
+    // camera is the DTLS server (str0m answers `actpass` passive): once
+    // its own handshake is done, what it sends then completes the
+    // engine's.
+    let mut pair = Pair::offer(&video_only());
+    let started = pair.now;
+    pair.answer(camera_config(false), |answer| answer);
+    for _ in 0..1_000 {
+        pair.now += Duration::from_millis(5);
+        pair.engine.handle_timeout(pair.now);
+        pair.drain();
+        let now = pair.now;
+        pair.camera().timeout(now);
+        if pair.camera().connected {
+            break;
+        }
+        pair.deliver();
+    }
+    assert!(pair.camera().connected);
+    assert!(!pair.engine.is_connected());
+    assert!(!pair.camera().out.is_empty());
+    pair.now = started + CONNECT_BY;
+    pair.deliver();
+    assert!(!pair.engine.is_connected());
+    let (error, code, _) = pair.ended().unwrap();
+    assert_eq!(
+        error,
+        SourceError::Timeout("webrtc: not connected 27000 ms into the attempt".into())
+    );
+    assert_eq!(code, close::ICE_FAILED);
 }
 
 #[test]
@@ -1454,6 +1405,29 @@ fn rfc7983_7_media_from_a_stranger_is_not_taken() {
     pair.engine.receive(pair.now, stranger, ENGINE, &rtp);
     assert_eq!(pair.engine.stats().bad_datagrams, 1);
     assert!(pair.engine.is_connected());
+}
+
+#[test]
+fn rfc6347_4_2_7_a_close_drops_what_was_queued_and_not_polled() {
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    let (_camera, answer) = Camera::answer(
+        pair.engine.offer_sdp(),
+        CAMERA,
+        camera_config(false),
+        pair.now,
+    );
+    // The answer's tracks queued, never polled, then the close.
+    pair.engine.accept_answer(pair.now, &answer);
+    assert!(pair.engine.answered());
+    pair.engine.close();
+    loop {
+        match pair.engine.poll() {
+            IngestOutput::Timeout(_) => break,
+            IngestOutput::Transmit { .. } => {}
+            other => panic!("after the close: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -2156,6 +2130,42 @@ mod source {
     }
 
     #[tokio::test]
+    async fn rfc8829_5_2_an_answer_or_a_failure_at_the_answer_deadline_ends_the_attempt_by_it() {
+        let _logs = logs();
+        for answering in [true, false] {
+            let clock = Arc::new(FakeClock::from_system());
+            let signaling = FakeSignaling::new(vec![LOOPBACK]);
+            let running = start(
+                serde_json::Value::Null,
+                Some(signaling.clone()),
+                clock.clone(),
+            );
+            let mut relay = within(signaling.next_signal()).await.unwrap();
+            let (offer, _) = read_offer(&mut relay).await;
+            let (_camera, answer) = Live::answer(&offer, true).await;
+            let signal = if answering {
+                RemoteSignal::Answer(answer)
+            } else {
+                RemoteSignal::Failed {
+                    code: "offline".into(),
+                    message: "gone".into(),
+                }
+            };
+            settle().await;
+            // Both before the source runs again: the deadline, then the
+            // signal.
+            clock.advance(ANSWER_TIMEOUT);
+            relay.incoming.try_send(signal).unwrap();
+            assert_eq!(
+                within(running.run).await.unwrap(),
+                SourceError::Timeout("webrtc: no answer within 20 s".into()),
+                "answering: {answering}"
+            );
+            assert_eq!(closed(relay).await.code, close::ANSWER_TIMEOUT);
+        }
+    }
+
+    #[tokio::test]
     async fn rfc8829_5_3_an_answer_that_is_no_sdp_ends_as_invalid_answer() {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
@@ -2655,7 +2665,7 @@ mod source {
     }
 
     #[tokio::test]
-    async fn rfc3264_7_a_camera_that_sends_h265_on_the_video_m_line_switches_the_track() {
+    async fn rfc3264_7_h265_on_an_h264_track_leaves_the_track_as_it_is() {
         use lotse_codec::h265::test_data as h265_data;
 
         let _logs = logs();
@@ -2679,24 +2689,22 @@ mod source {
         assert!(matches!(&*video.codec(), Codec::H264 { .. }));
         let mid = camera.camera.video.unwrap();
         let pt = camera.camera.pts(mid, EngineCodec::H265)[0];
-        within(async {
-            while video.stats().keyframes == 0 {
-                camera.camera.ts = camera.camera.ts.wrapping_add(3_000);
-                let now = SystemClock.now();
-                for unit in [h265_data::vps(), h265_data::sps(640, 480), h265_data::pps()] {
-                    camera.camera.write(now, pt, false, &unit);
-                }
-                let idr = h265_data::unit(19, &[0xaf, 0x08, 0x40, 0x10]);
-                camera.camera.write(now, pt, true, &idr);
-                camera.pump(Duration::from_millis(40)).await;
+        for _ in 0..5 {
+            camera.camera.ts = camera.camera.ts.wrapping_add(3_000);
+            let now = SystemClock.now();
+            for unit in [h265_data::vps(), h265_data::sps(640, 480), h265_data::pps()] {
+                camera.camera.write(now, pt, false, &unit);
             }
-        })
-        .await;
-        assert!(
-            matches!(&*video.codec(), Codec::H265 { sps: Some(_), .. }),
-            "{:?}",
-            video.codec()
-        );
+            let idr = h265_data::unit(19, &[0xaf, 0x08, 0x40, 0x10]);
+            camera.camera.write(now, pt, true, &idr);
+            camera.pump(Duration::from_millis(40)).await;
+        }
+        // Not one of them on the track, which is still H.264 and takes
+        // the camera's H.264.
+        assert_eq!(video.stats().packets, 0);
+        assert!(matches!(&*video.codec(), Codec::H264 { sps: None, .. }));
+        within(camera.stream_until(|| video.stats().keyframes >= 1)).await;
+        assert!(matches!(&*video.codec(), Codec::H264 { sps: Some(_), .. }));
         running.cancel.cancel();
         within(running.run).await.unwrap();
     }

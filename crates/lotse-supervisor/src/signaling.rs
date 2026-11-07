@@ -56,14 +56,25 @@
 //! signals (one that ends its signals and opens new ones in a loop still
 //! offers once per signal, as a source that keeps failing does). Per
 //! signal an offer is taken once, at most
-//! [`MAX_WORKER_CANDIDATES`] candidates after it and none after its
-//! end-of-candidates (RFC 8838 §13); a report past that ends the signal
+//! [`MAX_WORKER_CANDIDATES`] candidates after it, an end-of-candidates
+//! for at most [`MAX_ENDED_SECTIONS`] media sections, and no candidate for
+//! a section after its end-of-candidates (RFC 8838 §8.2, §13); a report
+//! past that ends the signal
 //! (`internal_error` to the client, [`REJECTED`] to the worker), so a
 //! signal cannot flood the client, whose signaling events are never shed:
 //! a subscription without room for one ends, and the server disconnects
 //! its client. The client's own commands are bounded too: one answer, at
-//! most [`MAX_CLIENT_CANDIDATES`] candidates and one end-of-candidates,
-//! and one error per signal, after which it takes no answer or candidate.
+//! most [`MAX_CLIENT_CANDIDATES`] candidates, one end-of-candidates per
+//! media section for at most [`MAX_ENDED_SECTIONS`] sections, after which
+//! that section takes no candidate, and one error per signal, after which
+//! it takes no answer or candidate.
+//!
+//! End-of-candidates ends one media section's candidates, not the
+//! signal's (RFC 8838 §8.2, §13): with BUNDLE (RFC 8843) one section
+//! carries them all, but a camera's integration may end each `a=mid` on
+//! its own and trickle another's after. A candidate's section is its
+//! `a=mid` when it names one, else its index (RFC 8829 §3.5.2.1), else
+//! the one unnamed section.
 //!
 //! Every line a worker's opens, cancels and reports can repeat (an open
 //! that waits, is cancelled or refused; a signal opened, offered, closed
@@ -145,6 +156,11 @@ const OVERFLOW_SLOT: usize = 1;
 /// room to spare.
 pub(crate) const MAX_CLIENT_CANDIDATES: u32 = 64;
 
+/// The media sections whose candidates one side of a signal may end
+/// (RFC 8838 §8.2): an audio, a video and a data section each, unbundled,
+/// with room to spare. It bounds the sections a signal remembers.
+pub(crate) const MAX_ENDED_SECTIONS: usize = 8;
+
 /// The most commands the registry holds for one worker while its driver's
 /// queue is full ([`State::take_held_signals`]): an answer per open and an
 /// end per signal, which [`MAX_PENDING_OPENS`] and [`MAX_OPEN_SIGNALS`]
@@ -212,6 +228,30 @@ struct Signal {
     client_sent: ClientSent,
 }
 
+/// The media section a candidate or end-of-candidates belongs to, as one
+/// is told from another for its end (RFC 8838 §8.2): by its `a=mid` when
+/// the sender named one, else by its index (RFC 8829 §3.5.2.1).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Section {
+    /// The section of this `a=mid` (RFC 8843 §7.1).
+    Mid(String),
+    /// The section of this index, 0 for the first, no `a=mid` named.
+    Index(u16),
+    /// Neither named: the one section a sender that names none has.
+    Unnamed,
+}
+
+impl Section {
+    /// The section a candidate naming `mid` and `mline_index` belongs to.
+    fn of(mid: Option<&str>, mline_index: Option<u16>) -> Self {
+        match (mid, mline_index) {
+            (Some(mid), _) => Self::Mid(mid.to_owned()),
+            (None, Some(index)) => Self::Index(index),
+            (None, None) => Self::Unnamed,
+        }
+    }
+}
+
 /// What a signal's worker sent so far.
 #[derive(Debug, Default)]
 struct WorkerSent {
@@ -219,8 +259,9 @@ struct WorkerSent {
     offer: bool,
     /// Its candidates, at most [`MAX_WORKER_CANDIDATES`].
     candidates: u32,
-    /// Its end-of-candidates: no candidate follows.
-    end: bool,
+    /// The sections it sent end-of-candidates for, at most
+    /// [`MAX_ENDED_SECTIONS`]: no candidate of theirs follows.
+    ended: BTreeSet<Section>,
 }
 
 /// What a signal's client sent so far.
@@ -234,15 +275,17 @@ struct ClientSent {
     /// Its candidates, the end-of-candidates aside: at most
     /// [`MAX_CLIENT_CANDIDATES`].
     candidates: u32,
-    /// Its end-of-candidates: no candidate follows.
-    end: bool,
+    /// The sections it sent end-of-candidates for, at most
+    /// [`MAX_ENDED_SECTIONS`]: no candidate of theirs follows.
+    ended: BTreeSet<Section>,
 }
 
 impl ClientSent {
-    /// Counts a candidate the client sent, or its end-of-candidates.
-    const fn took_candidate(&mut self, end: bool) {
+    /// Counts a candidate the client sent for `section`, or, `end`, the
+    /// section's end-of-candidates.
+    fn took_candidate(&mut self, section: Section, end: bool) {
         if end {
-            self.end = true;
+            self.ended.insert(section);
         } else {
             self.candidates = self.candidates.saturating_add(1);
         }
@@ -561,12 +604,20 @@ impl State {
         let Some(mut signal) = self.take_signal(connection, &signal_id) else {
             return;
         };
+        // The first media section when the source named none: its BUNDLE
+        // carries every candidate, and the client is told that index.
+        let mline_index = mline_index.unwrap_or(0);
+        let section = Section::of(mid.as_deref(), Some(mline_index));
+        let end = candidate.is_empty();
         let broken = if !signal.worker_sent.offer {
             Some("a candidate before the offer")
-        } else if signal.worker_sent.end {
-            // RFC 8838 §13: no candidate follows end-of-candidates.
-            Some("a candidate after its end-of-candidates")
-        } else if !candidate.is_empty() && signal.worker_sent.candidates >= MAX_WORKER_CANDIDATES {
+        } else if signal.worker_sent.ended.contains(&section) {
+            // RFC 8838 §13: no candidate of a media section follows its
+            // end-of-candidates.
+            Some("a candidate after its media section's end-of-candidates")
+        } else if end && signal.worker_sent.ended.len() >= MAX_ENDED_SECTIONS {
+            Some("more media sections ended than a signal allows")
+        } else if !end && signal.worker_sent.candidates >= MAX_WORKER_CANDIDATES {
             Some("more candidates than a signal allows")
         } else {
             None
@@ -575,23 +626,21 @@ impl State {
             self.worker_broke(&signal_id, &signal, reason, now);
             return;
         }
-        if candidate.is_empty() {
-            signal.worker_sent.end = true;
+        if end {
+            signal.worker_sent.ended.insert(section);
         } else {
             signal.worker_sent.candidates = signal.worker_sent.candidates.saturating_add(1);
         }
         tracing::debug!(
             signal.id = %signal_id,
-            end = candidate.is_empty(),
+            end,
             "signaling candidate relayed to the subscription"
         );
         let event = SignalingEvent::Candidate {
             signal_id: signal_id.clone(),
             candidate,
             sdp_mid: mid,
-            // The first media section when the source named none: its
-            // BUNDLE carries every candidate.
-            sdp_mline_index: mline_index.unwrap_or(0),
+            sdp_mline_index: mline_index,
         };
         self.deliver(signal_id, signal, &event);
     }
@@ -1139,9 +1188,10 @@ impl State {
     }
 
     /// `signaling/candidate` of `connection`: a candidate of the camera's,
-    /// at most [`MAX_CLIENT_CANDIDATES`] per signal, or its
-    /// end-of-candidates, once, after which no candidate follows (RFC 8838
-    /// §13), to its worker.
+    /// at most [`MAX_CLIENT_CANDIDATES`] per signal, or a media section's
+    /// end-of-candidates, once per section for at most
+    /// [`MAX_ENDED_SECTIONS`], after which no candidate of that section
+    /// follows (RFC 8838 §8.2, §13), to its worker.
     pub(crate) fn signal_candidate(
         &mut self,
         connection: ConnectionId,
@@ -1149,11 +1199,19 @@ impl State {
     ) -> Result<(), ApiError> {
         let signal = self.owned_signal(connection, &candidate.signal_id)?;
         let end = candidate.candidate.is_empty();
-        if signal.client_sent.end {
+        let section = Section::of(candidate.sdp_mid.as_deref(), candidate.sdp_mline_index);
+        if signal.client_sent.ended.contains(&section) {
             return Err(signal_refused(
                 &candidate.signal_id,
-                "the signal's candidates already ended",
+                "the media section's candidates already ended",
             ));
+        }
+        if end && signal.client_sent.ended.len() >= MAX_ENDED_SECTIONS {
+            return Err(ApiError::new(
+                ErrorCode::LimitReached,
+                "too many media sections ended for the signal",
+            )
+            .with_detail("limit", "signal_sections"));
         }
         if !end && signal.client_sent.candidates >= MAX_CLIENT_CANDIDATES {
             return Err(ApiError::new(
@@ -1174,7 +1232,7 @@ impl State {
             },
         )?;
         if let Some(signal) = self.signaling.signals.get_mut(&candidate.signal_id) {
-            signal.client_sent.took_candidate(end);
+            signal.client_sent.took_candidate(section, end);
         }
         tracing::debug!(signal.id = %candidate.signal_id, end, "signaling candidate relayed to the source");
         Ok(())
@@ -1502,6 +1560,17 @@ mod tests {
         }
     }
 
+    /// A worker's candidate report for the media section `mid`, its index
+    /// unnamed.
+    fn candidate_of(signal_id: &str, candidate: &str, mid: &str) -> SignalReport {
+        SignalReport::Candidate {
+            signal_id: signal_id.into(),
+            candidate: candidate.into(),
+            mid: Some(mid.into()),
+            mline_index: None,
+        }
+    }
+
     fn closed(signal_id: &str, code: &str) -> SignalReport {
         SignalReport::Closed {
             signal_id: signal_id.into(),
@@ -1653,11 +1722,11 @@ mod tests {
         assert_eq!(queues.take("c1"), failed(&signal_id, "a second offer"));
         assert_eq!(events(&mut all), [closing(&signal_id, "a second offer")]);
         assert!(state.signaling.signals.is_empty());
-        // A candidate after end-of-candidates.
+        // A second end-of-candidates for the same media section.
         let (mut state, mut queues, signal_id, mut all) = offered();
         report(&mut state, "c1", candidate(&signal_id, "", Some(0)));
         report(&mut state, "c1", candidate(&signal_id, "", Some(0)));
-        let reason = "a candidate after its end-of-candidates";
+        let reason = "a candidate after its media section's end-of-candidates";
         assert_eq!(queues.take("c1"), failed(&signal_id, reason));
         assert_eq!(events(&mut all)[1], closing(&signal_id, reason));
         // More candidates than a signal takes; their end-of-candidates
@@ -1698,6 +1767,55 @@ mod tests {
                 .len(),
             4
         );
+    }
+
+    #[test]
+    fn rfc8838_8_2_a_worker_s_end_of_candidates_ends_only_its_media_section() {
+        let failed = |signal_id: &str, reason: &str| {
+            [SignalCommand::Failed {
+                signal_id: signal_id.into(),
+                code: "signal_rejected".into(),
+                message: format!("the worker sent {reason}"),
+            }]
+        };
+        let closing = |signal_id: &str, reason: &str| {
+            json!({ "type": "closed", "signal_id": signal_id, "code": "internal_error",
+                    "message": format!("the worker sent {reason}") })
+        };
+        let host = "candidate:1 1 udp 1 192.0.2.7 9 typ host";
+        // Section "0" ends and section "1" still trickles; the sections
+        // up to the bound end, and a candidate of one more still goes.
+        let (mut state, mut queues, signal_id, mut all) = offered();
+        report(&mut state, "c1", candidate_of(&signal_id, "", "0"));
+        report(&mut state, "c1", candidate_of(&signal_id, host, "1"));
+        for mid in 1..MAX_ENDED_SECTIONS {
+            report(
+                &mut state,
+                "c1",
+                candidate_of(&signal_id, "", &mid.to_string()),
+            );
+        }
+        report(&mut state, "c1", candidate_of(&signal_id, host, "8"));
+        assert!(queues.take("c1").is_empty());
+        let got = events(&mut all);
+        assert_eq!(got.len(), MAX_ENDED_SECTIONS + 2);
+        assert_eq!(
+            got[1],
+            json!({ "type": "candidate", "signal_id": signal_id, "candidate": host,
+                    "sdp_mid": "1", "sdp_mline_index": 0 })
+        );
+        // One more section's end is past the bound.
+        report(&mut state, "c1", candidate_of(&signal_id, "", "8"));
+        let reason = "more media sections ended than a signal allows";
+        assert_eq!(queues.take("c1"), failed(&signal_id, reason));
+        assert_eq!(events(&mut all), [closing(&signal_id, reason)]);
+        // A candidate of a section after its own end-of-candidates.
+        let (mut state, mut queues, signal_id, mut all) = offered();
+        report(&mut state, "c1", candidate_of(&signal_id, "", "0"));
+        report(&mut state, "c1", candidate_of(&signal_id, host, "0"));
+        let reason = "a candidate after its media section's end-of-candidates";
+        assert_eq!(queues.take("c1"), failed(&signal_id, reason));
+        assert_eq!(events(&mut all)[1], closing(&signal_id, reason));
     }
 
     #[test]
@@ -2213,9 +2331,108 @@ mod tests {
         for after in [&end, &candidate] {
             let refused = state.signal_candidate(ConnectionId(1), after).unwrap_err();
             assert_eq!(refused.code, ErrorCode::InvalidRequest);
-            assert_eq!(refused.message, "the signal's candidates already ended");
+            assert_eq!(
+                refused.message,
+                "the media section's candidates already ended"
+            );
         }
         assert!(queues.take("c1").is_empty());
+    }
+
+    #[test]
+    fn rfc8838_8_2_a_client_s_end_of_candidates_ends_only_its_media_section() {
+        let (mut state, mut queues, signal_id, _all) = offered();
+        let sent =
+            |candidate: &str, mid: Option<&str>, mline_index: Option<u16>| SignalingCandidate {
+                id: 2,
+                signal_id: signal_id.clone(),
+                candidate: candidate.into(),
+                sdp_mid: mid.map(Into::into),
+                sdp_mline_index: mline_index,
+            };
+        let relayed = |candidate: &str, mid: Option<&str>, mline_index: Option<u16>| {
+            SignalCommand::Candidate {
+                signal_id: signal_id.clone(),
+                candidate: candidate.into(),
+                mid: mid.map(Into::into),
+                mline_index,
+            }
+        };
+        let host = "candidate:1 1 udp 1 198.51.100.1 9 typ host";
+        // Section "0" ends; section "1" still trickles, and ends on its own.
+        state
+            .signal_candidate(ConnectionId(1), &sent("", Some("0"), Some(0)))
+            .unwrap();
+        state
+            .signal_candidate(ConnectionId(1), &sent(host, Some("1"), Some(1)))
+            .unwrap();
+        // RFC 8838 §13: nothing of section "0" follows its end, not even
+        // a second end.
+        for after in [sent(host, Some("0"), Some(0)), sent("", Some("0"), None)] {
+            let refused = state.signal_candidate(ConnectionId(1), &after).unwrap_err();
+            assert_eq!(refused.code, ErrorCode::InvalidRequest);
+            assert_eq!(
+                refused.message,
+                "the media section's candidates already ended"
+            );
+            assert_eq!(refused.details["signal_id"], signal_id.as_str());
+        }
+        state
+            .signal_candidate(ConnectionId(1), &sent("", Some("1"), Some(1)))
+            .unwrap();
+        // Without a mid the index names the section, and without either
+        // the one unnamed section is meant: each ends on its own.
+        state
+            .signal_candidate(ConnectionId(1), &sent("", None, Some(1)))
+            .unwrap();
+        let refused = state
+            .signal_candidate(ConnectionId(1), &sent(host, None, Some(1)))
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::InvalidRequest);
+        state
+            .signal_candidate(ConnectionId(1), &sent(host, None, None))
+            .unwrap();
+        assert_eq!(
+            queues.take("c1"),
+            [
+                relayed("", Some("0"), Some(0)),
+                relayed(host, Some("1"), Some(1)),
+                relayed("", Some("1"), Some(1)),
+                relayed("", None, Some(1)),
+                relayed(host, None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_client_ends_the_candidates_of_at_most_8_media_sections_of_a_signal() {
+        let (mut state, mut queues, signal_id, _all) = offered();
+        let sent = |candidate: &str, mid: usize| SignalingCandidate {
+            id: 2,
+            signal_id: signal_id.clone(),
+            candidate: candidate.into(),
+            sdp_mid: Some(mid.to_string()),
+            sdp_mline_index: None,
+        };
+        for mid in 0..MAX_ENDED_SECTIONS {
+            state
+                .signal_candidate(ConnectionId(1), &sent("", mid))
+                .unwrap();
+        }
+        assert_eq!(queues.take("c1").len(), MAX_ENDED_SECTIONS);
+        let over = state
+            .signal_candidate(ConnectionId(1), &sent("", MAX_ENDED_SECTIONS))
+            .unwrap_err();
+        assert_eq!(over.code, ErrorCode::LimitReached);
+        assert_eq!(over.message, "too many media sections ended for the signal");
+        assert_eq!(over.details["limit"], "signal_sections");
+        assert!(queues.take("c1").is_empty());
+        // A candidate of one more section is no end, and still goes.
+        let host = "candidate:1 1 udp 1 198.51.100.1 9 typ host";
+        state
+            .signal_candidate(ConnectionId(1), &sent(host, MAX_ENDED_SECTIONS))
+            .unwrap();
+        assert_eq!(queues.take("c1").len(), 1);
     }
 
     /// What the registry tells a worker on its own (an open's answer, a

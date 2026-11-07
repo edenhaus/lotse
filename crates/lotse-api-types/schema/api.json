@@ -2686,7 +2686,7 @@
           "type": "object"
         },
         {
-          "description": "A candidate of the source's, trickled after the offer (RFC 8838\n§8); an empty `candidate` is end-of-candidates (§13), after which\nnone follows.",
+          "description": "A candidate of the source's, trickled after the offer (RFC 8838\n§8); an empty `candidate` is end-of-candidates for its media\nsection (§8.2, §13), after which none of that section follows.",
           "properties": {
             "candidate": {
               "description": "The `candidate:` attribute value, or empty.",

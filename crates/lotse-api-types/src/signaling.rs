@@ -43,8 +43,8 @@ pub enum SignalingEvent {
         sdp: String,
     },
     /// A candidate of the source's, trickled after the offer (RFC 8838
-    /// §8); an empty `candidate` is end-of-candidates (§13), after which
-    /// none follows.
+    /// §8); an empty `candidate` is end-of-candidates for its media
+    /// section (§8.2, §13), after which none of that section follows.
     #[cfg_attr(feature = "schema", schemars(title = "SignalingEventCandidate"))]
     Candidate {
         /// The signal.
