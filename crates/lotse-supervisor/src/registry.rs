@@ -339,6 +339,9 @@ pub(crate) struct State {
     /// Rate-limits the line of a signal command a driver's full queue
     /// dropped, which a worker's reports can cause as fast as it sends.
     pub(crate) signal_queue_lines: Throttle,
+    /// Rate-limits the line of an open refused for want of a client, which
+    /// a worker's opens and cancels can cause as fast as it sends them.
+    pub(crate) signal_refused_lines: Throttle,
 }
 
 impl State {

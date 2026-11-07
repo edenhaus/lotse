@@ -54,7 +54,9 @@ pub(crate) struct SignalFrom<'a> {
 
 impl State {
     /// The checked signal `report` of the worker `from`, at `now`. An open
-    /// is refused [`NO_SIGNALING_CLIENT`] through the connection's driver;
+    /// is refused [`NO_SIGNALING_CLIENT`] through the connection's driver,
+    /// its line rate-limited (a worker opens and cancels as fast as it
+    /// sends);
     /// anything else concerns no signal the supervisor holds and is
     /// dropped (a second close of a signal among them).
     pub(crate) fn signal_report(
@@ -66,11 +68,14 @@ impl State {
         let connection = from.connection;
         match report {
             SignalReport::Open { request } => {
-                tracing::info!(
-                    connection.id = connection,
-                    request,
-                    "signaling channel refused: no client relays the source's signaling"
-                );
+                if let Some(count) = self.signal_refused_lines.hit(now) {
+                    tracing::info!(
+                        connection.id = connection,
+                        request,
+                        count,
+                        "signaling channel refused: no client relays the source's signaling"
+                    );
+                }
                 self.signal_worker(
                     from,
                     now,
@@ -206,6 +211,13 @@ mod tests {
         let dropped = captured.lines("the driver's queue is full; signal command dropped");
         assert_eq!(dropped.len(), 2, "{dropped:?}");
         assert!(dropped[1].contains("count=3"), "{dropped:?}");
+        // The refusal's own line is rate-limited the same way: one for the
+        // five opens now, one with their count a summary interval later.
+        let refused =
+            captured.lines("signaling channel refused: no client relays the source's signaling");
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(refused[0].contains("count=1"), "{refused:?}");
+        assert!(refused[1].contains("count=5"), "{refused:?}");
         // A connection that is gone takes none.
         state.signal_report(&from("gone"), SignalReport::Open { request: 6 }, now);
         assert_eq!(
