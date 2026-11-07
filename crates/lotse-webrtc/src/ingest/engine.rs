@@ -364,24 +364,69 @@ fn check_offer_size(offer: &str) -> Result<(), String> {
 /// itself answers a rejected m-line without one (observed 2026-11-06) and
 /// refuses to parse that, so a camera on str0m (or any other that writes
 /// it so) would have its whole answer refused for an audio m-line it
-/// declined. The format added, `0`, is never used: the m-line is stopped.
+/// declined. The format added is never used (the m-line is stopped): the
+/// lowest payload type the answer names nowhere, so it gives no other
+/// m-line's payload type a second codec (`0` unless the answer uses 0),
+/// mapped to PCMU; `Err` when the answer names every one.
 // SPEC-DEVIATION(RFC 8866 §5.14): an answer that lists no format on a
 // rejected m-line breaks the grammar and is taken anyway, as str0m 0.24
 // writes such answers itself; a live m-line without formats is still
 // refused (by str0m);
 // gate: rfc8866_5_14_a_rejected_m_line_without_formats_gets_one
-fn with_formats(answer: &str) -> String {
-    let mut out = String::with_capacity(answer.len().saturating_add(8));
+fn with_formats(answer: &str) -> Result<String, String> {
+    let named = named_payload_types(answer);
+    let placeholder = (0..=127_u8).find(|pt| !named.contains(pt));
+    let mut out = String::with_capacity(answer.len().saturating_add(32));
+    // The added format's `a=rtpmap`, written at the end of its media
+    // section: str0m 0.24 refuses a format above the static ones without
+    // one, and reads the `a=mid` only where the section has it.
+    let mut rtpmap: Option<String> = None;
     for line in answer.lines() {
+        if line.starts_with("m=") {
+            out.push_str(&rtpmap.take().unwrap_or_default());
+        }
         let fields: Vec<&str> = line.split_whitespace().collect();
         let empty = matches!(fields.as_slice(), [media, port, _] if media.starts_with("m=") && *port == "0");
         out.push_str(line.trim_end());
         if empty {
-            out.push_str(" 0");
+            let pt = placeholder.ok_or(
+                "a rejected m-line without formats, and no payload type left to name on it",
+            )?;
+            out.push(' ');
+            out.push_str(&pt.to_string());
+            rtpmap = Some(format!("a=rtpmap:{pt} PCMU/8000\r\n"));
         }
         out.push_str("\r\n");
     }
-    out
+    out.push_str(&rtpmap.unwrap_or_default());
+    Ok(out)
+}
+
+/// The payload types `sdp` names anywhere: as formats of its `m=` lines
+/// and in its `a=rtpmap`, `a=fmtp` and `a=rtcp-fb` attributes.
+fn named_payload_types(sdp: &str) -> Vec<u8> {
+    let mut named = Vec::new();
+    for line in sdp.lines() {
+        if let Some(media) = line.strip_prefix("m=") {
+            named.extend(
+                media
+                    .split_whitespace()
+                    .skip(3)
+                    .filter_map(|format| format.parse::<u8>().ok()),
+            );
+        } else if let Some(value) = ["a=rtpmap:", "a=fmtp:", "a=rtcp-fb:"]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+        {
+            named.extend(
+                value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|pt| pt.parse::<u8>().ok()),
+            );
+        }
+    }
+    named
 }
 
 /// What core declares a negotiated payload of `spec` as, `None` for a
@@ -611,9 +656,6 @@ impl IngestEngine {
     /// [`IngestEngine::accept_answer`]'s work, the reason it failed in
     /// `Err`.
     fn apply_answer(&mut self, sdp: &str) -> Result<(), String> {
-        // str0m 0.24 panics on a payload type reused across media
-        // sections ("Pt locked multiple times"), so the check comes first.
-        check_payload_types(sdp)?;
         let parsed = Sdp::parse(sdp);
         let stopped: Vec<&str> = parsed
             .media()
@@ -622,7 +664,11 @@ impl IngestEngine {
             .filter_map(Section::mid)
             .collect();
         let (rest, candidates) = split_candidates(sdp);
-        let rest = with_formats(&rest);
+        let rest = with_formats(&rest)?;
+        // str0m 0.24 panics on a payload type reused across media
+        // sections ("Pt locked multiple times"), so the check comes first,
+        // of exactly what str0m parses.
+        check_payload_types(&rest)?;
         let answer = SdpAnswer::from_sdp_string(&rest).map_err(|err| err.to_string())?;
         let pending = self.pending.take().ok_or("no offer pending")?;
         self.rtc
@@ -1348,15 +1394,46 @@ mod tests {
     fn rfc8866_5_14_a_rejected_m_line_without_formats_gets_one() {
         let answer = "v=0\r\nm=audio 0 UDP/TLS/RTP/SAVPF \r\na=mid:a\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=video 0 UDP/TLS/RTP/SAVPF 97\r\n";
         assert_eq!(
-            with_formats(answer),
-            "v=0\r\nm=audio 0 UDP/TLS/RTP/SAVPF 0\r\na=mid:a\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=video 0 UDP/TLS/RTP/SAVPF 97\r\n"
+            with_formats(answer).unwrap(),
+            "v=0\r\nm=audio 0 UDP/TLS/RTP/SAVPF 0\r\na=mid:a\r\na=rtpmap:0 PCMU/8000\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=video 0 UDP/TLS/RTP/SAVPF 97\r\n"
         );
         // Only a stopped one: a live m-line without formats stays as
         // written, for str0m to refuse.
         assert_eq!(
-            with_formats("m=video 9 UDP/TLS/RTP/SAVPF\n"),
+            with_formats("m=video 9 UDP/TLS/RTP/SAVPF\n").unwrap(),
             "m=video 9 UDP/TLS/RTP/SAVPF\r\n"
         );
+    }
+
+    #[test]
+    fn rfc8866_5_14_the_format_added_is_one_the_answer_names_nowhere() {
+        // 0 on the video (its rtpmap), 1 in an fmtp, 2 in an rtcp-fb: 3.
+        let answer = "m=audio 0 UDP/TLS/RTP/SAVPF\r\nm=video 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 H264/90000\r\na=fmtp:1 apt=0\r\na=rtcp-fb:2 nack\r\na=rtcp-fb:* nack\r\n";
+        assert_eq!(named_payload_types(answer), [0, 0, 1, 2]);
+        assert!(
+            with_formats(answer)
+                .unwrap()
+                .starts_with("m=audio 0 UDP/TLS/RTP/SAVPF 3\r\na=rtpmap:3 PCMU/8000\r\nm=video ")
+        );
+        // A rejected m-line last: its rtpmap closes the description.
+        assert_eq!(
+            with_formats(
+                "m=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=audio 0 UDP/TLS/RTP/SAVPF\r\na=mid:a\r\n"
+            )
+            .unwrap(),
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=audio 0 UDP/TLS/RTP/SAVPF 0\r\na=mid:a\r\na=rtpmap:0 PCMU/8000\r\n"
+        );
+        // Every payload type named: none to add.
+        let all: String = (0..=127_u8)
+            .flat_map(|pt| [" ".to_owned(), pt.to_string()])
+            .collect();
+        let full = format!("m=audio 0 UDP/TLS/RTP/SAVPF\r\nm=video 9 UDP/TLS/RTP/SAVPF{all}\r\n");
+        assert_eq!(
+            with_formats(&full).unwrap_err(),
+            "a rejected m-line without formats, and no payload type left to name on it"
+        );
+        // But nothing to add, nothing missing.
+        assert!(with_formats(&format!("m=video 9 UDP/TLS/RTP/SAVPF{all}\r\n")).is_ok());
     }
 
     #[test]

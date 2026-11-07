@@ -204,6 +204,31 @@ impl Run {
     }
 }
 
+/// `answer` with its video's first payload type renamed `to` on the
+/// `m=video` line and in every attribute that names it.
+fn rename_video_pt(answer: &str, to: u8) -> String {
+    let Some(from) = answer
+        .lines()
+        .find_map(|line| line.strip_prefix("m=video "))
+        .and_then(|media| media.split(' ').nth(2))
+        .map(str::to_owned)
+    else {
+        return answer.to_owned();
+    };
+    answer
+        .lines()
+        .map(|line| {
+            let line = if line.starts_with("m=video ") {
+                line.replacen(&format!(" {from}"), &format!(" {to}"), 1)
+            } else {
+                line.replace(&format!(":{from} "), &format!(":{to} "))
+                    .replace(&format!("apt={from}"), &format!("apt={to}"))
+            };
+            format!("{line}\r\n")
+        })
+        .collect()
+}
+
 /// The mid of the offer's first `m=<kind>` section.
 fn mid_of(offer: &str, kind: &str) -> Option<Mid> {
     offer
@@ -214,16 +239,20 @@ fn mid_of(offer: &str, kind: &str) -> Option<Mid> {
         .map(Mid::from)
 }
 
-/// A str0m camera's answer to `offer`, and the camera: H.264, H.265 and
-/// Opus.
-fn camera_answer(offer: &str, now: Instant) -> Option<(Rtc, String)> {
-    let mut rtc = Rtc::builder()
+/// A str0m camera's answer to `offer`, and the camera: H.264, H.265, and
+/// Opus when `audio`.
+fn camera_answer(offer: &str, now: Instant, audio: bool) -> Option<(Rtc, String)> {
+    let builder = Rtc::builder()
         .set_rtp_mode(true)
         .clear_codecs()
         .enable_h264(true)
-        .enable_h265(true)
-        .enable_opus(true, false)
-        .build(now);
+        .enable_h265(true);
+    let builder = if audio {
+        builder.enable_opus(true, false)
+    } else {
+        builder
+    };
+    let mut rtc = builder.build(now);
     rtc.add_local_candidate(Candidate::host(CAMERA, "udp").ok()?);
     let offer = SdpOffer::from_sdp_string(offer).ok()?;
     let answer = rtc.sdp_api().accept_offer(offer).ok()?;
@@ -236,7 +265,9 @@ fuzz_target!(|data: &[u8]| {
     let Some([setup]) = take::<1>(&mut rest) else {
         return;
     };
-    // Bit 0: audio; bit 1: the data channel; bit 2: a camera answers.
+    // Bit 0: audio; bit 1: the data channel; bit 2: a camera answers;
+    // bit 3: one without audio (str0m rejects an audio m-line listing no
+    // format); bit 4: its video's first payload type renamed.
     let options = WebRtcOptions {
         data_channel: (setup & 2 != 0).then(|| "dataSendChannel".to_owned()),
         audio: setup & 1 != 0,
@@ -260,8 +291,14 @@ fuzz_target!(|data: &[u8]| {
     };
     run.drain();
     if setup & 4 != 0 {
-        let Some((camera, answer)) = camera_answer(run.engine.offer_sdp(), t0) else {
+        let Some((camera, answer)) = camera_answer(run.engine.offer_sdp(), t0, setup & 8 == 0)
+        else {
             return;
+        };
+        // [pt:u8] the video's first payload type becomes, everywhere.
+        let answer = match (setup & 16 != 0, take::<1>(&mut rest)) {
+            (true, Some([pt])) => rename_video_pt(&answer, pt & 0x7f),
+            _ => answer,
         };
         // [offset:u16][splice] spliced into the real answer.
         let mut answer = answer.into_bytes();
