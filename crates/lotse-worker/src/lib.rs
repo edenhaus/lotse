@@ -38,7 +38,7 @@ mod test_logs;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use lotse_codec::transcode::recording::ToOpus;
@@ -141,6 +141,12 @@ pub enum Error {
     /// The source did not stop within the shutdown deadline.
     #[error("the source did not stop within {0} ms")]
     ShutdownTimeout(u64),
+    /// A signal report's send to the supervisor, held up by its full
+    /// socket, was cut short at the shutdown deadline: part of a frame may
+    /// be written, so the channel takes nothing more and the worker exits
+    /// without its final flush.
+    #[error("a signal report's send was cut short at the shutdown deadline")]
+    SignalSendCut,
 }
 
 /// Builds the runtime, opens the channel on stdin and serves until the
@@ -1433,7 +1439,9 @@ async fn close_backchannels(tasks: &BackchannelTasks, clock: &Arc<dyn Clock>) {
 /// reports of `signal_rx` to the supervisor on `tx` meanwhile, so no relay
 /// waits for room; the last ones go out with the worker's final flush. A
 /// send the supervisor's full socket holds up is cut short at the
-/// deadline too.
+/// deadline too, and is [`Error::SignalSendCut`]: it may have written
+/// part of a frame, so nothing, the final flush included, may follow it
+/// on `tx`.
 async fn close_signaling(
     signaling: &WorkerSignaling,
     signal_rx: &mut mpsc::Receiver<SignalReport>,
@@ -1442,6 +1450,8 @@ async fn close_signaling(
     deadline: Instant,
 ) -> Result<(), Error> {
     let open = signaling.relays();
+    // Set while a send is under way, so the deadline knows it cut one.
+    let sending = AtomicBool::new(false);
     let relay = async {
         let ended = signaling.relays_ended();
         tokio::pin!(ended);
@@ -1450,7 +1460,9 @@ async fn close_signaling(
                 biased;
                 // The signaling holds the reports' sender, so they never end.
                 Some(report) = signal_rx.recv() => {
+                    sending.store(true, Ordering::Relaxed);
                     tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
+                    sending.store(false, Ordering::Relaxed);
                 }
                 () = &mut ended => {
                     tracing::debug!(open, "signaling relays ended");
@@ -1467,6 +1479,12 @@ async fn close_signaling(
                 left = signaling.relays(),
                 "signaling relays still closing at the deadline; the worker exits without their closes"
             );
+            if sending.load(Ordering::Relaxed) {
+                tracing::warn!(
+                    "a signal report's send to the supervisor's full socket was cut short; the worker exits without its final flush"
+                );
+                return Err(Error::SignalSendCut);
+            }
             Ok(())
         }
     }
@@ -3064,16 +3082,21 @@ mod tests {
     }
 
     /// A report the supervisor does not read holds the shutdown up only
-    /// until its deadline: the send to a full socket is cut short.
+    /// until its deadline: the send to a full socket is cut short, and as
+    /// it may have written part of a frame, the shutdown ends in
+    /// `SignalSendCut` instead of the final flush, which would write after
+    /// it and wait on the same full socket with no deadline.
     #[tokio::test]
     async fn a_signal_report_a_full_socket_holds_up_is_cut_short_at_the_deadline() {
         let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, unread_socket) = serving(&settings);
         let fake = Arc::new(FakeClock::default());
-        let clock: Arc<dyn Clock> = fake.clone();
+        serving.clock = fake.clone();
         let (signaling, mut signal_rx) = WorkerSignaling::new();
         let channel = opened_channel(&signaling, &mut signal_rx, "sig-1").await;
         // More offers than the socket's buffer holds, which no one reads.
-        let (reports, mut unread) = mpsc::channel(64);
+        let (reports, unread) = mpsc::channel(64);
         for _ in 0..64 {
             reports
                 .try_send(SignalReport::Offer {
@@ -3082,21 +3105,24 @@ mod tests {
                 })
                 .unwrap();
         }
-        let (ours, theirs) = Channel::pair().unwrap();
-        let (mut tx, _) = Channel::from_fd(theirs).unwrap().split();
-        let deadline = fake.now() + Duration::from_secs(1);
-        let closing = spawn_named("test.close", async move {
-            close_signaling(&signaling, &mut unread, &mut tx, &clock, deadline)
-                .await
-                .unwrap();
-            unread.len()
-        });
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!closing.is_finished(), "the send waits for room");
-        fake.advance(Duration::from_secs(1));
-        let left = within(closing).await.unwrap();
+        serving.signaling = signaling;
+        serving.signal_rx = unread;
+        let done = AtomicBool::new(false);
+        let shutdown = async {
+            let ended = serving.on_shutdown(1_000).await;
+            done.store(true, Ordering::Relaxed);
+            ended
+        };
+        let deadline = async {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!done.load(Ordering::Relaxed), "the send waits for room");
+            fake.advance(Duration::from_secs(1));
+        };
+        let (ended, ()) = within(async { tokio::join!(shutdown, deadline) }).await;
+        let left = serving.signal_rx.len();
+        assert!(matches!(ended, Err(Error::SignalSendCut)), "{ended:?}");
         assert!(left > 0, "it stopped sending: {left} left");
         assert_eq!(
             logs.lines(
@@ -3106,7 +3132,15 @@ mod tests {
             .len(),
             1
         );
-        drop((channel, ours, reports));
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "a signal report's send to the supervisor's full socket was cut short; the worker exits without its final flush"
+            )
+            .len(),
+            1
+        );
+        drop((channel, unread_socket, reports));
     }
 
     /// A relay whose channel is still open at the shutdown's deadline is
@@ -5435,7 +5469,7 @@ mod tests {
             let (logs, _guard) = Logs::capture();
             let settings = settings();
             let (mut serving, _rx) = serving(&settings);
-            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let closed = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&closed);
             let close = CancellationToken::new();
             let _session = serving
