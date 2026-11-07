@@ -1,4 +1,5 @@
 //! Test support: the fake RTSP camera (with a fake ONVIF keyframe endpoint),
+//! the fake WebRTC camera that answers a `webrtc://` source's offer,
 //! the scripted HTTP server of the HTTP source,
 //! the third-party camera of the browser and interop tests (MediaMTX and
 //! ffmpeg), the fake TURN server, the source and output conformance suites, a
@@ -20,6 +21,7 @@ pub mod dscp;
 pub mod fake_camera;
 pub mod fake_http;
 pub mod fake_turn;
+pub mod fake_webrtc_camera;
 pub mod latency;
 pub mod libwebrtc;
 pub mod load;

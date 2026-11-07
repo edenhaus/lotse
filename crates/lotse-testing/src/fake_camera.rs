@@ -160,7 +160,12 @@ impl CameraVideo {
     /// P slice fragmented; in `slices` slices each when the camera is
     /// configured so, the parameter sets before every IDR slice with
     /// `sets_before_every_slice`.
-    fn access_unit(self, keyframe: bool, config: &CameraConfig, index: u32) -> Vec<Bytes> {
+    pub(crate) fn access_unit(
+        self,
+        keyframe: bool,
+        config: &CameraConfig,
+        index: u32,
+    ) -> Vec<Bytes> {
         let mut payloads = Vec::new();
         let idr_bytes = match config.alternate_idr_bytes {
             Some(bytes)

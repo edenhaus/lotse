@@ -8,7 +8,8 @@
 //! binary registers [`WebRtcFactory`] behind the `output-webrtc` feature.
 //! The source side implements the source contract (`lotse_core::source`)
 //! with signaling through `lotse_core::signaling`; its factory is
-//! [`ingest::WebRtcSourceFactory`].
+//! [`ingest::WebRtcSourceFactory`], which the binary registers behind the
+//! `source-webrtc` feature.
 //! Depends on `lotse-core` and `lotse-codec` only, never on a source.
 //!
 //! Standards: RFC 8829 (JSEP), RFC 3264, RFC 8445 (ICE; §6.1.2.2 remote

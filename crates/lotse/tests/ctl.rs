@@ -81,13 +81,17 @@ fn check_info(socket: &Path) {
             .unwrap()
             .contains(&Value::from("fake"))
     );
-    // The schemes follow the registered factories, `source-http` one of
-    // them by default.
+    // The schemes follow the registered factories, `source-http` and
+    // `source-webrtc` among them by default.
     let schemes = info["schemes"].as_array().unwrap();
-    for scheme in ["http", "https"] {
+    for (scheme, compiled) in [
+        ("http", cfg!(feature = "source-http")),
+        ("https", cfg!(feature = "source-http")),
+        ("webrtc", cfg!(feature = "source-webrtc")),
+    ] {
         assert_eq!(
             schemes.contains(&Value::from(scheme)),
-            cfg!(feature = "source-http"),
+            compiled,
             "{scheme} in {schemes:?}"
         );
     }
