@@ -226,6 +226,7 @@ impl Supervisor {
         );
         let mut state = State::default();
         state.registrations = registrations;
+        state.signaling.clock = Arc::clone(&clock);
         // A signaled source gathers on the hosts sessions answer with.
         for ip in hosts.iter().map(SocketAddr::ip) {
             if !state.signaling.local_addrs.contains(&ip) {
@@ -263,10 +264,12 @@ impl Supervisor {
         }
     }
 
-    /// Closes every session and ends every recording with `shutting_down`; the
-    /// first step of the shutdown, before the control connections say
-    /// goodbye. A recording's worker writes its last fragment while it stops,
-    /// but its report is not waited for, so the body is cut.
+    /// Closes every session and ends every recording with `shutting_down`,
+    /// and ends the signaling (each offered signal closes `source_stopped`,
+    /// each signaling subscription ends); the first step of the shutdown,
+    /// before the control connections say goodbye. A recording's worker
+    /// writes its last fragment while it stops, but its report is not
+    /// waited for, so the body is cut.
     pub fn close_sessions(&self) {
         let mut state = self.shared.lock();
         state.close_sessions_where(
@@ -276,6 +279,7 @@ impl Supervisor {
             CloseBy::Supervisor,
         );
         state.end_recordings_where(|_| true, RecordingCloseReason::ShuttingDown);
+        state.signaling_shutdown();
     }
 
     /// Closes the sessions, stops every connection's worker within the
