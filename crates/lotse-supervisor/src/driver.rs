@@ -1266,7 +1266,7 @@ impl Driver {
         }
         for request in ended {
             let from = self.signal_from();
-            let refused = self.shared.lock().signal_wait_expired(&from, request);
+            let refused = self.shared.lock().signal_wait_expired(&from, request, now);
             if !refused {
                 self.signal_opens.remove(&request);
             }
@@ -4573,7 +4573,10 @@ mod tests {
             connection: ConnectionId(1),
             subscription: 1,
         };
-        shared.lock().signaling_subscribe(owner, None, UNIX_EPOCH)
+        let now = shared.clock.now();
+        shared
+            .lock()
+            .signaling_subscribe(owner, None, (now, UNIX_EPOCH))
     }
 
     /// The next signaling event `events` holds now.
@@ -4978,8 +4981,9 @@ mod tests {
         );
         // The registry forgets them as well: a subscription serves only
         // the open the driver still counts.
+        // (One line for both: they were forgotten at one time.)
         let cancelled = captured.lines("signaling open cancelled while it waited for a client");
-        assert_eq!(cancelled.len(), 2, "{cancelled:?}");
+        assert_eq!(cancelled.len(), 1, "{cancelled:?}");
         let _events = subscribe_all(&shared);
         let queued = queued_signals(&mut driver);
         let_assert!([SignalCommand::Opened { request: 4, .. }] = queued.as_slice());

@@ -56,6 +56,12 @@
 //! most [`MAX_CLIENT_CANDIDATES`] candidates and one end-of-candidates,
 //! and one error per signal, after which it takes no answer or candidate.
 //!
+//! Every line a worker's opens, cancels and reports can repeat (an open
+//! that waits, is cancelled or refused; a signal opened, offered, closed
+//! or ended over a breach) is rate-limited per source connection on the
+//! injected clock, or is at debug level (a report on a signal the
+//! registry does not hold, a candidate relayed).
+//!
 //! Standards: RFC 8829 (JSEP) and RFC 8838 (Trickle ICE), the exchange
 //! the signals carry, as `lotse_core::signaling` cites them; ULID for the
 //! signal ids.
@@ -69,7 +75,7 @@ use lotse_api::{ConnectionId, Event, EventClass};
 use lotse_api_types::command::{SignalingAnswer, SignalingCandidate, SignalingError};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::signaling::{SignalCloseCode, SignalingEvent};
-use lotse_core::signaling::REJECTED;
+use lotse_core::signaling::{REJECTED, SignalCandidate};
 use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
 use lotse_ipc::{SignalCommand, SignalReport};
@@ -243,11 +249,34 @@ pub(crate) struct Signaling {
     /// The signals opened so far, for an id when the ULID's randomness is
     /// unavailable.
     opened: u64,
-    /// Rate-limits, per source connection, the line of an open refused
-    /// past [`MAX_OPEN_SIGNALS`], which a worker can repeat as fast as its
-    /// driver answers it: one worker's flood hides no other's. A
-    /// connection's goes with it.
-    limit_lines: BTreeMap<String, Throttle>,
+    /// Rate-limits, per source connection and [`Line`], the lines a
+    /// worker's opens, cancels and reports can repeat as fast as it sends
+    /// them: one worker's flood hides no other's. A connection's go with
+    /// it.
+    lines: BTreeMap<(String, Line), Throttle>,
+}
+
+/// A line of the router's a worker can repeat as fast as it sends, each
+/// rate-limited on the injected clock per source connection
+/// ([`Signaling::line`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Line {
+    /// An open refused past [`MAX_OPEN_SIGNALS`].
+    Limit,
+    /// An open that waits for a subscription.
+    Waits,
+    /// An open refused [`NO_SIGNALING_CLIENT`] at its wait's end.
+    NoClient,
+    /// A waiting open cancelled.
+    Cancelled,
+    /// A signal opened.
+    Opened,
+    /// A signal's offer relayed.
+    Offered,
+    /// A signal closed by its source.
+    Closed,
+    /// A signal ended over a worker's breach of the contract.
+    Broke,
 }
 
 impl Signaling {
@@ -267,6 +296,15 @@ impl Signaling {
                 let every = self.scopes.get(&None).filter(open)?;
                 Some((streams.first()?.clone(), every))
             })
+    }
+
+    /// Counts one occurrence of `line` of `connection` at `now`:
+    /// `Some(count)` when the line is due ([`Throttle::hit`]).
+    fn line(&mut self, connection: &str, line: Line, now: Instant) -> Option<u64> {
+        self.lines
+            .entry((connection.to_owned(), line))
+            .or_default()
+            .hit(now)
     }
 
     /// The signals and waiting opens of `connection`.
@@ -358,10 +396,11 @@ impl State {
                         request,
                         "signaling open cancelled; nothing holds it"
                     );
-                } else {
+                } else if let Some(count) = self.signaling.line(connection, Line::Cancelled, now) {
                     tracing::info!(
                         connection.id = connection,
                         request,
+                        count,
                         "signaling open cancelled while it waited for a client"
                     );
                 }
@@ -371,7 +410,7 @@ impl State {
                     return;
                 };
                 if signal.worker_sent.offer {
-                    self.worker_broke(&signal_id, &signal, "a second offer");
+                    self.worker_broke(&signal_id, &signal, "a second offer", now);
                     return;
                 }
                 signal.worker_sent.offer = true;
@@ -385,12 +424,15 @@ impl State {
                         .unwrap_or_default(),
                     sdp,
                 };
-                tracing::info!(
-                    signal.id = %signal_id,
-                    connection.id = connection,
-                    stream.id = %signal.stream_id,
-                    "signaling offer relayed to the subscription"
-                );
+                if let Some(count) = self.signaling.line(connection, Line::Offered, now) {
+                    tracing::info!(
+                        signal.id = %signal_id,
+                        connection.id = connection,
+                        stream.id = %signal.stream_id,
+                        count,
+                        "signaling offer relayed to the subscription"
+                    );
+                }
                 self.deliver(signal_id, signal, &event);
             }
             SignalReport::Candidate {
@@ -398,7 +440,16 @@ impl State {
                 candidate,
                 mid,
                 mline_index,
-            } => self.worker_candidate(connection, signal_id, candidate, mid, mline_index),
+            } => self.worker_candidate(
+                connection,
+                signal_id,
+                SignalCandidate {
+                    candidate,
+                    sdp_mid: mid,
+                    sdp_mline_index: mline_index,
+                },
+                now,
+            ),
             SignalReport::Closed {
                 signal_id,
                 code,
@@ -408,29 +459,34 @@ impl State {
                     return;
                 };
                 let code = close_code(&code);
-                tracing::info!(
-                    signal.id = %signal_id,
-                    connection.id = connection,
-                    code = code.as_str(),
-                    message = %message,
-                    "signal closed by its source"
-                );
+                if let Some(count) = self.signaling.line(connection, Line::Closed, now) {
+                    tracing::info!(
+                        signal.id = %signal_id,
+                        connection.id = connection,
+                        code = code.as_str(),
+                        message = %message,
+                        count,
+                        "signal closed by its source"
+                    );
+                }
                 self.close_signal(signal_id, &signal, code, message);
             }
         }
     }
 
-    /// A candidate line (or, empty, the end-of-candidates indication) of
-    /// the worker of `connection` for its signal `signal_id`, with its
-    /// media section's `mid` and index: relayed within the signal's
-    /// budget, else the signal ends.
+    /// A candidate (or, its line empty, the end-of-candidates indication)
+    /// of the worker of `connection` for its signal `signal_id`, at `now`:
+    /// relayed within the signal's budget, else the signal ends.
     fn worker_candidate(
         &mut self,
         connection: &str,
         signal_id: String,
-        candidate: String,
-        mid: Option<String>,
-        mline_index: Option<u16>,
+        SignalCandidate {
+            candidate,
+            sdp_mid: mid,
+            sdp_mline_index: mline_index,
+        }: SignalCandidate,
+        now: Instant,
     ) {
         let Some(mut signal) = self.take_signal(connection, &signal_id) else {
             return;
@@ -446,7 +502,7 @@ impl State {
             None
         };
         if let Some(reason) = broken {
-            self.worker_broke(&signal_id, &signal, reason);
+            self.worker_broke(&signal_id, &signal, reason, now);
             return;
         }
         if candidate.is_empty() {
@@ -497,16 +553,25 @@ impl State {
     }
 
     /// Ends `signal`, taken off the open ones, whose worker broke the
-    /// contract for `reason`: the worker is told the relay rejected it
-    /// ([`REJECTED`]: its source's fault, not the camera's), the client
-    /// that it closed `internal_error`.
-    fn worker_broke(&mut self, signal_id: &str, signal: &Signal, reason: &'static str) {
-        tracing::warn!(
-            signal.id = signal_id,
-            connection.id = %signal.connection,
-            reason,
-            "a worker's signaling breaks the contract; signal ended"
-        );
+    /// contract for `reason` at `now`: the worker is told the relay
+    /// rejected it ([`REJECTED`]: its source's fault, not the camera's),
+    /// the client that it closed `internal_error`.
+    fn worker_broke(
+        &mut self,
+        signal_id: &str,
+        signal: &Signal,
+        reason: &'static str,
+        now: Instant,
+    ) {
+        if let Some(count) = self.signaling.line(&signal.connection, Line::Broke, now) {
+            tracing::warn!(
+                signal.id = signal_id,
+                connection.id = %signal.connection,
+                reason,
+                count,
+                "a worker's signaling breaks the contract; signal ended"
+            );
+        }
         let message = format!("the worker sent {reason}");
         self.tell_worker(
             &signal.connection,
@@ -563,12 +628,7 @@ impl State {
             return;
         }
         if self.signaling.open_count(connection) >= MAX_OPEN_SIGNALS {
-            let lines = self
-                .signaling
-                .limit_lines
-                .entry(connection.to_owned())
-                .or_default();
-            if let Some(count) = lines.hit(now) {
+            if let Some(count) = self.signaling.line(connection, Line::Limit, now) {
                 tracing::warn!(
                     connection.id = connection,
                     request,
@@ -595,21 +655,24 @@ impl State {
             worker: from.worker,
             request,
         };
-        if !self.open_signal(&open, wall) {
-            tracing::info!(
-                connection.id = connection,
-                request,
-                wait_ms = crate::millis(SIGNAL_WAIT),
-                "no signaling subscription takes the stream; the open waits for one"
-            );
+        if !self.open_signal(&open, now, wall) {
+            if let Some(count) = self.signaling.line(connection, Line::Waits, now) {
+                tracing::info!(
+                    connection.id = connection,
+                    request,
+                    wait_ms = crate::millis(SIGNAL_WAIT),
+                    count,
+                    "no signaling subscription takes the stream; the open waits for one"
+                );
+            }
             self.signaling.waiting.push(open);
         }
     }
 
     /// Opens a signal for `open` on the subscription that takes one of
-    /// its connection's streams, if one does, named at `wall`. True when
-    /// one does: the worker is told.
-    fn open_signal(&mut self, open: &WaitingOpen, wall: SystemTime) -> bool {
+    /// its connection's streams, if one does, at `now`, named at `wall`.
+    /// True when one does: the worker is told.
+    fn open_signal(&mut self, open: &WaitingOpen, now: Instant, wall: SystemTime) -> bool {
         let Some((stream_id, subscriber)) = self
             .connections
             .get(&open.connection)
@@ -632,15 +695,18 @@ impl State {
                 local_addrs: self.signaling.local_addrs.clone(),
             },
         );
-        tracing::info!(
-            signal.id = %signal_id,
-            connection.id = %open.connection,
-            stream.id = %stream_id,
-            request = open.request,
-            control.connection = owner.connection.0,
-            subscription = owner.subscription,
-            "signal opened; it belongs to the subscription that takes its stream"
-        );
+        if let Some(count) = self.signaling.line(&open.connection, Line::Opened, now) {
+            tracing::info!(
+                signal.id = %signal_id,
+                connection.id = %open.connection,
+                stream.id = %stream_id,
+                request = open.request,
+                control.connection = owner.connection.0,
+                subscription = owner.subscription,
+                count,
+                "signal opened; it belongs to the subscription that takes its stream"
+            );
+        }
         self.signaling.signals.insert(
             signal_id,
             Signal {
@@ -660,8 +726,14 @@ impl State {
     /// no subscription took it meanwhile, it is refused
     /// [`NO_SIGNALING_CLIENT`], and the source's attempt ends unreachable.
     /// True when it is; false when the registry no longer holds it (taken,
-    /// or cancelled), so the driver need not wait for its answer.
-    pub(crate) fn signal_wait_expired(&mut self, from: &SignalFrom<'_>, request: u64) -> bool {
+    /// or cancelled), so the driver need not wait for its answer. `now` on
+    /// the injected clock rate-limits the line.
+    pub(crate) fn signal_wait_expired(
+        &mut self,
+        from: &SignalFrom<'_>,
+        request: u64,
+        now: Instant,
+    ) -> bool {
         let open = WaitingOpen {
             connection: from.connection.to_owned(),
             worker: from.worker,
@@ -676,11 +748,14 @@ impl State {
             return false;
         };
         self.signaling.waiting.remove(index);
-        tracing::info!(
-            connection.id = from.connection,
-            request,
-            "signaling channel refused: no client subscribed to the stream's signaling in time"
-        );
+        if let Some(count) = self.signaling.line(from.connection, Line::NoClient, now) {
+            tracing::info!(
+                connection.id = from.connection,
+                request,
+                count,
+                "signaling channel refused: no client subscribed to the stream's signaling in time"
+            );
+        }
         self.tell_worker(
             from.connection,
             from.worker,
@@ -703,7 +778,9 @@ impl State {
             .retain(|waiting| waiting.connection != connection);
         let _forgotten = self.signaling.held.remove(connection);
         if !self.connections.contains_key(connection) {
-            let _gone = self.signaling.limit_lines.remove(connection);
+            self.signaling
+                .lines
+                .retain(|(lines_of, _), _| lines_of != connection);
         }
         let (ended, open) = std::mem::take(&mut self.signaling.signals)
             .into_iter()
@@ -723,13 +800,14 @@ impl State {
 
     /// `signaling/subscribe` `owner` for `stream_id`, or every stream: it
     /// takes the scope from the subscription that had it, which gets
-    /// `superseded` and ends, and serves the opens waiting for it. `now`
-    /// on the wall clock names their signals.
+    /// `superseded` and ends, and serves the opens waiting for it, at
+    /// `now` on the injected clock (rate-limited lines), their signals
+    /// named at `wall` on its wall clock.
     pub(crate) fn signaling_subscribe(
         &mut self,
         owner: Owner,
         stream_id: Option<String>,
-        now: SystemTime,
+        (now, wall): (Instant, SystemTime),
     ) -> mpsc::Receiver<Event> {
         let (events, rx) = mpsc::channel(SIGNALING_QUEUE.saturating_add(OVERFLOW_SLOT));
         let scope = stream_id.as_deref().unwrap_or("*").to_owned();
@@ -756,7 +834,7 @@ impl State {
         }
         let waiting = std::mem::take(&mut self.signaling.waiting);
         for open in waiting {
-            if self.open_signal(&open, now) {
+            if self.open_signal(&open, now, wall) {
                 continue;
             }
             self.signaling.waiting.push(open);
@@ -1115,9 +1193,28 @@ mod tests {
         }
     }
 
-    /// `report` of worker [`WORKER`] of `connection`, now.
+    /// A time a summary interval after the one this gave before, so a
+    /// test's lines are never rate-limited unless it means them to be.
+    fn later() -> Instant {
+        thread_local! {
+            static CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            static START: Instant = SystemClock.now();
+        }
+        let calls = CALLS.with(|calls| {
+            calls.set(calls.get() + 1);
+            calls.get()
+        });
+        START.with(|start| *start + lotse_core::throttle::SUMMARY_INTERVAL * calls)
+    }
+
+    /// `report` of worker [`WORKER`] of `connection`, [`later`].
     fn report(state: &mut State, connection: &str, report: SignalReport) {
-        state.signal_report(&from(connection), report, SystemClock.now(), UNIX_EPOCH);
+        report_at(state, connection, report, later());
+    }
+
+    /// `report` of worker [`WORKER`] of `connection` at `now`.
+    fn report_at(state: &mut State, connection: &str, report: SignalReport, now: Instant) {
+        state.signal_report(&from(connection), report, now, UNIX_EPOCH);
     }
 
     /// A state with the signaled connections `c1` of stream `door` (its
@@ -1167,7 +1264,7 @@ mod tests {
         owner: Owner,
         stream_id: Option<&str>,
     ) -> mpsc::Receiver<Event> {
-        state.signaling_subscribe(owner, stream_id.map(str::to_owned), UNIX_EPOCH)
+        state.signaling_subscribe(owner, stream_id.map(str::to_owned), (later(), UNIX_EPOCH))
     }
 
     /// The events `events` holds now, each a signaling one.
@@ -1411,7 +1508,7 @@ mod tests {
                 .len(),
             2
         );
-        assert!(state.signal_wait_expired(&from("c1"), 1));
+        assert!(state.signal_wait_expired(&from("c1"), 1, later()));
         assert_eq!(
             queues.take("c1"),
             [SignalCommand::Refused {
@@ -1427,9 +1524,9 @@ mod tests {
             connection: "c1",
             worker: WORKER - 1,
         };
-        assert!(!state.signal_wait_expired(&from("c1"), 1));
-        assert!(!state.signal_wait_expired(&earlier, 2));
-        assert!(!state.signal_wait_expired(&from("c2"), 2));
+        assert!(!state.signal_wait_expired(&from("c1"), 1, later()));
+        assert!(!state.signal_wait_expired(&earlier, 2, later()));
+        assert!(!state.signal_wait_expired(&from("c2"), 2, later()));
         assert!(queues.take("c1").is_empty() && queues.take("c2").is_empty());
         // A cancel takes a waiting open back; a subscription finds none.
         report(&mut state, "c1", SignalReport::Cancel { request: 2 });
@@ -1979,7 +2076,7 @@ mod tests {
         // Nothing held, the queue takes the next.
         open(&mut state, "c1", 3);
         assert_eq!(state.signaling.waiting.len(), 1);
-        assert!(state.signal_wait_expired(&from("c1"), 3));
+        assert!(state.signal_wait_expired(&from("c1"), 3, later()));
         assert_eq!(queues.take("c1").len(), 1);
         assert_eq!(held(&state), 0);
         // A driver that takes none holds at most MAX_HELD_SIGNALS.
@@ -2034,7 +2131,12 @@ mod tests {
         for request in 1..=4 {
             open(&mut state, "c1", request);
         }
-        open(&mut state, "c1", 5);
+        // The refusals' lines within one summary interval.
+        let at = later();
+        let refuse = |state: &mut State, connection, request| {
+            report_at(state, connection, SignalReport::Open { request }, at);
+        };
+        refuse(&mut state, "c1", 5);
         assert_eq!(queues.take("c1"), [refusal(5)]);
         assert_eq!(state.signaling.waiting.len(), 4);
         // So do signals: a worker that opens and offers in a loop gets
@@ -2053,7 +2155,7 @@ mod tests {
             offer(&mut state, "c1", signal_id);
         }
         for request in 6..26 {
-            open(&mut state, "c1", request);
+            refuse(&mut state, "c1", request);
             assert_eq!(queues.take("c1").last(), Some(&refusal(request)));
         }
         assert_eq!(state.signaling.signals.len(), 4);
@@ -2068,7 +2170,7 @@ mod tests {
             open(&mut state, "c2", request);
         }
         let _yard = queues.take("c2");
-        open(&mut state, "c2", 5);
+        refuse(&mut state, "c2", 5);
         let lines = captured
             .lines("signaling open refused: the connection holds as many signals as it may");
         assert_eq!(lines.len(), 2, "one per connection: {lines:?}");
@@ -2080,10 +2182,81 @@ mod tests {
         // A worker's end keeps its connection's rate limit; the
         // connection's release forgets it.
         state.signals_ended("c1", SignalCloseCode::WorkerGone, "exited");
-        assert!(state.signaling.limit_lines.contains_key("c1"));
+        let has_lines = |state: &State| state.signaling.lines.keys().any(|(of, _)| of == "c1");
+        assert!(has_lines(&state));
         let _gone = state.connections.remove("c1");
         state.signals_ended("c1", SignalCloseCode::SourceStopped, "released");
-        assert!(!state.signaling.limit_lines.contains_key("c1"));
+        assert!(!has_lines(&state));
+    }
+
+    /// Every line a worker's opens, cancels and reports repeat is
+    /// rate-limited per connection on the injected clock: a worker that
+    /// opens, offers, closes, cancels and breaks the contract in a loop
+    /// logs each once per summary interval, with the count.
+    #[test]
+    fn a_worker_s_repeated_lines_are_rate_limited_per_connection() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let (mut state, mut queues) = signaled_state(64);
+        let at = later();
+        // Opens that wait, then are cancelled or refused at their wait's
+        // end.
+        for request in 1..=3 {
+            report_at(&mut state, "c1", SignalReport::Open { request }, at);
+        }
+        report_at(&mut state, "c1", SignalReport::Cancel { request: 1 }, at);
+        report_at(&mut state, "c1", SignalReport::Cancel { request: 2 }, at);
+        assert!(state.signal_wait_expired(&from("c1"), 3, at));
+        let _refused = queues.take("c1");
+        let _all = state.signaling_subscribe(owner(1, 1), None, (at, UNIX_EPOCH));
+        // Signals opened, offered twice (a breach) or closed.
+        for request in 4..=6 {
+            report_at(&mut state, "c1", SignalReport::Open { request }, at);
+            let signal_id = opened(&mut queues, "c1", request);
+            let offer = SignalReport::Offer {
+                signal_id: signal_id.clone(),
+                sdp: "v=0\r\n".into(),
+            };
+            report_at(&mut state, "c1", offer.clone(), at);
+            if request == 4 {
+                report_at(&mut state, "c1", closed(&signal_id, "peer_closed"), at);
+            } else {
+                report_at(&mut state, "c1", offer, at);
+                let _failed = queues.take("c1");
+            }
+        }
+        for message in [
+            "no signaling subscription takes the stream; the open waits for one",
+            "signaling open cancelled while it waited for a client",
+            "signal opened; it belongs to the subscription that takes its stream",
+            "signaling offer relayed to the subscription",
+            "a worker's signaling breaks the contract; signal ended",
+        ] {
+            let lines = captured.lines(message);
+            assert_eq!(lines.len(), 1, "{message}: {lines:?}");
+            assert!(lines[0].contains("count=1"), "{lines:?}");
+        }
+        for message in [
+            "no client subscribed to the stream's signaling in time",
+            "signal closed by its source",
+        ] {
+            assert_eq!(captured.lines(message).len(), 1, "{message}");
+        }
+        // A summary interval later, each says how many it covers.
+        let at = at + lotse_core::throttle::SUMMARY_INTERVAL;
+        report_at(&mut state, "c1", SignalReport::Open { request: 7 }, at);
+        let lines = captured.lines("signal opened; it belongs to the subscription");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("count=3"), "{lines:?}");
+        // Another connection's lines are its own.
+        report_at(&mut state, "c2", SignalReport::Open { request: 1 }, at);
+        let _yard = opened(&mut queues, "c2", 1);
+        assert_eq!(
+            captured
+                .lines("signal opened; it belongs to the subscription")
+                .len(),
+            3
+        );
     }
 
     /// A connection several streams share offers to the subscription of

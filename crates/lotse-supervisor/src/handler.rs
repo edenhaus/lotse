@@ -795,7 +795,7 @@ impl Supervisor {
             connection,
             subscription: id,
         };
-        let now = self.shared.clock.wall_now();
+        let now = (self.shared.clock.now(), self.shared.clock.wall_now());
         Outcome::Subscribed(
             self.shared
                 .lock()
