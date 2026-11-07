@@ -112,13 +112,14 @@ fn registries() -> Registries {
             .register(Arc::new(lotse_http::HttpFactory)),
     );
     // WebRTC cameras (Nest, Ring, Matter through Home Assistant): lotse
-    // offers, the control-API client relays the signaling.
+    // offers, the control-API client relays the signaling. No address, so
+    // a signaled protocol, not a URL scheme.
     #[cfg(feature = "source-webrtc")]
     registered(
         "webrtc source",
         registries
             .sources
-            .register(Arc::new(lotse_webrtc::ingest::WebRtcSourceFactory)),
+            .register_signaled(Arc::new(lotse_webrtc::ingest::WebRtcSourceFactory)),
     );
     #[cfg(feature = "source-fake")]
     // With a backchannel, so the talk-back tests reach a worker's arbiter
@@ -397,20 +398,19 @@ mod tests {
         assert!(!recording.accepts(&h264), "fMP4 needs the parameter sets");
     }
 
-    /// The registries of a build with the WebRTC source hold its scheme,
-    /// a signaled one without a backchannel.
+    /// The registries of a build with the WebRTC source hold it as the
+    /// signaled protocol `webrtc`, no URL scheme.
     #[cfg(feature = "source-webrtc")]
     #[test]
     fn the_webrtc_source_is_registered_behind_its_feature() {
         let registries = registries();
-        assert!(registries.sources.schemes().contains(&"webrtc"));
+        assert!(registries.sources.signaled_protocols().contains(&"webrtc"));
+        assert!(!registries.sources.schemes().contains(&"webrtc"));
         let webrtc = registries
             .sources
-            .get("webrtc")
+            .signaled("webrtc")
             .expect("the webrtc factory");
-        let capabilities = webrtc.capabilities();
-        assert!(capabilities.signaled);
-        assert!(!capabilities.backchannel);
+        assert_eq!(webrtc.protocol(), "webrtc");
     }
 
     #[cfg(any(

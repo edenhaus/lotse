@@ -1,5 +1,5 @@
 //! Test support: the fake RTSP camera (with a fake ONVIF keyframe endpoint),
-//! the fake WebRTC camera that answers a `webrtc://` source's offer,
+//! the fake WebRTC camera that answers a `webrtc` source's offer,
 //! the scripted HTTP server of the HTTP source,
 //! the third-party camera of the browser and interop tests (MediaMTX and
 //! ffmpeg), the fake TURN server, the source and output conformance suites, a

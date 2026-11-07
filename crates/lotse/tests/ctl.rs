@@ -81,29 +81,26 @@ fn check_info(socket: &Path) {
             .unwrap()
             .contains(&Value::from("fake"))
     );
-    // The schemes follow the registered factories, `source-http` and
-    // `source-webrtc` among them by default.
+    // The schemes follow the registered factories, `source-http` one of
+    // them by default.
     let schemes = info["schemes"].as_array().unwrap();
-    for (scheme, compiled) in [
-        ("http", cfg!(feature = "source-http")),
-        ("https", cfg!(feature = "source-http")),
-        ("webrtc", cfg!(feature = "source-webrtc")),
-    ] {
+    for scheme in ["http", "https"] {
         assert_eq!(
             schemes.contains(&Value::from(scheme)),
-            compiled,
+            cfg!(feature = "source-http"),
             "{scheme} in {schemes:?}"
         );
     }
-    // A signaled source is no scheme: named by its protocol.
-    assert!(
-        !schemes.contains(&Value::from("fake-signaled")),
-        "{schemes:?}"
-    );
-    assert_eq!(
-        info["signaled_protocols"],
-        serde_json::json!(["fake-signaled"])
-    );
+    // A signaled source is no scheme: named by its protocol, `webrtc`
+    // with `source-webrtc` (on by default).
+    for signaled in ["fake-signaled", "webrtc"] {
+        assert!(!schemes.contains(&Value::from(signaled)), "{schemes:?}");
+    }
+    let mut signaled = vec!["fake-signaled"];
+    if cfg!(feature = "source-webrtc") {
+        signaled.push("webrtc");
+    }
+    assert_eq!(info["signaled_protocols"], serde_json::json!(signaled));
     // The recording container follows its feature, with the limits of recordings.
     assert_eq!(
         info["outputs"]

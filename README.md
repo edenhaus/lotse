@@ -103,13 +103,15 @@ address only: anything that reaches the relay drives the daemon, so an
 address reachable from the network also needs `--insecure-listen`.
 
 A WebRTC camera (Home Assistant's native WebRTC cameras: Nest, Ring,
-Matter) is a `webrtc://<label>` source, the label naming the camera to the
-client, say `webrtc://camera.front_door`; its options are `data_channel`
-(the data channel label the camera's integration asks for, `dataSendChannel`
-for Nest) and `audio` (default `true`). lotse makes the offer, but the
-camera's signaling is its cloud's, so the control-API client relays it:
-it subscribes with `signaling/subscribe`, takes each `offer` and
-`candidate` event to the camera, and brings back the camera's answer, its
+Matter) has no address lotse could connect to, so a stream names it by
+protocol instead of a URL, `{"protocol": "webrtc", "options": {...}}`,
+and the stream is its identity (`info.signaled_protocols` lists the
+protocols); its options are `data_channel` (the data channel label the
+camera's integration asks for, `dataSendChannel` for Nest) and `audio`
+(default `true`). lotse makes the offer, but the camera's signaling is its
+cloud's, so the control-API client relays it: it subscribes with
+`signaling/subscribe`, takes each `offer` event (it names the stream) and
+each `candidate` event to the camera, and brings back the camera's answer, its
 candidates and its errors with `signaling/answer`, `signaling/candidate`
 and `signaling/error`; a `closed` event ends the camera's session. The
 media then comes straight from the camera to the worker over UDP: the

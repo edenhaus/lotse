@@ -1,5 +1,5 @@
 //! WebRTC cameras end to end: a real daemon (`lotse serve` and its
-//! workers, the binary's own registries) plays `webrtc://` sources, the
+//! workers, the binary's own registries) plays `webrtc` sources, the
 //! test playing Home Assistant, the client that relays their signaling over
 //! the control socket, and the fake WebRTC camera answering on loopback
 //! UDP. `signaling/subscribe` gets the source's offer (with the Nest
@@ -64,8 +64,9 @@ use tokio_tungstenite::tungstenite::Message;
 /// state, a recording.
 const STEP: Duration = Duration::from_secs(20);
 
-/// The source every test puts: a camera's entity id as its label.
-const SOURCE: &str = "webrtc://camera.front_door";
+/// The protocol of the source every test puts: a WebRTC camera has no
+/// address, its stream is its identity.
+const PROTOCOL: &str = "webrtc";
 
 /// The data channel Nest's integration asks for.
 const NEST_CHANNEL: &str = "dataSendChannel";
@@ -239,12 +240,12 @@ impl Control {
     }
 }
 
-/// `stream/put` of `door` playing [`SOURCE`] with `options`, preloaded,
+/// `stream/put` of `door` playing a [`PROTOCOL`] source with `options`, preloaded,
 /// with a pre-record window of `prerecord_ms`.
 fn put(options: &Value, prerecord_ms: u32) -> Value {
     json!({ "type": "stream/put", "stream_id": "door", "preload": true,
             "prerecord_ms": prerecord_ms,
-            "sources": [{ "url": SOURCE, "options": options }] })
+            "sources": [{ "protocol": PROTOCOL, "options": options }] })
 }
 
 /// One signal's offer as the subscription delivers it.
@@ -263,7 +264,8 @@ async fn offer(control: &mut Control, id: u64) -> Offer {
     let signal_id = offer["signal_id"].as_str().unwrap().to_owned();
     assert_eq!(signal_id.len(), 26, "a ULID: {offer}");
     assert_eq!(offer["stream_id"], "door");
-    assert_eq!(offer["source"], SOURCE);
+    assert_eq!(offer["protocol"], PROTOCOL);
+    assert!(offer.get("source").is_none(), "{offer}");
     let sdp = offer["sdp"].as_str().unwrap().to_owned();
     // The host candidate is in the offer itself, for integrations that read
     // no trickled one (Nest).
@@ -504,7 +506,8 @@ async fn rfc8445_2_5_a_nest_like_ice_lite_camera_answers_the_offer_and_its_strea
         .stream_where("door", |door| door["state"] == "live")
         .await;
     assert_eq!(door["last_error"], Value::Null, "{door}");
-    assert_eq!(door["sources"][0]["url"], SOURCE);
+    assert_eq!(door["sources"][0]["protocol"], PROTOCOL);
+    assert!(door["sources"][0].get("url").is_none(), "{door}");
     let codecs: Vec<&str> = door["tracks"]
         .as_array()
         .unwrap()

@@ -1,5 +1,5 @@
 //! A fake WebRTC camera, as Home Assistant's native WebRTC cameras are one
-//! (Nest, Ring, Matter): the answerer of the offer a `webrtc://` source
+//! (Nest, Ring, Matter): the answerer of the offer a `webrtc` source
 //! makes, on a real loopback UDP socket. The test plays the client that
 //! relays the signaling: it hands the offer to [`FakeWebRtcCamera::answer`],
 //! relays the answer and its candidates back over `signaling/*`, and hands

@@ -6,8 +6,8 @@ rule for humans: whoever submits a change can explain every line of it.
 
 ## What this is
 
-lotse is a media daemon built for Home Assistant: RTSP, HLS/MPEG-TS and
-client-signaled WebRTC cameras in, WebRTC to browsers and event recordings (fragmented MP4 with a pre-record) out, driven by its
+lotse is a media daemon built for Home Assistant: RTSP and HLS/MPEG-TS
+cameras by URL and WebRTC cameras whose signaling its client relays in, WebRTC to browsers and event recordings (fragmented MP4 with a pre-record) out, driven by its
 client over a Unix-socket control API. It is in the design phase.
 
 ## Commands
