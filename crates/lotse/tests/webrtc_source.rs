@@ -600,8 +600,9 @@ async fn rfc8445_2_5_a_nest_like_ice_lite_camera_answers_the_offer_and_its_strea
 /// §4.2.7) once its stream is live ends the signal `peer_closed`; after
 /// its backoff the source offers again under a new signal, which a
 /// Ring-like camera answers, PCMU audio and all: its candidate trickled
-/// only, each of the source's taken with its `sdpMLineIndex`, and ICE lite,
-/// so the source reaches it through the trickled candidate alone.
+/// only, each of the source's taken with its `sdpMLineIndex` (one without
+/// it refused), and ICE lite, so the source reaches it through the
+/// trickled candidate alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc6347_4_2_7_a_camera_that_closes_ends_its_signal_and_the_source_offers_again() {
     lotse_webrtc::install_crypto_provider();
@@ -653,6 +654,19 @@ async fn rfc6347_4_2_7_a_camera_that_closes_ends_its_signal_and_the_source_offer
         },
     )
     .await;
+    // Like Ring's integration, it refuses a candidate without
+    // `sdpMLineIndex`, however valid its line: none reaches its agent.
+    let taken = WebRtcCameraStats::count(&camera.stats().remote_candidates);
+    assert!(taken >= 1, "the source's candidates, with their index");
+    let host = second.candidates[0]["candidate"].as_str().unwrap();
+    assert_eq!(
+        camera.add_remote_candidate(host, None),
+        Err("a candidate without sdpMLineIndex".to_owned())
+    );
+    assert_eq!(
+        WebRtcCameraStats::count(&camera.stats().remote_candidates),
+        taken
+    );
     let door = control
         .stream_where("door", |door| {
             door["state"] == "live" && door["tracks"][0]["codec"] == "pcmu"
