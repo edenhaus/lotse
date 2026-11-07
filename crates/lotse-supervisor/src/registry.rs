@@ -19,6 +19,7 @@ use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::info::{ProcessMetrics, WorkerMetrics};
 use lotse_api_types::session::{CloseCode, Session, SessionEvent};
 use lotse_api_types::signaling::SignalCloseCode;
+use lotse_api_types::source::SourceSpec;
 use lotse_api_types::stream::{
     AudioMode, BackchannelState, ConnectionInfo, LastError, Orientation, SourceBackchannel,
     SourceInfo, Stream, StreamBackchannel, StreamEvent, StreamState, StreamStats, TalkerReason,
@@ -274,10 +275,10 @@ pub(crate) struct StreamSource {
     /// What names it: its URL, as `stream/get` reports it redacted, or
     /// its protocol.
     pub(crate) target: SourceTarget,
-    /// The per-scheme or per-protocol options as given.
+    /// The protocol's fields but the URL, defaults filled in.
     pub(crate) options: serde_json::Map<String, serde_json::Value>,
-    /// The protocol name the factory reports.
-    pub(crate) protocol: &'static str,
+    /// The source as `stream/get` reports it: as put, the URL redacted.
+    pub(crate) reported: SourceSpec,
     /// The connection's id.
     pub(crate) connection: String,
     /// What the connection's driver runs for this source; its
@@ -1382,8 +1383,7 @@ impl State {
                     .and_then(|s| s.worker.as_ref())
                     .and_then(|worker| worker.memory.clone());
                 let info = SourceInfo {
-                    url: source.target.url().map(ToString::to_string),
-                    protocol: source.protocol.to_owned(),
+                    source: source.reported.clone(),
                     state: snapshot.map_or(StreamState::Idle, |s| api_state(s.state)),
                     reconnects: snapshot.map_or(0, |s| s.reconnects),
                     backchannel: connection.and_then(source_backchannel),
@@ -1733,7 +1733,10 @@ mod tests {
                 spec: spec_on("c1", false),
                 target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                 options: serde_json::Map::new(),
-                protocol: "fake",
+                reported: serde_json::from_value(
+                    serde_json::json!({ "protocol": "fake", "url": "fake://127.0.0.1/" }),
+                )
+                .unwrap(),
                 connection: "c1".into(),
             }],
             preload,

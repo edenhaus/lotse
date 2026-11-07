@@ -129,8 +129,7 @@ pub enum Error {
     /// validates specs before spawning, so this is a bug on its side.
     #[error("source rejected ({code}): {message}")]
     SourceRejected {
-        /// The API code (`scheme_unsupported`, `protocol_unsupported`,
-        /// `invalid_request`).
+        /// The API code (`protocol_unsupported`, `invalid_request`).
         code: &'static str,
         /// What was wrong.
         message: String,
@@ -1253,8 +1252,9 @@ struct Built {
 }
 
 /// Builds the source `spec` names with the registry's factory for it: a
-/// URL's scheme's, or a signaled source's protocol's. The supervisor
-/// checked the spec before it sent it, so a refusal is a bug on its side.
+/// URL's scheme's, which is its protocol, or a signaled source's
+/// protocol's. The supervisor checked the spec before it sent it, so a
+/// refusal is a bug on its side.
 fn build_source(spec: &SourceSpec, registries: &Registries) -> Result<Built, Error> {
     let options: serde_json::Value =
         serde_json::from_str(&spec.options).map_err(|err| Error::SourceRejected {
@@ -1269,8 +1269,8 @@ fn build_source(spec: &SourceSpec, registries: &Registries) -> Result<Built, Err
             })?;
             let Some(factory) = registries.sources.get(url.scheme()) else {
                 return Err(Error::SourceRejected {
-                    code: "scheme_unsupported",
-                    message: format!("scheme {:?} is not compiled in", url.scheme()),
+                    code: "protocol_unsupported",
+                    message: format!("protocol {:?} is not compiled in", url.scheme()),
                 });
             };
             Ok(Built {
@@ -5102,8 +5102,8 @@ mod tests {
             ),
             (
                 spec("rtsp://cam/", "null"),
-                "scheme_unsupported",
-                "scheme \"rtsp\" is not compiled in",
+                "protocol_unsupported",
+                "protocol \"rtsp\" is not compiled in",
             ),
             (
                 spec("fake://cam/", "{not json"),
@@ -5152,7 +5152,7 @@ mod tests {
         }
         for (url, options, code) in [
             ("not a url", "null", "invalid_request"),
-            ("rtsp://cam/", "null", "scheme_unsupported"),
+            ("rtsp://cam/", "null", "protocol_unsupported"),
             ("fake://cam/", "{not json", "invalid_request"),
             ("fake://cam/", "{\"transport\":\"udp\"}", "invalid_request"),
         ] {
@@ -5188,7 +5188,7 @@ mod tests {
             .unwrap();
         let err = within(h.worker).await.unwrap().unwrap_err();
         let_assert!(Error::SourceRejected { code: got, .. } = err);
-        assert_eq!(got, "scheme_unsupported");
+        assert_eq!(got, "protocol_unsupported");
     }
 
     /// The worker process: the control channel on stdin, a runtime of its
@@ -5450,7 +5450,7 @@ mod tests {
     }
 
     impl SourceFactory for Stubborn {
-        fn schemes(&self) -> &'static [&'static str] {
+        fn protocols(&self) -> &'static [&'static str] {
             &["stubborn"]
         }
 
@@ -5685,11 +5685,11 @@ mod tests {
     fn errors_display_and_seeds_differ_by_time() {
         assert_eq!(
             Error::SourceRejected {
-                code: "scheme_unsupported",
+                code: "protocol_unsupported",
                 message: "x".into()
             }
             .to_string(),
-            "source rejected (scheme_unsupported): x"
+            "source rejected (protocol_unsupported): x"
         );
         assert_eq!(
             Error::ShutdownTimeout(5).to_string(),

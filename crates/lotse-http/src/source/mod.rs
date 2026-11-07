@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use lotse_api_types::source::TlsTrust;
 use lotse_core::secret::RedactedUrl;
 use lotse_core::source::{Source, SourceCtx, SourceDescriptor, SourceError};
 use lotse_core::source_url::SourceUrl;
@@ -58,7 +59,7 @@ use crate::client::{Body, Client, Connect, Plain, Response};
 use crate::fmp4;
 use crate::hls::{self, Playlist};
 use crate::media::{Event, Layout, Unit};
-use crate::options::HttpOptions;
+use crate::options::{HttpOptions, timeout};
 use crate::publish::Publisher;
 use crate::ts::Demuxer;
 
@@ -71,8 +72,12 @@ mod tests;
 
 use fetch::{Feed, Format, Segment};
 
-/// The protocol name the source reports, for both schemes.
+/// The `http` protocol (RFC 9110 §4.2.1), also the name the source's
+/// tracks and logs carry for both protocols.
 pub const PROTOCOL: &str = "http";
+
+/// The `https` protocol (RFC 9110 §4.2.2).
+pub const TLS_PROTOCOL: &str = "https";
 
 /// The size of an MPEG-TS transport packet (ISO/IEC 13818-1 §2.4.3.2).
 const TS_PACKET: usize = 188;
@@ -147,19 +152,41 @@ impl HttpSource {
     pub const fn new(url: SourceUrl, options: HttpOptions, tls: Option<TlsTarget>) -> Self {
         Self { url, options, tls }
     }
+
+    /// The source's fields as its protocol's `stream/put` variant has
+    /// them, but its URL: every default applied, and for `https` its trust
+    /// (a pin in its canonical form). Nothing here is secret: a
+    /// certificate fingerprint is public.
+    fn fields(&self) -> serde_json::Value {
+        let mut fields = serde_json::json!(self.options);
+        if let (Some(tls), Some(map)) = (&self.tls, fields.as_object_mut()) {
+            map.insert(
+                "tls".to_owned(),
+                serde_json::json!(TlsTrust::from(tls.trust)),
+            );
+        }
+        fields
+    }
 }
 
 impl Source for HttpSource {
     fn describe(&self) -> SourceDescriptor {
         SourceDescriptor {
-            protocol: PROTOCOL,
+            protocol: if self.tls.is_some() {
+                TLS_PROTOCOL
+            } else {
+                PROTOCOL
+            },
             url: Some(self.url.clone()),
-            options: self.options.redacted(),
+            options: self.fields(),
         }
     }
 
+    /// The fields: every one changes what is received, so none is left
+    /// out; every default applied, so `{}` and the defaults spelled out
+    /// are one key, as is every spelling of one pin.
     fn connection_options(&self) -> serde_json::Value {
-        self.options.connection_key()
+        self.fields()
     }
 
     fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
@@ -312,7 +339,7 @@ async fn attempt<C: Connect + Clone + 'static>(
             &url,
             ctx.peer.clone(),
             Arc::clone(&ctx.time),
-            options.timeout(),
+            timeout(&options),
             stop.clone(),
         )
     };

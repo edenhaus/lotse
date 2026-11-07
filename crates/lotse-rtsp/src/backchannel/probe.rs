@@ -298,7 +298,7 @@ mod tests {
     use lotse_testing::{CameraConfig, FakeCamera};
 
     use super::*;
-    use crate::options::RtspOptions;
+    use crate::options::{RtspOptions, defaults};
 
     fn camera_at(addr: std::net::SocketAddr, timeout_ms: u64) -> Camera {
         timed(addr, timeout_ms, Arc::new(SystemClock))
@@ -310,7 +310,7 @@ mod tests {
             options: RtspOptions {
                 backchannel: true,
                 timeout_ms,
-                ..RtspOptions::default()
+                ..defaults()
             },
             tls: None,
             addr,

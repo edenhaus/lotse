@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::session::{Candidate, Offer, offer};
 use crate::driver::Driver;
-use crate::options::RtspOptions;
+use crate::options::{RtspOptions, user_agent};
 use crate::source::{Dialer, MAX_MESSAGE, TEARDOWN, credentials, within_on};
 
 /// The camera of one source, as its backchannel's connections reach it.
@@ -64,7 +64,7 @@ impl Camera {
     pub(crate) fn session_options(&self) -> SessionOptions {
         SessionOptions::default()
             .creds(credentials(&self.url))
-            .user_agent(self.options.user_agent().to_owned())
+            .user_agent(user_agent(&self.options).to_owned())
             .teardown(TeardownPolicy::Auto)
             .max_message_size(MAX_MESSAGE)
             .backchannel(true)

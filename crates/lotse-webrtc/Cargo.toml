@@ -20,12 +20,12 @@ dimpl = { workspace = true } # DTLS on its RustCrypto backend
 hmac = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5)
 rcgen = { workspace = true } # the self-signed DTLS certificate
 sha1 = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5)
-serde = { workspace = true } # the `webrtc` source's typed options
-serde_json = { workspace = true } # the options as `stream/put` carries them
+serde_json = { workspace = true } # the options as the supervisor hands them, parsed into `WebRtcOptions`
 sha2 = { workspace = true } # the DTLS certificate fingerprint (RFC 8122 §5)
 str0m = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net"] } # the ingest source: `select!` over signals, datagrams, its timer and the cancel; its UDP sockets
 tracing = { workspace = true }
+lotse-api-types = { workspace = true } # the `webrtc` source's fields (`WebRtcOptions`), declared as the API's `stream/put` variant
 lotse-codec = { workspace = true } # RFC 6184 and RFC 7798 packetization of the join frames; the H.265 SPS's profile for negotiation
 lotse-core = { workspace = true }
 

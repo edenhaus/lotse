@@ -1576,6 +1576,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "lotse-api-types",
  "lotse-codec",
  "lotse-core",
  "lotse-testing",
@@ -1622,6 +1623,7 @@ version = "0.0.0-dev"
 dependencies = [
  "bytes",
  "futures-util",
+ "lotse-api-types",
  "lotse-codec",
  "lotse-core",
  "lotse-testing",
@@ -1718,6 +1720,7 @@ dependencies = [
 name = "lotse-tls"
 version = "0.0.0-dev"
 dependencies = [
+ "lotse-api-types",
  "lotse-core",
  "lotse-testing",
  "rustls",
@@ -1740,11 +1743,11 @@ dependencies = [
  "ctr",
  "dimpl",
  "hmac",
+ "lotse-api-types",
  "lotse-codec",
  "lotse-core",
  "lotse-testing",
  "rcgen",
- "serde",
  "serde_json",
  "sha1",
  "sha2",

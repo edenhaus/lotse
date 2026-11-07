@@ -264,7 +264,7 @@ async fn onvif_5_3_a_probe_and_a_claimed_backchannel_session_beside_the_viewing_
         |backchannel| backchannel.ptime = Some(40),
     ))
     .await;
-    let source = source(&cam, &serde_json::Value::Null);
+    let source = source(&cam, &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let slot = harness.backchannel.clone();
@@ -356,7 +356,7 @@ async fn onvif_5_3_2_a_551_to_the_probe_is_remembered_and_another_failure_asked_
             backchannel.require = answer;
         }))
         .await;
-        let source = source(&cam, &serde_json::Value::Null);
+        let source = source(&cam, &serde_json::json!({}));
         let slot = BackchannelSlot::default();
         let mut first = Harness::start_with(source.as_ref(), peer(&cam), clock(), slot.clone());
         assert!(first.wait_ready().await, "{answer:?}: plays");
@@ -394,7 +394,7 @@ async fn onvif_5_3_2_a_551_to_the_probe_is_remembered_and_another_failure_asked_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onvif_5_3_2_a_reconnect_whose_probe_finds_none_withdraws_the_offer() {
     let cam = camera(config(None, BackchannelCodec::Pcmu, |_| {})).await;
-    let source = source(&cam, &serde_json::Value::Null);
+    let source = source(&cam, &serde_json::json!({}));
     let slot = BackchannelSlot::default();
     let mut first = Harness::start_with(source.as_ref(), peer(&cam), clock(), slot.clone());
     assert!(first.wait_ready().await, "ready");
@@ -473,7 +473,7 @@ async fn onvif_5_3_1_the_connection_turns_the_probe_on_and_off_beside_the_viewin
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onvif_5_3_1_a_stream_that_does_not_opt_in_sends_no_require() {
     for options in [
-        serde_json::Value::Null,
+        json!({ "timeout_ms": 10_000 }),
         json!({}),
         json!({ "backchannel": false }),
     ] {
@@ -556,7 +556,7 @@ async fn rfc2326_10_4_a_refused_backchannel_session_says_why() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_10_12_a_lost_backchannel_session_says_why_and_a_viewing_reconnect_leaves_it() {
     let cam = camera(config(None, BackchannelCodec::Pcmu, |_| {})).await;
-    let source = source(&cam, &serde_json::Value::Null);
+    let source = source(&cam, &serde_json::json!({}));
     let slot = BackchannelSlot::default();
     let mut harness = Harness::start_with(source.as_ref(), peer(&cam), clock(), slot.clone());
     assert!(harness.wait_ready().await, "ready");
@@ -611,7 +611,7 @@ async fn rfc2326_10_7_a_lost_live555_backchannel_session_is_torn_down_on_a_fresh
     let mut config = config(None, BackchannelCodec::Pcmu, |_| {});
     config.sdp_session_lines = "a=tool:LIVE555 Streaming Media v2016.11.28\r\n".into();
     let cam = camera(config).await;
-    let source = source(&cam, &serde_json::Value::Null);
+    let source = source(&cam, &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let slot = harness.backchannel.clone();
@@ -645,7 +645,7 @@ async fn rfc2326_10_7_a_lost_session_is_reported_before_its_teardown_on_fresh_co
     config.sdp_session_lines = "a=tool:LIVE555 Streaming Media v2016.11.28\r\n".into();
     config.hang_up_on_teardown = true;
     let cam = camera(config).await;
-    let source = source(&cam, &serde_json::Value::Null);
+    let source = source(&cam, &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let slot = harness.backchannel.clone();
@@ -686,7 +686,7 @@ async fn rfc2326_10_7_a_refused_play_is_refused_to_the_claim_before_its_teardown
     config.sdp_session_lines = "a=tool:LIVE555 Streaming Media v2016.11.28\r\n".into();
     config.hang_up_on_teardown = true;
     let cam = camera(config).await;
-    let source = source(&cam, &serde_json::Value::Null);
+    let source = source(&cam, &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let slot = harness.backchannel.clone();
@@ -709,7 +709,7 @@ async fn rfc2326_10_7_a_refused_play_is_refused_to_the_claim_before_its_teardown
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_10_4_a_camera_gone_before_the_claim_refuses_without_a_status() {
     let cam = camera(config(None, BackchannelCodec::Pcmu, |_| {})).await;
-    let source = source(&cam, &serde_json::Value::Null);
+    let source = source(&cam, &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let slot = harness.backchannel.clone();
@@ -738,7 +738,7 @@ async fn rfc7826_19_2_over_rtsps_the_backchannel_takes_tls_on_its_own_connection
     let source = RtspFactory
         .validate(
             &SourceUrl::parse(&url).unwrap(),
-            &json!({ "tls_fingerprint": pin, "backchannel": true }),
+            &json!({ "tls": { "pin": pin }, "backchannel": true }),
         )
         .unwrap();
     let peer = ResolvedPeer {
@@ -806,7 +806,7 @@ async fn onvif_5_3_2_3_a_camera_that_takes_only_its_offered_payload_type_records
         backchannel.accept_only = Some(110);
     }))
     .await;
-    let source = source(&cam, &serde_json::Value::Null);
+    let source = source(&cam, &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let slot = harness.backchannel.clone();
@@ -833,7 +833,7 @@ async fn rfc8866_6_7_the_probe_takes_the_first_sendonly_audio_retina_sends_on() 
         backchannel.attributes = "a=fmtp\r\n".into();
     }))
     .await;
-    let unparsed = source(&cam, &serde_json::Value::Null);
+    let unparsed = source(&cam, &serde_json::json!({}));
     let mut harness = Harness::start(unparsed.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "plays");
     let slot = harness.backchannel.clone();
@@ -850,7 +850,7 @@ async fn rfc8866_6_7_the_probe_takes_the_first_sendonly_audio_retina_sends_on() 
     config.sdp_session_lines = "a=sendonly\r\n".into();
     config.video_fmtp = "\r\na=sendrecv".into();
     let cam = camera(config).await;
-    let sendonly = source(&cam, &serde_json::Value::Null);
+    let sendonly = source(&cam, &serde_json::json!({}));
     let mut harness = Harness::start(sendonly.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "plays");
     let offer = offered(&harness.backchannel).await;
@@ -866,7 +866,7 @@ async fn rfc8866_6_7_the_probe_takes_the_first_sendonly_audio_retina_sends_on() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claim_bypasses_the_connect_gate_while_the_probe_waits_for_a_permit() {
     let cam = camera(config(None, BackchannelCodec::Pcmu, |_| {})).await;
-    let source = source(&cam, &serde_json::Value::Null);
+    let source = source(&cam, &serde_json::json!({}));
     let (gate, mut asks) = ProbeGate::closed();
     let slot = BackchannelSlot::gated(gate.clone());
     let mut first = Harness::start_with(source.as_ref(), peer(&cam), clock(), slot.clone());

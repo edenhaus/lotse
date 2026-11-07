@@ -320,7 +320,8 @@ pub struct SourceSpec {
     pub connection_id: String,
     /// What names the source: its URL, or a signaled source's protocol.
     pub target: SourceTarget,
-    /// The per-scheme or per-protocol options as JSON text.
+    /// The protocol's fields but the URL, as JSON text: what its
+    /// factory parses.
     pub options: String,
     /// The host name, for the protocol URL and TLS SNI; empty for a
     /// signaled source, which has no address.
@@ -343,7 +344,7 @@ pub struct SourceSpec {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceTarget {
     /// A source the worker connects to: its full URL, credentials
-    /// included, of a scheme the worker's registry has.
+    /// included, whose scheme is a protocol the worker's registry has.
     Url(String),
     /// A source whose signaling the control-API client relays, by its
     /// protocol (`webrtc`), which the worker's registry has as a signaled

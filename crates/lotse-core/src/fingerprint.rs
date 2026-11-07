@@ -1,6 +1,6 @@
 //! The SHA-256 fingerprint of a DER certificate, the pin that names exactly
 //! one certificate wherever lotse trusts one by its hash rather than by a
-//! chain: a camera's `tls_fingerprint` and the control listener's pins.
+//! chain: a camera's `tls` pin and the control listener's pins.
 //!
 //! Standards: FIPS 180-4 (SHA-256), RFC 5280 §4.1 (the DER certificate that
 //! is hashed whole).
@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 /// The length of a SHA-256 digest in bytes.
 const FINGERPRINT_LEN: usize = 32;
 
-/// A SHA-256 fingerprint of a DER certificate: a camera's `tls_fingerprint`
+/// A SHA-256 fingerprint of a DER certificate: a camera's `tls`
 /// pin, and the pins of the control listener's server and clients.
 ///
 /// Parsed from 64 hex digits, upper or lower case, either run together or
@@ -25,7 +25,7 @@ const FINGERPRINT_LEN: usize = 32;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Fingerprint([u8; FINGERPRINT_LEN]);
 
-/// Why a `tls_fingerprint` does not parse.
+/// Why a certificate pin does not parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "a certificate fingerprint must be its SHA-256 as 64 hex digits, optionally with a colon between each pair, not {0:?}"

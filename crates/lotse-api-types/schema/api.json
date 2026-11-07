@@ -241,7 +241,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "`info`: version, build, schemes, outputs, codecs, limits and sandbox.",
+          "description": "`info`: version, build, protocols, outputs, codecs, limits and sandbox.",
           "properties": {
             "id": {
               "description": "The command id.",
@@ -1271,13 +1271,8 @@
           "type": "string"
         },
         {
-          "const": "scheme_unsupported",
-          "description": "The source URL scheme is not in `info.schemes`.",
-          "type": "string"
-        },
-        {
           "const": "protocol_unsupported",
-          "description": "The signaled source's protocol is not in\n`info.signaled_protocols`.",
+          "description": "The source's protocol is one the API defines but this build did\nnot register: not in `info.protocols`. A protocol the API does not\ndefine is `invalid_request`.",
           "type": "string"
         },
         {
@@ -1624,23 +1619,16 @@
           },
           "type": "array"
         },
+        "protocols": {
+          "description": "The source protocols this build registered, sorted: the\n`protocol`s `stream/put` takes here. A URL protocol's sources take\nURLs of the scheme of its name (`rtsps`); the client relays the\nsignaling of the others (`webrtc`) through `signaling/subscribe`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "sandbox": {
           "$ref": "#/$defs/SandboxInfo",
           "description": "The sandbox."
-        },
-        "schemes": {
-          "description": "The URL schemes a client may route here.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "signaled_protocols": {
-          "description": "The protocols of the sources whose signaling the client relays\n(`webrtc`), which `stream/put` names by `protocol` instead of a\nURL; their offers come through `signaling/subscribe`.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
         },
         "version": {
           "description": "The daemon version.",
@@ -1650,8 +1638,7 @@
       "required": [
         "version",
         "build",
-        "schemes",
-        "signaled_protocols",
+        "protocols",
         "outputs",
         "features",
         "codecs",
@@ -2661,26 +2648,6 @@
         }
       ]
     },
-    "SignaledSource": {
-      "additionalProperties": false,
-      "description": "A source whose signaling the client relays, named by its protocol: a\n`stream/put` source of a protocol in `info.signaled_protocols`. Its\nconnection attempts offer through `signaling/subscribe`.",
-      "properties": {
-        "options": {
-          "additionalProperties": true,
-          "description": "Per-protocol options, typed by the protocol's factory; unknown\nfields there are rejected too.",
-          "type": "object"
-        },
-        "protocol": {
-          "description": "The protocol (`webrtc`).",
-          "maxLength": 64,
-          "type": "string"
-        }
-      },
-      "required": [
-        "protocol"
-      ],
-      "type": "object"
-    },
     "SignalingEvent": {
       "description": "An event of `signaling/subscribe`. Never coalesced or shed: a client\ntoo slow to take one is disconnected (close code 1008), and the\nsignals of its subscription end. Each variant's schema title names the\nPython client's class for it.",
       "oneOf": [
@@ -2688,7 +2655,7 @@
           "description": "A connection attempt of a signaled source opened the signal\n`signal_id` and offers this SDP; the first event of every signal.\nThe signal belongs to this subscription: only its control\nconnection may answer, trickle or end it.",
           "properties": {
             "protocol": {
-              "description": "The signaled source's protocol (`webrtc`), one of\n`info.signaled_protocols`.",
+              "description": "The signaled source's protocol (`webrtc`), one of\n`info.protocols`.",
               "type": "string"
             },
             "sdp": {
@@ -2821,7 +2788,7 @@
       "type": "object"
     },
     "SourceInfo": {
-      "description": "A source as `stream/get` reports it.",
+      "description": "A source as `stream/get` reports it: the source in the shape\n`stream/put` takes it, and its connection's state. The source is an\nobject of its own, not flattened in here: a protocol's fields may share\na name with the state's (`rtsp`'s `backchannel` option and the\n`backchannel` the probe found).",
       "properties": {
         "backchannel": {
           "anyOf": [
@@ -2839,30 +2806,23 @@
           "$ref": "#/$defs/ConnectionInfo",
           "description": "The shared connection."
         },
-        "protocol": {
-          "description": "The protocol (`rtsp`; `webrtc` for a signaled source).",
-          "type": "string"
-        },
         "reconnects": {
           "description": "Reconnects so far.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
+        "source": {
+          "$ref": "#/$defs/SourceSpec",
+          "description": "The source as `stream/put` took it, its `protocol` and its fields\nwith every default filled in, its `url` redacted to its origin,\n`scheme://[****@]host[:port]`, then `/****` when the path is\nanything but empty or `/` and `?****` when a query is present: the\npath and query can carry secrets (a camera key, a session token) as\nthe userinfo can."
+        },
         "state": {
           "$ref": "#/$defs/StreamState",
           "description": "The connection's state."
-        },
-        "url": {
-          "description": "The URL redacted to its origin, `scheme://[****@]host[:port]`, then\n`/****` when the path is anything but empty or `/` and `?****` when\na query is present: the path and query can carry secrets (a camera\nkey, a session token) as the userinfo can. Absent for a signaled\nsource, which has no address.",
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [
-        "protocol",
+        "source",
         "state",
         "reconnects",
         "connection"
@@ -2870,13 +2830,208 @@
       "type": "object"
     },
     "SourceSpec": {
-      "description": "One entry of `stream/put`'s `sources`: a source lotse connects to, named by its `url`, or a source whose signaling the client relays (a WebRTC camera), named by its `protocol`. Exactly one of the two.",
+      "description": "One entry of `stream/put`'s `sources`, named by its `protocol`, with\nthe protocol's own fields beside it; `stream/get` reports each source\nin the same shape, defaults filled in and the URL redacted. A URL\nprotocol's `url` has the protocol's name as its scheme. The protocols\na build registered are `info.protocols`; one this build left out is\nrefused with `protocol_unsupported`.",
       "oneOf": [
         {
-          "$ref": "#/$defs/UrlSource"
+          "additionalProperties": false,
+          "description": "An RTSP camera.",
+          "properties": {
+            "backchannel": {
+              "default": false,
+              "description": "Ask the camera for its ONVIF backchannel, two-way audio's path\nto its speaker. Once the stream's session plays, a `DESCRIBE`\nwith `Require: www.onvif.org/ver20/backchannel` (ONVIF Streaming\nSpecification §5.3.1) on a connection of its own asks whether\nthe camera has one, on every connect; a talker's claim opens it\nin a session of its own and its release closes it, so the\ncamera's backchannel is free whenever nobody talks, and the\nsession that plays the stream never carries the header. Off by\ndefault: the client knows which cameras talk back and opts a\nstream in, so a camera without one never sees the header. It\ndoes not tell connections apart: the connection a stream shares\nasks iff one of its streams does. Opting in or out never\nrestarts the connection: an opt-in probes at once while the\nstream plays (else at its next connect), and an offer that\nrequests talk-back meanwhile waits for the probe; the last\nopt-out drops what the probe found and frees the backchannel\nfrom its talker. A talk-back request the backchannel cannot\nserve is answered without it, with a `backchannel_declined`\nwarning.",
+              "type": "boolean"
+            },
+            "protocol": {
+              "const": "rtsp",
+              "type": "string"
+            },
+            "timeout_ms": {
+              "default": 10000,
+              "description": "The read deadline, in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "transport": {
+              "$ref": "#/$defs/Transport",
+              "default": "tcp",
+              "description": "`tcp`, the default, interleaves RTP on the RTSP connection;\n`udp` takes it on ports of its own."
+            },
+            "url": {
+              "description": "The source URL, a `rtsp://` one, credentials in its userinfo; redacted everywhere it is reported, `stream/get` included.",
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "user_agent": {
+              "default": null,
+              "description": "The `User-Agent` to send instead of the daemon's: 1 to 256\nprintable ASCII characters, spaces or tabs only between them\n(RFC 7230 §3.2, RFC 2326 §12.41); `null`, the default, sends\nthe daemon's.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "protocol",
+            "url"
+          ],
+          "title": "RtspSource",
+          "type": "object"
         },
         {
-          "$ref": "#/$defs/SignaledSource"
+          "additionalProperties": false,
+          "description": "An RTSP camera over TLS.",
+          "properties": {
+            "backchannel": {
+              "default": false,
+              "description": "Ask the camera for its ONVIF backchannel, two-way audio's path\nto its speaker. Once the stream's session plays, a `DESCRIBE`\nwith `Require: www.onvif.org/ver20/backchannel` (ONVIF Streaming\nSpecification §5.3.1) on a connection of its own asks whether\nthe camera has one, on every connect; a talker's claim opens it\nin a session of its own and its release closes it, so the\ncamera's backchannel is free whenever nobody talks, and the\nsession that plays the stream never carries the header. Off by\ndefault: the client knows which cameras talk back and opts a\nstream in, so a camera without one never sees the header. It\ndoes not tell connections apart: the connection a stream shares\nasks iff one of its streams does. Opting in or out never\nrestarts the connection: an opt-in probes at once while the\nstream plays (else at its next connect), and an offer that\nrequests talk-back meanwhile waits for the probe; the last\nopt-out drops what the probe found and frees the backchannel\nfrom its talker. A talk-back request the backchannel cannot\nserve is answered without it, with a `backchannel_declined`\nwarning.",
+              "type": "boolean"
+            },
+            "protocol": {
+              "const": "rtsps",
+              "type": "string"
+            },
+            "timeout_ms": {
+              "default": 10000,
+              "description": "The read deadline, in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tls": {
+              "$ref": "#/$defs/TlsTrust",
+              "default": "roots",
+              "description": "Whom the TLS connection trusts."
+            },
+            "url": {
+              "description": "The source URL, a `rtsps://` one, credentials in its userinfo; redacted everywhere it is reported, `stream/get` included.",
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "user_agent": {
+              "default": null,
+              "description": "The `User-Agent` to send instead of the daemon's: 1 to 256\nprintable ASCII characters, spaces or tabs only between them\n(RFC 7230 §3.2, RFC 2326 §12.41); `null`, the default, sends\nthe daemon's.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "protocol",
+            "url"
+          ],
+          "title": "RtspsSource",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "HLS or MPEG-TS over HTTP.",
+          "properties": {
+            "max_bandwidth": {
+              "default": null,
+              "description": "The highest variant `BANDWIDTH` (RFC 8216 §4.3.4.2, bits per\nsecond) to play from a multivariant playlist; `null`, the\ndefault, is uncapped.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "protocol": {
+              "const": "http",
+              "type": "string"
+            },
+            "timeout_ms": {
+              "default": 10000,
+              "description": "How long each connect, each answer and each wait for body\nbytes may take, in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "url": {
+              "description": "The source URL, a `http://` one, credentials in its userinfo; redacted everywhere it is reported, `stream/get` included.",
+              "maxLength": 4096,
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol",
+            "url"
+          ],
+          "title": "HttpSource",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "HLS or MPEG-TS over HTTPS.",
+          "properties": {
+            "max_bandwidth": {
+              "default": null,
+              "description": "The highest variant `BANDWIDTH` (RFC 8216 §4.3.4.2, bits per\nsecond) to play from a multivariant playlist; `null`, the\ndefault, is uncapped.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "protocol": {
+              "const": "https",
+              "type": "string"
+            },
+            "timeout_ms": {
+              "default": 10000,
+              "description": "How long each connect, each answer and each wait for body\nbytes may take, in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tls": {
+              "$ref": "#/$defs/TlsTrust",
+              "default": "roots",
+              "description": "Whom the TLS connection trusts."
+            },
+            "url": {
+              "description": "The source URL, a `https://` one, credentials in its userinfo; redacted everywhere it is reported, `stream/get` included.",
+              "maxLength": 4096,
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol",
+            "url"
+          ],
+          "title": "HttpsSource",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A WebRTC camera whose signaling the client relays.",
+          "properties": {
+            "audio": {
+              "default": true,
+              "description": "Offer to receive the camera's audio (default `true`); `false`\noffers video only.",
+              "type": "boolean"
+            },
+            "data_channel": {
+              "default": null,
+              "description": "The label of a data channel to offer beside the media (RFC 8831,\nRFC 8832), as the camera's integration asks for one: Nest refuses\nan offer without an `application` m-line and wants\n`dataSendChannel`. 1 to 64 characters, none a control character;\n`null`, the default, offers none.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "protocol": {
+              "const": "webrtc",
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol"
+          ],
+          "title": "WebrtcSource",
+          "type": "object"
         }
       ]
     },
@@ -3752,6 +3907,35 @@
         }
       ]
     },
+    "TlsTrust": {
+      "description": "Whom an `rtsps` or `https` source's TLS connection trusts: `\"roots\"`\n(the default), `\"insecure\"`, or `{\"pin\": \"<SHA-256 fingerprint>\"}`.\nRFC 7826 §19.2 and RFC 9110 §4.3.4 take the server's identity from\nRFC 2818 §3.1, which `roots` checks. In every mode the handshake\nsignature is verified with the presented certificate's key.",
+      "oneOf": [
+        {
+          "const": "roots",
+          "description": "The chain must end in an embedded root and the certificate must\nname the URL's host (RFC 2818 §3.1, RFC 6125).",
+          "type": "string"
+        },
+        {
+          "const": "insecure",
+          "description": "Any certificate; warned about on every connection.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Exactly the certificate with this SHA-256 fingerprint: 64 hex\ndigits, upper or lower case, optionally with a colon between each\npair (what `openssl x509 -fingerprint -sha256` prints). Chain,\nvalidity period and host name are not checked: a self-signed\ncamera certificate rarely names the host it is reached by.",
+          "properties": {
+            "pin": {
+              "maxLength": 95,
+              "type": "string"
+            }
+          },
+          "required": [
+            "pin"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "TrackInfo": {
       "description": "A track as `stream/get` reports it.",
       "properties": {
@@ -3896,25 +4080,20 @@
       ],
       "type": "object"
     },
-    "UrlSource": {
-      "additionalProperties": false,
-      "description": "A source lotse connects to, named by its URL: a `stream/put` source of\na scheme in `info.schemes`.",
-      "properties": {
-        "options": {
-          "additionalProperties": true,
-          "description": "Per-scheme options, typed by the scheme's factory; unknown fields\nthere are rejected too.",
-          "type": "object"
+    "Transport": {
+      "description": "How an `rtsp` source's RTP reaches the daemon (RFC 2326 §10.12,\n§12.39).",
+      "oneOf": [
+        {
+          "const": "tcp",
+          "description": "Interleaved over the RTSP connection (RFC 2326 §10.12); the\ndefault.",
+          "type": "string"
         },
-        "url": {
-          "description": "The source URL, credentials included; redacted everywhere it is\nreported.",
-          "maxLength": 4096,
+        {
+          "const": "udp",
+          "description": "Separate UDP ports, for wired cameras.",
           "type": "string"
         }
-      },
-      "required": [
-        "url"
-      ],
-      "type": "object"
+      ]
     },
     "WarningCode": {
       "description": "The code of a `warning` event: every code a session may warn with,\nand nothing else.",

@@ -1,15 +1,19 @@
-//! The `rtsp` and `rtsps` schemes' factory: options checked, the source
+//! The `rtsp` and `rtsps` protocols' factory: options checked, the source
 //! built.
 
 use lotse_core::source::{Source, SourceCapabilities, SourceConfigError, SourceFactory};
 use lotse_core::source_url::SourceUrl;
 use lotse_tls::{TlsTarget, Trust};
 
-use crate::options::{RtspOptions, Transport};
+use crate::options::{RtspOptions, RtspsOptions, Transport};
 use crate::source::RtspSource;
 
-/// The protocol name reported for every scheme of this factory.
+/// The `rtsp` protocol (RFC 2326), also the name the source's tracks and
+/// logs carry for both protocols.
 pub const PROTOCOL: &str = "rtsp";
+
+/// The `rtsps` protocol: RTSP over TLS (RFC 7826 §19.2).
+pub const TLS_PROTOCOL: &str = "rtsps";
 
 /// RFC 2326 §3.2: the default port of `rtsp://`.
 pub const DEFAULT_PORT: u16 = 554;
@@ -32,42 +36,52 @@ pub const BACKCHANNEL: bool = true;
 #[derive(Debug, Default)]
 pub struct RtspFactory;
 
-/// The `rtsps` target for `url` and `options`; `None` for `rtsp`. The TLS
-/// options are refused on `rtsp`, and the pin and `insecure_tls` together.
-fn tls_target(
+/// `options` parsed as `protocol`'s, or why not.
+fn parse<T: serde::de::DeserializeOwned>(
+    protocol: &'static str,
+    options: &serde_json::Value,
+) -> Result<T, SourceConfigError> {
+    serde_json::from_value(options.clone()).map_err(|err| SourceConfigError::InvalidOptions {
+        protocol,
+        message: err.to_string(),
+    })
+}
+
+/// An `rtsps` source's options as the source runs with them: its media
+/// interleaved on the TLS connection (RFC 7826 §19.2; over UDP it would
+/// leave the TLS session as plain RTP, and SRTP is not supported), and
+/// its TLS target, whose pin and host are checked here.
+fn rtsps(
     url: &SourceUrl,
-    options: &RtspOptions,
-) -> Result<Option<TlsTarget>, SourceConfigError> {
-    let invalid = |message: &str| SourceConfigError::InvalidOptions {
-        scheme: PROTOCOL,
-        message: message.to_owned(),
-    };
-    let trust = match (options.tls_fingerprint, options.insecure_tls) {
-        (Some(_), true) => return Err(invalid("set tls_fingerprint or insecure_tls, not both")),
-        (Some(pin), false) => Trust::Pin(pin),
-        (None, true) => Trust::Insecure,
-        (None, false) => Trust::Roots,
-    };
-    if url.scheme() != "rtsps" {
-        return if trust == Trust::Roots {
-            Ok(None)
-        } else {
-            Err(invalid(
-                "tls_fingerprint and insecure_tls apply to rtsps:// only",
-            ))
-        };
-    }
-    TlsTarget::new(url.host(), trust)
-        .map(Some)
-        .map_err(|message| SourceConfigError::InvalidUrl {
-            scheme: PROTOCOL,
+    options: RtspsOptions,
+) -> Result<(RtspOptions, TlsTarget), SourceConfigError> {
+    let RtspsOptions {
+        backchannel,
+        timeout_ms,
+        user_agent,
+        tls,
+    } = options;
+    let trust = Trust::try_from(&tls).map_err(|err| SourceConfigError::InvalidOptions {
+        protocol: TLS_PROTOCOL,
+        message: err.to_string(),
+    })?;
+    let target =
+        TlsTarget::new(url.host(), trust).map_err(|message| SourceConfigError::InvalidUrl {
+            protocol: TLS_PROTOCOL,
             message,
-        })
+        })?;
+    let options = RtspOptions {
+        transport: Transport::Tcp,
+        backchannel,
+        timeout_ms,
+        user_agent,
+    };
+    Ok((options, target))
 }
 
 impl SourceFactory for RtspFactory {
-    fn schemes(&self) -> &'static [&'static str] {
-        &["rtsp", "rtsps"]
+    fn protocols(&self) -> &'static [&'static str] {
+        &[PROTOCOL, TLS_PROTOCOL]
     }
 
     fn capabilities(&self) -> SourceCapabilities {
@@ -76,32 +90,29 @@ impl SourceFactory for RtspFactory {
         }
     }
 
-    fn default_port(&self, scheme: &str) -> Option<u16> {
-        Some(if scheme == "rtsps" {
+    fn default_port(&self, protocol: &str) -> Option<u16> {
+        Some(if protocol == TLS_PROTOCOL {
             DEFAULT_TLS_PORT
         } else {
             DEFAULT_PORT
         })
     }
 
+    /// `url`'s scheme picks the protocol, whose options `options` must
+    /// be: the supervisor hands an `rtsps` source's here only with an
+    /// `rtsps://` URL.
     fn validate(
         &self,
         url: &SourceUrl,
         options: &serde_json::Value,
     ) -> Result<Box<dyn Source>, SourceConfigError> {
-        let options =
-            RtspOptions::parse(options).map_err(|err| SourceConfigError::InvalidOptions {
-                scheme: PROTOCOL,
-                message: err.to_string(),
-            })?;
-        let tls = tls_target(url, &options)?;
-        if tls.is_some() && options.transport == Transport::Udp {
-            return Err(SourceConfigError::InvalidOptions {
-                scheme: PROTOCOL,
-                message: "transport udp is not available for rtsps://: the media would leave the TLS session as plain RTP (SRTP is not supported); use tcp".to_owned(),
-            });
-        }
-        Ok(Box::new(RtspSource::new(url.clone(), options, tls)))
+        let source = if url.scheme() == TLS_PROTOCOL {
+            let (options, tls) = rtsps(url, parse(TLS_PROTOCOL, options)?)?;
+            RtspSource::new(url.clone(), options, Some(tls))
+        } else {
+            RtspSource::new(url.clone(), parse(PROTOCOL, options)?, None)
+        };
+        Ok(Box::new(source))
     }
 }
 
@@ -117,22 +128,25 @@ mod tests {
 
     use super::*;
 
-    const PIN: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const PIN: &str = "BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD";
 
     #[test]
-    fn the_factory_validates_scheme_and_options() {
+    fn the_factory_validates_the_rtsp_options() {
         let factory = RtspFactory;
-        assert_eq!(factory.schemes(), ["rtsp", "rtsps"]);
+        assert_eq!(factory.protocols(), ["rtsp", "rtsps"]);
         assert!(factory.capabilities().backchannel, "the ONVIF backchannel");
         let url = SourceUrl::parse("rtsp://user:pass@192.168.1.10/h264").unwrap();
-        let source = factory.validate(&url, &serde_json::Value::Null).unwrap();
+        let source = factory.validate(&url, &json!({})).unwrap();
         let described = source.describe();
         assert_eq!(described.protocol, "rtsp");
         assert_eq!(described.url.as_ref(), Some(&url));
-        assert_eq!(described.options["transport"], "tcp");
+        assert_eq!(
+            described.options,
+            json!({ "transport": "tcp", "backchannel": false, "timeout_ms": 10_000, "user_agent": null })
+        );
         assert_eq!(
             source.connection_options(),
-            RtspOptions::default().connection_key()
+            json!({ "transport": "tcp", "timeout_ms": 10_000, "user_agent": null })
         );
         // ONVIF Streaming Specification §5.3.1: the `Require` header only
         // for a stream that opted in, on the same connection either way.
@@ -141,33 +155,43 @@ mod tests {
             .validate(&url, &json!({ "backchannel": true }))
             .unwrap();
         assert!(talking.wants_backchannel());
+        assert_eq!(talking.describe().options["backchannel"], true);
         assert_eq!(talking.connection_options(), source.connection_options());
-        let udp = factory
-            .validate(&url, &json!({ "transport": "udp" }))
+        // Spelled out, the same camera session.
+        let spelled = factory
+            .validate(&url, &json!({ "timeout_ms": 10_000, "transport": "tcp" }))
             .unwrap();
-        assert_eq!(udp.describe().options["transport"], "udp");
-        assert_ne!(udp.connection_options(), source.connection_options());
-        let err = factory.validate(&url, &json!({ "nope": 1 })).unwrap_err();
-        assert!(
-            matches!(err, SourceConfigError::InvalidOptions { .. }),
-            "{err}"
-        );
-        // A user_agent retina would panic on is refused here, before a
-        // worker builds a request with it.
-        let err = factory
-            .validate(&url, &json!({ "user_agent": "lotse\r\nX: 1" }))
-            .unwrap_err();
-        assert!(
-            matches!(&err, SourceConfigError::InvalidOptions { message, .. } if message.contains("user_agent")),
-            "{err}"
-        );
-        let agent = factory
-            .validate(&url, &json!({ "user_agent": "Client/2026.10 (lotse)" }))
-            .unwrap();
-        assert_eq!(
-            agent.describe().options["user_agent"],
-            "Client/2026.10 (lotse)"
-        );
+        assert_eq!(spelled.connection_options(), source.connection_options());
+        for other in [
+            json!({ "transport": "udp" }),
+            json!({ "timeout_ms": 5_000 }),
+            json!({ "user_agent": "Client/2026.10 (lotse)" }),
+        ] {
+            let built = factory.validate(&url, &other).unwrap();
+            assert_ne!(
+                built.connection_options(),
+                source.connection_options(),
+                "{other}"
+            );
+        }
+        for bad in [
+            json!({ "nope": 1 }),
+            json!({ "tls": "insecure" }),
+            json!({ "user_agent": "lotse\r\nX: 1" }),
+            json!({ "transport": "sctp" }),
+        ] {
+            let err = factory.validate(&url, &bad).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    SourceConfigError::InvalidOptions {
+                        protocol: "rtsp",
+                        ..
+                    }
+                ),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -178,55 +202,76 @@ mod tests {
     }
 
     #[test]
-    fn rtsps_options_are_checked_at_put() {
+    fn rfc7826_19_2_rtsps_runs_interleaved_with_the_trust_it_names() {
         let factory = RtspFactory;
         let rtsps = SourceUrl::parse("rtsps://cam.local/").unwrap();
-        let rtsp = SourceUrl::parse("rtsp://cam.local/").unwrap();
-        for options in [
-            json!({}),
-            json!({ "tls_fingerprint": PIN }),
-            json!({ "insecure_tls": true }),
+        let source = factory.validate(&rtsps, &json!({})).unwrap();
+        let described = source.describe();
+        assert_eq!(described.protocol, "rtsps");
+        assert_eq!(
+            described.options,
+            json!({ "backchannel": false, "timeout_ms": 10_000, "user_agent": null, "tls": "roots" })
+        );
+        assert!(
+            format!("{source:?}").contains("transport: Tcp"),
+            "{source:?}"
+        );
+        for (options, trust) in [
+            (json!({ "tls": "insecure" }), json!("insecure")),
+            (
+                json!({ "tls": { "pin": PIN } }),
+                json!({ "pin": PIN.to_lowercase() }),
+            ),
+            (
+                json!({ "tls": { "pin": PIN.replace(':', "") } }),
+                json!({ "pin": PIN.to_lowercase() }),
+            ),
         ] {
-            assert!(factory.validate(&rtsps, &options).is_ok(), "{options}");
+            let built = factory.validate(&rtsps, &options).unwrap();
+            assert_eq!(built.describe().options["tls"], trust, "{options}");
+            // Every spelling of one pin is one key; each trust its own.
+            assert_eq!(built.connection_options()["tls"], trust, "{options}");
+            assert_ne!(built.connection_options(), source.connection_options());
         }
-        let both = json!({ "tls_fingerprint": PIN, "insecure_tls": true });
-        let err = factory.validate(&rtsps, &both).unwrap_err();
-        assert!(err.to_string().contains("not both"), "{err}");
+        let key = source.connection_options();
+        assert!(key.get("backchannel").is_none(), "{key}");
         let err = factory
-            .validate(&rtsps, &json!({ "tls_fingerprint": "ab:cd" }))
+            .validate(&rtsps, &json!({ "tls": { "pin": "ab:cd" } }))
             .unwrap_err();
         assert!(
-            matches!(err, SourceConfigError::InvalidOptions { .. })
-                && err.to_string().contains("64 hex digits"),
+            matches!(
+                &err,
+                SourceConfigError::InvalidOptions {
+                    protocol: "rtsps",
+                    ..
+                }
+            ) && err.to_string().contains("64 hex digits"),
             "{err}"
         );
-        for options in [
-            json!({ "tls_fingerprint": PIN }),
-            json!({ "insecure_tls": true }),
-        ] {
-            let err = factory.validate(&rtsp, &options).unwrap_err();
-            assert!(err.to_string().contains("rtsps:// only"), "{err}");
-        }
-        // RFC 7826 §19.2 protects the RTSP session; media over plain UDP
-        // would leave it.
+        // Its media never leaves the TLS session: no transport to choose.
         let err = factory
             .validate(&rtsps, &json!({ "transport": "udp" }))
             .unwrap_err();
         assert!(
-            matches!(err, SourceConfigError::InvalidOptions { .. })
-                && err.to_string().contains("not available for rtsps://"),
+            matches!(
+                &err,
+                SourceConfigError::InvalidOptions {
+                    protocol: "rtsps",
+                    ..
+                }
+            ) && err.to_string().contains("unknown field `transport`"),
             "{err}"
-        );
-        assert!(
-            factory
-                .validate(&rtsps, &json!({ "transport": "tcp" }))
-                .is_ok()
         );
         let bad_host = SourceUrl::parse("rtsps://a!b/").unwrap();
         let err = factory.validate(&bad_host, &json!({})).unwrap_err();
         assert!(
-            matches!(err, SourceConfigError::InvalidUrl { .. })
-                && err.to_string().contains("TLS server name"),
+            matches!(
+                err,
+                SourceConfigError::InvalidUrl {
+                    protocol: "rtsps",
+                    ..
+                }
+            ) && err.to_string().contains("TLS server name"),
             "{err}"
         );
     }

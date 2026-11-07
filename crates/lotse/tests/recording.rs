@@ -211,7 +211,7 @@ impl Control {
     async fn put(&mut self, stream_id: &str, url: &str, preload: bool, prerecord_ms: u32) {
         let put = self
             .call(json!({ "type": "stream/put", "stream_id": stream_id,
-                          "sources": [{ "url": url }], "preload": preload,
+                          "sources": [lotse_testing::source(url, json!({}))], "preload": preload,
                           "prerecord_ms": prerecord_ms }))
             .await;
         assert_eq!(put, json!({ "created": true }));

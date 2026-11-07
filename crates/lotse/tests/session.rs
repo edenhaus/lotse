@@ -179,7 +179,7 @@ async fn closed(worker: &mut Worker) -> (String, String) {
 /// Runs the source until it is live, granting its attempt as the
 /// supervisor would.
 async fn run_camera(door: &mut FrontDoor, cam: &FakeCamera) {
-    run_camera_with(door, cam, "null").await;
+    run_camera_with(door, cam, "{}").await;
 }
 
 /// [`run_camera`] with the source's `options` (JSON).

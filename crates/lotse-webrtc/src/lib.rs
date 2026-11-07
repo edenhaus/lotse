@@ -10,7 +10,8 @@
 //! with signaling through `lotse_core::signaling`; its factory is
 //! [`ingest::WebRtcSourceFactory`], which the binary registers behind the
 //! `source-webrtc` feature.
-//! Depends on `lotse-core` and `lotse-codec` only, never on a source.
+//! Depends on `lotse-core`, `lotse-codec` and `lotse-api-types` (the
+//! `webrtc` source's fields, declared there once) only, never on a source.
 //!
 //! Standards: RFC 8829 (JSEP), RFC 3264, RFC 8445 (ICE; §6.1.2.2 remote
 //! candidates by address class), draft-ietf-mmusic-mdns-ice-candidates

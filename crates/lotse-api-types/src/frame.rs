@@ -210,11 +210,11 @@ mod tests {
             serde_json::to_value(Success::new(3, json!({ "created": true }))).unwrap(),
             json!({ "id": 3, "type": "result", "success": true, "result": { "created": true } })
         );
-        let failure = Failure::new(Some(3), ApiError::new(ErrorCode::SchemeUnsupported, "no"));
+        let failure = Failure::new(Some(3), ApiError::new(ErrorCode::ProtocolUnsupported, "no"));
         assert_eq!(
             serde_json::to_value(&failure).unwrap(),
             json!({ "id": 3, "type": "result", "success": false,
-                    "error": { "code": "scheme_unsupported", "message": "no" } })
+                    "error": { "code": "protocol_unsupported", "message": "no" } })
         );
         assert_eq!(
             serde_json::to_value(EventFrame::new(

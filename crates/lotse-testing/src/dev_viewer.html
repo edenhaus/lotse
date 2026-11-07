@@ -406,7 +406,7 @@ const call = (command) => new Promise((resolve) => send(command, resolve));
 
 // The source `stream/put` gets: the RTSP option `backchannel` only when
 // talk-back is on, so a camera without one never sees the request.
-const source = (url, talkback) => (talkback ? { url, options: { backchannel: true } } : { url });
+const source = (url, talkback) => ({ protocol: url.slice(0, url.indexOf("://")).toLowerCase(), url, ...(talkback ? { backchannel: true } : {}) });
 
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);

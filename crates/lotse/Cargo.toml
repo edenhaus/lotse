@@ -23,7 +23,7 @@ source-http = ["dep:lotse-http"] # the HTTP source factory: HLS and MPEG-TS over
 source-webrtc = ["dep:lotse-webrtc"] # the `webrtc` source factory: WebRTC cameras whose signaling the control-API client relays (`signaling/*`)
 output-webrtc = ["dep:lotse-webrtc"] # the WebRTC session output factory
 output-recording = ["dep:lotse-mux"] # the event recordings' fragmented MP4 container
-source-fake = ["lotse-core/test-util"] # the `fake://` source of lotse-core's fakes, for tests and development only
+source-fake = ["lotse-core/test-util", "lotse-api-types/test-util"] # the `fake` and `fake-signaled` sources of lotse-core's fakes, and their `stream/put` variants, for tests and development only
 
 [dependencies]
 anyhow = { workspace = true }

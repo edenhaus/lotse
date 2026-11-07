@@ -57,7 +57,7 @@ use tokio::net::UdpSocket;
 
 use super::engine::{IngestEnd, IngestEngine, IngestOutput, IngestTrack};
 use super::factory::PROTOCOL;
-use super::options::WebRtcOptions;
+use super::options::{WebRtcOptions, normalized};
 
 /// The receive buffer: a datagram above the path MTU does not come from
 /// a WebRTC peer, and one cut short fails its SRTP check.
@@ -82,13 +82,13 @@ impl Source for WebRtcSource {
         SourceDescriptor {
             protocol: PROTOCOL,
             url: None,
-            options: self.options.normalized(),
+            options: normalized(&self.options),
         }
     }
 
     /// Every option changes the offer, so the key is all of them.
     fn connection_options(&self) -> serde_json::Value {
-        self.options.normalized()
+        normalized(&self.options)
     }
 
     fn run(&self, ctx: SourceCtx) -> BoxFuture<'static, SourceError> {

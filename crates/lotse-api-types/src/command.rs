@@ -12,11 +12,12 @@ use crate::error::{ApiError, ErrorCode};
 #[cfg(feature = "schema")]
 use crate::limits::{ID_PATTERN, RECORDING_ID_PATTERN, SIGNAL_ERROR_CODE_PATTERN};
 use crate::limits::{
-    MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_PROTOCOL_CHARS, MAX_SDP_CHARS,
+    MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_SDP_CHARS,
     MAX_SIGNAL_ERROR_CODE_CHARS, MAX_SOURCES, MAX_TEXT_CHARS, MAX_URL_CHARS,
 };
 use crate::session::IceServer;
-use crate::stream::{AudioMode, Orientation, SourceSpec};
+use crate::source::{SourceSpec, TlsTrust};
+use crate::stream::{AudioMode, Orientation};
 
 /// `ping`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,7 +483,7 @@ pub enum Command {
     #[serde(rename = "ping")]
     #[cfg_attr(feature = "schema", schemars(title = "PingCommand"))]
     Ping(Ping),
-    /// `info`: version, build, schemes, outputs, codecs, limits and sandbox.
+    /// `info`: version, build, protocols, outputs, codecs, limits and sandbox.
     #[serde(rename = "info")]
     #[cfg_attr(feature = "schema", schemars(title = "InfoCommand"))]
     Info(Info),
@@ -840,14 +841,13 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             cap_stream_id(&put.stream_id)?;
             cap_items("sources", put.sources.len(), MAX_SOURCES)?;
             for source in &put.sources {
-                match source {
-                    SourceSpec::Url(source) => {
-                        cap_chars("sources[].url", &source.url, MAX_URL_CHARS)?;
-                    }
-                    SourceSpec::Signaled(source) => {
-                        cap_chars("sources[].protocol", &source.protocol, MAX_PROTOCOL_CHARS)?;
-                    }
-                }
+                cap_chars(
+                    "sources[].url",
+                    source.url().unwrap_or_default(),
+                    MAX_URL_CHARS,
+                )?;
+                let pin = source.tls().and_then(TlsTrust::pin).unwrap_or_default();
+                cap_chars("sources[].tls.pin", pin, MAX_PIN_CHARS)?;
             }
         }
         Command::WebrtcOffer(offer) => {
@@ -1027,8 +1027,8 @@ mod tests {
     fn stream_put_parses_from_the_contract_shape() {
         let put = parse_command(
             r#"{ "id": 3, "type": "stream/put", "stream_id": "front",
-                 "sources": [ { "url": "rtsp://user:pass@192.168.1.10:554/h264",
-                                "options": { "transport": "tcp" } } ],
+                 "sources": [ { "protocol": "rtsp", "url": "rtsp://user:pass@192.168.1.10:554/h264",
+                                "transport": "udp" } ],
                  "preload": true, "audio": "off", "orientation": "rotate_left" }"#,
         )
         .unwrap();
@@ -1038,7 +1038,7 @@ mod tests {
             (put.id, put.stream_id.as_str(), put.preload, put.audio),
             (3, "front", true, AudioMode::Off)
         );
-        assert_eq!(put.sources[0].options()["transport"], "tcp");
+        assert_eq!(put.sources[0].options()["transport"], "udp");
         assert_eq!(put.orientation, Orientation::RotateLeft);
     }
 
@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn the_fields_a_command_leaves_out_take_their_defaults() {
         let minimal = parse_command(
-            r#"{"id":1,"type":"stream/put","stream_id":"x","sources":[{"url":"rtsp://c/"}]}"#,
+            r#"{"id":1,"type":"stream/put","stream_id":"x","sources":[{"protocol":"webrtc"}]}"#,
         )
         .unwrap();
         let_assert!(Command::StreamPut(minimal) = minimal);
@@ -1146,7 +1146,7 @@ mod tests {
             !minimal.preload
                 && minimal.audio == AudioMode::Auto
                 && minimal.orientation == Orientation::NoTransform
-                && minimal.sources[0].options().is_empty()
+                && minimal.sources[0].options()["audio"] == true
                 && minimal.prerecord_ms == 0
         );
         // A client may send only the offer and the stream; the rest defaults.
@@ -1371,7 +1371,7 @@ mod tests {
     fn a_put_keeps_a_pre_record_window_only_when_it_asks_for_one() {
         let_assert!(
             Command::StreamPut(put) = parse_command(
-                r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"url":"rtsp://c/"}],"prerecord_ms":30000}"#
+                r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"protocol":"rtsp","url":"rtsp://c/"}],"prerecord_ms":30000}"#
             )
             .unwrap()
         );
@@ -1397,7 +1397,8 @@ mod tests {
     fn every_string_and_list_input_is_capped_at_its_limit_and_no_further() {
         let text = |n: usize| "x".repeat(n);
         let put = |sources: usize, url: usize| {
-            let source = json!({ "url": format!("rtsp://c/{}", text(url - 9)) });
+            let source =
+                json!({ "protocol": "rtsp", "url": format!("rtsp://c/{}", text(url - 9)) });
             json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": vec![source; sources] })
         };
         let server = |urls: usize, url: usize, username: usize, credential: usize| json!({ "urls": vec![text(url); urls], "username": text(username), "credential": text(credential) });
@@ -1406,11 +1407,11 @@ mod tests {
         let renegotiate = |session: usize, sdp: usize| json!({ "id": 1, "type": "webrtc/renegotiate", "session_id": text(session), "sdp": text(sdp) });
         let at_cap = server(MAX_ICE_URLS, MAX_TEXT_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS);
         let remove = |pin: usize| json!({ "id": 1, "type": "clients/remove", "pin": text(pin) });
-        let signaled = |protocol: usize| json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [{ "protocol": text(protocol) }] });
+        let pinned = |pin: usize| json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [{ "protocol": "https", "url": "https://c/", "tls": { "pin": text(pin) } }] });
         let accepted = [
             remove(MAX_PIN_CHARS),
             put(MAX_SOURCES, MAX_URL_CHARS),
-            signaled(MAX_PROTOCOL_CHARS),
+            pinned(MAX_PIN_CHARS),
             offer(MAX_SDP_CHARS, vec![at_cap.clone(); MAX_ICE_SERVERS]),
             candidate(MAX_ID_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS),
             renegotiate(MAX_ID_CHARS, MAX_SDP_CHARS),
@@ -1422,7 +1423,7 @@ mod tests {
             (remove(MAX_PIN_CHARS + 1), "pin"),
             (put(MAX_SOURCES + 1, 10), "sources"),
             (put(1, MAX_URL_CHARS + 1), "sources[].url"),
-            (signaled(MAX_PROTOCOL_CHARS + 1), "sources[].protocol"),
+            (pinned(MAX_PIN_CHARS + 1), "sources[].tls.pin"),
             (offer(MAX_SDP_CHARS + 1, vec![]), "sdp"),
             (offer(1, vec![at_cap; MAX_ICE_SERVERS + 1]), "ice_servers"),
             (
@@ -1548,7 +1549,7 @@ mod tests {
         let id = |n: usize| "x".repeat(n);
         let frames = |n: usize| {
             [
-                json!({ "id": 1, "type": "stream/put", "stream_id": id(n), "sources": [{ "url": "rtsp://c/" }] }),
+                json!({ "id": 1, "type": "stream/put", "stream_id": id(n), "sources": [{ "protocol": "rtsp", "url": "rtsp://c/" }] }),
                 json!({ "id": 1, "type": "stream/get", "stream_id": id(n) }),
                 json!({ "id": 1, "type": "stream/delete", "stream_id": id(n) }),
                 json!({ "id": 1, "type": "stream/subscribe", "stream_id": id(n) }),
@@ -1608,7 +1609,7 @@ mod tests {
             "{message}"
         );
         let message = refused(
-            r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"url":"x"}],"audio":"secret"}"#,
+            r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"protocol":"rtsp","url":"x"}],"audio":"secret"}"#,
         );
         assert!(
             message.starts_with("unknown variant, expected `auto` or `off`"),
@@ -1721,7 +1722,7 @@ mod tests {
         let err = parse_command(r#"{"id": -1, "type": "ping"}"#).unwrap_err();
         assert_eq!((err.id, err.error.code), (None, ErrorCode::InvalidRequest));
 
-        let err = parse_command(r#"{"id": 8, "type": "stream/put", "stream_id": "x", "sources": [{"url": "rtsp://c/", "opt": 1}]}"#).unwrap_err();
+        let err = parse_command(r#"{"id": 8, "type": "stream/put", "stream_id": "x", "sources": [{"protocol": "rtsp", "url": "rtsp://c/", "opt": 1}]}"#).unwrap_err();
         assert!(err.error.message.contains("opt"), "{}", err.error.message);
         assert_eq!(
             err.error.to_string(),

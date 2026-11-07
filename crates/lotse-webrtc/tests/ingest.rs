@@ -1770,14 +1770,14 @@ mod source {
     async fn without_a_relay_or_with_the_open_refused_the_source_is_unreachable() {
         let _logs = logs();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let running = start(serde_json::Value::Null, None, Arc::clone(&clock));
+        let running = start(serde_json::json!({}), None, Arc::clone(&clock));
         assert_eq!(
             within(running.run).await.unwrap(),
             SourceError::Unreachable("webrtc: no signaling relay to the client".into())
         );
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         signaling.refuse_next("no_signaling_client", "nobody relays it");
-        let running = start(serde_json::Value::Null, Some(signaling.clone()), clock);
+        let running = start(serde_json::json!({}), Some(signaling.clone()), clock);
         assert_eq!(
             within(running.run).await.unwrap(),
             SourceError::Unreachable(
@@ -1792,7 +1792,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -1809,7 +1809,7 @@ mod source {
         // TEST-NET-1: no interface has it.
         let signaling = FakeSignaling::new(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -1973,7 +1973,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -2000,7 +2000,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -2033,7 +2033,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -2117,7 +2117,7 @@ mod source {
         let clock = Arc::new(FakeClock::from_system());
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             clock.clone(),
         );
@@ -2147,7 +2147,7 @@ mod source {
         let clock = Arc::new(FakeClock::from_system());
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             clock.clone(),
         );
@@ -2171,7 +2171,7 @@ mod source {
             let clock = Arc::new(FakeClock::from_system());
             let signaling = FakeSignaling::new(vec![LOOPBACK]);
             let running = start(
-                serde_json::Value::Null,
+                serde_json::json!({}),
                 Some(signaling.clone()),
                 clock.clone(),
             );
@@ -2205,7 +2205,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -2232,7 +2232,7 @@ mod source {
             .collect();
         let signaling = FakeSignaling::new(hosts);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -2310,7 +2310,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -2603,7 +2603,7 @@ mod source {
         // A failure while the signals wait unread.
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -2629,7 +2629,7 @@ mod source {
             let clock = Arc::new(FakeClock::from_system());
             let signaling = FakeSignaling::new(vec![LOOPBACK]);
             let running = start(
-                serde_json::Value::Null,
+                serde_json::json!({}),
                 Some(signaling.clone()),
                 clock.clone(),
             );
@@ -2664,7 +2664,7 @@ mod source {
         let clock = Arc::new(FakeClock::from_system());
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::Value::Null,
+            serde_json::json!({}),
             Some(signaling.clone()),
             clock.clone(),
         );

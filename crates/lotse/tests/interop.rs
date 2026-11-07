@@ -294,7 +294,7 @@ async fn interop(transport: Transport, audio: Audio) {
         .command(json!({
             "type": "stream/put",
             "stream_id": STREAM,
-            "sources": [{ "url": camera.url(), "options": { "transport": transport.name() } }],
+            "sources": [lotse_testing::source(&camera.url(), json!({ "transport": transport.name() }))],
             "preload": true,
         }))
         .await
@@ -410,7 +410,7 @@ async fn mediamtx_rfc2326_10_7_a_failed_udp_attempt_is_torn_down() {
         .command(json!({
             "type": "stream/put",
             "stream_id": STREAM,
-            "sources": [{ "url": camera.url(), "options": { "transport": "udp", "timeout_ms": 1500 } }],
+            "sources": [lotse_testing::source(&camera.url(), json!({ "transport": "udp", "timeout_ms": 1500 }))],
             "preload": true,
         }))
         .await
@@ -541,7 +541,7 @@ mod http {
             .command(json!({
                 "type": "stream/put",
                 "stream_id": STREAM,
-                "sources": [{ "url": url, "options": options }],
+                "sources": [lotse_testing::source(url, options.clone())],
                 "preload": true,
             }))
             .await
@@ -552,7 +552,10 @@ mod http {
     /// by its arrival.
     fn check_live_http(stream: &Value, audio: Audio) {
         check_live(stream, audio);
-        assert_eq!(stream["sources"][0]["protocol"], "http", "{stream}");
+        assert_eq!(
+            stream["sources"][0]["source"]["protocol"], "http",
+            "{stream}"
+        );
         let tracks = stream["tracks"].as_array().expect("tracks");
         assert!(tracks.iter().all(|t| t["sync"] == "arrival"), "{stream}");
     }
@@ -645,7 +648,7 @@ mod http {
         let url = camera.hls_url().expect("HLS");
         let options = certificate.as_ref().map_or_else(
             || json!({}),
-            |c| json!({ "tls_fingerprint": c.fingerprint() }),
+            |c| json!({ "tls": { "pin": c.fingerprint() } }),
         );
         let (daemon, control) = daemon(&format!("hls-{}-{}", variant.name(), audio.name())).await;
         put(&control, &url, options).await;
@@ -873,7 +876,7 @@ mod recording {
             .command(json!({
                 "type": "stream/put",
                 "stream_id": STREAM,
-                "sources": [{ "url": camera.url() }],
+                "sources": [lotse_testing::source(&camera.url(), json!({}))],
                 "preload": true,
                 "prerecord_ms": WINDOW_MS,
             }))
