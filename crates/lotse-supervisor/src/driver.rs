@@ -678,8 +678,13 @@ impl Driver {
         self.stop_all().await;
     }
 
-    /// Waits for the next thing to happen.
+    /// Waits for the next thing to happen. A signaling wait that is over
+    /// comes right after demand, ahead of the worker's events and the
+    /// commands: those can be ready on every turn, and the biased select
+    /// would otherwise keep the wait's timer from ever being polled, so an
+    /// open without a subscriber would wait past [`SIGNAL_WAIT`].
     async fn wait(&mut self) -> Wake {
+        let signal_due = self.signal_wait_due();
         let Self {
             demand,
             commands,
@@ -701,6 +706,7 @@ impl Driver {
             changed = demand.changed() => {
                 Wake::Demand(changed.ok().map(|()| *demand.borrow_and_update()))
             }
+            () = std::future::ready(()), if signal_due => Wake::SignalWaited,
             event = next_worker_event(worker) => Wake::Worker(event),
             wake = connect.wait() => Wake::Connect(wake),
             wake = switch_connect.wait() => Wake::SwitchConnect(wake),
@@ -1236,6 +1242,15 @@ impl Driver {
         for request in expired {
             self.to_registry(SignalReport::Cancel { request });
         }
+    }
+
+    /// Whether a wait of `signal_opens` is over now and still to be ended.
+    fn signal_wait_due(&self) -> bool {
+        let now = self.shared.clock.now();
+        self.signal_opens
+            .values()
+            .filter_map(PendingOpen::wait_end)
+            .any(|end| end <= now)
     }
 
     /// Times the earliest wait of `signal_opens` still to end; none when
@@ -4736,6 +4751,41 @@ mod tests {
         drop(driver);
         let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Regression: a signaling wait that is over ends ahead of commands
+    /// ready in the queue (and so of worker events, polled before them),
+    /// which the biased select would otherwise take on every turn while
+    /// they keep coming; demand still comes first.
+    #[tokio::test]
+    async fn a_signal_wait_that_is_over_ends_before_ready_commands() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 1 }));
+        clock.advance(SIGNAL_WAIT.checked_sub(Duration::from_millis(1)).unwrap());
+        assert!(!driver.signal_wait_due(), "not over yet");
+        clock.advance(Duration::from_millis(1));
+        assert!(driver.signal_wait_due());
+        driver
+            .commands_tx
+            .try_send(DriverCommand::Prerecord { ms: 0 })
+            .unwrap();
+        demand_tx.send_replace(PRELOAD);
+        assert!(matches!(driver.wait().await, Wake::Demand(Some(_))));
+        assert!(matches!(driver.wait().await, Wake::SignalWaited));
+        driver.handle(Wake::SignalWaited).await;
+        assert!(
+            !driver.signal_opens[&1].waiting,
+            "refused, its answer queued"
+        );
+        assert!(!driver.signal_wait_due());
+        assert!(matches!(
+            driver.wait().await,
+            Wake::Command(DriverCommand::Prerecord { ms: 0 })
+        ));
+        drop(driver);
     }
 
     /// An open the registry no longer holds when its wait ends (a
