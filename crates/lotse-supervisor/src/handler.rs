@@ -36,12 +36,15 @@ use lotse_api_types::info::{
 };
 use lotse_api_types::recording::{RecordingCloseReason, RecordingCreateResult, recording_path};
 use lotse_api_types::session::{CloseCode, SessionEvent, SessionList, WebrtcRenegotiateResult};
-use lotse_api_types::stream::{AudioMode, BackchannelReleaseResult, StreamList, StreamPutResult};
+use lotse_api_types::stream::{
+    AudioMode, BackchannelReleaseResult, SignaledSource, SourceSpec, StreamList, StreamPutResult,
+    UrlSource,
+};
 use lotse_core::clock::Clock;
 use lotse_core::codec::{CodecFamily, Kind};
 use lotse_core::connection::{ConnectionConfig, ConnectionError, ConnectionState};
 use lotse_core::id::{RecordingId, StreamId};
-use lotse_core::registry::{Registries, SourceRegistry};
+use lotse_core::registry::Registries;
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_ipc::{RecordingSpec, SessionSpec};
@@ -60,8 +63,8 @@ use crate::recording::{
     RECORDING_QUEUE, RecordingEntry, RecordingLimits, RecordingOwner, RecordingTimer,
 };
 use crate::registry::{
-    CloseBy, ConnectionEntry, ConnectionKey, ConnectionSnapshot, Shared, State, StreamEntry,
-    StreamSource, Talker,
+    CloseBy, ConnectionEntry, ConnectionKey, ConnectionSnapshot, Shared, SourceTarget, State,
+    StreamEntry, StreamSource, Talker,
 };
 use crate::session::{
     MAX_EARLY_CANDIDATES, MAX_REMOTE_CANDIDATES, SESSION_QUEUE, SessionEntry, api_event,
@@ -153,14 +156,15 @@ pub struct FrontDoor {
 
 /// A source of `stream/put` after validation.
 struct ValidatedSource {
-    /// The parsed URL.
-    url: SourceUrl,
-    /// The URL as given, credentials included, for the worker.
-    raw: String,
+    /// The parsed URL, or the signaled source's protocol and stream.
+    target: SourceTarget,
+    /// The URL as given, credentials included, or the protocol, for the
+    /// worker.
+    raw: lotse_ipc::SourceTarget,
     /// The options as given.
     options: serde_json::Map<String, serde_json::Value>,
-    /// What the connection is keyed by: the URL, credentials included, and
-    /// the source's normalized connection options.
+    /// What the connection is keyed by: the target, credentials included,
+    /// and the source's normalized connection options.
     key: ConnectionKey,
     /// The options as the source reports them, secrets redacted.
     described: serde_json::Value,
@@ -171,20 +175,16 @@ struct ValidatedSource {
     /// The source asks for the camera's backchannel
     /// ([`Source::wants_backchannel`](lotse_core::source::Source::wants_backchannel)).
     backchannel: bool,
-    /// The source's signaling is the control-API client's to relay
-    /// (`SourceCapabilities::signaled`): no host to look up, no port.
-    signaled: bool,
 }
 
 impl ValidatedSource {
     /// The port the source's worker may connect to, from the URL or the
     /// scheme's default; none for a signaled source, which connects to
-    /// what the client's signaling names, never to its URL.
+    /// what the client's signaling names.
     fn port(&self) -> Option<u16> {
-        if self.signaled {
-            return None;
-        }
-        self.url.port().or(self.default_port)
+        self.target
+            .url()
+            .and_then(|url| url.port().or(self.default_port))
     }
 }
 
@@ -315,6 +315,13 @@ impl Supervisor {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            signaled_protocols: self
+                .registries
+                .sources
+                .signaled_protocols()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             outputs: self.outputs(),
             features: self.features(),
             codecs: Codecs {
@@ -422,42 +429,113 @@ impl Supervisor {
         }
     }
 
-    /// Checks a source's URL, scheme and options with the scheme's factory.
+    /// Checks a source of `stream_id` with its factory: a URL's scheme and
+    /// options with the scheme's, a signaled source's options with its
+    /// protocol's.
     fn validate_source(
         &self,
-        source: &lotse_api_types::stream::SourceSpec,
+        stream_id: &StreamId,
+        source: &SourceSpec,
     ) -> Result<ValidatedSource, ApiError> {
+        match source {
+            SourceSpec::Url(source) => self.validate_url_source(source),
+            SourceSpec::Signaled(source) => self.validate_signaled_source(stream_id, source),
+        }
+    }
+
+    /// Checks a source lotse connects to: its URL, its scheme, which must
+    /// be no signaled protocol, and its options.
+    fn validate_url_source(&self, source: &UrlSource) -> Result<ValidatedSource, ApiError> {
         let url = SourceUrl::parse(&source.url).map_err(|err| {
             ApiError::new(ErrorCode::InvalidRequest, format!("source url: {err}"))
         })?;
-        let factory = self.registries.sources.get(url.scheme()).ok_or_else(|| {
-            ApiError::new(
+        let sources = &self.registries.sources;
+        let Some(factory) = sources.get(url.scheme()) else {
+            if sources.signaled(url.scheme()).is_some() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "a {0} source has no url: the client relays its signaling, so name it by protocol, {{\"protocol\": \"{0}\"}}",
+                        url.scheme()
+                    ),
+                )
+                .with_detail("protocol", url.scheme()));
+            }
+            return Err(ApiError::new(
                 ErrorCode::SchemeUnsupported,
                 format!("no source handles {:?} urls", url.scheme()),
             )
-            .with_detail("scheme", url.scheme())
-        })?;
+            .with_detail("scheme", url.scheme()));
+        };
         let options = serde_json::Value::Object(source.options.clone());
         let built = factory
             .validate(&url, &options)
             .map_err(|err| ApiError::new(ErrorCode::InvalidRequest, err.to_string()))?;
         let described = built.describe();
-        let backchannel = built.wants_backchannel();
-        let signaled = factory.capabilities().signaled;
         let default_port = factory.default_port(url.scheme());
+        let target = SourceTarget::Url(url);
         Ok(ValidatedSource {
             key: ConnectionKey {
-                url: url.clone(),
+                target: target.clone(),
                 options: built.connection_options(),
             },
-            url,
-            raw: source.url.clone(),
+            target,
+            raw: lotse_ipc::SourceTarget::Url(source.url.clone()),
             options: source.options.clone(),
             described: described.options,
             protocol: described.protocol,
             default_port,
-            backchannel,
-            signaled,
+            backchannel: built.wants_backchannel(),
+        })
+    }
+
+    /// Checks a source of `stream_id` whose signaling the client relays:
+    /// its protocol, which must be no URL scheme, and its options. Its
+    /// stream is its identity.
+    fn validate_signaled_source(
+        &self,
+        stream_id: &StreamId,
+        source: &SignaledSource,
+    ) -> Result<ValidatedSource, ApiError> {
+        let sources = &self.registries.sources;
+        let protocol = source.protocol.as_str();
+        let Some(factory) = sources.signaled(protocol) else {
+            if sources.get(protocol).is_some() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "a {protocol} source is named by its url, {{\"url\": \"{protocol}://…\"}}, not by protocol"
+                    ),
+                )
+                .with_detail("scheme", protocol));
+            }
+            return Err(ApiError::new(
+                ErrorCode::ProtocolUnsupported,
+                format!("no signaled source speaks {protocol:?}"),
+            )
+            .with_detail("protocol", protocol));
+        };
+        let options = serde_json::Value::Object(source.options.clone());
+        let built = factory
+            .validate(&options)
+            .map_err(|err| ApiError::new(ErrorCode::InvalidRequest, err.to_string()))?;
+        let described = built.describe();
+        let target = SourceTarget::Signaled {
+            protocol: factory.protocol(),
+            stream: stream_id.as_str().to_owned(),
+        };
+        Ok(ValidatedSource {
+            key: ConnectionKey {
+                target: target.clone(),
+                options: built.connection_options(),
+            },
+            target,
+            raw: lotse_ipc::SourceTarget::Signaled(factory.protocol().to_owned()),
+            options: source.options.clone(),
+            described: described.options,
+            protocol: described.protocol,
+            default_port: None,
+            backchannel: built.wants_backchannel(),
         })
     }
 
@@ -600,7 +678,7 @@ impl Supervisor {
         let validated = put
             .sources
             .iter()
-            .map(|source| self.validate_source(source))
+            .map(|source| self.validate_source(&stream_id, source))
             .collect::<Result<Vec<_>, _>>()?;
         Ok((stream_id, validated))
     }
@@ -623,13 +701,13 @@ impl Supervisor {
                 Some(id) => id,
                 None => match previous
                     .get(index)
-                    .filter(|id| switchable(state, &self.registries.sources, id, &source))
+                    .filter(|id| switchable(state, id, &source))
                 {
                     Some(id) => {
                         tracing::info!(
                             stream.id = %stream_id,
                             connection.id = %id,
-                            url = %source.url,
+                            source = %source.target,
                             "stream/put: the connection switches to the new source in place"
                         );
                         state.switch_connection(id, source.key.clone(), driver_spec(id, &source));
@@ -643,7 +721,7 @@ impl Supervisor {
             }
             sources.push(StreamSource {
                 spec: driver_spec(&connection, &source),
-                url: source.url,
+                target: source.target,
                 options: source.options,
                 protocol: source.protocol,
                 connection,
@@ -693,7 +771,7 @@ impl Supervisor {
             linger: self.settings.linger,
             ..ConnectionConfig::default()
         };
-        let span = tracing::info_span!("connection", connection.id = %id, url = %source.url);
+        let span = tracing::info_span!("connection", connection.id = %id, source = %source.target);
         let run = Driver::new(
             (spec, prerecord_ms),
             Arc::clone(&self.shared),
@@ -704,7 +782,7 @@ impl Supervisor {
         .run()
         .instrument(span);
         let _handle = spawn_named("connection.driver", self.shared.tracker.track_future(run));
-        tracing::info!(connection.id = %id, url = %source.url, options = %source.described, "connection created");
+        tracing::info!(connection.id = %id, source = %source.target, options = %source.described, "connection created");
         id
     }
 
@@ -1234,9 +1312,10 @@ impl Supervisor {
             .sources
             .iter()
             .filter(|source| {
-                self.registries
-                    .sources
-                    .get(source.url.scheme())
+                source
+                    .target
+                    .url()
+                    .and_then(|url| self.registries.sources.get(url.scheme()))
                     .is_some_and(|factory| factory.capabilities().backchannel)
             })
             .filter_map(|source| state.connections.get(&source.connection))
@@ -1601,7 +1680,7 @@ fn unchanged(entry: &StreamEntry, put: &StreamPut, validated: &[ValidatedSource]
             .sources
             .iter()
             .zip(validated)
-            .all(|(a, b)| a.url == b.url && a.options == b.options)
+            .all(|(a, b)| a.target == b.target && a.options == b.options)
 }
 
 /// `source_in_use` when a source of `stream_id`'s put is another stream's
@@ -1613,19 +1692,19 @@ fn source_in_use(
     validated: &[ValidatedSource],
 ) -> Option<ApiError> {
     validated.iter().find_map(|source| {
-        let other = state.stream_with_source(stream_id, &source.url)?;
+        let url = source.target.url()?;
+        let other = state.stream_with_source(stream_id, url)?;
         tracing::info!(
             stream.id = %stream_id,
             other.id = %other,
-            url = %source.url,
+            url = %url,
             "stream/put refused: the source is another stream's"
         );
         Some(
             ApiError::new(
                 ErrorCode::SourceInUse,
                 format!(
-                    "{} is already the source of stream {other}; use that stream id, or put {other} with the new source",
-                    source.url
+                    "{url} is already the source of stream {other}; use that stream id, or put {other} with the new source"
                 ),
             )
             .with_detail("stream_id", other),
@@ -1637,27 +1716,27 @@ fn source_in_use(
 fn driver_spec(id: &str, source: &ValidatedSource) -> DriverSpec {
     DriverSpec {
         connection_id: id.to_owned(),
-        url: source.raw.clone(),
+        target: source.raw.clone(),
         options: serde_json::Value::Object(source.options.clone()).to_string(),
-        host: source.url.host().to_owned(),
+        host: source
+            .target
+            .url()
+            .map(|url| url.host().to_owned())
+            .unwrap_or_default(),
         port: source.port(),
         backchannel: source.backchannel,
-        signaled: source.signaled,
     }
 }
 
 /// Whether connection `id` can switch to `source` in place, keeping its
 /// worker and so its sessions: the worker's sandbox is pinned to the port
 /// it may connect to, so a source on another port needs a new worker. A
-/// signaled source, which `sources` says the connection's or `source`'s
-/// scheme is, never switches in place: its standby would be a second
-/// signal of one camera, offered while the first still streams.
-fn switchable(state: &State, sources: &SourceRegistry, id: &str, source: &ValidatedSource) -> bool {
+/// signaled source never switches in place, to or from: its standby would
+/// be a second signal of one camera, offered while the first still
+/// streams.
+fn switchable(state: &State, id: &str, source: &ValidatedSource) -> bool {
     state.connections.get(id).is_some_and(|entry| {
-        let signaled = sources
-            .get(entry.key.url.scheme())
-            .is_some_and(|factory| factory.capabilities().signaled);
-        !signaled && !source.signaled && entry.port == source.port()
+        !entry.key.target.signaled() && !source.target.signaled() && entry.port == source.port()
     })
 }
 
@@ -2063,6 +2142,7 @@ mod tests {
         assert_eq!(hello.features, ["session_adopt"]);
         let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
         assert_eq!(info["schemes"], json!(["fake"]));
+        assert_eq!(info["signaled_protocols"], json!(["fake-signaled"]));
         assert_eq!(info["build"]["target"], "test");
         // Only what an output can play: MJPEG is ingested and reported per
         // track, but no output negotiates it.
@@ -3581,21 +3661,88 @@ mod tests {
         s.shutdown().await;
     }
 
+    /// `stream/put` with a signaled source: `{"protocol": ...}`.
+    fn put_signaled(stream_id: &str, protocol: &str, options: &Value) -> String {
+        json!({ "id": 1, "type": "stream/put", "stream_id": stream_id,
+                "sources": [{ "protocol": protocol, "options": options }] })
+        .to_string()
+    }
+
+    /// A signaled source is named by its protocol, a URL source by its
+    /// URL, and each form is refused for the other, saying which it
+    /// needs; an unknown protocol is `protocol_unsupported`.
+    #[tokio::test]
+    async fn a_signaled_source_is_named_by_protocol_and_a_url_source_by_url() {
+        let s = supervisor("/bin/sh", Arc::new(SystemClock));
+        let err = error(call(&s, &put("a", "fake-signaled://camera.front_door", false)).await);
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert_eq!(err.details["protocol"], "fake-signaled");
+        assert_eq!(
+            err.message,
+            r#"a fake-signaled source has no url: the client relays its signaling, so name it by protocol, {"protocol": "fake-signaled"}"#
+        );
+        let err = error(call(&s, &put_signaled("a", "fake", &json!({}))).await);
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert_eq!(err.details["scheme"], "fake");
+        assert_eq!(
+            err.message,
+            r#"a fake source is named by its url, {"url": "fake://…"}, not by protocol"#
+        );
+        let err = error(call(&s, &put_signaled("a", "webrtc", &json!({}))).await);
+        assert_eq!(err.code, ErrorCode::ProtocolUnsupported);
+        assert_eq!(err.details["protocol"], "webrtc");
+        assert_eq!(err.message, r#"no signaled source speaks "webrtc""#);
+        let err = error(
+            call(
+                &s,
+                &put_signaled("a", "fake-signaled", &json!({ "audio": true })),
+            )
+            .await,
+        );
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert!(
+            err.message
+                .contains("fake signaled source takes no options"),
+            "{err}"
+        );
+        // Two streams each have their own: no source is another's.
+        for stream in ["a", "b"] {
+            let put = put_signaled(stream, "fake-signaled", &json!({}));
+            assert_eq!(result(call(&s, &put).await)["created"], true);
+            assert_eq!(result(call(&s, &put).await)["created"], false, "unchanged");
+        }
+        let a = result(call(&s, r#"{"id":1,"type":"stream/get","stream_id":"a"}"#).await);
+        let reported = &a["sources"][0];
+        assert_eq!(reported["protocol"], "fake-signaled");
+        assert!(reported.get("url").is_none(), "no address: {reported}");
+        let (a, b, key) = {
+            let state = s.shared.lock();
+            let a = state.streams["a"].sources[0].clone();
+            let key = format!("{:?}", state.connections[&a.connection].key);
+            (a, state.streams["b"].sources[0].clone(), key)
+        };
+        assert_ne!(a.connection, b.connection);
+        assert_eq!(
+            key,
+            r#"ConnectionKey { target: fake-signaled of stream a, options: ["signaled"] }"#
+        );
+        assert_eq!(
+            a.spec.target,
+            lotse_ipc::SourceTarget::Signaled("fake-signaled".into())
+        );
+        assert_eq!((a.spec.host.as_str(), a.spec.port), ("", None));
+        s.shutdown().await;
+    }
+
     /// A signaled source has no port to pin its worker to, and a
     /// connection never switches to or from one in place: each is a new
     /// connection.
     #[tokio::test]
     async fn a_signaled_source_has_no_port_and_never_switches_in_place() {
         let dir = private_dir("signaled-switch");
-        let mut environment = environment(&blocking_worker(&dir));
-        environment
-            .registries
-            .sources
-            .register(Arc::new(FakeSourceFactory::signaled(&["webrtc"])))
-            .unwrap();
         let s = Supervisor::new(
             settings(PathBuf::from("/nonexistent/lotse.sock")),
-            environment,
+            environment(&blocking_worker(&dir)),
             Arc::new(SystemClock),
         );
         let captured = Captured::default();
@@ -3610,14 +3757,19 @@ mod tests {
         let mut connections = Vec::new();
         for url in [
             "fake://127.0.0.1/",
-            "webrtc://camera.front_door:9",
+            "fake-signaled",
             "fake://127.0.0.1/other",
             "fake://127.0.0.1/again",
         ] {
-            result(call(&s, &put("front", url, false)).await);
+            let signaled = !url.contains("://");
+            let put = if signaled {
+                put_signaled("front", url, &json!({}))
+            } else {
+                put("front", url, false)
+            };
+            result(call(&s, &put).await);
             let (connection, spec, port) = source(&s);
-            let signaled = url.starts_with("webrtc:");
-            assert_eq!(spec.signaled, signaled, "{url}");
+            assert_eq!(spec.signaled(), signaled, "{url}");
             assert_eq!((spec.port, port), (None, None), "{url}");
             connections.push(connection);
         }
@@ -4521,7 +4673,10 @@ mod tests {
             let validated: Vec<ValidatedSource> = put
                 .sources
                 .iter()
-                .map(|source| s.validate_source(source).unwrap())
+                .map(|source| {
+                    s.validate_source(&StreamId::new(&put.stream_id).unwrap(), source)
+                        .unwrap()
+                })
                 .collect();
             (put, validated)
         };
