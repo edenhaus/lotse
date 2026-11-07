@@ -11,6 +11,8 @@ exclude_globs = [
 # Equivalent mutants: mutations that cannot change behavior, each with its reason.
 # Keep this list short and delete entries with the code they refer to.
 exclude_re = [
+    # The NTP seconds are shifted above the 32-bit fraction, so `|` and `^` produce the same value.
+    "ingest/engine.rs:.*replace \\| with \\^ in ntp64$",
     # The default body already returns `None`.
     "replace Handler::unsubscribed -> Option<Event> with None",
     # The default body already returns an empty list.
