@@ -32,12 +32,13 @@
 //! §5.1's 30 s). The data channel (RFC 8831, RFC 8832) is opened, its
 //! messages counted and dropped.
 //!
-//! Every format the answer accepts on an m-line in a codec lotse carries
-//! is the camera's to send in (RFC 3264 §7): a packet in another of them
-//! than the one declared goes to the same track when it is the same codec
-//! (another H.264 profile or packetization mode, which the in-band
-//! parameter sets describe), else the track switches to its codec
-//! ([`IngestOutput::Switched`]).
+//! Every format the answer accepts on an m-line is the camera's to send in
+//! (RFC 3264 §7). A track carries one codec, the one the answer accepted
+//! first that lotse carries: a packet in another accepted format of that
+//! codec (another H.264 profile or packetization mode, which the in-band
+//! parameter sets describe) goes to the same track; one in another codec
+//! is dropped, counted and logged (`SPEC-DEVIATION`, at
+//! `IngestEngine::negotiated`).
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -155,11 +156,6 @@ pub enum IngestOutput {
     Tracks(Vec<IngestTrack>),
     /// ICE and DTLS are up: the source is ready, its media due.
     Connected,
-    /// The camera sends the track under `index` in another of the
-    /// formats the answer accepted on its m-line, of another codec than
-    /// the one carried (RFC 3264 §7): the track carries `declared` in
-    /// payload type `pt` from this packet on, which follows.
-    Switched(IngestTrack),
     /// An RTP packet of the track carried under `index`, arrived at
     /// `arrival`.
     Rtp {
@@ -195,12 +191,9 @@ pub struct IngestStats {
     pub rtp_packets: u64,
     /// RTP packets of no negotiated track or payload type, dropped.
     pub foreign_packets: u64,
-    /// RTP packets of another format than the track carries that came
-    /// late (older than the newest of their source), dropped: they do not
-    /// switch the track back.
-    pub late_packets: u64,
-    /// The times the camera switched a track's codec.
-    pub switches: u64,
+    /// RTP packets in a format the answer accepted of another codec than
+    /// their track's, dropped.
+    pub other_codec_packets: u64,
     /// Sender Reports handed on.
     pub sender_reports: u64,
     /// Sender Reports without a wallclock time, dropped.
@@ -242,13 +235,11 @@ struct Stream {
     mid: Mid,
     /// The caller's index.
     index: usize,
-    /// The payload type the track carries now: the first of `formats`
-    /// until the camera switches.
-    pt: u8,
-    /// Every format of the answer's m-line lotse carries on this track
-    /// (its kind and clock rate), in the answer's order, with what each
-    /// is declared as.
-    formats: Vec<(u8, Declared)>,
+    /// The payload types of the answer's m-line in the track's codec.
+    pts: Vec<u8>,
+    /// Those in another codec lotse carries, which the track does not
+    /// take.
+    others: Vec<u8>,
     /// Video, whose losses ask for a keyframe.
     video: bool,
     /// The synchronization source of the packets seen (RFC 3550 §3).
@@ -307,8 +298,8 @@ pub struct IngestEngine {
     foreign: Throttle,
     /// The rate limit of the unusable Sender Reports' log line.
     unusable: Throttle,
-    /// The rate limit of the codec switches' log line.
-    switch_log: Throttle,
+    /// The rate limit of the other codecs' packets' log line.
+    other_codec: Throttle,
     /// The counters.
     stats: IngestStats,
 }
@@ -542,7 +533,7 @@ impl IngestEngine {
             queued: VecDeque::new(),
             foreign: Throttle::default(),
             unusable: Throttle::default(),
-            switch_log: Throttle::default(),
+            other_codec: Throttle::default(),
             stats: IngestStats::default(),
         })
     }
@@ -592,14 +583,18 @@ impl IngestEngine {
         matches!(self.phase, Phase::Answered | Phase::Connected)
     }
 
-    /// Applies the camera's answer (RFC 8829 §5.3) at `now`. A repeated
-    /// answer is ignored. One the engine cannot apply, or without a video
+    /// Applies the camera's answer (RFC 8829 §5.3) at `now`. One at or
+    /// after the answer's deadline ends the attempt by the deadline; a
+    /// repeated answer is ignored. One the engine cannot apply, or without a video
     /// m-line it receives in a carried codec, ends the attempt as a
     /// protocol error closing `invalid_answer`; else the negotiated tracks
     /// are output ([`IngestOutput::Tracks`]) and ICE starts, the answer's
     /// candidates through the same check as trickled ones.
     pub fn accept_answer(&mut self, now: Instant, sdp: &str) {
         self.now = now;
+        if self.expired(now) {
+            return;
+        }
         if self.phase != Phase::Offered {
             tracing::debug!("webrtc: repeated answer ignored");
             return;
@@ -685,9 +680,15 @@ impl IngestEngine {
     /// declared as the first payload type of the camera's that lotse
     /// carries, `None` when the m-line does not send or has none. (A
     /// rejected m-line, port 0, is the caller's to leave out: str0m 0.24
-    /// keeps it live.) The camera may send in any format the answer
-    /// accepted (RFC 3264 §7), so the stream takes each one lotse carries
-    /// of the first one's kind and clock rate, which a track keeps.
+    /// keeps it live.) The track takes every payload type of the answer's
+    /// m-line in that codec; those of another codec it does not.
+    // SPEC-DEVIATION(RFC 3264 §7): the camera may change among the formats
+    // the answer accepted at any time, another codec among them; a track
+    // has one codec, so lotse carries the codec the answer accepted first
+    // and drops (counts and logs) packets in another one, rather than
+    // switch the track mid-stream. Observed behavior: Home Assistant's
+    // native WebRTC cameras send one codec for a session;
+    // gate: rfc3264_7_a_packet_of_another_accepted_codec_is_dropped_not_switched
     fn negotiated(&mut self, mid: Mid, index: usize) -> Option<IngestTrack> {
         let media = self.rtc.media(mid)?;
         if media.disabled() || !media.direction().is_receiving() {
@@ -703,19 +704,26 @@ impl IngestEngine {
             })
             .collect();
         let (pt, declared) = carried.first()?.clone();
-        let formats: Vec<(u8, Declared)> = carried
-            .into_iter()
-            .filter(|(_, format)| {
-                format.kind == declared.kind && format.clock_rate == declared.clock_rate
-            })
-            .collect();
-        let pts: Vec<u8> = formats.iter().map(|(pt, _)| *pt).collect();
-        tracing::debug!(index, ?pts, "webrtc: the formats the track takes");
+        let mut pts = Vec::new();
+        let mut others = Vec::new();
+        for (format_pt, format) in &carried {
+            if *format == declared {
+                pts.push(*format_pt);
+            } else {
+                others.push(*format_pt);
+            }
+        }
+        tracing::debug!(
+            index,
+            ?pts,
+            ?others,
+            "webrtc: the payload types the track takes, and not"
+        );
         self.streams.push(Stream {
             mid,
             index,
-            pt,
-            formats,
+            pts,
+            others,
             video: declared.kind == Kind::Video,
             ssrc: None,
             highest: None,
@@ -785,7 +793,8 @@ impl IngestEngine {
         }
     }
 
-    /// A datagram from `source` to the local `destination`, at `now`.
+    /// A datagram from `source` to the local `destination`, at `now`; at
+    /// or after the connection's deadline, the attempt ends by it first.
     pub fn receive(
         &mut self,
         now: Instant,
@@ -794,7 +803,7 @@ impl IngestEngine {
         bytes: &[u8],
     ) {
         self.now = now;
-        if self.phase == Phase::Ended {
+        if self.phase == Phase::Ended || self.expired(now) {
             return;
         }
         let Ok(contents) = DatagramRecv::try_from(bytes) else {
@@ -821,6 +830,20 @@ impl IngestEngine {
     /// engine's timers.
     pub fn handle_timeout(&mut self, now: Instant) {
         self.now = now;
+        if self.expired(now) {
+            return;
+        }
+        // Once ended, str0m is inert and nothing is due.
+        self.startup_pli(false);
+        self.input(Input::Timeout(now));
+    }
+
+    /// Ends the attempt when its deadline passed by `now`, the answer's or
+    /// the connection's; `true` then. The calls that take the camera's
+    /// input check it first: an answer or a datagram that comes at or
+    /// after its deadline is not taken, whether or not the timeout was
+    /// handled before.
+    fn expired(&mut self, now: Instant) -> bool {
         let overdue = self.deadline.is_some_and(|deadline| now >= deadline);
         match self.phase {
             Phase::Offered if overdue => {
@@ -830,7 +853,7 @@ impl IngestEngine {
                     close::ANSWER_TIMEOUT,
                     format!("webrtc: no answer within {secs} s"),
                 );
-                return;
+                true
             }
             Phase::Answered if overdue => {
                 let ms = now.saturating_duration_since(self.started).as_millis();
@@ -839,13 +862,10 @@ impl IngestEngine {
                     close::ICE_FAILED,
                     format!("webrtc: not connected {ms} ms into the attempt"),
                 );
-                return;
+                true
             }
-            // Once ended, str0m is inert and nothing is due.
-            _ => {}
+            _ => false,
         }
-        self.startup_pli(false);
-        self.input(Input::Timeout(now));
     }
 
     /// The first keyframe arrived: no more startup keyframe requests, and
@@ -1010,11 +1030,11 @@ impl IngestEngine {
 
     /// One RTP packet: handed on under its stream's index when it is of a
     /// negotiated m-line (str0m maps its SSRC by `a=ssrc` or the RFC 9143
-    /// `mid` header extension) in one of the formats its track takes,
-    /// else counted and dropped. A format of another codec than the one
-    /// carried switches the track first ([`IngestOutput::Switched`]). A
-    /// forward gap in the video's sequence numbers (RFC 3550 §A.1) is a
-    /// lost picture, which asks for a keyframe.
+    /// `mid` header extension) in a payload type of its track's codec,
+    /// else counted and dropped, one in another codec the answer accepted
+    /// with a warning. A forward gap in the video's sequence numbers of
+    /// one synchronization source (RFC 3550 §A.1) is a lost picture, which
+    /// asks for a keyframe.
     fn on_rtp(&mut self, packet: str0m::rtp::RtpPacket) {
         let header = &packet.header;
         let mid = self
@@ -1024,9 +1044,19 @@ impl IngestEngine {
             .map(|stream| stream.mid());
         let pt = *header.payload_type;
         let seq = header.sequence_number;
-        let Some(stream) = self.streams.iter_mut().find(|stream| {
-            Some(stream.mid) == mid && stream.formats.iter().any(|(format, _)| *format == pt)
-        }) else {
+        let Some(stream) = self
+            .streams
+            .iter_mut()
+            .find(|stream| Some(stream.mid) == mid && stream.pts.contains(&pt))
+        else {
+            let other = self
+                .streams
+                .iter()
+                .any(|stream| Some(stream.mid) == mid && stream.others.contains(&pt));
+            if other {
+                self.other_codec(pt);
+                return;
+            }
             self.stats.foreign_packets = self.stats.foreign_packets.saturating_add(1);
             if let Some(count) = self.foreign.hit(self.now) {
                 tracing::debug!(
@@ -1042,7 +1072,7 @@ impl IngestEngine {
         let ssrc = *header.ssrc;
         if stream.ssrc != Some(ssrc) {
             // A new synchronization source numbers its packets anew (RFC
-            // 3550 §5.1, §8.2): none of it is late.
+            // 3550 §5.1, §8.2): its gaps count from its own first one.
             tracing::debug!(index, ssrc, "webrtc: a new synchronization source");
             stream.ssrc = Some(ssrc);
             stream.highest = None;
@@ -1051,53 +1081,6 @@ impl IngestEngine {
             .highest
             .map_or(1, |highest| seq.wrapping_sub(highest));
         let forward = (1..0x8000).contains(&ahead);
-        let switched = {
-            let declared = |pt: u8| {
-                stream
-                    .formats
-                    .iter()
-                    .find(|(format, _)| *format == pt)
-                    .map(|(_, declared)| declared)
-            };
-            let format = declared(pt);
-            (format != declared(stream.pt))
-                .then(|| format.cloned())
-                .flatten()
-        };
-        if let Some(declared) = switched {
-            if !forward {
-                // Older than the newest packet: one of the codec before a
-                // switch (or after it) that came late. The receive path
-                // carries the other codec now, and switching back would
-                // restart it.
-                self.stats.late_packets = self.stats.late_packets.saturating_add(1);
-                tracing::trace!(
-                    index,
-                    pt,
-                    seq,
-                    "webrtc: late packet of another format dropped"
-                );
-                return;
-            }
-            self.stats.switches = self.stats.switches.saturating_add(1);
-            tracing::trace!(index, from = stream.pt, to = pt, "webrtc: codec switched");
-            if let Some(count) = self.switch_log.hit(self.now) {
-                tracing::info!(
-                    index,
-                    from = stream.pt,
-                    to = pt,
-                    codec = declared.codec.name(),
-                    count,
-                    "webrtc: the camera switched the track's codec"
-                );
-            }
-            stream.pt = pt;
-            self.queued.push_back(IngestOutput::Switched(IngestTrack {
-                index,
-                pt,
-                declared,
-            }));
-        }
         let lost = stream.video && forward && ahead > 1 && stream.highest.is_some();
         stream.highest = if forward { Some(seq) } else { stream.highest };
         self.stats.rtp_packets = self.stats.rtp_packets.saturating_add(1);
@@ -1121,6 +1104,20 @@ impl IngestEngine {
             }
         }
         self.startup_pli(true);
+    }
+
+    /// A packet in payload type `pt`, which the answer accepted in another
+    /// codec than its track's: dropped, counted, and logged as a warning
+    /// at most once per summary interval.
+    fn other_codec(&mut self, pt: u8) {
+        self.stats.other_codec_packets = self.stats.other_codec_packets.saturating_add(1);
+        if let Some(count) = self.other_codec.hit(self.now) {
+            tracing::warn!(
+                pt,
+                count,
+                "webrtc: RTP in another codec than its track's dropped; the track carries the codec the answer accepted first"
+            );
+        }
     }
 
     /// Sends the startup keyframe request when one is due: until the
@@ -1174,11 +1171,16 @@ impl IngestEngine {
         }));
     }
 
-    /// Closes str0m gracefully and queues what that sends, the DTLS
+    /// Drops what was queued and closes str0m gracefully, queuing what
+    /// that sends, the DTLS
     /// `close_notify` alert (RFC 6347 §4.2.7) and an RTCP BYE (RFC 3550
     /// §6.6), at most [`CLOSE_OUTPUTS`] and up to its first timeout, then
     /// drops it to inert, as a viewer session closes.
     fn drain_close(&mut self) {
+        // What was queued and not polled yet (the tracks of an answer, a
+        // connection, media) is of an attempt that ended: only the close
+        // goes out now.
+        self.queued.clear();
         self.deadline = None;
         self.pli_due = None;
         let started = self.rtc.close();
@@ -1263,8 +1265,8 @@ mod tests {
         engine.streams.push(Stream {
             mid,
             index: 3,
-            pt: 96,
-            formats: Vec::new(),
+            pts: Vec::new(),
+            others: Vec::new(),
             video: true,
             ssrc: None,
             highest: None,

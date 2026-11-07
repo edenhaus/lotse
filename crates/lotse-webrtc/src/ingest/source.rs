@@ -35,8 +35,9 @@
 //! go to the relay at once, at most [`MAX_HOSTS`] of them, which its queue
 //! holds, so nothing waits on the relay. The loop waits on the cancel,
 //! the signals, the host sockets (in turn, so a busy one starves none) and
-//! the engine's timeout; an engine timeout already due is handled before
-//! any more I/O, so I/O that is always ready postpones no deadline.
+//! the engine's timeout; an engine timeout that came due meanwhile is
+//! handled before the I/O that woke the loop, so I/O that is always ready,
+//! or that came at or after a deadline, neither postpones nor replaces it.
 
 use std::future::Future;
 use std::io;
@@ -164,11 +165,6 @@ impl Attempt {
     }
 }
 
-/// Whether an engine timeout at `wake` is due at `now`.
-fn due(now: Instant, wake: Instant) -> bool {
-    now >= wake
-}
-
 /// What woke the attempt's loop, short of its end (the cancel, the
 /// client gone), which the loop takes itself.
 enum Woke {
@@ -176,8 +172,6 @@ enum Woke {
     Signal(RemoteSignal),
     /// A datagram on host socket `.0`.
     Datagram(usize, io::Result<(SocketAddr, usize)>),
-    /// The engine's timeout.
-    Timer,
 }
 
 /// The end of an attempt by cancel.
@@ -206,8 +200,6 @@ struct Attempt {
     hosts: Hosts,
     /// The RTP receive path.
     rtp: RtpTracks,
-    /// The tracks declared, by stream index, for a switch of codec.
-    tracks: Vec<(usize, Arc<Track>)>,
     /// The video's index, its track and its keyframes before this
     /// attempt, while the attempt waits for its first.
     waiting: Option<(usize, Arc<Track>, u64)>,
@@ -219,8 +211,8 @@ struct Attempt {
 
 impl Attempt {
     /// Carries the engine's outputs until it waits: datagrams sent,
-    /// tracks declared, the source ready once connected, a track's codec
-    /// switched, packets and Sender Reports through the RTP receive path.
+    /// tracks declared, the source ready once connected, packets and
+    /// Sender Reports through the RTP receive path.
     /// `Ok` with when it wants the time next; `Err` with how the attempt
     /// ended, by the engine or by the receive path (the camera's
     /// timestamps keep jumping).
@@ -236,7 +228,6 @@ impl Attempt {
                 } => self.transmit(source, destination, &payload),
                 IngestOutput::Tracks(tracks) => self.declare(ctx, tracks),
                 IngestOutput::Connected => ctx.tracks.ready(),
-                IngestOutput::Switched(switched) => self.switch(&switched),
                 IngestOutput::Rtp {
                     index,
                     packet,
@@ -273,29 +264,8 @@ impl Attempt {
                 let before = track.stats().keyframes;
                 self.waiting = Some((negotiated.index, Arc::clone(&track), before));
             }
-            self.rtp.carry(
-                negotiated.index,
-                Arc::clone(&track),
-                negotiated.pt,
-                &declared,
-            );
-            self.tracks.push((negotiated.index, track));
-        }
-    }
-
-    /// The camera moved a track to another codec the answer accepted:
-    /// the track takes the codec, and the receive path carries its stream
-    /// in it from the next packet.
-    fn switch(&mut self, switched: &IngestTrack) {
-        let declared = &switched.declared;
-        if let Some((_, track)) = self
-            .tracks
-            .iter()
-            .find(|(index, _)| *index == switched.index)
-        {
-            track.set_codec(declared.codec.clone());
             self.rtp
-                .carry(switched.index, Arc::clone(track), switched.pt, declared);
+                .carry(negotiated.index, track, negotiated.pt, &declared);
         }
     }
 
@@ -352,7 +322,6 @@ impl Attempt {
                     self.engine.receive(now, from, local, datagram);
                 }
             }
-            Woke::Timer => self.engine.handle_timeout(now),
         }
         None
     }
@@ -492,7 +461,6 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
             next: 0,
         },
         rtp: RtpTracks::new(SCHEME),
-        tracks: Vec::new(),
         waiting: None,
         buf: vec![0_u8; RECEIVE_BUFFER],
         dropped: 0,
@@ -513,27 +481,39 @@ async fn run(
             Ok(wake) => wake,
             Err(end) => return attempt.finish(channel, end),
         };
-        let now = ctx.time.now();
-        let event = if due(now, wake) {
-            // Due already: before any more I/O, which could always be
-            // ready. (A cancel waits for this one step of the engine.)
-            Ok(Woke::Timer)
-        } else {
-            // A new timer each time: str0m's next timeout moves with
-            // nearly every datagram, so one kept would rarely be the one
-            // due.
-            let mut sleeping = ctx.time.sleep(wake.saturating_duration_since(now));
-            tokio::select! {
-                biased;
-                () = ctx.cancel.cancelled() => Err(cancelled()),
-                signal = channel.incoming.recv() => signal.map(Woke::Signal).ok_or_else(client_gone),
-                (index, received) = attempt.hosts.recv(&mut attempt.buf) => Ok(Woke::Datagram(index, received)),
-                () = &mut sleeping => Ok(Woke::Timer),
-            }
+        // A new timer each time: str0m's next timeout moves with nearly
+        // every datagram, so one kept would rarely be the one due.
+        let mut sleeping = ctx
+            .time
+            .sleep(wake.saturating_duration_since(ctx.time.now()));
+        let event = tokio::select! {
+            biased;
+            () = ctx.cancel.cancelled() => Err(cancelled()),
+            signal = channel.incoming.recv() => signal.map(|signal| Some(Woke::Signal(signal))).ok_or_else(client_gone),
+            (index, received) = attempt.hosts.recv(&mut attempt.buf) => Ok(Some(Woke::Datagram(index, received))),
+            () = &mut sleeping => Ok(None),
         };
+        let now = ctx.time.now();
         let end = match event {
-            Ok(event) => attempt.woke(event, ctx.time.now()),
             Err(end) => Some(end),
+            Ok(None) => {
+                attempt.engine.handle_timeout(now);
+                None
+            }
+            Ok(Some(event)) => {
+                // The engine's timeout first when it came due meanwhile:
+                // I/O that is always ready, or that came with it (an
+                // answer, a handshake's last datagram, after their
+                // deadline), neither postpones nor replaces a deadline.
+                if now >= wake {
+                    attempt.engine.handle_timeout(now);
+                }
+                if attempt.engine.is_ended() {
+                    None
+                } else {
+                    attempt.woke(event, now)
+                }
+            }
         };
         if let Some(end) = end {
             return attempt.finish(channel, end);
@@ -550,17 +530,8 @@ mod tests {
     )]
 
     use std::net::Ipv4Addr;
-    use std::time::Duration;
 
     use super::*;
-
-    #[test]
-    fn a_timeout_is_due_at_its_time_and_after() {
-        let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
-        assert!(due(now, now));
-        assert!(due(now + Duration::from_nanos(1), now));
-        assert!(!due(now, now + Duration::from_nanos(1)));
-    }
 
     #[test]
     fn rfc8445_5_1_1_the_preferred_host_addresses_are_kept_in_their_order() {
@@ -607,7 +578,6 @@ mod tests {
                 next: 0,
             },
             rtp: RtpTracks::new(SCHEME),
-            tracks: Vec::new(),
             waiting: None,
             buf: vec![0_u8; RECEIVE_BUFFER],
             dropped: 0,

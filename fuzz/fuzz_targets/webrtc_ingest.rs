@@ -8,9 +8,10 @@
 //! datagrams when there is a camera, the camera's RTP (any payload type,
 //! sequence number and payload, on either m-line; its Sender Reports come
 //! with it), time, keyframes and the close. The contract: at most one
-//! `Tracks`, video among them; `Connected` at most once, after them; a
-//! switch and RTP only of the indices declared; at most one `Ended`, and
-//! after it nothing but close datagrams and timeouts; `poll` always comes
+//! `Tracks`, video among them; `Connected` at most once, after them; RTP
+//! only of the indices declared; at most one `Ended`, and after it (or a
+//! close, even of output queued before it) nothing but close datagrams
+//! and timeouts; `poll` always comes
 //! to a timeout.
 //! Run with `cargo +nightly fuzz run webrtc_ingest` from the repository
 //! root.
@@ -117,14 +118,6 @@ impl Run {
                     assert!(!self.seen.connected, "connected once");
                     assert!(self.seen.tracks.is_some(), "connected after the answer");
                     self.seen.connected = true;
-                }
-                IngestOutput::Switched(track) => {
-                    assert!(!self.seen.ended, "no switch after the end");
-                    let declared = self.seen.tracks.as_deref().unwrap_or_default();
-                    assert!(
-                        declared.contains(&track.index),
-                        "a switch of a declared track"
-                    );
                 }
                 IngestOutput::Rtp { index, .. } | IngestOutput::SenderReport { index, .. } => {
                     assert!(!self.seen.ended, "no media after the end");
@@ -320,9 +313,9 @@ fuzz_target!(|data: &[u8]| {
             }
             6 => {
                 run.engine.close();
-                run.drain();
                 assert!(run.engine.is_ended());
                 run.seen.ended = true;
+                run.drain();
             }
             7 => {
                 // [m-line:u8][pt:u8][seq:u16][ts:u32][payload]
