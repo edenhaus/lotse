@@ -494,7 +494,8 @@ impl State {
 
     /// Recomputes which streams reference connection `id` and its demand
     /// from them; a connection nothing references any more is dropped,
-    /// which stops its driver.
+    /// which stops its driver, and one that still serves streams ends the
+    /// signals of those that left it ([`State::signals_left_streams`]).
     pub(crate) fn refresh_connection(&mut self, id: &str) {
         let Some(entry) = self.connections.get_mut(id) else {
             return;
@@ -547,6 +548,7 @@ impl State {
             );
             entry.demand.send_replace(demand);
         }
+        self.signals_left_streams(id);
     }
 
     /// Opens a subscription and queues the current state of every matching
