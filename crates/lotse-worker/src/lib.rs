@@ -5213,7 +5213,7 @@ mod tests {
         fn describe(&self) -> SourceDescriptor {
             SourceDescriptor {
                 protocol: "stubborn",
-                url: self.url.clone(),
+                url: Some(self.url.clone()),
                 options: serde_json::Value::Null,
             }
         }

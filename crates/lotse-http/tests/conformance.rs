@@ -730,7 +730,10 @@ async fn rfc7616_credentials_are_checked_and_never_described_debugged_or_logged(
         let url = format!("http://admin:secret@{addr}/vod/index.m3u8?token=hidden");
         let source = make_source(&url, &json!(null));
         let described = source.describe();
-        let shown = format!("{described:?} {} {source:?}", described.url);
+        let shown = format!(
+            "{described:?} {} {source:?}",
+            described.url.as_ref().unwrap()
+        );
         assert!(!shown.contains("secret"), "{shown}");
         let harness = Harness::start(source.as_ref(), peer(&server), Arc::new(SystemClock));
         let err = exit_within(harness, Duration::from_secs(5)).await;
