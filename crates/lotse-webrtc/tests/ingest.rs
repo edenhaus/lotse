@@ -1063,6 +1063,47 @@ fn rfc8829_5_3_answers_the_engine_cannot_take_end_the_attempt_as_invalid() {
 }
 
 #[test]
+fn rfc8866_5_14_a_format_less_rejected_m_line_beside_payload_type_0_reaches_no_engine_panic() {
+    let _logs = logs();
+    let mut pair = Pair::offer(&nest());
+    // A camera without audio rejects the audio m-line listing no format
+    // (as str0m writes it); its video's first payload type renamed 0,
+    // `a=rtpmap:0 H264/90000`. The format the rejected m-line gets must
+    // not give 0 a second codec: str0m 0.24 panics on that.
+    let answer = pair.answer(camera_config(false), |answer| {
+        let video = answer
+            .lines()
+            .find_map(|line| line.strip_prefix("m=video 9 UDP/TLS/RTP/SAVPF "))
+            .unwrap()
+            .to_owned();
+        let pt = video.split(' ').next().unwrap().to_owned();
+        let renamed = |line: &str| {
+            line.replace(&format!(":{pt} "), ":0 ")
+                .replace(&format!("SAVPF {pt}"), "SAVPF 0")
+                .replace(&format!("apt={pt}"), "apt=0")
+        };
+        answer
+            .lines()
+            .map(|line| format!("{}\r\n", renamed(line)))
+            .collect()
+    });
+    assert!(
+        answer
+            .lines()
+            .any(|line| line.trim_end() == "m=audio 0 UDP/TLS/RTP/SAVPF"),
+        "{answer}"
+    );
+    assert!(answer.contains("a=rtpmap:0 H264/90000"), "{answer}");
+    // The video on payload type 0, the rejected audio on another.
+    assert!(pair.ended().is_none(), "{:?}", pair.ended());
+    let tracks = pair.tracks();
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0].pt, 0);
+    assert!(matches!(tracks[0].declared.codec, Codec::H264 { .. }));
+    pair.connect();
+}
+
+#[test]
 fn rfc8829_5_2_no_answer_within_20_s_ends_the_attempt_as_answer_timeout() {
     let _logs = logs();
     let mut pair = Pair::offer(&nest());
