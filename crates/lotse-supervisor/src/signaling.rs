@@ -218,6 +218,8 @@ struct Signal {
     worker: u64,
     /// The stream it offers for: the one its subscription took it for.
     stream_id: String,
+    /// Its source's protocol, which its offer names.
+    protocol: &'static str,
     /// The subscription it belongs to.
     owner: Owner,
     /// Where its events go: its subscription's queue.
@@ -530,11 +532,7 @@ impl State {
                 let event = SignalingEvent::Offer {
                     signal_id: signal_id.clone(),
                     stream_id: signal.stream_id.clone(),
-                    source: self
-                        .connections
-                        .get(connection)
-                        .map(|entry| entry.key.url.redacted().to_string())
-                        .unwrap_or_default(),
+                    protocol: signal.protocol.to_owned(),
                     sdp,
                 };
                 if let Some(count) = self.signaling.line(connection, Line::Offered, now) {
@@ -792,10 +790,11 @@ impl State {
     /// its connection's streams, if one does, at `now`, named at `wall`.
     /// True when one does: the worker is told.
     fn open_signal(&mut self, open: &WaitingOpen, now: Instant, wall: SystemTime) -> bool {
-        let Some((stream_id, subscriber)) = self
-            .connections
-            .get(&open.connection)
-            .and_then(|entry| self.signaling.subscriber_for(&entry.streams))
+        let Some((protocol, (stream_id, subscriber))) =
+            self.connections.get(&open.connection).and_then(|entry| {
+                let protocol = entry.key.target.signaled_protocol()?;
+                Some((protocol, self.signaling.subscriber_for(&entry.streams)?))
+            })
         else {
             return false;
         };
@@ -830,6 +829,7 @@ impl State {
                 connection: open.connection.clone(),
                 worker: open.worker,
                 stream_id,
+                protocol,
                 owner,
                 events,
                 worker_sent: WorkerSent::default(),
@@ -1384,12 +1384,13 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use lotse_core::let_assert;
-    use lotse_core::source_url::SourceUrl;
     use serde_json::{Value, json};
     use tokio::sync::watch;
 
     use super::*;
-    use crate::registry::{ConnectionEntry, ConnectionKey, ConnectionSnapshot, Talker};
+    use crate::registry::{
+        ConnectionEntry, ConnectionKey, ConnectionSnapshot, SourceTarget, Talker,
+    };
     use crate::test_support::Captured;
 
     /// The serial of the workers the tests' reports come from.
@@ -1456,23 +1457,23 @@ mod tests {
         state.signal_report(&from(connection), report, now, UNIX_EPOCH);
     }
 
-    /// A state with the signaled connections `c1` of stream `door` (its
-    /// URL with credentials) and `c2` of stream `yard`, whose drivers'
-    /// queues hold `capacity` commands, and two local addresses.
+    /// A state with the signaled connections `c1` of stream `door` and
+    /// `c2` of stream `yard`, whose drivers' queues hold `capacity`
+    /// commands, and two local addresses.
     fn signaled_state(capacity: usize) -> (State, Queues) {
         let mut state = State::default();
         state.signaling.local_addrs = vec![[192, 0, 2, 7].into(), [0_u16; 8].into()];
         let mut drivers = BTreeMap::new();
-        for (id, stream, url) in [
-            ("c1", "door", "webrtc://user:secret@camera.front_door/"),
-            ("c2", "yard", "webrtc://camera.yard"),
-        ] {
+        for (id, stream) in [("c1", "door"), ("c2", "yard")] {
             let (commands, queued) = mpsc::channel(capacity);
             state.connections.insert(
                 id.into(),
                 ConnectionEntry {
                     key: ConnectionKey {
-                        url: SourceUrl::parse(url).unwrap(),
+                        target: SourceTarget::Signaled {
+                            protocol: "webrtc",
+                            stream: stream.into(),
+                        },
                         options: Value::Null,
                     },
                     port: None,
@@ -1638,9 +1639,10 @@ mod tests {
         assert_eq!(
             events(&mut all),
             [
-                // The source redacted as `stream/get` shows it.
+                // The stream and its source's protocol: a signaled
+                // source has no address.
                 json!({ "type": "offer", "signal_id": signal_id, "stream_id": "door",
-                        "source": "webrtc://****@camera.front_door/", "sdp": "v=0\r\n" }),
+                        "protocol": "webrtc", "sdp": "v=0\r\n" }),
                 json!({ "type": "candidate", "signal_id": signal_id, "candidate": host,
                         "sdp_mid": "0", "sdp_mline_index": 0 }),
                 json!({ "type": "candidate", "signal_id": signal_id, "candidate": host,
@@ -2789,14 +2791,16 @@ mod tests {
             sources: vec![crate::registry::StreamSource {
                 spec: crate::driver::DriverSpec {
                     connection_id: connection.into(),
-                    url: "webrtc://camera.front_door".into(),
+                    target: lotse_ipc::SourceTarget::Signaled("webrtc".into()),
                     options: "{}".into(),
-                    host: "camera.front_door".into(),
+                    host: String::new(),
                     port: None,
                     backchannel: false,
-                    signaled: true,
                 },
-                url: SourceUrl::parse("webrtc://camera.front_door").unwrap(),
+                target: SourceTarget::Signaled {
+                    protocol: "webrtc",
+                    stream: "door".into(),
+                },
                 options: serde_json::Map::new(),
                 protocol: "webrtc",
                 connection: connection.into(),

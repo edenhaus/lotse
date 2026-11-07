@@ -3674,7 +3674,11 @@ mod tests {
     #[tokio::test]
     async fn a_signaled_source_is_named_by_protocol_and_a_url_source_by_url() {
         let s = supervisor("/bin/sh", Arc::new(SystemClock));
-        let err = error(call(&s, &put("a", "fake-signaled://camera.front_door", false)).await);
+        // A URL whose scheme is a signaled protocol, as a client might
+        // write one.
+        let protocol = "fake-signaled";
+        let url = format!("{protocol}://camera.front_door");
+        let err = error(call(&s, &put("a", &url, false)).await);
         assert_eq!(err.code, ErrorCode::InvalidRequest);
         assert_eq!(err.details["protocol"], "fake-signaled");
         assert_eq!(
@@ -3823,11 +3827,6 @@ mod tests {
     async fn signaling_commands_reach_the_owner_s_signals_and_end_with_its_subscription() {
         let dir = private_dir("signaling-commands");
         let mut environment = environment(&blocking_worker(&dir));
-        environment
-            .registries
-            .sources
-            .register(Arc::new(FakeSourceFactory::signaled(&["webrtc"])))
-            .unwrap();
         environment.front_door = Some(FrontDoor {
             registrations: Arc::new(Registrations::default()),
             // Two ports of one address: a source gathers on each address
@@ -3854,7 +3853,7 @@ mod tests {
                 "2001:db8::1".parse().unwrap()
             ]
         );
-        result(call(&s, &put("door", "webrtc://camera.front_door", false)).await);
+        result(call(&s, &put_signaled("door", "fake-signaled", &json!({}))).await);
         let refused = error(
             call_on(
                 &s,
@@ -3877,7 +3876,7 @@ mod tests {
         let offer = next(&mut door).await;
         assert_eq!(offer["type"], "offer");
         assert_eq!(offer["signal_id"], signal_id.as_str());
-        assert_eq!(offer["source"], "webrtc://camera.front_door");
+        assert_eq!(offer["protocol"], "fake-signaled");
         assert_eq!(offer["sdp"], lotse_core::test_util::FAKE_SIGNALED_OFFER);
         let commands = |id: u64, signal_id: &str| {
             [

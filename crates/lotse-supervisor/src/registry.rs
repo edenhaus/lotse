@@ -208,6 +208,15 @@ impl SourceTarget {
     pub(crate) const fn signaled(&self) -> bool {
         matches!(self, Self::Signaled { .. })
     }
+
+    /// The protocol of a signaled source, which its offers name; `None`
+    /// for a source lotse connects to, whose worker opens no signal.
+    pub(crate) const fn signaled_protocol(&self) -> Option<&'static str> {
+        match self {
+            Self::Url(_) => None,
+            Self::Signaled { protocol, .. } => Some(protocol),
+        }
+    }
 }
 
 /// The redacted URL, or `<protocol> of stream <stream>`.
@@ -2746,6 +2755,12 @@ mod tests {
         assert_ne!(front, signaled("other", "front"));
         assert_eq!(front.target.url(), None);
         assert!(front.target.signaled() && !secret.target.signaled());
+        assert_eq!(front.target.signaled_protocol(), Some("webrtc"));
+        assert_eq!(
+            secret.target.signaled_protocol(),
+            None,
+            "a URL source opens no signal"
+        );
         assert_eq!(
             format!("{front:?}"),
             "ConnectionKey { target: webrtc of stream front, options: [] }"
