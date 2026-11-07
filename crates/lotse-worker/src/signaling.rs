@@ -1,6 +1,6 @@
 //! The worker's end of its signaled sources' signaling: the
-//! [`SignalingOpener`] a signaled source gets in its context
-//! (`SourceCapabilities::signaled`), which carries each channel through
+//! [`SignalingOpener`] a signaled source (one a `SignaledSourceFactory`
+//! built) gets in its context, which carries each channel through
 //! the supervisor to the control-API client that relays the source's
 //! signaling.
 //!
