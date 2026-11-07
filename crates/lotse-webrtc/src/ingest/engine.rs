@@ -78,12 +78,6 @@ pub const PLI_INTERVAL: Duration = Duration::from_secs(1);
 /// a camera that sends none after them follows its own GOP.
 pub const STARTUP_PLIS: u32 = 5;
 
-/// The close code of an attempt the WebRTC engine itself failed (a DTLS
-/// handshake that failed, an engine error): the control API's
-/// `SignalCloseCode` `internal_error`, which [`close`] does not list as a
-/// source's own.
-pub const INTERNAL_ERROR: &str = "internal_error";
-
 /// How many of the camera's candidates are held until its answer: the
 /// control API's bound on a client's candidates per signal.
 pub const MAX_EARLY_CANDIDATES: usize = 64;
@@ -111,7 +105,7 @@ pub struct IngestTrack {
 }
 
 /// How an attempt ended: the source's error and the code its signaling
-/// channel closes with ([`close`], or [`INTERNAL_ERROR`]).
+/// channel closes with ([`close`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestEnd {
     /// What the source returns.
@@ -857,7 +851,7 @@ impl IngestEngine {
         if let Err(err) = result {
             self.end(
                 SourceError::Protocol,
-                INTERNAL_ERROR,
+                close::INTERNAL_ERROR,
                 format!("webrtc engine: {err}"),
             );
         }

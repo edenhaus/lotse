@@ -13,6 +13,7 @@
 //! | no host address could be bound | `Unreachable` | `ice_failed` |
 //! | no answer within 20 s | `Timeout` | `answer_timeout` |
 //! | an answer the engine cannot apply | `Protocol` | `invalid_answer` |
+//! | the relay refused a signal of the source's (`signal_rejected`) | `Protocol` | `internal_error` |
 //! | the camera failed before its answer | `Unreachable("camera: code: message")` | `camera_error` |
 //! | the camera failed after it | `Ended("camera: code: message")` | `camera_error` |
 //! | not connected within 10 s of the answer | `Timeout` | `ice_failed` |
@@ -44,7 +45,7 @@ use std::time::Instant;
 
 use lotse_codec::rtp_ingest::RtpTracks;
 use lotse_core::codec::Kind;
-use lotse_core::signaling::{LocalSignal, RemoteSignal, SignalingChannel, close};
+use lotse_core::signaling::{LocalSignal, REJECTED, RemoteSignal, SignalingChannel, close};
 use lotse_core::source::{Source, SourceCtx, SourceDescriptor, SourceError};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::BoxFuture;
@@ -52,7 +53,7 @@ use lotse_core::track::Track;
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
-use super::engine::{INTERNAL_ERROR, IngestEnd, IngestEngine, IngestOutput, IngestTrack};
+use super::engine::{IngestEnd, IngestEngine, IngestOutput, IngestTrack};
 use super::factory::SCHEME;
 use super::options::WebRtcOptions;
 
@@ -241,7 +242,7 @@ impl Attempt {
                         .map_err(|error| IngestEnd {
                             message: error.to_string(),
                             error,
-                            close: INTERNAL_ERROR,
+                            close: close::INTERNAL_ERROR,
                         })?;
                     self.keyframe(index);
                 }
@@ -314,6 +315,16 @@ impl Attempt {
             Woke::Signal(Some(RemoteSignal::Answer(sdp))) => self.engine.accept_answer(now, &sdp),
             Woke::Signal(Some(RemoteSignal::Candidate(candidate))) => {
                 self.engine.add_remote_candidate(now, &candidate);
+            }
+            Woke::Signal(Some(RemoteSignal::Failed { code, message })) if code == REJECTED => {
+                // The relay refused what the source sent: the fault is
+                // lotse's, not the camera's.
+                let message = format!("webrtc: the relay refused a signal: {message}");
+                return Some(IngestEnd {
+                    error: SourceError::Protocol(message.clone()),
+                    close: close::INTERNAL_ERROR,
+                    message,
+                });
             }
             Woke::Signal(Some(RemoteSignal::Failed { code, message })) => {
                 let message = format!("camera: {code}: {message}");
@@ -405,7 +416,7 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
         // a retry, so no offer is made.
         let reason = "no host address to gather on: the WebRTC UDP front door is off";
         tracing::warn!("webrtc: {reason}");
-        channel.close(INTERNAL_ERROR, reason.to_owned());
+        channel.close(close::INTERNAL_ERROR, reason.to_owned());
         return SourceError::Unreachable(format!("webrtc: {reason}"));
     }
     let hosts = bind(&channel.local_addrs).await;

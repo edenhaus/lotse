@@ -40,9 +40,7 @@ use lotse_core::source_url::SourceUrl;
 use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::test_util::FakeSignaling;
 use lotse_core::track::TrackLimits;
-use lotse_webrtc::ingest::engine::{
-    ANSWER_TIMEOUT, CONNECT_TIMEOUT, INTERNAL_ERROR, PLI_INTERVAL, STARTUP_PLIS,
-};
+use lotse_webrtc::ingest::engine::{ANSWER_TIMEOUT, CONNECT_TIMEOUT, PLI_INTERVAL, STARTUP_PLIS};
 use lotse_webrtc::ingest::{
     IngestEngine, IngestOutput, IngestTrack, WebRtcOptions, WebRtcSourceFactory,
 };
@@ -1121,7 +1119,7 @@ fn rfc5763_5_a_wrong_fingerprint_fails_the_handshake_as_an_engine_error() {
     pair.run(Duration::from_secs(2));
     let (error, code, message) = pair.ended().unwrap();
     assert!(matches!(error, SourceError::Protocol(_)), "{error}");
-    assert_eq!(code, INTERNAL_ERROR);
+    assert_eq!(code, close::INTERNAL_ERROR);
     assert!(message.starts_with("webrtc engine: "), "{message}");
 }
 
@@ -1785,6 +1783,39 @@ mod source {
     }
 
     #[tokio::test]
+    async fn a_signal_the_relay_refused_is_lotse_s_fault_not_the_camera_s() {
+        let _logs = logs();
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
+        let running = start(
+            serde_json::Value::Null,
+            Some(signaling.clone()),
+            Arc::new(SystemClock),
+        );
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        read_offer(&mut relay).await;
+        relay
+            .incoming
+            .send(RemoteSignal::Failed {
+                code: lotse_core::signaling::REJECTED.into(),
+                message: "the offer is too long".into(),
+            })
+            .await
+            .unwrap();
+        let what = "webrtc: the relay refused a signal: the offer is too long";
+        assert_eq!(
+            within(running.run).await.unwrap(),
+            SourceError::Protocol(what.into())
+        );
+        assert_eq!(
+            closed(relay).await,
+            SignalClose {
+                code: close::INTERNAL_ERROR,
+                message: what.into(),
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn the_client_gone_ends_the_attempt_as_signaling_lost() {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
@@ -1981,7 +2012,7 @@ mod source {
         let error = run.await.unwrap();
         assert!(matches!(error, SourceError::Protocol(_)), "{error}");
         let close = closed(relay).await;
-        assert_eq!(close.code, INTERNAL_ERROR);
+        assert_eq!(close.code, close::INTERNAL_ERROR);
         assert_eq!(close.message, error.to_string());
     }
 
@@ -2015,7 +2046,7 @@ mod source {
         );
         assert!(relay.outgoing.try_recv().is_err(), "no offer");
         let close = closed(relay).await;
-        assert_eq!(close.code, INTERNAL_ERROR);
+        assert_eq!(close.code, close::INTERNAL_ERROR);
         assert_eq!(close.message, reason);
     }
 
