@@ -417,9 +417,13 @@ pub struct SignalingAnswer {
 
 /// `signaling/candidate`: a candidate of the camera's (RFC 8838 §10),
 /// taken only from the control connection that owns the signal; at most
-/// 64 per signal (`limit_reached`), its end-of-candidates aside, which
-/// comes once and after which no candidate follows (RFC 8838 §13), and
-/// none after the client's `signaling/error` (`invalid_request`).
+/// 64 per signal (`limit_reached`), its end-of-candidates aside. An
+/// end-of-candidates ends one media section's candidates (RFC 8838 §8.2,
+/// §13): the section of its `sdp_mid`, else of its `sdp_mline_index`, else
+/// the one unnamed section. It comes once per section, for at most 8
+/// sections (`limit_reached`), and no candidate of a section follows its
+/// end (`invalid_request`); nor does any after the client's
+/// `signaling/error` (`invalid_request`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]

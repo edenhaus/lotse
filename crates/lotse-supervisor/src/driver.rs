@@ -2973,6 +2973,15 @@ mod tests {
         out: &std::path::Path,
         want: &lotse_ipc::ToWorker,
     ) -> Vec<lotse_ipc::ToWorker> {
+        recorded_where(out, |message| message == want).await
+    }
+
+    /// The messages a recording worker wrote to `out`, once one of them
+    /// is `wanted`; five seconds without one fail the test.
+    async fn recorded_where(
+        out: &std::path::Path,
+        wanted: impl Fn(&lotse_ipc::ToWorker) -> bool,
+    ) -> Vec<lotse_ipc::ToWorker> {
         let mut attempt = 0_u32;
         loop {
             let bytes = std::fs::read(out).unwrap_or_default();
@@ -2986,10 +2995,10 @@ mod tests {
                 messages.push(lotse_ipc::decode::<lotse_ipc::ToWorker>(frame).unwrap());
                 rest = tail;
             }
-            if messages.contains(want) {
+            if messages.iter().any(&wanted) {
                 return messages;
             }
-            assert!(attempt < 500, "never received {want:?}: {messages:?}");
+            assert!(attempt < 500, "never received it: {messages:?}");
             attempt += 1;
             SystemClock.sleep(Duration::from_millis(10)).await;
         }
@@ -4840,7 +4849,15 @@ mod tests {
             driver.handle(wake).await;
             assert_eq!(waiting(&driver).is_empty(), ms == 4, "after {ms}");
         }
-        let messages = recorded(&out, &lotse_ipc::ToWorker::Prerecord { ms: 4 }).await;
+        // The held answer goes out after the command, so waiting for the
+        // command alone may read the file before the answer is in it.
+        let messages = recorded_where(&out, |message| {
+            matches!(
+                message,
+                lotse_ipc::ToWorker::Signal(SignalCommand::Opened { request: 1, .. })
+            )
+        })
+        .await;
         let opened = messages
             .iter()
             .position(|message| {
@@ -4891,7 +4908,15 @@ mod tests {
             assert!(!driver.commands.is_empty());
             assert_eq!(waiting(&driver).is_empty(), handled == 5, "after {handled}");
         }
-        let messages = recorded(&out, &lotse_ipc::ToWorker::Prerecord { ms: 5 }).await;
+        // The held answer goes out after the command, so waiting for the
+        // command alone may read the file before the answer is in it.
+        let messages = recorded_where(&out, |message| {
+            matches!(
+                message,
+                lotse_ipc::ToWorker::Signal(SignalCommand::Opened { request: 1, .. })
+            )
+        })
+        .await;
         let opened = messages
             .iter()
             .position(|message| {
