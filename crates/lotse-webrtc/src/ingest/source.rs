@@ -167,12 +167,11 @@ fn due(now: Instant, wake: Instant) -> bool {
     now >= wake
 }
 
-/// What woke the attempt's loop.
+/// What woke the attempt's loop, short of its end (the cancel, the
+/// client gone), which the loop takes itself.
 enum Woke {
-    /// The cancel.
-    Cancelled,
-    /// A signal from the client, `None` once it is gone.
-    Signal(Option<RemoteSignal>),
+    /// A signal from the client.
+    Signal(RemoteSignal),
     /// A datagram on host socket `.0`.
     Datagram(usize, io::Result<(SocketAddr, usize)>),
     /// The engine's timeout.
@@ -187,6 +186,15 @@ fn cancelled() -> IngestEnd {
         error: SourceError::Ended("webrtc: cancelled".into()),
         close: close::SOURCE_STOPPED,
         message: "cancelled".to_owned(),
+    }
+}
+
+/// The end of an attempt by the relaying client going away.
+fn client_gone() -> IngestEnd {
+    IngestEnd {
+        error: SourceError::Ended("signaling client gone".into()),
+        close: close::SIGNALING_LOST,
+        message: "the signaling client is gone".to_owned(),
     }
 }
 
@@ -311,12 +319,11 @@ impl Attempt {
     /// ended.
     fn woke(&mut self, event: Woke, now: Instant) -> Option<IngestEnd> {
         match event {
-            Woke::Cancelled => return Some(cancelled()),
-            Woke::Signal(Some(RemoteSignal::Answer(sdp))) => self.engine.accept_answer(now, &sdp),
-            Woke::Signal(Some(RemoteSignal::Candidate(candidate))) => {
+            Woke::Signal(RemoteSignal::Answer(sdp)) => self.engine.accept_answer(now, &sdp),
+            Woke::Signal(RemoteSignal::Candidate(candidate)) => {
                 self.engine.add_remote_candidate(now, &candidate);
             }
-            Woke::Signal(Some(RemoteSignal::Failed { code, message })) if code == REJECTED => {
+            Woke::Signal(RemoteSignal::Failed { code, message }) if code == REJECTED => {
                 // The relay refused what the source sent: the fault is
                 // lotse's, not the camera's.
                 let message = format!("webrtc: the relay refused a signal: {message}");
@@ -326,7 +333,7 @@ impl Attempt {
                     message,
                 });
             }
-            Woke::Signal(Some(RemoteSignal::Failed { code, message })) => {
+            Woke::Signal(RemoteSignal::Failed { code, message }) => {
                 let message = format!("camera: {code}: {message}");
                 let error = if self.engine.answered() {
                     SourceError::Ended(message.clone())
@@ -337,13 +344,6 @@ impl Attempt {
                     error,
                     close: close::CAMERA_ERROR,
                     message,
-                });
-            }
-            Woke::Signal(None) => {
-                return Some(IngestEnd {
-                    error: SourceError::Ended("signaling client gone".into()),
-                    close: close::SIGNALING_LOST,
-                    message: "the signaling client is gone".to_owned(),
                 });
             }
             Woke::Datagram(index, received) => {
@@ -469,7 +469,7 @@ async fn run(
         let event = if due(now, wake) {
             // Due already: before any more I/O, which could always be
             // ready. (A cancel waits for this one step of the engine.)
-            Woke::Timer
+            Ok(Woke::Timer)
         } else {
             // A new timer each time: str0m's next timeout moves with
             // nearly every datagram, so one kept would rarely be the one
@@ -478,17 +478,21 @@ async fn run(
             let sending = !attempt.outbox.is_empty();
             tokio::select! {
                 biased;
-                () = ctx.cancel.cancelled() => Woke::Cancelled,
-                signal = channel.incoming.recv() => Woke::Signal(signal),
+                () = ctx.cancel.cancelled() => Err(cancelled()),
+                signal = channel.incoming.recv() => signal.map(Woke::Signal).ok_or_else(client_gone),
                 permit = channel.outgoing.reserve(), if sending => {
                     let sent = permit.ok().zip(attempt.outbox.pop_front());
-                    Woke::Sent(sent.map(|(permit, signal)| permit.send(signal)).is_some())
+                    Ok(Woke::Sent(sent.map(|(permit, signal)| permit.send(signal)).is_some()))
                 }
-                (index, received) = attempt.hosts.recv(&mut attempt.buf) => Woke::Datagram(index, received),
-                () = &mut sleeping => Woke::Timer,
+                (index, received) = attempt.hosts.recv(&mut attempt.buf) => Ok(Woke::Datagram(index, received)),
+                () = &mut sleeping => Ok(Woke::Timer),
             }
         };
-        if let Some(end) = attempt.woke(event, ctx.time.now()) {
+        let end = match event {
+            Ok(event) => attempt.woke(event, ctx.time.now()),
+            Err(end) => Some(end),
+        };
+        if let Some(end) = end {
             return attempt.finish(channel, end);
         }
     }
