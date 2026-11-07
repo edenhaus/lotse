@@ -1086,7 +1086,12 @@ fn rfc8829_5_3_a_camera_without_a_carried_audio_codec_still_sends_video() {
 #[test]
 fn rfc8829_5_3_answers_the_engine_cannot_take_end_the_attempt_as_invalid() {
     let _logs = logs();
-    let cases: [(&str, fn(String) -> String, &str); 4] = [
+    let cases: [(&str, fn(String) -> String, &str); 5] = [
+        (
+            "an m-line short",
+            |answer| answer[..answer.find("m=application").unwrap()].to_owned(),
+            "Differing m-line count in offer vs answer",
+        ),
         (
             "garbage",
             |_| "v=0\r\nnonsense\r\n".to_owned(),

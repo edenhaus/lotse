@@ -495,9 +495,7 @@ impl IngestEngine {
             .data_channel
             .as_ref()
             .map(|label| (api.add_channel(label.clone()), label.clone()));
-        let (offer, pending) = api
-            .apply()
-            .ok_or_else(|| "the engine made no offer".to_owned())?;
+        let (offer, pending) = api.apply().ok_or("the engine made no offer")?;
         let offer = offer.to_sdp_string();
         check_offer_mids(&offer)?;
         if offer.len() > MAX_OFFER_BYTES {

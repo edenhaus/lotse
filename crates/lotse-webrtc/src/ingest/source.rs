@@ -592,6 +592,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_receive_that_failed_or_on_no_socket_reaches_nothing() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let local = socket.local_addr().unwrap();
+        let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
+        let options = WebRtcOptions {
+            data_channel: None,
+            audio: false,
+        };
+        let mut attempt = Attempt {
+            engine: IngestEngine::offer(&options, &[local], now, now).unwrap(),
+            hosts: Hosts {
+                sockets: vec![(local, socket)],
+                next: 0,
+            },
+            rtp: RtpTracks::new(SCHEME),
+            tracks: Vec::new(),
+            waiting: None,
+            buf: vec![0_u8; RECEIVE_BUFFER],
+            dropped: 0,
+        };
+        let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let failed = Woke::Datagram(0, Err(io::Error::other("refused")));
+        assert!(attempt.woke(failed, now).is_none());
+        // A datagram on a socket the attempt does not have.
+        assert!(
+            attempt
+                .woke(Woke::Datagram(1, Ok((from, 4))), now)
+                .is_none()
+        );
+        assert_eq!(attempt.engine.stats().bad_datagrams, 0);
+        // The same on the one it has is the engine's (and not one it reads).
+        assert!(
+            attempt
+                .woke(Woke::Datagram(0, Ok((from, 4))), now)
+                .is_none()
+        );
+        assert_eq!(attempt.engine.stats().bad_datagrams, 1);
+    }
+
+    #[tokio::test]
     async fn the_host_sockets_are_read_in_turn_so_a_busy_one_starves_none() {
         let mut sockets = Vec::new();
         for _ in 0..2 {
