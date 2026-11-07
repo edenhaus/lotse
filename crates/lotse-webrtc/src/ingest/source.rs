@@ -466,11 +466,9 @@ async fn run(
             Err(end) => return attempt.finish(channel, end),
         };
         let now = ctx.time.now();
-        let event = if ctx.cancel.is_cancelled() {
-            Woke::Cancelled
-        } else if due(now, wake) {
+        let event = if due(now, wake) {
             // Due already: before any more I/O, which could always be
-            // ready.
+            // ready. (A cancel waits for this one step of the engine.)
             Woke::Timer
         } else {
             // A new timer each time: str0m's next timeout moves with

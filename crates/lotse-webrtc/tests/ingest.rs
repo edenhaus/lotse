@@ -890,13 +890,16 @@ fn rfc3264_7_an_accepted_audio_format_of_another_clock_rate_is_not_the_track_s()
     assert!(!pcmu.is_empty(), "the answer takes PCMU too");
     assert_eq!(Pt::from(pair.tracks()[0].pt), opus[0]);
     let now = pair.now;
-    // PCMU's 8 kHz is not the Opus track's 48 kHz: dropped.
-    pair.camera()
-        .write_on(audio, now, pcmu[0], true, &[0xff; 160]);
+    // PCMU's 8 kHz is not the Opus track's 48 kHz: dropped (the line
+    // logged once).
+    for _ in 0..2 {
+        pair.camera()
+            .write_on(audio, now, pcmu[0], true, &[0xff; 160]);
+    }
     pair.camera()
         .write_on(audio, now, opus[0], true, &[0xfc, 0xff, 0xfe]);
     pair.step(Duration::ZERO);
-    assert_eq!(pair.engine.stats().foreign_packets, 1);
+    assert_eq!(pair.engine.stats().foreign_packets, 2);
     assert_eq!(pair.engine.stats().rtp_packets, 1);
     assert!(
         !pair
@@ -1926,6 +1929,29 @@ mod source {
             SourceError::Timeout("webrtc: no answer within 20 s".into())
         );
         assert_eq!(closed(relay).await.code, close::ANSWER_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_goes_before_a_deadline_due_at_the_same_time() {
+        let _logs = logs();
+        let clock = Arc::new(FakeClock::from_system());
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
+        let running = start(
+            serde_json::Value::Null,
+            Some(signaling.clone()),
+            clock.clone(),
+        );
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        read_offer(&mut relay).await;
+        settle().await;
+        // Both before the source runs again.
+        clock.advance(ANSWER_TIMEOUT);
+        running.cancel.cancel();
+        assert_eq!(
+            within(running.run).await.unwrap(),
+            SourceError::Ended("webrtc: cancelled".into())
+        );
+        assert_eq!(closed(relay).await.code, close::SOURCE_STOPPED);
     }
 
     #[tokio::test]
