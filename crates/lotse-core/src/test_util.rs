@@ -2469,8 +2469,11 @@ mod tests {
     }
 
     /// A signaled fake source over [`crowded`] addresses whose relay does
-    /// not drain `outgoing`, once its queue is full and the source waits
-    /// for room: its run, its track set and the relay.
+    /// not drain `outgoing`, so its offer fills the queue and then waits
+    /// for room: its run, its track set and the relay. Whatever the test
+    /// sends on `incoming` the source takes once its sends wait (it
+    /// prefers sending while there is room), so the outcome does not
+    /// depend on how far it got.
     async fn blocked() -> (
         tokio::task::JoinHandle<SourceError>,
         Arc<TrackSet>,
@@ -2480,15 +2483,6 @@ mod tests {
         let signaling = FakeSignaling::new(crowded());
         let (run, set, cancel) = run_signaled(Some(signaling.clone()));
         let relay = within(signaling.next_signal()).await.unwrap();
-        within(async {
-            loop {
-                tokio::task::yield_now().await;
-                if relay.outgoing.len() == crate::signaling::OUTGOING_CAPACITY {
-                    break;
-                }
-            }
-        })
-        .await;
         (run, set, cancel, relay)
     }
 
@@ -2544,6 +2538,11 @@ mod tests {
             .await
             .unwrap();
         drained(&relay).await;
+        assert_eq!(
+            relay.outgoing.len(),
+            crate::signaling::OUTGOING_CAPACITY,
+            "the offer waits for room"
+        );
         assert!(set.tracks().is_empty(), "not live before the offer is out");
         // The offer, a candidate per address, the end-of-candidates.
         for _ in 0..crowded().len() + 2 {
