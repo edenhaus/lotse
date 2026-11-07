@@ -542,10 +542,12 @@ impl Supervisor {
                 recordings,
             },
         );
+        let now = (self.shared.clock.now(), self.shared.clock.wall_now());
         for connection in connections {
             state.refresh_connection(&connection);
             state.follow_backchannel(&connection, stream_id.as_str());
             state.follow_prerecord(&connection, stream_id.as_str());
+            state.route_waiting_opens(&connection, now);
         }
         close_moved_sessions(&mut state, stream_id.as_str());
         if reoriented {

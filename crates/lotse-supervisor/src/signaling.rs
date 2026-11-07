@@ -34,12 +34,21 @@
 //! gone, its source ends and connects again after its backoff, offering
 //! to whichever subscription takes the stream then.
 //!
-//! What the registry tells a worker on its own (an open's answer, the end
-//! of a signal) is never lost to a full driver queue: it waits in the
-//! registry, ahead of anything later for that worker, until the driver
-//! has handled its queue and takes it ([`State::take_held_signals`]).
-//! Only a client's command is refused on a busy driver (`limit_reached`),
-//! for the client to send again.
+//! What the registry or the driver tells a worker on its own (an open's
+//! answer or refusal, the end of a signal) is never lost to a full driver
+//! queue: it waits in the registry, ahead of anything later for that
+//! worker, until the driver has handled the commands its queue held when
+//! the first was held, and takes it ([`State::take_held_signals`]); a
+//! queue that never empties cannot starve it. Only a client's command is
+//! refused on a busy driver (`limit_reached`), for the client to send
+//! again.
+//!
+//! A signal belongs to its stream: one whose stream no longer reads from
+//! its connection (the stream deleted or moved to another source while
+//! the connection serves others) ends as its subscription's end does, the
+//! client told it closed `source_stopped`. An open waiting for a
+//! subscription is offered again when a subscription opens or a stream
+//! joins its connection.
 //!
 //! The worker is untrusted. A source connection holds at most
 //! [`MAX_OPEN_SIGNALS`] signals and waiting opens at once, an open past
@@ -238,6 +247,19 @@ impl ClientSent {
     }
 }
 
+/// The commands held for one worker while its driver's queue is full.
+#[derive(Debug, Default)]
+struct Held {
+    /// The commands, oldest first, each with the worker's serial.
+    commands: VecDeque<(u64, SignalCommand)>,
+    /// The commands the driver is still to handle before it takes these:
+    /// those its queue held when the first was held, and one more, which
+    /// it may have taken off the queue then and not yet handled. As the
+    /// queue is first in, first out, every command queued before the held
+    /// ones is handled by then, whatever is queued after.
+    ahead: usize,
+}
+
 /// The signaling the registry routes: the subscriptions, the opens
 /// waiting for one, and the open signals.
 #[derive(Debug, Default)]
@@ -253,10 +275,9 @@ pub(crate) struct Signaling {
     /// The open signals, by id.
     signals: BTreeMap<String, Signal>,
     /// The commands for each source connection's worker its driver's full
-    /// queue did not take, oldest first, each with the worker's serial:
-    /// they go before any later command for it, when the driver takes
-    /// them ([`State::take_held_signals`]).
-    held: BTreeMap<String, VecDeque<(u64, SignalCommand)>>,
+    /// queue did not take: they go before any later command for it, when
+    /// the driver takes them ([`State::take_held_signals`]).
+    held: BTreeMap<String, Held>,
     /// The signals opened so far, for an id when the ULID's randomness is
     /// unavailable.
     opened: u64,
@@ -339,6 +360,19 @@ impl Signaling {
 /// does not know.
 fn close_code(code: &str) -> SignalCloseCode {
     SignalCloseCode::parse(code).unwrap_or(SignalCloseCode::InternalError)
+}
+
+/// The id of the `opened`th signal: its ULID, or, when the ULID's
+/// randomness is unavailable (Linux's getrandom does not fail once the
+/// kernel's pool is ready), the count, unique within the process.
+fn signal_id(ulid: Result<String, getrandom::Error>, opened: u64) -> String {
+    match ulid {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(%error, opened, "no randomness for a signal's ULID; its count names it");
+            format!("{opened:026}")
+        }
+    }
 }
 
 /// Queues `event` on a signaling subscription's `events`, leaving the
@@ -694,9 +728,7 @@ impl State {
         let (owner, events) = (subscriber.owner, subscriber.events.clone());
         self.signaling.opened = self.signaling.opened.wrapping_add(1);
         let opened = self.signaling.opened;
-        // Linux's getrandom does not fail once the kernel's pool is ready;
-        // the count stands in, unique within the process.
-        let signal_id = ulid(wall).unwrap_or_else(|_| format!("{opened:026}"));
+        let signal_id = signal_id(ulid(wall), opened);
         self.tell_worker(
             &open.connection,
             open.worker,
@@ -843,14 +875,74 @@ impl State {
             let _last = emit(&previous.events, &SignalingEvent::Superseded {});
             self.end_subscription(previous.owner, "superseded");
         }
+        self.route_waiting(None, now, wall);
+        rx
+    }
+
+    /// The streams of `connection` changed (a `stream/put`) at `now` on
+    /// the injected clock: the opens it has waiting are offered again, as
+    /// a stream that joined it may have a subscription of its own that
+    /// takes them, their signals named at `wall` on its wall clock.
+    pub(crate) fn route_waiting_opens(
+        &mut self,
+        connection: &str,
+        (now, wall): (Instant, SystemTime),
+    ) {
+        self.route_waiting(Some(connection), now, wall);
+    }
+
+    /// Offers the waiting opens, of `connection` only if it is one, to the
+    /// subscriptions at `now`, naming their signals at `wall`; those none
+    /// takes wait on, in order.
+    fn route_waiting(&mut self, connection: Option<&str>, now: Instant, wall: SystemTime) {
         let waiting = std::mem::take(&mut self.signaling.waiting);
         for open in waiting {
-            if self.open_signal(&open, now, wall) {
+            if connection.is_none_or(|only| only == open.connection)
+                && self.open_signal(&open, now, wall)
+            {
                 continue;
             }
             self.signaling.waiting.push(open);
         }
-        rx
+    }
+
+    /// The streams of `connection`, which still serves some, changed:
+    /// each of its signals whose stream no longer reads from it ends, as
+    /// its subscription took it for that stream. Its worker is told the
+    /// client is gone, so the attempt ends and its source connects again,
+    /// offering to whichever subscription takes one of its streams then;
+    /// the client is told it closed `source_stopped`.
+    pub(crate) fn signals_left_streams(&mut self, connection: &str) {
+        let Some(entry) = self.connections.get(connection) else {
+            return;
+        };
+        let (ended, open): (BTreeMap<_, _>, _) = std::mem::take(&mut self.signaling.signals)
+            .into_iter()
+            .partition(|(_, signal)| {
+                signal.connection == connection && !entry.streams.contains(&signal.stream_id)
+            });
+        self.signaling.signals = open;
+        for (signal_id, signal) in ended {
+            tracing::info!(
+                signal.id = %signal_id,
+                connection.id = connection,
+                stream.id = %signal.stream_id,
+                "signal ended: its stream no longer reads from its connection; its source reconnects"
+            );
+            self.tell_worker(
+                connection,
+                signal.worker,
+                SignalCommand::Gone {
+                    signal_id: signal_id.clone(),
+                },
+            );
+            self.close_signal(
+                signal_id,
+                &signal,
+                SignalCloseCode::SourceStopped,
+                "the signal's stream no longer reads from its source".to_owned(),
+            );
+        }
     }
 
     /// Ends the subscription `owner`, for `reason`: it gives up its scope
@@ -1081,12 +1173,12 @@ impl State {
     }
 
     /// Tells the worker `worker` of `connection` `command`, which the
-    /// registry decided on its own and so must not be lost: through its
-    /// driver's queue, or, while that is full or other commands are held
-    /// before it, held until the driver takes it
+    /// registry or the driver decided on its own and so must not be lost:
+    /// through its driver's queue, or, while that is full or other
+    /// commands are held before it, held until the driver takes it
     /// ([`State::take_held_signals`]). One for a connection that is gone,
     /// or past [`MAX_HELD_SIGNALS`], is dropped.
-    fn tell_worker(&mut self, connection: &str, worker: u64, command: SignalCommand) {
+    pub(crate) fn tell_worker(&mut self, connection: &str, worker: u64, command: SignalCommand) {
         let Some(entry) = self.connections.get(connection) else {
             tracing::debug!(
                 connection.id = connection,
@@ -1101,12 +1193,19 @@ impl State {
             permit.send(DriverCommand::Signal { worker, command });
             return;
         }
+        let queued = entry
+            .commands
+            .max_capacity()
+            .saturating_sub(entry.commands.capacity());
         let held = self
             .signaling
             .held
             .entry(connection.to_owned())
-            .or_default();
-        if held.len() >= MAX_HELD_SIGNALS {
+            .or_insert_with(|| Held {
+                commands: VecDeque::new(),
+                ahead: queued.saturating_add(1),
+            });
+        if held.commands.len() >= MAX_HELD_SIGNALS {
             tracing::error!(
                 connection.id = connection,
                 ?command,
@@ -1120,15 +1219,33 @@ impl State {
             ?command,
             "the driver's queue is full; signal command held until it takes it"
         );
-        held.push_back((worker, command));
+        held.commands.push_back((worker, command));
     }
 
-    /// The commands held for the worker of `connection` while its driver's
-    /// queue was full, oldest first, each with the worker's serial; the
-    /// driver takes them once its queue is empty, so they go after
-    /// everything queued before them and before anything queued after.
-    pub(crate) fn take_held_signals(&mut self, connection: &str) -> VecDeque<(u64, SignalCommand)> {
-        self.signaling.held.remove(connection).unwrap_or_default()
+    /// The driver of `connection` handled a command, its queue now
+    /// `drained` or not: the commands held for its worker while the queue
+    /// was full, oldest first, each with the worker's serial, once it has
+    /// handled those its queue held when the first was held
+    /// ([`Held::ahead`]) or its queue is empty, else none yet. So they go
+    /// after everything queued before them and before anything the
+    /// registry or the driver tells the worker after, and a queue that
+    /// other commands keep from emptying holds them up for at most one
+    /// queue's worth.
+    pub(crate) fn take_held_signals(
+        &mut self,
+        connection: &str,
+        drained: bool,
+    ) -> VecDeque<(u64, SignalCommand)> {
+        let Entry::Occupied(mut held) = self.signaling.held.entry(connection.to_owned()) else {
+            return VecDeque::new();
+        };
+        let ahead = held.get().ahead.saturating_sub(1);
+        held.get_mut().ahead = ahead;
+        if drained || ahead == 0 {
+            held.remove().commands
+        } else {
+            VecDeque::new()
+        }
     }
 }
 
@@ -1346,6 +1463,29 @@ mod tests {
         offer(&mut state, "c1", &signal_id);
         assert_eq!(events(&mut subscription).len(), 1);
         (state, queues, signal_id, subscription)
+    }
+
+    /// A signal is named by its ULID; without randomness, by its count,
+    /// with a warning.
+    #[test]
+    fn a_signal_without_randomness_for_its_ulid_is_named_by_its_count() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        assert_eq!(
+            signal_id(Ok("01ARYZ6S41TSV4RRFFQ69G5FAV".into()), 7),
+            "01ARYZ6S41TSV4RRFFQ69G5FAV"
+        );
+        assert!(captured.lines("no randomness").is_empty());
+        assert_eq!(
+            signal_id(Err(getrandom::Error::UNSUPPORTED), 7),
+            "00000000000000000000000007"
+        );
+        assert_eq!(
+            captured
+                .lines("no randomness for a signal's ULID; its count names it")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2033,7 +2173,13 @@ mod tests {
         open(&mut state, "c1", 1);
         open(&mut state, "c1", 2);
         assert_eq!(state.signaling.signals.len(), 2, "both opened");
-        let held = |state: &State| state.signaling.held.get("c1").map_or(0, VecDeque::len);
+        let held = |state: &State| {
+            state
+                .signaling
+                .held
+                .get("c1")
+                .map_or(0, |held| held.commands.len())
+        };
         assert_eq!(held(&state), 1);
         let first = opened(&mut queues, "c1", 1);
         offer(&mut state, "c1", &first);
@@ -2051,7 +2197,7 @@ mod tests {
         // open's answer, though the queue has room.
         assert!(state.signaling_unsubscribed(ConnectionId(1), 1));
         assert!(queues.take("c1").is_empty());
-        let taken: Vec<_> = state.take_held_signals("c1").into_iter().collect();
+        let taken: Vec<_> = state.take_held_signals("c1", true).into_iter().collect();
         let_assert!(
             [
                 (
@@ -2080,7 +2226,7 @@ mod tests {
         let mut ids = [first, second.clone()];
         ids.sort();
         assert_eq!([gone_first, gone_second], [&ids[0], &ids[1]]);
-        assert!(state.take_held_signals("c1").is_empty(), "taken once");
+        assert!(state.take_held_signals("c1", true).is_empty(), "taken once");
         let held_lines =
             captured.lines("the driver's queue is full; signal command held until it takes it");
         assert_eq!(held_lines.len(), 3, "{held_lines:?}");
@@ -2269,6 +2415,163 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    /// What the registry holds for a worker goes once the driver has
+    /// handled what its queue held before it, and one more it may have had
+    /// in hand, though the queue never empties; or at once once the queue
+    /// is empty.
+    #[test]
+    fn held_commands_go_once_the_driver_handled_what_its_queue_held_before_them() {
+        let (mut state, mut queues) = signaled_state(2);
+        let gone = |n: u32| SignalCommand::Gone {
+            signal_id: format!("s{n}"),
+        };
+        // Nothing held: nothing to take, and nothing counted.
+        assert!(state.take_held_signals("c1", false).is_empty());
+        for n in 0..3 {
+            state.tell_worker("c1", WORKER, gone(n));
+        }
+        for handled in 1..=2 {
+            assert!(
+                state.take_held_signals("c1", false).is_empty(),
+                "after {handled}"
+            );
+        }
+        assert_eq!(
+            Vec::from(state.take_held_signals("c1", false)),
+            [(WORKER, gone(2))]
+        );
+        assert!(
+            state.take_held_signals("c1", false).is_empty(),
+            "taken once"
+        );
+        assert_eq!(queues.take("c1"), [gone(0), gone(1)]);
+        // The queue empty, they go at once.
+        for n in 3..6 {
+            state.tell_worker("c1", WORKER, gone(n));
+        }
+        assert_eq!(
+            Vec::from(state.take_held_signals("c1", true)),
+            [(WORKER, gone(5))]
+        );
+        // Only the connection's own.
+        state.tell_worker("c1", WORKER, gone(6));
+        assert!(state.take_held_signals("c2", true).is_empty());
+        assert_eq!(state.signaling.held["c1"].commands.len(), 1);
+    }
+
+    /// An open waiting for a subscription is offered again when a stream
+    /// joins its connection: one with its own subscription takes it.
+    /// Another connection's change leaves it waiting.
+    #[test]
+    fn a_waiting_open_is_offered_again_when_a_stream_with_a_subscription_joins_its_connection() {
+        let (mut state, mut queues) = signaled_state(8);
+        let mut porch = subscribe(&mut state, owner(1, 1), Some("porch"));
+        open(&mut state, "c1", 1);
+        open(&mut state, "c2", 1);
+        assert_eq!(state.signaling.waiting.len(), 2);
+        let _joined = state
+            .connections
+            .get_mut("c1")
+            .unwrap()
+            .streams
+            .insert("porch".into());
+        state.route_waiting_opens("c2", (later(), UNIX_EPOCH));
+        assert_eq!(state.signaling.waiting.len(), 2);
+        assert!(queues.take("c1").is_empty());
+        state.route_waiting_opens("c1", (later(), UNIX_EPOCH));
+        let signal_id = opened(&mut queues, "c1", 1);
+        offer(&mut state, "c1", &signal_id);
+        assert_eq!(events(&mut porch)[0]["stream_id"], "porch");
+        let_assert!([WaitingOpen { connection, .. }] = state.signaling.waiting.as_slice());
+        assert_eq!(connection, "c2");
+    }
+
+    /// A stream on connection `connection`, as the registry keeps it.
+    fn stream_on(connection: &str) -> crate::registry::StreamEntry {
+        crate::registry::StreamEntry {
+            sources: vec![crate::registry::StreamSource {
+                spec: crate::driver::DriverSpec {
+                    connection_id: connection.into(),
+                    url: "webrtc://camera.front_door".into(),
+                    options: "{}".into(),
+                    host: "camera.front_door".into(),
+                    port: None,
+                    backchannel: false,
+                    signaled: true,
+                },
+                url: SourceUrl::parse("webrtc://camera.front_door").unwrap(),
+                options: serde_json::Map::new(),
+                protocol: "webrtc",
+                connection: connection.into(),
+            }],
+            preload: false,
+            audio: lotse_api_types::stream::AudioMode::Auto,
+            orientation: lotse_api_types::stream::Orientation::NoTransform,
+            created: UNIX_EPOCH,
+            prerecord_ms: 0,
+            recordings: crate::recording::RecordingCounters::default(),
+        }
+    }
+
+    /// A signal whose stream leaves a connection that serves others ends:
+    /// its worker is told the client is gone, so its source connects
+    /// again, and its subscription that it closed `source_stopped`; the
+    /// other stream's stays open.
+    #[test]
+    fn a_signal_whose_stream_leaves_its_shared_connection_ends_source_stopped() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let (mut state, mut queues) = signaled_state(8);
+        let _joined = state
+            .connections
+            .get_mut("c1")
+            .unwrap()
+            .streams
+            .insert("porch".into());
+        for stream in ["door", "porch"] {
+            state.streams.insert(stream.into(), stream_on("c1"));
+        }
+        let mut porch = subscribe(&mut state, owner(1, 1), Some("porch"));
+        open(&mut state, "c1", 1);
+        let at_porch = opened(&mut queues, "c1", 1);
+        offer(&mut state, "c1", &at_porch);
+        let mut door = subscribe(&mut state, owner(2, 1), Some("door"));
+        open(&mut state, "c1", 2);
+        let at_door = opened(&mut queues, "c1", 2);
+        offer(&mut state, "c1", &at_door);
+        let _offers = (events(&mut porch), events(&mut door));
+        // Nothing left: nothing ends.
+        state.refresh_connection("c1");
+        assert_eq!(state.signaling.signals.len(), 2);
+        assert!(queues.take("c1").is_empty());
+        let _deleted = state.streams.remove("porch");
+        state.refresh_connection("c1");
+        assert_eq!(
+            queues.take("c1"),
+            [SignalCommand::Gone {
+                signal_id: at_porch.clone()
+            }]
+        );
+        assert_eq!(
+            events(&mut porch),
+            [
+                json!({ "type": "closed", "signal_id": at_porch, "code": "source_stopped",
+                     "message": "the signal's stream no longer reads from its source" })
+            ]
+        );
+        assert!(events(&mut door).is_empty());
+        assert_eq!(state.signal_ids_for_tests(), [at_door]);
+        assert_eq!(
+            captured
+                .lines("signal ended: its stream no longer reads from its connection")
+                .len(),
+            1
+        );
+        // A connection that is gone has none to end.
+        state.signals_left_streams("gone");
+        assert_eq!(state.signaling.signals.len(), 1);
     }
 
     /// A connection several streams share offers to the subscription of
