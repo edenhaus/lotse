@@ -427,8 +427,9 @@ pub enum ToSupervisor {
     Signal(SignalReport),
 }
 
-/// The most bytes of SDP a [`SignalReport::Offer`] or a
-/// [`SignalCommand::Answer`] carries: the control API's cap on an SDP
+/// The most bytes of SDP a [`SignalCommand::Answer`] carries, and the
+/// bound of a [`SignalReport::Offer`]'s tighter cap
+/// ([`MAX_SIGNAL_OFFER_BYTES`]): the control API's cap on an SDP
 /// (`MAX_SDP_CHARS`, 64 Ki characters, which its frame bounds to as many
 /// bytes). With [`MAX_SIGNAL_TEXT_BYTES`] for the rest, a signal message
 /// stays far below the frame's [`MAX_MESSAGE_BYTES`](crate::MAX_MESSAGE_BYTES),
@@ -440,6 +441,20 @@ pub const MAX_SIGNAL_SDP_BYTES: usize = 64 * 1024;
 /// on a candidate line (`MAX_TEXT_CHARS`, 1024 characters) in bytes,
 /// four per character.
 pub const MAX_SIGNAL_TEXT_BYTES: usize = 4 * 1024;
+
+/// The most bytes of SDP a worker's [`SignalReport::Offer`] carries: what
+/// the supervisor passes on to the client. A WebRTC offer of audio, video
+/// and a data channel, its host candidates included, is two or three KiB.
+/// The worker ends a signal whose offer is longer itself, so the
+/// supervisor never has to reject one.
+pub const MAX_SIGNAL_OFFER_BYTES: usize = 16 * 1024;
+
+/// The most bytes of a worker's [`SignalReport::Candidate`] line or `mid`:
+/// the control API's cap on a candidate line (`MAX_TEXT_CHARS`, 1024
+/// characters), which the supervisor checks it against in bytes. The
+/// worker ends a signal whose candidate is longer itself, as for an
+/// offer over [`MAX_SIGNAL_OFFER_BYTES`].
+pub const MAX_SIGNAL_CANDIDATE_BYTES: usize = 1024;
 
 /// What a worker's signaled source sends toward the control-API client
 /// that relays its signaling (`lotse_core::signaling`), in the order it
@@ -466,7 +481,7 @@ pub enum SignalReport {
     Offer {
         /// The signal.
         signal_id: String,
-        /// The SDP, at most [`MAX_SIGNAL_SDP_BYTES`].
+        /// The SDP, at most [`MAX_SIGNAL_OFFER_BYTES`].
         sdp: String,
     },
     /// A local candidate trickled after the offer (RFC 8838 §8), or the
@@ -474,9 +489,11 @@ pub enum SignalReport {
     Candidate {
         /// The signal.
         signal_id: String,
-        /// The `candidate:` attribute without `a=`, or empty.
+        /// The `candidate:` attribute without `a=`, or empty; at most
+        /// [`MAX_SIGNAL_CANDIDATE_BYTES`].
         candidate: String,
-        /// The `a=mid` of its media section (RFC 8843 §7.1).
+        /// The `a=mid` of its media section (RFC 8843 §7.1), at most
+        /// [`MAX_SIGNAL_CANDIDATE_BYTES`].
         mid: Option<String>,
         /// The index of its media section, 0 for the first.
         mline_index: Option<u16>,
@@ -1285,6 +1302,17 @@ mod tests {
                 "Signal(Gone { signal_id: \"01JSIG\" })",
             ]
         );
+    }
+
+    /// The caps in bytes: an offer of a few KiB fits many times over, a
+    /// candidate line as the control API's 1024 characters, an answer as
+    /// its 64 Ki, any other text four bytes per such character.
+    #[test]
+    fn the_signal_caps_are_16_kib_for_an_offer_and_the_control_api_s_for_the_rest() {
+        assert_eq!(MAX_SIGNAL_OFFER_BYTES, 16_384);
+        assert_eq!(MAX_SIGNAL_CANDIDATE_BYTES, 1_024);
+        assert_eq!(MAX_SIGNAL_SDP_BYTES, 65_536);
+        assert_eq!(MAX_SIGNAL_TEXT_BYTES, 4_096);
     }
 
     #[test]

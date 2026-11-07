@@ -1077,13 +1077,20 @@ fn fake_offer(local_addrs: &[IpAddr]) -> Vec<LocalSignal> {
 
 /// Ends a [`FakeSignaledSource`]'s attempt on the failure `code` and
 /// `message` the client relayed: closes `channel` as `camera_error` and
-/// returns the error `as_error` makes of what happened.
+/// returns the error `as_error` makes of what happened. The relay's own
+/// rejection ([`crate::signaling::REJECTED`]) is no camera's failure: it
+/// closes as `internal_error` and ends the attempt as a protocol error.
 fn camera_failed(
     channel: SignalingChannel,
     code: &str,
     message: &str,
     as_error: fn(String) -> SourceError,
 ) -> SourceError {
+    if code == crate::signaling::REJECTED {
+        let what = format!("the relay rejected the source's signal: {message}");
+        channel.close(close::INTERNAL_ERROR, what.clone());
+        return SourceError::Protocol(what);
+    }
     let what = format!("camera: {code}: {message}");
     channel.close(close::CAMERA_ERROR, what.clone());
     as_error(what)
@@ -2459,6 +2466,36 @@ mod tests {
         );
         assert_eq!(set.tracks().len(), 1, "live before it failed");
         assert_eq!(within(relay.closed.wait()).await.code, close::CAMERA_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_signaled_fake_whose_signal_the_relay_rejected_ends_as_a_protocol_error() {
+        for answered in [false, true] {
+            let (run, _set, _cancel, relay) = offered().await;
+            if answered {
+                relay
+                    .incoming
+                    .send(RemoteSignal::Answer("v=0 answer".into()))
+                    .await
+                    .unwrap();
+            }
+            relay
+                .incoming
+                .send(RemoteSignal::Failed {
+                    code: crate::signaling::REJECTED.into(),
+                    message: "malformed offer".into(),
+                })
+                .await
+                .unwrap();
+            let what = "the relay rejected the source's signal: malformed offer";
+            assert_eq!(
+                within(run).await.unwrap(),
+                SourceError::Protocol(what.into())
+            );
+            let close = within(relay.closed.wait()).await;
+            assert_eq!(close.code, close::INTERNAL_ERROR);
+            assert_eq!(close.message, what);
+        }
     }
 
     #[tokio::test]

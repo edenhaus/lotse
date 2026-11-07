@@ -369,12 +369,22 @@ const fn with_audio() -> bool {
 /// for every stream, supersedes the earlier, which gets `superseded` and
 /// ends, its signals with it. A subscription for one stream takes that
 /// stream's new signals from the one for every stream, which keeps the
-/// signals it already has. A signal belongs to the subscription that got
-/// its offer: only its control connection may answer, trickle or end it.
-/// A source finding no subscription waits for one up to 10 s, then its
-/// attempt fails `source_unreachable` and it backs off; an `unsubscribe`
-/// or the control connection's close ends the subscription's signals at
-/// once, and their sources connect again after their backoff.
+/// signals it already has. A source several streams share offers to the
+/// subscription of the first of them that has its own, else to the one
+/// for every stream; the offer's `stream_id` names the stream it was
+/// taken for. A signal belongs to the subscription that got its offer:
+/// only its control connection may answer, trickle or end it. A source
+/// finding no subscription waits for one up to 10 s, then its attempt
+/// fails `source_unreachable` and it backs off.
+///
+/// When the subscription ends (`unsubscribe`, the control connection's
+/// close, a supersede, or an event queue it let overflow), every signal it
+/// holds ends at once, answered and live ones included, without a
+/// `closed` event: the client is taken to have lost what it kept for
+/// them (the camera's session, a stream extension it renewed), so each
+/// source ends its attempt and connects again after its backoff, offering
+/// to whichever subscription takes its stream then. A client that only
+/// reconnects should subscribe again, and expect new offers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -388,7 +398,8 @@ pub struct SignalingSubscribe {
 }
 
 /// `signaling/answer`: the camera's SDP answer (RFC 8829 §5.3) to a
-/// signal's offer, once per signal, taken only from the control
+/// signal's offer, once per signal and not after the client's
+/// `signaling/error` (`invalid_request`), taken only from the control
 /// connection whose subscription got the offer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -406,7 +417,9 @@ pub struct SignalingAnswer {
 
 /// `signaling/candidate`: a candidate of the camera's (RFC 8838 §10),
 /// taken only from the control connection that owns the signal; at most
-/// 64 per signal.
+/// 64 per signal (`limit_reached`), its end-of-candidates aside, which
+/// comes once and after which no candidate follows (RFC 8838 §13), and
+/// none after the client's `signaling/error` (`invalid_request`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -432,7 +445,8 @@ pub struct SignalingCandidate {
 /// `signaling/error`: the camera or its integration failed the signal;
 /// it ends, closing `camera_error`, and its source connects again after
 /// its backoff. Taken only from the control connection that owns the
-/// signal.
+/// signal, once: a second, or an answer or candidate after it, is
+/// `invalid_request`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -442,7 +456,9 @@ pub struct SignalingError {
     /// The signal.
     #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
     pub signal_id: String,
-    /// The client's code, `^[a-z0-9_]{1,64}$`.
+    /// The client's code, `^[a-z0-9_]{1,64}$`; not `signal_rejected`,
+    /// the supervisor's own for a rejection of the source's signaling
+    /// (`invalid_request`).
     #[cfg_attr(feature = "schema", schemars(regex(pattern = SIGNAL_ERROR_CODE_PATTERN)))]
     pub code: String,
     /// For humans.
@@ -558,7 +574,10 @@ pub enum Command {
     #[cfg_attr(feature = "schema", schemars(title = "RecordingCreateCommand"))]
     RecordingCreate(RecordingCreate),
     /// `signaling/subscribe`: a subscription to the offers of one
-    /// stream's signaled sources, or of every stream's.
+    /// stream's signaled sources, or of every stream's. Its end
+    /// (`unsubscribe`, the connection's close, a supersede) ends every
+    /// signal it holds at once, live ones included, without `closed`:
+    /// their sources connect again after their backoff.
     #[serde(rename = "signaling/subscribe")]
     #[cfg_attr(feature = "schema", schemars(title = "SignalingSubscribeCommand"))]
     SignalingSubscribe(SignalingSubscribe),
@@ -570,7 +589,8 @@ pub enum Command {
     #[serde(rename = "signaling/candidate")]
     #[cfg_attr(feature = "schema", schemars(title = "SignalingCandidateCommand"))]
     SignalingCandidate(SignalingCandidate),
-    /// `signaling/error`: the camera failed a signal, which ends.
+    /// `signaling/error`: the camera failed a signal, which ends; once
+    /// per signal.
     #[serde(rename = "signaling/error")]
     #[cfg_attr(feature = "schema", schemars(title = "SignalingErrorCommand"))]
     SignalingError(SignalingError),
