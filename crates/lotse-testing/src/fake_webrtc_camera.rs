@@ -12,9 +12,9 @@
 //! fragments, RFC 6184 §5.7.1 and §5.8) and, when configured, Opus (RFC
 //! 7587) or PCMU (RFC 3551 §4.5.14) audio in 20 ms packets, each RTP packet
 //! with the RFC 9143 `mid` header extension as libwebrtc sends it (unless
-//! configured without, then not negotiated either); str0m sends the Sender Reports (RFC 3550 §6.4.1). A
-//! Picture Loss Indication (RFC 4585 §6.3.1) makes the next picture a
-//! keyframe.
+//! configured without, then not negotiated either); str0m sends the Sender
+//! Reports (RFC 3550 §6.4.1). A Picture Loss Indication (RFC 4585 §6.3.1)
+//! makes the next picture a keyframe.
 //!
 //! Knobs model the integrations' habits: candidates in the answer, trickled
 //! after it, or both (RFC 8838); an ICE lite agent (RFC 8445 §2.5) that
@@ -214,7 +214,8 @@ pub struct WebRtcCameraStats {
     pub keyframe_requests: AtomicU64,
     /// The source's candidates handed to its ICE agent.
     pub remote_candidates: AtomicU64,
-    /// The source's candidates dropped ([`WebRtcCameraConfig::drop_remote_candidates`]).
+    /// The source's candidates dropped
+    /// ([`WebRtcCameraConfig::drop_remote_candidates`]).
     pub dropped_candidates: AtomicU64,
     /// The camera closed the connection itself.
     pub closed: AtomicBool,
@@ -522,7 +523,7 @@ struct Connection {
     /// The source's trickled candidates; closed once the camera's handle
     /// is gone.
     incoming: mpsc::UnboundedReceiver<Candidate>,
-    /// The stop.
+    /// The close: the test's, or the dropped handle's.
     cancel: CancellationToken,
     /// The offer's video m-line.
     video_mid: Option<Mid>,
