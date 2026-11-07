@@ -341,6 +341,19 @@ fn close_code(code: &str) -> SignalCloseCode {
     SignalCloseCode::parse(code).unwrap_or(SignalCloseCode::InternalError)
 }
 
+/// The id of the `opened`th signal: its ULID, or, when the ULID's
+/// randomness is unavailable (Linux's getrandom does not fail once the
+/// kernel's pool is ready), the count, unique within the process.
+fn signal_id(ulid: Result<String, getrandom::Error>, opened: u64) -> String {
+    match ulid {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(%error, opened, "no randomness for a signal's ULID; its count names it");
+            format!("{opened:026}")
+        }
+    }
+}
+
 /// Queues `event` on a signaling subscription's `events`, leaving the
 /// overflow slot free. A signaling event is never dropped: without room
 /// for it the subscription ends with [`EventClass::Overflowed`], after
@@ -694,9 +707,7 @@ impl State {
         let (owner, events) = (subscriber.owner, subscriber.events.clone());
         self.signaling.opened = self.signaling.opened.wrapping_add(1);
         let opened = self.signaling.opened;
-        // Linux's getrandom does not fail once the kernel's pool is ready;
-        // the count stands in, unique within the process.
-        let signal_id = ulid(wall).unwrap_or_else(|_| format!("{opened:026}"));
+        let signal_id = signal_id(ulid(wall), opened);
         self.tell_worker(
             &open.connection,
             open.worker,
@@ -1346,6 +1357,29 @@ mod tests {
         offer(&mut state, "c1", &signal_id);
         assert_eq!(events(&mut subscription).len(), 1);
         (state, queues, signal_id, subscription)
+    }
+
+    /// A signal is named by its ULID; without randomness, by its count,
+    /// with a warning.
+    #[test]
+    fn a_signal_without_randomness_for_its_ulid_is_named_by_its_count() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        assert_eq!(
+            signal_id(Ok("01ARYZ6S41TSV4RRFFQ69G5FAV".into()), 7),
+            "01ARYZ6S41TSV4RRFFQ69G5FAV"
+        );
+        assert!(captured.lines("no randomness").is_empty());
+        assert_eq!(
+            signal_id(Err(getrandom::Error::UNSUPPORTED), 7),
+            "00000000000000000000000007"
+        );
+        assert_eq!(
+            captured
+                .lines("no randomness for a signal's ULID; its count names it")
+                .len(),
+            1
+        );
     }
 
     #[test]
