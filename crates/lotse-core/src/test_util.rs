@@ -992,21 +992,26 @@ async fn signaled_run(
         Err(refused) => return SourceError::Unreachable(format!("signaling refused: {refused}")),
     };
     tracing::debug!(signal = %channel.id, "fake signaled source: channel open; offering");
-    for signal in fake_offer(&channel.local_addrs) {
-        // A relay that stopped reading shows as the client gone on
-        // `incoming`.
-        let _sent = channel.outgoing.send(signal).await;
-    }
-    let answer = loop {
-        match channel.incoming.recv().await {
-            Some(RemoteSignal::Answer(sdp)) => break sdp,
-            // A fake has no ICE agent to feed.
-            Some(RemoteSignal::Candidate(_)) => {}
-            Some(RemoteSignal::Failed { code, message }) => {
-                return camera_failed(channel, &code, &message, SourceError::Unreachable);
-            }
-            None => return client_gone(channel),
+    let early = match offer(&mut channel).await {
+        Ok(early) => early,
+        Err(Unanswered::Failed { code, message }) => {
+            return camera_failed(channel, &code, &message, SourceError::Unreachable);
         }
+        Err(Unanswered::Gone) => return client_gone(channel),
+    };
+    let answer = match early {
+        Some(answer) => answer,
+        None => loop {
+            match channel.incoming.recv().await {
+                Some(RemoteSignal::Answer(sdp)) => break sdp,
+                // A fake has no ICE agent to feed.
+                Some(RemoteSignal::Candidate(_)) => {}
+                Some(RemoteSignal::Failed { code, message }) => {
+                    return camera_failed(channel, &code, &message, SourceError::Unreachable);
+                }
+                None => return client_gone(channel),
+            }
+        },
     };
     if !answer.starts_with("v=0") {
         channel.close(close::INVALID_ANSWER, "the answer is no SDP".to_owned());
@@ -1038,6 +1043,52 @@ async fn signaled_run(
             },
         }
     }
+}
+
+/// Why a [`FakeSignaledSource`]'s offer got no answer.
+#[derive(Debug)]
+enum Unanswered {
+    /// The client relayed the camera's failure.
+    Failed {
+        /// The camera's code.
+        code: String,
+        /// The camera's message.
+        message: String,
+    },
+    /// The client is gone (`incoming` yields `None`).
+    Gone,
+}
+
+/// Sends [`fake_offer`] on `channel` while listening on its `incoming`,
+/// so a relay that stopped draining `outgoing` (more candidates than the
+/// queue holds) cannot hold the source in a send once the client is
+/// gone or failed: the answer that came meanwhile, if any, once all is
+/// sent, or why there will be none. Candidates and repeated answers
+/// meanwhile change nothing.
+async fn offer(channel: &mut SignalingChannel) -> Result<Option<String>, Unanswered> {
+    let mut early = None;
+    for signal in fake_offer(&channel.local_addrs) {
+        let mut send = std::pin::pin!(channel.outgoing.send(signal));
+        loop {
+            tokio::select! {
+                biased;
+                // A relay that dropped its receiver: what it relays comes
+                // to `incoming` no more either, which says so.
+                _sent = &mut send => break,
+                incoming = channel.incoming.recv() => match incoming {
+                    Some(RemoteSignal::Answer(sdp)) => {
+                        early.get_or_insert(sdp);
+                    }
+                    Some(RemoteSignal::Candidate(_)) => {}
+                    Some(RemoteSignal::Failed { code, message }) => {
+                        return Err(Unanswered::Failed { code, message });
+                    }
+                    None => return Err(Unanswered::Gone),
+                },
+            }
+        }
+    }
+    Ok(early)
 }
 
 /// What a [`FakeSignaledSource`] sends once its channel is open: its
@@ -1096,6 +1147,10 @@ fn client_gone(channel: SignalingChannel) -> SourceError {
 /// How many opened channels a [`FakeSignaling`] holds for the test before
 /// an open waits for it to take one.
 const FAKE_RELAYS: usize = 8;
+
+/// The code of an open a [`FakeSignaling`] refuses because it was
+/// dropped before the open was awaited: no relay would take the channel.
+pub const FAKE_SIGNALING_GONE: &str = "fake_signaling_gone";
 
 /// A scripted [`SignalingOpener`], the control-API client's relay as a
 /// test plays it. An open takes the next refusal queued
@@ -1172,8 +1227,14 @@ impl SignalingOpener for FakeSignaling {
             crate::signaling::channel(format!("fake-signal-{n}"), self.local_addrs.clone());
         let relays = self.relays.clone();
         Box::pin(async move {
-            // The fake holds the receiving end as long as it lives.
-            let _held = relays.send(relay).await;
+            // The fake holds the receiving end as long as it lives; once
+            // it is gone, nobody would relay the channel.
+            if relays.send(relay).await.is_err() {
+                return Err(SignalingRefused {
+                    code: FAKE_SIGNALING_GONE.to_owned(),
+                    message: "the fake signaling is gone".to_owned(),
+                });
+            }
             Ok(channel)
         })
     }
@@ -2400,6 +2461,114 @@ mod tests {
             within(relay.closed.wait()).await.code,
             close::SOURCE_STOPPED
         );
+    }
+
+    /// More local addresses than the outgoing queue holds signals: the
+    /// offer, a candidate each and the end-of-candidates do not fit.
+    fn crowded() -> Vec<IpAddr> {
+        (1..=40).map(|n| IpAddr::from([192, 0, 2, n])).collect()
+    }
+
+    /// A signaled fake source over [`crowded`] addresses whose relay does
+    /// not drain `outgoing`, once its queue is full and the source waits
+    /// for room: its run, its track set and the relay.
+    async fn blocked() -> (
+        tokio::task::JoinHandle<SourceError>,
+        Arc<TrackSet>,
+        CancellationToken,
+        SignalingRelay,
+    ) {
+        let signaling = FakeSignaling::new(crowded());
+        let (run, set, cancel) = run_signaled(Some(signaling.clone()));
+        let relay = within(signaling.next_signal()).await.unwrap();
+        within(async {
+            loop {
+                tokio::task::yield_now().await;
+                if relay.outgoing.len() == crate::signaling::OUTGOING_CAPACITY {
+                    break;
+                }
+            }
+        })
+        .await;
+        (run, set, cancel, relay)
+    }
+
+    /// Regression: a source whose offer waits for room in a full queue
+    /// still hears the client go (or the camera fail) and closes, instead
+    /// of waiting in its send for a relay that keeps the queue but stopped
+    /// reading it.
+    #[tokio::test]
+    async fn a_signaled_fake_waiting_for_room_for_its_offer_still_hears_the_client_go_or_fail() {
+        let (run, set, _cancel, relay) = blocked().await;
+        let SignalingRelay {
+            outgoing,
+            incoming,
+            closed,
+            ..
+        } = relay;
+        // A candidate meanwhile changes nothing.
+        incoming.send(remote_candidate()).await.unwrap();
+        drop(incoming);
+        assert_eq!(
+            within(run).await.unwrap(),
+            SourceError::Ended("signaling client gone".into())
+        );
+        assert!(set.tracks().is_empty());
+        assert_eq!(within(closed.wait()).await.code, close::SIGNALING_LOST);
+        drop(outgoing);
+
+        let (run, set, _cancel, relay) = blocked().await;
+        relay.incoming.send(failed()).await.unwrap();
+        assert_eq!(
+            within(run).await.unwrap(),
+            SourceError::Unreachable("camera: camera_offline: the camera is offline".into())
+        );
+        assert!(set.tracks().is_empty());
+        assert_eq!(within(relay.closed.wait()).await.code, close::CAMERA_ERROR);
+    }
+
+    /// An answer that comes while the offer waits for room is kept: once
+    /// the rest of the offer is sent, the source goes live on it.
+    #[tokio::test]
+    async fn a_signaled_fake_keeps_an_answer_that_comes_while_its_offer_waits_for_room() {
+        let (run, set, cancel, mut relay) = blocked().await;
+        let mut ready = set.ready();
+        relay
+            .incoming
+            .send(RemoteSignal::Answer("v=0 answer".into()))
+            .await
+            .unwrap();
+        // A repeated answer: the first stands.
+        relay
+            .incoming
+            .send(RemoteSignal::Answer("no sdp".into()))
+            .await
+            .unwrap();
+        drained(&relay).await;
+        assert!(set.tracks().is_empty(), "not live before the offer is out");
+        // The offer, a candidate per address, the end-of-candidates.
+        for _ in 0..crowded().len() + 2 {
+            assert!(within(relay.outgoing.recv()).await.is_some());
+        }
+        within(ready.wait_for(|ready| *ready)).await.unwrap();
+        assert_eq!(set.tracks().len(), 1);
+        cancel.cancel();
+        assert_eq!(
+            within(run).await.unwrap(),
+            SourceError::Ended("cancelled".into())
+        );
+    }
+
+    /// Regression: an open whose future outlives the fake is refused, as
+    /// no relay would take its channel.
+    #[tokio::test]
+    async fn a_fake_signaling_dropped_before_its_open_is_awaited_refuses_it() {
+        let signaling = FakeSignaling::new(loopback());
+        let open = signaling.open();
+        drop(signaling);
+        let refused = within(open).await.unwrap_err();
+        assert_eq!(refused.code, FAKE_SIGNALING_GONE);
+        assert_eq!(refused.message, "the fake signaling is gone");
     }
 
     #[tokio::test]
