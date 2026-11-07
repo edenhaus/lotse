@@ -98,7 +98,7 @@ use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::throttle::Throttle;
 use lotse_ipc::{
     RecordingReport, RecordingSpec, STOPPED_AS_ASKED, SessionSpec, SignalCommand, SignalReport,
-    SourceSpec,
+    SourceSpec, SourceTarget,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -337,11 +337,13 @@ impl DatagramSink for SessionSink {
 pub(crate) struct DriverSpec {
     /// The connection's id.
     pub(crate) connection_id: String,
-    /// The full source URL, credentials included.
-    pub(crate) url: String,
-    /// The per-scheme options as JSON text.
+    /// The full source URL, credentials included, or a signaled source's
+    /// protocol.
+    pub(crate) target: SourceTarget,
+    /// The per-scheme or per-protocol options as JSON text.
     pub(crate) options: String,
-    /// The host to resolve, as the URL spells it.
+    /// The host to resolve, as the URL spells it; empty for a signaled
+    /// source.
     pub(crate) host: String,
     /// The port, from the URL or the scheme's default.
     pub(crate) port: Option<u16>,
@@ -349,13 +351,15 @@ pub(crate) struct DriverSpec {
     /// ([`Source::wants_backchannel`](lotse_core::source::Source::wants_backchannel)),
     /// as its options say.
     pub(crate) backchannel: bool,
-    /// The source's signaling is the control-API client's to relay
-    /// (`SourceCapabilities::signaled`): it has no host to look up and no
-    /// port to connect to.
-    pub(crate) signaled: bool,
 }
 
 impl DriverSpec {
+    /// Whether the source's signaling is the control-API client's to
+    /// relay: it has no host to look up and no port to connect to.
+    pub(crate) const fn signaled(&self) -> bool {
+        matches!(self.target, SourceTarget::Signaled(_))
+    }
+
     /// The spec as the worker takes it, with the resolved addresses, where
     /// its reconnect schedule starts, and the connection's pre-record window.
     fn source_spec(
@@ -366,7 +370,7 @@ impl DriverSpec {
     ) -> SourceSpec {
         SourceSpec {
             connection_id: self.connection_id.clone(),
-            url: self.url.clone(),
+            target: self.target.clone(),
             options: self.options.clone(),
             peer_host: self.host.clone(),
             peer_addrs,
@@ -389,7 +393,7 @@ impl fmt::Debug for DriverSpec {
                 .map(|options| options.keys().cloned().collect::<Vec<_>>());
         let mut out = f.debug_struct("DriverSpec");
         out.field("connection_id", &self.connection_id)
-            .field("url", &"****");
+            .field("target", &self.target);
         match &options {
             Ok(names) => out.field("options", names),
             Err(_) => out.field("options", &"****"),
@@ -397,7 +401,6 @@ impl fmt::Debug for DriverSpec {
         out.field("host", &self.host)
             .field("port", &self.port)
             .field("backchannel", &self.backchannel)
-            .field("signaled", &self.signaled)
             .finish()
     }
 }
@@ -994,7 +997,7 @@ impl Driver {
     /// reaches its camera through the client's signaling and has no host
     /// to look up, no addresses at once.
     fn lookup(&self) -> BoxFuture<'static, Result<Vec<SocketAddr>, String>> {
-        if self.spec.signaled {
+        if self.spec.signaled() {
             tracing::debug!("signaled source: no host to look up");
             return Box::pin(std::future::ready(Ok(Vec::new())));
         }
@@ -2105,12 +2108,11 @@ mod tests {
     fn the_spec_logs_without_its_credentials() {
         let spec = DriverSpec {
             connection_id: "c1".into(),
-            url: "rtsps://admin:secret@cam/key?token=tok".into(),
+            target: SourceTarget::Url("rtsps://admin:secret@cam/key?token=tok".into()),
             options: r#"{"user_agent":"secret/1"}"#.into(),
             host: "cam".into(),
             port: Some(322),
             backchannel: false,
-            signaled: false,
         };
         let logged = format!("{spec:?}");
         for secret in ["secret", "key", "tok"] {
@@ -2124,12 +2126,11 @@ mod tests {
     fn the_spec_logs_its_option_names_without_their_values() {
         let spec = |options: &str| DriverSpec {
             connection_id: "c1".into(),
-            url: "rtsp://cam/".into(),
+            target: SourceTarget::Url("rtsp://cam/".into()),
             options: options.into(),
             host: "cam".into(),
             port: None,
             backchannel: false,
-            signaled: false,
         };
         let logged = format!(
             "{:?}",
@@ -2153,12 +2154,11 @@ mod tests {
             (
                 DriverSpec {
                     connection_id: "c1".into(),
-                    url: "fake://h/".into(),
+                    target: SourceTarget::Url("fake://h/".into()),
                     options: "{}".into(),
                     host: "h".into(),
                     port: None,
                     backchannel: false,
-                    signaled: false,
                 },
                 0,
             ),
@@ -2448,7 +2448,9 @@ mod tests {
                     backchannel: false,
                     prerecord_ms: 0,
                     key: crate::registry::ConnectionKey {
-                        url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        target: crate::registry::SourceTarget::Url(
+                            lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        ),
                         options: serde_json::Value::Null,
                     },
                     demand: demand_tx,
@@ -2464,7 +2466,9 @@ mod tests {
                 crate::registry::StreamEntry {
                     sources: vec![crate::registry::StreamSource {
                         spec: spec_of("fake://127.0.0.1/"),
-                        url: lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        target: crate::registry::SourceTarget::Url(
+                            lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                        ),
                         options: serde_json::Map::new(),
                         protocol: "fake",
                         connection: "c1".into(),
@@ -2562,12 +2566,11 @@ mod tests {
             (
                 DriverSpec {
                     connection_id: "c1".into(),
-                    url: "fake://127.0.0.1/".into(),
+                    target: SourceTarget::Url("fake://127.0.0.1/".into()),
                     options: "{}".into(),
                     host: "127.0.0.1".into(),
                     port: None,
                     backchannel: false,
-                    signaled: false,
                 },
                 0,
             ),
@@ -2607,7 +2610,7 @@ mod tests {
         let run = |attempts, immediate_used| {
             lotse_ipc::ToWorker::RunSource(SourceSpec {
                 connection_id: "c1".into(),
-                url: "fake://127.0.0.1/".into(),
+                target: SourceTarget::Url("fake://127.0.0.1/".into()),
                 options: "{}".into(),
                 peer_host: "127.0.0.1".into(),
                 peer_addrs: vec!["127.0.0.1:0".parse().unwrap()],
@@ -2700,7 +2703,7 @@ mod tests {
         step(&mut driver).await;
         let first = lotse_ipc::ToWorker::RunSource(SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://127.0.0.1/".into(),
+            target: SourceTarget::Url("fake://127.0.0.1/".into()),
             options: "{}".into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:0".parse().unwrap()],
@@ -2722,12 +2725,11 @@ mod tests {
         driver
             .handle(Wake::Command(DriverCommand::SwitchSource(DriverSpec {
                 connection_id: "c1".into(),
-                url: "fake://127.0.0.1:2/".into(),
+                target: SourceTarget::Url("fake://127.0.0.1:2/".into()),
                 options: "{}".into(),
                 host: "127.0.0.1".into(),
                 port: Some(2),
                 backchannel: false,
-                signaled: false,
             })))
             .await;
         assert_eq!(driver.machine.backoff_position().attempts, 0);
@@ -2741,7 +2743,7 @@ mod tests {
         step(&mut driver).await;
         let run = lotse_ipc::ToWorker::RunSource(SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://127.0.0.1:2/".into(),
+            target: SourceTarget::Url("fake://127.0.0.1:2/".into()),
             options: "{}".into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:2".parse().unwrap()],
@@ -2833,7 +2835,10 @@ mod tests {
             BackoffPosition::default(),
             0,
         );
-        assert_eq!(switched.url, "fake://127.0.0.1:2/");
+        assert_eq!(
+            switched.target,
+            SourceTarget::Url("fake://127.0.0.1:2/".into())
+        );
         recorded(
             &dir.join("received-1"),
             &lotse_ipc::ToWorker::RunSource(switched),
@@ -3172,21 +3177,18 @@ mod tests {
         let mut driver = driver_on(&shared, demand);
         let switch = |url: &str, host: &str| DriverSpec {
             connection_id: "c1".into(),
-            url: url.into(),
+            target: SourceTarget::Url(url.into()),
             options: "{}".into(),
             host: host.into(),
             port: Some(1),
             backchannel: false,
-            signaled: false,
         };
         // Without a worker the spec is taken for the next one, nothing more.
+        let a = switch("fake://127.0.0.1:1/a", "127.0.0.1");
         driver
-            .handle(Wake::Command(DriverCommand::SwitchSource(switch(
-                "fake://127.0.0.1:1/a",
-                "127.0.0.1",
-            ))))
+            .handle(Wake::Command(DriverCommand::SwitchSource(a.clone())))
             .await;
-        assert_eq!(driver.spec.url, "fake://127.0.0.1:1/a");
+        assert_eq!(driver.spec.target, a.target);
         assert!(ready_wake(&mut driver).await.is_none(), "nothing pending");
         // While the old host resolves, the lookup starts over for the new.
         driver.start_resolving();
@@ -3215,7 +3217,7 @@ mod tests {
         driver.handle(wake).await;
         let want = lotse_ipc::ToWorker::SwitchSource(SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://127.0.0.1:1/c".into(),
+            target: SourceTarget::Url("fake://127.0.0.1:1/c".into()),
             options: "{}".into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
@@ -3291,16 +3293,15 @@ mod tests {
         let mut driver = driver_on(&shared, demand);
         let spec = |options: &str, backchannel: bool| DriverSpec {
             connection_id: "c1".into(),
-            url: "fake://127.0.0.1:1/".into(),
+            target: SourceTarget::Url("fake://127.0.0.1:1/".into()),
             options: options.into(),
             host: "127.0.0.1".into(),
             port: Some(1),
             backchannel,
-            signaled: false,
         };
         let source = |options: &str| SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://127.0.0.1:1/".into(),
+            target: SourceTarget::Url("fake://127.0.0.1:1/".into()),
             options: options.into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec!["127.0.0.1:1".parse().unwrap()],
@@ -3606,12 +3607,11 @@ mod tests {
     fn spec_of(url: &str) -> DriverSpec {
         DriverSpec {
             connection_id: "c1".into(),
-            url: url.into(),
+            target: SourceTarget::Url(url.into()),
             options: "{}".into(),
             host: "127.0.0.1".into(),
             port: Some(1),
             backchannel: false,
-            signaled: false,
         }
     }
 
@@ -3921,7 +3921,7 @@ mod tests {
             StreamEntry {
                 sources: vec![StreamSource {
                     spec,
-                    url: url.clone(),
+                    target: crate::registry::SourceTarget::Url(url.clone()),
                     options: serde_json::Map::new(),
                     protocol: "fake",
                     connection: "c1".into(),
@@ -3938,7 +3938,7 @@ mod tests {
             "c1".into(),
             ConnectionEntry {
                 key: ConnectionKey {
-                    url,
+                    target: crate::registry::SourceTarget::Url(url),
                     options: serde_json::json!({}),
                 },
                 port: None,
@@ -3989,12 +3989,11 @@ mod tests {
             (
                 DriverSpec {
                     connection_id: "c1".into(),
-                    url: "fake://admin:hunter2@cam.example/".into(),
+                    target: SourceTarget::Url("fake://admin:hunter2@cam.example/".into()),
                     options: "{}".into(),
                     host: "cam.example".into(),
                     port: None,
                     backchannel: false,
-                    signaled: false,
                 },
                 0,
             ),
@@ -4272,7 +4271,8 @@ mod tests {
         let (demand_tx, demand) = watch::channel(Demand::default());
         let mut driver = driver_on(&shared, demand);
         // Over the channel's message limit: the send fails before a write.
-        driver.spec.url = format!("fake://127.0.0.1/{}", "x".repeat(300 * 1024));
+        driver.spec.target =
+            SourceTarget::Url(format!("fake://127.0.0.1/{}", "x".repeat(300 * 1024)));
         demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         let captured = crate::test_support::Captured::default();
@@ -4317,12 +4317,11 @@ mod tests {
             (
                 DriverSpec {
                     connection_id: "c1".into(),
-                    url: "fake://127.0.0.1/".into(),
+                    target: SourceTarget::Url("fake://127.0.0.1/".into()),
                     options: "{}".into(),
                     host: "127.0.0.1".into(),
                     port: None,
                     backchannel: false,
-                    signaled: false,
                 },
                 0,
             ),
@@ -4500,17 +4499,15 @@ mod tests {
         );
     }
 
-    /// The spec of a signaled source whose label is no host anyone could
-    /// look up.
+    /// The spec of a signaled source: no host to look up.
     fn signaled_spec() -> DriverSpec {
         DriverSpec {
             connection_id: "c1".into(),
-            url: "webrtc://camera.front_door".into(),
+            target: SourceTarget::Signaled("webrtc".into()),
             options: "{}".into(),
-            host: "camera.front_door".into(),
+            host: String::new(),
             port: None,
             backchannel: false,
-            signaled: true,
         }
     }
 
@@ -4525,8 +4522,10 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: crate::registry::ConnectionKey {
-                    url: lotse_core::source_url::SourceUrl::parse("webrtc://camera.front_door")
-                        .unwrap(),
+                    target: crate::registry::SourceTarget::Signaled {
+                        protocol: "webrtc",
+                        stream: "front".into(),
+                    },
                     options: serde_json::Value::Null,
                 },
                 demand: watch::channel(Demand::default()).0,
@@ -4556,14 +4555,14 @@ mod tests {
         demand_tx.send_replace(PRELOAD);
         step(&mut driver).await;
         assert!(matches!(driver.pending, Pending::Resolving(_)));
-        // No DNS: the label resolves to nothing, at once.
+        // No DNS: no host, no addresses, at once.
         let wake = next_wake(&mut driver).await;
         assert!(matches!(&wake, Wake::Resolved(Ok(addrs)) if addrs.is_empty()));
         driver.handle(wake).await;
         let run = driver
             .spec
             .source_spec(vec![], driver.machine.backoff_position(), 0);
-        assert_eq!(run.peer_host, "camera.front_door");
+        assert_eq!(run.peer_host, "", "no host");
         recorded(&out, &lotse_ipc::ToWorker::RunSource(run)).await;
         driver.start_resolving_switch();
         let wake = next_wake(&mut driver).await;

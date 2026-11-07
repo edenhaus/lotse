@@ -318,13 +318,15 @@ pub enum SessionEvent {
 pub struct SourceSpec {
     /// The supervisor's id for the connection, echoed in reports.
     pub connection_id: String,
-    /// The full source URL, credentials included.
-    pub url: String,
-    /// The per-scheme options as JSON text.
+    /// What names the source: its URL, or a signaled source's protocol.
+    pub target: SourceTarget,
+    /// The per-scheme or per-protocol options as JSON text.
     pub options: String,
-    /// The host name, for the protocol URL and TLS SNI.
+    /// The host name, for the protocol URL and TLS SNI; empty for a
+    /// signaled source, which has no address.
     pub peer_host: String,
-    /// The resolved addresses to try, in order (workers have no DNS).
+    /// The resolved addresses to try, in order (workers have no DNS); none
+    /// for a signaled source.
     pub peer_addrs: Vec<SocketAddr>,
     /// Where the reconnect schedule starts: where the connection's earlier
     /// workers left it, so a source that keeps failing is not retried at
@@ -334,6 +336,28 @@ pub struct SourceSpec {
     /// The pre-record window the connection's tracks keep, in milliseconds,
     /// 0 for none; [`ToWorker::Prerecord`] changes it later.
     pub prerecord_ms: u32,
+}
+
+/// What names a source a worker runs. `Debug` redacts the URL, which
+/// carries the credentials.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceTarget {
+    /// A source the worker connects to: its full URL, credentials
+    /// included, of a scheme the worker's registry has.
+    Url(String),
+    /// A source whose signaling the control-API client relays, by its
+    /// protocol (`webrtc`), which the worker's registry has as a signaled
+    /// one: it has no address, and each attempt opens a signaling channel.
+    Signaled(String),
+}
+
+impl fmt::Debug for SourceTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Url(_) => f.write_str("Url(****)"),
+            Self::Signaled(protocol) => f.debug_tuple("Signaled").field(protocol).finish(),
+        }
+    }
 }
 
 /// Where a source's reconnect schedule stands: all a new worker needs to
@@ -351,7 +375,7 @@ impl fmt::Debug for SourceSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SourceSpec")
             .field("connection_id", &self.connection_id)
-            .field("url", &"****")
+            .field("target", &self.target)
             .field("options", &"****")
             .field("peer_host", &self.peer_host)
             .field("peer_addrs", &self.peer_addrs)
@@ -936,7 +960,7 @@ mod tests {
     fn source_spec_debug_redacts_the_url() {
         let spec = SourceSpec {
             connection_id: "c1".into(),
-            url: "rtsp://admin:hunter2@cam/main".into(),
+            target: SourceTarget::Url("rtsp://admin:hunter2@cam/main".into()),
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec!["192.168.1.10:554".parse().unwrap()],
@@ -948,7 +972,7 @@ mod tests {
         };
         let text = format!("{spec:?}");
         assert!(!text.contains("hunter2"), "{text}");
-        assert!(text.contains("url: \"****\""), "{text}");
+        assert!(text.contains("target: Url(****)"), "{text}");
         assert!(text.contains("options: \"****\""), "{text}");
         assert!(text.contains("192.168.1.10:554"), "{text}");
         assert!(
@@ -956,8 +980,24 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("prerecord_ms: 30000"), "{text}");
-        let wrapped = ToWorker::RunSource(spec);
+        let wrapped = ToWorker::RunSource(spec.clone());
         assert!(!format!("{wrapped:?}").contains("hunter2"));
+        assert_eq!(
+            decode::<ToWorker>(&encode(&wrapped).unwrap()).unwrap(),
+            wrapped
+        );
+        // A signaled source: its protocol, no address.
+        let signaled = SourceSpec {
+            target: SourceTarget::Signaled("webrtc".into()),
+            peer_host: String::new(),
+            peer_addrs: vec![],
+            ..spec
+        };
+        assert!(
+            format!("{signaled:?}").contains(r#"target: Signaled("webrtc")"#),
+            "{signaled:?}"
+        );
+        let wrapped = ToWorker::SwitchSource(signaled);
         assert_eq!(
             decode::<ToWorker>(&encode(&wrapped).unwrap()).unwrap(),
             wrapped

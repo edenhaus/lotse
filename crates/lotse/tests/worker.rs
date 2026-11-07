@@ -56,7 +56,7 @@ fn manager_with_sandbox(sandbox: &str) -> WorkerManager {
 fn spec(options: &str) -> SourceSpec {
     SourceSpec {
         connection_id: "c1".into(),
-        url: "fake://cam/".into(),
+        target: lotse_ipc::SourceTarget::Url("fake://cam/".into()),
         options: options.into(),
         peer_host: "cam".into(),
         peer_addrs: vec![],
@@ -244,7 +244,7 @@ async fn a_sandboxed_worker_plays_rtsps_on_its_own_connection() {
     assert_eq!(read, cfg!(target_os = "linux").then_some(true));
     let spec = SourceSpec {
         connection_id: "c1".into(),
-        url: format!("rtsps://camera.test:{port}/stream"),
+        target: lotse_ipc::SourceTarget::Url(format!("rtsps://camera.test:{port}/stream")),
         options: format!("{{\"tls_fingerprint\": \"{pin}\"}}"),
         peer_host: "camera.test".into(),
         peer_addrs: vec![cam.addr()],
@@ -293,7 +293,7 @@ async fn a_sandboxed_worker_receives_rtsp_media_over_udp() {
     ));
     let spec = SourceSpec {
         connection_id: "c1".into(),
-        url: cam.url(),
+        target: lotse_ipc::SourceTarget::Url(cam.url()),
         options: r#"{"transport": "udp"}"#.into(),
         peer_host: "127.0.0.1".into(),
         peer_addrs: vec![cam.addr()],
@@ -363,7 +363,7 @@ async fn play_http_in_sandbox(
     ));
     let spec = SourceSpec {
         connection_id: "c1".into(),
-        url,
+        target: lotse_ipc::SourceTarget::Url(url),
         options,
         peer_host: "camera.test".into(),
         peer_addrs: vec![server.addr()],
@@ -457,7 +457,7 @@ async fn a_sandboxed_worker_records_a_recording_into_its_pipe() {
     ));
     let spec = SourceSpec {
         connection_id: "c1".into(),
-        url: format!("http://camera.test:{port}/live/index.m3u8"),
+        target: lotse_ipc::SourceTarget::Url(format!("http://camera.test:{port}/live/index.m3u8")),
         options: "null".into(),
         peer_host: "camera.test".into(),
         peer_addrs: vec![server.addr()],

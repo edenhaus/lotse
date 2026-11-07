@@ -34,11 +34,12 @@ pub enum SignalingEvent {
     Offer {
         /// The signal, a ULID, new for every connection attempt.
         signal_id: String,
-        /// The stream whose source offers.
+        /// The stream whose source offers: the camera the client relays
+        /// the offer to, as a signaled source has no address.
         stream_id: String,
-        /// The source's URL, redacted as `stream/get` reports it: its
-        /// credentials, path and query masked.
-        source: String,
+        /// The signaled source's protocol (`webrtc`), one of
+        /// `info.signaled_protocols`.
+        protocol: String,
         /// The SDP offer (RFC 8829 §5.2).
         sdp: String,
     },
@@ -182,11 +183,11 @@ mod tests {
                 SignalingEvent::Offer {
                     signal_id: "01JSIG".into(),
                     stream_id: "door".into(),
-                    source: "webrtc://camera.front_door".into(),
+                    protocol: "webrtc".into(),
                     sdp: "v=0\r\n".into(),
                 },
                 json!({ "type": "offer", "signal_id": "01JSIG", "stream_id": "door",
-                        "source": "webrtc://camera.front_door", "sdp": "v=0\r\n" }),
+                        "protocol": "webrtc", "sdp": "v=0\r\n" }),
             ),
             (
                 SignalingEvent::Candidate {

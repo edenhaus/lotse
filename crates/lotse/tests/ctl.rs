@@ -95,6 +95,15 @@ fn check_info(socket: &Path) {
             "{scheme} in {schemes:?}"
         );
     }
+    // A signaled source is no scheme: named by its protocol.
+    assert!(
+        !schemes.contains(&Value::from("fake-signaled")),
+        "{schemes:?}"
+    );
+    assert_eq!(
+        info["signaled_protocols"],
+        serde_json::json!(["fake-signaled"])
+    );
     // The recording container follows its feature, with the limits of recordings.
     assert_eq!(
         info["outputs"]

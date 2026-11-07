@@ -1,4 +1,4 @@
-//! One `webrtc://` source and the I/O of its attempts: the signaling
+//! One WebRTC camera source and the I/O of its attempts: the signaling
 //! channel opened through the client's relay, one UDP socket per host
 //! address on an ephemeral port, the [`IngestEngine`] driven by datagrams,
 //! signals and the injected clock, and what it outputs carried onto the
@@ -50,41 +50,38 @@ use lotse_codec::rtp_ingest::RtpTracks;
 use lotse_core::codec::Kind;
 use lotse_core::signaling::{LocalSignal, REJECTED, RemoteSignal, SignalingChannel, close};
 use lotse_core::source::{Source, SourceCtx, SourceDescriptor, SourceError};
-use lotse_core::source_url::SourceUrl;
 use lotse_core::task::BoxFuture;
 use lotse_core::track::Track;
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
 use super::engine::{IngestEnd, IngestEngine, IngestOutput, IngestTrack};
-use super::factory::SCHEME;
+use super::factory::PROTOCOL;
 use super::options::WebRtcOptions;
 
 /// The receive buffer: a datagram above the path MTU does not come from
 /// a WebRTC peer, and one cut short fails its SRTP check.
 const RECEIVE_BUFFER: usize = 2_048;
 
-/// A validated `webrtc://` source.
+/// A validated WebRTC camera source: no address, its options only.
 #[derive(Debug, Clone)]
 pub struct WebRtcSource {
-    /// The URL, its label naming the camera to the client.
-    url: SourceUrl,
     /// The options.
     options: WebRtcOptions,
 }
 
 impl WebRtcSource {
-    /// The source of `url` with `options`, both checked by the factory.
-    pub const fn new(url: SourceUrl, options: WebRtcOptions) -> Self {
-        Self { url, options }
+    /// The source with `options`, checked by the factory.
+    pub const fn new(options: WebRtcOptions) -> Self {
+        Self { options }
     }
 }
 
 impl Source for WebRtcSource {
     fn describe(&self) -> SourceDescriptor {
         SourceDescriptor {
-            protocol: SCHEME,
-            url: self.url.clone(),
+            protocol: PROTOCOL,
+            url: None,
             options: self.options.normalized(),
         }
     }
@@ -460,7 +457,7 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
             sockets: hosts,
             next: 0,
         },
-        rtp: RtpTracks::new(SCHEME),
+        rtp: RtpTracks::new(PROTOCOL),
         waiting: None,
         buf: vec![0_u8; RECEIVE_BUFFER],
         dropped: 0,
@@ -577,7 +574,7 @@ mod tests {
                 sockets: vec![(local, socket)],
                 next: 0,
             },
-            rtp: RtpTracks::new(SCHEME),
+            rtp: RtpTracks::new(PROTOCOL),
             waiting: None,
             buf: vec![0_u8; RECEIVE_BUFFER],
             dropped: 0,

@@ -134,8 +134,8 @@ fn registries() -> Registries {
     // the supervisor.
     registered(
         "signaled fake source",
-        registries.sources.register(Arc::new(
-            lotse_core::test_util::FakeSourceFactory::signaled(&["fake-signaled"]),
+        registries.sources.register_signaled(Arc::new(
+            lotse_core::test_util::FakeSignaledSourceFactory::new("fake-signaled"),
         )),
     );
     registries

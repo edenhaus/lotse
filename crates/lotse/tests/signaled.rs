@@ -30,7 +30,7 @@ use lotse_api_types::command::parse_command;
 use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::registry::Registries;
-use lotse_core::test_util::{FAKE_SIGNALED_OFFER, FakeSourceFactory};
+use lotse_core::test_util::{FAKE_SIGNALED_OFFER, FakeSignaledSourceFactory};
 use lotse_supervisor::api::{ConnectionId, Event, EventClass, Handler as _, Outcome};
 use lotse_supervisor::net::demux::Registrations;
 use lotse_supervisor::worker::WorkerConfig;
@@ -73,7 +73,7 @@ fn supervisor() -> Supervisor {
     let mut registries = Registries::default();
     registries
         .sources
-        .register(Arc::new(FakeSourceFactory::signaled(&["fake-signaled"])))
+        .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
         .unwrap();
     let environment = Environment {
         registries,
@@ -185,7 +185,8 @@ async fn offer(events: &mut mpsc::Receiver<Event>) -> String {
     let signal_id = offer["signal_id"].as_str().unwrap().to_owned();
     assert_eq!(signal_id.len(), 26, "a ULID: {offer}");
     assert_eq!(offer["stream_id"], "door");
-    assert_eq!(offer["source"], "fake-signaled://camera.front_door");
+    assert_eq!(offer["protocol"], "fake-signaled");
+    assert!(offer.get("source").is_none(), "{offer}");
     assert_eq!(offer["sdp"], FAKE_SIGNALED_OFFER);
     // One host candidate per address of the front door's hosts, then
     // end-of-candidates (RFC 8838 §13).
@@ -204,7 +205,7 @@ async fn offer(events: &mut mpsc::Receiver<Event>) -> String {
 
 fn put() -> Value {
     json!({ "id": 1, "type": "stream/put", "stream_id": "door",
-            "sources": [{ "url": "fake-signaled://camera.front_door" }], "preload": true })
+            "sources": [{ "protocol": "fake-signaled" }], "preload": true })
 }
 
 fn answer(id: u64, signal_id: &str) -> Value {

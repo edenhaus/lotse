@@ -368,8 +368,8 @@ pub struct SourceRunner {
     /// The backchannel slot shared with the connection.
     backchannel: BackchannelSlot,
     /// Opens each attempt's signaling channel, for a signaled source
-    /// ([`crate::source::SourceCapabilities::signaled`]); every attempt
-    /// gets it.
+    /// (one a [`crate::source::SignaledSourceFactory`] built); every
+    /// attempt gets it.
     signaling: Option<Arc<dyn SignalingOpener>>,
     /// The clock.
     clock: Arc<dyn Clock>,
@@ -858,15 +858,13 @@ mod tests {
     #[tokio::test]
     async fn every_attempt_of_a_signaled_source_opens_its_own_channel_and_a_refusal_backs_off() {
         use crate::signaling::{LocalSignal, RemoteSignal, close};
-        use crate::test_util::{FAKE_SIGNALED_OFFER, FakeSignaling};
+        use crate::source::SignaledSourceFactory as _;
+        use crate::test_util::{FAKE_SIGNALED_OFFER, FakeSignaledSourceFactory, FakeSignaling};
 
         let signaling = FakeSignaling::new(vec![std::net::IpAddr::from([127, 0, 0, 1])]);
         signaling.refuse_next("no_signaling_client", "nobody relays it");
-        let source = FakeSourceFactory::signaled(&["fake-signaled"])
-            .validate(
-                &SourceUrl::parse("fake-signaled://cam").unwrap(),
-                &serde_json::Value::Null,
-            )
+        let source = FakeSignaledSourceFactory::new("fake-signaled")
+            .validate(&serde_json::Value::Null)
             .unwrap();
         let mut h = start_source(
             RunnerConfig::default(),
@@ -1214,7 +1212,7 @@ mod tests {
             fn describe(&self) -> crate::source::SourceDescriptor {
                 crate::source::SourceDescriptor {
                     protocol: "eager",
-                    url: SourceUrl::parse("eager://x/").unwrap(),
+                    url: Some(SourceUrl::parse("eager://x/").unwrap()),
                     options: serde_json::Value::Null,
                 }
             }
@@ -1298,7 +1296,7 @@ mod tests {
         fn describe(&self) -> crate::source::SourceDescriptor {
             crate::source::SourceDescriptor {
                 protocol: "silent",
-                url: SourceUrl::parse("silent://x/").unwrap(),
+                url: Some(SourceUrl::parse("silent://x/").unwrap()),
                 options: serde_json::Value::Null,
             }
         }
@@ -1417,7 +1415,7 @@ mod tests {
         fn describe(&self) -> crate::source::SourceDescriptor {
             crate::source::SourceDescriptor {
                 protocol: "deaf",
-                url: SourceUrl::parse("deaf://x/").unwrap(),
+                url: Some(SourceUrl::parse("deaf://x/").unwrap()),
                 options: serde_json::Value::Null,
             }
         }

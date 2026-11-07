@@ -5,8 +5,8 @@
 //! on UDP sockets the source binds itself, one per host address the
 //! supervisor enumerated.
 //!
-//! [`WebRtcSourceFactory`] checks `webrtc://<label>` URLs and their
-//! [`WebRtcOptions`]; each attempt of its source runs an [`IngestEngine`]
+//! [`WebRtcSourceFactory`] is the signaled protocol `webrtc`: a camera
+//! has no address, so it checks [`WebRtcOptions`] only; each attempt of its source runs an [`IngestEngine`]
 //! (sans-I/O, on str0m) in a thin loop that does the I/O
 //! ([`source`]). Standards: RFC 8829 (JSEP, the offerer's side), RFC 8445
 //! (ICE, controlling), RFC 8838 (Trickle ICE), RFC 5763 and RFC 5764
