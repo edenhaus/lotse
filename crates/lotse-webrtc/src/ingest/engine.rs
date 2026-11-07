@@ -47,6 +47,7 @@ use bytes::Bytes;
 use lotse_codec::rtp_ingest::{Declared, RtpPacket, Sprop};
 use lotse_codec::{h264, h265};
 use lotse_core::codec::{Codec, Kind};
+use lotse_core::runner::DEFAULT_READY_TIMEOUT;
 use lotse_core::signaling::{SignalCandidate, close};
 use lotse_core::source::SourceError;
 use lotse_core::throttle::Throttle;
@@ -61,12 +62,33 @@ use super::options::WebRtcOptions;
 use crate::sdp::{Sdp, Section, check_payload_types};
 use crate::session::{Scope, is_mdns, refused_address, scope, split_candidates};
 
-/// How long the camera has to answer the offer, from the offer: under the
-/// runner's ready timeout (30 s), so the attempt ends with its own reason.
+/// How long the camera has to answer, from the attempt's start: the wait
+/// for a client to relay the offer included, so the attempt ends with its
+/// own reason well before the runner's ready timeout
+/// ([`DEFAULT_READY_TIMEOUT`], 30 s) cancels it.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long ICE and DTLS have to connect, from the answer.
+/// When ICE and DTLS must be up, from the attempt's start, for an answer
+/// that came by [`CONNECT_TIMEOUT`] before: 3 s under the runner's ready
+/// timeout ([`DEFAULT_READY_TIMEOUT`]), which bounds an attempt until it is
+/// ready.
+pub const CONNECT_BY: Duration = DEFAULT_READY_TIMEOUT.saturating_sub(Duration::from_secs(3));
+
+/// The least time ICE and DTLS have after a late answer, as far as
+/// [`ATTEMPT_BUDGET`] allows.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The attempt's last deadline, from its start, however late its answer:
+/// 2 s under the runner's ready timeout ([`DEFAULT_READY_TIMEOUT`]), so an
+/// attempt that does not connect ends as `ice_failed`, never cancelled by
+/// the runner as not ready.
+pub const ATTEMPT_BUDGET: Duration = DEFAULT_READY_TIMEOUT.saturating_sub(Duration::from_secs(2));
+
+/// The most bytes of an offer: what the supervisor relays of a worker's
+/// offer (`lotse_ipc::MAX_SIGNAL_OFFER_BYTES`, 16 KiB; lotse-webrtc does
+/// not depend on lotse-ipc, so the number is repeated here). The source
+/// bounds its host addresses so its offer stays well under it.
+pub const MAX_OFFER_BYTES: usize = 16 * 1024;
 
 /// The spacing of the Picture Loss Indications asked for until the first
 /// keyframe, and the least spacing of those after a loss. RFC 4585 §6.3.1
@@ -173,6 +195,12 @@ pub struct IngestStats {
     pub rtp_packets: u64,
     /// RTP packets of no negotiated track or payload type, dropped.
     pub foreign_packets: u64,
+    /// RTP packets of another format than the track carries that came
+    /// late (older than the newest of their source), dropped: they do not
+    /// switch the track back.
+    pub late_packets: u64,
+    /// The times the camera switched a track's codec.
+    pub switches: u64,
     /// Sender Reports handed on.
     pub sender_reports: u64,
     /// Sender Reports without a wallclock time, dropped.
@@ -223,7 +251,9 @@ struct Stream {
     formats: Vec<(u8, Declared)>,
     /// Video, whose losses ask for a keyframe.
     video: bool,
-    /// The highest sequence number seen.
+    /// The synchronization source of the packets seen (RFC 3550 §3).
+    ssrc: Option<u32>,
+    /// The highest sequence number seen of it.
     highest: Option<u16>,
 }
 
@@ -252,6 +282,8 @@ pub struct IngestEngine {
     early: Vec<String>,
     /// Where the attempt is.
     phase: Phase,
+    /// When the attempt started: the deadlines count from it.
+    started: Instant,
     /// The last time handed in.
     now: Instant,
     /// The answer's deadline while offered, the connection's once
@@ -275,6 +307,8 @@ pub struct IngestEngine {
     foreign: Throttle,
     /// The rate limit of the unusable Sender Reports' log line.
     unusable: Throttle,
+    /// The rate limit of the codec switches' log line.
+    switch_log: Throttle,
     /// The counters.
     stats: IngestStats,
 }
@@ -418,16 +452,18 @@ fn low32(value: u64) -> u32 {
 }
 
 impl IngestEngine {
-    /// The offer of an attempt with `options`, gathering on the local
-    /// `hosts` (each a bound socket's address), at `now`.
+    /// The offer of an attempt with `options` that `started` (before its
+    /// signaling channel opened: the deadlines count from then), gathering
+    /// on the local `hosts` (each a bound socket's address), at `now`.
     ///
     /// # Errors
     ///
     /// Why no offer can be made: str0m took none of the host candidates,
-    /// or drew one mid twice.
+    /// drew one mid twice, or wrote an offer over [`MAX_OFFER_BYTES`].
     pub fn offer(
         options: &WebRtcOptions,
         hosts: &[SocketAddr],
+        started: Instant,
         now: Instant,
     ) -> Result<Self, String> {
         crate::install_crypto_provider();
@@ -464,6 +500,12 @@ impl IngestEngine {
             .ok_or_else(|| "the engine made no offer".to_owned())?;
         let offer = offer.to_sdp_string();
         check_offer_mids(&offer)?;
+        if offer.len() > MAX_OFFER_BYTES {
+            return Err(format!(
+                "an offer of {} bytes, over the {MAX_OFFER_BYTES} the relay takes",
+                offer.len()
+            ));
+        }
         let first_mid = audio_mid.unwrap_or(video_mid).to_string();
         tracing::debug!(
             candidates = local.len(),
@@ -483,8 +525,9 @@ impl IngestEngine {
             scopes,
             early: Vec::new(),
             phase: Phase::Offered,
+            started,
             now,
-            deadline: now.checked_add(ANSWER_TIMEOUT),
+            deadline: started.checked_add(ANSWER_TIMEOUT),
             streams: Vec::new(),
             keyframe: false,
             startup_plis: 0,
@@ -494,6 +537,7 @@ impl IngestEngine {
             queued: VecDeque::new(),
             foreign: Throttle::default(),
             unusable: Throttle::default(),
+            switch_log: Throttle::default(),
             stats: IngestStats::default(),
         })
     }
@@ -617,9 +661,19 @@ impl IngestEngine {
             self.add_remote(&line);
         }
         self.phase = Phase::Answered;
-        self.deadline = self.now.checked_add(CONNECT_TIMEOUT);
+        self.deadline = self.connect_deadline();
         self.queued.push_back(IngestOutput::Tracks(tracks));
         Ok(())
+    }
+
+    /// When ICE and DTLS must be up, the answer applied now: by
+    /// [`CONNECT_BY`] from the attempt's start, or [`CONNECT_TIMEOUT`]
+    /// after a later answer, but never past [`ATTEMPT_BUDGET`].
+    fn connect_deadline(&self) -> Option<Instant> {
+        let by = self.started.checked_add(CONNECT_BY)?;
+        let last = self.started.checked_add(ATTEMPT_BUDGET)?;
+        let after_answer = self.now.checked_add(CONNECT_TIMEOUT)?;
+        Some(by.max(after_answer).min(last))
     }
 
     /// The track the answer negotiated on `mid`, carried under `index`:
@@ -658,6 +712,7 @@ impl IngestEngine {
             pt,
             formats,
             video: declared.kind == Kind::Video,
+            ssrc: None,
             highest: None,
         });
         Some(IngestTrack {
@@ -773,11 +828,11 @@ impl IngestEngine {
                 return;
             }
             Phase::Answered if overdue => {
-                let secs = CONNECT_TIMEOUT.as_secs();
+                let ms = now.saturating_duration_since(self.started).as_millis();
                 self.end(
                     SourceError::Timeout,
                     close::ICE_FAILED,
-                    format!("webrtc: not connected within {secs} s of the answer"),
+                    format!("webrtc: not connected {ms} ms into the attempt"),
                 );
                 return;
             }
@@ -979,6 +1034,18 @@ impl IngestEngine {
             return;
         };
         let index = stream.index;
+        let ssrc = *header.ssrc;
+        if stream.ssrc != Some(ssrc) {
+            // A new synchronization source numbers its packets anew (RFC
+            // 3550 §5.1, §8.2): none of it is late.
+            tracing::debug!(index, ssrc, "webrtc: a new synchronization source");
+            stream.ssrc = Some(ssrc);
+            stream.highest = None;
+        }
+        let ahead = stream
+            .highest
+            .map_or(1, |highest| seq.wrapping_sub(highest));
+        let forward = (1..0x8000).contains(&ahead);
         let switched = {
             let declared = |pt: u8| {
                 stream
@@ -993,13 +1060,32 @@ impl IngestEngine {
                 .flatten()
         };
         if let Some(declared) = switched {
-            tracing::info!(
-                index,
-                from = stream.pt,
-                to = pt,
-                codec = declared.codec.name(),
-                "webrtc: the camera switched the track's codec"
-            );
+            if !forward {
+                // Older than the newest packet: one of the codec before a
+                // switch (or after it) that came late. The receive path
+                // carries the other codec now, and switching back would
+                // restart it.
+                self.stats.late_packets = self.stats.late_packets.saturating_add(1);
+                tracing::trace!(
+                    index,
+                    pt,
+                    seq,
+                    "webrtc: late packet of another format dropped"
+                );
+                return;
+            }
+            self.stats.switches = self.stats.switches.saturating_add(1);
+            tracing::trace!(index, from = stream.pt, to = pt, "webrtc: codec switched");
+            if let Some(count) = self.switch_log.hit(self.now) {
+                tracing::info!(
+                    index,
+                    from = stream.pt,
+                    to = pt,
+                    codec = declared.codec.name(),
+                    count,
+                    "webrtc: the camera switched the track's codec"
+                );
+            }
             stream.pt = pt;
             self.queued.push_back(IngestOutput::Switched(IngestTrack {
                 index,
@@ -1007,10 +1093,6 @@ impl IngestEngine {
                 declared,
             }));
         }
-        let ahead = stream
-            .highest
-            .map_or(1, |highest| seq.wrapping_sub(highest));
-        let forward = (1..0x8000).contains(&ahead);
         let lost = stream.video && forward && ahead > 1 && stream.highest.is_some();
         stream.highest = if forward { Some(seq) } else { stream.highest };
         self.stats.rtp_packets = self.stats.rtp_packets.saturating_add(1);
@@ -1019,7 +1101,7 @@ impl IngestEngine {
             packet: RtpPacket {
                 seq,
                 ts: header.timestamp,
-                ssrc: *header.ssrc,
+                ssrc,
                 marker: header.marker,
                 payload: Bytes::from_owner(packet.payload),
             },
@@ -1169,6 +1251,7 @@ mod tests {
             },
             &[addr],
             now,
+            now,
         )
         .unwrap();
         let mid = engine.video_mid;
@@ -1178,6 +1261,7 @@ mod tests {
             pt: 96,
             formats: Vec::new(),
             video: true,
+            ssrc: None,
             highest: None,
         });
         let report = |ntp_time| {

@@ -249,7 +249,7 @@ fuzz_target!(|data: &[u8]| {
         audio: setup & 1 != 0,
     };
     let t0 = Instant::now();
-    let Ok(engine) = IngestEngine::offer(&options, &[ENGINE], t0) else {
+    let Ok(engine) = IngestEngine::offer(&options, &[ENGINE], t0, t0) else {
         // str0m 0.24 can draw one mid twice; the engine refuses that offer.
         return;
     };
