@@ -33,10 +33,9 @@ use lotse_core::signaling::{
     LocalSignal, RemoteSignal, SignalCandidate, SignalClose, SignalingOpener, SignalingRelay, close,
 };
 use lotse_core::source::{
-    BackchannelSlot, ClockInput, ClockReport, ResolvedPeer, SourceCtx, SourceError,
-    SourceFactory as _, SyncHint, TrackSet,
+    BackchannelSlot, ClockInput, ClockReport, ResolvedPeer, SignaledSourceFactory as _, SourceCtx,
+    SourceError, SyncHint, TrackSet,
 };
-use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_core::test_util::FakeSignaling;
 use lotse_core::track::TrackLimits;
@@ -1635,18 +1634,13 @@ mod source {
         clock: Arc<dyn Clock>,
     ) -> Running {
         lotse_webrtc::install_crypto_provider();
-        let source = WebRtcSourceFactory
-            .validate(
-                &SourceUrl::parse("webrtc://camera.front_door").unwrap(),
-                &options,
-            )
-            .unwrap();
+        let source = WebRtcSourceFactory.validate(&options).unwrap();
         let set = TrackSet::new(TrackLimits::default(), clock.now());
         let (input, reports) = ClockInput::channel(Arc::new(ClockMapper::new()));
         let cancel = CancellationToken::new();
         let run = source.run(SourceCtx {
             peer: ResolvedPeer {
-                host: "camera.front_door".into(),
+                host: String::new(),
                 addrs: vec![],
             },
             tracks: set.publisher(),
@@ -2376,10 +2370,7 @@ mod source {
         use lotse_core::runner::{ConnectGate, RunnerConfig, SourceRunner};
 
         let source = WebRtcSourceFactory
-            .validate(
-                &SourceUrl::parse("webrtc://camera.front_door").unwrap(),
-                &serde_json::json!({ "audio": false }),
-            )
+            .validate(&serde_json::json!({ "audio": false }))
             .unwrap();
         let set = TrackSet::new(TrackLimits::default(), clock.now());
         let (events, reports) = mpsc::channel(64);
@@ -2387,7 +2378,7 @@ mod source {
         let runner = SourceRunner::new(
             source,
             ResolvedPeer {
-                host: "camera.front_door".into(),
+                host: String::new(),
                 addrs: vec![],
             },
             Arc::clone(&set),

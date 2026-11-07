@@ -1,4 +1,4 @@
-//! The `options` of a `webrtc://` source as `stream/put` carries them.
+//! The `options` of a `webrtc` source as `stream/put` carries them.
 //! Unknown fields are rejected, so a typo fails at `stream/put`, and so
 //! does a data channel label that is empty, too long or carries a control
 //! character.
@@ -38,7 +38,7 @@ const fn audio_default() -> bool {
     true
 }
 
-/// The typed options of a `webrtc://` source. Every field changes the
+/// The typed options of a `webrtc` source. Every field changes the
 /// offer, so every field is part of the connection key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

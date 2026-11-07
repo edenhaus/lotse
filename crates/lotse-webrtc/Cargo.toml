@@ -20,7 +20,7 @@ dimpl = { workspace = true } # DTLS on its RustCrypto backend
 hmac = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5)
 rcgen = { workspace = true } # the self-signed DTLS certificate
 sha1 = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5)
-serde = { workspace = true } # the `webrtc://` source's typed options
+serde = { workspace = true } # the `webrtc` source's typed options
 serde_json = { workspace = true } # the options as `stream/put` carries them
 sha2 = { workspace = true } # the DTLS certificate fingerprint (RFC 8122 §5)
 str0m = { workspace = true }
