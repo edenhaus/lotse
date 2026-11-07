@@ -1262,8 +1262,8 @@ fn start_runner(
         Arc::clone(&mapper),
         backchannel.clone().unwrap_or_default(),
         // No relay of signaling to the control-API client yet: a signaled
-        // source (`SourceCapabilities::signaled`) gets no opener, and each
-        // of its attempts ends unreachable.
+        // source gets no opener, and each of its attempts ends
+        // unreachable.
         None,
         Arc::clone(clock),
         settings.runner,
@@ -4830,7 +4830,7 @@ mod tests {
         fn describe(&self) -> SourceDescriptor {
             SourceDescriptor {
                 protocol: "stubborn",
-                url: self.url.clone(),
+                url: Some(self.url.clone()),
                 options: serde_json::Value::Null,
             }
         }

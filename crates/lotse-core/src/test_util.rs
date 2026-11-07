@@ -29,8 +29,8 @@ use crate::signaling::{
 };
 use crate::source::{
     BackchannelOffer, BackchannelOpener, BackchannelRefused, BackchannelSession, BackchannelSlot,
-    ProbeMark, Source, SourceCapabilities, SourceConfigError, SourceCtx, SourceDescriptor,
-    SourceError, SourceFactory, TrackPublisher,
+    ProbeMark, SignaledSourceFactory, Source, SourceCapabilities, SourceConfigError, SourceCtx,
+    SourceDescriptor, SourceError, SourceFactory, TrackPublisher,
 };
 use crate::source_url::SourceUrl;
 use crate::task::BoxFuture;
@@ -84,9 +84,7 @@ macro_rules! let_assert {
 /// tests can see the validation error path. Beside any of these,
 /// `{"talk": true}` has the source ask for the device's backchannel
 /// ([`Source::wants_backchannel`]), left out of its connection options as
-/// RTSP's `backchannel` is. A signaled factory
-/// ([`FakeSourceFactory::signaled`]) takes no options and makes
-/// [`FakeSignaledSource`]s instead.
+/// RTSP's `backchannel` is.
 #[derive(Debug)]
 pub struct FakeSourceFactory {
     /// The schemes it claims.
@@ -97,9 +95,6 @@ pub struct FakeSourceFactory {
     backchannel: bool,
     /// Where its sources' backchannels put what they receive.
     capture: Option<BackchannelCapture>,
-    /// Its signaling is relayed by the client
-    /// (`SourceCapabilities::signaled`): it makes [`FakeSignaledSource`]s.
-    signaled: bool,
 }
 
 impl FakeSourceFactory {
@@ -113,20 +108,6 @@ impl FakeSourceFactory {
             abort: std::process::abort,
             backchannel: false,
             capture: None,
-            signaled: false,
-        }
-    }
-
-    /// A factory claiming `schemes` whose protocol's signaling the client
-    /// relays (`SourceCapabilities::signaled`), as the WebRTC camera
-    /// source's is: its sources are [`FakeSignaledSource`]s.
-    pub const fn signaled(schemes: &'static [&'static str]) -> Self {
-        Self {
-            schemes,
-            abort: std::process::abort,
-            backchannel: false,
-            capture: None,
-            signaled: true,
         }
     }
 
@@ -138,7 +119,6 @@ impl FakeSourceFactory {
             abort: std::process::abort,
             backchannel: true,
             capture: None,
-            signaled: false,
         }
     }
 
@@ -159,7 +139,6 @@ impl FakeSourceFactory {
             abort: std::process::abort,
             backchannel: true,
             capture: Some(capture),
-            signaled: false,
         }
     }
 }
@@ -360,7 +339,6 @@ impl SourceFactory for FakeSourceFactory {
     fn capabilities(&self) -> SourceCapabilities {
         SourceCapabilities {
             backchannel: self.backchannel,
-            signaled: self.signaled,
         }
     }
 
@@ -370,9 +348,6 @@ impl SourceFactory for FakeSourceFactory {
         options: &serde_json::Value,
     ) -> Result<Box<dyn Source>, SourceConfigError> {
         let scheme = self.schemes.first().copied().unwrap_or("fake");
-        if self.signaled {
-            return FakeSignaledSource::validate(scheme, url, options);
-        }
         let Some((talk, options)) = take_talk(options) else {
             return Err(SourceConfigError::InvalidOptions {
                 scheme,
@@ -605,7 +580,7 @@ impl Source for FakeSource {
     fn describe(&self) -> SourceDescriptor {
         SourceDescriptor {
             protocol: self.protocol,
-            url: self.url.clone(),
+            url: Some(self.url.clone()),
             options: serde_json::Value::Null,
         }
     }
@@ -911,8 +886,44 @@ pub const FAKE_SIGNALED_OFFER: &str = "v=0 fake signaled offer";
 /// local preference, 65535 (§5.1.2.2).
 const FAKE_HOST_PRIORITY: u32 = 2_130_706_431;
 
+/// A signaled source factory for the given protocol (`fake-signaled`), as
+/// the WebRTC camera source's is: its sources, [`FakeSignaledSource`]s,
+/// take no options.
+#[derive(Debug, Clone, Copy)]
+pub struct FakeSignaledSourceFactory {
+    /// The protocol it claims.
+    protocol: &'static str,
+}
+
+impl FakeSignaledSourceFactory {
+    /// A factory claiming `protocol`.
+    pub const fn new(protocol: &'static str) -> Self {
+        Self { protocol }
+    }
+}
+
+impl SignaledSourceFactory for FakeSignaledSourceFactory {
+    fn protocol(&self) -> &'static str {
+        self.protocol
+    }
+
+    /// Takes `null` or an empty object only.
+    fn validate(&self, options: &serde_json::Value) -> Result<Box<dyn Source>, SourceConfigError> {
+        let empty = options.is_null() || options.as_object().is_some_and(serde_json::Map::is_empty);
+        if !empty {
+            return Err(SourceConfigError::InvalidOptions {
+                scheme: self.protocol,
+                message: format!("fake signaled source takes no options, got {options}"),
+            });
+        }
+        Ok(Box::new(FakeSignaledSource {
+            protocol: self.protocol,
+        }))
+    }
+}
+
 /// A source whose signaling the client relays, as the WebRTC camera
-/// source's is, made by a signaled [`FakeSourceFactory`]. Each attempt
+/// source's is, made by a [`FakeSignaledSourceFactory`]. Each attempt
 /// opens a channel through its context's opener (none: unreachable;
 /// refused: unreachable with the refusal), sends [`FAKE_SIGNALED_OFFER`],
 /// a host candidate per local address of the channel and the
@@ -929,37 +940,13 @@ const FAKE_HOST_PRIORITY: u32 = 2_130_706_431;
 pub struct FakeSignaledSource {
     /// The protocol name it reports.
     protocol: &'static str,
-    /// Its URL.
-    url: SourceUrl,
-}
-
-impl FakeSignaledSource {
-    /// A signaled source of `scheme` for `url`, whose `options` must be
-    /// `null` or an empty object.
-    fn validate(
-        scheme: &'static str,
-        url: &SourceUrl,
-        options: &serde_json::Value,
-    ) -> Result<Box<dyn Source>, SourceConfigError> {
-        let empty = options.is_null() || options.as_object().is_some_and(serde_json::Map::is_empty);
-        if !empty {
-            return Err(SourceConfigError::InvalidOptions {
-                scheme,
-                message: format!("fake signaled source takes no options, got {options}"),
-            });
-        }
-        Ok(Box::new(Self {
-            protocol: scheme,
-            url: url.clone(),
-        }))
-    }
 }
 
 impl Source for FakeSignaledSource {
     fn describe(&self) -> SourceDescriptor {
         SourceDescriptor {
             protocol: self.protocol,
-            url: self.url.clone(),
+            url: None,
             options: serde_json::Value::Null,
         }
     }
@@ -1790,7 +1777,7 @@ mod tests {
         let url = SourceUrl::parse("fake://cam/").unwrap();
         let source = factory.validate(&url, &serde_json::Value::Null).unwrap();
         assert_eq!(source.describe().protocol, "fake");
-        assert_eq!(source.describe().url, url);
+        assert_eq!(source.describe().url, Some(url));
 
         let set = TrackSet::new(TrackLimits::default(), SystemClock.now());
         let (clock, _reports) = ClockInput::channel(Arc::new(crate::clock_map::ClockMapper::new()));
@@ -2210,18 +2197,15 @@ mod tests {
         CancellationToken,
     ) {
         let clock = Arc::new(crate::clock::FakeClock::default());
-        let source = FakeSourceFactory::signaled(&["fake-signaled"])
-            .validate(
-                &SourceUrl::parse("fake-signaled://cam").unwrap(),
-                &serde_json::Value::Null,
-            )
+        let source = FakeSignaledSourceFactory::new("fake-signaled")
+            .validate(&serde_json::Value::Null)
             .unwrap();
         let set = TrackSet::new(TrackLimits::default(), clock.now());
         let (input, _reports) = ClockInput::channel(Arc::new(crate::clock_map::ClockMapper::new()));
         let cancel = CancellationToken::new();
         let run = source.run(SourceCtx {
             peer: ResolvedPeer {
-                host: "cam".into(),
+                host: String::new(),
                 addrs: vec![],
             },
             tracks: set.publisher(),
@@ -2286,32 +2270,13 @@ mod tests {
     }
 
     #[test]
-    fn a_signaled_fake_factory_declares_signaling_and_takes_no_options() {
-        assert!(!FakeSourceFactory::new(&["fake"]).capabilities().signaled);
-        assert!(
-            !FakeSourceFactory::with_backchannel(&["fake"])
-                .capabilities()
-                .signaled
-        );
-        let capture = BackchannelCapture::default();
-        assert!(
-            !FakeSourceFactory::capturing(&["fake"], capture)
-                .capabilities()
-                .signaled
-        );
-        let factory = FakeSourceFactory::signaled(&["fake-signaled"]);
-        assert_eq!(
-            factory.capabilities(),
-            SourceCapabilities {
-                backchannel: false,
-                signaled: true,
-            }
-        );
-        let url = SourceUrl::parse("fake-signaled://cam").unwrap();
+    fn a_signaled_fake_factory_names_its_protocol_and_takes_no_options() {
+        let factory = FakeSignaledSourceFactory::new("fake-signaled");
+        assert_eq!(factory.protocol(), "fake-signaled");
         for options in [serde_json::Value::Null, serde_json::json!({})] {
-            let source = factory.validate(&url, &options).unwrap();
+            let source = factory.validate(&options).unwrap();
             assert_eq!(source.describe().protocol, "fake-signaled");
-            assert_eq!(source.describe().url, url);
+            assert_eq!(source.describe().url, None, "no address");
             assert_eq!(source.describe().options, serde_json::Value::Null);
             assert_eq!(
                 source.connection_options(),
@@ -2320,7 +2285,7 @@ mod tests {
             assert!(!source.wants_backchannel());
         }
         let err = factory
-            .validate(&url, &serde_json::json!({"audio": true}))
+            .validate(&serde_json::json!({"audio": true}))
             .unwrap_err();
         assert_eq!(
             err,

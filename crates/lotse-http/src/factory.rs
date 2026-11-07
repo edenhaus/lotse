@@ -59,10 +59,7 @@ impl SourceFactory for HttpFactory {
 
     /// Nothing goes back to the server: no backchannel.
     fn capabilities(&self) -> SourceCapabilities {
-        SourceCapabilities {
-            backchannel: false,
-            signaled: false,
-        }
+        SourceCapabilities { backchannel: false }
     }
 
     fn default_port(&self, scheme: &str) -> Option<u16> {
@@ -127,8 +124,8 @@ mod tests {
         let source = factory.validate(&url, &serde_json::Value::Null).unwrap();
         let described = source.describe();
         assert_eq!(described.protocol, "http");
-        assert_eq!(described.url, url);
-        assert!(!described.url.to_string().contains("pass"));
+        assert_eq!(described.url.as_ref(), Some(&url));
+        assert!(!described.url.as_ref().unwrap().to_string().contains("pass"));
         assert_eq!(described.options, HttpOptions::default().redacted());
         assert_eq!(
             source.connection_options(),
