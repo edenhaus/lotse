@@ -10,11 +10,55 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 
-/// One entry of `stream/put`'s `sources`.
+/// One entry of `stream/put`'s `sources`: a source lotse connects to,
+/// named by its URL, or a source whose signaling the client relays (a
+/// WebRTC camera whose offer and answer travel through Home Assistant),
+/// named by its protocol: it has no address, and the stream it belongs to
+/// is its identity. Exactly one of `url` and `protocol`; the schema is a
+/// `oneOf` of the two forms, each closed to other fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SourceFields", into = "SourceFields")]
+pub enum SourceSpec {
+    /// A source lotse connects to (`rtsp://…`, `https://…`).
+    Url(UrlSource),
+    /// A source whose signaling the client relays (`webrtc`).
+    Signaled(SignaledSource),
+}
+
+impl SourceSpec {
+    /// The options, typed by the scheme's or the protocol's factory.
+    pub const fn options(&self) -> &serde_json::Map<String, serde_json::Value> {
+        match self {
+            Self::Url(source) => &source.options,
+            Self::Signaled(source) => &source.options,
+        }
+    }
+}
+
+/// The schema of [`SourceSpec`]: a `oneOf` of its two forms.
+#[cfg(feature = "schema")]
+impl JsonSchema for SourceSpec {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SourceSpec".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "One entry of `stream/put`'s `sources`: a source lotse connects to, named by its `url`, or a source whose signaling the client relays (a WebRTC camera), named by its `protocol`. Exactly one of the two.",
+            "oneOf": [
+                generator.subschema_for::<UrlSource>(),
+                generator.subschema_for::<SignaledSource>(),
+            ],
+        })
+    }
+}
+
+/// A source lotse connects to, named by its URL: a `stream/put` source of
+/// a scheme in `info.schemes`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
-pub struct SourceSpec {
+pub struct UrlSource {
     /// The source URL, credentials included; redacted everywhere it is
     /// reported.
     #[cfg_attr(feature = "schema", schemars(length(max = crate::limits::MAX_URL_CHARS)))]
@@ -30,12 +74,94 @@ pub struct SourceSpec {
 /// yet, so where its userinfo, path and query end is not known, and any of
 /// them can carry a secret. `Serialize` is the wire form a client sends,
 /// so it keeps both; a serialized command is never logged.
-impl fmt::Debug for SourceSpec {
+impl fmt::Debug for UrlSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SourceSpec")
+        f.debug_struct("UrlSource")
             .field("url", &redact_unparsed(&self.url))
             .field("options", &self.options.keys().collect::<Vec<_>>())
             .finish()
+    }
+}
+
+/// A source whose signaling the client relays, named by its protocol: a
+/// `stream/put` source of a protocol in `info.signaled_protocols`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignaledSource {
+    /// The protocol (`webrtc`).
+    #[cfg_attr(feature = "schema", schemars(length(max = crate::limits::MAX_PROTOCOL_CHARS)))]
+    pub protocol: String,
+    /// Per-protocol options, typed by the protocol's factory; unknown
+    /// fields there are rejected too.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub options: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Prints the options' names without their values, which a future
+/// protocol may make secret.
+impl fmt::Debug for SignaledSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignaledSource")
+            .field("protocol", &self.protocol)
+            .field("options", &self.options.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// A `stream/put` source as it arrives, before it is one of
+/// [`SourceSpec`]'s forms: the client is told which field is missing or
+/// one too many, which an untagged enum's error would not say.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceFields {
+    /// [`UrlSource::url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    /// [`SignaledSource::protocol`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<String>,
+    /// The options of either form.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    options: serde_json::Map<String, serde_json::Value>,
+}
+
+impl TryFrom<SourceFields> for SourceSpec {
+    type Error = &'static str;
+
+    fn try_from(fields: SourceFields) -> Result<Self, Self::Error> {
+        let SourceFields {
+            url,
+            protocol,
+            options,
+        } = fields;
+        match (url, protocol) {
+            (Some(url), None) => Ok(Self::Url(UrlSource { url, options })),
+            (None, Some(protocol)) => Ok(Self::Signaled(SignaledSource { protocol, options })),
+            (Some(_), Some(_)) => Err(
+                "a source names either `url` (a source lotse connects to) or `protocol` (a source whose signaling the client relays), not both",
+            ),
+            (None, None) => Err(
+                "a source needs `url` (a source lotse connects to) or `protocol` (a source whose signaling the client relays)",
+            ),
+        }
+    }
+}
+
+impl From<SourceSpec> for SourceFields {
+    fn from(spec: SourceSpec) -> Self {
+        match spec {
+            SourceSpec::Url(UrlSource { url, options }) => Self {
+                url: Some(url),
+                protocol: None,
+                options,
+            },
+            SourceSpec::Signaled(SignaledSource { protocol, options }) => Self {
+                url: None,
+                protocol: Some(protocol),
+                options,
+            },
+        }
     }
 }
 
@@ -196,9 +322,11 @@ pub struct SourceInfo {
     /// The URL redacted to its origin, `scheme://[****@]host[:port]`, then
     /// `/****` when the path is anything but empty or `/` and `?****` when
     /// a query is present: the path and query can carry secrets (a camera
-    /// key, a session token) as the userinfo can.
-    pub url: String,
-    /// The protocol (`rtsp`).
+    /// key, a session token) as the userinfo can. Absent for a signaled
+    /// source, which has no address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The protocol (`rtsp`; `webrtc` for a signaled source).
     pub protocol: String,
     /// The connection's state.
     pub state: StreamState,
@@ -574,7 +702,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             format!("{spec:?}"),
-            r#"SourceSpec { url: "rtsp://****", options: ["transport"] }"#
+            r#"Url(UrlSource { url: "rtsp://****", options: ["transport"] })"#
         );
         // The command that carries it prints it the same way.
         let put = crate::parse_command(
@@ -604,6 +732,56 @@ mod tests {
             ("", "****"),
         ] {
             assert_eq!(redact_unparsed(url), shown, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_source_is_named_by_url_or_by_protocol_never_both() {
+        let signaled: SourceSpec = serde_json::from_value(json!({
+            "protocol": "webrtc",
+            "options": { "data_channel": "dataSendChannel" }
+        }))
+        .unwrap();
+        assert!(
+            matches!(&signaled, SourceSpec::Signaled(source) if source.protocol == "webrtc"),
+            "{signaled:?}"
+        );
+        assert_eq!(signaled.options()["data_channel"], "dataSendChannel");
+        assert_eq!(
+            format!("{signaled:?}"),
+            r#"Signaled(SignaledSource { protocol: "webrtc", options: ["data_channel"] })"#
+        );
+        // The wire form round-trips, an empty `options` left out.
+        assert_eq!(
+            serde_json::to_value(&signaled).unwrap(),
+            json!({ "protocol": "webrtc", "options": { "data_channel": "dataSendChannel" } })
+        );
+        let bare = json!({ "protocol": "webrtc" });
+        let parsed: SourceSpec = serde_json::from_value(bare.clone()).unwrap();
+        assert!(parsed.options().is_empty());
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), bare);
+        let url = json!({ "url": "rtsp://cam/" });
+        let parsed: SourceSpec = serde_json::from_value(url.clone()).unwrap();
+        assert!(matches!(&parsed, SourceSpec::Url(source) if source.url == "rtsp://cam/"));
+        assert!(parsed.options().is_empty());
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), url);
+        // Both, neither, or a field of neither form: refused, saying why.
+        for (value, says) in [
+            (
+                json!({ "url": "rtsp://cam/", "protocol": "webrtc" }),
+                "a source names either `url` (a source lotse connects to) or `protocol` (a source whose signaling the client relays), not both",
+            ),
+            (
+                json!({ "options": {} }),
+                "a source needs `url` (a source lotse connects to) or `protocol` (a source whose signaling the client relays)",
+            ),
+            (
+                json!({ "protocol": "webrtc", "label": "camera.front_door" }),
+                "unknown field `label`",
+            ),
+        ] {
+            let err = serde_json::from_value::<SourceSpec>(value).unwrap_err();
+            assert!(err.to_string().starts_with(says), "{err}");
         }
     }
 
@@ -715,7 +893,7 @@ mod tests {
             since: "2026-09-28T11:02:03.000Z".into(),
             last_error: None,
             sources: vec![SourceInfo {
-                url: "rtsp://****@192.168.1.10:554/****".into(),
+                url: Some("rtsp://****@192.168.1.10:554/****".into()),
                 protocol: "rtsp".into(),
                 state: StreamState::Live,
                 reconnects: 2,

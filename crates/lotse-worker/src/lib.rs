@@ -51,15 +51,17 @@ use lotse_core::runner::{
 };
 use lotse_core::session::SessionLimits;
 use lotse_core::signaling::SignalingOpener;
-use lotse_core::source::{BackchannelSlot, BackchannelTasks, ResolvedPeer, TrackSet};
+use lotse_core::source::{
+    BackchannelSlot, BackchannelTasks, ResolvedPeer, Source, SourceConfigError, TrackSet,
+};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
 use lotse_core::track::{Track, TrackId, TrackLimits};
 use lotse_ipc::{
     Channel, Decoded, IpcError, PrerecordStats, RecordingReport, RecordingSpec, Sender,
-    SessionEvent, SessionSpec, SignalCommand, SignalReport, SourceSpec, SourceState, ToSupervisor,
-    ToWorker, TrackInfo, TrackStats, WorkerStats,
+    SessionEvent, SessionSpec, SignalCommand, SignalReport, SourceSpec, SourceState, SourceTarget,
+    ToSupervisor, ToWorker, TrackInfo, TrackStats, WorkerStats,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -127,7 +129,8 @@ pub enum Error {
     /// validates specs before spawning, so this is a bug on its side.
     #[error("source rejected ({code}): {message}")]
     SourceRejected {
-        /// The API code (`scheme_unsupported`, `invalid_request`).
+        /// The API code (`scheme_unsupported`, `protocol_unsupported`,
+        /// `invalid_request`).
         code: &'static str,
         /// What was wrong.
         message: String,
@@ -1229,6 +1232,75 @@ fn start_source(
     })
 }
 
+/// A source a spec names, built by its factory, and how the worker wires
+/// it.
+#[derive(Debug)]
+struct Built {
+    /// The source.
+    source: Box<dyn Source>,
+    /// Its protocol can carry audio back (`SourceCapabilities::backchannel`).
+    backchannel: bool,
+    /// The client relays its signaling: it gets the signaling opener.
+    signaled: bool,
+    /// What names it in the log: the redacted URL, or the protocol.
+    shown: String,
+}
+
+/// Builds the source `spec` names with the registry's factory for it: a
+/// URL's scheme's, or a signaled source's protocol's. The supervisor
+/// checked the spec before it sent it, so a refusal is a bug on its side.
+fn build_source(spec: &SourceSpec, registries: &Registries) -> Result<Built, Error> {
+    let options: serde_json::Value =
+        serde_json::from_str(&spec.options).map_err(|err| Error::SourceRejected {
+            code: "invalid_request",
+            message: format!("options are not JSON: {err}"),
+        })?;
+    match &spec.target {
+        SourceTarget::Url(raw) => {
+            let url = SourceUrl::parse(raw).map_err(|err| Error::SourceRejected {
+                code: "invalid_request",
+                message: err.to_string(),
+            })?;
+            let Some(factory) = registries.sources.get(url.scheme()) else {
+                return Err(Error::SourceRejected {
+                    code: "scheme_unsupported",
+                    message: format!("scheme {:?} is not compiled in", url.scheme()),
+                });
+            };
+            Ok(Built {
+                source: factory
+                    .validate(&url, &options)
+                    .map_err(|err| invalid(&err))?,
+                backchannel: factory.capabilities().backchannel,
+                signaled: false,
+                shown: url.to_string(),
+            })
+        }
+        SourceTarget::Signaled(protocol) => {
+            let Some(factory) = registries.sources.signaled(protocol) else {
+                return Err(Error::SourceRejected {
+                    code: "protocol_unsupported",
+                    message: format!("signaled protocol {protocol:?} is not compiled in"),
+                });
+            };
+            Ok(Built {
+                source: factory.validate(&options).map_err(|err| invalid(&err))?,
+                backchannel: false,
+                signaled: true,
+                shown: protocol.clone(),
+            })
+        }
+    }
+}
+
+/// A factory's refusal of a spec's source, as the worker reports it.
+fn invalid(err: &SourceConfigError) -> Error {
+    Error::SourceRejected {
+        code: "invalid_request",
+        message: err.to_string(),
+    }
+}
+
 /// Validates `spec` against the registry and starts its runner on
 /// `native`, reporting to `events`, its probes waiting at `probes`, its
 /// backchannel sessions' tasks tracked in `backchannels`, its signaling
@@ -1250,44 +1322,26 @@ fn start_runner(
     native: Arc<TrackSet>,
     role: &'static str,
 ) -> Result<Runner, Error> {
-    let url = SourceUrl::parse(&spec.url).map_err(|err| Error::SourceRejected {
-        code: "invalid_request",
-        message: err.to_string(),
-    })?;
-    let factory = registries
-        .sources
-        .get(url.scheme())
-        .ok_or_else(|| Error::SourceRejected {
-            code: "scheme_unsupported",
-            message: format!("scheme {:?} is not compiled in", url.scheme()),
-        })?;
-    let options: serde_json::Value =
-        serde_json::from_str(&spec.options).map_err(|err| Error::SourceRejected {
-            code: "invalid_request",
-            message: format!("options are not JSON: {err}"),
-        })?;
-    let source = factory
-        .validate(&url, &options)
-        .map_err(|err| Error::SourceRejected {
-            code: "invalid_request",
-            message: err.to_string(),
-        })?;
+    let Built {
+        source,
+        backchannel,
+        signaled,
+        shown,
+    } = build_source(spec, registries)?;
     // Two-way audio stays off for a protocol that cannot carry audio
     // back, whatever its source puts in the slot.
-    let backchannel = factory
-        .capabilities()
-        .backchannel
-        .then(|| BackchannelSlot::gated(probes.clone()).tracked(backchannels.clone()));
+    let backchannel =
+        backchannel.then(|| BackchannelSlot::gated(probes.clone()).tracked(backchannels.clone()));
     let capable = backchannel.is_some();
     // Only a signaled source gets the opener: no other opens a channel to
     // the control-API client.
-    let signaled = factory.capabilities().signaled.then(|| {
+    let signaled = signaled.then(|| {
         let opener: Arc<dyn SignalingOpener> = Arc::<WorkerSignaling>::clone(signaling);
         opener
     });
     tracing::info!(
         connection = %spec.connection_id,
-        url = %url,
+        source = %shown,
         peer = %spec.peer_host,
         addrs = ?spec.peer_addrs,
         role,
@@ -1646,7 +1700,7 @@ mod tests {
     use lotse_core::task::BoxFuture;
     use lotse_core::test_util::{
         BackchannelCapture, ECHO_ANSWER, EchoSessionFactory, FakeOutputFactory,
-        FakeRecordingMuxerFactory, FakeSourceFactory,
+        FakeRecordingMuxerFactory, FakeSignaledSourceFactory, FakeSourceFactory,
     };
     use lotse_ipc::Receiver;
     use tokio::sync::Notify;
@@ -1708,7 +1762,7 @@ mod tests {
     fn spec(url: &str, options: &str) -> SourceSpec {
         SourceSpec {
             connection_id: "c1".into(),
-            url: url.into(),
+            target: SourceTarget::Url(url.into()),
             options: options.into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
@@ -2797,14 +2851,23 @@ mod tests {
         );
     }
 
-    /// The signaled fake source, as the WebRTC camera source's scheme.
+    /// The signaled fake source, as the WebRTC camera source's protocol.
     fn signaled_registries() -> Arc<Registries> {
         let mut registries = Registries::default();
         registries
             .sources
-            .register(Arc::new(FakeSourceFactory::signaled(&["webrtc"])))
+            .register_signaled(Arc::new(FakeSignaledSourceFactory::new("webrtc")))
             .unwrap();
         Arc::new(registries)
+    }
+
+    /// The spec of a signaled source of `protocol`: no address.
+    fn signaled_spec(protocol: &str, options: &str) -> SourceSpec {
+        SourceSpec {
+            target: SourceTarget::Signaled(protocol.into()),
+            peer_host: String::new(),
+            ..spec("unused://", options)
+        }
     }
 
     /// The worker's next signal report, the other messages skipped.
@@ -2829,12 +2892,9 @@ mod tests {
     async fn rfc8829_5_a_signaled_source_s_offer_and_answer_go_through_the_supervisor() {
         let mut h = start_with_settings(signaled_registries(), quiet_settings());
         h.next().await;
-        h.tx.send_msg(
-            &ToWorker::RunSource(spec("webrtc://camera.front_door", "{}")),
-            &[],
-        )
-        .await
-        .unwrap();
+        h.tx.send_msg(&ToWorker::RunSource(signaled_spec("webrtc", "{}")), &[])
+            .await
+            .unwrap();
         let_assert!(SignalReport::Open { request } = next_signal(&mut h).await);
         signal_command(
             &mut h,
@@ -2926,12 +2986,9 @@ mod tests {
                 message: "the attempt that asked for the channel is over".into(),
             }
         );
-        h.tx.send_msg(
-            &ToWorker::RunSource(spec("webrtc://camera.front_door", "{}")),
-            &[],
-        )
-        .await
-        .unwrap();
+        h.tx.send_msg(&ToWorker::RunSource(signaled_spec("webrtc", "{}")), &[])
+            .await
+            .unwrap();
         let_assert!(SignalReport::Open { request: again } = next_signal(&mut h).await);
         signal_command(
             &mut h,
@@ -4951,6 +5008,62 @@ mod tests {
 
     #[tokio::test]
     async fn bad_specs_and_a_second_source_are_errors() {
+        for (spec, code, message) in [
+            (
+                spec("not a url", "null"),
+                "invalid_request",
+                "url does not parse",
+            ),
+            (
+                spec("rtsp://cam/", "null"),
+                "scheme_unsupported",
+                "scheme \"rtsp\" is not compiled in",
+            ),
+            (
+                spec("fake://cam/", "{not json"),
+                "invalid_request",
+                "options are not JSON",
+            ),
+            (
+                spec("fake://cam/", "{\"transport\":\"udp\"}"),
+                "invalid_request",
+                "fake source takes no options",
+            ),
+            (
+                signaled_spec("webrtc", "null"),
+                "protocol_unsupported",
+                "signaled protocol \"webrtc\" is not compiled in",
+            ),
+            (
+                signaled_spec("fake-signaled", "{\"audio\":true}"),
+                "invalid_request",
+                "fake signaled source takes no options",
+            ),
+            (
+                signaled_spec("fake-signaled", "{not json"),
+                "invalid_request",
+                "options are not JSON",
+            ),
+        ] {
+            let mut registries = Registries::default();
+            registries
+                .sources
+                .register(Arc::new(FakeSourceFactory::new(&["fake"])))
+                .unwrap();
+            registries
+                .sources
+                .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
+                .unwrap();
+            let shown = format!("{:?}", spec.target);
+            let_assert!(
+                Err(Error::SourceRejected {
+                    code: got,
+                    message: text
+                }) = build_source(&spec, &registries)
+            );
+            assert_eq!(got, code, "{shown}");
+            assert!(text.contains(message), "{shown}: {text}");
+        }
         for (url, options, code) in [
             ("not a url", "null", "invalid_request"),
             ("rtsp://cam/", "null", "scheme_unsupported"),

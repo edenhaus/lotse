@@ -139,7 +139,6 @@ mod tests {
 
     use lotse_core::clock::{Clock as _, SystemClock};
     use lotse_core::let_assert;
-    use lotse_core::source_url::SourceUrl;
     use tokio::sync::{mpsc, watch};
 
     use super::*;
@@ -155,7 +154,10 @@ mod tests {
             "c1".into(),
             ConnectionEntry {
                 key: ConnectionKey {
-                    url: SourceUrl::parse("webrtc://camera.front_door").unwrap(),
+                    target: crate::registry::SourceTarget::Signaled {
+                        protocol: "webrtc",
+                        stream: "front".into(),
+                    },
                     options: serde_json::Value::Null,
                 },
                 port: None,

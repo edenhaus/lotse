@@ -28,7 +28,7 @@ use lotse_api_types::command::parse_command;
 use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::registry::Registries;
-use lotse_core::test_util::FakeSourceFactory;
+use lotse_core::test_util::{FakeSignaledSourceFactory, FakeSourceFactory};
 use lotse_supervisor::api::{ConnectionId, Event, Handler as _, Outcome};
 use lotse_supervisor::worker::WorkerConfig;
 use lotse_supervisor::{Environment, Identity, Limits, Settings, Supervisor};
@@ -70,7 +70,7 @@ fn supervisor_with(connects: NonZeroUsize) -> Supervisor {
         .unwrap();
     registries
         .sources
-        .register(Arc::new(FakeSourceFactory::signaled(&["fake-signaled"])))
+        .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
         .unwrap();
     let environment = Environment {
         registries,
@@ -218,16 +218,17 @@ async fn preload_starts_a_worker_that_goes_live_and_linger_stops_it() {
     s.shutdown().await;
 }
 
-/// A signaled source's worker starts without a host lookup (its label
-/// resolves nowhere), and with no control-API client relaying its
-/// signaling the supervisor refuses its open: the source's attempt ends
-/// unreachable, and the stream backs off with that as its last error.
+/// A signaled source, named by its protocol, starts its worker without a
+/// host lookup (it has no address), and with no control-API client
+/// relaying its signaling the supervisor refuses its open: the source's
+/// attempt ends unreachable, and the stream backs off with that as its
+/// last error.
 #[tokio::test]
 async fn a_signaled_source_without_a_signaling_client_backs_off_unreachable() {
     let s = supervisor();
     let mut events = subscription(call(&s, json!({ "id": 1, "type": "stream/subscribe" })).await);
     let put = json!({ "id": 2, "type": "stream/put", "stream_id": "door",
-        "sources": [{ "url": "fake-signaled://camera.front_door" }], "preload": true });
+        "sources": [{ "protocol": "fake-signaled" }], "preload": true });
     assert_eq!(result(call(&s, put).await)["created"], true);
     let mut states = Vec::new();
     let error = loop {
