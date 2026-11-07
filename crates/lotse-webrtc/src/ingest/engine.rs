@@ -242,10 +242,47 @@ struct Stream {
     others: Vec<u8>,
     /// Video, whose losses ask for a keyframe.
     video: bool,
-    /// The synchronization source of the packets seen (RFC 3550 §3).
-    ssrc: Option<u32>,
-    /// The highest sequence number seen of it.
-    highest: Option<u16>,
+    /// The synchronization sources of the packets seen (RFC 3550 §3),
+    /// the latest first, each with the highest sequence number seen of
+    /// it: at most [`MAX_SOURCES`].
+    sources: Vec<(u32, u16)>,
+}
+
+/// How many synchronization sources a stream keeps the numbers of: the
+/// one a camera sends from, and a few before it whose delayed packets may
+/// still arrive (an encoder restart starts a new one, RFC 3550 §8.2).
+/// A late packet of one of them leaves the others' numbers alone; a
+/// camera that keeps changing its SSRC holds no more than this.
+const MAX_SOURCES: usize = 4;
+
+impl Stream {
+    /// Notes packet `seq` of synchronization source `ssrc`, `true` when
+    /// it skips ahead of the highest seen of that source: a loss (RFC 3550
+    /// §A.1). Each source numbers its packets on its own (§5.1, §8.2), so
+    /// a source's first packet is no loss, and a late or repeated one
+    /// (no more than half the sequence space behind) changes nothing.
+    fn sequence(&mut self, ssrc: u32, seq: u16) -> bool {
+        let highest = self
+            .sources
+            .iter()
+            .find(|(seen, _)| *seen == ssrc)
+            .map(|(_, highest)| *highest);
+        let ahead = highest.map_or(1, |highest| seq.wrapping_sub(highest));
+        if !(1..0x8000).contains(&ahead) {
+            return false;
+        }
+        if highest.is_none() {
+            tracing::debug!(
+                index = self.index,
+                ssrc,
+                "webrtc: a new synchronization source"
+            );
+        }
+        self.sources.retain(|(seen, _)| *seen != ssrc);
+        self.sources.insert(0, (ssrc, seq));
+        self.sources.truncate(MAX_SOURCES);
+        ahead > 1
+    }
 }
 
 /// One WebRTC ingest attempt, from the offer to its end.
@@ -771,8 +808,7 @@ impl IngestEngine {
             pts,
             others,
             video: declared.kind == Kind::Video,
-            ssrc: None,
-            highest: None,
+            sources: Vec::new(),
         });
         Some(IngestTrack {
             index,
@@ -1116,19 +1152,7 @@ impl IngestEngine {
         };
         let index = stream.index;
         let ssrc = *header.ssrc;
-        if stream.ssrc != Some(ssrc) {
-            // A new synchronization source numbers its packets anew (RFC
-            // 3550 §5.1, §8.2): its gaps count from its own first one.
-            tracing::debug!(index, ssrc, "webrtc: a new synchronization source");
-            stream.ssrc = Some(ssrc);
-            stream.highest = None;
-        }
-        let ahead = stream
-            .highest
-            .map_or(1, |highest| seq.wrapping_sub(highest));
-        let forward = (1..0x8000).contains(&ahead);
-        let lost = stream.video && forward && ahead > 1 && stream.highest.is_some();
-        stream.highest = if forward { Some(seq) } else { stream.highest };
+        let lost = stream.sequence(ssrc, seq) && stream.video;
         self.stats.rtp_packets = self.stats.rtp_packets.saturating_add(1);
         self.queued.push_back(IngestOutput::Rtp {
             index,
@@ -1272,6 +1296,42 @@ mod tests {
     }
 
     #[test]
+    fn rfc3550_a_1_each_synchronization_source_keeps_its_own_numbers() {
+        const A: u32 = 0xa;
+        const B: u32 = 0xb;
+        let mut stream = Stream {
+            mid: Mid::from("v"),
+            index: 0,
+            pts: Vec::new(),
+            others: Vec::new(),
+            video: true,
+            sources: Vec::new(),
+        };
+        assert!(!stream.sequence(A, 1_000), "a source's first packet");
+        assert!(!stream.sequence(B, 5), "a new source's first packet");
+        // A packet of the former source, delayed: B's numbers stay.
+        assert!(!stream.sequence(A, 999));
+        assert!(stream.sequence(B, 9), "B's own gap");
+        assert!(!stream.sequence(B, 10));
+        assert!(!stream.sequence(B, 10), "a repeat");
+        assert!(!stream.sequence(B, 8), "a late one");
+        // A's numbers are kept too: its gap after it comes back.
+        assert!(stream.sequence(A, 1_002));
+        assert_eq!(stream.sources, [(A, 1_002), (B, 10)]);
+        // Half the sequence space ahead is still ahead; more is behind.
+        assert!(stream.sequence(A, 1_002_u16.wrapping_add(0x7fff)));
+        assert!(!stream.sequence(A, 1_002_u16.wrapping_add(0x7fff).wrapping_add(0x8000)));
+        // At most MAX_SOURCES, the oldest forgotten: B, then a new source
+        // again.
+        for ssrc in 1..u32::try_from(MAX_SOURCES).unwrap() {
+            assert!(!stream.sequence(0x100 + ssrc, 1));
+        }
+        assert_eq!(stream.sources.len(), MAX_SOURCES);
+        assert!(!stream.sources.iter().any(|(ssrc, _)| *ssrc == B));
+        assert!(!stream.sequence(B, 2_000));
+    }
+
+    #[test]
     fn rfc5905_6_ntp_timestamps_count_from_1900_with_a_32_bit_fraction() {
         let half = UNIX_EPOCH + Duration::from_millis(1_500);
         assert_eq!(
@@ -1314,8 +1374,7 @@ mod tests {
             pts: Vec::new(),
             others: Vec::new(),
             video: true,
-            ssrc: None,
-            highest: None,
+            sources: Vec::new(),
         });
         let report = |ntp_time| {
             Event::SenderFeedback(SenderFeedback {
