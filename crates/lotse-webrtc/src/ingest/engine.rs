@@ -355,6 +355,18 @@ fn check_offer_mids(offer: &str) -> Result<(), String> {
     }
 }
 
+/// Whether the relay takes `offer`: at most [`MAX_OFFER_BYTES`].
+fn check_offer_size(offer: &str) -> Result<(), String> {
+    if offer.len() <= MAX_OFFER_BYTES {
+        Ok(())
+    } else {
+        Err(format!(
+            "an offer of {} bytes, over the {MAX_OFFER_BYTES} the relay takes",
+            offer.len()
+        ))
+    }
+}
+
 /// `answer` with a format on every `m=` line of port 0 that lists none,
 /// so str0m parses it. RFC 8866 §5.14 has at least one format on every
 /// `m=` line, and RFC 3264 §6 lets a rejected one list any; str0m 0.24
@@ -498,12 +510,7 @@ impl IngestEngine {
         let (offer, pending) = api.apply().ok_or("the engine made no offer")?;
         let offer = offer.to_sdp_string();
         check_offer_mids(&offer)?;
-        if offer.len() > MAX_OFFER_BYTES {
-            return Err(format!(
-                "an offer of {} bytes, over the {MAX_OFFER_BYTES} the relay takes",
-                offer.len()
-            ));
-        }
+        check_offer_size(&offer)?;
         let first_mid = audio_mid.unwrap_or(video_mid).to_string();
         tracing::debug!(
             candidates = local.len(),
@@ -1347,6 +1354,15 @@ mod tests {
         assert_eq!(
             with_formats("m=video 9 UDP/TLS/RTP/SAVPF\n"),
             "m=video 9 UDP/TLS/RTP/SAVPF\r\n"
+        );
+    }
+
+    #[test]
+    fn an_offer_of_up_to_16_kib_is_taken() {
+        assert!(check_offer_size(&"a".repeat(MAX_OFFER_BYTES)).is_ok());
+        assert_eq!(
+            check_offer_size(&"a".repeat(MAX_OFFER_BYTES + 1)).unwrap_err(),
+            "an offer of 16385 bytes, over the 16384 the relay takes"
         );
     }
 
