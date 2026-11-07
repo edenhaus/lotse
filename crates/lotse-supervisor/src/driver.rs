@@ -4720,6 +4720,28 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// An open the registry no longer holds when its wait ends (a
+    /// subscription took it; its answer is still on the way) is forgotten
+    /// then, so no answer lost after it can hold its place.
+    #[tokio::test]
+    async fn an_open_taken_before_its_wait_ends_is_forgotten_at_its_end() {
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with("/usr/bin/true", clock.clone());
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 1 }));
+        let _events = subscribe_all(&shared);
+        assert_eq!(waiting(&driver), [1], "its answer is queued");
+        clock.advance(SIGNAL_WAIT);
+        driver.end_signal_waits();
+        assert!(waiting(&driver).is_empty());
+        assert!(driver.signal_wait.is_none());
+        // Its answer still reaches the worker.
+        let queued = queued_signals(&mut driver);
+        let_assert!([SignalCommand::Opened { request: 1, .. }] = queued.as_slice());
+        drop(driver);
+    }
+
     /// The supervisor reads nothing a stopping worker still reports, so a
     /// worker's stop closes its signals in the registry itself, as its
     /// exit does.

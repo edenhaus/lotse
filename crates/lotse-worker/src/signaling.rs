@@ -892,12 +892,10 @@ mod tests {
         drop(channels.remove(0));
         let_assert!(SignalReport::Closed { signal_id, .. } = next(&mut reports).await);
         assert_eq!(signal_id, "sig-0");
-        for _ in 0..100 {
-            if lock(&signaling.state).relaying.len() < MAX_SIGNALS {
-                break;
-            }
+        for _ in 0..10 {
             tokio::task::yield_now().await;
         }
+        assert_eq!(lock(&signaling.state).relaying.len(), MAX_SIGNALS - 1);
         channels.push(open(&signaling, &mut reports, "sig-y").await);
         assert_eq!(lock(&signaling.state).relaying.len(), MAX_SIGNALS);
         drop(channels);
