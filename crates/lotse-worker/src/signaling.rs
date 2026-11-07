@@ -15,29 +15,39 @@
 //! without waiting. A queue the source does not drain in time ends the
 //! signal: its incoming end is dropped, which the source reads as the
 //! client gone, as it does a [`SignalCommand::Gone`]. A worker holds at
-//! most [`MAX_SIGNALS`] channels; an `Opened` past them is refused.
+//! most [`MAX_SIGNALS`] channels, each until its relay queued its close
+//! (one it let go of early included); an `Opened` past them is refused.
 //!
-//! Every report is bounded so its message fits the IPC frame
-//! ([`MAX_SIGNAL_SDP_BYTES`], [`MAX_SIGNAL_TEXT_BYTES`]): a source's
-//! longer offer or candidate ends its signal instead, and its close's
-//! message is cut. A supervisor's command for a signal the worker does
-//! not hold is ignored.
+//! Every report is bounded as the supervisor takes it
+//! ([`MAX_SIGNAL_OFFER_BYTES`], [`MAX_SIGNAL_CANDIDATE_BYTES`]), so the
+//! worker never sends what the supervisor would reject: a source's longer
+//! offer or candidate ends its signal here instead, and its close's
+//! message is cut ([`MAX_SIGNAL_TEXT_BYTES`]). A supervisor's command for
+//! a signal the worker does not hold is ignored.
+//!
+//! The relay tasks are tracked: the worker's shutdown waits for them
+//! ([`WorkerSignaling::relays_ended`]), so the close each queues last
+//! goes out with the worker's last messages.
 //!
 //! Standards: RFC 8829 (JSEP) for the offer and answer the channel
 //! carries; RFC 8838 (Trickle ICE) for the candidates and the
 //! end-of-candidates indication, as `lotse_core::signaling` cites them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lotse_core::signaling::{
-    LocalSignal, RemoteSignal, SignalCandidate, SignalClosed, SignalingChannel, SignalingOpener,
-    SignalingRefused, close,
+    LocalSignal, REJECTED, RemoteSignal, SignalCandidate, SignalClosed, SignalingChannel,
+    SignalingOpener, SignalingRefused, close,
 };
 use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::text::plain;
-use lotse_ipc::{MAX_SIGNAL_SDP_BYTES, MAX_SIGNAL_TEXT_BYTES, SignalCommand, SignalReport};
+use lotse_ipc::{
+    MAX_SIGNAL_CANDIDATE_BYTES, MAX_SIGNAL_OFFER_BYTES, MAX_SIGNAL_TEXT_BYTES, SignalCommand,
+    SignalReport,
+};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::task::TaskTracker;
 
 /// The most signaling channels a worker holds at once: its source and a
 /// standby open one per connection attempt, so two at a time, with room
@@ -50,7 +60,7 @@ pub(crate) const REPORT_CAPACITY: usize = 64;
 
 /// The close code of a signal the worker ends itself, and the refusal
 /// code of an open it refuses itself: the control API's `internal_error`.
-const INTERNAL_ERROR: &str = "internal_error";
+const INTERNAL_ERROR: &str = close::INTERNAL_ERROR;
 
 /// What a pending open is answered with.
 type OpenAnswer = Result<SignalingChannel, SignalingRefused>;
@@ -63,6 +73,8 @@ pub(crate) struct WorkerSignaling {
     state: Arc<Mutex<Signals>>,
     /// Where the reports for the supervisor go: the main loop.
     reports: mpsc::Sender<SignalReport>,
+    /// The channels' relay tasks, until each queued its close.
+    relays: TaskTracker,
 }
 
 /// The pending opens and the open channels.
@@ -74,6 +86,26 @@ struct Signals {
     opening: HashMap<u64, oneshot::Sender<OpenAnswer>>,
     /// The open channels' incoming ends, by signal id.
     open: HashMap<String, mpsc::Sender<RemoteSignal>>,
+    /// The channels whose relay still runs, by signal id: a channel the
+    /// worker let go of early (failed, its client gone) counts against
+    /// [`MAX_SIGNALS`] until its source closed it and its relay queued
+    /// the close.
+    relaying: HashSet<String>,
+}
+
+/// A channel's place among [`Signals::relaying`], which its relay holds
+/// and gives up when it ends, however it ends.
+struct Relaying {
+    /// The signals.
+    state: Arc<Mutex<Signals>>,
+    /// The channel.
+    signal_id: String,
+}
+
+impl Drop for Relaying {
+    fn drop(&mut self) {
+        lock(&self.state).relaying.remove(&self.signal_id);
+    }
 }
 
 /// Locks the signals; a poisoned lock is taken as it is, since every
@@ -89,8 +121,22 @@ impl WorkerSignaling {
         let signaling = Arc::new(Self {
             state: Arc::default(),
             reports,
+            relays: TaskTracker::new(),
         });
         (signaling, rx)
+    }
+
+    /// How many channels' relays still run.
+    pub(crate) fn relays(&self) -> usize {
+        self.relays.len()
+    }
+
+    /// Resolves once every relay ended, each having queued its channel's
+    /// close; a relay started meanwhile is waited for too. For the
+    /// worker's shutdown.
+    pub(crate) async fn relays_ended(&self) {
+        self.relays.close();
+        self.relays.wait().await;
     }
 
     /// The supervisor's `command`; what to report back at once, if
@@ -173,8 +219,8 @@ impl WorkerSignaling {
                 message: "the attempt that asked for the channel is over".to_owned(),
             });
         };
-        let duplicate = state.open.contains_key(&signal_id);
-        if duplicate || state.open.len() >= MAX_SIGNALS {
+        let duplicate = state.relaying.contains(&signal_id);
+        if duplicate || state.relaying.len() >= MAX_SIGNALS {
             drop(state);
             let message = if duplicate {
                 "the signal id names an open channel"
@@ -196,17 +242,23 @@ impl WorkerSignaling {
         }
         let (channel, relay) = lotse_core::signaling::channel(signal_id.clone(), local_addrs);
         state.open.insert(signal_id.clone(), relay.incoming);
+        state.relaying.insert(signal_id.clone());
         drop(state);
+        let relaying = Relaying {
+            state: Arc::clone(&self.state),
+            signal_id: signal_id.clone(),
+        };
         tracing::info!(request, signal = %signal_id, local_addrs = ?channel.local_addrs, "signaling channel opened");
         let _relay = spawn_named(
             "signal.relay",
-            relay_signal(
+            self.relays.track_future(relay_signal(
                 Arc::clone(&self.state),
                 self.reports.clone(),
                 signal_id,
                 relay.outgoing,
                 relay.closed,
-            ),
+                relaying,
+            )),
         );
         // An open abandoned meanwhile drops the channel, which closes it
         // as `source_stopped`.
@@ -229,7 +281,7 @@ impl WorkerSignaling {
             Ok(()) => {
                 state.open.remove(signal_id);
                 drop(state);
-                tracing::info!(signal = %signal_id, "the camera failed the signal; the source is told");
+                tracing::info!(signal = %signal_id, "the signal failed; the source is told");
             }
             Err(mpsc::error::TrySendError::Full(signal)) => {
                 state.open.remove(signal_id);
@@ -310,14 +362,17 @@ impl Drop for PendingOpen {
 
 /// Relays the channel `signal_id`'s `outgoing` signals to `reports` as
 /// the supervisor's reports, ahead of its close from `closed`, which goes
-/// last; then the channel leaves `state`. A signal too long for the IPC
-/// frame ends the signal there.
+/// last; then the channel leaves `state`, and with `relaying` its place
+/// among the channels the worker holds. A signal longer than the
+/// supervisor takes ends the signal there: the source is told the relay
+/// rejected it ([`REJECTED`]), its own fault and not the camera's.
 async fn relay_signal(
     state: Arc<Mutex<Signals>>,
     reports: mpsc::Sender<SignalReport>,
     signal_id: String,
     mut outgoing: mpsc::Receiver<LocalSignal>,
     closed: SignalClosed,
+    relaying: Relaying,
 ) {
     let mut closed = std::pin::pin!(closed.wait());
     let (code, message) = loop {
@@ -334,6 +389,15 @@ async fn relay_signal(
                 }
                 Err(reason) => {
                     tracing::warn!(signal = %signal_id, reason, "the source sent a signal longer than the supervisor takes; signal ended");
+                    let incoming = lock(&state).open.remove(&signal_id);
+                    if let Some(incoming) = incoming {
+                        // A source that does not take it reads the client
+                        // gone instead.
+                        let _told = incoming.try_send(RemoteSignal::Failed {
+                            code: REJECTED.to_owned(),
+                            message: reason.to_owned(),
+                        });
+                    }
                     break (INTERNAL_ERROR, reason.to_owned());
                 }
             },
@@ -349,24 +413,25 @@ async fn relay_signal(
             message: plain(&message, MAX_SIGNAL_TEXT_BYTES),
         })
         .await;
+    drop(relaying);
 }
 
-/// `signal` of `signal_id` as the supervisor's report, or why it does not
-/// fit one: an offer over [`MAX_SIGNAL_SDP_BYTES`], a candidate line or
-/// `mid` over [`MAX_SIGNAL_TEXT_BYTES`].
+/// `signal` of `signal_id` as the supervisor's report, or why the
+/// supervisor would not take it: an offer over [`MAX_SIGNAL_OFFER_BYTES`],
+/// a candidate line or `mid` over [`MAX_SIGNAL_CANDIDATE_BYTES`].
 fn report(signal_id: &str, signal: LocalSignal) -> Result<SignalReport, &'static str> {
     match signal {
-        LocalSignal::Offer(sdp) if sdp.len() > MAX_SIGNAL_SDP_BYTES => Err("offer too long"),
+        LocalSignal::Offer(sdp) if sdp.len() > MAX_SIGNAL_OFFER_BYTES => Err("offer too long"),
         LocalSignal::Offer(sdp) => Ok(SignalReport::Offer {
             signal_id: signal_id.to_owned(),
             sdp,
         }),
         LocalSignal::Candidate(candidate)
-            if candidate.candidate.len() > MAX_SIGNAL_TEXT_BYTES
+            if candidate.candidate.len() > MAX_SIGNAL_CANDIDATE_BYTES
                 || candidate
                     .sdp_mid
                     .as_ref()
-                    .is_some_and(|mid| mid.len() > MAX_SIGNAL_TEXT_BYTES) =>
+                    .is_some_and(|mid| mid.len() > MAX_SIGNAL_CANDIDATE_BYTES) =>
         {
             Err("candidate too long")
         }
@@ -787,18 +852,67 @@ mod tests {
         drop(channels);
     }
 
+    /// A channel the worker let go of early (here the relay rejected it)
+    /// still counts until its source closed it and its relay queued the
+    /// close, so a source cannot hold more channels than the supervisor's
+    /// driver remembers ending.
     #[tokio::test]
-    async fn a_signal_longer_than_the_frame_takes_ends_its_signal() {
+    async fn a_channel_counts_against_max_signals_until_its_relay_ends() {
         let (signaling, mut reports) = WorkerSignaling::new();
-        let long_offer = LocalSignal::Offer("v".repeat(MAX_SIGNAL_SDP_BYTES + 1));
+        let mut channels = Vec::new();
+        for n in 0..MAX_SIGNALS {
+            channels.push(open(&signaling, &mut reports, &format!("sig-{n}")).await);
+        }
+        assert_eq!(
+            signaling.command(SignalCommand::Failed {
+                signal_id: "sig-0".into(),
+                code: REJECTED.into(),
+                message: "rejected".into(),
+            }),
+            None
+        );
+        assert_eq!(held(&signaling), MAX_SIGNALS - 1, "let go of");
+        let opening = spawn_named("test.open", signaling.open());
+        let_assert!(SignalReport::Open { request } = next(&mut reports).await);
+        let_assert!(
+            Some(SignalReport::Closed { message, .. }) =
+                signaling.command(opened(request, "sig-x"))
+        );
+        assert_eq!(
+            message,
+            "the worker holds as many signaling channels as it may"
+        );
+        assert!(opening.await.unwrap().is_err());
+        // Its id is still taken, too.
+        let opening = spawn_named("test.open", signaling.open());
+        let_assert!(SignalReport::Open { request } = next(&mut reports).await);
+        assert_eq!(signaling.command(opened(request, "sig-0")), None);
+        assert!(opening.await.unwrap().is_err());
+        // Its source closes it; once the close is queued, a place is free.
+        drop(channels.remove(0));
+        let_assert!(SignalReport::Closed { signal_id, .. } = next(&mut reports).await);
+        assert_eq!(signal_id, "sig-0");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(lock(&signaling.state).relaying.len(), MAX_SIGNALS - 1);
+        channels.push(open(&signaling, &mut reports, "sig-y").await);
+        assert_eq!(lock(&signaling.state).relaying.len(), MAX_SIGNALS);
+        drop(channels);
+    }
+
+    #[tokio::test]
+    async fn a_signal_longer_than_the_supervisor_takes_ends_its_signal_in_the_worker() {
+        let (signaling, mut reports) = WorkerSignaling::new();
+        let long_offer = LocalSignal::Offer("v".repeat(MAX_SIGNAL_OFFER_BYTES + 1));
         let long_candidate = LocalSignal::Candidate(SignalCandidate {
-            candidate: "c".repeat(MAX_SIGNAL_TEXT_BYTES + 1),
+            candidate: "c".repeat(MAX_SIGNAL_CANDIDATE_BYTES + 1),
             sdp_mid: None,
             sdp_mline_index: Some(0),
         });
         let long_mid = LocalSignal::Candidate(SignalCandidate {
             candidate: String::new(),
-            sdp_mid: Some("m".repeat(MAX_SIGNAL_TEXT_BYTES + 1)),
+            sdp_mid: Some("m".repeat(MAX_SIGNAL_CANDIDATE_BYTES + 1)),
             sdp_mline_index: Some(0),
         });
         for (n, (signal, reason)) in [
@@ -820,16 +934,23 @@ mod tests {
                     message: reason.into(),
                 }
             );
-            // The source learns the client is gone.
+            // The source learns the relay rejected it, and nothing follows.
+            assert_eq!(
+                channel.incoming.recv().await,
+                Some(RemoteSignal::Failed {
+                    code: "signal_rejected".into(),
+                    message: reason.into(),
+                })
+            );
             assert_eq!(channel.incoming.recv().await, None);
         }
         // The longest that fit pass.
         let channel = open(&signaling, &mut reports, "sig-fit").await;
         for signal in [
-            LocalSignal::Offer("v".repeat(MAX_SIGNAL_SDP_BYTES)),
+            LocalSignal::Offer("v".repeat(MAX_SIGNAL_OFFER_BYTES)),
             LocalSignal::Candidate(SignalCandidate {
-                candidate: "c".repeat(MAX_SIGNAL_TEXT_BYTES),
-                sdp_mid: Some("m".repeat(MAX_SIGNAL_TEXT_BYTES)),
+                candidate: "c".repeat(MAX_SIGNAL_CANDIDATE_BYTES),
+                sdp_mid: Some("m".repeat(MAX_SIGNAL_CANDIDATE_BYTES)),
                 sdp_mline_index: None,
             }),
         ] {

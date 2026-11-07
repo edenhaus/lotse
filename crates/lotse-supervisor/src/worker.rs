@@ -399,9 +399,11 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
 }
 
 /// A worker's signal report as the driver takes it: a close's code and
-/// message made [`plain`]. A signal id over [`MAX_NAME_BYTES`] names no
-/// signal the supervisor opened (its ids are ULIDs) and fails the channel,
-/// as a broken protocol does.
+/// message made [`plain`]. A signal id the supervisor never gives (its
+/// ids are ULIDs): empty, over [`MAX_NAME_BYTES`] or with a byte outside
+/// [`is_signal_id`]'s set, fails the channel, as a broken protocol does;
+/// so an id is safe to log as it is, with no line break or control
+/// character to forge a log line with.
 fn signal(report: SignalReport) -> WorkerEvent {
     let signal_id = match &report {
         SignalReport::Open { .. } | SignalReport::Cancel { .. } => None,
@@ -409,9 +411,9 @@ fn signal(report: SignalReport) -> WorkerEvent {
         | SignalReport::Candidate { signal_id, .. }
         | SignalReport::Closed { signal_id, .. } => Some(signal_id),
     };
-    if let Some(signal_id) = signal_id.filter(|id| id.len() > MAX_NAME_BYTES) {
+    if let Some(signal_id) = signal_id.filter(|id| !is_signal_id(id)) {
         return WorkerEvent::ChannelError(format!(
-            "signal report with a {}-byte signal id",
+            "signal report with a malformed {}-byte signal id",
             signal_id.len()
         ));
     }
@@ -427,6 +429,16 @@ fn signal(report: SignalReport) -> WorkerEvent {
         },
         report => report,
     })
+}
+
+/// Whether `id` could be a signal id the supervisor gave: 1 to
+/// [`MAX_NAME_BYTES`] bytes of ASCII letters, digits, `.`, `_` and `-`, a
+/// superset of a ULID's Crockford base32.
+fn is_signal_id(id: &str) -> bool {
+    (1..=MAX_NAME_BYTES).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// The tracks of a worker's declaration the supervisor keeps: the first
@@ -1241,9 +1253,47 @@ mod tests {
         ] {
             assert_eq!(
                 mapped(ToSupervisor::Signal(report), None),
-                WorkerEvent::ChannelError("signal report with a 65-byte signal id".into())
+                WorkerEvent::ChannelError(
+                    "signal report with a malformed 65-byte signal id".into()
+                )
             );
         }
+    }
+
+    /// A signal id is logged as it is, so one that could forge a log line
+    /// (a line break, a control character) or that the supervisor never
+    /// gives fails the channel.
+    #[test]
+    fn a_signal_id_outside_the_supervisor_s_charset_fails_the_channel() {
+        for id in [
+            "",
+            "sig\nlevel=ERROR forged",
+            "sig\r",
+            "sig\u{1b}[31m",
+            "sig id",
+            "sig\"",
+            "sigé",
+            "sig/1",
+        ] {
+            assert_eq!(
+                mapped(
+                    ToSupervisor::Signal(SignalReport::Offer {
+                        signal_id: id.into(),
+                        sdp: String::new(),
+                    }),
+                    None
+                ),
+                WorkerEvent::ChannelError(format!(
+                    "signal report with a malformed {}-byte signal id",
+                    id.len()
+                )),
+                "{id:?}"
+            );
+        }
+        for id in ["01JSIGABCDEFGHJKMNPQRSTVWX", "sig-1", "a.b_c-D9", "x"] {
+            assert!(is_signal_id(id), "{id:?}");
+        }
+        assert!(is_signal_id(&"s".repeat(MAX_NAME_BYTES)));
     }
 
     #[test]

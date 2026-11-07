@@ -910,7 +910,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "`signaling/subscribe`: a subscription to the offers of one\nstream's signaled sources, or of every stream's.",
+          "description": "`signaling/subscribe`: a subscription to the offers of one\nstream's signaled sources, or of every stream's. Its end\n(`unsubscribe`, the connection's close, a supersede) ends every\nsignal it holds at once, live ones included, without `closed`:\ntheir sources connect again after their backoff.",
           "properties": {
             "id": {
               "description": "The command id, which becomes the subscription id.",
@@ -1026,10 +1026,10 @@
         },
         {
           "additionalProperties": false,
-          "description": "`signaling/error`: the camera failed a signal, which ends.",
+          "description": "`signaling/error`: the camera failed a signal, which ends; once\nper signal.",
           "properties": {
             "code": {
-              "description": "The client's code, `^[a-z0-9_]{1,64}$`.",
+              "description": "The client's code, `^[a-z0-9_]{1,64}$`; not `signal_rejected`,\nthe supervisor's own for a rejection of the source's signaling\n(`invalid_request`).",
               "pattern": "^[a-z0-9_]{1,64}$",
               "type": "string"
             },

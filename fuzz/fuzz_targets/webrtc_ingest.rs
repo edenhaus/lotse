@@ -5,16 +5,20 @@
 //! (so the fuzzer reaches the engine past str0m's SDP parser), and then
 //! the input drives trickled candidates, datagrams of arbitrary bytes from
 //! the camera's address and from an unknown one, the camera's own
-//! datagrams when there is a camera, time, keyframes and the close. The
-//! contract: at most one `Tracks`, video among them; RTP only of the
-//! indices declared; at most one `Ended`, and after it nothing but close
-//! datagrams and timeouts; `poll` always comes to a timeout.
+//! datagrams when there is a camera, the camera's RTP (any payload type,
+//! sequence number and payload, on either m-line; its Sender Reports come
+//! with it), time, keyframes and the close. The contract: at most one
+//! `Tracks`, video among them; `Connected` at most once, after them; a
+//! switch and RTP only of the indices declared; at most one `Ended`, and
+//! after it nothing but close datagrams and timeouts; `poll` always comes
+//! to a timeout.
 //! Run with `cargo +nightly fuzz run webrtc_ingest` from the repository
 //! root.
 
 #![no_main]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use libfuzzer_sys::fuzz_target;
@@ -22,7 +26,9 @@ use lotse_core::codec::Kind;
 use lotse_core::signaling::SignalCandidate;
 use lotse_webrtc::ingest::{IngestEngine, IngestOutput, WebRtcOptions};
 use str0m::change::SdpOffer;
+use str0m::media::{Mid, Pt};
 use str0m::net::{DatagramRecv, Protocol, Receive};
+use str0m::rtp::{ExtensionValues, RtpWrite, SeqNo};
 use str0m::{Candidate, Input, Output, Rtc};
 
 /// The engine's host candidate.
@@ -61,6 +67,8 @@ fn bytes<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
 struct Seen {
     /// The indices of the tracks declared, once declared.
     tracks: Option<Vec<usize>>,
+    /// It said it connected.
+    connected: bool,
     /// It ended.
     ended: bool,
 }
@@ -72,6 +80,10 @@ struct Run {
     now: Instant,
     to_camera: Vec<(SocketAddr, Vec<u8>)>,
     seen: Seen,
+    /// The offer's audio m-line, if any.
+    audio: Option<Mid>,
+    /// The offer's video m-line.
+    video: Option<Mid>,
 }
 
 impl Run {
@@ -100,6 +112,20 @@ impl Run {
                     );
                     self.seen.tracks = Some(tracks.iter().map(|t| t.index).collect());
                 }
+                IngestOutput::Connected => {
+                    assert!(!self.seen.ended, "not connected after the end");
+                    assert!(!self.seen.connected, "connected once");
+                    assert!(self.seen.tracks.is_some(), "connected after the answer");
+                    self.seen.connected = true;
+                }
+                IngestOutput::Switched(track) => {
+                    assert!(!self.seen.ended, "no switch after the end");
+                    let declared = self.seen.tracks.as_deref().unwrap_or_default();
+                    assert!(
+                        declared.contains(&track.index),
+                        "a switch of a declared track"
+                    );
+                }
                 IngestOutput::Rtp { index, .. } | IngestOutput::SenderReport { index, .. } => {
                     assert!(!self.seen.ended, "no media after the end");
                     let declared = self.seen.tracks.as_deref().unwrap_or_default();
@@ -112,6 +138,38 @@ impl Run {
             }
         }
         panic!("the engine never stops producing output");
+    }
+
+    /// The camera writes one RTP packet on the m-line `video` picks, of
+    /// payload type `pt`, number `seq` and timestamp `ts`, with the RFC
+    /// 9143 `mid` header extension; nothing without a camera or before it
+    /// knows its stream.
+    fn write(&mut self, video: bool, pt: u8, seq: u16, ts: u32, payload: &[u8]) {
+        let now = self.now;
+        let Some(camera) = self.camera.as_mut() else {
+            return;
+        };
+        let Some(mid) = (if video { self.video } else { self.audio }) else {
+            return;
+        };
+        let mut api = camera.direct_api();
+        let Some(stream) = api.stream_tx_by_mid(mid, None) else {
+            return;
+        };
+        let _ = stream.write_rtp(
+            RtpWrite::new(
+                Pt::from(pt),
+                SeqNo::from(u64::from(seq)),
+                ts,
+                now,
+                Arc::<[u8]>::from(payload),
+            )
+            .marker(seq & 1 == 0)
+            .ext_vals(ExtensionValues {
+                mid: Some(mid),
+                ..ExtensionValues::default()
+            }),
+        );
     }
 
     /// Moves the camera's datagrams into the engine and the engine's into
@@ -153,12 +211,24 @@ impl Run {
     }
 }
 
-/// A str0m camera's answer to `offer`, and the camera: H.264 and Opus.
+/// The mid of the offer's first `m=<kind>` section.
+fn mid_of(offer: &str, kind: &str) -> Option<Mid> {
+    offer
+        .split(&format!("m={kind}"))
+        .nth(1)?
+        .lines()
+        .find_map(|line| line.strip_prefix("a=mid:"))
+        .map(Mid::from)
+}
+
+/// A str0m camera's answer to `offer`, and the camera: H.264, H.265 and
+/// Opus.
 fn camera_answer(offer: &str, now: Instant) -> Option<(Rtc, String)> {
     let mut rtc = Rtc::builder()
         .set_rtp_mode(true)
         .clear_codecs()
         .enable_h264(true)
+        .enable_h265(true)
         .enable_opus(true, false)
         .build(now);
     rtc.add_local_candidate(Candidate::host(CAMERA, "udp").ok()?);
@@ -184,12 +254,16 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     assert!(engine.offer_sdp().len() <= 16 * 1024, "the offer budget");
+    let audio = mid_of(engine.offer_sdp(), "audio");
+    let video = mid_of(engine.offer_sdp(), "video");
     let mut run = Run {
         engine,
         camera: None,
         now: t0,
         to_camera: Vec::new(),
         seen: Seen::default(),
+        audio,
+        video,
     };
     run.drain();
     if setup & 4 != 0 {
@@ -209,7 +283,7 @@ fuzz_target!(|data: &[u8]| {
         run.drain();
     }
     while let Some([op]) = take::<1>(&mut rest) {
-        match op % 8 {
+        match op % 9 {
             0 => {
                 let Some(body) = bytes(&mut rest) else { break };
                 run.engine
@@ -249,6 +323,27 @@ fuzz_target!(|data: &[u8]| {
                 run.drain();
                 assert!(run.engine.is_ended());
                 run.seen.ended = true;
+            }
+            7 => {
+                // [m-line:u8][pt:u8][seq:u16][ts:u32][payload]
+                let (Some([mline]), Some([pt]), Some(seq), Some(ts), Some(payload)) = (
+                    take::<1>(&mut rest),
+                    take::<1>(&mut rest),
+                    take::<2>(&mut rest),
+                    take::<4>(&mut rest),
+                    bytes(&mut rest),
+                ) else {
+                    break;
+                };
+                run.write(
+                    mline & 1 != 0,
+                    pt & 0x7f,
+                    u16::from_le_bytes(seq),
+                    u32::from_le_bytes(ts),
+                    payload,
+                );
+                // Through the camera's pacer, its Sender Reports when due.
+                run.step(Duration::ZERO);
             }
             _ => run.step(Duration::from_millis(5)),
         }

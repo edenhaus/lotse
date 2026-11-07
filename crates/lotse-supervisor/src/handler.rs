@@ -542,10 +542,12 @@ impl Supervisor {
                 recordings,
             },
         );
+        let now = (self.shared.clock.now(), self.shared.clock.wall_now());
         for connection in connections {
             state.refresh_connection(&connection);
             state.follow_backchannel(&connection, stream_id.as_str());
             state.follow_prerecord(&connection, stream_id.as_str());
+            state.route_waiting_opens(&connection, now);
         }
         close_moved_sessions(&mut state, stream_id.as_str());
         if reoriented {
@@ -795,7 +797,7 @@ impl Supervisor {
             connection,
             subscription: id,
         };
-        let now = self.shared.clock.wall_now();
+        let now = (self.shared.clock.now(), self.shared.clock.wall_now());
         Outcome::Subscribed(
             self.shared
                 .lock()
@@ -3633,9 +3635,15 @@ mod tests {
     fn offered_signal(s: &Supervisor, request: u64) -> String {
         let mut state = s.shared.lock();
         let connection = state.streams["door"].sources[0].connection.clone();
+        let from = crate::signaling::SignalFrom {
+            connection: &connection,
+            worker: 1,
+        };
+        let now = SystemClock.now();
         state.signal_report(
-            &connection,
+            &from,
             lotse_ipc::SignalReport::Open { request },
+            now,
             std::time::UNIX_EPOCH,
         );
         let signal_id = state
@@ -3644,11 +3652,12 @@ mod tests {
             .last()
             .expect("a signal");
         state.signal_report(
-            &connection,
+            &from,
             lotse_ipc::SignalReport::Offer {
                 signal_id: signal_id.clone(),
                 sdp: lotse_core::test_util::FAKE_SIGNALED_OFFER.into(),
             },
+            now,
             std::time::UNIX_EPOCH,
         );
         signal_id

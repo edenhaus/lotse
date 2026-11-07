@@ -9,9 +9,11 @@
 //! | what happened | the source's error | close code |
 //! |---|---|---|
 //! | no relay, or the open refused | `Unreachable` | (none opened) |
+//! | no host address enumerated (the UDP front door off) | `Unreachable` | `internal_error` |
 //! | no host address could be bound | `Unreachable` | `ice_failed` |
 //! | no answer within 20 s | `Timeout` | `answer_timeout` |
 //! | an answer the engine cannot apply | `Protocol` | `invalid_answer` |
+//! | the relay refused a signal of the source's (`signal_rejected`) | `Protocol` | `internal_error` |
 //! | the camera failed before its answer | `Unreachable("camera: code: message")` | `camera_error` |
 //! | the camera failed after it | `Ended("camera: code: message")` | `camera_error` |
 //! | not connected within 10 s of the answer | `Timeout` | `ice_failed` |
@@ -22,7 +24,18 @@
 //!
 //! A cancel is honored at once: the engine closes (`close_notify`, RTCP
 //! BYE) and is disconnected, its close datagrams sent without waiting.
+//!
+//! The tracks are declared at the answer and the source is ready once ICE
+//! and DTLS are up: until then the runner's ready timeout bounds the
+//! attempt, not its stall watchdog, so a camera that takes seconds to
+//! connect is not cut off as stalled, and one that never connects ends as
+//! `ice_failed`. The loop waits on the cancel, the signals, the host
+//! sockets (in turn, so a busy one starves none), the engine's timeout and
+//! the relay taking the next outgoing signal; an engine timeout already
+//! due is handled before any more I/O, so a socket that is always readable
+//! postpones no deadline.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -32,7 +45,7 @@ use std::time::Instant;
 
 use lotse_codec::rtp_ingest::RtpTracks;
 use lotse_core::codec::Kind;
-use lotse_core::signaling::{LocalSignal, RemoteSignal, SignalingChannel, close};
+use lotse_core::signaling::{LocalSignal, REJECTED, RemoteSignal, SignalingChannel, close};
 use lotse_core::source::{Source, SourceCtx, SourceDescriptor, SourceError};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::BoxFuture;
@@ -40,7 +53,7 @@ use lotse_core::track::Track;
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
-use super::engine::{INTERNAL_ERROR, IngestEnd, IngestEngine, IngestOutput, IngestTrack};
+use super::engine::{IngestEnd, IngestEngine, IngestOutput, IngestTrack};
 use super::factory::SCHEME;
 use super::options::WebRtcOptions;
 
@@ -103,22 +116,38 @@ async fn bind(addrs: &[IpAddr]) -> Vec<Host> {
     hosts
 }
 
-/// The next datagram on any of `hosts`, into `buf`: the index of the
-/// socket it came in on, and its sender and length or the error.
-fn recv_any<'a>(
-    hosts: &'a [Host],
-    buf: &'a mut [u8],
-) -> impl Future<Output = (usize, io::Result<(SocketAddr, usize)>)> + 'a {
-    std::future::poll_fn(move |cx| {
-        for (index, (_, socket)) in hosts.iter().enumerate() {
-            let mut read = ReadBuf::new(buf);
-            if let Poll::Ready(received) = socket.poll_recv_from(cx, &mut read) {
-                let len = read.filled().len();
-                return Poll::Ready((index, received.map(|from| (from, len))));
+/// The host sockets, read in turn.
+struct Hosts {
+    /// The sockets.
+    sockets: Vec<Host>,
+    /// The one read first next time: the one after the last that had a
+    /// datagram, so a socket that always has one starves none of the
+    /// others.
+    next: usize,
+}
+
+impl Hosts {
+    /// The next datagram on any of the sockets, into `buf`: the index of
+    /// the socket it came in on, and its sender and length or the error.
+    /// The sockets are polled from the one after the last read.
+    fn recv<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = (usize, io::Result<(SocketAddr, usize)>)> + 'a {
+        std::future::poll_fn(move |cx| {
+            let count = self.sockets.len();
+            let turn = self.sockets.iter().enumerate().cycle().skip(self.next);
+            for (index, (_, socket)) in turn.take(count) {
+                let mut read = ReadBuf::new(buf);
+                if let Poll::Ready(received) = socket.poll_recv_from(cx, &mut read) {
+                    let len = read.filled().len();
+                    self.next = index.wrapping_add(1);
+                    return Poll::Ready((index, received.map(|from| (from, len))));
+                }
             }
-        }
-        Poll::Pending
-    })
+            Poll::Pending
+        })
+    }
 }
 
 impl Attempt {
@@ -126,23 +155,29 @@ impl Attempt {
     /// `destination`, without waiting: a datagram that does not fit the
     /// socket's buffer now is lost, as on the wire, and counted.
     fn transmit(&mut self, source: SocketAddr, destination: SocketAddr, payload: &[u8]) {
-        let socket = self.hosts.iter().find(|(addr, _)| *addr == source);
+        let socket = self.hosts.sockets.iter().find(|(addr, _)| *addr == source);
         let sent =
             socket.is_some_and(|(_, socket)| socket.try_send_to(payload, destination).is_ok());
         self.dropped = self.dropped.saturating_add(u64::from(!sent));
     }
 }
 
-/// What woke the attempt's loop.
+/// Whether an engine timeout at `wake` is due at `now`.
+fn due(now: Instant, wake: Instant) -> bool {
+    now >= wake
+}
+
+/// What woke the attempt's loop, short of its end (the cancel, the
+/// client gone), which the loop takes itself.
 enum Woke {
-    /// The cancel.
-    Cancelled,
-    /// A signal from the client, `None` once it is gone.
-    Signal(Option<RemoteSignal>),
+    /// A signal from the client.
+    Signal(RemoteSignal),
     /// A datagram on host socket `.0`.
     Datagram(usize, io::Result<(SocketAddr, usize)>),
     /// The engine's timeout.
     Timer,
+    /// The relay took the next outgoing signal, or is gone (`false`).
+    Sent(bool),
 }
 
 /// The end of an attempt by cancel.
@@ -154,14 +189,28 @@ fn cancelled() -> IngestEnd {
     }
 }
 
+/// The end of an attempt by the relaying client going away.
+fn client_gone() -> IngestEnd {
+    IngestEnd {
+        error: SourceError::Ended("signaling client gone".into()),
+        close: close::SIGNALING_LOST,
+        message: "the signaling client is gone".to_owned(),
+    }
+}
+
 /// One attempt's engine and I/O.
 struct Attempt {
     /// The engine.
     engine: IngestEngine,
     /// The host sockets.
-    hosts: Vec<Host>,
+    hosts: Hosts,
     /// The RTP receive path.
     rtp: RtpTracks,
+    /// The tracks declared, by stream index, for a switch of codec.
+    tracks: Vec<(usize, Arc<Track>)>,
+    /// The signals the relay has yet to take, in order: the offer, the
+    /// host candidates and the end-of-candidates indication.
+    outbox: VecDeque<LocalSignal>,
     /// The video's index, its track and its keyframes before this
     /// attempt, while the attempt waits for its first.
     waiting: Option<(usize, Arc<Track>, u64)>,
@@ -173,10 +222,11 @@ struct Attempt {
 
 impl Attempt {
     /// Carries the engine's outputs until it waits: datagrams sent,
-    /// tracks declared and the source ready, packets and Sender Reports
-    /// through the RTP receive path. `Ok` with when it wants the time
-    /// next; `Err` with how the attempt ended, by the engine or by the
-    /// receive path (the camera's timestamps keep jumping).
+    /// tracks declared, the source ready once connected, a track's codec
+    /// switched, packets and Sender Reports through the RTP receive path.
+    /// `Ok` with when it wants the time next; `Err` with how the attempt
+    /// ended, by the engine or by the receive path (the camera's
+    /// timestamps keep jumping).
     fn drain(&mut self, ctx: &mut SourceCtx) -> Result<Instant, IngestEnd> {
         loop {
             match self.engine.poll() {
@@ -188,6 +238,8 @@ impl Attempt {
                     payload,
                 } => self.transmit(source, destination, &payload),
                 IngestOutput::Tracks(tracks) => self.declare(ctx, tracks),
+                IngestOutput::Connected => ctx.tracks.ready(),
+                IngestOutput::Switched(switched) => self.switch(&switched),
                 IngestOutput::Rtp {
                     index,
                     packet,
@@ -198,7 +250,7 @@ impl Attempt {
                         .map_err(|error| IngestEnd {
                             message: error.to_string(),
                             error,
-                            close: INTERNAL_ERROR,
+                            close: close::INTERNAL_ERROR,
                         })?;
                     self.keyframe(index);
                 }
@@ -212,8 +264,8 @@ impl Attempt {
         }
     }
 
-    /// Declares `tracks`, the ones the answer negotiated, carries each on
-    /// the RTP receive path, and makes the source ready.
+    /// Declares `tracks`, the ones the answer negotiated, and carries each
+    /// on the RTP receive path; the source is ready once connected.
     fn declare(&mut self, ctx: &mut SourceCtx, tracks: Vec<IngestTrack>) {
         for negotiated in tracks {
             let declared = negotiated.declared;
@@ -224,10 +276,30 @@ impl Attempt {
                 let before = track.stats().keyframes;
                 self.waiting = Some((negotiated.index, Arc::clone(&track), before));
             }
-            self.rtp
-                .carry(negotiated.index, track, negotiated.pt, &declared);
+            self.rtp.carry(
+                negotiated.index,
+                Arc::clone(&track),
+                negotiated.pt,
+                &declared,
+            );
+            self.tracks.push((negotiated.index, track));
         }
-        ctx.tracks.ready();
+    }
+
+    /// The camera moved a track to another codec the answer accepted:
+    /// the track takes the codec, and the receive path carries its stream
+    /// in it from the next packet.
+    fn switch(&mut self, switched: &IngestTrack) {
+        let declared = &switched.declared;
+        if let Some((_, track)) = self
+            .tracks
+            .iter()
+            .find(|(index, _)| *index == switched.index)
+        {
+            track.set_codec(declared.codec.clone());
+            self.rtp
+                .carry(switched.index, Arc::clone(track), switched.pt, declared);
+        }
     }
 
     /// After a packet of stream `index`: once the video track counted a
@@ -247,12 +319,21 @@ impl Attempt {
     /// ended.
     fn woke(&mut self, event: Woke, now: Instant) -> Option<IngestEnd> {
         match event {
-            Woke::Cancelled => return Some(cancelled()),
-            Woke::Signal(Some(RemoteSignal::Answer(sdp))) => self.engine.accept_answer(now, &sdp),
-            Woke::Signal(Some(RemoteSignal::Candidate(candidate))) => {
+            Woke::Signal(RemoteSignal::Answer(sdp)) => self.engine.accept_answer(now, &sdp),
+            Woke::Signal(RemoteSignal::Candidate(candidate)) => {
                 self.engine.add_remote_candidate(now, &candidate);
             }
-            Woke::Signal(Some(RemoteSignal::Failed { code, message })) => {
+            Woke::Signal(RemoteSignal::Failed { code, message }) if code == REJECTED => {
+                // The relay refused what the source sent: the fault is
+                // lotse's, not the camera's.
+                let message = format!("webrtc: the relay refused a signal: {message}");
+                return Some(IngestEnd {
+                    error: SourceError::Protocol(message.clone()),
+                    close: close::INTERNAL_ERROR,
+                    message,
+                });
+            }
+            Woke::Signal(RemoteSignal::Failed { code, message }) => {
                 let message = format!("camera: {code}: {message}");
                 let error = if self.engine.answered() {
                     SourceError::Ended(message.clone())
@@ -265,15 +346,8 @@ impl Attempt {
                     message,
                 });
             }
-            Woke::Signal(None) => {
-                return Some(IngestEnd {
-                    error: SourceError::Ended("signaling client gone".into()),
-                    close: close::SIGNALING_LOST,
-                    message: "the signaling client is gone".to_owned(),
-                });
-            }
             Woke::Datagram(index, received) => {
-                let local = self.hosts.get(index).map(|(addr, _)| *addr);
+                let local = self.hosts.sockets.get(index).map(|(addr, _)| *addr);
                 let received = received
                     .inspect_err(|err| tracing::debug!(error = %err, "webrtc: receive failed"));
                 if let (Some(local), Ok((from, len))) = (local, received) {
@@ -282,6 +356,16 @@ impl Attempt {
                 }
             }
             Woke::Timer => self.engine.handle_timeout(now),
+            Woke::Sent(true) => {}
+            Woke::Sent(false) => {
+                // A relay that stopped reading shows as the client gone on
+                // `incoming`.
+                tracing::debug!(
+                    unsent = self.outbox.len(),
+                    "webrtc: the relay takes no more signals"
+                );
+                self.outbox.clear();
+            }
         }
         None
     }
@@ -309,29 +393,6 @@ impl Attempt {
     }
 }
 
-/// Sends the offer on `channel`, then the host candidates and the
-/// end-of-candidates indication; `false` once the attempt was
-/// cancelled meanwhile.
-async fn offer(engine: &IngestEngine, channel: &SignalingChannel, ctx: &SourceCtx) -> bool {
-    let mut signals = vec![LocalSignal::Offer(engine.offer_sdp().to_owned())];
-    signals.extend(
-        engine
-            .local_candidates()
-            .into_iter()
-            .map(LocalSignal::Candidate),
-    );
-    for signal in signals {
-        tokio::select! {
-            biased;
-            () = ctx.cancel.cancelled() => return false,
-            // A relay that stopped reading shows as the client gone on
-            // `incoming`.
-            _sent = channel.outgoing.send(signal) => {}
-        }
-    }
-    true
-}
-
 /// One connection attempt of a source with `options`.
 async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
     let Some(relay) = ctx.signaling.clone() else {
@@ -349,6 +410,15 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
         }
     };
     tracing::debug!(signal = %channel.id, addrs = ?channel.local_addrs, "webrtc: signaling channel open");
+    if channel.local_addrs.is_empty() {
+        // The supervisor enumerated no host address: the daemon's WebRTC
+        // UDP front door is off. No candidate can be gathered, now or on
+        // a retry, so no offer is made.
+        let reason = "no host address to gather on: the WebRTC UDP front door is off";
+        tracing::warn!("webrtc: {reason}");
+        channel.close(close::INTERNAL_ERROR, reason.to_owned());
+        return SourceError::Unreachable(format!("webrtc: {reason}"));
+    }
     let hosts = bind(&channel.local_addrs).await;
     let addrs: Vec<SocketAddr> = hosts.iter().map(|(addr, _)| *addr).collect();
     let engine = match IngestEngine::offer(&options, &addrs, ctx.time.now()) {
@@ -359,10 +429,22 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
             return error;
         }
     };
+    let mut outbox = VecDeque::from([LocalSignal::Offer(engine.offer_sdp().to_owned())]);
+    outbox.extend(
+        engine
+            .local_candidates()
+            .into_iter()
+            .map(LocalSignal::Candidate),
+    );
     let attempt = Attempt {
         engine,
-        hosts,
+        hosts: Hosts {
+            sockets: hosts,
+            next: 0,
+        },
         rtp: RtpTracks::new(SCHEME),
+        tracks: Vec::new(),
+        outbox,
         waiting: None,
         buf: vec![0_u8; RECEIVE_BUFFER],
         dropped: 0,
@@ -370,34 +452,100 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
     Box::pin(run(attempt, channel, &mut ctx)).await
 }
 
-/// Runs `attempt` on `channel` until it ends.
+/// Runs `attempt` on `channel` until it ends: the offer and the host
+/// candidates go out as the relay takes them, meanwhile the deadlines and
+/// the signals in keep being served.
 async fn run(
     mut attempt: Attempt,
     mut channel: SignalingChannel,
     ctx: &mut SourceCtx,
 ) -> SourceError {
-    if !offer(&attempt.engine, &channel, ctx).await {
-        return attempt.finish(channel, cancelled());
-    }
     loop {
         let wake = match attempt.drain(ctx) {
             Ok(wake) => wake,
             Err(end) => return attempt.finish(channel, end),
         };
-        // A new timer each time: str0m's next timeout moves with nearly
-        // every datagram, so one kept would rarely be the one due.
-        let mut sleeping = ctx
-            .time
-            .sleep(wake.saturating_duration_since(ctx.time.now()));
-        let event = tokio::select! {
-            biased;
-            () = ctx.cancel.cancelled() => Woke::Cancelled,
-            signal = channel.incoming.recv() => Woke::Signal(signal),
-            (index, received) = recv_any(&attempt.hosts, &mut attempt.buf) => Woke::Datagram(index, received),
-            () = &mut sleeping => Woke::Timer,
+        let now = ctx.time.now();
+        let event = if due(now, wake) {
+            // Due already: before any more I/O, which could always be
+            // ready. (A cancel waits for this one step of the engine.)
+            Ok(Woke::Timer)
+        } else {
+            // A new timer each time: str0m's next timeout moves with
+            // nearly every datagram, so one kept would rarely be the one
+            // due.
+            let mut sleeping = ctx.time.sleep(wake.saturating_duration_since(now));
+            let sending = !attempt.outbox.is_empty();
+            tokio::select! {
+                biased;
+                () = ctx.cancel.cancelled() => Err(cancelled()),
+                signal = channel.incoming.recv() => signal.map(Woke::Signal).ok_or_else(client_gone),
+                permit = channel.outgoing.reserve(), if sending => {
+                    let sent = permit.ok().zip(attempt.outbox.pop_front());
+                    Ok(Woke::Sent(sent.map(|(permit, signal)| permit.send(signal)).is_some()))
+                }
+                (index, received) = attempt.hosts.recv(&mut attempt.buf) => Ok(Woke::Datagram(index, received)),
+                () = &mut sleeping => Ok(Woke::Timer),
+            }
         };
-        if let Some(end) = attempt.woke(event, ctx.time.now()) {
+        let end = match event {
+            Ok(event) => attempt.woke(event, ctx.time.now()),
+            Err(end) => Some(end),
+        };
+        if let Some(end) = end {
             return attempt.finish(channel, end);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::arithmetic_side_effects,
+        clippy::missing_docs_in_private_items,
+        reason = "test code"
+    )]
+
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn a_timeout_is_due_at_its_time_and_after() {
+        let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
+        assert!(due(now, now));
+        assert!(due(now + Duration::from_nanos(1), now));
+        assert!(!due(now, now + Duration::from_nanos(1)));
+    }
+
+    #[tokio::test]
+    async fn the_host_sockets_are_read_in_turn_so_a_busy_one_starves_none() {
+        let mut sockets = Vec::new();
+        for _ in 0..2 {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            sockets.push((socket.local_addr().unwrap(), socket));
+        }
+        let (first, second) = (sockets[0].0, sockets[1].0);
+        let mut hosts = Hosts { sockets, next: 0 };
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        for n in 0..3_u8 {
+            sender.send_to(&[n], first).await.unwrap();
+        }
+        sender.send_to(&[10], second).await.unwrap();
+        let mut buf = vec![0_u8; 16];
+        let mut read = Vec::new();
+        for _ in 0..4 {
+            let (index, received) = hosts.recv(&mut buf).await;
+            let (from, len) = received.unwrap();
+            assert_eq!(from, sender.local_addr().unwrap());
+            read.push((index, buf[..len].to_vec()));
+        }
+        // The busy first socket in turn with the second, not before it.
+        assert_eq!(
+            read,
+            [(0, vec![0]), (1, vec![10]), (0, vec![1]), (0, vec![2])]
+        );
+        assert_eq!(hosts.next, 1);
     }
 }

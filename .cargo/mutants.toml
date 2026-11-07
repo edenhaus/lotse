@@ -13,11 +13,6 @@ exclude_globs = [
 exclude_re = [
     # The NTP seconds are shifted above the 32-bit fraction, so `|` and `^` produce the same value.
     "ingest/engine.rs:.*replace \\| with \\^ in ntp64$",
-    # str0m 0.24's agent reports Disconnected only after more than the 10 s connect deadline without
-    # answers, so before the connection that deadline ends the attempt first, whichever the guard.
-    "ingest/engine.rs:.*replace && with \\|\\| in IngestEngine::on_event$",
-    # The count of datagrams the sockets did not take reaches the attempt's last log line only.
-    "ingest/source.rs:.*delete ! in Attempt::transmit$",
     # The default body already returns `None`.
     "replace Handler::unsubscribed -> Option<Event> with None",
     # The default body already returns an empty list.
