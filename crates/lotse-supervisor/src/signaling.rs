@@ -227,6 +227,17 @@ struct ClientSent {
     end: bool,
 }
 
+impl ClientSent {
+    /// Counts a candidate the client sent, or its end-of-candidates.
+    const fn took_candidate(&mut self, end: bool) {
+        if end {
+            self.end = true;
+        } else {
+            self.candidates = self.candidates.saturating_add(1);
+        }
+    }
+}
+
 /// The signaling the registry routes: the subscriptions, the opens
 /// waiting for one, and the open signals.
 #[derive(Debug, Default)]
@@ -1022,11 +1033,7 @@ impl State {
             },
         )?;
         if let Some(signal) = self.signaling.signals.get_mut(&candidate.signal_id) {
-            if end {
-                signal.client_sent.end = true;
-            } else {
-                signal.client_sent.candidates = signal.client_sent.candidates.saturating_add(1);
-            }
+            signal.client_sent.took_candidate(end);
         }
         tracing::debug!(signal.id = %candidate.signal_id, end, "signaling candidate relayed to the source");
         Ok(())
@@ -2201,16 +2208,17 @@ mod tests {
         let at = later();
         // Opens that wait, then are cancelled or refused at their wait's
         // end.
-        for request in 1..=3 {
+        for request in 1..=4 {
             report_at(&mut state, "c1", SignalReport::Open { request }, at);
         }
         report_at(&mut state, "c1", SignalReport::Cancel { request: 1 }, at);
         report_at(&mut state, "c1", SignalReport::Cancel { request: 2 }, at);
         assert!(state.signal_wait_expired(&from("c1"), 3, at));
-        let _refused = queues.take("c1");
+        assert!(state.signal_wait_expired(&from("c1"), 4, at));
+        assert_eq!(queues.take("c1").len(), 2);
         let _all = state.signaling_subscribe(owner(1, 1), None, (at, UNIX_EPOCH));
         // Signals opened, offered twice (a breach) or closed.
-        for request in 4..=6 {
+        for request in 5..=8 {
             report_at(&mut state, "c1", SignalReport::Open { request }, at);
             let signal_id = opened(&mut queues, "c1", request);
             let offer = SignalReport::Offer {
@@ -2218,7 +2226,7 @@ mod tests {
                 sdp: "v=0\r\n".into(),
             };
             report_at(&mut state, "c1", offer.clone(), at);
-            if request == 4 {
+            if request < 7 {
                 report_at(&mut state, "c1", closed(&signal_id, "peer_closed"), at);
             } else {
                 report_at(&mut state, "c1", offer, at);
@@ -2244,10 +2252,10 @@ mod tests {
         }
         // A summary interval later, each says how many it covers.
         let at = at + lotse_core::throttle::SUMMARY_INTERVAL;
-        report_at(&mut state, "c1", SignalReport::Open { request: 7 }, at);
+        report_at(&mut state, "c1", SignalReport::Open { request: 9 }, at);
         let lines = captured.lines("signal opened; it belongs to the subscription");
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[1].contains("count=3"), "{lines:?}");
+        assert!(lines[1].contains("count=4"), "{lines:?}");
         // Another connection's lines are its own.
         report_at(&mut state, "c2", SignalReport::Open { request: 1 }, at);
         let _yard = opened(&mut queues, "c2", 1);
