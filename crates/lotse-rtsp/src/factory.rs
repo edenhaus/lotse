@@ -128,7 +128,7 @@ mod tests {
         let source = factory.validate(&url, &serde_json::Value::Null).unwrap();
         let described = source.describe();
         assert_eq!(described.protocol, "rtsp");
-        assert_eq!(described.url, url);
+        assert_eq!(described.url.as_ref(), Some(&url));
         assert_eq!(described.options["transport"], "tcp");
         assert_eq!(
             source.connection_options(),

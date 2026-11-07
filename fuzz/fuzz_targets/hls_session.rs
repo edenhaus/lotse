@@ -467,6 +467,7 @@ fuzz_target!(|data: &[u8]| {
             clock: clock_input,
             time,
             backchannel: BackchannelSlot::default(),
+            signaling: None,
             cancel: cancel.clone(),
         };
         let run = source.run(ctx);
