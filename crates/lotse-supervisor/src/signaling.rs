@@ -78,12 +78,14 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use lotse_api::{ConnectionId, Event, EventClass};
 use lotse_api_types::command::{SignalingAnswer, SignalingCandidate, SignalingError};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::signaling::{SignalCloseCode, SignalingEvent};
+use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::signaling::{REJECTED, SignalCandidate};
 use lotse_core::text::plain;
 use lotse_core::throttle::Throttle;
@@ -262,7 +264,7 @@ struct Held {
 
 /// The signaling the registry routes: the subscriptions, the opens
 /// waiting for one, and the open signals.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Signaling {
     /// The host addresses a source may gather candidates on: the front
     /// door's, enumerated before the sandbox.
@@ -286,6 +288,26 @@ pub(crate) struct Signaling {
     /// them: one worker's flood hides no other's. A connection's go with
     /// it.
     lines: BTreeMap<(String, Line), Throttle>,
+    /// The injected clock, for the lines [`State::tell_worker`]
+    /// rate-limits: not all of its callers know the time.
+    pub(crate) clock: Arc<dyn Clock>,
+}
+
+impl Default for Signaling {
+    /// No subscription, open or signal, on the system clock until the
+    /// supervisor injects its own.
+    fn default() -> Self {
+        Self {
+            local_addrs: Vec::new(),
+            scopes: BTreeMap::new(),
+            waiting: Vec::new(),
+            signals: BTreeMap::new(),
+            held: BTreeMap::new(),
+            opened: 0,
+            lines: BTreeMap::new(),
+            clock: Arc::new(SystemClock),
+        }
+    }
 }
 
 /// A line of the router's a worker can repeat as fast as it sends, each
@@ -309,6 +331,9 @@ enum Line {
     Closed,
     /// A signal ended over a worker's breach of the contract.
     Broke,
+    /// A command for the worker dropped past [`MAX_HELD_SIGNALS`]: the
+    /// driver's refusals of a worker's opens can repeat it.
+    Dropped,
 }
 
 impl Signaling {
@@ -974,6 +999,30 @@ impl State {
         }
     }
 
+    /// The daemon shuts down, ahead of its goodbye: every signal whose
+    /// offer went out closes `source_stopped`, every signaling
+    /// subscription ends, and the waiting opens and held commands are
+    /// forgotten, as the workers stop next.
+    pub(crate) fn signaling_shutdown(&mut self) {
+        let signals = std::mem::take(&mut self.signaling.signals);
+        tracing::info!(
+            signals = signals.len(),
+            subscriptions = self.signaling.scopes.len(),
+            "signaling ends: the daemon is shutting down"
+        );
+        for (signal_id, signal) in signals {
+            self.close_signal(
+                signal_id,
+                &signal,
+                SignalCloseCode::SourceStopped,
+                "the daemon is shutting down".to_owned(),
+            );
+        }
+        self.signaling.scopes.clear();
+        self.signaling.waiting.clear();
+        self.signaling.held.clear();
+    }
+
     /// `unsubscribe` of `subscription` of `connection`: true if it was a
     /// signaling subscription, which ends with its signals.
     pub(crate) fn signaling_unsubscribed(
@@ -1197,6 +1246,24 @@ impl State {
             .commands
             .max_capacity()
             .saturating_sub(entry.commands.capacity());
+        let full = self
+            .signaling
+            .held
+            .get(connection)
+            .is_some_and(|held| held.commands.len() >= MAX_HELD_SIGNALS);
+        if full {
+            let now = self.signaling.clock.now();
+            if let Some(count) = self.signaling.line(connection, Line::Dropped, now) {
+                tracing::error!(
+                    connection.id = connection,
+                    ?command,
+                    limit = MAX_HELD_SIGNALS,
+                    count,
+                    "signal command dropped: its driver takes none of those held for it"
+                );
+            }
+            return;
+        }
         let held = self
             .signaling
             .held
@@ -1205,15 +1272,6 @@ impl State {
                 commands: VecDeque::new(),
                 ahead: queued.saturating_add(1),
             });
-        if held.commands.len() >= MAX_HELD_SIGNALS {
-            tracing::error!(
-                connection.id = connection,
-                ?command,
-                limit = MAX_HELD_SIGNALS,
-                "signal command dropped: its driver takes none of those held for it"
-            );
-            return;
-        }
         tracing::debug!(
             connection.id = connection,
             ?command,
@@ -1267,7 +1325,6 @@ mod tests {
 
     use std::time::UNIX_EPOCH;
 
-    use lotse_core::clock::{Clock as _, SystemClock};
     use lotse_core::let_assert;
     use lotse_core::source_url::SourceUrl;
     use serde_json::{Value, json};
@@ -2236,21 +2293,46 @@ mod tests {
         assert!(state.signal_wait_expired(&from("c1"), 3, later()));
         assert_eq!(queues.take("c1").len(), 1);
         assert_eq!(held(&state), 0);
-        // A driver that takes none holds at most MAX_HELD_SIGNALS.
-        for _ in 0..=MAX_HELD_SIGNALS + 1 {
-            state.tell_worker(
-                "c1",
-                WORKER,
-                SignalCommand::Gone {
-                    signal_id: "s".into(),
-                },
-            );
+    }
+
+    /// A driver that takes none has at most [`MAX_HELD_SIGNALS`] commands
+    /// held for it; the line of those dropped is rate-limited on the
+    /// injected clock, as a worker's reports can repeat it. The worker's
+    /// end forgets what was held, and a connection that is gone takes no
+    /// command.
+    #[test]
+    fn at_most_256_commands_are_held_and_the_line_of_those_dropped_is_rate_limited() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let (mut state, _queues) = signaled_state(1);
+        let held = |state: &State| {
+            state
+                .signaling
+                .held
+                .get("c1")
+                .map_or(0, |held| held.commands.len())
+        };
+        let fake = Arc::new(lotse_core::clock::FakeClock::default());
+        state.signaling.clock = fake.clone();
+        let gone = SignalCommand::Gone {
+            signal_id: "s".into(),
+        };
+        // The queue's one, the held ones, and 9 dropped.
+        for _ in 0..MAX_HELD_SIGNALS + 10 {
+            state.tell_worker("c1", WORKER, gone.clone());
         }
         assert_eq!(held(&state), MAX_HELD_SIGNALS);
-        let dropped =
-            captured.lines("signal command dropped: its driver takes none of those held for it");
+        let dropped_lines =
+            || captured.lines("signal command dropped: its driver takes none of those held for it");
+        let dropped = dropped_lines();
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert!(dropped[0].contains("limit=256"), "{dropped:?}");
+        assert!(dropped[0].contains("count=1"), "{dropped:?}");
+        fake.advance(lotse_core::throttle::SUMMARY_INTERVAL);
+        state.tell_worker("c1", WORKER, gone);
+        let dropped = dropped_lines();
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        assert!(dropped[1].contains("count=9"), "{dropped:?}");
         // The worker's end forgets what was held for it.
         state.signals_ended("c1", SignalCloseCode::WorkerGone, "exited");
         assert_eq!(held(&state), 0);
@@ -2572,6 +2654,53 @@ mod tests {
         // A connection that is gone has none to end.
         state.signals_left_streams("gone");
         assert_eq!(state.signaling.signals.len(), 1);
+    }
+
+    /// At the shutdown every offered signal closes `source_stopped`, every
+    /// signaling subscription ends, and nothing waits or is held.
+    #[test]
+    fn the_shutdown_closes_the_signals_and_ends_the_subscriptions() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let (mut state, mut queues) = signaled_state(8);
+        let mut door = subscribe(&mut state, owner(1, 1), Some("door"));
+        open(&mut state, "c1", 1);
+        let offered = opened(&mut queues, "c1", 1);
+        offer(&mut state, "c1", &offered);
+        let _offer = events(&mut door);
+        open(&mut state, "c1", 2);
+        let _quiet = opened(&mut queues, "c1", 2);
+        // An open of `yard`, which no subscription takes, waits, and
+        // commands are held for its full queue.
+        open(&mut state, "c2", 1);
+        for _ in 0..9 {
+            state.tell_worker(
+                "c2",
+                WORKER,
+                SignalCommand::Gone {
+                    signal_id: "s".into(),
+                },
+            );
+        }
+        assert_eq!(state.signaling.waiting.len(), 1);
+        assert_eq!(state.signaling.held.len(), 1);
+        state.signaling_shutdown();
+        // Only the offered signal's client knows it, and is told.
+        assert_eq!(
+            events(&mut door),
+            [
+                json!({ "type": "closed", "signal_id": offered, "code": "source_stopped",
+                     "message": "the daemon is shutting down" })
+            ]
+        );
+        assert!(door.is_closed(), "the subscription ended");
+        assert!(state.signal_ids_for_tests().is_empty());
+        assert!(state.signaling.scopes.is_empty());
+        assert!(state.signaling.waiting.is_empty());
+        assert!(state.signaling.held.is_empty());
+        let lines = captured.lines("signaling ends: the daemon is shutting down");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("signals=2 subscriptions=1"), "{lines:?}");
     }
 
     /// A connection several streams share offers to the subscription of

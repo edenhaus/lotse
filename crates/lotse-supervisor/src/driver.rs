@@ -597,6 +597,10 @@ pub(crate) struct Driver {
     signal_open_lines: Throttle,
     /// Rate-limits the line of a worker's malformed offer or candidate.
     signal_text_lines: Throttle,
+    /// Rate-limits the line of a signal command the worker's channel did
+    /// not take: every command queued or held for it meets the same
+    /// broken channel until the worker's exit is seen.
+    signal_send_lines: Throttle,
 }
 
 impl Driver {
@@ -648,6 +652,7 @@ impl Driver {
             ended_signals: VecDeque::new(),
             signal_open_lines: Throttle::default(),
             signal_text_lines: Throttle::default(),
+            signal_send_lines: Throttle::default(),
         }
     }
 
@@ -1338,15 +1343,19 @@ impl Driver {
     /// the queue held before them or the queue is empty: so they go after
     /// everything queued before them, and before anything the registry or
     /// the driver tells the worker after (the registry holds every later
-    /// one while it holds any).
+    /// one while it holds any). The queue's emptiness is read under the
+    /// registry's lock, under which every signal command is queued or
+    /// held: read before it, another task could fill the queue and start a
+    /// hold in between, and the hold would go ahead of what the queue
+    /// still holds.
     ///
     /// [`State::take_held_signals`]: crate::registry::State::take_held_signals
     async fn release_held_signals(&mut self) {
-        let drained = self.commands.is_empty();
-        let held = self
-            .shared
-            .lock()
-            .take_held_signals(&self.spec.connection_id, drained);
+        let held = {
+            let mut state = self.shared.lock();
+            let drained = self.commands.is_empty();
+            state.take_held_signals(&self.spec.connection_id, drained)
+        };
         for (worker, command) in held {
             self.signal_worker(worker, command).await;
         }
@@ -1376,9 +1385,11 @@ impl Driver {
         {
             self.signal_opens.remove(request);
         }
-        if let Err(err) = running.signal(&command).await {
+        if let Err(err) = running.signal(&command).await
+            && let Some(count) = self.signal_send_lines.hit(self.shared.clock.now())
+        {
             // The exit follows, and the signals go with the worker.
-            tracing::warn!(pid = running.pid(), error = %err, "signal command could not be sent to the worker");
+            tracing::warn!(pid = running.pid(), error = %err, count, "signal command could not be sent to the worker");
         }
     }
 
@@ -1974,6 +1985,9 @@ impl Driver {
                 .stop(self.shared.shutdown_budget, &self.shared.clock)
                 .await;
         }
+        // The worker's close reports are not read any more: its signals
+        // close here, as at any stop.
+        self.signals_ended(SignalCloseCode::SourceStopped, "the source stopped");
         tracing::info!("connection driver stopped");
     }
 }
@@ -4767,6 +4781,38 @@ mod tests {
         drop(driver);
     }
 
+    /// A driver that stops, at the shutdown once the registry dropped its
+    /// connection, reads nothing its worker still reports: its signals
+    /// close in the registry `source_stopped`, as at any stop.
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "`stop_all` consumes the driver, a move the lint does not see"
+    )]
+    async fn a_driver_that_stops_closes_its_worker_s_signals_source_stopped() {
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        let mut events = subscribe_all(&shared);
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 1 }));
+        let queued = queued_signals(&mut driver);
+        let_assert!([SignalCommand::Opened { signal_id, .. }] = queued.as_slice());
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Offer {
+            signal_id: signal_id.clone(),
+            sdp: lotse_core::test_util::FAKE_SIGNALED_OFFER.into(),
+        }));
+        assert_eq!(signaling_event(&mut events)["type"], "offer");
+        let _dropped = shared.lock().connections.remove("c1");
+        driver.worker = Some(dead_worker(&shared).await);
+        driver.stop_all().await;
+        assert_eq!(
+            signaling_event(&mut events),
+            serde_json::json!({ "type": "closed", "signal_id": signal_id, "code": "source_stopped",
+                                "message": "the source stopped" })
+        );
+        assert!(shared.lock().signal_ids_for_tests().is_empty());
+    }
+
     /// What the registry held while the queue was full reaches the worker
     /// once the driver has handled what the queue held before it.
     #[tokio::test]
@@ -5201,23 +5247,23 @@ mod tests {
             "{held:?}"
         );
         assert_eq!(limit, LIMIT_REACHED);
-        // A worker that is gone cannot be told.
+        // A worker that is gone cannot be told: one line within the
+        // summary interval, however many commands meet its channel.
         driver.worker = Some(dead_worker(&shared).await);
-        driver
-            .handle(Wake::Command(DriverCommand::Signal {
-                worker: 0,
-                command: SignalCommand::Gone {
-                    signal_id: "sig".into(),
-                },
-            }))
-            .await;
+        for _ in 0..3 {
+            driver
+                .handle(Wake::Command(DriverCommand::Signal {
+                    worker: 0,
+                    command: SignalCommand::Gone {
+                        signal_id: "sig".into(),
+                    },
+                }))
+                .await;
+        }
         drop(driver);
-        assert_eq!(
-            captured
-                .lines("signal command could not be sent to the worker")
-                .len(),
-            1
-        );
+        let lines = captured.lines("signal command could not be sent to the worker");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("count=1"), "{lines:?}");
     }
 
     #[tokio::test]
