@@ -6,11 +6,14 @@
 //! integration's data channel) and its trickled candidates; the camera's
 //! answer and candidates go back with `signaling/answer` and
 //! `signaling/candidate`, and the stream goes live: a viewer plays its video
-//! and audio and a recording of it is an fMP4 file. A camera that closes
-//! its connection ends the signal `peer_closed`, a camera's error relayed
-//! with `signaling/error` ends it `camera_error`, and each time the source
-//! offers again with a new signal after its backoff. Without a client to
-//! relay the signaling the source is unreachable.
+//! and audio and a recording of it, read back with mp4-atom, holds both. An
+//! ICE lite camera (RFC 8445 §2.5) that drops the source's candidates is
+//! reached through the candidates it gave, in its answer or trickled. A
+//! camera that closes its connection ends the signal `peer_closed`, a
+//! camera's error relayed with `signaling/error` ends it `camera_error`,
+//! and each time the source offers again with a new signal after its
+//! backoff. Without a client to relay the signaling the source is
+//! unreachable.
 //! Needs the `source-webrtc`, `output-webrtc` and `output-recording`
 //! features (the defaults).
 
@@ -37,6 +40,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::mp4::{assert_starts_at_a_keyframe_without_holes, holes, ms, parse};
 use common::recording_body::fetch_on_socket;
 use common::{Daemon, SocketDir, socket_dir};
 use futures_util::stream::SplitSink;
@@ -49,6 +53,7 @@ use lotse_testing::fake_webrtc_camera::{
     WebRtcCameraStats,
 };
 use lotse_testing::viewer::{Outgoing, Viewer};
+use mp4_atom::Codec as SampleEntry;
 use serde_json::{Value, json};
 use tokio::net::{UdpSocket, UnixStream};
 use tokio::sync::mpsc;
@@ -64,6 +69,12 @@ const SOURCE: &str = "webrtc://camera.front_door";
 
 /// The data channel Nest's integration asks for.
 const NEST_CHANNEL: &str = "dataSendChannel";
+
+/// The fake camera's frame interval, in milliseconds (25 fps).
+const FRAME_MS: u64 = 40;
+
+/// The video's timescale, the RTP clock of H.264 (RFC 6184 §8.2.1).
+const VIDEO_RATE: u64 = 90_000;
 
 fn clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock)
@@ -289,9 +300,19 @@ async fn answer(
     offer: &Offer,
     config: WebRtcCameraConfig,
 ) -> FakeWebRtcCamera {
+    let mid_extension = config.mid_extension;
     let (camera, answer) = FakeWebRtcCamera::answer(&offer.sdp, config, clock())
         .await
         .expect("the camera answers");
+    // RFC 9143 §15: the answer has the `mid` extension only when the camera
+    // sends it; its streams' `a=ssrc` (RFC 5576 §4.1) either way.
+    assert_eq!(
+        answer.sdp.contains("urn:ietf:params:rtp-hdrext:sdes:mid"),
+        mid_extension,
+        "{}",
+        answer.sdp
+    );
+    assert!(answer.sdp.contains("\r\na=ssrc:"), "{}", answer.sdp);
     control
         .call(
             json!({ "type": "signaling/answer", "signal_id": offer.signal_id, "sdp": answer.sdp }),
@@ -398,14 +419,53 @@ fn holds(stream: &Value, held_ms: u64) -> bool {
         .is_some_and(|held| held >= held_ms)
 }
 
-/// A Nest-like camera (it refuses an offer without the data channel's
-/// `application` m-line) answers the source's offer, which carries its
-/// candidates and the data channel: the stream goes live with the camera's
-/// H.264 and Opus, the camera sees the data channel open and a keyframe
-/// request, a viewer plays both tracks, and a recording of the stream is a
-/// whole fMP4 file of them.
+/// A recording of a second with a second of pre-record, read back with
+/// mp4-atom: an `avc1` track at 90 kHz from a keyframe with its IDR and
+/// without a hole, as long as the pre-record and the second together,
+/// and an Opus track of 20 ms packets (RFC 7587 §4.2) at 48 kHz without a
+/// hole that starts with the video (EBU R37: within 40 ms).
+fn check_recording(file: &[u8], prerecord_ms: u64) {
+    let mp4 = parse(file);
+    let (video_id, video_rate) = mp4.video();
+    assert_eq!(video_rate, VIDEO_RATE);
+    let video = mp4.samples(file, video_id);
+    assert_starts_at_a_keyframe_without_holes(&video);
+    let last = video.last().unwrap();
+    let span = ms(last.dts + last.duration - video[0].dts, video_rate);
+    let expected = prerecord_ms + 1_000;
+    assert!(
+        span.abs_diff(expected) <= 2 * FRAME_MS,
+        "the video covers {span} ms, the recording asked {expected} ms"
+    );
+    assert!(
+        video.iter().all(|sample| !sample.bytes.is_empty()),
+        "every picture has its bytes"
+    );
+    let (entry, audio_rate, audio) = mp4.audio(file).expect("an audio track");
+    assert!(matches!(entry, SampleEntry::Opus(_)), "{entry:?}");
+    assert_eq!(audio_rate, 48_000);
+    assert!(audio.len() >= 40, "{} audio samples", audio.len());
+    assert!(audio.iter().all(|sample| sample.duration == 960));
+    assert_eq!(holes(&audio), [], "the audio runs without a hole");
+    let (video_start, audio_start) = (ms(video[0].dts, video_rate), ms(audio[0].dts, audio_rate));
+    assert!(
+        audio_start.abs_diff(video_start) <= FRAME_MS,
+        "audio at {audio_start} ms, video at {video_start} ms"
+    );
+}
+
+/// A Nest-like camera answers the source's offer, which carries its
+/// candidates and the data channel. Like Nest it refuses an offer without
+/// the data channel's `application` m-line, its candidates are in its
+/// answer only, it drops the source's trickled candidates, and it is ICE
+/// lite (RFC 8445 §2.5), checking nothing itself: the source reaches it
+/// through the answer's candidate alone. The stream goes live with the
+/// camera's H.264 and Opus, the camera sees the data channel open and a
+/// keyframe request, a viewer plays both tracks, and a recording of the
+/// stream holds both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc8829_a_nest_like_camera_answers_the_offer_and_its_stream_plays_and_records() {
+async fn rfc8445_2_5_a_nest_like_ice_lite_camera_answers_the_offer_and_its_stream_plays_and_records()
+ {
     lotse_webrtc::install_crypto_provider();
     let (daemon, dir) = daemon("webrtc-source-live");
     let socket = dir.join("lotse.sock");
@@ -432,8 +492,9 @@ async fn rfc8829_a_nest_like_camera_answers_the_offer_and_its_stream_plays_and_r
         &offer,
         WebRtcCameraConfig {
             require_application: true,
-            require_mline_index: true,
-            candidates: CandidateDelivery::Both,
+            candidates: CandidateDelivery::InAnswer,
+            ice_lite: true,
+            drop_remote_candidates: true,
             ..WebRtcCameraConfig::default()
         },
     )
@@ -453,10 +514,9 @@ async fn rfc8829_a_nest_like_camera_answers_the_offer_and_its_stream_plays_and_r
     assert_eq!(codecs, ["opus", "h264"], "{door}");
     let stats = camera.stats();
     assert!(WebRtcCameraStats::get(&stats.connected));
-    assert!(
-        WebRtcCameraStats::count(&stats.remote_candidates) >= 1,
-        "the trickled host candidate reached the camera"
-    );
+    // The source's candidates were relayed and dropped: it found the camera.
+    assert_eq!(WebRtcCameraStats::count(&stats.remote_candidates), 0);
+    assert!(WebRtcCameraStats::count(&stats.dropped_candidates) >= 1);
     within("the data channel", async {
         while stats.data_channels().is_empty() {
             SystemClock.sleep(Duration::from_millis(20)).await;
@@ -526,10 +586,9 @@ async fn rfc8829_a_nest_like_camera_answers_the_offer_and_its_stream_plays_and_r
         closed["bytes"].as_u64(),
         u64::try_from(fetched.bytes.len()).ok()
     );
-    // ISO/IEC 14496-12 §4.3: `ftyp` first; then the movie and its fragments.
-    assert_eq!(&fetched.bytes[4..8], b"ftyp");
-    let contains = |name: &[u8]| fetched.bytes.windows(4).any(|window| window == name);
-    assert!(contains(b"moov") && contains(b"moof") && contains(b"mdat"));
+    let prerecord_ms = started["prerecord_ms"].as_u64().unwrap();
+    assert!(prerecord_ms >= 1_000, "{started}");
+    check_recording(&fetched.bytes, prerecord_ms);
 
     drop(control);
     camera.stop().await;
@@ -538,9 +597,11 @@ async fn rfc8829_a_nest_like_camera_answers_the_offer_and_its_stream_plays_and_r
 }
 
 /// A camera that closes its connection (DTLS `close_notify`, RFC 6347
-/// §4.2.7) after a second of media ends the signal `peer_closed`; after
-/// its backoff the source offers again under a new signal, which a camera
-/// whose candidates come trickled only answers, PCMU audio and all.
+/// §4.2.7) once its stream is live ends the signal `peer_closed`; after
+/// its backoff the source offers again under a new signal, which a
+/// Ring-like camera answers, PCMU audio and all: its candidate trickled
+/// only, each of the source's taken with its `sdpMLineIndex`, and ICE lite,
+/// so the source reaches it through the trickled candidate alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc6347_4_2_7_a_camera_that_closes_ends_its_signal_and_the_source_offers_again() {
     lotse_webrtc::install_crypto_provider();
@@ -553,18 +614,12 @@ async fn rfc6347_4_2_7_a_camera_that_closes_ends_its_signal_and_the_source_offer
     let first = offer(&mut control, signaling).await;
     // No data channel asked for: no application m-line.
     assert!(!first.sdp.contains("m=application"), "{}", first.sdp);
-    let closing = answer(
-        &mut control,
-        &first,
-        WebRtcCameraConfig {
-            close_after_packets: Some(100),
-            ..WebRtcCameraConfig::default()
-        },
-    )
-    .await;
+    let closing = answer(&mut control, &first, WebRtcCameraConfig::default()).await;
     control
         .stream_where("door", |door| door["state"] == "live")
         .await;
+    assert!(WebRtcCameraStats::count(&closing.stats().remote_candidates) >= 1);
+    closing.close();
     let closed = control.event(signaling).await;
     assert_eq!(
         (&closed["type"], &closed["signal_id"], &closed["code"]),
@@ -592,6 +647,8 @@ async fn rfc6347_4_2_7_a_camera_that_closes_ends_its_signal_and_the_source_offer
         WebRtcCameraConfig {
             audio: Some(WebRtcCameraAudio::Pcmu),
             candidates: CandidateDelivery::Trickled,
+            require_mline_index: true,
+            ice_lite: true,
             ..WebRtcCameraConfig::default()
         },
     )
@@ -643,7 +700,11 @@ async fn rfc6347_4_2_7_a_camera_that_closes_ends_its_signal_and_the_source_offer
 /// client relays its error with `signaling/error`, which ends the signal
 /// `camera_error`; the attempt failed before an answer, so the stream
 /// reports the source unreachable with the camera's words, and after its
-/// backoff the source offers again under a new signal.
+/// backoff the source offers again under a new signal, which a camera
+/// answers whose candidates come in its answer and trickled, and whose RTP
+/// has no RFC 9143 `mid` header extension: the source finds its m-line by
+/// the answer's `a=ssrc` (RFC 5576 §4.1). Its handle dropped closes its
+/// connection and ends its task.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_camera_error_ends_the_signal_and_the_source_offers_again_after_its_backoff() {
     lotse_webrtc::install_crypto_provider();
@@ -652,7 +713,7 @@ async fn a_camera_error_ends_the_signal_and_the_source_offers_again_after_its_ba
     let (signaling, _) = control
         .subscribe(json!({ "type": "signaling/subscribe", "stream_id": "door" }))
         .await;
-    control.call(put(&json!({ "audio": false }), 0)).await;
+    control.call(put(&json!({ "audio": false }), 2_000)).await;
     let first = offer(&mut control, signaling).await;
     let media = first.sdp.matches("\r\nm=").count();
     assert_eq!(media, 1, "video only: {}", first.sdp);
@@ -697,6 +758,8 @@ async fn a_camera_error_ends_the_signal_and_the_source_offers_again_after_its_ba
         &second,
         WebRtcCameraConfig {
             audio: None,
+            candidates: CandidateDelivery::Both,
+            mid_extension: false,
             ..WebRtcCameraConfig::default()
         },
     )
@@ -705,9 +768,32 @@ async fn a_camera_error_ends_the_signal_and_the_source_offers_again_after_its_ba
         .stream_where("door", |door| door["state"] == "live")
         .await;
     assert_eq!(door["tracks"].as_array().unwrap().len(), 1, "{door}");
+    // Its media reaches the stream: the video track's pre-record fills.
+    control.stream_where("door", |door| holds(door, 200)).await;
+
+    // A camera's handle dropped without a stop closes its connection, so
+    // the signal ends `peer_closed`, and ends its task, which lets its
+    // socket go.
+    let addr = camera.addr();
+    drop(camera);
+    let closed = control.event(signaling).await;
+    assert_eq!(
+        (&closed["type"], &closed["signal_id"], &closed["code"]),
+        (
+            &json!("closed"),
+            &json!(second.signal_id),
+            &json!("peer_closed")
+        ),
+        "{closed}"
+    );
+    within("the dropped camera's socket", async {
+        while UdpSocket::bind(addr).await.is_err() {
+            SystemClock.sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
 
     drop(control);
-    camera.stop().await;
     let (code, rest) = daemon.terminate();
     assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
 }

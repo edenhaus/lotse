@@ -11,17 +11,23 @@
 //! access units ([`crate::fake_camera`]: STAP-A parameter sets and FU-A
 //! fragments, RFC 6184 §5.7.1 and §5.8) and, when configured, Opus (RFC
 //! 7587) or PCMU (RFC 3551 §4.5.14) audio in 20 ms packets, each RTP packet
-//! with the RFC 9143 `mid` header extension as libwebrtc sends it; str0m
-//! sends the Sender Reports (RFC 3550 §6.4.1). A Picture Loss Indication
-//! (RFC 4585 §6.3.1) makes the next picture a keyframe.
+//! with the RFC 9143 `mid` header extension as libwebrtc sends it (unless
+//! configured without, then not negotiated either); str0m sends the Sender Reports (RFC 3550 §6.4.1). A
+//! Picture Loss Indication (RFC 4585 §6.3.1) makes the next picture a
+//! keyframe.
 //!
 //! Knobs model the integrations' habits: candidates in the answer, trickled
-//! after it, or both (RFC 8838); an offer without an `application` m-line
-//! refused, as Nest refuses one (observed in go2rtc's Nest client,
-//! 2026-10); a trickled candidate without `sdpMLineIndex` refused, as
-//! Ring's integration needs it; a refusal with an error (Home
-//! Assistant's `WebRTCError`); and a DTLS `close_notify` (RFC 6347 §4.2.7)
-//! after so many RTP packets, as a camera that ends its session.
+//! after it, or both (RFC 8838); an ICE lite agent (RFC 8445 §2.5) that
+//! sends no connectivity check and only answers the source's; the source's
+//! trickled candidates dropped, as Home Assistant's Nest integration drops
+//! them (Google's Smart Device Management API takes the offer's SDP only,
+//! `GenerateWebRtcStream`, its reference as read 2026-11); an offer without
+//! an `application` m-line refused, as Nest refuses one (observed in
+//! go2rtc's Nest client, 2026-10); and a trickled candidate without
+//! `sdpMLineIndex` refused, as Ring's integration needs it. The test closes
+//! the connection (DTLS `close_notify`, RFC 6347 §4.2.7) when it wants a
+//! camera that ends its session ([`FakeWebRtcCamera::close`]); dropping the
+//! camera's handle closes it too.
 //!
 //! It runs on str0m's process-default crypto provider, which the caller
 //! installs first with `lotse_webrtc::install_crypto_provider` (this crate
@@ -40,7 +46,7 @@ use str0m::crypto::CryptoProvider;
 use str0m::format::Codec as EngineCodec;
 use str0m::media::{Mid, Pt};
 use str0m::net::{DatagramRecv, Protocol, Receive};
-use str0m::rtp::{ExtensionValues, RtpWrite, SeqNo};
+use str0m::rtp::{Extension, ExtensionMap, ExtensionValues, RtpWrite, SeqNo};
 use str0m::{Candidate, Event, Input, Output, Rtc};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -122,6 +128,10 @@ impl CameraRefusal {
 
 /// How the camera behaves.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent knobs, each an integration's habit a test turns on alone"
+)]
 pub struct WebRtcCameraConfig {
     /// Frames per second.
     pub fps: u32,
@@ -137,11 +147,18 @@ pub struct WebRtcCameraConfig {
     /// Refuse a trickled candidate without `sdpMLineIndex`, as Ring's
     /// integration does.
     pub require_mline_index: bool,
-    /// Refuse every offer with this error.
-    pub refuse: Option<CameraRefusal>,
-    /// Close the connection (DTLS `close_notify`) once this many RTP
-    /// packets went out.
-    pub close_after_packets: Option<u64>,
+    /// Run ICE lite (RFC 8445 §2.5): no connectivity check of its own, it
+    /// only answers the source's, so the source must reach it through the
+    /// candidates the camera gave (a media server's habit).
+    pub ice_lite: bool,
+    /// Drop the source's trickled candidates instead of handing them to its
+    /// ICE agent, as Home Assistant's Nest integration does.
+    pub drop_remote_candidates: bool,
+    /// Answer the RFC 9143 `mid` header extension and send it, as
+    /// libwebrtc does; without it the answer has no `a=extmap` for it and
+    /// the source finds each stream's m-line by the answer's `a=ssrc` (RFC
+    /// 5576 §4.1) alone.
+    pub mid_extension: bool,
     /// The address it binds, loopback by default.
     pub ip: IpAddr,
 }
@@ -155,8 +172,9 @@ impl Default for WebRtcCameraConfig {
             candidates: CandidateDelivery::InAnswer,
             require_application: false,
             require_mline_index: false,
-            refuse: None,
-            close_after_packets: None,
+            ice_lite: false,
+            drop_remote_candidates: false,
+            mid_extension: true,
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         }
     }
@@ -194,8 +212,10 @@ pub struct WebRtcCameraStats {
     pub audio_packets: AtomicU64,
     /// Keyframe requests received.
     pub keyframe_requests: AtomicU64,
-    /// The source's candidates taken.
+    /// The source's candidates handed to its ICE agent.
     pub remote_candidates: AtomicU64,
+    /// The source's candidates dropped ([`WebRtcCameraConfig::drop_remote_candidates`]).
+    pub dropped_candidates: AtomicU64,
     /// The camera closed the connection itself.
     pub closed: AtomicBool,
     /// The source closed it (its `close_notify` arrived).
@@ -229,8 +249,8 @@ impl WebRtcCameraStats {
     }
 }
 
-/// A camera that answered an offer and runs its connection until it ends
-/// or is stopped.
+/// A camera that answered an offer and runs its connection until it ends,
+/// it is closed or stopped, or its handle is dropped.
 #[derive(Debug)]
 pub struct FakeWebRtcCamera {
     /// Its socket's address, its one host candidate.
@@ -241,7 +261,9 @@ pub struct FakeWebRtcCamera {
     candidates: mpsc::UnboundedSender<Candidate>,
     /// Refuse a candidate without `sdpMLineIndex`.
     require_mline_index: bool,
-    /// Stops the connection.
+    /// Drop the source's candidates.
+    drop_remote_candidates: bool,
+    /// Closes the connection and ends its task.
     cancel: CancellationToken,
     /// The connection's task.
     task: JoinHandle<()>,
@@ -278,6 +300,17 @@ fn mid_of(sdp: &str, kind: &str) -> Option<Mid> {
         .map(Mid::from)
 }
 
+/// str0m's standard header extensions without the RFC 9143 `mid`.
+fn without_mid() -> ExtensionMap {
+    let mut map = ExtensionMap::empty();
+    for (id, extension) in ExtensionMap::standard().iter() {
+        if *extension != Extension::RtpMid {
+            map.set(id, extension.clone());
+        }
+    }
+    map
+}
+
 /// The camera's str0m, `config`'s codecs, with its host candidate at
 /// `addr`, and its answer to `offer` at `now`.
 fn negotiate(
@@ -289,8 +322,12 @@ fn negotiate(
     let failed = |message: String| CameraRefusal::new("webrtc_offer_failed", message);
     let mut builder = Rtc::builder()
         .set_rtp_mode(true)
+        .set_ice_lite(config.ice_lite)
         .clear_codecs()
         .enable_h264(true);
+    if !config.mid_extension {
+        builder = builder.set_extension_map(without_mid());
+    }
     builder = match config.audio {
         Some(WebRtcCameraAudio::Opus) => builder.enable_opus(true, false),
         Some(WebRtcCameraAudio::Pcmu) => builder.enable_pcmu(true, false),
@@ -336,18 +373,15 @@ impl FakeWebRtcCamera {
     ///
     /// # Errors
     ///
-    /// The camera's refusal: the configured one, an offer without an
-    /// `application` m-line when one is required, or an offer it cannot
-    /// apply (code `webrtc_offer_failed`, as Home Assistant's own).
+    /// The camera's refusal: an offer without an `application` m-line when
+    /// one is required, or an offer it cannot apply (code
+    /// `webrtc_offer_failed`, as Home Assistant's own).
     pub async fn answer(
         offer: &str,
         config: WebRtcCameraConfig,
         clock: Arc<dyn Clock>,
     ) -> Result<(Self, WebRtcAnswer), CameraRefusal> {
         let failed = |message: String| CameraRefusal::new("webrtc_offer_failed", message);
-        if let Some(refusal) = config.refuse.clone() {
-            return Err(refusal);
-        }
         if config.require_application && !offer.contains("m=application") {
             return Err(failed(
                 "the offer has no application m-line (data channel)".into(),
@@ -370,6 +404,7 @@ impl FakeWebRtcCamera {
         let (candidates, incoming) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
         let require_mline_index = config.require_mline_index;
+        let drop_remote_candidates = config.drop_remote_candidates;
         let connection = Connection {
             video_mid: mid_of(offer, "video"),
             audio_mid: mid_of(offer, "audio"),
@@ -400,6 +435,7 @@ impl FakeWebRtcCamera {
                 stats,
                 candidates,
                 require_mline_index,
+                drop_remote_candidates,
                 cancel,
                 task,
             },
@@ -419,7 +455,7 @@ impl FakeWebRtcCamera {
 
     /// A candidate the source trickled, as the client relays it: the
     /// end-of-candidates indication (empty, RFC 8838 §13) is taken and
-    /// ignored.
+    /// ignored, and so is every candidate when the camera drops them.
     ///
     /// # Errors
     ///
@@ -438,17 +474,34 @@ impl FakeWebRtcCamera {
         }
         let line = candidate.strip_prefix("a=").unwrap_or(candidate);
         let parsed = Candidate::from_sdp_string(line).map_err(|err| err.to_string())?;
+        if self.drop_remote_candidates {
+            WebRtcCameraStats::bump(&self.stats.dropped_candidates);
+            return Ok(());
+        }
         WebRtcCameraStats::bump(&self.stats.remote_candidates);
         // A connection that ended takes no more; nothing to tell.
         let _ended = self.candidates.send(parsed);
         Ok(())
     }
 
-    /// Stops the connection, closing it (DTLS `close_notify`) when it is
-    /// still up, and waits for its task.
-    pub async fn stop(self) {
+    /// Closes the connection (DTLS `close_notify`, RFC 6347 §4.2.7, and an
+    /// RTCP BYE) when it is still up, as a camera that ends its session,
+    /// and ends its task; its stats stay.
+    pub fn close(&self) {
         self.cancel.cancel();
-        let _joined = self.task.await;
+    }
+
+    /// [`FakeWebRtcCamera::close`], and waits for its task.
+    pub async fn stop(mut self) {
+        self.cancel.cancel();
+        let _joined = (&mut self.task).await;
+    }
+}
+
+impl Drop for FakeWebRtcCamera {
+    /// A dropped handle closes the connection, so its task ends.
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -466,7 +519,8 @@ struct Connection {
     stats: Arc<WebRtcCameraStats>,
     /// The time.
     clock: Arc<dyn Clock>,
-    /// The source's trickled candidates.
+    /// The source's trickled candidates; closed once the camera's handle
+    /// is gone.
     incoming: mpsc::UnboundedReceiver<Candidate>,
     /// The stop.
     cancel: CancellationToken,
@@ -500,10 +554,10 @@ struct Connection {
 
 /// What woke the connection.
 enum Woke {
-    /// The stop.
+    /// The close, or the camera's handle gone.
     Stopped,
-    /// A trickled candidate, `None` once the camera's handle is gone.
-    Candidate(Option<Candidate>),
+    /// A trickled candidate.
+    Candidate(Candidate),
     /// A datagram.
     Datagram(io::Result<(usize, SocketAddr)>),
     /// A timer.
@@ -511,8 +565,8 @@ enum Woke {
 }
 
 impl Connection {
-    /// Runs until the connection ends, the camera closes it or it is
-    /// stopped.
+    /// Runs until the connection ends or is closed: by the test, or by
+    /// the camera's handle dropped (its candidate channel closed).
     async fn run(mut self) {
         let mut buf = vec![0_u8; 2_048];
         loop {
@@ -528,7 +582,7 @@ impl Connection {
             let event = tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => Woke::Stopped,
-                candidate = self.incoming.recv() => Woke::Candidate(candidate),
+                candidate = self.incoming.recv() => candidate.map_or(Woke::Stopped, Woke::Candidate),
                 received = self.socket.recv_from(&mut buf) => Woke::Datagram(received),
                 () = sleep => Woke::Timer,
             };
@@ -538,10 +592,9 @@ impl Connection {
                     self.close().await;
                     break;
                 }
-                Woke::Candidate(Some(candidate)) => {
+                Woke::Candidate(candidate) => {
                     self.rtc.add_remote_candidate(candidate);
                 }
-                Woke::Candidate(None) => {}
                 Woke::Datagram(Ok((len, source))) => {
                     let bytes = buf.get(..len).unwrap_or_default();
                     self.receive(now, source, bytes);
@@ -551,10 +604,7 @@ impl Connection {
                 }
                 Woke::Timer => {
                     self.input(Input::Timeout(now));
-                    if self.media(now) {
-                        self.close().await;
-                        break;
-                    }
+                    self.media(now);
                 }
             }
         }
@@ -663,8 +713,8 @@ impl Connection {
         })
     }
 
-    /// Sends the media due at `now`; `true` once the camera is to close.
-    fn media(&mut self, now: Instant) -> bool {
+    /// Sends the media due at `now`.
+    fn media(&mut self, now: Instant) {
         if let (Some(due), Some((mid, pt))) = (self.next_frame, self.video)
             && due <= now
         {
@@ -686,9 +736,6 @@ impl Connection {
         }
         // Through str0m's pacer at once.
         self.input(Input::Timeout(now));
-        self.config
-            .close_after_packets
-            .is_some_and(|after| self.packets >= after)
     }
 
     /// One picture: a keyframe at the start of every group of pictures or
@@ -727,7 +774,8 @@ impl Connection {
         self.frames = self.frames.wrapping_add(1);
     }
 
-    /// One RTP packet on `mid`, with the RFC 9143 `mid` header extension.
+    /// One RTP packet on `mid`, with the RFC 9143 `mid` header extension
+    /// when it was negotiated (str0m writes only those).
     #[expect(
         clippy::too_many_arguments,
         reason = "an RTP header's fields, one call site per media kind"
