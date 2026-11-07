@@ -632,6 +632,18 @@ fn rfc8445_6_1_1_the_offerer_controls_connects_and_carries_the_negotiated_tracks
     pair.camera().drain();
     pair.run(Duration::from_millis(100));
     assert!(!pair.engine.stats().data_channel_open);
+    // One the camera opens itself is not the offer's: it opens nothing
+    // the engine counts (RFC 8832 §6, no renegotiation for a second).
+    let mut api = pair.camera().rtc.sdp_api();
+    let theirs = api.add_channel("camera".into());
+    assert!(api.apply().is_none());
+    pair.camera().drain();
+    pair.run(Duration::from_millis(100));
+    assert!(
+        pair.camera().rtc.channel(theirs).is_some(),
+        "open at the camera"
+    );
+    assert!(!pair.engine.stats().data_channel_open);
     assert!(pair.ended().is_none(), "a closed data channel ends nothing");
     // A repeated answer changes nothing.
     pair.engine.accept_answer(pair.now, &answer);
