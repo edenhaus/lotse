@@ -726,12 +726,20 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversize_frame_is_refused_on_both_sides() {
+        use std::task::{Context, Poll, Waker};
+
         let (mut a_tx, _a_rx, _b_tx, _b_rx) = pair();
         let big = vec![0_u8; MAX_MESSAGE_BYTES + 1];
-        assert!(matches!(
-            a_tx.send(&big, &[]).await.unwrap_err(),
-            IpcError::TooLarge { .. }
-        ));
+        // Refused before any write, in its first poll: a send let through
+        // would wait for a reader that never comes.
+        let polled = {
+            let send = std::pin::pin!(a_tx.send(&big, &[]));
+            send.poll(&mut Context::from_waker(Waker::noop()))
+        };
+        // On one line: a `matches!` split over lines leaves its unmatched
+        // arm a line of its own, which a passing test never runs.
+        let refused = matches!(polled, Poll::Ready(Err(IpcError::TooLarge { .. })));
+        assert!(refused, "{polled:?}");
         let fds: Vec<OwnedFd> = (0..=MAX_FDS)
             .map(|_| {
                 let (s, _t) = UnixStream::pair().unwrap();
@@ -754,6 +762,26 @@ mod tests {
             b_rx.recv().await.unwrap_err(),
             IpcError::TooLarge { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn a_frame_of_exactly_the_cap_goes_through() {
+        let (mut a_tx, _a_rx, _b_tx, mut b_rx) = pair();
+        let exact = vec![7_u8; MAX_MESSAGE_BYTES];
+        // A refused send ends the join at once; the receive would wait on.
+        let ((), received) = tokio::try_join!(a_tx.send(&exact, &[]), b_rx.recv()).unwrap();
+        assert_eq!(received.unwrap().payload, exact);
+    }
+
+    #[tokio::test]
+    async fn a_frame_with_exactly_the_most_descriptors_goes_through() {
+        let (mut a_tx, _a_rx, _b_tx, mut b_rx) = pair();
+        let (_kept, passed) = passable(MAX_FDS);
+        let borrowed: Vec<BorrowedFd<'_>> = passed.iter().map(AsFd::as_fd).collect();
+        a_tx.send(b"eight", &borrowed).await.unwrap();
+        let message = b_rx.recv().await.unwrap().unwrap();
+        assert_eq!(message.fds.len(), MAX_FDS);
+        assert!(!message.fds_truncated);
     }
 
     /// `count` socketpairs: the ends the test keeps, and the ends it passes.

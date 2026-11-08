@@ -105,6 +105,13 @@ def options(settings: Settings) -> webdriver.ChromeOptions | webdriver.FirefoxOp
             options = webdriver.FirefoxOptions()
             if settings.headless:
                 options.add_argument("-headless")
+                # Web Audio runs on an audio output, and headless Firefox with no sound server
+                # (CI's Ubuntu runner) has none: it leaves `AudioContext.resume()` pending and the
+                # page never starts. Firefox's mock audio backend (cubeb's mock context) is an
+                # output clocked in real time: the context runs on it, its clock within 3 % of the
+                # wall clock (Firefox 159 and geckodriver 0.37.1 on Linux, observed 2026-11-08).
+                # With a window the sound goes to the real output.
+                options.set_preference("media.cubeb.force_mock_context", value=True)
             # Autoplay with sound, without a gesture (0: allowed).
             options.set_preference("media.autoplay.default", 0)
             options.set_preference("media.autoplay.blocking_policy", 0)

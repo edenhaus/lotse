@@ -36,7 +36,7 @@ def test_the_browser_plays_and_hears_the_camera(
     settings: Settings, case: Case, out: Path, served: Served, driver: WebDriver
 ) -> None:
     user_agent, page = play(driver, served, settings.play_s, case.disrupt)
-    verdict = check(page, served.stream, case.disrupt)
+    verdict = check(page, served.stream, case.disrupt, settings.engine)
     report = {
         "engine": settings.engine,
         "case": case.name,

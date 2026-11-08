@@ -797,6 +797,53 @@ mod tests {
     }
 
     #[test]
+    fn rfc8489_5_the_method_bits_are_spread_around_the_class_bits() {
+        // Method 0xabc: M11-M7 in bits 13-9, M6-M4 in bits 7-5, M3-M0 in
+        // bits 3-0, the class bits C1 (8) and C0 (4) between them.
+        for (kind, class) in [(0x2a6c_u16, Class::Request), (0x2b7c, Class::Error)] {
+            let mut bytes = REQUEST[..HEADER_LEN].to_vec();
+            bytes[..2].copy_from_slice(&kind.to_be_bytes());
+            bytes[2..4].copy_from_slice(&0_u16.to_be_bytes());
+            let message = parse(&bytes).unwrap();
+            assert_eq!((message.method, message.class), (0xabc, class));
+        }
+    }
+
+    #[test]
+    fn rfc8489_5_a_length_that_is_no_multiple_of_4_is_refused() {
+        let mut bytes = REQUEST[..HEADER_LEN].to_vec();
+        bytes[2..4].copy_from_slice(&2_u16.to_be_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        assert_eq!(parse(&bytes), Err(StunError::Length));
+    }
+
+    #[test]
+    fn rfc8489_5_a_stun_message_has_the_header_zero_leading_bits_and_the_cookie() {
+        assert!(is_stun(&REQUEST[..HEADER_LEN]));
+        assert!(!is_stun(&REQUEST[..HEADER_LEN - 1]), "short of a header");
+        let mut no_cookie = REQUEST[..HEADER_LEN].to_vec();
+        no_cookie[7] ^= 1;
+        assert!(!is_stun(&no_cookie));
+        let mut first_bits = REQUEST[..HEADER_LEN].to_vec();
+        first_bits[0] |= 0x40;
+        assert!(!is_stun(&first_bits));
+    }
+
+    #[test]
+    fn rfc8489_14_only_the_first_integrity_and_fingerprint_count() {
+        let bytes = Builder::new(Class::Request, METHOD_BINDING, TRANSACTION)
+            .username("abcd:efgh")
+            .integrity(b"pass")
+            .fingerprint()
+            .attribute(ATTR_MESSAGE_INTEGRITY, &[0; INTEGRITY_LEN])
+            .attribute(ATTR_FINGERPRINT, &[0; 4])
+            .build();
+        let message = parse(&bytes).unwrap();
+        assert!(message.verify_integrity(&bytes, b"pass"));
+        assert!(message.fingerprint_ok(&bytes));
+    }
+
+    #[test]
     fn broken_input_is_an_error_never_a_panic() {
         assert_eq!(parse(&[]), Err(StunError::Short));
         assert_eq!(parse(&[0x80; 20]), Err(StunError::NotStun));

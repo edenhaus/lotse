@@ -908,6 +908,43 @@ mod tests {
         sets
     }
 
+    /// The resplits counted when a STAP-A loses a late PPS and is repacked
+    /// to `max_payload`, which is `delta` bytes off the STAP-A's size.
+    fn resplit_of_a_shrunk_stap_a(delta: isize) -> u64 {
+        let stap = nal::stap_a(&[&pps(), &idr(10), &idr(12)]);
+        let max_payload = stap.len().checked_add_signed(delta).unwrap();
+        let mut n = PacketNormalizer::new(max_payload, known_sets());
+        run(&mut n, 1000, false, &idr(8));
+        let before = n.stats().resplit;
+        let out = run(&mut n, 1000, false, &stap);
+        assert_eq!(n.stats().misplaced_sets_dropped, 1);
+        assert_ne!(out, [], "the slices go on");
+        n.stats().resplit - before
+    }
+
+    #[test]
+    fn a_stap_a_that_lost_units_is_resplit_only_when_too_large_rfc6184_5_7_1() {
+        assert_eq!(
+            resplit_of_a_shrunk_stap_a(100),
+            0,
+            "smaller than the target"
+        );
+        assert_eq!(resplit_of_a_shrunk_stap_a(0), 0, "exactly the target");
+        assert_eq!(resplit_of_a_shrunk_stap_a(-1), 1, "larger than the target");
+    }
+
+    #[test]
+    fn units_that_fill_the_target_exactly_share_one_stap_a_rfc6184_5_7_1() {
+        let (a, b) = (idr(10), idr(12));
+        let target = 1 + (a.len() + 2) + (b.len() + 2);
+        let mut n = PacketNormalizer::new(target, known_sets());
+        run(&mut n, 1000, false, &idr(8));
+        // The late PPS goes, the two slices are repacked into the target.
+        let out = run(&mut n, 1000, false, &nal::stap_a(&[&pps(), &a, &b]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].payload, nal::stap_a(&[&a, &b]));
+    }
+
     #[test]
     fn re_split_fragments_fill_every_packet_rfc6184_5_8() {
         // A camera fragmenting a 140 kB IDR at 1400 bytes: cut one by
