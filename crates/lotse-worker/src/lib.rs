@@ -5177,7 +5177,7 @@ mod tests {
             "nothing for the window or the stop"
         );
         assert_eq!(h.next().await, refused("k2"));
-        assert!(drained(reader).is_empty());
+        assert_eq!(drained(reader), b"");
         let windows = logs.lines(Level::DEBUG, "pre-record window received");
         assert!(windows[0].fields.contains("window_ms=30000"), "{windows:?}");
         assert_eq!(
@@ -5224,7 +5224,7 @@ mod tests {
         rustix::process::setrlimit(rustix::process::Resource::Nofile, limit).unwrap();
         drop(writer);
         assert_eq!(answer, refused("k1"));
-        assert!(drained(reader).is_empty());
+        assert_eq!(drained(reader), b"");
         assert_eq!(
             logs.count(
                 Level::WARN,
@@ -5380,7 +5380,7 @@ mod tests {
             } = h.next().await
         );
         assert_eq!(reason, "source_not_live");
-        assert!(recording_bytes(reader).await.is_empty());
+        assert_eq!(recording_bytes(reader).await, b"");
         h.tx.send_msg(
             &ToWorker::RunSource(spec("fake://cam/", r#"{"keyframes_every_ms": 100}"#)),
             &[],
@@ -5479,8 +5479,8 @@ mod tests {
         })
         .await;
         assert!(seen.contains(&refused("k5")), "{seen:?}");
-        assert!(recording_bytes(second).await.is_empty());
-        assert!(recording_bytes(fifth).await.is_empty());
+        assert_eq!(recording_bytes(second).await, b"");
+        assert_eq!(recording_bytes(fifth).await, b"");
         (reader, seen)
     }
 
@@ -5805,7 +5805,7 @@ mod tests {
             ),
             0
         );
-        assert!(recording_bytes(reader).await.is_empty());
+        assert_eq!(recording_bytes(reader).await, b"");
     }
 
     /// A recording whose reader stalls ends by the shutdown's deadline, aborted

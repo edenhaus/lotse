@@ -74,7 +74,7 @@ fn segment_error(init: &[u8], segment: &[u8]) -> Fmp4Error {
     let mut reader = Reader::new(init, MAX).unwrap();
     let mut units = Vec::new();
     let err = reader.read_segment(segment, &mut units).unwrap_err();
-    assert!(units.is_empty());
+    assert_eq!(units, []);
     assert_eq!(reader.stats(), Fmp4Stats::default());
     err
 }
@@ -824,7 +824,7 @@ fn iso14496_12_4_2_a_box_size_of_zero_runs_to_the_end_and_bytes_too_few_for_a_he
     assert_eq!(reader.stats().segments, 1);
     // An empty segment has nothing.
     let (reader, units) = read(H264_AAC_INIT, &[&[]], MAX);
-    assert!(units.is_empty());
+    assert_eq!(units, []);
     assert_eq!(reader.stats().segments, 1);
 }
 

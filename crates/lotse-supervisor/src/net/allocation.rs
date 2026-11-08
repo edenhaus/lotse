@@ -1494,7 +1494,7 @@ mod tests {
             Some(start + Duration::from_millis(39_500))
         );
         rig.advance(Duration::from_millis(39_499));
-        assert!(rig.events().is_empty());
+        assert_eq!(rig.events(), []);
         rig.advance(Duration::from_millis(1));
         assert_eq!(rig.sent.len(), 1);
         assert_eq!(
@@ -1519,7 +1519,7 @@ mod tests {
         assert_eq!(rig.machine.poll_timeout(), Some(rig.now() + 540 * SECOND));
         rig.advance(540 * SECOND);
         assert_eq!(rig.server.allocations()[0].refreshes, 2);
-        assert!(rig.events().is_empty());
+        assert_eq!(rig.events(), []);
     }
 
     #[test]
@@ -1622,7 +1622,7 @@ mod tests {
                 (REFRESH, ok("alice"), None)
             ]
         );
-        assert!(rig.events().is_empty());
+        assert_eq!(rig.events(), []);
     }
 
     #[test]
@@ -1916,7 +1916,7 @@ mod tests {
         );
         assert!(rig.machine.handle_input(rig.now(), &wrong_key));
         assert!(rig.machine.is_pending(&allocate.transaction_id));
-        assert!(rig.events().is_empty());
+        assert_eq!(rig.events(), []);
         // The retransmission reaches the server.
         rig.advance(Duration::from_millis(500));
         assert!(
@@ -2017,7 +2017,7 @@ mod tests {
             .count();
         assert_eq!(permissions, 2);
         // A refresh says nothing new.
-        assert!(rig.events().is_empty());
+        assert_eq!(rig.events(), []);
     }
 
     /// A channel is held by the sessions that bound it, not by every
@@ -2184,7 +2184,7 @@ mod tests {
             .filter(|(method, ..)| *method == CHANNEL_BIND)
             .count();
         assert_eq!(binds, 3);
-        assert!(rig.events().is_empty());
+        assert_eq!(rig.events(), []);
     }
 
     #[test]
@@ -2255,7 +2255,7 @@ mod tests {
         rig.machine.bind_channel(rig.now(), other, peer(1)).unwrap();
         rig.machine.remove_session(rig.now(), other);
         rig.pump();
-        assert!(rig.events().is_empty());
+        assert_eq!(rig.events(), []);
         // The number waits out a full lifetime since the binding was never
         // confirmed, but its peer gets it back.
         let again = rig.machine.bind_channel(rig.now(), rig.lease, peer(1));
@@ -2339,12 +2339,12 @@ mod tests {
         rig.machine.remove_session(now, lease);
         rig.pump();
         assert_eq!(rig.log()[2], (REFRESH, ok("alice"), None));
-        assert!(rig.server.allocations().is_empty());
+        assert_eq!(rig.server.allocations(), []);
         assert_eq!(rig.events(), [Event::Closed { error: None }]);
         assert!(rig.machine.is_closed());
         assert_eq!(rig.machine.add_session(&creds("alice")), None);
         rig.machine.remove_session(now, lease);
-        assert!(rig.events().is_empty());
+        assert_eq!(rig.events(), []);
     }
 
     #[test]
@@ -2370,7 +2370,7 @@ mod tests {
             rig.events().as_slice(),
             [Event::Allocated { .. }, Event::Closed { error: None }]
         ));
-        assert!(rig.server.allocations().is_empty());
+        assert_eq!(rig.server.allocations(), []);
     }
 
     #[test]

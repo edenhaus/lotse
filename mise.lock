@@ -327,9 +327,9 @@ url_api = "https://api.github.com/repos/j178/prek/releases/assets/707839320"
 provenance = "github-attestations"
 
 [[tools.rust]]
-version = "1.98.0"
+version = "1.99.1"
 backend = "core:rust"
-specifiers = ["1.98.0"]
+specifiers = ["1.99.1"]
 
 [tools.rust.options]
 components = "clippy,llvm-tools,rustfmt"

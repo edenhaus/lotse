@@ -675,12 +675,9 @@ mod tests {
         assert_eq!(m.state(), S::Idle);
         assert_eq!(m.handle(Input::Demand(1), now), [Action::SpawnWorker]);
         assert_eq!((m.state(), m.demand()), (S::Connecting, 1));
-        assert!(m.handle(Input::Demand(2), now).is_empty());
-        assert!(
-            m.handle(Input::Report(WorkerReport::Connecting), now)
-                .is_empty()
-        );
-        assert!(m.handle(Input::Report(WorkerReport::Live), now).is_empty());
+        assert_eq!(m.handle(Input::Demand(2), now), []);
+        assert_eq!(m.handle(Input::Report(WorkerReport::Connecting), now), []);
+        assert_eq!(m.handle(Input::Report(WorkerReport::Live), now), []);
         assert_eq!(m.state(), S::Live);
         assert_eq!(m.last_error(), None);
     }
@@ -695,13 +692,10 @@ mod tests {
             retry_in: Duration::from_secs(1),
             position: at(1),
         };
-        assert!(m.handle(Input::Report(backoff), now).is_empty());
+        assert_eq!(m.handle(Input::Report(backoff), now), []);
         assert_eq!(m.state(), S::Backoff);
         assert_eq!(m.last_error().unwrap().code(), "source_unreachable");
-        assert!(
-            m.handle(Input::Report(WorkerReport::Connecting), now)
-                .is_empty()
-        );
+        assert_eq!(m.handle(Input::Report(WorkerReport::Connecting), now), []);
         assert_eq!(m.state(), S::Connecting);
         m.handle(Input::Report(WorkerReport::Live), now);
         assert_eq!(m.state(), S::Live);
@@ -714,9 +708,9 @@ mod tests {
         let mut m = machine();
         m.handle(Input::Demand(1), now);
         m.handle(Input::Report(WorkerReport::Live), now);
-        assert!(
-            m.handle(Input::Report(WorkerReport::Reconnecting(timeout())), now)
-                .is_empty()
+        assert_eq!(
+            m.handle(Input::Report(WorkerReport::Reconnecting(timeout())), now),
+            []
         );
         assert_eq!(m.state(), S::Reconnecting);
         assert_eq!(m.last_error().unwrap().code(), "source_timeout");
@@ -756,7 +750,7 @@ mod tests {
             [Action::StartLinger(DEFAULT_LINGER)]
         );
         assert_eq!(m.state(), S::Draining);
-        assert!(m.handle(Input::Demand(0), now).is_empty());
+        assert_eq!(m.handle(Input::Demand(0), now), []);
         // Demand returns within the linger: back to live, no reconnect.
         assert_eq!(m.handle(Input::Demand(1), now), [Action::CancelLinger]);
         assert_eq!(m.state(), S::Live);
@@ -958,7 +952,7 @@ mod tests {
         // Reports from the dead worker are ignored.
         m.handle(Input::Report(WorkerReport::Live), now);
         assert_eq!(m.state(), S::Restarting);
-        assert!(m.handle(Input::Demand(2), now).is_empty());
+        assert_eq!(m.handle(Input::Demand(2), now), []);
         assert_eq!(
             m.handle(Input::CrashBackoffExpired, now),
             [Action::SpawnWorker]
@@ -1031,7 +1025,7 @@ mod tests {
         );
         // The viewer re-offers: no worker, still failed.
         clock.advance(Duration::from_secs(1));
-        assert!(m.handle(Input::Demand(1), clock.now()).is_empty());
+        assert_eq!(m.handle(Input::Demand(1), clock.now()), []);
         assert_eq!(m.state(), S::Idle);
         assert!(m.failure().is_some());
         let held = logs.lines(
@@ -1046,7 +1040,7 @@ mod tests {
         m.handle(Input::Demand(0), clock.now());
         // A moment before the end: still nothing.
         clock.advance(Duration::from_secs(4) - Duration::from_nanos(1));
-        assert!(m.handle(Input::Demand(1), clock.now()).is_empty());
+        assert_eq!(m.handle(Input::Demand(1), clock.now()), []);
         // The timer fires at the end: the demand that waited connects.
         clock.advance(Duration::from_nanos(1));
         assert_eq!(
@@ -1092,10 +1086,7 @@ mod tests {
         m.handle(failed_attempt(Duration::from_secs(5)), clock.now());
         m.handle(Input::Demand(0), clock.now());
         clock.advance(Duration::from_secs(5));
-        assert!(
-            m.handle(Input::BackoffWindowExpired, clock.now())
-                .is_empty()
-        );
+        assert_eq!(m.handle(Input::BackoffWindowExpired, clock.now()), []);
         assert_eq!((m.state(), m.failure()), (S::Idle, None));
         assert_eq!(
             m.handle(Input::Demand(1), clock.now()),
@@ -1159,7 +1150,7 @@ mod tests {
         );
         assert_eq!(m.failure(), Some(&ConnectionError::WorkerCrashed));
         clock.advance(Duration::from_millis(399));
-        assert!(m.handle(Input::Demand(1), clock.now()).is_empty());
+        assert_eq!(m.handle(Input::Demand(1), clock.now()), []);
         m.handle(Input::Demand(0), clock.now());
         clock.advance(Duration::from_millis(1));
         assert_eq!(
@@ -1213,7 +1204,7 @@ mod tests {
             ]
         );
         assert_eq!(m.failure(), None, "a drop");
-        assert!(m.handle(Input::Demand(1), clock.now()).is_empty());
+        assert_eq!(m.handle(Input::Demand(1), clock.now()), []);
         clock.advance(Duration::from_secs(1));
         assert_eq!(
             m.handle(Input::BackoffWindowExpired, clock.now()),
@@ -1253,10 +1244,7 @@ mod tests {
         let mut m = machine();
         m.handle(Input::Demand(1), clock.now());
         m.handle(failed_attempt(Duration::from_secs(5)), clock.now());
-        assert!(
-            m.handle(Input::BackoffWindowExpired, clock.now())
-                .is_empty()
-        );
+        assert_eq!(m.handle(Input::BackoffWindowExpired, clock.now()), []);
         assert_eq!(m.state(), S::Backoff);
         assert_eq!(
             m.handle(Input::Demand(0), clock.now()),
@@ -1334,7 +1322,7 @@ mod tests {
         m.source_switched();
         assert_eq!(m.backoff_position().attempts, 0);
         assert!(m.failure().is_some());
-        assert!(m.handle(Input::Demand(1), clock.now()).is_empty());
+        assert_eq!(m.handle(Input::Demand(1), clock.now()), []);
     }
 
     fn failed_for(retry_in: Duration, attempts: u32) -> WorkerReport {
@@ -1433,7 +1421,7 @@ mod tests {
                 Action::StartBackoffWindow(Duration::from_secs(50))
             ]
         );
-        assert!(m.handle(Input::Demand(1), clock.now()).is_empty());
+        assert_eq!(m.handle(Input::Demand(1), clock.now()), []);
 
         // Without demand: a healthy worker crashes during the linger.
         let mut m = machine();
@@ -1442,7 +1430,7 @@ mod tests {
         m.handle(Input::Demand(0), clock.now());
         m.handle(Input::WorkerExited, clock.now());
         assert_eq!(m.failure(), Some(&ConnectionError::WorkerCrashed));
-        assert!(m.handle(Input::Demand(1), clock.now()).is_empty());
+        assert_eq!(m.handle(Input::Demand(1), clock.now()), []);
         clock.advance(Duration::from_millis(500));
         assert_eq!(
             m.handle(Input::BackoffWindowExpired, clock.now()),
