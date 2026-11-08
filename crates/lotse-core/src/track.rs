@@ -2989,7 +2989,7 @@ mod tests {
         // Another clock rate (RFC 3550 §5.1) on the same descriptor clears
         // the ring all the same: its timestamps tick at the old one.
         track.redeclare((*track.codec()).clone(), 45_000);
-        assert!(prerecord(&track, t0).is_empty());
+        assert_eq!(prerecord(&track, t0), Vec::<i64>::new());
         assert_eq!(track.prerecord_shared.floor(), None);
     }
 
