@@ -681,7 +681,8 @@ fn to_ipc(event: SessionEvent) -> Option<IpcEvent> {
             code: code.to_owned(),
             message,
         }),
-        // The worker's own: the join, and the track's keyframe request.
+        // The worker's own: the join, and a keyframe request, which only
+        // a session without video leaves for here, with no track to ask.
         SessionEvent::Connected | SessionEvent::KeyframeRequest => None,
     }
 }
@@ -1543,15 +1544,17 @@ async fn drain(
                     opened.engine.join(ctx.clock.now(), gop.as_deref());
                 }
             }
-            SessionOutput::Event(SessionEvent::KeyframeRequest) => {
-                // The cache could not serve the viewer (the session bursts
-                // it on join when it can): the track asks the source
-                // feeding it, coalesced with its other viewers' requests.
-                // Recordings never ask: they wait for the next keyframe.
-                if let Some(video) = &opened.video {
-                    let outcome = video.track.request_keyframe(ctx.clock.now());
-                    tracing::trace!(?outcome, "keyframe wanted upstream");
-                }
+            // The cache could not serve the viewer (the session bursts it
+            // on join when it can): the track asks the source feeding it,
+            // coalesced with its other viewers' requests. A session
+            // without video has no track to ask: its request goes on to
+            // `to_ipc`, which drops it. Recordings never ask: they wait
+            // for the next keyframe.
+            SessionOutput::Event(SessionEvent::KeyframeRequest)
+                if let Some(video) = &opened.video =>
+            {
+                let outcome = video.track.request_keyframe(ctx.clock.now());
+                tracing::trace!(?outcome, "keyframe wanted upstream");
             }
             SessionOutput::Event(SessionEvent::Closed { code, message }) => {
                 ctx.finish(code, message).await;
@@ -2331,7 +2334,8 @@ mod tests {
     /// A client that only talks back offers no video: its session claims
     /// the backchannel for the offer as a viewer's does, opens its engine
     /// without video, takes none of the stream's video and joins none
-    /// once connected; the stream's audio it was asked for reaches it.
+    /// once connected, nor asks the stream's video for a keyframe; the
+    /// stream's audio it was asked for reaches it.
     #[tokio::test]
     async fn a_talk_only_session_claims_the_backchannel_and_plays_no_video() {
         let (arbiter, mut feed) = arbiter();
@@ -2362,11 +2366,17 @@ mod tests {
             .publish_packet(packet(rig.clock.now()));
         rig.script
             .then(SessionOutput::Event(SessionEvent::Connected));
+        rig.script
+            .then(SessionOutput::Event(SessionEvent::KeyframeRequest));
         rig.control(Control::Candidate("candidate:browser".into()));
         assert!(poll_once(&mut task).await.is_pending());
         assert!(rig.script.called("audio"));
         assert!(!rig.script.called("video"));
         assert!(!rig.script.called("join"));
+        // Its engine's keyframe request has no video track to ask: the
+        // stream's is not asked, and nothing goes to the client.
+        assert_eq!(rig.track(Kind::Video).stats().keyframe_requests, 0);
+        assert_eq!(rig.events(), []);
     }
 
     /// A session that asks for the stream's audio on a stream without
