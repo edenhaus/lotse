@@ -1443,8 +1443,11 @@ mod tests {
             .await
             .unwrap();
         worker.stop_recording("k1").await.unwrap();
+        let candidate = "candidate:1 1 udp 2130706431 192.0.2.1 9 typ host";
+        worker.candidate("s1", candidate).await.unwrap();
+        worker.close_session("s1", "gone", "bye").await.unwrap();
         assert_eq!(
-            received(&dir, 8).await,
+            received(&dir, 10).await,
             [
                 ToWorker::Sockets,
                 ToWorker::RunSource(spec),
@@ -1455,6 +1458,15 @@ mod tests {
                 ToWorker::StartRecording(recording),
                 ToWorker::StopRecording {
                     recording_id: "k1".into()
+                },
+                ToWorker::RemoteCandidate {
+                    session_id: "s1".into(),
+                    candidate: candidate.into(),
+                },
+                ToWorker::CloseSession {
+                    session_id: "s1".into(),
+                    code: "gone".into(),
+                    message: "bye".into(),
                 },
             ],
             "the sockets ride on the first message, once"

@@ -679,10 +679,11 @@ impl Continuity {
 /// position: its frames still come before every frame the subscription
 /// yields, and a camera's Sender Reports can date a keyframe ahead of a
 /// later one, so a search by capture time could start past it. The
-/// descriptor and the source the track takes come with the pair they were
-/// taken with.
+/// descriptor, the clock rate and the source the track takes come with the
+/// pair they were taken with.
 fn start_video(video: &Arc<Track>, target: Instant) -> TrackStart {
-    let (subscription, mut snapshot, codec, source) = video.subscribe_from_prerecord(target);
+    let (subscription, mut snapshot, codec, clock_rate, source) =
+        video.subscribe_from_prerecord(target);
     if let Some(snapshot) = &mut snapshot
         && !sets_match(&codec, &snapshot.start().payload)
     {
@@ -692,13 +693,19 @@ fn start_video(video: &Arc<Track>, target: Instant) -> TrackStart {
             "recording: the start keyframe carries other parameter sets than the track's"
         );
     }
-    (subscription, snapshot, codec, source)
+    (subscription, snapshot, codec, clock_rate, source)
 }
 
 /// A track's start as [`Track::subscribe_from_prerecord`] takes it: the
-/// subscription, the snapshot, the descriptor and the source the track
-/// takes.
-type TrackStart = (TrackSubscription, Option<PrerecordSnapshot>, Arc<Codec>, u8);
+/// subscription, the snapshot, the descriptor, the clock rate and the
+/// source the track takes.
+type TrackStart = (
+    TrackSubscription,
+    Option<PrerecordSnapshot>,
+    Arc<Codec>,
+    u32,
+    u8,
+);
 
 /// A recording's audio start: the subscription, the snapshot and the sample
 /// entry.
@@ -974,10 +981,10 @@ impl Recording {
             .started
             .checked_sub(self.before)
             .unwrap_or(self.started);
-        let (video, snapshot, codec, source) = start_video(video_track, target);
+        let (video, snapshot, codec, clock_rate, source) = start_video(video_track, target);
         let video_entry = RecordingTrack {
             codec: (*codec).clone(),
-            clock_rate: video_track.clock_rate(),
+            clock_rate,
         };
         // The keyframe's capture time as dated, where the container puts
         // it: the audio frame playing then plays with it in the file.
@@ -1028,7 +1035,8 @@ impl Recording {
         target: Instant,
         source: u8,
     ) -> Result<Option<AudioStart>, EndReason> {
-        let (subscription, snapshot, codec, audio_source) = track.subscribe_from_prerecord(target);
+        let (subscription, snapshot, codec, clock_rate, audio_source) =
+            track.subscribe_from_prerecord(target);
         if audio_source != source {
             tracing::info!(
                 recording.id = %self.id,
@@ -1047,7 +1055,7 @@ impl Recording {
         }
         let entry = RecordingTrack {
             codec: (*codec).clone(),
-            clock_rate: track.clock_rate(),
+            clock_rate,
         };
         Ok(Some((subscription, snapshot, entry)))
     }
@@ -1521,9 +1529,10 @@ impl Recording {
     /// recording, started or not, since another source is another stream, and
     /// so do control events the subscription lost, since a codec change or
     /// a switch among them leaves the frames after them under a codec the
-    /// recording does not know; a codec other than its sample entry's ends it
-    /// once the container started, since one file has one entry per track;
-    /// before, it is the entry the frames after it go under, audio the
+    /// recording does not know; a codec or a clock rate other than its
+    /// sample entry's ends it once the container started, since one file
+    /// has one entry and one timescale per track; before, it is the entry
+    /// the frames after it go under, audio the
     /// container cannot carry as it is transcoded by a new [`ToOpus`] for
     /// it (and no longer for one it carries), or, for audio the container
     /// cannot carry nor the recording transcode, the audio is dropped, the recording
@@ -1545,8 +1554,8 @@ impl Recording {
             tracing::debug!(recording.id = %self.id, ?event, "recording: a video track event behind the video's end left out");
             return Ok(());
         }
-        let codec = match event {
-            TrackEvent::TrackChanged(codec) => codec,
+        let (codec, clock_rate) = match event {
+            TrackEvent::TrackChanged { codec, clock_rate } => (codec, *clock_rate),
             TrackEvent::SourceSwitched => {
                 tracing::info!(recording.id = %self.id, %track, "recording: the connection switched to another source; ending");
                 return Err(EndReason::StreamChanged);
@@ -1561,11 +1570,13 @@ impl Recording {
             Kind::Video => Some(&mut media.entries.0),
             Kind::Audio => media.entries.1.as_mut(),
         };
-        let Some(entry) = entry.filter(|entry| entry.codec != **codec) else {
+        let Some(entry) =
+            entry.filter(|entry| entry.codec != **codec || entry.clock_rate != clock_rate)
+        else {
             return Ok(());
         };
         if self.begun {
-            tracing::info!(recording.id = %self.id, %track, codec = codec.name(), "recording: the track changed; ending");
+            tracing::info!(recording.id = %self.id, %track, codec = codec.name(), clock_rate, "recording: the track changed; ending");
             return Err(EndReason::StreamChanged);
         }
         if track == Kind::Audio {
@@ -1584,8 +1595,11 @@ impl Recording {
                 }
             }
         }
-        tracing::debug!(recording.id = %self.id, %track, codec = codec.name(), transcoded = self.transcoder.is_some(), "recording: the track changed before the start; its entry follows");
+        tracing::debug!(recording.id = %self.id, %track, codec = codec.name(), clock_rate, transcoded = self.transcoder.is_some(), "recording: the track changed before the start; its entry follows");
         entry.codec = (**codec).clone();
+        // The container's timescale: the frames after the change tick at
+        // the rate it carries (RFC 3550 §5.1).
+        entry.clock_rate = clock_rate;
         Ok(())
     }
 
@@ -2623,8 +2637,8 @@ mod tests {
     }
 
     /// G.711 that comes back in place of Opus on a reconnect is transcoded
-    /// on its own 8000 Hz clock (RFC 3551 §4.5.14), not the 48 kHz the
-    /// track keeps from its first codec: whether the reconnect comes before
+    /// on its own 8000 Hz clock (RFC 3551 §4.5.14), not the 48 kHz of the
+    /// track's first codec: whether the reconnect comes before
     /// the recording starts (its start picks the transcode) or while it waits for
     /// its first keyframe (the codec change does), its packets come out as
     /// for a track declared PCMU. Regression: the chain read the 8000 Hz
@@ -2633,11 +2647,11 @@ mod tests {
     #[tokio::test]
     async fn rfc3551_4_5_14_g711_back_after_opus_is_transcoded_on_its_8000_hz_clock() {
         /// The camera reconnecting with PCMU where it had Opus: the track
-        /// keeps its first rate (`TrackSet::declare`).
+        /// is redeclared at 8000 (`Track::redeclare`), in a new epoch.
         fn reconnect(rig: &Rig) {
             let audio = rig.set.publisher().declare(Kind::Audio, Codec::Pcmu, 8_000);
             assert!(Arc::ptr_eq(&audio, rig.audio.as_ref().unwrap()));
-            assert_eq!(audio.clock_rate(), 48_000, "the track keeps its first rate");
+            assert_eq!(audio.clock_rate(), 8_000, "the track follows the rate");
         }
         let payload = narrowband_payload(&Codec::Pcmu);
         let delay = ToOpus::new(&Codec::Pcmu).unwrap().delay();
@@ -3275,6 +3289,122 @@ mod tests {
         rig.video_frame(100, 1, false, 16);
         let reports = rig.until_closed().await;
         let_assert_reason(&reports, "stream_changed");
+    }
+
+    /// The sample entries, video and audio, of each start an [`Entries`]
+    /// container saw.
+    type Started = Arc<std::sync::Mutex<Vec<(RecordingTrack, Option<RecordingTrack>)>>>;
+
+    /// A container that keeps the sample entries its recordings start
+    /// with: the fake one otherwise.
+    #[derive(Debug, Default)]
+    struct Entries(Started);
+
+    /// [`Entries`]'s muxer.
+    struct EntriesMuxer {
+        inner: Box<dyn RecordingMuxer>,
+        started: Started,
+    }
+
+    impl RecordingMuxerFactory for Entries {
+        fn accepts(&self, codec: &Codec) -> bool {
+            FakeRecordingMuxerFactory::default().accepts(codec)
+        }
+
+        fn muxer(&self, policy: &RecordingPolicy) -> Box<dyn RecordingMuxer> {
+            Box::new(EntriesMuxer {
+                inner: FakeRecordingMuxerFactory::default().muxer(policy),
+                started: Arc::clone(&self.0),
+            })
+        }
+    }
+
+    impl RecordingMuxer for EntriesMuxer {
+        fn start(
+            &mut self,
+            video: &RecordingTrack,
+            audio: Option<&RecordingTrack>,
+        ) -> Result<Vec<Bytes>, RecordingError> {
+            self.started
+                .lock()
+                .unwrap()
+                .push((video.clone(), audio.cloned()));
+            self.inner.start(video, audio)
+        }
+
+        fn set_origin(&mut self, origin: Instant) {
+            self.inner.set_origin(origin);
+        }
+
+        fn push(
+            &mut self,
+            track: Kind,
+            frame: Arc<MediaFrame>,
+        ) -> Result<Vec<Bytes>, RecordingError> {
+            self.inner.push(track, frame)
+        }
+
+        fn media_time(&self, track: Kind) -> Duration {
+            self.inner.media_time(track)
+        }
+
+        fn finish(&mut self) -> Result<Vec<Bytes>, RecordingError> {
+            self.inner.finish()
+        }
+    }
+
+    /// The container's timescale is the clock rate of the frames it
+    /// takes (RFC 3550 §5.1): a reconnect that redeclares the audio at
+    /// another rate before the recording starts makes it the audio
+    /// entry's, with the codec or alone, and one after the start ends the
+    /// recording, as a codec change does, since one file has one timescale
+    /// per track. Regression: the entry kept the rate the track had when
+    /// the recording subscribed.
+    #[tokio::test]
+    async fn rfc3550_5_1_the_audio_entry_follows_a_clock_rate_change_before_the_start_and_one_after_ends_it()
+     {
+        let aac48 = Codec::AacLc {
+            sample_rate: 48_000,
+            channels: 1,
+            config: Bytes::from_static(&[0x11, 0x88]),
+        };
+        for (codec, rate) in [(aac48, 48_000), (fake_aac(), 32_000)] {
+            let factory = Entries::default();
+            let entries = Arc::clone(&factory.0);
+            let mut rig = Rig::new(Some(fake_aac()));
+            let _reader =
+                rig.start_with(spec(0, LONG, true), factory, RecordingSettings::default());
+            settle().await;
+            let audio = rig
+                .set
+                .publisher()
+                .declare(Kind::Audio, codec.clone(), rate);
+            assert_eq!(audio.clock_rate(), rate);
+            settle().await;
+            rig.video_frame(0, 0, true, 32);
+            rig.audio_frame(0);
+            rig.audio_frame(1);
+            settle().await;
+            // Audio frame 1 at 64 ms releases the keyframe captured at 0.
+            assert_eq!(rig.report().await, started(64, Some("aac_lc")));
+            let entries = entries.lock().unwrap().clone();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0.clock_rate, 90_000);
+            assert_eq!(
+                entries[0].1,
+                Some(RecordingTrack {
+                    codec: codec.clone(),
+                    clock_rate: rate,
+                }),
+                "{rate}"
+            );
+            // Back at 16 kHz with the same descriptor once the file has
+            // begun: another timescale, the end.
+            rig.set.publisher().declare(Kind::Audio, fake_aac(), 16_000);
+            rig.video_frame(100, 1, false, 16);
+            let reports = rig.until_closed().await;
+            let_assert_reason(&reports, "stream_changed");
+        }
     }
 
     fn let_assert_reason(reports: &[RecordingReport], expected: &str) {
@@ -6295,7 +6425,7 @@ mod tests {
             rig.at(150),
             reports,
         );
-        let (_video, snapshot, _, source) = start_video(rig.video(), rig.at(0));
+        let (_video, snapshot, _, _, source) = start_video(rig.video(), rig.at(0));
         assert_eq!((snapshot.unwrap().frames().count(), source), (2, 0));
         // The switch, then the new source's audio, captured at 50 ms,
         // before the old P-frame at 100 the video's start holds.

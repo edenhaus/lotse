@@ -1245,6 +1245,43 @@ mod tests {
         assert_eq!(logs.count(Level::DEBUG, timeline), 1);
     }
 
+    #[test]
+    fn a_new_anchor_where_the_last_packet_ended_continues_the_epoch() {
+        let output = opus_track(1, 48_000);
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::from_system());
+        let mut chain = Chain::new(F48.config, output, clock).unwrap();
+        let ts = 30 * 1024;
+        let next_packet = chain.anchor_at(ts).next_packet;
+        assert_eq!(chain.pending_epoch, None, "nothing sent yet");
+        // Sent up to exactly where the new anchor starts: contiguous.
+        chain.published_end = Some(next_packet);
+        assert_eq!(chain.anchor_at(ts).next_packet, next_packet);
+        assert_eq!(chain.pending_epoch, None);
+        // One sample more sent: the new timeline would overlap it.
+        chain.published_end = Some(next_packet + 1);
+        chain.anchor_at(ts);
+        assert_eq!(chain.pending_epoch, Some("overlap"));
+    }
+
+    #[tokio::test]
+    async fn a_jitter_as_large_as_one_reported_before_is_not_reported_again() {
+        let jitter = "transcoder: camera audio timestamps jitter; following the sample count";
+        let (logs, _guard) = Logs::capture();
+        let mut rig = Rig::of(&F16);
+        // Every third frame 5 samples late: the median stays on time, and
+        // the 5 samples are reported when first seen, not at every repeat.
+        publish_silent(
+            &rig,
+            (0..48).map(|i| i * 1024 + if i % 3 == 2 { 5 } else { 0 }),
+        )
+        .await;
+        let _ = rig.finish().await;
+        assert_eq!(
+            logs.fields(Level::INFO, jitter),
+            vec![vec!["track=a1".to_owned(), "jitter_samples=5".to_owned()]]
+        );
+    }
+
     /// The log line of a re-anchor over a moved timeline.
     const MOVED: &str = "transcoder: camera audio timeline moved; re-anchoring";
 

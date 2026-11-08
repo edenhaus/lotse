@@ -41,7 +41,7 @@ use lotse_core::source::{
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_core::track::{
-    SubscriptionError, Track, TrackEvent, TrackLimits, TrackSubscription, Unit,
+    SubscriptionError, Track, TrackEvent, TrackId, TrackLimits, TrackSubscription, Unit,
 };
 use lotse_rtsp::RtspFactory;
 use lotse_rtsp::options::RtspOptions;
@@ -935,6 +935,127 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
             break;
         }
     }
+    runner.await.unwrap();
+    cam.stop().await;
+}
+
+/// The runner's next event other than `Stable`, within 10 s.
+async fn next_runner_event(events: &mut mpsc::Receiver<RunnerEvent>) -> RunnerEvent {
+    loop {
+        let event = tokio::select! {
+            event = events.recv() => event.expect("the runner reports"),
+            () = clock().sleep(Duration::from_secs(10)) => panic!("no runner event in 10 s"),
+        };
+        if event != RunnerEvent::Stable {
+            return event;
+        }
+    }
+}
+
+/// Waits for the runner's next `Live`, through the reconnect's reports.
+async fn until_live(events: &mut mpsc::Receiver<RunnerEvent>) {
+    loop {
+        match next_runner_event(events).await {
+            RunnerEvent::Live => return,
+            RunnerEvent::Stopped => panic!("stopped before going live"),
+            _ => {}
+        }
+    }
+}
+
+/// A camera reconfigured between connections: its AAC at 16 kHz (RFC
+/// 3640 §3.3.1) comes back as PCMU at 8000 (RFC 3551 §4.5.14), and `a0`,
+/// the same track, follows the new RTP clock rate (RFC 3550 §5.1) in a
+/// new epoch; then its SDP has no audio, and `a0` stays, silent, while
+/// the video streams on past the audio's stall timeout. Regressions: the
+/// track kept its first rate, and the watchdog timed the left-out audio
+/// out and reconnected in a loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3550_5_1_a_reconnect_follows_the_audio_s_clock_rate_and_one_without_audio_streams_on() {
+    let cam = camera(CameraConfig {
+        audio: Some(CameraAudio::Aac),
+        ..CameraConfig::default()
+    })
+    .await;
+    let tracks = TrackSet::new(TrackLimits::default(), clock().now());
+    let (tx, mut events) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let stall_audio = Duration::from_millis(1_500);
+    let runner = SourceRunner::new(
+        make_source(&cam.url(), &serde_json::Value::Null),
+        peer(&cam),
+        Arc::clone(&tracks),
+        Arc::new(ClockMapper::new()),
+        BackchannelSlot::default(),
+        None,
+        clock(),
+        RunnerConfig {
+            stall_audio,
+            stall_check: Duration::from_millis(100),
+            ..RunnerConfig::default()
+        },
+        ReconnectBackoff::new(1),
+        tx,
+        ConnectGate::open(),
+        cancel.clone(),
+    );
+    let runner = spawn_named("test.runner", runner.run());
+    until_live(&mut events).await;
+    let audio_id = TrackId::new(lotse_core::codec::Kind::Audio, 0);
+    let a0 = tracks.get(audio_id).expect("the camera's audio");
+    assert_eq!(
+        (a0.codec().family(), a0.clock_rate()),
+        (lotse_core::codec::CodecFamily::AacLc, 16_000)
+    );
+    let mut sub = a0.subscribe(Unit::Packets);
+
+    cam.set_audio(Some(CameraAudio::Pcmu));
+    cam.drop_connections();
+    until_live(&mut events).await;
+    assert!(
+        Arc::ptr_eq(&tracks.get(audio_id).unwrap(), &a0),
+        "the same track"
+    );
+    assert_eq!(
+        (a0.codec(), a0.clock_rate()),
+        (Arc::new(Codec::Pcmu), 8_000)
+    );
+    let mut control = Vec::new();
+    let first = loop {
+        match next_event(&mut sub).await {
+            TrackEvent::Packet(packet) if packet.epoch < 2 => {}
+            TrackEvent::Packet(packet) => break packet,
+            event => control.push(event),
+        }
+    };
+    assert_eq!(
+        control,
+        [
+            TrackEvent::SourceLost,
+            TrackEvent::EpochStart { epoch: 1 },
+            TrackEvent::TrackChanged {
+                codec: Arc::new(Codec::Pcmu),
+                clock_rate: 8_000,
+            },
+            TrackEvent::EpochStart { epoch: 2 },
+            TrackEvent::SourceRestored,
+        ]
+    );
+    assert_eq!(first.rtp.pt, CameraAudio::Pcmu.payload_type());
+
+    cam.set_audio(None);
+    cam.drop_connections();
+    until_live(&mut events).await;
+    assert_eq!(tracks.tracks().len(), 2, "the audio stays in the set");
+    // Twice the audio's stall timeout: the connection streams on.
+    tokio::select! {
+        event = next_runner_event(&mut events) => panic!("{event:?}"),
+        () = clock().sleep(stall_audio * 2) => {}
+    }
+    assert!(Arc::ptr_eq(&tracks.get(audio_id).unwrap(), &a0));
+
+    cancel.cancel();
+    while next_runner_event(&mut events).await != RunnerEvent::Stopped {}
     runner.await.unwrap();
     cam.stop().await;
 }

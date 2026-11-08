@@ -80,7 +80,7 @@ def _play(settings: Settings, server: str, round_: int, out: Path) -> dict[str, 
             finished = time.monotonic()
             sampler.stop()
         ran = versions(driver, settings)
-    verdict = check(page, running.served.stream)
+    verdict = check(page, running.served.stream, engine=settings.engine)
     play_s = verdict.measured.get("play_s") or 0.0
     version = running.version or (page.get("daemon") or {}).get("version")
     result = {

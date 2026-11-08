@@ -883,10 +883,14 @@ impl Asks {
 }
 
 /// The native tracks of one source connection. Declared by the source,
-/// stable across reconnects, read by every sink of the connection. Derived
-/// tracks (a transcoder's output) are kept by their owner beside the set,
-/// not in it: the runner watches every track here for stalls and starts
-/// their epochs together, and a derived track's are its transcoder's.
+/// stable across reconnects, read by every sink of the connection. A track
+/// a reconnect does not declare again stays in the set, silent: sinks may
+/// hold it, and a later connection that declares it again gets it back.
+/// Derived tracks (a transcoder's output) are kept by their owner beside
+/// the set, not in it: the runner starts the set's epochs together and
+/// watches the tracks the current attempt declared
+/// ([`TrackPublisher::declare`]) for stalls, and a derived track's are its
+/// transcoder's.
 #[derive(Debug)]
 pub struct TrackSet {
     /// The bounds every track enforces.
@@ -1072,24 +1076,18 @@ impl TrackSet {
     pub fn publisher(self: &Arc<Self>) -> TrackPublisher {
         TrackPublisher {
             set: Arc::clone(self),
-            declared: Vec::new(),
+            declared: DeclaredTracks::default(),
         }
     }
 
-    /// Returns the existing track `id` with its codec updated, or declares
-    /// a new one: a staging set's forwards into the live track of that id,
+    /// Returns the existing track `id` redeclared with `codec` at
+    /// `clock_rate` ([`Track::redeclare`]: the same object, its descriptor
+    /// and RTP clock rate following the new connection's), or declares a
+    /// new one: a staging set's forwards into the live track of that id,
     /// if there is one.
     pub(crate) fn declare(&self, id: TrackId, codec: Codec, clock_rate: u32) -> Arc<Track> {
         if let Some(existing) = self.get(id) {
-            if existing.clock_rate() != clock_rate {
-                tracing::warn!(
-                    track = %id,
-                    was = existing.clock_rate(),
-                    now = clock_rate,
-                    "track clock rate changed on reconnect; keeping the original"
-                );
-            }
-            existing.set_codec(codec);
+            existing.redeclare(codec, clock_rate);
             return existing;
         }
         tracing::info!(track = %id, codec = codec.name(), clock_rate, tag = self.tag, "track declared");
@@ -1113,6 +1111,45 @@ impl TrackSet {
     }
 }
 
+/// The tracks one connection attempt has declared, in declaration order:
+/// shared by the attempt's [`TrackPublisher`], which numbers the next track
+/// by them, and the runner, whose stall watchdog watches only these. A
+/// track of the set this attempt did not declare (a camera that dropped
+/// its audio from the new connection's SDP) has nothing to stall on.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeclaredTracks {
+    /// The tracks, in declaration order. Written by the source's task only.
+    tracks: Arc<RwLock<Vec<Arc<Track>>>>,
+}
+
+impl DeclaredTracks {
+    /// The tracks declared so far, in declaration order.
+    pub(crate) fn tracks(&self) -> Vec<Arc<Track>> {
+        self.tracks
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many tracks of `kind` were declared so far.
+    fn count(&self, kind: Kind) -> usize {
+        self.tracks
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|track| track.kind() == kind)
+            .count()
+    }
+
+    /// Records `track` as declared.
+    fn push(&self, track: Arc<Track>) {
+        self.tracks
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(track);
+    }
+}
+
 /// What a source uses to declare tracks and signal readiness and
 /// discontinuities for one connection attempt. Media goes straight to the
 /// [`Track`]s it returns.
@@ -1120,20 +1157,29 @@ impl TrackSet {
 pub struct TrackPublisher {
     /// The connection's tracks.
     set: Arc<TrackSet>,
-    /// The ids this attempt has declared, to number the next one.
-    declared: Vec<TrackId>,
+    /// The tracks this attempt has declared, which number the next one.
+    declared: DeclaredTracks,
 }
 
 impl TrackPublisher {
     /// Declares the next track of `kind`: the first video declared is `v0`,
     /// the first audio `a0`. On a reconnect the existing track comes back,
-    /// with `TrackChanged` if the codec differs. Must be called before the
-    /// first packet of that track.
+    /// with `TrackChanged` if the codec or the clock rate differs (the
+    /// latter in a new epoch of the track's own, RFC 3550 §5.1: nothing
+    /// timed at the old rate is read at the new one). Must be called before
+    /// the first packet of that track.
     pub fn declare(&mut self, kind: Kind, codec: Codec, clock_rate: u32) -> Arc<Track> {
-        let index = self.declared.iter().filter(|id| id.kind() == kind).count();
+        let index = self.declared.count(kind);
         let id = TrackId::new(kind, u8::try_from(index).unwrap_or(u8::MAX));
-        self.declared.push(id);
-        self.set.declare(id, codec, clock_rate)
+        let track = self.set.declare(id, codec, clock_rate);
+        self.declared.push(Arc::clone(&track));
+        track
+    }
+
+    /// The tracks this attempt declares, as it declares them: what the
+    /// runner's stall watchdog watches.
+    pub(crate) fn declared(&self) -> DeclaredTracks {
+        self.declared.clone()
     }
 
     /// Every track is declared; the connection is live.
@@ -1318,7 +1364,10 @@ mod tests {
         );
         assert_eq!(
             video.next().await,
-            Some(TrackEvent::TrackChanged(Arc::new(h265())))
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(h265()),
+                clock_rate: 90_000,
+            })
         );
         assert_eq!(next_packet(&mut video).await, (3, 1));
         assert_eq!(audio.next().await, Some(TrackEvent::SourceSwitched));
@@ -1328,7 +1377,10 @@ mod tests {
         );
         assert_eq!(
             audio.next().await,
-            Some(TrackEvent::TrackChanged(Arc::new(Codec::Pcma)))
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(Codec::Pcma),
+                clock_rate: 8_000,
+            })
         );
         assert_eq!(v0.codec().family(), CodecFamily::H265);
         // The old source's writes are dropped now; the standby's reach the
@@ -1363,7 +1415,10 @@ mod tests {
         assert_eq!(video.next().await, Some(TrackEvent::SourceLost));
         assert_eq!(
             video.next().await,
-            Some(TrackEvent::TrackChanged(Arc::new(Codec::Mjpeg)))
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(Codec::Mjpeg),
+                clock_rate: 90_000,
+            })
         );
         // The standby's connection drops reset the live set's readiness;
         // the old source's no longer touch it.
@@ -1477,6 +1532,94 @@ mod tests {
         assert_eq!(a0.codec().family(), CodecFamily::Pcma);
     }
 
+    /// A standby's RTP clock rate (RFC 3550 §5.1) is its own until the
+    /// switch, which puts it on the live track with its codec, in a new
+    /// epoch of that track; once the standby feeds the connection, its
+    /// reconnect's rate reaches the live track and its own track, whose
+    /// Sender Reports are mapped at it. The old live source's declaration
+    /// changes nothing once it no longer feeds. Opus is 48 kHz (RFC 7587
+    /// §4.1), G.711 8000 (RFC 3551 §4.5.14).
+    #[tokio::test]
+    async fn rfc7587_4_1_a_standby_s_clock_rate_reaches_the_live_track_at_the_switch_and_after() {
+        let live = TrackSet::new(TrackLimits::default(), SystemClock.now());
+        let mut old = live.publisher();
+        let v0 = old.declare(Kind::Video, h264(), 90_000);
+        let a0 = old.declare(Kind::Audio, Codec::Opus { channels: 1 }, 48_000);
+        let mut audio = a0.subscribe(Unit::Packets);
+
+        let staging = TrackSet::staging(&live);
+        let mut standby = staging.publisher();
+        let sv0 = standby.declare(Kind::Video, h264(), 90_000);
+        let sa0 = standby.declare(Kind::Audio, Codec::Opus { channels: 1 }, 48_000);
+        // The standby reconnects before the switch, its audio now G.711:
+        // its own track follows, the live one is the old source's.
+        let mut again = staging.publisher();
+        assert!(Arc::ptr_eq(
+            &again.declare(Kind::Video, h264(), 90_000),
+            &sv0
+        ));
+        assert!(Arc::ptr_eq(
+            &again.declare(Kind::Audio, Codec::Pcmu, 8_000),
+            &sa0
+        ));
+        assert_eq!((sa0.clock_rate(), a0.clock_rate()), (8_000, 48_000));
+        assert_eq!(a0.codec().family(), CodecFamily::Opus);
+
+        again.ready();
+        staging.arm_switch();
+        sv0.publish_packet(packet(1, true));
+        assert!(staging.is_active());
+        assert_eq!(
+            (a0.clock_rate(), a0.codec().family()),
+            (8_000, CodecFamily::Pcmu)
+        );
+        assert_eq!(audio.next().await, Some(TrackEvent::SourceSwitched));
+        assert_eq!(
+            audio.next().await,
+            Some(TrackEvent::EpochStart { epoch: 1 })
+        );
+        assert_eq!(
+            audio.next().await,
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(Codec::Pcmu),
+                clock_rate: 8_000,
+            })
+        );
+        assert_eq!(
+            audio.next().await,
+            Some(TrackEvent::EpochStart { epoch: 2 })
+        );
+        assert_eq!(v0.epoch(), 1, "the video's rate stayed: one epoch");
+
+        // The standby, now the feed, reconnects with Opus again.
+        let mut third = staging.publisher();
+        third.declare(Kind::Video, h264(), 90_000);
+        third.declare(Kind::Audio, Codec::Opus { channels: 1 }, 48_000);
+        assert_eq!((sa0.clock_rate(), a0.clock_rate()), (48_000, 48_000));
+        assert_eq!(a0.codec().family(), CodecFamily::Opus);
+        assert_eq!(
+            audio.next().await,
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(Codec::Opus { channels: 1 }),
+                clock_rate: 48_000,
+            })
+        );
+        assert_eq!(
+            audio.next().await,
+            Some(TrackEvent::EpochStart { epoch: 3 })
+        );
+
+        // The old live source declares again: it feeds nothing any more.
+        let mut stale = live.publisher();
+        stale.declare(Kind::Video, h264(), 90_000);
+        stale.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        assert_eq!(
+            (a0.clock_rate(), a0.codec().family()),
+            (48_000, CodecFamily::Opus)
+        );
+        assert_eq!(a0.epoch(), 3);
+    }
+
     #[tokio::test]
     async fn a_disarmed_standby_does_not_switch_and_the_live_set_cannot_be_armed() {
         let live = TrackSet::new(TrackLimits::default(), SystemClock.now());
@@ -1502,20 +1645,39 @@ mod tests {
         assert_eq!(v0.stats().packets, 1);
     }
 
+    /// A reconnect gets the same track objects back under the same ids,
+    /// their codec and RFC 3550 §5.1 RTP clock rate following the new
+    /// connection's: AAC at 16 kHz (RFC 3640 §3.3.1) back as PCMU at 8000
+    /// (RFC 3551 §4.5.14) is read at 8000 from then on, in a new epoch of
+    /// its own. Regression: the track kept its first rate, so the new
+    /// connection's timestamps and Sender Reports were read at the old one.
     #[tokio::test]
-    async fn tracks_keep_their_identity_across_reconnects() {
+    async fn rfc3550_5_1_tracks_keep_their_identity_across_reconnects_and_follow_the_clock_rate() {
         let (logs, _guard) = Logs::capture();
         let set = TrackSet::new(TrackLimits::default(), SystemClock.now());
         let mut ready = set.ready();
         assert!(!*ready.borrow_and_update());
 
+        let aac = Codec::AacLc {
+            sample_rate: 16_000,
+            channels: 1,
+            config: bytes::Bytes::from_static(&[0x14, 0x08]),
+        };
         let mut first = set.publisher();
         let v0 = first.declare(Kind::Video, h264(), 90_000);
-        let a0 = first.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        let a0 = first.declare(Kind::Audio, aac, 16_000);
         let a1 = first.declare(Kind::Audio, Codec::Opus { channels: 1 }, 48_000);
         assert_eq!(v0.id().to_string(), "v0");
         assert_eq!(a0.id().to_string(), "a0");
         assert_eq!(a1.id().to_string(), "a1");
+        let ids = |declared: &DeclaredTracks| -> Vec<String> {
+            declared
+                .tracks()
+                .iter()
+                .map(|track| track.id().to_string())
+                .collect()
+        };
+        assert_eq!(ids(&first.declared()), ["v0", "a0", "a1"]);
         first.ready();
         assert!(ready.changed().await.is_ok());
         assert!(*ready.borrow_and_update());
@@ -1524,27 +1686,50 @@ mod tests {
         assert!(set.get(TrackId::new(Kind::Audio, 2)).is_none());
 
         let mut sub = v0.subscribe(Unit::Packets);
+        let mut audio = a0.subscribe(Unit::Packets);
         set.reset_ready();
         assert!(!*set.ready().borrow());
 
         let mut second = set.publisher();
+        let declared = second.declared();
         let again = second.declare(Kind::Video, Codec::Mjpeg, 90_000);
         assert!(Arc::ptr_eq(&v0, &again), "same track object");
         assert_eq!(again.codec().family(), CodecFamily::Mjpeg);
         assert_eq!(
             sub.next().await,
-            Some(TrackEvent::TrackChanged(Arc::new(Codec::Mjpeg)))
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(Codec::Mjpeg),
+                clock_rate: 90_000,
+            })
         );
-        let audio_again = second.declare(Kind::Audio, Codec::Pcmu, 16_000);
-        assert!(Arc::ptr_eq(&a0, &audio_again));
-        assert_eq!(audio_again.clock_rate(), 8_000, "clock rate is kept");
+        let audio_again = second.declare(Kind::Audio, Codec::Pcmu, 8_000);
+        assert!(Arc::ptr_eq(&a0, &audio_again), "same track object");
+        assert_eq!(audio_again.clock_rate(), 8_000, "the clock rate follows");
+        assert_eq!(
+            audio.next().await,
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(Codec::Pcmu),
+                clock_rate: 8_000,
+            })
+        );
+        assert_eq!(
+            audio.next().await,
+            Some(TrackEvent::EpochStart { epoch: 1 }),
+            "a new epoch at the new rate"
+        );
+        assert_eq!((v0.epoch(), a0.epoch()), (0, 1), "the video's is its own");
         let changed = logs.lines(
-            tracing::Level::WARN,
-            "track clock rate changed on reconnect; keeping the original",
+            tracing::Level::INFO,
+            "track clock rate changed; a new epoch at the new rate",
         );
         assert_eq!(changed.len(), 1);
-        assert_eq!(changed[0].fields, " track=a0 was=8000 now=16000");
+        assert_eq!(
+            changed[0].fields,
+            " track=a0 codec=\"pcmu\" was=16000 now=8000 epoch=1 prerecord_cleared=false"
+        );
+        // `a1` stays in the set, but this attempt did not declare it.
         assert_eq!(set.tracks().len(), 3);
+        assert_eq!(ids(&declared), ["v0", "a0"]);
         assert!(Arc::ptr_eq(second.tracks(), &set));
     }
 

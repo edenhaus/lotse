@@ -5699,6 +5699,23 @@ mod tests {
         let a = jitter_seed(&clock);
         clock.advance(Duration::from_millis(1));
         assert_ne!(a, jitter_seed(&clock));
+        // The wall clock's nanoseconds mixed with the pid, every bit of both:
+        // on a clock whose low 32 bits are all ones, the pid's bits flip them.
+        let wall_nanos = || {
+            clock
+                .wall_now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        };
+        let low = u64::try_from(wall_nanos() % (1 << 32)).unwrap();
+        clock.advance(Duration::from_nanos(u64::from(u32::MAX) - low));
+        let nanos = wall_nanos();
+        assert_eq!(nanos % (1 << 32), u128::from(u32::MAX));
+        assert_eq!(
+            jitter_seed(&clock),
+            u64::try_from(nanos).unwrap() ^ u64::from(std::process::id())
+        );
         assert_eq!(STATS_INTERVAL, Duration::from_secs(1));
     }
 

@@ -5,7 +5,10 @@
 //! Protocol-independent: a source only runs one connection and reports how
 //! it ended. Tracks keep their identity across reconnects through the
 //! `TrackSet`; a reconnect starts a new epoch on every track together and
-//! tells subscribers when the source is lost and back.
+//! tells subscribers when the source is lost and back. The stall watchdog
+//! watches the tracks the current attempt declared, not every track the
+//! set ever held: a reconnect that leaves a track out (a camera whose new
+//! SDP has no audio) keeps it in the set, silent, without a stall.
 //!
 //! Every attempt is announced (`Connecting`, `Reconnecting`) and then waits
 //! at its [`ConnectGate`] for the supervisor's grant, which keeps at most
@@ -24,7 +27,8 @@ use crate::codec::Kind;
 use crate::connection::DEFAULT_STABLE_AFTER;
 use crate::signaling::SignalingOpener;
 use crate::source::{
-    BackchannelSlot, ClockInput, ResolvedPeer, Source, SourceCtx, SourceError, TrackSet,
+    BackchannelSlot, ClockInput, DeclaredTracks, ResolvedPeer, Source, SourceCtx, SourceError,
+    TrackSet,
 };
 use crate::task::BoxFuture;
 
@@ -502,9 +506,11 @@ impl SourceRunner {
         }
         let cancel = self.cancel.child_token();
         let (clock_input, mut reports) = ClockInput::channel(Arc::clone(&self.mapper));
+        let publisher = self.tracks.publisher();
+        let declared = publisher.declared();
         let ctx = SourceCtx {
             peer: self.peer.clone(),
-            tracks: self.tracks.publisher(),
+            tracks: publisher,
             clock: clock_input,
             time: Arc::clone(&self.clock),
             backchannel: self.backchannel.clone(),
@@ -536,7 +542,8 @@ impl SourceRunner {
                         let now = self.clock.now();
                         live_since = Some(now);
                         stable = Some(self.clock.sleep(self.config.stable_after));
-                        self.on_live(reconnect, now.saturating_duration_since(started)).await;
+                        self.on_live(reconnect, now.saturating_duration_since(started), &declared)
+                            .await;
                     }
                 }
                 () = until(&mut stable) => {
@@ -551,7 +558,7 @@ impl SourceRunner {
                 Some(report) = reports.recv() => self.mapper.ingest(report),
                 () = &mut check => {
                     check = self.clock.sleep(self.config.stall_check);
-                    if let Some(error) = self.watchdog(started, live_since) {
+                    if let Some(error) = self.watchdog(started, live_since, &declared) {
                         watchdog_error = Some(error);
                         cancel.cancel();
                     }
@@ -592,23 +599,44 @@ impl SourceRunner {
         }
     }
 
-    /// The tracks are ready: splice the connection in and report.
-    async fn on_live(&self, reconnect: bool, after: Duration) {
+    /// The tracks are ready: splice the connection in and report. A track
+    /// of the set the attempt did not declare is named, once per attempt:
+    /// it stays, silent, and the stall watchdog leaves it out.
+    async fn on_live(&self, reconnect: bool, after: Duration, declared: &DeclaredTracks) {
         if reconnect {
             self.tracks.set_source_lost(false);
+        }
+        let declared = declared.tracks();
+        let tracks = self.tracks.tracks();
+        for track in &tracks {
+            if !declared.iter().any(|ours| Arc::ptr_eq(ours, track)) {
+                tracing::info!(
+                    track = %track.id(),
+                    codec = track.codec().name(),
+                    "track not declared by this connection; kept silent, the stall watchdog leaves it out"
+                );
+            }
         }
         tracing::info!(
             reconnect,
             connect_ms = after.as_millis(),
-            tracks = self.tracks.tracks().len(),
+            tracks = tracks.len(),
+            declared = declared.len(),
             "source live"
         );
         self.emit(RunnerEvent::Live).await;
     }
 
-    /// The stall watchdog: not ready in time, or a live track without
-    /// items for longer than its stall timeout.
-    fn watchdog(&self, started: Instant, live_since: Option<Instant>) -> Option<SourceError> {
+    /// The stall watchdog: not ready in time, or a track this attempt
+    /// declared without items for longer than its stall timeout. A track
+    /// of the set the attempt did not declare is not watched: no item of
+    /// it is due.
+    fn watchdog(
+        &self,
+        started: Instant,
+        live_since: Option<Instant>,
+        declared: &DeclaredTracks,
+    ) -> Option<SourceError> {
         let now = self.clock.now();
         let Some(live_since) = live_since else {
             let waited = now.saturating_duration_since(started);
@@ -619,7 +647,7 @@ impl SourceRunner {
                 ))
             });
         };
-        for track in self.tracks.tracks() {
+        for track in declared.tracks() {
             let limit = match track.kind() {
                 Kind::Video => self.config.stall_video,
                 Kind::Audio => self.config.stall_audio,
@@ -664,7 +692,7 @@ mod tests {
     use crate::task::spawn_named;
     use crate::test_logs::Logs;
     use crate::test_util::FakeSourceFactory;
-    use crate::track::{TrackEvent, TrackLimits, Unit};
+    use crate::track::{TrackEvent, TrackId, TrackLimits, Unit};
 
     struct Harness {
         clock: Arc<FakeClock>,
@@ -788,12 +816,17 @@ mod tests {
 
     #[tokio::test]
     async fn connects_goes_live_and_stops_on_cancel() {
+        let (logs, _guard) = Logs::capture();
         let mut h = start(RunnerConfig::default());
         assert_eq!(
             next(&mut h.events).await,
             Some(RunnerEvent::Connecting { attempt: 1 })
         );
         assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Live));
+        // The first connection is no hot swap: no new epoch, no `SourceRestored`.
+        let live = logs.lines(tracing::Level::INFO, "source live");
+        assert_eq!(live.len(), 1);
+        assert!(live[0].fields.starts_with(" reconnect=false"), "{live:?}");
         assert_eq!(h.tracks.tracks().len(), 1);
         assert!(*h.tracks.ready().borrow());
         h.cancel.cancel();
@@ -1286,6 +1319,132 @@ mod tests {
         };
         assert_eq!((first.rtp.seq, first.epoch), (1, 1));
         cancel.cancel();
+        runner.await.unwrap();
+    }
+
+    /// A camera whose reconnect leaves its audio out, as one whose new SDP
+    /// has no audio media does: the first connection declares `v0` and
+    /// `a0`, sends on both and hangs up a second later; every later one
+    /// declares `v0` alone and sends video every second until cancelled.
+    #[derive(Debug, Default)]
+    struct DropsAudio {
+        runs: std::sync::atomic::AtomicU32,
+    }
+
+    impl Source for DropsAudio {
+        fn describe(&self) -> crate::source::SourceDescriptor {
+            crate::source::SourceDescriptor {
+                protocol: "drops-audio",
+                url: Some(SourceUrl::parse("drops-audio://x/").unwrap()),
+                options: serde_json::Value::Null,
+            }
+        }
+        fn connection_options(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+        fn run(&self, mut ctx: SourceCtx) -> BoxFuture<'static, SourceError> {
+            let first = self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
+            Box::pin(async move {
+                let video = ctx
+                    .tracks
+                    .declare(Kind::Video, crate::codec::Codec::Mjpeg, 90_000);
+                let audio = first.then(|| {
+                    ctx.tracks
+                        .declare(Kind::Audio, crate::codec::Codec::Pcmu, 8_000)
+                });
+                ctx.tracks.ready();
+                loop {
+                    video.publish_packet(packet(ctx.time.now()));
+                    if let Some(audio) = &audio {
+                        audio.publish_packet(packet(ctx.time.now()));
+                    }
+                    tokio::select! {
+                        () = ctx.cancel.cancelled() => return SourceError::Ended("cancelled".into()),
+                        () = ctx.time.sleep(Duration::from_secs(1)) => {}
+                    }
+                    if audio.is_some() {
+                        return SourceError::Ended("hung up".into());
+                    }
+                }
+            })
+        }
+    }
+
+    /// A reconnect that does not declare a track the previous connection
+    /// had keeps it in the set, silent, and the stall watchdog leaves it
+    /// out. Regression: the watchdog checked every track the set ever
+    /// held, so the camera's dropped audio timed out 10 s after every
+    /// reconnect and the runner reconnected in a loop.
+    #[tokio::test]
+    async fn a_track_the_reconnect_did_not_declare_is_kept_and_never_stalls_the_connection() {
+        let (logs, _guard) = Logs::capture();
+        let source = DropsAudio::default();
+        assert_eq!(
+            (source.describe().protocol, source.connection_options()),
+            ("drops-audio", serde_json::Value::Null)
+        );
+        let clock = Arc::new(FakeClock::default());
+        let tracks = TrackSet::new(TrackLimits::default(), clock.now());
+        let (tx, mut events) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let runner = SourceRunner::new(
+            Box::new(source),
+            ResolvedPeer {
+                host: "x".into(),
+                addrs: vec![],
+            },
+            Arc::clone(&tracks),
+            Arc::new(ClockMapper::new()),
+            BackchannelSlot::default(),
+            None,
+            clock.clone(),
+            RunnerConfig::default(),
+            ReconnectBackoff::new(1),
+            tx,
+            ConnectGate::open(),
+            cancel.clone(),
+        );
+        let runner = spawn_named("test.runner", runner.run());
+        let advance = |total: Duration| {
+            let clock = Arc::clone(&clock);
+            async move {
+                let mut passed = Duration::ZERO;
+                while passed < total {
+                    clock.advance(DEFAULT_STALL_CHECK);
+                    passed += DEFAULT_STALL_CHECK;
+                    for _ in 0..5 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        };
+        assert_eq!(
+            next(&mut events).await,
+            Some(RunnerEvent::Connecting { attempt: 1 })
+        );
+        assert_eq!(next(&mut events).await, Some(RunnerEvent::Live));
+        let a0 = tracks.get(TrackId::new(Kind::Audio, 0)).unwrap();
+        advance(Duration::from_secs(1)).await;
+        crate::let_assert!(Some(RunnerEvent::Reconnecting { error }) = next(&mut events).await);
+        assert_eq!(error.to_string(), "source ended: hung up");
+        assert_eq!(next(&mut events).await, Some(RunnerEvent::Live));
+        // Past the audio's stall timeout and more: the connection streams on.
+        advance(DEFAULT_STALL_AUDIO + DEFAULT_STALL_AUDIO).await;
+        assert!(quiet(&mut events).await, "no stall, no reconnect");
+        let kept = tracks.tracks();
+        assert_eq!(kept.len(), 2, "the audio stays in the set");
+        assert!(kept.iter().any(|track| Arc::ptr_eq(track, &a0)));
+        let left_out = logs.lines(
+            tracing::Level::INFO,
+            "track not declared by this connection; kept silent, the stall watchdog leaves it out",
+        );
+        assert_eq!(left_out.len(), 1, "once, for the reconnect");
+        assert_eq!(left_out[0].fields, " track=a0 codec=\"pcmu\"");
+        let live = logs.lines(tracing::Level::INFO, "source live");
+        let fields = &live[1].fields;
+        assert!(fields.ends_with(" tracks=2 declared=1"), "{fields}");
+        cancel.cancel();
+        assert_eq!(next(&mut events).await, Some(RunnerEvent::Stopped));
         runner.await.unwrap();
     }
 

@@ -709,6 +709,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_inbound_message_cap_is_64_kib_and_the_outbound_budget_1_mib() {
+        assert_eq!(MAX_MESSAGE_BYTES, 65_536);
+        assert_eq!(OUTBOUND_BUDGET_BYTES, 1_048_576);
+        assert_eq!(MAX_UPGRADE_HEADER_BYTES, 16_384);
+    }
+
     #[tokio::test]
     async fn the_default_hooks_have_no_last_word_and_no_side_effect() {
         let handler = Minimal;

@@ -1066,6 +1066,10 @@ pub struct FakeCamera {
     /// Ends the connections open now, a child of `cancel` replaced on
     /// every [`FakeCamera::drop_connections`].
     hangup: Arc<Mutex<CancellationToken>>,
+    /// What a connection accepted now is served: the configuration, as
+    /// [`FakeCamera::set_audio`] last changed it. Each connection keeps
+    /// the one it was accepted with.
+    config: Arc<Mutex<Arc<CameraConfig>>>,
     /// The accept loop.
     accept: JoinHandle<()>,
     /// The credentials, for the URL.
@@ -1088,12 +1092,12 @@ impl FakeCamera {
         } else {
             "rtsp"
         };
-        let config = Arc::new(config);
+        let config = Arc::new(Mutex::new(Arc::new(config)));
         let accept = spawn_named(
             "fake_camera.accept",
             accept_loop(
                 listener,
-                config,
+                Arc::clone(&config),
                 Arc::clone(&stats),
                 cancel.clone(),
                 Arc::clone(&hangup),
@@ -1105,6 +1109,7 @@ impl FakeCamera {
             stats,
             cancel,
             hangup,
+            config,
             accept,
             auth,
             scheme,
@@ -1129,6 +1134,18 @@ impl FakeCamera {
     /// What it saw so far.
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// Offers `audio` (none: video alone) to the connections accepted from
+    /// now on, in place of the configuration's, as a camera reconfigured
+    /// between two connections does: the next `DESCRIBE` answers an SDP
+    /// with that audio, or without any. Connections open now keep theirs.
+    pub fn set_audio(&self, audio: Option<CameraAudio>) {
+        let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
+        *config = Arc::new(CameraConfig {
+            audio,
+            ..CameraConfig::clone(&config)
+        });
     }
 
     /// Answers the backchannel's requests as `setup` says from now on, in
@@ -1181,11 +1198,12 @@ impl FakeCamera {
     }
 }
 
-/// Accepts connections until cancelled; each connection ends with
-/// `cancel` or with the `hangup` token current when it was accepted.
+/// Accepts connections until cancelled; each connection is served the
+/// configuration current when it was accepted, and ends with `cancel` or
+/// with the `hangup` token current then.
 async fn accept_loop(
     listener: TcpListener,
-    config: Arc<CameraConfig>,
+    config: Arc<Mutex<Arc<CameraConfig>>>,
     stats: Arc<Stats>,
     cancel: CancellationToken,
     hangup: Arc<Mutex<CancellationToken>>,
@@ -1210,7 +1228,7 @@ async fn accept_loop(
             tracing::warn!(error = %err, "fake camera: TCP_NODELAY failed");
         }
         Stats::bump(&stats.connections);
-        let config = Arc::clone(&config);
+        let config = Arc::clone(&config.lock().unwrap_or_else(PoisonError::into_inner));
         let stats = Arc::clone(&stats);
         let cancel = hangup
             .lock()
