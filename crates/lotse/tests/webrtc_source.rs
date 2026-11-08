@@ -739,7 +739,9 @@ async fn rfc6347_4_2_7_a_camera_that_closes_ends_its_signal_and_the_source_offer
 /// `camera_error`; the attempt failed before an answer, so the stream
 /// reports the source unreachable with the camera's words, and after its
 /// backoff the source offers again under a new signal, which a camera
-/// answers whose candidates come in its answer and trickled, and whose RTP
+/// without audio answers (its audio m-line rejected with port 0, RFC 3264
+/// §6, so the stream has the video alone), whose candidates come in its
+/// answer and trickled, and whose RTP
 /// has no RFC 9143 `mid` header extension: the source finds its m-line by
 /// the answer's `a=ssrc` (RFC 5576 §4.1). Its handle dropped closes its
 /// connection and ends its task.
@@ -751,10 +753,10 @@ async fn a_camera_error_ends_the_signal_and_the_source_offers_again_after_its_ba
     let (signaling, _) = control
         .subscribe(json!({ "type": "signaling/subscribe", "stream_id": "door" }))
         .await;
-    control.call(put(&json!({ "audio": false }), 2_000)).await;
+    control.call(put(&json!({}), 2_000)).await;
     let first = offer(&mut control, signaling).await;
     let media = first.sdp.matches("\r\nm=").count();
-    assert_eq!(media, 1, "video only: {}", first.sdp);
+    assert_eq!(media, 2, "audio and video, no data channel: {}", first.sdp);
     let nest = WebRtcCameraConfig {
         require_application: true,
         ..WebRtcCameraConfig::default()

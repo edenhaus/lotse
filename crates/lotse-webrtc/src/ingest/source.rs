@@ -567,10 +567,7 @@ mod tests {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let local = socket.local_addr().unwrap();
         let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
-        let options = WebRtcOptions {
-            data_channel: None,
-            audio: false,
-        };
+        let options = WebRtcOptions { data_channel: None };
         let mut attempt = Attempt {
             engine: IngestEngine::offer(&options, &[local], now, now).unwrap(),
             hosts: Hosts {

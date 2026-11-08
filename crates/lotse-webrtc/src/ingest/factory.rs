@@ -49,10 +49,7 @@ mod tests {
         let described = source.describe();
         assert_eq!(described.protocol, "webrtc");
         assert_eq!(described.url, None, "no address");
-        assert_eq!(
-            described.options,
-            json!({ "data_channel": null, "audio": true })
-        );
+        assert_eq!(described.options, json!({ "data_channel": null }));
         assert_eq!(source.connection_options(), described.options);
         assert!(!source.wants_backchannel());
         let nest = factory
@@ -60,23 +57,26 @@ mod tests {
             .unwrap();
         assert_eq!(
             nest.connection_options(),
-            json!({ "data_channel": "dataSendChannel", "audio": true })
+            json!({ "data_channel": "dataSendChannel" })
         );
         // Spelled differently, the same connection.
-        let spelled_out = factory
-            .validate(&json!({ "data_channel": "dataSendChannel", "audio": true }))
-            .unwrap();
-        assert_eq!(nest.connection_options(), spelled_out.connection_options());
+        let spelled_out = factory.validate(&json!({ "data_channel": null })).unwrap();
+        assert_eq!(
+            source.connection_options(),
+            spelled_out.connection_options()
+        );
     }
 
     #[test]
     fn bad_options_are_refused_as_invalid_options() {
-        let err = WebRtcSourceFactory
-            .validate(&json!({ "codec": "h264" }))
-            .unwrap_err();
-        assert!(
-            matches!(&err, SourceConfigError::InvalidOptions { protocol: "webrtc", message } if message.contains("unknown field")),
-            "{err}"
-        );
+        // `audio` among them: the offer always asks for the camera's
+        // audio, which a camera without any rejects (RFC 3264 §6).
+        for bad in [json!({ "codec": "h264" }), json!({ "audio": false })] {
+            let err = WebRtcSourceFactory.validate(&bad).unwrap_err();
+            assert!(
+                matches!(&err, SourceConfigError::InvalidOptions { protocol: "webrtc", message } if message.contains("unknown field")),
+                "{bad}: {err}"
+            );
+        }
     }
 }

@@ -23,17 +23,13 @@ mod tests {
     #[test]
     fn rfc8832_5_1_the_options_normalize_with_every_default() {
         let parsed: WebRtcOptions = serde_json::from_value(json!({})).unwrap();
-        assert_eq!(
-            normalized(&parsed),
-            json!({ "data_channel": null, "audio": true })
-        );
+        assert_eq!(normalized(&parsed), json!({ "data_channel": null }));
         let nest = WebRtcOptions {
             data_channel: Some("dataSendChannel".into()),
-            audio: false,
         };
         assert_eq!(
             normalized(&nest),
-            json!({ "data_channel": "dataSendChannel", "audio": false })
+            json!({ "data_channel": "dataSendChannel" })
         );
         assert_eq!(MAX_LABEL_CHARS, 64);
     }
