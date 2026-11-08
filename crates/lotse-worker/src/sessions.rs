@@ -3586,7 +3586,7 @@ mod tests {
         // A connection ends before it went live: still not ready.
         rig.publisher.tracks().reset_ready();
         assert!(poll_once(&mut session).await.is_pending());
-        assert!(rig.events().is_empty());
+        assert_eq!(rig.events(), []);
         request_close(&rig.close, "session_closed", "bye".into());
         assert!(poll_once(&mut session).await.is_ready());
         assert_eq!(rig.events(), [closed("session_closed", "bye")]);
@@ -3659,7 +3659,7 @@ mod tests {
         assert!(poll_once(&mut session).await.is_pending());
         rig.clock.advance(Duration::from_secs(3600));
         assert!(poll_once(&mut session).await.is_pending());
-        assert!(rig.events().is_empty());
+        assert_eq!(rig.events(), []);
         rig.publisher.ready();
         assert!(poll_once(&mut session).await.is_pending());
         assert_eq!(

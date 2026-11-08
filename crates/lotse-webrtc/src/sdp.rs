@@ -4,7 +4,7 @@
 //! payload type check every offer passes before the engine sees it
 //! (RFC 9143 §9.1.1; RFC 8866 §6.6 and §6.15; RFC 3551 §6).
 //!
-//! str0m 0.24 keeps one payload type table per session and asserts that no
+//! str0m 0.25 keeps one payload type table per session and asserts that no
 //! number is locked twice: an offer that gives one number two codec
 //! configurations reaches that assert, and with `panic = "abort"` the
 //! camera's worker dies with every viewer on it. [`check_payload_types`]
@@ -459,7 +459,7 @@ mod tests {
         );
         assert_eq!(audio.attribute("rtp").count(), 0);
         assert_eq!(video.mid(), None);
-        assert!(video.lines().is_empty());
+        assert_eq!(video.lines(), Vec::<&str>::new());
         assert!(video.is("video") && !video.is("vide") && !video.is("audio"));
         assert_eq!(
             sdp.first("video").map(Section::m_line),

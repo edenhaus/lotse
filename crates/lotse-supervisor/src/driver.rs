@@ -3778,10 +3778,9 @@ mod tests {
         let switch = DriverCommand::SwitchSource(spec_of("fake://127.0.0.1:1/b"));
         Driver::send(worker, &shared, &commands, switch).await;
         drop(driver);
-        assert!(
-            captured
-                .lines("session message could not be sent")
-                .is_empty()
+        assert_eq!(
+            captured.lines("session message could not be sent"),
+            Vec::<String>::new()
         );
     }
 
@@ -4643,7 +4642,7 @@ mod tests {
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 1 }));
         clock.advance(Duration::from_secs(4));
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 2 }));
-        assert!(queued_signals(&mut driver).is_empty());
+        assert_eq!(queued_signals(&mut driver), Vec::<SignalCommand>::new());
         clock.advance(Duration::from_millis(5_999));
         assert_eq!(SIGNAL_WAIT, Duration::from_secs(10));
         assert!(
@@ -4710,7 +4709,7 @@ mod tests {
         let wake = next_wake(&mut driver).await;
         assert!(matches!(wake, Wake::SignalWaited));
         driver.handle(wake).await;
-        assert!(queued_signals(&mut driver).is_empty());
+        assert_eq!(queued_signals(&mut driver), Vec::<SignalCommand>::new());
         assert!(driver.signal_wait.is_none());
         // Its offer goes to the subscription; the worker's exit closes it.
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Offer {
@@ -4802,7 +4801,7 @@ mod tests {
         assert_eq!(waiting(&driver), [1], "its answer is queued");
         clock.advance(SIGNAL_WAIT);
         driver.end_signal_waits();
-        assert!(waiting(&driver).is_empty());
+        assert_eq!(waiting(&driver), Vec::<u64>::new());
         assert!(driver.signal_wait.is_none());
         // Its answer still reaches the worker.
         let queued = queued_signals(&mut driver);
@@ -4835,7 +4834,7 @@ mod tests {
             serde_json::json!({ "type": "closed", "signal_id": signal_id, "code": "source_stopped",
                                 "message": "the source stopped" })
         );
-        assert!(shared.lock().signal_ids_for_tests().is_empty());
+        assert_eq!(shared.lock().signal_ids_for_tests(), Vec::<String>::new());
         drop(driver);
     }
 
@@ -4868,7 +4867,7 @@ mod tests {
             serde_json::json!({ "type": "closed", "signal_id": signal_id, "code": "source_stopped",
                                 "message": "the source stopped" })
         );
-        assert!(shared.lock().signal_ids_for_tests().is_empty());
+        assert_eq!(shared.lock().signal_ids_for_tests(), Vec::<String>::new());
     }
 
     /// What the registry held while the queue was full reaches the worker
@@ -5022,7 +5021,7 @@ mod tests {
                 assert_eq!(waiting(&driver), [1]);
             }
         }
-        assert!(waiting(&driver).is_empty());
+        assert_eq!(waiting(&driver), Vec::<u64>::new());
         let seen = recorded(&out, &lotse_ipc::ToWorker::Signal(refused(1, "current"))).await;
         assert!(
             !seen.contains(&lotse_ipc::ToWorker::Signal(refused(1, "stale"))),
@@ -5096,7 +5095,7 @@ mod tests {
         driver.ended_signals.push_back("ended".into());
         driver.worker = Some(dead_worker(&shared).await);
         driver.on_worker_exited(ExitStatus::default());
-        assert!(waiting(&driver).is_empty());
+        assert_eq!(waiting(&driver), Vec::<u64>::new());
         assert!(driver.signal_wait.is_none());
         assert!(driver.ended_signals.is_empty());
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 7 }));
@@ -5108,7 +5107,7 @@ mod tests {
         assert!(driver.signal_wait.is_none());
         assert!(driver.ended_signals.is_empty(), "a stop clears them too");
         let _events = subscribe_all(&shared);
-        assert!(queued_signals(&mut driver).is_empty());
+        assert_eq!(queued_signals(&mut driver), Vec::<SignalCommand>::new());
         drop(driver);
     }
 
@@ -5126,7 +5125,7 @@ mod tests {
         for request in [1, 2] {
             driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request }));
         }
-        assert!(queued_signals(&mut driver).is_empty());
+        assert_eq!(queued_signals(&mut driver), Vec::<SignalCommand>::new());
         clock.advance(OPEN_EXPIRY.checked_sub(Duration::from_millis(1)).unwrap());
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 3 }));
         assert_eq!(waiting(&driver), [1, 2]);
@@ -5407,7 +5406,7 @@ mod tests {
         // message and discarded it, the read end is at its end.
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).unwrap();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         let worker = driver.worker.take().unwrap();
         drop(driver);
         let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;

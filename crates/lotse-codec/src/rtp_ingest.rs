@@ -273,8 +273,8 @@ impl RtpTracks {
     /// on its track, cut through and depacketized on the side branch,
     /// after a new timeline if its timestamp left the stream's (RFC 3550
     /// §5.1). A packet of a stream not carried is dropped. An error ends
-    /// the attempt: the camera's timestamps keep jumping, more than ten
-    /// new timelines within ten seconds.
+    /// the attempt: the camera's timestamps keep jumping, more than
+    /// `MAX_TIMELINES` new timelines within `TIMELINE_WINDOW`.
     pub fn receive(
         &mut self,
         index: usize,
@@ -282,14 +282,20 @@ impl RtpTracks {
         arrival: Instant,
         ctx: &SourceCtx,
     ) -> Result<(), SourceError> {
+        // One scan per packet: `new_timeline` restarts the tracks' state
+        // but never adds or removes one, so the position stays valid.
+        let Some(position) = self.tracks.iter().position(|(i, _)| *i == index) else {
+            return Ok(());
+        };
         let jumped = self
-            .entry_mut(index)
-            .and_then(|entry| entry.guard.observe(packet.ts, arrival));
+            .tracks
+            .get_mut(position)
+            .and_then(|(_, entry)| entry.guard.observe(packet.ts, arrival));
         if let Some(moved_ms) = jumped {
             self.new_timeline(index, ctx, moved_ms, arrival)?;
         }
         let normalized = &mut self.normalized;
-        if let Some((_, entry)) = self.tracks.iter_mut().find(|(i, _)| *i == index) {
+        if let Some((_, entry)) = self.tracks.get_mut(position) {
             on_rtp(entry, ctx, arrival, packet, normalized);
         }
         Ok(())
@@ -719,7 +725,7 @@ mod tests {
     use tracing::Level;
 
     use super::*;
-    use crate::transcode::tests::Logs;
+    use crate::transcode::Logs;
 
     /// The protocol the tests' lines are logged for.
     const RTSP: &str = "rtsp";

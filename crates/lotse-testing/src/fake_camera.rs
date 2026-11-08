@@ -2721,7 +2721,7 @@ mod tests {
         );
         let unmarked = BackchannelRtp::parse(&rtp_of(0, 1, 1, 1, false, &[]), at, 3).unwrap();
         assert!(!unmarked.marker);
-        assert!(unmarked.payload.is_empty());
+        assert_eq!(unmarked.payload, b"");
         // Two CSRCs, a one-word extension and three bytes of padding
         // (RFC 3550 §5.1, §5.3.1).
         let mut full = rtp_of(0, 1, 2, 3, false, &[]);

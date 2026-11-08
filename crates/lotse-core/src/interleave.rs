@@ -1451,7 +1451,10 @@ mod tests {
             &snapshot(&recording, &audio, usize::MAX),
             recording.now(),
         );
-        assert!(drain(&mut queue, Kind::Audio, &recording).is_empty());
+        assert_eq!(
+            drain(&mut queue, Kind::Audio, &recording),
+            Vec::<String>::new()
+        );
 
         let video = [recording.frame(10, true, 10)];
         queue.prerecord(
@@ -1491,7 +1494,10 @@ mod tests {
             &snapshot(&recording, &audio, usize::MAX),
             recording.now(),
         );
-        assert!(drain(&mut queue, Kind::Audio, &recording).is_empty());
+        assert_eq!(
+            drain(&mut queue, Kind::Audio, &recording),
+            Vec::<String>::new()
+        );
 
         recording.push(&mut queue, Kind::Video, 40, false);
         queue.end(Kind::Video);
@@ -1647,7 +1653,7 @@ mod tests {
             "the late audio still goes first"
         );
         recording.advance(599);
-        assert!(release(&mut merged, &recording).is_empty());
+        assert_eq!(release(&mut merged, &recording), Vec::<String>::new());
         assert_eq!(merged.deadline(), Some(deadline));
         recording.advance(1);
         assert_eq!(
@@ -2063,7 +2069,10 @@ mod tests {
         recording.push(&mut queue, Kind::Audio, 0, true);
         queue.end(Kind::Video);
         recording.push(&mut queue, Kind::Audio, 20, true);
-        assert!(drain(&mut queue, Kind::Audio, &recording).is_empty());
+        assert_eq!(
+            drain(&mut queue, Kind::Audio, &recording),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -2210,7 +2219,7 @@ mod tests {
         recording.advance(1000);
         assert_eq!(release(&mut merged, &recording), ["v0", "v3600000"]);
         recording.push(merged.queue_mut(), Kind::Audio, 1040, true);
-        assert!(release(&mut merged, &recording).is_empty());
+        assert_eq!(release(&mut merged, &recording), Vec::<String>::new());
         recording.push(merged.queue_mut(), Kind::Video, 1020, false);
         assert_eq!(release(&mut merged, &recording), ["v1020"]);
     }
