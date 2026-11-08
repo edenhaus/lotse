@@ -11,6 +11,9 @@ exclude_globs = [
 # Equivalent mutants: mutations that cannot change behavior, each with its reason.
 # Keep this list short and delete entries with the code they refer to.
 exclude_re = [
+    # Test infrastructure, as in exclude_globs: the codecs' test data where it is a module of the
+    # file it serves (h264/sps.rs's `test_data`, behind lotse-codec's `test-util` feature).
+    "lotse-codec/src/.*: .* in test_data::",
     # The default body already returns `None`.
     "replace Handler::unsubscribed -> Option<Event> with None",
     # The default body already returns an empty list.
@@ -93,10 +96,18 @@ exclude_re = [
     # The FU-A indicator and header (RFC 6184 §5.8): F and NRI above the type, S and E above
     # the original type, disjoint bits, so `|` and `^` produce the same value.
     "h264/nal.rs:.*replace \\| with \\^ in fu_part$",
+    # The FU-A header rebuilt from the indicator's F and NRI (0xe0) and a type of 1 to 23, and the
+    # STAP-A indicator's NRI (bits 5-6) and type 24 (bits 3-4): disjoint bits (RFC 6184 §5.7.1,
+    # §5.8), so `|` and `^` produce the same value.
+    "h264/nal.rs:.*replace \\| with \\^ in (parse|stap_a)$",
+    # The filler header that ends a unit (RFC 6184 §5.1): the dropped unit's F and NRI (0xe0) and
+    # type 12 (H.264), or its forbidden bit and layer id's high bit (0x81) and type 38 shifted
+    # left (0x4c, H.265 §7.3.1.2): disjoint bits, so `|` and `^` produce the same value.
+    "h26[45]/packet.rs:.*replace \\| with \\^ in Classified::end_of_unit$",
     # A unit of exactly the target goes through `fragment`, which returns it whole, and alone
     # either way: the same payloads in the same order.
     # (Column 27 is `unit.len() > self.max_payload`; the group check after it stays mutated.)
-    "h265/packet.rs:\\d+:27: replace > with >= in PacketNormalizer::pack_units",
+    "h26[45]/packet.rs:\\d+:27: replace > with >= in PacketNormalizer::pack_units",
     # retina's RTP channel is even, so OR-ing in the RTCP bit and XOR-ing it set the same channel.
     "lotse-rtsp/src/udp.rs:.*replace \\| with \\^ in UdpRelay::datagram$",
     # Reading one more piece of the body before the sniff decides the same: it looks at the

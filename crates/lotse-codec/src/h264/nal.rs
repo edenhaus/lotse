@@ -485,6 +485,8 @@ mod tests {
     fn header_bits_follow_14496_10_7_3_1() {
         assert_eq!(nal_type(0x65), NAL_IDR);
         assert_eq!(nri(0x65), 3);
+        assert_eq!(nri(0x41), 2);
+        assert_eq!(nri(0x06), 0);
         assert!(!forbidden_bit(0x65));
         assert!(forbidden_bit(0xe5));
         assert!(is_vcl(NAL_SLICE) && is_vcl(NAL_IDR) && !is_vcl(NAL_SPS));
@@ -614,6 +616,7 @@ mod tests {
         let mut out = vec![];
         assert!(!sets.annex_b_append(&mut out));
         assert!(sets.observe(SPS));
+        assert!(!sets.complete(), "no PPS yet");
         assert!(!sets.observe(SPS), "unchanged");
         assert!(!sets.observe(&[0x65, 0]), "not a parameter set");
         assert!(!sets.observe(&[]));
