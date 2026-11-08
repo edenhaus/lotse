@@ -5097,17 +5097,14 @@ mod tests {
         for request in [1, 2, 3] {
             driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request }));
         }
-        let refusal = next_wake(&mut driver).await;
-        assert!(
-            matches!(
-                &refusal,
-                Wake::Command(DriverCommand::Signal {
-                    command: SignalCommand::Refused { request: 3, .. },
-                    ..
-                })
-            ),
-            "the refusal of the third"
+        let_assert!(
+            Ok(DriverCommand::Signal {
+                worker,
+                command: command @ SignalCommand::Refused { request: 3, .. },
+            }) = driver.commands.try_recv(),
+            "the refusal of the third, queued for the driver"
         );
+        let refusal = Wake::Command(DriverCommand::Signal { worker, command });
         {
             let mut handled = std::pin::pin!(driver.handle(refusal));
             let real = Duration::from_millis(200);

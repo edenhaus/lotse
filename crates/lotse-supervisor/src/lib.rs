@@ -567,14 +567,17 @@ pub(crate) mod test_support {
     /// 2026-11-08), so a few dozen do; more than a thousand fail the test.
     pub(crate) async fn fill_control(worker: &mut worker::Worker) {
         let filler = "x".repeat(16 * 1024);
-        for _ in 0..1000 {
+        for sent in 0.. {
+            assert!(
+                sent < 1000,
+                "the socket took {sent} messages without a wait"
+            );
             let mut write = std::pin::pin!(worker.candidate("s1", &filler));
             match settled(&mut write, Duration::from_millis(200)).await {
-                Some(sent) => sent.unwrap(),
+                Some(written) => written.unwrap(),
                 None => return,
             }
         }
-        panic!("the control socket took a thousand 16 KiB messages without a wait");
     }
 
     /// An environment whose workers are `binary`, with the fake source and
