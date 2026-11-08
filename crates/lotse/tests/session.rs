@@ -98,6 +98,7 @@ fn front_door_with(sandbox: &str, ports: &[u16]) -> FrontDoor {
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
         },
         Some(bound.socket),
+        clock(),
     );
     let worker = manager.spawn(ports).expect("spawns");
     FrontDoor {
@@ -405,7 +406,7 @@ async fn viewer_gets_h264(sandbox: &str) {
     );
 
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -473,7 +474,7 @@ async fn sessions_are_refused_with_a_code_when_they_cannot_start() {
         .close_session("ghost", "session_closed", "")
         .await
         .expect("close");
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -639,7 +640,7 @@ async fn a_session_survives_a_camera_reconnect_and_its_clock_continues() {
     }
 
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -748,7 +749,7 @@ async fn the_daemon_adds_little_latency_and_never_waits_for_a_whole_frame() {
         "the first packet waited for its frame: {spread:?} between first and last"
     );
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -875,7 +876,7 @@ async fn abs_capture_time_carries_the_clock_maps_capture_time_to_the_viewer() {
     }
     assert!(checked.0 >= 1 && checked.1 >= 1, "checked {checked:?}");
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -923,6 +924,7 @@ async fn two_sessions_on_one_stream_send_every_datagram() {
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
         },
         Some(bound.socket),
+        clock(),
     );
     let worker = manager.spawn(&[]).expect("spawns");
     let mut door = FrontDoor {
@@ -1009,7 +1011,7 @@ async fn two_sessions_on_one_stream_send_every_datagram() {
     assert_eq!(counters.send_failures, 0, "datagrams dropped at the socket");
 
     drop(viewers);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -1095,7 +1097,7 @@ async fn a_viewer_gets_pcmu_audio_in_sync_with_video() {
     );
 
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -1178,7 +1180,7 @@ async fn rfc8829_5_3_1_a_video_first_session_answers_audio_inactive_and_plays_vi
     assert_eq!(viewer.audio_packets(), []);
 
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -1309,7 +1311,7 @@ async fn a_viewer_gets_opus_from_an_aac_camera_in_sync_with_video_by_ebu_r37() {
     );
 
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -1443,7 +1445,7 @@ async fn h265_camera_plays_and_refuses(
     );
 
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -1544,7 +1546,7 @@ async fn libwebrtc_assembles_every_picture_after_a_keyframe_that_arrives_slowly(
     );
 
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -1645,7 +1647,7 @@ async fn h265_7_4_2_4_4_parameter_sets_between_slice_segments_never_reach_the_br
     );
 
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -1768,7 +1770,7 @@ async fn libwebrtc_max_frame_packets_a_larger_keyframe_is_sent_whole_with_a_warn
     );
 
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;
@@ -1839,7 +1841,7 @@ async fn rfc2326_12_39_a_viewer_plays_a_camera_over_udp_and_the_worker_counts_it
     }
 
     registrations.unregister(UFRAG);
-    let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
+    let exit = door.worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     door.demux.stop();
     cam.stop().await;

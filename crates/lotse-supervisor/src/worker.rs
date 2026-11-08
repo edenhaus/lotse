@@ -11,10 +11,17 @@
 //! worker hand the API a quarter MiB per `stream/get`. A trim is logged
 //! once per worker, so a worker repeating an over-long message cannot
 //! flood the log either.
+//!
+//! The worker must not hold the supervisor up either: every message to it
+//! goes out within [`CONTROL_WRITE_DEADLINE`] or not at all. A worker that stops reading its control channel
+//! fills the socket's send buffer, and a write would then wait for good;
+//! one that waited out the deadline gives up on the channel, so every later
+//! write fails at once, and kills the worker, whose exit runs the crash
+//! path. Whoever sends to a worker is thus held up by at most the deadline.
 
 use std::io;
 use std::net::UdpSocket;
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -47,6 +54,26 @@ use crate::worker_text::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES};
 /// a camera declares a handful, a derived audio track adds one, and the
 /// API copies each into every `stream/get` and `stream/list`.
 pub(crate) const MAX_TRACKS: usize = 32;
+
+/// How long one message to a worker may wait for room in its control
+/// socket before the supervisor gives up on the worker: the write fails
+/// with [`IpcError::Stalled`], as does every later one, and the worker is
+/// killed.
+///
+/// A healthy worker takes its control messages as its loop turns, and the
+/// socket's send buffer holds a few hundred of the usual ones (about
+/// 208 KiB, `net.core.wmem_default`, observed on Linux 6.18, 2026-11-08),
+/// so a write waits only once that much went unread: the worker's loop
+/// stopped turning, or it never reads. The deadline only has to cover a
+/// scheduling hiccup or a worker's start, not a slow peer, and two seconds
+/// is far beyond either. It is the default shutdown budget
+/// ([`SHUTDOWN_BUDGET`](crate::SHUTDOWN_BUDGET)), the time a healthy worker
+/// is given to take its `Shutdown` and finish everything, so a driver held
+/// up by a write still stops within the time the supervisor waits for its
+/// drivers at shutdown; and a fifth of the ten seconds after which a
+/// worker that sends nothing is taken for hung (the driver's
+/// `WORKER_SILENCE_LIMIT`).
+pub const CONTROL_WRITE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How a worker is started.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +194,8 @@ pub enum SpawnError {
 pub struct WorkerManager {
     /// How workers are started.
     config: WorkerConfig,
+    /// The clock every worker's write deadline and stop budget run on.
+    clock: Arc<dyn Clock>,
     /// The shared WebRTC UDP socket every worker gets a duplicate of;
     /// `None` in tests that run no sessions.
     udp: Option<Arc<UdpSocket>>,
@@ -176,10 +205,16 @@ pub struct WorkerManager {
 }
 
 impl WorkerManager {
-    /// A manager starting workers as `config` says, handing each `udp`.
-    pub const fn new(config: WorkerConfig, udp: Option<Arc<UdpSocket>>) -> Self {
+    /// A manager starting workers as `config` says, handing each `udp`,
+    /// their write deadlines and stop budgets running on `clock`.
+    pub const fn new(
+        config: WorkerConfig,
+        udp: Option<Arc<UdpSocket>>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             config,
+            clock,
             udp,
             turn: None,
         }
@@ -274,6 +309,8 @@ impl WorkerManager {
             pid,
             child,
             control,
+            stalled: false,
+            clock: Arc::clone(&self.clock),
             events,
             reader,
             _uplink: uplink,
@@ -506,8 +543,14 @@ pub struct Worker {
     pid: u32,
     /// The process.
     child: Child,
-    /// The sending half of the control channel.
+    /// The sending half of the control channel, written only through
+    /// [`Worker::send`].
     control: Sender,
+    /// A write waited out [`CONTROL_WRITE_DEADLINE`]: the channel is given
+    /// up on, and nothing is written to it any more ([`IpcError::Stalled`]).
+    stalled: bool,
+    /// The clock the write deadline and the stop budget run on.
+    clock: Arc<dyn Clock>,
     /// The relayed events.
     events: mpsc::Receiver<WorkerEvent>,
     /// The relay task.
@@ -544,12 +587,47 @@ impl Worker {
         Arc::clone(&self.datagrams)
     }
 
+    /// Sends `message` with `fds`: the one way anything reaches the
+    /// worker, within [`CONTROL_WRITE_DEADLINE`] or not at all.
+    ///
+    /// The write waits only while the socket's send buffer is full, which
+    /// a worker that reads nothing makes it (a non-blocking `sendmsg(2)` on
+    /// a full `AF_UNIX` stream socket fails with `EAGAIN` and the runtime
+    /// waits for room; observed on Linux 6.18, 2026-11-08). One that waits
+    /// out the deadline is abandoned, possibly mid-frame, so the channel is
+    /// given up on: this and every later write fail with
+    /// [`IpcError::Stalled`] without touching the socket, and the worker,
+    /// which can no longer be told anything, is killed. Its exit arrives
+    /// as [`WorkerEvent::Exited`], which counts as a crash. A caller is
+    /// thus held up by at most the deadline.
+    async fn send(&mut self, message: &ToWorker, fds: &[BorrowedFd<'_>]) -> Result<(), IpcError> {
+        let deadline_ms = crate::millis(CONTROL_WRITE_DEADLINE);
+        if self.stalled {
+            return Err(IpcError::Stalled { deadline_ms });
+        }
+        let deadline = self.clock.sleep(CONTROL_WRITE_DEADLINE);
+        tokio::select! {
+            biased;
+            sent = self.control.send_msg(message, fds) => sent,
+            () = deadline => {
+                self.stalled = true;
+                tracing::warn!(
+                    pid = self.pid,
+                    kind = message.name(),
+                    deadline_ms,
+                    "worker took no control message within the deadline; its channel is given up on"
+                );
+                self.kill("control write timed out");
+                Err(IpcError::Stalled { deadline_ms })
+            }
+        }
+    }
+
     /// Hands the worker its sockets with the first message it gets, so
     /// they are there whatever comes first.
     async fn send_pending_sockets(&mut self) -> Result<(), IpcError> {
         if let Some((udp, theirs)) = self.pending_sockets.take() {
-            self.control
-                .send_msg(&ToWorker::Sockets, &[udp.as_fd(), theirs.as_fd()])
+            self.send(&ToWorker::Sockets, &[udp.as_fd(), theirs.as_fd()])
                 .await?;
         }
         Ok(())
@@ -558,41 +636,33 @@ impl Worker {
     /// Tells the worker which source to run.
     pub async fn run_source(&mut self, spec: &SourceSpec) -> Result<(), IpcError> {
         self.send_pending_sockets().await?;
-        self.control
-            .send_msg(&ToWorker::RunSource(spec.clone()), &[])
-            .await
+        self.send(&ToWorker::RunSource(spec.clone()), &[]).await
     }
 
     /// Lets the connection attempt the worker announced go ahead: the
     /// driver holds a connect permit for it.
     pub async fn grant_connect(&mut self) -> Result<(), IpcError> {
-        self.control.send_msg(&ToWorker::ConnectGranted, &[]).await
+        self.send(&ToWorker::ConnectGranted, &[]).await
     }
 
     /// Tells the worker to connect `spec` as the standby of its source and
     /// switch to it at its first keyframe.
     pub async fn switch_source(&mut self, spec: &SourceSpec) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::SwitchSource(spec.clone()), &[])
-            .await
+        self.send(&ToWorker::SwitchSource(spec.clone()), &[]).await
     }
 
     /// Tells the worker whether its connection asks for the camera's
     /// backchannel from now on (`asks`): its sources turn their probe on
     /// or off, and nothing restarts.
     pub async fn backchannel(&mut self, asks: bool) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::Backchannel { asks }, &[])
-            .await
+        self.send(&ToWorker::Backchannel { asks }, &[]).await
     }
 
     /// Tells the worker its connection's pre-record window is `ms` from now
     /// on, 0 for none: its tracks keep or free their rings, and nothing
     /// reconnects.
     pub async fn prerecord(&mut self, ms: u32) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::Prerecord { ms }, &[])
-            .await
+        self.send(&ToWorker::Prerecord { ms }, &[]).await
     }
 
     /// Starts the event recording `spec` on the worker's tracks, its bytes going
@@ -606,8 +676,7 @@ impl Worker {
         spec: &RecordingSpec,
         pipe: OwnedFd,
     ) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::StartRecording(spec.clone()), &[pipe.as_fd()])
+        self.send(&ToWorker::StartRecording(spec.clone()), &[pipe.as_fd()])
             .await
     }
 
@@ -617,20 +686,17 @@ impl Worker {
         let message = ToWorker::StopRecording {
             recording_id: recording_id.to_owned(),
         };
-        self.control.send_msg(&message, &[]).await
+        self.send(&message, &[]).await
     }
 
     /// Lets the standby's announced attempt go ahead.
     pub async fn grant_switch_connect(&mut self) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::SwitchConnectGranted, &[])
-            .await
+        self.send(&ToWorker::SwitchConnectGranted, &[]).await
     }
 
     /// Lets the probe `probe` the worker announced go ahead.
     pub async fn grant_probe_connect(&mut self, probe: u64) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::ProbeConnectGranted { probe }, &[])
+        self.send(&ToWorker::ProbeConnectGranted { probe }, &[])
             .await
     }
 
@@ -648,43 +714,39 @@ impl Worker {
             peer,
             first_frame,
         };
-        self.control.send_msg(&message, &[stream.as_fd()]).await
+        self.send(&message, &[stream.as_fd()]).await
     }
 
     /// Opens a viewer session on the worker's source; the answer and the
     /// rest arrive as [`WorkerEvent::Session`] events.
     pub async fn open_session(&mut self, spec: &SessionSpec) -> Result<(), IpcError> {
         self.send_pending_sockets().await?;
-        self.control
-            .send_msg(&ToWorker::OpenSession(spec.clone()), &[])
-            .await
+        self.send(&ToWorker::OpenSession(spec.clone()), &[]).await
     }
 
     /// Passes a trickled remote candidate to a session.
     pub async fn candidate(&mut self, session_id: &str, candidate: &str) -> Result<(), IpcError> {
-        self.control
-            .send_msg(
-                &ToWorker::RemoteCandidate {
-                    session_id: session_id.to_owned(),
-                    candidate: candidate.to_owned(),
-                },
-                &[],
-            )
-            .await
+        self.send(
+            &ToWorker::RemoteCandidate {
+                session_id: session_id.to_owned(),
+                candidate: candidate.to_owned(),
+            },
+            &[],
+        )
+        .await
     }
 
     /// A re-offer for a session (`webrtc/renegotiate`); the worker
     /// answers with a `Renegotiated` or `RenegotiateRefused` report.
     pub async fn renegotiate(&mut self, session_id: &str, sdp: &str) -> Result<(), IpcError> {
-        self.control
-            .send_msg(
-                &ToWorker::Renegotiate {
-                    session_id: session_id.to_owned(),
-                    sdp: sdp.to_owned(),
-                },
-                &[],
-            )
-            .await
+        self.send(
+            &ToWorker::Renegotiate {
+                session_id: session_id.to_owned(),
+                sdp: sdp.to_owned(),
+            },
+            &[],
+        )
+        .await
     }
 
     /// Hands a session the relay candidate at `relayed`, on the
@@ -706,7 +768,7 @@ impl Worker {
             local,
             tcp,
         };
-        self.control.send_msg(&message, &[]).await
+        self.send(&message, &[]).await
     }
 
     /// Hands a session the channel bound to `peer` on its relay candidate
@@ -724,7 +786,7 @@ impl Worker {
             peer,
             channel,
         };
-        self.control.send_msg(&message, &[]).await
+        self.send(&message, &[]).await
     }
 
     /// Tells a session its stream's orientation changed to the one
@@ -738,7 +800,7 @@ impl Worker {
             session_id: session_id.to_owned(),
             orientation,
         };
-        self.control.send_msg(&message, &[]).await
+        self.send(&message, &[]).await
     }
 
     /// Frees the connection's backchannel from its talker, or only from
@@ -747,17 +809,14 @@ impl Worker {
         &mut self,
         session_id: Option<String>,
     ) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::ReleaseBackchannel { session_id }, &[])
+        self.send(&ToWorker::ReleaseBackchannel { session_id }, &[])
             .await
     }
 
     /// Tells the worker what the supervisor answers its signaled source's
     /// signaling with: an open's answer, or what the client relays.
     pub async fn signal(&mut self, command: &SignalCommand) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::Signal(command.clone()), &[])
-            .await
+        self.send(&ToWorker::Signal(command.clone()), &[]).await
     }
 
     /// Closes a session with this `closed` code.
@@ -767,16 +826,15 @@ impl Worker {
         code: &str,
         message: &str,
     ) -> Result<(), IpcError> {
-        self.control
-            .send_msg(
-                &ToWorker::CloseSession {
-                    session_id: session_id.to_owned(),
-                    code: code.to_owned(),
-                    message: message.to_owned(),
-                },
-                &[],
-            )
-            .await
+        self.send(
+            &ToWorker::CloseSession {
+                session_id: session_id.to_owned(),
+                code: code.to_owned(),
+                message: message.to_owned(),
+            },
+            &[],
+        )
+        .await
     }
 
     /// The next event: a relayed message, or the exit. After `Exited`, every
@@ -792,8 +850,9 @@ impl Worker {
         }
     }
 
-    /// Kills the process for `reason`, once: one whose channel ended, or
-    /// that went silent, can no longer be told to stop. Its exit arrives as
+    /// Kills the process for `reason`, once: one whose channel ended, that
+    /// went silent, or that took no message within the write deadline
+    /// ([`CONTROL_WRITE_DEADLINE`]) can no longer be told to stop. Its exit arrives as
     /// [`WorkerEvent::Exited`], which counts as a crash.
     pub fn kill(&mut self, reason: &'static str) {
         if self.killed {
@@ -807,18 +866,28 @@ impl Worker {
 
     /// Asks the worker to shut down within `budget`, then kills it if it is
     /// still there. Returns how it exited.
-    pub async fn stop(mut self, budget: Duration, clock: &Arc<dyn Clock>) -> ExitStatus {
+    ///
+    /// The budget covers the whole stop, the `Shutdown` message included:
+    /// a worker that takes no message is killed when the budget or the
+    /// write's own deadline ([`CONTROL_WRITE_DEADLINE`]) runs out,
+    /// whichever comes first, and one whose channel was given up on gets no
+    /// message at all.
+    pub async fn stop(mut self, budget: Duration) -> ExitStatus {
         let deadline_ms = u32::try_from(budget.as_millis()).unwrap_or(u32::MAX);
-        if let Err(err) = self
-            .control
-            .send_msg(&ToWorker::Shutdown { deadline_ms }, &[])
-            .await
-        {
-            tracing::debug!(pid = self.pid, error = %err, "worker unreachable for shutdown; killing");
-        }
+        let pid = self.pid;
+        let over = self.clock.sleep(budget);
         let status = tokio::select! {
-            status = self.child.wait() => status,
-            () = clock.sleep(budget) => {
+            status = async {
+                if let Err(err) = self.send(&ToWorker::Shutdown { deadline_ms }, &[]).await {
+                    tracing::debug!(
+                        pid,
+                        error = %err,
+                        "worker unreachable for shutdown; killed unless it exits within the budget"
+                    );
+                }
+                self.child.wait().await
+            } => status,
+            () = over => {
                 tracing::warn!(pid = self.pid, budget_ms = deadline_ms, "worker missed the shutdown budget; killing");
                 let _already_gone = self.child.start_kill();
                 self.child.wait().await
@@ -1415,7 +1484,7 @@ mod tests {
             ..RecordingLimits::DEFAULT
         };
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
-        let manager = WorkerManager::new(config, Some(udp));
+        let manager = WorkerManager::new(config, Some(udp), Arc::new(SystemClock));
         let mut worker = manager.spawn(&[554, 8554]).unwrap();
         let spec = SourceSpec {
             connection_id: "c1".into(),
@@ -1532,7 +1601,7 @@ mod tests {
         let mut config = crate::test_support::environment("/bin/sh").worker;
         config.binary = script;
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
-        let manager = WorkerManager::new(config, Some(udp));
+        let manager = WorkerManager::new(config, Some(udp), Arc::new(SystemClock));
         let worker = manager.spawn(&[554]).unwrap();
         let proc = PathBuf::from(format!("/proc/{}", worker.pid()));
         // The shell holds its script open until it `exec`s `sleep`: look
@@ -1612,9 +1681,11 @@ mod tests {
     #[tokio::test]
     async fn a_worker_reaped_elsewhere_is_a_channel_error_and_stops_without_a_status() {
         use rustix::process::{Pid, WaitOptions, waitpid};
+        // The fake clock never moves: the failed wait ends the stop.
         let manager = WorkerManager::new(
             crate::test_support::environment("/usr/bin/true").worker,
             None,
+            Arc::new(FakeClock::default()),
         );
         let mut worker = manager.spawn(&[]).unwrap();
         // Reaped before the runtime looks: its wait fails with `ECHILD`.
@@ -1632,9 +1703,7 @@ mod tests {
         );
         let captured = Captured::default();
         let _logs = captured.install();
-        // The fake clock never moves: the failed wait ends the stop.
-        let clock: Arc<dyn Clock> = Arc::new(FakeClock::default());
-        let status = worker.stop(Duration::from_secs(1), &clock).await;
+        let status = worker.stop(Duration::from_secs(1)).await;
         assert_eq!(status, ExitStatus::default());
         assert_eq!(
             captured.lines("worker unreachable for shutdown").len(),
@@ -1642,6 +1711,173 @@ mod tests {
             "its channel is gone"
         );
         assert_eq!(captured.lines("worker exit could not be observed").len(), 1);
+    }
+
+    /// A worker at `dir/worker.sh` that never reads its control channel,
+    /// started on `clock`.
+    fn deaf_worker(dir: &std::path::Path, clock: Arc<dyn Clock>) -> Worker {
+        let script = dir.join("worker.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mut config = crate::test_support::environment("/bin/sh").worker;
+        config.binary = script;
+        WorkerManager::new(config, None, clock).spawn(&[]).unwrap()
+    }
+
+    /// Regression: a worker that stopped reading its control channel held
+    /// every write to it, and so its driver, for good. Once the socket's
+    /// send buffer is full a write waits for room (a non-blocking
+    /// `sendmsg(2)` on a full `AF_UNIX` stream socket fails with `EAGAIN`,
+    /// observed on Linux 6.18, 2026-11-08); the deadline, on the injected
+    /// clock, now ends the wait, kills the worker and gives its channel up,
+    /// so every later write fails at once.
+    #[tokio::test]
+    async fn a_write_to_a_worker_that_reads_nothing_ends_at_its_deadline_and_kills_the_worker() {
+        use crate::test_support::{fill_control, settled};
+        let dir = crate::test_support::private_dir("worker-deaf");
+        let clock = Arc::new(FakeClock::default());
+        let mut worker = deaf_worker(&dir, clock.clone());
+        fill_control(&mut worker).await;
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let deadline_ms = 2_000;
+        assert_eq!(CONTROL_WRITE_DEADLINE, Duration::from_millis(deadline_ms));
+        {
+            let mut write = std::pin::pin!(worker.grant_connect());
+            let real = Duration::from_millis(200);
+            assert!(settled(&mut write, real).await.is_none(), "the write waits");
+            clock.advance(
+                CONTROL_WRITE_DEADLINE
+                    .checked_sub(Duration::from_millis(1))
+                    .unwrap(),
+            );
+            assert!(
+                settled(&mut write, real).await.is_none(),
+                "not before the deadline"
+            );
+            clock.advance(Duration::from_millis(1));
+            let err = settled(&mut write, Duration::from_secs(5))
+                .await
+                .expect("the deadline ends the write")
+                .unwrap_err();
+            assert!(
+                matches!(err, IpcError::Stalled { deadline_ms: 2_000 }),
+                "{err}"
+            );
+        }
+        let lines = captured.lines("worker took no control message within the deadline");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let pid = worker.pid();
+        for field in [
+            format!("pid={pid}"),
+            "kind=\"connect_granted\"".to_owned(),
+            "deadline_ms=2000".to_owned(),
+        ] {
+            assert!(lines[0].contains(&field), "{field}: {lines:?}");
+        }
+        let killed = captured.lines("worker killed");
+        assert_eq!(killed.len(), 1, "{killed:?}");
+        assert!(killed[0].contains("control write timed out"), "{killed:?}");
+        // Every later write fails at once, the clock standing still, and
+        // the worker is killed only once.
+        let signal = SignalCommand::Gone {
+            signal_id: "01JSIG".into(),
+        };
+        {
+            let mut write = std::pin::pin!(worker.signal(&signal));
+            let err = settled(&mut write, Duration::from_secs(5))
+                .await
+                .expect("at once")
+                .unwrap_err();
+            assert!(
+                matches!(err, IpcError::Stalled { deadline_ms: 2_000 }),
+                "{err}"
+            );
+        }
+        let err = worker.prerecord(0).await.unwrap_err();
+        assert!(matches!(err, IpcError::Stalled { .. }), "{err}");
+        assert_eq!(captured.lines("worker killed").len(), 1);
+        assert_eq!(
+            captured
+                .lines("worker took no control message within the deadline")
+                .len(),
+            1
+        );
+        // Its exit counts as a crash.
+        let mut event = WorkerEvent::ChannelClosed;
+        while event == WorkerEvent::ChannelClosed {
+            event = worker.next_event().await;
+        }
+        assert!(
+            matches!(&event, WorkerEvent::Exited(status) if status.signal() == Some(9)),
+            "{event:?}"
+        );
+        // A stop sends nothing on the given-up channel.
+        let status = worker.stop(Duration::from_secs(1)).await;
+        assert_eq!(status.signal(), Some(9));
+        let unreachable = captured.lines("worker unreachable for shutdown");
+        assert_eq!(unreachable.len(), 1, "{unreachable:?}");
+        assert!(unreachable[0].contains("abandoned"), "{unreachable:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A stop's budget covers its `Shutdown` too: a worker that reads
+    /// nothing is killed when the budget runs out, or the write's own
+    /// deadline when that comes first, and the stop ends then.
+    #[tokio::test]
+    async fn a_stop_of_a_worker_that_reads_nothing_ends_within_its_budget() {
+        use crate::test_support::{fill_control, settled};
+        let dir = crate::test_support::private_dir("worker-deaf-stop");
+        let captured = Captured::default();
+        let _logs = captured.install();
+        // A budget shorter than the write's deadline.
+        let clock = Arc::new(FakeClock::default());
+        let mut worker = deaf_worker(&dir, clock.clone());
+        fill_control(&mut worker).await;
+        let budget = Duration::from_millis(500);
+        let mut stop = std::pin::pin!(worker.stop(budget));
+        let real = Duration::from_millis(200);
+        assert!(settled(&mut stop, real).await.is_none(), "the write waits");
+        clock.advance(budget.checked_sub(Duration::from_millis(1)).unwrap());
+        assert!(
+            settled(&mut stop, real).await.is_none(),
+            "within the budget"
+        );
+        clock.advance(Duration::from_millis(1));
+        let status = settled(&mut stop, Duration::from_secs(5))
+            .await
+            .expect("the budget ends the stop");
+        assert_eq!(status.signal(), Some(9));
+        let missed = captured.lines("worker missed the shutdown budget");
+        assert_eq!(missed.len(), 1, "{missed:?}");
+        assert!(missed[0].contains("budget_ms=500"), "{missed:?}");
+        assert!(
+            captured.lines("worker killed").is_empty(),
+            "the stop's own kill"
+        );
+        // A budget longer than it: the write's deadline kills the worker.
+        let clock = Arc::new(FakeClock::default());
+        let mut worker = deaf_worker(&dir, clock.clone());
+        fill_control(&mut worker).await;
+        let mut stop = std::pin::pin!(worker.stop(Duration::from_secs(5)));
+        assert!(settled(&mut stop, real).await.is_none(), "the write waits");
+        clock.advance(CONTROL_WRITE_DEADLINE);
+        let status = settled(&mut stop, Duration::from_secs(5))
+            .await
+            .expect("the write's deadline ends the stop");
+        assert_eq!(status.signal(), Some(9));
+        let killed = captured.lines("worker killed");
+        assert_eq!(killed.len(), 1, "{killed:?}");
+        assert!(killed[0].contains("control write timed out"), "{killed:?}");
+        let unreachable = captured.lines("worker unreachable for shutdown");
+        assert_eq!(unreachable.len(), 1, "{unreachable:?}");
+        assert_eq!(
+            captured.lines("worker missed the shutdown budget").len(),
+            1,
+            "the second budget did not run out"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -1658,6 +1894,7 @@ mod tests {
                 recordings: RecordingLimits::DEFAULT,
             },
             None,
+            Arc::new(SystemClock),
         );
         let err = manager.spawn(&[554]).unwrap_err();
         assert!(matches!(err, SpawnError::Spawn { .. }), "{err}");

@@ -49,6 +49,21 @@ pub enum IpcError {
     /// The socket failed.
     #[error("channel i/o failed: {0}")]
     Io(#[from] std::io::Error),
+    /// The peer took nothing off the channel for `deadline_ms`: a write
+    /// waited that long for room in the socket, and its writer gave up on
+    /// the channel. The abandoned write may have left part of a frame on
+    /// the stream, after which the peer could not tell one message from
+    /// the next, so every later write on the channel fails with this as
+    /// well, without touching the socket. The [`Sender`](crate::Sender)
+    /// itself knows no deadline: its user races [`Sender::send`] against
+    /// one and reports this.
+    ///
+    /// [`Sender::send`]: crate::Sender::send
+    #[error("the peer read nothing for {deadline_ms} ms; the channel is abandoned")]
+    Stalled {
+        /// The deadline the write missed, in milliseconds.
+        deadline_ms: u64,
+    },
 }
 
 /// Encodes `message`, refusing one that would exceed the cap.
@@ -184,6 +199,10 @@ mod tests {
         assert_eq!(
             IpcError::Encode("x".into()).to_string(),
             "message does not encode: x"
+        );
+        assert_eq!(
+            IpcError::Stalled { deadline_ms: 2000 }.to_string(),
+            "the peer read nothing for 2000 ms; the channel is abandoned"
         );
         let io: IpcError = std::io::Error::other("boom").into();
         assert_eq!(io.to_string(), "channel i/o failed: boom");

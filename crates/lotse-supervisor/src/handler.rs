@@ -241,9 +241,9 @@ impl Supervisor {
             RecordingLimits::NONE
         };
         let shared = Arc::new(Shared {
-            clock,
-            manager: WorkerManager::new(environment.worker, environment.udp)
+            manager: WorkerManager::new(environment.worker, environment.udp, Arc::clone(&clock))
                 .with_turn(turn.clone()),
+            clock,
             tracker: TaskTracker::new(),
             shutdown_budget: settings.shutdown_budget,
             connects: ConnectPermits::new(settings.connect_concurrency),
