@@ -932,6 +932,54 @@ fn rfc3264_7_every_accepted_h264_format_goes_to_the_video_track_and_others_are_d
 }
 
 #[test]
+fn rfc3550_a_1_a_packet_of_another_accepted_codec_is_received_so_no_loss() {
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    let ingest = Arc::new(IngestCounters::default());
+    pair.engine.count_into(Arc::clone(&ingest));
+    pair.answer(camera_config(false).enable_h265(true), |answer| answer);
+    pair.connect();
+    let video = pair.camera().video.unwrap();
+    let h264 = pair.camera().pts(video, EngineCodec::H264)[0];
+    let h265 = pair.camera().pts(video, EngineCodec::H265)[0];
+    // Past the first keyframe and the PLI spacing: a loss would ask for
+    // one now.
+    pair.frame(true);
+    pair.engine.keyframe_seen();
+    pair.step(PLI_INTERVAL);
+    let plis = pair.engine.stats().plis;
+    let before = pair.rtp().len();
+    // n carried, n + 1 in H.265 (dropped from the H.264 track), n + 2
+    // carried.
+    let n = pair.camera().seq;
+    let now = pair.now;
+    pair.camera().write(now, h264, true, &[0x41, 0x00]);
+    pair.camera().write(now, h265, true, &[0x02, 0x01, 0x00]);
+    pair.camera().write(now, h264, true, &[0x41, 0x00]);
+    pair.step(Duration::ZERO);
+    let stats = pair.engine.stats();
+    assert_eq!(stats.other_codec_packets, 1);
+    assert_eq!(stats.lost_packets, 0);
+    assert_eq!(ingest.snapshot().packets_lost, 0);
+    assert_eq!(stats.plis, plis, "no loss, no keyframe request");
+    assert_eq!(
+        pair.rtp()[before..]
+            .iter()
+            .map(|(_, seq, _)| *seq)
+            .collect::<Vec<_>>(),
+        [n, n + 2]
+    );
+    // A real gap before a packet in the other codec is still a loss, and
+    // asks for a keyframe.
+    pair.camera().seq = n + 5;
+    pair.camera().write(now, h265, true, &[0x02, 0x01, 0x00]);
+    pair.step(Duration::ZERO);
+    assert_eq!(pair.engine.stats().lost_packets, 2);
+    assert_eq!(pair.engine.stats().plis, plis + 1);
+    assert_eq!(pair.engine.stats().other_codec_packets, 2);
+}
+
+#[test]
 fn rfc3264_7_a_packet_of_another_accepted_codec_is_dropped_not_switched() {
     let captured = Captured::default();
     let writer = captured.clone();
