@@ -50,6 +50,7 @@ fn manager_with_sandbox(sandbox: &str) -> WorkerManager {
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
         },
         Some(Arc::new(udp)),
+        Arc::new(SystemClock),
     )
 }
 
@@ -67,7 +68,6 @@ fn spec(options: &str) -> SourceSpec {
 
 #[tokio::test]
 async fn a_worker_runs_the_fake_source_and_stops_within_the_budget() {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut worker = manager().spawn(&[554]).expect("spawns");
     let pid = worker.pid();
     let WorkerEvent::Ready { pid: ready, memory } = worker.next_event().await else {
@@ -98,7 +98,7 @@ async fn a_worker_runs_the_fake_source_and_stops_within_the_budget() {
     };
     assert_eq!(stats.tracks[0].0, "v0");
 
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
 }
 
@@ -142,10 +142,9 @@ async fn a_worker_crash_is_observed_and_contained() {
     assert!(!status.success());
     assert_eq!(status.signal(), Some(6), "SIGABRT, got {status:?}");
     // The supervisor side is unaffected: it can start another worker.
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut next = manager().spawn(&[]).expect("spawns again");
     assert!(matches!(next.next_event().await, WorkerEvent::Ready { .. }));
-    assert!(next.stop(Duration::from_secs(5), &clock).await.success());
+    assert!(next.stop(Duration::from_secs(5)).await.success());
 }
 
 /// A recording's pipe crosses into a worker under its sandbox with its
@@ -155,7 +154,6 @@ async fn a_worker_crash_is_observed_and_contained() {
 /// container and refuses every recording `internal_error` first.
 #[tokio::test]
 async fn a_sandboxed_worker_takes_a_recording_s_pipe_and_closes_it() {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut worker = manager_with_sandbox("on").spawn(&[]).expect("spawns");
     assert!(matches!(
         worker.next_event().await,
@@ -196,7 +194,7 @@ async fn a_sandboxed_worker_takes_a_recording_s_pipe_and_closes_it() {
     let mut rest = Vec::new();
     std::io::Read::read_to_end(&mut reader, &mut rest).expect("reads to the end");
     assert_eq!(rest, b"");
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
 }
 
@@ -265,7 +263,7 @@ async fn a_sandboxed_worker_plays_rtsps_on_its_own_connection() {
         worker.next_event().await,
         WorkerEvent::Report(WorkerReport::Live)
     );
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     cam.stop().await;
 }
@@ -315,7 +313,7 @@ async fn a_sandboxed_worker_receives_rtsp_media_over_udp() {
         WorkerEvent::Report(WorkerReport::Live)
     );
     assert_eq!(Stats::get(&cam.stats().udp_setups), 1);
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     cam.stop().await;
 }
@@ -353,7 +351,6 @@ async fn play_http_in_sandbox(
     url: String,
     options: String,
 ) {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut worker = manager_with_sandbox("on")
         .spawn(&[server.addr().port()])
         .expect("spawns");
@@ -385,7 +382,7 @@ async fn play_http_in_sandbox(
         worker.next_event().await,
         WorkerEvent::Report(WorkerReport::Live)
     );
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
 }
 
@@ -444,7 +441,6 @@ async fn a_sandboxed_worker_plays_hls_over_https_with_a_pinned_certificate() {
 #[cfg(all(feature = "source-http", feature = "output-recording"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sandboxed_worker_records_a_recording_into_its_pipe() {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let server = lotse_testing::fake_http::FakeHttp::start()
         .await
         .expect("server binds");
@@ -544,7 +540,7 @@ async fn a_sandboxed_worker_records_a_recording_into_its_pipe() {
     assert_eq!(*bytes, u64::try_from(file.len()).unwrap());
     // ISO/IEC 14496-12 §4.3: the file begins with its `ftyp` box.
     assert_eq!(file.get(4..8), Some(&b"ftyp"[..]), "{} bytes", file.len());
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     server.stop().await;
 }

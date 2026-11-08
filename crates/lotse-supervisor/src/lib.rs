@@ -545,6 +545,41 @@ pub(crate) mod test_support {
         }
     }
 
+    /// What `future` gives within `real` time on the system clock, `None`
+    /// while it is still pending then: a write to a worker waits on its
+    /// socket, which no fake clock moves.
+    pub(crate) async fn settled<F: Future + Unpin>(
+        future: &mut F,
+        real: Duration,
+    ) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            output = future => Some(output),
+            () = SystemClock.sleep(real) => None,
+        }
+    }
+
+    /// Fills the control socket of `worker`, which never reads it, until a
+    /// write waits for room: 16 KiB messages until one is still pending
+    /// after 200 ms. That write is dropped, maybe mid-frame, which a worker
+    /// that never reads cannot tell. The socket's send buffer holds about
+    /// 208 KiB (`net.core.wmem_default`, observed on Linux 6.18,
+    /// 2026-11-08), so a few dozen do; more than a thousand fail the test.
+    pub(crate) async fn fill_control(worker: &mut worker::Worker) {
+        let filler = "x".repeat(16 * 1024);
+        for sent in 0.. {
+            assert!(
+                sent < 1000,
+                "the socket took {sent} messages without a wait"
+            );
+            let mut write = std::pin::pin!(worker.candidate("s1", &filler));
+            match settled(&mut write, Duration::from_millis(200)).await {
+                Some(written) => written.unwrap(),
+                None => return,
+            }
+        }
+    }
+
     /// An environment whose workers are `binary`, with the fake source and
     /// the signaled fake source (`fake-signaled`).
     pub(crate) fn environment(binary: &str) -> Environment {
