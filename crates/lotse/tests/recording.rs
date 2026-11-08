@@ -362,7 +362,7 @@ impl Mp4 {
                 for trun in &traf.trun {
                     let offset = usize::try_from(trun.data_offset.expect("a data offset")).unwrap();
                     let mut at = start + offset;
-                    for entry in &trun.entries {
+                    for entry in &trun.samples {
                         let size = usize::try_from(entry.size.expect("a size")).unwrap();
                         let duration = u64::from(entry.duration.expect("a duration"));
                         let flags = entry

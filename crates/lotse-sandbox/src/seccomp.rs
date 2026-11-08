@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn every_profile_compiles_to_a_filter() {
         let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
-        assert!(!errno_filter(arch).unwrap().is_empty());
+        assert_ne!(errno_filter(arch).unwrap(), []);
         let empty = [
             Profile::Supervisor {
                 binary: "/lotse".into(),

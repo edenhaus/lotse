@@ -1334,7 +1334,7 @@ async fn onvif_5_3_a_re_offer_adds_talk_back_whose_tone_reaches_the_camera() {
         .pump(&mut [&mut peer], |_, peers| peers[0].viewer.is_connected())
         .await;
     assert_eq!(peer.viewer.talkback_direction(), None);
-    assert!(worker.talkers.is_empty());
+    assert_eq!(worker.talkers, []);
     let reoffer = peer
         .viewer
         .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
@@ -2665,8 +2665,8 @@ async fn rfc8829_5_3_1_a_talk_only_session_beside_a_viewer_talks_to_the_camera()
     pump_for(&mut api, &mut [&mut v, &mut t], Duration::from_millis(500)).await;
     assert!(v.peer.viewer.packets().len() > video, "the viewer plays on");
     assert!(v.peer.viewer.packets().len() >= 15, "{video}");
-    assert!(t.peer.viewer.packets().is_empty());
-    assert!(t.peer.viewer.audio_packets().is_empty());
+    assert_eq!(t.peer.viewer.packets(), []);
+    assert_eq!(t.peer.viewer.audio_packets(), []);
 
     let mut u = ApiPeer::offer_talk_only(&api, "u").await;
     pump(&mut api, &mut [&mut v, &mut t, &mut u], |_, peers| {

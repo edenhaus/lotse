@@ -366,10 +366,10 @@ mod tests {
         let mut d = AacDepacketizer::new(1024);
         let (r, out) = push(&mut d, 65_535, 7, false, &fragment(9, b"abcd"));
         r.unwrap();
-        assert!(out.is_empty());
+        assert_eq!(out, []);
         let (r, out) = push(&mut d, 0, 7, false, &fragment(9, b"ef"));
         r.unwrap();
-        assert!(out.is_empty());
+        assert_eq!(out, []);
         let (r, out) = push(&mut d, 1, 7, true, &fragment(9, b"ghi"));
         r.unwrap();
         assert_eq!(out[0].payload, Bytes::from_static(b"abcdefghi"));
@@ -471,7 +471,7 @@ mod tests {
         // A fragment announcing more than the limit is not reassembled.
         let (r, out) = push(&mut d, 2, 2048, false, &fragment(9, b"abc"));
         r.unwrap();
-        assert!(out.is_empty());
+        assert_eq!(out, []);
         assert_eq!(d.stats().dropped_oversize, 2);
         assert_eq!(d.stats().dropped_lost, 0);
         // A unit of exactly the limit is kept, whole or fragmented.
