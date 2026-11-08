@@ -16,6 +16,8 @@ exclude_re = [
     "lotse-codec/src/.*: .* in test_data::",
     # The default body already returns `None`.
     "replace Handler::unsubscribed -> Option<Event> with None",
+    # The default body already does nothing.
+    "replace Handler::connection_closed with \\(\\)",
     # The default body already returns an empty list.
     "replace OutputFactory::session_tracks -> Vec<TrackRequest> with vec!\\[\\]",
     # The recording takes the later of it and the media times it saw, the default's value.
