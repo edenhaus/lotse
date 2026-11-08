@@ -4469,7 +4469,7 @@ mod tests {
             })
         };
         recorded(&out, &refused(2)).await;
-        assert!(waiting(&driver).is_empty());
+        assert_eq!(waiting(&driver), Vec::<u64>::new());
         let worker = driver.worker.take().unwrap();
         drop(driver);
         let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
@@ -4507,7 +4507,7 @@ mod tests {
                 assert_eq!(waiting(&driver), [1]);
             }
         }
-        assert!(waiting(&driver).is_empty());
+        assert_eq!(waiting(&driver), Vec::<u64>::new());
         let seen = recorded(&out, &lotse_ipc::ToWorker::Signal(refused(1, "current"))).await;
         assert!(
             !seen.contains(&lotse_ipc::ToWorker::Signal(refused(1, "stale"))),
@@ -4586,7 +4586,7 @@ mod tests {
         driver.ended_signals.push_back("ended".into());
         driver.worker = Some(dead_worker(&shared).await);
         driver.on_worker_exited(ExitStatus::default());
-        assert!(waiting(&driver).is_empty());
+        assert_eq!(waiting(&driver), Vec::<u64>::new());
         assert!(driver.ended_signals.is_empty());
         driver.signal_opens.insert(7, shared.clock.now());
         driver.ended_signals.push_back("ended".into());
