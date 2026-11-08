@@ -32,7 +32,7 @@ lotse-worker = { path = "../crates/lotse-worker" }
 mp4-atom = { version = "0.16", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # Without its default features, as in the root: they link aws-lc-rs, which .cargo/deny.toml bans.
-str0m = { version = "0.24", default-features = false }
+str0m = { version = "0.25", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "io-util", "macros"] }
 tokio-util = { version = "0.7", default-features = false }
 url = { version = "2", default-features = false, features = ["std"] }

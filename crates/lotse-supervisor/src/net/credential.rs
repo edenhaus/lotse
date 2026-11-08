@@ -16,8 +16,9 @@
 use std::fmt;
 
 use lotse_core::secret::Secret;
+// md-5 0.10 and sha2 0.11 implement `Digest` of digest 0.10 and 0.11.
 use md5::{Digest as _, Md5};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 
 use super::stun::{
     ATTR_NONCE, ATTR_PASSWORD_ALGORITHM, ATTR_PASSWORD_ALGORITHMS, ATTR_REALM, ATTR_USERHASH,
