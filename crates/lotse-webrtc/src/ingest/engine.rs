@@ -207,6 +207,9 @@ pub struct IngestStats {
     pub sender_reports: u64,
     /// Sender Reports without a wallclock time, dropped.
     pub unusable_reports: u64,
+    /// Sender Reports of a source other than the stream's newest packet's
+    /// (a former one, or one that has sent no packet yet), dropped.
+    pub other_source_reports: u64,
     /// Picture Loss Indications sent.
     pub plis: u64,
     /// Data channel messages received and dropped.
@@ -341,6 +344,14 @@ impl Stream {
         }
     }
 
+    /// Whether `ssrc` is the source of the stream's newest packet, the one
+    /// whose timeline the stream carries.
+    fn is_newest(&self, ssrc: u32) -> bool {
+        self.sources
+            .first()
+            .is_some_and(|(newest, _, _)| *newest == ssrc)
+    }
+
     /// Whether `ts` is more than [`MAX_TIMESTAMP_JUMP`] of media time
     /// from `newest`, either way, 32-bit wrap included (RFC 3550 §5.1):
     /// as far as `TimestampGuard` lets a timeline move back.
@@ -407,6 +418,8 @@ pub struct IngestEngine {
     new_source: Throttle,
     /// The rate limit of the stale packets' log line.
     stale: Throttle,
+    /// The rate limit of the other sources' Sender Reports' log line.
+    other_source: Throttle,
     /// The counters.
     stats: IngestStats,
 }
@@ -711,6 +724,7 @@ impl IngestEngine {
             other_codec: Throttle::default(),
             new_source: Throttle::default(),
             stale: Throttle::default(),
+            other_source: Throttle::default(),
             stats: IngestStats::default(),
         })
     }
@@ -1199,10 +1213,36 @@ impl IngestEngine {
     /// sender without a wallclock (§6.4.1), names no instant and is
     /// dropped, as is one before 1970 (str0m 0.25 hands NTP zero over as
     /// the Unix epoch).
+    ///
+    /// Only the reports of the stream's newest source are handed on (str0m
+    /// 0.25 keys a report by its sender's SSRC, `SenderInfo::ssrc`): the
+    /// report maps the timeline of the packets the stream carries, which
+    /// is that source's. A former source's report, delayed past an encoder
+    /// restart (RFC 3550 §8.2), maps the old timeline; after the new
+    /// source's jump reset the clock mapping it would be the first anchor
+    /// and misplace the current media. A report of a source that has sent
+    /// no packet yet is dropped too: until its first packet the stream
+    /// carries the former timeline, and its next report (RFC 3550 §6.2,
+    /// every few seconds) anchors the new one. A sender sends reports only
+    /// once it sends packets (§6.4), so the first anchor of an attempt
+    /// waits at most one report.
     fn on_sender_report(&mut self, feedback: &SenderFeedback) {
         let Some(stream) = self.streams.iter().find(|s| s.mid == feedback.mid) else {
             return;
         };
+        let ssrc = *feedback.sender_info.ssrc;
+        if !stream.is_newest(ssrc) {
+            self.stats.other_source_reports = self.stats.other_source_reports.saturating_add(1);
+            if let Some(count) = self.other_source.hit(self.now) {
+                tracing::debug!(
+                    index = stream.index,
+                    ssrc,
+                    count,
+                    "webrtc: Sender Report of a source other than the newest packet's dropped"
+                );
+            }
+            return;
+        }
         let Some(ntp) = ntp64(feedback.sender_info.ntp_time) else {
             self.stats.unusable_reports = self.stats.unusable_reports.saturating_add(1);
             if let Some(count) = self.unusable.hit(self.now) {
@@ -1660,6 +1700,8 @@ mod tests {
         engine.streams.push(Stream {
             mid,
             index: 3,
+            // Source 1's packets: its reports are the ones handed on.
+            sources: vec![(1, 0, 7)],
             ..video_stream()
         });
         let report = |ntp_time| {
@@ -1701,6 +1743,65 @@ mod tests {
         engine.on_event(other);
         assert!(engine.queued.is_empty());
         assert_eq!(engine.stats.unusable_reports, 2);
+    }
+
+    #[test]
+    fn rfc3550_8_2_a_former_source_s_sender_report_after_a_restart_is_dropped() {
+        const A: u32 = 0xa;
+        const B: u32 = 0xb;
+        const C: u32 = 0xc;
+        let addr = "192.0.2.10:5000".parse().unwrap();
+        let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
+        let options = WebRtcOptions {
+            data_channel: None,
+            audio: false,
+        };
+        let mut engine = IngestEngine::offer(&options, &[addr], now, now).unwrap();
+        let mid = engine.video_mid;
+        engine.streams.push(Stream {
+            mid,
+            index: 1,
+            ..video_stream()
+        });
+        let wallclock = UNIX_EPOCH + Duration::from_secs(1);
+        let report = |ssrc: u32, rtp_time: u64| {
+            Event::SenderFeedback(SenderFeedback {
+                mid,
+                rid: None,
+                received_at: now,
+                sender_info: str0m::rtp::rtcp::SenderInfo {
+                    ssrc: ssrc.into(),
+                    ntp_time: wallclock,
+                    rtp_time: str0m::media::MediaTime::new(rtp_time, Frequency::NINETY_KHZ),
+                    sender_packet_count: 0,
+                    sender_octet_count: 0,
+                },
+            })
+        };
+        let forwarded = |rtp_ts| IngestOutput::SenderReport {
+            index: 1,
+            ntp: (NTP_UNIX_OFFSET + 1) << 32,
+            rtp_ts,
+            arrival: now,
+        };
+        // Before any packet: no timeline carried yet, no anchor.
+        engine.on_event(report(A, 900_000));
+        assert_eq!(engine.queued.pop_front(), None);
+        // A's packets, then its report: handed on.
+        engine.streams[0].sequence(A, 1_000, 900_000);
+        engine.on_event(report(A, 900_000));
+        assert_eq!(engine.queued.pop_front(), Some(forwarded(900_000)));
+        // The encoder restarted: B's packets on a new timeline. A report
+        // of A delayed past it, and one of C that has sent no packet, are
+        // dropped; B's is handed on.
+        engine.streams[0].sequence(B, 5, 3_000);
+        engine.on_event(report(A, 903_000));
+        engine.on_event(report(C, 6_000));
+        assert_eq!(engine.queued.pop_front(), None);
+        engine.on_event(report(B, 6_000));
+        assert_eq!(engine.queued.pop_front(), Some(forwarded(6_000)));
+        assert_eq!(engine.stats.other_source_reports, 3);
+        assert_eq!(engine.stats.sender_reports, 2);
     }
 
     /// str0m 0.25's error for dimpl's `err` (its `dtls.rs`).
