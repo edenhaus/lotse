@@ -45,6 +45,7 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -53,6 +54,7 @@ use lotse_codec::rtp_ingest::{Declared, RtpPacket, Sprop};
 use lotse_codec::{h264, h265};
 use lotse_core::codec::{Codec, Kind};
 use lotse_core::discontinuity::MAX_TIMESTAMP_JUMP;
+use lotse_core::ingest::IngestCounters;
 use lotse_core::runner::DEFAULT_READY_TIMEOUT;
 use lotse_core::signaling::{SignalCandidate, close};
 use lotse_core::source::SourceError;
@@ -204,6 +206,9 @@ pub struct IngestStats {
     /// of a former source, more than a second of media time off the
     /// newest packet's, dropped (RFC 3550 §5.1).
     pub stale_packets: u64,
+    /// RTP packets the sequence numbers say never arrived (RFC 3550
+    /// §6.4.1): the numbers each source skipped.
+    pub lost_packets: u64,
     /// Other late or repeated RTP packets (reordered or repaired on the
     /// way), dropped: the depacketizers take packets in sequence order.
     pub late_packets: u64,
@@ -281,11 +286,11 @@ enum Refused {
 /// What a packet is to its stream's numbering ([`Stream::sequence`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seen {
-    /// Ahead of the highest of its source: `lost` when it skips numbers
+    /// Ahead of the highest of its source: `lost` the numbers it skips
     /// (RFC 3550 §A.1), `new_source` when it is its source's first.
     Ahead {
-        /// Numbers were skipped.
-        lost: bool,
+        /// How many numbers were skipped: packets lost.
+        lost: u16,
         /// The first packet of a synchronization source.
         new_source: bool,
     },
@@ -350,7 +355,7 @@ impl Stream {
         self.sources.insert(0, (ssrc, seq, ts));
         self.sources.truncate(MAX_SOURCES);
         Seen::Ahead {
-            lost: ahead > 1,
+            lost: ahead.wrapping_sub(1),
             new_source: highest.is_none(),
         }
     }
@@ -431,6 +436,13 @@ pub struct IngestEngine {
     stale: Throttle,
     /// The rate limit of the late packets' log line.
     late: Throttle,
+    /// The rate limit of the lost packets' log line.
+    loss: Throttle,
+    /// The connection's ingest counters, which the source shows
+    /// (`TrackSet::ingest`): packets lost, packets dropped out of order,
+    /// datagrams rejected, counted as the RTSP source counts them
+    /// ([`Self::count_into`]).
+    ingest: Arc<IngestCounters>,
     /// The rate limit of the other sources' Sender Reports' log line.
     other_source: Throttle,
     /// The counters.
@@ -738,6 +750,8 @@ impl IngestEngine {
             new_source: Throttle::default(),
             stale: Throttle::default(),
             late: Throttle::default(),
+            loss: Throttle::default(),
+            ingest: Arc::default(),
             other_source: Throttle::default(),
             stats: IngestStats::default(),
         })
@@ -765,6 +779,18 @@ impl IngestEngine {
                 Some(0),
             )))
             .collect()
+    }
+
+    /// Counts into `ingest`, the connection's counters, from now on, as
+    /// the RTSP source counts into them: the packets a sequence gap says
+    /// were lost (RFC 3550 §6.4.1), its size; a packet dropped late,
+    /// repeated or stale as out of order, one that arrived after a later
+    /// one; a datagram the engine could not read, or that str0m's session
+    /// does not take (not STUN, DTLS, RTP or RTCP by RFC 7983 §7, or not
+    /// on one of its candidate pairs), as rejected, as RTSP rejects one
+    /// that is not RTP or not from the camera's media port.
+    pub fn count_into(&mut self, ingest: Arc<IngestCounters>) {
+        self.ingest = ingest;
     }
 
     /// The counters.
@@ -1024,7 +1050,7 @@ impl IngestEngine {
             return;
         }
         let Ok(contents) = DatagramRecv::try_from(bytes) else {
-            self.stats.bad_datagrams = self.stats.bad_datagrams.saturating_add(1);
+            self.reject();
             return;
         };
         let input = Input::Receive(
@@ -1037,10 +1063,16 @@ impl IngestEngine {
             },
         );
         if !self.rtc.accepts(&input) {
-            self.stats.bad_datagrams = self.stats.bad_datagrams.saturating_add(1);
+            self.reject();
             return;
         }
         self.input(input);
+    }
+
+    /// Counts a datagram the engine rejects.
+    fn reject(&mut self) {
+        self.stats.bad_datagrams = self.stats.bad_datagrams.saturating_add(1);
+        self.ingest.count_rejected();
     }
 
     /// Time passed: the deadlines, the startup keyframe requests and the
@@ -1283,6 +1315,66 @@ impl IngestEngine {
         });
     }
 
+    /// Counts what packet `seq` of source `ssrc` on stream `index` is to
+    /// its stream's numbering ([`Seen`]), in the engine's stats and the
+    /// connection's ingest counters ([`Self::count_into`]), with
+    /// rate-limited lines: `Some` when it is handed on, `true` when
+    /// numbers before it were lost; `None` when it is dropped, late or
+    /// stale, counted as out of order.
+    fn counted(&mut self, seen: Seen, index: usize, ssrc: u32, seq: u16) -> Option<bool> {
+        let (stale, log) = match seen {
+            Seen::Ahead { lost, new_source } => {
+                if new_source && let Some(count) = self.new_source.hit(self.now) {
+                    tracing::debug!(index, ssrc, count, "webrtc: a new synchronization source");
+                }
+                if lost > 0 {
+                    self.stats.lost_packets =
+                        self.stats.lost_packets.saturating_add(u64::from(lost));
+                    self.ingest.count_lost(u64::from(lost));
+                    if let Some(count) = self.loss.hit(self.now) {
+                        tracing::debug!(
+                            index,
+                            ssrc,
+                            lost,
+                            count,
+                            "webrtc: RTP sequence gap; packets lost"
+                        );
+                    }
+                }
+                return Some(lost > 0);
+            }
+            Seen::Late => {
+                self.stats.late_packets = self.stats.late_packets.saturating_add(1);
+                (false, self.late.hit(self.now))
+            }
+            Seen::Stale => {
+                self.stats.stale_packets = self.stats.stale_packets.saturating_add(1);
+                (true, self.stale.hit(self.now))
+            }
+        };
+        self.ingest.count_out_of_order();
+        if let Some(count) = log {
+            if stale {
+                tracing::debug!(
+                    index,
+                    ssrc,
+                    seq,
+                    count,
+                    "webrtc: a packet from before the camera's timestamps jumped dropped"
+                );
+            } else {
+                tracing::debug!(
+                    index,
+                    ssrc,
+                    seq,
+                    count,
+                    "webrtc: a late or repeated packet dropped"
+                );
+            }
+        }
+        None
+    }
+
     /// Whether `id` is the data channel the offer opened.
     fn is_ours(&self, id: ChannelId) -> bool {
         self.channel.as_ref().is_some_and(|(ours, _)| *ours == id)
@@ -1336,40 +1428,11 @@ impl IngestEngine {
         let index = stream.index;
         let ssrc = *header.ssrc;
         let video = stream.video;
-        let lost = match stream.sequence(ssrc, seq, header.timestamp) {
-            Seen::Ahead { lost, new_source } => {
-                if new_source && let Some(count) = self.new_source.hit(self.now) {
-                    tracing::debug!(index, ssrc, count, "webrtc: a new synchronization source");
-                }
-                lost && video
-            }
-            Seen::Late => {
-                self.stats.late_packets = self.stats.late_packets.saturating_add(1);
-                if let Some(count) = self.late.hit(self.now) {
-                    tracing::debug!(
-                        index,
-                        ssrc,
-                        seq,
-                        count,
-                        "webrtc: a late or repeated packet dropped"
-                    );
-                }
-                return;
-            }
-            Seen::Stale => {
-                self.stats.stale_packets = self.stats.stale_packets.saturating_add(1);
-                if let Some(count) = self.stale.hit(self.now) {
-                    tracing::debug!(
-                        index,
-                        ssrc,
-                        seq,
-                        count,
-                        "webrtc: a packet from before the camera's timestamps jumped dropped"
-                    );
-                }
-                return;
-            }
+        let seen = stream.sequence(ssrc, seq, header.timestamp);
+        let Some(lost) = self.counted(seen, index, ssrc, seq) else {
+            return;
         };
+        let lost = lost && video;
         self.stats.rtp_packets = self.stats.rtp_packets.saturating_add(1);
         self.queued.push_back(IngestOutput::Rtp {
             index,
@@ -1517,32 +1580,33 @@ mod tests {
         const A: u32 = 0xa;
         const B: u32 = 0xb;
         let ahead = |lost, new_source| Seen::Ahead { lost, new_source };
+        // `lost` counts the numbers skipped.
         let mut stream = video_stream();
         // All on one timeline: the timestamps play no part here.
         let ts = 90_000;
         assert_eq!(
             stream.sequence(A, 1_000, ts),
-            ahead(false, true),
+            ahead(0, true),
             "a source's first packet"
         );
         assert_eq!(
             stream.sequence(B, 5, ts),
-            ahead(false, true),
+            ahead(0, true),
             "a new source's first packet"
         );
         // A packet of the former source, delayed: B's numbers stay.
         assert_eq!(stream.sequence(A, 999, ts), Seen::Late);
-        assert_eq!(stream.sequence(B, 9, ts), ahead(true, false), "B's own gap");
-        assert_eq!(stream.sequence(B, 10, ts), ahead(false, false));
+        assert_eq!(stream.sequence(B, 9, ts), ahead(3, false), "B's own gap");
+        assert_eq!(stream.sequence(B, 10, ts), ahead(0, false));
         assert_eq!(stream.sequence(B, 10, ts), Seen::Late, "a repeat");
         assert_eq!(stream.sequence(B, 8, ts), Seen::Late, "a late one");
         // A's numbers are kept too: its gap after it comes back.
-        assert_eq!(stream.sequence(A, 1_002, ts), ahead(true, false));
+        assert_eq!(stream.sequence(A, 1_002, ts), ahead(1, false));
         assert_eq!(stream.sources, [(A, 1_002, ts), (B, 10, ts)]);
         // Half the sequence space ahead is still ahead; more is behind.
         assert_eq!(
             stream.sequence(A, 1_002_u16.wrapping_add(0x7fff), ts),
-            ahead(true, false)
+            ahead(0x7ffe, false)
         );
         assert_eq!(
             stream.sequence(A, 1_002_u16.wrapping_add(0x7fff).wrapping_add(0x8000), ts),
@@ -1551,11 +1615,11 @@ mod tests {
         // At most MAX_SOURCES, the oldest forgotten: B, then a new source
         // again.
         for ssrc in 1..u32::try_from(MAX_SOURCES).unwrap() {
-            assert_eq!(stream.sequence(0x100 + ssrc, 1, ts), ahead(false, true));
+            assert_eq!(stream.sequence(0x100 + ssrc, 1, ts), ahead(0, true));
         }
         assert_eq!(stream.sources.len(), MAX_SOURCES);
         assert!(!stream.sources.iter().any(|(ssrc, _, _)| *ssrc == B));
-        assert_eq!(stream.sequence(B, 2_000, ts), ahead(false, true));
+        assert_eq!(stream.sequence(B, 2_000, ts), ahead(0, true));
     }
 
     /// A video stream of no payload types, at 90 kHz.
@@ -1666,7 +1730,7 @@ mod tests {
         assert_eq!(
             stream.sequence(B, 8, 45_003_000),
             Seen::Ahead {
-                lost: false,
+                lost: 0,
                 new_source: false
             }
         );
@@ -1675,7 +1739,7 @@ mod tests {
         assert_eq!(
             stream.sequence(A, 103, 45_006_000),
             Seen::Ahead {
-                lost: true,
+                lost: 1,
                 new_source: false
             }
         );
@@ -1686,7 +1750,7 @@ mod tests {
         assert_eq!(
             stream.sequence(0xc, 1, 90_000_000),
             Seen::Ahead {
-                lost: false,
+                lost: 0,
                 new_source: true
             }
         );

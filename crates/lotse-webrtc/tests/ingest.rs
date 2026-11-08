@@ -29,6 +29,7 @@ use lotse_codec::h264::test_data;
 use lotse_core::clock::{Clock, FakeClock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::codec::{Codec, Kind};
+use lotse_core::ingest::{IngestCounters, IngestStats};
 use lotse_core::signaling::{
     LocalSignal, RemoteSignal, SignalCandidate, SignalClose, SignalingOpener, SignalingRelay, close,
 };
@@ -788,6 +789,79 @@ fn rfc4585_6_3_1_a_keyframe_stops_the_startup_plis_and_a_loss_asks_again_rate_li
     pair.frame(false);
     pair.step(PLI_INTERVAL * 2);
     assert_eq!(pair.engine.stats().plis, 3);
+}
+
+#[test]
+fn rfc3550_6_4_1_losses_late_packets_and_rejected_datagrams_reach_the_connection_s_counters() {
+    const A: u32 = 0x0a00;
+    const B: u32 = 0x0b00;
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish(),
+    );
+    let mut pair = Pair::offer(&video_only());
+    let ingest = Arc::new(IngestCounters::default());
+    pair.engine.count_into(Arc::clone(&ingest));
+    pair.answer(camera_config(false), |answer| answer);
+    pair.connect();
+    pair.step(Duration::from_millis(1));
+    // One packet `seq` at timestamp `ts`, through to the engine.
+    let send = |pair: &mut Pair, seq: u16, ts: u32| {
+        pair.camera().seq = seq;
+        pair.camera().ts = ts.wrapping_sub(3_000);
+        pair.frame(false);
+    };
+    pair.camera().new_ssrc(A);
+    send(&mut pair, 100, 9_000);
+    // Three numbers skipped: three packets lost, the gap's size.
+    send(&mut pair, 104, 12_000);
+    // One of them late: out of order.
+    send(&mut pair, 102, 10_000);
+    // An encoder restart; then a packet of the former source from before
+    // it, stale: out of order too. B's first is no loss.
+    pair.camera().new_ssrc(B);
+    send(&mut pair, 7, 900_000);
+    pair.camera().new_ssrc(A);
+    send(&mut pair, 105, 15_000);
+    // A datagram nothing reads (RFC 7983 §7), and media from a stranger.
+    pair.engine
+        .receive(pair.now, CAMERA, ENGINE, &[0xff, 1, 2, 3]);
+    let stranger: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+    let mut rtp = vec![0x80, 0x60, 0x00, 0x01, 0, 0, 0, 1, 0, 0, 0, 2];
+    rtp.extend_from_slice(&[0; 20]);
+    pair.engine.receive(pair.now, stranger, ENGINE, &rtp);
+    assert_eq!(
+        ingest.snapshot(),
+        IngestStats {
+            packets_lost: 3,
+            packets_out_of_order: 2,
+            datagrams_rejected: 2,
+        }
+    );
+    let stats = pair.engine.stats();
+    assert_eq!(
+        (
+            stats.lost_packets,
+            stats.late_packets,
+            stats.stale_packets,
+            stats.bad_datagrams
+        ),
+        (3, 1, 1, 2)
+    );
+    // One line for the one gap, with its size; packets in order log none.
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let gaps: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("RTP sequence gap"))
+        .collect();
+    assert_eq!(gaps.len(), 1, "{logs}");
+    assert!(gaps[0].contains("lost=3"), "{logs}");
+    assert!(pair.ended().is_none(), "{:?}", pair.ended());
 }
 
 #[test]
@@ -2350,6 +2424,68 @@ mod source {
         assert_eq!(camera.camera.keyframe_requests, asked);
         running.cancel.cancel();
         within(running.run).await.unwrap();
+    }
+
+    /// The source counts into its connection's ingest counters, which the
+    /// worker and the API show: a sequence gap's size as lost, a late
+    /// packet as out of order, a datagram nothing reads as rejected, as
+    /// the RTSP source counts them.
+    #[tokio::test]
+    async fn rfc3550_6_4_1_the_source_reports_its_losses_in_the_connection_s_ingest_counters() {
+        let _logs = logs();
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
+        let running = start(
+            serde_json::json!({ "audio": false }),
+            Some(signaling.clone()),
+            Arc::new(SystemClock),
+        );
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        let (offer, candidates) = read_offer(&mut relay).await;
+        let fields: Vec<&str> = candidates[0].candidate.split_whitespace().collect();
+        let host = SocketAddr::new(fields[4].parse().unwrap(), fields[5].parse().unwrap());
+        let (mut camera, answer) = Live::answer(&offer, false).await;
+        relay
+            .incoming
+            .send(RemoteSignal::Answer(answer))
+            .await
+            .unwrap();
+        camera.connect().await;
+        let video = Arc::clone(&running.set.tracks()[0]);
+        let frame = |camera: &mut Live| camera.camera.frame(SystemClock.now(), false);
+        frame(&mut camera);
+        camera.pump(Duration::from_millis(50)).await;
+        within(async {
+            while video.stats().packets == 0 {
+                camera.pump(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // Three numbers skipped; then one of them, late; then on in order.
+        let next = camera.camera.seq;
+        camera.camera.seq = next + 3;
+        frame(&mut camera);
+        camera.pump(Duration::from_millis(50)).await;
+        camera.camera.seq = next + 1;
+        frame(&mut camera);
+        camera.pump(Duration::from_millis(50)).await;
+        camera.camera.seq = next + 4;
+        frame(&mut camera);
+        // A datagram nothing reads (RFC 7983 §7).
+        camera.socket.send_to(&[0xff, 1, 2, 3], host).await.unwrap();
+        let expected = IngestStats {
+            packets_lost: 3,
+            packets_out_of_order: 1,
+            datagrams_rejected: 1,
+        };
+        within(async {
+            while running.set.ingest() != expected {
+                camera.pump(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        running.cancel.cancel();
+        within(running.run).await.unwrap();
+        assert_eq!(running.set.ingest(), expected);
     }
 
     #[tokio::test]
