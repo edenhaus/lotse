@@ -676,6 +676,7 @@ mod tests {
         assert_eq!(m.handle(Input::Demand(1), now), [Action::SpawnWorker]);
         assert_eq!((m.state(), m.demand()), (S::Connecting, 1));
         assert_eq!(m.handle(Input::Demand(2), now), []);
+        assert_eq!(m.demand(), 2);
         assert_eq!(m.handle(Input::Report(WorkerReport::Connecting), now), []);
         assert_eq!(m.handle(Input::Report(WorkerReport::Live), now), []);
         assert_eq!(m.state(), S::Live);

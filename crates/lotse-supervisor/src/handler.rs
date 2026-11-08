@@ -3040,6 +3040,69 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A worker that reports its source connecting and then live, as
+    /// frames on its control channel (its standard input), then blocks
+    /// until it is killed.
+    fn live_worker(dir: &std::path::Path) -> String {
+        let mut frames = Vec::new();
+        for message in [
+            lotse_ipc::ToSupervisor::SourceState(lotse_ipc::SourceState::Connecting { attempt: 1 }),
+            lotse_ipc::ToSupervisor::SourceState(lotse_ipc::SourceState::Live),
+        ] {
+            let payload = lotse_ipc::encode(&message).unwrap();
+            frames.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+            frames.extend_from_slice(&payload);
+        }
+        let reports = dir.join("reports");
+        std::fs::write(&reports, frames).unwrap();
+        let path = dir.join("worker.sh");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ncat {} >&0\nexec sleep 30\n", reports.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_configured_linger_holds_a_live_worker_after_its_demand_goes() {
+        let dir = private_dir("linger");
+        let clock = Arc::new(FakeClock::from_system());
+        let mut settings = settings(PathBuf::from("/nonexistent/lotse.sock"));
+        settings.shutdown_budget = Duration::from_millis(200);
+        // Not the default of 5 s, and short of the worker's silence limit.
+        settings.linger = Duration::from_secs(8);
+        let s = Supervisor::new(settings, environment(&live_worker(&dir)), clock.clone());
+        let mut events = subscription(call(&s, r#"{"id":1,"type":"stream/subscribe"}"#).await);
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", true)).await);
+        for expected in ["idle", "connecting", "live"] {
+            assert_eq!(next(&mut events).await["state"], expected);
+        }
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        assert_eq!(next(&mut events).await["state"], "draining");
+        clock.advance(Duration::from_secs(5));
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(events.try_recv().is_err(), "still lingering after 5 s");
+        clock.advance(Duration::from_secs(3));
+        assert_eq!(next(&mut events).await["state"], "idle");
+        // The worker ignores its stop: the budget runs out on the fake
+        // clock, and it is killed.
+        let shutdown = s.shutdown();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                () = SystemClock.sleep(Duration::from_millis(5)) => {
+                    clock.advance(Duration::from_millis(200));
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_running_worker_is_stopped_when_demand_goes_and_at_shutdown() {
         let dir = private_dir("stop");

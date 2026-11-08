@@ -519,8 +519,15 @@ async function disrupt(session, signaling, marks) {
   return session;
 }
 
+// The audio running, or an error in 5 s: AudioContext.resume() resolves
+// once the context runs, or rejects when it cannot acquire its audio
+// output (Web Audio API §1.2.3 resume()), but headless Firefox 159 with no
+// sound server leaves it pending (observed 2026-11-08), which held the
+// whole page until the harness's script timeout.
+const AUDIO_MS = 5000;
 async function run() {
-  const marks = await prepareAudio().catch((err) => { fail(`audio: ${err}`); return undefined; });
+  const marks = await Promise.race([prepareAudio(), timeout(AUDIO_MS, "the audio running")])
+    .catch((err) => { fail(`audio: ${err}`); return undefined; });
   const params = new URLSearchParams(location.search);
   out.signaling = params.get("signal") === "go2rtc" ? "go2rtc" : "lotse";
   const signaling = out.signaling === "go2rtc" ? go2rtcSignaling(params.get("api")) : lotseSignaling();
