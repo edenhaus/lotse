@@ -980,6 +980,60 @@ fn rfc3550_a_1_a_packet_of_another_accepted_codec_is_received_so_no_loss() {
 }
 
 #[test]
+fn rfc3550_8_2_another_source_s_packet_in_another_codec_moves_no_carried_timeline() {
+    const A: u32 = 0x0a00;
+    const B: u32 = 0x0b00;
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    pair.answer(camera_config(false).enable_h265(true), |answer| answer);
+    pair.connect();
+    pair.step(Duration::from_millis(1));
+    let video = pair.camera().video.unwrap();
+    let h264 = pair.camera().pts(video, EngineCodec::H264)[0];
+    let h265 = pair.camera().pts(video, EngineCodec::H265)[0];
+    let send = |pair: &mut Pair, pt: Pt, seq: u16, ts: u32| {
+        pair.camera().seq = seq;
+        pair.camera().ts = ts;
+        let now = pair.now;
+        pair.camera().write(now, pt, true, &[0x41, 0x00]);
+        pair.step(Duration::ZERO);
+    };
+    // A/100 in H.264, B/5 in H.265 on another timeline (dropped from the
+    // H.264 track), A/101 in H.264 on A's.
+    pair.camera().new_ssrc(A);
+    send(&mut pair, h264, 100, 900_000);
+    pair.camera().new_ssrc(B);
+    send(&mut pair, h265, 5, 3_000);
+    pair.camera().new_ssrc(A);
+    send(&mut pair, h264, 101, 903_000);
+    let stats = pair.engine.stats();
+    assert_eq!(stats.other_codec_packets, 1);
+    assert_eq!(
+        (stats.stale_packets, stats.late_packets, stats.lost_packets),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        pair.rtp()
+            .iter()
+            .map(|(_, seq, _)| *seq)
+            .collect::<Vec<_>>(),
+        [100, 101]
+    );
+    // A goes on, and its Sender Reports are the ones handed on.
+    for n in 2..60_u16 {
+        send(&mut pair, h264, 100 + n, 900_000 + 3_000 * u32::from(n));
+        pair.step(Duration::from_millis(100));
+        if pair.engine.stats().sender_reports > 0 {
+            break;
+        }
+    }
+    assert!(pair.engine.stats().sender_reports > 0);
+    assert_eq!(pair.engine.stats().other_source_reports, 0);
+    assert_eq!(pair.engine.stats().stale_packets, 0);
+    assert!(pair.ended().is_none(), "{:?}", pair.ended());
+}
+
+#[test]
 fn rfc3264_7_a_packet_of_another_accepted_codec_is_dropped_not_switched() {
     let captured = Captured::default();
     let writer = captured.clone();
