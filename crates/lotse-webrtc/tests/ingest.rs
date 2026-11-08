@@ -102,6 +102,18 @@ fn camera_config(audio: bool) -> RtcConfig {
     }
 }
 
+/// `answer` with the camera as the DTLS client (`a=setup:active`, RFC 5763
+/// §5) rather than str0m's passive, so the engine is the DTLS server: it
+/// sends no flight before a `ClientHello` and so never gives the handshake
+/// up for time (dimpl 0.9 arms no timer before one). The tests of the
+/// connection's deadline use it on a cut link, where the engine as the
+/// client would give up after its jittered retransmissions (23 to 39 s)
+/// and sometimes before the deadline.
+fn camera_dtls_client(answer: String) -> String {
+    assert!(answer.contains("a=setup:passive"), "{answer}");
+    answer.replace("a=setup:passive", "a=setup:active")
+}
+
 /// A datagram between the two.
 type Datagram = (SocketAddr, SocketAddr, Vec<u8>);
 
@@ -974,6 +986,42 @@ fn rfc3550_5_1_a_late_packet_from_before_a_timestamp_jump_is_dropped() {
     assert!(pair.ended().is_none(), "{:?}", pair.ended());
 }
 
+#[test]
+fn rfc3550_8_2_a_former_source_s_packets_off_the_new_timeline_are_dropped() {
+    const A: u32 = 0x0a00;
+    const B: u32 = 0x0b00;
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    pair.answer(camera_config(false), |answer| answer);
+    pair.connect();
+    pair.step(Duration::from_millis(1));
+    // One packet `seq` of `ssrc` at timestamp `ts`, through to the engine.
+    let send = |pair: &mut Pair, ssrc: u32, seq: u16, ts: u32| {
+        pair.camera().new_ssrc(ssrc);
+        pair.camera().seq = seq;
+        pair.camera().ts = ts.wrapping_sub(3_000);
+        pair.frame(false);
+    };
+    send(&mut pair, A, 1_000, 900_000);
+    // The encoder restarted: a new source on a new timeline.
+    send(&mut pair, B, 5, 3_000);
+    for n in 1..=5 {
+        // A's packets sent before the restart arrive after it, never seen
+        // before, ahead in A's own numbering, among B's.
+        send(&mut pair, A, 1_000 + n, 900_000 + 3_000 * u32::from(n));
+        send(&mut pair, B, 5 + n, 3_000 + 3_000 * u32::from(n));
+    }
+    assert_eq!(pair.engine.stats().stale_packets, 5);
+    assert_eq!(
+        pair.rtp()
+            .iter()
+            .map(|(_, seq, _)| *seq)
+            .collect::<Vec<_>>(),
+        [1_000, 5, 6, 7, 8, 9, 10]
+    );
+    assert!(pair.ended().is_none(), "{:?}", pair.ended());
+}
+
 /// A camera that keeps changing its SSRC (RFC 3550 §8.2) among more
 /// than the stream keeps the numbers of: every packet is a new source's
 /// first, logged at most once per summary interval.
@@ -1238,12 +1286,15 @@ fn rfc8445_8_not_connected_in_the_attempt_s_budget_ends_as_ice_failed_before_the
     assert!(CONNECT_BY < ATTEMPT_BUDGET);
     assert!(ATTEMPT_BUDGET < lotse_core::runner::DEFAULT_READY_TIMEOUT);
     // (when the answer came, when the attempt ends): by 27 s into it,
-    // 10 s after a later answer, at 28 s at the latest.
+    // 10 s after a later answer, at 28 s at the latest. The engine is the
+    // DTLS server, so only the deadline ends the attempt; the client's
+    // giving up is rfc8445_8_a_dtls_client_that_gives_up_before_the_
+    // deadline_ends_as_not_connected_too.
     for (answer_ms, end_ms) in [(0, 27_000), (17_500, 27_500), (19_000, 28_000)] {
         let mut pair = Pair::offer(&video_only());
         pair.link = false;
         pair.run(Duration::from_millis(answer_ms));
-        pair.answer(camera_config(false), |answer| answer);
+        pair.answer(camera_config(false), camera_dtls_client);
         assert_eq!(pair.tracks().len(), 1, "{answer_ms}");
         pair.run(Duration::from_millis(end_ms - answer_ms - 10));
         assert!(pair.ended().is_none(), "{answer_ms}: {:?}", pair.ended());
@@ -1329,15 +1380,41 @@ fn rfc8445_8_an_answer_or_a_handshake_completing_at_its_deadline_is_not_taken() 
 }
 
 #[test]
+fn rfc8445_8_a_dtls_client_that_gives_up_before_the_deadline_ends_as_not_connected_too() {
+    let _logs = logs();
+    // The engine is the DTLS client (str0m answers `actpass` passive) on
+    // a cut link: dimpl 0.9 gives its unanswered handshake up 23 to 39 s
+    // after the answer, at random (its retransmissions' jitter), and the
+    // deadline is at 27 s. Whichever comes first, the attempt ends as not
+    // connected (`ice_failed`), never as the engine's internal error.
+    for _ in 0..8 {
+        let mut pair = Pair::offer(&video_only());
+        pair.link = false;
+        pair.answer(camera_config(false), |answer| answer);
+        pair.run(Duration::from_secs(20));
+        assert!(pair.ended().is_none(), "{:?}", pair.ended());
+        pair.run(CONNECT_BY - Duration::from_secs(20));
+        let (error, code, message) = pair.ended().unwrap();
+        let SourceError::Timeout(reason) = &error else {
+            panic!("{error:?}");
+        };
+        assert!(reason.starts_with("webrtc: not connected "), "{reason}");
+        assert_eq!(*reason, message);
+        assert_eq!(code, close::ICE_FAILED);
+    }
+}
+
+#[test]
 fn rfc8445_8_ice_up_without_dtls_and_then_lost_is_ice_failed_at_the_deadline() {
     let _logs = logs();
     let mut pair = Pair::offer(&video_only());
     pair.dtls = false;
-    pair.answer(camera_config(false), |answer| answer);
+    pair.answer(camera_config(false), camera_dtls_client);
     // STUN only (RFC 7983 §7: first byte 0 to 3): ICE pairs, DTLS never
     // gets through; then the link goes altogether. Not connected, the
     // attempt ends at the connection deadline; str0m 0.25's agent going
-    // Disconnected meanwhile ends nothing.
+    // Disconnected meanwhile ends nothing. (The engine is the DTLS
+    // server, so its handshake never gives up first.)
     pair.run(Duration::from_secs(1));
     assert!(!pair.engine.is_connected());
     pair.link = false;
