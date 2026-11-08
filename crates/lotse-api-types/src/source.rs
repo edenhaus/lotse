@@ -44,6 +44,14 @@ pub const USER_AGENT_PATTERN: &str = "^[!-~]([\\t -~]*[!-~])?$";
 /// integrations ask for is a short name (Nest's `dataSendChannel`).
 pub const MAX_LABEL_CHARS: usize = 64;
 
+/// The schema's shape of a `data_channel` label, as the daemon
+/// checks it: no control character (`char::is_control`, Unicode `Cc`:
+/// U+0000 to U+001F and U+007F to U+009F), so clients generated from the
+/// bundle refuse what the daemon refuses. Its length, 1 to
+/// [`MAX_LABEL_CHARS`] characters, is the schema's `minLength` and
+/// `maxLength`.
+pub const DATA_CHANNEL_PATTERN: &str = "^[^\\u0000-\\u001f\\u007f-\\u009f]*$";
+
 /// [`DEFAULT_TIMEOUT_MS`], as serde's `default` takes it.
 const fn default_timeout_ms() -> u64 {
     DEFAULT_TIMEOUT_MS
@@ -339,7 +347,10 @@ pub struct WebRtcOptions {
     /// `dataSendChannel`. 1 to 64 characters, none a control character;
     /// `null`, the default, offers none.
     #[serde(default, deserialize_with = "deserialize_label")]
-    #[cfg_attr(feature = "schema", schemars(length(min = 1, max = MAX_LABEL_CHARS)))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(length(min = 1, max = MAX_LABEL_CHARS), regex(pattern = DATA_CHANNEL_PATTERN))
+    )]
     pub data_channel: Option<String>,
     /// Offer to receive the camera's audio (default `true`); `false`
     /// offers video only.
@@ -790,6 +801,35 @@ mod tests {
         }
         let err = refusal(json!({ "protocol": "webrtc", "data_channel": 7 }));
         assert!(err.contains("invalid type"), "{err}");
+    }
+
+    /// The schema of the property `name`, wherever the bundle has it.
+    fn property<'a>(schema: &'a Value, name: &str) -> Option<&'a Value> {
+        match schema {
+            Value::Object(fields) => fields
+                .get("properties")
+                .and_then(|properties| properties.get(name))
+                .or_else(|| fields.values().find_map(|value| property(value, name))),
+            Value::Array(items) => items.iter().find_map(|value| property(value, name)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn rfc8832_5_1_the_bundle_states_a_label_s_characters_as_is_valid_label_checks_them() {
+        // The pattern's ranges are exactly the characters `is_valid_label`
+        // refuses (no regex engine in the tree to run the pattern itself).
+        assert_eq!(DATA_CHANNEL_PATTERN, r"^[^\u0000-\u001f\u007f-\u009f]*$");
+        for c in (0..=0x10_ffff).filter_map(char::from_u32) {
+            let in_pattern = matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}');
+            assert_eq!(c.is_control(), in_pattern, "{c:?}");
+            assert_eq!(is_valid_label(&c.to_string()), !in_pattern, "{c:?}");
+        }
+        let bundle = crate::schema::committed();
+        let label = property(&bundle, "data_channel").unwrap();
+        assert_eq!(label["pattern"], DATA_CHANNEL_PATTERN);
+        assert_eq!(label["minLength"], 1);
+        assert_eq!(label["maxLength"], MAX_LABEL_CHARS);
     }
 
     #[test]

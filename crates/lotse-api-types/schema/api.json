@@ -3025,6 +3025,7 @@
               "description": "The label of a data channel to offer beside the media (RFC 8831,\nRFC 8832), as the camera's integration asks for one: Nest refuses\nan offer without an `application` m-line and wants\n`dataSendChannel`. 1 to 64 characters, none a control character;\n`null`, the default, offers none.",
               "maxLength": 64,
               "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$",
               "type": [
                 "string",
                 "null"
