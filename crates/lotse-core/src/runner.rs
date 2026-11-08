@@ -758,12 +758,17 @@ mod tests {
 
     #[tokio::test]
     async fn connects_goes_live_and_stops_on_cancel() {
+        let (logs, _guard) = Logs::capture();
         let mut h = start(RunnerConfig::default());
         assert_eq!(
             next(&mut h.events).await,
             Some(RunnerEvent::Connecting { attempt: 1 })
         );
         assert_eq!(next(&mut h.events).await, Some(RunnerEvent::Live));
+        // The first connection is no hot swap: no new epoch, no `SourceRestored`.
+        let live = logs.lines(tracing::Level::INFO, "source live");
+        assert_eq!(live.len(), 1);
+        assert!(live[0].fields.starts_with(" reconnect=false"), "{live:?}");
         assert_eq!(h.tracks.tracks().len(), 1);
         assert!(*h.tracks.ready().borrow());
         h.cancel.cancel();

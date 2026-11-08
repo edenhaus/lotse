@@ -125,4 +125,7 @@ exclude_re = [
     "logging.rs:.*replace retina -> L with Default::default\\(\\)$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
+    # An empty host let through goes on to `Url::set_username`, which refuses a URL whose host
+    # is empty (url 2): the same `MissingHost`.
+    "source_url.rs:.*replace match guard !host.is_empty\\(\\) with true in SourceUrl::parse$",
 ]
