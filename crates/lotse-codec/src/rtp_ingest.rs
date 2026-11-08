@@ -1047,6 +1047,34 @@ mod tests {
         assert!(frames.try_recv().unwrap().is_none(), "no side branch");
     }
 
+    /// RTP cut through as it came (no normalizer for the codec): every
+    /// audio packet starts a frame, a video packet only when its timestamp
+    /// moves on (RFC 3550 §5.1: the packets of a frame share one).
+    #[test]
+    fn rfc3550_5_1_cut_through_frames_start_per_audio_packet_and_per_video_timestamp() {
+        let (t0, _set, mut ctx) = video_ctx();
+        let mjpeg = declared(Kind::Video, Codec::Mjpeg, 90_000, Sprop::None);
+        for (stream, pt, starts) in [
+            (pcmu(), 0, [true, true, true]),
+            (mjpeg, 26, [true, false, true]),
+        ] {
+            let track = declare(&mut ctx, &stream);
+            let mut tracks = RtpTracks::new(RTSP);
+            tracks.carry(0, Arc::clone(&track), pt, &stream);
+            assert!(tracks.entry(0).unwrap().video.is_none(), "cut through");
+            let mut packets = track.subscribe_packets();
+            for (seq, ts) in [(1, 1_000), (2, 1_000), (3, 4_000)] {
+                tracks
+                    .receive(0, packet(seq, ts, false, &[1, 2, 3]), t0, &ctx)
+                    .unwrap();
+            }
+            let got: Vec<bool> = (0..3)
+                .map(|_| packets.try_recv().unwrap().unwrap().frame_start)
+                .collect();
+            assert_eq!(got, starts, "{:?}", stream.codec);
+        }
+    }
+
     #[test]
     fn rfc3551_4_5_an_audio_packet_is_a_frame_and_starts_one() {
         let (t0, _set, mut ctx) = video_ctx();
@@ -1391,7 +1419,7 @@ mod tests {
             let Poll::Ready(Some(event)) = next.poll(&mut cx) else {
                 break;
             };
-            if let TrackEvent::TrackChanged(codec) = event {
+            if let TrackEvent::TrackChanged { codec, .. } = event {
                 changes.push(Codec::clone(&codec));
             }
         }

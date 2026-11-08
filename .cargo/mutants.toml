@@ -5,14 +5,22 @@ test_tool = "nextest"
 # `test-util` feature, exercised by the other crates' tests.
 exclude_globs = [
     "crates/lotse-testing/**",
+    # Built only off Linux (macOS, a development host): the Mutants jobs run on Linux, where no
+    # test reaches it.
+    "crates/lotse-sandbox/src/other.rs",
     "crates/lotse-codec/src/aac/test_data.rs",
     "crates/lotse-codec/src/g722/test_data.rs",
 ]
 # Equivalent mutants: mutations that cannot change behavior, each with its reason.
 # Keep this list short and delete entries with the code they refer to.
 exclude_re = [
+    # Test infrastructure, as in exclude_globs: the codecs' test data where it is a module of the
+    # file it serves (h264/sps.rs's `test_data`, behind lotse-codec's `test-util` feature).
+    "lotse-codec/src/.*: .* in test_data::",
     # The default body already returns `None`.
     "replace Handler::unsubscribed -> Option<Event> with None",
+    # The default body already does nothing.
+    "replace Handler::connection_closed with \\(\\)",
     # The default body already returns an empty list.
     "replace OutputFactory::session_tracks -> Vec<TrackRequest> with vec!\\[\\]",
     # The recording takes the later of it and the media times it saw, the default's value.
@@ -93,10 +101,18 @@ exclude_re = [
     # The FU-A indicator and header (RFC 6184 §5.8): F and NRI above the type, S and E above
     # the original type, disjoint bits, so `|` and `^` produce the same value.
     "h264/nal.rs:.*replace \\| with \\^ in fu_part$",
+    # The FU-A header rebuilt from the indicator's F and NRI (0xe0) and a type of 1 to 23, and the
+    # STAP-A indicator's NRI (bits 5-6) and type 24 (bits 3-4): disjoint bits (RFC 6184 §5.7.1,
+    # §5.8), so `|` and `^` produce the same value.
+    "h264/nal.rs:.*replace \\| with \\^ in (parse|stap_a)$",
+    # The filler header that ends a unit (RFC 6184 §5.1): the dropped unit's F and NRI (0xe0) and
+    # type 12 (H.264), or its forbidden bit and layer id's high bit (0x81) and type 38 shifted
+    # left (0x4c, H.265 §7.3.1.2): disjoint bits, so `|` and `^` produce the same value.
+    "h26[45]/packet.rs:.*replace \\| with \\^ in Classified::end_of_unit$",
     # A unit of exactly the target goes through `fragment`, which returns it whole, and alone
     # either way: the same payloads in the same order.
     # (Column 27 is `unit.len() > self.max_payload`; the group check after it stays mutated.)
-    "h265/packet.rs:\\d+:27: replace > with >= in PacketNormalizer::pack_units",
+    "h26[45]/packet.rs:\\d+:27: replace > with >= in PacketNormalizer::pack_units",
     # retina's RTP channel is even, so OR-ing in the RTCP bit and XOR-ing it set the same channel.
     "lotse-rtsp/src/udp.rs:.*replace \\| with \\^ in UdpRelay::datagram$",
     # Reading one more piece of the body before the sniff decides the same: it looks at the
@@ -123,6 +139,32 @@ exclude_re = [
     # Built only without the RTSP source, and the mutants are tested with every feature on:
     # no test of the run reaches it. (With the source, `retina` returns a `RetinaLog`.)
     "logging.rs:.*replace retina -> L with Default::default\\(\\)$",
+    # Without `MSG_NOSIGNAL` a write to a closed peer still fails with `EPIPE` and raises no
+    # signal: Rust's runtime ignores `SIGPIPE` before `main` in every process that sends (the
+    # daemon, the worker, the tests), and `unsafe` code, which resetting it takes, is forbidden.
+    "channel.rs:.*replace send_flags -> SendFlags with Default::default\\(\\)$",
+    # The default body already returns `false`.
+    "replace DatagramSink::ice_tcp -> bool with false",
+    # Both arms answer `false`, a dropped datagram; the guard only picks whether a failed send
+    # other than a full channel is logged at debug.
+    "demux.rs:.*in <impl DatagramSink for WorkerSink>::forward$",
+    # The method's three groups of bits (RFC 8489 §5: M0-M3, M4-M6, M7-M11) are disjoint once
+    # shifted, so `|` and `^` produce the same method.
+    "net/stun.rs:.*replace \\| with \\^ in parse$",
+    # Only picks whether a skip to the next keyframe is logged at debug; the skip itself and its
+    # count are the same.
+    "writer.rs:.*replace != with == in VideoWriter::skip$",
+    # A step of exactly half the RTP clock reads as a jump back (`jumps_back` takes a distance
+    # back of up to `HALF_RANGE`), so this arm never sees it: `<` and `<=` pick the same.
+    "backchannel.rs:.*replace < with <= in Packetizer::stamp$",
+    # `abi_of` only picks filesystem rights (`AccessFs::from_all`), and ABI 4 adds none to ABI 3's
+    # (landlock(7), "Landlock ABI versions"): ABI 3 taken as 4 handles the same rights.
+    "lotse-sandbox/src/linux.rs:.*delete match arm 3 in abi_of$",
+    # Landlock's TCP rights are disjoint flags, so `|` and `^` produce the same set.
+    "lotse-sandbox/src/linux.rs:.*replace \\| with \\^ in net_access$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
+    # An empty host let through goes on to `Url::set_username`, which refuses a URL whose host
+    # is empty (url 2): the same `MissingHost`.
+    "source_url.rs:.*replace match guard !host.is_empty\\(\\) with true in SourceUrl::parse$",
 ]

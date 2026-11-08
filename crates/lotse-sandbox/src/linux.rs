@@ -866,6 +866,13 @@ mod tests {
         };
         let report = crate::apply(&supervisor, &SandboxConfig::default()).unwrap();
         assert_eq!(limits(Resource::Fsize), file_size);
+        // Only workers and decoders die with their parent (prctl(2)
+        // `PR_SET_PDEATHSIG`; their filter refuses `PR_GET_PDEATHSIG`): the
+        // supervisor outlives whoever started it.
+        assert_eq!(
+            rustix::process::parent_process_death_signal().unwrap(),
+            None
+        );
         // No closure over the notes: unprivileged, under a kernel with
         // every layer, there are none, and it would never run.
         let notes = report.notes;
@@ -1105,6 +1112,51 @@ mod tests {
                 "landlock.net: not enforced by this kernel",
             ]
         );
+    }
+
+    /// `require` refuses exactly the layers this kernel does not enforce:
+    /// with ABI 4 or later (Linux 6.7) both are, and it passes; before it,
+    /// the TCP rules are missing. Restricts this test's thread, which
+    /// touches no file afterwards.
+    #[test]
+    fn landlock7_require_refuses_exactly_the_layers_the_kernel_does_not_enforce() {
+        let abi = probe_abi();
+        assert!(abi > 0, "needs a kernel with Landlock");
+        let mut notes = Vec::new();
+        let applied = apply_landlock(
+            &Profile::Decoder,
+            open_rules(&Profile::Decoder),
+            Mode::Require,
+            abi,
+            &mut notes,
+        );
+        assert_eq!(applied.is_ok(), abi >= 4, "{applied:?}");
+        // Either both layers enforced, or the TCP layer refused.
+        let shown = format!("{applied:?}");
+        let allowed = [
+            "Ok(LandlockReport { fs: Enforced, net: Enforced,",
+            "Err(Required { layer: \"landlock.net\",",
+        ];
+        assert!(
+            allowed.iter().any(|start| shown.starts_with(start)),
+            "{shown}"
+        );
+    }
+
+    /// Each probed ABI number maps onto the crate's ABI of that version,
+    /// whose rights it probes (landlock(7), "Landlock ABI versions").
+    #[test]
+    fn landlock7_each_probed_abi_probes_its_own_version_s_rights() {
+        for (probed, abi) in [
+            (0, ABI::V1),
+            (1, ABI::V1),
+            (2, ABI::V2),
+            (3, ABI::V3),
+            (4, ABI::V4),
+            (9, ABI::V4),
+        ] {
+            assert_eq!(probe_rights(probed).0, AccessFs::from_all(abi), "{probed}");
+        }
     }
 
     #[test]

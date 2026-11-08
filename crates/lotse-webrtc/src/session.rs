@@ -1841,6 +1841,80 @@ mod tests {
 
     use super::*;
 
+    /// A session answering a stand-in browser's offer of H.264 video.
+    fn answered() -> Session {
+        use lotse_core::clock::{Clock as _, SystemClock};
+        let now = SystemClock.now();
+        install_crypto_provider();
+        let viewer =
+            lotse_testing::viewer::Viewer::new("192.0.2.20:40000".parse().unwrap(), now).unwrap();
+        let request = SessionRequest {
+            offer: viewer.offer().to_owned(),
+            ice: lotse_core::session::IceCredentials {
+                ufrag: "lotseufrag".into(),
+                pass: "lotsepassword0123456789ab".into(),
+            },
+            candidates: vec!["192.0.2.10:18556".parse().unwrap()],
+            tcp_candidates: vec![],
+            video: Some(Arc::new(Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            })),
+            audio: None,
+            backchannel: None,
+            claim: TalkbackClaim::Granted,
+            orientation: Orientation::default(),
+            limits: SessionLimits::default(),
+            wall: SystemClock.wall_now(),
+        };
+        Session::answer(&request, now).unwrap().0
+    }
+
+    /// ICE's states move the session only from the states they belong to:
+    /// checks start a connection only while gathering, a disconnection
+    /// is a loss of consent (RFC 7675 §5.1) only once connected, and the
+    /// DTLS state reported is `connected` exactly while connected or
+    /// disconnected.
+    #[test]
+    fn rfc7675_5_1_ice_states_move_the_session_only_from_their_own_states() {
+        let mut session = answered();
+        let ice = |session: &mut Session, ice| {
+            session.on_event(&Event::IceConnectionStateChange(ice));
+            (session.state, session.dtls)
+        };
+        assert_eq!(session.state, State::Gathering);
+        assert_eq!(
+            ice(&mut session, IceConnectionState::Disconnected),
+            (State::Gathering, "new")
+        );
+        assert_eq!(session.disconnect_deadline, None, "no consent to lose yet");
+        assert_eq!(
+            ice(&mut session, IceConnectionState::Checking),
+            (State::Connecting, "new")
+        );
+        session.on_event(&Event::Connected);
+        assert_eq!(
+            ice(&mut session, IceConnectionState::Completed),
+            (State::Connected, "connected")
+        );
+        assert_eq!(
+            ice(&mut session, IceConnectionState::Disconnected),
+            (State::Disconnected, "connected")
+        );
+        assert!(session.disconnect_deadline.is_some(), "consent lost");
+        assert_eq!(
+            ice(&mut session, IceConnectionState::Checking),
+            (State::Disconnected, "connected"),
+            "checks again are no new connection"
+        );
+        assert_eq!(
+            ice(&mut session, IceConnectionState::Connected),
+            (State::Connected, "connected")
+        );
+        assert_eq!(session.disconnect_deadline, None, "consent regained");
+    }
+
     /// A 12-byte header with first byte `v`, second byte `pt` and SSRC
     /// `ssrc`.
     fn header(v: u8, pt: u8, ssrc: u32) -> Vec<u8> {

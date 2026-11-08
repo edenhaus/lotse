@@ -69,6 +69,16 @@ holds 11 ms. Audio is held for lip-sync to the video and its own jitter: 52 ms m
 189-285 ms in browsers playing a transcoded AAC camera before the transcoder paced its packets and
 33-34 ms since. Above these the latency budget is spent."""
 
+SAFARI_AUDIO_JITTER_BUFFER_MS = 500.0
+"""Safari's bound on the mean audio jitter-buffer delay, in place of `JITTER_BUFFER_MS`'s. The first
+session of a run, the `join` case, held 405-435 ms of PCMU in Safari 26.6.2 and 27.2 on CI's macOS
+runner in each of the six nightly runs from 2026-10-20 to 2026-11-07 that played it, with NetEq's
+own target at 172 ms and the excess drained by accelerating (`removedSamplesForAcceleration`);
+the later sessions of the same run, each against a daemon and camera started afresh exactly as
+the first, held 120-190 ms. That first session also took 360-410 ms to its first frame against
+50-80 ms for the others, and Chrome holds 42-62 ms in every case: Safari starting cold, not the
+stream (observed 2026-11-08)."""
+
 BEYOND_JITTER_BUFFER_FRAMES = 1.0
 """The mean video processing delay beyond the jitter buffer (`totalProcessingDelay /
 framesDecoded` less the mean jitter-buffer delay, webrtc-stats §8.5): what a frame waits for and
@@ -506,12 +516,20 @@ def _browser_estimate(page: Json) -> float | None:
     return video - audio
 
 
+def jitter_buffer_bound_ms(kind: str, engine: str | None) -> float:
+    """The bound on the mean jitter-buffer delay of `kind` in the browser `engine`, in ms."""
+    if kind == "audio" and engine == "safari":
+        return SAFARI_AUDIO_JITTER_BUFFER_MS
+    return JITTER_BUFFER_MS[kind]
+
+
 def check(  # noqa: PLR0915 -- one check after another
-    page: Json, stream: Stream, disrupt: str | None = None
+    page: Json, stream: Stream, disrupt: str | None = None, engine: str | None = None
 ) -> Verdict:
     """The checks on what the page measured; each failed one as a sentence.
 
-    With `disrupt`, the case's disruption (`harness.Case.disrupt`), the window after the recovery.
+    With `disrupt`, the case's disruption (`harness.Case.disrupt`), the window after the recovery;
+    `engine` is the browser (`chrome`, `firefox`, `safari`) where a bound depends on it.
     """
     failures = [f"the page: {error}" for error in page.get("errors", [])]
     failures += disruption_failures(page, disrupt)
@@ -651,10 +669,11 @@ def check(  # noqa: PLR0915 -- one check after another
             _delta(first, last, "jitterBufferEmittedCount"),
         )
         measured[f"{kind}_jitter_buffer_ms"] = buffer_ms
+        bound = jitter_buffer_bound_ms(kind, engine)
         expect(
-            buffer_ms is not None and 0 < buffer_ms <= JITTER_BUFFER_MS[kind],
-            f"a mean {kind} jitter-buffer delay above 0 and at most "
-            f"{JITTER_BUFFER_MS[kind]:.0f} ms (got {buffer_ms})",
+            buffer_ms is not None and 0 < buffer_ms <= bound,
+            f"a mean {kind} jitter-buffer delay above 0 and at most {bound:.0f} ms "
+            f"(got {buffer_ms})",
         )
     processing_ms = _mean_ms(_delta(video_start, video, "totalProcessingDelay"), decoded)
     buffer_ms = measured["video_jitter_buffer_ms"]

@@ -160,6 +160,11 @@ mod tests {
         assert!(matches!(err, IpcError::TooLarge { .. }));
         let fits = vec![1_u8; MAX_MESSAGE_BYTES - 8];
         assert_eq!(decode::<Vec<u8>>(&encode(&fits).unwrap()).unwrap(), fits);
+        // Exactly the cap, a three-byte varint length included, both ways.
+        let exact = vec![1_u8; MAX_MESSAGE_BYTES - 3];
+        let bytes = encode(&exact).unwrap();
+        assert_eq!(bytes.len(), MAX_MESSAGE_BYTES);
+        assert_eq!(decode::<Vec<u8>>(&bytes).unwrap(), exact);
     }
 
     #[test]
