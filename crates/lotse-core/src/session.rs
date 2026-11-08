@@ -456,14 +456,14 @@ pub fn apply_track_event(
             tracing::debug!(epoch, "new epoch; waiting for its keyframe");
             engine.skip_to_keyframe("epoch");
         }
-        Some(TrackEvent::TrackChanged(codec)) if codec.family() != family => {
+        Some(TrackEvent::TrackChanged { codec, .. }) if codec.family() != family => {
             engine.close(
                 now,
                 "stream_changed",
                 format!("video is now {}", codec.name()),
             );
         }
-        Some(TrackEvent::TrackChanged(codec)) => match engine.check_video_change(&codec) {
+        Some(TrackEvent::TrackChanged { codec, .. }) => match engine.check_video_change(&codec) {
             Ok(()) => tracing::debug!(codec = codec.name(), "codec changed within the family"),
             Err(reason) => {
                 tracing::info!(reason, "video outside its payload type; closing");
@@ -490,7 +490,11 @@ pub fn apply_track_event(
 ///   else, and an `EpochStart` needs nothing: the writer's timestamp
 ///   offset follows each packet's epoch;
 /// - a `TrackChanged` closes with `stream_changed` only when the family
-///   changed, since the answer named the old codec's payload type;
+///   changed, since the answer named the old codec's payload type; the
+///   family fixes the RTP clock rate the answer named too (8000 for G.711
+///   and G.722, RFC 3551 §4.5.14 and §4.5.2; 48 kHz for Opus, RFC 7587
+///   §4.1), and the epoch that follows a rate change re-anchors the
+///   writer's timestamps;
 /// - `SourceLost`, `SourceRestored` and `SourceSwitched` keep the session;
 /// - the track's end stops the audio; the video track's end closes a
 ///   session that plays video.
@@ -511,7 +515,7 @@ pub fn apply_audio_event(
             tracing::debug!(skipped, "audio lagged; packets lost");
             true
         }
-        Some(TrackEvent::TrackChanged(codec)) if codec.family() != family => {
+        Some(TrackEvent::TrackChanged { codec, .. }) if codec.family() != family => {
             engine.close(
                 now,
                 "stream_changed",
@@ -521,7 +525,7 @@ pub fn apply_audio_event(
         }
         Some(
             TrackEvent::EpochStart { .. }
-            | TrackEvent::TrackChanged(_)
+            | TrackEvent::TrackChanged { .. }
             | TrackEvent::SourceLost
             | TrackEvent::SourceRestored
             | TrackEvent::SourceSwitched
@@ -540,6 +544,15 @@ mod tests {
     #![allow(clippy::missing_docs_in_private_items, reason = "test code")]
 
     use super::*;
+
+    /// The `TrackChanged` of a track now carrying `codec` at its RTP clock
+    /// rate.
+    fn changed(codec: Codec) -> TrackEvent {
+        TrackEvent::TrackChanged {
+            clock_rate: codec.rtp_clock_rate().unwrap_or_default(),
+            codec: Arc::new(codec),
+        }
+    }
 
     /// The wallclock of every `apply_track_event` and `apply_audio_event`
     /// call here: one type, so one instantiation of each runs every arm,
@@ -607,13 +620,7 @@ mod tests {
             sps: None,
             pps: None,
         };
-        apply_track_event(
-            &mut engine,
-            now,
-            h264,
-            Some(TrackEvent::TrackChanged(Arc::new(main))),
-            at(now),
-        );
+        apply_track_event(&mut engine, now, h264, Some(changed(main)), at(now));
         assert!(
             matches!(
                 engine.poll(),
@@ -692,7 +699,7 @@ mod tests {
             payload: bytes::Bytes::new(),
         };
         for event in [
-            TrackEvent::TrackChanged(Arc::new(high)),
+            changed(high),
             TrackEvent::SourceLost,
             TrackEvent::SourceRestored,
             TrackEvent::Frame(Arc::new(frame)),
@@ -709,13 +716,7 @@ mod tests {
             sps: None,
             pps: None,
         };
-        apply_track_event(
-            &mut engine,
-            now,
-            h264,
-            Some(TrackEvent::TrackChanged(Arc::new(h265))),
-            at(now),
-        );
+        apply_track_event(&mut engine, now, h264, Some(changed(h265)), at(now));
         assert!(matches!(
             engine.poll(),
             SessionOutput::Event(SessionEvent::Closed {
@@ -784,7 +785,7 @@ mod tests {
         for event in [
             TrackEvent::Gap { skipped: 4 },
             TrackEvent::EpochStart { epoch: 1 },
-            TrackEvent::TrackChanged(Arc::new(Codec::Pcmu)),
+            changed(Codec::Pcmu),
             TrackEvent::SourceLost,
             TrackEvent::SourceRestored,
         ] {
@@ -803,9 +804,7 @@ mod tests {
             &mut engine,
             now,
             pcmu,
-            Some(TrackEvent::TrackChanged(Arc::new(Codec::Opus {
-                channels: 2
-            }))),
+            Some(changed(Codec::Opus { channels: 2 })),
             at(now),
         ));
         assert!(matches!(
