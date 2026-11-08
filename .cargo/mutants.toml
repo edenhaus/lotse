@@ -134,6 +134,10 @@ exclude_re = [
     # Built only without the RTSP source, and the mutants are tested with every feature on:
     # no test of the run reaches it. (With the source, `retina` returns a `RetinaLog`.)
     "logging.rs:.*replace retina -> L with Default::default\\(\\)$",
+    # Without `MSG_NOSIGNAL` a write to a closed peer still fails with `EPIPE` and raises no
+    # signal: Rust's runtime ignores `SIGPIPE` before `main` in every process that sends (the
+    # daemon, the worker, the tests), and `unsafe` code, which resetting it takes, is forbidden.
+    "channel.rs:.*replace send_flags -> SendFlags with Default::default\\(\\)$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
     # An empty host let through goes on to `Url::set_username`, which refuses a URL whose host

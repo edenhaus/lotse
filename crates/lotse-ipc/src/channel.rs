@@ -756,6 +756,26 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn a_frame_of_exactly_the_cap_goes_through() {
+        let (mut a_tx, _a_rx, _b_tx, mut b_rx) = pair();
+        let exact = vec![7_u8; MAX_MESSAGE_BYTES];
+        let (sent, received) = tokio::join!(a_tx.send(&exact, &[]), b_rx.recv());
+        sent.unwrap();
+        assert_eq!(received.unwrap().unwrap().payload, exact);
+    }
+
+    #[tokio::test]
+    async fn a_frame_with_exactly_the_most_descriptors_goes_through() {
+        let (mut a_tx, _a_rx, _b_tx, mut b_rx) = pair();
+        let (_kept, passed) = passable(MAX_FDS);
+        let borrowed: Vec<BorrowedFd<'_>> = passed.iter().map(AsFd::as_fd).collect();
+        a_tx.send(b"eight", &borrowed).await.unwrap();
+        let message = b_rx.recv().await.unwrap().unwrap();
+        assert_eq!(message.fds.len(), MAX_FDS);
+        assert!(!message.fds_truncated);
+    }
+
     /// `count` socketpairs: the ends the test keeps, and the ends it passes.
     fn passable(count: usize) -> (Vec<std::os::unix::net::UnixStream>, Vec<OwnedFd>) {
         (0..count)
