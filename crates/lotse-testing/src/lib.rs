@@ -31,5 +31,20 @@ pub mod source_harness;
 pub mod viewer;
 
 pub use fake_camera::{CameraConfig, FakeCamera};
+
+/// A `stream/put` source of `url`, named by the URL's scheme, which is its
+/// protocol (`rtsp`, `https`, the fake `fake`), with the protocol's
+/// `fields` beside it (an object; anything else adds none).
+pub fn source(url: &str, fields: serde_json::Value) -> serde_json::Value {
+    let protocol = url
+        .split_once("://")
+        .map_or(url, |(scheme, _)| scheme)
+        .to_ascii_lowercase();
+    let mut source = serde_json::json!({ "protocol": protocol, "url": url });
+    if let (Some(source), serde_json::Value::Object(fields)) = (source.as_object_mut(), fields) {
+        source.extend(fields);
+    }
+    source
+}
 pub use source_harness::Harness;
 pub use viewer::Viewer;

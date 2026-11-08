@@ -399,13 +399,13 @@ mod tests {
     }
 
     /// The registries of a build with the WebRTC source hold it as the
-    /// signaled protocol `webrtc`, no URL scheme.
+    /// signaled protocol `webrtc`, no URL protocol.
     #[cfg(feature = "source-webrtc")]
     #[test]
     fn the_webrtc_source_is_registered_behind_its_feature() {
         let registries = registries();
-        assert!(registries.sources.signaled_protocols().contains(&"webrtc"));
-        assert!(!registries.sources.schemes().contains(&"webrtc"));
+        assert!(registries.sources.protocols().contains(&"webrtc"));
+        assert!(registries.sources.get("webrtc").is_none());
         let webrtc = registries
             .sources
             .signaled("webrtc")
@@ -425,11 +425,14 @@ mod tests {
         use lotse_core::registry::RegistryError;
         let logs = logging::capture_logs(|| {
             registered("fake source", Ok(()));
-            registered("fake source", Err(RegistryError::DuplicateScheme("fake")));
+            registered("fake source", Err(RegistryError::DuplicateProtocol("fake")));
         });
         assert_eq!(logs.lines().count(), 1, "{logs}");
         assert!(logs.contains("ERROR"), "{logs}");
         assert!(logs.contains("fake source not registered"), "{logs}");
-        assert!(logs.contains("scheme fake is already registered"), "{logs}");
+        assert!(
+            logs.contains("protocol fake is already registered"),
+            "{logs}"
+        );
     }
 }

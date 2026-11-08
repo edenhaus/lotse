@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use lotse_api_types::source::TlsTrust;
 use lotse_codec::h264::ParameterSets;
 use lotse_codec::h265;
 use lotse_codec::rtp_ingest::{Declared, RtpPacket, RtpTracks, Sprop};
@@ -64,8 +65,8 @@ use crate::backchannel::probe;
 use crate::backchannel::session::Probed;
 use crate::driver::{Budget, Connection, Driver, Duplex, Item, Received};
 use crate::error::camera_text;
-use crate::factory::PROTOCOL;
-use crate::options::{RtspOptions, Transport as MediaTransport};
+use crate::factory::{PROTOCOL, TLS_PROTOCOL};
+use crate::options::{RtspOptions, Transport as MediaTransport, user_agent};
 use crate::udp::Pair;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -99,7 +100,7 @@ pub(crate) const TEARDOWN: Budget = Budget {
 pub struct RtspSource {
     /// The URL, credentials inside.
     url: SourceUrl,
-    /// The options.
+    /// The options; an `rtsps` source's interleave over TCP.
     options: RtspOptions,
     /// For `rtsps`: the server name and the certificate check.
     tls: Option<TlsTarget>,
@@ -118,19 +119,49 @@ impl RtspSource {
             probed: Probed::default(),
         }
     }
+
+    /// The source's fields as its protocol's `stream/put` variant has
+    /// them, but its URL: every default applied, and for `rtsps` its trust
+    /// (a pin in its canonical form) in place of the `transport` that
+    /// protocol does not take. Nothing here is secret: a certificate
+    /// fingerprint is public.
+    fn fields(&self) -> serde_json::Value {
+        let mut fields = serde_json::json!(self.options);
+        if let (Some(tls), Some(map)) = (&self.tls, fields.as_object_mut()) {
+            let _transport = map.remove("transport");
+            map.insert(
+                "tls".to_owned(),
+                serde_json::json!(TlsTrust::from(tls.trust)),
+            );
+        }
+        fields
+    }
 }
 
 impl Source for RtspSource {
     fn describe(&self) -> SourceDescriptor {
         SourceDescriptor {
-            protocol: PROTOCOL,
+            protocol: if self.tls.is_some() {
+                TLS_PROTOCOL
+            } else {
+                PROTOCOL
+            },
             url: Some(self.url.clone()),
-            options: self.options.redacted(),
+            options: self.fields(),
         }
     }
 
+    /// The fields, minus `backchannel`, which is deliberately not in the
+    /// key so enabling talk-back never opens a second camera session: the
+    /// supervisor asks for the backchannel on the shared connection when
+    /// one of its streams does. Every default is applied, so `{}` and the
+    /// defaults spelled out are one key, as is every spelling of one pin.
     fn connection_options(&self) -> serde_json::Value {
-        self.options.connection_key()
+        let mut key = self.fields();
+        if let Some(fields) = key.as_object_mut() {
+            let _backchannel = fields.remove("backchannel");
+        }
+        key
     }
 
     fn wants_backchannel(&self) -> bool {
@@ -487,7 +518,7 @@ fn session_options(ask: &Ask) -> SessionOptions {
     let url = &ask.camera.url;
     SessionOptions::default()
         .creds(credentials(url))
-        .user_agent(ask.camera.options.user_agent().to_owned())
+        .user_agent(user_agent(&ask.camera.options).to_owned())
         .teardown(TeardownPolicy::Auto)
         .max_message_size(MAX_MESSAGE)
 }

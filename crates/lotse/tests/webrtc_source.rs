@@ -245,7 +245,16 @@ impl Control {
 fn put(options: &Value, prerecord_ms: u32) -> Value {
     json!({ "type": "stream/put", "stream_id": "door", "preload": true,
             "prerecord_ms": prerecord_ms,
-            "sources": [{ "protocol": PROTOCOL, "options": options }] })
+            "sources": [signaled(options)] })
+}
+
+/// A [`PROTOCOL`] source with `options` beside its protocol.
+fn signaled(options: &Value) -> Value {
+    let mut source = json!({ "protocol": PROTOCOL });
+    if let (Some(source), Some(options)) = (source.as_object_mut(), options.as_object()) {
+        source.extend(options.clone());
+    }
+    source
 }
 
 /// One signal's offer as the subscription delivers it.
@@ -506,8 +515,8 @@ async fn rfc8445_2_5_a_nest_like_ice_lite_camera_answers_the_offer_and_its_strea
         .stream_where("door", |door| door["state"] == "live")
         .await;
     assert_eq!(door["last_error"], Value::Null, "{door}");
-    assert_eq!(door["sources"][0]["protocol"], PROTOCOL);
-    assert!(door["sources"][0].get("url").is_none(), "{door}");
+    assert_eq!(door["sources"][0]["source"]["protocol"], PROTOCOL);
+    assert!(door["sources"][0]["source"].get("url").is_none(), "{door}");
     let codecs: Vec<&str> = door["tracks"]
         .as_array()
         .unwrap()

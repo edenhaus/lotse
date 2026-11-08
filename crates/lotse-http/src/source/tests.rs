@@ -194,7 +194,7 @@ impl Rig {
 fn options() -> HttpOptions {
     HttpOptions {
         timeout_ms: 3_600_000,
-        ..HttpOptions::default()
+        ..crate::options::defaults()
     }
 }
 
@@ -529,7 +529,7 @@ async fn the_source_describes_itself_without_secrets() {
         url,
         HttpOptions {
             max_bandwidth: Some(1),
-            ..HttpOptions::default()
+            ..crate::options::defaults()
         },
         None,
     );

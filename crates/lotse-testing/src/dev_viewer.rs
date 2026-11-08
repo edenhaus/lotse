@@ -1024,9 +1024,11 @@ mod tests {
         let page = PAGE;
         assert!(page.contains(r#"<input id="talkback" type="checkbox">"#));
         assert!(page.contains(r#"<button id="talk" type="button" class="secondary" disabled"#));
-        // The option only when opted in, so a camera without a backchannel
-        // never sees the request.
-        assert!(page.contains("(talkback ? { url, options: { backchannel: true } } : { url })"));
+        // The field only when opted in, so a camera without a backchannel
+        // never sees the request; the URL's scheme names the protocol.
+        assert!(page.contains(
+            r#"({ protocol: url.slice(0, url.indexOf("://")).toLowerCase(), url, ...(talkback ? { backchannel: true } : {}) })"#
+        ));
         assert!(page.contains(
             r#"call({ type: "stream/put", stream_id: streamId, sources: [source(url, talkback)], orientation })"#
         ));

@@ -382,7 +382,7 @@ async fn hello_comes_first_then_results_follow_the_contract() {
     send(&mut ws, json!({ "id": 1, "type": "ping" })).await;
     assert_eq!(recv(&mut ws).await, json!({ "id": 1, "type": "pong" }));
 
-    send(&mut ws, json!({ "id": 2, "type": "stream/put", "stream_id": "front", "sources": [{ "url": "rtsp://c/" }] })).await;
+    send(&mut ws, json!({ "id": 2, "type": "stream/put", "stream_id": "front", "sources": [{ "protocol": "rtsp", "url": "rtsp://c/" }] })).await;
     assert_eq!(
         recv(&mut ws).await,
         json!({ "id": 2, "type": "result", "success": true, "result": { "created": true } })
@@ -434,7 +434,7 @@ async fn subscriptions_deliver_events_until_unsubscribed() {
     let running = start("subscribe", FakeHandler::default(), 8);
     let mut ws = connect(&running.socket).await;
     recv(&mut ws).await;
-    send(&mut ws, json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [{ "url": "rtsp://c/" }] })).await;
+    send(&mut ws, json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [{ "protocol": "rtsp", "url": "rtsp://c/" }] })).await;
     recv(&mut ws).await;
 
     send(&mut ws, json!({ "id": 2, "type": "stream/subscribe" })).await;
@@ -448,7 +448,7 @@ async fn subscriptions_deliver_events_until_unsubscribed() {
         json!({ "id": 2, "type": "event", "event": { "type": "stream", "stream_id": "a", "state": "idle", "last_error": null } })
     );
 
-    send(&mut ws, json!({ "id": 3, "type": "stream/put", "stream_id": "b", "sources": [{ "url": "rtsp://c/" }] })).await;
+    send(&mut ws, json!({ "id": 3, "type": "stream/put", "stream_id": "b", "sources": [{ "protocol": "rtsp", "url": "rtsp://c/" }] })).await;
     let mut seen = [recv(&mut ws).await, recv(&mut ws).await];
     seen.sort_by_key(|f| f["type"].as_str().unwrap().to_owned());
     assert_eq!(seen[0]["event"]["stream_id"], "b");
@@ -460,7 +460,7 @@ async fn subscriptions_deliver_events_until_unsubscribed() {
     )
     .await;
     assert_eq!(recv(&mut ws).await["success"], true);
-    send(&mut ws, json!({ "id": 5, "type": "stream/put", "stream_id": "c", "sources": [{ "url": "rtsp://c/" }] })).await;
+    send(&mut ws, json!({ "id": 5, "type": "stream/put", "stream_id": "c", "sources": [{ "protocol": "rtsp", "url": "rtsp://c/" }] })).await;
     assert_eq!(recv(&mut ws).await["result"]["created"], true);
     send(&mut ws, json!({ "id": 6, "type": "ping" })).await;
     assert_eq!(recv(&mut ws).await["type"], "pong", "no event slipped in");

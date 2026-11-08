@@ -1,96 +1,15 @@
-//! The `options` of a `webrtc` source as `stream/put` carries them.
-//! Unknown fields are rejected, so a typo fails at `stream/put`, and so
-//! does a data channel label that is empty, too long or carries a control
-//! character.
+//! The options a `webrtc` source runs with: [`WebRtcOptions`], declared as
+//! the API's `stream/put` variant in `lotse_api_types::source`, which also
+//! checks them (unknown fields, a data channel label that is empty, too
+//! long or carries a control character, RFC 8832 §5.1).
 
-use serde::{Deserialize, Deserializer, Serialize};
+pub use lotse_api_types::source::{MAX_LABEL_CHARS, WebRtcOptions};
 
-/// The longest `data_channel` label accepted, in characters. Not from a
-/// spec (RFC 8832 §5.1 allows up to 65535 bytes); the label the cameras'
-/// integrations ask for is a short name (Nest's `dataSendChannel`).
-pub const MAX_LABEL_CHARS: usize = 64;
-
-/// Whether `label` can be the data channel's label: 1 to
-/// [`MAX_LABEL_CHARS`] characters, none of them a control character
-/// (`char::is_control`, Unicode `Cc`), so it logs as one line. Other
-/// characters that do not print (a format or private-use one) are taken.
-fn is_valid_label(label: &str) -> bool {
-    let chars = label.chars().count();
-    (1..=MAX_LABEL_CHARS).contains(&chars) && !label.chars().any(char::is_control)
-}
-
-/// Deserializes `data_channel`, refusing a label [`is_valid_label`]
-/// rejects.
-fn deserialize_label<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error> {
-    let value = Option::<String>::deserialize(deserializer)?;
-    match value {
-        Some(label) if !is_valid_label(&label) => Err(serde::de::Error::custom(format!(
-            "data_channel must be 1 to {MAX_LABEL_CHARS} characters, none a control character, not {label:?}"
-        ))),
-        other => Ok(other),
-    }
-}
-
-/// The default of [`WebRtcOptions::audio`]: the camera's audio is offered
-/// for.
-const fn audio_default() -> bool {
-    true
-}
-
-/// The typed options of a `webrtc` source. Every field changes the
-/// offer, so every field is part of the connection key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebRtcOptions {
-    /// The label of a data channel to offer beside the media (RFC 8831,
-    /// RFC 8832), as the camera's integration asks for one: Nest refuses
-    /// an offer without an `application` m-line and wants
-    /// `dataSendChannel`. `None` (the default) offers none.
-    #[serde(default, deserialize_with = "deserialize_label")]
-    pub data_channel: Option<String>,
-    /// Offer to receive the camera's audio (default `true`); `false`
-    /// offers video only.
-    #[serde(default = "audio_default")]
-    pub audio: bool,
-}
-
-impl Default for WebRtcOptions {
-    fn default() -> Self {
-        Self {
-            data_channel: None,
-            audio: audio_default(),
-        }
-    }
-}
-
-impl WebRtcOptions {
-    /// Parses `stream/put`'s untyped `options`: `null` is the defaults,
-    /// an object is checked field by field, anything else is refused.
-    ///
-    /// # Errors
-    ///
-    /// What is wrong with them, for `invalid_request`.
-    pub fn parse(value: &serde_json::Value) -> Result<Self, serde_json::Error> {
-        match value {
-            serde_json::Value::Null => Ok(Self::default()),
-            serde_json::Value::Object(_) => serde_json::from_value(value.clone()),
-            other => Err(serde::de::Error::custom(format!(
-                "options must be an object, not {other}"
-            ))),
-        }
-    }
-
-    /// The options normalized, every default applied: what `stream/get`
-    /// reports (nothing here is secret) and the options half of the
-    /// connection key, since each one changes the offer.
-    pub fn normalized(&self) -> serde_json::Value {
-        serde_json::json!({
-            "data_channel": self.data_channel,
-            "audio": self.audio,
-        })
-    }
+/// `options` with every default applied: what `stream/get` reports
+/// (nothing here is secret) and the options half of the connection key,
+/// since each one changes the offer.
+pub fn normalized(options: &WebRtcOptions) -> serde_json::Value {
+    serde_json::json!(options)
 }
 
 #[cfg(test)]
@@ -102,64 +21,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn null_and_empty_options_are_the_defaults() {
-        for options in [serde_json::Value::Null, json!({})] {
-            let parsed = WebRtcOptions::parse(&options).unwrap();
-            assert_eq!(parsed, WebRtcOptions::default());
-            assert!(parsed.audio);
-            assert_eq!(parsed.data_channel, None);
-            assert_eq!(
-                parsed.normalized(),
-                json!({ "data_channel": null, "audio": true })
-            );
-        }
-    }
-
-    #[test]
-    fn rfc8832_5_1_a_data_channel_label_and_audio_off_are_taken() {
-        let parsed =
-            WebRtcOptions::parse(&json!({ "data_channel": "dataSendChannel", "audio": false }))
-                .unwrap();
-        assert_eq!(parsed.data_channel.as_deref(), Some("dataSendChannel"));
-        assert!(!parsed.audio);
+    fn rfc8832_5_1_the_options_normalize_with_every_default() {
+        let parsed: WebRtcOptions = serde_json::from_value(json!({})).unwrap();
         assert_eq!(
-            parsed.normalized(),
+            normalized(&parsed),
+            json!({ "data_channel": null, "audio": true })
+        );
+        let nest = WebRtcOptions {
+            data_channel: Some("dataSendChannel".into()),
+            audio: false,
+        };
+        assert_eq!(
+            normalized(&nest),
             json!({ "data_channel": "dataSendChannel", "audio": false })
         );
-        let longest = "é".repeat(MAX_LABEL_CHARS);
-        let parsed = WebRtcOptions::parse(&json!({ "data_channel": longest })).unwrap();
-        assert_eq!(parsed.data_channel, Some(longest));
-        // A character that does not print but is no control character (a
-        // zero-width space, Unicode `Cf`) is taken.
-        let parsed = WebRtcOptions::parse(&json!({ "data_channel": "data\u{200b}" })).unwrap();
-        assert_eq!(parsed.data_channel.as_deref(), Some("data\u{200b}"));
-        // `null` spelled out is no data channel.
-        let parsed = WebRtcOptions::parse(&json!({ "data_channel": null })).unwrap();
-        assert_eq!(parsed.data_channel, None);
-    }
-
-    #[test]
-    fn bad_labels_unknown_fields_and_non_objects_are_refused() {
-        for label in [
-            String::new(),
-            "x".repeat(MAX_LABEL_CHARS + 1),
-            "data\nchannel".to_owned(),
-            "\u{7f}".to_owned(),
-        ] {
-            let err = WebRtcOptions::parse(&json!({ "data_channel": label })).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("data_channel must be 1 to 64 characters, none a control character"),
-                "{label:?}: {err}"
-            );
-        }
-        let err = WebRtcOptions::parse(&json!({ "data_channel": 7 })).unwrap_err();
-        assert!(err.to_string().contains("invalid type"), "{err}");
-        let err = WebRtcOptions::parse(&json!({ "backchannel": true })).unwrap_err();
-        assert!(err.to_string().contains("unknown field"), "{err}");
-        let err = WebRtcOptions::parse(&json!({ "audio": "yes" })).unwrap_err();
-        assert!(err.to_string().contains("invalid type"), "{err}");
-        let err = WebRtcOptions::parse(&json!([1])).unwrap_err();
-        assert_eq!(err.to_string(), "options must be an object, not [1]");
+        assert_eq!(MAX_LABEL_CHARS, 64);
     }
 }

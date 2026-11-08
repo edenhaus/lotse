@@ -32,9 +32,6 @@ pub const MAX_SOURCES: usize = 8;
 /// The longest source URL, credentials and query included.
 pub const MAX_URL_CHARS: usize = 4096;
 
-/// The longest name of a signaled source's protocol (`webrtc`).
-pub const MAX_PROTOCOL_CHARS: usize = 64;
-
 /// The longest SDP offer: the whole 64 KiB frame.
 pub const MAX_SDP_CHARS: usize = 64 * 1024;
 
@@ -44,8 +41,8 @@ pub const MAX_ICE_SERVERS: usize = 16;
 /// The most `urls` of one ICE server.
 pub const MAX_ICE_URLS: usize = 16;
 
-/// The longest certificate pin of `clients/remove`: 32 hex pairs and the
-/// 31 colons between them.
+/// The longest certificate pin, of `clients/remove` and of a source's
+/// `tls`: 32 hex pairs and the 31 colons between them.
 pub const MAX_PIN_CHARS: usize = 95;
 
 /// The longest ICE server URL, TURN username or credential, trickled

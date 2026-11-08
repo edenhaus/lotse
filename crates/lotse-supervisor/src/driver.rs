@@ -340,12 +340,12 @@ pub(crate) struct DriverSpec {
     /// The full source URL, credentials included, or a signaled source's
     /// protocol.
     pub(crate) target: SourceTarget,
-    /// The per-scheme or per-protocol options as JSON text.
+    /// The protocol's fields but the URL, as JSON text.
     pub(crate) options: String,
     /// The host to resolve, as the URL spells it; empty for a signaled
     /// source.
     pub(crate) host: String,
-    /// The port, from the URL or the scheme's default.
+    /// The port, from the URL or the protocol's default.
     pub(crate) port: Option<u16>,
     /// The source asks the camera for its backchannel
     /// ([`Source::wants_backchannel`](lotse_core::source::Source::wants_backchannel)),
@@ -384,7 +384,7 @@ impl DriverSpec {
 }
 
 /// Prints the options by name only, as `SourceSpec` and `ConnectionKey`
-/// do: a value may be a scheme's secret, and the spec is logged at info
+/// do: a value may be a protocol's secret, and the spec is logged at info
 /// on every driver start. Text that is not a JSON object prints as `****`.
 impl fmt::Debug for DriverSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2485,7 +2485,10 @@ mod tests {
                             lotse_core::source_url::SourceUrl::parse("fake://127.0.0.1/").unwrap(),
                         ),
                         options: serde_json::Map::new(),
-                        protocol: "fake",
+                        reported: serde_json::from_value(
+                            serde_json::json!({ "protocol": "fake", "url": "fake://127.0.0.1/" }),
+                        )
+                        .unwrap(),
                         connection: "c1".into(),
                     }],
                     preload: false,
@@ -3941,7 +3944,10 @@ mod tests {
                     spec,
                     target: crate::registry::SourceTarget::Url(url.clone()),
                     options: serde_json::Map::new(),
-                    protocol: "fake",
+                    reported: serde_json::from_value(
+                        serde_json::json!({ "protocol": "fake", "url": "fake://127.0.0.1/" }),
+                    )
+                    .unwrap(),
                     connection: "c1".into(),
                 }],
                 preload: false,

@@ -38,7 +38,7 @@ pub enum SignalingEvent {
         /// the offer to, as a signaled source has no address.
         stream_id: String,
         /// The signaled source's protocol (`webrtc`), one of
-        /// `info.signaled_protocols`.
+        /// `info.protocols`.
         protocol: String,
         /// The SDP offer (RFC 8829 §5.2).
         sdp: String,

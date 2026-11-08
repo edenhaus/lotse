@@ -2806,7 +2806,8 @@ mod tests {
                     stream: "door".into(),
                 },
                 options: serde_json::Map::new(),
-                protocol: "webrtc",
+                reported: serde_json::from_value(serde_json::json!({ "protocol": "webrtc" }))
+                    .unwrap(),
                 connection: connection.into(),
             }],
             preload: false,

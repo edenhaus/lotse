@@ -257,7 +257,7 @@ async fn rfc6184_h264_is_packetized_for_the_live_path_and_framed_on_the_side_bra
     let server = server().await;
     serve_vod(&server, "vod", &[0, 1, 2]);
     let clock = Arc::new(FakeClock::from_system());
-    let source = make_source(&server.url("/vod/index.m3u8"), &json!(null));
+    let source = make_source(&server.url("/vod/index.m3u8"), &json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&server), clock.clone());
     assert!(ready_within(&mut harness).await);
     let (video, audio) = video_and_audio(&harness.tracks);
@@ -357,7 +357,7 @@ async fn without_sync_hints_audio_and_video_map_by_arrival_on_one_base() {
     let server = server().await;
     serve_vod(&server, "vod", &[0, 1]);
     let clock = Arc::new(FakeClock::from_system());
-    let source = make_source(&server.url("/vod/index.m3u8"), &json!(null));
+    let source = make_source(&server.url("/vod/index.m3u8"), &json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&server), clock.clone());
     assert!(ready_within(&mut harness).await);
     let (video, audio) = video_and_audio(&harness.tracks);
@@ -417,7 +417,7 @@ async fn rfc3550_5_1_a_timestamp_reset_without_a_discontinuity_starts_one_epoch_
     // the first's again, two seconds back.
     serve_vod(&server, "reset", &[0, 1, 0]);
     let clock = Arc::new(FakeClock::from_system());
-    let source = make_source(&server.url("/reset/index.m3u8"), &json!(null));
+    let source = make_source(&server.url("/reset/index.m3u8"), &json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&server), clock.clone());
     assert!(ready_within(&mut harness).await);
     let (video, audio) = video_and_audio(&harness.tracks);
@@ -497,7 +497,7 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
     let (tx, mut events) = mpsc::channel(16);
     let cancel = CancellationToken::new();
     let runner = SourceRunner::new(
-        make_source(&server.url("/raw"), &json!(null)),
+        make_source(&server.url("/raw"), &json!({})),
         peer(&server),
         Arc::clone(&tracks),
         Arc::new(ClockMapper::new()),
@@ -579,7 +579,7 @@ async fn rfc8216_6_2_1_a_live_playlist_that_stops_growing_and_a_stalled_body_tim
         Bytes::from_static(LIVE[0]),
     );
     let clock = Arc::new(FakeClock::from_system());
-    let source = make_source(&server.url("/live/index.m3u8"), &json!(null));
+    let source = make_source(&server.url("/live/index.m3u8"), &json!({}));
     let harness = Harness::start(source.as_ref(), peer(&server), clock.clone());
     let err = run_to_exit(&clock, harness, || {}).await;
     assert!(
@@ -614,11 +614,11 @@ async fn cancel_ends_the_attempt_within_100_ms_and_stops_fetching() {
     }
     server.set("/hang", Reply::Hang);
     // Playing, paced on the real clock, a reload ahead.
-    let source = make_source(&server.url("/live/index.m3u8"), &json!(null));
+    let source = make_source(&server.url("/live/index.m3u8"), &json!({}));
     let mut playing = Harness::start(source.as_ref(), peer(&server), Arc::new(SystemClock));
     assert!(ready_within(&mut playing).await);
     // Waiting for the first answer.
-    let source = make_source(&server.url("/hang"), &json!(null));
+    let source = make_source(&server.url("/hang"), &json!({}));
     let waiting = Harness::start(source.as_ref(), peer(&server), Arc::new(SystemClock));
     for _ in 0..1_000 {
         if server.requests().iter().any(|seen| seen.target == "/hang") {
@@ -646,7 +646,7 @@ async fn unreachable_timeout_protocol_and_ended_are_typed_errors() {
     let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = free.local_addr().unwrap();
     drop(free);
-    let closed = make_source(&format!("http://{addr}/index.m3u8"), &json!(null));
+    let closed = make_source(&format!("http://{addr}/index.m3u8"), &json!({}));
     let harness = Harness::start(
         closed.as_ref(),
         ResolvedPeer {
@@ -674,13 +674,13 @@ async fn unreachable_timeout_protocol_and_ended_are_typed_errors() {
     assert!(matches!(err, SourceError::Timeout(_)), "{err:?}");
     // Protocol: a missing playlist (RFC 9110 §15.5.5), and something that is
     // neither HLS nor MPEG-TS.
-    let err = exit_within(run("/missing.m3u8", json!(null)), Duration::from_secs(3)).await;
+    let err = exit_within(run("/missing.m3u8", json!({})), Duration::from_secs(3)).await;
     assert!(
         matches!(&err, SourceError::Protocol(m) if m.contains("404")),
         "{err:?}"
     );
     server.set("/page", Reply::body("text/html", "<html></html>"));
-    let err = exit_within(run("/page", json!(null)), Duration::from_secs(3)).await;
+    let err = exit_within(run("/page", json!({})), Duration::from_secs(3)).await;
     assert!(
         matches!(&err, SourceError::Protocol(m) if m.contains("text/html")),
         "{err:?}"
@@ -688,13 +688,13 @@ async fn unreachable_timeout_protocol_and_ended_are_typed_errors() {
     // Ended: an ended playlist played out (RFC 8216 §4.3.3.4), and a raw
     // MPEG-TS body the server ends.
     serve_vod(&server, "vod", &[0]);
-    let err = exit_within(run("/vod/index.m3u8", json!(null)), Duration::from_secs(5)).await;
+    let err = exit_within(run("/vod/index.m3u8", json!({})), Duration::from_secs(5)).await;
     assert!(
         matches!(&err, SourceError::Ended(m) if m.contains("EXT-X-ENDLIST")),
         "{err:?}"
     );
     server.set("/raw", Reply::body(MP2T, Bytes::from_static(LIVE[0])));
-    let err = exit_within(run("/raw", json!(null)), Duration::from_secs(5)).await;
+    let err = exit_within(run("/raw", json!({})), Duration::from_secs(5)).await;
     assert!(
         matches!(&err, SourceError::Ended(m) if m.contains("MPEG-TS")),
         "{err:?}"
@@ -720,7 +720,7 @@ async fn rfc7616_credentials_are_checked_and_never_described_debugged_or_logged(
             format!("http://{addr}/vod/index.m3u8"),
             format!("http://admin:wrong@{addr}/vod/index.m3u8"),
         ] {
-            let source = make_source(&url, &json!(null));
+            let source = make_source(&url, &json!({}));
             let harness = Harness::start(source.as_ref(), peer(&server), Arc::new(SystemClock));
             let err = exit_within(harness, Duration::from_secs(3)).await;
             assert!(matches!(err, SourceError::AuthFailed(_)), "{err:?}");
@@ -728,7 +728,7 @@ async fn rfc7616_credentials_are_checked_and_never_described_debugged_or_logged(
         }
         // The right ones: it plays, and nothing shows them.
         let url = format!("http://admin:secret@{addr}/vod/index.m3u8?token=hidden");
-        let source = make_source(&url, &json!(null));
+        let source = make_source(&url, &json!({}));
         let described = source.describe();
         let shown = format!(
             "{described:?} {} {source:?}",
@@ -773,7 +773,10 @@ fn unknown_options_are_refused() {
         assert!(
             matches!(
                 err,
-                SourceConfigError::InvalidOptions { scheme: "http", .. }
+                SourceConfigError::InvalidOptions {
+                    protocol: "http",
+                    ..
+                }
             ),
             "{options}: {err}"
         );

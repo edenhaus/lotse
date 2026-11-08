@@ -294,6 +294,13 @@ mod tests {
         stream.read_to_string(&mut response).await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("window.lotseTest"));
+        // The source's protocol is its URL's scheme in lower case, as
+        // `stream/put` names protocols (a URL's scheme may be upper case).
+        assert!(
+            PAGE.contains(
+                r#"protocol: config.url.slice(0, config.url.indexOf("://")).toLowerCase()"#
+            )
+        );
         let json = serde_json::to_value(&ready).unwrap();
         assert_eq!(json["page"], ready.page.as_str());
         served.stop();

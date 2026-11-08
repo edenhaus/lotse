@@ -144,7 +144,7 @@ async fn next_state(events: &mut mpsc::Receiver<Event>) -> (String, Option<Strin
 
 fn put(stream_id: &str, options: &Value, preload: bool) -> Value {
     json!({ "id": 1, "type": "stream/put", "stream_id": stream_id,
-            "sources": [{ "url": "fake://127.0.0.1/", "options": options }], "preload": preload })
+            "sources": [lotse_testing::source("fake://127.0.0.1/", options.clone())], "preload": preload })
 }
 
 #[tokio::test]
@@ -353,8 +353,7 @@ async fn with_one_connect_permit_two_preloaded_cameras_connect_one_at_a_time() {
             call(
                 &s,
                 json!({ "id": 1, "type": "stream/put", "stream_id": stream,
-                        "sources": [{ "url": format!("fake://127.0.0.1:{port}/"),
-                                      "options": { "ready_after_ms": 400 } }],
+                        "sources": [lotse_testing::source(&format!("fake://127.0.0.1:{port}/"), json!({ "ready_after_ms": 400 }))],
                         "preload": true }),
             )
             .await,

@@ -175,7 +175,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Mozilla's root certificates, embedded: the worker has no filesystem to read a CA bundle from.
 webpki-roots = { version = "1", default-features = false }
-# SHA-256 of a certificate pin (a camera's `tls_fingerprint`, the control listener's), of the DTLS certificate
+# SHA-256 of a certificate pin (a camera's `tls` pin, the control listener's), of the DTLS certificate
 # fingerprint (RFC 8122 §5) in str0m's crypto provider, and the TURN client's SHA-256 password
 # algorithm, USERHASH and MESSAGE-INTEGRITY-SHA256 (RFC 8489 §18.5.1.2, §14.4, §14.6); already in
 # the tree via dimpl. retina's Digest auth (http-auth) keeps 0.10 beside it until it moves.

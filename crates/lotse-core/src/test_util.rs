@@ -64,7 +64,8 @@ macro_rules! let_assert {
     };
 }
 
-/// A source factory for the given schemes. Options must be `null`, an
+/// A source factory for the given protocols (`fake`, whose URLs are
+/// `fake://`). Options must be `null`, an
 /// empty object, `{"crash": true}` for the crash-injection test,
 /// `{"ready_after_ms": n}` to go live only after `n` ms on the injected
 /// clock (a cancel meanwhile ends the run at once, as the ingest contract
@@ -87,8 +88,8 @@ macro_rules! let_assert {
 /// RTSP's `backchannel` is.
 #[derive(Debug)]
 pub struct FakeSourceFactory {
-    /// The schemes it claims.
-    schemes: &'static [&'static str],
+    /// The protocols it claims.
+    protocols: &'static [&'static str],
     /// What a crashing source calls once ready: aborts the process.
     abort: fn() -> !,
     /// The protocol can carry audio back (`SourceCapabilities::backchannel`).
@@ -98,24 +99,24 @@ pub struct FakeSourceFactory {
 }
 
 impl FakeSourceFactory {
-    /// A factory claiming `schemes`, whose protocol has no backchannel and
+    /// A factory claiming `protocols`, whose protocol has no backchannel and
     /// whose crashing sources abort the process: `abort`, not `panic`,
     /// because the test profile ignores `panic = "abort"`, and the point is
     /// the process dying, not the unwinding.
-    pub const fn new(schemes: &'static [&'static str]) -> Self {
+    pub const fn new(protocols: &'static [&'static str]) -> Self {
         Self {
-            schemes,
+            protocols,
             abort: std::process::abort,
             backchannel: false,
             capture: None,
         }
     }
 
-    /// A factory claiming `schemes` whose protocol declares a backchannel,
+    /// A factory claiming `protocols` whose protocol declares a backchannel,
     /// as the RTSP source will once it can send.
-    pub const fn with_backchannel(schemes: &'static [&'static str]) -> Self {
+    pub const fn with_backchannel(protocols: &'static [&'static str]) -> Self {
         Self {
-            schemes,
+            protocols,
             abort: std::process::abort,
             backchannel: true,
             capture: None,
@@ -133,9 +134,12 @@ impl FakeSourceFactory {
     /// [`FakeSourceFactory::with_backchannel`], whose sources' backchannels
     /// put every packet they receive into `capture`: the camera's end of
     /// talk-back, for tests that follow it there.
-    pub const fn capturing(schemes: &'static [&'static str], capture: BackchannelCapture) -> Self {
+    pub const fn capturing(
+        protocols: &'static [&'static str],
+        capture: BackchannelCapture,
+    ) -> Self {
         Self {
-            schemes,
+            protocols,
             abort: std::process::abort,
             backchannel: true,
             capture: Some(capture),
@@ -332,8 +336,8 @@ fn fake_backchannel(name: &str) -> Option<Codec> {
 }
 
 impl SourceFactory for FakeSourceFactory {
-    fn schemes(&self) -> &'static [&'static str] {
-        self.schemes
+    fn protocols(&self) -> &'static [&'static str] {
+        self.protocols
     }
 
     fn capabilities(&self) -> SourceCapabilities {
@@ -347,10 +351,10 @@ impl SourceFactory for FakeSourceFactory {
         url: &SourceUrl,
         options: &serde_json::Value,
     ) -> Result<Box<dyn Source>, SourceConfigError> {
-        let scheme = self.schemes.first().copied().unwrap_or("fake");
+        let protocol = self.protocols.first().copied().unwrap_or("fake");
         let Some((talk, options)) = take_talk(options) else {
             return Err(SourceConfigError::InvalidOptions {
-                scheme,
+                protocol,
                 message: "fake source's talk must be true or false".to_owned(),
             });
         };
@@ -387,7 +391,7 @@ impl SourceFactory for FakeSourceFactory {
             _ if doorbell.is_some() => (false, Duration::ZERO, FakeAudio::None),
             other => {
                 return Err(SourceConfigError::InvalidOptions {
-                    scheme,
+                    protocol,
                     message: format!(
                         "fake source takes no options but {{\"crash\": true}}, {{\"ready_after_ms\": n}}, {{\"keyframes_every_ms\": n}}, {{\"audio\": true | \"aac\" | \"aac_drifting\" | \"aac_steady\"}}, {{\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"}} and {{\"video\": true}}, got {other}"
                     ),
@@ -396,7 +400,7 @@ impl SourceFactory for FakeSourceFactory {
         };
         let (backchannel, video) = doorbell.unwrap_or((None, false));
         Ok(Box::new(FakeSource {
-            protocol: scheme,
+            protocol,
             url: url.clone(),
             crash,
             abort: self.abort,
@@ -913,7 +917,7 @@ impl SignaledSourceFactory for FakeSignaledSourceFactory {
         let empty = options.is_null() || options.as_object().is_some_and(serde_json::Map::is_empty);
         if !empty {
             return Err(SourceConfigError::InvalidOptions {
-                scheme: self.protocol,
+                protocol: self.protocol,
                 message: format!("fake signaled source takes no options, got {options}"),
             });
         }
@@ -2359,7 +2363,7 @@ mod tests {
         assert_eq!(
             err,
             SourceConfigError::InvalidOptions {
-                scheme: "fake-signaled",
+                protocol: "fake-signaled",
                 message: "fake signaled source takes no options, got {\"audio\":true}".into(),
             }
         );
@@ -2886,7 +2890,7 @@ mod tests {
         assert_eq!(
             err,
             SourceConfigError::InvalidOptions {
-                scheme: "fake",
+                protocol: "fake",
                 message: "fake source takes no options but {\"crash\": true}, {\"ready_after_ms\": n}, {\"keyframes_every_ms\": n}, {\"audio\": true | \"aac\" | \"aac_drifting\" | \"aac_steady\"}, {\"backchannel\": \"pcmu\" | \"pcma\" | \"opus\"} and {\"video\": true}, got {\"transport\":\"udp\"}"
                     .into()
             }
@@ -2914,7 +2918,7 @@ mod tests {
                 .validate(&url, &serde_json::json!({"ready_after_ms": 5}))
                 .is_ok()
         );
-        assert_eq!(FakeSourceFactory::new(&[]).schemes().len(), 0);
+        assert_eq!(FakeSourceFactory::new(&[]).protocols().len(), 0);
         assert!(
             FakeSourceFactory::new(&[])
                 .validate(&url, &serde_json::Value::Null)

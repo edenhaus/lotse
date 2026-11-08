@@ -23,11 +23,12 @@ impl SignaledSourceFactory for WebRtcSourceFactory {
     }
 
     fn validate(&self, options: &serde_json::Value) -> Result<Box<dyn Source>, SourceConfigError> {
-        let options =
-            WebRtcOptions::parse(options).map_err(|err| SourceConfigError::InvalidOptions {
-                scheme: PROTOCOL,
+        let options: WebRtcOptions = serde_json::from_value(options.clone()).map_err(|err| {
+            SourceConfigError::InvalidOptions {
+                protocol: PROTOCOL,
                 message: err.to_string(),
-            })?;
+            }
+        })?;
         Ok(Box::new(WebRtcSource::new(options)))
     }
 }
@@ -44,7 +45,7 @@ mod tests {
     fn the_factory_names_its_protocol_and_builds_a_source_without_an_address() {
         let factory = WebRtcSourceFactory;
         assert_eq!(factory.protocol(), "webrtc");
-        let source = factory.validate(&serde_json::Value::Null).unwrap();
+        let source = factory.validate(&json!({})).unwrap();
         let described = source.describe();
         assert_eq!(described.protocol, "webrtc");
         assert_eq!(described.url, None, "no address");
@@ -74,7 +75,7 @@ mod tests {
             .validate(&json!({ "codec": "h264" }))
             .unwrap_err();
         assert!(
-            matches!(&err, SourceConfigError::InvalidOptions { scheme: "webrtc", message } if message.contains("unknown field")),
+            matches!(&err, SourceConfigError::InvalidOptions { protocol: "webrtc", message } if message.contains("unknown field")),
             "{err}"
         );
     }
