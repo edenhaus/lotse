@@ -235,6 +235,15 @@ mod tests {
         }
         let key = source.connection_options();
         assert!(key.get("backchannel").is_none(), "{key}");
+        // A refused pin is not repeated: a value pasted there can carry
+        // credentials.
+        let err = factory
+            .validate(
+                &rtsps,
+                &json!({ "tls": { "pin": "rtsps://u:hunter2@cam/" } }),
+            )
+            .unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
         let err = factory
             .validate(&rtsps, &json!({ "tls": { "pin": "ab:cd" } }))
             .unwrap_err();

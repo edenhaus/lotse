@@ -213,6 +213,15 @@ mod tests {
             // Every spelling of one pin is one key.
             assert_eq!(built.connection_options()["tls"], shown, "{options}");
         }
+        // A refused pin is not repeated: a value pasted there can carry
+        // credentials.
+        let err = factory
+            .validate(
+                &https,
+                &json!({ "tls": { "pin": "https://u:hunter2@cam/" } }),
+            )
+            .unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
         let err = factory
             .validate(&https, &json!({ "tls": { "pin": "ab:cd" } }))
             .unwrap_err();

@@ -25,12 +25,15 @@ const FINGERPRINT_LEN: usize = 32;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Fingerprint([u8; FINGERPRINT_LEN]);
 
-/// Why a certificate pin does not parse.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Why a certificate pin does not parse: the format it must have. The
+/// refused text is not kept, so it is never repeated in an error a client
+/// sees or a log line: a value pasted into the wrong field can be a secret
+/// (a URL with credentials).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "a certificate fingerprint must be its SHA-256 as 64 hex digits, optionally with a colon between each pair, not {0:?}"
+    "a certificate fingerprint must be its SHA-256 as 64 hex digits, optionally with a colon between each pair"
 )]
-pub struct FingerprintError(String);
+pub struct FingerprintError;
 
 impl Fingerprint {
     /// The fingerprint of a DER-encoded certificate.
@@ -49,12 +52,11 @@ impl Fingerprint {
 
     /// Parses the hex form, with or without colons between the pairs.
     pub fn parse(text: &str) -> Result<Self, FingerprintError> {
-        let error = || FingerprintError(text.to_owned());
         let digits: Vec<u8> = if text.contains(':') {
             let mut digits = Vec::with_capacity(FINGERPRINT_LEN * 2);
             for pair in text.split(':') {
                 if pair.len() != 2 {
-                    return Err(error());
+                    return Err(FingerprintError);
                 }
                 digits.extend_from_slice(pair.as_bytes());
             }
@@ -63,7 +65,7 @@ impl Fingerprint {
             text.as_bytes().to_vec()
         };
         if digits.len() != FINGERPRINT_LEN * 2 || !digits.iter().all(u8::is_ascii_hexdigit) {
-            return Err(error());
+            return Err(FingerprintError);
         }
         let value = |digit: &u8| char::from(*digit).to_digit(16);
         let mut bytes = [0_u8; FINGERPRINT_LEN];
@@ -71,7 +73,7 @@ impl Fingerprint {
             *byte = value(high)
                 .zip(value(low))
                 .and_then(|(high, low)| u8::try_from(high.checked_mul(16)?.checked_add(low)?).ok())
-                .ok_or_else(error)?;
+                .ok_or(FingerprintError)?;
         }
         Ok(Self(bytes))
     }
@@ -171,6 +173,9 @@ mod tests {
             let err = Fingerprint::parse(bad).unwrap_err();
             assert!(err.to_string().contains("64 hex digits"), "{bad}: {err}");
         }
+        // The refused text is not repeated: it may be a secret.
+        let err = Fingerprint::parse("rtsp://u:hunter2@cam/").unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
     }
 
     #[test]
