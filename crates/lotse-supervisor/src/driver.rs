@@ -4642,7 +4642,7 @@ mod tests {
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 1 }));
         clock.advance(Duration::from_secs(4));
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 2 }));
-        assert!(queued_signals(&mut driver).is_empty());
+        assert_eq!(queued_signals(&mut driver), Vec::<SignalCommand>::new());
         clock.advance(Duration::from_millis(5_999));
         assert_eq!(SIGNAL_WAIT, Duration::from_secs(10));
         assert!(
@@ -4709,7 +4709,7 @@ mod tests {
         let wake = next_wake(&mut driver).await;
         assert!(matches!(wake, Wake::SignalWaited));
         driver.handle(wake).await;
-        assert!(queued_signals(&mut driver).is_empty());
+        assert_eq!(queued_signals(&mut driver), Vec::<SignalCommand>::new());
         assert!(driver.signal_wait.is_none());
         // Its offer goes to the subscription; the worker's exit closes it.
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Offer {
@@ -4834,7 +4834,7 @@ mod tests {
             serde_json::json!({ "type": "closed", "signal_id": signal_id, "code": "source_stopped",
                                 "message": "the source stopped" })
         );
-        assert!(shared.lock().signal_ids_for_tests().is_empty());
+        assert_eq!(shared.lock().signal_ids_for_tests(), Vec::<String>::new());
         drop(driver);
     }
 
@@ -4867,7 +4867,7 @@ mod tests {
             serde_json::json!({ "type": "closed", "signal_id": signal_id, "code": "source_stopped",
                                 "message": "the source stopped" })
         );
-        assert!(shared.lock().signal_ids_for_tests().is_empty());
+        assert_eq!(shared.lock().signal_ids_for_tests(), Vec::<String>::new());
     }
 
     /// What the registry held while the queue was full reaches the worker
@@ -5107,7 +5107,7 @@ mod tests {
         assert!(driver.signal_wait.is_none());
         assert!(driver.ended_signals.is_empty(), "a stop clears them too");
         let _events = subscribe_all(&shared);
-        assert!(queued_signals(&mut driver).is_empty());
+        assert_eq!(queued_signals(&mut driver), Vec::<SignalCommand>::new());
         drop(driver);
     }
 
@@ -5125,7 +5125,7 @@ mod tests {
         for request in [1, 2] {
             driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request }));
         }
-        assert!(queued_signals(&mut driver).is_empty());
+        assert_eq!(queued_signals(&mut driver), Vec::<SignalCommand>::new());
         clock.advance(OPEN_EXPIRY.checked_sub(Duration::from_millis(1)).unwrap());
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 3 }));
         assert_eq!(waiting(&driver), [1, 2]);
