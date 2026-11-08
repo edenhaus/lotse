@@ -3609,10 +3609,9 @@ mod tests {
         let switch = DriverCommand::SwitchSource(spec_of("fake://127.0.0.1:1/b"));
         Driver::send(worker, &shared, &commands, switch).await;
         drop(driver);
-        assert!(
-            captured
-                .lines("session message could not be sent")
-                .is_empty()
+        assert_eq!(
+            captured.lines("session message could not be sent"),
+            Vec::<String>::new()
         );
     }
 
@@ -4870,7 +4869,7 @@ mod tests {
         // message and discarded it, the read end is at its end.
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).unwrap();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         let worker = driver.worker.take().unwrap();
         drop(driver);
         let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;

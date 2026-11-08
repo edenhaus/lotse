@@ -289,9 +289,9 @@ mod tests {
             registries.recording.is_none(),
             "no recording container by default"
         );
-        assert!(registries.sources.schemes().is_empty());
-        assert!(registries.sources.signaled_protocols().is_empty());
-        assert!(registries.outputs.kinds().is_empty());
+        assert_eq!(registries.sources.schemes(), Vec::<&str>::new());
+        assert_eq!(registries.sources.signaled_protocols(), Vec::<&str>::new());
+        assert_eq!(registries.outputs.kinds(), Vec::<&str>::new());
         assert_eq!(
             RegistryError::DuplicateScheme("x").to_string(),
             "scheme x is already registered"

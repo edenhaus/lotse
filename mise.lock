@@ -28,37 +28,27 @@ backend = "cargo:cargo-mutants"
 specifiers = ["27.1.0"]
 
 [[tools.cmake]]
-version = "4.4.3"
+version = "4.4.5"
 backend = "aqua:Kitware/CMake"
-specifiers = ["4.4.3"]
+specifiers = ["4.4.5"]
 
 [tools.cmake."platforms.linux-arm64"]
-checksum = "sha256:2efc974dbd63b4444c0e8494b92f2e80c2d7e635b4b80eac2916985ddd8f72a6"
-url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-linux-aarch64.tar.gz"
-url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/529577299"
+checksum = "sha256:301d5063ab259577c1b57ce5490b1aab9ea5c56dc4c822f73499553dab94925f"
+checksum_source = "mise-versions"
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.5/cmake-4.4.5-linux-aarch64.tar.gz"
+url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/682698880"
 
 [tools.cmake."platforms.linux-x64"]
-checksum = "sha256:d6c83076c575bc00b823522ac974bda66d0af05d6ddc30e739c12385cf32c6cc"
-url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-linux-x86_64.tar.gz"
-url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/529577408"
+checksum = "sha256:ed85135c5a5135b45e50423cb406dea04ca3338da0b8ef3c9ede963559680be0"
+checksum_source = "mise-versions"
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.5/cmake-4.4.5-linux-x86_64.tar.gz"
+url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/682699189"
 
 [tools.cmake."platforms.macos-arm64"]
-checksum = "sha256:0c5d65251c14cc884bfa16bdbed3c263ce5bffe2e21c0d0d00962cb0610464fa"
-url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-macos-universal.tar.gz"
-url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/529577557"
-
-[[tools."github:AlexxIT/go2rtc"]]
-version = "1.9.14"
-backend = "github:AlexxIT/go2rtc"
-specifiers = ["1.9.14"]
-
-[tools."github:AlexxIT/go2rtc".options]
-asset_pattern = "go2rtc_linux_amd64"
-
-[tools."github:AlexxIT/go2rtc"."platforms.linux-x64"]
-checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6"
-url = "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_amd64"
-url_api = "https://api.github.com/repos/AlexxIT/go2rtc/releases/assets/342672036"
+checksum = "sha256:679e77a96b9ef9484cc6c1445255fc4f84206b48a65420efbedf16bdab55fbff"
+checksum_source = "mise-versions"
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.5/cmake-4.4.5-macos-universal.tar.gz"
+url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/682699600"
 
 [[tools."github:AlexxIT/go2rtc"]]
 version = "1.9.14"
@@ -73,19 +63,18 @@ checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904
 url = "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_arm64"
 url_api = "https://api.github.com/repos/AlexxIT/go2rtc/releases/assets/342672062"
 
-[[tools."github:BtbN/FFmpeg-Builds"]]
-version = "autobuild-2026-09-30-13-08"
-backend = "github:BtbN/FFmpeg-Builds"
-specifiers = ["autobuild-2026-09-30-13-08"]
+[[tools."github:AlexxIT/go2rtc"]]
+version = "1.9.14"
+backend = "github:AlexxIT/go2rtc"
+specifiers = ["1.9.14"]
 
-[tools."github:BtbN/FFmpeg-Builds".options]
-asset_pattern = "ffmpeg-n9.0.2-17-g2a571b6068-linux64-gpl-9.0.tar.xz"
-version_prefix = ""
+[tools."github:AlexxIT/go2rtc".options]
+asset_pattern = "go2rtc_linux_amd64"
 
-[tools."github:BtbN/FFmpeg-Builds"."platforms.linux-x64"]
-checksum = "sha256:68ee646831adaae2495618346f3bba94ff207ff83bbd34d643e7004730d66269"
-url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n9.0.2-17-g2a571b6068-linux64-gpl-9.0.tar.xz"
-url_api = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/600951759"
+[tools."github:AlexxIT/go2rtc"."platforms.linux-x64"]
+checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6"
+url = "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_amd64"
+url_api = "https://api.github.com/repos/AlexxIT/go2rtc/releases/assets/342672036"
 
 [[tools."github:BtbN/FFmpeg-Builds"]]
 version = "autobuild-2026-09-30-13-08"
@@ -107,12 +96,13 @@ backend = "github:BtbN/FFmpeg-Builds"
 specifiers = ["autobuild-2026-09-30-13-08"]
 
 [tools."github:BtbN/FFmpeg-Builds".options]
+asset_pattern = "ffmpeg-n9.0.2-17-g2a571b6068-linux64-gpl-9.0.tar.xz"
 version_prefix = ""
 
-[tools."github:BtbN/FFmpeg-Builds"."platforms.macos-arm64"]
-checksum = "sha256:b1944308d6306839f6ce22095920de7e6f31f9ec901834fe1257e013d9fc3aa7"
-url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-N-127021-ge0c94b2d1c-linuxarm64-gpl.tar.xz"
-url_api = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/600951222"
+[tools."github:BtbN/FFmpeg-Builds"."platforms.linux-x64"]
+checksum = "sha256:68ee646831adaae2495618346f3bba94ff207ff83bbd34d643e7004730d66269"
+url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n9.0.2-17-g2a571b6068-linux64-gpl-9.0.tar.xz"
+url_api = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/600951759"
 
 [[tools."github:CycloneDX/cyclonedx-rust-cargo"]]
 version = "0.5.9"
@@ -141,46 +131,49 @@ url_api = "https://api.github.com/repos/CycloneDX/cyclonedx-rust-cargo/releases/
 provenance = "github-attestations"
 
 [[tools."github:EmbarkStudios/cargo-about"]]
-version = "0.9.2"
+version = "0.9.3"
 backend = "github:EmbarkStudios/cargo-about"
-specifiers = ["0.9.2"]
+specifiers = ["0.9.3"]
 
 [tools."github:EmbarkStudios/cargo-about"."platforms.linux-arm64"]
-checksum = "sha256:af5169282fb6f84e13471493f405437e43ac517744c9ae12fbe2cdf0a6f0e5a8"
-url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.2/cargo-about-0.9.2-aarch64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/519590290"
+checksum = "sha256:eb4d9ff6ebd2518152a8308729431a04b3836e71d2bd5ead7aea69f91a71162e"
+checksum_source = "mise-versions"
+url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.3/cargo-about-0.9.3-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/677829692"
 
 [tools."github:EmbarkStudios/cargo-about"."platforms.linux-x64"]
-checksum = "sha256:9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af"
-url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.2/cargo-about-0.9.2-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/519590057"
+checksum = "sha256:3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4"
+checksum_source = "mise-versions"
+url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.3/cargo-about-0.9.3-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/677828105"
 
 [tools."github:EmbarkStudios/cargo-about"."platforms.macos-arm64"]
-checksum = "sha256:ae72f0df0c399a1e96336f696fa55b1b28679fd725632eba8cf8e4568467cc3e"
-url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.2/cargo-about-0.9.2-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/519589772"
+checksum = "sha256:45520df8680978a6e7c4023ace0e3f311c73efc208cd68e5a7f4ed4822fa0349"
+checksum_source = "mise-versions"
+url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.3/cargo-about-0.9.3-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/677829608"
 
 [[tools."github:bluenviron/mediamtx"]]
-version = "1.21.1"
+version = "1.21.3"
 backend = "github:bluenviron/mediamtx"
-specifiers = ["1.21.1"]
+specifiers = ["1.21.3"]
 
 [tools."github:bluenviron/mediamtx"."platforms.linux-arm64"]
-checksum = "sha256:6a3aa635fb60ea9b8d566ec306f0a42ff1b6b52a3942bc2baffbe55880d4c3dd"
-url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.1/mediamtx_v1.21.1_linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/577109573"
+checksum = "sha256:27f038237cb5f77a724f6afc58eca2798f2bc4edf9989895631a80eeb41a4fe2"
+url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.3/mediamtx_v1.21.3_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/674819375"
 provenance = "github-attestations"
 
 [tools."github:bluenviron/mediamtx"."platforms.linux-x64"]
-checksum = "sha256:653abc672a3e693f8d3b2717752492fdcfb8072291ec108d03d3dd857411b0ee"
-url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.1/mediamtx_v1.21.1_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/577109534"
+checksum = "sha256:0a2ea7eba96023631efa1bea7804823a9145b043b6646a8a05798d4ac24ed635"
+url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.3/mediamtx_v1.21.3_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/674819329"
 provenance = "github-attestations"
 
 [tools."github:bluenviron/mediamtx"."platforms.macos-arm64"]
-checksum = "sha256:25e20ed41611f1f3103b8359585210b29b11b69fa0d9e11bd11b92f7bbcb42ef"
-url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.1/mediamtx_v1.21.1_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/577109505"
+checksum = "sha256:bc1a0762fd18ffb413bcd81dcb9a072ac159fbd1f27e79ac6f14598aaac5ed3f"
+url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.3/mediamtx_v1.21.3_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/674819276"
 provenance = "github-attestations"
 
 [[tools."github:boshen/cargo-shear"]]
@@ -207,72 +200,75 @@ url_api = "https://api.github.com/repos/Boshen/cargo-shear/releases/assets/58085
 provenance = "github-attestations"
 
 [[tools."github:nextest-rs/nextest"]]
-version = "0.9.146"
+version = "0.9.151"
 backend = "github:nextest-rs/nextest"
-specifiers = ["0.9.146"]
+specifiers = ["0.9.151"]
 
 [tools."github:nextest-rs/nextest".options]
 version_prefix = "cargo-nextest-"
 
 [tools."github:nextest-rs/nextest"."platforms.linux-arm64"]
-checksum = "sha256:b2e33d7c72de7ade0ff7b3a948ac37516b24f8a836b7a8870c1f634a94be9de9"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/579608024"
+checksum = "sha256:3e35e8f6913af92558ba09d7155f74e35dd1f0024ef3cd891637433ae4eacbdd"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/703601411"
 provenance = "github-attestations"
 
 [tools."github:nextest-rs/nextest"."platforms.linux-x64"]
-checksum = "sha256:682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/579609342"
+checksum = "sha256:1d4ce302b820c41f4b89c5fb9bce45f0f0c94882c1cf08fc360caf08be6e7df4"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/703600788"
 provenance = "github-attestations"
 
 [tools."github:nextest-rs/nextest"."platforms.macos-arm64"]
-checksum = "sha256:39785160b3c2f6ed9a765049cf4fa79f3b39aa02eb7598a5a0e2a1a0b9ffb9a8"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-universal-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/579630774"
+checksum = "sha256:d1d7d025d4bfc9fb154cd76aea3949bd78534829a0589abefa6e5dd4edb135dd"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-universal-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/703616437"
 provenance = "github-attestations"
 
 [[tools."github:rust-cross/cargo-zigbuild"]]
-version = "0.23.4"
+version = "0.24.1"
 backend = "github:rust-cross/cargo-zigbuild"
-specifiers = ["0.23.4"]
+specifiers = ["0.24.1"]
 
 [tools."github:rust-cross/cargo-zigbuild"."platforms.linux-arm64"]
-checksum = "sha256:25cf2cdc6cde848b33a761ff2cf46d1efe6ba7e1adfc4b6f3ee2d570cacb5419"
-url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.4/cargo-zigbuild-aarch64-unknown-linux-gnu.tar.xz"
-url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/541272860"
+checksum = "sha256:70bb4c9cc71a6d16211b9079996e3cd588671053312adeff4d043499ed887601"
+checksum_source = "mise-versions"
+url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.24.1/cargo-zigbuild-aarch64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/709674761"
 
 [tools."github:rust-cross/cargo-zigbuild"."platforms.linux-x64"]
-checksum = "sha256:6b69963040818ca1ef573d8135a95aa902e17cf7f873c32c6426642dadfe7f59"
-url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.4/cargo-zigbuild-x86_64-unknown-linux-gnu.tar.xz"
-url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/541272889"
+checksum = "sha256:32581c8e13f27a807bb244aaaac870522f5b51263c766cf77b1a99771ce9fa5c"
+checksum_source = "mise-versions"
+url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.24.1/cargo-zigbuild-x86_64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/709674861"
 
 [tools."github:rust-cross/cargo-zigbuild"."platforms.macos-arm64"]
-checksum = "sha256:ca2369ae1a9995542206a6c18dd372acff94dddeb9d7c07e09bfb7594197cea3"
-url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.4/cargo-zigbuild-aarch64-apple-darwin.tar.xz"
-url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/541272865"
+checksum = "sha256:e38d2a30aa8f4c27bf9e3ced266aae1f47e4dbd6be939852ec07d8662eec408e"
+checksum_source = "mise-versions"
+url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.24.1/cargo-zigbuild-aarch64-apple-darwin.tar.xz"
+url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/709674719"
 
 [[tools."github:taiki-e/cargo-hack"]]
-version = "0.6.45"
+version = "0.6.46"
 backend = "github:taiki-e/cargo-hack"
-specifiers = ["0.6.45"]
+specifiers = ["0.6.46"]
 
 [tools."github:taiki-e/cargo-hack"."platforms.linux-arm64"]
-checksum = "sha256:821536b7dc4666764d36c09e665affcf98e3d69f5a99b171c03d47d3ec24d0e7"
-url = "https://github.com/taiki-e/cargo-hack/releases/download/v0.6.45/cargo-hack-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/taiki-e/cargo-hack/releases/assets/433843287"
+checksum = "sha256:6194a409da4a47bc7a7407583b6cbeba8ee98c1fbfb81d57f1e337124aa111ba"
+url = "https://github.com/taiki-e/cargo-hack/releases/download/v0.6.46/cargo-hack-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/taiki-e/cargo-hack/releases/assets/698521742"
 provenance = "github-attestations"
 
 [tools."github:taiki-e/cargo-hack"."platforms.linux-x64"]
-checksum = "sha256:16394b932180a4ae509a22b3b8294fc2525573d8592420133c428457ed676d5d"
-url = "https://github.com/taiki-e/cargo-hack/releases/download/v0.6.45/cargo-hack-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/taiki-e/cargo-hack/releases/assets/433843006"
+checksum = "sha256:ff1b9441986e494d32ce46a7c5a25af1cda3a18da2cde306b2f96dd0e7055b28"
+url = "https://github.com/taiki-e/cargo-hack/releases/download/v0.6.46/cargo-hack-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/taiki-e/cargo-hack/releases/assets/698520256"
 provenance = "github-attestations"
 
 [tools."github:taiki-e/cargo-hack"."platforms.macos-arm64"]
-checksum = "sha256:af0ab90e56aa716ae9f545a93e4338d4f36525e187d367b6519da71b60249b50"
-url = "https://github.com/taiki-e/cargo-hack/releases/download/v0.6.45/cargo-hack-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/taiki-e/cargo-hack/releases/assets/433843066"
+checksum = "sha256:9ad9fae78158671df8161b1803bb6b9f6a8b0081adc70a5c2bb91dff5ec4044d"
+url = "https://github.com/taiki-e/cargo-hack/releases/download/v0.6.46/cargo-hack-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/taiki-e/cargo-hack/releases/assets/698520811"
 provenance = "github-attestations"
 
 [[tools."github:taiki-e/cargo-llvm-cov"]]
@@ -303,45 +299,37 @@ version = "9.0.2"
 backend = "http:ffmpeg"
 specifiers = ["9.0.2"]
 
-[tools."http:ffmpeg"."platforms.linux-arm64"]
-checksum = "sha256:c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
-url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip"
-
-[tools."http:ffmpeg"."platforms.linux-x64"]
-checksum = "sha256:c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
-url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip"
-
 [tools."http:ffmpeg"."platforms.macos-arm64"]
 checksum = "sha256:c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
 url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip"
 
 [[tools.prek]]
-version = "0.5.4"
+version = "0.5.10"
 backend = "aqua:j178/prek"
-specifiers = ["0.5.4"]
+specifiers = ["0.5.10"]
 
 [tools.prek."platforms.linux-arm64"]
-checksum = "sha256:5478e436210b5226b8db3dccdd1a2e9094b1c63d81155d96bfa8b83f0398885c"
-url = "https://github.com/j178/prek/releases/download/v0.5.4/prek-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/j178/prek/releases/assets/594534943"
+checksum = "sha256:6ee3e5696f0b76bb4c95708579a54714aabd9a20e89c998f69a1a5cc41dbbbee"
+url = "https://github.com/j178/prek/releases/download/v0.5.10/prek-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/j178/prek/releases/assets/707839366"
 provenance = "github-attestations"
 
 [tools.prek."platforms.linux-x64"]
-checksum = "sha256:6147dfe64051af590f4bfc2c073a0780fb5e2cc37d9eab8e47fe9fe26c7dfb80"
-url = "https://github.com/j178/prek/releases/download/v0.5.4/prek-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/j178/prek/releases/assets/594534988"
+checksum = "sha256:5c832a9ccd0855b7c054320d8921d90165a37459d3ac175923bdf121ff1aa9b1"
+url = "https://github.com/j178/prek/releases/download/v0.5.10/prek-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/j178/prek/releases/assets/707839458"
 provenance = "github-attestations"
 
 [tools.prek."platforms.macos-arm64"]
-checksum = "sha256:88eec06dd10fd61a9b345223fafc9bedb6746ee4cc47377551239d89d752b365"
-url = "https://github.com/j178/prek/releases/download/v0.5.4/prek-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/j178/prek/releases/assets/594534934"
+checksum = "sha256:28186099374a3158e7b27e82fedb0bd20723658dc8ee24a841bdffe8a91b1ad9"
+url = "https://github.com/j178/prek/releases/download/v0.5.10/prek-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/j178/prek/releases/assets/707839320"
 provenance = "github-attestations"
 
 [[tools.rust]]
-version = "1.98.0"
+version = "1.99.1"
 backend = "core:rust"
-specifiers = ["1.98.0"]
+specifiers = ["1.99.1"]
 
 [tools.rust.options]
 components = "clippy,llvm-tools,rustfmt"
@@ -369,64 +357,64 @@ url = "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellche
 url_api = "https://api.github.com/repos/koalaman/shellcheck/releases/assets/279056932"
 
 [[tools.uv]]
-version = "0.12.23"
+version = "0.13.7"
 backend = "aqua:astral-sh/uv"
-specifiers = ["0.12.23"]
+specifiers = ["0.13.7"]
 
 [tools.uv."platforms.linux-arm64"]
-checksum = "sha256:6524bd338177ed50d035d39354e12545e993bbeba2ecbddf0480c5b3a81d313f"
-url = "https://github.com/astral-sh/uv/releases/download/0.12.23/uv-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/608232491"
+checksum = "sha256:71279f8d3c67241e807b9d8db872d1bf541579fb9f08b7d1eb1682196d1e57dc"
+url = "https://github.com/astral-sh/uv/releases/download/0.13.7/uv-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/704009469"
 provenance = "github-attestations"
 
 [tools.uv."platforms.linux-x64"]
-checksum = "sha256:9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6"
-url = "https://github.com/astral-sh/uv/releases/download/0.12.23/uv-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/608232628"
+checksum = "sha256:c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83"
+url = "https://github.com/astral-sh/uv/releases/download/0.13.7/uv-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/704009823"
 provenance = "github-attestations"
 
 [tools.uv."platforms.macos-arm64"]
-checksum = "sha256:50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544"
-url = "https://github.com/astral-sh/uv/releases/download/0.12.23/uv-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/608232483"
+checksum = "sha256:81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731"
+url = "https://github.com/astral-sh/uv/releases/download/0.13.7/uv-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/704009442"
 provenance = "github-attestations"
 
 [[tools.zig]]
-version = "0.15.2"
+version = "0.17.1"
 backend = "core:zig"
-specifiers = ["0.15.2"]
+specifiers = ["0.17.1"]
 
 [tools.zig."platforms.linux-arm64"]
-checksum = "sha256:958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f"
-url = "https://ziglang.org/download/0.15.2/zig-aarch64-linux-0.15.2.tar.xz"
+checksum = "sha256:a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795"
+url = "https://ziglang.org/download/0.17.1/zig-aarch64-linux-0.17.1.tar.xz"
 
 [tools.zig."platforms.linux-x64"]
-checksum = "sha256:02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239"
-url = "https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz"
+checksum = "sha256:3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a"
+url = "https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz"
 
 [tools.zig."platforms.macos-arm64"]
-checksum = "sha256:3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b"
-url = "https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz"
+checksum = "sha256:75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d"
+url = "https://ziglang.org/download/0.17.1/zig-aarch64-macos-0.17.1.tar.xz"
 
 [[tools.zizmor]]
-version = "1.30.1"
+version = "1.32.0"
 backend = "aqua:zizmorcore/zizmor"
-specifiers = ["1.30.1"]
+specifiers = ["1.32.0"]
 
 [tools.zizmor."platforms.linux-arm64"]
-checksum = "sha256:7ff1dce33bdd18fd2a4affe63bdd47efcccca97b2cec1c1863ec26e9e2647540"
-url = "https://github.com/zizmorcore/zizmor/releases/download/v1.30.1/zizmor-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/zizmorcore/zizmor/releases/assets/552067643"
+checksum = "sha256:cb152b207f815116d7fa1c1ee4614f61578803351395052908095e79adfd9fd0"
+url = "https://github.com/zizmorcore/zizmor/releases/download/v1.32.0/zizmor-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/zizmorcore/zizmor/releases/assets/703541931"
 provenance = "github-attestations"
 
 [tools.zizmor."platforms.linux-x64"]
-checksum = "sha256:e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a"
-url = "https://github.com/zizmorcore/zizmor/releases/download/v1.30.1/zizmor-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/zizmorcore/zizmor/releases/assets/552067642"
+checksum = "sha256:bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b"
+url = "https://github.com/zizmorcore/zizmor/releases/download/v1.32.0/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/zizmorcore/zizmor/releases/assets/703541932"
 provenance = "github-attestations"
 
 [tools.zizmor."platforms.macos-arm64"]
-checksum = "sha256:e28d22b087f9ebb8d99da6e740d348c930f559961c7c3f12badda54f882195a2"
-url = "https://github.com/zizmorcore/zizmor/releases/download/v1.30.1/zizmor-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/zizmorcore/zizmor/releases/assets/552067640"
+checksum = "sha256:6efed18c4539a663fd3c851a2be9533fd8456c4e646d9416206da059154a0d3c"
+url = "https://github.com/zizmorcore/zizmor/releases/download/v1.32.0/zizmor-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/zizmorcore/zizmor/releases/assets/703541933"
 provenance = "github-attestations"
