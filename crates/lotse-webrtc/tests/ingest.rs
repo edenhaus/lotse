@@ -866,49 +866,88 @@ fn rfc3550_6_4_1_losses_late_packets_and_rejected_datagrams_reach_the_connection
 
 /// The track's viewers' keyframe requests, coalesced by core, become
 /// PLIs under the spacing the startup and loss PLIs keep: at most one per
-/// interval for all three causes together.
+/// interval for all three causes together. One the spacing holds is
+/// deferred to the interval's end, not dropped: a startup PLI at 0 ms
+/// answered at 100 ms leaves a viewer that joins at 800 ms on a cache too
+/// old to burst, and the keyframe it asks for comes from a PLI at 1 s.
 #[test]
 fn rfc4585_6_3_1_a_viewer_s_keyframe_request_is_a_pli_rate_limited_with_the_startup_and_loss_plis()
 {
     let _logs = logs();
+    let ms = Duration::from_millis;
     let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
-    // Before the connection: no stream to ask on yet.
+    // Before the connection: no stream to ask on yet, and nothing kept.
     assert!(!pair.engine.request_keyframe(pair.now));
     pair.connect();
-    pair.step(Duration::from_millis(1));
+    pair.step(ms(1));
     assert_eq!(pair.engine.stats().plis, 1, "the first startup PLI");
     // While the startup PLIs run, a viewer's request adds none.
     assert!(!pair.engine.request_keyframe(pair.now));
-    pair.step(Duration::from_millis(1));
-    assert_eq!(pair.engine.stats().plis, 1);
+    // The second startup PLI, to the millisecond: the timeline's 0 ms.
+    while pair.engine.stats().plis < 2 {
+        pair.step(ms(1));
+    }
+    pair.step(ms(100));
     pair.frame(true);
     pair.engine.keyframe_seen();
-    // Within the interval of the startup PLI: none.
+    // 800 ms after the startup PLI: deferred to the interval's end.
+    pair.step(ms(700));
     assert!(!pair.engine.request_keyframe(pair.now));
-    pair.step(PLI_INTERVAL);
-    // Past it: one, which reaches the camera.
-    assert!(pair.engine.request_keyframe(pair.now));
-    pair.step(Duration::from_millis(50));
-    assert_eq!(pair.engine.stats().plis, 2);
-    assert_eq!(pair.camera().keyframe_requests, 2);
+    pair.step(ms(199));
+    assert_eq!(pair.engine.stats().plis, 2, "to the tick");
+    pair.step(ms(1));
+    assert_eq!(pair.engine.stats().plis, 3, "the viewer's, deferred");
+    pair.step(ms(50));
+    assert_eq!(pair.camera().keyframe_requests, 3);
     // A loss within the interval of the viewer's asks nothing more.
     pair.camera().seq += 3;
     pair.frame(false);
-    assert_eq!(pair.engine.stats().plis, 2);
-    // A viewer's within the interval of a loss's neither.
+    assert_eq!(pair.engine.stats().plis, 3);
+    // Past it, a viewer's goes out at once; a loss's waits a whole
+    // interval after it.
+    pair.step(PLI_INTERVAL);
+    assert!(pair.engine.request_keyframe(pair.now));
+    assert_eq!(pair.engine.stats().plis, 4);
+    pair.camera().seq += 3;
+    pair.frame(false);
+    assert_eq!(pair.engine.stats().plis, 4);
     pair.step(PLI_INTERVAL);
     pair.camera().seq += 3;
     pair.frame(false);
-    assert_eq!(pair.engine.stats().plis, 3, "the loss's");
-    assert!(!pair.engine.request_keyframe(pair.now));
-    pair.step(PLI_INTERVAL - Duration::from_millis(1));
-    assert!(!pair.engine.request_keyframe(pair.now), "to the tick");
-    pair.step(Duration::from_millis(1));
+    assert_eq!(pair.engine.stats().plis, 5, "the loss's");
+    pair.step(ms(50));
+    assert_eq!(pair.camera().keyframe_requests, 5);
+}
+
+/// A viewers' request the PLI spacing deferred does not go out once a
+/// keyframe broadcast after it answered it (core says none is wanted).
+#[test]
+fn rfc4585_6_3_1_a_deferred_viewer_request_a_keyframe_answers_goes_no_further() {
+    let _logs = logs();
+    let ms = Duration::from_millis;
+    let mut pair = Pair::offer(&media_only());
+    pair.answer(camera_config(false), |answer| answer);
+    pair.connect();
+    pair.step(ms(1));
+    pair.frame(true);
+    pair.engine.keyframe_seen();
+    pair.step(PLI_INTERVAL);
     assert!(pair.engine.request_keyframe(pair.now));
-    pair.step(Duration::from_millis(50));
-    assert_eq!(pair.engine.stats().plis, 4);
-    assert_eq!(pair.camera().keyframe_requests, 4);
+    assert_eq!(pair.engine.stats().plis, 2);
+    // A viewer asks again within the interval, then the camera's
+    // keyframe comes and answers it.
+    pair.step(ms(300));
+    assert!(!pair.engine.request_keyframe(pair.now));
+    pair.step(ms(200));
+    pair.frame(true);
+    pair.engine.keyframe_answered();
+    pair.step(PLI_INTERVAL);
+    assert_eq!(pair.engine.stats().plis, 2);
+    // Nothing deferred: the answer of a request never deferred is no-op.
+    pair.engine.keyframe_answered();
+    pair.step(PLI_INTERVAL);
+    assert_eq!(pair.engine.stats().plis, 2);
 }
 
 #[test]
@@ -2332,6 +2371,19 @@ mod source {
         }
 
         /// Runs the camera for `span`: datagrams in and out, its timers.
+        /// Delta frames every 100 ms until `until`, pumped.
+        async fn deltas_until(&mut self, until: Instant) {
+            loop {
+                let now = SystemClock.now();
+                if now >= until {
+                    return;
+                }
+                self.camera.frame(now, false);
+                self.pump((until - now).min(Duration::from_millis(100)))
+                    .await;
+            }
+        }
+
         async fn pump(&mut self, span: Duration) {
             let until = SystemClock.now() + span;
             loop {
@@ -2577,6 +2629,63 @@ mod source {
             camera.pump(Duration::from_millis(100)).await;
         }
         assert_eq!(camera.camera.keyframe_requests, asked);
+        running.cancel.cancel();
+        within(running.run).await.unwrap();
+    }
+
+    /// A viewer that joins half a second after the startup PLI, its
+    /// keyframe in the cache but too old to burst, asks within that PLI's
+    /// interval: the camera gets the request at the interval's end, 1 s,
+    /// not never, and not only when core asks again a second after the
+    /// viewer, at 1.5 s. Core does ask again then, no keyframe having
+    /// come; the source defers that one to 2 s, and drops it when the
+    /// camera's keyframe at 1.7 s answers it (core: no longer wanted).
+    #[tokio::test]
+    async fn rfc4585_6_3_1_a_request_within_the_startup_pli_s_interval_reaches_the_camera_at_its_end()
+     {
+        let _logs = logs();
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
+        let running = start(
+            serde_json::json!({}),
+            Some(signaling.clone()),
+            Arc::new(SystemClock),
+        );
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        let (offer, _) = read_offer(&mut relay).await;
+        let (mut camera, answer) = Live::answer(&offer, false).await;
+        relay
+            .incoming
+            .send(RemoteSignal::Answer(answer))
+            .await
+            .unwrap();
+        camera.connect().await;
+        let video = Arc::clone(&running.set.tracks()[0]);
+        // The startup PLI goes out with the camera's first packet (str0m
+        // learns its SSRC from it): 0 ms. Its keyframe right after.
+        let t0 = SystemClock.now();
+        while video.stats().keyframes == 0 {
+            camera.camera.frame(SystemClock.now(), true);
+            camera.pump(Duration::from_millis(100)).await;
+        }
+        let asked = camera.camera.keyframe_requests;
+        camera.deltas_until(t0 + Duration::from_millis(500)).await;
+        assert_eq!(
+            video.request_keyframe(SystemClock.now()),
+            KeyframeOutcome::Forwarded
+        );
+        camera.deltas_until(t0 + Duration::from_millis(1_250)).await;
+        assert_eq!(
+            camera.camera.keyframe_requests,
+            asked + 1,
+            "the deferred PLI, before core asks again"
+        );
+        assert_eq!(video.stats().keyframe_requests_forwarded, 1);
+        camera.deltas_until(t0 + Duration::from_millis(1_700)).await;
+        assert_eq!(video.stats().keyframe_requests_forwarded, 2, "core again");
+        camera.camera.frame(SystemClock.now(), true);
+        camera.deltas_until(t0 + Duration::from_millis(3_000)).await;
+        assert_eq!(camera.camera.keyframe_requests, asked + 1, "answered");
+        assert_eq!(video.stats().keyframe_requests_forwarded, 2);
         running.cancel.cancel();
         within(running.run).await.unwrap();
     }

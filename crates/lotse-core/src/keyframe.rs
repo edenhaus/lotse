@@ -18,14 +18,30 @@
 //! - a request within that interval is folded into the one that went out,
 //!   whose keyframe is still due: every waiting viewer takes the next
 //!   keyframe off the live path, so one keyframe answers them all;
-//! - a request folded in so is sent at the interval's end only if no
-//!   keyframe arrived meanwhile (a camera that lost or ignored the first
-//!   one is asked again, once); one that did arrive answered it, and the
-//!   GOP cache now holds it for the joins after it.
+//! - only a keyframe broadcast after a request answers it, by the track's
+//!   broadcast sequence, not by time: one broadcast before may be the
+//!   very keyframe the viewer lost, whatever its arrival;
+//! - a request stays wanted until so answered, sent or folded in: the
+//!   first frame once the interval since the last one sent ends asks
+//!   again (a camera that lost or ignored it, or a source that could not
+//!   send it yet, is asked again), so spacing defers a request and never
+//!   drops it. A keyframe that answers it ends that, and the GOP cache
+//!   now holds it for the joins after it.
+//!
+//! Frames, not a timer, drive the request asked again: a track that gets
+//! none has no keyframe to give either, and once none came for
+//! `sources.stall_timeout` (5 s for video,
+//! [`DEFAULT_STALL_VIDEO`](crate::runner::DEFAULT_STALL_VIDEO)) the
+//! runner's stall watchdog ends the attempt, whose successor asks for its
+//! first keyframe itself (the WebRTC ingest's startup PLIs). A source
+//! that has to space its own requests (the WebRTC ingest, across its
+//! PLIs' causes) defers one it cannot send yet on its own timer, and asks
+//! [`KeyframeRequests::is_wanted`] whether a keyframe answered it
+//! meanwhile.
 //!
 //! The spacing runs on the injected clock, as the callers read it: the
-//! session's `now` for a request, a frame's `arrival` for one sent at the
-//! interval's end. A live track a standby feeds since a switch
+//! session's `now` for a request, a frame's `arrival` for one asked
+//! again. A live track a standby feeds since a switch
 //! ([`Feeds`](crate::track::Feeds)) hands its requests to the standby's
 //! source.
 //!
@@ -58,11 +74,14 @@ pub const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 /// What became of one keyframe request ([`Track::request_keyframe`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyframeOutcome {
-    /// Handed to the source feeding the track.
+    /// Handed to the source feeding the track; unless a keyframe
+    /// broadcast after it arrives first, asked again once the interval
+    /// ends.
     Forwarded,
     /// Folded into the request sent within the last
-    /// [`KEYFRAME_REQUEST_INTERVAL`]: its keyframe is due, and unless one
-    /// arrives first a request goes out once the interval ends.
+    /// [`KEYFRAME_REQUEST_INTERVAL`]: its keyframe is due, and unless a
+    /// keyframe broadcast after this one arrives first a request goes out
+    /// once the interval ends.
     Coalesced,
     /// No source feeding the track takes requests (none attached between
     /// two connection attempts, or one whose protocol cannot ask): counted
@@ -78,14 +97,15 @@ pub enum KeyframeOutcome {
 pub struct KeyframeRequests {
     /// Bumped once per request the track forwards.
     rx: watch::Receiver<u64>,
-    /// Keeps the sending end alive, so the receiver never sees it closed.
-    _track: Arc<Track>,
+    /// Keeps the sending end alive, so the receiver never sees it closed,
+    /// and answers [`Self::is_wanted`].
+    track: Arc<Track>,
 }
 
 impl KeyframeRequests {
     /// The receiving end of `rx`, the counter of `track`, which it keeps.
     pub(crate) const fn new(rx: watch::Receiver<u64>, track: Arc<Track>) -> Self {
-        Self { rx, _track: track }
+        Self { rx, track }
     }
 
     /// Resolves once a request was forwarded since the last call returned
@@ -100,6 +120,13 @@ impl KeyframeRequests {
     /// returned for yet.
     pub fn is_requested(&self) -> bool {
         self.rx.has_changed().unwrap_or(false)
+    }
+
+    /// Whether a request is wanted that no keyframe broadcast after it
+    /// answered yet. A source that defers a request it cannot send yet
+    /// asks this before it sends it, and drops it once this is `false`.
+    pub fn is_wanted(&self) -> bool {
+        self.track.keyframe_wanted()
     }
 }
 
@@ -232,6 +259,31 @@ mod tests {
         assert!(video.publish_frame(frame(false, t0 + ms(2_500))));
         assert_eq!(counted(&video), [3, 2, 2, 0]);
         drop(requests);
+    }
+
+    /// A request sent stays wanted until a keyframe broadcast after it:
+    /// a camera that lost or ignored it, or a source that could not send
+    /// it yet, is asked again at the interval's end, once per interval;
+    /// the keyframe ends it.
+    #[test]
+    fn a_request_sent_is_asked_again_each_interval_until_a_keyframe_after_it() {
+        let t0 = SystemClock.now();
+        let (_set, video) = live(t0);
+        let requests = video.keyframe_requests();
+        assert!(!requests.is_wanted());
+        assert_eq!(video.request_keyframe(t0), KeyframeOutcome::Forwarded);
+        assert!(requests.is_wanted());
+        assert!(video.publish_frame(frame(false, t0 + ms(999))));
+        assert_eq!(counted(&video), [1, 1, 0, 0]);
+        assert!(video.publish_frame(frame(false, t0 + ms(1_000))));
+        assert_eq!(counted(&video), [1, 2, 0, 0], "asked again");
+        assert!(video.publish_frame(frame(false, t0 + ms(1_999))));
+        assert!(video.publish_frame(frame(false, t0 + ms(2_000))));
+        assert_eq!(counted(&video), [1, 3, 0, 0], "and again");
+        assert!(video.publish_frame(frame(true, t0 + ms(2_100))));
+        assert!(!requests.is_wanted());
+        assert!(video.publish_frame(frame(false, t0 + ms(5_000))));
+        assert_eq!(counted(&video), [1, 3, 0, 0], "answered");
     }
 
     #[test]

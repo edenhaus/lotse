@@ -289,6 +289,20 @@ impl Attempt {
         }
     }
 
+    /// The engine's timeout at `now`. First, whether the viewers'
+    /// keyframe request it may have deferred is still wanted: core knows
+    /// whether a keyframe broadcast after it answered it.
+    fn timeout(&mut self, now: Instant) {
+        if self
+            .keyframes
+            .as_ref()
+            .is_some_and(|requests| !requests.is_wanted())
+        {
+            self.engine.keyframe_answered();
+        }
+        self.engine.handle_timeout(now);
+    }
+
     /// Takes what woke the loop at `now`; `Some` with how the attempt
     /// ended.
     fn woke(&mut self, event: Woke, now: Instant) -> Option<IngestEnd> {
@@ -520,7 +534,7 @@ async fn run(
         let end = match event {
             Err(end) => Some(end),
             Ok(None) => {
-                attempt.engine.handle_timeout(now);
+                attempt.timeout(now);
                 None
             }
             Ok(Some(event)) => {
@@ -529,7 +543,7 @@ async fn run(
                 // answer, a handshake's last datagram, after their
                 // deadline), neither postpones nor replaces a deadline.
                 if now >= wake {
-                    attempt.engine.handle_timeout(now);
+                    attempt.timeout(now);
                 }
                 if attempt.engine.is_ended() {
                     None

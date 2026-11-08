@@ -31,7 +31,9 @@
 //! [`PLI_INTERVAL`] until one arrived (at most [`STARTUP_PLIS`]), after
 //! a gap in the video's sequence numbers, and when the track's viewers
 //! want one (`IngestEngine::request_keyframe`), these two together at
-//! most one per [`PLI_INTERVAL`]. Consent freshness
+//! most one per [`PLI_INTERVAL`]: a viewers' request the spacing holds
+//! goes out at the interval's end, unless a keyframe broadcast after it
+//! answered it meanwhile. Consent freshness
 //! (RFC 7675) is str0m's: its agent going disconnected after the
 //! connection ends the attempt (`SPEC-DEVIATION`, at
 //! `IngestEngine::on_event`: seconds without an answer, not RFC 7675
@@ -504,6 +506,10 @@ pub struct IngestEngine {
     pli_blocked: bool,
     /// When the last one went out.
     last_pli: Option<Instant>,
+    /// A viewers' request the PLI spacing held: when it goes out, unless
+    /// a keyframe answers it first ([`IngestEngine::keyframe_answered`])
+    /// or a PLI of another cause goes out before.
+    viewer_pli: Option<Instant>,
     /// Outputs queued ahead of the engine's.
     queued: VecDeque<IngestOutput>,
     /// The rate limit of the foreign packets' log line.
@@ -824,6 +830,7 @@ impl IngestEngine {
             pli_due: None,
             pli_blocked: false,
             last_pli: None,
+            viewer_pli: None,
             queued: VecDeque::new(),
             foreign: Throttle::default(),
             unusable: Throttle::default(),
@@ -1167,6 +1174,7 @@ impl IngestEngine {
         }
         // Once ended, str0m is inert and nothing is due.
         self.startup_pli(false);
+        self.deferred_pli();
         self.input(Input::Timeout(now));
     }
 
@@ -1227,7 +1235,7 @@ impl IngestEngine {
             }
             match self.rtc.poll_output() {
                 Ok(Output::Timeout(at)) => {
-                    let at = [self.deadline, self.pli_due]
+                    let at = [self.deadline, self.pli_due, self.viewer_pli]
                         .into_iter()
                         .flatten()
                         .fold(at, Instant::min);
@@ -1593,8 +1601,15 @@ impl IngestEngine {
 
     /// Whether [`PLI_INTERVAL`] passed since the last PLI, of any cause.
     fn pli_spaced(&self) -> bool {
+        self.pli_held_until().is_none()
+    }
+
+    /// Until when the spacing holds the next PLI: [`PLI_INTERVAL`] after
+    /// the last one, of any cause; `None` once it passed.
+    fn pli_held_until(&self) -> Option<Instant> {
         self.last_pli
-            .is_none_or(|last| self.now.saturating_duration_since(last) >= PLI_INTERVAL)
+            .and_then(|last| last.checked_add(PLI_INTERVAL))
+            .filter(|&until| self.now < until)
     }
 
     /// The track's viewers want a keyframe at `now`, a request core
@@ -1603,22 +1618,46 @@ impl IngestEngine {
     /// a PLI (RFC 4585 §6.3.1) under the spacing a loss's keeps,
     /// [`PLI_INTERVAL`] since the last PLI of any cause, so the startup,
     /// loss and viewer requests together send at most one per interval.
-    /// Before the connection it adds none, and while the startup PLIs
-    /// still run neither: they ask already once it is up. Whether one
-    /// went out.
+    /// One the spacing holds is deferred to the interval's end, not
+    /// dropped: the last PLI's keyframe may have come already, before the
+    /// viewer asked, and answers nothing then. Before the connection it
+    /// adds none, and while the startup PLIs still run neither: they ask
+    /// already once it is up, until the first keyframe. Whether one went
+    /// out now.
     pub fn request_keyframe(&mut self, now: Instant) -> bool {
         self.now = now;
         if !self.is_connected() || self.pli_due.is_some() {
             tracing::debug!("webrtc: keyframe request left to the startup PLIs");
             return false;
         }
-        if !self.pli_spaced() {
+        if let Some(until) = self.pli_held_until() {
             tracing::debug!(
-                "webrtc: keyframe request within the PLI interval; the last PLI's keyframe is due"
+                "webrtc: keyframe request within the PLI interval; deferred to its end"
             );
+            self.viewer_pli = Some(until);
             return false;
         }
         self.request_pli("a viewer wants a keyframe")
+    }
+
+    /// The viewers' requests were answered by a keyframe broadcast after
+    /// them ([`KeyframeRequests::is_wanted`](lotse_core::keyframe::KeyframeRequests::is_wanted)
+    /// is `false`): a deferred one does not go out.
+    pub fn keyframe_answered(&mut self) {
+        if self.viewer_pli.take().is_some() {
+            tracing::debug!("webrtc: deferred keyframe request answered by a keyframe");
+        }
+    }
+
+    /// Sends the viewers' deferred request once the PLI interval it
+    /// waited for ended. Taken before it is sent, so one that cannot go
+    /// out is not due again at every timeout.
+    fn deferred_pli(&mut self) {
+        if self.viewer_pli.is_some_and(|due| self.now >= due) {
+            self.viewer_pli = None;
+            let _sent =
+                self.request_pli("a viewer wants a keyframe; deferred to the interval's end");
+        }
     }
 
     /// Asks the camera for a keyframe with a Picture Loss Indication (RFC
@@ -1632,6 +1671,9 @@ impl IngestEngine {
         stream.request_keyframe(KeyframeRequestKind::Pli);
         self.stats.plis = self.stats.plis.saturating_add(1);
         self.last_pli = Some(self.now);
+        // A PLI of any cause asks for the keyframe a deferred viewers'
+        // request waits for.
+        self.viewer_pli = None;
         tracing::debug!(reason, "webrtc: keyframe requested");
         true
     }
@@ -1664,6 +1706,7 @@ impl IngestEngine {
         self.queued.clear();
         self.deadline = None;
         self.pli_due = None;
+        self.viewer_pli = None;
         let started = self.rtc.close();
         for _ in 0..CLOSE_OUTPUTS {
             // A closing str0m reports no events; its first timeout or

@@ -1027,15 +1027,21 @@ pub struct Track {
     /// request forwarded, its receiver held by the source
     /// ([`Self::keyframe_requests`]) while it can ask.
     keyframe_tx: watch::Sender<u64>,
-    /// When the last keyframe request was forwarded, and the throttle of
-    /// the line of a dropped one. Taken by whoever asks (the sessions'
-    /// tasks) and, while a request is folded in, by the source's task at
-    /// each frame; never held across anything else.
+    /// When the last keyframe request was forwarded, where in the
+    /// broadcast the latest one was made, and the throttle of the line of
+    /// a dropped one. Taken by whoever asks (the sessions' tasks) and,
+    /// while a request is wanted, by the source's task at each frame;
+    /// never held across anything else.
     keyframe_gate: Mutex<KeyframeGate>,
-    /// A request was folded in and goes out at the interval's end, unless
-    /// a keyframe comes first. Written under `keyframe_gate`; read
-    /// without it on every frame, so a track nobody asks costs one load.
-    keyframe_pending: AtomicBool,
+    /// A request was made that no keyframe broadcast after it answered
+    /// yet: it goes out again once the interval since the last one sent
+    /// ends. Set under `keyframe_gate` before the request reads
+    /// `frame_seq`, and read after a frame's broadcast (both
+    /// sequentially consistent with `frame_seq`), so a keyframe that
+    /// sees it unset was numbered before the request read the sequence
+    /// and cannot answer it; read without the gate on every frame, so a
+    /// track nobody asks costs one load.
+    keyframe_wanted: AtomicBool,
 }
 
 /// A track's keyframe-request spacing ([`Track::request_keyframe`]).
@@ -1043,6 +1049,10 @@ pub struct Track {
 struct KeyframeGate {
     /// When the last request was forwarded, on the injected clock.
     last_forwarded: Option<Instant>,
+    /// `frame_seq` as the latest request read it: only a keyframe
+    /// numbered at or after it, broadcast after the request, answers it.
+    /// One numbered before may be the very keyframe its viewer lost.
+    wanted_from: u64,
     /// Rate-limits the line of a dropped request, which every viewer of a
     /// source that cannot ask makes.
     drops: Throttle,
@@ -1123,7 +1133,7 @@ impl Track {
             forward_to: ArcSwapOption::new(forward_to),
             keyframe_tx: watch::channel(0).0,
             keyframe_gate: Mutex::default(),
-            keyframe_pending: AtomicBool::new(false),
+            keyframe_wanted: AtomicBool::new(false),
         }
     }
 
@@ -1399,9 +1409,10 @@ impl Track {
         let _delivered_to = self.control.send((before, event));
     }
 
-    /// The next side-branch item's sequence number, taken.
+    /// The next side-branch item's sequence number, taken. Sequentially
+    /// consistent, for the keyframe requests (`keyframe_wanted`).
     fn frame_seq(&self) -> u64 {
-        self.frame_seq.fetch_add(1, Ordering::Relaxed)
+        self.frame_seq.fetch_add(1, Ordering::SeqCst)
     }
 
     /// The connection switched to the source tagged `tag`: the track takes
@@ -1734,10 +1745,11 @@ impl Track {
         let truncation = self.update_prerecord(&mut fed, &frame);
         self.last_frame.store(Some(Arc::clone(&frame)));
         // As above: no subscriber is not an error.
-        let _delivered_to = self.frames.send((self.frame_seq(), Some(frame)));
+        let seq = self.frame_seq();
+        let _delivered_to = self.frames.send((seq, Some(frame)));
         drop(fed);
-        if self.keyframe_pending.load(Ordering::Acquire) {
-            self.settle_keyframe_request(keyframe, arrival);
+        if self.keyframe_wanted.load(Ordering::SeqCst) {
+            self.settle_keyframe_request(keyframe, seq, arrival);
         }
         if let Some(truncation) = truncation {
             tracing::debug!(
@@ -1755,7 +1767,8 @@ impl Track {
     /// A viewer of this track wants a keyframe at `now` (on the injected
     /// clock): forwarded to the source feeding the track, unless one was
     /// within [`KEYFRAME_REQUEST_INTERVAL`], whose keyframe this request
-    /// then waits for too (`crate::keyframe` has the rules). A live track
+    /// then waits for too. Either way it stays wanted until a keyframe
+    /// broadcast after it (`crate::keyframe` has the rules). A live track
     /// fed by a standby since a switch forwards to the standby's source.
     pub fn request_keyframe(&self, now: Instant) -> KeyframeOutcome {
         self.counters
@@ -1765,8 +1778,10 @@ impl Track {
             .keyframe_gate
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // Wanted before the sequence is read (`keyframe_wanted`).
+        self.keyframe_wanted.store(true, Ordering::SeqCst);
+        gate.wanted_from = self.frame_seq.load(Ordering::SeqCst);
         if !spaced(gate.last_forwarded, now) {
-            self.keyframe_pending.store(true, Ordering::Release);
             drop(gate);
             self.counters
                 .keyframe_requests_coalesced
@@ -1779,38 +1794,47 @@ impl Track {
         outcome
     }
 
-    /// A frame arrived at `arrival` while a request was folded in: a
-    /// `keyframe` answers it; any other frame sends it once the interval
-    /// since the last one sent has passed.
-    fn settle_keyframe_request(&self, keyframe: bool, arrival: Instant) {
+    /// Frame `seq`, arrived at `arrival`, was broadcast while a request
+    /// was wanted: a `keyframe` numbered at or after the latest request
+    /// answers it; any other frame, a keyframe before it included, asks
+    /// again once the interval since the last request sent has passed.
+    fn settle_keyframe_request(&self, keyframe: bool, seq: u64, arrival: Instant) {
         let mut gate = self
             .keyframe_gate
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if keyframe {
-            self.keyframe_pending.store(false, Ordering::Release);
+        if !self.keyframe_wanted.load(Ordering::SeqCst) {
+            return;
+        }
+        if keyframe && seq >= gate.wanted_from {
+            self.keyframe_wanted.store(false, Ordering::SeqCst);
             tracing::trace!(track = %self.id, "keyframe request answered by a keyframe");
-        } else if self.keyframe_pending.load(Ordering::Acquire)
-            && spaced(gate.last_forwarded, arrival)
-        {
+        } else if spaced(gate.last_forwarded, arrival) {
             let _outcome = self.forward_keyframe_request(
                 &mut gate,
                 arrival,
-                "no keyframe within the interval",
+                "no keyframe since the request within the interval",
             );
         }
     }
 
+    /// Whether a request was made that no keyframe broadcast after it
+    /// answered yet ([`KeyframeRequests::is_wanted`]).
+    pub(crate) fn keyframe_wanted(&self) -> bool {
+        self.keyframe_wanted.load(Ordering::SeqCst)
+    }
+
     /// Hands a request to the source feeding the track at `now`, for
-    /// `reason`, with `gate` held: forwarded, or dropped and counted when
-    /// that source takes none. Either way nothing stays folded in.
+    /// `reason`, with `gate` held: forwarded, and still wanted until its
+    /// keyframe; or dropped and counted when that source takes none, and
+    /// then no longer wanted, so a track no source asks for is not asked
+    /// again at every frame.
     fn forward_keyframe_request(
         &self,
         gate: &mut KeyframeGate,
         now: Instant,
         reason: &'static str,
     ) -> KeyframeOutcome {
-        self.keyframe_pending.store(false, Ordering::Release);
         let sent = if self.fed() {
             self.signal_keyframe()
         } else {
@@ -1819,6 +1843,7 @@ impl Track {
                 .is_some_and(|feeder| feeder.signal_keyframe())
         };
         if !sent {
+            self.keyframe_wanted.store(false, Ordering::SeqCst);
             self.counters
                 .keyframe_requests_dropped
                 .fetch_add(1, Ordering::Relaxed);
@@ -2038,6 +2063,41 @@ mod tests {
         assert_eq!(id.index(), 2);
         assert_eq!(TrackId::new(Kind::Video, 0).index(), 0);
         assert_eq!(TrackId::new(Kind::Video, 0).to_string(), "v0");
+    }
+
+    /// A keyframe answers only the requests made before its broadcast.
+    /// `publish_frame` broadcasts a frame, then settles the requests, so
+    /// a viewer's request can come in between: the viewer lost the
+    /// keyframe just broadcast and asks again (a PLI, RFC 4585 §6.3.1).
+    /// The keyframe's settlement, after that request, must not answer it:
+    /// it stays wanted and is asked again at the interval's end. Replays
+    /// the two halves of `publish_frame` around the request, in the order
+    /// two tasks can run them.
+    #[test]
+    fn rfc4585_6_3_1_a_keyframe_broadcast_before_a_request_never_answers_it() {
+        let t0 = SystemClock.now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let video = Arc::new(video_track(TrackLimits::default()));
+        let requests = video.keyframe_requests();
+        assert_eq!(video.request_keyframe(t0), KeyframeOutcome::Forwarded);
+        // The camera's keyframe is numbered and broadcast…
+        let keyframe = video.frame_seq();
+        // …a viewer that lost it asks within the interval…
+        assert_eq!(video.request_keyframe(at(100)), KeyframeOutcome::Coalesced);
+        // …and only then does the keyframe's settlement run.
+        video.settle_keyframe_request(true, keyframe, at(100));
+        assert!(requests.is_wanted(), "the keyframe came before the request");
+        // A frame before the interval's end asks nothing; the first one at
+        // its end asks again.
+        assert!(video.publish_frame(timed(t0, 999, false, 10)));
+        assert_eq!(video.stats().keyframe_requests_forwarded, 1);
+        assert!(video.publish_frame(timed(t0, 1_000, false, 10)));
+        assert_eq!(video.stats().keyframe_requests_forwarded, 2);
+        // A keyframe broadcast after the request answers it.
+        assert!(video.publish_frame(timed(t0, 1_100, true, 10)));
+        assert!(!requests.is_wanted());
+        assert!(video.publish_frame(timed(t0, 2_100, false, 10)));
+        assert_eq!(video.stats().keyframe_requests_forwarded, 2);
     }
 
     #[test]
