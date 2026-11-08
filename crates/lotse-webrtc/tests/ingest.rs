@@ -25,12 +25,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use lotse_codec::h264::test_data;
 use lotse_core::clock::{Clock, FakeClock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::codec::{Codec, Kind};
 use lotse_core::ingest::{IngestCounters, IngestStats};
 use lotse_core::keyframe::KeyframeOutcome;
+use lotse_core::media::{MediaFrame, MediaTime};
 use lotse_core::signaling::{
     LocalSignal, RemoteSignal, SignalCandidate, SignalClose, SignalingOpener, SignalingRelay, close,
 };
@@ -2686,6 +2688,63 @@ mod source {
         camera.deltas_until(t0 + Duration::from_millis(3_000)).await;
         assert_eq!(camera.camera.keyframe_requests, asked + 1, "answered");
         assert_eq!(video.stats().keyframe_requests_forwarded, 2);
+        running.cancel.cancel();
+        within(running.run).await.unwrap();
+    }
+
+    /// A keyframe broadcast after a request, before the source takes the
+    /// request's wake, answered it: the source sends no PLI for it. The
+    /// source's own drain can publish one so; here the test publishes it
+    /// on the track between the request and the wake, which this
+    /// single-threaded runtime orders: the source task runs only once the
+    /// test yields.
+    #[tokio::test]
+    async fn rfc4585_6_3_1_a_request_a_keyframe_answered_before_the_source_took_it_sends_no_pli() {
+        let _logs = logs();
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
+        let running = start(
+            serde_json::json!({}),
+            Some(signaling.clone()),
+            Arc::new(SystemClock),
+        );
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        let (offer, _) = read_offer(&mut relay).await;
+        let (mut camera, answer) = Live::answer(&offer, false).await;
+        relay
+            .incoming
+            .send(RemoteSignal::Answer(answer))
+            .await
+            .unwrap();
+        camera.connect().await;
+        let video = Arc::clone(&running.set.tracks()[0]);
+        while video.stats().keyframes == 0 {
+            camera.camera.frame(SystemClock.now(), true);
+            camera.pump(Duration::from_millis(100)).await;
+        }
+        // Past the startup PLI's interval: a request would go out at once.
+        camera
+            .deltas_until(SystemClock.now() + Duration::from_millis(1_200))
+            .await;
+        let asked = camera.camera.keyframe_requests;
+
+        let now = SystemClock.now();
+        assert_eq!(video.request_keyframe(now), KeyframeOutcome::Forwarded);
+        let keyframes = video.stats().keyframes;
+        assert!(video.publish_frame(MediaFrame {
+            ts: MediaTime::ZERO,
+            wallclock: now,
+            arrival: now,
+            keyframe: true,
+            discontinuity: false,
+            epoch: 0,
+            payload: Bytes::from_static(&[0x65, 0x88, 0x84, 0x00, 0x10]),
+        }));
+        assert_eq!(video.stats().keyframes, keyframes + 1);
+        camera
+            .deltas_until(SystemClock.now() + Duration::from_millis(500))
+            .await;
+        assert_eq!(camera.camera.keyframe_requests, asked, "no PLI");
+        assert_eq!(video.stats().keyframe_requests_forwarded, 1);
         running.cancel.cancel();
         within(running.run).await.unwrap();
     }

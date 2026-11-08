@@ -308,8 +308,21 @@ impl Attempt {
     fn woke(&mut self, event: Woke, now: Instant) -> Option<IngestEnd> {
         match event {
             Woke::Signal(RemoteSignal::Answer(sdp)) => self.engine.accept_answer(now, &sdp),
+            // The wake was taken (`requested`); a keyframe broadcast since
+            // the request, by this loop's own drain before it got here, may
+            // have answered it already: then no PLI.
             Woke::Keyframe => {
-                let _sent = self.engine.request_keyframe(now);
+                if self
+                    .keyframes
+                    .as_ref()
+                    .is_some_and(KeyframeRequests::is_wanted)
+                {
+                    let _sent = self.engine.request_keyframe(now);
+                } else {
+                    tracing::debug!(
+                        "webrtc: keyframe request answered by a keyframe before the source took it"
+                    );
+                }
             }
             Woke::Signal(RemoteSignal::Candidate(candidate)) => {
                 self.engine.add_remote_candidate(now, &candidate);
