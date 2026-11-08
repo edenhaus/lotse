@@ -871,7 +871,7 @@ fn rfc3550_6_4_1_losses_late_packets_and_rejected_datagrams_reach_the_connection
 fn rfc4585_6_3_1_a_viewer_s_keyframe_request_is_a_pli_rate_limited_with_the_startup_and_loss_plis()
 {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     // Before the connection: no stream to ask on yet.
     assert!(!pair.engine.request_keyframe(pair.now));
@@ -2590,7 +2590,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::json!({ "audio": false }),
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
