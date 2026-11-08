@@ -289,8 +289,8 @@ fn iso14496_12_8_8_8_1_the_b_frame_fixture_keeps_decode_order_with_negative_comp
         };
         for traf in moof.traf {
             let mut dts = i64::try_from(traf.tfdt.unwrap().base_media_decode_time).unwrap();
-            for entry in traf.trun.iter().flat_map(|trun| &trun.entries) {
-                let cts = i64::from(entry.cts.unwrap_or(0));
+            for entry in traf.trun.iter().flat_map(|trun| &trun.samples) {
+                let cts = entry.cts.unwrap_or(0);
                 negative += usize::from(cts < 0);
                 presented.push(dts + cts);
                 dts += i64::from(entry.duration.unwrap());

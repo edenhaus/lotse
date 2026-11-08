@@ -274,7 +274,8 @@ fuzz_target!(|data: &[u8]| {
     };
     let t0 = Instant::now();
     let Ok(engine) = IngestEngine::offer(&options, &[ENGINE], t0, t0) else {
-        // str0m 0.24 can draw one mid twice; the engine refuses that offer.
+        // str0m 0.24 could draw one mid twice (0.25 does not); the engine
+        // refuses such an offer.
         return;
     };
     assert!(engine.offer_sdp().len() <= 16 * 1024, "the offer budget");

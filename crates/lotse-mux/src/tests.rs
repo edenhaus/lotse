@@ -258,7 +258,7 @@ fn samples(file: &[u8], track_id: u32) -> Vec<Read> {
             assert_eq!(traf.trun.len(), 1);
             let trun = &traf.trun[0];
             let mut at = start + usize::try_from(trun.data_offset.unwrap()).unwrap();
-            for entry in &trun.entries {
+            for entry in &trun.samples {
                 let size = usize::try_from(entry.size.unwrap()).unwrap();
                 let duration = entry.duration.unwrap();
                 out.push(Read {
@@ -266,7 +266,7 @@ fn samples(file: &[u8], track_id: u32) -> Vec<Read> {
                     dts,
                     duration,
                     flags: entry.flags,
-                    cts: entry.cts.unwrap_or(0),
+                    cts: i32::try_from(entry.cts.unwrap_or(0)).unwrap(),
                     bytes: file[at..at + size].to_vec(),
                 });
                 at += size;
@@ -374,11 +374,11 @@ fn iso14496_15_5_3_2_video_samples_are_slices_of_the_frame_never_copies() {
     let au = h264_au(true, 7);
     let mut muxer = Muxer::new(&policy(1000));
     muxer.start(&h264_track(), None).unwrap();
-    assert!(
+    assert_eq!(
         muxer
             .push(Kind::Video, frame(base, 0, true, 0, au.clone()))
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        Vec::<Bytes>::new()
     );
     let out = muxer.finish().unwrap();
     // The moof and mdat header, then length and unit for each of the three units.
@@ -600,8 +600,12 @@ fn iso14496_12_8_4_each_track_has_its_media_header_handler_and_empty_sample_tabl
         assert_eq!(stbl.stsd.codecs.len(), 1);
         assert!(stbl.stts.entries.is_empty() && stbl.stsc.entries.is_empty());
         assert_eq!(stbl.stco.as_ref().unwrap().entries, Vec::<u32>::new());
-        assert_eq!(trak.mdia.minf.dinf.dref.urls.len(), 1);
-        assert_eq!(trak.mdia.minf.dinf.dref.urls[0].location, "");
+        let entries = &trak.mdia.minf.dinf.dref.entries;
+        assert_eq!(entries.len(), 1);
+        let mp4_atom::DrefEntry::Url(url) = &entries[0] else {
+            panic!("a url entry: {entries:?}");
+        };
+        assert_eq!(url.location, "");
     }
 }
 
@@ -681,7 +685,7 @@ fn iso14496_15_5_3_3_1_avcc_carries_the_sets_profile_level_and_the_high_profiles
         (ext.chroma_format, ext.bit_depth_luma, ext.bit_depth_chroma),
         (2, 10, 10)
     );
-    assert!(ext.sequence_parameter_sets_ext.is_empty());
+    assert_eq!(ext.sequence_parameter_sets_ext, Vec::<Vec<u8>>::new());
     assert_eq!((avc1.visual.width, avc1.visual.height), (640, 480));
 }
 
@@ -2100,7 +2104,7 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
         file.extend_from_slice(&piece);
     }
     for (kind, frame) in reordered_gop(base, 0, 0, 0) {
-        assert!(reordered.push(kind, frame).unwrap().is_empty());
+        assert_eq!(reordered.push(kind, frame).unwrap(), Vec::<Bytes>::new());
     }
     assert_eq!(
         reordered.media_end(),
@@ -2108,7 +2112,10 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
         "P6's end"
     );
     let audio = frame(ms(base, 300), 0, true, 0, opus_packet(0));
-    assert!(reordered.push(Kind::Audio, audio).unwrap().is_empty());
+    assert_eq!(
+        reordered.push(Kind::Audio, audio).unwrap(),
+        Vec::<Bytes>::new()
+    );
     assert_eq!(
         reordered.media_end(),
         Duration::from_millis(320),

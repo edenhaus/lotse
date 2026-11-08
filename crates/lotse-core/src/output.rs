@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn a_kind_by_default_wants_no_tracks_and_no_talkback() {
         let factory = FakeOutputFactory("fake");
-        assert!(factory.session_tracks("m=video", true).is_empty());
+        assert_eq!(factory.session_tracks("m=video", true), []);
         let target = TalkbackTarget {
             codec: Codec::Pcmu,
             takes: vec![crate::uplink::UplinkCodec::Pcmu],

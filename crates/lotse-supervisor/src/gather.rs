@@ -502,7 +502,7 @@ mod tests {
         );
         assert_eq!(plan.turn[0].credentials.username, "ha");
         assert_eq!(plan.turn[0].credentials.password.expose_secret(), "pw");
-        assert!(plan.warnings.is_empty());
+        assert_eq!(plan.warnings, []);
         // The limit counts what is left.
         let mut many: Vec<String> = (0..6).map(|n| format!("turn:t{n}?transport=tcp")).collect();
         many.extend((0..3).map(|n| format!("turn:t{n}")));

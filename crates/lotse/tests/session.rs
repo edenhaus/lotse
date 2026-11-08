@@ -1175,7 +1175,7 @@ async fn rfc8829_5_3_1_a_video_first_session_answers_audio_inactive_and_plays_vi
         |v, _| v.packets().len() >= target,
     )
     .await;
-    assert!(viewer.audio_packets().is_empty());
+    assert_eq!(viewer.audio_packets(), []);
 
     registrations.unregister(UFRAG);
     let exit = door.worker.stop(Duration::from_secs(5), &clock()).await;
