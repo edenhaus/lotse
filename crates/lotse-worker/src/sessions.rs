@@ -4040,14 +4040,17 @@ mod tests {
         // The reader holds the datagram channel while it runs.
         let channel = Arc::downgrade(&manager.datagrams);
         drop(manager);
-        // The aborted reader is dropped once the runtime gets to it.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
+        // The aborted reader is dropped once the runtime polls it again:
+        // until then, yield; five seconds of real time fail the test.
+        let dropped = async {
+            while channel.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            () = dropped => {}
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the reader outlived the manager"),
         }
-        assert!(
-            channel.upgrade().is_none(),
-            "the reader went with the manager"
-        );
     }
 
     /// Regression for SBX-4: the shared socket stayed at whatever number
