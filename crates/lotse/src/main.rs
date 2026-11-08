@@ -120,6 +120,15 @@ fn registries() -> Registries {
             lotse_core::test_util::FakeSourceFactory::with_backchannel(&["fake"]),
         )),
     );
+    #[cfg(feature = "source-fake")]
+    // Signaled, so the end-to-end tests reach a worker's signaling through
+    // the supervisor.
+    registered(
+        "signaled fake source",
+        registries.sources.register_signaled(Arc::new(
+            lotse_core::test_util::FakeSignaledSourceFactory::new("fake-signaled"),
+        )),
+    );
     registries
 }
 

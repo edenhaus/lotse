@@ -12,8 +12,8 @@ use crate::error::{ApiError, ErrorCode};
 #[cfg(feature = "schema")]
 use crate::limits::{ID_PATTERN, RECORDING_ID_PATTERN};
 use crate::limits::{
-    MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_SDP_CHARS, MAX_SOURCES,
-    MAX_TEXT_CHARS, MAX_URL_CHARS,
+    MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_PROTOCOL_CHARS, MAX_SDP_CHARS,
+    MAX_SOURCES, MAX_TEXT_CHARS, MAX_URL_CHARS,
 };
 use crate::session::IceServer;
 use crate::stream::{AudioMode, Orientation, SourceSpec};
@@ -698,7 +698,14 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             cap_stream_id(&put.stream_id)?;
             cap_items("sources", put.sources.len(), MAX_SOURCES)?;
             for source in &put.sources {
-                cap_chars("sources[].url", &source.url, MAX_URL_CHARS)?;
+                match source {
+                    SourceSpec::Url(source) => {
+                        cap_chars("sources[].url", &source.url, MAX_URL_CHARS)?;
+                    }
+                    SourceSpec::Signaled(source) => {
+                        cap_chars("sources[].protocol", &source.protocol, MAX_PROTOCOL_CHARS)?;
+                    }
+                }
             }
         }
         Command::WebrtcOffer(offer) => {
@@ -855,7 +862,7 @@ mod tests {
             (put.id, put.stream_id.as_str(), put.preload, put.audio),
             (3, "front", true, AudioMode::Off)
         );
-        assert_eq!(put.sources[0].options["transport"], "tcp");
+        assert_eq!(put.sources[0].options()["transport"], "tcp");
         assert_eq!(put.orientation, Orientation::RotateLeft);
     }
 
@@ -947,7 +954,7 @@ mod tests {
             !minimal.preload
                 && minimal.audio == AudioMode::Auto
                 && minimal.orientation == Orientation::NoTransform
-                && minimal.sources[0].options.is_empty()
+                && minimal.sources[0].options().is_empty()
                 && minimal.prerecord_ms == 0
         );
         // A client may send only the offer and the stream; the rest defaults.
@@ -1128,9 +1135,11 @@ mod tests {
         let renegotiate = |session: usize, sdp: usize| json!({ "id": 1, "type": "webrtc/renegotiate", "session_id": text(session), "sdp": text(sdp) });
         let at_cap = server(MAX_ICE_URLS, MAX_TEXT_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS);
         let remove = |pin: usize| json!({ "id": 1, "type": "clients/remove", "pin": text(pin) });
+        let signaled = |protocol: usize| json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [{ "protocol": text(protocol) }] });
         let accepted = [
             remove(MAX_PIN_CHARS),
             put(MAX_SOURCES, MAX_URL_CHARS),
+            signaled(MAX_PROTOCOL_CHARS),
             offer(MAX_SDP_CHARS, vec![at_cap.clone(); MAX_ICE_SERVERS]),
             candidate(MAX_ID_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS),
             renegotiate(MAX_ID_CHARS, MAX_SDP_CHARS),
@@ -1142,6 +1151,7 @@ mod tests {
             (remove(MAX_PIN_CHARS + 1), "pin"),
             (put(MAX_SOURCES + 1, 10), "sources"),
             (put(1, MAX_URL_CHARS + 1), "sources[].url"),
+            (signaled(MAX_PROTOCOL_CHARS + 1), "sources[].protocol"),
             (offer(MAX_SDP_CHARS + 1, vec![]), "sdp"),
             (offer(1, vec![at_cap; MAX_ICE_SERVERS + 1]), "ice_servers"),
             (

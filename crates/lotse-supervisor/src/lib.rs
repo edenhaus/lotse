@@ -48,6 +48,7 @@ mod recording;
 mod registry;
 mod resolve;
 mod session;
+mod signaling;
 pub mod worker;
 mod worker_text;
 
@@ -454,7 +455,7 @@ pub(crate) mod test_support {
 
     use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
     use lotse_core::registry::Registries;
-    use lotse_core::test_util::FakeSourceFactory;
+    use lotse_core::test_util::{FakeSignaledSourceFactory, FakeSourceFactory};
 
     use super::*;
     use crate::worker::WorkerConfig;
@@ -541,13 +542,18 @@ pub(crate) mod test_support {
         }
     }
 
-    /// An environment whose workers are `binary`, with the fake source.
+    /// An environment whose workers are `binary`, with the fake source and
+    /// the signaled fake source (`fake-signaled`).
     pub(crate) fn environment(binary: &str) -> Environment {
         let mut registries = Registries::default();
         registries
             .sources
             .register(Arc::new(FakeSourceFactory::new(&["fake"])))
             .expect("the fake source registers");
+        registries
+            .sources
+            .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
+            .expect("the signaled fake source registers");
         Environment {
             registries,
             worker: WorkerConfig {

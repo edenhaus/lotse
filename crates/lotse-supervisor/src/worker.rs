@@ -7,7 +7,7 @@
 //! value here (an error code onto a `SourceError` variant, for example)
 //! and never used as a path or a command, and what is kept is bounded
 //! here: at most 32 tracks and track counters with short names, error
-//! text cut and on one line. The frame cap alone would let a
+//! text and a signal's close cut and on one line, signal ids short. The frame cap alone would let a
 //! worker hand the API a quarter MiB per `stream/get`. A trim is logged
 //! once per worker, so a worker repeating an over-long message cannot
 //! flood the log either.
@@ -30,7 +30,8 @@ use lotse_core::task::spawn_named;
 use lotse_core::text::plain;
 use lotse_ipc::{Channel, IpcError, Receiver, Sender, SourceState, ToSupervisor, ToWorker};
 pub use lotse_ipc::{
-    RecordingReport, RecordingSpec, SessionEvent, SessionSpec, SourceSpec, TrackInfo, WorkerStats,
+    RecordingReport, RecordingSpec, SessionEvent, SessionSpec, SignalCommand, SignalReport,
+    SourceSpec, TrackInfo, WorkerStats,
 };
 use tokio::process::Child;
 use tokio::sync::mpsc;
@@ -118,6 +119,9 @@ pub enum WorkerEvent {
         /// When, on the worker's wall clock.
         at: SystemTime,
     },
+    /// A signaled source's signaling, its signal id short and its close's
+    /// code and message plain; the driver checks the rest.
+    Signal(SignalReport),
     /// An event recording reported something, as the worker wrote it: checked
     /// against the recording the supervisor holds under `recording_id`, as a
     /// session's report is against its session.
@@ -390,7 +394,51 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
                 change.reason
             )),
         },
+        ToSupervisor::Signal(report) => signal(report),
     }
+}
+
+/// A worker's signal report as the driver takes it: a close's code and
+/// message made [`plain`]. A signal id the supervisor never gives (its
+/// ids are ULIDs): empty, over [`MAX_NAME_BYTES`] or with a byte outside
+/// [`is_signal_id`]'s set, fails the channel, as a broken protocol does;
+/// so an id is safe to log as it is, with no line break or control
+/// character to forge a log line with.
+fn signal(report: SignalReport) -> WorkerEvent {
+    let signal_id = match &report {
+        SignalReport::Open { .. } | SignalReport::Cancel { .. } => None,
+        SignalReport::Offer { signal_id, .. }
+        | SignalReport::Candidate { signal_id, .. }
+        | SignalReport::Closed { signal_id, .. } => Some(signal_id),
+    };
+    if let Some(signal_id) = signal_id.filter(|id| !is_signal_id(id)) {
+        return WorkerEvent::ChannelError(format!(
+            "signal report with a malformed {}-byte signal id",
+            signal_id.len()
+        ));
+    }
+    WorkerEvent::Signal(match report {
+        SignalReport::Closed {
+            signal_id,
+            code,
+            message,
+        } => SignalReport::Closed {
+            signal_id,
+            code: plain(&code, MAX_NAME_BYTES),
+            message: plain(&message, MAX_MESSAGE_BYTES),
+        },
+        report => report,
+    })
+}
+
+/// Whether `id` could be a signal id the supervisor gave: 1 to
+/// [`MAX_NAME_BYTES`] bytes of ASCII letters, digits, `.`, `_` and `-`, a
+/// superset of a ULID's Crockford base32.
+fn is_signal_id(id: &str) -> bool {
+    (1..=MAX_NAME_BYTES).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// The tracks of a worker's declaration the supervisor keeps: the first
@@ -701,6 +749,14 @@ impl Worker {
     ) -> Result<(), IpcError> {
         self.control
             .send_msg(&ToWorker::ReleaseBackchannel { session_id }, &[])
+            .await
+    }
+
+    /// Tells the worker what the supervisor answers its signaled source's
+    /// signaling with: an open's answer, or what the client relays.
+    pub async fn signal(&mut self, command: &SignalCommand) -> Result<(), IpcError> {
+        self.control
+            .send_msg(&ToWorker::Signal(command.clone()), &[])
             .await
     }
 
@@ -1135,6 +1191,112 @@ mod tests {
     }
 
     #[test]
+    fn a_signal_report_maps_with_its_close_plain_and_a_long_signal_id_fails_the_channel() {
+        let passed = [
+            SignalReport::Open { request: 1 },
+            SignalReport::Cancel { request: 1 },
+            SignalReport::Offer {
+                signal_id: "s".repeat(MAX_NAME_BYTES),
+                sdp: "v=0\r\n".into(),
+            },
+            SignalReport::Candidate {
+                signal_id: "01JSIG".into(),
+                candidate: String::new(),
+                mid: None,
+                mline_index: Some(0),
+            },
+        ];
+        for report in passed {
+            assert_eq!(
+                mapped(ToSupervisor::Signal(report.clone()), None),
+                WorkerEvent::Signal(report)
+            );
+        }
+        assert_eq!(
+            mapped(
+                ToSupervisor::Signal(SignalReport::Closed {
+                    signal_id: "01JSIG".into(),
+                    code: format!("ice_failed\n{}", "x".repeat(MAX_NAME_BYTES)),
+                    message: format!("line\none{}", "y".repeat(MAX_MESSAGE_BYTES)),
+                }),
+                None
+            ),
+            WorkerEvent::Signal(SignalReport::Closed {
+                signal_id: "01JSIG".into(),
+                code: plain(
+                    &format!("ice_failed {}", "x".repeat(MAX_NAME_BYTES)),
+                    MAX_NAME_BYTES
+                ),
+                message: plain(
+                    &format!("line one{}", "y".repeat(MAX_MESSAGE_BYTES)),
+                    MAX_MESSAGE_BYTES
+                ),
+            })
+        );
+        let long = "s".repeat(MAX_NAME_BYTES + 1);
+        for report in [
+            SignalReport::Offer {
+                signal_id: long.clone(),
+                sdp: String::new(),
+            },
+            SignalReport::Candidate {
+                signal_id: long.clone(),
+                candidate: String::new(),
+                mid: None,
+                mline_index: None,
+            },
+            SignalReport::Closed {
+                signal_id: long,
+                code: String::new(),
+                message: String::new(),
+            },
+        ] {
+            assert_eq!(
+                mapped(ToSupervisor::Signal(report), None),
+                WorkerEvent::ChannelError(
+                    "signal report with a malformed 65-byte signal id".into()
+                )
+            );
+        }
+    }
+
+    /// A signal id is logged as it is, so one that could forge a log line
+    /// (a line break, a control character) or that the supervisor never
+    /// gives fails the channel.
+    #[test]
+    fn a_signal_id_outside_the_supervisor_s_charset_fails_the_channel() {
+        for id in [
+            "",
+            "sig\nlevel=ERROR forged",
+            "sig\r",
+            "sig\u{1b}[31m",
+            "sig id",
+            "sig\"",
+            "sigé",
+            "sig/1",
+        ] {
+            assert_eq!(
+                mapped(
+                    ToSupervisor::Signal(SignalReport::Offer {
+                        signal_id: id.into(),
+                        sdp: String::new(),
+                    }),
+                    None
+                ),
+                WorkerEvent::ChannelError(format!(
+                    "signal report with a malformed {}-byte signal id",
+                    id.len()
+                )),
+                "{id:?}"
+            );
+        }
+        for id in ["01JSIGABCDEFGHJKMNPQRSTVWX", "sig-1", "a.b_c-D9", "x"] {
+            assert!(is_signal_id(id), "{id:?}");
+        }
+        assert!(is_signal_id(&"s".repeat(MAX_NAME_BYTES)));
+    }
+
+    #[test]
     fn a_session_message_maps_onto_its_session_s_event() {
         let event = SessionEvent::Answer {
             sdp: "v=0".into(),
@@ -1257,7 +1419,7 @@ mod tests {
         let mut worker = manager.spawn(&[554, 8554]).unwrap();
         let spec = SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://cam/".into(),
+            target: lotse_ipc::SourceTarget::Url("fake://cam/".into()),
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
