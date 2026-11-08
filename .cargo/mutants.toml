@@ -17,6 +17,8 @@ exclude_re = [
     # Test infrastructure, as in exclude_globs: the codecs' test data where it is a module of the
     # file it serves (h264/sps.rs's `test_data`, behind lotse-codec's `test-util` feature).
     "lotse-codec/src/.*: .* in test_data::",
+    # The NTP seconds are shifted above the 32-bit fraction, so `|` and `^` produce the same value.
+    "ingest/engine.rs:.*replace \\| with \\^ in ntp64$",
     # The default body already returns `None`.
     "replace Handler::unsubscribed -> Option<Event> with None",
     # The default body already does nothing.

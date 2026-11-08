@@ -1,10 +1,14 @@
 //! WebRTC session output on `str0m`: SDP negotiation, the RTP cut-through
 //! writer, join catch-up and still, RTX, the transports, the session
-//! state machine and the pure-Rust crypto provider str0m runs on.
+//! state machine and the pure-Rust crypto provider str0m runs on; and
+//! WebRTC cameras as sources ([`ingest`]), lotse making the offer.
 //!
 //! First implementation of the output contract; runs in a worker, which
 //! drives it through `lotse_core::session` and never links this crate: the
 //! binary registers [`WebRtcFactory`] behind the `output-webrtc` feature.
+//! The source side implements the source contract (`lotse_core::source`)
+//! with signaling through `lotse_core::signaling`; its factory is
+//! [`ingest::WebRtcSourceFactory`].
 //! Depends on `lotse-core` and `lotse-codec` only, never on a source.
 //!
 //! Standards: RFC 8829 (JSEP), RFC 3264, RFC 8445 (ICE; §6.1.2.2 remote
@@ -18,12 +22,16 @@
 //! 26.114 §7.4.5 and RFC 8285 (the video orientation extension), RFC 6716
 //! §3.4 (talk-back packets checked, [`talkback`]), and the webrtc.org
 //! `abs-capture-time` extension (observed behavior, not a standard;
-//! `capture_time`).
+//! `capture_time`). The ingest side: RFC 8829 as the offerer, RFC 8838
+//! (Trickle ICE), RFC 5763 (`actpass`), RFC 7675 (consent), RFC 4585
+//! §6.3.1 (PLI), RFC 3550 §6.4.1 (Sender Reports), RFC 8831 and RFC 8832
+//! (data channels), RFC 7587 (Opus).
 
 mod audio;
 mod capture_time;
 mod crypto;
 mod cvo;
+pub mod ingest;
 pub mod sdp;
 pub mod session;
 pub mod talkback;

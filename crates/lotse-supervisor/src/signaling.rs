@@ -1662,17 +1662,21 @@ mod tests {
         let closing = events(&mut all).pop().unwrap();
         assert_eq!(closing["code"], "internal_error");
         assert_eq!(closing["message"], "made_up happened");
-        // A signal closed before its offer is closed quietly.
-        open(&mut state, "c1", 6);
-        let signal_id = opened(&mut queues, "c1", 6);
-        report(&mut state, "c1", closed(&signal_id, "source_stopped"));
-        assert_eq!(events(&mut all), Vec::<Value>::new());
-        assert_eq!(captured.lines("signal closed by its source").len(), 3);
+        // A signal closed before its offer is closed quietly, whatever
+        // the code: a WebRTC source without a host address closes
+        // `internal_error` before it offers.
+        for (request, code) in [(6, "source_stopped"), (7, "internal_error")] {
+            open(&mut state, "c1", request);
+            let signal_id = opened(&mut queues, "c1", request);
+            report(&mut state, "c1", closed(&signal_id, code));
+            assert_eq!(events(&mut all), Vec::<Value>::new(), "{code}");
+        }
+        assert_eq!(captured.lines("signal closed by its source").len(), 4);
         assert_eq!(
             captured
                 .lines("signal opened; it belongs to the subscription that takes its stream")
                 .len(),
-            3
+            4
         );
     }
 
@@ -3007,6 +3011,7 @@ mod tests {
             close::PEER_CLOSED,
             close::CAMERA_ERROR,
             close::SIGNALING_LOST,
+            close::INTERNAL_ERROR,
         ] {
             assert_eq!(close_code(code).as_str(), code);
         }
