@@ -1317,21 +1317,22 @@ mod tests {
 
     /// Only the result of the command's own id ends `raw`: a stale result of
     /// another id, and an event under the command's id, are printed and
-    /// read past.
+    /// read past. Both would end it in success, so only the failed result
+    /// of its own id gives the failure asserted.
     #[tokio::test]
     async fn raw_ends_only_at_the_result_of_its_own_id() {
         let script = vec![
             Step::Read,
-            text(&json!({ "type": "result", "id": 99, "success": false, "error": {} })),
+            text(&json!({ "type": "result", "id": 99, "success": true, "result": {} })),
             text(&json!({ "type": "event", "id": 1, "event": {} })),
-            text(&json!({ "type": "result", "id": 1, "success": true, "result": {} })),
+            text(&json!({ "type": "result", "id": 1, "success": false, "error": {} })),
         ];
         let (code, _read) = against("raw-own-id", true, script, async |socket| {
             let mut client = Client::connect(socket).await.unwrap();
             client.raw(json!({ "type": "info" }), true).await.unwrap()
         })
         .await;
-        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(code, ExitCode::FAILURE);
     }
 
     #[tokio::test]
