@@ -26,7 +26,7 @@ use lotse_core::source::{ClockReport, SourceCtx, SourceError, SyncHint};
 use lotse_core::throttle::Throttle;
 use lotse_core::track::Track;
 
-use crate::aac::AacDepacketizer;
+use crate::aac::{AacDepacketizer, AacFrame};
 use crate::h264::{
     DEFAULT_MAX_PAYLOAD, Depacketizer, FrameOverLimit, LIBWEBRTC_MAX_FRAME_PACKETS,
     NormalizedPacket, PacketNormalizer, ParameterSets,
@@ -176,7 +176,7 @@ struct RtpTrack {
     /// The normalization layers, for H.264 and H.265.
     video: Option<Video>,
     /// The side-branch depacketizer, for AAC-LC.
-    aac: Option<AacDepacketizer>,
+    aac: Option<Aac>,
     /// Cut-through audio codecs: every packet is a frame too.
     packet_frames: bool,
     /// Unwraps timestamps for the side branch.
@@ -191,6 +191,17 @@ struct RtpTrack {
     over_limit: Throttle,
 }
 
+/// An AAC-LC stream's side branch: its depacketizer and the frames one
+/// packet yields, a buffer kept across packets so publishing them
+/// allocates nothing once it has grown.
+#[derive(Debug)]
+struct Aac {
+    /// The RFC 3640 depacketizer.
+    depacketizer: AacDepacketizer,
+    /// The frames of the packet being published; empty between packets.
+    frames: Vec<AacFrame>,
+}
+
 impl RtpTrack {
     /// The state for a declared stream on `track`.
     fn new(track: Arc<Track>, pt: u8, declared: &Declared, protocol: &'static str) -> Self {
@@ -198,8 +209,10 @@ impl RtpTrack {
             pt,
             protocol,
             video: Video::new(declared, track.limits().max_frame_bytes),
-            aac: matches!(declared.codec, Codec::AacLc { .. })
-                .then(|| AacDepacketizer::new(track.limits().max_frame_bytes)),
+            aac: matches!(declared.codec, Codec::AacLc { .. }).then(|| Aac {
+                depacketizer: AacDepacketizer::new(track.limits().max_frame_bytes),
+                frames: Vec::new(),
+            }),
             packet_frames: matches!(
                 declared.codec,
                 Codec::Pcmu | Codec::Pcma | Codec::G722 | Codec::Opus { .. }
@@ -678,20 +691,23 @@ fn on_rtp(
 /// capture time and its arrival. A violation is warned about once per
 /// connection, prefixed with the source's `protocol`.
 fn publish_aac(
-    aac: &mut AacDepacketizer,
+    aac: &mut Aac,
     (track, protocol): (&Track, &str),
     unwrapper: &mut TimestampUnwrapper,
     stamp: impl Fn(u32) -> (Instant, Instant),
     rtp: RtpHeaderFields,
     payload: &[u8],
 ) {
-    let mut frames = Vec::new();
-    if let Err(err) = aac.push(rtp.seq, rtp.ts, rtp.marker, payload, &mut frames)
-        && aac.stats().violations == 1
+    let Aac {
+        depacketizer,
+        frames,
+    } = aac;
+    if let Err(err) = depacketizer.push(rtp.seq, rtp.ts, rtp.marker, payload, frames)
+        && depacketizer.stats().violations == 1
     {
         tracing::warn!(track = %track.id(), error = %err, "{protocol}: AAC payload violates RFC 3640; packet dropped");
     }
-    for frame in frames {
+    for frame in frames.drain(..) {
         let ticks = unwrapper.unwrap(frame.ts);
         let (wallclock, arrival) = stamp(frame.ts);
         track.publish_frame(MediaFrame {
@@ -1605,7 +1621,8 @@ mod tests {
             (second.ts.ticks(), &second.payload[..]),
             (6_024, &b"cd"[..])
         );
-        assert_eq!(aac.stats().violations, 2);
+        assert_eq!(aac.depacketizer.stats().violations, 2);
+        assert!(aac.frames.is_empty(), "drained between packets");
         assert_eq!(
             logs.count(
                 Level::WARN,
