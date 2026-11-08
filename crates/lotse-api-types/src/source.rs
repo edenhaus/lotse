@@ -384,13 +384,32 @@ impl fmt::Debug for FakeSource {
 }
 
 /// The signaled fake source of `lotse_core::test_util`, in builds with the
-/// `test-util` feature only.
+/// `test-util` feature only. Like every signaled source it has no address:
+/// a `url` is refused when the source is read ([`Self::try_from`]), so none
+/// can reach `stream/get` unredacted.
 #[cfg(feature = "test-util")]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "serde_json::Map<String, serde_json::Value>")]
 pub struct FakeSignaledSource {
-    /// The fake factory's options.
+    /// The fake factory's options; never a `url`.
     #[serde(flatten)]
     pub options: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Reads a fake signaled source's fields, refusing a `url` without
+/// repeating it: the value may carry credentials.
+#[cfg(feature = "test-util")]
+impl TryFrom<serde_json::Map<String, serde_json::Value>> for FakeSignaledSource {
+    type Error = &'static str;
+
+    fn try_from(options: serde_json::Map<String, serde_json::Value>) -> Result<Self, Self::Error> {
+        if options.contains_key("url") {
+            return Err(
+                "a fake-signaled source has no `url`: its signaling is relayed by the client",
+            );
+        }
+        Ok(Self { options })
+    }
 }
 
 /// Prints the options' names only: a misplaced `url` lands among them, and
@@ -943,13 +962,20 @@ mod tests {
         );
         assert!(signaled.options().is_empty());
         assert_eq!(signaled.clone().with_url("x://".into()), signaled);
-        // A misplaced URL lands among the options: its credentials stay
-        // out of the debug output.
-        let misplaced =
-            spec(json!({ "protocol": "fake-signaled", "url": "rtsp://u:hunter2@cam/" }));
+        // An option's value stays out of the debug output.
+        let secret = spec(json!({ "protocol": "fake-signaled", "token": "hunter2" }));
         assert_eq!(
-            format!("{misplaced:?}"),
-            r#"FakeSignaled(FakeSignaledSource { options: ["url"] })"#
+            format!("{secret:?}"),
+            r#"FakeSignaled(FakeSignaledSource { options: ["token"] })"#
         );
+        // A signaled source has no address: a `url` is refused, and its
+        // value, credentials and all, is not repeated in the error.
+        let err = serde_json::from_value::<SourceSpec>(
+            json!({ "protocol": "fake-signaled", "url": "rtsp://u:hunter2@cam/" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("has no `url`"), "{err}");
+        assert!(!err.contains("hunter2") && !err.contains("cam/"), "{err}");
     }
 }
