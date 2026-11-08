@@ -19,7 +19,7 @@ ctr = { workspace = true } # the counter mode of SRTP AES-CM
 dimpl = { workspace = true } # DTLS on its RustCrypto backend
 hmac = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5)
 rcgen = { workspace = true } # the self-signed DTLS certificate
-sha1 = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5)
+sha1 = { workspace = true } # STUN MESSAGE-INTEGRITY (RFC 8489 §14.5); a remote's SHA-1 DTLS fingerprint (RFC 8122 §5)
 serde_json = { workspace = true } # the options as the supervisor hands them, parsed into `WebRtcOptions`
 sha2 = { workspace = true } # the DTLS certificate fingerprint (RFC 8122 §5)
 str0m = { workspace = true }

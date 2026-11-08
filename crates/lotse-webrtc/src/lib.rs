@@ -199,7 +199,7 @@ mod tests {
         assert!(!both[1].required);
         assert_eq!(both[1].accept[0], CodecFamily::Opus);
         assert_eq!(track_requests(false, true), both[1..]);
-        assert!(track_requests(false, false).is_empty());
+        assert_eq!(track_requests(false, false), []);
         assert_eq!(MAX_PACER_DELAY, Duration::from_millis(50));
     }
 
@@ -215,19 +215,19 @@ mod tests {
                 "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\na={direction}\r\na=rtpmap:0 PCMU/8000\r\n"
             )
         };
-        assert!(factory.session_tracks(&audio("sendonly"), true).is_empty());
-        assert!(factory.session_tracks(&audio("inactive"), true).is_empty());
+        assert_eq!(factory.session_tracks(&audio("sendonly"), true), []);
+        assert_eq!(factory.session_tracks(&audio("inactive"), true), []);
         for receiving in ["recvonly", "sendrecv"] {
             assert_eq!(
                 factory.session_tracks(&audio(receiving), true),
                 track_requests(false, true),
                 "{receiving}"
             );
-            assert!(factory.session_tracks(&audio(receiving), false).is_empty());
+            assert_eq!(factory.session_tracks(&audio(receiving), false), []);
         }
         // Stopped, its direction kept: it receives nothing.
         let stopped = audio("recvonly").replace("m=audio 9 ", "m=audio 0 ");
-        assert!(factory.session_tracks(&stopped, true).is_empty());
+        assert_eq!(factory.session_tracks(&stopped, true), []);
         // Beside video the stream's audio is wanted whatever the audio
         // m-lines say: a re-offer may add the one it goes down on.
         let talking = format!(

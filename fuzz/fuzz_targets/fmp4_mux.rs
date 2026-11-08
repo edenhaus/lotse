@@ -276,7 +276,7 @@ fuzz_target!(|data: &[u8]| {
                     moof_start + usize::try_from(trun.data_offset.unwrap()).unwrap(),
                     at
                 );
-                for entry in &trun.entries {
+                for entry in &trun.samples {
                     let size = usize::try_from(entry.size.unwrap()).unwrap();
                     read[track].push(file[at..at + size].to_vec());
                     at += size;

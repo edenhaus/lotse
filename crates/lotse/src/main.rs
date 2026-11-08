@@ -341,7 +341,7 @@ mod tests {
             ("off", "off", 0)
         );
         assert_eq!(info.notes.len(), 1);
-        assert!(!env!("LOTSE_TARGET").is_empty());
+        assert_ne!(env!("LOTSE_TARGET"), "");
         assert!(
             env!("LOTSE_RUSTC").starts_with('1'),
             "{}",

@@ -1050,7 +1050,7 @@ async fn connections_awaiting_the_upgrade_are_bounded() {
     // Shutdown closes the connections still waiting and returns.
     running.shutdown.cancel();
     for stream in &mut parked {
-        assert!(drain(stream).await.is_empty());
+        assert_eq!(drain(stream).await, b"");
     }
     running.server.await.unwrap().unwrap();
     std::fs::remove_dir_all(&running.dir).unwrap();

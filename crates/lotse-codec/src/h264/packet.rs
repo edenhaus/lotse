@@ -714,8 +714,8 @@ mod tests {
         assert_eq!(out.len(), 2, "STAP-A inserted before the first slice");
         // The repeats before the second slice are dropped, and noted: a new
         // SPS still counts.
-        assert!(run(&mut n, 1000, false, &sps(1280, 720)).is_empty());
-        assert!(run(&mut n, 1000, false, &pps()).is_empty());
+        assert_eq!(run(&mut n, 1000, false, &sps(1280, 720)), []);
+        assert_eq!(run(&mut n, 1000, false, &pps()), []);
         assert_eq!(n.parameter_sets().sps.as_deref(), Some(&sps(1280, 720)[..]));
         assert_eq!(n.stats().misplaced_sets_dropped, 2);
         // The second slice: no insertion, no keyframe start of its own.
@@ -761,7 +761,7 @@ mod tests {
         assert!(parts.len() >= 2, "{}", parts.len());
         let before = n.stats().misplaced_sets_dropped;
         for part in &parts[..parts.len() - 1] {
-            assert!(run(&mut n, 3000, false, part).is_empty());
+            assert_eq!(run(&mut n, 3000, false, part), []);
         }
         let out = run(&mut n, 3000, true, parts.last().unwrap());
         assert_eq!(out.len(), 1);
@@ -1086,7 +1086,7 @@ mod tests {
     #[test]
     fn filler_is_dropped_and_violations_are_errors() {
         let mut n = PacketNormalizer::new(DEFAULT_MAX_PAYLOAD, ParameterSets::default());
-        assert!(run(&mut n, 1, false, &[0x0c, 0xff, 0xff]).is_empty());
+        assert_eq!(run(&mut n, 1, false, &[0x0c, 0xff, 0xff]), []);
         let stap = nal::stap_a(&[&[0x0c, 0xff], &slice(4)]);
         let out = run(&mut n, 2, true, &stap);
         assert_eq!(out.len(), 1);
@@ -1096,7 +1096,7 @@ mod tests {
             "rebuilt without filler"
         );
         let only_filler = nal::stap_a(&[&[0x0c, 0xff]]);
-        assert!(run(&mut n, 3, false, &only_filler).is_empty());
+        assert_eq!(run(&mut n, 3, false, &only_filler), []);
         assert_eq!(n.stats().filler_dropped, 3);
         let mut out = Vec::new();
         assert_eq!(
@@ -1112,7 +1112,7 @@ mod tests {
             ),
             Err(PayloadError::Truncated)
         );
-        assert!(out.is_empty());
+        assert_eq!(out, []);
         assert_eq!(n.stats().violations, 2);
         assert_eq!(n.stats().packets, 5);
     }

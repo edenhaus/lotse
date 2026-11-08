@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn plans_follow_request_order_and_an_empty_request_list_is_empty() {
-        assert!(negotiate(&[], &[info(V0, h264(), None)], &[]).is_empty());
+        assert_eq!(negotiate(&[], &[info(V0, h264(), None)], &[]), []);
         let requests = [
             request(Kind::Audio, &[CodecFamily::Pcmu], false),
             request(Kind::Video, &[CodecFamily::H264], true),

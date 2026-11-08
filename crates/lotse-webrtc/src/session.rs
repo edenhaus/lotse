@@ -167,6 +167,14 @@ pub struct Session {
     connect_deadline: Option<Instant>,
     /// When `ice_failed` fires while consent is lost.
     disconnect_deadline: Option<Instant>,
+    /// When the engine gets its first timeout: at the answer, until the
+    /// first one. The agent checks its pairs on its own, paced by Ta (RFC
+    /// 8445 §6.1.4.2), which a relay candidate needs: the TURN server lets
+    /// the browser's checks in only once ours opened the permission (RFC
+    /// 8656 §9). str0m 0.25's agent schedules no check before its first
+    /// timeout, and the engine reports none until then (`is` 0.12.0
+    /// `IceAgent::poll_timeout`, read 2026-11-06).
+    first_timeout: Option<Instant>,
     /// The last instant handed in.
     now: Instant,
     /// The scopes of the session's own host candidates, which let a remote
@@ -897,7 +905,7 @@ struct Prepared<'a> {
 /// Plans `request.offer`, and refuses an offer the engine must not see
 /// ([`check_payload_types`]).
 fn prepare(request: &SessionRequest) -> Result<Prepared<'_>, SessionOpenError> {
-    // Before the engine sees it: str0m 0.24 panics on a payload type
+    // Before the engine sees it: str0m 0.25 panics on a payload type
     // with two codec configurations, which would abort the worker. The
     // offer as the browser sent it: the engine's offer only leaves
     // lines out ([`AudioPlan::engine_offer`]), so it passes too, while
@@ -1135,6 +1143,7 @@ impl Session {
                     .unwrap_or(now),
             ),
             disconnect_deadline: None,
+            first_timeout: Some(now),
             now,
             scopes,
             stream_audio: request.audio.clone(),
@@ -1490,10 +1499,14 @@ impl Session {
 
     /// The earliest of the engine's timeout and the session's deadlines.
     fn next_timeout(&self, engine: Instant) -> Instant {
-        [self.connect_deadline, self.disconnect_deadline]
-            .into_iter()
-            .flatten()
-            .fold(engine, Instant::min)
+        [
+            self.connect_deadline,
+            self.disconnect_deadline,
+            self.first_timeout,
+        ]
+        .into_iter()
+        .flatten()
+        .fold(engine, Instant::min)
     }
 }
 
@@ -1575,6 +1588,7 @@ impl SessionEngine for Session {
 
     fn handle_timeout(&mut self, now: Instant) {
         self.now = now;
+        self.first_timeout = None;
         if let Some(deadline) = self.connect_deadline
             && now >= deadline
             && matches!(self.state, State::Gathering | State::Connecting)
@@ -2062,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn rfc9143_9_1_1_str0m_0_24_panics_on_the_offers_the_check_refuses() {
+    fn rfc9143_9_1_1_str0m_0_25_panics_on_the_offers_the_check_refuses() {
         use lotse_core::clock::{Clock as _, SystemClock};
         use lotse_core::session::IceCredentials;
 

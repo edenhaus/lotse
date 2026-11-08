@@ -198,7 +198,7 @@ fn track(
                 smhd: (!video).then(Smhd::default),
                 dinf: Dinf {
                     dref: Dref {
-                        urls: vec![Url::default()],
+                        entries: vec![Url::default().into()],
                     },
                 },
                 stbl: Stbl {
@@ -353,6 +353,12 @@ fn audio_entry(codec: &Codec) -> Result<SampleEntry, RecordingError> {
                     // The track identifies the stream in a file; the ES_ID
                     // stays 0.
                     es_id: 0,
+                    // ISO/IEC 14496-1 §7.2.6.5.1: no `streamDependenceFlag`,
+                    // `URL_Flag` or `OCRstreamFlag`, `streamPriority` 0.
+                    depends_on_es_id: None,
+                    url: None,
+                    ocr_es_id: None,
+                    stream_priority: 0,
                     dec_config: DecoderConfig {
                         object_type_indication: OBJECT_TYPE_MPEG4_AUDIO,
                         stream_type: STREAM_TYPE_AUDIO,
@@ -379,6 +385,7 @@ fn audio_entry(codec: &Codec) -> Result<SampleEntry, RecordingError> {
                 pre_skip: 0,
                 input_sample_rate: OPUS_RATE,
                 output_gain: 0,
+                channel_mapping: None,
             },
             btrt: None,
         }

@@ -748,9 +748,9 @@ fn traf(run: &Run, offset: i32) -> Traf {
             duration: Some(sample.duration),
             size: Some(sample.size),
             flags: sample.flags,
-            cts: sample.cts,
+            cts: sample.cts.map(i64::from),
         })
-        .collect();
+        .collect::<Vec<_>>();
     Traf {
         tfhd: Tfhd {
             track_id: run.track_id,
@@ -762,7 +762,7 @@ fn traf(run: &Run, offset: i32) -> Traf {
         }),
         trun: vec![Trun {
             data_offset: Some(offset),
-            entries,
+            samples: entries.into(),
         }],
         ..Traf::default()
     }

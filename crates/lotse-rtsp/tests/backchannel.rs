@@ -594,7 +594,7 @@ async fn rfc2326_10_12_a_lost_backchannel_session_says_why_and_a_viewing_reconne
     let mut session = open(&slot).await.unwrap();
     let why = lost(&mut session).await;
     assert_eq!(why.status, None, "{why:?}");
-    assert!(!why.message.is_empty());
+    assert_ne!(why.message, "");
     finish(again).await;
     cam.stop().await;
 }

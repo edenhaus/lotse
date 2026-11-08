@@ -739,7 +739,7 @@ mod tests {
         assert!(parts.len() >= 2, "{}", parts.len());
         let before = n.stats().misplaced_sets_dropped;
         for part in &parts[..parts.len() - 1] {
-            assert!(run(&mut n, 3000, false, part).is_empty());
+            assert_eq!(run(&mut n, 3000, false, part), []);
         }
         let out = run(&mut n, 3000, true, parts.last().unwrap());
         assert_eq!(out.len(), 1);
@@ -1055,7 +1055,7 @@ mod tests {
     fn filler_is_dropped_and_violations_are_errors() {
         let filler = [nal::FD_NUT << 1, 0x01, 0xff];
         let mut n = PacketNormalizer::new(DEFAULT_MAX_PAYLOAD, ParameterSets::default());
-        assert!(run(&mut n, 1, false, &filler).is_empty());
+        assert_eq!(run(&mut n, 1, false, &filler), []);
         let ap = nal::aggregate(&[&filler, &slice(4)]);
         let out = run(&mut n, 2, true, &ap);
         assert_eq!(out.len(), 1);
@@ -1065,7 +1065,7 @@ mod tests {
             "rebuilt without filler"
         );
         let only_filler = nal::aggregate(&[&filler]);
-        assert!(run(&mut n, 3, false, &only_filler).is_empty());
+        assert_eq!(run(&mut n, 3, false, &only_filler), []);
         assert_eq!(n.stats().filler_dropped, 3);
         let mut out = Vec::new();
         assert_eq!(
@@ -1081,7 +1081,7 @@ mod tests {
             ),
             Err(PayloadError::Truncated)
         );
-        assert!(out.is_empty());
+        assert_eq!(out, []);
         assert_eq!(n.stats().violations, 2);
         assert_eq!(n.stats().packets, 5);
     }

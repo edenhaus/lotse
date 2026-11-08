@@ -534,7 +534,7 @@ mod tests {
         assert!(packets.iter().all(|p| p.len() <= 100));
         assert_eq!(packets[0].as_ref(), VPS);
         assert_eq!(nal_type(packets[3][0]), FU);
-        assert!(packetize(&[], 100).is_empty());
+        assert_eq!(packetize(&[], 100), Vec::<Bytes>::new());
     }
 
     #[test]

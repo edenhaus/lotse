@@ -253,7 +253,7 @@ mod tests {
         let mut framed = FramedNormalizer::new(DEFAULT_MAX_PAYLOAD, 1000, ParameterSets::default());
         let (packets, units) = push(&mut framed, 0, &annex_b(&[&slice(5000)]));
         assert_one_frame(&packets);
-        assert!(units.is_empty());
+        assert_eq!(units, []);
         assert_eq!(framed.frame_layer().stats().dropped_oversize, 1);
         assert_eq!(framed.frame_layer().buffered(), 0);
         let (_, units) = push(&mut framed, 3000, &annex_b(&[&slice(500)]));

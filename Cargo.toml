@@ -8,7 +8,7 @@ version = "0.0.0-dev"
 edition = "2024"
 license = "MIT OR Apache-2.0" # see README, License
 publish = false
-rust-version = "1.98"
+rust-version = "1.99"
 repository = "https://github.com/edenhaus/lotse"
 readme = "README.md"
 keywords = ["media-server", "webrtc", "rtsp", "camera", "streaming"]
@@ -65,7 +65,7 @@ libc = { version = "0.2", default-features = false }
 # The command line of the one binary: subcommands, flags and `LOTSE_*` environment variables.
 clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 # The standalone TOML configuration file, below flags and environment in precedence.
-toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 # JSON (or text) log lines on stderr with `RUST_LOG` filtering.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
 # The `log` facade that crates below lotse still log through (dimpl, sctp-proto, mpeg2ts-reader,
@@ -122,10 +122,10 @@ mpeg2ts-reader = { version = "0.18", default-features = false }
 # trun); bounded `Vec`s for untrusted counts, no `unsafe` in the decoding. Also the encoder of the
 # event recordings' fragmented MP4 (lotse-mux): the same boxes, with `mp4a`/`Opus` sample entries. Its
 # optional features (bytes, serde, tokio) are off; num, derive_more, pastey and thiserror 1 come
-# with it. Pinned: the fmp4 reader's box walk mirrors how 0.16.2 reads boxes, item references and
-# descriptors (what it counts unchecked, what it reads on the stack), so every bump re-audits
-# those internals.
-mp4-atom = { version = "=0.16.2", default-features = false }
+# with it. Pinned: the fmp4 reader's box walk mirrors how 0.17.1 reads boxes, labels and
+# descriptors (which it reads by their type, from where, what it reads on the stack), so every
+# bump re-audits those internals, and what it counts unchecked or allocates from a count.
+mp4-atom = { version = "=0.17.1", default-features = false }
 # RTSP message parsing and serialization for the fake camera of the tests.
 rtsp-types = { version = "0.1", default-features = false }
 # SDP media descriptions in `lotse-rtsp`: the payload type and `a=ptime` of a camera's backchannel
@@ -136,13 +136,18 @@ sdp-types = { version = "0.2", default-features = false }
 h264-reader = { version = "0.9", default-features = false }
 # Transaction ids of the STUN client (RFC 8489 §5: 96 bits, unpredictable); the random SSRC,
 # sequence number and timestamp a camera's backchannel stream starts at (RFC 3550 §5.1, §8.1); the
-# OS entropy source.
+# OS entropy source. 0.3 as the rand 0.9 of sctp-proto and tungstenite; dimpl's rand 0.10 brings
+# 0.4 beside it.
 getrandom = { version = "0.3", default-features = false }
-# STUN MESSAGE-INTEGRITY (RFC 8489 §14.5) in the supervisor's demux and in str0m's crypto provider.
-hmac = { version = "0.12", default-features = false }
-sha1 = { version = "0.10", default-features = false }
+# STUN MESSAGE-INTEGRITY (RFC 8489 §14.5) in the supervisor's demux and in str0m's crypto provider,
+# and SHA-1 of a remote's DTLS certificate fingerprint (RFC 8122 §5) there; hmac as dimpl's. HMAC
+# 0.13 takes digest 0.11, so sha1 0.11 sits beside the 0.10 of axum and tungstenite (the WebSocket
+# accept key) until they move.
+hmac = { version = "0.13", default-features = false }
+sha1 = { version = "0.11", default-features = false }
 # The TURN client's long-term credential key for the MD5 password algorithm (RFC 8489 §9.2.2,
-# §18.5.1.1), which every TURN server still offers; already in the tree via retina's Digest auth.
+# §18.5.1.1), which every TURN server still offers; already in the tree via retina's Digest auth
+# (http-auth), on digest 0.10.
 md-5 = { version = "0.10", default-features = false }
 # Socket options the standard library lacks: dual-stack, buffer sizes, DSCP, and `sendmsg` with a
 # control message for the audio track's DSCP.
@@ -152,15 +157,15 @@ socket2 = { version = "0.6", default-features = false, features = ["all"] }
 quinn-udp = { version = "0.6", default-features = false }
 # The WebRTC engine, sans-IO, without a crypto feature: lotse-webrtc's own provider supplies it,
 # because str0m's `rust-crypto` feature turns on dimpl's `rcgen` feature and with it aws-lc-rs.
-str0m = { version = "0.24", default-features = false }
+str0m = { version = "0.25", default-features = false }
 # DTLS 1.2/1.3 of the crypto provider on its RustCrypto backend only, so neither aws-lc nor OpenSSL
 # is linked; already in the tree via str0m.
-dimpl = { version = "0.7", default-features = false, features = ["rust-crypto"] }
+dimpl = { version = "0.9", default-features = false, features = ["rust-crypto"] }
 # SRTP ciphers of the crypto provider: AES-CM (RFC 3711 §4.1.1) and AEAD AES-GCM (RFC 7714);
 # already in the tree via dimpl.
-aes = { version = "0.8", default-features = false }
-ctr = { version = "0.9", default-features = false }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+aes = { version = "0.9", default-features = false }
+ctr = { version = "0.10", default-features = false }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
 # TLS of the sources (lotse-tls), `rtsps://` cameras first, and the control API's TLS listener,
 # with the `ring` provider so the static musl build carries no OpenSSL or aws-lc of its own; TLS 1.2
 # stays on because cameras often speak nothing newer (the control listener offers TLS 1.3 only).
@@ -173,8 +178,8 @@ webpki-roots = { version = "1", default-features = false }
 # SHA-256 of a certificate pin (a camera's `tls` pin, the control listener's), of the DTLS certificate
 # fingerprint (RFC 8122 §5) in str0m's crypto provider, and the TURN client's SHA-256 password
 # algorithm, USERHASH and MESSAGE-INTEGRITY-SHA256 (RFC 8489 §18.5.1.2, §14.4, §14.6); already in
-# the tree via dimpl.
-sha2 = { version = "0.10", default-features = false }
+# the tree via dimpl. retina's Digest auth (http-auth) keeps 0.10 beside it until it moves.
+sha2 = { version = "0.11", default-features = false }
 # Constant-time comparison of the control listener's pairing secret; already in the tree via the
 # RustCrypto ciphers.
 subtle = { version = "2", default-features = false }
@@ -243,10 +248,9 @@ unused_qualifications = "warn"
 unused_lifetimes = "warn"
 trivial_casts = "warn"
 trivial_numeric_casts = "warn"
-# `aes_armv8` and `polyval_armv8` select the ARMv8 crypto backends of `aes` and `polyval` (.cargo/config.toml),
-# which a test checks on aarch64. `coverage` is set by cargo-llvm-cov (the coverage gate) and
-# opens to sandboxed processes what the profiler runtime does when it writes its profile.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(aes_armv8)", "cfg(polyval_armv8)", "cfg(coverage)"] }
+# `coverage` is set by cargo-llvm-cov (the coverage gate) and opens to sandboxed processes what
+# the profiler runtime does when it writes its profile.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"

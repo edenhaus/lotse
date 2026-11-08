@@ -2093,7 +2093,7 @@ mod tests {
             (hello.api.as_str(), hello.version.as_str()),
             (API_VERSION, "0.0.0-test")
         );
-        assert!(hello.outputs.is_empty());
+        assert_eq!(hello.outputs, Vec::<String>::new());
         assert_eq!(hello.features, ["session_adopt"]);
         let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
         assert_eq!(info["protocols"], json!(["fake", "fake-signaled"]));
@@ -5422,7 +5422,7 @@ mod tests {
             next(&mut events).await,
             json!({ "type": "candidate", "candidate": "" })
         );
-        assert!(turn.allocations().is_empty());
+        assert_eq!(turn.allocations(), []);
         s.shutdown().await;
         demux.stop();
     }
@@ -5585,7 +5585,7 @@ mod tests {
         let mut body = s.recording_body(&RecordingId::new("k1").unwrap()).unwrap();
         let mut bytes = Vec::new();
         within(body.reader.read_to_end(&mut bytes)).await.unwrap();
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, b"");
         recording_report(
             &s,
             "k1",

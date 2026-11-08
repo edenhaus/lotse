@@ -270,10 +270,9 @@ mod tests {
             "padding is zero"
         );
         assert_eq!(DSCP_EF_TOS, 0xb8, "EF is DSCP 46");
-        assert!(
-            control("192.0.2.1:9".parse().unwrap(), None, None)
-                .bytes()
-                .is_empty()
+        assert_eq!(
+            control("192.0.2.1:9".parse().unwrap(), None, None).bytes(),
+            b""
         );
     }
 
@@ -377,7 +376,7 @@ mod tests {
             Some(0xb8),
             Some("192.0.2.7".parse().unwrap()),
         );
-        assert!(to_v4.bytes().is_empty());
+        assert_eq!(to_v4.bytes(), b"");
         assert_eq!(to_v6.bytes().len(), cmsg_space(4), "the mark alone");
     }
 

@@ -341,7 +341,7 @@ mod tests {
         );
         assert_eq!(args.connect_ports, [554, 80]);
         let bare: WorkerArgs = args_of(&["lotse", "worker"], "worker");
-        assert!(bare.connect_ports.is_empty());
+        assert_eq!(bare.connect_ports, Vec::<u16>::new());
         assert_eq!(bare.sandbox, Mode::On);
         assert_eq!(bare.max_sessions, 256);
         // A worker started by hand holds the daemon's default recording limits.

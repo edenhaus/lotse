@@ -1602,7 +1602,7 @@ mod tests {
             signal_id(Ok("01ARYZ6S41TSV4RRFFQ69G5FAV".into()), 7),
             "01ARYZ6S41TSV4RRFFQ69G5FAV"
         );
-        assert!(captured.lines("no randomness").is_empty());
+        assert_eq!(captured.lines("no randomness"), Vec::<String>::new());
         assert_eq!(
             signal_id(Err(getrandom::Error::UNSUPPORTED), 7),
             "00000000000000000000000007"
@@ -1669,7 +1669,7 @@ mod tests {
             open(&mut state, "c1", request);
             let signal_id = opened(&mut queues, "c1", request);
             report(&mut state, "c1", closed(&signal_id, code));
-            assert!(events(&mut all).is_empty(), "{code}");
+            assert_eq!(events(&mut all), Vec::<Value>::new(), "{code}");
         }
         assert_eq!(captured.lines("signal closed by its source").len(), 4);
         assert_eq!(
@@ -1691,7 +1691,7 @@ mod tests {
         report(&mut state, "c2", candidate(&signal_id, "", None));
         report(&mut state, "c2", closed(&signal_id, "peer_closed"));
         offer(&mut state, "c1", "gone");
-        assert!(events(&mut all).is_empty());
+        assert_eq!(events(&mut all), Vec::<Value>::new());
         assert!(queues.take("c1").is_empty() && queues.take("c2").is_empty());
         assert_eq!(
             captured
@@ -1749,7 +1749,7 @@ mod tests {
             report(&mut state, "c1", candidate(&signal_id, host, Some(0)));
         }
         report(&mut state, "c1", candidate(&signal_id, "", Some(0)));
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         assert_eq!(events(&mut all).len(), 65);
         // A candidate before the offer: the client does not know the
         // signal, so only the worker hears of it.
@@ -1762,7 +1762,7 @@ mod tests {
             queues.take("c1"),
             failed(&signal_id, "a candidate before the offer")
         );
-        assert!(events(&mut all).is_empty());
+        assert_eq!(events(&mut all), Vec::<Value>::new());
         assert_eq!(
             captured
                 .lines("a worker's signaling breaks the contract; signal ended")
@@ -1798,7 +1798,7 @@ mod tests {
             );
         }
         report(&mut state, "c1", candidate_of(&signal_id, host, "8"));
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         let got = events(&mut all);
         assert_eq!(got.len(), MAX_ENDED_SECTIONS + 2);
         assert_eq!(
@@ -1829,7 +1829,7 @@ mod tests {
         let _yard = subscribe(&mut state, owner(1, 1), Some("yard"));
         open(&mut state, "c1", 1);
         open(&mut state, "c1", 2);
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         assert_eq!(
             captured
                 .lines("no signaling subscription takes the stream; the open waits for one")
@@ -1872,10 +1872,10 @@ mod tests {
             1
         );
         let _door = subscribe(&mut state, owner(1, 2), Some("door"));
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         // The open of a connection that is gone is dropped.
         open(&mut state, "gone", 3);
-        assert!(state.signaling.waiting.is_empty());
+        assert_eq!(state.signaling.waiting, Vec::<WaitingOpen>::new());
         assert_eq!(
             captured
                 .lines("signaling open of a connection that is gone; dropped")
@@ -1893,7 +1893,7 @@ mod tests {
         // `yard`'s subscription serves its open, the others wait on.
         let mut yard = subscribe(&mut state, owner(1, 1), Some("yard"));
         let yard_signal = opened(&mut queues, "c2", 1);
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         assert_eq!(
             state.signaling.waiting,
             [1, 2].map(|request| WaitingOpen {
@@ -1920,7 +1920,7 @@ mod tests {
             ] = taken.as_slice()
         );
         assert_ne!(first, second, "a new ULID per signal");
-        assert!(state.signaling.waiting.is_empty());
+        assert_eq!(state.signaling.waiting, Vec::<WaitingOpen>::new());
         offer(&mut state, "c2", &yard_signal);
         offer(&mut state, "c1", first);
         assert_eq!(events(&mut yard)[0]["signal_id"], yard_signal.as_str());
@@ -1929,7 +1929,7 @@ mod tests {
         open(&mut state, "c2", 2);
         let _gone = state.connections.remove("c2");
         state.signals_ended("c2", SignalCloseCode::SourceStopped, "gone");
-        assert!(state.signaling.waiting.is_empty());
+        assert_eq!(state.signaling.waiting, Vec::<WaitingOpen>::new());
     }
 
     #[test]
@@ -1982,7 +1982,7 @@ mod tests {
         // `door`'s signal is its own subscription's, which stays.
         report(&mut state, "c1", candidate(&taken, "", None));
         assert_eq!(events(&mut door).len(), 1);
-        assert!(events(&mut later).is_empty());
+        assert_eq!(events(&mut later), Vec::<Value>::new());
         // So is a later one for `door`, which supersedes its earlier.
         let _door_later = subscribe(&mut state, owner(3, 1), Some("door"));
         assert_eq!(events(&mut door), [json!({ "type": "superseded" })]);
@@ -1999,7 +1999,7 @@ mod tests {
         // Not a signaling subscription, or not this connection's.
         assert!(!state.signaling_unsubscribed(ConnectionId(1), 9));
         assert!(!state.signaling_unsubscribed(ConnectionId(2), 1));
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         assert!(state.signaling_unsubscribed(ConnectionId(1), 1));
         assert_eq!(queues.take("c1"), [SignalCommand::Gone { signal_id }]);
         assert!(state.signaling.signals.is_empty() && state.signaling.scopes.is_empty());
@@ -2096,7 +2096,7 @@ mod tests {
                 assert_eq!(error.details["signal_id"], id);
             }
         }
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         // A signal whose offer has not gone out is no one's yet.
         open(&mut state, "c1", 2);
         let unoffered = opened(&mut queues, "c1", 2);
@@ -2224,7 +2224,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(refused.code, ErrorCode::InvalidRequest);
         assert_eq!(refused.details["code"], "signal_rejected");
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         // The signal still takes the client's own code.
         state
             .signal_error(
@@ -2313,7 +2313,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(over.code, ErrorCode::LimitReached);
         assert_eq!(over.details["limit"], "signal_candidates");
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         // RFC 8838 §13: the end-of-candidates is no candidate and still
         // fits, once; nothing follows it.
         let end = SignalingCandidate {
@@ -2338,7 +2338,7 @@ mod tests {
                 "the media section's candidates already ended"
             );
         }
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
     }
 
     #[test]
@@ -2428,7 +2428,7 @@ mod tests {
         assert_eq!(over.code, ErrorCode::LimitReached);
         assert_eq!(over.message, "too many media sections ended for the signal");
         assert_eq!(over.details["limit"], "signal_sections");
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         // A candidate of one more section is no end, and still goes.
         let host = "candidate:1 1 udp 1 198.51.100.1 9 typ host";
         state
@@ -2472,7 +2472,7 @@ mod tests {
         // The subscription ends: its signals' ends are held behind the
         // open's answer, though the queue has room.
         assert!(state.signaling_unsubscribed(ConnectionId(1), 1));
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         let taken: Vec<_> = state.take_held_signals("c1", true).into_iter().collect();
         let_assert!(
             [
@@ -2780,7 +2780,7 @@ mod tests {
             .insert("porch".into());
         state.route_waiting_opens("c2", (later(), UNIX_EPOCH));
         assert_eq!(state.signaling.waiting.len(), 2);
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         state.route_waiting_opens("c1", (later(), UNIX_EPOCH));
         let signal_id = opened(&mut queues, "c1", 1);
         offer(&mut state, "c1", &signal_id);
@@ -2849,7 +2849,7 @@ mod tests {
         // Nothing left: nothing ends.
         state.refresh_connection("c1");
         assert_eq!(state.signaling.signals.len(), 2);
-        assert!(queues.take("c1").is_empty());
+        assert_eq!(queues.take("c1"), Vec::<SignalCommand>::new());
         let _deleted = state.streams.remove("porch");
         state.refresh_connection("c1");
         assert_eq!(
@@ -2865,7 +2865,7 @@ mod tests {
                      "message": "the signal's stream no longer reads from its source" })
             ]
         );
-        assert!(events(&mut door).is_empty());
+        assert_eq!(events(&mut door), Vec::<Value>::new());
         assert_eq!(state.signal_ids_for_tests(), [at_door]);
         assert_eq!(
             captured
@@ -2916,9 +2916,9 @@ mod tests {
             ]
         );
         assert!(door.is_closed(), "the subscription ended");
-        assert!(state.signal_ids_for_tests().is_empty());
+        assert_eq!(state.signal_ids_for_tests(), Vec::<String>::new());
         assert!(state.signaling.scopes.is_empty());
-        assert!(state.signaling.waiting.is_empty());
+        assert_eq!(state.signaling.waiting, Vec::<WaitingOpen>::new());
         assert!(state.signaling.held.is_empty());
         let lines = captured.lines("signaling ends: the daemon is shutting down");
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -2944,7 +2944,7 @@ mod tests {
         offer(&mut state, "c1", &signal_id);
         let got = events(&mut porch);
         assert_eq!(got[0]["stream_id"], "porch", "{got:?}");
-        assert!(events(&mut all).is_empty());
+        assert_eq!(events(&mut all), Vec::<Value>::new());
         // `door`, the first, wins once it has its own.
         let mut door = subscribe(&mut state, owner(3, 1), Some("door"));
         open(&mut state, "c1", 2);
