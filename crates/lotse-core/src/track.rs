@@ -2100,6 +2100,26 @@ mod tests {
         assert_eq!(video.stats().keyframe_requests_forwarded, 2);
     }
 
+    /// A frame whose lock-free look saw a request wanted settles nothing
+    /// once a request in between was dropped (the attempt that took them
+    /// ended) and so no longer wanted: no second drop for the same
+    /// request. Replays `publish_frame`'s settlement after that drop.
+    #[test]
+    fn a_frame_settled_after_a_drop_asks_nothing_more() {
+        let t0 = SystemClock.now();
+        let video = Arc::new(video_track(TrackLimits::default()));
+        let requests = video.keyframe_requests();
+        assert_eq!(video.request_keyframe(t0), KeyframeOutcome::Forwarded);
+        // The frame saw the request wanted; the attempt ends and a viewer's
+        // request a second later is dropped before the frame settles.
+        let seq = video.frame_seq();
+        drop(requests);
+        let later = t0 + Duration::from_secs(1);
+        assert_eq!(video.request_keyframe(later), KeyframeOutcome::Dropped);
+        video.settle_keyframe_request(false, seq, later);
+        assert_eq!(video.stats().keyframe_requests_dropped, 1);
+    }
+
     #[test]
     fn default_limits_hold_a_4_mib_frame_and_a_4_mib_gop() {
         let limits = TrackLimits::default();
