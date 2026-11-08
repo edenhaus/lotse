@@ -556,7 +556,7 @@ mod tests {
             frame_channel_data(Channel::MIN, &vec![0; 65536], true, &mut out),
             Err(ChannelDataError::TooLong)
         );
-        assert!(out.is_empty());
+        assert_eq!(out, b"");
         frame_channel_data(Channel::MIN, &vec![7; 65535], false, &mut out).unwrap();
         assert_eq!(parse_channel_data(&out).unwrap().data.len(), 65535);
         assert_eq!(
@@ -582,7 +582,7 @@ mod tests {
             frames.push(frame);
             rest = tail;
         }
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0], &stun[..]);
         assert_eq!(parse_channel_data(frames[1]).unwrap().data, b"abcde");

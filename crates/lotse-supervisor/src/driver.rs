@@ -3778,10 +3778,9 @@ mod tests {
         let switch = DriverCommand::SwitchSource(spec_of("fake://127.0.0.1:1/b"));
         Driver::send(worker, &shared, &commands, switch).await;
         drop(driver);
-        assert!(
-            captured
-                .lines("session message could not be sent")
-                .is_empty()
+        assert_eq!(
+            captured.lines("session message could not be sent"),
+            Vec::<String>::new()
         );
     }
 
@@ -4802,7 +4801,7 @@ mod tests {
         assert_eq!(waiting(&driver), [1], "its answer is queued");
         clock.advance(SIGNAL_WAIT);
         driver.end_signal_waits();
-        assert!(waiting(&driver).is_empty());
+        assert_eq!(waiting(&driver), Vec::<u64>::new());
         assert!(driver.signal_wait.is_none());
         // Its answer still reaches the worker.
         let queued = queued_signals(&mut driver);
@@ -5022,7 +5021,7 @@ mod tests {
                 assert_eq!(waiting(&driver), [1]);
             }
         }
-        assert!(waiting(&driver).is_empty());
+        assert_eq!(waiting(&driver), Vec::<u64>::new());
         let seen = recorded(&out, &lotse_ipc::ToWorker::Signal(refused(1, "current"))).await;
         assert!(
             !seen.contains(&lotse_ipc::ToWorker::Signal(refused(1, "stale"))),
@@ -5096,7 +5095,7 @@ mod tests {
         driver.ended_signals.push_back("ended".into());
         driver.worker = Some(dead_worker(&shared).await);
         driver.on_worker_exited(ExitStatus::default());
-        assert!(waiting(&driver).is_empty());
+        assert_eq!(waiting(&driver), Vec::<u64>::new());
         assert!(driver.signal_wait.is_none());
         assert!(driver.ended_signals.is_empty());
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 7 }));
@@ -5407,7 +5406,7 @@ mod tests {
         // message and discarded it, the read end is at its end.
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).unwrap();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         let worker = driver.worker.take().unwrap();
         drop(driver);
         let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;

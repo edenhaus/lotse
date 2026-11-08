@@ -1093,7 +1093,7 @@ mod tests {
         let mut notes = Vec::new();
         let full = layer_status(&RulesetStatus::FullyEnforced, "landlock.fs", &mut notes);
         assert_eq!(full, LayerStatus::Enforced);
-        assert!(notes.is_empty());
+        assert_eq!(notes, Vec::<String>::new());
         let partial = layer_status(&RulesetStatus::PartiallyEnforced, "landlock.fs", &mut notes);
         assert_eq!(partial, LayerStatus::Enforced);
         let none = layer_status(&RulesetStatus::NotEnforced, "landlock.net", &mut notes);
@@ -1132,8 +1132,8 @@ mod tests {
                 Path::new("/lotse"),
             ]
         );
-        assert!(fs_rules(&worker).is_empty());
-        assert!(fs_rules(&Profile::Decoder).is_empty());
+        assert_eq!(fs_rules(&worker), []);
+        assert_eq!(fs_rules(&Profile::Decoder), []);
         assert!(net_rules(&supervisor).is_empty(), "no TCP port bindable");
         assert_eq!(
             net_rules(&worker),
@@ -1142,7 +1142,7 @@ mod tests {
                 (80, AccessNet::ConnectTcp.into())
             ]
         );
-        assert!(net_rules(&Profile::Decoder).is_empty());
+        assert_eq!(net_rules(&Profile::Decoder), []);
         assert_eq!(net_access(&supervisor), AccessNet::BindTcp);
         let both = AccessNet::BindTcp | AccessNet::ConnectTcp;
         assert_eq!(net_access(&worker), both);

@@ -643,7 +643,7 @@ async fn rfc8216_4_3_3_4_an_ended_ts_playlist_plays_every_segment_at_its_time_an
     assert_eq!(video.stats().keyframes, 3);
     assert!(audio.stats().frames >= 140, "{:?}", audio.stats());
     assert_eq!(video.epoch(), 0);
-    assert!(rig.logs.lines("layout repeated").is_empty());
+    assert_eq!(rig.logs.lines("layout repeated"), Vec::<String>::new());
     let playing = rig.logs.lines("http: playing");
     assert!(playing[0].contains("tracks=2 streams=1"), "{playing:?}");
     let fetched = rig.logs.lines("segment fetched");
@@ -761,7 +761,10 @@ async fn rfc8216_4_3_3_4_an_ended_playlist_is_no_stall() {
     let err = exit_within(harness, Duration::from_secs(3)).await;
     assert_ended_with(&err, "EXT-X-ENDLIST");
     assert_eq!(rig.seen(playlist), 6);
-    assert!(rig.logs.lines("stopped adding segments").is_empty());
+    assert_eq!(
+        rig.logs.lines("stopped adding segments"),
+        Vec::<String>::new()
+    );
     rig.stop().await;
 }
 
@@ -895,7 +898,7 @@ async fn rfc8216_3_2_ts_segments_take_their_tables_from_their_ext_x_map() {
     rig.body("/t/tables.ts", MP2T, tables);
     for (i, body) in [LIVE_0, LIVE_1, LIVE_2].into_iter().enumerate() {
         let (_, media) = split_tables(body);
-        assert!(!media.is_empty());
+        assert_ne!(media, b"");
         rig.body(&format!("/t/live_{i}.m2t"), MP2T, media);
     }
     rig.playlist(

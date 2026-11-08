@@ -1464,7 +1464,7 @@ mod tests {
         // read end ends.
         let mut rest = Vec::new();
         io::Read::read_to_end(&mut recording_bytes, &mut rest).unwrap();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         let args = std::fs::read_to_string(dir.join("args")).unwrap();
         assert!(args.contains("--connect-ports\n554,8554\n"), "{args}");
         assert!(

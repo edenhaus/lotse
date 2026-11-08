@@ -392,7 +392,7 @@ fn iso13818_1_2_4_4_8_a_new_program_map_version_with_other_streams_is_a_new_layo
     assert_eq!(units(&events[..second], 0).len(), 10);
     assert_eq!(units(&events[..second], 1).len(), 48);
     assert_eq!(units(&events[second..], 0).len(), 10);
-    assert!(units(&events[second..], 1).is_empty());
+    assert_eq!(units(&events[second..], 1), Vec::<&Unit>::new());
 }
 
 #[test]
@@ -495,7 +495,7 @@ fn iso13818_1_2_4_4_8_the_layout_waits_for_the_first_adts_header_within_a_bound(
     let (events, _) = demux(&input, 4_000);
     assert_eq!(layouts(&events).len(), 1);
     assert_eq!(units(&events, 0).len(), 10);
-    assert!(units(&events, 1).is_empty());
+    assert_eq!(units(&events, 1), Vec::<&Unit>::new());
 }
 
 #[test]
@@ -616,7 +616,7 @@ fn iso13818_1_2_4_3_7_adts_timestamps_restart_only_half_a_frame_or_more_away() {
     let mut ctx = audio_ctx(false);
     feed(&mut ctx, adts_frames(SINE_48K_MONO, 2), None);
     assert_eq!(ctx.stats.dropped_untimed, 2);
-    assert!(units(&ctx.events, 0).is_empty());
+    assert_eq!(units(&ctx.events, 0), Vec::<&Unit>::new());
 }
 
 /// A PES packet's PTS times the first frame that begins in it (ISO/IEC
@@ -628,7 +628,7 @@ fn iso13818_1_2_4_3_7_a_frame_split_across_pes_packets_keeps_the_pts_of_the_one_
     // Frame 0 begins in a packet with a PTS and ends in one without.
     let mut ctx = audio_ctx(false);
     feed(&mut ctx, &frame(0)[..8], Some(0));
-    assert!(ctx.events.is_empty());
+    assert_eq!(ctx.events, []);
     feed(&mut ctx, &frame(0)[8..], None);
     assert_eq!(timestamps(&ctx.events), [0]);
     assert_eq!(ctx.stats.dropped_untimed, 0);
@@ -751,7 +751,7 @@ fn iso13818_7_6_2_a_configuration_change_before_the_layout_only_updates_it() {
     let mut ctx = audio_ctx(true);
     feed(&mut ctx, adts_frames(SINE_48K_MONO, 1), Some(0));
     feed(&mut ctx, adts_frames(SINE_16K_MONO, 1), Some(5_760));
-    assert!(ctx.events.is_empty());
+    assert_eq!(ctx.events, []);
     assert_eq!(ctx.held.len(), 2);
     // The new configuration counts from its own PTS: 0.064 s at 16 kHz.
     assert_eq!(ctx.held[1].ts, 1_024);
@@ -783,7 +783,7 @@ fn iso14496_3_1_6_2_1_an_undecodable_adts_configuration_is_unsupported_without_u
         all[0].tracks[0],
         unsupported_track(AUDIO_PID, 0x0f, Kind::Audio, err.codec_name())
     );
-    assert!(units(&ctx.events, 0).is_empty());
+    assert_eq!(units(&ctx.events, 0), Vec::<&Unit>::new());
     // The splitter read both frames all the same.
     let mut splitter = AdtsSplitter::new(MAX);
     let mut frames = Vec::new();
@@ -804,7 +804,7 @@ fn iso13818_1_2_4_4_8_units_are_held_at_most_two_seconds_or_max_frame_bytes() {
     let mut ctx = audio_ctx(false);
     ctx.emit(unit(1_000, 10));
     ctx.emit(unit(1_000 + HOLD_TICKS as i64, 10));
-    assert!(ctx.events.is_empty());
+    assert_eq!(ctx.events, []);
     ctx.emit(unit(1_000 + HOLD_TICKS as i64 + 1, 10));
     assert_eq!(layouts(&ctx.events).len(), 1);
     assert_eq!(ctx.events.len(), 4);
@@ -819,7 +819,7 @@ fn iso13818_1_2_4_4_8_units_are_held_at_most_two_seconds_or_max_frame_bytes() {
     ctx.max_frame_bytes = 100 + 2 * HELD_UNIT_BYTES;
     ctx.emit(unit(0, 60));
     ctx.emit(unit(0, 40));
-    assert!(ctx.events.is_empty());
+    assert_eq!(ctx.events, []);
     assert_eq!(ctx.held_bytes, 100 + 2 * HELD_UNIT_BYTES);
     ctx.emit(unit(0, 0));
     assert_eq!(layouts(&ctx.events).len(), 1);
@@ -829,7 +829,7 @@ fn iso13818_1_2_4_4_8_units_are_held_at_most_two_seconds_or_max_frame_bytes() {
     for _ in 0..10 {
         ctx.emit(unit(0, 0));
     }
-    assert!(ctx.events.is_empty());
+    assert_eq!(ctx.events, []);
     ctx.emit(unit(0, 0));
     assert_eq!(layouts(&ctx.events).len(), 1);
 }
@@ -848,7 +848,7 @@ fn iso13818_1_2_4_3_7_an_empty_video_pes_is_dropped() {
         });
         ctx.finish(1);
     }
-    assert!(ctx.held.is_empty());
+    assert_eq!(ctx.held, []);
     assert_eq!(ctx.held_bytes, 0);
     assert_eq!(ctx.stats.dropped_empty, 3);
     assert_eq!(ctx.stats.dropped_untimed, 0);
