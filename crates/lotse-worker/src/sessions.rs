@@ -4023,6 +4023,36 @@ mod tests {
         drop(manager);
     }
 
+    #[tokio::test]
+    async fn dropping_the_manager_stops_its_reader() {
+        let supervisors = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (datagrams, _peer) = StdUnixDatagram::pair().unwrap();
+        let (events, _rx) = mpsc::channel(1);
+        let manager = SessionManager::new(
+            OwnedFd::from(supervisors),
+            None,
+            OwnedFd::from(datagrams),
+            256,
+            Arc::new(SystemClock),
+            events,
+        )
+        .unwrap();
+        // The reader holds the datagram channel while it runs.
+        let channel = Arc::downgrade(&manager.datagrams);
+        drop(manager);
+        // The aborted reader is dropped once the runtime polls it again:
+        // until then, yield; five seconds of real time fail the test.
+        let dropped = async {
+            while channel.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            () = dropped => {}
+            () = SystemClock.sleep(Duration::from_secs(5)) => panic!("the reader outlived the manager"),
+        }
+    }
+
     /// Regression for SBX-4: the shared socket stayed at whatever number
     /// `recvmsg` gave it, which no seccomp rule can name; the manager now
     /// sends from the number it is told, the one the filter keeps to

@@ -1735,11 +1735,19 @@ mod tests {
 
     #[test]
     fn track_ids_display_as_letter_and_index() {
-        let id = TrackId::new(Kind::Audio, 1);
-        assert_eq!(id.to_string(), "a1");
+        let id = TrackId::new(Kind::Audio, 2);
+        assert_eq!(id.to_string(), "a2");
         assert_eq!(id.kind(), Kind::Audio);
-        assert_eq!(id.index(), 1);
+        assert_eq!(id.index(), 2);
+        assert_eq!(TrackId::new(Kind::Video, 0).index(), 0);
         assert_eq!(TrackId::new(Kind::Video, 0).to_string(), "v0");
+    }
+
+    #[test]
+    fn default_limits_hold_a_4_mib_frame_and_a_4_mib_gop() {
+        let limits = TrackLimits::default();
+        assert_eq!(limits.max_frame_bytes, 4 << 20);
+        assert_eq!(limits.gop_cache_bytes, 4 << 20);
     }
 
     #[tokio::test]
