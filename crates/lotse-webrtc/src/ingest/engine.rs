@@ -450,10 +450,11 @@ fn check_offer_size(offer: &str) -> Result<(), String> {
 /// refused to parse that, so a camera on str0m 0.24 (or any other that
 /// writes it so) would have had its whole answer refused for an audio
 /// m-line it declined. str0m 0.25 writes `0` there and parses one without
-/// (`MediaLine`'s `Display` and consistency check, read 2026-11-08). The format added is never used (the m-line is stopped): the
-/// lowest payload type the answer names nowhere, so it gives no other
-/// m-line's payload type a second codec (`0` unless the answer uses 0),
-/// mapped to PCMU; `Err` when the answer names every one.
+/// (`MediaLine`'s `Display` and consistency check, read 2026-11-08). The
+/// format added is never used (the m-line is stopped): the lowest payload
+/// type the answer names nowhere, so it gives no other m-line's payload
+/// type a second codec (`0` unless the answer uses 0), mapped to PCMU;
+/// `Err` when the answer names every one.
 // SPEC-DEVIATION(RFC 8866 §5.14): an answer that lists no format on a
 // rejected m-line breaks the grammar and is taken anyway, as str0m 0.24
 // wrote such answers itself; a live m-line without formats is still
