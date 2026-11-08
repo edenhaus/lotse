@@ -140,6 +140,14 @@ exclude_re = [
     # signal: Rust's runtime ignores `SIGPIPE` before `main` in every process that sends (the
     # daemon, the worker, the tests), and `unsafe` code, which resetting it takes, is forbidden.
     "channel.rs:.*replace send_flags -> SendFlags with Default::default\\(\\)$",
+    # The default body already returns `false`.
+    "replace DatagramSink::ice_tcp -> bool with false",
+    # Both arms answer `false`, a dropped datagram; the guard only picks whether a failed send
+    # other than a full channel is logged at debug.
+    "demux.rs:.*in <impl DatagramSink for WorkerSink>::forward$",
+    # The method's three groups of bits (RFC 8489 §5: M0-M3, M4-M6, M7-M11) are disjoint once
+    # shifted, so `|` and `^` produce the same method.
+    "net/stun.rs:.*replace \\| with \\^ in parse$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
     # An empty host let through goes on to `Url::set_username`, which refuses a URL whose host

@@ -494,6 +494,41 @@ mod tests {
         running.cancel.cancel();
     }
 
+    #[tokio::test]
+    async fn a_first_frame_of_1500_bytes_is_read_and_a_longer_one_refused_at_its_length() {
+        let running = start(IceTcpConfig::default());
+        let sink = Arc::new(MemorySink::default());
+        running
+            .registrations
+            .register("tcpu", b"tcp-pass".to_vec(), sink.clone());
+        // A verified Binding Request padded with an unknown
+        // comprehension-optional attribute (RFC 8489 §14) to `total` bytes.
+        let padded = |total: usize, id: u8| {
+            let request = Builder::new(Class::Request, METHOD_BINDING, [id; 12])
+                .username("tcpu:peer")
+                .attribute(0xc0ff, &vec![0; total - 20 - 16 - 24 - 8 - 4])
+                .integrity(b"tcp-pass")
+                .fingerprint()
+                .build();
+            assert_eq!(request.len(), total);
+            let mut framed = u16::try_from(total).unwrap().to_be_bytes().to_vec();
+            framed.extend_from_slice(&request);
+            framed
+        };
+        let mut fits = TcpStream::connect(running.addr).await.unwrap();
+        fits.write_all(&padded(MAX_FIRST_FRAME, 7)).await.unwrap();
+        settle(&running.stats, |s| IceTcpStats::get(&s.handed_off), 1).await;
+        let mut longer = TcpStream::connect(running.addr).await.unwrap();
+        longer
+            .write_all(&padded(MAX_FIRST_FRAME + 4, 8))
+            .await
+            .unwrap();
+        settle(&running.stats, |s| IceTcpStats::get(&s.rejected), 1).await;
+        assert_eq!(IceTcpStats::get(&running.stats.handed_off), 1);
+        assert_eq!(IceTcpStats::get(&running.stats.over_budget), 0);
+        running.cancel.cancel();
+    }
+
     /// A Binding Request for `tcpu` in its RFC 4571 frame.
     fn framed_request(id: u8) -> Vec<u8> {
         let request = Builder::new(Class::Request, METHOD_BINDING, [id; 12])

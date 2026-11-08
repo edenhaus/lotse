@@ -248,6 +248,35 @@ mod tests {
         demux.stop();
     }
 
+    #[tokio::test]
+    async fn a_mapping_is_served_from_the_cache_for_less_than_the_cache_time() {
+        let bound = super::super::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let local = bound.local;
+        let clock = Arc::new(FakeClock::default());
+        let demux =
+            Demux::start(Arc::clone(&bound.socket), local, vec![local], clock.clone()).unwrap();
+        // The server answers twice: the first gathering and the one after
+        // the cache time; a third request would find no answer.
+        let (server, thread) = fake_server(2, false);
+        let client = StunClient::new(
+            bound.socket,
+            demux.responses(),
+            clock.clone(),
+            StunClientConfig {
+                rto: Duration::from_millis(50),
+                retries: 2,
+                cache: Duration::from_secs(60),
+            },
+        );
+        let mapped = client.reflexive(server).await.unwrap();
+        clock.advance(Duration::from_secs(59));
+        assert_eq!(client.reflexive(server).await.unwrap(), mapped);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(client.reflexive(server).await.unwrap(), mapped);
+        thread.join().unwrap();
+        demux.stop();
+    }
+
     fn demux_port(_demux: &Demux, client: &StunClient) -> u16 {
         client.socket.local_addr().unwrap().port()
     }
