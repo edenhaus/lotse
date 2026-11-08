@@ -1955,7 +1955,7 @@ mod tests {
     fn codec_changes(sub: &mut lotse_core::track::TrackSubscription) -> Vec<Codec> {
         let mut changes = Vec::new();
         while let Some(Some(event)) = sub.next().now_or_never() {
-            if let lotse_core::track::TrackEvent::TrackChanged(codec) = event {
+            if let lotse_core::track::TrackEvent::TrackChanged { codec, .. } = event {
                 changes.push(Codec::clone(&codec));
             }
         }
