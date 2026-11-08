@@ -154,6 +154,9 @@ exclude_re = [
     # Only picks whether a skip to the next keyframe is logged at debug; the skip itself and its
     # count are the same.
     "writer.rs:.*replace != with == in VideoWriter::skip$",
+    # A step of exactly half the RTP clock reads as a jump back (`jumps_back` takes a distance
+    # back of up to `HALF_RANGE`), so this arm never sees it: `<` and `<=` pick the same.
+    "backchannel.rs:.*replace < with <= in Packetizer::stamp$",
     # `abi_of` only picks filesystem rights (`AccessFs::from_all`), and ABI 4 adds none to ABI 3's
     # (landlock(7), "Landlock ABI versions"): ABI 3 taken as 4 handles the same rights.
     "lotse-sandbox/src/linux.rs:.*delete match arm 3 in abi_of$",

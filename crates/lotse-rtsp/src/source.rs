@@ -2120,6 +2120,61 @@ mod tests {
         assert_eq!(entry.violations, 2);
     }
 
+    /// RTP cut through as it came (no normalizer for the codec): every
+    /// audio packet starts a frame, a video packet only when its timestamp
+    /// moves on (RFC 3550 §5.1: the packets of a frame share one).
+    #[test]
+    fn rfc3550_5_1_cut_through_frames_start_per_audio_packet_and_per_video_timestamp() {
+        use lotse_core::clock::{Clock as _, SystemClock};
+        use lotse_core::clock_map::ClockMapper;
+        use lotse_core::source::{BackchannelSlot, ClockInput, TrackSet};
+        use lotse_core::track::TrackLimits;
+
+        let t0 = SystemClock.now();
+        let set = TrackSet::new(TrackLimits::default(), t0);
+        let (clock, _reports) = ClockInput::channel(Arc::new(ClockMapper::new()));
+        let mut ctx = SourceCtx {
+            peer: ResolvedPeer {
+                host: "cam".into(),
+                addrs: vec![],
+            },
+            tracks: set.publisher(),
+            clock,
+            time: Arc::new(SystemClock),
+            backchannel: BackchannelSlot::default(),
+            cancel: CancellationToken::new(),
+        };
+        let received = |seq, ts| Received {
+            stream: 0,
+            ts,
+            seq,
+            ssrc: 1,
+            marker: false,
+            loss: 0,
+            payload: Bytes::from_static(&[1, 2, 3]),
+        };
+        let mut normalized = Vec::new();
+        for (media, encoding, rate, starts) in [
+            ("audio", "pcmu", 8_000, [true, true, true]),
+            ("video", "jpeg", 90_000, [true, false, true]),
+        ] {
+            let declared = declare(media, encoding, rate, None, Sprop::None, &[]).unwrap();
+            let track = ctx
+                .tracks
+                .declare(declared.kind, declared.codec.clone(), rate);
+            let mut entry = Carried::new(Arc::clone(&track), 0, &declared);
+            assert!(entry.video.is_none(), "cut through");
+            let mut packets = track.subscribe_packets();
+            for (seq, ts) in [(1, 1_000), (2, 1_000), (3, 4_000)] {
+                on_rtp(&mut entry, &ctx, t0, received(seq, ts), &mut normalized);
+            }
+            let got: Vec<bool> = (0..3)
+                .map(|_| packets.try_recv().unwrap().unwrap().frame_start)
+                .collect();
+            assert_eq!(got, starts, "{encoding}");
+        }
+    }
+
     #[test]
     fn rfc3640_violations_drop_the_packet_and_good_units_become_frames() {
         use lotse_core::clock::{Clock as _, SystemClock};
