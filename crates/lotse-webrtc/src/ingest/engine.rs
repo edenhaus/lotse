@@ -366,8 +366,9 @@ fn config() -> RtcConfig {
 }
 
 /// Whether the media sections of `offer` carry distinct mids: str0m 0.24
-/// draws each m-line's mid at random and can draw one twice within one
-/// offer (observed 2026-10-01, see the `webrtc_session` fuzz target).
+/// drew each m-line's mid at random and could draw one twice within one
+/// offer (observed 2026-10-01); str0m 0.25 draws none twice (its
+/// changelog, #1092), and the check stays as the guard of that.
 fn check_offer_mids(offer: &str) -> Result<(), String> {
     let mut mids: Vec<&str> = offer
         .lines()
@@ -398,16 +399,17 @@ fn check_offer_size(offer: &str) -> Result<(), String> {
 /// `answer` with a format on every `m=` line of port 0 that lists none,
 /// so str0m parses it. RFC 8866 §5.14 has at least one format on every
 /// `m=` line, and RFC 3264 §6 lets a rejected one list any; str0m 0.24
-/// itself answers a rejected m-line without one (observed 2026-11-06) and
-/// refuses to parse that, so a camera on str0m (or any other that writes
-/// it so) would have its whole answer refused for an audio m-line it
-/// declined. The format added is never used (the m-line is stopped): the
+/// itself answered a rejected m-line without one (observed 2026-11-06) and
+/// refused to parse that, so a camera on str0m 0.24 (or any other that
+/// writes it so) would have had its whole answer refused for an audio
+/// m-line it declined. str0m 0.25 writes `0` there and parses one without
+/// (`MediaLine`'s `Display` and consistency check, read 2026-11-08). The format added is never used (the m-line is stopped): the
 /// lowest payload type the answer names nowhere, so it gives no other
 /// m-line's payload type a second codec (`0` unless the answer uses 0),
 /// mapped to PCMU; `Err` when the answer names every one.
 // SPEC-DEVIATION(RFC 8866 §5.14): an answer that lists no format on a
 // rejected m-line breaks the grammar and is taken anyway, as str0m 0.24
-// writes such answers itself; a live m-line without formats is still
+// wrote such answers itself; a live m-line without formats is still
 // refused (by str0m);
 // gate: rfc8866_5_14_a_rejected_m_line_without_formats_gets_one
 fn with_formats(answer: &str) -> Result<String, String> {
@@ -415,7 +417,7 @@ fn with_formats(answer: &str) -> Result<String, String> {
     let placeholder = (0..=127_u8).find(|pt| !named.contains(pt));
     let mut out = String::with_capacity(answer.len().saturating_add(32));
     // The added format's `a=rtpmap`, written at the end of its media
-    // section: str0m 0.24 refuses a format above the static ones without
+    // section: str0m 0.25 refuses a format above the static ones without
     // one, and reads the `a=mid` only where the section has it.
     let mut rtpmap: Option<String> = None;
     for line in answer.lines() {
@@ -513,7 +515,7 @@ fn declared(spec: &CodecSpec) -> Option<Declared> {
 /// since 1900 in the high word, the fraction in the low one; the era wraps
 /// as NTP's does. str0m hands a Sender Report's NTP timestamp over as a
 /// `SystemTime` through a 64-bit float, so this is the camera's to within
-/// a microsecond. `None` at or before the Unix epoch: str0m 0.24 makes
+/// a microsecond. `None` at or before the Unix epoch: str0m 0.25 makes
 /// every NTP timestamp before 1970 the epoch itself, the zero of a sender
 /// without a wallclock (RFC 3550 §6.4.1) among them, which names no
 /// instant.
@@ -702,7 +704,7 @@ impl IngestEngine {
             .collect();
         let (rest, candidates) = split_candidates(sdp);
         let rest = with_formats(&rest)?;
-        // str0m 0.24 panics on a payload type reused across media
+        // str0m 0.25 panics on a payload type reused across media
         // sections ("Pt locked multiple times"), so the check comes first,
         // of exactly what str0m parses.
         check_payload_types(&rest)?;
@@ -762,7 +764,7 @@ impl IngestEngine {
     /// The track the answer negotiated on `mid`, carried under `index`:
     /// declared as the first payload type of the camera's that lotse
     /// carries, `None` when the m-line does not send or has none. (A
-    /// rejected m-line, port 0, is the caller's to leave out: str0m 0.24
+    /// rejected m-line, port 0, is the caller's to leave out: str0m 0.25
     /// keeps it live.) The track takes every payload type of the answer's
     /// m-line in that codec; those of another codec it does not.
     // SPEC-DEVIATION(RFC 3264 §7): the camera may change among the formats
@@ -1033,7 +1035,7 @@ impl IngestEngine {
             Event::IceConnectionStateChange(state) => {
                 tracing::debug!(?state, "webrtc: ICE state");
                 // SPEC-DEVIATION(RFC 7675 §5.1): consent expires 30 s after
-                // the last answered check; str0m 0.24's agent goes
+                // the last answered check; str0m 0.25's agent goes
                 // Disconnected once its nominated pair has gone unanswered
                 // for a few seconds and offers no 30 s timer, so the
                 // attempt ends then: a camera that answers no check for
@@ -1079,7 +1081,7 @@ impl IngestEngine {
     /// A Sender Report (RFC 3550 §6.4.1) of a negotiated stream, handed on
     /// as its NTP and RTP timestamps; one whose NTP timestamp is zero, a
     /// sender without a wallclock (§6.4.1), names no instant and is
-    /// dropped, as is one before 1970 (str0m 0.24 hands NTP zero over as
+    /// dropped, as is one before 1970 (str0m 0.25 hands NTP zero over as
     /// the Unix epoch).
     fn on_sender_report(&mut self, feedback: &SenderFeedback) {
         let Some(stream) = self.streams.iter().find(|s| s.mid == feedback.mid) else {
@@ -1347,7 +1349,7 @@ mod tests {
 
     #[test]
     fn rfc3550_6_4_1_an_ntp_time_of_zero_or_before_1970_names_no_instant() {
-        // str0m 0.24 reads NTP 0 (a sender without a wallclock) as the
+        // str0m 0.25 reads NTP 0 (a sender without a wallclock) as the
         // epoch.
         assert_eq!(ntp64(UNIX_EPOCH), None);
         assert_eq!(ntp64(UNIX_EPOCH - Duration::from_secs(1)), None);
