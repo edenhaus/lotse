@@ -1146,7 +1146,7 @@ mod tests {
             !minimal.preload
                 && minimal.audio == AudioMode::Auto
                 && minimal.orientation == Orientation::NoTransform
-                && minimal.sources[0].options()["audio"] == true
+                && minimal.sources[0].options()["data_channel"].is_null()
                 && minimal.prerecord_ms == 0
         );
         // A client may send only the offer and the stream; the rest defaults.

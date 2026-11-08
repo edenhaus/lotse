@@ -80,15 +80,12 @@ fn logs() -> tracing::subscriber::DefaultGuard {
 fn nest() -> WebRtcOptions {
     WebRtcOptions {
         data_channel: Some("dataSendChannel".into()),
-        audio: true,
     }
 }
 
-fn video_only() -> WebRtcOptions {
-    WebRtcOptions {
-        data_channel: None,
-        audio: false,
-    }
+/// No data channel: the offer has the audio and the video m-line.
+fn media_only() -> WebRtcOptions {
+    WebRtcOptions { data_channel: None }
 }
 
 /// A camera's str0m: H.264, with Opus when `audio`.
@@ -534,27 +531,29 @@ fn rfc8829_5_2_1_the_offer_has_audio_video_and_the_data_channel_in_that_order() 
 }
 
 #[test]
-fn rfc8829_5_2_1_without_audio_or_data_channel_the_offer_is_video_alone() {
+fn rfc8829_5_2_1_without_a_data_channel_the_offer_is_audio_then_video() {
     let _logs = logs();
     lotse_webrtc::install_crypto_provider();
     let engine = IngestEngine::offer(
-        &video_only(),
+        &media_only(),
         &[ENGINE],
         SystemClock.now(),
         SystemClock.now(),
     )
     .unwrap();
-    let lines = media_lines(engine.offer_sdp());
-    assert_eq!(lines.len(), 1);
-    assert!(lines[0].starts_with("m=video "));
-    let video_mid = engine
-        .offer_sdp()
+    let offer = engine.offer_sdp();
+    let lines = media_lines(offer);
+    assert_eq!(lines.len(), 2, "{offer}");
+    assert!(lines[0].starts_with("m=audio "), "{offer}");
+    assert!(lines[1].starts_with("m=video "), "{offer}");
+    assert_eq!(offer.matches("a=recvonly").count(), 2, "{offer}");
+    let audio_mid = offer
         .lines()
         .find_map(|line| line.strip_prefix("a=mid:"))
         .unwrap();
     assert_eq!(
         engine.local_candidates()[0].sdp_mid.as_deref(),
-        Some(video_mid)
+        Some(audio_mid)
     );
 }
 
@@ -732,11 +731,11 @@ fn rfc8445_6_1_1_the_offerer_controls_connects_and_carries_the_negotiated_tracks
 #[test]
 fn rfc4585_6_3_1_startup_plis_every_second_until_a_keyframe_at_most_five() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     let tracks = pair.tracks();
     assert_eq!(tracks.len(), 1);
-    assert_eq!(tracks[0].index, 0, "the video is the first m-line");
+    assert_eq!(tracks[0].index, 1, "the video is the second m-line");
     // The first as the connection is up.
     pair.connect();
     assert_eq!(pair.engine.stats().plis, 1);
@@ -752,7 +751,7 @@ fn rfc4585_6_3_1_startup_plis_every_second_until_a_keyframe_at_most_five() {
 #[test]
 fn rfc4585_6_3_1_a_keyframe_stops_the_startup_plis_and_a_loss_asks_again_rate_limited() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.step(Duration::from_millis(1));
@@ -805,7 +804,7 @@ fn rfc3550_6_4_1_losses_late_packets_and_rejected_datagrams_reach_the_connection
             .with_ansi(false)
             .finish(),
     );
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     let ingest = Arc::new(IngestCounters::default());
     pair.engine.count_into(Arc::clone(&ingest));
     pair.answer(camera_config(false), |answer| answer);
@@ -915,7 +914,7 @@ fn rfc4585_6_3_1_a_viewer_s_keyframe_request_is_a_pli_rate_limited_with_the_star
 #[test]
 fn rfc4585_6_3_1_a_loss_before_the_first_keyframe_is_left_to_the_startup_plis() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.step(Duration::from_millis(1));
@@ -928,7 +927,7 @@ fn rfc4585_6_3_1_a_loss_before_the_first_keyframe_is_left_to_the_startup_plis() 
 #[test]
 fn rfc9143_without_a_ssrc_the_first_pli_waits_for_the_first_packet() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| {
         answer
             .lines()
@@ -952,7 +951,7 @@ fn rfc9143_without_a_ssrc_the_first_pli_waits_for_the_first_packet() {
 #[test]
 fn rfc3264_7_every_accepted_h264_format_goes_to_the_video_track_and_others_are_dropped() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     let pts = pair.camera().h264_pts();
@@ -966,12 +965,13 @@ fn rfc3264_7_every_accepted_h264_format_goes_to_the_video_track_and_others_are_d
     pair.camera().write(now, pts[1], true, &[0x41, 0x02]);
     pair.step(Duration::ZERO);
     assert_eq!(pair.engine.stats().rtp_packets, 3);
+    // Index 1, the video's m-line: the audio's, rejected, is the first.
     assert_eq!(
         pair.rtp()
             .iter()
             .map(|(index, _, _)| *index)
             .collect::<Vec<_>>(),
-        [0, 0, 0]
+        [1, 1, 1]
     );
     // A payload type the answer did not accept: not handed on.
     pair.camera().write(now, Pt::from(50), true, &[0x41, 0x03]);
@@ -982,7 +982,7 @@ fn rfc3264_7_every_accepted_h264_format_goes_to_the_video_track_and_others_are_d
 #[test]
 fn rfc3550_a_1_a_packet_of_another_accepted_codec_is_received_so_no_loss() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     let ingest = Arc::new(IngestCounters::default());
     pair.engine.count_into(Arc::clone(&ingest));
     pair.answer(camera_config(false).enable_h265(true), |answer| answer);
@@ -1032,7 +1032,7 @@ fn rfc3550_8_2_another_source_s_packet_in_another_codec_moves_no_carried_timelin
     const A: u32 = 0x0a00;
     const B: u32 = 0x0b00;
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false).enable_h265(true), |answer| answer);
     pair.connect();
     pair.step(Duration::from_millis(1));
@@ -1092,10 +1092,7 @@ fn rfc3264_7_a_packet_of_another_accepted_codec_is_dropped_not_switched() {
             .with_ansi(false)
             .finish(),
     );
-    let mut pair = Pair::offer(&WebRtcOptions {
-        data_channel: None,
-        audio: true,
-    });
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(true).enable_h265(true), |answer| answer);
     pair.connect();
     let video = pair.camera().video.unwrap();
@@ -1138,7 +1135,7 @@ fn rfc3264_7_a_packet_of_another_accepted_codec_is_dropped_not_switched() {
 #[test]
 fn rfc3550_8_2_a_new_synchronization_source_s_losses_count_from_its_own_numbers() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.step(Duration::from_millis(1));
@@ -1179,7 +1176,7 @@ fn rfc3550_8_2_a_new_synchronization_source_s_losses_count_from_its_own_numbers(
 #[test]
 fn rfc3550_5_1_a_late_packet_from_before_a_timestamp_jump_is_dropped() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.step(Duration::from_millis(1));
@@ -1299,7 +1296,7 @@ fn fu_a(start: bool, end: bool) -> Vec<u8> {
 #[test]
 fn rfc6184_5_8_a_reordered_packet_damages_no_later_access_unit() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.step(Duration::from_millis(1));
@@ -1366,7 +1363,7 @@ fn rfc3550_8_2_a_former_source_s_packets_off_the_new_timeline_are_dropped() {
     const A: u32 = 0x0a00;
     const B: u32 = 0x0b00;
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.step(Duration::from_millis(1));
@@ -1411,7 +1408,7 @@ fn rfc3550_8_2_new_synchronization_sources_are_logged_once_per_interval() {
             .with_ansi(false)
             .finish(),
     );
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.step(Duration::from_millis(1));
@@ -1463,10 +1460,7 @@ fn an_offer_over_what_the_relay_takes_is_not_made() {
 #[test]
 fn rfc3264_7_an_accepted_audio_codec_other_than_the_track_s_is_dropped() {
     let _logs = logs();
-    let mut pair = Pair::offer(&WebRtcOptions {
-        data_channel: None,
-        audio: true,
-    });
+    let mut pair = Pair::offer(&media_only());
     let config = camera_config(true).enable_pcmu(true, false);
     pair.answer(config, |answer| answer);
     pair.connect();
@@ -1490,14 +1484,25 @@ fn rfc3264_7_an_accepted_audio_codec_other_than_the_track_s_is_dropped() {
 }
 
 #[test]
-fn rfc8829_5_3_a_camera_without_a_carried_audio_codec_still_sends_video() {
+fn rfc3264_6_a_camera_without_audio_rejects_its_m_line_and_still_sends_video() {
     let _logs = logs();
-    let mut pair = Pair::offer(&nest());
-    let answer = pair.answer(camera_config(false), |answer| answer);
-    let tracks = pair.tracks();
-    assert_eq!(tracks.len(), 1, "{tracks:?} {:?} {answer}", pair.outputs);
-    assert_eq!(tracks[0].index, 1, "the video keeps its m-line's index");
-    assert_eq!(tracks[0].declared.kind, Kind::Video);
+    for options in [nest(), media_only()] {
+        let mut pair = Pair::offer(&options);
+        let answer = pair.answer(camera_config(false), |answer| answer);
+        // RFC 3264 §6: the audio m-line rejected with port 0.
+        let lines = media_lines(&answer);
+        assert!(lines[0].starts_with("m=audio 0 "), "{answer}");
+        assert!(lines[1].starts_with("m=video 9 "), "{answer}");
+        let tracks = pair.tracks();
+        assert_eq!(tracks.len(), 1, "{tracks:?} {:?} {answer}", pair.outputs);
+        assert_eq!(tracks[0].index, 1, "the video keeps its m-line's index");
+        assert_eq!(tracks[0].declared.kind, Kind::Video);
+        pair.connect();
+        pair.frame(true);
+        let rtp = pair.rtp();
+        assert!(!rtp.is_empty(), "{:?}", pair.outputs);
+        assert!(rtp.iter().all(|(index, _, _)| *index == 1), "{rtp:?}");
+    }
 }
 
 #[test]
@@ -1666,7 +1671,7 @@ fn rfc8445_8_not_connected_in_the_attempt_s_budget_ends_as_ice_failed_before_the
     // giving up is rfc8445_8_a_dtls_client_that_gives_up_before_the_
     // deadline_ends_as_not_connected_too.
     for (answer_ms, end_ms) in [(0, 27_000), (17_500, 27_500), (19_000, 28_000)] {
-        let mut pair = Pair::offer(&video_only());
+        let mut pair = Pair::offer(&media_only());
         pair.link = false;
         pair.run(Duration::from_millis(answer_ms));
         pair.answer(camera_config(false), camera_dtls_client);
@@ -1694,7 +1699,7 @@ fn rfc8829_5_2_the_answer_deadline_counts_from_the_attempt_s_start() {
     // The offer made 9 s into the attempt (a client came late): the
     // answer is due 11 s later.
     let now = started + Duration::from_secs(9);
-    let mut engine = IngestEngine::offer(&video_only(), &[ENGINE], started, now).unwrap();
+    let mut engine = IngestEngine::offer(&media_only(), &[ENGINE], started, now).unwrap();
     engine.handle_timeout(started + ANSWER_TIMEOUT - Duration::from_millis(1));
     loop {
         match engine.poll() {
@@ -1711,7 +1716,7 @@ fn rfc8829_5_2_the_answer_deadline_counts_from_the_attempt_s_start() {
 fn rfc8445_8_an_answer_or_a_handshake_completing_at_its_deadline_is_not_taken() {
     let _logs = logs();
     // The answer at its deadline, the timeout not handled yet.
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.now += ANSWER_TIMEOUT;
     pair.answer(camera_config(false), |answer| answer);
     assert_eq!(pair.tracks(), []);
@@ -1726,7 +1731,7 @@ fn rfc8445_8_an_answer_or_a_handshake_completing_at_its_deadline_is_not_taken() 
     // camera is the DTLS server (str0m answers `actpass` passive): once
     // its own handshake is done, what it sends then completes the
     // engine's.
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     let started = pair.now;
     pair.answer(camera_config(false), |answer| answer);
     for _ in 0..1_000 {
@@ -1763,7 +1768,7 @@ fn rfc8445_8_a_dtls_client_that_gives_up_before_the_deadline_ends_as_not_connect
     // deadline is at 27 s. Whichever comes first, the attempt ends as not
     // connected (`ice_failed`), never as the engine's internal error.
     for _ in 0..8 {
-        let mut pair = Pair::offer(&video_only());
+        let mut pair = Pair::offer(&media_only());
         pair.link = false;
         pair.answer(camera_config(false), |answer| answer);
         pair.run(Duration::from_secs(20));
@@ -1782,7 +1787,7 @@ fn rfc8445_8_a_dtls_client_that_gives_up_before_the_deadline_ends_as_not_connect
 #[test]
 fn rfc8445_8_ice_up_without_dtls_and_then_lost_is_ice_failed_at_the_deadline() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.dtls = false;
     pair.answer(camera_config(false), camera_dtls_client);
     // STUN only (RFC 7983 §7: first byte 0 to 3): ICE pairs, DTLS never
@@ -1804,7 +1809,7 @@ fn rfc8445_8_ice_up_without_dtls_and_then_lost_is_ice_failed_at_the_deadline() {
 #[test]
 fn rfc7675_5_1_a_camera_that_stops_answering_consent_ends_as_consent_lost() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.link = false;
@@ -1820,7 +1825,7 @@ fn rfc7675_5_1_a_camera_that_stops_answering_consent_ends_as_consent_lost() {
 #[test]
 fn rfc6347_4_2_7_the_camera_s_close_notify_ends_as_peer_closed() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.camera().rtc.close().unwrap();
@@ -1838,7 +1843,7 @@ fn rfc6347_4_2_7_the_camera_s_close_notify_ends_as_peer_closed() {
 #[test]
 fn rfc6347_4_2_7_a_close_from_outside_sends_close_notify_and_ends_nothing_else() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.engine.close();
@@ -1856,7 +1861,7 @@ fn rfc6347_4_2_7_a_close_from_outside_sends_close_notify_and_ends_nothing_else()
 #[test]
 fn rfc5763_5_a_wrong_fingerprint_fails_the_handshake_as_an_engine_error() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| {
         let line = answer
             .lines()
@@ -1885,7 +1890,7 @@ fn rfc8445_8_a_candidate_at_a_deadline_ends_the_attempt_first_and_is_not_taken()
     // The answer's deadline, the timeout not handled yet: a candidate just
     // before it is held, the end-of-candidates indication at it ends the
     // attempt.
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     let started = pair.now;
     pair.engine.add_remote_candidate(
         started + ANSWER_TIMEOUT - Duration::from_millis(1),
@@ -1907,7 +1912,7 @@ fn rfc8445_8_a_candidate_at_a_deadline_ends_the_attempt_first_and_is_not_taken()
 
     // The connection's deadline: a candidate just before it goes to the
     // agent, one at it ends the attempt and is not taken.
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     let started = pair.now;
     pair.link = false;
     pair.answer(camera_config(false), |answer| answer);
@@ -1934,7 +1939,7 @@ fn rfc8445_8_a_candidate_at_a_deadline_ends_the_attempt_first_and_is_not_taken()
 #[test]
 fn rfc8838_10_trickled_candidates_connect_and_bad_ones_are_refused() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     let candidate = |line: &str| SignalCandidate {
         candidate: line.to_owned(),
         sdp_mid: Some("0".into()),
@@ -1987,7 +1992,7 @@ fn rfc8838_10_trickled_candidates_connect_and_bad_ones_are_refused() {
 #[test]
 fn rfc8838_10_at_most_64_candidates_are_held_until_the_answer() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     for port in 0..=64 {
         let line = format!(
             "candidate:{port} 1 udp 2130706431 192.0.2.30 {} typ host",
@@ -2012,7 +2017,7 @@ fn rfc8838_10_at_most_64_candidates_are_held_until_the_answer() {
 #[test]
 fn rfc7983_datagrams_that_are_not_the_engine_s_are_counted_and_dropped() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     // Nothing the demultiplexing reads (RFC 7983 §7).
     pair.engine
@@ -2031,7 +2036,7 @@ fn rfc7983_datagrams_that_are_not_the_engine_s_are_counted_and_dropped() {
 fn rfc8445_5_1_3_a_host_address_given_twice_is_one_candidate() {
     let _logs = logs();
     let engine = IngestEngine::offer(
-        &video_only(),
+        &media_only(),
         &[ENGINE, ENGINE],
         SystemClock.now(),
         SystemClock.now(),
@@ -2044,7 +2049,7 @@ fn rfc8445_5_1_3_a_host_address_given_twice_is_one_candidate() {
 #[test]
 fn rfc7983_7_media_from_a_stranger_is_not_taken() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     let stranger: SocketAddr = "198.51.100.7:4000".parse().unwrap();
@@ -2058,7 +2063,7 @@ fn rfc7983_7_media_from_a_stranger_is_not_taken() {
 #[test]
 fn rfc6347_4_2_7_a_close_drops_what_was_queued_and_not_polled() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     let (_camera, answer) = Camera::answer(
         pair.engine.offer_sdp(),
         CAMERA,
@@ -2081,7 +2086,7 @@ fn rfc6347_4_2_7_a_close_drops_what_was_queued_and_not_polled() {
 #[test]
 fn rfc6347_4_2_7_a_close_queues_its_close_notify() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     pair.answer(camera_config(false), |answer| answer);
     pair.connect();
     pair.engine.close();
@@ -2108,7 +2113,7 @@ fn without_candidates(answer: &str) -> (Vec<String>, String) {
 #[test]
 fn rfc8445_2_2_an_ice_lite_camera_with_its_candidates_in_the_answer_connects() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     // An ICE-lite camera (Nest-like) sends no checks of its own: the
     // engine pairs with the answer's candidate and checks it.
     pair.answer(camera_config(false).set_ice_lite(true), |answer| {
@@ -2126,7 +2131,7 @@ fn rfc8445_2_2_an_ice_lite_camera_with_its_candidates_in_the_answer_connects() {
 fn rfc8838_10_an_ice_lite_camera_whose_candidates_come_only_trickled_connects() {
     let _logs = logs();
     for early in [false, true] {
-        let mut pair = Pair::offer(&video_only());
+        let mut pair = Pair::offer(&media_only());
         let (camera, answer) = Camera::answer(
             pair.engine.offer_sdp(),
             CAMERA,
@@ -2168,7 +2173,7 @@ fn rfc8838_10_an_ice_lite_camera_whose_candidates_come_only_trickled_connects() 
 #[test]
 fn rfc8445_6_1_2_2_an_answer_whose_candidates_pair_with_none_connects_by_the_camera_s_checks() {
     let _logs = logs();
-    let mut pair = Pair::offer(&video_only());
+    let mut pair = Pair::offer(&media_only());
     // An IPv6 candidate alone against the engine's IPv4 host: no pair, so
     // str0m's agent reports Disconnected before the connection; that ends
     // nothing, and the camera's own checks make a peer-reflexive pair
@@ -2189,7 +2194,7 @@ fn rfc8445_6_1_2_2_an_answer_whose_candidates_pair_with_none_connects_by_the_cam
 fn rfc8445_8_a_second_host_address_that_reaches_nothing_ends_nothing_once_connected() {
     let _logs = logs();
     let dead: SocketAddr = "192.0.2.11:5000".parse().unwrap();
-    let mut pair = Pair::offer_on(&video_only(), &[ENGINE, dead]);
+    let mut pair = Pair::offer_on(&media_only(), &[ENGINE, dead]);
     assert_eq!(
         pair.engine.local_candidates().len(),
         3,
@@ -2538,7 +2543,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::json!({ "audio": false }),
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -2651,7 +2656,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::json!({ "audio": false }),
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -2715,7 +2720,7 @@ mod source {
         lotse_webrtc::install_crypto_provider();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let source = WebRtcSourceFactory
-            .validate(&serde_json::json!({ "audio": true }))
+            .validate(&serde_json::json!({}))
             .unwrap();
         let set = TrackSet::new(TrackLimits::default(), clock.now());
         let pcmu = Rtc::builder()
@@ -2881,13 +2886,14 @@ mod source {
         );
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::json!({ "audio": false }),
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
         let mut relay = within(signaling.next_signal()).await.unwrap();
         let (offer, _) = read_offer(&mut relay).await;
-        assert_eq!(media_lines(&offer).len(), 1);
+        // Audio and video, the camera's audio rejected (RFC 3264 §6).
+        assert_eq!(media_lines(&offer).len(), 2);
         let (mut camera, answer) = Live::answer(&offer, false).await;
         relay
             .incoming
@@ -3081,7 +3087,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::json!({ "audio": false }),
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );
@@ -3186,7 +3192,7 @@ mod source {
         use lotse_core::runner::{ConnectGate, RunnerConfig, SourceRunner};
 
         let source = WebRtcSourceFactory
-            .validate(&serde_json::json!({ "audio": false }))
+            .validate(&serde_json::json!({}))
             .unwrap();
         let set = TrackSet::new(TrackLimits::default(), clock.now());
         let (events, reports) = mpsc::channel(64);
@@ -3519,7 +3525,7 @@ mod source {
         let _logs = logs();
         let signaling = FakeSignaling::new(vec![LOOPBACK]);
         let running = start(
-            serde_json::json!({ "audio": false }),
+            serde_json::json!({}),
             Some(signaling.clone()),
             Arc::new(SystemClock),
         );

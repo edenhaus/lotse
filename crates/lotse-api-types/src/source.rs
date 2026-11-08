@@ -57,12 +57,6 @@ const fn default_timeout_ms() -> u64 {
     DEFAULT_TIMEOUT_MS
 }
 
-/// `true`, as serde's `default` takes it: the default of
-/// [`WebRtcOptions::audio`].
-const fn default_true() -> bool {
-    true
-}
-
 /// Whether `value` can be sent as the `User-Agent` header: RFC 2326
 /// §12.41 makes it `1*(product | comment)`, so it is non-empty, and
 /// RFC 7230 §3.2 makes it a `field-value` without `obs-text`, which retina
@@ -353,10 +347,6 @@ pub struct WebRtcOptions {
         schemars(length(min = 1, max = MAX_LABEL_CHARS), regex(pattern = DATA_CHANNEL_PATTERN))
     )]
     pub data_channel: Option<String>,
-    /// Offer to receive the camera's audio (default `true`); `false`
-    /// offers video only.
-    #[serde(default = "default_true")]
-    pub audio: bool,
 }
 
 /// The fake source of `lotse_core::test_util` (`fake://` URLs), in
@@ -588,7 +578,7 @@ mod tests {
                 json!({ "protocol": "webrtc" }),
                 "webrtc",
                 None,
-                json!({ "data_channel": null, "audio": true }),
+                json!({ "data_channel": null }),
             ),
         ] {
             let parsed = spec(given.clone());
@@ -633,12 +623,10 @@ mod tests {
         ] {
             assert_eq!(spec(no_tls.clone()).tls(), None, "{no_tls}");
         }
-        let webrtc = spec(
-            json!({ "protocol": "webrtc", "data_channel": "dataSendChannel", "audio": false }),
-        );
+        let webrtc = spec(json!({ "protocol": "webrtc", "data_channel": "dataSendChannel" }));
         assert_eq!(
             Value::Object(webrtc.options()),
-            json!({ "data_channel": "dataSendChannel", "audio": false })
+            json!({ "data_channel": "dataSendChannel" })
         );
     }
 
@@ -665,7 +653,9 @@ mod tests {
         options_round_trip::<HttpsOptions>(
             &json!({ "protocol": "https", "url": "https://cam/", "tls": "insecure" }),
         );
-        options_round_trip::<WebRtcOptions>(&json!({ "protocol": "webrtc", "audio": false }));
+        options_round_trip::<WebRtcOptions>(
+            &json!({ "protocol": "webrtc", "data_channel": "dataSendChannel" }),
+        );
         // The options alone take no `url` and default as the variant does.
         let err =
             serde_json::from_value::<RtspOptions>(json!({ "url": "rtsp://cam/" })).unwrap_err();
@@ -726,10 +716,6 @@ mod tests {
                 json!({ "protocol": "http", "url": "http://cam/", "max_bandwidth": -1 }),
                 "invalid value: integer `-1`",
             ),
-            (
-                json!({ "protocol": "webrtc", "audio": "yes" }),
-                "invalid type: string \"yes\", expected a boolean",
-            ),
             (json!({ "protocol": null }), "invalid type: null"),
             (
                 json!({ "protocol": "rtsp", "url": null }),
@@ -738,6 +724,21 @@ mod tests {
         ] {
             let err = refusal(value.clone());
             assert!(err.starts_with(says), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn rfc3264_6_a_webrtc_source_takes_no_audio_field() {
+        // The offer always carries an audio m-line `recvonly`; a camera
+        // without audio rejects it with port 0 (RFC 3264 §6), so there is
+        // nothing to turn off, and `audio` is an unknown field.
+        for audio in [json!(true), json!(false)] {
+            let err = refusal(json!({ "protocol": "webrtc", "audio": audio }));
+            assert!(err.starts_with("unknown field `audio`"), "{audio}: {err}");
+            let err = serde_json::from_value::<WebRtcOptions>(json!({ "audio": audio }))
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("unknown field `audio`"), "{audio}: {err}");
         }
     }
 
@@ -871,7 +872,7 @@ mod tests {
             assert_eq!(shown.options(), options, "{given}");
             assert_eq!(shown.protocol(), given["protocol"], "{given}");
         }
-        let webrtc = spec(json!({ "protocol": "webrtc", "audio": false }));
+        let webrtc = spec(json!({ "protocol": "webrtc", "data_channel": "dataSendChannel" }));
         assert_eq!(webrtc.clone().with_url("x://".into()), webrtc);
     }
 
@@ -915,7 +916,7 @@ mod tests {
             ),
             (
                 json!({ "protocol": "webrtc" }),
-                "Webrtc(WebRtcOptions { data_channel: None, audio: true })",
+                "Webrtc(WebRtcOptions { data_channel: None })",
             ),
         ] {
             assert_eq!(format!("{:?}", spec(given)), shown);

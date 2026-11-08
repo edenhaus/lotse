@@ -112,7 +112,7 @@ registered:
 { "protocol": "rtsps",  "url": "rtsps://cam/s1", "tls": { "pin": "AB:CD:…" } }
 { "protocol": "http",   "url": "http://cam/live.m3u8", "max_bandwidth": 4000000 }
 { "protocol": "https",  "url": "https://cam/live.m3u8", "tls": "insecure" }
-{ "protocol": "webrtc", "data_channel": "dataSendChannel", "audio": true }
+{ "protocol": "webrtc", "data_channel": "dataSendChannel" }
 ```
 
 A URL protocol's name is its URL's scheme; credentials go in the URL's
@@ -124,9 +124,10 @@ for one without a URL, and merges `--options` into it.
 A WebRTC camera (Home Assistant's native WebRTC cameras: Nest, Ring,
 Matter) has no address lotse could connect to, so a stream names it by
 its protocol alone, `{"protocol": "webrtc"}`, and the stream is its
-identity; its fields are `data_channel` (the data channel label the
-camera's integration asks for, `dataSendChannel` for Nest) and `audio`
-(default `true`). lotse makes the offer, but the camera's signaling is its
+identity; its one field is `data_channel` (the data channel label the
+camera's integration asks for, `dataSendChannel` for Nest). The offer
+always asks for the camera's audio; a camera without audio rejects that
+m-line (RFC 3264 §6) and the stream has video alone. lotse makes the offer, but the camera's signaling is its
 cloud's, so the control-API client relays it: it subscribes with
 `signaling/subscribe`, takes each `offer` event (it names the stream) and
 each `candidate` event to the camera, and brings back the camera's answer, its

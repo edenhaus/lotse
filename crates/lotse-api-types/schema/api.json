@@ -3015,11 +3015,6 @@
           "additionalProperties": false,
           "description": "A WebRTC camera whose signaling the client relays.",
           "properties": {
-            "audio": {
-              "default": true,
-              "description": "Offer to receive the camera's audio (default `true`); `false`\noffers video only.",
-              "type": "boolean"
-            },
             "data_channel": {
               "default": null,
               "description": "The label of a data channel to offer beside the media (RFC 8831,\nRFC 8832), as the camera's integration asks for one: Nest refuses\nan offer without an `application` m-line and wants\n`dataSendChannel`. 1 to 64 characters, none a control character;\n`null`, the default, offers none.",
