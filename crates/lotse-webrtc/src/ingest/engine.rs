@@ -220,6 +220,10 @@ pub struct IngestStats {
     /// former one, or one none of whose packets was handed on yet),
     /// dropped.
     pub other_source_reports: u64,
+    /// Sender Reports of the carried source whose RTP timestamp is off the
+    /// timeline it carries (from before a reset of its timestamps),
+    /// dropped.
+    pub stale_reports: u64,
     /// Picture Loss Indications sent.
     pub plis: u64,
     /// Data channel messages received and dropped.
@@ -265,8 +269,10 @@ enum Phase {
 ///   packets were handed on to the track, the latest first, each with the
 ///   timestamp of its newest one handed on, at most [`MAX_SOURCES`]. Fed
 ///   only by packets handed on: one the track does not take (another
-///   codec) never moves it. The first is the timeline the track carries;
-///   staleness and the Sender Reports handed on are judged by it alone.
+///   codec) never moves it. The first is the timeline the track carries,
+///   with the arrival of its newest packet handed on
+///   ([`Stream::handed_at`]); staleness and the Sender Reports handed on
+///   are judged by it alone.
 ///
 /// A packet is stale ([`Seen::Stale`]) when its timestamp is more than
 /// [`MAX_TIMESTAMP_JUMP`] off the carried timeline's and it is late or of
@@ -275,6 +281,19 @@ enum Phase {
 /// carried starts its own timeline with its first packet handed on (an
 /// encoder restart, RFC 3550 §8.2), and the carried source's own jump
 /// moves the timeline (RFC 3550 §5.1).
+///
+/// A Sender Report is handed on only when its source is the carried one
+/// and its RTP timestamp is on the carried timeline
+/// ([`Stream::report`]): no more than [`MAX_TIMESTAMP_JUMP`]
+/// back of the newest timestamp handed on, nor more than it ahead of that
+/// timestamp plus the time since that packet arrived, the bound
+/// `TimestampGuard` holds packets to. A report's RTP timestamp is the
+/// sender's clock when it sends the report (RFC 3550 §6.4.1), so it runs
+/// ahead of the newest packet by the time since that packet, which the
+/// elapsed time allows whatever the report spacing (RFC 3550 §6.2) or a
+/// pause in the media; the second covers jitter and the packetization
+/// delay. A report from before a reset of the same source's timestamps
+/// is off by the reset.
 #[derive(Debug, Clone)]
 struct Stream {
     /// Its m-line's mid.
@@ -296,6 +315,8 @@ struct Stream {
     /// The carried timeline: each source handed on with the timestamp of
     /// its newest packet handed on, the latest first.
     carried: Vec<(u32, u32)>,
+    /// When the newest packet handed on arrived.
+    handed_at: Option<Instant>,
 }
 
 /// Why a remote candidate is not handed to the agent
@@ -385,20 +406,44 @@ impl Stream {
         }
     }
 
-    /// Notes that the packet of `ssrc` at timestamp `ts` was handed on to
-    /// the track: its source carries the timeline from now on.
-    fn carry(&mut self, ssrc: u32, ts: u32) {
+    /// Notes that the packet of `ssrc` at timestamp `ts`, arrived at
+    /// `arrival`, was handed on to the track: its source carries the
+    /// timeline from now on.
+    fn carry(&mut self, ssrc: u32, ts: u32, arrival: Instant) {
         self.carried.retain(|(carried, _)| *carried != ssrc);
         self.carried.insert(0, (ssrc, ts));
         self.carried.truncate(MAX_SOURCES);
+        self.handed_at = Some(arrival);
     }
 
-    /// Whether `ssrc` is the source the track carries, whose timeline
-    /// its Sender Reports map.
-    fn is_newest(&self, ssrc: u32) -> bool {
-        self.carried
-            .first()
-            .is_some_and(|(newest, _)| *newest == ssrc)
+    /// What a Sender Report of `ssrc` with RTP timestamp `rtp_ts`,
+    /// arrived at `arrival`, is to the carried timeline (see [`Stream`]):
+    /// `None` when `ssrc` is not the carried source; else whether `rtp_ts`
+    /// is on its timeline, no more than [`MAX_TIMESTAMP_JUMP`] back of the
+    /// newest timestamp handed on, nor more than it ahead of that plus the
+    /// time since that packet arrived, 32-bit wrap included (RFC 3550
+    /// §5.1).
+    fn report(&self, ssrc: u32, rtp_ts: u32, arrival: Instant) -> Option<bool> {
+        let (carried, newest) = *self.carried.first()?;
+        if carried != ssrc {
+            return None;
+        }
+        let handed_at = self.handed_at?;
+        let moved = i128::from(i32::from_ne_bytes(
+            rtp_ts.wrapping_sub(newest).to_ne_bytes(),
+        ));
+        let back = self.ticks(MAX_TIMESTAMP_JUMP);
+        let ahead = self
+            .ticks(MAX_TIMESTAMP_JUMP.saturating_add(arrival.saturating_duration_since(handed_at)));
+        Some(moved >= back.saturating_neg() && moved <= ahead)
+    }
+
+    /// `span` in the stream's RTP clock ticks.
+    fn ticks(&self, span: Duration) -> i128 {
+        i128::try_from(span.as_nanos())
+            .unwrap_or(i128::MAX)
+            .saturating_mul(i128::from(self.clock_rate))
+            .saturating_div(1_000_000_000)
     }
 
     /// Whether `ts` is more than [`MAX_TIMESTAMP_JUMP`] of media time
@@ -478,6 +523,8 @@ pub struct IngestEngine {
     ingest: Arc<IngestCounters>,
     /// The rate limit of the other sources' Sender Reports' log line.
     other_source: Throttle,
+    /// The rate limit of the stale Sender Reports' log line.
+    stale_report: Throttle,
     /// The counters.
     stats: IngestStats,
 }
@@ -786,6 +833,7 @@ impl IngestEngine {
             loss: Throttle::default(),
             ingest: Arc::default(),
             other_source: Throttle::default(),
+            stale_report: Throttle::default(),
             stats: IngestStats::default(),
         })
     }
@@ -993,6 +1041,7 @@ impl IngestEngine {
             clock_rate: declared.clock_rate,
             received: Vec::new(),
             carried: Vec::new(),
+            handed_at: None,
         });
         Some(IngestTrack {
             index,
@@ -1311,7 +1360,10 @@ impl IngestEngine {
     /// that has sent none, or only in another codec) is dropped too: until
     /// its first packet handed on the track carries the former timeline,
     /// and its next report (RFC 3550 §6.2, every few seconds) anchors the
-    /// new one. A sender sends reports only
+    /// new one. A report of the carried source is handed on only when its
+    /// RTP timestamp is on the carried timeline too (see [`Stream`]): one
+    /// from before a reset of that source's timestamps, delayed past it,
+    /// maps the old timeline as a former source's would. A sender sends reports only
     /// once it sends packets (§6.4), so the first anchor of an attempt
     /// waits at most one report.
     fn on_sender_report(&mut self, feedback: &SenderFeedback) {
@@ -1319,7 +1371,8 @@ impl IngestEngine {
             return;
         };
         let ssrc = *feedback.sender_info.ssrc;
-        if !stream.is_newest(ssrc) {
+        let rtp_ts = low32(feedback.sender_info.rtp_time.numer());
+        let Some(on_timeline) = stream.report(ssrc, rtp_ts, feedback.received_at) else {
             self.stats.other_source_reports = self.stats.other_source_reports.saturating_add(1);
             if let Some(count) = self.other_source.hit(self.now) {
                 tracing::debug!(
@@ -1327,6 +1380,19 @@ impl IngestEngine {
                     ssrc,
                     count,
                     "webrtc: Sender Report of a source other than the carried one dropped"
+                );
+            }
+            return;
+        };
+        if !on_timeline {
+            self.stats.stale_reports = self.stats.stale_reports.saturating_add(1);
+            if let Some(count) = self.stale_report.hit(self.now) {
+                tracing::debug!(
+                    index = stream.index,
+                    ssrc,
+                    rtp_ts,
+                    count,
+                    "webrtc: Sender Report off the carried timeline dropped (from before a timestamp reset)"
                 );
             }
             return;
@@ -1346,7 +1412,7 @@ impl IngestEngine {
         self.queued.push_back(IngestOutput::SenderReport {
             index: stream.index,
             ntp,
-            rtp_ts: low32(feedback.sender_info.rtp_time.numer()),
+            rtp_ts,
             arrival: feedback.received_at,
         });
     }
@@ -1463,7 +1529,7 @@ impl IngestEngine {
         let carried = stream.pts.contains(&pt);
         let seen = stream.sequence(ssrc, seq, header.timestamp);
         if carried && matches!(seen, Seen::Ahead { .. }) {
-            stream.carry(ssrc, header.timestamp);
+            stream.carry(ssrc, header.timestamp, packet.timestamp);
         }
         let Some(lost) = self.counted(seen, index, ssrc, seq) else {
             return;
@@ -1674,6 +1740,7 @@ mod tests {
             clock_rate: 90_000,
             received: Vec::new(),
             carried: Vec::new(),
+            handed_at: None,
         }
     }
 
@@ -1682,7 +1749,8 @@ mod tests {
     fn handed(stream: &mut Stream, ssrc: u32, seq: u16, ts: u32) -> Seen {
         let seen = stream.sequence(ssrc, seq, ts);
         if matches!(seen, Seen::Ahead { .. }) {
-            stream.carry(ssrc, ts);
+            let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
+            stream.carry(ssrc, ts, now);
         }
         seen
     }
@@ -1842,8 +1910,9 @@ mod tests {
                 new_source: false
             }
         );
-        assert!(stream.is_newest(A));
-        assert!(!stream.is_newest(B));
+        let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
+        assert_eq!(stream.report(A, 903_000, now), Some(true));
+        assert_eq!(stream.report(B, 3_000, now), None);
         // B's first packet handed on starts its own timeline (an encoder
         // restart, RFC 3550 §8.2): B was never carried, so not former.
         assert_eq!(
@@ -1853,7 +1922,8 @@ mod tests {
                 new_source: false
             }
         );
-        assert!(stream.is_newest(B));
+        assert_eq!(stream.report(B, 6_000, now), Some(true));
+        assert_eq!(stream.report(A, 906_000, now), None);
         // Now A is the former carried source: off B's timeline, stale.
         assert_eq!(handed(&mut stream, A, 102, 906_000), Seen::Stale);
         assert_eq!(stream.carried, [(B, 6_000), (A, 903_000)]);
@@ -1903,6 +1973,7 @@ mod tests {
             // handed on.
             received: vec![(1, 0)],
             carried: vec![(1, 7)],
+            handed_at: Some(now),
             ..video_stream()
         });
         let report = |ntp_time| {
@@ -2003,6 +2074,77 @@ mod tests {
         assert_eq!(engine.queued.pop_front(), Some(forwarded(6_000)));
         assert_eq!(engine.stats.other_source_reports, 3);
         assert_eq!(engine.stats.sender_reports, 2);
+    }
+
+    #[test]
+    fn rfc3550_6_4_1_a_report_from_before_a_same_source_timestamp_reset_is_dropped() {
+        const A: u32 = 0xa;
+        let addr = "192.0.2.10:5000".parse().unwrap();
+        let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
+        let options = WebRtcOptions {
+            data_channel: None,
+            audio: false,
+        };
+        let mut engine = IngestEngine::offer(&options, &[addr], now, now).unwrap();
+        let mid = engine.video_mid;
+        engine.streams.push(Stream {
+            mid,
+            index: 1,
+            ..video_stream()
+        });
+        // A/1000 at 900000 handed on, then A/1001 at 3000: the camera
+        // reset its timestamps, its source and numbers the same.
+        let stream = &mut engine.streams[0];
+        for (seq, ts) in [(1_000, 900_000), (1_001, 3_000)] {
+            assert!(matches!(stream.sequence(A, seq, ts), Seen::Ahead { .. }));
+            stream.carry(A, ts, now);
+        }
+        let wallclock = UNIX_EPOCH + Duration::from_secs(1);
+        let report = |rtp_ts: u32, received_at| {
+            Event::SenderFeedback(SenderFeedback {
+                mid,
+                rid: None,
+                received_at,
+                sender_info: str0m::rtp::rtcp::SenderInfo {
+                    ssrc: A.into(),
+                    ntp_time: wallclock,
+                    rtp_time: str0m::media::MediaTime::new(
+                        u64::from(rtp_ts),
+                        Frequency::NINETY_KHZ,
+                    ),
+                    sender_packet_count: 0,
+                    sender_octet_count: 0,
+                },
+            })
+        };
+        let forwarded = |engine: &mut IngestEngine| match engine.queued.pop_front() {
+            Some(IngestOutput::SenderReport { rtp_ts, .. }) => Some(rtp_ts),
+            _ => None,
+        };
+        // A report from before the reset, delayed past it: dropped.
+        engine.on_event(report(900_500, now));
+        assert_eq!(forwarded(&mut engine), None);
+        assert_eq!(engine.stats.stale_reports, 1);
+        // One on the new timeline: handed on.
+        engine.on_event(report(6_000, now));
+        assert_eq!(forwarded(&mut engine), Some(6_000));
+        // The bounds (1 s is 90000 ticks): back across the wrap, and ahead,
+        // ahead further by the time since the newest packet arrived.
+        let later = now + Duration::from_secs(2);
+        for (rtp_ts, at, on) in [
+            (3_000_u32.wrapping_sub(90_000), now, true),
+            (3_000_u32.wrapping_sub(90_001), now, false),
+            (93_000, now, true),
+            (93_001, now, false),
+            (273_000, later, true),
+            (273_001, later, false),
+        ] {
+            engine.on_event(report(rtp_ts, at));
+            assert_eq!(forwarded(&mut engine), on.then_some(rtp_ts), "{rtp_ts}");
+        }
+        assert_eq!(engine.stats.stale_reports, 4);
+        assert_eq!(engine.stats.sender_reports, 4);
+        assert_eq!(engine.stats.other_source_reports, 0);
     }
 
     /// str0m 0.25's error for dimpl's `err` (its `dtls.rs`).
