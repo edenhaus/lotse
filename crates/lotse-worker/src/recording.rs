@@ -2647,7 +2647,7 @@ mod tests {
     #[tokio::test]
     async fn rfc3551_4_5_14_g711_back_after_opus_is_transcoded_on_its_8000_hz_clock() {
         /// The camera reconnecting with PCMU where it had Opus: the track
-        /// is re-declared at 8000 (`Track::redeclare`), in a new epoch.
+        /// is redeclared at 8000 (`Track::redeclare`), in a new epoch.
         fn reconnect(rig: &Rig) {
             let audio = rig.set.publisher().declare(Kind::Audio, Codec::Pcmu, 8_000);
             assert!(Arc::ptr_eq(&audio, rig.audio.as_ref().unwrap()));
@@ -3354,7 +3354,7 @@ mod tests {
     }
 
     /// The container's timescale is the clock rate of the frames it
-    /// takes (RFC 3550 §5.1): a reconnect that re-declares the audio at
+    /// takes (RFC 3550 §5.1): a reconnect that redeclares the audio at
     /// another rate before the recording starts makes it the audio
     /// entry's, with the codec or alone, and one after the start ends the
     /// recording, as a codec change does, since one file has one timescale

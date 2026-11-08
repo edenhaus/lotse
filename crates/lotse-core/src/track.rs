@@ -887,7 +887,7 @@ pub struct Track {
     /// The track's id within its stream.
     id: TrackId,
     /// Ticks per second of `MediaTime` and of the RTP timestamps (RFC 3550
-    /// §5.1); changed only by a re-declaration ([`Self::redeclare`]): with
+    /// §5.1); changed only by a redeclaration ([`Self::redeclare`]): with
     /// the codec under the pre-record lock, or, on a staging track that
     /// forwards into its live counterpart, as its source's own rate alone.
     clock_rate: AtomicU32,
@@ -1110,7 +1110,7 @@ impl Track {
         self.set_format(codec, None);
     }
 
-    /// Re-declares the track for a new connection of its source: `codec`
+    /// Redeclares the track for a new connection of its source: `codec`
     /// as [`Self::set_codec`] sets it, and `clock_rate`, the RTP clock the
     /// new connection's timestamps and Sender Reports tick at (RFC 3550
     /// §5.1), which a codec change can move (AAC at 16 kHz back as PCMU at
@@ -3043,7 +3043,7 @@ mod tests {
         assert_eq!(prerecord(&track, t0), [128]);
     }
 
-    /// A re-declaration at another RTP clock rate (RFC 3550 §5.1), even
+    /// A redeclaration at another RTP clock rate (RFC 3550 §5.1), even
     /// with the same descriptor, is a change: the rate follows, the
     /// pre-record timed at the old rate goes, the `TrackChanged` carries
     /// the new rate and a new epoch follows it, and lateness is measured at

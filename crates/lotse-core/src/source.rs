@@ -1052,7 +1052,7 @@ impl TrackSet {
         }
     }
 
-    /// Returns the existing track `id` re-declared with `codec` at
+    /// Returns the existing track `id` redeclared with `codec` at
     /// `clock_rate` ([`Track::redeclare`]: the same object, its descriptor
     /// and RTP clock rate following the new connection's), or declares a
     /// new one: a staging set's forwards into the live track of that id,
