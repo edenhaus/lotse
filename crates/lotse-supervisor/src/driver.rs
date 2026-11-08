@@ -5123,7 +5123,16 @@ mod tests {
         assert_eq!(captured.lines("worker killed").len(), 1);
         // The next refusal fails at once, the clock standing still.
         driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 4 }));
-        let refusal = next_wake(&mut driver).await;
+        // Taken from the queue itself: `wait` puts the killed worker's
+        // events first, which would run its exit before this refusal.
+        let_assert!(
+            Ok(DriverCommand::Signal {
+                worker,
+                command: command @ SignalCommand::Refused { request: 4, .. },
+            }) = driver.commands.try_recv(),
+            "the refusal of the fourth, queued for the driver"
+        );
+        let refusal = Wake::Command(DriverCommand::Signal { worker, command });
         {
             let mut handled = std::pin::pin!(driver.handle(refusal));
             assert!(
