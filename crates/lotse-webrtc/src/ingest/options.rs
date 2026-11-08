@@ -11,8 +11,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub const MAX_LABEL_CHARS: usize = 64;
 
 /// Whether `label` can be the data channel's label: 1 to
-/// [`MAX_LABEL_CHARS`] characters, none of them a control character, so
-/// it prints and logs as one line.
+/// [`MAX_LABEL_CHARS`] characters, none of them a control character
+/// (`char::is_control`, Unicode `Cc`), so it logs as one line. Other
+/// characters that do not print (a format or private-use one) are taken.
 fn is_valid_label(label: &str) -> bool {
     let chars = label.chars().count();
     (1..=MAX_LABEL_CHARS).contains(&chars) && !label.chars().any(char::is_control)
@@ -26,7 +27,7 @@ fn deserialize_label<'de, D: Deserializer<'de>>(
     let value = Option::<String>::deserialize(deserializer)?;
     match value {
         Some(label) if !is_valid_label(&label) => Err(serde::de::Error::custom(format!(
-            "data_channel must be 1 to {MAX_LABEL_CHARS} printable characters, not {label:?}"
+            "data_channel must be 1 to {MAX_LABEL_CHARS} characters, none a control character, not {label:?}"
         ))),
         other => Ok(other),
     }
@@ -128,6 +129,10 @@ mod tests {
         let longest = "é".repeat(MAX_LABEL_CHARS);
         let parsed = WebRtcOptions::parse(&json!({ "data_channel": longest })).unwrap();
         assert_eq!(parsed.data_channel, Some(longest));
+        // A character that does not print but is no control character (a
+        // zero-width space, Unicode `Cf`) is taken.
+        let parsed = WebRtcOptions::parse(&json!({ "data_channel": "data\u{200b}" })).unwrap();
+        assert_eq!(parsed.data_channel.as_deref(), Some("data\u{200b}"));
         // `null` spelled out is no data channel.
         let parsed = WebRtcOptions::parse(&json!({ "data_channel": null })).unwrap();
         assert_eq!(parsed.data_channel, None);
@@ -144,7 +149,7 @@ mod tests {
             let err = WebRtcOptions::parse(&json!({ "data_channel": label })).unwrap_err();
             assert!(
                 err.to_string()
-                    .contains("data_channel must be 1 to 64 printable characters"),
+                    .contains("data_channel must be 1 to 64 characters, none a control character"),
                 "{label:?}: {err}"
             );
         }
