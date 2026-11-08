@@ -210,6 +210,42 @@ mod tests {
         (addr, thread)
     }
 
+    /// A STUN server on loopback that answers every request with the
+    /// sender's address until `stop` is set, looking for it every 50 ms;
+    /// its thread returns how many it answered.
+    fn counting_server() -> (
+        SocketAddr,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<usize>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let mut buf = [0_u8; 1500];
+            let mut answered = 0;
+            while !stopped.load(Ordering::Acquire) {
+                let Ok((n, from)) = socket.recv_from(&mut buf) else {
+                    continue;
+                };
+                let request = stun::parse(&buf[..n]).unwrap();
+                let reply = Builder::new(Class::Success, METHOD_BINDING, request.transaction_id)
+                    .xor_mapped_address(from)
+                    .build();
+                socket.send_to(&reply, from).unwrap();
+                answered += 1;
+            }
+            answered
+        });
+        (addr, stop, thread)
+    }
+
     fn client(
         answers: usize,
         error: bool,
@@ -255,9 +291,9 @@ mod tests {
         let clock = Arc::new(FakeClock::default());
         let demux =
             Demux::start(Arc::clone(&bound.socket), local, vec![local], clock.clone()).unwrap();
-        // The server answers twice: the first gathering and the one after
-        // the cache time; a third request would find no answer.
-        let (server, thread) = fake_server(2, false);
+        // The server answers whatever it is asked; it is asked twice: the
+        // first gathering and the one at the cache time.
+        let (server, stop, thread) = counting_server();
         let client = StunClient::new(
             bound.socket,
             demux.responses(),
@@ -273,7 +309,8 @@ mod tests {
         assert_eq!(client.reflexive(server).await.unwrap(), mapped);
         clock.advance(Duration::from_secs(1));
         assert_eq!(client.reflexive(server).await.unwrap(), mapped);
-        thread.join().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(thread.join().unwrap(), 2, "gathered at 0 s and at 60 s");
         demux.stop();
     }
 

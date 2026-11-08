@@ -502,14 +502,27 @@ mod tests {
             .registrations
             .register("tcpu", b"tcp-pass".to_vec(), sink.clone());
         // A verified Binding Request padded with an unknown
-        // comprehension-optional attribute (RFC 8489 §14) to `total` bytes.
-        let padded = |total: usize, id: u8| {
-            let request = Builder::new(Class::Request, METHOD_BINDING, [id; 12])
-                .username("tcpu:peer")
-                .attribute(0xc0ff, &vec![0; total - 20 - 16 - 24 - 8 - 4])
+        // comprehension-optional attribute (RFC 8489 §14) to `total` bytes:
+        // the request without it, then the attribute's header and the rest.
+        let request = |id: u8, padding: Option<usize>| {
+            let builder =
+                Builder::new(Class::Request, METHOD_BINDING, [id; 12]).username("tcpu:peer");
+            padding
+                .into_iter()
+                .fold(builder, |builder, len| {
+                    builder.attribute(0xc0ff, &vec![0; len])
+                })
                 .integrity(b"tcp-pass")
                 .fingerprint()
-                .build();
+                .build()
+        };
+        let bare = request(0, None).len();
+        let padded = |total: usize, id: u8| {
+            let padding = total
+                .checked_sub(bare + 4)
+                .expect("a target above the bare request");
+            assert_eq!(padding % 4, 0, "no padding of its own (RFC 8489 §14)");
+            let request = request(id, Some(padding));
             assert_eq!(request.len(), total);
             let mut framed = u16::try_from(total).unwrap().to_be_bytes().to_vec();
             framed.extend_from_slice(&request);
