@@ -61,4 +61,11 @@ exclude = ["^\\.venv/"]
 [tool.pytest.ini_options]
 testpaths = ["."]
 addopts = "--strict-markers -p no:cacheprovider"
-filterwarnings = ["error"]
+filterwarnings = [
+  "error",
+  # Selenium 4.52.0 stops a driver with `GET /shutdown` (`Service.send_remote_shutdown_command`)
+  # and drops the `HTTPError` of a driver that has no such endpoint unclosed, geckodriver 0.37.1's
+  # 405 and safaridriver's 404 (Safari 27.2); Python 3.14 warns when it is collected (observed
+  # 2026-11-08). Nothing of ours holds it; the test session has quit by then.
+  "ignore:Implicitly cleaning up <HTTPError 40[45]\\b:ResourceWarning:tempfile",
+]

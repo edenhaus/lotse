@@ -2590,6 +2590,86 @@ mod source {
         assert_eq!(running.set.ingest(), expected);
     }
 
+    /// A reconnect whose answer takes another audio codec than the last
+    /// one's: the audio track is declared again under its id at the new
+    /// clock rate (core's `TrackSet::declare`, a new epoch), so its RTP
+    /// timestamps, its Sender Reports and the timeline guard all read the
+    /// codec this attempt negotiated.
+    #[tokio::test]
+    async fn rfc3264_a_reconnect_that_takes_pcmu_after_opus_redeclares_the_audio_at_8_khz() {
+        let _logs = logs();
+        lotse_webrtc::install_crypto_provider();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let source = WebRtcSourceFactory
+            .validate(&serde_json::json!({ "audio": true }))
+            .unwrap();
+        let set = TrackSet::new(TrackLimits::default(), clock.now());
+        let pcmu = Rtc::builder()
+            .set_rtp_mode(true)
+            .clear_codecs()
+            .enable_h264(true)
+            .enable_pcmu(true, false);
+        let cases: [(RtcConfig, fn(&Codec) -> bool, u32); 2] = [
+            (
+                camera_config(true),
+                |codec| matches!(codec, Codec::Opus { .. }),
+                48_000,
+            ),
+            (pcmu, |codec| matches!(codec, Codec::Pcmu), 8_000),
+        ];
+        let mut epochs = Vec::new();
+        for (config, is_codec, clock_rate) in cases {
+            let signaling = FakeSignaling::new(vec![LOOPBACK]);
+            let (input, _reports) = ClockInput::channel(Arc::new(ClockMapper::new()));
+            let cancel = CancellationToken::new();
+            let run = spawn_named(
+                "test.webrtc_source",
+                source.run(SourceCtx {
+                    peer: ResolvedPeer {
+                        host: String::new(),
+                        addrs: vec![],
+                    },
+                    tracks: set.publisher(),
+                    clock: input,
+                    time: Arc::clone(&clock),
+                    backchannel: BackchannelSlot::default(),
+                    signaling: Some(signaling.clone()),
+                    cancel: cancel.clone(),
+                }),
+            );
+            let mut relay = within(signaling.next_signal()).await.unwrap();
+            let (offer, _) = read_offer(&mut relay).await;
+            let (_camera, answer) = Live::answer_with(&offer, config).await;
+            relay
+                .incoming
+                .send(RemoteSignal::Answer(answer))
+                .await
+                .unwrap();
+            // Declared at the answer.
+            within(async {
+                while set
+                    .tracks()
+                    .first()
+                    .is_none_or(|audio| !is_codec(&audio.codec()))
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let tracks = set.tracks();
+            assert_eq!(tracks.len(), 2, "the same two tracks");
+            assert_eq!(tracks[0].kind(), Kind::Audio);
+            assert_eq!(tracks[0].clock_rate(), clock_rate);
+            epochs.push(tracks[0].epoch());
+            cancel.cancel();
+            within(run).await.unwrap();
+        }
+        assert!(
+            epochs[1] > epochs[0],
+            "a new epoch at the new rate: {epochs:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_camera_failure_before_its_answer_is_unreachable() {
         let _logs = logs();

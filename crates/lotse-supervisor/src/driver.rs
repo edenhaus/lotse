@@ -2549,6 +2549,10 @@ mod tests {
         }
         let mut driver = driver_on(&shared, demand);
         driver.on_worker_event(WorkerEvent::Exited(ExitStatus::from_raw(0)));
+        // An idle connection's worker exiting is no crash: none counted.
+        assert_eq!(driver.machine.crashes(), 0);
+        assert_eq!(driver.snapshot.last_crash, None);
+        assert_eq!(shared.lock().worker_restarts, 0);
         drop(driver);
         assert!(!shared.lock().sessions.contains_key("s1"));
         assert!(shared.lock().sessions.contains_key("s2"));

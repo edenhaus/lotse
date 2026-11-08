@@ -7,3 +7,11 @@
 # whole process group: the `lotse serve` and workers it started go with it.
 # The slowest test takes about 10 s (2026-10-09), so this only fires on a hang.
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# `lotse ctl`'s tests bound each client by 60 s (`ctl::tests::bounded`), which a client spinning
+# without ever yielding cannot reach on the current-thread runtime: a mutant of `Printer::write`
+# that returns at once spins the print loop. nextest ends such a test at the same 60 s instead
+# of after three minutes.
+[[profile.default.overrides]]
+filter = 'package(lotse) & test(/^ctl::tests::/)'
+slow-timeout = { period = "20s", terminate-after = 3 }

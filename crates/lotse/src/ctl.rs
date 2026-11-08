@@ -1396,6 +1396,26 @@ mod tests {
         );
     }
 
+    /// Only the result of the command's own id ends `raw`: a stale result of
+    /// another id, and an event under the command's id, are printed and
+    /// read past. Both would end it in success, so only the failed result
+    /// of its own id gives the failure asserted.
+    #[tokio::test]
+    async fn raw_ends_only_at_the_result_of_its_own_id() {
+        let script = vec![
+            Step::Read,
+            text(&json!({ "type": "result", "id": 99, "success": true, "result": {} })),
+            text(&json!({ "type": "event", "id": 1, "event": {} })),
+            text(&json!({ "type": "result", "id": 1, "success": false, "error": {} })),
+        ];
+        let (code, _read) = against("raw-own-id", true, script, async |socket| {
+            let mut client = Client::connect(socket).await.unwrap();
+            client.raw(json!({ "type": "info" }), true).await.unwrap()
+        })
+        .await;
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
     #[tokio::test]
     async fn raw_fails_when_the_connection_closes_before_the_result() {
         let script = vec![Step::Read, Step::Send(Message::Close(None))];
@@ -1466,6 +1486,20 @@ mod tests {
         shutdown.push(text(&json!({ "type": "shutdown" })));
         let (code, _command) = subscribe("sub-shutdown", None, None, ok, shutdown).await;
         assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+    }
+
+    /// Another subscription's event does not count toward the limit: the
+    /// client reads on, here into a frame that is not JSON.
+    #[tokio::test]
+    async fn subscribe_counts_only_its_own_events() {
+        let ok = json!({ "type": "result", "id": 1, "success": true, "result": {} });
+        let then = vec![
+            text(&json!({ "type": "event", "id": 1, "event": { "n": 1 } })),
+            text(&json!({ "type": "event", "id": 2, "event": { "n": 0 } })),
+            Step::Send(Message::Text("not json".into())),
+        ];
+        let (code, _command) = subscribe("sub-own", None, Some(2), ok, then).await;
+        assert!(code.is_err(), "read past the other subscription's event");
     }
 
     #[tokio::test]
@@ -2043,6 +2077,20 @@ mod tests {
             "the result and closed: {printed}"
         );
         assert_eq!(read.len(), 2, "recording/create and GET: {read:?}");
+    }
+
+    /// `write` hands every queued line to stdout and flushes it, and fails
+    /// with stdout: a write that returned at once would leave the line
+    /// queued.
+    #[tokio::test]
+    async fn printer_write_hands_the_queued_lines_to_stdout_and_flushes() {
+        let (stdout, taken) = quiet_stdout();
+        let mut printer = Printer::new(Box::pin(stdout));
+        printer.push(&json!({ "a": 1 }), true);
+        let err = bounded(printer.write()).await.unwrap_err();
+        assert_eq!(err.to_string(), "writing stdout");
+        assert_eq!(&*taken.lock().unwrap(), b"{\"a\":1}\n");
+        assert!(printer.queued.is_empty());
     }
 
     /// `finish` has nothing to wait for without a queued line.
