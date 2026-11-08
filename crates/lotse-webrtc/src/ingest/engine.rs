@@ -22,9 +22,10 @@
 //! `a=setup:actpass` (RFC 5763 §5, RFC 8842 §5.2), so the camera picks its
 //! DTLS role; DTLS-SRTP keys the media (RFC 5764). Media is received in
 //! str0m's RTP mode: each packet goes to the caller as it arrived, mapped
-//! to the stream index its m-line has, except a late one from before the
-//! camera's timestamps jumped (RFC 3550 §5.1), which is dropped. Picture Loss Indications (RFC 4585
-//! §6.3.1) ask the camera for a keyframe once connected, every
+//! to the stream index its m-line has, except one from before the
+//! camera's timestamps jumped (RFC 3550 §5.1), late or of a former
+//! source, which is dropped. Picture Loss Indications (RFC 4585 §6.3.1)
+//! ask the camera for a keyframe once connected, every
 //! [`PLI_INTERVAL`] until one arrived (at most [`STARTUP_PLIS`]), and after
 //! a gap in the video's sequence numbers, rate-limited. Consent freshness
 //! (RFC 7675) is str0m's: its agent going disconnected after the
@@ -46,6 +47,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
+use dimpl::TimeoutError;
 use lotse_codec::rtp_ingest::{Declared, RtpPacket, Sprop};
 use lotse_codec::{h264, h265};
 use lotse_core::codec::{Codec, Kind};
@@ -56,6 +58,7 @@ use lotse_core::source::SourceError;
 use lotse_core::throttle::Throttle;
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::channel::ChannelId;
+use str0m::crypto::{CryptoError, DtlsError};
 use str0m::format::{Codec as EngineCodec, CodecSpec};
 use str0m::media::{Direction, KeyframeRequestKind, MediaKind, Mid, SenderFeedback};
 use str0m::net::{DatagramRecv, Protocol, Receive};
@@ -196,9 +199,9 @@ pub struct IngestStats {
     /// RTP packets in a format the answer accepted of another codec than
     /// their track's, dropped.
     pub other_codec_packets: u64,
-    /// Late RTP packets from before the camera's timestamps jumped,
-    /// more than a second of media time off the newest packet's,
-    /// dropped (RFC 3550 §5.1).
+    /// RTP packets from before the camera's timestamps jumped, late or
+    /// of a former source, more than a second of media time off the
+    /// newest packet's, dropped (RFC 3550 §5.1).
     pub stale_packets: u64,
     /// Sender Reports handed on.
     pub sender_reports: u64,
@@ -270,11 +273,14 @@ enum Seen {
     /// Late or repeated within its source's numbering, near the newest
     /// packet's timestamp: reordered or repaired on the way, handed on.
     Late,
-    /// Late or repeated, with a timestamp more than
+    /// Late or repeated, or of a former source (one the stream knows
+    /// that is not the newest packet's), with a timestamp more than
     /// [`MAX_TIMESTAMP_JUMP`] of media time from the newest packet's: it
     /// was sent before the camera's timestamps jumped (an encoder restart,
-    /// RFC 3550 §5.1, §8.2) and arrived after, delayed or retransmitted.
-    /// Dropped: handed on, it would take the stream back to its old
+    /// RFC 3550 §5.1, §8.2) and arrived after, delayed or retransmitted;
+    /// a former source's packet may be ahead in its own numbering, never
+    /// having arrived before. Dropped, and its source's numbers left as
+    /// they were: handed on, it would take the stream back to its old
     /// timeline and the next packet forward again, a new timeline each
     /// (`lotse_codec::rtp_ingest::RtpTracks`).
     Stale,
@@ -292,8 +298,11 @@ impl Stream {
     /// `ts`. Each source numbers its packets on its own (RFC 3550 §5.1,
     /// §8.2), so a source's first packet is no loss, and a late or
     /// repeated one (no more than half the sequence space behind) changes
-    /// nothing; it is [`Seen::Stale`] when its timestamp is off the newest
-    /// packet's timeline (the latest source's highest).
+    /// nothing. It is [`Seen::Stale`] when its timestamp is off the newest
+    /// packet's timeline (the latest source's highest) and it is late or
+    /// of a former source: only the newest source moves the timeline (its
+    /// own jump is the camera's, RFC 3550 §5.1), and a source never seen
+    /// (or forgotten) starts its own (an encoder restart, RFC 3550 §8.2).
     fn sequence(&mut self, ssrc: u32, seq: u16, ts: u32) -> Seen {
         let highest = self
             .sources
@@ -301,13 +310,15 @@ impl Stream {
             .find(|(seen, _, _)| *seen == ssrc)
             .map(|(_, highest, _)| *highest);
         let ahead = highest.map_or(1, |highest| seq.wrapping_sub(highest));
-        if !(1..0x8000).contains(&ahead) {
-            let newest = self.sources.first().map(|(_, _, newest)| *newest);
-            return if newest.is_some_and(|newest| self.off_timeline(ts, newest)) {
-                Seen::Stale
-            } else {
-                Seen::Late
-            };
+        let late = !(1..0x8000).contains(&ahead);
+        let newest = self.sources.first().copied();
+        let former = highest.is_some() && newest.is_some_and(|(newest, _, _)| newest != ssrc);
+        let off = newest.is_some_and(|(_, _, newest)| self.off_timeline(ts, newest));
+        if off && (late || former) {
+            return Seen::Stale;
+        }
+        if late {
+            return Seen::Late;
         }
         self.sources.retain(|(seen, _, _)| *seen != ssrc);
         self.sources.insert(0, (ssrc, seq, ts));
@@ -410,6 +421,26 @@ fn config() -> RtcConfig {
         .enable_opus(true, false)
         .enable_pcmu(true, false)
         .enable_pcma(true, false)
+}
+
+/// Whether `err` is dimpl giving up a DTLS handshake for time: its
+/// retransmissions exhausted, its handshake deadline passed, or an Auto
+/// `ClientHello` unresolved ([`TimeoutError`]). str0m 0.25 hands every
+/// dimpl error on as text, `CryptoError::Other("DTLS error: {err}")`
+/// (its `dtls.rs`, read 2026-11-08; observed as "DTLS error: timeout:
+/// handshake" the same day), so the timeout is told by that text, made
+/// with dimpl's own `Display`.
+fn dtls_timed_out(err: &RtcError) -> bool {
+    let RtcError::Dtls(DtlsError::CryptoError(CryptoError::Other(message))) = err else {
+        return false;
+    };
+    [
+        TimeoutError::HybridClientHello,
+        TimeoutError::Connect,
+        TimeoutError::Handshake,
+    ]
+    .into_iter()
+    .any(|timeout| *message == format!("DTLS error: {}", dimpl::Error::Timeout(timeout)))
 }
 
 /// Whether the media sections of `offer` carry distinct mids: str0m 0.24
@@ -991,12 +1022,8 @@ impl IngestEngine {
                 true
             }
             Phase::Answered if overdue => {
-                let ms = now.saturating_duration_since(self.started).as_millis();
-                self.end(
-                    SourceError::Timeout,
-                    close::ICE_FAILED,
-                    format!("webrtc: not connected {ms} ms into the attempt"),
-                );
+                let message = self.not_connected();
+                self.end(SourceError::Timeout, close::ICE_FAILED, message);
                 true
             }
             _ => false,
@@ -1059,11 +1086,32 @@ impl IngestEngine {
         self.check(handled);
     }
 
+    /// Why an attempt that is not connected ends, at [`Self::now`]: how
+    /// far into the attempt.
+    fn not_connected(&self) -> String {
+        let ms = self.now.saturating_duration_since(self.started).as_millis();
+        format!("webrtc: not connected {ms} ms into the attempt")
+    }
+
     /// Ends the attempt as a protocol error when str0m failed: a DTLS
     /// handshake that failed (a fingerprint that does not match, RFC 5763
-    /// §5), or another engine error.
+    /// §5), or another engine error. A DTLS handshake that timed out
+    /// before the connection ends it as not connected instead, as the
+    /// connection's deadline does (`ice_failed`): dimpl 0.9's
+    /// retransmissions of an unanswered flight (1 s doubling, 4 retries,
+    /// each ±25 %, so 23 to 39 s; its `Config::handshake_timeout` docs,
+    /// read 2026-11-08) can give up before [`CONNECT_BY`], and a camera
+    /// that never answered the handshake is a connection that never came
+    /// up, not lotse's internal error. Once connected, a DTLS error keeps
+    /// its protocol ending.
     fn check(&mut self, result: Result<(), RtcError>) {
-        if let Err(err) = result {
+        let Err(err) = result else {
+            return;
+        };
+        if self.phase == Phase::Answered && dtls_timed_out(&err) {
+            let message = format!("{}: {err}", self.not_connected());
+            self.end(SourceError::Timeout, close::ICE_FAILED, message);
+        } else {
             self.end(
                 SourceError::Protocol,
                 close::INTERNAL_ERROR,
@@ -1170,9 +1218,10 @@ impl IngestEngine {
     /// with a warning. A forward gap in the video's sequence numbers of
     /// one synchronization source (RFC 3550 §A.1) is a lost picture, which
     /// asks for a keyframe. A late packet from before the camera's
-    /// timestamps jumped is dropped ([`Seen::Stale`]), as an RTSP source's
-    /// reorderer drops every late packet (retina's `Reorderer`); one
-    /// merely reordered or repaired is handed on. New sources and stale
+    /// timestamps jumped, or one of a former source off the newest
+    /// source's timeline, is dropped ([`Seen::Stale`]), as an RTSP
+    /// source's reorderer drops every late packet (retina's `Reorderer`);
+    /// one merely reordered or repaired is handed on. New sources and stale
     /// packets are logged at most once per summary interval.
     fn on_rtp(&mut self, packet: str0m::rtp::RtpPacket) {
         let header = &packet.header;
@@ -1226,7 +1275,7 @@ impl IngestEngine {
                         ssrc,
                         seq,
                         count,
-                        "webrtc: a late packet from before the camera's timestamps jumped dropped"
+                        "webrtc: a packet from before the camera's timestamps jumped dropped"
                     );
                 }
                 return;
@@ -1474,6 +1523,52 @@ mod tests {
     }
 
     #[test]
+    fn rfc3550_8_2_a_former_source_s_packet_off_the_newest_timeline_is_stale_even_ahead() {
+        const A: u32 = 0xa;
+        const B: u32 = 0xb;
+        let mut stream = video_stream();
+        assert!(matches!(stream.sequence(A, 101, 0), Seen::Ahead { .. }));
+        // An encoder restart (RFC 3550 §8.2): a new source, a new timeline.
+        assert!(matches!(
+            stream.sequence(B, 7, 45_000_000),
+            Seen::Ahead { .. }
+        ));
+        // A packet of the former source never seen before, ahead in its
+        // own numbering, off the newest source's timeline: stale, its
+        // source's numbers kept and the newest source still the newest.
+        assert_eq!(stream.sequence(A, 102, 3_000), Seen::Stale);
+        assert_eq!(stream.sequence(A, 105, 6_000), Seen::Stale);
+        assert_eq!(stream.sources, [(B, 7, 45_000_000), (A, 101, 0)]);
+        assert_eq!(
+            stream.sequence(B, 8, 45_003_000),
+            Seen::Ahead {
+                lost: false,
+                new_source: false
+            }
+        );
+        // On the newest source's timeline, the former source comes back
+        // as the newest, its own gap a loss (RFC 3550 §A.1).
+        assert_eq!(
+            stream.sequence(A, 103, 45_006_000),
+            Seen::Ahead {
+                lost: true,
+                new_source: false
+            }
+        );
+        assert_eq!(stream.sources, [(A, 103, 45_006_000), (B, 8, 45_003_000)]);
+        // The newest source's own jump moves the timeline (RFC 3550 §5.1),
+        // and a source never seen starts its own (RFC 3550 §8.2).
+        assert!(matches!(stream.sequence(A, 104, 0), Seen::Ahead { .. }));
+        assert_eq!(
+            stream.sequence(0xc, 1, 90_000_000),
+            Seen::Ahead {
+                lost: false,
+                new_source: true
+            }
+        );
+    }
+
+    #[test]
     fn rfc5905_6_ntp_timestamps_count_from_1900_with_a_32_bit_fraction() {
         let half = UNIX_EPOCH + Duration::from_millis(1_500);
         assert_eq!(
@@ -1554,6 +1649,93 @@ mod tests {
         engine.on_event(other);
         assert!(engine.queued.is_empty());
         assert_eq!(engine.stats.unusable_reports, 2);
+    }
+
+    /// str0m 0.25's error for dimpl's `err` (its `dtls.rs`).
+    fn str0m_dtls(err: impl std::fmt::Display) -> RtcError {
+        RtcError::Dtls(DtlsError::CryptoError(CryptoError::Other(format!(
+            "DTLS error: {err}"
+        ))))
+    }
+
+    #[test]
+    fn rfc6347_4_2_4_a_dtls_handshake_that_timed_out_is_told_from_other_errors() {
+        for timeout in [
+            TimeoutError::HybridClientHello,
+            TimeoutError::Connect,
+            TimeoutError::Handshake,
+        ] {
+            assert!(
+                dtls_timed_out(&str0m_dtls(dimpl::Error::Timeout(timeout))),
+                "{timeout}"
+            );
+        }
+        // As observed from str0m 0.25 with dimpl 0.9, 2026-11-08.
+        assert!(dtls_timed_out(&str0m_dtls("timeout: handshake")));
+        assert!(!dtls_timed_out(&str0m_dtls(dimpl::Error::ReceiveQueueFull)));
+        assert!(!dtls_timed_out(&str0m_dtls("timeout: handshake, and more")));
+        assert!(!dtls_timed_out(&RtcError::Dtls(DtlsError::CryptoError(
+            CryptoError::Other("timeout: handshake".into())
+        ))));
+        assert!(!dtls_timed_out(&RtcError::Dtls(DtlsError::Io(
+            std::io::Error::other("DTLS error: timeout: handshake")
+        ))));
+        assert!(!dtls_timed_out(&RtcError::RemoteSdp(
+            "DTLS error: timeout: handshake".into()
+        )));
+    }
+
+    #[test]
+    fn rfc8445_8_a_dtls_handshake_that_times_out_before_the_connection_ends_as_ice_failed() {
+        let addr = "192.0.2.10:5000".parse().unwrap();
+        let started = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
+        let ended = |phase, err| {
+            let options = WebRtcOptions {
+                data_channel: None,
+                audio: false,
+            };
+            let mut engine = IngestEngine::offer(&options, &[addr], started, started).unwrap();
+            engine.phase = phase;
+            engine.now = started + Duration::from_millis(23_456);
+            engine.check(Err(err));
+            assert!(engine.is_ended());
+            // The close's transmits, if any, then the end, last.
+            engine.queued.pop_back()
+        };
+        let timeout = || str0m_dtls(dimpl::Error::Timeout(TimeoutError::Handshake));
+        // Before the connection: not connected, as at the deadline.
+        assert_eq!(
+            ended(Phase::Answered, timeout()),
+            Some(IngestOutput::Ended(IngestEnd {
+                error: SourceError::Timeout(
+                    "webrtc: not connected 23456 ms into the attempt: \
+                     DTLS error: timeout: handshake"
+                        .into()
+                ),
+                close: close::ICE_FAILED,
+                message: "webrtc: not connected 23456 ms into the attempt: \
+                          DTLS error: timeout: handshake"
+                    .into(),
+            }))
+        );
+        // Once connected, and any other DTLS error: the engine's error.
+        for (phase, err) in [
+            (Phase::Connected, timeout()),
+            (Phase::Answered, str0m_dtls(dimpl::Error::ReceiveQueueFull)),
+        ] {
+            let end = ended(phase, err);
+            assert!(
+                matches!(
+                    &end,
+                    Some(IngestOutput::Ended(IngestEnd {
+                        error: SourceError::Protocol(_),
+                        close: close::INTERNAL_ERROR,
+                        message,
+                    })) if message.starts_with("webrtc engine: DTLS error: ")
+                ),
+                "{end:?}"
+            );
+        }
     }
 
     #[test]
