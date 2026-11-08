@@ -5,6 +5,9 @@ test_tool = "nextest"
 # `test-util` feature, exercised by the other crates' tests.
 exclude_globs = [
     "crates/lotse-testing/**",
+    # Built only off Linux (macOS, a development host): the Mutants jobs run on Linux, where no
+    # test reaches it.
+    "crates/lotse-sandbox/src/other.rs",
     "crates/lotse-codec/src/aac/test_data.rs",
     "crates/lotse-codec/src/g722/test_data.rs",
 ]
@@ -148,6 +151,11 @@ exclude_re = [
     # The method's three groups of bits (RFC 8489 §5: M0-M3, M4-M6, M7-M11) are disjoint once
     # shifted, so `|` and `^` produce the same method.
     "net/stun.rs:.*replace \\| with \\^ in parse$",
+    # `abi_of` only picks filesystem rights (`AccessFs::from_all`), and ABI 4 adds none to ABI 3's
+    # (landlock(7), "Landlock ABI versions"): ABI 3 taken as 4 handles the same rights.
+    "lotse-sandbox/src/linux.rs:.*delete match arm 3 in abi_of$",
+    # Landlock's TCP rights are disjoint flags, so `|` and `^` produce the same set.
+    "lotse-sandbox/src/linux.rs:.*replace \\| with \\^ in net_access$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
     # An empty host let through goes on to `Url::set_username`, which refuses a URL whose host
