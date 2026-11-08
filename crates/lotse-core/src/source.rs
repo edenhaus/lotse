@@ -25,6 +25,7 @@ use crate::media::MediaPacket;
 use crate::negotiate::TrackInfo;
 use crate::prerecord::PrerecordShared;
 use crate::runner::ProbeGate;
+use crate::signaling::SignalingOpener;
 use crate::source_url::SourceUrl;
 use crate::task::{BoxFuture, spawn_named};
 use crate::track::{Feeds, Track, TrackId, TrackLimits};
@@ -36,15 +37,16 @@ pub struct SourceCapabilities {
     pub backchannel: bool,
 }
 
-/// Why a factory refused a URL and its options. The API reports it as
-/// `invalid_request` with the message.
+/// Why a factory refused a URL and its options, or a signaled factory its
+/// options. The API reports it as `invalid_request` with the message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SourceConfigError {
     /// The options do not match the scheme's typed options (unknown field,
-    /// bad value, wrong type).
+    /// bad value, wrong type), or a signaled protocol's.
     #[error("invalid options for scheme {scheme}: {message}")]
     InvalidOptions {
-        /// The scheme whose options were checked.
+        /// The scheme whose options were checked, or the signaled
+        /// protocol's name.
         scheme: &'static str,
         /// What was wrong, for humans.
         message: String,
@@ -59,7 +61,8 @@ pub enum SourceConfigError {
     },
 }
 
-/// One source protocol, registered at startup behind its Cargo feature.
+/// One source protocol whose sources lotse connects to by URL, registered
+/// at startup behind its Cargo feature.
 pub trait SourceFactory: fmt::Debug + Send + Sync {
     /// The URL schemes this protocol serves (`rtsp`, `rtsps`; `http`,
     /// `https`; later `rtmp`, ...), lowercase. `info.schemes` is the union over the registry.
@@ -85,13 +88,34 @@ pub trait SourceFactory: fmt::Debug + Send + Sync {
     ) -> Result<Box<dyn Source>, SourceConfigError>;
 }
 
+/// One source protocol whose signaling the control-API client relays (a
+/// WebRTC camera whose offer and answer travel through Home Assistant),
+/// registered at startup behind its Cargo feature. Such a source has no
+/// address: the API names it by [`Self::protocol`], and the stream it
+/// belongs to is its identity. Each of its connection attempts opens a
+/// channel to the client through [`SourceCtx::signaling`], which the
+/// worker hands only to such a source.
+pub trait SignaledSourceFactory: fmt::Debug + Send + Sync {
+    /// The protocol's name (`webrtc`), lowercase: what `stream/put` names
+    /// such a source by, and what it reports as its protocol.
+    /// `info.signaled_protocols` lists them over the registry.
+    fn protocol(&self) -> &'static str;
+
+    /// Checks the untyped `options` against the protocol's typed options
+    /// (unknown fields rejected) and builds the source. Pure: no I/O, so
+    /// it can run inside `stream/put`.
+    fn validate(&self, options: &serde_json::Value) -> Result<Box<dyn Source>, SourceConfigError>;
+}
+
 /// A source as the API reports it: protocol, redacted URL, redacted options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceDescriptor {
-    /// The protocol name, which is also the scheme family (`rtsp`).
+    /// The protocol name, which is also the scheme family (`rtsp`), or a
+    /// signaled source's protocol ([`SignaledSourceFactory::protocol`]).
     pub protocol: &'static str,
-    /// The URL; its `Display` is redacted.
-    pub url: SourceUrl,
+    /// The URL; its `Display` is redacted. `None` for a signaled source,
+    /// which has no address.
+    pub url: Option<SourceUrl>,
     /// The options with secrets redacted.
     pub options: serde_json::Value,
 }
@@ -180,12 +204,16 @@ impl SourceError {
 }
 
 /// The addresses a source connects to. Resolved by the supervisor: workers
-/// have no DNS. The host name stays for the protocol URL and TLS SNI.
+/// have no DNS. The host name stays for the protocol URL and TLS SNI. A
+/// signaled source has no address, so its peer is empty: no host, no
+/// addresses; it connects to what its signaling names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPeer {
-    /// The host as written in the URL, for the protocol's own URL and SNI.
+    /// The host as written in the URL, for the protocol's own URL and SNI;
+    /// empty for a signaled source.
     pub host: String,
-    /// The addresses to try, in order, with the port already applied.
+    /// The addresses to try, in order, with the port already applied;
+    /// none for a signaled source.
     pub addrs: Vec<SocketAddr>,
 }
 
@@ -1192,6 +1220,11 @@ pub struct SourceCtx {
     /// if the protocol has one, and where the probe waits for its connect
     /// permit.
     pub backchannel: BackchannelSlot,
+    /// Opens this attempt's signaling channel to the control-API client,
+    /// for a signaled source (one a [`SignaledSourceFactory`] built);
+    /// `None` for every other source, and for a signaled one that has no relay to
+    /// the client, which then cannot connect.
+    pub signaling: Option<Arc<dyn SignalingOpener>>,
     /// Cancelled when core wants the connection to end; honor within 100 ms.
     pub cancel: CancellationToken,
 }

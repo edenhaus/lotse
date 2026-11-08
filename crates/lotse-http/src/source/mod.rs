@@ -153,7 +153,7 @@ impl Source for HttpSource {
     fn describe(&self) -> SourceDescriptor {
         SourceDescriptor {
             protocol: PROTOCOL,
-            url: self.url.clone(),
+            url: Some(self.url.clone()),
             options: self.options.redacted(),
         }
     }

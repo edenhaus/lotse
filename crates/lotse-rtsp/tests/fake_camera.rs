@@ -348,7 +348,7 @@ async fn credentials_are_checked_and_never_reported() {
     assert!(lotse_testing::fake_camera::Stats::get(&cam.stats().unauthorized) >= 2);
     // The right ones: live, and the description hides them.
     let source = make_source(&cam.url(), &serde_json::Value::Null);
-    let described = format!("{:?} {}", source.describe(), source.describe().url);
+    let described = format!("{:?} {}", source.describe(), source.describe().url.unwrap());
     assert!(!described.contains("secret"), "{described}");
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await);
@@ -881,6 +881,7 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
         Arc::clone(&tracks),
         Arc::new(ClockMapper::new()),
         BackchannelSlot::default(),
+        None,
         clock(),
         RunnerConfig::default(),
         ReconnectBackoff::new(1),
@@ -986,6 +987,7 @@ async fn rfc3550_5_1_a_reconnect_follows_the_audio_s_clock_rate_and_one_without_
         Arc::clone(&tracks),
         Arc::new(ClockMapper::new()),
         BackchannelSlot::default(),
+        None,
         clock(),
         RunnerConfig {
             stall_audio,
@@ -1326,10 +1328,13 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
         let source = make_source(&url, &serde_json::Value::Null);
         let described = source.describe();
         assert_eq!(
-            described.url.to_string(),
+            described.url.as_ref().unwrap().to_string(),
             format!("rtsp://****@{}/****?****", cam.addr())
         );
-        printed.push(format!("{described:?} {} {source:?}", described.url));
+        printed.push(format!(
+            "{described:?} {} {source:?}",
+            described.url.as_ref().unwrap()
+        ));
         let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
         assert_eq!(
             harness.wait_ready().await,
